@@ -243,6 +243,6 @@ Scrape multiple URLs in parallel with worker processes.
 
 ## License
 
-MIT
+Apache 2.0
 
 ---
