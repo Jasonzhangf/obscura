@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand};
 use obscura_browser::{BrowserContext, Page};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command as TokioCommand;
+use tokio::time::{timeout, Duration};
 
 #[derive(Parser)]
 #[command(name = "obscura", about = "Obscura - A lightweight headless browser for web scraping and automation")]
@@ -86,6 +87,9 @@ enum Command {
 
         #[arg(long, default_value = "json")]
         format: String,
+
+        #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..))]
+        timeout: u64,
     },
 
 }
@@ -149,8 +153,8 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Fetch { url, dump, selector, wait, wait_until, user_agent, stealth, eval, quiet }) => {
             run_fetch(&url, dump, selector, wait, &wait_until, user_agent, stealth, eval, quiet).await?;
         }
-        Some(Command::Scrape { urls, eval, concurrency, format }) => {
-            run_parallel_scrape(urls, eval, concurrency, &format).await?;
+        Some(Command::Scrape { urls, eval, concurrency, format, timeout }) => {
+            run_parallel_scrape(urls, eval, concurrency, &format, timeout).await?;
         }
         None => {
             print_banner(args.port);
@@ -403,13 +407,14 @@ async fn run_parallel_scrape(
     eval: Option<String>,
     concurrency: usize,
     format: &str,
+    timeout_secs: u64,
 ) -> anyhow::Result<()> {
     let total = urls.len();
     let start = Instant::now();
 
     eprintln!(
-        "Scraping {} URLs with {} concurrent workers...",
-        total, concurrency
+        "Scraping {} URLs with {} concurrent workers (per-worker timeout: {}s)...",
+        total, concurrency, timeout_secs
     );
 
     let worker_path = std::env::current_exe()
@@ -427,6 +432,9 @@ async fn run_parallel_scrape(
     let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
     let eval = Arc::new(eval);
     let worker_path = Arc::new(worker_path);
+    let worker_timeout = Duration::from_secs(timeout_secs);
+    let read_timeout = Duration::from_secs(timeout_secs.min(30));
+    let shutdown_timeout = Duration::from_secs(5);
 
     let mut handles = Vec::new();
 
@@ -455,77 +463,122 @@ async fn run_parallel_scrape(
                 }
             };
 
-            let stdin = child.stdin.as_mut().unwrap();
-            let stdout = child.stdout.take().unwrap();
+            let mut stdin = match child.stdin.take() {
+                Some(stdin) => stdin,
+                None => {
+                    let _ = timeout(shutdown_timeout, child.kill()).await;
+                    return serde_json::json!({
+                        "url": url,
+                        "error": "Failed to open worker stdin",
+                        "time_ms": task_start.elapsed().as_millis(),
+                    });
+                }
+            };
+            let stdout = match child.stdout.take() {
+                Some(stdout) => stdout,
+                None => {
+                    let _ = timeout(shutdown_timeout, child.kill()).await;
+                    return serde_json::json!({
+                        "url": url,
+                        "error": "Failed to open worker stdout",
+                        "time_ms": task_start.elapsed().as_millis(),
+                    });
+                }
+            };
             let mut reader = BufReader::new(stdout);
 
-            let nav_cmd = serde_json::json!({"cmd": "navigate", "url": url});
-            let mut line = serde_json::to_string(&nav_cmd).unwrap();
-            line.push('\n');
-            if stdin.write_all(line.as_bytes()).await.is_err() {
-                let _ = child.kill().await;
-                return serde_json::json!({"url": url, "error": "Write failed"});
-            }
-            let _ = stdin.flush().await;
+            let worker_result: Result<serde_json::Value, String> = match timeout(worker_timeout, async {
+                let nav_cmd = serde_json::json!({"cmd": "navigate", "url": url});
+                let mut line = serde_json::to_string(&nav_cmd).unwrap();
+                line.push('\n');
+                if stdin.write_all(line.as_bytes()).await.is_err() {
+                    return Err("Write failed".to_string());
+                }
+                if stdin.flush().await.is_err() {
+                    return Err("Write failed".to_string());
+                }
 
-            let mut resp_line = String::new();
-            if reader.read_line(&mut resp_line).await.is_err() {
-                let _ = child.kill().await;
-                return serde_json::json!({"url": url, "error": "Read failed"});
-            }
+                let mut resp_line = String::new();
+                match timeout(read_timeout, reader.read_line(&mut resp_line)).await {
+                    Ok(Ok(bytes)) if bytes > 0 => {}
+                    Ok(Ok(_)) | Ok(Err(_)) => return Err("Read failed".to_string()),
+                    Err(_) => return Err("timeout".to_string()),
+                };
 
-            let nav_resp: serde_json::Value =
-                serde_json::from_str(resp_line.trim()).unwrap_or(serde_json::json!({"ok": false}));
+                let nav_resp: serde_json::Value =
+                    serde_json::from_str(resp_line.trim()).unwrap_or(serde_json::json!({"ok": false}));
 
-            if !nav_resp["ok"].as_bool().unwrap_or(false) {
-                let _ = child.kill().await;
-                return serde_json::json!({
-                    "url": url,
-                    "error": nav_resp["error"].as_str().unwrap_or("navigate failed"),
-                    "time_ms": task_start.elapsed().as_millis(),
-                });
-            }
+                if !nav_resp["ok"].as_bool().unwrap_or(false) {
+                    return Err(
+                        nav_resp["error"]
+                            .as_str()
+                            .unwrap_or("navigate failed")
+                            .to_string(),
+                    );
+                }
 
-            let title = nav_resp["result"]["title"]
-                .as_str()
-                .unwrap_or("")
-                .to_string();
+                let title = nav_resp["result"]["title"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string();
 
-            let eval_result = if let Some(ref expr) = *eval {
-                let eval_cmd = serde_json::json!({"cmd": "evaluate", "expression": expr});
-                let mut line = serde_json::to_string(&eval_cmd).unwrap();
+                let eval_result = if let Some(ref expr) = *eval {
+                    let eval_cmd = serde_json::json!({"cmd": "evaluate", "expression": expr});
+                    let mut line = serde_json::to_string(&eval_cmd).unwrap();
+                    line.push('\n');
+                    if stdin.write_all(line.as_bytes()).await.is_err() {
+                        return Err("Write failed".to_string());
+                    }
+                    if stdin.flush().await.is_err() {
+                        return Err("Write failed".to_string());
+                    }
+
+                    let mut resp_line = String::new();
+                    match timeout(read_timeout, reader.read_line(&mut resp_line)).await {
+                        Ok(Ok(bytes)) if bytes > 0 => {
+                            let resp: serde_json::Value = serde_json::from_str(resp_line.trim())
+                                .unwrap_or(serde_json::json!({"ok": false}));
+                            resp["result"].clone()
+                        }
+                        Ok(Ok(_)) | Ok(Err(_)) => return Err("Read failed".to_string()),
+                        Err(_) => return Err("timeout".to_string()),
+                    }
+                } else {
+                    serde_json::Value::Null
+                };
+
+                let shutdown_cmd = serde_json::json!({"cmd": "shutdown"});
+                let mut line = serde_json::to_string(&shutdown_cmd).unwrap();
                 line.push('\n');
                 let _ = stdin.write_all(line.as_bytes()).await;
                 let _ = stdin.flush().await;
+                let _ = timeout(shutdown_timeout, child.wait()).await;
 
-                let mut resp_line = String::new();
-                if reader.read_line(&mut resp_line).await.is_ok() {
-                    let resp: serde_json::Value = serde_json::from_str(resp_line.trim())
-                        .unwrap_or(serde_json::json!({"ok": false}));
-                    resp["result"].clone()
-                } else {
-                    serde_json::Value::Null
-                }
-            } else {
-                serde_json::Value::Null
+                Ok(serde_json::json!({
+                    "url": url,
+                    "title": title,
+                    "eval": eval_result,
+                    "time_ms": task_start.elapsed().as_millis(),
+                    "worker": i,
+                }))
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err("timeout".to_string()),
             };
 
-            let shutdown_cmd = serde_json::json!({"cmd": "shutdown"});
-            let mut line = serde_json::to_string(&shutdown_cmd).unwrap();
-            line.push('\n');
-            let _ = stdin.write_all(line.as_bytes()).await;
-            let _ = stdin.flush().await;
-            let _ = child.wait().await;
-
-            let elapsed = task_start.elapsed().as_millis();
-
-            serde_json::json!({
-                "url": url,
-                "title": title,
-                "eval": eval_result,
-                "time_ms": elapsed,
-                "worker": i,
-            })
+            match worker_result {
+                Ok(result) => result,
+                Err(error) => {
+                    let _ = timeout(shutdown_timeout, child.kill()).await;
+                    serde_json::json!({
+                        "url": url,
+                        "error": error,
+                        "time_ms": task_start.elapsed().as_millis(),
+                    })
+                }
+            }
         });
 
         handles.push(handle);
