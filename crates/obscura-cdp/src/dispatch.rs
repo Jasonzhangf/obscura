@@ -31,11 +31,19 @@ pub struct CdpContext {
 
 impl CdpContext {
     pub fn new() -> Self {
-        Self::new_with_proxy(None)
+        Self::new_with_options(None, false)
     }
 
     pub fn new_with_proxy(proxy: Option<String>) -> Self {
-        let default_context = Arc::new(BrowserContext::with_proxy("default".to_string(), proxy));
+        Self::new_with_options(proxy, false)
+    }
+
+    pub fn new_with_options(proxy: Option<String>, stealth: bool) -> Self {
+        let default_context = Arc::new(BrowserContext::with_options(
+            "default".to_string(),
+            proxy,
+            stealth,
+        ));
         CdpContext {
             pages: Vec::new(),
             sessions: HashMap::new(),
