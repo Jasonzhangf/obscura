@@ -127,6 +127,13 @@ impl ObscuraJsRuntime {
         self.object_counter += 1;
         let oid = self.make_oid(self.object_counter);
 
+        // Same trailing-semicolon trim as wrap_expression — Playwright's
+        // utility-script eval ends with `})();`, and `({expr})` would
+        // otherwise become `(...;)` which is a parse-time SyntaxError.
+        let cleaned_expr = expression
+            .trim()
+            .trim_end_matches(|c: char| c == ';' || c.is_whitespace());
+
         let meta_code = format!(
             "(function() {{\n\
                 var __result;\n\
@@ -134,7 +141,7 @@ impl ObscuraJsRuntime {
                 globalThis.__obscura_objects['{oid}'] = __result;\n\
                 return {meta_fn};\n\
             }})()",
-            expr = expression,
+            expr = cleaned_expr,
             oid = oid,
             meta_fn = Self::meta_extract_js("__result"),
         );
@@ -559,9 +566,17 @@ impl ObscuraJsRuntime {
                 expression
             )
         } else {
+            // Strip trailing semicolons + whitespace before wrapping in
+            // `return (...);`. Playwright's utility-script expression is
+            // an IIFE that ends with `})();` — leaving the `;` in place
+            // produces `return (...;);`, a SyntaxError. The script fails
+            // to parse, the catch never fires (parse errors are not
+            // catchable), and the function silently returns `undefined`.
+            // Stripping makes the wrapped expression syntactically valid.
+            let cleaned = trimmed.trim_end_matches(|c: char| c == ';' || c.is_whitespace());
             format!(
                 "(function() {{ try {{ return ({}); }} catch(e) {{ return null; }} }})()",
-                expression
+                cleaned
             )
         }
     }
