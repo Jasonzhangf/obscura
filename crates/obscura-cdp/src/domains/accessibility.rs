@@ -3,6 +3,16 @@ use serde_json::{json, Value};
 
 use crate::dispatch::CdpContext;
 
+/// Build a CDP AXValue for a role type.
+fn ax_value_role(role: &str) -> Value {
+    json!({"type": "role", "value": role})
+}
+
+/// Build a CDP AXValue for a string type.
+fn ax_value_string(s: &str) -> Value {
+    json!({"type": "string", "value": s})
+}
+
 pub async fn handle(
     method: &str,
     _params: &Value,
@@ -88,9 +98,9 @@ fn build_ax_node(
     Some(json!({
         "nodeId": ax_id,
         "ignored": false,
-        "role": role,
-        "name": name,
-        "value": value,
+        "role": ax_value_role(role),
+        "name": name.as_deref().map(ax_value_string),
+        "value": value.as_deref().map(ax_value_string),
         "properties": properties,
         "childIds": child_ids,
         "backendDOMNodeId": node_id.raw(),
@@ -215,7 +225,7 @@ fn map_role(data: &NodeData) -> &'static str {
 }
 
 /// Compute the accessible name for a node.
-fn compute_name(dom: &DomTree, node: &obscura_dom::Node) -> Option<Value> {
+fn compute_name(dom: &DomTree, node: &obscura_dom::Node) -> Option<String> {
     if let NodeData::Element { attrs, .. } = &node.data {
         // aria-label takes highest priority
         if let Some(label) = attrs
@@ -223,7 +233,7 @@ fn compute_name(dom: &DomTree, node: &obscura_dom::Node) -> Option<Value> {
             .find(|a| a.name.local.as_ref() == "aria-label")
             .map(|a| a.value.clone())
         {
-            return Some(json!(label));
+            return Some(label);
         }
 
         // aria-labelledby
@@ -241,7 +251,7 @@ fn compute_name(dom: &DomTree, node: &obscura_dom::Node) -> Option<Value> {
             }
             let trimmed = name.trim().to_string();
             if !trimmed.is_empty() {
-                return Some(json!(trimmed));
+                return Some(trimmed);
             }
         }
 
@@ -252,7 +262,7 @@ fn compute_name(dom: &DomTree, node: &obscura_dom::Node) -> Option<Value> {
             .map(|a| a.value.clone())
         {
             if !alt.is_empty() {
-                return Some(json!(alt));
+                return Some(alt);
             }
         }
 
@@ -263,7 +273,7 @@ fn compute_name(dom: &DomTree, node: &obscura_dom::Node) -> Option<Value> {
             .map(|a| a.value.clone())
         {
             if !title.is_empty() {
-                return Some(json!(title));
+                return Some(title);
             }
         }
 
@@ -274,7 +284,7 @@ fn compute_name(dom: &DomTree, node: &obscura_dom::Node) -> Option<Value> {
             .map(|a| a.value.clone())
         {
             if !placeholder.is_empty() {
-                return Some(json!(placeholder));
+                return Some(placeholder);
             }
         }
     }
@@ -283,7 +293,7 @@ fn compute_name(dom: &DomTree, node: &obscura_dom::Node) -> Option<Value> {
     if let NodeData::Text { contents } = &node.data {
         let trimmed = contents.trim().to_string();
         if !trimmed.is_empty() {
-            return Some(json!(trimmed));
+            return Some(trimmed);
         }
     }
 
@@ -291,7 +301,7 @@ fn compute_name(dom: &DomTree, node: &obscura_dom::Node) -> Option<Value> {
 }
 
 /// Compute the accessible value for a node (e.g., current input value).
-fn compute_value(_dom: &DomTree, node: &obscura_dom::Node) -> Option<Value> {
+fn compute_value(_dom: &DomTree, node: &obscura_dom::Node) -> Option<String> {
     if let NodeData::Element { name, attrs, .. } = &node.data {
         let tag = name.local.as_ref();
         // For input elements, return the value attribute
@@ -299,7 +309,7 @@ fn compute_value(_dom: &DomTree, node: &obscura_dom::Node) -> Option<Value> {
             if let Some(val) = attrs
                 .iter()
                 .find(|a| a.name.local.as_ref() == "value")
-                .map(|a| json!(a.value.clone()))
+                .map(|a| a.value.clone())
             {
                 return Some(val);
             }
