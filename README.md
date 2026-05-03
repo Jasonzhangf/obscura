@@ -55,6 +55,9 @@ No Chrome, no Node.js, no dependencies. Release archives include both
 `obscura` and `obscura-worker`; keep them in the same directory for the
 parallel `scrape` command.
 
+Linux release builds target Ubuntu 22.04 so the downloaded binary remains
+usable on common LTS servers with glibc 2.35+.
+
 ### Build from source
 
 ```bash
