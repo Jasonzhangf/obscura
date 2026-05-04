@@ -27,6 +27,14 @@ Designed for automation at scale, not desktop browsing.
 | Puppeteer    | **Yes**      | Yes              |
 | Playwright   | **Yes**      | Yes              |
 
+## 🎉 10,000 stars and what's next
+
+I'm working on **Obscura Cloud** the hosted version, with managed infrastructure, residential proxies, and dedicated support. For people who want the engine without operating it themselves.
+
+The open-source engine stays Apache-2.0, fully featured. No feature gating, ever.
+
+**[Get on the waitlist →](https://tally.so/r/gDWzdD)**
+
 ## Install
 
 ### Download
