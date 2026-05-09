@@ -120,7 +120,7 @@ fn print_banner(port: u16) {
  | |__| | |_) \__ \ (__| |_| | | | (_| |
   \____/|_.__/|___/\___|\__,_|_|  \__,_|
                    
-  Headless Browser v0.1.0
+  Headless Browser v0.1.2
   CDP server: ws://127.0.0.1:{}/devtools/browser
 "#, port);
 }
@@ -770,7 +770,11 @@ fn dump_links(page: &Page) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::write_or_print;
+    use super::{
+        extract_readable_text, is_quiet_command, select_log_filter, write_or_print, Args, Command,
+    };
+    use clap::Parser;
+    use obscura_dom::parse_html;
 
     #[tokio::test(flavor = "current_thread")]
     async fn write_or_print_writes_output_file_with_tokio_fs() {
@@ -791,11 +795,6 @@ mod tests {
 
         assert_eq!(content, "rendered output");
     }
-}
-#[cfg(test)]
-mod tests {
-    use super::{is_quiet_command, select_log_filter, Args, Command};
-    use clap::Parser;
 
     #[test]
     fn default_filter_is_warn() {
@@ -874,15 +873,10 @@ mod tests {
             stealth: false,
             eval: None,
             quiet: true,
+            output: None,
         });
         assert!(is_quiet_command(&cmd));
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::extract_readable_text;
-    use obscura_dom::parse_html;
 
     fn body_text(html: &str) -> String {
         let dom = parse_html(html);
