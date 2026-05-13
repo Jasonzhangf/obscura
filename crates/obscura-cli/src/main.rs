@@ -121,7 +121,7 @@ fn print_banner(port: u16) {
  | |__| | |_) \__ \ (__| |_| | | | (_| |
   \____/|_.__/|___/\___|\__,_|_|  \__,_|
                    
-  Headless Browser v0.1.2
+  Headless Browser v0.1.3
   CDP server: ws://127.0.0.1:{}/devtools/browser
 "#, port);
 }
