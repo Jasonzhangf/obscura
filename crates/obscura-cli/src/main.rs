@@ -544,10 +544,11 @@ async fn run_parallel_scrape(
         );
     }
 
+    let worker_name = if cfg!(windows) { "obscura-worker.exe" } else { "obscura-worker" };
     let worker_path = std::env::current_exe()
         .ok()
-        .and_then(|p| p.parent().map(|d| d.join("obscura-worker")))
-        .unwrap_or_else(|| std::path::PathBuf::from("obscura-worker"));
+        .and_then(|p| p.parent().map(|d| d.join(worker_name)))
+        .unwrap_or_else(|| std::path::PathBuf::from(worker_name));
 
     if !worker_path.exists() {
         anyhow::bail!(
