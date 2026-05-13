@@ -69,6 +69,14 @@ parallel `scrape` command.
 Linux release builds target Ubuntu 22.04 so the downloaded binary remains
 usable on common LTS servers with glibc 2.35+.
 
+### Docker
+
+```bash
+docker run -d --name obscura -p 127.0.0.1:9222:9222 h4ckf0r0day/obscura
+```
+
+Image on [Docker Hub](https://hub.docker.com/r/h4ckf0r0day/obscura). Multi-stage build on `distroless/cc`, no shell, no package manager, ~57 MB compressed.
+
 ### Build from source
 
 ```bash
