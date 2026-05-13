@@ -35,6 +35,13 @@ enum Command {
         #[arg(short, long, default_value_t = 9222)]
         port: u16,
 
+        // Bind address. Defaults to 127.0.0.1 (loopback only) for safety.
+        // Set to 0.0.0.0 to listen on all interfaces (e.g. inside a Docker
+        // container where you want the port to be reachable from the host
+        // via -p mapping).
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+
         #[arg(long)]
         proxy: Option<String>,
 
@@ -181,7 +188,7 @@ async fn main() -> anyhow::Result<()> {
     let global_proxy = args.proxy.clone();
 
     match args.command {
-        Some(Command::Serve { port, proxy, user_agent, stealth, workers }) => {
+        Some(Command::Serve { port, host, proxy, user_agent, stealth, workers }) => {
             let proxy = merge_proxy(global_proxy.clone(), proxy);
             print_banner(port);
             if let Some(ref proxy) = proxy {
@@ -203,7 +210,7 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!("{} worker processes", workers);
                 run_multi_worker_serve(port, workers, proxy, stealth, user_agent).await?;
             } else {
-                obscura_cdp::start_with_full_options(port, proxy, stealth, user_agent).await?;
+                obscura_cdp::start_with_host(port, &host, proxy, stealth, user_agent).await?;
             }
         }
         Some(Command::Fetch { url, dump, selector, wait, timeout, wait_until, user_agent, stealth, eval, output, quiet }) => {
