@@ -101,6 +101,23 @@ enum Command {
         quiet: bool,
     },
 
+    Mcp {
+        #[arg(long)]
+        http: bool,
+
+        #[arg(long, default_value_t = 3000)]
+        port: u16,
+
+        #[arg(long)]
+        proxy: Option<String>,
+
+        #[arg(long)]
+        user_agent: Option<String>,
+
+        #[arg(long)]
+        stealth: bool,
+    },
+
 }
 
 
@@ -194,6 +211,13 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Command::Scrape { urls, eval, concurrency, format, timeout, quiet }) => {
             run_parallel_scrape(urls, eval, concurrency.get(), &format, timeout, quiet, global_proxy).await?;
+        }
+        Some(Command::Mcp { http, port, proxy, user_agent, stealth }) => {
+            if http {
+                obscura_mcp::http::run(port, proxy, user_agent, stealth).await?;
+            } else {
+                obscura_mcp::run(proxy, user_agent, stealth).await?;
+            }
         }
         None => {
             print_banner(args.port);
