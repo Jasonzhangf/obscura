@@ -136,7 +136,14 @@ impl Page {
             return;
         }
 
-        let mut rt = ObscuraJsRuntime::with_base_url(&self.url_string());
+        // Thread the BrowserContext's proxy through to the ES-module loader
+        // and op_fetch_url so dynamic imports and JS fetch() honour the
+        // configured upstream proxy (#139). When proxy_url is None this is
+        // equivalent to with_base_url() (direct connection).
+        let mut rt = ObscuraJsRuntime::with_base_url_and_proxy(
+            &self.url_string(),
+            self.context.proxy_url.clone(),
+        );
         rt.set_url(&self.url_string());
         rt.set_title(&self.title);
 
