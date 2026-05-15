@@ -188,6 +188,26 @@ fn merge_proxy(global_proxy: Option<String>, command_proxy: Option<String>) -> O
     command_proxy.or(global_proxy)
 }
 
+/// `--stealth` routes outbound traffic through `wreq`, which doesn't speak
+/// SOCKS5. A previous workaround silently rewrote `socks5://` to `http://`,
+/// which broke plain SOCKS5 servers (#160). Refuse the combination at
+/// startup so the user gets a clear message instead of `TunnelUnexpectedEof`.
+fn reject_stealth_with_socks5(proxy: Option<&str>, stealth: bool) -> anyhow::Result<()> {
+    if !stealth {
+        return Ok(());
+    }
+    let Some(p) = proxy else { return Ok(()) };
+    let scheme = p.split("://").next().unwrap_or("").to_ascii_lowercase();
+    if scheme == "socks5" || scheme == "socks5h" {
+        anyhow::bail!(
+            "--stealth does not support SOCKS5 proxies (the stealth HTTP \
+             client cannot reach the upstream). Use --proxy http://... \
+             or drop --stealth."
+        );
+    }
+    Ok(())
+}
+
 /// Normalize a raw `--v8-flags` value into the string we'll hand to V8.
 /// Returns `None` when the user didn't pass the flag, passed an empty string,
 /// or passed only whitespace; in those cases V8 is left untouched.
@@ -224,6 +244,7 @@ async fn main() -> anyhow::Result<()> {
     match args.command {
         Some(Command::Serve { port, host, proxy, user_agent, stealth, workers, allow_file_access }) => {
             let proxy = merge_proxy(global_proxy.clone(), proxy);
+            reject_stealth_with_socks5(proxy.as_deref(), stealth)?;
             print_banner(port);
             if let Some(ref proxy) = proxy {
                 tracing::info!("Using proxy: {}", proxy);
@@ -250,12 +271,15 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Some(Command::Fetch { url, dump, selector, wait, timeout, wait_until, user_agent, stealth, eval, output, quiet }) => {
+            reject_stealth_with_socks5(global_proxy.as_deref(), stealth)?;
             run_fetch(&url, dump, selector, wait, timeout, &wait_until, user_agent, stealth, eval, output, quiet, global_proxy).await?;
         }
         Some(Command::Scrape { urls, eval, concurrency, format, timeout, quiet }) => {
             run_parallel_scrape(urls, eval, concurrency.get(), &format, timeout, quiet, global_proxy).await?;
         }
         Some(Command::Mcp { http, port, proxy, user_agent, stealth }) => {
+            let mcp_proxy = merge_proxy(global_proxy.clone(), proxy.clone());
+            reject_stealth_with_socks5(mcp_proxy.as_deref(), stealth)?;
             if http {
                 obscura_mcp::http::run(port, proxy, user_agent, stealth).await?;
             } else {
@@ -929,8 +953,8 @@ fn dump_links(page: &Page) -> String {
 mod tests {
     use super::{
         extract_readable_text, fetch_original_bytes, is_quiet_command, merge_proxy,
-        normalize_v8_flags, select_log_filter, write_or_print, write_or_print_bytes, Args,
-        Command, DumpFormat,
+        normalize_v8_flags, reject_stealth_with_socks5, select_log_filter, write_or_print,
+        write_or_print_bytes, Args, Command, DumpFormat,
     };
     use clap::Parser;
     use obscura_dom::parse_html;
@@ -1177,6 +1201,41 @@ mod tests {
     fn normalize_v8_flags_preserves_multi_flag_string() {
         let input = "--max-old-space-size=4096 --max-semi-space-size=64 --expose-gc";
         assert_eq!(normalize_v8_flags(Some(input)).as_deref(), Some(input));
+    }
+
+    #[test]
+    fn reject_stealth_with_socks5_passes_when_no_stealth() {
+        assert!(reject_stealth_with_socks5(Some("socks5://127.0.0.1:1080"), false).is_ok());
+    }
+
+    #[test]
+    fn reject_stealth_with_socks5_passes_when_no_proxy() {
+        assert!(reject_stealth_with_socks5(None, true).is_ok());
+    }
+
+    #[test]
+    fn reject_stealth_with_socks5_passes_for_http_proxy() {
+        assert!(reject_stealth_with_socks5(Some("http://127.0.0.1:8080"), true).is_ok());
+        assert!(reject_stealth_with_socks5(Some("https://proxy.example:443"), true).is_ok());
+    }
+
+    #[test]
+    fn reject_stealth_with_socks5_fails_for_socks5() {
+        let err = reject_stealth_with_socks5(Some("socks5://127.0.0.1:9999"), true).unwrap_err();
+        assert!(err.to_string().contains("SOCKS5"));
+        assert!(err.to_string().contains("--stealth"));
+    }
+
+    #[test]
+    fn reject_stealth_with_socks5_fails_for_socks5h() {
+        let err = reject_stealth_with_socks5(Some("socks5h://127.0.0.1:9999"), true).unwrap_err();
+        assert!(err.to_string().contains("SOCKS5"));
+    }
+
+    #[test]
+    fn reject_stealth_with_socks5_is_case_insensitive() {
+        let err = reject_stealth_with_socks5(Some("SOCKS5://127.0.0.1:9999"), true).unwrap_err();
+        assert!(err.to_string().contains("SOCKS5"));
     }
 
     #[test]
