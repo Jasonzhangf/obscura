@@ -47,6 +47,10 @@ curl -LO https://github.com/h4ckf0r0day/obscura/releases/latest/download/obscura
 tar xzf obscura-x86_64-linux.tar.gz
 ./obscura fetch https://example.com --eval "document.title"
 
+# Linux ARM64 (aarch64)
+curl -LO https://github.com/h4ckf0r0day/obscura/releases/latest/download/obscura-aarch64-linux.tar.gz
+tar xzf obscura-aarch64-linux.tar.gz
+
 # Arch Linux (AUR)
 yay -S obscura-browser
 
