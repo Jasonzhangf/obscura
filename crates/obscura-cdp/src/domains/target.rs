@@ -2,6 +2,7 @@ use serde_json::{json, Value};
 
 use crate::dispatch::CdpContext;
 use crate::types::CdpEvent;
+use crate::util::url_is_file_scheme;
 
 pub async fn handle(method: &str, params: &Value, ctx: &mut CdpContext) -> Result<Value, String> {
     match method {
@@ -55,6 +56,17 @@ pub async fn handle(method: &str, params: &Value, ctx: &mut CdpContext) -> Resul
         }
         "createTarget" => {
             let url = params.get("url").and_then(|v| v.as_str()).unwrap_or("about:blank");
+
+            // Same gate as Page.navigate (GHSA-q55h-vfv9-qcr5). Without this,
+            // a CDP client can call Target.createTarget {url:"file:///etc/passwd"}
+            // and then Runtime.evaluate the body off the created target,
+            // bypassing the page-domain check entirely.
+            if url_is_file_scheme(url) && !ctx.default_context.allow_file_access {
+                return Err(
+                    "Target.createTarget to file:// is disabled. Restart with `obscura serve --allow-file-access` to enable.".to_string()
+                );
+            }
+
             let page_id = ctx.create_page();
             let session_id = format!("{}-session", page_id);
 

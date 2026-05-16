@@ -3,14 +3,7 @@ use serde_json::{json, Value};
 
 use crate::dispatch::CdpContext;
 use crate::types::CdpEvent;
-
-fn url_is_file_scheme(raw: &str) -> bool {
-    url::Url::parse(raw)
-        .map(|u| u.scheme().eq_ignore_ascii_case("file"))
-        .unwrap_or_else(|_| {
-            raw.trim_start().to_ascii_lowercase().starts_with("file:")
-        })
-}
+use crate::util::url_is_file_scheme;
 
 pub async fn handle(
     method: &str,
