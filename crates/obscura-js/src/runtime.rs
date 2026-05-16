@@ -934,6 +934,37 @@ mod tests {
         assert_eq!(result, serde_json::json!(["A", "B"]));
     }
 
+    /// Regression test for #147: a TypeError in one script must not poison
+    /// the runtime so that subsequent scripts (or DOM queries) collapse to
+    /// empty. The reporter saw `--dump text` return 1 byte after offside.js
+    /// crashed; that cascade should never happen.
+    #[test]
+    fn script_typeerror_does_not_poison_subsequent_execution() {
+        let mut rt = setup_runtime(
+            "<html><body><p id=hit>BODY_TEXT</p></body></html>",
+        );
+
+        // 1. First script throws the same flavor of error offside.js produced
+        //    (`Cannot read properties of undefined (reading 'classList')`).
+        let err = rt
+            .execute_script("buggy", "var x; x.classList.add('y');")
+            .unwrap_err();
+        assert!(err.contains("classList") || err.contains("undefined"),
+                "expected classList/undefined error, got: {}", err);
+
+        // 2. The runtime must still be usable: a follow-up script runs.
+        rt.execute_script("ok", "globalThis.__after_error = 'still alive';")
+            .unwrap();
+        let result = rt.evaluate("globalThis.__after_error").unwrap();
+        assert_eq!(result, serde_json::json!("still alive"));
+
+        // 3. DOM queries still work after the script error.
+        let text = rt
+            .evaluate("document.querySelector('#hit').textContent")
+            .unwrap();
+        assert_eq!(text, serde_json::json!("BODY_TEXT"));
+    }
+
     #[test]
     fn test_console_log() {
         let mut rt = setup_runtime("<html><body></body></html>");

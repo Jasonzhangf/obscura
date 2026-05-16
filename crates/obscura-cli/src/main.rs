@@ -8,7 +8,11 @@ use tokio::process::Command as TokioCommand;
 use tokio::time::{timeout, Duration};
 
 #[derive(Parser)]
-#[command(name = "obscura", about = "Obscura - A lightweight headless browser for web scraping and automation")]
+#[command(
+    name = "obscura",
+    version = env!("CARGO_PKG_VERSION"),
+    about = "Obscura - A lightweight headless browser for web scraping and automation",
+)]
 struct Args {
     #[arg(short, long, global = true)]
     verbose: bool,
