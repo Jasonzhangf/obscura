@@ -291,7 +291,11 @@ fn op_console_msg(state: &OpState, #[string] level: &str, #[string] msg: &str) {
 // network round-trip; the simplification is worth not having to invalidate
 // a cache when the proxy is reconfigured between fetches.
 fn build_request_client(proxy_url: Option<&str>) -> Result<reqwest::Client, String> {
-    let mut builder = reqwest::Client::builder();
+    // Redirects are followed manually below so each hop can be re-validated
+    // against the same SSRF policy as the initial URL (GHSA-8v6v-g4rh-jmcm).
+    // With reqwest's default auto-follow, an attacker-controlled origin can
+    // 302 to http://127.0.0.1 and read the internal-service body.
+    let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
     if let Some(proxy) = proxy_url {
         let p = reqwest::Proxy::all(proxy)
             .map_err(|e| format!("Invalid op_fetch_url proxy '{}': {}", proxy, e))?;
@@ -301,6 +305,10 @@ fn build_request_client(proxy_url: Option<&str>) -> Result<reqwest::Client, Stri
         .build()
         .map_err(|e| format!("failed to build reqwest::Client: {}", e))
 }
+
+/// Cap on the number of redirect hops op_fetch_url will follow.
+/// Matches reqwest's default policy of 10.
+const FETCH_REDIRECT_LIMIT: usize = 10;
 
 #[op2(async)]
 #[string]
@@ -459,60 +467,126 @@ async fn op_fetch_url(
         }
     }
 
-    let mut req = client.request(req_method, &url);
+    // Follow redirects manually so the SSRF policy applies to every hop.
+    // reqwest's auto-follow would bypass validate_fetch_url on the redirect
+    // target and let an attacker-allowed origin 302 to http://127.0.0.1
+    // (GHSA-8v6v-g4rh-jmcm).
+    let mut current_url = url.clone();
+    let mut current_method = req_method;
+    let mut current_body = body;
+    let mut redirects_followed: usize = 0;
+    let response = loop {
+        let mut req = client.request(current_method.clone(), &current_url);
 
-    if is_cross_origin {
-        req = req.header("Origin", &page_origin);
-    }
+        if is_cross_origin {
+            req = req.header("Origin", &page_origin);
+        }
 
-    if !is_cross_origin {
-        if let Some(ref jar) = cookie_jar {
-            if let Ok(parsed_url) = url::Url::parse(&url) {
-                let cookie_header = jar.get_cookie_header(&parsed_url);
-                if !cookie_header.is_empty() {
-                    req = req.header("Cookie", &cookie_header);
+        if !is_cross_origin {
+            if let Some(ref jar) = cookie_jar {
+                if let Ok(parsed_url) = url::Url::parse(&current_url) {
+                    let cookie_header = jar.get_cookie_header(&parsed_url);
+                    if !cookie_header.is_empty() {
+                        req = req.header("Cookie", &cookie_header);
+                    }
                 }
             }
         }
-    }
 
-    for (k, v) in &custom_headers {
-        req = req.header(k.as_str(), v.as_str());
-    }
+        for (k, v) in &custom_headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
 
-    if !body.is_empty() {
-        req = req.body(body);
-    }
+        if !current_body.is_empty() {
+            req = req.body(current_body.clone());
+        }
 
-    if let Some(ref counter) = in_flight {
-        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
+        if let Some(ref counter) = in_flight {
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
 
-    let response = req
-        .send()
-        .await
-        .map_err(|e| {
+        let resp = req.send().await.map_err(|e| {
             if let Some(ref counter) = in_flight {
                 counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             }
             deno_error::JsErrorBox::generic(e.to_string())
         })?;
 
-    if let Some(ref counter) = in_flight {
-        counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-    }
+        if let Some(ref counter) = in_flight {
+            counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
 
-    let status = response.status().as_u16();
-
-    if let Some(ref jar) = cookie_jar {
-        if let Ok(parsed_url) = url::Url::parse(&url) {
-            for val in response.headers().get_all(reqwest::header::SET_COOKIE) {
-                if let Ok(s) = val.to_str() {
-                    jar.set_cookie(s, &parsed_url);
+        if let Some(ref jar) = cookie_jar {
+            if let Ok(parsed_url) = url::Url::parse(&current_url) {
+                for val in resp.headers().get_all(reqwest::header::SET_COOKIE) {
+                    if let Ok(s) = val.to_str() {
+                        jar.set_cookie(s, &parsed_url);
+                    }
                 }
             }
         }
-    }
+
+        if !resp.status().is_redirection() {
+            break resp;
+        }
+
+        let location_header = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let Some(location) = location_header else {
+            // 3xx without a Location header is not actually a redirect.
+            break resp;
+        };
+
+        let base = match url::Url::parse(&current_url) {
+            Ok(b) => b,
+            Err(_) => break resp,
+        };
+        let next_url = match base.join(&location) {
+            Ok(u) => u,
+            Err(_) => break resp,
+        };
+
+        // Re-validate every redirect target against the SSRF policy.
+        if let Err(reason) = validate_fetch_url(&next_url) {
+            return Ok(serde_json::json!({
+                "status": 0,
+                "body": "",
+                "url": next_url.to_string(),
+                "headers": {},
+                "blocked": true,
+                "error": format!("Redirect to forbidden URL blocked: {}", reason),
+            })
+            .to_string());
+        }
+
+        redirects_followed += 1;
+        if redirects_followed > FETCH_REDIRECT_LIMIT {
+            return Ok(serde_json::json!({
+                "status": 0,
+                "body": "",
+                "url": next_url.to_string(),
+                "headers": {},
+                "blocked": true,
+                "error": format!("Too many redirects (>{})", FETCH_REDIRECT_LIMIT),
+            })
+            .to_string());
+        }
+
+        // Browser semantics: 301/302/303 downgrade to GET with no body.
+        // 307/308 preserve method and body.
+        let status_code = resp.status().as_u16();
+        if status_code == 301 || status_code == 302 || status_code == 303 {
+            current_method = reqwest::Method::GET;
+            current_body.clear();
+        }
+
+        current_url = next_url.to_string();
+    };
+
+    let status = response.status().as_u16();
 
     let resp_headers: std::collections::HashMap<String, String> = response
         .headers()
