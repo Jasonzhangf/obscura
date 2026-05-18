@@ -138,15 +138,65 @@ pub async fn handle(
         "setAttributeValue" => Ok(json!({})),
         "removeNode" => Ok(json!({})),
         "getBoxModel" => {
+            let node_id = params.get("nodeId").and_then(|v| v.as_u64())
+                .or_else(|| params.get("backendNodeId").and_then(|v| v.as_u64()))
+                .unwrap_or(0);
+            let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
+            let code = format!(
+                "(function() {{\
+                    var el = globalThis._wrap && globalThis._wrap({0});\
+                    if (!el || typeof el.getBoundingClientRect !== 'function') return null;\
+                    var r = el.getBoundingClientRect();\
+                    return [r.left, r.top, r.right, r.top, r.right, r.bottom, r.left, r.bottom,\
+                            r.width, r.height];\
+                }})()",
+                node_id
+            );
+            let val = page.evaluate(&code);
+            let (quad, w, h) = if let Some(arr) = val.as_array() {
+                let nums: Vec<f64> = arr.iter().filter_map(|v| v.as_f64()).collect();
+                if nums.len() >= 10 {
+                    let q: Vec<Value> = nums[..8].iter().map(|n| json!(n)).collect();
+                    (q, nums[8], nums[9])
+                } else {
+                    (vec![json!(8),json!(8),json!(108),json!(8),json!(108),json!(28),json!(8),json!(28)], 100.0, 20.0)
+                }
+            } else {
+                (vec![json!(8),json!(8),json!(108),json!(8),json!(108),json!(28),json!(8),json!(28)], 100.0, 20.0)
+            };
             Ok(json!({
                 "model": {
-                    "content": [8,8, 108,8, 108,28, 8,28],
-                    "padding": [8,8, 108,8, 108,28, 8,28],
-                    "border": [8,8, 108,8, 108,28, 8,28],
-                    "margin": [0,0, 116,0, 116,36, 0,36],
-                    "width": 100, "height": 20,
+                    "content": quad.clone(),
+                    "padding": quad.clone(),
+                    "border": quad.clone(),
+                    "margin": quad,
+                    "width": w, "height": h,
                 }
             }))
+        }
+        "getContentQuads" => {
+            let node_id = params.get("nodeId").and_then(|v| v.as_u64())
+                .or_else(|| params.get("backendNodeId").and_then(|v| v.as_u64()))
+                .unwrap_or(0);
+            let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
+            let code = format!(
+                "(function() {{\
+                    var el = globalThis._wrap && globalThis._wrap({0});\
+                    if (!el || typeof el.getBoundingClientRect !== 'function') return null;\
+                    var r = el.getBoundingClientRect();\
+                    return [r.left, r.top, r.right, r.top, r.right, r.bottom, r.left, r.bottom];\
+                }})()",
+                node_id
+            );
+            let val = page.evaluate(&code);
+            let quad = if let Some(arr) = val.as_array() {
+                let nums: Vec<f64> = arr.iter().filter_map(|v| v.as_f64()).collect();
+                if nums.len() == 8 { nums.iter().map(|n| json!(n)).collect::<Vec<_>>() }
+                else { vec![json!(8),json!(8),json!(108),json!(8),json!(108),json!(28),json!(8),json!(28)] }
+            } else {
+                vec![json!(8),json!(8),json!(108),json!(8),json!(108),json!(28),json!(8),json!(28)]
+            };
+            Ok(json!({ "quads": [quad] }))
         }
         _ => Err(format!("Unknown DOM method: {}", method)),
     }

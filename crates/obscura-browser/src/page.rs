@@ -611,6 +611,12 @@ impl Page {
             }
         }
 
+        if url.scheme() == "about" {
+            self.navigate_blank();
+            self.init_js();
+            return Ok(());
+        }
+
         let response = if url.scheme() == "data" {
             let content_type = url_str.strip_prefix("data:")
                 .and_then(|s| s.split(',').next())

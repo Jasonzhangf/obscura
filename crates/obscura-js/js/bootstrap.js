@@ -1076,6 +1076,9 @@ function _wrapEl(nid) {
   return n;
 }
 
+globalThis._wrap = _wrap;
+globalThis.self = globalThis;
+
 globalThis.document = null;
 function _resolveUrl(url) {
   if (!url) return url;
