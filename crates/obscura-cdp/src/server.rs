@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
@@ -14,6 +14,16 @@ use crate::dispatch::{self, CdpContext};
 // must be bounded so a stalled navigation cannot OOM the process. When the cap
 // is reached we return an explicit error response rather than silently dropping.
 const MAX_DEFERRED_MESSAGES: usize = 256;
+
+// The WS-stream forwarding channel must also be bounded: if the LocalSet
+// (CDP processor + nav tasks) stalls, the accept thread keeps pushing
+// `std::net::TcpStream`s into the queue. An unbounded channel would let
+// that queue grow without limit and OOM the process. With a bounded
+// capacity, when the LocalSet is saturated the accept thread closes the
+// new connection on the spot instead of buffering it — the kernel TCP
+// backlog still absorbs short-term spikes, but a long-term stall now
+// fails loudly at accept time rather than silently piling up FDs.
+const MAX_PENDING_WS_HANDOFFS: usize = 128;
 use crate::types::CdpRequest;
 
 struct CdpMessage {
@@ -71,7 +81,19 @@ pub async fn start_with_host_and_security(
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid --host '{}': {}", host, e))?;
     let addr = SocketAddr::new(ip, port);
-    let listener = TcpListener::bind(&addr).await?;
+
+    // Issue #62: the HTTP control plane (/json/version, /json) must remain
+    // reachable even while V8 JS evaluation blocks the tokio LocalSet thread.
+    //
+    // We use a dedicated OS thread with a blocking std::net::TcpListener so
+    // the kernel's accept backlog is always drained promptly. HTTP endpoints
+    // are served directly via blocking I/O; WebSocket connections are
+    // forwarded to the existing LocalSet for CDP processing.
+    let std_listener = std::net::TcpListener::bind(addr)
+        .map_err(|e| anyhow::anyhow!("bind {}:{}: {}", host, port, e))?;
+    std_listener
+        .set_nonblocking(false)
+        .map_err(|e| anyhow::anyhow!("set_nonblocking: {}", e))?;
 
     info!("Obscura CDP server listening on ws://{}:{}", host, port);
     info!(
@@ -82,31 +104,178 @@ pub async fn start_with_host_and_security(
         info!("file:// navigation enabled (--allow-file-access). Do not expose this port to untrusted networks.");
     }
 
+    let (ws_tx, mut ws_rx) = mpsc::channel::<std::net::TcpStream>(MAX_PENDING_WS_HANDOFFS);
+
+    // Dedicated accept thread: drains the kernel backlog immediately and
+    // handles HTTP endpoints (/json/version, /json, /json/protocol) with
+    // blocking I/O so they never contend with the LocalSet's V8 work.
+    //
+    // Lifecycle note: this thread is spawned detached (no `join` handle).
+    // It is intended to run for the entire process lifetime — the same
+    // contract Chromium DevTools / Playwright clients expect from a CDP
+    // server. When `start_with_*` returns (whether by Ok or panic in the
+    // LocalSet), `ws_rx` drops; the next `ws_tx.blocking_send` then
+    // returns `SendError`, which `accept_dispatch` surfaces as
+    // "accept channel closed" and the loop logs+continues. The listener
+    // FD stays bound until the process exits. If we ever need to support
+    // graceful shutdown for embedded/library use, add an
+    // `Arc<AtomicBool>` shutdown flag checked between `accept()`s and
+    // switch to a non-blocking `set_nonblocking(true)` + poll loop.
+    // For the standalone `obscura serve` binary the detached lifetime is
+    // correct.
+    std::thread::Builder::new()
+        .name("obscura-cdp-accept".into())
+        .spawn(move || {
+            for stream in std_listener.incoming() {
+                match stream {
+                    Ok(stream) => {
+                        if let Err(e) = accept_dispatch(stream, port, &ws_tx) {
+                            if !format!("{}", e).contains("close") {
+                                error!("Accept dispatch error: {}", e);
+                            }
+                        }
+                    }
+                    Err(e) => error!("Accept error: {}", e),
+                }
+            }
+        })?;
+
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
             let (msg_tx, msg_rx) = mpsc::unbounded_channel::<ServerMessage>();
 
-            let _processor_handle = tokio::task::spawn_local(cdp_processor(msg_rx, proxy, stealth, user_agent, allow_file_access));
+            let _processor_handle = tokio::task::spawn_local(cdp_processor(
+                msg_rx, proxy, stealth, user_agent, allow_file_access,
+            ));
 
-            loop {
-                match listener.accept().await {
-                    Ok((stream, peer_addr)) => {
-                        info!("New connection from {}", peer_addr);
-                        let tx = msg_tx.clone();
-                        tokio::task::spawn_local(async move {
-                            if let Err(e) = handle_connection(stream, port, tx).await {
-                                if !format!("{}", e).contains("close") {
-                                    error!("Connection error from {}: {}", peer_addr, e);
-                                }
-                            }
-                        });
+            while let Some(stream) = ws_rx.recv().await {
+                // Convert std TcpStream → tokio TcpStream inside the LocalSet
+                // where the tokio runtime is active.
+                stream
+                    .set_nonblocking(true)
+                    .map_err(|e| error!("set_nonblocking on WS stream: {}", e))
+                    .ok();
+                let tokio_stream = match TcpStream::from_std(stream) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        error!("TcpStream::from_std failed: {}", e);
+                        continue;
                     }
-                    Err(e) => error!("Accept error: {}", e),
-                }
+                };
+                let tx = msg_tx.clone();
+                tokio::task::spawn_local(async move {
+                    if let Err(e) = handle_connection_ws(tokio_stream, tx).await {
+                        error!("WebSocket connection error: {}", e);
+                    }
+                });
             }
         })
-        .await
+        .await;
+
+    Ok(())
+}
+
+const HTTP_PEEK_BUF: usize = 4096;
+const WS_PEEK_BUF: usize = 4;
+
+/// Dispatch a freshly-accepted TCP connection on the dedicated accept thread.
+///
+/// Peek at the first bytes to decide HTTP vs WebSocket:
+/// - HTTP (`GET /json/*`): serve synchronously via blocking I/O so the
+///   response is never stalled by the LocalSet.
+/// - WebSocket: set non-blocking, convert to tokio `TcpStream`, and forward
+///   to the LocalSet for CDP processing.
+fn accept_dispatch(
+    stream: std::net::TcpStream,
+    port: u16,
+    ws_tx: &mpsc::Sender<std::net::TcpStream>,
+) -> anyhow::Result<()> {
+    let mut buf = [0u8; WS_PEEK_BUF];
+    let n = stream.peek(&mut buf)?;
+
+    if n >= 4 && &buf == b"GET " {
+        let mut peek_buf = [0u8; HTTP_PEEK_BUF];
+        let n = stream.peek(&mut peek_buf)?;
+        let line = String::from_utf8_lossy(&peek_buf[..n]);
+
+        let endpoint = if line.contains("/json/version") {
+            Some("version")
+        } else if line.contains("/json/list") || line.contains("/json\r\n") || line.contains("/json HTTP") {
+            Some("list")
+        } else if line.contains("/json/protocol") {
+            Some("protocol")
+        } else {
+            None
+        };
+
+        if let Some(ep) = endpoint {
+            return handle_http_json_blocking(stream, port, ep);
+        }
+        // Fall through: GET request that isn't a /json endpoint → treat as
+        // WebSocket upgrade (Chromium DevTools clients issue GET with
+        // Upgrade: websocket).
+    }
+
+    // Try to hand off the WS stream to the LocalSet. If the bounded channel
+    // is full the LocalSet is saturated — drop the connection cleanly
+    // rather than blocking the accept thread (which would freeze the HTTP
+    // control plane that this whole rework exists to keep alive). The
+    // dropped `stream` closes itself; the client will see ECONNRESET and
+    // can retry.
+    ws_tx
+        .try_send(stream)
+        .map_err(|e| match e {
+            mpsc::error::TrySendError::Full(_) => {
+                warn!("WS handoff channel full ({}); dropping new WebSocket connection", MAX_PENDING_WS_HANDOFFS);
+                anyhow::anyhow!("ws handoff channel full")
+            }
+            mpsc::error::TrySendError::Closed(_) => anyhow::anyhow!("accept channel closed"),
+        })
+}
+
+/// Serve an HTTP `/json/*` endpoint with blocking I/O on the accept thread.
+fn handle_http_json_blocking(
+    mut stream: std::net::TcpStream,
+    port: u16,
+    endpoint: &str,
+) -> anyhow::Result<()> {
+    use std::io::{Read, Write};
+
+    let mut buf = vec![0u8; 4096];
+    let _ = stream.read(&mut buf)?;
+
+    let body = match endpoint {
+        "version" => serde_json::to_string_pretty(&json!({
+            "Browser": "Obscura/0.1.0",
+            "Protocol-Version": "1.3",
+            "User-Agent": "Obscura/0.1.0 (Headless Browser)",
+            "V8-Version": "N/A",
+            "WebKit-Version": "N/A",
+            "webSocketDebuggerUrl": format!("ws://127.0.0.1:{}/devtools/browser", port),
+        }))?,
+        "list" => serde_json::to_string_pretty(&json!([{
+            "description": "",
+            "devtoolsFrontendUrl": "",
+            "id": "page-1",
+            "title": "",
+            "type": "page",
+            "url": "about:blank",
+            "webSocketDebuggerUrl": format!("ws://127.0.0.1:{}/devtools/page/page-1", port),
+        }]))?,
+        "protocol" => {
+            serde_json::to_string_pretty(&json!({ "version": { "major": "1", "minor": "3" } }))?
+        }
+        _ => "{}".to_string(),
+    };
+
+    let resp = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(), body,
+    );
+    stream.write_all(resp.as_bytes())?;
+    stream.flush()?;
+    Ok(())
 }
 
 async fn cdp_processor(
@@ -661,28 +830,10 @@ fn check_pending_navigation(ctx: &CdpContext, session_id: &Option<String>) -> Op
     page.take_pending_navigation()
 }
 
-async fn handle_connection(
+async fn handle_connection_ws(
     stream: TcpStream,
-    port: u16,
     msg_tx: mpsc::UnboundedSender<ServerMessage>,
 ) -> anyhow::Result<()> {
-    let mut buf = [0u8; 4];
-    stream.peek(&mut buf).await?;
-
-    if &buf == b"GET " {
-        let mut peek_buf = [0u8; 1024];
-        let n = stream.peek(&mut peek_buf).await?;
-        let line = String::from_utf8_lossy(&peek_buf[..n]);
-
-        if line.contains("/json/version") {
-            return handle_http_json(stream, port, "version").await;
-        } else if line.contains("/json/list") || line.contains("/json\r\n") || line.contains("/json HTTP") {
-            return handle_http_json(stream, port, "list").await;
-        } else if line.contains("/json/protocol") {
-            return handle_http_json(stream, port, "protocol").await;
-        }
-    }
-
     let ws_stream = tokio_tungstenite::accept_async(stream).await?;
     info!("WebSocket connected");
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
@@ -746,45 +897,5 @@ async fn handle_connection(
     }
 
     send_task.abort();
-    Ok(())
-}
-
-async fn handle_http_json(stream: TcpStream, port: u16, endpoint: &str) -> anyhow::Result<()> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    let mut stream = stream;
-    let mut buf = vec![0u8; 4096];
-    let _ = stream.read(&mut buf).await?;
-
-    let body = match endpoint {
-        "version" => serde_json::to_string_pretty(&json!({
-            "Browser": "Obscura/0.1.0",
-            "Protocol-Version": "1.3",
-            "User-Agent": "Obscura/0.1.0 (Headless Browser)",
-            "V8-Version": "N/A",
-            "WebKit-Version": "N/A",
-            "webSocketDebuggerUrl": format!("ws://127.0.0.1:{}/devtools/browser", port),
-        }))?,
-        "list" => serde_json::to_string_pretty(&json!([{
-            "description": "",
-            "devtoolsFrontendUrl": "",
-            "id": "page-1",
-            "title": "",
-            "type": "page",
-            "url": "about:blank",
-            "webSocketDebuggerUrl": format!("ws://127.0.0.1:{}/devtools/page/page-1", port),
-        }]))?,
-        "protocol" => {
-            serde_json::to_string_pretty(&json!({ "version": { "major": "1", "minor": "3" } }))?
-        }
-        _ => "{}".to_string(),
-    };
-
-    let resp = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body.len(), body,
-    );
-    stream.write_all(resp.as_bytes()).await?;
-    stream.flush().await?;
     Ok(())
 }
