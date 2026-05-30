@@ -279,19 +279,30 @@ class Node {
     if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('childList', this._nid, [c._nid], []);
     if (c instanceof Element && c.tagName === 'SCRIPT') {
       const scriptType = c.getAttribute('type') || '';
-      if (scriptType && scriptType !== 'text/javascript' && scriptType !== 'application/javascript') {
+      const isModule = scriptType === 'module';
+      if (scriptType && !isModule && scriptType !== 'text/javascript' && scriptType !== 'application/javascript') {
         return c;
       }
       const src = c.getAttribute('src');
+      const prevNid = globalThis.__currentScriptNid;
       if (src) {
-        const fullUrl = src.startsWith('http') ? src : new URL(src, globalThis.location?.href || 'http://localhost/').href;
+        const fullUrl = src.startsWith('http') || src.startsWith('data:')
+          ? src
+          : new URL(src, globalThis.location?.href || 'http://localhost/').href;
         const pageOrigin = (function() { try { return new URL(globalThis.location?.href || "about:blank").origin; } catch(e) { return ""; } })();
         (async () => {
           try {
-            const raw = await Deno.core.ops.op_fetch_url(fullUrl, "GET", "{}", "", pageOrigin, "no-cors");
-            const parsed = JSON.parse(raw);
-            if (parsed.body) {
-              try { (0, eval)(parsed.body); } catch(e) { console.error('Dynamic script error (' + fullUrl + '):', e.message); }
+            if (isModule) {
+              await import(fullUrl);
+            } else {
+              const raw = await Deno.core.ops.op_fetch_url(fullUrl, "GET", "{}", "", pageOrigin, "no-cors");
+              const parsed = JSON.parse(raw);
+              if (parsed.body) {
+                globalThis.__currentScriptNid = c._nid;
+                try { (0, eval)(parsed.body); }
+                catch(e) { console.error('Dynamic script error (' + fullUrl + '):', e.message); }
+                finally { globalThis.__currentScriptNid = prevNid || 0; }
+              }
             }
             if (typeof c.onload === 'function') try { c.onload(new Event('load')); } catch(e) {}
               try { c.dispatchEvent(new Event('load')); } catch(e) {}
@@ -302,7 +313,20 @@ class Node {
         })();
       } else {
         const code = c.textContent;
-        if (code) { try { (0, eval)(code); } catch(e) { console.error('Dynamic inline script error:', e.message); } }
+        if (code) {
+          if (isModule) {
+            const dataUrl = 'data:text/javascript;base64,' + btoa(unescape(encodeURIComponent(code)));
+            (async () => {
+              try { await import(dataUrl); }
+              catch(e) { console.error('Dynamic inline module error:', e.message); }
+            })();
+          } else {
+            globalThis.__currentScriptNid = c._nid;
+            try { (0, eval)(code); }
+            catch(e) { console.error('Dynamic inline script error:', e.message); }
+            finally { globalThis.__currentScriptNid = prevNid || 0; }
+          }
+        }
       }
     }
     return c;
@@ -612,6 +636,20 @@ class Element extends Node {
     if (!event) return true;
     if (!event.target) event.target = this;
     event.currentTarget = this;
+    // Spec: inline `onclick="..."` content attributes are event handlers
+    // for the matching event type. Fire them alongside any
+    // addEventListener handlers. Also honor the IDL property
+    // `el.onclick = fn` if set. Without this, b.click() never invokes
+    // the inline handler and forms with onsubmit / buttons with onclick
+    // are silently dead.
+    const handlerName = 'on' + event.type;
+    const inlineFn = this[handlerName] || this._resolveInlineHandler(handlerName);
+    if (typeof inlineFn === 'function') {
+      try {
+        const ret = inlineFn.call(this, event);
+        if (ret === false) event.preventDefault();
+      } catch(e) { console.error(e); }
+    }
     const handlers = (_eventRegistry[this._nid] || {})[event.type] || [];
     for (const h of handlers) {
       try { h.call(this, event); } catch(e) { console.error(e); }
@@ -621,6 +659,20 @@ class Element extends Node {
       this.parentNode.dispatchEvent(event);
     }
     return !event.defaultPrevented;
+  }
+  _resolveInlineHandler(name) {
+    // name = 'onclick' / 'onsubmit' / etc. Compile the content attribute
+    // as a function body on first read and cache it on the instance.
+    const cache = this.__inlineHandlerCache || (this.__inlineHandlerCache = {});
+    if (Object.prototype.hasOwnProperty.call(cache, name)) return cache[name];
+    const src = this.getAttribute && this.getAttribute(name);
+    if (!src) { cache[name] = null; return null; }
+    try {
+      cache[name] = new Function('event', src);
+    } catch (e) {
+      cache[name] = null;
+    }
+    return cache[name];
   }
   click() {
     const cancelled = !this.dispatchEvent(new MouseEvent("click", {bubbles: true, cancelable: true}));
@@ -645,14 +697,44 @@ class Element extends Node {
   focus() { globalThis.__obscura_focused = this; globalThis.__obscura_click_target = this; }
   blur() { if (globalThis.__obscura_focused === this) globalThis.__obscura_focused = null; }
   get value() {
-    if (_formValues[this._nid] !== undefined) return _formValues[this._nid];
     const tag = this.localName;
+    if (tag === 'select') {
+      // Selected option wins; otherwise first option (HTML default).
+      const opts = this.querySelectorAll('option');
+      for (let i = 0; i < opts.length; i++) {
+        if (opts[i].selected) {
+          return opts[i].getAttribute('value') !== null ? opts[i].getAttribute('value') : opts[i].textContent;
+        }
+      }
+      if (opts.length) return opts[0].getAttribute('value') !== null ? opts[0].getAttribute('value') : opts[0].textContent;
+      return '';
+    }
+    if (_formValues[this._nid] !== undefined) return _formValues[this._nid];
     if (tag === 'textarea') return this.textContent;
+    if (tag === 'option') {
+      const attr = this.getAttribute('value');
+      return attr !== null ? attr : this.textContent;
+    }
     return this.getAttribute("value") || "";
   }
   set value(v) {
-    _formValues[this._nid] = String(v);
     const tag = this.localName;
+    if (tag === 'select') {
+      // Set selected on matching option, clear on others. Puppeteer's
+      // page.select(selector, value) round-trips through this setter.
+      const wanted = String(v);
+      const opts = this.querySelectorAll('option');
+      let matched = false;
+      for (let i = 0; i < opts.length; i++) {
+        const attrV = opts[i].getAttribute('value');
+        const optVal = attrV !== null ? attrV : opts[i].textContent;
+        if (optVal === wanted) { opts[i].selected = true; matched = true; }
+        else { opts[i].selected = false; }
+      }
+      if (matched) try { this.dispatchEvent(new Event('change', { bubbles: true })); } catch (e) {}
+      return;
+    }
+    _formValues[this._nid] = String(v);
     if (tag === 'textarea') {
       this.textContent = String(v);
     }
@@ -823,14 +905,36 @@ class Element extends Node {
       set(_, k, v) { el.setAttribute("data-"+k.replace(/([A-Z])/g,"-$1").toLowerCase(), v); return true; },
     });
   }
-  get offsetWidth() { return 100; } get offsetHeight() { return 20; }
+  get offsetWidth() { return this._isViewportRoot() ? (globalThis.innerWidth || 1280) : 100; }
+  get offsetHeight() { return this._isViewportRoot() ? (globalThis.innerHeight || 720) : 20; }
   get offsetTop() { return 0; } get offsetLeft() { return 0; }
-  get clientWidth() { return 100; } get clientHeight() { return 20; }
-  get scrollWidth() { return 100; } get scrollHeight() { return 20; }
+  // documentElement / body / window expose VIEWPORT geometry, not their own content box.
+  // Puppeteer's #clickableBox clips boxes to document.documentElement.clientWidth/Height;
+  // returning 100x20 there made every element appear off-screen and broke .click().
+  get clientWidth() { return this._isViewportRoot() ? (globalThis.innerWidth || 1280) : 100; }
+  get clientHeight() { return this._isViewportRoot() ? (globalThis.innerHeight || 720) : 20; }
+  get scrollWidth() { return this._isViewportRoot() ? (globalThis.innerWidth || 1280) : 100; }
+  get scrollHeight() { return this._isViewportRoot() ? (globalThis.innerHeight || 720) : 20; }
+  _isViewportRoot() {
+    const t = this.tagName;
+    return t === 'HTML' || t === 'BODY';
+  }
   get scrollTop() { return 0; } set scrollTop(v) {}
   get scrollLeft() { return 0; } set scrollLeft(v) {}
   getBoundingClientRect() {
     globalThis.__obscura_click_target = this;
+    // documentElement and body span the full viewport. Without this every
+    // hit test against them clips down to a 100x20 synthetic cell and
+    // Document.elementFromPoint can never recurse into their children.
+    if (this._isViewportRoot()) {
+      const vw = globalThis.innerWidth || 1280;
+      const vh = globalThis.innerHeight || 720;
+      return {
+        x: 0, y: 0, width: vw, height: vh,
+        top: 0, right: vw, bottom: vh, left: 0,
+        toJSON() { return this; },
+      };
+    }
     // No layout engine, but Playwright's actionability polling needs each
     // element to occupy a stable, distinct rect so hit-testing can pick the
     // right one (issue #45). Synthesize a deterministic position from the
@@ -933,6 +1037,13 @@ class Document extends Node {
   get characterSet() { return "UTF-8"; }
   get contentType() { return "text/html"; }
   get readyState() { return globalThis.__documentReadyState__ || 'complete'; }
+  get currentScript() {
+    // Next.js / Turbopack chunk loader reads document.currentScript.src to
+    // derive its base path. page.rs sets __currentScriptNid before each
+    // <script> body runs and clears it after, mirroring real Chrome.
+    const nid = globalThis.__currentScriptNid;
+    return nid ? _wrapEl(+nid) : null;
+  }
   get hidden() { return false; }
   get visibilityState() { return "visible"; }
   getElementById(id) { return _wrapEl(+_dom("get_element_by_id", id)); }
@@ -1438,8 +1549,8 @@ globalThis.WebGL2RenderingContext = class WebGL2RenderingContext {};
 globalThis.screen = { width:1920, height:1080, availWidth:1920, availHeight:1040, colorDepth:24, pixelDepth:24, availTop:0, availLeft:0, orientation:{type:"landscape-primary",angle:0,addEventListener(){},removeEventListener(){},dispatchEvent(){return true;}} };
 globalThis.visualViewport = { width:1920, height:1000, offsetLeft:0, offsetTop:0, scale:1, addEventListener(){}, removeEventListener(){} };
 globalThis.devicePixelRatio = 1;
-globalThis.innerWidth = 1920; globalThis.innerHeight = 1000;
-globalThis.outerWidth = 1920; globalThis.outerHeight = 1080;
+globalThis.innerWidth = 1280; globalThis.innerHeight = 720;
+globalThis.outerWidth = 1280; globalThis.outerHeight = 720;
 globalThis.scrollX = 0; globalThis.scrollY = 0;
 globalThis.pageXOffset = 0; globalThis.pageYOffset = 0;
 
@@ -2217,10 +2328,66 @@ globalThis.__notifyMutation = function(type, target_nid, addedNodes, removedNode
 globalThis.ShadowRoot = class ShadowRoot {};
 globalThis.customElements = {
   _registry: new Map(),
-  define(name, cls, opts) { this._registry.set(name, cls); },
+  _whenDefinedResolvers: new Map(),
+  define(name, cls, opts) {
+    if (this._registry.has(name)) return;
+    this._registry.set(name, cls);
+    // Upgrade existing matching elements: instantiate the class on each,
+    // fire connectedCallback if the element is in the document. Without
+    // this, lit / MusicKit / Polymer components never wire up their
+    // shadow DOM or render, leaving heavy chunks of YouTube,
+    // music.apple.com, and any web-component site as empty shells.
+    try {
+      const matches = globalThis.document?.querySelectorAll(name) || [];
+      for (const el of matches) this._upgradeElement(el, cls);
+    } catch (e) {}
+    const resolvers = this._whenDefinedResolvers.get(name);
+    if (resolvers) {
+      for (const r of resolvers) r(cls);
+      this._whenDefinedResolvers.delete(name);
+    }
+  },
+  _upgradeElement(el, cls) {
+    if (el.__customUpgraded) return;
+    el.__customUpgraded = true;
+    try {
+      // Web Components spec: copy own props from the prototype onto the
+      // element. JS-side classes define behavior via methods on the
+      // prototype; we don't truly swap prototypes (Element is shared),
+      // so attach the prototype methods directly to the instance.
+      const proto = cls.prototype;
+      for (const key of Object.getOwnPropertyNames(proto)) {
+        if (key === 'constructor') continue;
+        const desc = Object.getOwnPropertyDescriptor(proto, key);
+        if (desc) Object.defineProperty(el, key, desc);
+      }
+      // Run constructor-side init on the element. Real custom elements
+      // run the class constructor, but Element instances aren't a `cls`
+      // subclass here; calling `.call(el)` runs whatever init logic the
+      // class defines without needing a new allocation.
+      try { cls.call(el); } catch (e) {}
+      if (typeof el.connectedCallback === 'function' && globalThis.document?.contains?.(el)) {
+        try { el.connectedCallback(); } catch (e) {}
+      }
+    } catch (e) {}
+  },
   get(name) { return this._registry.get(name); },
-  whenDefined(name) { return Promise.resolve(this._registry.get(name)); },
-  upgrade() {},
+  whenDefined(name) {
+    const cls = this._registry.get(name);
+    if (cls) return Promise.resolve(cls);
+    return new Promise((resolve) => {
+      const list = this._whenDefinedResolvers.get(name) || [];
+      list.push(resolve);
+      this._whenDefinedResolvers.set(name, list);
+    });
+  },
+  upgrade(root) {
+    if (!root || !root.querySelectorAll) return;
+    for (const [name, cls] of this._registry.entries()) {
+      const matches = root.querySelectorAll(name);
+      for (const el of matches) this._upgradeElement(el, cls);
+    }
+  },
 };
 globalThis.NodeFilter = { SHOW_ELEMENT: 1, SHOW_TEXT: 4, SHOW_ALL: 0xFFFFFFFF };
 // ResizeObserver is defined earlier with real per-target firing; the stub
@@ -3894,16 +4061,37 @@ if (typeof Document !== 'undefined' && !Document.prototype.importNode) {
 // Wrong-but-non-throwing beats "undefined", which traps ad/analytics bootstraps in retry loops
 // (see issue #63).
 if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
+  // Real hit testing against the synthetic bboxes from getBoundingClientRect.
+  // Flat iteration over every element, NOT a tree walk: our synthetic rects
+  // don't form a proper containment hierarchy (a child's rect can lie far
+  // outside its parent's), so a tree walk that only descends into ancestors
+  // containing (x,y) would never reach a deep <input> inside <label><p>.
+  // Returns the deepest matching element (highest nid wins as a proxy for
+  // tree depth) so descendants beat ancestors.
   Document.prototype.elementFromPoint = function(x, y) {
     if (typeof x !== 'number' || typeof y !== 'number' || !isFinite(x) || !isFinite(y)) {
       return null;
     }
-    var w = (typeof window !== 'undefined' && window.innerWidth) || 0;
-    var h = (typeof window !== 'undefined' && window.innerHeight) || 0;
-    if (x < 0 || y < 0 || x > w || y > h) {
-      return null;
+    var w = (typeof window !== 'undefined' && window.innerWidth) || 1280;
+    var h = (typeof window !== 'undefined' && window.innerHeight) || 720;
+    if (x < 0 || y < 0 || x > w || y > h) return null;
+    var all = this.querySelectorAll('*');
+    var best = null;
+    var bestNid = -1;
+    for (var i = 0; i < all.length; i++) {
+      var el = all[i];
+      if (!el || !el.getBoundingClientRect) continue;
+      // documentElement / body span the viewport; skip them so we pick a
+      // real descendant instead of falling back to <html>/<body>.
+      if (el === this.documentElement || el === this.body) continue;
+      var r = el.getBoundingClientRect();
+      if (r.width === 0 || r.height === 0) continue;
+      if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) {
+        var nid = el._nid | 0;
+        if (nid > bestNid) { best = el; bestNid = nid; }
+      }
     }
-    return this.body || this.documentElement || null;
+    return best || this.body || this.documentElement || null;
   };
   Document.prototype.elementsFromPoint = function(x, y) {
     var el = this.elementFromPoint(x, y);

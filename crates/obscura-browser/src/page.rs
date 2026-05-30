@@ -70,15 +70,17 @@ fn cross_scheme_to_file(from: &str, to: &str) -> bool {
         .unwrap_or(true)
 }
 
-/// Sub-resource fetch policy. A page may only pull a `<script src>` /
-/// `<link rel=stylesheet href>` / etc. when the URL scheme is safe for
-/// the page's origin. http(s) pages cannot reach into file: or data:
-/// to fabricate scripts, and pages with no origin only get http/https.
+/// Sub-resource fetch policy. http(s) is always fine; data: is allowed
+/// because the bytes are inline in the URI (no network fetch, no SSRF);
+/// file: is only allowed when the page itself was loaded from file:;
+/// everything else (javascript:, chrome:, etc) is blocked.
+/// Real Chrome allows data: subresources by default; Instagram and most
+/// Meta properties depend on this for their inline bootstrap scripts.
 fn subresource_allowed(page_url: Option<&Url>, resource: &str) -> bool {
     let Ok(target) = Url::parse(resource) else { return false };
     let scheme = target.scheme().to_ascii_lowercase();
     match scheme.as_str() {
-        "http" | "https" => true,
+        "http" | "https" | "data" => true,
         "file" => page_url.map(|u| u.scheme().eq_ignore_ascii_case("file")).unwrap_or(false),
         _ => false,
     }
@@ -132,6 +134,11 @@ pub struct Page {
     pub http_client: Arc<ObscuraHttpClient>,
     pub context: Arc<BrowserContext>,
     pub title: String,
+    /// Navigation history for Page.getNavigationHistory / navigateToHistoryEntry.
+    /// Entries are URLs in visit order; `history_index` is the current position.
+    /// Pushed on every successful navigation; truncated on goBack -> new nav.
+    pub history: Vec<String>,
+    pub history_index: usize,
     pub network_events: Vec<NetworkEvent>,
     network_event_counter: u32,
     pub intercept_enabled: bool,
@@ -181,6 +188,8 @@ impl Page {
             http_client,
             context,
             title: String::new(),
+            history: Vec::new(),
+            history_index: 0,
             network_events: Vec::new(),
             network_event_counter: 0,
             intercept_enabled: false,
@@ -268,6 +277,16 @@ impl Page {
 
     async fn execute_scripts(&mut self) {
         tracing::info!("execute_scripts called, js runtime exists: {}", self.js.is_some());
+        // Soft deadline on the entire script-execution phase. Heavy SPAs
+        // (GitHub, Linear, CodeSandbox) ship 50+ scripts and our serial
+        // fetch + execute loop can blow past a 25s Puppeteer goto timeout.
+        // Override via OBSCURA_SCRIPT_DEADLINE_MS for slow networks.
+        let script_deadline_ms: u64 = std::env::var("OBSCURA_SCRIPT_DEADLINE_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10_000);
+        let script_deadline = tokio::time::Instant::now()
+            + tokio::time::Duration::from_millis(script_deadline_ms);
 
         #[derive(Debug)]
         struct ScriptInfo {
@@ -276,6 +295,7 @@ impl Page {
             is_defer: bool,
             is_async: bool,
             is_module: bool,
+            nid: u32,
         }
 
         let all_scripts = match &self.js {
@@ -313,6 +333,7 @@ impl Page {
                                     is_defer,
                                     is_async,
                                     is_module,
+                                    nid: sid.raw(),
                                 });
                             }
                         }
@@ -393,6 +414,30 @@ impl Page {
             let idx = *idx;
             async move {
                 let parsed = Url::parse(&url).unwrap_or_else(|_| Url::parse("about:blank").unwrap());
+                if parsed.scheme() == "data" {
+                    // data: URIs are inline; decode locally, no network fetch.
+                    // Instagram and other Meta properties serve their bootstrap
+                    // as <script src="data:application/x-javascript;base64,...">.
+                    let body = decode_data_uri(&url).unwrap_or_default();
+                    let content_type = url
+                        .strip_prefix("data:")
+                        .and_then(|s| s.split(',').next())
+                        .unwrap_or("application/javascript")
+                        .split(';')
+                        .next()
+                        .unwrap_or("application/javascript")
+                        .to_string();
+                    let mut headers = std::collections::HashMap::new();
+                    headers.insert("content-type".to_string(), content_type);
+                    let resp = obscura_net::Response {
+                        url: parsed,
+                        status: 200,
+                        headers,
+                        body,
+                        redirected_from: Vec::new(),
+                    };
+                    return Some((idx, url, resp));
+                }
                 match client.fetch(&parsed).await {
                     Ok(resp) => Some((idx, url, resp)),
                     Err(e) => {
@@ -403,7 +448,18 @@ impl Page {
             }
         }).collect();
 
-        let fetch_results = futures::future::join_all(fetch_futures).await;
+        let fetch_results = match tokio::time::timeout_at(
+            script_deadline,
+            futures::future::join_all(fetch_futures),
+        ).await {
+            Ok(results) => results,
+            Err(_) => {
+                tracing::warn!(
+                    "execute_scripts: fetch deadline reached, some scripts may not have loaded"
+                );
+                Vec::new()
+            }
+        };
 
         let mut fetched: std::collections::HashMap<usize, (String, String, obscura_net::Response)> = std::collections::HashMap::new();
         for result in fetch_results {
@@ -437,26 +493,41 @@ impl Page {
         }
 
         for (i, script) in all_to_execute.iter().enumerate() {
+            if tokio::time::Instant::now() >= script_deadline {
+                tracing::warn!(
+                    "execute_scripts: deadline reached, skipping {} remaining scripts",
+                    all_to_execute.len() - i,
+                );
+                break;
+            }
             if script.src.is_some() {
                 if let Some((url, code, resp)) = fetched.remove(&i) {
                     tracing::info!("Executing script ({} bytes): {}", code.len(), url);
                     self.record_network_event(&url, "GET", "Script", resp.status, &resp.headers, resp.body.len());
                     if let Some(js) = &mut self.js {
+                        let _ = js.execute_script("<current-script>", &format!("globalThis.__currentScriptNid={};", script.nid));
                         if let Err(e) = js.execute_script_guarded(&url, &code) {
                             tracing::warn!("Script error ({}): {}", url, e);
                         }
+                        let _ = js.execute_script("<current-script>", "globalThis.__currentScriptNid=0;");
                     }
                 }
             } else if !script.inline.is_empty() {
                 if let Some(js) = &mut self.js {
+                    let _ = js.execute_script("<current-script>", &format!("globalThis.__currentScriptNid={};", script.nid));
                     if let Err(e) = js.execute_script_guarded("<inline>", &script.inline) {
                         tracing::warn!("Inline script error: {}", e);
                     }
+                    let _ = js.execute_script("<current-script>", "globalThis.__currentScriptNid=0;");
                 }
             }
         }
 
         for module_script in &module_scripts {
+            if tokio::time::Instant::now() >= script_deadline {
+                tracing::warn!("execute_scripts: deadline reached, skipping remaining module scripts");
+                break;
+            }
             if let Some(ref src) = module_script.src {
                 let full_url = if src.starts_with("http://") || src.starts_with("https://") {
                     src.clone()
@@ -576,7 +647,7 @@ impl Page {
             .unwrap_or(30_000);
         let nav_timeout = tokio::time::Duration::from_millis(nav_timeout_ms);
 
-        match tokio::time::timeout(
+        let result = match tokio::time::timeout(
             nav_timeout,
             self.navigate_with_wait_post_inner(url_str, wait_until, method, body),
         )
@@ -589,6 +660,34 @@ impl Page {
                     "navigation exceeded {nav_timeout_ms}ms deadline"
                 )))
             }
+        };
+        if result.is_ok() {
+            self.push_history(self.url_string());
+        }
+        result
+    }
+
+    /// Append the current URL to the history stack, truncating any forward
+    /// entries past the cursor (matches real Chrome: navigating after a
+    /// goBack clobbers the forward history).
+    pub fn push_history(&mut self, url: String) {
+        if url.is_empty() { return; }
+        // Don't dupe consecutive entries (Page.reload would otherwise pile up).
+        if self.history.get(self.history_index) == Some(&url) {
+            return;
+        }
+        if !self.history.is_empty() && self.history_index < self.history.len() - 1 {
+            self.history.truncate(self.history_index + 1);
+        }
+        self.history.push(url);
+        self.history_index = self.history.len() - 1;
+    }
+
+    /// Move the history cursor without re-navigating; used by
+    /// Page.navigateToHistoryEntry which then drives the actual fetch.
+    pub fn set_history_index(&mut self, idx: usize) {
+        if idx < self.history.len() {
+            self.history_index = idx;
         }
     }
 
@@ -811,15 +910,11 @@ impl Page {
         }
 
         self.dom = Some(dom);
-        self.lifecycle = LifecycleState::DomContentLoaded;
-
-        if wait_until == crate::lifecycle::WaitUntil::DomContentLoaded {
-            self.init_js();
-            return Ok(());
-        }
-
         self.init_js();
 
+        // Inject CSS as a global so getComputedStyle and any CSS-aware shim
+        // can read it. Has to happen before scripts run, regardless of
+        // waitUntil, so handlers that read window.__obscura_css see it.
         if !css_sources.is_empty() {
             if let Some(js) = &mut self.js {
                 let combined_css = css_sources.join("\n");
@@ -839,7 +934,19 @@ impl Page {
                 "(function() { var iframes = document.querySelectorAll('iframe[src]'); for (var i = 0; i < iframes.length; i++) { var src = iframes[i].getAttribute('src'); if (src && src !== 'about:blank') iframes[i]._loadIframeSrc(src); } })()");
         }
 
+        // Spec: DOMContentLoaded fires AFTER parser-blocking scripts run,
+        // not before. Skipping execute_scripts() on the DCL path meant
+        // every inline <script> in the page was silently dropped: form
+        // listeners never registered, frameworks never bootstrapped,
+        // page.click() handlers were no-ops. Now scripts run regardless
+        // of waitUntil and DCL means "DOM parsed AND scripts executed".
         self.execute_scripts().await;
+
+        self.lifecycle = LifecycleState::DomContentLoaded;
+
+        if wait_until == crate::lifecycle::WaitUntil::DomContentLoaded {
+            return Ok(());
+        }
 
         if let Some(js) = &mut self.js {
             if let Ok(new_title) = js.evaluate("document.title") {
@@ -1132,6 +1239,13 @@ impl Page {
         self.intercept_tx = Some(tx.clone());
         if let Some(js) = &self.js {
             js.set_intercept_tx(tx);
+        }
+    }
+
+    pub fn enable_intercept(&mut self, enabled: bool) {
+        self.intercept_enabled = enabled;
+        if let Some(js) = &self.js {
+            js.set_intercept_enabled(enabled);
         }
     }
 }
