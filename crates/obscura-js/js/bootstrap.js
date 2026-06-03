@@ -1012,15 +1012,33 @@ class Element extends Node {
     return false;
   }
   remove() { if (this.parentNode) this.parentNode.removeChild(this); }
-  append(...nodes) { for (const n of nodes) { if (typeof n === "string") this.appendChild(document.createTextNode(n)); else this.appendChild(n); } }
+  append(...nodes) { for (const n of _convertNodes(nodes)) this.appendChild(n); }
   prepend(...nodes) {
     const ref = this.firstChild;
-    for (const n of nodes) {
-      const node = (typeof n === "string") ? document.createTextNode(n) : n;
-      if (ref) this.insertBefore(node, ref);
-      else this.appendChild(node);
+    for (const n of _convertNodes(nodes)) {
+      if (ref) this.insertBefore(n, ref); else this.appendChild(n);
     }
   }
+  replaceChildren(...nodes) {
+    const converted = _convertNodes(nodes);
+    let c;
+    while ((c = this.firstChild)) this.removeChild(c);
+    for (const n of converted) this.appendChild(n);
+  }
+}
+
+// WHATWG "convert nodes into a node": a Node argument passes through, anything
+// else is stringified into a Text node, so e.g. append(null) inserts the text
+// "null" and append(undefined) inserts "undefined" per the (Node or DOMString)
+// union, rather than throwing.
+function _convertNodes(nodes) {
+  const out = [];
+  for (let i = 0; i < nodes.length; i++) {
+    const n = nodes[i];
+    if (n && typeof n._nid === "number") out.push(n);
+    else out.push(document.createTextNode(String(n)));
+  }
+  return out;
 }
 
 class Document extends Node {
@@ -2581,11 +2599,55 @@ globalThis.IntersectionObserver = class IntersectionObserver {
 globalThis.IntersectionObserverEntry = class IntersectionObserverEntry {};
 globalThis.PerformanceObserver = class { constructor(){} observe(){} disconnect(){} };
 
+globalThis.DOMException = (function () {
+  const NAME_TO_CODE = {
+    IndexSizeError: 1, HierarchyRequestError: 3, WrongDocumentError: 4,
+    InvalidCharacterError: 5, NoModificationAllowedError: 7, NotFoundError: 8,
+    NotSupportedError: 9, InUseAttributeError: 10, InvalidStateError: 11,
+    SyntaxError: 12, InvalidModificationError: 13, NamespaceError: 14,
+    InvalidAccessError: 15, TypeMismatchError: 17, SecurityError: 18,
+    NetworkError: 19, AbortError: 20, URLMismatchError: 21,
+    QuotaExceededError: 22, TimeoutError: 23, InvalidNodeTypeError: 24,
+    DataCloneError: 25,
+  };
+  class DOMException extends Error {
+    constructor(message = "", name = "Error") {
+      super(message);
+      this.name = name;
+      this.message = String(message);
+    }
+    get code() { return NAME_TO_CODE[this.name] || 0; }
+  }
+  const CONSTS = {
+    INDEX_SIZE_ERR: 1, DOMSTRING_SIZE_ERR: 2, HIERARCHY_REQUEST_ERR: 3,
+    WRONG_DOCUMENT_ERR: 4, INVALID_CHARACTER_ERR: 5, NO_DATA_ALLOWED_ERR: 6,
+    NO_MODIFICATION_ALLOWED_ERR: 7, NOT_FOUND_ERR: 8, NOT_SUPPORTED_ERR: 9,
+    INUSE_ATTRIBUTE_ERR: 10, INVALID_STATE_ERR: 11, SYNTAX_ERR: 12,
+    INVALID_MODIFICATION_ERR: 13, NAMESPACE_ERR: 14, INVALID_ACCESS_ERR: 15,
+    VALIDATION_ERR: 16, TYPE_MISMATCH_ERR: 17, SECURITY_ERR: 18,
+    NETWORK_ERR: 19, ABORT_ERR: 20, URL_MISMATCH_ERR: 21,
+    QUOTA_EXCEEDED_ERR: 22, TIMEOUT_ERR: 23, INVALID_NODE_TYPE_ERR: 24,
+    DATA_CLONE_ERR: 25,
+  };
+  for (const k in CONSTS) {
+    Object.defineProperty(DOMException, k, { value: CONSTS[k], enumerable: true });
+    Object.defineProperty(DOMException.prototype, k, { value: CONSTS[k], enumerable: true });
+  }
+  return DOMException;
+})();
 globalThis.Event = class Event {
   constructor(t,o={}) { this.type=t;this.bubbles=!!o.bubbles;this.cancelable=!!o.cancelable;this.composed=!!o.composed;this.defaultPrevented=false;this.target=null;this.currentTarget=null;this.eventPhase=0;this.timeStamp=Date.now();this._propagationStopped=false;this._immediatePropagationStopped=false; }
   get isTrusted() { return true; }
   preventDefault() { if (this.cancelable) this.defaultPrevented=true; } stopPropagation(){ this._propagationStopped=true; } stopImmediatePropagation(){ this._propagationStopped=true; this._immediatePropagationStopped=true; }
   initEvent(type,bubbles,cancelable) { this.type=type;this.bubbles=!!bubbles;this.cancelable=!!cancelable;this.defaultPrevented=false;this._propagationStopped=false;this._immediatePropagationStopped=false; }
+  composedPath() {
+    if (!this.target) return [];
+    const path = [];
+    let n = this.target;
+    while (n) { path.push(n); n = n.parentNode || null; }
+    if (typeof window !== "undefined" && window && path[path.length - 1] !== window) path.push(window);
+    return path;
+  }
 };
 globalThis.CustomEvent = class extends Event {
   constructor(t,o={}) { super(t,o);this.detail=o.detail; }
@@ -2971,7 +3033,27 @@ globalThis.DocumentType = DocumentType;
 globalThis.Node = Node;
 globalThis.Element = Element;
 globalThis.Document = Document;
+// ParentNode mixin: Document and DocumentFragment are ParentNodes too, so they
+// share Element's append / prepend / replaceChildren.
+for (const _proto of [Document.prototype, DocumentFragment.prototype]) {
+  _proto.append = Element.prototype.append;
+  _proto.prepend = Element.prototype.prepend;
+  _proto.replaceChildren = Element.prototype.replaceChildren;
+}
 globalThis.EventTarget = Node;
+globalThis.HTMLCollection = class HTMLCollection extends Array {
+  item(i) { return this[i] != null ? this[i] : null; }
+  namedItem(name) {
+    if (!name) return null;
+    for (const el of this) {
+      if (el && (el.id === name || (typeof el.getAttribute === "function" && el.getAttribute("name") === name))) return el;
+    }
+    return null;
+  }
+};
+globalThis.NodeList = class NodeList extends Array {
+  item(i) { return this[i] != null ? this[i] : null; }
+};
 globalThis.Range = class Range { setStart(){} setEnd(){} collapse(){} selectNodeContents(){} deleteContents(){} cloneContents(){ return document.createDocumentFragment(); } insertNode(){} getBoundingClientRect(){return {x:0,y:0,width:0,height:0,top:0,right:0,bottom:0,left:0};} };
 
 [
@@ -3511,6 +3593,8 @@ Element.prototype.attachShadow = function attachShadow(opts) {
     get nodeType() { return 11; }, // DOCUMENT_FRAGMENT_NODE
     get nodeName() { return '#document-fragment'; },
     addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true; },
+    setHTMLUnsafe(v) { this.innerHTML = String(v == null ? "" : v); },
+    getHTML() { return this.innerHTML; },
     cloneNode() { return shadow; },
   };
   this.shadowRoot = shadow;
@@ -3518,6 +3602,15 @@ Element.prototype.attachShadow = function attachShadow(opts) {
 };
 
 _markNative(Element.prototype.attachShadow);
+
+// setHTMLUnsafe / getHTML: shims over innerHTML. setHTMLUnsafe parses markup
+// like innerHTML (declarative shadow roots inside are not expanded yet, but the
+// call no longer throws so the rest of a test file can run); getHTML serializes
+// like innerHTML.
+Element.prototype.setHTMLUnsafe = function setHTMLUnsafe(html) { this.innerHTML = String(html == null ? "" : html); };
+Element.prototype.getHTML = function getHTML() { return this.innerHTML; };
+_markNative(Element.prototype.setHTMLUnsafe);
+_markNative(Element.prototype.getHTML);
 
 globalThis.AudioContext = class AudioContext {
   constructor() { this.sampleRate=_fp('audioSampleRate'); this.state='running'; this.currentTime=0; this.baseLatency=_fp('audioBaseLatency'); this.destination={maxChannelCount:2,numberOfInputs:1,numberOfOutputs:0,channelCount:2}; }
@@ -4271,3 +4364,468 @@ globalThis.__obscura_init = function() {
 globalThis.__obscura_hide_list = Object.keys(globalThis).filter(k =>
   k.startsWith('_') || k.includes('obscura') || k.includes('Obscura')
 );
+
+/* ===== WPT conformance shims: batch 2 ===== */
+
+// ---- Node namespace lookup methods ----
+
+Node.prototype.lookupNamespaceURI = function(prefix) {
+  let node = this;
+  if (node.nodeType === 9) node = node.documentElement;
+  if (!node || node.nodeType !== 1) return null;
+  const _ns_builtins = { 'xml': 'http://www.w3.org/XML/1998/namespace', 'xmlns': 'http://www.w3.org/2000/xmlns/' };
+  if (prefix && _ns_builtins[prefix]) return _ns_builtins[prefix];
+  while (node && node.nodeType === 1) {
+    if (prefix) {
+      if (node.prefix === prefix && node.namespaceURI) return node.namespaceURI;
+      const nsAttr = node.getAttribute('xmlns:' + prefix);
+      if (nsAttr !== null) return nsAttr || null;
+    } else {
+      const defaultNs = node.getAttribute('xmlns');
+      if (defaultNs !== null) return defaultNs || null;
+      if (node.prefix === null && node.namespaceURI) return node.namespaceURI;
+    }
+    node = node.parentElement;
+  }
+  return null;
+};
+_markNative(Node.prototype.lookupNamespaceURI);
+
+Node.prototype.lookupPrefix = function(namespace) {
+  namespace = namespace || null;
+  let node = this;
+  if (node.nodeType === 9) node = node.documentElement;
+  if (!node || node.nodeType !== 1) return null;
+  const _ns_builtins = { 'http://www.w3.org/XML/1998/namespace': 'xml', 'http://www.w3.org/2000/xmlns/': 'xmlns' };
+  if (_ns_builtins[namespace]) return _ns_builtins[namespace];
+  while (node && node.nodeType === 1) {
+    if (node.namespaceURI === namespace) {
+      const p = node.prefix;
+      if (p) return p;
+    }
+    const attrs = node.attributes || [];
+    for (let i = 0; i < attrs.length; i++) {
+      const attr = attrs[i];
+      const attrName = attr.name || attr.nodeName || '';
+      const attrValue = attr.value || attr.nodeValue || '';
+      if (attrName === 'xmlns' && attrValue === namespace) return '';
+      if (attrName.startsWith('xmlns:')) {
+        const prefix = attrName.substring(6);
+        if (attrValue === namespace) return prefix;
+      }
+    }
+    node = node.parentElement;
+  }
+  return null;
+};
+_markNative(Node.prototype.lookupPrefix);
+
+Node.prototype.isDefaultNamespace = function(namespace) {
+  return this.lookupNamespaceURI(null) === (namespace || null);
+};
+_markNative(Node.prototype.isDefaultNamespace);
+
+
+// ---- getElementsByTagNameNS on Element and Document ----
+// getElementsByTagNameNS on Element and Document
+if (!Element.prototype.getElementsByTagNameNS) {
+  Element.prototype.getElementsByTagNameNS = function(namespaceURI, localName) {
+    const all = this.querySelectorAll('*');
+    const filtered = [];
+    const nsMatch = namespaceURI === '*';
+    const tagMatch = localName === '*';
+    for (let i = 0; i < all.length; i++) {
+      const el = all[i];
+      if (!el) continue;
+      const elNs = el.namespaceURI;
+      const elTag = el.localName;
+      const nsOk = nsMatch || (elNs === (namespaceURI || null));
+      const tagOk = tagMatch || (elTag === localName);
+      if (nsOk && tagOk) filtered.push(el);
+    }
+    const result = new HTMLCollection(...filtered);
+    result.item = (i) => result[i] != null ? result[i] : null;
+    return result;
+  };
+  _markNative(Element.prototype.getElementsByTagNameNS);
+}
+if (!Document.prototype.getElementsByTagNameNS) {
+  Document.prototype.getElementsByTagNameNS = function(namespaceURI, localName) {
+    const all = this.querySelectorAll('*');
+    const filtered = [];
+    const nsMatch = namespaceURI === '*';
+    const tagMatch = localName === '*';
+    for (let i = 0; i < all.length; i++) {
+      const el = all[i];
+      if (!el) continue;
+      const elNs = el.namespaceURI;
+      const elTag = el.localName;
+      const nsOk = nsMatch || (elNs === (namespaceURI || null));
+      const tagOk = tagMatch || (elTag === localName);
+      if (nsOk && tagOk) filtered.push(el);
+    }
+    const result = new HTMLCollection(...filtered);
+    result.item = (i) => result[i] != null ? result[i] : null;
+    return result;
+  };
+  _markNative(Document.prototype.getElementsByTagNameNS);
+}
+
+// ---- Attr nodes and createAttribute ----
+// Attr class: represents attribute nodes (nodeType 2)
+if (!globalThis.Attr) {
+  globalThis.Attr = class Attr {
+    constructor(name, value = '', namespaceURI = null, prefix = null) {
+      this.name = name;
+      this.localName = name;
+      this.value = value;
+      this.namespaceURI = namespaceURI;
+      this.prefix = prefix;
+      this.ownerElement = null;
+      this.specified = true;
+    }
+    get nodeName() { return this.name; }
+    get nodeValue() { return this.value; }
+    set nodeValue(v) { this.value = v; }
+    get nodeType() { return 2; }
+  };
+}
+
+// XML Name validation helper for attribute/processing instruction names
+const _ns_isValidXmlName = (name) => {
+  if (typeof name !== 'string' || !name.length) return false;
+  return /^[A-Za-z_:][\w.\-:]*$/.test(name);
+};
+
+// Document.prototype.createAttribute: create a detached Attr node
+if (!Document.prototype.createAttribute) {
+  Document.prototype.createAttribute = function(localName) {
+    const name = String(localName || '');
+    if (!_ns_isValidXmlName(name)) {
+      throw new DOMException('Invalid attribute name', 'InvalidCharacterError');
+    }
+    return new Attr(name, '', null, null);
+  };
+  _markNative(Document.prototype.createAttribute);
+}
+
+// Document.prototype.createAttributeNS: create a namespaced Attr node
+if (!Document.prototype.createAttributeNS) {
+  Document.prototype.createAttributeNS = function(namespaceURI, qualifiedName) {
+    const ns = namespaceURI ? String(namespaceURI) : null;
+    const qn = String(qualifiedName || '');
+    if (!qn.length) {
+      throw new DOMException('Invalid attribute name', 'InvalidCharacterError');
+    }
+    let prefix = null;
+    let localName = qn;
+    const colonIdx = qn.indexOf(':');
+    if (colonIdx !== -1) {
+      prefix = qn.substring(0, colonIdx);
+      localName = qn.substring(colonIdx + 1);
+      if (!_ns_isValidXmlName(prefix) || !_ns_isValidXmlName(localName)) {
+        throw new DOMException('Invalid attribute name', 'InvalidCharacterError');
+      }
+    } else {
+      if (!_ns_isValidXmlName(localName)) {
+        throw new DOMException('Invalid attribute name', 'InvalidCharacterError');
+      }
+    }
+    return new Attr(qn, '', ns, prefix);
+  };
+  _markNative(Document.prototype.createAttributeNS);
+}
+
+// Element.prototype.getAttributeNode: return an Attr node or null
+if (!Element.prototype.getAttributeNode) {
+  Element.prototype.getAttributeNode = function(name) {
+    const val = this.getAttribute(name);
+    if (val === null) return null;
+    const attr = new Attr(name, val, null, null);
+    attr.ownerElement = this;
+    return attr;
+  };
+  _markNative(Element.prototype.getAttributeNode);
+}
+
+// Element.prototype.getAttributeNodeNS: return a namespaced Attr node or null
+if (!Element.prototype.getAttributeNodeNS) {
+  Element.prototype.getAttributeNodeNS = function(namespaceURI, localName) {
+    const val = this.getAttributeNS(namespaceURI, localName);
+    if (val === null) return null;
+    const name = String(localName || '');
+    const attr = new Attr(name, val, namespaceURI ? String(namespaceURI) : null, null);
+    attr.ownerElement = this;
+    return attr;
+  };
+  _markNative(Element.prototype.getAttributeNodeNS);
+}
+
+// Element.prototype.setAttributeNode: set an Attr and return the previous one
+if (!Element.prototype.setAttributeNode) {
+  Element.prototype.setAttributeNode = function(attr) {
+    if (!attr || typeof attr.name !== 'string') return null;
+    const prevVal = this.getAttribute(attr.name);
+    const prevAttr = prevVal !== null ? new Attr(attr.name, prevVal, null, null) : null;
+    if (prevAttr) prevAttr.ownerElement = this;
+    this.setAttribute(attr.name, attr.value);
+    attr.ownerElement = this;
+    return prevAttr;
+  };
+  _markNative(Element.prototype.setAttributeNode);
+}
+
+// Element.prototype.setAttributeNodeNS: set a namespaced Attr and return the previous one
+if (!Element.prototype.setAttributeNodeNS) {
+  Element.prototype.setAttributeNodeNS = function(attr) {
+    if (!attr || typeof attr.name !== 'string') return null;
+    const prevVal = this.getAttribute(attr.name);
+    const prevAttr = prevVal !== null 
+      ? new Attr(attr.name, prevVal, attr.namespaceURI || null, attr.prefix || null) 
+      : null;
+    if (prevAttr) prevAttr.ownerElement = this;
+    this.setAttributeNS(attr.namespaceURI || null, attr.name, attr.value);
+    attr.ownerElement = this;
+    return prevAttr;
+  };
+  _markNative(Element.prototype.setAttributeNodeNS);
+}
+
+// Element.prototype.removeAttributeNode: remove and return an Attr
+if (!Element.prototype.removeAttributeNode) {
+  Element.prototype.removeAttributeNode = function(attr) {
+    if (!attr || typeof attr.name !== 'string') return attr;
+    const val = this.getAttribute(attr.name);
+    if (val !== null) {
+      this.removeAttribute(attr.name);
+    }
+    return attr;
+  };
+  _markNative(Element.prototype.removeAttributeNode);
+}
+
+
+// ---- form control validity and text selection ----
+
+// ValidityState class for form validation state reporting
+if (typeof ValidityState === 'undefined') {
+  globalThis.ValidityState = class ValidityState {
+    constructor() {
+      this.badInput = false;
+      this.customError = false;
+      this.patternMismatch = false;
+      this.rangeOverflow = false;
+      this.rangeUnderflow = false;
+      this.stepMismatch = false;
+      this.tooLong = false;
+      this.tooShort = false;
+      this.typeMismatch = false;
+      this.valueMissing = false;
+      this.valid = true;
+    }
+  };
+}
+
+// Validity and validation message storage on elements
+const _ns_validityCache = new WeakMap();
+const _ns_customValidityMsg = new WeakMap();
+
+// Element.prototype.validity - returns cached ValidityState for the element
+if (!Element.prototype.validity) {
+  Object.defineProperty(Element.prototype, 'validity', {
+    get: function() {
+      if (!_ns_validityCache.has(this)) {
+        _ns_validityCache.set(this, new ValidityState());
+      }
+      return _ns_validityCache.get(this);
+    },
+    enumerable: true,
+    configurable: true
+  });
+}
+
+// Element.prototype.willValidate - whether element is subject to constraint validation
+if (!Element.prototype.willValidate) {
+  Object.defineProperty(Element.prototype, 'willValidate', {
+    get: function() {
+      return true;
+    },
+    enumerable: true,
+    configurable: true
+  });
+}
+
+// Element.prototype.validationMessage - custom validation message if set
+if (!Element.prototype.validationMessage) {
+  Object.defineProperty(Element.prototype, 'validationMessage', {
+    get: function() {
+      return _ns_customValidityMsg.get(this) || '';
+    },
+    enumerable: true,
+    configurable: true
+  });
+}
+
+// Element.prototype.checkValidity - stub returns true
+if (!Element.prototype.checkValidity) {
+  Element.prototype.checkValidity = function checkValidity() {
+    return true;
+  };
+  _markNative(Element.prototype.checkValidity);
+}
+
+// Element.prototype.reportValidity - stub returns true
+if (!Element.prototype.reportValidity) {
+  Element.prototype.reportValidity = function reportValidity() {
+    return true;
+  };
+  _markNative(Element.prototype.reportValidity);
+}
+
+// Element.prototype.setCustomValidity - set custom validation message
+if (!Element.prototype.setCustomValidity) {
+  Element.prototype.setCustomValidity = function setCustomValidity(msg) {
+    const validity = this.validity;
+    if (msg && msg.length > 0) {
+      _ns_customValidityMsg.set(this, msg);
+      validity.customError = true;
+      validity.valid = false;
+    } else {
+      _ns_customValidityMsg.delete(this);
+      validity.customError = false;
+      validity.valid = true;
+    }
+  };
+  _markNative(Element.prototype.setCustomValidity);
+}
+
+// Text selection on Element.prototype
+const _ns_selectionStart = new WeakMap();
+const _ns_selectionEnd = new WeakMap();
+const _ns_selectionDir = new WeakMap();
+
+// Element.prototype.selectionStart - get/set selection start position
+if (!Element.prototype.selectionStart) {
+  Object.defineProperty(Element.prototype, 'selectionStart', {
+    get: function() {
+      return _ns_selectionStart.get(this) ?? null;
+    },
+    set: function(v) {
+      _ns_selectionStart.set(this, v == null ? null : Math.max(0, parseInt(v, 10) || 0));
+    },
+    enumerable: true,
+    configurable: true
+  });
+}
+
+// Element.prototype.selectionEnd - get/set selection end position
+if (!Element.prototype.selectionEnd) {
+  Object.defineProperty(Element.prototype, 'selectionEnd', {
+    get: function() {
+      return _ns_selectionEnd.get(this) ?? null;
+    },
+    set: function(v) {
+      _ns_selectionEnd.set(this, v == null ? null : Math.max(0, parseInt(v, 10) || 0));
+    },
+    enumerable: true,
+    configurable: true
+  });
+}
+
+// Element.prototype.selectionDirection - get/set selection direction
+if (!Element.prototype.selectionDirection) {
+  Object.defineProperty(Element.prototype, 'selectionDirection', {
+    get: function() {
+      return _ns_selectionDir.get(this) ?? 'none';
+    },
+    set: function(v) {
+      _ns_selectionDir.set(this, v === 'forward' || v === 'backward' ? v : 'none');
+    },
+    enumerable: true,
+    configurable: true
+  });
+}
+
+// Element.prototype.setSelectionRange - set text selection range
+if (!Element.prototype.setSelectionRange) {
+  Element.prototype.setSelectionRange = function setSelectionRange(start, end, direction) {
+    start = Math.max(0, parseInt(start, 10) || 0);
+    end = Math.max(0, parseInt(end, 10) || 0);
+    direction = direction === 'forward' || direction === 'backward' ? direction : 'none';
+    _ns_selectionStart.set(this, start);
+    _ns_selectionEnd.set(this, end);
+    _ns_selectionDir.set(this, direction);
+  };
+  _markNative(Element.prototype.setSelectionRange);
+}
+
+// Element.prototype.setRangeText - replace selection with text
+if (!Element.prototype.setRangeText) {
+  Element.prototype.setRangeText = function setRangeText(replacement, start, end, selectMode) {
+    const val = this.value;
+    if (!val) return;
+    const strVal = String(val);
+    start = start === undefined ? (this.selectionStart ?? 0) : Math.max(0, parseInt(start, 10) || 0);
+    end = end === undefined ? (this.selectionEnd ?? 0) : Math.max(0, parseInt(end, 10) || 0);
+    const newValue = strVal.slice(0, start) + String(replacement) + strVal.slice(end);
+    this.value = newValue;
+    selectMode = selectMode || 'preserve';
+    if (selectMode === 'select') {
+      const replLen = String(replacement).length;
+      _ns_selectionStart.set(this, start);
+      _ns_selectionEnd.set(this, start + replLen);
+      _ns_selectionDir.set(this, 'none');
+    } else if (selectMode === 'start') {
+      _ns_selectionStart.set(this, start);
+      _ns_selectionEnd.set(this, start);
+      _ns_selectionDir.set(this, 'none');
+    } else if (selectMode === 'end') {
+      const replLen = String(replacement).length;
+      _ns_selectionStart.set(this, start + replLen);
+      _ns_selectionEnd.set(this, start + replLen);
+      _ns_selectionDir.set(this, 'none');
+    }
+  };
+  _markNative(Element.prototype.setRangeText);
+}
+
+// Element.prototype.select - select all text in the element
+if (!Element.prototype.select) {
+  Element.prototype.select = function select() {
+    const val = this.value;
+    if (val === undefined || val === null) return;
+    const len = String(val).length;
+    _ns_selectionStart.set(this, 0);
+    _ns_selectionEnd.set(this, len);
+    _ns_selectionDir.set(this, 'none');
+  };
+  _markNative(Element.prototype.select);
+}
+
+
+// ---- Response.blob() on the real fetch path ----
+
+if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype.blob) {
+  Response.prototype.blob = async function() {
+    const bytes = await this.arrayBuffer();
+    const contentType = this.headers && typeof this.headers.get === 'function' ? this.headers.get('content-type') : '';
+    return new Blob([new Uint8Array(bytes)], { type: contentType || '' });
+  };
+  _markNative(Response.prototype.blob);
+}
+if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype.text) {
+  Response.prototype.text = async function() {
+    const buffer = await this.arrayBuffer();
+    return new TextDecoder().decode(new Uint8Array(buffer));
+  };
+  _markNative(Response.prototype.text);
+}
+if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype.json) {
+  Response.prototype.json = async function() {
+    return JSON.parse(await this.text());
+  };
+  _markNative(Response.prototype.json);
+}
+// arrayBuffer is the body primitive that blob/text/json derive from; the
+// engine's Response provides it natively, so it is intentionally not shimmed
+// here (a JS fallback could only recurse into itself).
