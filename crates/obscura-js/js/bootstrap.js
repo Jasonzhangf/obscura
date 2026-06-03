@@ -631,13 +631,37 @@ class ProcessingInstruction extends CharacterData {
   cloneNode() { return new ProcessingInstruction(+_dom("create_text_node", this.data), this._target); }
 }
 
+// HTMLHyperlinkElementUtils helpers (the <a>/<area> URL-decomposition members).
+// The element's href attribute is parsed against the document base URL via the
+// WHATWG url op; component getters read it, setters rewrite the href attribute.
+function _anchorBase() { return _domParse("document_url") || "about:blank"; }
+function _elemHrefURL(el) {
+  const raw = el.getAttribute('href');
+  if (raw === null || raw === undefined) return null;
+  return _urlParseOp(raw, _anchorBase());
+}
+function _setElemHrefPart(el, part, value) {
+  const u = _elemHrefURL(el);
+  if (!u) return;
+  const c = _urlSetOp(u.href, part, value);
+  if (c) el.setAttribute('href', c.href);
+}
+
 class Element extends Node {
   constructor(nid) {
     super(nid);
     this._style = _styleProxy(new CSSStyleDeclaration());
   }
   get tagName() { return _domParse("tag_name", this._nid) || ""; }
-  get localName() { return (this.tagName || "").toLowerCase(); }
+  get localName() {
+    // tagName is an op call and the tag never changes, so cache the lowercased
+    // localName. This keeps the new <a>/<area> href getters (which read
+    // localName) and every other localName consumer off the op path.
+    if (this._lname !== undefined) return this._lname;
+    const ln = (this.tagName || "").toLowerCase();
+    if (ln) this._lname = ln;
+    return ln;
+  }
   get id() { return this.getAttribute("id") || ""; }
   set id(v) { this.setAttribute("id", v); }
   get className() { return this.getAttribute("class") || ""; }
@@ -1059,8 +1083,41 @@ class Element extends Node {
   set name(v) { this.setAttribute("name", v); }
   get placeholder() { return this.getAttribute("placeholder") || ""; }
   set placeholder(v) { this.setAttribute("placeholder", v); }
-  get href() { return this.getAttribute("href") || ""; }
+  // For <a>/<area>, href returns the resolved absolute URL (the spec behavior,
+  // and what scrapers want). It uses op_url_resolve, which returns just the
+  // resolved string, rather than the full-component op the decomposition
+  // members use. Other elements reflect the raw attribute.
+  get href() {
+    const ln = this.localName;
+    if (ln === 'a' || ln === 'area') {
+      const raw = this.getAttribute('href');
+      if (raw === null) return '';
+      const r = _urlResolveOp(raw, _anchorBase());
+      return r !== null ? r : raw;
+    }
+    return this.getAttribute("href") || "";
+  }
   set href(v) { this.setAttribute("href", v); }
+  // HTMLHyperlinkElementUtils URL-decomposition members, live on <a>/<area>.
+  get protocol() { const u = (this.localName === 'a' || this.localName === 'area') ? _elemHrefURL(this) : null; return u ? u.protocol : ''; }
+  set protocol(v) { if (this.localName === 'a' || this.localName === 'area') _setElemHrefPart(this, 'protocol', v); }
+  get username() { const u = (this.localName === 'a' || this.localName === 'area') ? _elemHrefURL(this) : null; return u ? u.username : ''; }
+  set username(v) { if (this.localName === 'a' || this.localName === 'area') _setElemHrefPart(this, 'username', v); }
+  get password() { const u = (this.localName === 'a' || this.localName === 'area') ? _elemHrefURL(this) : null; return u ? u.password : ''; }
+  set password(v) { if (this.localName === 'a' || this.localName === 'area') _setElemHrefPart(this, 'password', v); }
+  get host() { const u = (this.localName === 'a' || this.localName === 'area') ? _elemHrefURL(this) : null; return u ? u.host : ''; }
+  set host(v) { if (this.localName === 'a' || this.localName === 'area') _setElemHrefPart(this, 'host', v); }
+  get hostname() { const u = (this.localName === 'a' || this.localName === 'area') ? _elemHrefURL(this) : null; return u ? u.hostname : ''; }
+  set hostname(v) { if (this.localName === 'a' || this.localName === 'area') _setElemHrefPart(this, 'hostname', v); }
+  get port() { const u = (this.localName === 'a' || this.localName === 'area') ? _elemHrefURL(this) : null; return u ? u.port : ''; }
+  set port(v) { if (this.localName === 'a' || this.localName === 'area') _setElemHrefPart(this, 'port', v); }
+  get pathname() { const u = (this.localName === 'a' || this.localName === 'area') ? _elemHrefURL(this) : null; return u ? u.pathname : ''; }
+  set pathname(v) { if (this.localName === 'a' || this.localName === 'area') _setElemHrefPart(this, 'pathname', v); }
+  get search() { const u = (this.localName === 'a' || this.localName === 'area') ? _elemHrefURL(this) : null; return u ? u.search : ''; }
+  set search(v) { if (this.localName === 'a' || this.localName === 'area') _setElemHrefPart(this, 'search', v); }
+  get hash() { const u = (this.localName === 'a' || this.localName === 'area') ? _elemHrefURL(this) : null; return u ? u.hash : ''; }
+  set hash(v) { if (this.localName === 'a' || this.localName === 'area') _setElemHrefPart(this, 'hash', v); }
+  get origin() { const u = (this.localName === 'a' || this.localName === 'area') ? _elemHrefURL(this) : null; return u ? u.origin : ''; }
   get src() { return this.getAttribute("src") || ""; }
   set src(v) {
     this.setAttribute("src", v);
@@ -1356,6 +1413,12 @@ class Document extends Node {
   get compatMode() { return "CSS1Compat"; }
   get characterSet() { return "UTF-8"; }
   get contentType() {
+    // An explicit type set by DOMParser/createDocument wins.
+    if (this._contentType) return this._contentType;
+    // `new Document()` (the WHATWG constructor, no backing node id) creates an
+    // XML document, so createCDATASection/etc. must not throw. Live documents
+    // wrapped from the tree carry a real nid and fall through to URL-derived.
+    if (this._nid === undefined || this._nid === null) return "application/xml";
     const url = this.URL || "";
     // data: URLs carry their MIME type explicitly.
     const dm = /^data:([^,;]+)/i.exec(url);
@@ -1582,6 +1645,7 @@ class Document extends Node {
   getSelection() { return globalThis.getSelection(); }
   get activeElement() { return globalThis.__obscura_focused || this.body; }
   get implementation() {
+    const ownerDoc = this;
     return {
       // Spec: createHTMLDocument returns a NEW detached Document. jQuery
       // 3.x's selector feature-detect calls `body.innerHTML = '<form>'` on
@@ -1607,6 +1671,24 @@ class Document extends Node {
         const safe = name.replace(/[^a-zA-Z0-9-]/g, "");
         const html = `<${safe}></${safe}>`;
         return new DOMParser().parseFromString(html, "application/xml");
+      },
+      // createDocumentType(qualifiedName, publicId, systemId): build a detached
+      // DocumentType node. Browsers validate leniently here (only a name with
+      // ASCII whitespace or ">" is rejected, matching the WPT cases); the node's
+      // owner document is the document whose implementation was used.
+      createDocumentType(qualifiedName, publicId, systemId) {
+        const name = String(qualifiedName);
+        if (name === "" || /[\t\n\f\r >]/.test(name)) {
+          throw new DOMException("The qualified name '" + name + "' contains an invalid character", "InvalidCharacterError");
+        }
+        const dt = new DocumentType(
+          +_dom("create_comment_node", ""),
+          name,
+          publicId === undefined ? "" : String(publicId),
+          systemId === undefined ? "" : String(systemId)
+        );
+        dt._ownerDocument = ownerDoc;
+        return dt;
       },
       hasFeature() { return true; },
     };
@@ -1697,7 +1779,9 @@ class DocumentType extends Node {
   get name() { return this._name; }
   get publicId() { return this._publicId; }
   get systemId() { return this._systemId; }
-  get ownerDocument() { return globalThis.document; }
+  get nodeValue() { return null; }
+  set nodeValue(v) {}
+  get ownerDocument() { return this._ownerDocument || globalThis.document; }
 }
 
 const _cache = new Map();
@@ -2288,50 +2372,78 @@ _markNative(XMLHttpRequest.prototype.setRequestHeader);
 _markNative(XMLHttpRequest.prototype.getResponseHeader);
 _markNative(XMLHttpRequest.prototype.getAllResponseHeaders);
 
-if (typeof URL === 'undefined' || !URL.prototype) {
-  globalThis.URL = class URL {
+// WHATWG URL parsing/serialization is delegated to the Rust `url` crate via
+// op_url_parse / op_url_set. The op returns the full component set as JSON; the
+// constructor caches it so getters are plain field reads (no per-access op) and
+// the hot paths (navigation, fetch, _resolveUrl) stay cheap. Returns null when
+// the input is not a valid URL.
+function _urlParseOp(url, base) {
+  try {
+    const s = Deno.core.ops.op_url_parse(String(url), (base === undefined || base === null) ? "" : String(base));
+    const c = JSON.parse(s);
+    return (c && c.ok) ? c : null;
+  } catch (e) { return null; }
+}
+function _urlSetOp(href, part, value) {
+  try {
+    const s = Deno.core.ops.op_url_set(String(href), part, String(value));
+    const c = JSON.parse(s);
+    return (c && c.ok) ? c : null;
+  } catch (e) { return null; }
+}
+// Returns just the resolved absolute URL string (no component JSON), or null on
+// failure. Cheaper than _urlParseOp for callers that only need the href.
+function _urlResolveOp(href, base) {
+  try {
+    const r = Deno.core.ops.op_url_resolve(String(href), (base === undefined || base === null) ? "" : String(base));
+    return r ? r : null;
+  } catch (e) { return null; }
+}
+if (typeof URL === 'undefined' || !URL.prototype || !URL.__obscura) {
+  const _URL = class URL {
     constructor(url, base) {
-      // Per WHATWG URL spec, both arguments are stringified — callers
-      // routinely pass `window.location` (Location object) or a URL
-      // instance as `base`. Coerce explicitly so the regex .match() calls
-      // below don't blow up on non-strings.
-      url = String(url);
-      if (base !== undefined && base !== null) base = String(base);
-      let full = url;
-      if (base && !url.includes('://')) {
-        var bm = base.match(/^(https?:\/\/[^\/\?#]+)(\/[^?#]*)?/);
-        if (bm) {
-          var bOrigin = bm[1];
-          var bPath = bm[2] || '/';
-          if (url.startsWith('/')) {
-            full = bOrigin + url;
-          } else if (url.startsWith('?') || url.startsWith('#')) {
-            full = bOrigin + bPath + url;
-          } else {
-            var dir = bPath.substring(0, bPath.lastIndexOf('/') + 1);
-            full = bOrigin + dir + url;
-          }
-        }
-      }
-      const m = full.match(/^(https?):\/\/([^\/\?#]+)(\/[^?#]*)?(\?[^#]*)?(#.*)?$/);
-      if (m) {
-        this.protocol = m[1] + ':';
-        this.host = m[2]; this.hostname = m[2].split(':')[0];
-        this.port = m[2].includes(':') ? m[2].split(':')[1] : '';
-        this.pathname = m[3] || '/';
-        this.search = m[4] || ''; this.hash = m[5] || '';
-      } else {
-        this.protocol = ''; this.host = ''; this.hostname = '';
-        this.port = ''; this.pathname = full; this.search = ''; this.hash = '';
-      }
-      this.href = full; this.origin = this.protocol + '//' + this.host;
-      this.searchParams = new URLSearchParams(this.search);
+      const c = _urlParseOp(url, base);
+      if (!c) throw new TypeError("Failed to construct 'URL': Invalid URL");
+      this._c = c;
+      this._sp = null;
     }
-    toString() { return this.href; }
-    toJSON() { return this.href; }
+    get href() { return this._c.href; }
+    set href(v) { const c = _urlParseOp(v, undefined); if (!c) throw new TypeError("Failed to set the 'href' property on 'URL': Invalid URL"); this._c = c; this._refreshSP(); }
+    get protocol() { return this._c.protocol; }
+    set protocol(v) { this._set('protocol', v); }
+    get username() { return this._c.username; }
+    set username(v) { this._set('username', v); }
+    get password() { return this._c.password; }
+    set password(v) { this._set('password', v); }
+    get host() { return this._c.host; }
+    set host(v) { this._set('host', v); }
+    get hostname() { return this._c.hostname; }
+    set hostname(v) { this._set('hostname', v); }
+    get port() { return this._c.port; }
+    set port(v) { this._set('port', v); }
+    get pathname() { return this._c.pathname; }
+    set pathname(v) { this._set('pathname', v); }
+    get search() { return this._c.search; }
+    set search(v) { this._set('search', v); this._refreshSP(); }
+    get hash() { return this._c.hash; }
+    set hash(v) { this._set('hash', v); }
+    get origin() { return this._c.origin; }
+    get searchParams() {
+      if (!this._sp) { this._sp = new URLSearchParams(this._c.search); this._sp._url = this; }
+      return this._sp;
+    }
+    _set(part, value) { const c = _urlSetOp(this._c.href, part, value); if (c) this._c = c; }
+    // search changed on the URL side: refresh the bound searchParams contents.
+    _refreshSP() { if (this._sp && this._sp._setFromString) this._sp._setFromString(this._c.search); }
+    // searchParams mutated: write the serialized query back without re-refreshing.
+    _updateSearch(qs) { this._set('search', qs ? ('?' + qs) : ''); }
+    toString() { return this._c.href; }
+    toJSON() { return this._c.href; }
     static createObjectURL() { return 'blob:null/fake-' + Math.random().toString(36).slice(2); }
     static revokeObjectURL() {}
   };
+  _URL.__obscura = true;
+  globalThis.URL = _URL;
 }
 
 globalThis.requestIdleCallback = globalThis.requestIdleCallback || function requestIdleCallback(cb, opts) {
@@ -3086,24 +3198,54 @@ globalThis.AbortSignal = { timeout(ms){return {aborted:false,addEventListener(){
 if (typeof Blob === "undefined") globalThis.Blob = class Blob { constructor(parts=[],opts={}){this._data=parts.join("");this.size=this._data.length;this.type=opts.type||"";} async text(){return this._data;} };
 if (typeof File === "undefined") globalThis.File = class extends Blob { constructor(parts,name,opts){super(parts,opts);this.name=name;} };
 if (typeof FormData === "undefined") globalThis.FormData = class FormData { constructor(){this._d=[];} append(k,v){this._d.push([k,v]);} get(k){const e=this._d.find(([a])=>a===k);return e?e[1]:null;} getAll(k){return this._d.filter(([a])=>a===k).map(([,v])=>v);} has(k){return this._d.some(([a])=>a===k);} entries(){return this._d[Symbol.iterator]();} forEach(cb){this._d.forEach(([k,v])=>cb(v,k));} };
-if (typeof URLSearchParams === "undefined") globalThis.URLSearchParams = class {
+// application/x-www-form-urlencoded serializer: like encodeURIComponent but
+// space -> '+' and also percent-encoding the chars encodeURIComponent leaves
+// bare ( ! ~ ' ( ) ), keeping the form-urlencoded safe set ( * - . _ ).
+function _formEncode(s){
+  return encodeURIComponent(String(s)).replace(/%20/g,'+').replace(/[!'()~]/g, c => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+}
+if (typeof URLSearchParams === "undefined") globalThis.URLSearchParams = class URLSearchParams {
   constructor(init=""){
     this._p=[];
-    if(typeof init==="string"){
-      init.replace(/^\?/,"").split("&").forEach(p=>{const[k,...v]=p.split("=");if(k)this.append(decodeURIComponent(k),decodeURIComponent(v.join("=")));});
+    this._url=null; // set by URL.searchParams so mutations write back to the URL
+    if (typeof URLSearchParams === 'function' && init instanceof URLSearchParams) {
+      this._p = init._p.map(pair => [pair[0], pair[1]]);
+    } else if(typeof init==="string"){
+      this._parseString(init);
     } else if (init && typeof init[Symbol.iterator] === 'function') {
-      for (const pair of init) if (pair && pair.length >= 2) this.append(pair[0], pair[1]);
+      for (const pair of init) { const a = Array.from(pair); if (a.length >= 2) this._p.push([String(a[0]), String(a[1])]); }
     } else if (init && typeof init === 'object') {
-      Object.keys(init).forEach(k => this.append(k, init[k]));
+      Object.keys(init).forEach(k => this._p.push([String(k), String(init[k])]));
     }
   }
-  append(k,v){this._p.push([String(k),String(v)]);}
-  get(k){const p=this._p.find(([key])=>key===String(k)); return p?p[1]:null;}
-  set(k,v){this.delete(k); this.append(k,v);}
-  delete(k){k=String(k); this._p=this._p.filter(([key])=>key!==k);}
+  _decode(s){ try { return decodeURIComponent(String(s).replace(/\+/g, ' ')); } catch(e) { return String(s); } }
+  _parseString(s){
+    s = String(s).replace(/^\?/, "");
+    if (s === "") return;
+    for (const pair of s.split("&")) {
+      if (pair === "") continue;
+      const i = pair.indexOf("=");
+      const k = i === -1 ? pair : pair.slice(0, i);
+      const v = i === -1 ? "" : pair.slice(i + 1);
+      this._p.push([this._decode(k), this._decode(v)]);
+    }
+  }
+  _setFromString(s){ this._p = []; this._parseString(s); }
+  _notify(){ if (this._url) this._url._updateSearch(this.toString()); }
+  append(k,v){ this._p.push([String(k),String(v)]); this._notify(); }
+  get(k){k=String(k); const p=this._p.find(([key])=>key===k); return p?p[1]:null;}
+  getAll(k){k=String(k); return this._p.filter(([key])=>key===k).map(pair=>pair[1]);}
+  set(k,v){k=String(k); v=String(v); let done=false; const out=[]; for (const pair of this._p){ if(pair[0]===k){ if(!done){ out.push([k,v]); done=true; } } else out.push(pair); } if(!done) out.push([k,v]); this._p=out; this._notify(); }
+  delete(k){k=String(k); this._p=this._p.filter(([key])=>key!==k); this._notify();}
   has(k){k=String(k); return this._p.some(([key])=>key===k);}
-  toString(){return this._p.map(([k,v])=>`${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join("&");}
-  forEach(cb){this._p.forEach(([k,v])=>cb(v,k,this));}
+  sort(){ this._p.sort((a,b)=> a[0]<b[0]?-1:(a[0]>b[0]?1:0)); this._notify(); }
+  get size(){ return this._p.length; }
+  toString(){return this._p.map(pair=>_formEncode(pair[0])+"="+_formEncode(pair[1])).join("&");}
+  forEach(cb,thisArg){this._p.slice().forEach(pair=>cb.call(thisArg,pair[1],pair[0],this));}
+  *entries(){ for (const pair of this._p) yield [pair[0],pair[1]]; }
+  *keys(){ for (const pair of this._p) yield pair[0]; }
+  *values(){ for (const pair of this._p) yield pair[1]; }
+  [Symbol.iterator](){ return this.entries(); }
 };
 
 // Real-enough DOMParser. The previous one-liner returned `globalThis.document`,
@@ -3527,7 +3669,165 @@ globalThis.DOMTokenList = DOMTokenList;
 globalThis.NodeList = class NodeList extends Array {
   item(i) { return this[i] != null ? this[i] : null; }
 };
-globalThis.Range = class Range { setStart(){} setEnd(){} collapse(){} selectNodeContents(){} deleteContents(){} cloneContents(){ return document.createDocumentFragment(); } insertNode(){} getBoundingClientRect(){return {x:0,y:0,width:0,height:0,top:0,right:0,bottom:0,left:0};} };
+// Live Range over the real DOM tree. dom/ranges/* tests are pure boundary-point
+// algorithms (no layout, no editing engine), so a property-storing Range with
+// correct tree-order comparison passes them. Mutating ops (extract/delete/
+// insert/surround) are kept minimal: they do not throw, but do not rewrite the
+// tree (that is the editing mega-bucket, out of scope).
+function _rngNodeLength(n) {
+  const t = n.nodeType;
+  if (t === 3 || t === 4 || t === 8 || t === 7) return (n.data || n.nodeValue || "").length;
+  return n.childNodes.length;
+}
+function _rngNodeIndex(n) {
+  const p = n.parentNode;
+  if (!p) return 0;
+  const kids = p.childNodes;
+  for (let i = 0; i < kids.length; i++) if (kids[i] && kids[i]._nid === n._nid) return i;
+  return 0;
+}
+function _rngSame(a, b) { return a === b || (!!a && !!b && a._nid === b._nid); }
+function _rngRoot(n) { let r = n; while (r && r.parentNode) r = r.parentNode; return r; }
+function _rngAncestors(n) { const a = []; let c = n; while (c) { a.push(c); c = c.parentNode; } return a; }
+// document (preorder) tree order: -1 if a precedes b, 1 if a follows b, 0 same.
+function _rngOrder(a, b) {
+  if (_rngSame(a, b)) return 0;
+  const aa = _rngAncestors(a).reverse(), bb = _rngAncestors(b).reverse();
+  if (aa[0]._nid !== bb[0]._nid) return (a._nid | 0) < (b._nid | 0) ? -1 : 1;
+  let i = 0;
+  while (i < aa.length && i < bb.length && aa[i]._nid === bb[i]._nid) i++;
+  if (i >= aa.length) return -1; // a is an ancestor of b -> a precedes
+  if (i >= bb.length) return 1;  // b is an ancestor of a -> a follows
+  return _rngNodeIndex(aa[i]) < _rngNodeIndex(bb[i]) ? -1 : 1;
+}
+// Position of (nA,oA) relative to (nB,oB): -1 before, 0 equal, 1 after.
+function _rngCmp(nA, oA, nB, oB) {
+  if (_rngSame(nA, nB)) return oA < oB ? -1 : (oA > oB ? 1 : 0);
+  if (_rngOrder(nA, nB) > 0) return -_rngCmp(nB, oB, nA, oA);
+  if (nA.contains && nA.contains(nB)) { // nA is a strict ancestor of nB
+    let child = nB;
+    while (child && child.parentNode && child.parentNode._nid !== nA._nid) child = child.parentNode;
+    if (child && child.parentNode && child.parentNode._nid === nA._nid && _rngNodeIndex(child) < oA) return 1;
+    return -1;
+  }
+  return -1;
+}
+function _rngCheckOffset(n, o) {
+  if (n && n.nodeType === 10) throw new DOMException("Range boundary cannot be a DocumentType", "InvalidNodeTypeError");
+  if (o < 0 || o > _rngNodeLength(n)) throw new DOMException("Range offset out of bounds", "IndexSizeError");
+}
+globalThis.Range = class Range {
+  constructor() {
+    const d = globalThis.document || null;
+    this._sc = d; this._so = 0; this._ec = d; this._eo = 0;
+  }
+  get startContainer() { return this._sc; }
+  get startOffset() { return this._so; }
+  get endContainer() { return this._ec; }
+  get endOffset() { return this._eo; }
+  get collapsed() { return _rngSame(this._sc, this._ec) && this._so === this._eo; }
+  get commonAncestorContainer() {
+    if (!this._sc || !this._ec) return null;
+    const setA = new Set(_rngAncestors(this._sc).map(n => n._nid));
+    let c = this._ec;
+    while (c) { if (setA.has(c._nid)) return c; c = c.parentNode; }
+    return null;
+  }
+  setStart(n, o) { _rngCheckOffset(n, o); this._sc = n; this._so = o; if (_rngRoot(n)._nid !== _rngRoot(this._ec)._nid || _rngCmp(this._sc, this._so, this._ec, this._eo) > 0) { this._ec = n; this._eo = o; } }
+  setEnd(n, o) { _rngCheckOffset(n, o); this._ec = n; this._eo = o; if (_rngRoot(n)._nid !== _rngRoot(this._sc)._nid || _rngCmp(this._sc, this._so, this._ec, this._eo) > 0) { this._sc = n; this._so = o; } }
+  setStartBefore(n) { const p = n.parentNode; if (!p) throw new DOMException("node has no parent", "InvalidNodeTypeError"); this.setStart(p, _rngNodeIndex(n)); }
+  setStartAfter(n) { const p = n.parentNode; if (!p) throw new DOMException("node has no parent", "InvalidNodeTypeError"); this.setStart(p, _rngNodeIndex(n) + 1); }
+  setEndBefore(n) { const p = n.parentNode; if (!p) throw new DOMException("node has no parent", "InvalidNodeTypeError"); this.setEnd(p, _rngNodeIndex(n)); }
+  setEndAfter(n) { const p = n.parentNode; if (!p) throw new DOMException("node has no parent", "InvalidNodeTypeError"); this.setEnd(p, _rngNodeIndex(n) + 1); }
+  collapse(toStart) { if (toStart) { this._ec = this._sc; this._eo = this._so; } else { this._sc = this._ec; this._so = this._eo; } }
+  selectNode(n) { const p = n.parentNode; if (!p) throw new DOMException("node has no parent", "InvalidNodeTypeError"); const i = _rngNodeIndex(n); this._sc = p; this._so = i; this._ec = p; this._eo = i + 1; }
+  selectNodeContents(n) { if (n && n.nodeType === 10) throw new DOMException("cannot select a DocumentType", "InvalidNodeTypeError"); const len = _rngNodeLength(n); this._sc = n; this._so = 0; this._ec = n; this._eo = len; }
+  comparePoint(n, o) {
+    if (_rngRoot(n)._nid !== _rngRoot(this._sc)._nid) throw new DOMException("nodes are in different trees", "WrongDocumentError");
+    if (n.nodeType === 10) throw new DOMException("node is a DocumentType", "InvalidNodeTypeError");
+    if (o > _rngNodeLength(n)) throw new DOMException("offset out of bounds", "IndexSizeError");
+    if (_rngCmp(n, o, this._sc, this._so) < 0) return -1;
+    if (_rngCmp(n, o, this._ec, this._eo) > 0) return 1;
+    return 0;
+  }
+  isPointInRange(n, o) {
+    if (!this._sc || _rngRoot(n)._nid !== _rngRoot(this._sc)._nid) return false;
+    if (n.nodeType === 10) throw new DOMException("node is a DocumentType", "InvalidNodeTypeError");
+    if (o > _rngNodeLength(n)) throw new DOMException("offset out of bounds", "IndexSizeError");
+    return _rngCmp(n, o, this._sc, this._so) >= 0 && _rngCmp(n, o, this._ec, this._eo) <= 0;
+  }
+  compareBoundaryPoints(how, other) {
+    let a, b;
+    switch (how) {
+      case 0: a = [this._sc, this._so]; b = [other._sc, other._so]; break; // START_TO_START
+      case 1: a = [this._ec, this._eo]; b = [other._sc, other._so]; break; // START_TO_END
+      case 2: a = [this._ec, this._eo]; b = [other._ec, other._eo]; break; // END_TO_END
+      case 3: a = [this._sc, this._so]; b = [other._ec, other._eo]; break; // END_TO_START
+      default: throw new DOMException("invalid comparison type", "NotSupportedError");
+    }
+    if (_rngRoot(a[0])._nid !== _rngRoot(b[0])._nid) throw new DOMException("ranges are in different trees", "WrongDocumentError");
+    return _rngCmp(a[0], a[1], b[0], b[1]);
+  }
+  intersectsNode(n) {
+    if (_rngRoot(n)._nid !== _rngRoot(this._sc)._nid) return false;
+    const p = n.parentNode;
+    if (!p) return true;
+    const o = _rngNodeIndex(n);
+    return _rngCmp(p, o, this._ec, this._eo) < 0 && _rngCmp(p, o + 1, this._sc, this._so) > 0;
+  }
+  cloneRange() { const r = new Range(); r._sc = this._sc; r._so = this._so; r._ec = this._ec; r._eo = this._eo; return r; }
+  toString() {
+    const sc = this._sc, ec = this._ec;
+    if (!sc) return "";
+    if (_rngSame(sc, ec) && (sc.nodeType === 3 || sc.nodeType === 4)) return (sc.data || "").slice(this._so, this._eo);
+    let s = "";
+    if (sc.nodeType === 3 || sc.nodeType === 4) s += (sc.data || "").slice(this._so);
+    const cac = this.commonAncestorContainer;
+    if (cac) {
+      const walk = (node) => {
+        if (node.nodeType === 3 || node.nodeType === 4) {
+          if (!_rngSame(node, sc) && !_rngSame(node, ec) &&
+              _rngCmp(node, 0, this._sc, this._so) >= 0 && _rngCmp(node, _rngNodeLength(node), this._ec, this._eo) <= 0) {
+            s += (node.data || "");
+          }
+        }
+        const kids = node.childNodes;
+        for (let i = 0; i < kids.length; i++) if (kids[i]) walk(kids[i]);
+      };
+      walk(cac);
+    }
+    if (!_rngSame(sc, ec) && (ec.nodeType === 3 || ec.nodeType === 4)) s += (ec.data || "").slice(0, this._eo);
+    return s;
+  }
+  cloneContents() { return (globalThis.document || document).createDocumentFragment(); }
+  extractContents() { return (globalThis.document || document).createDocumentFragment(); }
+  deleteContents() {}
+  insertNode(node) { if (node && this._sc && this._sc.insertBefore) { const kids = this._sc.childNodes; this._sc.insertBefore(node, kids[this._so] || null); } }
+  surroundContents(node) { this.insertNode(node); }
+  detach() {}
+  getBoundingClientRect() { return new DOMRect(); }
+  getClientRects() { return []; }
+  static get START_TO_START() { return 0; }
+  static get START_TO_END() { return 1; }
+  static get END_TO_END() { return 2; }
+  static get END_TO_START() { return 3; }
+};
+Object.assign(globalThis.Range.prototype, { START_TO_START: 0, START_TO_END: 1, END_TO_END: 2, END_TO_START: 3 });
+globalThis.StaticRange = class StaticRange {
+  constructor(init) {
+    if (!init || init.startContainer == null || init.endContainer == null)
+      throw new TypeError("Failed to construct 'StaticRange': required members are undefined");
+    const sc = init.startContainer, ec = init.endContainer;
+    if (sc.nodeType === 10 || ec.nodeType === 10 || sc.nodeType === 7 || ec.nodeType === 7)
+      throw new DOMException("StaticRange endpoints cannot be DocumentType or ProcessingInstruction", "InvalidNodeTypeError");
+    this._sc = sc; this._so = init.startOffset >>> 0; this._ec = ec; this._eo = init.endOffset >>> 0;
+  }
+  get startContainer() { return this._sc; }
+  get startOffset() { return this._so; }
+  get endContainer() { return this._ec; }
+  get endOffset() { return this._eo; }
+  get collapsed() { return _rngSame(this._sc, this._ec) && this._so === this._eo; }
+};
 
 [
   navigator.getBattery, navigator.getGamepads, navigator.sendBeacon,
