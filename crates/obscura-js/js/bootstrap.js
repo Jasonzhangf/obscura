@@ -422,7 +422,24 @@ class Node {
     return 4; // DOCUMENT_POSITION_FOLLOWING
   }
   getRootNode() { return globalThis.document; }
-  normalize() {} // no-op
+  normalize() {
+    // Merge adjacent exclusive Text nodes, drop empty ones, recurse. Detached
+    // removed nodes keep their own data (read from the backing node by nid).
+    let child = this.firstChild;
+    while (child) {
+      const next = child.nextSibling;
+      if (child.nodeType === 3) {
+        let data = child.data, sib = child.nextSibling;
+        while (sib && sib.nodeType === 3) { const after = sib.nextSibling; data += sib.data; this.removeChild(sib); sib = after; }
+        if (data.length === 0) { this.removeChild(child); child = sib; continue; }
+        if (data !== child.data) child.data = data;
+        child = sib; continue;
+      } else if (child.nodeType === 1 || child.nodeType === 11) {
+        child.normalize();
+      }
+      child = next;
+    }
+  }
   isEqualNode(other) {
     if (!other) return false;
     if (this._nid === other._nid) return true;
@@ -631,6 +648,49 @@ class ProcessingInstruction extends CharacterData {
   cloneNode() { return new ProcessingInstruction(+_dom("create_text_node", this.data), this._target); }
 }
 
+// Document character encoding (WHATWG canonical name, e.g. "UTF-8", "EUC-JP").
+// Cached per runtime: the encoding is fixed for a document's lifetime and this
+// is read on every <a>/<area> URL-component access, so the UTF-8 common case
+// must reduce to a single cached-boolean read with no op call and no allocation.
+let __docEncoding;
+let __docIsUtf8;
+function _docEncoding() {
+  if (__docEncoding === undefined) {
+    const e = _domParse("document_encoding");
+    __docEncoding = (typeof e === 'string' && e) ? e : 'UTF-8';
+    __docIsUtf8 = __docEncoding.toLowerCase() === 'utf-8';
+  }
+  return __docEncoding;
+}
+function _docIsUtf8() { if (__docIsUtf8 === undefined) _docEncoding(); return __docIsUtf8; }
+// WHATWG "special scheme" check (these get the special-query percent-encode set).
+function _isSpecialScheme(protocol) {
+  const s = (protocol || '').replace(/:$/, '').toLowerCase();
+  return s === 'http' || s === 'https' || s === 'ws' || s === 'wss' || s === 'ftp' || s === 'file';
+}
+// Apply the WHATWG URL "encoding override": in a legacy (non-UTF-8) document
+// the query of an <a>/<area> href is percent-encoded in the document charset,
+// not UTF-8. The url op already produced a UTF-8-encoded query; recover the
+// original characters (percent-decode + UTF-8) and re-encode them through the
+// document charset. Pure-ASCII queries round-trip unchanged.
+function _applyDocQueryEncoding(u) {
+  if (!u || !u.search || u.search.length < 2) return u;
+  let decoded;
+  try { decoded = decodeURIComponent(u.search.slice(1)); } catch (e) { return u; }
+  let reencoded;
+  try { reencoded = Deno.core.ops.op_url_encode_query(decoded, _docEncoding(), _isSpecialScheme(u.protocol)); }
+  catch (e) { return u; }
+  const newSearch = '?' + reencoded;
+  if (newSearch === u.search) return u;
+  const hashIdx = u.href.indexOf('#');
+  const frag = hashIdx >= 0 ? u.href.slice(hashIdx) : '';
+  const beforeHash = hashIdx >= 0 ? u.href.slice(0, hashIdx) : u.href;
+  const qIdx = beforeHash.indexOf('?');
+  u.href = (qIdx >= 0 ? beforeHash.slice(0, qIdx) : beforeHash) + newSearch + frag;
+  u.search = newSearch;
+  return u;
+}
+
 // HTMLHyperlinkElementUtils helpers (the <a>/<area> URL-decomposition members).
 // The element's href attribute is parsed against the document base URL via the
 // WHATWG url op; component getters read it, setters rewrite the href attribute.
@@ -638,13 +698,51 @@ function _anchorBase() { return _domParse("document_url") || "about:blank"; }
 function _elemHrefURL(el) {
   const raw = el.getAttribute('href');
   if (raw === null || raw === undefined) return null;
-  return _urlParseOp(raw, _anchorBase());
+  const u = _urlParseOp(raw, _anchorBase());
+  if (u && !_docIsUtf8()) return _applyDocQueryEncoding(u);
+  return u;
 }
 function _setElemHrefPart(el, part, value) {
   const u = _elemHrefURL(el);
   if (!u) return;
   const c = _urlSetOp(u.href, part, value);
   if (c) el.setAttribute('href', c.href);
+}
+
+// --- <input> number/date conversion (valueAsNumber/valueAsDate/stepUp/Down) ---
+// Applicable types and their step scale factor + default step (HTML spec).
+const _INPUT_NUM_TYPES = { date: 1, month: 1, week: 1, time: 1, 'datetime-local': 1, number: 1, range: 1 };
+const _INPUT_DATE_TYPES = { date: 1, month: 1, week: 1, time: 1, 'datetime-local': 1 };
+const _INPUT_STEP_SCALE = { date: 86400000, 'datetime-local': 1000, month: 1, number: 1, range: 1, time: 1000, week: 604800000 };
+const _INPUT_STEP_DEFAULT = { date: 1, 'datetime-local': 60, month: 1, number: 1, range: 1, time: 60, week: 1 };
+function _pad(n, w) { n = String(Math.abs(n | 0)); while (n.length < w) n = '0' + n; return n; }
+function _daysInMonth(y, m) { return [31, ((y % 4 === 0 && y % 100 !== 0) || y % 400 === 0) ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][m - 1]; }
+function _isoWeek1Monday(y) { const jan4 = Date.UTC(y, 0, 4); const dow = (new Date(jan4).getUTCDay() + 6) % 7; return jan4 - dow * 86400000; }
+// Parse an <input> value string to its numeric form per type; NaN if invalid.
+function _inputParseNumber(type, v) {
+  v = String(v == null ? '' : v);
+  let m;
+  switch (type) {
+    case 'number': case 'range': { if (v === '') return NaN; const n = Number(v); return isFinite(n) ? n : NaN; }
+    case 'date': if ((m = /^(\d{4,})-(\d{2})-(\d{2})$/.exec(v))) { const y = +m[1], mo = +m[2], d = +m[3]; if (mo >= 1 && mo <= 12 && d >= 1 && d <= _daysInMonth(y, mo)) return Date.UTC(y, mo - 1, d); } return NaN;
+    case 'month': if ((m = /^(\d{4,})-(\d{2})$/.exec(v))) { const y = +m[1], mo = +m[2]; if (mo >= 1 && mo <= 12) return (y - 1970) * 12 + (mo - 1); } return NaN;
+    case 'week': if ((m = /^(\d{4,})-W(\d{2})$/.exec(v))) { const y = +m[1], w = +m[2]; if (w >= 1 && w <= 53) return _isoWeek1Monday(y) + (w - 1) * 604800000; } return NaN;
+    case 'time': if ((m = /^(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?$/.exec(v))) { const h = +m[1], mi = +m[2], s = m[3] ? +m[3] : 0, ms = m[4] ? +((m[4] + '00').slice(0, 3)) : 0; if (h <= 23 && mi <= 59 && s <= 59) return ((h * 60 + mi) * 60 + s) * 1000 + ms; } return NaN;
+    case 'datetime-local': if ((m = /^(\d{4,})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?$/.exec(v))) { const y = +m[1], mo = +m[2], d = +m[3], h = +m[4], mi = +m[5], s = m[6] ? +m[6] : 0, ms = m[7] ? +((m[7] + '00').slice(0, 3)) : 0; if (mo >= 1 && mo <= 12 && d >= 1 && d <= _daysInMonth(y, mo) && h <= 23 && mi <= 59 && s <= 59) return Date.UTC(y, mo - 1, d, h, mi, s, ms); } return NaN;
+  }
+  return NaN;
+}
+// Format a numeric value back to an <input> value string per type.
+function _inputFormatNumber(type, n) {
+  switch (type) {
+    case 'number': case 'range': return String(n);
+    case 'date': { const dt = new Date(n); return _pad(dt.getUTCFullYear(), 4) + '-' + _pad(dt.getUTCMonth() + 1, 2) + '-' + _pad(dt.getUTCDate(), 2); }
+    case 'month': { const y = 1970 + Math.floor(n / 12); const mo = ((n % 12) + 12) % 12 + 1; return _pad(y, 4) + '-' + _pad(mo, 2); }
+    case 'week': { const d = new Date(n); const dow = (d.getUTCDay() + 6) % 7; const thu = n - dow * 86400000 + 3 * 86400000; const ty = new Date(thu).getUTCFullYear(); const w = Math.round((n - dow * 86400000 - _isoWeek1Monday(ty)) / 604800000) + 1; return _pad(ty, 4) + '-W' + _pad(w, 2); }
+    case 'time': { n = ((n % 86400000) + 86400000) % 86400000; const ms = n % 1000; n = Math.floor(n / 1000); const s = n % 60; n = Math.floor(n / 60); const mi = n % 60; const h = Math.floor(n / 60); let str = _pad(h, 2) + ':' + _pad(mi, 2); if (s || ms) { str += ':' + _pad(s, 2); if (ms) str += '.' + _pad(ms, 3); } return str; }
+    case 'datetime-local': { const dt = new Date(n); let str = _pad(dt.getUTCFullYear(), 4) + '-' + _pad(dt.getUTCMonth() + 1, 2) + '-' + _pad(dt.getUTCDate(), 2) + 'T' + _pad(dt.getUTCHours(), 2) + ':' + _pad(dt.getUTCMinutes(), 2); const s = dt.getUTCSeconds(), ms = dt.getUTCMilliseconds(); if (s || ms) { str += ':' + _pad(s, 2); if (ms) str += '.' + _pad(ms, 3); } return str; }
+  }
+  return String(n);
 }
 
 class Element extends Node {
@@ -819,6 +917,14 @@ class Element extends Node {
     if (typeof s === "string" && s.indexOf(":popover-open") !== -1) {
       if (this._popoverState !== "showing") return false;
       const rest = s.replace(/:popover-open/g, "").trim();
+      if (rest === "") return true;
+      return this.matches(rest);
+    }
+    // :modal is a JS-observable dialog state (a dialog opened via showModal()),
+    // not understood by the native selector engine; handle it like :popover-open.
+    if (typeof s === "string" && s.indexOf(":modal") !== -1) {
+      if (this._dialogModal !== true) return false;
+      const rest = s.replace(/:modal/g, "").trim();
       if (rest === "") return true;
       return this.matches(rest);
     }
@@ -1022,6 +1128,65 @@ class Element extends Node {
       setTimeout(() => { try { target.dispatchEvent(new ToggleEvent("toggle", { oldState: "open", newState: "closed" })); } catch (e) {} }, 0);
     }
   }
+  // HTMLDialogElement members (live on Element.prototype like popover/input;
+  // meaningful only when localName === 'dialog'). Modal top-layer/focus/render
+  // is layout (out of scope); the open state, returnValue, and beforetoggle/
+  // toggle/close/cancel events are JS-observable and implemented here.
+  get open() { return this.hasAttribute('open'); }
+  set open(v) { if (v) { if (!this.hasAttribute('open')) this.setAttribute('open', ''); } else if (this.hasAttribute('open')) { this.removeAttribute('open'); this._dialogModal = false; } }
+  get returnValue() { return this._returnValue != null ? this._returnValue : ''; }
+  set returnValue(v) { this._returnValue = String(v); }
+  get oncancel() { return this._oncancel || null; }
+  set oncancel(f) { this._oncancel = typeof f === 'function' ? f : null; }
+  get onclose() { return this._onclose || null; }
+  set onclose(f) { this._onclose = typeof f === 'function' ? f : null; }
+  get closedBy() { const v = (this.getAttribute('closedby') || '').toLowerCase(); return (v === 'any' || v === 'closerequest' || v === 'none') ? v : 'auto'; }
+  set closedBy(v) { this.setAttribute('closedby', String(v)); }
+  show() {
+    if (this.hasAttribute('open')) { if (this._dialogModal) throw new DOMException("The dialog is already open as a modal dialog.", "InvalidStateError"); return; }
+    const before = new ToggleEvent("beforetoggle", { cancelable: true, oldState: "closed", newState: "open" });
+    if (!this.dispatchEvent(before)) return;
+    if (this.hasAttribute('open')) return;
+    this.setAttribute('open', ''); this._dialogModal = false;
+    const self = this; setTimeout(() => { try { self.dispatchEvent(new ToggleEvent("toggle", { oldState: "closed", newState: "open" })); } catch (e) {} }, 0);
+  }
+  showModal() {
+    if (this.hasAttribute('open')) throw new DOMException("The dialog is already open.", "InvalidStateError");
+    if (!this.isConnected) throw new DOMException("The dialog is not connected to a document.", "InvalidStateError");
+    const before = new ToggleEvent("beforetoggle", { cancelable: true, oldState: "closed", newState: "open" });
+    if (!this.dispatchEvent(before)) return;
+    if (this.hasAttribute('open')) return;
+    this.setAttribute('open', ''); this._dialogModal = true;
+    const self = this; setTimeout(() => { try { self.dispatchEvent(new ToggleEvent("toggle", { oldState: "closed", newState: "open" })); } catch (e) {} }, 0);
+  }
+  _dialogClose(result, fireClose) {
+    if (!this.hasAttribute('open')) return;
+    this.dispatchEvent(new ToggleEvent("beforetoggle", { oldState: "open", newState: "closed" }));
+    this.removeAttribute('open'); this._dialogModal = false;
+    if (result !== undefined) this._returnValue = String(result);
+    const self = this;
+    setTimeout(() => { try { self.dispatchEvent(new ToggleEvent("toggle", { oldState: "open", newState: "closed" })); } catch (e) {} }, 0);
+    if (fireClose) setTimeout(() => { try { self.dispatchEvent(new Event('close', { bubbles: false, cancelable: false })); } catch (e) {} }, 0);
+  }
+  close(result) { this._dialogClose(result, true); }
+  requestClose(result) {
+    if (!this.hasAttribute('open')) return;
+    if (this._dialogCancelFiring) return; // no re-entrant cancel
+    this._dialogCancelFiring = true;
+    let canceled = false;
+    try { const ev = new Event('cancel', { bubbles: false, cancelable: true }); this.dispatchEvent(ev); canceled = ev.defaultPrevented; }
+    finally { this._dialogCancelFiring = false; }
+    if (canceled) return;
+    this._dialogClose(result, true);
+  }
+  attachInternals() {
+    const reg = (typeof customElements !== 'undefined' && customElements._registry) ? customElements._registry : null;
+    if (!reg || !reg.get(this.localName)) throw new DOMException("Failed to execute 'attachInternals' on 'HTMLElement': Unable to attach ElementInternals to non-custom elements.", "NotSupportedError");
+    if (this.getAttribute('is')) throw new DOMException("Failed to execute 'attachInternals' on 'HTMLElement': Unable to attach ElementInternals to a customized built-in element.", "NotSupportedError");
+    if (this._internalsAttached) throw new DOMException("Failed to execute 'attachInternals' on 'HTMLElement': ElementInternals for the specified element was already attached.", "NotSupportedError");
+    this._internalsAttached = true;
+    return new ElementInternals(this);
+  }
   get value() {
     const tag = this.localName;
     if (tag === 'select') {
@@ -1065,6 +1230,78 @@ class Element extends Node {
       this.textContent = String(v);
     }
   }
+  get min() { return this.getAttribute('min') || ''; }
+  set min(v) { this.setAttribute('min', v); }
+  get max() { return this.getAttribute('max') || ''; }
+  set max(v) { this.setAttribute('max', v); }
+  get step() { return this.getAttribute('step') || ''; }
+  set step(v) { this.setAttribute('step', v); }
+  _inputType() { return this.localName === 'input' ? (this.getAttribute('type') || 'text').toLowerCase() : ''; }
+  get valueAsNumber() {
+    const t = this._inputType();
+    if (!_INPUT_NUM_TYPES[t]) return NaN;
+    if (t === 'range') {
+      let minN = _inputParseNumber('range', this.getAttribute('min')); if (isNaN(minN)) minN = 0;
+      let maxN = _inputParseNumber('range', this.getAttribute('max')); if (isNaN(maxN)) maxN = 100;
+      if (maxN < minN) maxN = minN;
+      const v = _inputParseNumber('range', this.value);
+      let n = isNaN(v) ? (minN + (maxN - minN) / 2) : v;
+      if (n < minN) n = minN; if (n > maxN) n = maxN;
+      return n;
+    }
+    return _inputParseNumber(t, this.value);
+  }
+  set valueAsNumber(n) {
+    const t = this._inputType();
+    if (!_INPUT_NUM_TYPES[t]) throw new DOMException("Failed to set the 'valueAsNumber' property on 'HTMLInputElement': This input element does not support Number values.", 'InvalidStateError');
+    n = Number(n);
+    if (isNaN(n)) { this.value = ''; return; }
+    if (!isFinite(n)) throw new TypeError("Failed to set the 'valueAsNumber' property on 'HTMLInputElement': The value provided is infinite.");
+    this.value = _inputFormatNumber(t, n);
+  }
+  get valueAsDate() {
+    const t = this._inputType();
+    if (!_INPUT_DATE_TYPES[t]) return null;
+    const n = _inputParseNumber(t, this.value);
+    if (isNaN(n)) return null;
+    if (t === 'month') { const y = 1970 + Math.floor(n / 12); const mo = ((n % 12) + 12) % 12; return new Date(Date.UTC(y, mo, 1)); }
+    return new Date(n);
+  }
+  set valueAsDate(d) {
+    const t = this._inputType();
+    if (!_INPUT_DATE_TYPES[t]) throw new DOMException("Failed to set the 'valueAsDate' property on 'HTMLInputElement': This input element does not support Date values.", 'InvalidStateError');
+    if (d === null) { this.value = ''; return; }
+    if (!(d instanceof Date)) throw new TypeError("Failed to set the 'valueAsDate' property on 'HTMLInputElement': The provided value is not a Date.");
+    const ms = d.getTime();
+    if (isNaN(ms)) { this.value = ''; return; }
+    if (t === 'month') { this.value = _inputFormatNumber('month', (d.getUTCFullYear() - 1970) * 12 + d.getUTCMonth()); return; }
+    this.value = _inputFormatNumber(t, ms);
+  }
+  stepUp(n) { this._stepBy(n === undefined ? 1 : (n | 0)); }
+  stepDown(n) { this._stepBy(-(n === undefined ? 1 : (n | 0))); }
+  _stepBy(delta) {
+    const t = this._inputType();
+    const stepAttr = this.getAttribute('step');
+    if (!_INPUT_STEP_SCALE[t] || (stepAttr && stepAttr.trim().toLowerCase() === 'any')) {
+      throw new DOMException("Failed to execute 'stepUp' on 'HTMLInputElement': This form element does not have allowed value steps.", 'InvalidStateError');
+    }
+    const scale = _INPUT_STEP_SCALE[t];
+    let stepN = _INPUT_STEP_DEFAULT[t];
+    if (stepAttr) { const s = Number(stepAttr); if (isFinite(s) && s > 0) stepN = s; }
+    const allowed = stepN * scale;
+    const minN = _inputParseNumber(t, this.getAttribute('min'));
+    const maxN = _inputParseNumber(t, this.getAttribute('max'));
+    const stepBase = isNaN(minN) ? 0 : minN;
+    let value = this.valueAsNumber;
+    if (isNaN(value)) value = isNaN(minN) ? 0 : minN;
+    value += delta * allowed;
+    value = stepBase + Math.round((value - stepBase) / allowed) * allowed;
+    const effMin = (t === 'range' && isNaN(minN)) ? 0 : minN;
+    const effMax = (t === 'range' && isNaN(maxN)) ? 100 : maxN;
+    if (!isNaN(effMin) && value < effMin) value = effMin;
+    if (!isNaN(effMax) && value > effMax) value = effMax;
+    this.value = _inputFormatNumber(t, value);
+  }
   get checked() {
     if (_formChecked[this._nid] !== undefined) return _formChecked[this._nid];
     return this.hasAttribute("checked");
@@ -1092,6 +1329,8 @@ class Element extends Node {
     if (ln === 'a' || ln === 'area') {
       const raw = this.getAttribute('href');
       if (raw === null) return '';
+      // Legacy-charset document: href must reflect the encoding-override query.
+      if (!_docIsUtf8()) { const u = _elemHrefURL(this); return u ? u.href : raw; }
       const r = _urlResolveOp(raw, _anchorBase());
       return r !== null ? r : raw;
     }
@@ -1386,6 +1625,105 @@ function _convertNodes(nodes) {
   return out;
 }
 
+// ---- Reflected IDL attributes (WHATWG) ---------------------------------------
+// Installed ONCE on Element.prototype as shared getter/setter pairs. This is
+// data-driven so there is no per-element defineProperty: element creation and
+// the querySelector/mutation hot paths are unaffected (each access is a normal
+// prototype getter that reads the backing attribute). Covers the global content
+// attributes reflected on every element plus the ARIAMixin (aria-* + ariaXxx).
+(function installElementReflectors() {
+  const P = Element.prototype;
+  const def = (name, get, set) => {
+    if (Object.prototype.hasOwnProperty.call(P, name)) return; // never clobber an existing member
+    Object.defineProperty(P, name, { get, set, enumerable: true, configurable: true });
+  };
+  // WHATWG "rules for parsing integers"; returns a JS number or null on failure.
+  const parseIntAttr = (s) => {
+    if (s === null || s === undefined) return null;
+    const m = /^[ \t\n\f\r]*([+-]?[0-9]+)/.exec(String(s));
+    if (!m) return null;
+    const n = parseInt(m[1], 10);
+    return Number.isFinite(n) ? n : null;
+  };
+  // IDL `long` conversion (ToInt32): finite, truncated, wrapped to 32-bit signed.
+  const toLong = (v) => {
+    let n = Number(v);
+    if (!Number.isFinite(n)) n = 0;
+    n = Math.trunc(n) % 4294967296;
+    if (n >= 2147483648) n -= 4294967296;
+    else if (n < -2147483648) n += 4294967296;
+    return n;
+  };
+  // DOMString reflect: get -> attribute or ""; set -> setAttribute(String(v)).
+  const reflectStr = (name, attr) => def(name,
+    function () { const v = this.getAttribute(attr); return v === null ? "" : v; },
+    function (v) { this.setAttribute(attr, String(v)); });
+  // boolean reflect: get -> hasAttribute; set -> truthy ? add("") : remove.
+  const reflectBool = (name, attr) => def(name,
+    function () { return this.hasAttribute(attr); },
+    function (v) { if (v) this.setAttribute(attr, ""); else this.removeAttribute(attr); });
+  // long reflect: get -> parse else default (static value or per-element fn);
+  // set -> setAttribute(String(ToInt32(v))).
+  const reflectLong = (name, attr, dflt) => def(name,
+    function () {
+      const r = parseIntAttr(this.getAttribute(attr));
+      if (r !== null && r >= -2147483648 && r <= 2147483647) return r;
+      return typeof dflt === "function" ? dflt.call(this) : dflt;
+    },
+    function (v) { this.setAttribute(attr, String(toLong(v))); });
+  // enumerated reflect: get -> canonical (lowercased) keyword, else missing/
+  // invalid default; set -> setAttribute(String(v)) (canonicalization on get).
+  const reflectEnum = (name, attr, keywords, missingDefault, invalidDefault) => def(name,
+    function () {
+      const v = this.getAttribute(attr);
+      if (v === null) return missingDefault;
+      const lc = String(v).toLowerCase();
+      return keywords.indexOf(lc) !== -1 ? lc : invalidDefault;
+    },
+    function (v) { this.setAttribute(attr, String(v)); });
+  // nullable DOMString reflect (ARIA): get -> attribute or null; set -> null/
+  // undefined removes, else setAttribute(String(v)).
+  const reflectNullable = (name, attr) => def(name,
+    function () { return this.getAttribute(attr); },
+    function (v) { if (v === null || v === undefined) this.removeAttribute(attr); else this.setAttribute(attr, String(v)); });
+
+  // Global content attributes reflected on every element (HTML "global attributes").
+  reflectStr("title", "title");
+  reflectStr("lang", "lang");
+  reflectStr("accessKey", "accesskey");
+  reflectStr("slot", "slot");
+  reflectEnum("dir", "dir", ["ltr", "rtl", "auto"], "", "");
+  reflectBool("autofocus", "autofocus");
+  reflectBool("hidden", "hidden");
+  // tabIndex default is element-dependent (0 for natively-focusable, else -1);
+  // reflection.js does not assert it, but match the common case anyway.
+  reflectLong("tabIndex", "tabindex", function () {
+    const ln = this.localName;
+    if (ln === "a" || ln === "area" || ln === "link") return this.hasAttribute("href") ? 0 : -1;
+    return (ln === "button" || ln === "input" || ln === "select" || ln === "textarea" || ln === "iframe") ? 0 : -1;
+  });
+
+  // ARIAMixin: aria-* content attributes reflected as nullable DOMString IDL
+  // properties (ariaAtomic <-> aria-atomic, ...).
+  const ARIA = {
+    ariaAtomic: "aria-atomic", ariaAutoComplete: "aria-autocomplete", ariaBrailleLabel: "aria-braillelabel",
+    ariaBrailleRoleDescription: "aria-brailleroledescription", ariaBusy: "aria-busy", ariaChecked: "aria-checked",
+    ariaColCount: "aria-colcount", ariaColIndex: "aria-colindex", ariaColIndexText: "aria-colindextext",
+    ariaColSpan: "aria-colspan", ariaCurrent: "aria-current", ariaDescription: "aria-description",
+    ariaDisabled: "aria-disabled", ariaExpanded: "aria-expanded", ariaHasPopup: "aria-haspopup",
+    ariaHidden: "aria-hidden", ariaInvalid: "aria-invalid", ariaKeyShortcuts: "aria-keyshortcuts",
+    ariaLabel: "aria-label", ariaLevel: "aria-level", ariaLive: "aria-live", ariaModal: "aria-modal",
+    ariaMultiLine: "aria-multiline", ariaMultiSelectable: "aria-multiselectable", ariaOrientation: "aria-orientation",
+    ariaPlaceholder: "aria-placeholder", ariaPosInSet: "aria-posinset", ariaPressed: "aria-pressed",
+    ariaReadOnly: "aria-readonly", ariaRelevant: "aria-relevant", ariaRequired: "aria-required",
+    ariaRoleDescription: "aria-roledescription", ariaRowCount: "aria-rowcount", ariaRowIndex: "aria-rowindex",
+    ariaRowIndexText: "aria-rowindextext", ariaRowSpan: "aria-rowspan", ariaSelected: "aria-selected",
+    ariaSetSize: "aria-setsize", ariaSort: "aria-sort", ariaValueMax: "aria-valuemax",
+    ariaValueMin: "aria-valuemin", ariaValueNow: "aria-valuenow", ariaValueText: "aria-valuetext",
+  };
+  for (const prop in ARIA) reflectNullable(prop, ARIA[prop]);
+})();
+
 class Document extends Node {
   get documentElement() { return _wrapEl(+_dom("document_element")); }
   get head() { return this.querySelector("head"); }
@@ -1411,7 +1749,13 @@ class Document extends Node {
   get nodeName() { return "#document"; }
   get ownerDocument() { return null; } // Document has no ownerDocument
   get compatMode() { return "CSS1Compat"; }
-  get characterSet() { return "UTF-8"; }
+  // The document's character encoding, detected from the response charset
+  // (HTTP Content-Type -> <meta charset>). characterSet/charset/inputEncoding
+  // are WHATWG aliases. A node-less document (DOMParser/createDocument) has no
+  // backing encoding and reports UTF-8.
+  get characterSet() { return (this._nid === undefined || this._nid === null) ? "UTF-8" : _docEncoding(); }
+  get charset() { return this.characterSet; }
+  get inputEncoding() { return this.characterSet; }
   get contentType() {
     // An explicit type set by DOMParser/createDocument wins.
     if (this._contentType) return this._contentType;
@@ -1642,7 +1986,7 @@ class Document extends Node {
   createNodeIterator(root, whatToShow, filter) {
     return this.createTreeWalker(root, whatToShow, filter);
   }
-  getSelection() { return globalThis.getSelection(); }
+  getSelection() { return this.defaultView ? _selectionFor(this) : null; }
   get activeElement() { return globalThis.__obscura_focused || this.body; }
   get implementation() {
     const ownerDoc = this;
@@ -2495,6 +2839,23 @@ if (typeof Request === 'undefined') {
   };
 }
 
+// Decode a response body honoring the Content-Type charset, so fetch()/XHR
+// over non-UTF-8 resources (GBK, Shift_JIS, ISO-8859-x, ...) return correctly
+// decoded text instead of mojibake. The UTF-8 case (the overwhelming majority)
+// takes the plain TextDecoder fast path; only an explicit non-UTF-8 charset
+// routes through TextDecoder(label), which falls back to UTF-8 on a bad label.
+function _decodeBodyWithCharset(bytes, headers) {
+  let label = '';
+  try {
+    const ct = headers && typeof headers.get === 'function' ? (headers.get('content-type') || '') : '';
+    const m = /charset\s*=\s*"?([^";]+)"?/i.exec(ct);
+    if (m) label = m[1].trim();
+  } catch (e) {}
+  if (!label || /^utf-?8$/i.test(label)) return new TextDecoder().decode(bytes);
+  try { return new TextDecoder(label).decode(bytes); }
+  catch (e) { return new TextDecoder().decode(bytes); }
+}
+
 if (typeof Response === 'undefined') {
   globalThis.Response = class Response {
     constructor(body, init = {}) {
@@ -2503,7 +2864,7 @@ if (typeof Response === 'undefined') {
       this.headers = new Headers(init.headers);
       this.type = init.type || 'basic'; this.url = init.url || ''; this.redirected = !!init.redirected;
     }
-    async text() { return new TextDecoder().decode(this._bodyBytes); }
+    async text() { return _decodeBodyWithCharset(this._bodyBytes, this.headers); }
     async json() { return JSON.parse(await this.text()); }
     async arrayBuffer() { return _arrayBufferFromBytes(this._bodyBytes); }
     async blob() { return new Blob([this._bodyBytes]); }
@@ -2629,23 +2990,52 @@ if (typeof TextEncoder === 'undefined') {
     encodeInto(str, dest) { const enc = this.encode(str); dest.set(enc.slice(0, dest.length)); return { read: str.length, written: Math.min(enc.length, dest.length) }; }
   };
 }
+// Fast pure-JS UTF-8 decode (the common case: Response/Blob .text(), most
+// pages). Avoids the op + JSON round trip for plain UTF-8.
+function _utf8DecodeBytes(bytes, start) {
+  let str = '', i = start | 0;
+  const n = bytes.length;
+  while (i < n) {
+    let c = bytes[i++];
+    if (c < 0x80) str += String.fromCharCode(c);
+    else if (c < 0xE0) str += String.fromCharCode(((c & 0x1F) << 6) | (bytes[i++] & 0x3F));
+    else if (c < 0xF0) { const b1 = bytes[i++], b2 = bytes[i++]; str += String.fromCharCode(((c & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F)); }
+    else { const b1 = bytes[i++], b2 = bytes[i++], b3 = bytes[i++]; const cp = ((c & 0x07) << 18) | ((b1 & 0x3F) << 12) | ((b2 & 0x3F) << 6) | (b3 & 0x3F); if (cp > 0xFFFF) { const s = cp - 0x10000; str += String.fromCharCode(0xD800 + (s >> 10), 0xDC00 + (s & 0x3FF)); } else str += String.fromCharCode(cp); }
+  }
+  return str;
+}
 if (typeof TextDecoder === 'undefined') {
   globalThis.TextDecoder = class TextDecoder {
-    constructor(label) { this.encoding = label || 'utf-8'; }
-    decode(buf) {
-      if (!buf) return '';
-      const bytes = ArrayBuffer.isView(buf)
-        ? new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength)
-        : new Uint8Array(buf);
-      let str = '', i = 0;
-      while (i < bytes.length) {
-        let c = bytes[i++];
-        if (c < 0x80) str += String.fromCharCode(c);
-        else if (c < 0xE0) str += String.fromCharCode(((c&0x1F)<<6)|(bytes[i++]&0x3F));
-        else if (c < 0xF0) { const b1=bytes[i++], b2=bytes[i++]; str += String.fromCharCode(((c&0x0F)<<12)|((b1&0x3F)<<6)|(b2&0x3F)); }
-        else { const b1=bytes[i++], b2=bytes[i++], b3=bytes[i++]; const cp=((c&0x07)<<18)|((b1&0x3F)<<12)|((b2&0x3F)<<6)|(b3&0x3F); if(cp>0xFFFF){const s=cp-0x10000;str+=String.fromCharCode(0xD800+(s>>10),0xDC00+(s&0x3FF));}else str+=String.fromCharCode(cp); }
+    constructor(label, options) {
+      // No-arg construction (Response.text()/Blob.text() and most pages) is
+      // UTF-8; skip the label-validation op on that hot path.
+      let name;
+      if (label === undefined) {
+        name = 'utf-8';
+      } else {
+        name = Deno.core.ops.op_encoding_for_label(String(label));
+        if (!name) throw new RangeError("Failed to construct 'TextDecoder': The encoding label provided ('" + label + "') is invalid.");
       }
-      return str;
+      const o = options || {};
+      Object.defineProperty(this, 'encoding', { value: name, enumerable: true });
+      Object.defineProperty(this, 'fatal', { value: !!o.fatal, enumerable: true });
+      Object.defineProperty(this, 'ignoreBOM', { value: !!o.ignoreBOM, enumerable: true });
+    }
+    decode(input, options) {
+      if (input === undefined) return '';
+      const bytes = ArrayBuffer.isView(input)
+        ? new Uint8Array(input.buffer, input.byteOffset, input.byteLength)
+        : new Uint8Array(input);
+      // Fast path: plain UTF-8, non-fatal (Response/Blob text, most pages).
+      if (this.encoding === 'utf-8' && !this.fatal) {
+        let off = 0;
+        if (!this.ignoreBOM && bytes.length >= 3 && bytes[0] === 0xEF && bytes[1] === 0xBB && bytes[2] === 0xBF) off = 3;
+        return _utf8DecodeBytes(bytes, off);
+      }
+      // Legacy encodings / fatal mode: encoding_rs via the op.
+      const r = JSON.parse(Deno.core.ops.op_text_decode(this.encoding, bytes, this.fatal, this.ignoreBOM));
+      if (!r.ok) throw new TypeError("Failed to execute 'decode' on 'TextDecoder': The encoded data was not valid.");
+      return r.v;
     }
   };
 }
@@ -2736,22 +3126,16 @@ globalThis.getComputedStyle = (el) => {
     },
   });
 };
+// Returns the one Selection instance for a document (cached on the document),
+// so window.getSelection() === document.getSelection(). The real Selection
+// class is defined below, after Range. _selectionFor is hoisted.
+function _selectionFor(doc) {
+  if (!doc) return null;
+  if (!doc._selection) doc._selection = new Selection(doc);
+  return doc._selection;
+}
 globalThis.getSelection = _markNative(function getSelection() {
-  return {
-    rangeCount: 0,
-    anchorNode: null, anchorOffset: 0,
-    focusNode: null, focusOffset: 0,
-    isCollapsed: true, type: 'None',
-    removeAllRanges() { this.rangeCount = 0; },
-    addRange(range) { this.rangeCount = 1; this._range = range; },
-    getRangeAt(i) { return this._range || null; },
-    collapse(node, offset) { this.anchorNode = node; this.anchorOffset = offset || 0; this.isCollapsed = true; },
-    extend(node, offset) { this.focusNode = node; this.focusOffset = offset || 0; },
-    selectAllChildren(node) {},
-    deleteFromDocument() {},
-    containsNode(node) { return false; },
-    toString() { return ''; },
-  };
+  return _selectionFor(globalThis.document);
 });
 
 globalThis.CSSStyleSheet = class CSSStyleSheet {
@@ -2879,12 +3263,35 @@ globalThis.__notifyMutation = function(type, target_nid, addedNodes, removedNode
 };
 
 globalThis.ShadowRoot = class ShadowRoot extends DocumentFragment {};
+// Constructible-stylesheet adoption, mirroring Document.adoptedStyleSheets.
+Object.defineProperty(globalThis.ShadowRoot.prototype, 'adoptedStyleSheets', {
+  get() { return this._adoptedStyleSheets || []; },
+  set(sheets) { this._adoptedStyleSheets = sheets; },
+  configurable: true,
+});
 globalThis.__obscura_shadowHostNames = new Set(['article','aside','blockquote','body','div','footer','h1','h2','h3','h4','h5','h6','header','main','nav','p','section','span']);
-globalThis.customElements = {
-  _registry: new Map(),
-  _whenDefinedResolvers: new Map(),
+function _isConstructorCE(v) {
+  if (typeof v !== 'function') return false;
+  try { Reflect.construct(function () {}, [], v); return true; } catch (e) { return false; }
+}
+const _CE_RESERVED = new Set(['annotation-xml', 'color-profile', 'font-face', 'font-face-src', 'font-face-uri', 'font-face-format', 'font-face-name', 'missing-glyph']);
+function _isValidCustomElementName(name) {
+  if (typeof name !== 'string' || _CE_RESERVED.has(name)) return false;
+  // PotentialCustomElementName (approx): lowercase start, a hyphen, no uppercase.
+  return /^[a-z][a-z0-9._·À-￿-]*-[a-z0-9._·À-￿-]*$/.test(name);
+}
+class CustomElementRegistry {
+  constructor() { this._registry = new Map(); this._byCtor = new Map(); this._whenDefinedResolvers = new Map(); this._defining = false; }
   define(name, cls, opts) {
-    if (this._registry.has(name)) return;
+    if (!_isConstructorCE(cls)) throw new TypeError("Failed to execute 'define' on 'CustomElementRegistry': parameter 2 is not a constructor.");
+    if (!_isValidCustomElementName(name)) throw new DOMException("Failed to execute 'define' on 'CustomElementRegistry': \"" + name + "\" is not a valid custom element name", "SyntaxError");
+    if (this._defining) throw new DOMException("Failed to execute 'define' on 'CustomElementRegistry': operation is not supported while a definition is in progress", "NotSupportedError");
+    if (this._registry.has(name)) throw new DOMException("Failed to execute 'define' on 'CustomElementRegistry': the name \"" + name + "\" has already been used with this registry", "NotSupportedError");
+    if (this._byCtor.has(cls)) throw new DOMException("Failed to execute 'define' on 'CustomElementRegistry': the constructor has already been used with this registry", "NotSupportedError");
+    this._defining = true;
+    try { this._byCtor.set(cls, name); this._defineInner(name, cls, opts); } finally { this._defining = false; }
+  }
+  _defineInner(name, cls, opts) {
     this._registry.set(name, cls);
     // Upgrade existing matching elements: instantiate the class on each,
     // fire connectedCallback if the element is in the document. Without
@@ -2900,7 +3307,7 @@ globalThis.customElements = {
       for (const r of resolvers) r(cls);
       this._whenDefinedResolvers.delete(name);
     }
-  },
+  }
   _upgradeElement(el, cls) {
     if (el.__customUpgraded) return;
     el.__customUpgraded = true;
@@ -2924,9 +3331,14 @@ globalThis.customElements = {
         try { el.connectedCallback(); } catch (e) {}
       }
     } catch (e) {}
-  },
-  get(name) { return this._registry.get(name); },
+  }
+  get(name) { return this._registry.get(name); }
+  getName(cls) {
+    if (!_isConstructorCE(cls)) throw new TypeError("Failed to execute 'getName' on 'CustomElementRegistry': parameter 1 is not a constructor.");
+    return this._byCtor.has(cls) ? this._byCtor.get(cls) : null;
+  }
   whenDefined(name) {
+    if (!_isValidCustomElementName(name)) return Promise.reject(new DOMException("Failed to execute 'whenDefined' on 'CustomElementRegistry': \"" + name + "\" is not a valid custom element name", "SyntaxError"));
     const cls = this._registry.get(name);
     if (cls) return Promise.resolve(cls);
     return new Promise((resolve) => {
@@ -2934,14 +3346,41 @@ globalThis.customElements = {
       list.push(resolve);
       this._whenDefinedResolvers.set(name, list);
     });
-  },
+  }
   upgrade(root) {
     if (!root || !root.querySelectorAll) return;
     for (const [name, cls] of this._registry.entries()) {
       const matches = root.querySelectorAll(name);
       for (const el of matches) this._upgradeElement(el, cls);
     }
-  },
+  }
+}
+globalThis.CustomElementRegistry = CustomElementRegistry;
+globalThis.customElements = new CustomElementRegistry();
+globalThis.HTMLUnknownElement = Element;
+// ElementInternals: form-associated custom element internals. Validity/state
+// are JS-observable; ARIA reflection that needs the accessibility tree is not.
+globalThis.ElementInternals = class ElementInternals {
+  constructor(el) { this._el = el; this._valid = true; this._flags = {}; this._message = ''; this._value = null; this._states = new Set(); }
+  setFormValue(value, state) { this._value = value; }
+  setValidity(flags, message, anchor) {
+    flags = flags || {};
+    const bad = Object.keys(flags).some((k) => k !== 'valid' && flags[k]);
+    if (bad && (message == null || message === '')) throw new TypeError("Failed to execute 'setValidity' on 'ElementInternals': The second argument should not be empty if one or more flags in the first argument are true.");
+    this._flags = flags; this._valid = !bad; this._message = bad ? String(message) : '';
+  }
+  checkValidity() { return this._valid; }
+  reportValidity() { return this._valid; }
+  get validity() {
+    const f = this._flags || {};
+    return { valid: this._valid, valueMissing: !!f.valueMissing, typeMismatch: !!f.typeMismatch, patternMismatch: !!f.patternMismatch, tooLong: !!f.tooLong, tooShort: !!f.tooShort, rangeUnderflow: !!f.rangeUnderflow, rangeOverflow: !!f.rangeOverflow, stepMismatch: !!f.stepMismatch, badInput: !!f.badInput, customError: !!f.customError };
+  }
+  get validationMessage() { return this._message || ''; }
+  get willValidate() { return true; }
+  get form() { return this._el && this._el.closest ? this._el.closest('form') : null; }
+  get labels() { return _nodeList([]); }
+  get shadowRoot() { return (this._el && this._el._shadowRoot) || null; }
+  get states() { return this._states; }
 };
 globalThis.NodeFilter = { SHOW_ELEMENT: 1, SHOW_TEXT: 4, SHOW_ALL: 0xFFFFFFFF };
 // ResizeObserver is defined earlier with real per-target firing; the stub
@@ -3514,15 +3953,36 @@ globalThis.crypto = globalThis.crypto || { getRandomValues(arr) { for(let i=0;i<
 globalThis.structuredClone = globalThis.structuredClone || ((v) => JSON.parse(JSON.stringify(v)));
 globalThis.reportError = globalThis.reportError || ((e) => console.error(e));
 
+// WHATWG Storage as a legacy platform object: a Proxy routes property access
+// (localStorage.foo, localStorage["foo"], delete, `in`, Object.keys) through
+// the named getter/setter so length/key()/iteration stay in sync with the
+// backing map. Plain prototype methods alone could not intercept direct
+// property access, so `localStorage.foo = x` never updated length before.
 globalThis.Storage = function Storage() {};
-Storage.prototype.getItem = function(k) { return (this._data && this._data[k]) ?? null; };
-Storage.prototype.setItem = function(k, v) { if (this._data) this._data[k] = String(v); };
-Storage.prototype.removeItem = function(k) { if (this._data) delete this._data[k]; };
-Storage.prototype.clear = function() { if (this._data) for (var k in this._data) delete this._data[k]; };
-Object.defineProperty(Storage.prototype, 'length', { get: function() { return this._data ? Object.keys(this._data).length : 0; } });
-Storage.prototype.key = function(i) { return this._data ? Object.keys(this._data)[i] ?? null : null; };
+Storage.prototype.getItem = function(k) { k = String(k); return Object.prototype.hasOwnProperty.call(this._data, k) ? this._data[k] : null; };
+Storage.prototype.setItem = function(k, v) { this._data[String(k)] = String(v); };
+Storage.prototype.removeItem = function(k) { delete this._data[String(k)]; };
+Storage.prototype.clear = function() { const d = this._data; for (const k in d) delete d[k]; };
+Storage.prototype.key = function(i) { const ks = Object.keys(this._data); i = i >>> 0; return i < ks.length ? ks[i] : null; };
+Object.defineProperty(Storage.prototype, 'length', { get: function() { return Object.keys(this._data).length; }, configurable: true });
 
-const _mkStore = () => { var s = Object.create(Storage.prototype); s._data = {}; return s; };
+const _mkStore = () => {
+  const target = Object.create(Storage.prototype);
+  Object.defineProperty(target, '_data', { value: Object.create(null), writable: true, enumerable: false, configurable: true });
+  const isReal = (p) => p === '_data' || p === 'constructor' || (p in Storage.prototype);
+  return new Proxy(target, {
+    get(t, p, recv) { if (typeof p === 'symbol' || isReal(p)) return Reflect.get(t, p, recv); const v = t.getItem(p); return v === null ? undefined : v; },
+    set(t, p, v, recv) { if (typeof p === 'symbol' || isReal(p)) return Reflect.set(t, p, v, recv); t.setItem(p, v); return true; },
+    has(t, p) { if (typeof p === 'symbol' || isReal(p)) return true; return Object.prototype.hasOwnProperty.call(t._data, p); },
+    deleteProperty(t, p) { if (typeof p === 'symbol' || isReal(p)) return Reflect.deleteProperty(t, p); t.removeItem(p); return true; },
+    ownKeys(t) { return Object.keys(t._data); },
+    getOwnPropertyDescriptor(t, p) {
+      if (typeof p !== 'symbol' && Object.prototype.hasOwnProperty.call(t._data, p))
+        return { value: t._data[p], writable: true, enumerable: true, configurable: true };
+      return Reflect.getOwnPropertyDescriptor(t, p);
+    },
+  });
+};
 globalThis.localStorage = _mkStore();
 globalThis.sessionStorage = _mkStore();
 
@@ -3835,15 +4295,25 @@ globalThis.Range = class Range {
     return _rngCmp(n, o, this._sc, this._so) >= 0 && _rngCmp(n, o, this._ec, this._eo) <= 0;
   }
   compareBoundaryPoints(how, other) {
+    // `how` is a WebIDL `unsigned short`: ToUint16-convert before validating,
+    // so NaN/Infinity become 0 (START_TO_START) rather than throwing.
+    let h = Math.trunc(Number(how));
+    if (!Number.isFinite(h)) h = 0;
+    h = ((h % 65536) + 65536) % 65536;
     let a, b;
-    switch (how) {
+    switch (h) {
       case 0: a = [this._sc, this._so]; b = [other._sc, other._so]; break; // START_TO_START
       case 1: a = [this._ec, this._eo]; b = [other._sc, other._so]; break; // START_TO_END
       case 2: a = [this._ec, this._eo]; b = [other._ec, other._eo]; break; // END_TO_END
       case 3: a = [this._sc, this._so]; b = [other._ec, other._eo]; break; // END_TO_START
       default: throw new DOMException("invalid comparison type", "NotSupportedError");
     }
-    if (_rngRoot(a[0])._nid !== _rngRoot(b[0])._nid) throw new DOMException("ranges are in different trees", "WrongDocumentError");
+    // Different roots -> WrongDocumentError. Guard so a null/foreign container
+    // raises that DOMException rather than a raw TypeError from _rngRoot.
+    let differ;
+    try { differ = _rngRoot(a[0])._nid !== _rngRoot(b[0])._nid; }
+    catch (e) { differ = true; }
+    if (differ) throw new DOMException("The two Ranges are not in the same tree.", "WrongDocumentError");
     return _rngCmp(a[0], a[1], b[0], b[1]);
   }
   intersectsNode(n) {
@@ -3854,6 +4324,14 @@ globalThis.Range = class Range {
     return _rngCmp(p, o, this._ec, this._eo) < 0 && _rngCmp(p, o + 1, this._sc, this._so) > 0;
   }
   cloneRange() { const r = new Range(); r._sc = this._sc; r._so = this._so; r._ec = this._ec; r._eo = this._eo; return r; }
+  createContextualFragment(html) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'createContextualFragment' on 'Range': 1 argument required, but only 0 present.");
+    const node = this._sc;
+    const ownerDoc = (node && node.ownerDocument) || globalThis.document;
+    const frag = ownerDoc.createDocumentFragment();
+    frag.innerHTML = String(html);
+    return frag;
+  }
   toString() {
     const sc = this._sc, ec = this._ec;
     if (!sc) return "";
@@ -3906,6 +4384,40 @@ globalThis.StaticRange = class StaticRange {
   get endOffset() { return this._eo; }
   get collapsed() { return _rngSame(this._sc, this._ec) && this._so === this._eo; }
 };
+// Live Selection over the real Range: at most one range + a direction, one
+// instance per document. Everything except modify() (needs visual line/word
+// layout) is layout-free, built on the Range boundary-point helpers above.
+globalThis.Selection = class Selection {
+  constructor(doc) { this._doc = doc; this._range = null; this._direction = 'none'; }
+  _setRange(r, dir) { this._range = r; this._direction = dir; }
+  _inDoc(node) { return !!(node && this._doc && this._doc.contains && this._doc.contains(node)); }
+  get rangeCount() { return this._range ? 1 : 0; }
+  get isCollapsed() { return !this._range || this._range.collapsed; }
+  get type() { return !this._range ? 'None' : (this._range.collapsed ? 'Caret' : 'Range'); }
+  get _anchor() { const r = this._range; if (!r) return null; return this._direction === 'backwards' ? [r.endContainer, r.endOffset] : [r.startContainer, r.startOffset]; }
+  get _focus() { const r = this._range; if (!r) return null; return this._direction === 'backwards' ? [r.startContainer, r.startOffset] : [r.endContainer, r.endOffset]; }
+  get anchorNode() { return this._anchor ? this._anchor[0] : null; }
+  get anchorOffset() { return this._anchor ? this._anchor[1] : 0; }
+  get focusNode() { return this._focus ? this._focus[0] : null; }
+  get focusOffset() { return this._focus ? this._focus[1] : 0; }
+  getRangeAt(i) { i = +i; if (!this._range || i < 0 || i > 0) throw new DOMException('The index provided is out of range.', 'IndexSizeError'); return this._range; }
+  addRange(range) { if (this._range) return; if (!(range instanceof Range)) return; if (!this._inDoc(range.startContainer) || !this._inDoc(range.endContainer)) return; this._setRange(range, 'forwards'); }
+  removeRange(range) { if (!(range instanceof Range)) throw new TypeError("Failed to execute 'removeRange' on 'Selection': parameter 1 is not a Range."); if (this._range === range) this._setRange(null, 'none'); else throw new DOMException('The range was not found.', 'NotFoundError'); }
+  removeAllRanges() { this._setRange(null, 'none'); }
+  empty() { this.removeAllRanges(); }
+  collapse(node, offset) { if (node == null) { this.removeAllRanges(); return; } offset = offset >>> 0; _rngCheckOffset(node, offset); if (!this._inDoc(node)) return; const r = new Range(); r.setStart(node, offset); r.setEnd(node, offset); this._setRange(r, 'forwards'); }
+  setPosition(node, offset) { this.collapse(node, offset); }
+  collapseToStart() { if (!this._range) throw new DOMException('There is no selection to collapse.', 'InvalidStateError'); const r = new Range(); r.setStart(this._range.startContainer, this._range.startOffset); r.setEnd(this._range.startContainer, this._range.startOffset); this._setRange(r, 'forwards'); }
+  collapseToEnd() { if (!this._range) throw new DOMException('There is no selection to collapse.', 'InvalidStateError'); const r = new Range(); r.setStart(this._range.endContainer, this._range.endOffset); r.setEnd(this._range.endContainer, this._range.endOffset); this._setRange(r, 'forwards'); }
+  extend(node, offset) { if (!this._range) throw new DOMException('There is no selection to extend.', 'InvalidStateError'); if (!this._inDoc(node)) return; offset = offset >>> 0; _rngCheckOffset(node, offset); const a = this._anchor; const r = new Range(); if (_rngRoot(node)._nid !== _rngRoot(a[0])._nid) { r.setStart(node, offset); r.setEnd(node, offset); this._setRange(r, 'forwards'); return; } if (_rngCmp(a[0], a[1], node, offset) <= 0) { r.setStart(a[0], a[1]); r.setEnd(node, offset); this._setRange(r, 'forwards'); } else { r.setStart(node, offset); r.setEnd(a[0], a[1]); this._setRange(r, 'backwards'); } }
+  setBaseAndExtent(aN, aO, fN, fO) { if (arguments.length < 4) throw new TypeError("Failed to execute 'setBaseAndExtent' on 'Selection': 4 arguments required."); if (aN == null || fN == null) throw new TypeError("Failed to execute 'setBaseAndExtent' on 'Selection': nodes must not be null."); aO = +aO; fO = +fO; if (aO < 0 || aO > _rngNodeLength(aN)) throw new DOMException('anchor offset out of range', 'IndexSizeError'); if (fO < 0 || fO > _rngNodeLength(fN)) throw new DOMException('focus offset out of range', 'IndexSizeError'); if (!this._inDoc(aN) || !this._inDoc(fN)) { this.removeAllRanges(); return; } const r = new Range(); if (_rngCmp(aN, aO, fN, fO) <= 0) { r.setStart(aN, aO); r.setEnd(fN, fO); this._setRange(r, 'forwards'); } else { r.setStart(fN, fO); r.setEnd(aN, aO); this._setRange(r, 'backwards'); } }
+  selectAllChildren(node) { if (node && node.nodeType === 10) throw new DOMException('cannot selectAllChildren of a DocumentType', 'InvalidNodeTypeError'); if (!this._inDoc(node)) return; const len = _rngNodeLength(node); const r = new Range(); r.setStart(node, 0); r.setEnd(node, len); this._setRange(r, 'forwards'); }
+  containsNode(node, allowPartial) { const r = this._range; if (!r || !node) return false; if (_rngRoot(node)._nid !== _rngRoot(r.startContainer)._nid) return false; const len = _rngNodeLength(node); if (allowPartial) return _rngCmp(node, len, r.startContainer, r.startOffset) > 0 && _rngCmp(node, 0, r.endContainer, r.endOffset) < 0; return _rngCmp(node, 0, r.startContainer, r.startOffset) >= 0 && _rngCmp(node, len, r.endContainer, r.endOffset) <= 0; }
+  deleteFromDocument() { if (this._range) this._range.deleteContents(); }
+  toString() { return this._range ? this._range.toString() : ''; }
+  modify() {}
+};
+_markNative(globalThis.Selection);
 
 [
   navigator.getBattery, navigator.getGamepads, navigator.sendBeacon,
