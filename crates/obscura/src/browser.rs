@@ -22,15 +22,6 @@ impl Browser {
     }
 
     pub fn build(config: BrowserConfig) -> Result<Self, Error> {
-        let cookie_jar = Arc::new(CookieJar::new());
-
-        if let Some(ref dir) = config.storage_dir {
-            let cookie_path = dir.join("cookies.json");
-            if cookie_path.exists() {
-                let _ = cookie_jar.load_from_file(&cookie_path);
-            }
-        }
-
         let context = if let Some(ref dir) = config.storage_dir {
             BrowserContext::with_storage_full(
                 "api".to_string(),
@@ -48,10 +39,10 @@ impl Browser {
             )
         };
 
-        Ok(Browser {
-            context: Arc::new(context),
-            cookie_jar,
-        })
+        let context = Arc::new(context);
+        let cookie_jar = context.cookie_jar.clone();
+
+        Ok(Browser { context, cookie_jar })
     }
 
     pub fn builder() -> BrowserBuilder {

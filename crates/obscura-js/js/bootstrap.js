@@ -283,6 +283,23 @@ class Node {
   get nodeType() { return +_dom("node_type", this._nid); }
   get nodeName() { return _domParse("node_name", this._nid) || ""; }
   get ownerDocument() { return globalThis.document; }
+  // https://dom.spec.whatwg.org/#dom-node-baseuri
+  get baseURI() {
+    try {
+      const doc = globalThis.document;
+      const docUrl = (doc && doc.URL) || "";
+      const baseEl = (doc && doc.querySelector) ? doc.querySelector("base[href]") : null;
+      if (baseEl) {
+        const href = baseEl.getAttribute("href");
+        if (href) {
+          return docUrl ? new URL(href, docUrl).href : href;
+        }
+      }
+      return docUrl;
+    } catch (e) {
+      return "";
+    }
+  }
   get textContent() { return _domParse("text_content", this._nid) ?? ""; }
   set textContent(v) {
     const oldChildren = _domParse("child_nodes", this._nid) || [];
@@ -2584,7 +2601,42 @@ if (typeof Headers === "undefined") {
   };
 }
 
-globalThis.XMLHttpRequest = class XMLHttpRequest {
+// XMLHttpRequestEventTarget — spec-required ancestor for XHR EventTarget methods.
+// zone.js prefers to walk XMLHttpRequestEventTarget.prototype for addEventListener/
+// removeEventListener/dispatchEvent descriptors before falling back to XHR.prototype.
+class XMLHttpRequestEventTarget {
+  addEventListener(type, handler) {
+    if (!this._listeners) this._listeners = {};
+    if (!this._listeners[type]) this._listeners[type] = [];
+    this._listeners[type].push(handler);
+  }
+  removeEventListener(type, handler) {
+    if (this._listeners && this._listeners[type]) {
+      this._listeners[type] = this._listeners[type].filter(h => h !== handler);
+    }
+  }
+  dispatchEvent(event) {
+    if (!event || !event.type) return false;
+    const ev = (typeof event === 'object') ? event : { type: event };
+    ev.target = ev.target || this;
+    ev.currentTarget = ev.currentTarget || this;
+    const type = ev.type;
+    const handlers = (this._listeners && this._listeners[type]) || [];
+    for (const h of handlers) { try { h.call(this, ev); } catch (e) {} }
+    const prop = 'on' + type;
+    if (typeof this[prop] === 'function') {
+      try { this[prop](ev); } catch (e) {}
+    }
+    return true;
+  }
+}
+globalThis.XMLHttpRequestEventTarget = XMLHttpRequestEventTarget;
+_markNative(XMLHttpRequestEventTarget);
+_markNative(XMLHttpRequestEventTarget.prototype.addEventListener);
+_markNative(XMLHttpRequestEventTarget.prototype.removeEventListener);
+_markNative(XMLHttpRequestEventTarget.prototype.dispatchEvent);
+
+globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarget {
   static UNSENT = 0;
   static OPENED = 1;
   static HEADERS_RECEIVED = 2;
@@ -2593,6 +2645,7 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
   UNSENT = 0; OPENED = 1; HEADERS_RECEIVED = 2; LOADING = 3; DONE = 4;
 
   constructor() {
+    super();
     this.readyState = 0;
     this.status = 0;
     this.statusText = "";
@@ -2755,6 +2808,23 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
     }
   }
 
+  // Per WHATWG DOM spec — required by zone.js which patches XHR via
+  // Object.getOwnPropertyDescriptor on XMLHttpRequestEventTarget.prototype.
+  dispatchEvent(event) {
+    if (!event || !event.type) return false;
+    const ev = (typeof event === 'object') ? event : { type: event };
+    ev.target = ev.target || this;
+    ev.currentTarget = ev.currentTarget || this;
+    const type = ev.type;
+    const handlers = (this._listeners && this._listeners[type]) || [];
+    for (const h of handlers) { try { h.call(this, ev); } catch (e) {} }
+    const prop = 'on' + type;
+    if (typeof this[prop] === 'function') {
+      try { this[prop](ev); } catch (e) {}
+    }
+    return true;
+  }
+
   _setReadyState(state) {
     this.readyState = state;
     this._fireEvent('readystatechange');
@@ -2778,6 +2848,9 @@ _markNative(XMLHttpRequest.prototype.open);
 _markNative(XMLHttpRequest.prototype.send);
 _markNative(XMLHttpRequest.prototype.abort);
 _markNative(XMLHttpRequest.prototype.setRequestHeader);
+_markNative(XMLHttpRequest.prototype.addEventListener);
+_markNative(XMLHttpRequest.prototype.removeEventListener);
+_markNative(XMLHttpRequest.prototype.dispatchEvent);
 _markNative(XMLHttpRequest.prototype.getResponseHeader);
 _markNative(XMLHttpRequest.prototype.getAllResponseHeaders);
 
