@@ -899,12 +899,16 @@ class Element extends Node {
     const ok = (ns === "http://www.w3.org/2000/svg" && ln === "a") ||
                (ns === "http://www.w3.org/1999/xhtml" && (ln === "a" || ln === "area" || ln === "link"));
     if (!ok) return undefined;
-    if (!this._relList) this._relList = new DOMTokenList(this, "rel");
+    // relList has supported tokens, so relList.supports(x) returns a boolean
+    // rather than throwing. Vite's modulepreload polyfill runs
+    // link.relList.supports('modulepreload') at the top of every bundle; a
+    // throw there aborts the whole module and the SPA renders blank.
+    if (!this._relList) this._relList = new DOMTokenList(this, "rel", ["alternate","dns-prefetch","icon","manifest","modulepreload","next","pingback","preconnect","prefetch","preload","prev","search","stylesheet"]);
     return this._relList;
   }
   get sandbox() {
     if (this.namespaceURI !== "http://www.w3.org/1999/xhtml" || this.localName !== "iframe") return undefined;
-    if (!this._sandboxList) this._sandboxList = new DOMTokenList(this, "sandbox");
+    if (!this._sandboxList) this._sandboxList = new DOMTokenList(this, "sandbox", ["allow-downloads","allow-forms","allow-modals","allow-orientation-lock","allow-pointer-lock","allow-popups","allow-popups-to-escape-sandbox","allow-presentation","allow-same-origin","allow-scripts","allow-top-navigation","allow-top-navigation-by-user-activation","allow-top-navigation-to-custom-protocols"]);
     return this._sandboxList;
   }
   get sizes() {
