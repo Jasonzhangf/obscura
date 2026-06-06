@@ -52,6 +52,24 @@ Want to sponsor? Email [hello@obscura.sh](mailto:hello@obscura.sh).
       <a href="https://www.swiftproxy.net/?ref=obscura"><b>Swiftproxy</b></a> — High-quality residential proxies designed for privacy-conscious users. Access 80M+ rotating residential IPs across 190+ countries with high anonymity, non-expiring traffic, and stable connections. Perfect for browser automation, data collection, AI agents, and large-scale online operations.
     </td>
   </tr>
+  <tr>
+    <td width="200" align="center" valign="middle">
+      <a href="https://proxyempire.io/?ref=obscura&utm_source=obscuragithub" target="_blank">
+        <img alt="ProxyEmpire" src="assets/sponsors/proxyempire.png" width="180"/>
+      </a>
+    </td>
+    <td valign="middle">
+      🚀 <b>Obscura × ProxyEmpire</b><br>
+      Using Obscura for AI agents, browser automation, or web scraping? Power it with reliable residential and mobile proxies from <a href="https://proxyempire.io/?ref=obscura&utm_source=obscuragithub"><b>ProxyEmpire</b></a>.<br><br>
+      <b>🌍 30M+ residential IPs in 170+ countries<br>
+      📱 4G/5G mobile proxies<br>
+      🔄 Rotating & sticky sessions<br>
+      🎯 City, region & ISP targeting<br>
+      🔐 HTTP, HTTPS & SOCKS5 support<br><br>
+      🎁 Use code <b>OBSCURA35</b> for a <b>35% recurring discount</b>.<br><br></b>
+      Better proxies. Fewer blocks. More scalable automation.
+    </td>
+  </tr>
 </table>
 
 ## Install
