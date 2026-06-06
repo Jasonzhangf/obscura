@@ -35,6 +35,25 @@ The open-source engine stays Apache-2.0, fully featured. No feature gating, ever
 
 **[Get on the waitlist →](https://tally.so/r/gDWzdD)**
 
+## Sponsors
+
+**Obscura** is supported by sponsors who help keep development independent. 
+
+Want to sponsor? Email [hello@obscura.sh](mailto:hello@obscura.sh).
+
+<table>
+  <tr>
+    <td width="200" align="center" valign="middle">
+      <a href="https://www.swiftproxy.net/?ref=obscura" target="_blank">
+        <img alt="Swiftproxy" src="assets/sponsors/swiftproxy.png" width="180"/>
+      </a>
+    </td>
+    <td valign="middle">
+      <a href="https://www.swiftproxy.net/?ref=obscura"><b>Swiftproxy</b></a> — High-quality residential proxies designed for privacy-conscious users. Access 80M+ rotating residential IPs across 190+ countries with high anonymity, non-expiring traffic, and stable connections. Perfect for browser automation, data collection, AI agents, and large-scale online operations.
+    </td>
+  </tr>
+</table>
+
 ## Install
 
 ### Download
