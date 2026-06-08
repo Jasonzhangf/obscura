@@ -1,6 +1,7 @@
 pub mod page;
 pub mod context;
 pub mod lifecycle;
+pub mod profiles;
 
 pub use page::{NetworkEvent, Page, PageError};
 pub use context::BrowserContext;

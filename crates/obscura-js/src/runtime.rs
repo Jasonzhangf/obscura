@@ -206,6 +206,19 @@ impl ObscuraJsRuntime {
             format!("globalThis.__obscura_ua = '{}';", escaped),
         );
     }
+
+    pub fn set_platform(&mut self, platform: &str, ua_platform: &str, ua_platform_version: &str) {
+        let p = platform.replace('\'', "\\'");
+        let uap = ua_platform.replace('\'', "\\'");
+        let uapv = ua_platform_version.replace('\'', "\\'");
+        let _ = self.runtime.execute_script(
+            "<set-platform>",
+            format!(
+                "globalThis.__obscura_platform='{}';globalThis.__obscura_ua_platform='{}';globalThis.__obscura_ua_platform_version='{}';",
+                p, uap, uapv
+            ),
+        );
+    }
     pub fn evaluate(&mut self, expression: &str) -> Result<serde_json::Value, String> {
         let wrapped = Self::wrap_expression(expression);
         let result = self
@@ -1511,7 +1524,7 @@ mod tests {
         let ua = rt.evaluate("navigator.userAgent").unwrap();
         assert!(ua.as_str().unwrap().contains("Chrome"), "UA should contain Chrome: {}", ua);
         let wd = rt.evaluate("navigator.webdriver").unwrap();
-        assert_eq!(wd, serde_json::Value::Null);
+        assert_eq!(wd, serde_json::json!(false));
         let plugins = rt.evaluate("navigator.plugins.length").unwrap();
         assert!(plugins.as_f64().unwrap() > 0.0, "Should have plugins");
         let chrome = rt.evaluate("typeof window.chrome").unwrap();

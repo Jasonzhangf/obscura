@@ -267,6 +267,11 @@ impl Page {
         if let Ok(ua) = self.http_client.user_agent.try_read() {
             rt.set_user_agent(&ua);
         }
+        rt.set_platform(
+            &self.context.platform,
+            &self.context.ua_platform,
+            &self.context.ua_platform_version,
+        );
 
         rt.set_cookie_jar(self.context.cookie_jar.clone());
         rt.set_http_client(self.http_client.clone());

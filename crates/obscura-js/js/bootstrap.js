@@ -72,7 +72,15 @@ function _fpNoise(x, y, channel) {
 var _fpCache = null;
 function _getFp() {
   if (_fpCache) return _fpCache;
-  const gpuPool = [
+  const isMac = (globalThis.__obscura_ua_platform || 'Windows') === 'macOS';
+  const gpuPool = isMac ? [
+    'ANGLE (Apple, ANGLE Metal Renderer: Apple M1, Unspecified Version)',
+    'ANGLE (Apple, ANGLE Metal Renderer: Apple M1 Pro, Unspecified Version)',
+    'ANGLE (Apple, ANGLE Metal Renderer: Apple M2, Unspecified Version)',
+    'ANGLE (Apple, ANGLE Metal Renderer: Apple M2 Pro, Unspecified Version)',
+    'ANGLE (Apple, ANGLE Metal Renderer: Apple M3, Unspecified Version)',
+    'ANGLE (Intel Inc., ANGLE Metal Renderer: Intel(R) Iris(TM) Plus Graphics, Unspecified Version)',
+  ] : [
     'ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)',
     'ANGLE (NVIDIA, NVIDIA GeForce GTX 1660 SUPER Direct3D11 vs_5_0 ps_5_0, D3D11)',
     'ANGLE (NVIDIA, NVIDIA GeForce RTX 2070 SUPER Direct3D11 vs_5_0 ps_5_0, D3D11)',
@@ -86,7 +94,11 @@ function _getFp() {
     'ANGLE (AMD, AMD Radeon RX 5700 XT Direct3D11 vs_5_0 ps_5_0, D3D11)',
     'ANGLE (NVIDIA, NVIDIA GeForce RTX 3080 Direct3D11 vs_5_0 ps_5_0, D3D11)',
   ];
-  const gpuVendorPool = [
+  const gpuVendorPool = isMac ? [
+    'Google Inc. (Apple)','Google Inc. (Apple)','Google Inc. (Apple)',
+    'Google Inc. (Apple)','Google Inc. (Apple)',
+    'Google Inc. (Intel Inc.)',
+  ] : [
     'Google Inc. (NVIDIA)','Google Inc. (NVIDIA)','Google Inc. (NVIDIA)',
     'Google Inc. (Intel)','Google Inc. (Intel)',
     'Google Inc. (AMD)','Google Inc. (AMD)',
@@ -2354,14 +2366,14 @@ function _registerIframe(iframeEl) {
 globalThis.navigator = {
   get userAgent() { return globalThis.__obscura_ua || "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"; },
   get appVersion() { return this.userAgent.replace('Mozilla/', ''); },
-  language: "en-US", languages: ["en-US","en"], platform: "Linux x86_64",
+  language: "en-US", languages: ["en-US","en"], get platform() { return globalThis.__obscura_platform || "Win32"; },
   onLine: true, cookieEnabled: true, hardwareConcurrency: 8,
   maxTouchPoints: 0,
   vendor: "Google Inc.", product: "Gecko", productSub: "20030107",
   doNotTrack: null,
   deviceMemory: 8,
   connection: { effectiveType: "4g", rtt: 50, downlink: 10, saveData: false },
-  get webdriver() { return undefined; },
+  get webdriver() { return false; },
   pdfViewerEnabled: true,
   get plugins() {
     const p = [
@@ -2393,7 +2405,7 @@ globalThis.navigator = {
       {brand: "Not=A?Brand", version: "24"},
     ],
     mobile: false,
-    platform: "Linux",
+    get platform() { return globalThis.__obscura_ua_platform || "Windows"; },
     getHighEntropyValues(hints) {
       return Promise.resolve({
         architecture: "x86",
@@ -2402,8 +2414,8 @@ globalThis.navigator = {
         fullVersionList: [{brand:"Google Chrome",version:"145.0.0.0"},{brand:"Chromium",version:"145.0.0.0"},{brand:"Not=A?Brand",version:"24.0.0.0"}],
         mobile: false,
         model: "",
-        platform: "Linux",
-        platformVersion: "6.8.0",
+        platform: globalThis.__obscura_ua_platform || "Windows",
+        platformVersion: globalThis.__obscura_ua_platform_version || "15.0.0",
         uaFullVersion: "145.0.0.0",
       });
     },
@@ -5509,21 +5521,10 @@ _markNative(SpeechSynthesisUtterance);
 _markNative(MediaStream); _markNative(MediaStreamTrack);
 _markNative(RTCPeerConnection); _markNative(RTCSessionDescription); _markNative(RTCIceCandidate);
 
-const _OrigDateTimeFormat = Intl.DateTimeFormat;
-const _defaultTZ = 'Europe/Berlin';
-Intl.DateTimeFormat = function(locales, options) {
-  if (!options) options = {};
-  if (!options.timeZone) options.timeZone = _defaultTZ;
-  return new _OrigDateTimeFormat(locales, options);
-};
-Intl.DateTimeFormat.prototype = _OrigDateTimeFormat.prototype;
-Intl.DateTimeFormat.supportedLocalesOf = _OrigDateTimeFormat.supportedLocalesOf;
-const _origResolved = _OrigDateTimeFormat.prototype.resolvedOptions;
-_OrigDateTimeFormat.prototype.resolvedOptions = function() {
-  const r = _origResolved.call(this);
-  if (r.timeZone === 'UTC') r.timeZone = _defaultTZ;
-  return r;
-};
+// Timezone is driven by the process TZ (set by the CLI, default Europe/Berlin),
+// so native Intl.DateTimeFormat and Date report the same zone. No JS override:
+// forcing a fixed zone here only on Intl left Date on UTC, which is the exact
+// cross-surface mismatch a fingerprinting script looks for.
 
 if (typeof PointerEvent === 'undefined') {
   globalThis.PointerEvent = class PointerEvent extends MouseEvent {
