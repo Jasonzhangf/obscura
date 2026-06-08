@@ -77,6 +77,17 @@ HTTP, HTTPS & SOCKS5 support<br><br>
       Better proxies. Fewer blocks. More scalable automation.
     </td>
   </tr>
+  <tr>
+    <td width="200" align="center" valign="middle">
+      <a href="https://mangoproxy.com/?utm_source=github&utm_medium=partner&utm_campaign=h4ckf0r0day" target="_blank">
+        <img alt="MangoProxy" src="assets/sponsors/mangoproxy.png" width="180"/>
+      </a>
+    </td>
+    <td valign="middle">
+      <a href="https://mangoproxy.com/?utm_source=github&utm_medium=partner&utm_campaign=h4ckf0r0day"><b>MangoProxy</b></a> provides residential, ISP, datacenter, and mobile proxies in 200+ countries. Trusted by businesses worldwide for stable connections, fast response times, and scalable proxy infrastructure.<br>
+      Use Promo code <b>OBSCURA</b> for 8% off Static ISP Proxies.
+    </td>
+  </tr>
 </table>
 
 ## Install
