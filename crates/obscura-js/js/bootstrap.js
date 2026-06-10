@@ -1111,10 +1111,8 @@ class Element extends Node {
         break;
     }
   }
-  // Same insertion semantics as insertAdjacentHTML but inserts a Text node
-  // instead of parsing markup — that distinction is the whole point of the API
-  // (DDoS-Guard, reCAPTCHA, and others use it precisely because it does NOT
-  // parse HTML). Position string is case-insensitive per spec. See issue #285.
+  // Like insertAdjacentHTML but inserts a Text node instead of parsing markup,
+  // so the content stays literal.
   insertAdjacentText(position, text) {
     const parent = this.parentNode;
     const node = document.createTextNode(String(text));
@@ -1133,9 +1131,8 @@ class Element extends Node {
         break;
     }
   }
-  // Per spec, returns the inserted element, or null when position is
-  // beforebegin/afterend and this element has no parent (so the node could
-  // not be placed). See issue #285.
+  // Returns the inserted element, or null for beforebegin/afterend when this
+  // element has no parent.
   insertAdjacentElement(position, element) {
     const parent = this.parentNode;
     switch (String(position).toLowerCase()) {

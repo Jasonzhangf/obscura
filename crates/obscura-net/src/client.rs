@@ -315,9 +315,7 @@ impl ObscuraHttpClient {
                 .redirect(Policy::none())
                 .timeout(Duration::from_secs(30))
                 .danger_accept_invalid_certs(false)
-                // SSRF: resolve + validate every hostname against the deny-set
-                // so a public name pointing at a private/loopback IP is rejected
-                // at connect time (DNS-rebinding safe).
+                // SSRF guard: reject hostnames that resolve to a private/loopback IP.
                 .dns_resolver(Arc::new(SsrfGuardResolver::new(self.allow_private_network)))
 ;
 

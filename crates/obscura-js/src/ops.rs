@@ -509,9 +509,7 @@ fn build_request_client(proxy_url: Option<&str>) -> Result<reqwest::Client, Stri
     let mut builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_millis(timeout_ms))
-        // SSRF: same DNS-resolving guard as the navigation client, so a scripted
-        // fetch()/XHR cannot reach a private/loopback IP via a public hostname
-        // (env/--allow-private-network still relaxes it inside the resolver).
+        // SSRF guard: also reject hostnames that resolve to a private/loopback IP.
         .dns_resolver(std::sync::Arc::new(obscura_net::SsrfGuardResolver::new(false)))
         // Be explicit about pool size: default is unbounded which is fine,
         // but pool_idle_timeout default (90s) is short for SPA-heavy
