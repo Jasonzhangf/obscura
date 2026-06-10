@@ -72,7 +72,14 @@ impl CookieJar {
                             }
                         }
                         "samesite" => {
-                            same_site = val.trim().to_string();
+                            // SameSite is case-insensitive per RFC 6265bis; normalize to
+                            // title-case so downstream comparisons work regardless of what
+                            // the server sent. Unknown values default to Lax per spec.
+                            same_site = match val.trim().to_ascii_lowercase().as_str() {
+                                "strict" => "Strict",
+                                "none"   => "None",
+                                _        => "Lax",
+                            }.to_string();
                         }
                         _ => {}
                     }
@@ -280,7 +287,14 @@ impl CookieJar {
                             }
                         }
                         "samesite" => {
-                            same_site = val.trim().to_string();
+                            // SameSite is case-insensitive per RFC 6265bis; normalize to
+                            // title-case so downstream comparisons work regardless of what
+                            // the server sent. Unknown values default to Lax per spec.
+                            same_site = match val.trim().to_ascii_lowercase().as_str() {
+                                "strict" => "Strict",
+                                "none"   => "None",
+                                _        => "Lax",
+                            }.to_string();
                         }
                         _ => {}
                     }
