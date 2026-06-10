@@ -4,6 +4,18 @@ use url::Url;
 
 const DEFAULT_SAME_SITE: &str = "Lax";
 
+/// SameSite is case-insensitive per RFC 6265bis; normalize a present value to
+/// title-case so stored cookies compare equal regardless of how they were sent.
+/// Unrecognized values fall back to Lax per spec.
+fn normalize_same_site(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "strict" => "Strict",
+        "none" => "None",
+        _ => "Lax",
+    }
+    .to_string()
+}
+
 pub struct CookieJar {
     cookies: RwLock<HashMap<String, HashMap<String, CookieEntry>>>,
 }
@@ -72,14 +84,7 @@ impl CookieJar {
                             }
                         }
                         "samesite" => {
-                            // SameSite is case-insensitive per RFC 6265bis; normalize to
-                            // title-case so downstream comparisons work regardless of what
-                            // the server sent. Unknown values default to Lax per spec.
-                            same_site = match val.trim().to_ascii_lowercase().as_str() {
-                                "strict" => "Strict",
-                                "none"   => "None",
-                                _        => "Lax",
-                            }.to_string();
+                            same_site = normalize_same_site(val);
                         }
                         _ => {}
                     }
@@ -187,7 +192,7 @@ impl CookieJar {
             let same_site = if cookie.same_site.is_empty() {
                 DEFAULT_SAME_SITE.to_string()
             } else {
-                cookie.same_site
+                normalize_same_site(&cookie.same_site)
             };
             let expires = cookie.expires.and_then(|e| if e > 0 { Some(e as u64) } else { None });
             let entry = CookieEntry {
@@ -287,14 +292,7 @@ impl CookieJar {
                             }
                         }
                         "samesite" => {
-                            // SameSite is case-insensitive per RFC 6265bis; normalize to
-                            // title-case so downstream comparisons work regardless of what
-                            // the server sent. Unknown values default to Lax per spec.
-                            same_site = match val.trim().to_ascii_lowercase().as_str() {
-                                "strict" => "Strict",
-                                "none"   => "None",
-                                _        => "Lax",
-                            }.to_string();
+                            same_site = normalize_same_site(val);
                         }
                         _ => {}
                     }
