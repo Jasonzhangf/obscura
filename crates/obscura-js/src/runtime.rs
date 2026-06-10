@@ -2357,6 +2357,27 @@ mod tests {
     /// Setting an ARIA reflection property must write through to the
     /// underlying attribute so frameworks that toggle state via
     /// `el.ariaExpanded = 'true'` actually update the DOM.
+    /// Regression: React 18 / mobile SPAs (e.g. goofish.com) call
+    /// addEventListener on navigator.connection (NetworkInformation) and
+    /// navigator.serviceWorker (ServiceWorkerContainer). Both are EventTargets
+    /// in real browsers; missing the method crashed the app bundle with
+    /// "addEventListener is not a function".
+    #[test]
+    fn navigator_eventtarget_stubs_expose_add_event_listener() {
+        let mut rt = setup_runtime("<div></div>");
+        let result = rt
+            .evaluate(
+                r#"
+                return [
+                    typeof navigator.connection.addEventListener,
+                    typeof navigator.serviceWorker.addEventListener,
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!(["function", "function"]));
+    }
+
     /// Regression test for #285: DDoS-Guard's challenge calls
     /// `t.insertAdjacentText(...)` and dies with `TypeError: ... is not a
     /// function` because `Element.prototype.insertAdjacentText` was missing.

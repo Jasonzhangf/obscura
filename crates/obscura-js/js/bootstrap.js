@@ -2469,7 +2469,7 @@ globalThis.navigator = {
   vendor: "Google Inc.", product: "Gecko", productSub: "20030107",
   doNotTrack: null,
   deviceMemory: 8,
-  connection: { effectiveType: "4g", rtt: 50, downlink: 10, saveData: false },
+  connection: { effectiveType: "4g", rtt: 50, downlink: 10, saveData: false, onchange: null, addEventListener(){}, removeEventListener(){}, dispatchEvent(){return true;} },
   get webdriver() { return false; },
   pdfViewerEnabled: true,
   get plugins() {
@@ -2518,7 +2518,7 @@ globalThis.navigator = {
     },
     toJSON() { return {brands:this.brands,mobile:this.mobile,platform:this.platform}; },
   },
-  serviceWorker: { ready: Promise.resolve(), register(){return Promise.resolve();}, getRegistrations(){return Promise.resolve([]);}, controller: null },
+  serviceWorker: { ready: Promise.resolve(), register(){return Promise.resolve();}, getRegistrations(){return Promise.resolve([]);}, controller: null, oncontrollerchange: null, onmessage: null, addEventListener(){}, removeEventListener(){}, dispatchEvent(){return true;} },
   mediaDevices: {
     enumerateDevices() {
       return Promise.resolve([
