@@ -41,6 +41,21 @@ fn origin_allowed(origin: Option<&str>, allowlist: Option<&str>) -> bool {
     }
 }
 
+/// CORS `Access-Control-Allow-Origin` value for a response. With no allowlist
+/// we keep the permissive `*` (issue #175). With an allowlist the request's
+/// origin has already passed `origin_allowed`, so echo it back plus `Vary:
+/// Origin` instead of advertising `*`; a native client with no `Origin` needs
+/// no CORS header at all.
+fn cors_header(origin: Option<&str>, allowlist: Option<&str>) -> String {
+    match allowlist {
+        None => "Access-Control-Allow-Origin: *\r\n".to_string(),
+        Some(_) => match origin {
+            Some(o) => format!("Access-Control-Allow-Origin: {o}\r\nVary: Origin\r\n"),
+            None => String::new(),
+        },
+    }
+}
+
 /// MCP Streamable HTTP transport (POST /mcp → JSON response).
 ///
 /// Connections are handled sequentially on the current thread — the browser
@@ -52,11 +67,12 @@ pub async fn run(host: String, port: u16, proxy: Option<String>, user_agent: Opt
     tracing::info!("MCP HTTP server on http://{}:{}/mcp", host, port);
 
     let mut state = BrowserState::new(proxy, user_agent, stealth);
+    let allowed_origins = allowed_origins_env();
 
     loop {
         let (stream, peer) = listener.accept().await?;
         tracing::debug!("MCP HTTP connection from {}", peer);
-        if let Err(e) = handle_connection(stream, &mut state).await {
+        if let Err(e) = handle_connection(stream, &mut state, allowed_origins.as_deref()).await {
             tracing::debug!("connection closed: {}", e);
         }
     }
@@ -65,6 +81,7 @@ pub async fn run(host: String, port: u16, proxy: Option<String>, user_agent: Opt
 async fn handle_connection(
     stream: tokio::net::TcpStream,
     state: &mut BrowserState,
+    allowed_origins: Option<&str>,
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
@@ -128,10 +145,11 @@ async fn handle_connection(
         // browser session (mitigates a malicious local web page issuing
         // cross-origin POSTs to the loopback MCP port). The permissive default
         // and no-Origin native clients are unaffected.
-        if !origin_allowed(origin.as_deref(), allowed_origins_env().as_deref()) {
+        if !origin_allowed(origin.as_deref(), allowed_origins) {
             respond(&mut writer, 403, b"{\"error\":\"origin not allowed\"}").await?;
             break;
         }
+        let cors = cors_header(origin.as_deref(), allowed_origins);
 
         match method {
             "OPTIONS" => {
@@ -139,23 +157,27 @@ async fn handle_connection(
                 // X-API-Key are common for hosted deployments. Without these
                 // listed the browser preflight check fails and blocks the actual
                 // request.
-                let hdr = "HTTP/1.1 204 No Content\r\n\
-                    Access-Control-Allow-Origin: *\r\n\
+                let hdr = format!(
+                    "HTTP/1.1 204 No Content\r\n\
+                    {cors}\
                     Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
                     Access-Control-Allow-Headers: Content-Type, Authorization, X-API-Key, mcp-protocol-version\r\n\
                     Access-Control-Max-Age: 86400\r\n\
-                    \r\n";
+                    \r\n"
+                );
                 writer.write_all(hdr.as_bytes()).await?;
             }
 
             "GET" if accept_sse => {
                 // SSE stream: hold open and send periodic keep-alive comments
-                let hdr = "HTTP/1.1 200 OK\r\n\
+                let hdr = format!(
+                    "HTTP/1.1 200 OK\r\n\
                     Content-Type: text/event-stream\r\n\
                     Cache-Control: no-cache\r\n\
                     Connection: keep-alive\r\n\
-                    Access-Control-Allow-Origin: *\r\n\
-                    \r\n";
+                    {cors}\
+                    \r\n"
+                );
                 writer.write_all(hdr.as_bytes()).await?;
                 loop {
                     tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
@@ -189,7 +211,7 @@ async fn handle_connection(
 
                 let response = process_body(&body, state).await;
                 let bytes = serde_json::to_vec(&response)?;
-                respond_json(&mut writer, &bytes).await?;
+                respond_json(&mut writer, &bytes, &cors).await?;
 
                 if !keep_alive {
                     break;
@@ -234,12 +256,12 @@ async fn process_one(msg: &Value, state: &mut BrowserState) -> Option<Value> {
     Some(serde_json::to_value(resp).unwrap())
 }
 
-async fn respond_json(writer: &mut (impl AsyncWriteExt + Unpin), body: &[u8]) -> Result<()> {
+async fn respond_json(writer: &mut (impl AsyncWriteExt + Unpin), body: &[u8], cors: &str) -> Result<()> {
     let hdr = format!(
         "HTTP/1.1 200 OK\r\n\
          Content-Type: application/json\r\n\
          Content-Length: {}\r\n\
-         Access-Control-Allow-Origin: *\r\n\
+         {cors}\
          Connection: keep-alive\r\n\
          \r\n",
         body.len()
