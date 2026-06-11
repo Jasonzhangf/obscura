@@ -276,18 +276,30 @@ impl Page {
         #[cfg(feature = "stealth")]
         if self.stealth_client.is_some() {
             rt.set_user_agent(obscura_net::STEALTH_USER_AGENT);
-        } else if let Ok(ua) = self.http_client.user_agent.try_read() {
-            rt.set_user_agent(&ua);
+            // Match platform to the Linux UA so navigator.platform and
+            // userAgentData.platform are consistent with navigator.userAgent.
+            rt.set_platform("Linux x86_64", "Linux", "");
+        } else {
+            if let Ok(ua) = self.http_client.user_agent.try_read() {
+                rt.set_user_agent(&ua);
+            }
+            rt.set_platform(
+                &self.context.platform,
+                &self.context.ua_platform,
+                &self.context.ua_platform_version,
+            );
         }
         #[cfg(not(feature = "stealth"))]
-        if let Ok(ua) = self.http_client.user_agent.try_read() {
-            rt.set_user_agent(&ua);
+        {
+            if let Ok(ua) = self.http_client.user_agent.try_read() {
+                rt.set_user_agent(&ua);
+            }
+            rt.set_platform(
+                &self.context.platform,
+                &self.context.ua_platform,
+                &self.context.ua_platform_version,
+            );
         }
-        rt.set_platform(
-            &self.context.platform,
-            &self.context.ua_platform,
-            &self.context.ua_platform_version,
-        );
         if let Some((lat, lon)) = env_geolocation() {
             rt.set_geolocation(lat, lon);
         }

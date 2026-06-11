@@ -1,5 +1,46 @@
 "use strict";
 
+// Pre-declare all internal globals as non-enumerable so they are invisible
+// to Object.keys(window) / for-in enumeration. Must run before any var
+// declarations or property assignments below: once a property is defined
+// with enumerable:false here, subsequent `var x = value` assignments will
+// find the property already exists and only update the value, leaving the
+// descriptor intact. Direct globalThis.x = value assignments also only
+// update the value without touching enumerable when the property is
+// writable:true and configurable:true.
+(function _preHideInternals() {
+  var _names = [
+    // runtime-set by Rust (runtime.rs / page.rs)
+    '__obscura_errors', '__obscura_init', '__obscura_hide_list',
+    '__obscura_objects', '__obscura_oid', '__obscura_ua',
+    '__obscura_platform', '__obscura_ua_platform', '__obscura_ua_platform_version',
+    '__documentReadyState__', '__currentUrl',
+    // internal helpers (var-declared throughout the file)
+    '__processDynScriptQueue', '_markNative', '_fpRand', '_fpNoise',
+    '_fpCache', '_getFp', '_fp', '_splitAsciiWhitespace',
+    '_getElementsByClassName', '_docEncoding', '_docIsUtf8',
+    '_isSpecialScheme', '_applyDocQueryEncoding', '_anchorBase',
+    '_elemHrefURL', '_setElemHrefPart', '_pad', '_daysInMonth',
+    '_isoWeek1Monday', '_inputParseNumber', '_inputFormatNumber',
+    '_htmlAttrName', '_convertNodes', '_elementClassFor', '_wrap', '_wrapEl',
+    '_resolveUrl', '_registerIframe', '_base64ToUint8Array',
+    '_bodyToUint8Array', '_arrayBufferFromBytes',
+    '_installWasmStreamingFallback', '_urlParseOp', '_urlSetOp',
+    '_urlResolveOp', '_decodeBodyWithCharset', '_utf8DecodeBytes',
+    '_selectionFor', '_isConstructorCE', '_isValidCustomElementName',
+    '_blobPartToBytes', '_bytesToBinaryString', '_formEncode', '_hexv',
+    '_commonFonts', '_isXMLDocument', '_isValidPITarget', '_isHTMLEl',
+    '_nodeList', '_rngNodeLength', '_rngNodeIndex', '_rngSame', '_rngRoot',
+    '_rngAncestors', '_rngOrder', '_rngCmp', '_rngCheckOffset',
+    '_idbRequest', '_idbObjectStore', '_idbTransaction', '_idbDatabase',
+    '_makeListenerBox',
+  ];
+  var _desc = { value: undefined, writable: true, enumerable: false, configurable: true };
+  for (var _i = 0; _i < _names.length; _i++) {
+    try { Object.defineProperty(globalThis, _names[_i], _desc); } catch (_e) {}
+  }
+})();
+
 globalThis.__obscura_errors = [];
 
 globalThis.addEventListener = globalThis.addEventListener || function(){};
