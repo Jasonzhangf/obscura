@@ -2501,6 +2501,28 @@ function _registerIframe(iframeEl) {
     enumerable: false,
   });
 }
+// PluginArray must exist before navigator is built so the plugins getter can use it.
+function PluginArray(items) {
+  for (var _pi = 0; _pi < items.length; _pi++) this[_pi] = items[_pi];
+  this.length = items.length;
+}
+PluginArray.prototype = Object.create(Array.prototype);
+PluginArray.prototype.constructor = PluginArray;
+PluginArray.prototype.item = function(i) { return this[i] || null; };
+PluginArray.prototype.namedItem = function(name) {
+  for (var _pi = 0; _pi < this.length; _pi++) {
+    if (this[_pi].name === name) return this[_pi];
+  }
+  return null;
+};
+PluginArray.prototype.refresh = function() {};
+PluginArray.prototype[Symbol.iterator] = Array.prototype[Symbol.iterator];
+Object.defineProperty(PluginArray.prototype, Symbol.toStringTag, {value: 'PluginArray', configurable: true});
+_markNative(PluginArray);
+_markNative(PluginArray.prototype.item);
+_markNative(PluginArray.prototype.namedItem);
+_markNative(PluginArray.prototype.refresh);
+
 globalThis.navigator = {
   get userAgent() { return globalThis.__obscura_ua || "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"; },
   get appVersion() { return this.userAgent.replace('Mozilla/', ''); },
@@ -2511,20 +2533,15 @@ globalThis.navigator = {
   doNotTrack: null,
   deviceMemory: 8,
   connection: { effectiveType: "4g", rtt: 50, downlink: 10, saveData: false, onchange: null, addEventListener(){}, removeEventListener(){}, dispatchEvent(){return true;} },
-  get webdriver() { return false; },
   pdfViewerEnabled: true,
   get plugins() {
-    const p = [
-      { name: "PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format", length: 1 },
-      { name: "Chrome PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format", length: 1 },
-      { name: "Chromium PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format", length: 1 },
-      { name: "Microsoft Edge PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format", length: 1 },
-      { name: "WebKit built-in PDF", filename: "internal-pdf-viewer", description: "Portable Document Format", length: 1 },
-    ];
-    p.item = (i) => p[i] || null;
-    p.namedItem = (name) => p.find(x => x.name === name) || null;
-    p.refresh = () => {};
-    p[Symbol.iterator] = Array.prototype[Symbol.iterator].bind(p);
+    const p = new PluginArray([
+      { name: "PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format", length: 1, [Symbol.toStringTag]: "Plugin" },
+      { name: "Chrome PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format", length: 1, [Symbol.toStringTag]: "Plugin" },
+      { name: "Chromium PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format", length: 1, [Symbol.toStringTag]: "Plugin" },
+      { name: "Microsoft Edge PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format", length: 1, [Symbol.toStringTag]: "Plugin" },
+      { name: "WebKit built-in PDF", filename: "internal-pdf-viewer", description: "Portable Document Format", length: 1, [Symbol.toStringTag]: "Plugin" },
+    ]);
     return p;
   },
   get mimeTypes() {
@@ -2619,6 +2636,17 @@ globalThis.navigator = {
     persisted() { return Promise.resolve(false); },
   },
 };
+
+// Move navigator.webdriver off the instance and onto a thin prototype so that
+// Object.getOwnPropertyDescriptor(navigator, 'webdriver') returns undefined,
+// matching Chrome where the property lives on Navigator.prototype.
+(function() {
+  var _wdGetter = function() { return false; };
+  _markNative(_wdGetter);
+  var _wdProto = Object.create(Object.getPrototypeOf(globalThis.navigator));
+  Object.defineProperty(_wdProto, 'webdriver', {get: _wdGetter, set: undefined, enumerable: true, configurable: true});
+  Object.setPrototypeOf(globalThis.navigator, _wdProto);
+})();
 
 globalThis.chrome = {
   app: { isInstalled: false, InstallState: { DISABLED: "disabled", INSTALLED: "installed", NOT_INSTALLED: "not_installed" }, RunningState: { CANNOT_RUN: "cannot_run", READY_TO_RUN: "ready_to_run", RUNNING: "running" } },
