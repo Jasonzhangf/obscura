@@ -2698,7 +2698,7 @@ globalThis.navigator = {
 
 globalThis.chrome = {
   app: { isInstalled: false, InstallState: { DISABLED: "disabled", INSTALLED: "installed", NOT_INSTALLED: "not_installed" }, RunningState: { CANNOT_RUN: "cannot_run", READY_TO_RUN: "ready_to_run", RUNNING: "running" } },
-  runtime: { OnInstalledReason: {}, OnRestartRequiredReason: {}, PlatformArch: {}, PlatformNaclArch: {}, PlatformOs: {}, RequestUpdateCheckStatus: {}, connect() { return {}; }, sendMessage() {} },
+  runtime: { OnInstalledReason: {}, OnRestartRequiredReason: {}, PlatformArch: {}, PlatformNaclArch: {}, PlatformOs: {}, RequestUpdateCheckStatus: {}, connect() { throw new Error("Could not establish connection. Receiving end does not exist."); }, sendMessage() { throw new Error("Could not establish connection. Receiving end does not exist."); } },
   csi() {
     const t = Date.now();
     return { onloadT: t, startE: t - Math.floor(100 + _fpRand(610) * 200), pageT: 0, tran: 5, flashVersion: "" };
@@ -2733,7 +2733,23 @@ globalThis.Notification = class Notification {
 globalThis.WebGLRenderingContext = class WebGLRenderingContext {};
 globalThis.WebGL2RenderingContext = class WebGL2RenderingContext {};
 
-globalThis.screen = { width:1920, height:1080, availWidth:1920, availHeight:1040, colorDepth:24, pixelDepth:24, availTop:0, availLeft:0, orientation:{type:"landscape-primary",angle:0,addEventListener(){},removeEventListener(){},dispatchEvent(){return true;}} };
+class Screen {
+  constructor(w, h) {
+    this._w = w; this._h = h;
+    this.colorDepth = 24; this.pixelDepth = 24; this.availTop = 0; this.availLeft = 0;
+    this.orientation = {type:'landscape-primary',angle:0,addEventListener(){},removeEventListener(){},dispatchEvent(){return true;}};
+  }
+  get width() { return this._w; }
+  get height() { return this._h; }
+  get availWidth() { return this._w; }
+  get availHeight() { return this._h - 40; }
+}
+['width','height','availWidth','availHeight'].forEach(function(k) {
+  var d = Object.getOwnPropertyDescriptor(Screen.prototype, k);
+  if (d && d.get) _markNative(d.get);
+});
+globalThis.Screen = Screen;
+globalThis.screen = new Screen(1920, 1080);
 globalThis.visualViewport = { width:1920, height:1000, offsetLeft:0, offsetTop:0, scale:1, addEventListener(){}, removeEventListener(){} };
 globalThis.devicePixelRatio = 1;
 globalThis.innerWidth = 1920; globalThis.innerHeight = 1000;
@@ -4400,7 +4416,14 @@ globalThis.XMLSerializer = class XMLSerializer {
   }
 };
 globalThis.performance = globalThis.performance || {
-  now: () => Date.now(),
+  now: (function() {
+    var _lastMs = -1, _sub = 0;
+    return function() {
+      var ms = Date.now() - (globalThis.performance.timeOrigin || 0);
+      if (ms !== _lastMs) { _lastMs = ms; _sub = 0; } else { _sub += 0.1; }
+      return ms + _sub;
+    };
+  })(),
   mark(){}, measure(){},
   clearMarks(){}, clearMeasures(){}, clearResourceTimings(){},
   getEntries(){return [];}, getEntriesByName(){return [];}, getEntriesByType(){return [];},
@@ -5662,7 +5685,11 @@ globalThis.AudioContext = class AudioContext {
   createGain() { return {gain:{value:1,setValueAtTime(){}},connect(){},disconnect(){}}; }
   createBiquadFilter() { return {type:'lowpass',frequency:{value:350},Q:{value:1},connect(){},disconnect(){}}; }
   createBufferSource() { return {buffer:null,connect(){},start(){},stop(){},disconnect(){},loop:false}; }
-  createBuffer(ch,len,rate) { return {length:len,sampleRate:rate,numberOfChannels:ch,getChannelData(c){return new Float32Array(len);},duration:len/rate}; }
+  createBuffer(ch,len,rate) {
+    var chs = [];
+    for (var _c=0; _c<(ch||1); _c++) chs.push(new Float32Array(len||0));
+    return {length:len,sampleRate:rate,numberOfChannels:ch,getChannelData:function(c){return chs[c]||chs[0];},duration:len/rate};
+  }
   createScriptProcessor() { return {connect(){},disconnect(){},onaudioprocess:null}; }
   decodeAudioData(buf) { return Promise.resolve(this.createBuffer(2,44100,44100)); }
   resume() { this.state='running'; return Promise.resolve(); }
@@ -5670,8 +5697,33 @@ globalThis.AudioContext = class AudioContext {
   close() { this.state='closed'; return Promise.resolve(); }
 };
 globalThis.OfflineAudioContext = class OfflineAudioContext extends AudioContext {
-  constructor(ch,len,rate) { super(); this.length=len||44100; }
-  startRendering() { return Promise.resolve(this.createBuffer(2,this.length,44100)); }
+  constructor(ch,len,rate) { super(); this.length=len||44100; this.oncomplete=null; }
+  startRendering() {
+    var self = this;
+    var buf = this.createBuffer(1, self.length, 44100);
+    var data = buf.getChannelData(0);
+    // Simulate compressed triangle wave at 10kHz.
+    // Target: sum(|data[4500..5000]|) matches Chrome Linux (~124.04347527516074).
+    var target = 124.04347527516074 + (_fpRand(9991) - 0.5) * 0.002;
+    var freq = 10000, sr = 44100;
+    for (var i = 0; i < self.length; i++) {
+      var phase = ((i * freq / sr) % 1 + 1) % 1;
+      data[i] = phase < 0.5 ? 4*phase - 1 : 3 - 4*phase;
+    }
+    var s = 0;
+    for (var i = 4500; i < 5000; i++) s += Math.abs(data[i]);
+    var scale = s > 0 ? target / s : 0;
+    for (var i = 0; i < self.length; i++) data[i] *= scale;
+    // Fire oncomplete on next microtask so callers can set ctx.oncomplete
+    // synchronously after calling startRendering() (fpCollect pattern).
+    var p = Promise.resolve().then(function() {
+      if (typeof self.oncomplete === 'function') {
+        try { self.oncomplete({renderedBuffer: buf, target: self, type: 'complete'}); } catch(e) {}
+      }
+      return buf;
+    });
+    return p;
+  }
 };
 globalThis.webkitAudioContext = globalThis.AudioContext;
 
@@ -6196,6 +6248,13 @@ if (typeof EventSource === 'undefined') {
 if (typeof WebSocket === 'undefined') {
   globalThis.WebSocket = class WebSocket {
     constructor(url, protocols) {
+      // Validate URL scheme per spec — Chrome throws SyntaxError for non-ws/wss URLs
+      if (typeof url !== 'string' || !/^wss?:\/\//i.test(url)) {
+        throw new DOMException(
+          "Failed to construct 'WebSocket': The URL '" + url + "' is invalid.",
+          'SyntaxError'
+        );
+      }
       this.url = url;
       this.readyState = 0; // CONNECTING
       this.bufferedAmount = 0;
@@ -6388,7 +6447,7 @@ globalThis.__obscura_init = function() {
 
   const scr = _fp('screen');
   const sw = scr[0], sh = scr[1];
-  globalThis.screen = { width:sw, height:sh, availWidth:sw, availHeight:sh-40, colorDepth:24, pixelDepth:24, availTop:0, availLeft:0, orientation:{type:"landscape-primary",angle:0,addEventListener(){},removeEventListener(){},dispatchEvent(){return true;}} };
+  globalThis.screen = new Screen(sw, sh);
   globalThis.visualViewport = { width:sw, height:sh-80, offsetLeft:0, offsetTop:0, scale:1, addEventListener(){}, removeEventListener(){} };
   globalThis.devicePixelRatio = sw >= 2560 ? 2 : 1;
   globalThis.innerWidth = sw; globalThis.innerHeight = sh - 80;
