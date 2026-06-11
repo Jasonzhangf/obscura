@@ -3486,7 +3486,29 @@ if (typeof TextDecoder === 'undefined') {
   };
 }
 
-globalThis.matchMedia = _markNative(function matchMedia(q) { return { matches: false, media: q, addListener(){}, removeListener(){}, addEventListener(){}, removeEventListener(){}, dispatchEvent(){return true;} }; });
+globalThis.matchMedia = _markNative(function matchMedia(q) {
+  var s = (q || '').toLowerCase().replace(/\s+/g, '');
+  var matches = false;
+  if (s.includes('prefers-color-scheme:light')) matches = false;
+  else if (s.includes('prefers-color-scheme:dark')) matches = true;
+  else if (s.includes('prefers-reduced-motion:no-preference')) matches = true;
+  else if (s.includes('prefers-reduced-motion:reduce')) matches = false;
+  else if (s.includes('any-pointer:fine')) matches = true;
+  else if (s.includes('any-pointer:coarse')) matches = false;
+  else if (s.includes('pointer:fine')) matches = true;
+  else if (s.includes('hover:hover')) matches = true;
+  else if (s.includes('any-hover:hover')) matches = true;
+  else if (s.includes('color)') || s === '(color)') matches = true;
+  else if (s.includes('min-width')) {
+    var m = s.match(/min-width:\s*(\d+)px/);
+    matches = m ? (globalThis.innerWidth || 1440) >= parseInt(m[1]) : false;
+  }
+  else if (s.includes('max-width')) {
+    var m2 = s.match(/max-width:\s*(\d+)px/);
+    matches = m2 ? (globalThis.innerWidth || 1440) <= parseInt(m2[1]) : false;
+  }
+  return { matches: matches, media: q, onchange: null, addListener(){}, removeListener(){}, addEventListener(){}, removeEventListener(){}, dispatchEvent(){return true;} };
+});
 globalThis.getComputedStyle = (el) => {
   if (!el) el = document.body || {};
   const style = el?.style || el?._style || new CSSStyleDeclaration();
@@ -4467,7 +4489,7 @@ globalThis.performance = globalThis.performance || {
   timing: { navigationStart: 0, domContentLoadedEventEnd: 0, loadEventEnd: 0 },
   navigation: { type: 0, redirectCount: 0 },
   memory: {
-    jsHeapSizeLimit: 2172649472,
+    jsHeapSizeLimit: 4294705152,
     totalJSHeapSize: 19321856,
     usedJSHeapSize: 16781520,
   },
@@ -6670,7 +6692,7 @@ globalThis.__obscura_init = function() {
   globalThis.performance.timing = { navigationStart: t0, domContentLoadedEventEnd: t0, loadEventEnd: t0 };
   var _totalHeap = 15000000 + Math.floor(_fpRand(620) * 85000000);
   globalThis.performance.memory = {
-    jsHeapSizeLimit: 2172649472,
+    jsHeapSizeLimit: 4294705152,
     totalJSHeapSize: _totalHeap,
     usedJSHeapSize: Math.floor(_totalHeap * (0.3 + _fpRand(621) * 0.5)),
   };
@@ -6693,8 +6715,8 @@ globalThis.__obscura_init = function() {
           {brand:"Chromium",version:"145.0.0.0"},
         ],
         mobile: false, model: "",
-        platform: "Linux",
-        platformVersion: "6.1.0",
+        platform: "Windows",
+        platformVersion: "10.0.0",
         uaFullVersion: "145.0.0.0",
       });
     };
