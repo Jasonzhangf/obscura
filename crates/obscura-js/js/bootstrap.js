@@ -1622,7 +1622,7 @@ class Element extends Node {
         el._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', fullUrl, el);
         el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
       }
-      _registerIframe(el);
+
       if (typeof el.onload === 'function') {
         try { el.onload(); } catch(e) {}
       } else {
@@ -1632,7 +1632,7 @@ class Element extends Node {
     }).catch(() => {
       el._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', fullUrl, el);
       el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
-      _registerIframe(el);
+
       if (typeof el.onload === 'function') try { el.onload(); } catch(e) {}
     });
   }
@@ -1655,7 +1655,8 @@ class Element extends Node {
   get contentWindow() {
     if (this.localName !== 'iframe') return undefined;
     if (!this._iframeWin) {
-      this.contentDocument; // side effect: creates _iframeDoc + _iframeWin
+      if (this.parentNode === null) return null;
+      this.contentDocument;
     }
     return this._iframeWin;
   }
@@ -1796,7 +1797,7 @@ class Element extends Node {
       toJSON() { return this; },
     };
   }
-  getClientRects() { return [this.getBoundingClientRect()]; }
+  getClientRects() { return new DOMRectList([this.getBoundingClientRect()]); }
   // No layout engine: a stub that always returns true unblocks Playwright's
   // actionability polling. With a real layout we'd check display, visibility,
   // opacity and rect dimensions per spec.
@@ -2332,6 +2333,9 @@ class Document extends Node {
 }
 
 class DocumentFragment extends Node {
+  constructor(nid) {
+    super(nid !== undefined ? nid : +_dom("create_document_fragment"));
+  }
   get nodeType() { return 11; }
   get nodeName() { return "#document-fragment"; }
   get innerHTML() { return _domParse("inner_html", this._nid) ?? ""; }
@@ -2533,17 +2537,30 @@ Object.defineProperty(globalThis.Window, Symbol.hasInstance, {
 });
 
 
-const _iframeRegistry = [];
-function _registerIframe(iframeEl) {
-  const idx = _iframeRegistry.length;
-  _iframeRegistry.push(iframeEl);
-  globalThis.length = _iframeRegistry.length;
-  Object.defineProperty(globalThis, idx, {
-    get() { return iframeEl._iframeWin || null; },
+// Remove the static _iframeRegistry and replace with dynamic getters.
+Object.defineProperty(globalThis, 'length', {
+  get() {
+    return document.querySelectorAll('iframe').length;
+  },
+  configurable: true,
+  enumerable: true
+});
+
+// Since we cannot define a Proxy on globalThis easily, we'll define a reasonable number of indexed getters.
+for (let i = 0; i < 50; i++) {
+  Object.defineProperty(globalThis, i, {
+    get() {
+      const iframes = document.querySelectorAll('iframe');
+      if (i < iframes.length) {
+        return iframes[i].contentWindow;
+      }
+      return undefined;
+    },
     configurable: true,
-    enumerable: false,
+    enumerable: false
   });
 }
+
 // Navigator constructor so that typeof Navigator !== 'undefined' and
 // navigatorPrototype checks don't throw a ReferenceError.
 function Navigator() {}
@@ -4486,7 +4503,11 @@ Object.defineProperty(Document.prototype, 'fonts', {
   },
   configurable: true,
 });
-globalThis.crypto = globalThis.crypto || { getRandomValues(arr) { for(let i=0;i<arr.length;i++) arr[i]=Math.floor(Math.random()*256); return arr; }, randomUUID(){ return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g,c=>{const r=Math.random()*16|0;return(c==="x"?r:(r&3|8)).toString(16);}); } };
+globalThis.Crypto = class Crypto {
+  getRandomValues(arr) { for(let i=0;i<arr.length;i++) arr[i]=Math.floor(Math.random()*256); return arr; }
+  randomUUID() { return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g,c=>{const r=Math.random()*16|0;return(c==="x"?r:(r&3|8)).toString(16);}); }
+};
+globalThis.crypto = globalThis.crypto || new globalThis.Crypto();
 globalThis.structuredClone = globalThis.structuredClone || ((v) => JSON.parse(JSON.stringify(v)));
 globalThis.reportError = globalThis.reportError || ((e) => console.error(e));
 
@@ -4920,8 +4941,20 @@ globalThis.Range = class Range {
   insertNode(node) { if (node && this._sc && this._sc.insertBefore) { const kids = this._sc.childNodes; this._sc.insertBefore(node, kids[this._so] || null); } }
   surroundContents(node) { this.insertNode(node); }
   detach() {}
-  getBoundingClientRect() { return new DOMRect(); }
-  getClientRects() { return []; }
+  getBoundingClientRect() {
+    if (this.collapsed) return new DOMRect();
+    let cac = this.commonAncestorContainer;
+    while (cac && cac.nodeType !== 1 && cac.nodeType !== 9) cac = cac.parentNode;
+    if (cac && cac.getBoundingClientRect) {
+      const r = cac.getBoundingClientRect();
+      return new DOMRect(r.x, r.y, r.width, r.height);
+    }
+    return new DOMRect();
+  }
+  getClientRects() {
+    if (this.collapsed) return new DOMRectList([]);
+    return new DOMRectList([this.getBoundingClientRect()]);
+  }
   static get START_TO_START() { return 0; }
   static get START_TO_END() { return 1; }
   static get END_TO_END() { return 2; }
@@ -5011,6 +5044,7 @@ _markNative(globalThis.Selection);
   Element.prototype.before, Element.prototype.after, Element.prototype.replaceWith,
   HTMLFormElement.prototype.reset,
   Element.prototype.getContext, Element.prototype.toDataURL, Element.prototype.toBlob,
+  Element.prototype.getBBox,
   Node.prototype.appendChild, Node.prototype.removeChild,
   Node.prototype.replaceChild, Node.prototype.insertBefore,
   Node.prototype.contains, Node.prototype.hasChildNodes, Node.prototype.cloneNode,
@@ -5297,7 +5331,7 @@ class _Canvas2D {
     this._stateStack = [];
   }
   _parseColor(css) {
-    if (!css || css === 'none') return [0,0,0,0];
+    if (!css || typeof css !== 'string' || css === 'none') return [0,0,0,0];
     if (css.startsWith('#')) {
       const hex = css.slice(1);
       if (hex.length === 3) return [parseInt(hex[0]+hex[0],16),parseInt(hex[1]+hex[1],16),parseInt(hex[2]+hex[2],16),255];
@@ -5493,6 +5527,13 @@ Element.prototype.getContext = function getContext(type) {
   if (type === 'webgl' || type === 'experimental-webgl' || type === 'webgl2') {
     return {
       canvas: this,
+      MAX_VIEWPORT_DIMS: 0x0D33,
+      MAX_TEXTURE_SIZE: 0x0D33,
+      MAX_RENDERBUFFER_SIZE: 0x84E8,
+      MAX_TEXTURE_MAX_ANISOTROPY_EXT: 0x84EA,
+      MAX_DRAW_BUFFERS_WEBGL: 0x8824,
+      getContextAttributes() { return { alpha: true, antialias: true, depth: true, failIfMajorPerformanceCaveat: false, powerPreference: "default", premultipliedAlpha: true, preserveDrawingBuffer: false, stencil: true, desynchronized: false }; },
+      uniform2f() {},
       getExtension(name) {
         if (name === 'WEBGL_debug_renderer_info') return { UNMASKED_VENDOR_WEBGL: 0x9245, UNMASKED_RENDERER_WEBGL: 0x9246 };
         return null;
@@ -5504,6 +5545,10 @@ Element.prototype.getContext = function getContext(type) {
         if (pname === 0x1F00) return 'WebKit';          // GL_VENDOR
         if (pname === 0x1F02) return 'OpenGL ES 3.0 (ANGLE)'; // GL_VERSION
         if (pname === 0x8B8C) return 'WebGL GLSL ES 3.00 (ANGLE)'; // GL_SHADING_LANGUAGE_VERSION
+        if (pname === undefined) return [0, 0];
+        // Some properties like MAX_VIEWPORT_DIMS return arrays
+        if (pname === 0x0D33) return [8192, 8192];
+        if (pname === 0x8A2A) return [8192, 8192];
         return 0;
       },
       getSupportedExtensions() { return ['WEBGL_debug_renderer_info','EXT_texture_filter_anisotropic','WEBGL_compressed_texture_s3tc','WEBGL_lose_context']; },
@@ -5536,6 +5581,10 @@ Element.prototype.toDataURL = function(type) {
   return _fp('canvasFingerprint');
 };
 Element.prototype.toBlob = function(cb, type, q) { cb(new Blob([''])); };
+Element.prototype.getBBox = function() { return { x: 0, y: 0, width: 0, height: 0 }; };
+Element.prototype.getComputedTextLength = function() { return 0; };
+Element.prototype.getExtentOfChar = function(ch) { return { x: 0, y: 0, width: 0, height: 0 }; };
+Element.prototype.getSubStringLength = function(ch, len) { return 0; };
 
 _markNative(Element.prototype.getContext);
 _markNative(Element.prototype.toDataURL);
@@ -5673,24 +5722,37 @@ if (typeof Document !== 'undefined' && typeof Document.parseHTMLUnsafe !== 'func
   _markNative(Document.parseHTMLUnsafe);
 }
 
+globalThis.AudioBuffer = class AudioBuffer {
+  constructor(opts) {
+    var o = (typeof opts === 'object' && opts !== null) ? opts : {};
+    this.numberOfChannels = o.numberOfChannels || 1;
+    this.length = o.length || 0;
+    this.sampleRate = o.sampleRate || 44100;
+    this.duration = this.length / (this.sampleRate || 44100);
+    this._chs = [];
+    for (var c = 0; c < this.numberOfChannels; c++) this._chs.push(new Float32Array(this.length));
+  }
+  getChannelData(c) { return this._chs[c] || this._chs[0] || new Float32Array(0); }
+  copyFromChannel(dst, ch, start) { var s=this._chs[ch]||this._chs[0]; start=start||0; for(var i=0;i<dst.length;i++) dst[i]=(s&&s[start+i])||0; }
+  copyToChannel(src, ch, start) { var d=this._chs[ch]||this._chs[0]; start=start||0; if(d) for(var i=0;i<src.length;i++) d[start+i]=src[i]; }
+};
 globalThis.AudioContext = class AudioContext {
-  constructor() { this.sampleRate=_fp('audioSampleRate'); this.state='running'; this.currentTime=0; this.baseLatency=_fp('audioBaseLatency'); this.destination={maxChannelCount:2,numberOfInputs:1,numberOfOutputs:0,channelCount:2}; }
-  createOscillator() { return {type:'sine',frequency:{value:440,setValueAtTime(){}},connect(){},start(){},stop(){},disconnect(){},addEventListener(){}}; }
-  createDynamicsCompressor() { return {threshold:{value:_fp('compThreshold')},knee:{value:_fp('compKnee')},ratio:{value:_fp('compRatio')},attack:{value:0.003},release:{value:0.25},reduction:0,connect(){},disconnect(){}}; }
+  constructor() { this.sampleRate=_fp('audioSampleRate'); this.state='running'; this.currentTime=0; this.baseLatency=_fp('audioBaseLatency'); this.destination={maxChannelCount:2,numberOfInputs:1,numberOfOutputs:0,channelCount:2}; this._listeners={}; }
+  addEventListener(type, fn) { if (!this._listeners[type]) this._listeners[type]=[]; this._listeners[type].push(fn); }
+  removeEventListener(type, fn) { if (this._listeners[type]) this._listeners[type]=this._listeners[type].filter(h=>h!==fn); }
+  _ap(v, min=-3.4028235e38, max=3.4028235e38) { return { value: v, defaultValue: v, minValue: min, maxValue: max, setValueAtTime(){} }; }
+  createOscillator() { return {context:this,type:'sine',frequency:this._ap(440, -22050, 22050),detune:this._ap(0, -153600, 153600),connect(){},start(){},stop(){},disconnect(){},addEventListener(){},removeEventListener(){}}; }
+  createDynamicsCompressor() { return {context:this,threshold:this._ap(_fp('compThreshold'), -100, 0),knee:this._ap(_fp('compKnee'), 0, 40),ratio:this._ap(_fp('compRatio'), 1, 20),attack:this._ap(0.003, 0, 1),release:this._ap(0.25, 0, 1),reduction:0,connect(){},disconnect(){}}; }
   createAnalyser() {
-    return {fftSize:2048,frequencyBinCount:1024,connect(){},disconnect(){},
+    return {context:this,fftSize:2048,frequencyBinCount:1024,channelCount:2,channelCountMode:'max',channelInterpretation:'speakers',maxDecibels:-30,minDecibels:-100,numberOfInputs:1,numberOfOutputs:1,smoothingTimeConstant:0.8,connect(){},disconnect(){},
       getByteFrequencyData(a){for(let i=0;i<a.length;i++)a[i]=Math.floor(_fpRand(600+i)*10);},
       getFloatFrequencyData(a){for(let i=0;i<a.length;i++)a[i]=-100+_fpRand(700+i)*5;}
     };
   }
-  createGain() { return {gain:{value:1,setValueAtTime(){}},connect(){},disconnect(){}}; }
-  createBiquadFilter() { return {type:'lowpass',frequency:{value:350},Q:{value:1},connect(){},disconnect(){}}; }
-  createBufferSource() { return {buffer:null,connect(){},start(){},stop(){},disconnect(){},loop:false}; }
-  createBuffer(ch,len,rate) {
-    var chs = [];
-    for (var _c=0; _c<(ch||1); _c++) chs.push(new Float32Array(len||0));
-    return {length:len,sampleRate:rate,numberOfChannels:ch,getChannelData:function(c){return chs[c]||chs[0];},duration:len/rate};
-  }
+  createGain() { return {context:this,gain:this._ap(1),connect(){},disconnect(){}}; }
+  createBiquadFilter() { return {context:this,type:'lowpass',frequency:this._ap(350, 0, 22050),Q:this._ap(1, 0.0001, 1000),gain:this._ap(0, -40, 40),connect(){},disconnect(){}}; }
+  createBufferSource() { return {context:this,buffer:null,connect(){},start(){},stop(){},disconnect(){},loop:false}; }
+  createBuffer(ch,len,rate) { return new globalThis.AudioBuffer({numberOfChannels:ch||1,length:len||0,sampleRate:rate||44100}); }
   createScriptProcessor() { return {connect(){},disconnect(){},onaudioprocess:null}; }
   decodeAudioData(buf) { return Promise.resolve(this.createBuffer(2,44100,44100)); }
   resume() { this.state='running'; return Promise.resolve(); }
@@ -5698,7 +5760,17 @@ globalThis.AudioContext = class AudioContext {
   close() { this.state='closed'; return Promise.resolve(); }
 };
 globalThis.OfflineAudioContext = class OfflineAudioContext extends AudioContext {
-  constructor(ch,len,rate) { super(); this.length=len||44100; this.oncomplete=null; }
+  constructor(ch,len,rate) {
+    super();
+    if (typeof ch === 'object' && ch !== null) {
+      this.length = ch.length || 44100;
+      this.sampleRate = ch.sampleRate || 44100;
+    } else {
+      this.length = len || 44100;
+      this.sampleRate = rate || 44100;
+    }
+    this.oncomplete = null;
+  }
   startRendering() {
     var self = this;
     var buf = this.createBuffer(1, self.length, 44100);
@@ -5715,11 +5787,16 @@ globalThis.OfflineAudioContext = class OfflineAudioContext extends AudioContext 
     for (var i = 4500; i < 5000; i++) s += Math.abs(data[i]);
     var scale = s > 0 ? target / s : 0;
     for (var i = 0; i < self.length; i++) data[i] *= scale;
-    // Fire oncomplete on next microtask so callers can set ctx.oncomplete
-    // synchronously after calling startRendering() (fpCollect pattern).
+    // Fire oncomplete + 'complete' listeners on next microtask so callers
+    // can register handlers synchronously after startRendering().
     var p = Promise.resolve().then(function() {
+      var evt = {renderedBuffer: buf, target: self, type: 'complete'};
       if (typeof self.oncomplete === 'function') {
-        try { self.oncomplete({renderedBuffer: buf, target: self, type: 'complete'}); } catch(e) {}
+        try { self.oncomplete(evt); } catch(e) {}
+      }
+      var listeners = (self._listeners && self._listeners['complete']) || [];
+      for (var i = 0; i < listeners.length; i++) {
+        try { listeners[i](evt); } catch(e) {}
       }
       return buf;
     });
@@ -5939,18 +6016,75 @@ globalThis.Worker = class Worker {
     this._listeners = {};
     const worker = this;
 
-    if (typeof url === 'string' && (url.startsWith('blob:') || url.startsWith('http'))) {
-      const blobContent = globalThis.__blobStore?.[url];
-      if (blobContent) {
-        this._code = blobContent;
-      } else {
-        (async () => {
-          try {
-            const resp = await fetch(url);
-            worker._code = await resp.text();
-          } catch(e) { if (worker.onerror) worker.onerror(e); }
-        })();
+    let resolvedUrl = url;
+    if (typeof url === 'string') {
+      const blob = globalThis.__blobStore?.[url];
+      if (blob) {
+        worker._code = blob;
+        // Auto-start on next tick so caller can set onmessage first.
+        setTimeout(() => worker._autoRun(), 0);
+        return;
       }
+      // Resolve relative URLs against the current page.
+      if (!url.startsWith('http') && !url.startsWith('blob:') && !url.startsWith('data:')) {
+        try { resolvedUrl = new URL(url, globalThis.location?.href || '').href; } catch(e) {}
+      }
+      (async () => {
+        try {
+          const resp = await fetch(resolvedUrl);
+          worker._code = await resp.text();
+          if (!worker._terminated) worker._autoRun();
+        } catch(e) { if (worker.onerror) worker.onerror(e); }
+      })();
+    }
+  }
+  _makeScope() {
+    const worker = this;
+    // WorkerGlobalScope defined + no document property → IS_WORKER_SCOPE = true in creepjs
+    const scope = {
+      WorkerGlobalScope: function WorkerGlobalScope() {},
+      DedicatedWorkerGlobalScope: function DedicatedWorkerGlobalScope() {},
+      postMessage: (msg) => {
+        if (worker._terminated) return;
+        const evt = { data: msg };
+        if (worker.onmessage) worker.onmessage(evt);
+        const ls = worker._listeners['message'] || [];
+        for (const h of ls) h(evt);
+      },
+      addEventListener: (type, fn) => {
+        if (!scope._ev) scope._ev = {};
+        if (!scope._ev[type]) scope._ev[type] = [];
+        scope._ev[type].push(fn);
+      },
+      close: () => { worker._terminated = true; },
+      crypto: globalThis.crypto,
+      Crypto: globalThis.Crypto,
+      TextEncoder: globalThis.TextEncoder,
+      TextDecoder: globalThis.TextDecoder,
+      atob: globalThis.atob,
+      btoa: globalThis.btoa,
+      setTimeout: globalThis.setTimeout,
+      setInterval: globalThis.setInterval,
+      clearTimeout: globalThis.clearTimeout,
+      clearInterval: globalThis.clearInterval,
+      fetch: globalThis.fetch,
+      console: globalThis.console,
+      performance: globalThis.performance,
+      location: globalThis.location,
+    };
+    scope.self = scope;
+    return scope;
+  }
+  _autoRun() {
+    if (this._terminated || !this._code) return;
+    const worker = this;
+    const scope = worker._makeScope();
+    try {
+      const fn = new Function('self', 'postMessage', 'addEventListener', 'close', worker._code);
+      fn(scope, scope.postMessage, scope.addEventListener, scope.close);
+    } catch(e) {
+      console.error('Worker error:', e.message);
+      if (worker.onerror) worker.onerror(e);
     }
   }
   postMessage(data) {
@@ -5958,32 +6092,13 @@ globalThis.Worker = class Worker {
     const worker = this;
     setTimeout(() => {
       if (worker._terminated || !worker._code) return;
+      const scope = worker._makeScope();
       try {
-        const workerSelf = {
-          onmessage: null,
-          postMessage: (msg) => {
-            const evt = { data: msg };
-            if (worker.onmessage) worker.onmessage(evt);
-            const handlers = worker._listeners['message'] || [];
-            for (const h of handlers) h(evt);
-          },
-          addEventListener: (type, fn) => { workerSelf['on' + type] = fn; },
-          close: () => { worker._terminated = true; },
-          crypto: globalThis.crypto,
-          TextEncoder: globalThis.TextEncoder,
-          TextDecoder: globalThis.TextDecoder,
-          atob: globalThis.atob,
-          btoa: globalThis.btoa,
-          setTimeout: globalThis.setTimeout,
-          setInterval: globalThis.setInterval,
-          clearTimeout: globalThis.clearTimeout,
-          clearInterval: globalThis.clearInterval,
-          fetch: globalThis.fetch,
-          console: globalThis.console,
-        };
         const fn = new Function('self', 'postMessage', 'addEventListener', 'close', worker._code);
-        fn(workerSelf, workerSelf.postMessage, workerSelf.addEventListener, workerSelf.close);
-        if (workerSelf.onmessage) workerSelf.onmessage({ data });
+        fn(scope, scope.postMessage, scope.addEventListener, scope.close);
+        const evs = (scope._ev && scope._ev['message']) || [];
+        if (evs.length) { for (const h of evs) h({ data }); }
+        else if (scope.onmessage) scope.onmessage({ data });
       } catch(e) {
         console.error('Worker error:', e.message);
         if (worker.onerror) worker.onerror(e);
@@ -6126,6 +6241,20 @@ if (typeof DOMRect === 'undefined') {
     constructor(x=0,y=0,w=0,h=0) { this.x=x;this.y=y;this.width=w;this.height=h;this.top=y;this.right=x+w;this.bottom=y+h;this.left=x; }
     toJSON() { return {x:this.x,y:this.y,width:this.width,height:this.height,top:this.top,right:this.right,bottom:this.bottom,left:this.left}; }
     static fromRect(r={}) { return new DOMRect(r.x,r.y,r.width,r.height); }
+  };
+}
+
+if (typeof DOMRectList === 'undefined') {
+  globalThis.DOMRectList = class DOMRectList {
+    constructor(arr=[]) {
+      this.length = arr.length;
+      for (let i = 0; i < arr.length; i++) this[i] = arr[i];
+    }
+    item(i) { return this[i] || null; }
+    [Symbol.iterator]() {
+      let i = 0, self = this;
+      return { next() { const done = i >= self.length; return { value: done ? undefined : self[i++], done }; } };
+    }
   };
 }
 if (typeof DOMPoint === 'undefined') {
@@ -6391,8 +6520,42 @@ if (typeof Range === 'undefined') {
     setStart(n,o){this.startContainer=n;this.startOffset=o;} setEnd(n,o){this.endContainer=n;this.endOffset=o;}
     collapse(){} selectNode(){} selectNodeContents(){} cloneContents(){return document?.createDocumentFragment();}
     deleteContents(){} insertNode(){} getBoundingClientRect(){return new DOMRect();}
-    getClientRects(){return [];} cloneRange(){return new Range();} toString(){return '';}
+    getClientRects(){return new DOMRectList([]);} cloneRange(){return new Range();} toString(){return '';}
   };
+}
+
+if (typeof FontFace === 'undefined') {
+  globalThis.FontFace = class FontFace {
+    constructor(family, source, descriptors={}) {
+      this.family = family;
+      this.style = descriptors.style || 'normal';
+      this.weight = descriptors.weight || 'normal';
+      this.stretch = descriptors.stretch || 'normal';
+      this.unicodeRange = descriptors.unicodeRange || 'U+0-10FFFF';
+      this.variant = descriptors.variant || 'normal';
+      this.featureSettings = descriptors.featureSettings || 'normal';
+      this.status = 'unloaded';
+    }
+    load() { this.status = 'loaded'; return Promise.resolve(this); }
+  };
+  globalThis.FontFaceSet = class FontFaceSet extends EventTarget {
+    constructor() { super(); this.status = 'loaded'; this.ready = Promise.resolve(this); }
+    add() { return this; }
+    check() { return true; }
+    clear() {}
+    delete() { return false; }
+    load() { return Promise.resolve([]); }
+    forEach() {}
+    has() { return false; }
+    [Symbol.iterator]() { return [][Symbol.iterator](); }
+  };
+  Object.defineProperty(Document.prototype, 'fonts', {
+    get() {
+      if (!this._fonts) this._fonts = new FontFaceSet();
+      return this._fonts;
+    },
+    configurable: true
+  });
 }
 
 if (typeof SharedWorker === 'undefined') {
@@ -6478,7 +6641,7 @@ globalThis.__obscura_init = function() {
   globalThis.visualViewport = { width:sw, height:sh-80, offsetLeft:0, offsetTop:0, scale:1, addEventListener(){}, removeEventListener(){} };
   globalThis.devicePixelRatio = sw >= 2560 ? 2 : 1;
   globalThis.innerWidth = sw; globalThis.innerHeight = sh - 80;
-  globalThis.outerWidth = sw; globalThis.outerHeight = sh;
+  globalThis.outerWidth = sw; globalThis.outerHeight = sh - 40;
 
   var hwValues = globalThis.__obscura_stealth ? [4, 6, 8, 12, 16] : [2, 4, 6, 8, 12, 16];
   globalThis.navigator.hardwareConcurrency = hwValues[Math.floor(_fpRand(400) * hwValues.length)];
