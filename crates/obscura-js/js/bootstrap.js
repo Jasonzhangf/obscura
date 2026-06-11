@@ -5177,13 +5177,84 @@ class _IframeWindow {
   blur() {}
 }
 
+// Encode an RGBA pixel buffer into a valid PNG data URL.
+// Uses stored-block DEFLATE (no compression) wrapped in zlib.
+// This produces a larger file than a real browser but the hash is unique
+// per session (from _fpNoise) and valid, so it does not match the known
+// headless stub.
+function _encodePNG(w, h, rgba) {
+  // RGB scanlines: filter byte (0) + 3 bytes per pixel
+  var rowLen = 1 + w * 3;
+  var raw = new Uint8Array(h * rowLen);
+  for (var y = 0; y < h; y++) {
+    var base = y * rowLen;
+    raw[base] = 0;
+    for (var x = 0; x < w; x++) {
+      var s = (y * w + x) << 2, d = base + 1 + x * 3;
+      raw[d] = rgba[s]; raw[d+1] = rgba[s+1]; raw[d+2] = rgba[s+2];
+    }
+  }
+  // Adler32 of raw
+  var s1 = 1, s2 = 0, M = 65521;
+  for (var i = 0; i < raw.length; i++) { s1 = (s1 + raw[i]) % M; s2 = (s2 + s1) % M; }
+  var adler = ((s2 << 16) | s1) >>> 0;
+  // Stored DEFLATE blocks (zlib level 0)
+  var MAXB = 65535, nb = Math.ceil(raw.length / MAXB) || 1;
+  var dlen = 2 + nb * 5 + raw.length + 4;
+  var def = new Uint8Array(dlen), dp = 0;
+  def[dp++] = 0x78; def[dp++] = 0x01;
+  for (var bi = 0; bi < nb; bi++) {
+    var bs = bi * MAXB, be = Math.min(raw.length, bs + MAXB), bl = be - bs;
+    def[dp++] = bi === nb-1 ? 1 : 0;
+    def[dp++] = bl&0xff; def[dp++] = (bl>>8)&0xff;
+    def[dp++] = (~bl)&0xff; def[dp++] = (~bl>>8)&0xff;
+    def.set(raw.subarray(bs, be), dp); dp += bl;
+  }
+  def[dp++]=(adler>>24)&0xff; def[dp++]=(adler>>16)&0xff; def[dp++]=(adler>>8)&0xff; def[dp]=adler&0xff;
+  // CRC32 (lazy table)
+  if (!_encodePNG._t) {
+    var t = new Uint32Array(256);
+    for (var n = 0; n < 256; n++) { var c = n; for (var k=0;k<8;k++) c=c&1?0xEDB88320^(c>>>1):(c>>>1); t[n]=c; }
+    _encodePNG._t = t;
+  }
+  var T = _encodePNG._t;
+  function crc32(a, st, ln) { var c=0xFFFFFFFF; for(var i=st,e=st+ln;i<e;i++) c=T[(c^a[i])&0xff]^(c>>>8); return (c^0xFFFFFFFF)>>>0; }
+  function putChunk(out, off, type, data) {
+    var dl = data.length;
+    out[off]=(dl>>24)&0xff; out[off+1]=(dl>>16)&0xff; out[off+2]=(dl>>8)&0xff; out[off+3]=dl&0xff;
+    out[off+4]=type.charCodeAt(0); out[off+5]=type.charCodeAt(1); out[off+6]=type.charCodeAt(2); out[off+7]=type.charCodeAt(3);
+    out.set(data, off+8);
+    var cr = crc32(out, off+4, 4+dl);
+    out[off+8+dl]=(cr>>24)&0xff; out[off+9+dl]=(cr>>16)&0xff; out[off+10+dl]=(cr>>8)&0xff; out[off+11+dl]=cr&0xff;
+    return off+12+dl;
+  }
+  var ihd = new Uint8Array(13);
+  ihd[0]=(w>>24)&0xff; ihd[1]=(w>>16)&0xff; ihd[2]=(w>>8)&0xff; ihd[3]=w&0xff;
+  ihd[4]=(h>>24)&0xff; ihd[5]=(h>>16)&0xff; ihd[6]=(h>>8)&0xff; ihd[7]=h&0xff;
+  ihd[8]=8; ihd[9]=2; // 8-bit RGB
+  var png = new Uint8Array(8 + 25 + (12+dlen) + 12);
+  png.set([0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A]);
+  var p = 8;
+  p = putChunk(png, p, 'IHDR', ihd);
+  p = putChunk(png, p, 'IDAT', def);
+  putChunk(png, p, 'IEND', new Uint8Array(0));
+  // Base64 encode
+  var C = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  var b64 = 'data:image/png;base64,';
+  for (var i = 0; i < png.length; i += 3) {
+    var a=png[i], b=i+1<png.length?png[i+1]:0, c=i+2<png.length?png[i+2]:0;
+    b64 += C[a>>2] + C[((a&3)<<4)|(b>>4)] + (i+1<png.length?C[((b&15)<<2)|(c>>6)]:'=') + (i+2<png.length?C[c&63]:'=');
+  }
+  return b64;
+}
+
 globalThis.__ariaQuerySelector = function(root, selector) { return null; };
 globalThis.__ariaQuerySelectorAll = async function*(root, selector) { /* yields nothing */ };
 class _Canvas2D {
   constructor(canvas) {
     this.canvas = canvas;
-    this._w = canvas.width || 300;
-    this._h = canvas.height || 150;
+    this._w = parseInt(canvas.getAttribute('width')) || 300;
+    this._h = parseInt(canvas.getAttribute('height')) || 150;
     this._buf = new Uint8ClampedArray(this._w * this._h * 4);
     for (let i = 0; i < this._w * this._h; i++) {
       this._buf[i*4+0] = 255 + Math.floor(_fpNoise(i % this._w, Math.floor(i / this._w), 0));
@@ -5219,10 +5290,17 @@ class _Canvas2D {
     if (x < 0 || x >= this._w || y < 0 || y >= this._h) return;
     const idx = (y * this._w + x) * 4;
     const alpha = (a / 255) * this.globalAlpha;
-    this._buf[idx+0] = Math.round(r * alpha + this._buf[idx+0] * (1 - alpha));
-    this._buf[idx+1] = Math.round(g * alpha + this._buf[idx+1] * (1 - alpha));
-    this._buf[idx+2] = Math.round(b * alpha + this._buf[idx+2] * (1 - alpha));
-    this._buf[idx+3] = Math.min(255, Math.round(a * alpha + this._buf[idx+3] * (1 - alpha)));
+    if (this.globalCompositeOperation === 'multiply') {
+      this._buf[idx+0] = Math.round((r/255) * (this._buf[idx+0]/255) * 255);
+      this._buf[idx+1] = Math.round((g/255) * (this._buf[idx+1]/255) * 255);
+      this._buf[idx+2] = Math.round((b/255) * (this._buf[idx+2]/255) * 255);
+      this._buf[idx+3] = Math.min(255, this._buf[idx+3] + Math.round(a * alpha));
+    } else {
+      this._buf[idx+0] = Math.round(r * alpha + this._buf[idx+0] * (1 - alpha));
+      this._buf[idx+1] = Math.round(g * alpha + this._buf[idx+1] * (1 - alpha));
+      this._buf[idx+2] = Math.round(b * alpha + this._buf[idx+2] * (1 - alpha));
+      this._buf[idx+3] = Math.min(255, Math.round(a * alpha + this._buf[idx+3] * (1 - alpha)));
+    }
   }
   fillRect(x, y, w, h) {
     const [r,g,b,a] = this._parseColor(this.fillStyle);
@@ -5343,7 +5421,22 @@ class _Canvas2D {
   arc(x, y, r, s, e) { if (this._path) this._path.push({t:'A',x,y,r}); }
   arcTo() {}
   rect(x, y, w, h) { this.fillRect(x, y, w, h); }
-  fill() {}
+  fill() {
+    if (!this._path) return;
+    const [r,g,b,a] = this._parseColor(this.fillStyle);
+    for (const seg of this._path) {
+      if (seg.t === 'A') {
+        const cx = Math.round(seg.x), cy = Math.round(seg.y), rad = seg.r;
+        const r2 = rad * rad;
+        for (let py = Math.max(0, cy - rad); py <= Math.min(this._h - 1, cy + rad); py++) {
+          for (let px = Math.max(0, cx - rad); px <= Math.min(this._w - 1, cx + rad); px++) {
+            if ((px-cx)*(px-cx) + (py-cy)*(py-cy) <= r2) this._setPixel(px, py, r, g, b, a);
+          }
+        }
+      }
+    }
+    this._path = [];
+  }
   stroke() {}
   clip() {}
   save() { this._stateStack.push({fillStyle: this.fillStyle, strokeStyle: this.strokeStyle, globalAlpha: this.globalAlpha, font: this.font, lineWidth: this.lineWidth}); }
@@ -5414,18 +5507,7 @@ Element.prototype.getContext = function getContext(type) {
 Element.prototype.toDataURL = function(type) {
   if (this._ctx && this._ctx._buf) {
     const ctx = this._ctx;
-    const w = ctx._w, h = ctx._h, buf = ctx._buf;
-    let hash = _fpSeed;
-    for (let i = 0; i < buf.length; i += 37) {
-      hash = ((hash << 5) - hash + buf[i]) | 0;
-    }
-    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-    let b64 = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUg';
-    for (let i = 0; i < 60; i++) {
-      hash = ((hash << 5) - hash + i) | 0;
-      b64 += chars[(hash >>> 0) % 64];
-    }
-    return b64 + '==';
+    return _encodePNG(ctx._w, ctx._h, ctx._buf);
   }
   return _fp('canvasFingerprint');
 };
