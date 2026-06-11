@@ -2588,6 +2588,23 @@ _markNative(PluginArray.prototype.item);
 _markNative(PluginArray.prototype.namedItem);
 _markNative(PluginArray.prototype.refresh);
 
+class NetworkInformation {
+  get downlink() { return 10; }
+  get downlinkMax() { return Infinity; }
+  get effectiveType() { return '4g'; }
+  get rtt() { return 50; }
+  get saveData() { return false; }
+  get type() { return 'wifi'; }
+  get onchange() { return null; }
+  set onchange(v) {}
+  get ontypechange() { return null; }
+  set ontypechange(v) {}
+}
+_markNative(NetworkInformation);
+globalThis.NetworkInformation = NetworkInformation;
+
+globalThis.ContentIndex = class ContentIndex {};
+
 globalThis.navigator = {
   get userAgent() { return globalThis.__obscura_ua || "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"; },
   get appVersion() { return this.userAgent.replace('Mozilla/', ''); },
@@ -2597,7 +2614,7 @@ globalThis.navigator = {
   vendor: "Google Inc.", product: "Gecko", productSub: "20030107",
   doNotTrack: null,
   deviceMemory: 8,
-  connection: { effectiveType: "4g", type: "wifi", rtt: 50, downlink: 10, saveData: false, onchange: null, addEventListener(){}, removeEventListener(){}, dispatchEvent(){return true;} },
+  connection: new NetworkInformation(),
   pdfViewerEnabled: true,
   get plugins() {
     const p = new PluginArray([
