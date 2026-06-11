@@ -2383,9 +2383,51 @@ class DocumentType extends Node {
 }
 
 const _cache = new Map();
+
+// Media elements need canPlayType for codec detection fingerprinting.
+// Values match Chrome 145 on Linux x86_64 without proprietary codecs.
+class HTMLMediaElement extends Element {
+  canPlayType(type) {
+    if (!type || typeof type !== 'string') return '';
+    const mime = type.split(';')[0].trim().toLowerCase();
+    if (mime === 'video/mp4' || mime === 'video/webm' || mime === 'video/ogg') return 'probably';
+    if (mime === 'video/x-matroska') return 'maybe';
+    if (mime === 'audio/ogg' || mime === 'audio/webm' || mime === 'audio/wav' ||
+        mime === 'audio/mpeg') return 'probably';
+    if (mime === 'audio/mp4' || mime === 'audio/x-m4a' || mime === 'audio/aac') return 'maybe';
+    return '';
+  }
+  load() {}
+  play() { return Promise.resolve(); }
+  pause() {}
+  get paused() { return true; }
+  get ended() { return false; }
+  get readyState() { return 0; }
+  get currentTime() { return 0; }
+  set currentTime(v) {}
+  get duration() { return NaN; }
+  get volume() { return 1; }
+  set volume(v) {}
+  get muted() { return false; }
+  set muted(v) {}
+  get src() { return this.getAttribute('src') || ''; }
+  set src(v) { this.setAttribute('src', v); }
+}
+_markNative(HTMLMediaElement.prototype.canPlayType);
+_markNative(HTMLMediaElement.prototype.play);
+_markNative(HTMLMediaElement.prototype.load);
+_markNative(HTMLMediaElement.prototype.pause);
+class HTMLVideoElement extends HTMLMediaElement {}
+class HTMLAudioElement extends HTMLMediaElement {}
+globalThis.HTMLMediaElement = HTMLMediaElement;
+globalThis.HTMLVideoElement = HTMLVideoElement;
+globalThis.HTMLAudioElement = HTMLAudioElement;
+
 function _elementClassFor(nid) {
   const tag = _domParse("tag_name", nid);
   if (tag === "FORM" && globalThis.HTMLFormElement) return globalThis.HTMLFormElement;
+  if (tag === "AUDIO") return HTMLAudioElement;
+  if (tag === "VIDEO") return HTMLVideoElement;
   return Element;
 }
 function _wrap(nid) {
@@ -2501,6 +2543,11 @@ function _registerIframe(iframeEl) {
     enumerable: false,
   });
 }
+// Navigator constructor so that typeof Navigator !== 'undefined' and
+// navigatorPrototype checks don't throw a ReferenceError.
+function Navigator() {}
+_markNative(Navigator);
+
 // PluginArray must exist before navigator is built so the plugins getter can use it.
 function PluginArray(items) {
   for (var _pi = 0; _pi < items.length; _pi++) this[_pi] = items[_pi];
@@ -2640,10 +2687,11 @@ globalThis.navigator = {
 // Move navigator.webdriver off the instance and onto a thin prototype so that
 // Object.getOwnPropertyDescriptor(navigator, 'webdriver') returns undefined,
 // matching Chrome where the property lives on Navigator.prototype.
+// Use Navigator.prototype as the chain base so navigator instanceof Navigator === true.
 (function() {
   var _wdGetter = function() { return false; };
   _markNative(_wdGetter);
-  var _wdProto = Object.create(Object.getPrototypeOf(globalThis.navigator));
+  var _wdProto = Object.create(Navigator.prototype);
   Object.defineProperty(_wdProto, 'webdriver', {get: _wdGetter, set: undefined, enumerable: true, configurable: true});
   Object.setPrototypeOf(globalThis.navigator, _wdProto);
 })();
@@ -4574,8 +4622,7 @@ globalThis.HTMLLabelElement = Element;
 globalThis.HTMLTableElement = Element;
 globalThis.HTMLIFrameElement = Element;
 globalThis.HTMLCanvasElement = Element;
-globalThis.HTMLVideoElement = Element;
-globalThis.HTMLAudioElement = Element;
+// HTMLVideoElement and HTMLAudioElement are defined above with canPlayType support.
 globalThis.HTMLScriptElement = Element;
 globalThis.HTMLStyleElement = Element;
 globalThis.HTMLLinkElement = Element;
