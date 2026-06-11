@@ -14,6 +14,7 @@
     '__obscura_errors', '__obscura_init', '__obscura_hide_list',
     '__obscura_objects', '__obscura_oid', '__obscura_ua',
     '__obscura_platform', '__obscura_ua_platform', '__obscura_ua_platform_version',
+    '__obscura_stealth',
     '__documentReadyState__', '__currentUrl',
     // internal helpers (var-declared throughout the file)
     '__processDynScriptQueue', '_markNative', '_fpRand', '_fpNoise',
@@ -2579,7 +2580,7 @@ globalThis.navigator = {
   vendor: "Google Inc.", product: "Gecko", productSub: "20030107",
   doNotTrack: null,
   deviceMemory: 8,
-  connection: { effectiveType: "4g", rtt: 50, downlink: 10, saveData: false, onchange: null, addEventListener(){}, removeEventListener(){}, dispatchEvent(){return true;} },
+  connection: { effectiveType: "4g", type: "wifi", rtt: 50, downlink: 10, saveData: false, onchange: null, addEventListener(){}, removeEventListener(){}, dispatchEvent(){return true;} },
   pdfViewerEnabled: true,
   get plugins() {
     const p = new PluginArray([
@@ -2604,7 +2605,7 @@ globalThis.navigator = {
     brands: [
       {brand: "Google Chrome", version: "145"},
       {brand: "Chromium", version: "145"},
-      {brand: "Not=A?Brand", version: "24"},
+      {brand: "Not;A=Brand", version: "24"},
     ],
     mobile: false,
     get platform() { return globalThis.__obscura_ua_platform || "Windows"; },
@@ -2612,8 +2613,8 @@ globalThis.navigator = {
       return Promise.resolve({
         architecture: "x86",
         bitness: "64",
-        brands: [{brand:"Google Chrome",version:"145"},{brand:"Chromium",version:"145"},{brand:"Not=A?Brand",version:"24"}],
-        fullVersionList: [{brand:"Google Chrome",version:"145.0.0.0"},{brand:"Chromium",version:"145.0.0.0"},{brand:"Not=A?Brand",version:"24.0.0.0"}],
+        brands: [{brand:"Google Chrome",version:"145"},{brand:"Chromium",version:"145"},{brand:"Not;A=Brand",version:"24"}],
+        fullVersionList: [{brand:"Google Chrome",version:"145.0.0.0"},{brand:"Chromium",version:"145.0.0.0"},{brand:"Not;A=Brand",version:"24.0.0.0"}],
         mobile: false,
         model: "",
         platform: globalThis.__obscura_ua_platform || "Windows",
@@ -5902,6 +5903,32 @@ if (typeof navigator.credentials === 'undefined') {
   navigator.credentials = { get(){return Promise.resolve(null);}, create(){return Promise.resolve(null);}, store(){return Promise.resolve();}, preventSilentAccess(){return Promise.resolve();} };
 }
 
+navigator.mediaCapabilities = {
+  decodingInfo(cfg) {
+    return Promise.resolve({ supported: true, smooth: true, powerEfficient: true, keySystemAccess: null, configuration: cfg });
+  },
+  encodingInfo(cfg) {
+    return Promise.resolve({ supported: true, smooth: true, powerEfficient: true, configuration: cfg });
+  },
+};
+navigator.locks = {
+  request(name, opts, cb) {
+    if (typeof opts === 'function') { cb = opts; opts = {}; }
+    if (typeof cb === 'function') return Promise.resolve(cb({ name, mode: (opts && opts.mode) || 'exclusive' }));
+    return Promise.resolve(null);
+  },
+  query() { return Promise.resolve({ held: [], pending: [] }); },
+};
+navigator.keyboard = {
+  getLayoutMap() { return Promise.resolve(new Map()); },
+  lock() { return Promise.resolve(); },
+  unlock() {},
+};
+navigator.gpu = { requestAdapter() { return Promise.resolve(null); } };
+navigator.wakeLock = { request() { return Promise.reject(new DOMException('Not allowed', 'NotAllowedError')); } };
+navigator.share = function(data) { return Promise.reject(new DOMException('Not allowed', 'NotAllowedError')); };
+navigator.canShare = function() { return false; };
+
 globalThis.opener = null;
 
 globalThis.Worker = class Worker {
@@ -5990,16 +6017,16 @@ URL.revokeObjectURL = function(url) {
 globalThis.scrollTo = function(x, y) {};
 globalThis.scrollBy = function(x, y) {};
 globalThis.scroll = function(x, y) {};
-globalThis.focus = function() {};
-globalThis.blur = function() {};
-globalThis.print = function() {};
-globalThis.alert = function() {};
-globalThis.confirm = function() { return true; };
-globalThis.prompt = function() { return null; };
-globalThis.open = function() { return null; };
-globalThis.close = function() {};
-globalThis.stop = function() {};
-globalThis.postMessage = function() {};
+globalThis.focus = function() {}; _markNative(globalThis.focus);
+globalThis.blur = function() {}; _markNative(globalThis.blur);
+globalThis.print = function() {}; _markNative(globalThis.print);
+globalThis.alert = function() {}; _markNative(globalThis.alert);
+globalThis.confirm = function() { return true; }; _markNative(globalThis.confirm);
+globalThis.prompt = function() { return null; }; _markNative(globalThis.prompt);
+globalThis.open = function() { return null; }; _markNative(globalThis.open);
+globalThis.close = function() {}; _markNative(globalThis.close);
+globalThis.stop = function() {}; _markNative(globalThis.stop);
+globalThis.postMessage = function() {}; _markNative(globalThis.postMessage);
 globalThis.requestIdleCallback = globalThis.requestIdleCallback || function(cb) { return setTimeout(cb, 0); };
 globalThis.cancelIdleCallback = globalThis.cancelIdleCallback || function(id) { clearTimeout(id); };
 if (typeof ReadableStream === 'undefined') {
@@ -6453,20 +6480,45 @@ globalThis.__obscura_init = function() {
   globalThis.innerWidth = sw; globalThis.innerHeight = sh - 80;
   globalThis.outerWidth = sw; globalThis.outerHeight = sh;
 
-  var hwValues = [2, 4, 6, 8, 12, 16];
+  var hwValues = globalThis.__obscura_stealth ? [4, 6, 8, 12, 16] : [2, 4, 6, 8, 12, 16];
   globalThis.navigator.hardwareConcurrency = hwValues[Math.floor(_fpRand(400) * hwValues.length)];
-  var memValues = [0.25, 0.5, 1, 2, 4, 8];
+  var memValues = globalThis.__obscura_stealth ? [4, 8] : [0.25, 0.5, 1, 2, 4, 8];
   globalThis.navigator.deviceMemory = memValues[Math.floor(_fpRand(401) * memValues.length)];
 
   const t0 = Date.now() + Math.floor(_fpRand(641) * 100) - 50;
   globalThis.performance.timeOrigin = t0;
   globalThis.performance.timing = { navigationStart: t0, domContentLoadedEventEnd: t0, loadEventEnd: t0 };
+  var _totalHeap = 15000000 + Math.floor(_fpRand(620) * 85000000);
   globalThis.performance.memory = {
     jsHeapSizeLimit: 2172649472,
-    totalJSHeapSize: 15000000 + Math.floor(_fpRand(620) * 85000000),
-    usedJSHeapSize: 8000000 + Math.floor(_fpRand(621) * 42000000),
+    totalJSHeapSize: _totalHeap,
+    usedJSHeapSize: Math.floor(_totalHeap * (0.3 + _fpRand(621) * 0.5)),
   };
-  globalThis.Notification.permission = _fpRand(630) > 0.5 ? "granted" : "default";
+  globalThis.Notification.permission = "default";
+
+  if (globalThis.__obscura_stealth) {
+    var _stealthBrands = [
+      {brand: "Not:A-Brand", version: "99"},
+      {brand: "Google Chrome", version: "145"},
+      {brand: "Chromium", version: "145"},
+    ];
+    globalThis.navigator.userAgentData.brands = _stealthBrands;
+    globalThis.navigator.userAgentData.getHighEntropyValues = function(hints) {
+      return Promise.resolve({
+        architecture: "x86", bitness: "64",
+        brands: _stealthBrands,
+        fullVersionList: [
+          {brand:"Not:A-Brand",version:"99.0.0.0"},
+          {brand:"Google Chrome",version:"145.0.0.0"},
+          {brand:"Chromium",version:"145.0.0.0"},
+        ],
+        mobile: false, model: "",
+        platform: "Linux",
+        platformVersion: "6.1.0",
+        uaFullVersion: "145.0.0.0",
+      });
+    };
+  }
 
   // Hide internals (_*, obscura, Obscura). The set of keys is static at
   // snapshot-build time, so we precompute it ONCE below (after this

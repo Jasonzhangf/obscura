@@ -130,7 +130,7 @@ impl ObscuraJsRuntime {
         runtime
             .execute_script(
                 "<obscura:init>",
-                "globalThis.__obscura_objects = {}; globalThis.__obscura_oid = 0; globalThis.__obscura_init();".to_string(),
+                "globalThis.__obscura_objects = {}; globalThis.__obscura_oid = 0;".to_string(),
             )
             .expect("init should not fail");
 
@@ -217,6 +217,22 @@ impl ObscuraJsRuntime {
                 "globalThis.__obscura_platform='{}';globalThis.__obscura_ua_platform='{}';globalThis.__obscura_ua_platform_version='{}';",
                 p, uap, uapv
             ),
+        );
+    }
+
+    pub fn set_stealth(&mut self, enabled: bool) {
+        let _ = self.runtime.execute_script(
+            "<set-stealth>",
+            format!("globalThis.__obscura_stealth = {};", enabled),
+        );
+    }
+
+    /// Run __obscura_init() after all per-page properties (UA, platform, stealth, etc.)
+    /// have been set. Must be called once per page setup, after all set_* methods.
+    pub fn run_page_init(&mut self) {
+        let _ = self.runtime.execute_script(
+            "<obscura:page-init>",
+            "globalThis.__obscura_init();".to_string(),
         );
     }
 

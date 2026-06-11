@@ -275,6 +275,7 @@ impl Page {
 
         #[cfg(feature = "stealth")]
         if self.stealth_client.is_some() {
+            rt.set_stealth(true);
             rt.set_user_agent(obscura_net::STEALTH_USER_AGENT);
             // Match platform to the Linux UA so navigator.platform and
             // userAgentData.platform are consistent with navigator.userAgent.
@@ -314,6 +315,8 @@ impl Page {
         if let Some(dom) = self.dom.take() {
             rt.set_dom(dom);
         }
+
+        rt.run_page_init();
 
         self.js = Some(rt);
     }
