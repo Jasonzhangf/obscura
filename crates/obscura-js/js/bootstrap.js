@@ -1,5 +1,47 @@
 "use strict";
 
+// Pre-declare all internal globals as non-enumerable so they are invisible
+// to Object.keys(window) / for-in enumeration. Must run before any var
+// declarations or property assignments below: once a property is defined
+// with enumerable:false here, subsequent `var x = value` assignments will
+// find the property already exists and only update the value, leaving the
+// descriptor intact. Direct globalThis.x = value assignments also only
+// update the value without touching enumerable when the property is
+// writable:true and configurable:true.
+(function _preHideInternals() {
+  var _names = [
+    // runtime-set by Rust (runtime.rs / page.rs)
+    '__obscura_errors', '__obscura_init', '__obscura_hide_list',
+    '__obscura_objects', '__obscura_oid', '__obscura_ua',
+    '__obscura_platform', '__obscura_ua_platform', '__obscura_ua_platform_version',
+    '__obscura_stealth',
+    '__documentReadyState__', '__currentUrl',
+    // internal helpers (var-declared throughout the file)
+    '__processDynScriptQueue', '_markNative', '_fpRand', '_fpNoise',
+    '_fpCache', '_getFp', '_fp', '_splitAsciiWhitespace',
+    '_getElementsByClassName', '_docEncoding', '_docIsUtf8',
+    '_isSpecialScheme', '_applyDocQueryEncoding', '_anchorBase',
+    '_elemHrefURL', '_setElemHrefPart', '_pad', '_daysInMonth',
+    '_isoWeek1Monday', '_inputParseNumber', '_inputFormatNumber',
+    '_htmlAttrName', '_convertNodes', '_elementClassFor', '_wrap', '_wrapEl',
+    '_resolveUrl', '_registerIframe', '_base64ToUint8Array',
+    '_bodyToUint8Array', '_arrayBufferFromBytes',
+    '_installWasmStreamingFallback', '_urlParseOp', '_urlSetOp',
+    '_urlResolveOp', '_decodeBodyWithCharset', '_utf8DecodeBytes',
+    '_selectionFor', '_isConstructorCE', '_isValidCustomElementName',
+    '_blobPartToBytes', '_bytesToBinaryString', '_formEncode', '_hexv',
+    '_commonFonts', '_isXMLDocument', '_isValidPITarget', '_isHTMLEl',
+    '_nodeList', '_rngNodeLength', '_rngNodeIndex', '_rngSame', '_rngRoot',
+    '_rngAncestors', '_rngOrder', '_rngCmp', '_rngCheckOffset',
+    '_idbRequest', '_idbObjectStore', '_idbTransaction', '_idbDatabase',
+    '_makeListenerBox',
+  ];
+  var _desc = { value: undefined, writable: true, enumerable: false, configurable: true };
+  for (var _i = 0; _i < _names.length; _i++) {
+    try { Object.defineProperty(globalThis, _names[_i], _desc); } catch (_e) {}
+  }
+})();
+
 globalThis.__obscura_errors = [];
 
 globalThis.addEventListener = globalThis.addEventListener || function(){};
@@ -2348,9 +2390,51 @@ class DocumentType extends Node {
 }
 
 const _cache = new Map();
+
+// Media elements need canPlayType for codec detection fingerprinting.
+// Values match Chrome 145 on Linux x86_64 without proprietary codecs.
+class HTMLMediaElement extends Element {
+  canPlayType(type) {
+    if (!type || typeof type !== 'string') return '';
+    const mime = type.split(';')[0].trim().toLowerCase();
+    if (mime === 'video/mp4' || mime === 'video/webm' || mime === 'video/ogg') return 'probably';
+    if (mime === 'video/x-matroska') return 'maybe';
+    if (mime === 'audio/ogg' || mime === 'audio/webm' || mime === 'audio/wav' ||
+        mime === 'audio/mpeg') return 'probably';
+    if (mime === 'audio/mp4' || mime === 'audio/x-m4a' || mime === 'audio/aac') return 'maybe';
+    return '';
+  }
+  load() {}
+  play() { return Promise.resolve(); }
+  pause() {}
+  get paused() { return true; }
+  get ended() { return false; }
+  get readyState() { return 0; }
+  get currentTime() { return 0; }
+  set currentTime(v) {}
+  get duration() { return NaN; }
+  get volume() { return 1; }
+  set volume(v) {}
+  get muted() { return false; }
+  set muted(v) {}
+  get src() { return this.getAttribute('src') || ''; }
+  set src(v) { this.setAttribute('src', v); }
+}
+_markNative(HTMLMediaElement.prototype.canPlayType);
+_markNative(HTMLMediaElement.prototype.play);
+_markNative(HTMLMediaElement.prototype.load);
+_markNative(HTMLMediaElement.prototype.pause);
+class HTMLVideoElement extends HTMLMediaElement {}
+class HTMLAudioElement extends HTMLMediaElement {}
+globalThis.HTMLMediaElement = HTMLMediaElement;
+globalThis.HTMLVideoElement = HTMLVideoElement;
+globalThis.HTMLAudioElement = HTMLAudioElement;
+
 function _elementClassFor(nid) {
   const tag = _domParse("tag_name", nid);
   if (tag === "FORM" && globalThis.HTMLFormElement) return globalThis.HTMLFormElement;
+  if (tag === "AUDIO") return HTMLAudioElement;
+  if (tag === "VIDEO") return HTMLVideoElement;
   return Element;
 }
 function _wrap(nid) {
@@ -2466,6 +2550,33 @@ function _registerIframe(iframeEl) {
     enumerable: false,
   });
 }
+// Navigator constructor so that typeof Navigator !== 'undefined' and
+// navigatorPrototype checks don't throw a ReferenceError.
+function Navigator() {}
+_markNative(Navigator);
+
+// PluginArray must exist before navigator is built so the plugins getter can use it.
+function PluginArray(items) {
+  for (var _pi = 0; _pi < items.length; _pi++) this[_pi] = items[_pi];
+  this.length = items.length;
+}
+PluginArray.prototype = Object.create(Array.prototype);
+PluginArray.prototype.constructor = PluginArray;
+PluginArray.prototype.item = function(i) { return this[i] || null; };
+PluginArray.prototype.namedItem = function(name) {
+  for (var _pi = 0; _pi < this.length; _pi++) {
+    if (this[_pi].name === name) return this[_pi];
+  }
+  return null;
+};
+PluginArray.prototype.refresh = function() {};
+PluginArray.prototype[Symbol.iterator] = Array.prototype[Symbol.iterator];
+Object.defineProperty(PluginArray.prototype, Symbol.toStringTag, {value: 'PluginArray', configurable: true});
+_markNative(PluginArray);
+_markNative(PluginArray.prototype.item);
+_markNative(PluginArray.prototype.namedItem);
+_markNative(PluginArray.prototype.refresh);
+
 globalThis.navigator = {
   get userAgent() { return globalThis.__obscura_ua || "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"; },
   get appVersion() { return this.userAgent.replace('Mozilla/', ''); },
@@ -2475,21 +2586,16 @@ globalThis.navigator = {
   vendor: "Google Inc.", product: "Gecko", productSub: "20030107",
   doNotTrack: null,
   deviceMemory: 8,
-  connection: { effectiveType: "4g", rtt: 50, downlink: 10, saveData: false, onchange: null, addEventListener(){}, removeEventListener(){}, dispatchEvent(){return true;} },
-  get webdriver() { return false; },
+  connection: { effectiveType: "4g", type: "wifi", rtt: 50, downlink: 10, saveData: false, onchange: null, addEventListener(){}, removeEventListener(){}, dispatchEvent(){return true;} },
   pdfViewerEnabled: true,
   get plugins() {
-    const p = [
-      { name: "PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format", length: 1 },
-      { name: "Chrome PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format", length: 1 },
-      { name: "Chromium PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format", length: 1 },
-      { name: "Microsoft Edge PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format", length: 1 },
-      { name: "WebKit built-in PDF", filename: "internal-pdf-viewer", description: "Portable Document Format", length: 1 },
-    ];
-    p.item = (i) => p[i] || null;
-    p.namedItem = (name) => p.find(x => x.name === name) || null;
-    p.refresh = () => {};
-    p[Symbol.iterator] = Array.prototype[Symbol.iterator].bind(p);
+    const p = new PluginArray([
+      { name: "PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format", length: 1, [Symbol.toStringTag]: "Plugin" },
+      { name: "Chrome PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format", length: 1, [Symbol.toStringTag]: "Plugin" },
+      { name: "Chromium PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format", length: 1, [Symbol.toStringTag]: "Plugin" },
+      { name: "Microsoft Edge PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format", length: 1, [Symbol.toStringTag]: "Plugin" },
+      { name: "WebKit built-in PDF", filename: "internal-pdf-viewer", description: "Portable Document Format", length: 1, [Symbol.toStringTag]: "Plugin" },
+    ]);
     return p;
   },
   get mimeTypes() {
@@ -2505,7 +2611,7 @@ globalThis.navigator = {
     brands: [
       {brand: "Google Chrome", version: "145"},
       {brand: "Chromium", version: "145"},
-      {brand: "Not=A?Brand", version: "24"},
+      {brand: "Not;A=Brand", version: "24"},
     ],
     mobile: false,
     get platform() { return globalThis.__obscura_ua_platform || "Windows"; },
@@ -2513,8 +2619,8 @@ globalThis.navigator = {
       return Promise.resolve({
         architecture: "x86",
         bitness: "64",
-        brands: [{brand:"Google Chrome",version:"145"},{brand:"Chromium",version:"145"},{brand:"Not=A?Brand",version:"24"}],
-        fullVersionList: [{brand:"Google Chrome",version:"145.0.0.0"},{brand:"Chromium",version:"145.0.0.0"},{brand:"Not=A?Brand",version:"24.0.0.0"}],
+        brands: [{brand:"Google Chrome",version:"145"},{brand:"Chromium",version:"145"},{brand:"Not;A=Brand",version:"24"}],
+        fullVersionList: [{brand:"Google Chrome",version:"145.0.0.0"},{brand:"Chromium",version:"145.0.0.0"},{brand:"Not;A=Brand",version:"24.0.0.0"}],
         mobile: false,
         model: "",
         platform: globalThis.__obscura_ua_platform || "Windows",
@@ -2585,9 +2691,21 @@ globalThis.navigator = {
   },
 };
 
+// Move navigator.webdriver off the instance and onto a thin prototype so that
+// Object.getOwnPropertyDescriptor(navigator, 'webdriver') returns undefined,
+// matching Chrome where the property lives on Navigator.prototype.
+// Use Navigator.prototype as the chain base so navigator instanceof Navigator === true.
+(function() {
+  var _wdGetter = function() { return false; };
+  _markNative(_wdGetter);
+  var _wdProto = Object.create(Navigator.prototype);
+  Object.defineProperty(_wdProto, 'webdriver', {get: _wdGetter, set: undefined, enumerable: true, configurable: true});
+  Object.setPrototypeOf(globalThis.navigator, _wdProto);
+})();
+
 globalThis.chrome = {
   app: { isInstalled: false, InstallState: { DISABLED: "disabled", INSTALLED: "installed", NOT_INSTALLED: "not_installed" }, RunningState: { CANNOT_RUN: "cannot_run", READY_TO_RUN: "ready_to_run", RUNNING: "running" } },
-  runtime: { OnInstalledReason: {}, OnRestartRequiredReason: {}, PlatformArch: {}, PlatformNaclArch: {}, PlatformOs: {}, RequestUpdateCheckStatus: {}, connect() { return {}; }, sendMessage() {} },
+  runtime: { OnInstalledReason: {}, OnRestartRequiredReason: {}, PlatformArch: {}, PlatformNaclArch: {}, PlatformOs: {}, RequestUpdateCheckStatus: {}, connect() { throw new Error("Could not establish connection. Receiving end does not exist."); }, sendMessage() { throw new Error("Could not establish connection. Receiving end does not exist."); } },
   csi() {
     const t = Date.now();
     return { onloadT: t, startE: t - Math.floor(100 + _fpRand(610) * 200), pageT: 0, tran: 5, flashVersion: "" };
@@ -2622,7 +2740,23 @@ globalThis.Notification = class Notification {
 globalThis.WebGLRenderingContext = class WebGLRenderingContext {};
 globalThis.WebGL2RenderingContext = class WebGL2RenderingContext {};
 
-globalThis.screen = { width:1920, height:1080, availWidth:1920, availHeight:1040, colorDepth:24, pixelDepth:24, availTop:0, availLeft:0, orientation:{type:"landscape-primary",angle:0,addEventListener(){},removeEventListener(){},dispatchEvent(){return true;}} };
+class Screen {
+  constructor(w, h) {
+    this._w = w; this._h = h;
+    this.colorDepth = 24; this.pixelDepth = 24; this.availTop = 0; this.availLeft = 0;
+    this.orientation = {type:'landscape-primary',angle:0,addEventListener(){},removeEventListener(){},dispatchEvent(){return true;}};
+  }
+  get width() { return this._w; }
+  get height() { return this._h; }
+  get availWidth() { return this._w; }
+  get availHeight() { return this._h - 40; }
+}
+['width','height','availWidth','availHeight'].forEach(function(k) {
+  var d = Object.getOwnPropertyDescriptor(Screen.prototype, k);
+  if (d && d.get) _markNative(d.get);
+});
+globalThis.Screen = Screen;
+globalThis.screen = new Screen(1920, 1080);
 globalThis.visualViewport = { width:1920, height:1000, offsetLeft:0, offsetTop:0, scale:1, addEventListener(){}, removeEventListener(){} };
 globalThis.devicePixelRatio = 1;
 globalThis.innerWidth = 1920; globalThis.innerHeight = 1000;
@@ -4289,7 +4423,14 @@ globalThis.XMLSerializer = class XMLSerializer {
   }
 };
 globalThis.performance = globalThis.performance || {
-  now: () => Date.now(),
+  now: (function() {
+    var _lastMs = -1, _sub = 0;
+    return function() {
+      var ms = Date.now() - (globalThis.performance.timeOrigin || 0);
+      if (ms !== _lastMs) { _lastMs = ms; _sub = 0; } else { _sub += 0.1; }
+      return ms + _sub;
+    };
+  })(),
   mark(){}, measure(){},
   clearMarks(){}, clearMeasures(){}, clearResourceTimings(){},
   getEntries(){return [];}, getEntriesByName(){return [];}, getEntriesByType(){return [];},
@@ -4511,8 +4652,7 @@ globalThis.HTMLLabelElement = Element;
 globalThis.HTMLTableElement = Element;
 globalThis.HTMLIFrameElement = Element;
 globalThis.HTMLCanvasElement = Element;
-globalThis.HTMLVideoElement = Element;
-globalThis.HTMLAudioElement = Element;
+// HTMLVideoElement and HTMLAudioElement are defined above with canPlayType support.
 globalThis.HTMLScriptElement = Element;
 globalThis.HTMLStyleElement = Element;
 globalThis.HTMLLinkElement = Element;
@@ -5067,13 +5207,84 @@ class _IframeWindow {
   blur() {}
 }
 
+// Encode an RGBA pixel buffer into a valid PNG data URL.
+// Uses stored-block DEFLATE (no compression) wrapped in zlib.
+// This produces a larger file than a real browser but the hash is unique
+// per session (from _fpNoise) and valid, so it does not match the known
+// headless stub.
+function _encodePNG(w, h, rgba) {
+  // RGB scanlines: filter byte (0) + 3 bytes per pixel
+  var rowLen = 1 + w * 3;
+  var raw = new Uint8Array(h * rowLen);
+  for (var y = 0; y < h; y++) {
+    var base = y * rowLen;
+    raw[base] = 0;
+    for (var x = 0; x < w; x++) {
+      var s = (y * w + x) << 2, d = base + 1 + x * 3;
+      raw[d] = rgba[s]; raw[d+1] = rgba[s+1]; raw[d+2] = rgba[s+2];
+    }
+  }
+  // Adler32 of raw
+  var s1 = 1, s2 = 0, M = 65521;
+  for (var i = 0; i < raw.length; i++) { s1 = (s1 + raw[i]) % M; s2 = (s2 + s1) % M; }
+  var adler = ((s2 << 16) | s1) >>> 0;
+  // Stored DEFLATE blocks (zlib level 0)
+  var MAXB = 65535, nb = Math.ceil(raw.length / MAXB) || 1;
+  var dlen = 2 + nb * 5 + raw.length + 4;
+  var def = new Uint8Array(dlen), dp = 0;
+  def[dp++] = 0x78; def[dp++] = 0x01;
+  for (var bi = 0; bi < nb; bi++) {
+    var bs = bi * MAXB, be = Math.min(raw.length, bs + MAXB), bl = be - bs;
+    def[dp++] = bi === nb-1 ? 1 : 0;
+    def[dp++] = bl&0xff; def[dp++] = (bl>>8)&0xff;
+    def[dp++] = (~bl)&0xff; def[dp++] = (~bl>>8)&0xff;
+    def.set(raw.subarray(bs, be), dp); dp += bl;
+  }
+  def[dp++]=(adler>>24)&0xff; def[dp++]=(adler>>16)&0xff; def[dp++]=(adler>>8)&0xff; def[dp]=adler&0xff;
+  // CRC32 (lazy table)
+  if (!_encodePNG._t) {
+    var t = new Uint32Array(256);
+    for (var n = 0; n < 256; n++) { var c = n; for (var k=0;k<8;k++) c=c&1?0xEDB88320^(c>>>1):(c>>>1); t[n]=c; }
+    _encodePNG._t = t;
+  }
+  var T = _encodePNG._t;
+  function crc32(a, st, ln) { var c=0xFFFFFFFF; for(var i=st,e=st+ln;i<e;i++) c=T[(c^a[i])&0xff]^(c>>>8); return (c^0xFFFFFFFF)>>>0; }
+  function putChunk(out, off, type, data) {
+    var dl = data.length;
+    out[off]=(dl>>24)&0xff; out[off+1]=(dl>>16)&0xff; out[off+2]=(dl>>8)&0xff; out[off+3]=dl&0xff;
+    out[off+4]=type.charCodeAt(0); out[off+5]=type.charCodeAt(1); out[off+6]=type.charCodeAt(2); out[off+7]=type.charCodeAt(3);
+    out.set(data, off+8);
+    var cr = crc32(out, off+4, 4+dl);
+    out[off+8+dl]=(cr>>24)&0xff; out[off+9+dl]=(cr>>16)&0xff; out[off+10+dl]=(cr>>8)&0xff; out[off+11+dl]=cr&0xff;
+    return off+12+dl;
+  }
+  var ihd = new Uint8Array(13);
+  ihd[0]=(w>>24)&0xff; ihd[1]=(w>>16)&0xff; ihd[2]=(w>>8)&0xff; ihd[3]=w&0xff;
+  ihd[4]=(h>>24)&0xff; ihd[5]=(h>>16)&0xff; ihd[6]=(h>>8)&0xff; ihd[7]=h&0xff;
+  ihd[8]=8; ihd[9]=2; // 8-bit RGB
+  var png = new Uint8Array(8 + 25 + (12+dlen) + 12);
+  png.set([0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A]);
+  var p = 8;
+  p = putChunk(png, p, 'IHDR', ihd);
+  p = putChunk(png, p, 'IDAT', def);
+  putChunk(png, p, 'IEND', new Uint8Array(0));
+  // Base64 encode
+  var C = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  var b64 = 'data:image/png;base64,';
+  for (var i = 0; i < png.length; i += 3) {
+    var a=png[i], b=i+1<png.length?png[i+1]:0, c=i+2<png.length?png[i+2]:0;
+    b64 += C[a>>2] + C[((a&3)<<4)|(b>>4)] + (i+1<png.length?C[((b&15)<<2)|(c>>6)]:'=') + (i+2<png.length?C[c&63]:'=');
+  }
+  return b64;
+}
+
 globalThis.__ariaQuerySelector = function(root, selector) { return null; };
 globalThis.__ariaQuerySelectorAll = async function*(root, selector) { /* yields nothing */ };
 class _Canvas2D {
   constructor(canvas) {
     this.canvas = canvas;
-    this._w = canvas.width || 300;
-    this._h = canvas.height || 150;
+    this._w = parseInt(canvas.getAttribute('width')) || 300;
+    this._h = parseInt(canvas.getAttribute('height')) || 150;
     this._buf = new Uint8ClampedArray(this._w * this._h * 4);
     for (let i = 0; i < this._w * this._h; i++) {
       this._buf[i*4+0] = 255 + Math.floor(_fpNoise(i % this._w, Math.floor(i / this._w), 0));
@@ -5109,10 +5320,17 @@ class _Canvas2D {
     if (x < 0 || x >= this._w || y < 0 || y >= this._h) return;
     const idx = (y * this._w + x) * 4;
     const alpha = (a / 255) * this.globalAlpha;
-    this._buf[idx+0] = Math.round(r * alpha + this._buf[idx+0] * (1 - alpha));
-    this._buf[idx+1] = Math.round(g * alpha + this._buf[idx+1] * (1 - alpha));
-    this._buf[idx+2] = Math.round(b * alpha + this._buf[idx+2] * (1 - alpha));
-    this._buf[idx+3] = Math.min(255, Math.round(a * alpha + this._buf[idx+3] * (1 - alpha)));
+    if (this.globalCompositeOperation === 'multiply') {
+      this._buf[idx+0] = Math.round((r/255) * (this._buf[idx+0]/255) * 255);
+      this._buf[idx+1] = Math.round((g/255) * (this._buf[idx+1]/255) * 255);
+      this._buf[idx+2] = Math.round((b/255) * (this._buf[idx+2]/255) * 255);
+      this._buf[idx+3] = Math.min(255, this._buf[idx+3] + Math.round(a * alpha));
+    } else {
+      this._buf[idx+0] = Math.round(r * alpha + this._buf[idx+0] * (1 - alpha));
+      this._buf[idx+1] = Math.round(g * alpha + this._buf[idx+1] * (1 - alpha));
+      this._buf[idx+2] = Math.round(b * alpha + this._buf[idx+2] * (1 - alpha));
+      this._buf[idx+3] = Math.min(255, Math.round(a * alpha + this._buf[idx+3] * (1 - alpha)));
+    }
   }
   fillRect(x, y, w, h) {
     const [r,g,b,a] = this._parseColor(this.fillStyle);
@@ -5233,7 +5451,22 @@ class _Canvas2D {
   arc(x, y, r, s, e) { if (this._path) this._path.push({t:'A',x,y,r}); }
   arcTo() {}
   rect(x, y, w, h) { this.fillRect(x, y, w, h); }
-  fill() {}
+  fill() {
+    if (!this._path) return;
+    const [r,g,b,a] = this._parseColor(this.fillStyle);
+    for (const seg of this._path) {
+      if (seg.t === 'A') {
+        const cx = Math.round(seg.x), cy = Math.round(seg.y), rad = seg.r;
+        const r2 = rad * rad;
+        for (let py = Math.max(0, cy - rad); py <= Math.min(this._h - 1, cy + rad); py++) {
+          for (let px = Math.max(0, cx - rad); px <= Math.min(this._w - 1, cx + rad); px++) {
+            if ((px-cx)*(px-cx) + (py-cy)*(py-cy) <= r2) this._setPixel(px, py, r, g, b, a);
+          }
+        }
+      }
+    }
+    this._path = [];
+  }
   stroke() {}
   clip() {}
   save() { this._stateStack.push({fillStyle: this.fillStyle, strokeStyle: this.strokeStyle, globalAlpha: this.globalAlpha, font: this.font, lineWidth: this.lineWidth}); }
@@ -5304,18 +5537,7 @@ Element.prototype.getContext = function getContext(type) {
 Element.prototype.toDataURL = function(type) {
   if (this._ctx && this._ctx._buf) {
     const ctx = this._ctx;
-    const w = ctx._w, h = ctx._h, buf = ctx._buf;
-    let hash = _fpSeed;
-    for (let i = 0; i < buf.length; i += 37) {
-      hash = ((hash << 5) - hash + buf[i]) | 0;
-    }
-    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-    let b64 = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUg';
-    for (let i = 0; i < 60; i++) {
-      hash = ((hash << 5) - hash + i) | 0;
-      b64 += chars[(hash >>> 0) % 64];
-    }
-    return b64 + '==';
+    return _encodePNG(ctx._w, ctx._h, ctx._buf);
   }
   return _fp('canvasFingerprint');
 };
@@ -5470,7 +5692,11 @@ globalThis.AudioContext = class AudioContext {
   createGain() { return {gain:{value:1,setValueAtTime(){}},connect(){},disconnect(){}}; }
   createBiquadFilter() { return {type:'lowpass',frequency:{value:350},Q:{value:1},connect(){},disconnect(){}}; }
   createBufferSource() { return {buffer:null,connect(){},start(){},stop(){},disconnect(){},loop:false}; }
-  createBuffer(ch,len,rate) { return {length:len,sampleRate:rate,numberOfChannels:ch,getChannelData(c){return new Float32Array(len);},duration:len/rate}; }
+  createBuffer(ch,len,rate) {
+    var chs = [];
+    for (var _c=0; _c<(ch||1); _c++) chs.push(new Float32Array(len||0));
+    return {length:len,sampleRate:rate,numberOfChannels:ch,getChannelData:function(c){return chs[c]||chs[0];},duration:len/rate};
+  }
   createScriptProcessor() { return {connect(){},disconnect(){},onaudioprocess:null}; }
   decodeAudioData(buf) { return Promise.resolve(this.createBuffer(2,44100,44100)); }
   resume() { this.state='running'; return Promise.resolve(); }
@@ -5478,8 +5704,33 @@ globalThis.AudioContext = class AudioContext {
   close() { this.state='closed'; return Promise.resolve(); }
 };
 globalThis.OfflineAudioContext = class OfflineAudioContext extends AudioContext {
-  constructor(ch,len,rate) { super(); this.length=len||44100; }
-  startRendering() { return Promise.resolve(this.createBuffer(2,this.length,44100)); }
+  constructor(ch,len,rate) { super(); this.length=len||44100; this.oncomplete=null; }
+  startRendering() {
+    var self = this;
+    var buf = this.createBuffer(1, self.length, 44100);
+    var data = buf.getChannelData(0);
+    // Simulate compressed triangle wave at 10kHz.
+    // Target: sum(|data[4500..5000]|) matches Chrome Linux (~124.04347527516074).
+    var target = 124.04347527516074 + (_fpRand(9991) - 0.5) * 0.002;
+    var freq = 10000, sr = 44100;
+    for (var i = 0; i < self.length; i++) {
+      var phase = ((i * freq / sr) % 1 + 1) % 1;
+      data[i] = phase < 0.5 ? 4*phase - 1 : 3 - 4*phase;
+    }
+    var s = 0;
+    for (var i = 4500; i < 5000; i++) s += Math.abs(data[i]);
+    var scale = s > 0 ? target / s : 0;
+    for (var i = 0; i < self.length; i++) data[i] *= scale;
+    // Fire oncomplete on next microtask so callers can set ctx.oncomplete
+    // synchronously after calling startRendering() (fpCollect pattern).
+    var p = Promise.resolve().then(function() {
+      if (typeof self.oncomplete === 'function') {
+        try { self.oncomplete({renderedBuffer: buf, target: self, type: 'complete'}); } catch(e) {}
+      }
+      return buf;
+    });
+    return p;
+  }
 };
 globalThis.webkitAudioContext = globalThis.AudioContext;
 
@@ -5658,6 +5909,32 @@ if (typeof navigator.credentials === 'undefined') {
   navigator.credentials = { get(){return Promise.resolve(null);}, create(){return Promise.resolve(null);}, store(){return Promise.resolve();}, preventSilentAccess(){return Promise.resolve();} };
 }
 
+navigator.mediaCapabilities = {
+  decodingInfo(cfg) {
+    return Promise.resolve({ supported: true, smooth: true, powerEfficient: true, keySystemAccess: null, configuration: cfg });
+  },
+  encodingInfo(cfg) {
+    return Promise.resolve({ supported: true, smooth: true, powerEfficient: true, configuration: cfg });
+  },
+};
+navigator.locks = {
+  request(name, opts, cb) {
+    if (typeof opts === 'function') { cb = opts; opts = {}; }
+    if (typeof cb === 'function') return Promise.resolve(cb({ name, mode: (opts && opts.mode) || 'exclusive' }));
+    return Promise.resolve(null);
+  },
+  query() { return Promise.resolve({ held: [], pending: [] }); },
+};
+navigator.keyboard = {
+  getLayoutMap() { return Promise.resolve(new Map()); },
+  lock() { return Promise.resolve(); },
+  unlock() {},
+};
+navigator.gpu = { requestAdapter() { return Promise.resolve(null); } };
+navigator.wakeLock = { request() { return Promise.reject(new DOMException('Not allowed', 'NotAllowedError')); } };
+navigator.share = function(data) { return Promise.reject(new DOMException('Not allowed', 'NotAllowedError')); };
+navigator.canShare = function() { return false; };
+
 globalThis.opener = null;
 
 globalThis.Worker = class Worker {
@@ -5746,16 +6023,16 @@ URL.revokeObjectURL = function(url) {
 globalThis.scrollTo = function(x, y) {};
 globalThis.scrollBy = function(x, y) {};
 globalThis.scroll = function(x, y) {};
-globalThis.focus = function() {};
-globalThis.blur = function() {};
-globalThis.print = function() {};
-globalThis.alert = function() {};
-globalThis.confirm = function() { return true; };
-globalThis.prompt = function() { return null; };
-globalThis.open = function() { return null; };
-globalThis.close = function() {};
-globalThis.stop = function() {};
-globalThis.postMessage = function() {};
+globalThis.focus = function() {}; _markNative(globalThis.focus);
+globalThis.blur = function() {}; _markNative(globalThis.blur);
+globalThis.print = function() {}; _markNative(globalThis.print);
+globalThis.alert = function() {}; _markNative(globalThis.alert);
+globalThis.confirm = function() { return true; }; _markNative(globalThis.confirm);
+globalThis.prompt = function() { return null; }; _markNative(globalThis.prompt);
+globalThis.open = function() { return null; }; _markNative(globalThis.open);
+globalThis.close = function() {}; _markNative(globalThis.close);
+globalThis.stop = function() {}; _markNative(globalThis.stop);
+globalThis.postMessage = function() {}; _markNative(globalThis.postMessage);
 globalThis.requestIdleCallback = globalThis.requestIdleCallback || function(cb) { return setTimeout(cb, 0); };
 globalThis.cancelIdleCallback = globalThis.cancelIdleCallback || function(id) { clearTimeout(id); };
 if (typeof ReadableStream === 'undefined') {
@@ -6004,6 +6281,13 @@ if (typeof EventSource === 'undefined') {
 if (typeof WebSocket === 'undefined') {
   globalThis.WebSocket = class WebSocket {
     constructor(url, protocols) {
+      // Validate URL scheme per spec — Chrome throws SyntaxError for non-ws/wss URLs
+      if (typeof url !== 'string' || !/^wss?:\/\//i.test(url)) {
+        throw new DOMException(
+          "Failed to construct 'WebSocket': The URL '" + url + "' is invalid.",
+          'SyntaxError'
+        );
+      }
       this.url = url;
       this.readyState = 0; // CONNECTING
       this.bufferedAmount = 0;
@@ -6196,26 +6480,51 @@ globalThis.__obscura_init = function() {
 
   const scr = _fp('screen');
   const sw = scr[0], sh = scr[1];
-  globalThis.screen = { width:sw, height:sh, availWidth:sw, availHeight:sh-40, colorDepth:24, pixelDepth:24, availTop:0, availLeft:0, orientation:{type:"landscape-primary",angle:0,addEventListener(){},removeEventListener(){},dispatchEvent(){return true;}} };
+  globalThis.screen = new Screen(sw, sh);
   globalThis.visualViewport = { width:sw, height:sh-80, offsetLeft:0, offsetTop:0, scale:1, addEventListener(){}, removeEventListener(){} };
   globalThis.devicePixelRatio = sw >= 2560 ? 2 : 1;
   globalThis.innerWidth = sw; globalThis.innerHeight = sh - 80;
   globalThis.outerWidth = sw; globalThis.outerHeight = sh;
 
-  var hwValues = [2, 4, 6, 8, 12, 16];
+  var hwValues = globalThis.__obscura_stealth ? [4, 6, 8, 12, 16] : [2, 4, 6, 8, 12, 16];
   globalThis.navigator.hardwareConcurrency = hwValues[Math.floor(_fpRand(400) * hwValues.length)];
-  var memValues = [0.25, 0.5, 1, 2, 4, 8];
+  var memValues = globalThis.__obscura_stealth ? [4, 8] : [0.25, 0.5, 1, 2, 4, 8];
   globalThis.navigator.deviceMemory = memValues[Math.floor(_fpRand(401) * memValues.length)];
 
   const t0 = Date.now() + Math.floor(_fpRand(641) * 100) - 50;
   globalThis.performance.timeOrigin = t0;
   globalThis.performance.timing = { navigationStart: t0, domContentLoadedEventEnd: t0, loadEventEnd: t0 };
+  var _totalHeap = 15000000 + Math.floor(_fpRand(620) * 85000000);
   globalThis.performance.memory = {
     jsHeapSizeLimit: 2172649472,
-    totalJSHeapSize: 15000000 + Math.floor(_fpRand(620) * 85000000),
-    usedJSHeapSize: 8000000 + Math.floor(_fpRand(621) * 42000000),
+    totalJSHeapSize: _totalHeap,
+    usedJSHeapSize: Math.floor(_totalHeap * (0.3 + _fpRand(621) * 0.5)),
   };
-  globalThis.Notification.permission = _fpRand(630) > 0.5 ? "granted" : "default";
+  globalThis.Notification.permission = "default";
+
+  if (globalThis.__obscura_stealth) {
+    var _stealthBrands = [
+      {brand: "Not:A-Brand", version: "99"},
+      {brand: "Google Chrome", version: "145"},
+      {brand: "Chromium", version: "145"},
+    ];
+    globalThis.navigator.userAgentData.brands = _stealthBrands;
+    globalThis.navigator.userAgentData.getHighEntropyValues = function(hints) {
+      return Promise.resolve({
+        architecture: "x86", bitness: "64",
+        brands: _stealthBrands,
+        fullVersionList: [
+          {brand:"Not:A-Brand",version:"99.0.0.0"},
+          {brand:"Google Chrome",version:"145.0.0.0"},
+          {brand:"Chromium",version:"145.0.0.0"},
+        ],
+        mobile: false, model: "",
+        platform: "Linux",
+        platformVersion: "6.1.0",
+        uaFullVersion: "145.0.0.0",
+      });
+    };
+  }
 
   // Hide internals (_*, obscura, Obscura). The set of keys is static at
   // snapshot-build time, so we precompute it ONCE below (after this
