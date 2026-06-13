@@ -1072,6 +1072,7 @@ class Element extends Node {
   removeAttributeNS(ns, n) { _dom("remove_attribute", this._nid, String(n)); }
   hasAttribute(n) { return this.getAttribute(n) !== null; }
   hasAttributes() { return true; } // Simplified
+  getAttributeNames() { return _domParse("attribute_names", this._nid) || []; }
   get attributes() {
     const el = this;
     const names = _domParse("attribute_names", el._nid) || [];
