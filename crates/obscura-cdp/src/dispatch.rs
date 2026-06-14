@@ -238,6 +238,7 @@ fn is_v8_free_method(method: &str) -> bool {
         | "Network.getCookies" | "Network.getAllCookies"
         | "Network.setCookie" | "Network.setCookies"
         | "Network.deleteCookies" | "Network.clearBrowserCookies"
+        | "Network.getResponseBody"
         | "Fetch.continueRequest" | "Fetch.fulfillRequest"
         | "Fetch.failRequest" | "Fetch.getResponseBody"
         | "Storage.getCookies" | "Storage.setCookies" | "Storage.deleteCookies"

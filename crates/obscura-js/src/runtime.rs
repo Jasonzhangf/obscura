@@ -10,7 +10,7 @@ use obscura_dom::DomTree;
 pub use deno_core::v8::IsolateHandle;
 
 use crate::module_loader::ObscuraModuleLoader;
-use crate::ops::{build_extension, ObscuraState};
+use crate::ops::{build_extension, ObscuraState, StoredNetworkResponseBody};
 
 static SNAPSHOT: &[u8] = include_bytes!(env!("OBSCURA_SNAPSHOT_PATH"));
 
@@ -182,6 +182,16 @@ impl ObscuraJsRuntime {
 
     pub fn take_pending_binding_calls(&self) -> Vec<(String, String)> {
         std::mem::take(&mut self.state.borrow_mut().pending_binding_calls)
+    }
+
+    pub fn get_network_response_body(&self, request_id: &str) -> Option<StoredNetworkResponseBody> {
+        self.state.borrow().network_response_bodies.get(request_id).cloned()
+    }
+
+    pub fn clear_network_response_bodies(&self) {
+        let mut state = self.state.borrow_mut();
+        state.network_response_bodies.clear();
+        state.network_response_body_order.clear();
     }
 
     /// Wire up the interception channel without enabling interception.

@@ -32,6 +32,16 @@ pub async fn handle(
 ) -> Result<Value, String> {
     match method {
         "enable" => Ok(json!({})),
+        "disable" => {
+            if let Some(page) = ctx.get_session_page_mut(session_id) {
+                page.clear_response_bodies();
+            } else {
+                for page in &mut ctx.pages {
+                    page.clear_response_bodies();
+                }
+            }
+            Ok(json!({}))
+        }
         "setExtraHTTPHeaders" => {
             let headers = params.get("headers").and_then(|v| v.as_object());
             if let Some(page) = ctx.get_session_page(session_id) {
@@ -86,6 +96,26 @@ pub async fn handle(
         }
         "setCacheDisabled" => Ok(json!({})),
         "setRequestInterception" => Ok(json!({})),
+        "getResponseBody" => {
+            let request_id = params
+                .get("requestId")
+                .and_then(|v| v.as_str())
+                .ok_or("Network.getResponseBody requires requestId")?;
+
+            let body = if let Some(page) = ctx.get_session_page(session_id) {
+                page.get_response_body(request_id)
+            } else {
+                ctx.pages.iter().find_map(|page| page.get_response_body(request_id))
+            };
+
+            match body {
+                Some(body) => Ok(json!({
+                    "body": body.body,
+                    "base64Encoded": body.base64_encoded,
+                })),
+                None => Err(format!("No response body found for requestId {}", request_id)),
+            }
+        }
         _ => Err(format!("Unknown Network method: {}", method)),
     }
 }
@@ -192,6 +222,75 @@ mod tests {
             .await
             .expect("clearBrowserCookies must succeed");
         assert!(ctx.default_context.cookie_jar.get_all_cookies().is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_response_body_returns_stored_document_body() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = Some("session-1".to_string());
+        ctx.sessions.insert(session_id.clone().unwrap(), page_id.clone());
+
+        let page = ctx.get_page_mut(&page_id).unwrap();
+        page.navigate("data:text/html,<html><body>hello body</body></html>")
+            .await
+            .unwrap();
+        let request_id = page.network_events[0].request_id.clone();
+
+        let result = handle(
+            "getResponseBody",
+            &json!({ "requestId": request_id }),
+            &mut ctx,
+            &session_id,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result["body"], "<html><body>hello body</body></html>");
+        assert_eq!(result["base64Encoded"], false);
+    }
+
+    #[tokio::test]
+    async fn get_response_body_errors_for_unknown_request_id() {
+        let mut ctx = CdpContext::new();
+        let err = handle(
+            "getResponseBody",
+            &json!({ "requestId": "missing" }),
+            &mut ctx,
+            &None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.contains("missing"));
+    }
+
+    #[tokio::test]
+    async fn network_disable_clears_stored_response_bodies() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = Some("session-1".to_string());
+        ctx.sessions.insert(session_id.clone().unwrap(), page_id.clone());
+
+        let page = ctx.get_page_mut(&page_id).unwrap();
+        page.navigate("data:text/html,<html><body>temporary body</body></html>")
+            .await
+            .unwrap();
+        let request_id = page.network_events[0].request_id.clone();
+
+        handle("disable", &json!({}), &mut ctx, &session_id)
+            .await
+            .unwrap();
+
+        let err = handle(
+            "getResponseBody",
+            &json!({ "requestId": request_id }),
+            &mut ctx,
+            &session_id,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("No response body found"));
     }
 }
 
