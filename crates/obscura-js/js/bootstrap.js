@@ -4016,6 +4016,7 @@ globalThis.Event = class Event {
     return path;
   }
 };
+_markNative(Event);
 globalThis.CustomEvent = class extends Event {
   constructor(t,o={}) { super(t,o);this.detail=o.detail; }
   // Legacy DOM Level 2 init; some libraries (Starbucks China bundle, older
