@@ -88,6 +88,17 @@ HTTP, HTTPS & SOCKS5 support<br><br>
       Use Promo code <b>OBSCURA</b> for 8% off Static ISP Proxies.
     </td>
   </tr>
+    <tr>
+      <td width="200" align="center" valign="middle">
+        <a href="https://9proxy.com/?utm_source=Github&utm_campaign=obscura" target="_blank">
+          <img alt="9Proxy" src="assets/sponsors/9proxy.gif" width="180"/>
+        </a>
+      </td>
+      <td valign="middle">
+        <a href="https://9proxy.com/?utm_source=Github&utm_campaign=obscura"><b>9Proxy</b></a> provides residential proxies from
+  just $0.018/IP or $0.68/GB. 20M+ IPs across 90+ countries. Sticky or rotating sessions, managed from desktop or mobile app.
+      </td>
+    </tr>
 </table>
 
 ## Install
