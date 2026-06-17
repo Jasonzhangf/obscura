@@ -2897,7 +2897,7 @@ globalThis.fetch = async (input, init = {}) => {
   }
   const respType = parsed.status === 0 ? "opaque" : (fetchMode === "no-cors" ? "opaque" : "basic");
   const responseBody = parsed.bodyBase64 ? _base64ToUint8Array(parsed.bodyBase64) : (parsed.body || "");
-  return new Response(responseBody, {
+  const response = new Response(responseBody, {
     status: parsed.status,
     statusText: "",
     headers: parsed.headers || {},
@@ -2905,6 +2905,13 @@ globalThis.fetch = async (input, init = {}) => {
     url: parsed.url || url,
     redirected: false,
   });
+  if (parsed.requestId) {
+    Object.defineProperty(response, "__obscuraRequestId", {
+      value: parsed.requestId,
+      configurable: true,
+    });
+  }
+  return response;
 };
 
 if (typeof Headers === "undefined") {

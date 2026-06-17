@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -38,6 +38,12 @@ pub struct InterceptedRequest {
     pub resolver: tokio::sync::oneshot::Sender<InterceptResolution>,
 }
 
+#[derive(Debug, Clone)]
+pub struct StoredNetworkResponseBody {
+    pub body: String,
+    pub base64_encoded: bool,
+}
+
 pub struct ObscuraState {
     pub dom: Option<DomTree>,
     pub url: String,
@@ -57,6 +63,9 @@ pub struct ObscuraState {
     // `op_binding_called` op. Drained by the CDP layer after each dispatch
     // and emitted as `Runtime.bindingCalled` events.
     pub pending_binding_calls: Vec<(String, String)>,
+    pub network_response_bodies: HashMap<String, StoredNetworkResponseBody>,
+    pub network_response_body_order: VecDeque<String>,
+    pub network_response_body_counter: u64,
 }
 
 impl ObscuraState {
@@ -74,8 +83,25 @@ impl ObscuraState {
             intercept_counter: 0,
             intercept_enabled: false,
             pending_binding_calls: Vec::new(),
+            network_response_bodies: HashMap::new(),
+            network_response_body_order: VecDeque::new(),
+            network_response_body_counter: 0,
         }
     }
+}
+
+fn response_body_entry_limit() -> usize {
+    std::env::var("OBSCURA_NETWORK_BODY_BUFFER_ENTRIES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(128)
+}
+
+fn response_body_byte_limit() -> usize {
+    std::env::var("OBSCURA_NETWORK_BODY_BUFFER_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2 * 1024 * 1024)
 }
 
 pub type SharedState = Rc<RefCell<ObscuraState>>;
@@ -872,6 +898,31 @@ async fn op_fetch_url(
         .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
     let resp_body = String::from_utf8_lossy(&resp_bytes).to_string();
     let resp_body_base64 = BASE64.encode(&resp_bytes);
+    let response_request_id = {
+        let state_borrow = state.borrow();
+        let gs = state_borrow.borrow::<SharedState>().clone();
+        let mut gs = gs.borrow_mut();
+        gs.network_response_body_counter += 1;
+        let request_id = format!("fetch-{}", gs.network_response_body_counter);
+        let max_entries = response_body_entry_limit();
+        let max_bytes = response_body_byte_limit();
+        if max_entries > 0 && max_bytes > 0 && resp_bytes.len() <= max_bytes {
+            gs.network_response_bodies.insert(
+                request_id.clone(),
+                StoredNetworkResponseBody {
+                    body: resp_body.clone(),
+                    base64_encoded: false,
+                },
+            );
+            gs.network_response_body_order.push_back(request_id.clone());
+            while gs.network_response_body_order.len() > max_entries {
+                if let Some(oldest) = gs.network_response_body_order.pop_front() {
+                    gs.network_response_bodies.remove(&oldest);
+                }
+            }
+        }
+        request_id
+    };
 
     tracing::debug!("op_fetch_url completed: {} {} ({} bytes)", method, url, resp_body.len());
 
@@ -879,6 +930,7 @@ async fn op_fetch_url(
         "status": status,
         "body": resp_body,
         "bodyBase64": resp_body_base64,
+        "requestId": response_request_id,
         "url": url,
         "headers": resp_headers,
     })
