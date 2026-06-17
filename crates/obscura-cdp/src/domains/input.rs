@@ -23,9 +23,9 @@ pub async fn handle(
                             var target = (document.elementFromPoint && document.elementFromPoint({x},{y})) || globalThis.__obscura_click_target || document.activeElement || document.body;\
                             if (!target) return;\
                             globalThis.__obscura_click_target = target;\
-                            var evt = new MouseEvent('mousedown', {{bubbles:true,cancelable:true,clientX:{x},clientY:{y},button:0}});\
+                            var evt = globalThis.__obscura_markTrusted(new MouseEvent('mousedown', {{bubbles:true,cancelable:true,clientX:{x},clientY:{y},button:0}}));\
                             target.dispatchEvent(evt);\
-                            var click = new MouseEvent('click', {{bubbles:true,cancelable:true,clientX:{x},clientY:{y},button:0}});\
+                            var click = globalThis.__obscura_markTrusted(new MouseEvent('click', {{bubbles:true,cancelable:true,clientX:{x},clientY:{y},button:0}}));\
                             var cancelled = !target.dispatchEvent(click);\
                             if (!cancelled) {{\
                                 var link = target.closest ? target.closest('a[href]') : null;\
@@ -46,7 +46,7 @@ pub async fn handle(
                                         if (form2 && typeof form2.submit === 'function') {{ try {{ form2.submit(target); }} catch(e) {{}} }}\
                                     }} else if (tag === 'INPUT' && (type === 'checkbox' || type === 'radio')) {{\
                                         target.checked = !target.checked;\
-                                        try {{ target.dispatchEvent(new Event('change', {{bubbles:true}})); }} catch(e) {{}}\
+                                        try {{ target.dispatchEvent(globalThis.__obscura_markTrusted(new Event('change', {{bubbles:true}}))); }} catch(e) {{}}\
                                     }}\
                                 }}\
                             }}\
@@ -62,7 +62,7 @@ pub async fn handle(
                         "(function() {{\
                             var target = (document.elementFromPoint && document.elementFromPoint({x},{y})) || globalThis.__obscura_click_target || document.activeElement || document.body;\
                             if (!target) return;\
-                            var evt = new MouseEvent('mouseup', {{bubbles:true,cancelable:true,clientX:{x},clientY:{y},button:0}});\
+                            var evt = globalThis.__obscura_markTrusted(new MouseEvent('mouseup', {{bubbles:true,cancelable:true,clientX:{x},clientY:{y},button:0}}));\
                             target.dispatchEvent(evt);\
                         }})()",
                         x = x, y = y,
@@ -85,7 +85,7 @@ pub async fn handle(
                         let js = format!(
                             "(function() {{\
                                 var target = document.activeElement || document.body;\
-                                var evt = new KeyboardEvent('keydown', {{bubbles:true,cancelable:true,key:'{key}',code:'{code}'}});\
+                                var evt = globalThis.__obscura_markTrusted(new KeyboardEvent('keydown', {{bubbles:true,cancelable:true,key:'{key}',code:'{code}'}}));\
                                 target.dispatchEvent(evt);\
                             }})()",
                             key = key.replace('\'', "\\'"),
@@ -102,7 +102,7 @@ pub async fn handle(
                                     var target = document.activeElement;\
                                     if (target && (target.localName === 'input' || target.localName === 'textarea')) {{\
                                         target.value = (target.value || '') + '{text}';\
-                                        target.dispatchEvent(new Event('input', {{bubbles:true}}));\
+                                        target.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {{bubbles:true}})));\
                                     }}\
                                 }})()",
                                 text = escaped_text,
@@ -118,10 +118,10 @@ pub async fn handle(
                             let js = "(function() {\
                                 var target = document.activeElement;\
                                 if (!target) return;\
-                                target.dispatchEvent(new KeyboardEvent('keypress', {bubbles:true,key:'Enter',code:'Enter'}));\
+                                target.dispatchEvent(globalThis.__obscura_markTrusted(new KeyboardEvent('keypress', {bubbles:true,key:'Enter',code:'Enter'})));\
                                 if (target.localName === 'textarea') {\
                                     target.value = (target.value || '') + '\\n';\
-                                    target.dispatchEvent(new Event('input', {bubbles:true}));\
+                                    target.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {bubbles:true})));\
                                 } else {\
                                     var form = target.form || (target.closest && target.closest('form'));\
                                     if (form && typeof form.submit === 'function') form.submit();\
@@ -135,7 +135,7 @@ pub async fn handle(
                                 var target = document.activeElement;\
                                 if (target && (target.localName === 'input' || target.localName === 'textarea')) {\
                                     target.value = target.value.slice(0, -1);\
-                                    target.dispatchEvent(new Event('input', {bubbles:true}));\
+                                    target.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {bubbles:true})));\
                                 }\
                             })()";
                             page.evaluate(js);
@@ -145,7 +145,7 @@ pub async fn handle(
                         let js = format!(
                             "(function() {{\
                                 var target = document.activeElement || document.body;\
-                                var evt = new KeyboardEvent('keyup', {{bubbles:true,key:'{key}',code:'{code}'}});\
+                                var evt = globalThis.__obscura_markTrusted(new KeyboardEvent('keyup', {{bubbles:true,key:'{key}',code:'{code}'}}));\
                                 target.dispatchEvent(evt);\
                             }})()",
                             key = key.replace('\'', "\\'"),
@@ -160,7 +160,7 @@ pub async fn handle(
                                     var target = document.activeElement;\
                                     if (target && (target.localName === 'input' || target.localName === 'textarea')) {{\
                                         target.value = (target.value || '') + '{text}';\
-                                        target.dispatchEvent(new Event('input', {{bubbles:true}}));\
+                                        target.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {{bubbles:true}})));\
                                     }}\
                                 }})()",
                                 text = text.replace('\'', "\\'").replace('\\', "\\\\"),
