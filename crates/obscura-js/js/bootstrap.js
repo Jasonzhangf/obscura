@@ -14,7 +14,7 @@
     '__obscura_errors', '__obscura_init', '__obscura_hide_list',
     '__obscura_objects', '__obscura_oid', '__obscura_ua',
     '__obscura_platform', '__obscura_ua_platform', '__obscura_ua_platform_version',
-    '__obscura_stealth',
+    '__obscura_stealth', '__obscura_markTrusted',
     '__documentReadyState__', '__currentUrl',
     // internal helpers (var-declared throughout the file)
     '__processDynScriptQueue', '_markNative', '_fpRand', '_fpNoise',
@@ -4009,9 +4009,18 @@ globalThis.DOMException = (function () {
   }
   return DOMException;
 })();
+// Per the UI Events spec, only events the user agent dispatches (real or
+// automation-synthesized input) are trusted; events page script builds with
+// `new Event(...)` must report isTrusted === false (issue #303). Returning true
+// for everything is a trivial bot-detection tell. Trusted events are tracked in
+// a closure-private WeakSet so page JS can neither read nor forge the flag.
+// obscura's CDP input pipeline marks its synthetic events via the
+// non-enumerable __obscura_markTrusted helper.
+const _trustedEvents = new WeakSet();
+globalThis.__obscura_markTrusted = function(ev) { try { if (ev) _trustedEvents.add(ev); } catch (_e) {} return ev; };
 globalThis.Event = class Event {
   constructor(t,o={}) { this.type=t;this.bubbles=!!o.bubbles;this.cancelable=!!o.cancelable;this.composed=!!o.composed;this.defaultPrevented=false;this.target=null;this.currentTarget=null;this.eventPhase=0;this.timeStamp=Date.now();this._propagationStopped=false;this._immediatePropagationStopped=false; }
-  get isTrusted() { return true; }
+  get isTrusted() { return _trustedEvents.has(this); }
   preventDefault() { if (this.cancelable) this.defaultPrevented=true; } stopPropagation(){ this._propagationStopped=true; } stopImmediatePropagation(){ this._propagationStopped=true; this._immediatePropagationStopped=true; }
   initEvent(type,bubbles,cancelable) { if (arguments.length < 1) throw new TypeError("Failed to execute 'initEvent' on 'Event': 1 argument required, but only 0 present."); this.type=String(type);this.bubbles=!!bubbles;this.cancelable=!!cancelable;this.defaultPrevented=false;this._propagationStopped=false;this._immediatePropagationStopped=false; }
   composedPath() {
@@ -4023,6 +4032,7 @@ globalThis.Event = class Event {
     return path;
   }
 };
+_markNative(Event);
 globalThis.CustomEvent = class extends Event {
   constructor(t,o={}) { super(t,o);this.detail=o.detail; }
   // Legacy DOM Level 2 init; some libraries (Starbucks China bundle, older
