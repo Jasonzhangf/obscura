@@ -140,6 +140,12 @@ pub struct NetworkEvent {
     pub timestamp: f64,
 }
 
+#[derive(Debug, Clone)]
+pub struct StoredResponseBody {
+    pub body: String,
+    pub base64_encoded: bool,
+}
+
 pub struct Page {
     pub id: String,
     pub frame_id: String,
@@ -161,6 +167,8 @@ pub struct Page {
     pub history: Vec<String>,
     pub history_index: usize,
     pub network_events: Vec<NetworkEvent>,
+    response_bodies: std::collections::HashMap<String, StoredResponseBody>,
+    response_body_order: std::collections::VecDeque<String>,
     network_event_counter: u32,
     pub intercept_enabled: bool,
     pub intercept_block_patterns: Vec<String>,
@@ -213,6 +221,8 @@ impl Page {
             history: Vec::new(),
             history_index: 0,
             network_events: Vec::new(),
+            response_bodies: std::collections::HashMap::new(),
+            response_body_order: std::collections::VecDeque::new(),
             network_event_counter: 0,
             intercept_enabled: false,
             intercept_block_patterns: Vec::new(),
@@ -275,19 +285,32 @@ impl Page {
 
         #[cfg(feature = "stealth")]
         if self.stealth_client.is_some() {
+            rt.set_stealth(true);
             rt.set_user_agent(obscura_net::STEALTH_USER_AGENT);
-        } else if let Ok(ua) = self.http_client.user_agent.try_read() {
-            rt.set_user_agent(&ua);
+            // Match platform to the Linux UA so navigator.platform and
+            // userAgentData.platform are consistent with navigator.userAgent.
+            rt.set_platform("Linux x86_64", "Linux", "");
+        } else {
+            if let Ok(ua) = self.http_client.user_agent.try_read() {
+                rt.set_user_agent(&ua);
+            }
+            rt.set_platform(
+                &self.context.platform,
+                &self.context.ua_platform,
+                &self.context.ua_platform_version,
+            );
         }
         #[cfg(not(feature = "stealth"))]
-        if let Ok(ua) = self.http_client.user_agent.try_read() {
-            rt.set_user_agent(&ua);
+        {
+            if let Ok(ua) = self.http_client.user_agent.try_read() {
+                rt.set_user_agent(&ua);
+            }
+            rt.set_platform(
+                &self.context.platform,
+                &self.context.ua_platform,
+                &self.context.ua_platform_version,
+            );
         }
-        rt.set_platform(
-            &self.context.platform,
-            &self.context.ua_platform,
-            &self.context.ua_platform_version,
-        );
         if let Some((lat, lon)) = env_geolocation() {
             rt.set_geolocation(lat, lon);
         }
@@ -302,6 +325,8 @@ impl Page {
         if let Some(dom) = self.dom.take() {
             rt.set_dom(dom);
         }
+
+        rt.run_page_init();
 
         self.js = Some(rt);
     }
@@ -576,7 +601,7 @@ impl Page {
             if script.src.is_some() {
                 if let Some((url, code, resp)) = fetched.remove(&i) {
                     tracing::info!("Executing script ({} bytes): {}", code.len(), url);
-                    self.record_network_event(&url, "GET", "Script", resp.status, &resp.headers, resp.body.len());
+                    self.record_network_event_with_body(&url, "GET", "Script", resp.status, &resp.headers, &resp.body, false);
                     if let Some(js) = &mut self.js {
                         let _ = js.execute_script("<current-script>", &format!("globalThis.__currentScriptNid={};", script.nid));
                         if let Err(e) = js.execute_script_guarded(&url, &code) {
@@ -948,13 +973,14 @@ impl Page {
             PageError::NetworkError(e.to_string())
         })?;
 
-        self.record_network_event(
+        self.record_network_event_with_body(
             url.as_str(),
             "GET",
             "Document",
             response.status,
             &response.headers,
-            response.body.len(),
+            &response.body,
+            false,
         );
 
         if !response.redirected_from.is_empty() {
@@ -1048,7 +1074,7 @@ impl Page {
                 // CSS bodies: honor the Content-Type charset; CSS @charset is
                 // out of scope for the current scrape-focused pipeline.
                 let css = obscura_net::decode_non_html(&resp.body, resp.content_type());
-                self.record_network_event(&url_str, "GET", "Stylesheet", resp.status, &resp.headers, resp.body.len());
+                self.record_network_event_with_body(&url_str, "GET", "Stylesheet", resp.status, &resp.headers, &resp.body, false);
                 css_sources.push(css);
             }
         }
@@ -1341,13 +1367,47 @@ impl Page {
         response_headers: &std::collections::HashMap<String, String>,
         body_size: usize,
     ) {
+        self.record_network_event_inner(url, method, resource_type, status, response_headers, body_size);
+    }
+
+    fn record_network_event_with_body(
+        &mut self,
+        url: &str,
+        method: &str,
+        resource_type: &str,
+        status: u16,
+        response_headers: &std::collections::HashMap<String, String>,
+        body: &[u8],
+        base64_encoded: bool,
+    ) {
+        let request_id = self.record_network_event_inner(
+            url,
+            method,
+            resource_type,
+            status,
+            response_headers,
+            body.len(),
+        );
+        self.store_response_body(request_id, body, base64_encoded);
+    }
+
+    fn record_network_event_inner(
+        &mut self,
+        url: &str,
+        method: &str,
+        resource_type: &str,
+        status: u16,
+        response_headers: &std::collections::HashMap<String, String>,
+        body_size: usize,
+    ) -> String {
         self.network_event_counter += 1;
+        let request_id = format!("{}.{}", self.id, self.network_event_counter);
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs_f64();
         self.network_events.push(NetworkEvent {
-            request_id: format!("{}.{}", self.id, self.network_event_counter),
+            request_id: request_id.clone(),
             url: url.to_string(),
             method: method.to_string(),
             resource_type: resource_type.to_string(),
@@ -1357,6 +1417,46 @@ impl Page {
             body_size,
             timestamp,
         });
+        request_id
+    }
+
+    fn store_response_body(&mut self, request_id: String, body: &[u8], base64_encoded: bool) {
+        let max_entries = response_body_entry_limit();
+        let max_bytes = response_body_byte_limit();
+        if max_entries == 0 || max_bytes == 0 || body.len() > max_bytes {
+            return;
+        }
+        let body = if base64_encoded {
+            BASE64.encode(body)
+        } else {
+            String::from_utf8_lossy(body).to_string()
+        };
+        self.response_bodies.insert(request_id.clone(), StoredResponseBody { body, base64_encoded });
+        self.response_body_order.push_back(request_id);
+        while self.response_body_order.len() > max_entries {
+            if let Some(oldest) = self.response_body_order.pop_front() {
+                self.response_bodies.remove(&oldest);
+            }
+        }
+    }
+
+    pub fn get_response_body(&self, request_id: &str) -> Option<StoredResponseBody> {
+        self.response_bodies.get(request_id).cloned().or_else(|| {
+            self.js.as_ref()?.get_network_response_body(request_id).map(|body| {
+                StoredResponseBody {
+                    body: body.body,
+                    base64_encoded: body.base64_encoded,
+                }
+            })
+        })
+    }
+
+    pub fn clear_response_bodies(&mut self) {
+        self.response_bodies.clear();
+        self.response_body_order.clear();
+        if let Some(js) = &self.js {
+            js.clear_network_response_bodies();
+        }
     }
 
     pub fn execute_preload_script(&mut self, source: &str) -> Result<(), String> {
@@ -1462,4 +1562,18 @@ impl From<ObscuraNetError> for PageError {
     fn from(e: ObscuraNetError) -> Self {
         PageError::NetworkError(e.to_string())
     }
+}
+
+fn response_body_entry_limit() -> usize {
+    std::env::var("OBSCURA_NETWORK_BODY_BUFFER_ENTRIES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(128)
+}
+
+fn response_body_byte_limit() -> usize {
+    std::env::var("OBSCURA_NETWORK_BODY_BUFFER_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2 * 1024 * 1024)
 }

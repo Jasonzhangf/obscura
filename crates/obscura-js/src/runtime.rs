@@ -10,7 +10,7 @@ use obscura_dom::DomTree;
 pub use deno_core::v8::IsolateHandle;
 
 use crate::module_loader::ObscuraModuleLoader;
-use crate::ops::{build_extension, ObscuraState};
+use crate::ops::{build_extension, ObscuraState, StoredNetworkResponseBody};
 
 static SNAPSHOT: &[u8] = include_bytes!(env!("OBSCURA_SNAPSHOT_PATH"));
 
@@ -130,7 +130,7 @@ impl ObscuraJsRuntime {
         runtime
             .execute_script(
                 "<obscura:init>",
-                "globalThis.__obscura_objects = {}; globalThis.__obscura_oid = 0; globalThis.__obscura_init();".to_string(),
+                "globalThis.__obscura_objects = {}; globalThis.__obscura_oid = 0;".to_string(),
             )
             .expect("init should not fail");
 
@@ -184,6 +184,16 @@ impl ObscuraJsRuntime {
         std::mem::take(&mut self.state.borrow_mut().pending_binding_calls)
     }
 
+    pub fn get_network_response_body(&self, request_id: &str) -> Option<StoredNetworkResponseBody> {
+        self.state.borrow().network_response_bodies.get(request_id).cloned()
+    }
+
+    pub fn clear_network_response_bodies(&self) {
+        let mut state = self.state.borrow_mut();
+        state.network_response_bodies.clear();
+        state.network_response_body_order.clear();
+    }
+
     /// Wire up the interception channel without enabling interception.
     /// Use set_intercept_enabled separately. The two were entangled before
     /// and every navigation auto-enabled interception, which made
@@ -217,6 +227,22 @@ impl ObscuraJsRuntime {
                 "globalThis.__obscura_platform='{}';globalThis.__obscura_ua_platform='{}';globalThis.__obscura_ua_platform_version='{}';",
                 p, uap, uapv
             ),
+        );
+    }
+
+    pub fn set_stealth(&mut self, enabled: bool) {
+        let _ = self.runtime.execute_script(
+            "<set-stealth>",
+            format!("globalThis.__obscura_stealth = {};", enabled),
+        );
+    }
+
+    /// Run __obscura_init() after all per-page properties (UA, platform, stealth, etc.)
+    /// have been set. Must be called once per page setup, after all set_* methods.
+    pub fn run_page_init(&mut self) {
+        let _ = self.runtime.execute_script(
+            "<obscura:page-init>",
+            "globalThis.__obscura_init();".to_string(),
         );
     }
 
@@ -2450,6 +2476,21 @@ mod tests {
                 ["inside", "last"]
             ])
         );
+    }
+
+    #[test]
+    fn console_log_error_does_not_trigger_prepare_stack_trace() {
+        let mut rt = setup_runtime("<div></div>");
+        let result = rt.evaluate(r#"
+            let called = false;
+            const saved = Error.prepareStackTrace;
+            Error.prepareStackTrace = function() { called = true; return saved; };
+            const e = new Error("test");
+            console.log(e);
+            Error.prepareStackTrace = saved;
+            return called;
+        "#).unwrap();
+        assert_eq!(result, serde_json::json!(false));
     }
 
     #[test]

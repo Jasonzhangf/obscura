@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -38,6 +38,12 @@ pub struct InterceptedRequest {
     pub resolver: tokio::sync::oneshot::Sender<InterceptResolution>,
 }
 
+#[derive(Debug, Clone)]
+pub struct StoredNetworkResponseBody {
+    pub body: String,
+    pub base64_encoded: bool,
+}
+
 pub struct ObscuraState {
     pub dom: Option<DomTree>,
     pub url: String,
@@ -57,6 +63,9 @@ pub struct ObscuraState {
     // `op_binding_called` op. Drained by the CDP layer after each dispatch
     // and emitted as `Runtime.bindingCalled` events.
     pub pending_binding_calls: Vec<(String, String)>,
+    pub network_response_bodies: HashMap<String, StoredNetworkResponseBody>,
+    pub network_response_body_order: VecDeque<String>,
+    pub network_response_body_counter: u64,
 }
 
 impl ObscuraState {
@@ -74,8 +83,25 @@ impl ObscuraState {
             intercept_counter: 0,
             intercept_enabled: false,
             pending_binding_calls: Vec::new(),
+            network_response_bodies: HashMap::new(),
+            network_response_body_order: VecDeque::new(),
+            network_response_body_counter: 0,
         }
     }
+}
+
+fn response_body_entry_limit() -> usize {
+    std::env::var("OBSCURA_NETWORK_BODY_BUFFER_ENTRIES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(128)
+}
+
+fn response_body_byte_limit() -> usize {
+    std::env::var("OBSCURA_NETWORK_BODY_BUFFER_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2 * 1024 * 1024)
 }
 
 pub type SharedState = Rc<RefCell<ObscuraState>>;
@@ -137,7 +163,21 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
             "null".into()
         }
         "get_element_by_id" => {
-            dom.get_element_by_id(&arg1).map(|id| id.index().to_string()).unwrap_or("-1".into())
+            // Verify the indexed node is in the live document. The id_index is best-effort:
+            // it only registers nodes at creation time and doesn't update on reparent, so
+            // it can point to a detached clone while the live node is elsewhere in the tree.
+            let doc = dom.document();
+            let nid = dom.get_element_by_id(&arg1);
+            let live = nid.filter(|&n| dom.ancestors(n).contains(&doc));
+            match live {
+                Some(n) => n.index().to_string(),
+                None => {
+                    // Fall back to full scan for the live document.
+                    let sel = format!("[id=\"{}\"]", arg1.replace('\\', "\\\\").replace('"', "\\\""));
+                    dom.query_selector(&sel).ok().flatten()
+                        .map(|id| id.index().to_string()).unwrap_or("-1".into())
+                }
+            }
         }
         "query_selector" => {
             dom.query_selector(&arg1).ok().flatten().map(|id| id.index().to_string()).unwrap_or("-1".into())
@@ -235,19 +275,22 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
             serde_json::to_string(&dom.outer_html(NodeId::new(nid))).unwrap_or("\"\"".into())
         }
         "append_child" => {
-            let parent = arg1.parse::<u32>().unwrap_or(0);
-            let child = arg2.parse::<u32>().unwrap_or(0);
+            // Reject if either nid failed to parse (was "undefined"/empty) — those
+            // default to 0 which is the document root, and silently operating on it
+            // corrupts the tree. Require both args to be valid positive integers.
+            let parent = match arg1.parse::<u32>() { Ok(n) => n, Err(_) => return "false".into() };
+            let child = match arg2.parse::<u32>() { Ok(n) => n, Err(_) => return "false".into() };
             dom.append_child(NodeId::new(parent), NodeId::new(child));
             "true".into()
         }
         "remove_child" => {
-            let child = arg1.parse::<u32>().unwrap_or(0);
+            let child = match arg1.parse::<u32>() { Ok(n) => n, Err(_) => return "false".into() };
             dom.remove_child(NodeId::new(child));
             "true".into()
         }
         "insert_before" => {
-            let new_node = arg1.parse::<u32>().unwrap_or(0);
-            let ref_node = arg2.parse::<u32>().unwrap_or(0);
+            let new_node = match arg1.parse::<u32>() { Ok(n) => n, Err(_) => return "false".into() };
+            let ref_node = match arg2.parse::<u32>() { Ok(n) => n, Err(_) => return "false".into() };
             dom.insert_before(NodeId::new(ref_node), NodeId::new(new_node));
             "true".into()
         }
@@ -261,7 +304,12 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
             "true".into()
         }
         "set_inner_html" => {
-            let nid = arg1.parse::<u32>().unwrap_or(0);
+            let nid = match arg1.parse::<u32>() {
+                Ok(n) if n > 0 => n,
+                // nid=0 is the document root; never allow innerHTML to clear it.
+                // nid parse failure (e.g. "undefined") also falls here.
+                _ => return "false".into(),
+            };
             let target = NodeId::new(nid);
             let children = dom.children(target);
             for child in children {
@@ -850,6 +898,31 @@ async fn op_fetch_url(
         .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
     let resp_body = String::from_utf8_lossy(&resp_bytes).to_string();
     let resp_body_base64 = BASE64.encode(&resp_bytes);
+    let response_request_id = {
+        let state_borrow = state.borrow();
+        let gs = state_borrow.borrow::<SharedState>().clone();
+        let mut gs = gs.borrow_mut();
+        gs.network_response_body_counter += 1;
+        let request_id = format!("fetch-{}", gs.network_response_body_counter);
+        let max_entries = response_body_entry_limit();
+        let max_bytes = response_body_byte_limit();
+        if max_entries > 0 && max_bytes > 0 && resp_bytes.len() <= max_bytes {
+            gs.network_response_bodies.insert(
+                request_id.clone(),
+                StoredNetworkResponseBody {
+                    body: resp_body.clone(),
+                    base64_encoded: false,
+                },
+            );
+            gs.network_response_body_order.push_back(request_id.clone());
+            while gs.network_response_body_order.len() > max_entries {
+                if let Some(oldest) = gs.network_response_body_order.pop_front() {
+                    gs.network_response_bodies.remove(&oldest);
+                }
+            }
+        }
+        request_id
+    };
 
     tracing::debug!("op_fetch_url completed: {} {} ({} bytes)", method, url, resp_body.len());
 
@@ -857,6 +930,7 @@ async fn op_fetch_url(
         "status": status,
         "body": resp_body,
         "bodyBase64": resp_body_base64,
+        "requestId": response_request_id,
         "url": url,
         "headers": resp_headers,
     })
