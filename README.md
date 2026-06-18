@@ -91,7 +91,7 @@ HTTP, HTTPS & SOCKS5 support<br><br>
     <tr>
       <td width="200" align="center" valign="middle">
         <a href="https://9proxy.com/?utm_source=Github&utm_campaign=obscura" target="_blank">
-          <img alt="9Proxy" src="assets/sponsors/9proxy.gif" width="180"/>
+          <img alt="9Proxy" src="assets/sponsors/9proxy.png" width="180"/>
         </a>
       </td>
       <td valign="middle">
