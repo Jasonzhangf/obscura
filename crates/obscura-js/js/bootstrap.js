@@ -1977,6 +1977,95 @@ function _convertNodes(nodes) {
   for (const prop in ARIA) reflectNullable(prop, ARIA[prop]);
 })();
 
+function _parseXPathPredicate(part) {
+  part = String(part || "").trim();
+  let m = part.match(/^@([A-Za-z_][\w:.-]*)(?:\s*=\s*(["'])(.*?)\2)?$/);
+  if (m) return { kind: "attr", name: m[1], value: m[3] };
+  m = part.match(/^contains\(\s*@([A-Za-z_][\w:.-]*)\s*,\s*(["'])(.*?)\2\s*\)$/);
+  if (m) return { kind: "contains", name: m[1], value: m[3] };
+  m = part.match(/^starts-with\(\s*@([A-Za-z_][\w:.-]*)\s*,\s*(["'])(.*?)\2\s*\)$/);
+  if (m) return { kind: "startsWith", name: m[1], value: m[3] };
+  return null;
+}
+
+function _xpathPredicateParts(body) {
+  const out = [];
+  let quote = null, start = 0;
+  for (let i = 0; i < body.length; i++) {
+    const ch = body[i];
+    if (quote) {
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      continue;
+    }
+    if (body.slice(i, i + 5).toLowerCase() === " and " || body.slice(i, i + 4).toLowerCase() === "and ") {
+      const before = body.slice(start, i).trim();
+      if (before) out.push(before);
+      i += body[i] === " " ? 4 : 3;
+      start = i + 1;
+    }
+  }
+  const last = body.slice(start).trim();
+  if (last) out.push(last);
+  return out.length ? out : [body];
+}
+
+function _xpathFindNodes(expression, contextNode) {
+  expression = String(expression || "").trim();
+  contextNode = contextNode || document;
+  const m = expression.match(/^(?:\.?\/\/)([A-Za-z*][\w:.-]*|\*)?((?:\[[^\]]+\])*)$/);
+  if (!m) return [];
+  const tag = !m[1] || m[1] === "*" ? "*" : m[1];
+  const predicates = [];
+  const predText = m[2] || "";
+  for (const match of predText.matchAll(/\[([^\]]+)\]/g)) {
+    for (const part of _xpathPredicateParts(match[1])) {
+      const pred = _parseXPathPredicate(part);
+      if (pred) predicates.push(pred);
+    }
+  }
+  const source = typeof contextNode.querySelectorAll === "function"
+    ? contextNode.querySelectorAll(tag)
+    : [];
+  return Array.prototype.filter.call(source, (node) => {
+    for (const pred of predicates) {
+      const value = node.getAttribute?.(pred.name);
+      if (pred.kind === "attr") {
+        if (value === null) return false;
+        if (pred.value !== undefined && value !== pred.value) return false;
+      } else if (pred.kind === "contains") {
+        if (value === null || !String(value).includes(pred.value)) return false;
+      } else if (pred.kind === "startsWith") {
+        if (value === null || !String(value).startsWith(pred.value)) return false;
+      }
+    }
+    return true;
+  });
+}
+
+function _makeXPathResult(type, nodes) {
+  nodes = Array.from(nodes || []);
+  const requested = type || XPathResult.ANY_TYPE;
+  const resultType = requested === XPathResult.ANY_TYPE
+    ? XPathResult.UNORDERED_NODE_ITERATOR_TYPE
+    : requested;
+  let iter = 0;
+  return {
+    resultType,
+    singleNodeValue: nodes[0] || null,
+    snapshotLength: nodes.length,
+    snapshotItem(i) { return nodes[i] || null; },
+    iterateNext() { return nodes[iter++] || null; },
+    invalidIteratorState: false,
+    numberValue: nodes.length,
+    stringValue: nodes[0]?.textContent || "",
+    booleanValue: nodes.length > 0,
+  };
+}
+
 class Document extends Node {
   get documentElement() { return _wrapEl(+_dom("document_element")); }
   get head() { return this.querySelector("head"); }
@@ -2048,6 +2137,9 @@ class Document extends Node {
   getElementsByTagName(t) { return HTMLCollection._from(this.querySelectorAll(t)); }
   getElementsByClassName(c) { return _getElementsByClassName(this, c); }
   getElementsByName(name) { return this.querySelectorAll('[name="' + String(name).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"]'); }
+  evaluate(expression, contextNode, namespaceResolver, type, result) {
+    return _makeXPathResult(type, _xpathFindNodes(expression, contextNode || this));
+  }
   createElement(t) {
     const el = _wrapEl(+_dom("create_element", t.toLowerCase()));
     if (el && t.toLowerCase() === 'template') {
@@ -4780,6 +4872,19 @@ globalThis.DocumentType = DocumentType;
 globalThis.Node = Node;
 globalThis.Element = Element;
 globalThis.Document = Document;
+globalThis.XPathResult = globalThis.XPathResult || class XPathResult {};
+Object.assign(globalThis.XPathResult, {
+  ANY_TYPE: 0,
+  NUMBER_TYPE: 1,
+  STRING_TYPE: 2,
+  BOOLEAN_TYPE: 3,
+  UNORDERED_NODE_ITERATOR_TYPE: 4,
+  ORDERED_NODE_ITERATOR_TYPE: 5,
+  UNORDERED_NODE_SNAPSHOT_TYPE: 6,
+  ORDERED_NODE_SNAPSHOT_TYPE: 7,
+  ANY_UNORDERED_NODE_TYPE: 8,
+  FIRST_ORDERED_NODE_TYPE: 9,
+});
 // XMLDocument is a subclass of Document (DOMParser of an XML type and
 // implementation.createDocument produce one). The interface must exist globally.
 if (typeof XMLDocument === "undefined") globalThis.XMLDocument = class XMLDocument extends Document {};

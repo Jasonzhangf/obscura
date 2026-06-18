@@ -1407,6 +1407,16 @@ mod tests {
         assert_eq!(count_doc.as_f64().unwrap() as i64, 2);
     }
 
+    #[test]
+    fn document_evaluate_exposes_basic_xpath_result() {
+        let mut rt = setup_runtime("");
+
+        let exposed = rt
+            .evaluate("`${typeof XPathResult}:${typeof Document.prototype.evaluate}:${XPathResult.FIRST_ORDERED_NODE_TYPE}`")
+            .unwrap();
+        assert_eq!(exposed, serde_json::json!("function:function:9"));
+    }
+
     /// Regression for #105: `document.forms` / `images` / `links` must be
     /// live, not hardcoded `[]`. jQuery 1.x's submit-event setup iterates
     /// `document.forms` and crashes when it's empty for pages that have forms.
