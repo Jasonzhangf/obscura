@@ -14,7 +14,7 @@ pub async fn handle(
             let x = params.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
             let y = params.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
             let _button = params.get("button").and_then(|v| v.as_str()).unwrap_or("left");
-            let _click_count = params.get("clickCount").and_then(|v| v.as_u64()).unwrap_or(1);
+            let click_count = params.get("clickCount").and_then(|v| v.as_u64()).unwrap_or(1);
 
             if event_type == "mousePressed" {
                 if let Some(page) = ctx.get_session_page_mut(session_id) {
@@ -23,9 +23,9 @@ pub async fn handle(
                             var target = (document.elementFromPoint && document.elementFromPoint({x},{y})) || globalThis.__obscura_click_target || document.activeElement || document.body;\
                             if (!target) return;\
                             globalThis.__obscura_click_target = target;\
-                            var evt = globalThis.__obscura_markTrusted(new MouseEvent('mousedown', {{bubbles:true,cancelable:true,clientX:{x},clientY:{y},button:0}}));\
+                            var evt = globalThis.__obscura_markTrusted(new MouseEvent('mousedown', {{bubbles:true,cancelable:true,clientX:{x},clientY:{y},button:0,detail:{click_count}}}));\
                             target.dispatchEvent(evt);\
-                            var click = globalThis.__obscura_markTrusted(new MouseEvent('click', {{bubbles:true,cancelable:true,clientX:{x},clientY:{y},button:0}}));\
+                            var click = globalThis.__obscura_markTrusted(new MouseEvent('click', {{bubbles:true,cancelable:true,clientX:{x},clientY:{y},button:0,detail:{click_count}}}));\
                             var cancelled = !target.dispatchEvent(click);\
                             if (!cancelled) {{\
                                 var link = target.closest ? target.closest('a[href]') : null;\
@@ -51,7 +51,7 @@ pub async fn handle(
                                 }}\
                             }}\
                         }})()",
-                        x = x, y = y,
+                        x = x, y = y, click_count = click_count,
                     );
                     page.evaluate(&code);
                     page.process_pending_navigation().await.map_err(|e| e.to_string())?;
@@ -155,6 +155,7 @@ pub async fn handle(
                     }
                     "char" => {
                         if !text.is_empty() {
+                            let escaped_text = text.replace('\\', "\\\\").replace('\'', "\\'");
                             let js = format!(
                                 "(function() {{\
                                     var target = document.activeElement;\
@@ -163,9 +164,11 @@ pub async fn handle(
                                         target.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {{bubbles:true}})));\
                                     }}\
                                 }})()",
-                                text = text.replace('\'', "\\'").replace('\\', "\\\\"),
+                                text = escaped_text,
                             );
                             page.evaluate(&js);
+                            // Pump event loop so Angular change detection picks up the input
+                            page.settle(50).await;
                         }
                     }
                     _ => {}
