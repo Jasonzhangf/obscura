@@ -19,7 +19,18 @@ use crate::client::{Response, ObscuraNetError};
 
 #[cfg(feature = "stealth")]
 pub const STEALTH_USER_AGENT: &str =
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
+
+// The wreq emulation (Profile::Chrome145, Platform::Windows) sends this exact
+// UA and sec-ch-ua-platform "Windows" on the wire. navigator has to report the
+// same identity, otherwise the TLS/HTTP layer and the JS layer disagree and a
+// site cross-checks the mismatch as a bot signal.
+#[cfg(feature = "stealth")]
+pub const STEALTH_NAVIGATOR_PLATFORM: &str = "Win32";
+#[cfg(feature = "stealth")]
+pub const STEALTH_UA_PLATFORM: &str = "Windows";
+#[cfg(feature = "stealth")]
+pub const STEALTH_UA_PLATFORM_VERSION: &str = "15.0.0";
 
 #[cfg(feature = "stealth")]
 pub struct StealthHttpClient {
@@ -38,7 +49,7 @@ impl StealthHttpClient {
     pub fn with_proxy(cookie_jar: Arc<CookieJar>, proxy_url: Option<&str>) -> Self {
         let emulation_opts = wreq_util::Emulation::builder()
             .profile(wreq_util::Profile::Chrome145)
-            .platform(wreq_util::Platform::Linux)
+            .platform(wreq_util::Platform::Windows)
             .build();
 
         let mut builder = wreq::Client::builder()

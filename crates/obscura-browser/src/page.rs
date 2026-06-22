@@ -287,9 +287,11 @@ impl Page {
         if self.stealth_client.is_some() {
             rt.set_stealth(true);
             rt.set_user_agent(obscura_net::STEALTH_USER_AGENT);
-            // Match platform to the Linux UA so navigator.platform and
-            // userAgentData.platform are consistent with navigator.userAgent.
-            rt.set_platform("Linux x86_64", "Linux", "");
+            rt.set_platform(
+                obscura_net::STEALTH_NAVIGATOR_PLATFORM,
+                obscura_net::STEALTH_UA_PLATFORM,
+                obscura_net::STEALTH_UA_PLATFORM_VERSION,
+            );
         } else {
             if let Ok(ua) = self.http_client.user_agent.try_read() {
                 rt.set_user_agent(&ua);

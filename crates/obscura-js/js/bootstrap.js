@@ -154,7 +154,9 @@ function _fpNoise(x, y, channel) {
 var _fpCache = null;
 function _getFp() {
   if (_fpCache) return _fpCache;
-  const isMac = (globalThis.__obscura_ua_platform || 'Windows') === 'macOS';
+  const _uaPlat = globalThis.__obscura_ua_platform || 'Windows';
+  const isMac = _uaPlat === 'macOS';
+  const isLinux = _uaPlat === 'Linux';
   const gpuPool = isMac ? [
     'ANGLE (Apple, ANGLE Metal Renderer: Apple M1, Unspecified Version)',
     'ANGLE (Apple, ANGLE Metal Renderer: Apple M1 Pro, Unspecified Version)',
@@ -162,6 +164,14 @@ function _getFp() {
     'ANGLE (Apple, ANGLE Metal Renderer: Apple M2 Pro, Unspecified Version)',
     'ANGLE (Apple, ANGLE Metal Renderer: Apple M3, Unspecified Version)',
     'ANGLE (Intel Inc., ANGLE Metal Renderer: Intel(R) Iris(TM) Plus Graphics, Unspecified Version)',
+  ] : isLinux ? [
+    'ANGLE (Intel, Mesa Intel(R) UHD Graphics 630 (CFL GT2), OpenGL 4.6)',
+    'ANGLE (Intel, Mesa Intel(R) Iris(R) Xe Graphics (TGL GT2), OpenGL 4.6)',
+    'ANGLE (Intel, Mesa Intel(R) UHD Graphics 770 (RPL-S), OpenGL 4.6)',
+    'ANGLE (AMD, AMD Radeon RX 580 (polaris10, LLVM 15.0.7, DRM 3.54, LLVM 15.0.7), OpenGL 4.6)',
+    'ANGLE (AMD, AMD Radeon RX 6700 XT (navi22, LLVM 16.0.6, DRM 3.54, LLVM 16.0.6), OpenGL 4.6)',
+    'ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 OpenGL 4.6)',
+    'ANGLE (NVIDIA, NVIDIA GeForce RTX 4070 OpenGL 4.6)',
   ] : [
     'ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)',
     'ANGLE (NVIDIA, NVIDIA GeForce GTX 1660 SUPER Direct3D11 vs_5_0 ps_5_0, D3D11)',
@@ -180,6 +190,10 @@ function _getFp() {
     'Google Inc. (Apple)','Google Inc. (Apple)','Google Inc. (Apple)',
     'Google Inc. (Apple)','Google Inc. (Apple)',
     'Google Inc. (Intel Inc.)',
+  ] : isLinux ? [
+    'Google Inc. (Intel)','Google Inc. (Intel)','Google Inc. (Intel)',
+    'Google Inc. (AMD)','Google Inc. (AMD)',
+    'Google Inc. (NVIDIA)','Google Inc. (NVIDIA)',
   ] : [
     'Google Inc. (NVIDIA)','Google Inc. (NVIDIA)','Google Inc. (NVIDIA)',
     'Google Inc. (Intel)','Google Inc. (Intel)',
@@ -2612,8 +2626,35 @@ globalThis.NetworkInformation = NetworkInformation;
 
 globalThis.ContentIndex = class ContentIndex {};
 
+function _chromeMajor() {
+  var m = (globalThis.__obscura_ua || '').match(/Chrome\/(\d+)/);
+  return m ? (m[1] | 0) : 145;
+}
+// Chromium derives the sec-ch-ua GREASE brand, version, and brand order
+// deterministically from the Chrome major version
+// (components/embedder_support/user_agent_utils.cc). Replicating it keeps
+// sec-ch-ua and userAgentData exact for every profile version rather than
+// hardcoding one static token.
+var _GREASE_CHARS = [' ', '(', ':', '-', '.', '/', ')', ';', '=', '?', '_'];
+var _GREASE_VER = ['8', '99', '24'];
+var _BRAND_PERMS = [[0,1,2],[0,2,1],[1,0,2],[1,2,0],[2,0,1],[2,1,0]];
+function _uaBrands() {
+  var seed = _chromeMajor();
+  var grease = {
+    brand: 'Not' + _GREASE_CHARS[seed % 11] + 'A' + _GREASE_CHARS[(seed + 1) % 11] + 'Brand',
+    version: _GREASE_VER[seed % 3],
+  };
+  var ordered = [
+    grease,
+    {brand: 'Chromium', version: String(seed)},
+    {brand: 'Google Chrome', version: String(seed)},
+  ];
+  var p = _BRAND_PERMS[seed % 6];
+  return [ordered[p[0]], ordered[p[1]], ordered[p[2]]];
+}
+
 globalThis.navigator = {
-  get userAgent() { return globalThis.__obscura_ua || "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"; },
+  get userAgent() { return globalThis.__obscura_ua || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"; },
   get appVersion() { return this.userAgent.replace('Mozilla/', ''); },
   language: "en-US", languages: ["en-US","en"], get platform() { return globalThis.__obscura_platform || "Win32"; },
   onLine: true, cookieEnabled: true, hardwareConcurrency: 8,
@@ -2643,24 +2684,22 @@ globalThis.navigator = {
     return m;
   },
   userAgentData: {
-    brands: [
-      {brand: "Google Chrome", version: "145"},
-      {brand: "Chromium", version: "145"},
-      {brand: "Not;A=Brand", version: "24"},
-    ],
     mobile: false,
+    get brands() { return _uaBrands(); },
     get platform() { return globalThis.__obscura_ua_platform || "Windows"; },
     getHighEntropyValues(hints) {
+      var brands = _uaBrands();
       return Promise.resolve({
         architecture: "x86",
         bitness: "64",
-        brands: [{brand:"Google Chrome",version:"145"},{brand:"Chromium",version:"145"},{brand:"Not;A=Brand",version:"24"}],
-        fullVersionList: [{brand:"Google Chrome",version:"145.0.0.0"},{brand:"Chromium",version:"145.0.0.0"},{brand:"Not;A=Brand",version:"24.0.0.0"}],
+        brands: brands,
+        fullVersionList: brands.map(function(b) { return {brand: b.brand, version: b.version + ".0.0.0"}; }),
         mobile: false,
         model: "",
         platform: globalThis.__obscura_ua_platform || "Windows",
         platformVersion: globalThis.__obscura_ua_platform_version || "15.0.0",
-        uaFullVersion: "145.0.0.0",
+        uaFullVersion: _chromeMajor() + ".0.0.0",
+        wow64: false,
       });
     },
     toJSON() { return {brands:this.brands,mobile:this.mobile,platform:this.platform}; },
@@ -6722,29 +6761,9 @@ globalThis.__obscura_init = function() {
   };
   globalThis.Notification.permission = "default";
 
-  if (globalThis.__obscura_stealth) {
-    var _stealthBrands = [
-      {brand: "Not:A-Brand", version: "99"},
-      {brand: "Google Chrome", version: "145"},
-      {brand: "Chromium", version: "145"},
-    ];
-    globalThis.navigator.userAgentData.brands = _stealthBrands;
-    globalThis.navigator.userAgentData.getHighEntropyValues = function(hints) {
-      return Promise.resolve({
-        architecture: "x86", bitness: "64",
-        brands: _stealthBrands,
-        fullVersionList: [
-          {brand:"Not:A-Brand",version:"99.0.0.0"},
-          {brand:"Google Chrome",version:"145.0.0.0"},
-          {brand:"Chromium",version:"145.0.0.0"},
-        ],
-        mobile: false, model: "",
-        platform: "Windows",
-        platformVersion: "10.0.0",
-        uaFullVersion: "145.0.0.0",
-      });
-    };
-  }
+  // userAgentData brands and getHighEntropyValues now derive the Chrome
+  // version from navigator.userAgent and read the platform from the page
+  // globals, so every stealth surface agrees without a per-mode override.
 
   // Hide internals (_*, obscura, Obscura). The set of keys is static at
   // snapshot-build time, so we precompute it ONCE below (after this
