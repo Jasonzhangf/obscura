@@ -273,6 +273,46 @@ pub struct ObscuraHttpClient {
     pub allow_private_network: bool,
 }
 
+/// Derive the sec-ch-ua and sec-ch-ua-platform client-hint header values from a
+/// User-Agent string, using Chromium's per-major-version GREASE algorithm so
+/// the non-stealth HTTP path agrees with navigator.userAgentData instead of
+/// shipping a fixed Linux/Chrome-145 hint that contradicts a Windows profile.
+fn chrome_client_hints(ua: &str) -> (String, String) {
+    let major: usize = ua
+        .split("Chrome/")
+        .nth(1)
+        .and_then(|s| s.split('.').next())
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(145);
+    const GREASE_CHARS: [char; 11] = [' ', '(', ':', '-', '.', '/', ')', ';', '=', '?', '_'];
+    const GREASE_VER: [&str; 3] = ["8", "99", "24"];
+    const PERMS: [[usize; 3]; 6] = [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]];
+    let grease_brand = format!(
+        "Not{}A{}Brand",
+        GREASE_CHARS[major % 11],
+        GREASE_CHARS[(major + 1) % 11]
+    );
+    let brands = [
+        (grease_brand, GREASE_VER[major % 3].to_string()),
+        ("Chromium".to_string(), major.to_string()),
+        ("Google Chrome".to_string(), major.to_string()),
+    ];
+    let p = PERMS[major % 6];
+    let sec_ch_ua = p
+        .iter()
+        .map(|&i| format!("\"{}\";v=\"{}\"", brands[i].0, brands[i].1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let platform = if ua.contains("Windows NT") {
+        "\"Windows\""
+    } else if ua.contains("Macintosh") {
+        "\"macOS\""
+    } else {
+        "\"Linux\""
+    };
+    (sec_ch_ua, platform.to_string())
+}
+
 impl ObscuraHttpClient {
     pub fn new() -> Self {
         Self::with_cookie_jar(Arc::new(CookieJar::new()))
@@ -407,49 +447,37 @@ impl ObscuraHttpClient {
             }
 
             let ua = self.user_agent.read().await.clone();
+            let (sec_ch_ua, sec_ch_ua_platform) = chrome_client_hints(&ua);
             let mut headers = HeaderMap::new();
+            // Chrome's top-level navigation header order. (reqwest appends
+            // accept-encoding/host after these, so accept-encoding lands after
+            // accept-language rather than before it; the rest matches Chrome.)
+            headers.insert(
+                HeaderName::from_static("sec-ch-ua"),
+                HeaderValue::from_str(&sec_ch_ua)
+                    .unwrap_or_else(|_| HeaderValue::from_static("\"Not:A-Brand\";v=\"99\", \"Google Chrome\";v=\"145\", \"Chromium\";v=\"145\"")),
+            );
+            headers.insert(HeaderName::from_static("sec-ch-ua-mobile"), HeaderValue::from_static("?0"));
+            headers.insert(
+                HeaderName::from_static("sec-ch-ua-platform"),
+                HeaderValue::from_str(&sec_ch_ua_platform)
+                    .unwrap_or_else(|_| HeaderValue::from_static("\"Windows\"")),
+            );
+            headers.insert(HeaderName::from_static("upgrade-insecure-requests"), HeaderValue::from_static("1"));
             headers.insert(USER_AGENT, HeaderValue::from_str(&ua).unwrap_or_else(|_| {
-                HeaderValue::from_static("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36")
+                HeaderValue::from_static("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36")
             }));
             headers.insert(
                 reqwest::header::ACCEPT,
                 HeaderValue::from_static("text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"),
             );
+            headers.insert(HeaderName::from_static("sec-fetch-site"), HeaderValue::from_static("none"));
+            headers.insert(HeaderName::from_static("sec-fetch-mode"), HeaderValue::from_static("navigate"));
+            headers.insert(HeaderName::from_static("sec-fetch-user"), HeaderValue::from_static("?1"));
+            headers.insert(HeaderName::from_static("sec-fetch-dest"), HeaderValue::from_static("document"));
             headers.insert(
                 reqwest::header::ACCEPT_LANGUAGE,
                 HeaderValue::from_static("en-US,en;q=0.9"),
-            );
-            headers.insert(
-                HeaderName::from_static("sec-ch-ua"),
-                HeaderValue::from_static("\"Chromium\";v=\"145\", \"Not;A=Brand\";v=\"24\", \"Google Chrome\";v=\"145\""),
-            );
-            headers.insert(
-                HeaderName::from_static("sec-ch-ua-mobile"),
-                HeaderValue::from_static("?0"),
-            );
-            headers.insert(
-                HeaderName::from_static("sec-ch-ua-platform"),
-                HeaderValue::from_static("\"Linux\""),
-            );
-            headers.insert(
-                HeaderName::from_static("sec-fetch-dest"),
-                HeaderValue::from_static("document"),
-            );
-            headers.insert(
-                HeaderName::from_static("sec-fetch-mode"),
-                HeaderValue::from_static("navigate"),
-            );
-            headers.insert(
-                HeaderName::from_static("sec-fetch-site"),
-                HeaderValue::from_static("none"),
-            );
-            headers.insert(
-                HeaderName::from_static("sec-fetch-user"),
-                HeaderValue::from_static("?1"),
-            );
-            headers.insert(
-                HeaderName::from_static("upgrade-insecure-requests"),
-                HeaderValue::from_static("1"),
             );
 
             let cookie_header = self.cookie_jar.get_cookie_header(&current_url);

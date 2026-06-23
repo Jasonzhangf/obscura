@@ -19,7 +19,18 @@ use crate::client::{Response, ObscuraNetError};
 
 #[cfg(feature = "stealth")]
 pub const STEALTH_USER_AGENT: &str =
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
+
+// The wreq emulation (Profile::Chrome145, Platform::Windows) sends this exact
+// UA and sec-ch-ua-platform "Windows" on the wire. navigator has to report the
+// same identity, otherwise the TLS/HTTP layer and the JS layer disagree and a
+// site cross-checks the mismatch as a bot signal.
+#[cfg(feature = "stealth")]
+pub const STEALTH_NAVIGATOR_PLATFORM: &str = "Win32";
+#[cfg(feature = "stealth")]
+pub const STEALTH_UA_PLATFORM: &str = "Windows";
+#[cfg(feature = "stealth")]
+pub const STEALTH_UA_PLATFORM_VERSION: &str = "15.0.0";
 
 #[cfg(feature = "stealth")]
 pub struct StealthHttpClient {
@@ -38,7 +49,7 @@ impl StealthHttpClient {
     pub fn with_proxy(cookie_jar: Arc<CookieJar>, proxy_url: Option<&str>) -> Self {
         let emulation_opts = wreq_util::Emulation::builder()
             .profile(wreq_util::Profile::Chrome145)
-            .platform(wreq_util::Platform::Linux)
+            .platform(wreq_util::Platform::Windows)
             .build();
 
         let mut builder = wreq::Client::builder()
@@ -141,6 +152,85 @@ impl StealthHttpClient {
         }
 
         Err(ObscuraNetError::TooManyRedirects(url.to_string()))
+    }
+
+    /// One request with no redirect following, for scripted fetch()/XHR. Reads
+    /// the cookie jar for the Cookie header and stores Set-Cookie back into it,
+    /// so the caller only owns redirect hops and SSRF re-validation. Used in
+    /// stealth mode so JS-level requests carry the same Chrome TLS fingerprint
+    /// and client hints as the main navigation instead of the rustls ClientHello
+    /// that op_fetch_url would otherwise send (which bot managers read as a
+    /// non-browser script and reject, e.g. the AWS WAF challenge verify call).
+    pub async fn send_single(
+        &self,
+        method: &str,
+        url: &Url,
+        headers: &HashMap<String, String>,
+        body: &str,
+    ) -> Result<Response, ObscuraNetError> {
+        if let Some(host) = url.host_str() {
+            if crate::blocklist::is_blocked(host) {
+                tracing::debug!("Blocked tracker: {}", url);
+                return Ok(Response {
+                    status: 0,
+                    url: url.clone(),
+                    headers: HashMap::new(),
+                    body: Vec::new(),
+                    redirected_from: Vec::new(),
+                });
+            }
+        }
+
+        let req_method = method
+            .parse::<wreq::Method>()
+            .map_err(|e| ObscuraNetError::Network(format!("invalid method '{}': {}", method, e)))?;
+        let mut req = self.client.request(req_method, url.as_str());
+
+        let cookie_header = self.cookie_jar.get_cookie_header(url);
+        if !cookie_header.is_empty() {
+            req = req.header("cookie", &cookie_header);
+        }
+        for (k, v) in self.extra_headers.read().await.iter() {
+            req = req.header(k.as_str(), v.as_str());
+        }
+        for (k, v) in headers.iter() {
+            req = req.header(k.as_str(), v.as_str());
+        }
+        if !body.is_empty() {
+            req = req.body(body.to_string());
+        }
+
+        self.in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let resp = req.send().await.map_err(|e| {
+            self.in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            ObscuraNetError::Network(format!("{}: {}", url, e))
+        })?;
+        self.in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+
+        let status = resp.status();
+        for val in resp.headers().get_all("set-cookie") {
+            if let Ok(s) = val.to_str() {
+                self.cookie_jar.set_cookie(s, url);
+            }
+        }
+        let response_headers: HashMap<String, String> = resp
+            .headers()
+            .iter()
+            .map(|(k, v)| (k.as_str().to_lowercase(), v.to_str().unwrap_or("").to_string()))
+            .collect();
+        let resp_body = resp
+            .bytes()
+            .await
+            .map_err(|e| ObscuraNetError::Network(format!("Failed to read body: {}", e)))?
+            .to_vec();
+
+        Ok(Response {
+            url: url.clone(),
+            status: status.as_u16(),
+            headers: response_headers,
+            body: resp_body,
+            redirected_from: Vec::new(),
+        })
     }
 
     pub async fn set_extra_headers(&self, headers: HashMap<String, String>) {

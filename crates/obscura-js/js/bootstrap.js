@@ -154,7 +154,9 @@ function _fpNoise(x, y, channel) {
 var _fpCache = null;
 function _getFp() {
   if (_fpCache) return _fpCache;
-  const isMac = (globalThis.__obscura_ua_platform || 'Windows') === 'macOS';
+  const _uaPlat = globalThis.__obscura_ua_platform || 'Windows';
+  const isMac = _uaPlat === 'macOS';
+  const isLinux = _uaPlat === 'Linux';
   const gpuPool = isMac ? [
     'ANGLE (Apple, ANGLE Metal Renderer: Apple M1, Unspecified Version)',
     'ANGLE (Apple, ANGLE Metal Renderer: Apple M1 Pro, Unspecified Version)',
@@ -162,6 +164,14 @@ function _getFp() {
     'ANGLE (Apple, ANGLE Metal Renderer: Apple M2 Pro, Unspecified Version)',
     'ANGLE (Apple, ANGLE Metal Renderer: Apple M3, Unspecified Version)',
     'ANGLE (Intel Inc., ANGLE Metal Renderer: Intel(R) Iris(TM) Plus Graphics, Unspecified Version)',
+  ] : isLinux ? [
+    'ANGLE (Intel, Mesa Intel(R) UHD Graphics 630 (CFL GT2), OpenGL 4.6)',
+    'ANGLE (Intel, Mesa Intel(R) Iris(R) Xe Graphics (TGL GT2), OpenGL 4.6)',
+    'ANGLE (Intel, Mesa Intel(R) UHD Graphics 770 (RPL-S), OpenGL 4.6)',
+    'ANGLE (AMD, AMD Radeon RX 580 (polaris10, LLVM 15.0.7, DRM 3.54, LLVM 15.0.7), OpenGL 4.6)',
+    'ANGLE (AMD, AMD Radeon RX 6700 XT (navi22, LLVM 16.0.6, DRM 3.54, LLVM 16.0.6), OpenGL 4.6)',
+    'ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 OpenGL 4.6)',
+    'ANGLE (NVIDIA, NVIDIA GeForce RTX 4070 OpenGL 4.6)',
   ] : [
     'ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)',
     'ANGLE (NVIDIA, NVIDIA GeForce GTX 1660 SUPER Direct3D11 vs_5_0 ps_5_0, D3D11)',
@@ -180,6 +190,10 @@ function _getFp() {
     'Google Inc. (Apple)','Google Inc. (Apple)','Google Inc. (Apple)',
     'Google Inc. (Apple)','Google Inc. (Apple)',
     'Google Inc. (Intel Inc.)',
+  ] : isLinux ? [
+    'Google Inc. (Intel)','Google Inc. (Intel)','Google Inc. (Intel)',
+    'Google Inc. (AMD)','Google Inc. (AMD)',
+    'Google Inc. (NVIDIA)','Google Inc. (NVIDIA)',
   ] : [
     'Google Inc. (NVIDIA)','Google Inc. (NVIDIA)','Google Inc. (NVIDIA)',
     'Google Inc. (Intel)','Google Inc. (Intel)',
@@ -2577,7 +2591,7 @@ function __currentUrl() {
 }
 globalThis.location = {
   get href() { return __currentUrl(); },
-  set href(url) { globalThis.__virtualUrl = null; Deno.core.ops.op_navigate(_resolveUrl(url), 'GET', ''); },
+  set href(url) { var r = _resolveUrl(url); globalThis.__virtualUrl = r; Deno.core.ops.op_navigate(r, 'GET', ''); },
   get origin() { try { return new URL(this.href).origin; } catch { return ""; } },
   get protocol() { try { return new URL(this.href).protocol; } catch { return ""; } },
   get host() { try { return new URL(this.href).host; } catch { return ""; } },
@@ -2587,14 +2601,14 @@ globalThis.location = {
   get hash() { try { return new URL(this.href).hash; } catch { return ""; } },
   get port() { try { return new URL(this.href).port; } catch { return ""; } },
   toString() { return this.href; },
-  assign(url) { globalThis.__virtualUrl = null; Deno.core.ops.op_navigate(_resolveUrl(url), 'GET', ''); },
-  reload() {},
-  replace(url) { globalThis.__virtualUrl = null; Deno.core.ops.op_navigate(_resolveUrl(url), 'GET', ''); },
+  assign(url) { var r = _resolveUrl(url); globalThis.__virtualUrl = r; Deno.core.ops.op_navigate(r, 'GET', ''); },
+  reload() { var r = _resolveUrl(this.href); globalThis.__virtualUrl = r; Deno.core.ops.op_navigate(r, 'GET', ''); },
+  replace(url) { var r = _resolveUrl(url); globalThis.__virtualUrl = r; Deno.core.ops.op_navigate(r, 'GET', ''); },
 };
 const _locationObj = globalThis.location;
 Object.defineProperty(globalThis, 'location', {
   get() { return _locationObj; },
-  set(url) { Deno.core.ops.op_navigate(_resolveUrl(String(url)), 'GET', ''); },
+  set(url) { var r = _resolveUrl(String(url)); globalThis.__virtualUrl = r; Deno.core.ops.op_navigate(r, 'GET', ''); },
   configurable: false,
   enumerable: true,
 });
@@ -2752,8 +2766,35 @@ globalThis.NetworkInformation = NetworkInformation;
 
 globalThis.ContentIndex = class ContentIndex {};
 
+function _chromeMajor() {
+  var m = (globalThis.__obscura_ua || '').match(/Chrome\/(\d+)/);
+  return m ? (m[1] | 0) : 145;
+}
+// Chromium derives the sec-ch-ua GREASE brand, version, and brand order
+// deterministically from the Chrome major version
+// (components/embedder_support/user_agent_utils.cc). Replicating it keeps
+// sec-ch-ua and userAgentData exact for every profile version rather than
+// hardcoding one static token.
+var _GREASE_CHARS = [' ', '(', ':', '-', '.', '/', ')', ';', '=', '?', '_'];
+var _GREASE_VER = ['8', '99', '24'];
+var _BRAND_PERMS = [[0,1,2],[0,2,1],[1,0,2],[1,2,0],[2,0,1],[2,1,0]];
+function _uaBrands() {
+  var seed = _chromeMajor();
+  var grease = {
+    brand: 'Not' + _GREASE_CHARS[seed % 11] + 'A' + _GREASE_CHARS[(seed + 1) % 11] + 'Brand',
+    version: _GREASE_VER[seed % 3],
+  };
+  var ordered = [
+    grease,
+    {brand: 'Chromium', version: String(seed)},
+    {brand: 'Google Chrome', version: String(seed)},
+  ];
+  var p = _BRAND_PERMS[seed % 6];
+  return [ordered[p[0]], ordered[p[1]], ordered[p[2]]];
+}
+
 globalThis.navigator = {
-  get userAgent() { return globalThis.__obscura_ua || "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"; },
+  get userAgent() { return globalThis.__obscura_ua || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"; },
   get appVersion() { return this.userAgent.replace('Mozilla/', ''); },
   language: "en-US", languages: ["en-US","en"], get platform() { return globalThis.__obscura_platform || "Win32"; },
   onLine: true, cookieEnabled: true, hardwareConcurrency: 8,
@@ -2779,24 +2820,22 @@ globalThis.navigator = {
     ]);
   },
   userAgentData: {
-    brands: [
-      {brand: "Google Chrome", version: "145"},
-      {brand: "Chromium", version: "145"},
-      {brand: "Not;A=Brand", version: "24"},
-    ],
     mobile: false,
+    get brands() { return _uaBrands(); },
     get platform() { return globalThis.__obscura_ua_platform || "Windows"; },
     getHighEntropyValues(hints) {
+      var brands = _uaBrands();
       return Promise.resolve({
         architecture: "x86",
         bitness: "64",
-        brands: [{brand:"Google Chrome",version:"145"},{brand:"Chromium",version:"145"},{brand:"Not;A=Brand",version:"24"}],
-        fullVersionList: [{brand:"Google Chrome",version:"145.0.0.0"},{brand:"Chromium",version:"145.0.0.0"},{brand:"Not;A=Brand",version:"24.0.0.0"}],
+        brands: brands,
+        fullVersionList: brands.map(function(b) { return {brand: b.brand, version: b.version + ".0.0.0"}; }),
         mobile: false,
         model: "",
         platform: globalThis.__obscura_ua_platform || "Windows",
         platformVersion: globalThis.__obscura_ua_platform_version || "15.0.0",
-        uaFullVersion: "145.0.0.0",
+        uaFullVersion: _chromeMajor() + ".0.0.0",
+        wow64: false,
       });
     },
     toJSON() { return {brands:this.brands,mobile:this.mobile,platform:this.platform}; },
@@ -2817,8 +2856,12 @@ globalThis.navigator = {
   },
   clipboard: { writeText(){return Promise.resolve();}, readText(){return Promise.resolve("");} },
   permissions: { query(params){
-    if (params?.name === 'notifications') return Promise.resolve({state:"prompt",onchange:null});
-    return Promise.resolve({state:"granted"});
+    var n = params && params.name;
+    // Chrome defaults privacy-sensitive permissions to "prompt", not "granted";
+    // returning "granted" for camera/microphone is a bot tell.
+    if (n === 'notifications') return Promise.resolve({state: (globalThis.Notification && Notification.permission === 'granted') ? 'granted' : 'prompt', onchange: null});
+    if (n === 'geolocation' || n === 'camera' || n === 'microphone' || n === 'midi') return Promise.resolve({state: 'prompt', onchange: null});
+    return Promise.resolve({state: 'granted', onchange: null});
   } },
   getBattery() { return Promise.resolve({ charging: _fp('batteryCharging'), chargingTime: _fp('batteryCharging') ? 0 : Infinity, dischargingTime: _fp('batteryCharging') ? Infinity : Math.floor(3600 + _fpRand(250) * 7200), level: _fp('batteryLevel'), addEventListener(){} }); },
   getGamepads() { return []; },
@@ -3003,6 +3046,51 @@ function _installWasmStreamingFallback() {
 }
 _installWasmStreamingFallback();
 
+// Serialize a FormData into a multipart/form-data body the way a browser does
+// when it is passed as fetch()/XHR body. The previous shim did String(body),
+// so a FormData became the literal "[object Object]" and the multipart payload
+// (with its boundary) was lost; servers replied "Invalid boundary for
+// multipart/form-data" (e.g. the AWS WAF challenge /mp_verify POST).
+function _formDataToMultipart(fd) {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  let bnd = '----WebKitFormBoundary';
+  for (let i = 0; i < 16; i++) bnd += chars[Math.floor(Math.random() * chars.length)];
+  let out = '';
+  const entries = fd._d || [];
+  for (let i = 0; i < entries.length; i++) {
+    const k = entries[i][0], v = entries[i][1];
+    out += '--' + bnd + '\r\n';
+    if (v != null && typeof v === 'object' && v._bytes != null) {
+      out += 'Content-Disposition: form-data; name="' + k + '"; filename="' + (v.name || 'blob') + '"\r\n';
+      out += 'Content-Type: ' + (v.type || 'application/octet-stream') + '\r\n\r\n';
+      try { out += new TextDecoder().decode(v._bytes); } catch (e) {}
+      out += '\r\n';
+    } else {
+      out += 'Content-Disposition: form-data; name="' + k + '"\r\n\r\n' + String(v) + '\r\n';
+    }
+  }
+  out += '--' + bnd + '--\r\n';
+  return { boundary: bnd, body: out };
+}
+
+// Coerce a fetch()/XHR body into the string op_fetch_url expects, attaching a
+// Content-Type header for body types that need one (FormData, URLSearchParams).
+function _serializeBody(initBody, headers) {
+  if (initBody == null || initBody === '') return '';
+  if (initBody instanceof FormData) {
+    const mp = _formDataToMultipart(initBody);
+    headers['Content-Type'] = 'multipart/form-data; boundary=' + mp.boundary;
+    return mp.body;
+  }
+  if (initBody instanceof URLSearchParams) {
+    if (!Object.keys(headers).some(k => k.toLowerCase() === 'content-type')) {
+      headers['Content-Type'] = 'application/x-www-form-urlencoded;charset=UTF-8';
+    }
+    return initBody.toString();
+  }
+  return typeof initBody === 'string' ? initBody : String(initBody);
+}
+
 globalThis.fetch = async (input, init = {}) => {
   let url = typeof input === "string"
     ? input
@@ -3016,8 +3104,9 @@ globalThis.fetch = async (input, init = {}) => {
     } catch(e) { /* keep as-is if URL resolution fails */ }
   }
   const method = init.method || (input instanceof Request ? input.method : "GET");
-  const hdrs = JSON.stringify(init.headers instanceof Headers ? Object.fromEntries(init.headers.entries()) : init.headers || {});
-  const body = init.body ? String(init.body) : "";
+  let _h = init.headers instanceof Headers ? Object.fromEntries(init.headers.entries()) : (init.headers || {});
+  const body = _serializeBody(init.body, _h);
+  const hdrs = JSON.stringify(_h);
   const fetchMode = init.mode || (input instanceof Request ? input.mode : "cors");
   const pageOrigin = (function() { try { const u = new URL(_domParse("document_url") || "about:blank"); return u.origin; } catch(e) { return ""; } })();
   const raw = await Deno.core.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode);
@@ -6328,11 +6417,25 @@ globalThis.Worker = class Worker {
 };
 
 globalThis.__blobStore = globalThis.__blobStore || {};
-const _origCreateObjectURL = URL.createObjectURL;
 URL.createObjectURL = function(blob) {
-  if (blob && typeof blob.text === 'function') {
+  if (blob) {
     const id = 'blob:obscura/' + Math.random().toString(36).substring(2);
-    blob.text().then(text => { globalThis.__blobStore[id] = text; });
+    // Store synchronously so a Worker built from the blob URL in the same
+    // tick sees its source. Blob-URL Worker construction is synchronous in
+    // real browsers; the previous async blob.text().then() store raced the
+    // Worker constructor, so new Worker(blobURL) fell through to fetch() and
+    // failed (net::ERR_FAILED), which broke AWS WAF's proof-of-work worker.
+    // The obscura Blob materializes _bytes in its constructor; fall back to
+    // the async text() store only for foreign Blob shims without _bytes.
+    if (blob._bytes) {
+      let text = '';
+      try { text = new TextDecoder().decode(blob._bytes); } catch (e) {}
+      globalThis.__blobStore[id] = text;
+    } else if (typeof blob.text === 'function') {
+      blob.text().then(text => { globalThis.__blobStore[id] = text; });
+    } else {
+      globalThis.__blobStore[id] = '';
+    }
     return id;
   }
   return 'blob:obscura/fallback';
@@ -6421,7 +6524,8 @@ if (!globalThis.crypto.subtle) {
   globalThis.crypto.subtle = {
     async digest(algorithm, data) {
       const name = (typeof algorithm === 'string' ? algorithm : algorithm?.name || '').toUpperCase().replace('_', '-');
-      if (name !== 'SHA-1' && name !== 'SHA-256' && name !== 'SHA-384' && name !== 'SHA-512') {
+      if (name !== 'SHA-1' && name !== 'SHA-256' && name !== 'SHA-384' && name !== 'SHA-512' &&
+          name !== 'SHA-512/224' && name !== 'SHA-512/256') {
         throw new DOMException('Unrecognized algorithm name', 'NotSupportedError');
       }
       let bytes;
@@ -6840,6 +6944,10 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
 globalThis.__obscura_init = function() {
   _fpSeed = Date.now() ^ (Math.random() * 0xFFFFFFFF >>> 0);
   _fpCache = null;
+  // A real navigation just completed (this runs after set_url), so drop any
+  // URL a location setter previewed synchronously and let document_url drive
+  // location.href again, including any redirect target.
+  globalThis.__virtualUrl = null;
   _installWasmStreamingFallback();
 
   globalThis.document = new Document(+_dom("document_node_id"));
@@ -6868,29 +6976,9 @@ globalThis.__obscura_init = function() {
   };
   globalThis.Notification.permission = "default";
 
-  if (globalThis.__obscura_stealth) {
-    var _stealthBrands = [
-      {brand: "Not:A-Brand", version: "99"},
-      {brand: "Google Chrome", version: "145"},
-      {brand: "Chromium", version: "145"},
-    ];
-    globalThis.navigator.userAgentData.brands = _stealthBrands;
-    globalThis.navigator.userAgentData.getHighEntropyValues = function(hints) {
-      return Promise.resolve({
-        architecture: "x86", bitness: "64",
-        brands: _stealthBrands,
-        fullVersionList: [
-          {brand:"Not:A-Brand",version:"99.0.0.0"},
-          {brand:"Google Chrome",version:"145.0.0.0"},
-          {brand:"Chromium",version:"145.0.0.0"},
-        ],
-        mobile: false, model: "",
-        platform: "Windows",
-        platformVersion: "10.0.0",
-        uaFullVersion: "145.0.0.0",
-      });
-    };
-  }
+  // userAgentData brands and getHighEntropyValues now derive the Chrome
+  // version from navigator.userAgent and read the platform from the page
+  // globals, so every stealth surface agrees without a per-mode override.
 
   // Hide internals (_*, obscura, Obscura). The set of keys is static at
   // snapshot-build time, so we precompute it ONCE below (after this
