@@ -319,6 +319,10 @@ impl Page {
 
         rt.set_cookie_jar(self.context.cookie_jar.clone());
         rt.set_http_client(self.http_client.clone());
+        #[cfg(feature = "stealth")]
+        if let Some(ref stealth) = self.stealth_client {
+            rt.set_stealth_client(stealth.clone());
+        }
 
         if let Some(tx) = &self.intercept_tx {
             rt.set_intercept_tx(tx.clone());

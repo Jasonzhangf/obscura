@@ -3,6 +3,13 @@ name = "obscura-js"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+# Builds obscura-net with its stealth (wreq) HTTP client and lets scripted
+# fetch()/XHR be routed through it so JS-level requests carry the same Chrome
+# TLS fingerprint and client hints as stealth navigation.
+stealth = ["obscura-net/stealth"]
+
 [build-dependencies]
 deno_core = "0.350"
 

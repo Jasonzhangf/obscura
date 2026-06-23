@@ -9,6 +9,8 @@ use deno_core::Extension;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use obscura_dom::{DomTree, NodeData, NodeId};
 use obscura_net::{CookieJar, ObscuraHttpClient};
+#[cfg(feature = "stealth")]
+use obscura_net::StealthHttpClient;
 use tokio::sync::Mutex;
 
 pub type InterceptCallback = Arc<Mutex<Option<Box<dyn Fn(String, String, String) -> Option<(u16, String, String)> + Send + Sync>>>>;
@@ -55,6 +57,11 @@ pub struct ObscuraState {
     pub blocked_urls: Vec<String>,
     pub cookie_jar: Option<Arc<CookieJar>>,
     pub http_client: Option<Arc<ObscuraHttpClient>>,
+    /// When set (stealth mode), scripted fetch()/XHR is routed through the wreq
+    /// client so the request carries the Chrome TLS fingerprint and client
+    /// hints instead of the rustls ClientHello op_fetch_url would otherwise send.
+    #[cfg(feature = "stealth")]
+    pub stealth_client: Option<Arc<StealthHttpClient>>,
     pub pending_navigation: Option<(String, String, String)>,
     pub intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<InterceptedRequest>>,
     pub intercept_counter: u64,
@@ -82,6 +89,8 @@ impl ObscuraState {
             blocked_urls: Vec::new(),
             cookie_jar: None,
             http_client: None,
+            #[cfg(feature = "stealth")]
+            stealth_client: None,
             pending_navigation: None,
             intercept_tx: None,
             intercept_counter: 0,
@@ -707,6 +716,34 @@ async fn op_fetch_url(
     let custom_headers: std::collections::HashMap<String, String> =
         serde_json::from_str(&headers_json).unwrap_or_default();
 
+    // Stealth mode: route the scripted request through the wreq client so its
+    // TLS fingerprint and Chrome client hints match the main navigation. The
+    // rustls ClientHello plus missing client hints that op_fetch_url's reqwest
+    // path sends otherwise read as a non-browser script to bot managers (the
+    // AWS WAF challenge verify call, Akamai sensors, etc.).
+    #[cfg(feature = "stealth")]
+    {
+        let stealth = {
+            let st = state.borrow();
+            let gs = st.borrow::<SharedState>().clone();
+            let client = gs.borrow().stealth_client.clone();
+            client
+        };
+        if let Some(stealth) = stealth {
+            return stealth_fetch_all(
+                stealth,
+                url.clone(),
+                req_method.as_str().to_string(),
+                custom_headers.clone(),
+                body.clone(),
+                page_origin.clone(),
+                is_cross_origin,
+                mode.clone(),
+            )
+            .await;
+        }
+    }
+
     let needs_preflight = is_cross_origin
         && mode == "cors"
         && (req_method != reqwest::Method::GET
@@ -940,6 +977,120 @@ async fn op_fetch_url(
         "body": resp_body,
         "bodyBase64": resp_body_base64,
         "requestId": response_request_id,
+        "url": url,
+        "headers": resp_headers,
+    })
+    .to_string())
+}
+
+/// Stealth-mode scripted fetch()/XHR: mirrors op_fetch_url's redirect, SSRF,
+/// and CORS semantics but sends every hop through the wreq stealth client so
+/// the request carries the Chrome TLS fingerprint and client hints. Cookie
+/// handling lives inside StealthHttpClient::send_single, which shares the
+/// context jar. Response bodies are not mirrored into the CDP
+/// Network.getResponseBody buffer here; that is a follow-up for stealth fetches.
+#[cfg(feature = "stealth")]
+async fn stealth_fetch_all(
+    stealth: Arc<StealthHttpClient>,
+    url: String,
+    method: String,
+    custom_headers: HashMap<String, String>,
+    body: String,
+    page_origin: String,
+    is_cross_origin: bool,
+    mode: String,
+) -> Result<String, deno_error::JsErrorBox> {
+    let mut current_url = url.clone();
+    let mut current_method = method;
+    let mut current_body = body;
+    let mut redirects_followed: usize = 0;
+
+    let (status, resp_headers, resp_bytes): (u16, HashMap<String, String>, Vec<u8>) = loop {
+        let parsed_current = match url::Url::parse(&current_url) {
+            Ok(u) => u,
+            Err(_) => {
+                return Ok(serde_json::json!({
+                    "status": 0, "body": "", "url": current_url, "headers": {},
+                })
+                .to_string());
+            }
+        };
+
+        let mut req_headers: HashMap<String, String> = HashMap::new();
+        if is_cross_origin {
+            req_headers.insert("origin".to_string(), page_origin.clone());
+        }
+        for (k, v) in &custom_headers {
+            req_headers.insert(k.to_lowercase(), v.clone());
+        }
+
+        let r = stealth
+            .send_single(&current_method, &parsed_current, &req_headers, &current_body)
+            .await
+            .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
+
+        if !(300..400).contains(&r.status) {
+            break (r.status, r.headers, r.body);
+        }
+        let Some(location) = r.headers.get("location").cloned() else {
+            break (r.status, r.headers, r.body);
+        };
+        let next_url = match parsed_current.join(&location) {
+            Ok(u) => u,
+            Err(_) => break (r.status, r.headers, r.body),
+        };
+        // Re-validate every redirect target against the SSRF policy, matching
+        // op_fetch_url (GHSA-8v6v-g4rh-jmcm).
+        if let Err(reason) = validate_fetch_url(&next_url) {
+            return Ok(serde_json::json!({
+                "status": 0, "body": "", "url": next_url.to_string(), "headers": {},
+                "blocked": true,
+                "error": format!("Redirect to forbidden URL blocked: {}", reason),
+            })
+            .to_string());
+        }
+        redirects_followed += 1;
+        if redirects_followed > FETCH_REDIRECT_LIMIT {
+            return Ok(serde_json::json!({
+                "status": 0, "body": "", "url": next_url.to_string(), "headers": {},
+                "blocked": true,
+                "error": format!("Too many redirects (>{})", FETCH_REDIRECT_LIMIT),
+            })
+            .to_string());
+        }
+        // Browser semantics: 301/302/303 downgrade to GET with no body.
+        if r.status == 301 || r.status == 302 || r.status == 303 {
+            current_method = "GET".to_string();
+            current_body.clear();
+        }
+        current_url = next_url.to_string();
+    };
+
+    if is_cross_origin && mode == "cors" {
+        let allowed = resp_headers
+            .get("access-control-allow-origin")
+            .map(|s| s.as_str())
+            .unwrap_or("");
+        if allowed != "*" && allowed != page_origin {
+            return Ok(serde_json::json!({
+                "status": 0, "body": "", "url": url, "headers": {},
+                "corsBlocked": true,
+                "corsError": format!(
+                    "CORS error: Origin '{}' not in Access-Control-Allow-Origin '{}'",
+                    page_origin, allowed
+                ),
+            })
+            .to_string());
+        }
+    }
+
+    let resp_body = String::from_utf8_lossy(&resp_bytes).to_string();
+    let resp_body_base64 = BASE64.encode(&resp_bytes);
+
+    Ok(serde_json::json!({
+        "status": status,
+        "body": resp_body,
+        "bodyBase64": resp_body_base64,
         "url": url,
         "headers": resp_headers,
     })

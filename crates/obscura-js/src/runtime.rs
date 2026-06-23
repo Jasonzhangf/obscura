@@ -153,6 +153,13 @@ impl ObscuraJsRuntime {
         self.state.borrow_mut().http_client = Some(client);
     }
 
+    /// Install the stealth (wreq) HTTP client so scripted fetch()/XHR is routed
+    /// through it in stealth mode (see op_fetch_url / stealth_fetch_all).
+    #[cfg(feature = "stealth")]
+    pub fn set_stealth_client(&self, client: std::sync::Arc<obscura_net::StealthHttpClient>) {
+        self.state.borrow_mut().stealth_client = Some(client);
+    }
+
     pub fn set_dom(&self, dom: DomTree) {
         self.state.borrow_mut().dom = Some(dom);
     }
