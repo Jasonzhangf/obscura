@@ -2906,6 +2906,51 @@ function _installWasmStreamingFallback() {
 }
 _installWasmStreamingFallback();
 
+// Serialize a FormData into a multipart/form-data body the way a browser does
+// when it is passed as fetch()/XHR body. The previous shim did String(body),
+// so a FormData became the literal "[object Object]" and the multipart payload
+// (with its boundary) was lost; servers replied "Invalid boundary for
+// multipart/form-data" (e.g. the AWS WAF challenge /mp_verify POST).
+function _formDataToMultipart(fd) {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  let bnd = '----WebKitFormBoundary';
+  for (let i = 0; i < 16; i++) bnd += chars[Math.floor(Math.random() * chars.length)];
+  let out = '';
+  const entries = fd._d || [];
+  for (let i = 0; i < entries.length; i++) {
+    const k = entries[i][0], v = entries[i][1];
+    out += '--' + bnd + '\r\n';
+    if (v != null && typeof v === 'object' && v._bytes != null) {
+      out += 'Content-Disposition: form-data; name="' + k + '"; filename="' + (v.name || 'blob') + '"\r\n';
+      out += 'Content-Type: ' + (v.type || 'application/octet-stream') + '\r\n\r\n';
+      try { out += new TextDecoder().decode(v._bytes); } catch (e) {}
+      out += '\r\n';
+    } else {
+      out += 'Content-Disposition: form-data; name="' + k + '"\r\n\r\n' + String(v) + '\r\n';
+    }
+  }
+  out += '--' + bnd + '--\r\n';
+  return { boundary: bnd, body: out };
+}
+
+// Coerce a fetch()/XHR body into the string op_fetch_url expects, attaching a
+// Content-Type header for body types that need one (FormData, URLSearchParams).
+function _serializeBody(initBody, headers) {
+  if (initBody == null || initBody === '') return '';
+  if (initBody instanceof FormData) {
+    const mp = _formDataToMultipart(initBody);
+    headers['Content-Type'] = 'multipart/form-data; boundary=' + mp.boundary;
+    return mp.body;
+  }
+  if (initBody instanceof URLSearchParams) {
+    if (!Object.keys(headers).some(k => k.toLowerCase() === 'content-type')) {
+      headers['Content-Type'] = 'application/x-www-form-urlencoded;charset=UTF-8';
+    }
+    return initBody.toString();
+  }
+  return typeof initBody === 'string' ? initBody : String(initBody);
+}
+
 globalThis.fetch = async (input, init = {}) => {
   let url = typeof input === "string"
     ? input
@@ -2919,8 +2964,9 @@ globalThis.fetch = async (input, init = {}) => {
     } catch(e) { /* keep as-is if URL resolution fails */ }
   }
   const method = init.method || (input instanceof Request ? input.method : "GET");
-  const hdrs = JSON.stringify(init.headers instanceof Headers ? Object.fromEntries(init.headers.entries()) : init.headers || {});
-  const body = init.body ? String(init.body) : "";
+  let _h = init.headers instanceof Headers ? Object.fromEntries(init.headers.entries()) : (init.headers || {});
+  const body = _serializeBody(init.body, _h);
+  const hdrs = JSON.stringify(_h);
   const fetchMode = init.mode || (input instanceof Request ? input.mode : "cors");
   const pageOrigin = (function() { try { const u = new URL(_domParse("document_url") || "about:blank"); return u.origin; } catch(e) { return ""; } })();
   const raw = await Deno.core.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode);
