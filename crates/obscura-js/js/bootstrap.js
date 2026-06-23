@@ -2720,8 +2720,12 @@ globalThis.navigator = {
   },
   clipboard: { writeText(){return Promise.resolve();}, readText(){return Promise.resolve("");} },
   permissions: { query(params){
-    if (params?.name === 'notifications') return Promise.resolve({state:"prompt",onchange:null});
-    return Promise.resolve({state:"granted"});
+    var n = params && params.name;
+    // Chrome defaults privacy-sensitive permissions to "prompt", not "granted";
+    // returning "granted" for camera/microphone is a bot tell.
+    if (n === 'notifications') return Promise.resolve({state: (globalThis.Notification && Notification.permission === 'granted') ? 'granted' : 'prompt', onchange: null});
+    if (n === 'geolocation' || n === 'camera' || n === 'microphone' || n === 'midi') return Promise.resolve({state: 'prompt', onchange: null});
+    return Promise.resolve({state: 'granted', onchange: null});
   } },
   getBattery() { return Promise.resolve({ charging: _fp('batteryCharging'), chargingTime: _fp('batteryCharging') ? 0 : Infinity, dischargingTime: _fp('batteryCharging') ? Infinity : Math.floor(3600 + _fpRand(250) * 7200), level: _fp('batteryLevel'), addEventListener(){} }); },
   getGamepads() { return []; },
