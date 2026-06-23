@@ -2499,7 +2499,7 @@ function __currentUrl() {
 }
 globalThis.location = {
   get href() { return __currentUrl(); },
-  set href(url) { globalThis.__virtualUrl = null; Deno.core.ops.op_navigate(_resolveUrl(url), 'GET', ''); },
+  set href(url) { var r = _resolveUrl(url); globalThis.__virtualUrl = r; Deno.core.ops.op_navigate(r, 'GET', ''); },
   get origin() { try { return new URL(this.href).origin; } catch { return ""; } },
   get protocol() { try { return new URL(this.href).protocol; } catch { return ""; } },
   get host() { try { return new URL(this.href).host; } catch { return ""; } },
@@ -2509,14 +2509,14 @@ globalThis.location = {
   get hash() { try { return new URL(this.href).hash; } catch { return ""; } },
   get port() { try { return new URL(this.href).port; } catch { return ""; } },
   toString() { return this.href; },
-  assign(url) { globalThis.__virtualUrl = null; Deno.core.ops.op_navigate(_resolveUrl(url), 'GET', ''); },
-  reload() {},
-  replace(url) { globalThis.__virtualUrl = null; Deno.core.ops.op_navigate(_resolveUrl(url), 'GET', ''); },
+  assign(url) { var r = _resolveUrl(url); globalThis.__virtualUrl = r; Deno.core.ops.op_navigate(r, 'GET', ''); },
+  reload() { var r = _resolveUrl(this.href); globalThis.__virtualUrl = r; Deno.core.ops.op_navigate(r, 'GET', ''); },
+  replace(url) { var r = _resolveUrl(url); globalThis.__virtualUrl = r; Deno.core.ops.op_navigate(r, 'GET', ''); },
 };
 const _locationObj = globalThis.location;
 Object.defineProperty(globalThis, 'location', {
   get() { return _locationObj; },
-  set(url) { Deno.core.ops.op_navigate(_resolveUrl(String(url)), 'GET', ''); },
+  set(url) { var r = _resolveUrl(String(url)); globalThis.__virtualUrl = r; Deno.core.ops.op_navigate(r, 'GET', ''); },
   configurable: false,
   enumerable: true,
 });
@@ -6218,11 +6218,25 @@ globalThis.Worker = class Worker {
 };
 
 globalThis.__blobStore = globalThis.__blobStore || {};
-const _origCreateObjectURL = URL.createObjectURL;
 URL.createObjectURL = function(blob) {
-  if (blob && typeof blob.text === 'function') {
+  if (blob) {
     const id = 'blob:obscura/' + Math.random().toString(36).substring(2);
-    blob.text().then(text => { globalThis.__blobStore[id] = text; });
+    // Store synchronously so a Worker built from the blob URL in the same
+    // tick sees its source. Blob-URL Worker construction is synchronous in
+    // real browsers; the previous async blob.text().then() store raced the
+    // Worker constructor, so new Worker(blobURL) fell through to fetch() and
+    // failed (net::ERR_FAILED), which broke AWS WAF's proof-of-work worker.
+    // The obscura Blob materializes _bytes in its constructor; fall back to
+    // the async text() store only for foreign Blob shims without _bytes.
+    if (blob._bytes) {
+      let text = '';
+      try { text = new TextDecoder().decode(blob._bytes); } catch (e) {}
+      globalThis.__blobStore[id] = text;
+    } else if (typeof blob.text === 'function') {
+      blob.text().then(text => { globalThis.__blobStore[id] = text; });
+    } else {
+      globalThis.__blobStore[id] = '';
+    }
     return id;
   }
   return 'blob:obscura/fallback';
@@ -6733,6 +6747,10 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
 globalThis.__obscura_init = function() {
   _fpSeed = Date.now() ^ (Math.random() * 0xFFFFFFFF >>> 0);
   _fpCache = null;
+  // A real navigation just completed (this runs after set_url), so drop any
+  // URL a location setter previewed synchronously and let document_url drive
+  // location.href again, including any redirect target.
+  globalThis.__virtualUrl = null;
   _installWasmStreamingFallback();
 
   globalThis.document = new Document(+_dom("document_node_id"));
