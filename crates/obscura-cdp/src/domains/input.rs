@@ -47,6 +47,16 @@ pub async fn handle(
                                     }} else if (tag === 'INPUT' && (type === 'checkbox' || type === 'radio')) {{\
                                         target.checked = !target.checked;\
                                         try {{ target.dispatchEvent(globalThis.__obscura_markTrusted(new Event('change', {{bubbles:true}}))); }} catch(e) {{}}\
+                                    }} else if ({click_count} >= 3 && (tag === 'INPUT' || tag === 'TEXTAREA')) {{\
+                                        // Triple-click selects all text (browser native behavior not replicated
+                                        // by synthetic MouseEvent, so we do it manually).
+                                        var len = target.value ? target.value.length : 0;\
+                                        if (target.setSelectionRange) {{\
+                                            target.setSelectionRange(0, len);\
+                                        }} else {{\
+                                            target.selectionStart = 0;\
+                                            target.selectionEnd = len;\
+                                        }}\
                                     }}\
                                 }}\
                             }}\
