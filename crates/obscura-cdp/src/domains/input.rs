@@ -2,6 +2,59 @@ use serde_json::{json, Value};
 
 use crate::dispatch::CdpContext;
 
+// Insert `escaped_text` at the caret, replacing any non-collapsed selection
+// the way a real browser does when you type over selected text (for example
+// after a triple-click select-all). selectionStart is null during ordinary
+// typing, so the legacy append path is kept when no selection is tracked.
+fn insert_text_js(escaped_text: &str) -> String {
+    format!(
+        "(function() {{\
+            var t = document.activeElement;\
+            if (!t || (t.localName !== 'input' && t.localName !== 'textarea')) return;\
+            var v = t.value || '';\
+            var s = t.selectionStart, e = t.selectionEnd;\
+            if (s == null) {{\
+                t.value = v + '{text}';\
+            }} else {{\
+                s = Math.max(0, Math.min(s, v.length));\
+                e = (e == null) ? s : Math.max(0, Math.min(e, v.length));\
+                var lo = Math.min(s, e), hi = Math.max(s, e);\
+                t.value = v.slice(0, lo) + '{text}' + v.slice(hi);\
+                var caret = lo + ('{text}').length;\
+                t.setSelectionRange(caret, caret);\
+            }}\
+            t.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {{bubbles:true}})));\
+        }})()",
+        text = escaped_text,
+    )
+}
+
+// Backspace deletes the selected range when there is one, so the common
+// "triple-click to select-all, then Backspace to clear" pattern works. With a
+// collapsed caret it removes the character before the caret, and with no
+// selection tracked it falls back to trimming the last character (legacy).
+const BACKSPACE_JS: &str = "(function() {\
+    var t = document.activeElement;\
+    if (!t || (t.localName !== 'input' && t.localName !== 'textarea')) return;\
+    var v = t.value || '';\
+    var s = t.selectionStart, e = t.selectionEnd;\
+    if (s == null) {\
+        t.value = v.slice(0, -1);\
+    } else {\
+        s = Math.max(0, Math.min(s, v.length));\
+        e = (e == null) ? s : Math.max(0, Math.min(e, v.length));\
+        if (s !== e) {\
+            var lo = Math.min(s, e), hi = Math.max(s, e);\
+            t.value = v.slice(0, lo) + v.slice(hi);\
+            t.setSelectionRange(lo, lo);\
+        } else if (s > 0) {\
+            t.value = v.slice(0, s - 1) + v.slice(s);\
+            t.setSelectionRange(s - 1, s - 1);\
+        }\
+    }\
+    t.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {bubbles:true})));\
+})()";
+
 pub async fn handle(
     method: &str,
     params: &Value,
@@ -107,17 +160,7 @@ pub async fn handle(
                             // Need to escape backslash BEFORE single-quote so the new
                             // backslashes from quote escaping don't get double-escaped.
                             let escaped_text = text.replace('\\', "\\\\").replace('\'', "\\'");
-                            let js = format!(
-                                "(function() {{\
-                                    var target = document.activeElement;\
-                                    if (target && (target.localName === 'input' || target.localName === 'textarea')) {{\
-                                        target.value = (target.value || '') + '{text}';\
-                                        target.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {{bubbles:true}})));\
-                                    }}\
-                                }})()",
-                                text = escaped_text,
-                            );
-                            page.evaluate(&js);
+                            page.evaluate(&insert_text_js(&escaped_text));
                         }
 
                         if key == "Enter" {
@@ -141,14 +184,7 @@ pub async fn handle(
                         }
 
                         if key == "Backspace" {
-                            let js = "(function() {\
-                                var target = document.activeElement;\
-                                if (target && (target.localName === 'input' || target.localName === 'textarea')) {\
-                                    target.value = target.value.slice(0, -1);\
-                                    target.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {bubbles:true})));\
-                                }\
-                            })()";
-                            page.evaluate(js);
+                            page.evaluate(BACKSPACE_JS);
                         }
                     }
                     "keyUp" => {
@@ -166,17 +202,7 @@ pub async fn handle(
                     "char" => {
                         if !text.is_empty() {
                             let escaped_text = text.replace('\\', "\\\\").replace('\'', "\\'");
-                            let js = format!(
-                                "(function() {{\
-                                    var target = document.activeElement;\
-                                    if (target && (target.localName === 'input' || target.localName === 'textarea')) {{\
-                                        target.value = (target.value || '') + '{text}';\
-                                        target.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {{bubbles:true}})));\
-                                    }}\
-                                }})()",
-                                text = escaped_text,
-                            );
-                            page.evaluate(&js);
+                            page.evaluate(&insert_text_js(&escaped_text));
                             // Pump event loop so Angular change detection picks up the input
                             page.settle(50).await;
                         }
