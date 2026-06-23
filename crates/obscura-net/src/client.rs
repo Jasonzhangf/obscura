@@ -447,52 +447,37 @@ impl ObscuraHttpClient {
             }
 
             let ua = self.user_agent.read().await.clone();
-            let mut headers = HeaderMap::new();
-            headers.insert(USER_AGENT, HeaderValue::from_str(&ua).unwrap_or_else(|_| {
-                HeaderValue::from_static("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36")
-            }));
-            headers.insert(
-                reqwest::header::ACCEPT,
-                HeaderValue::from_static("text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"),
-            );
-            headers.insert(
-                reqwest::header::ACCEPT_LANGUAGE,
-                HeaderValue::from_static("en-US,en;q=0.9"),
-            );
             let (sec_ch_ua, sec_ch_ua_platform) = chrome_client_hints(&ua);
+            let mut headers = HeaderMap::new();
+            // Chrome's top-level navigation header order. (reqwest appends
+            // accept-encoding/host after these, so accept-encoding lands after
+            // accept-language rather than before it; the rest matches Chrome.)
             headers.insert(
                 HeaderName::from_static("sec-ch-ua"),
                 HeaderValue::from_str(&sec_ch_ua)
                     .unwrap_or_else(|_| HeaderValue::from_static("\"Not:A-Brand\";v=\"99\", \"Google Chrome\";v=\"145\", \"Chromium\";v=\"145\"")),
             );
-            headers.insert(
-                HeaderName::from_static("sec-ch-ua-mobile"),
-                HeaderValue::from_static("?0"),
-            );
+            headers.insert(HeaderName::from_static("sec-ch-ua-mobile"), HeaderValue::from_static("?0"));
             headers.insert(
                 HeaderName::from_static("sec-ch-ua-platform"),
                 HeaderValue::from_str(&sec_ch_ua_platform)
                     .unwrap_or_else(|_| HeaderValue::from_static("\"Windows\"")),
             );
+            headers.insert(HeaderName::from_static("upgrade-insecure-requests"), HeaderValue::from_static("1"));
+            headers.insert(USER_AGENT, HeaderValue::from_str(&ua).unwrap_or_else(|_| {
+                HeaderValue::from_static("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36")
+            }));
             headers.insert(
-                HeaderName::from_static("sec-fetch-dest"),
-                HeaderValue::from_static("document"),
+                reqwest::header::ACCEPT,
+                HeaderValue::from_static("text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"),
             );
+            headers.insert(HeaderName::from_static("sec-fetch-site"), HeaderValue::from_static("none"));
+            headers.insert(HeaderName::from_static("sec-fetch-mode"), HeaderValue::from_static("navigate"));
+            headers.insert(HeaderName::from_static("sec-fetch-user"), HeaderValue::from_static("?1"));
+            headers.insert(HeaderName::from_static("sec-fetch-dest"), HeaderValue::from_static("document"));
             headers.insert(
-                HeaderName::from_static("sec-fetch-mode"),
-                HeaderValue::from_static("navigate"),
-            );
-            headers.insert(
-                HeaderName::from_static("sec-fetch-site"),
-                HeaderValue::from_static("none"),
-            );
-            headers.insert(
-                HeaderName::from_static("sec-fetch-user"),
-                HeaderValue::from_static("?1"),
-            );
-            headers.insert(
-                HeaderName::from_static("upgrade-insecure-requests"),
-                HeaderValue::from_static("1"),
+                reqwest::header::ACCEPT_LANGUAGE,
+                HeaderValue::from_static("en-US,en;q=0.9"),
             );
 
             let cookie_header = self.cookie_jar.get_cookie_header(&current_url);
