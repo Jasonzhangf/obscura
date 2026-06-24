@@ -26,6 +26,12 @@ struct Args {
     #[arg(long, global = true)]
     proxy: Option<String>,
 
+    /// Enable stealth mode (consistent browser fingerprint, and with the
+    /// `stealth` build feature, TLS impersonation plus tracker blocking).
+    /// Global: applies to fetch, serve, scrape, and mcp.
+    #[arg(long, global = true)]
+    stealth: bool,
+
     #[arg(long)]
     obey_robots: bool,
 
@@ -68,9 +74,6 @@ enum Command {
 
         #[arg(long)]
         user_agent: Option<String>,
-
-        #[arg(long)]
-        stealth: bool,
 
         #[arg(long, default_value_t = 1)]
         workers: u16,
@@ -115,9 +118,6 @@ enum Command {
 
         #[arg(long)]
         user_agent: Option<String>,
-
-        #[arg(long)]
-        stealth: bool,
 
         #[arg(long, short)]
         eval: Option<String>,
@@ -166,9 +166,6 @@ enum Command {
 
         #[arg(long)]
         user_agent: Option<String>,
-
-        #[arg(long)]
-        stealth: bool,
     },
 
 }
@@ -313,9 +310,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let global_proxy = args.proxy.clone();
+    let stealth = args.stealth;
 
     match args.command {
-        Some(Command::Serve { port, host, proxy, user_agent, stealth, workers, allow_file_access, storage_dir, quiet: _ }) => {
+        Some(Command::Serve { port, host, proxy, user_agent, workers, allow_file_access, storage_dir, quiet: _ }) => {
             let proxy = merge_proxy(global_proxy.clone(), proxy);
             print_banner(port);
             if let Some(ref dir) = storage_dir {
@@ -346,13 +344,13 @@ async fn main() -> anyhow::Result<()> {
                 ).await?;
             }
         }
-        Some(Command::Fetch { url, dump, selector, wait, timeout, wait_until, user_agent, stealth, eval, output, quiet, storage_dir }) => {
+        Some(Command::Fetch { url, dump, selector, wait, timeout, wait_until, user_agent, eval, output, quiet, storage_dir }) => {
             run_fetch(&url, dump, selector, wait, timeout, &wait_until, user_agent, stealth, eval, output, quiet, global_proxy, storage_dir, args.allow_private_network).await?;
         }
         Some(Command::Scrape { urls, eval, concurrency, format, timeout, quiet }) => {
-            run_parallel_scrape(urls, eval, concurrency.get(), &format, timeout, quiet, global_proxy).await?;
+            run_parallel_scrape(urls, eval, concurrency.get(), &format, timeout, quiet, global_proxy, stealth).await?;
         }
-        Some(Command::Mcp { http, host, port, proxy, user_agent, stealth }) => {
+        Some(Command::Mcp { http, host, port, proxy, user_agent }) => {
             let mcp_proxy = merge_proxy(global_proxy.clone(), proxy);
             if http {
                 obscura_mcp::http::run(host, port, mcp_proxy, user_agent, stealth).await?;
@@ -365,7 +363,7 @@ async fn main() -> anyhow::Result<()> {
             if let Some(ref proxy) = args.proxy {
                 tracing::info!("Using proxy: {}", proxy);
             }
-            obscura_cdp::start_with_options(args.port, args.proxy, false).await?;
+            obscura_cdp::start_with_options(args.port, args.proxy, stealth).await?;
         }
     }
 
@@ -825,6 +823,7 @@ async fn run_parallel_scrape(
     timeout_secs: u64,
     quiet: bool,
     proxy: Option<String>,
+    stealth: bool,
 ) -> anyhow::Result<()> {
     let total = urls.len();
     let start = Instant::now();
@@ -877,6 +876,7 @@ async fn run_parallel_scrape(
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::null())
                 .env("OBSCURA_PROXY", proxy.as_deref().unwrap_or(""))
+                .env("OBSCURA_STEALTH", if stealth { "1" } else { "" })
                 .spawn()
             {
                 Ok(c) => c,
@@ -1498,7 +1498,6 @@ mod tests {
             timeout: 30,
             wait_until: "load".to_string(),
             user_agent: None,
-            stealth: false,
             eval: None,
             quiet: true,
             output: None,
