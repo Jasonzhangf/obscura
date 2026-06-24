@@ -8,7 +8,7 @@ use deno_core::OpState;
 use deno_core::Extension;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use obscura_dom::{DomTree, NodeData, NodeId};
-use obscura_net::{CookieJar, ObscuraHttpClient};
+use obscura_net::{CookieJar, ObscuraHttpClient, RequestInfo, ResourceType, Response};
 #[cfg(feature = "stealth")]
 use obscura_net::StealthHttpClient;
 use tokio::sync::Mutex;
@@ -619,7 +619,7 @@ async fn op_fetch_url(
         }
     }
 
-    let (cookie_jar, in_flight, intercept_tx, proxy_url) = {
+    let (cookie_jar, in_flight, intercept_tx, proxy_url, http_client) = {
         let state_borrow = state.borrow();
         let gs = state_borrow.borrow::<SharedState>().clone();
         let mut gs = gs.borrow_mut();
@@ -651,8 +651,15 @@ async fn op_fetch_url(
         } else {
             None
         };
-        (jar, in_flight, itx, proxy_url)
+        (jar, in_flight, itx, proxy_url, gs.http_client.clone())
     };
+
+    // Slots the interception channel can override via Continue so a consumer
+    // can rewrite url/method/headers/body before the request goes out.
+    let mut override_url: Option<String> = None;
+    let mut override_method: Option<String> = None;
+    let mut override_headers: Option<HashMap<String, String>> = None;
+    let mut override_body: Option<String> = None;
 
     if let Some((tx, request_id)) = intercept_tx {
         let custom_headers: HashMap<String, String> = serde_json::from_str(&headers_json).unwrap_or_default();
@@ -686,14 +693,46 @@ async fn op_fetch_url(
                         "error": reason,
                     }).to_string());
                 }
-                Ok(InterceptResolution::Continue { url: _new_url, method: _new_method, headers: _new_headers, body: _new_body }) => {
-                    tracing::debug!("Interception: continue request {}", url);
+                Ok(InterceptResolution::Continue { url, method, headers, body }) => {
+                    override_url = url;
+                    override_method = method;
+                    override_headers = headers;
+                    override_body = body;
+                    tracing::debug!(
+                        "Interception: continue (overrides url={} method={} headers={} body={})",
+                        override_url.is_some(), override_method.is_some(),
+                        override_headers.is_some(), override_body.is_some()
+                    );
                 }
                 Err(_) => {
                 }
             }
         }
     }
+
+    // Apply interception overrides (shadow the params for the rest of the op).
+    // A Continue rewrite of the URL must pass the same SSRF / private-network
+    // gate as the original request (checked above) and as redirects (checked
+    // below). Without this re-validation a rewrite to an internal address would
+    // bypass validate_fetch_url entirely.
+    let url = if let Some(new_url) = override_url {
+        if let Ok(parsed) = url::Url::parse(&new_url) {
+            if let Err(reason) = validate_fetch_url(&parsed) {
+                return Ok(serde_json::json!({
+                    "status": 0,
+                    "body": "",
+                    "url": new_url,
+                    "blocked": true,
+                    "error": format!("Intercept rewrite to forbidden URL blocked: {}", reason),
+                }).to_string());
+            }
+        }
+        new_url
+    } else {
+        url
+    };
+    let method = override_method.unwrap_or(method);
+    let body = override_body.unwrap_or(body);
 
     let client = cached_request_client(proxy_url.as_deref())
         .map_err(deno_error::JsErrorBox::generic)?;
@@ -714,7 +753,28 @@ async fn op_fetch_url(
     let req_method: reqwest::Method = method.parse().unwrap_or(reqwest::Method::GET);
 
     let custom_headers: std::collections::HashMap<String, String> =
-        serde_json::from_str(&headers_json).unwrap_or_default();
+        override_headers.unwrap_or_else(|| serde_json::from_str(&headers_json).unwrap_or_default());
+
+    // Passive request observation (non-blocking). Fires for every request that
+    // reaches the network (Fulfill/Fail from the interception channel short-
+    // circuit earlier). on_request/on_response previously fired only for
+    // navigation; this wires them for JS fetch()/XHR too.
+    if let Some(ref hc) = http_client {
+        let cbs = hc.on_request.read().await;
+        if !cbs.is_empty() {
+            if let Ok(parsed) = url::Url::parse(&url) {
+                let info = RequestInfo {
+                    url: parsed,
+                    method: method.clone(),
+                    headers: custom_headers.clone(),
+                    resource_type: ResourceType::Fetch,
+                };
+                for cb in cbs.iter() {
+                    cb(&info);
+                }
+            }
+        }
+    }
 
     // Stealth mode: route the scripted request through the wreq client so its
     // TLS fingerprint and Chrome client hints match the main navigation. The
@@ -739,6 +799,7 @@ async fn op_fetch_url(
                 page_origin.clone(),
                 is_cross_origin,
                 mode.clone(),
+                http_client.clone(),
             )
             .await;
         }
@@ -944,6 +1005,21 @@ async fn op_fetch_url(
         .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
     let resp_body = String::from_utf8_lossy(&resp_bytes).to_string();
     let resp_body_base64 = BASE64.encode(&resp_bytes);
+    if let Some(ref hc) = http_client {
+        let cbs = hc.on_response.read().await;
+        if !cbs.is_empty() {
+            let resp = fetch_response(&url, status, resp_headers.clone(), resp_bytes.to_vec());
+            let info = RequestInfo {
+                url: resp.url.clone(),
+                method: method.clone(),
+                headers: resp_headers.clone(),
+                resource_type: ResourceType::Fetch,
+            };
+            for cb in cbs.iter() {
+                cb(&info, &resp);
+            }
+        }
+    }
     let response_request_id = {
         let state_borrow = state.borrow();
         let gs = state_borrow.borrow::<SharedState>().clone();
@@ -983,6 +1059,19 @@ async fn op_fetch_url(
     .to_string())
 }
 
+/// Assemble a `Response` for the on_response interception callbacks from the
+/// parts op_fetch_url already holds. Navigation gets a Response straight from
+/// the http client, but the JS fetch path builds the pieces itself.
+fn fetch_response(url: &str, status: u16, headers: HashMap<String, String>, body: Vec<u8>) -> Response {
+    Response {
+        url: url::Url::parse(url).unwrap_or_else(|_| url::Url::parse("http://0.0.0.0/").unwrap()),
+        status,
+        headers,
+        body,
+        redirected_from: Vec::new(),
+    }
+}
+
 /// Stealth-mode scripted fetch()/XHR: mirrors op_fetch_url's redirect, SSRF,
 /// and CORS semantics but sends every hop through the wreq stealth client so
 /// the request carries the Chrome TLS fingerprint and client hints. Cookie
@@ -999,6 +1088,7 @@ async fn stealth_fetch_all(
     page_origin: String,
     is_cross_origin: bool,
     mode: String,
+    http_client: Option<Arc<ObscuraHttpClient>>,
 ) -> Result<String, deno_error::JsErrorBox> {
     let mut current_url = url.clone();
     let mut current_method = method;
@@ -1086,6 +1176,21 @@ async fn stealth_fetch_all(
 
     let resp_body = String::from_utf8_lossy(&resp_bytes).to_string();
     let resp_body_base64 = BASE64.encode(&resp_bytes);
+    if let Some(ref hc) = http_client {
+        let cbs = hc.on_response.read().await;
+        if !cbs.is_empty() {
+            let resp = fetch_response(&url, status, resp_headers.clone(), resp_bytes.clone());
+            let info = RequestInfo {
+                url: resp.url.clone(),
+                method: current_method.clone(),
+                headers: resp_headers.clone(),
+                resource_type: ResourceType::Fetch,
+            };
+            for cb in cbs.iter() {
+                cb(&info, &resp);
+            }
+        }
+    }
 
     Ok(serde_json::json!({
         "status": status,
