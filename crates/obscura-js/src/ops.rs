@@ -711,7 +711,26 @@ async fn op_fetch_url(
     }
 
     // Apply interception overrides (shadow the params for the rest of the op).
-    let url = override_url.unwrap_or(url);
+    // A Continue rewrite of the URL must pass the same SSRF / private-network
+    // gate as the original request (checked above) and as redirects (checked
+    // below). Without this re-validation a rewrite to an internal address would
+    // bypass validate_fetch_url entirely.
+    let url = if let Some(new_url) = override_url {
+        if let Ok(parsed) = url::Url::parse(&new_url) {
+            if let Err(reason) = validate_fetch_url(&parsed) {
+                return Ok(serde_json::json!({
+                    "status": 0,
+                    "body": "",
+                    "url": new_url,
+                    "blocked": true,
+                    "error": format!("Intercept rewrite to forbidden URL blocked: {}", reason),
+                }).to_string());
+            }
+        }
+        new_url
+    } else {
+        url
+    };
     let method = override_method.unwrap_or(method);
     let body = override_body.unwrap_or(body);
 
@@ -1040,12 +1059,9 @@ async fn op_fetch_url(
     .to_string())
 }
 
-/// Stealth-mode scripted fetch()/XHR: mirrors op_fetch_url's redirect, SSRF,
-/// and CORS semantics but sends every hop through the wreq stealth client so
-/// the request carries the Chrome TLS fingerprint and client hints. Cookie
-/// handling lives inside StealthHttpClient::send_single, which shares the
-/// context jar. Response bodies are not mirrored into the CDP
-/// Network.getResponseBody buffer here; that is a follow-up for stealth fetches.
+/// Assemble a `Response` for the on_response interception callbacks from the
+/// parts op_fetch_url already holds. Navigation gets a Response straight from
+/// the http client, but the JS fetch path builds the pieces itself.
 fn fetch_response(url: &str, status: u16, headers: HashMap<String, String>, body: Vec<u8>) -> Response {
     Response {
         url: url::Url::parse(url).unwrap_or_else(|_| url::Url::parse("http://0.0.0.0/").unwrap()),
@@ -1056,6 +1072,12 @@ fn fetch_response(url: &str, status: u16, headers: HashMap<String, String>, body
     }
 }
 
+/// Stealth-mode scripted fetch()/XHR: mirrors op_fetch_url's redirect, SSRF,
+/// and CORS semantics but sends every hop through the wreq stealth client so
+/// the request carries the Chrome TLS fingerprint and client hints. Cookie
+/// handling lives inside StealthHttpClient::send_single, which shares the
+/// context jar. Response bodies are not mirrored into the CDP
+/// Network.getResponseBody buffer here; that is a follow-up for stealth fetches.
 #[cfg(feature = "stealth")]
 async fn stealth_fetch_all(
     stealth: Arc<StealthHttpClient>,
