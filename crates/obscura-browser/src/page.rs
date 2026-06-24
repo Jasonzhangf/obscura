@@ -327,6 +327,11 @@ impl Page {
         if let Some(tx) = &self.intercept_tx {
             rt.set_intercept_tx(tx.clone());
         }
+        // Re-apply intercept_enabled: enable_interception()/enable_intercept()
+        // called before the first navigation sets this on the Page while the
+        // runtime does not exist yet, so the new runtime would otherwise start
+        // with interception disabled and op_fetch_url would never intercept.
+        rt.set_intercept_enabled(self.intercept_enabled);
 
         if let Some(dom) = self.dom.take() {
             rt.set_dom(dom);

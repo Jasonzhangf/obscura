@@ -654,6 +654,13 @@ async fn op_fetch_url(
         (jar, in_flight, itx, proxy_url, gs.http_client.clone())
     };
 
+    // Slots the interception channel can override via Continue so a consumer
+    // can rewrite url/method/headers/body before the request goes out.
+    let mut override_url: Option<String> = None;
+    let mut override_method: Option<String> = None;
+    let mut override_headers: Option<HashMap<String, String>> = None;
+    let mut override_body: Option<String> = None;
+
     if let Some((tx, request_id)) = intercept_tx {
         let custom_headers: HashMap<String, String> = serde_json::from_str(&headers_json).unwrap_or_default();
         let (resolve_tx, resolve_rx) = tokio::sync::oneshot::channel();
@@ -686,14 +693,27 @@ async fn op_fetch_url(
                         "error": reason,
                     }).to_string());
                 }
-                Ok(InterceptResolution::Continue { url: _new_url, method: _new_method, headers: _new_headers, body: _new_body }) => {
-                    tracing::debug!("Interception: continue request {}", url);
+                Ok(InterceptResolution::Continue { url, method, headers, body }) => {
+                    override_url = url;
+                    override_method = method;
+                    override_headers = headers;
+                    override_body = body;
+                    tracing::debug!(
+                        "Interception: continue (overrides url={} method={} headers={} body={})",
+                        override_url.is_some(), override_method.is_some(),
+                        override_headers.is_some(), override_body.is_some()
+                    );
                 }
                 Err(_) => {
                 }
             }
         }
     }
+
+    // Apply interception overrides (shadow the params for the rest of the op).
+    let url = override_url.unwrap_or(url);
+    let method = override_method.unwrap_or(method);
+    let body = override_body.unwrap_or(body);
 
     let client = cached_request_client(proxy_url.as_deref())
         .map_err(deno_error::JsErrorBox::generic)?;
@@ -714,7 +734,7 @@ async fn op_fetch_url(
     let req_method: reqwest::Method = method.parse().unwrap_or(reqwest::Method::GET);
 
     let custom_headers: std::collections::HashMap<String, String> =
-        serde_json::from_str(&headers_json).unwrap_or_default();
+        override_headers.unwrap_or_else(|| serde_json::from_str(&headers_json).unwrap_or_default());
 
     // Passive request observation (non-blocking). Fires for every request that
     // reaches the network (Fulfill/Fail from the interception channel short-

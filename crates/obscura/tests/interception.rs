@@ -25,6 +25,8 @@ fn spawn_echo_server() -> String {
             let path = req.split_whitespace().nth(1).unwrap_or("/");
             let (ct, body) = if path.starts_with("/api") {
                 ("application/json", "{\"hello\":\"world\"}".to_string())
+            } else if path.starts_with("/modified") {
+                ("text/plain", "REWRITTEN".to_string())
             } else {
                 ("text/html", "<script>fetch('/api');</script>".to_string())
             };
@@ -102,6 +104,64 @@ async fn page_intercepts_and_observes_js_fetch() {
     assert!(
         body.contains("hello"),
         "on_response did not capture the fetch response body: {:?}",
+        body
+    );
+}
+
+#[tokio::test]
+async fn page_rewrites_request_url_via_interception() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let base = spawn_echo_server();
+    let modified = format!("{}/modified", base);
+
+    let browser = Browser::new().unwrap();
+    let mut page = browser.new_page().await.unwrap();
+
+    let captured = Arc::new(Mutex::new(String::new()));
+    let cap = captured.clone();
+    page.on_response(Arc::new(move |info, resp| {
+        if info.resource_type == ResourceType::Fetch {
+            *cap.lock().unwrap() = String::from_utf8_lossy(&resp.body).into_owned();
+        }
+    }));
+
+    // Intercept and rewrite the /api request to /modified via Continue.
+    let mut rx = page.enable_interception();
+    let modified_for_task = modified.clone();
+    tokio::spawn(async move {
+        while let Some(req) = rx.recv().await {
+            let new_url = if req.url.contains("/api") {
+                Some(modified_for_task.clone())
+            } else {
+                None
+            };
+            if req
+                .resolver
+                .send(InterceptResolution::Continue {
+                    url: new_url,
+                    method: None,
+                    headers: None,
+                    body: None,
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    page.goto(&base).await.unwrap();
+    for _ in 0..20 {
+        page.settle(500).await;
+        if captured.lock().unwrap().contains("REWRITTEN") {
+            break;
+        }
+    }
+
+    let body = captured.lock().unwrap().clone();
+    assert!(
+        body.contains("REWRITTEN"),
+        "interception Continue url-rewrite did not take effect; captured: {:?}",
         body
     );
 }
