@@ -55,10 +55,84 @@ async fn main() -> anyhow::Result<()> {
 - `query_selector(css)` first match as an `Element`, or `None`
 - `wait_for_selector(css, Duration).await` poll until present
 - `settle(max_ms).await` drive the event loop so async work (`fetch`, timers) completes
+- `on_request(cb)` / `on_response(cb)` passive callbacks for every request and response
+- `enable_interception()` channel to block, mock, or rewrite requests
+- `add_preload_script(js)` run a script before the page's own scripts
 
 `Element`: `text()`, `attribute(name)`, `click()`.
 
 `CookieStore`: `set`, `get_all`, `get_for_url`, `save_to_file`, `load_from_file`.
+
+## Intercept requests
+
+The interception API observes, blocks, mocks, and rewrites the requests a page makes, including JavaScript `fetch()` and XHR. Use it to capture API payloads while crawling, block trackers, or mock responses in tests.
+
+### Passive callbacks
+
+`on_request` and `on_response` fire for every request and response (navigation and JS `fetch()`/XHR) and are non-blocking. `on_response` is the main path for capturing the JSON an SPA loads asynchronously.
+
+```rust
+use obscura::{Browser, ResourceType};
+use std::sync::Arc;
+
+let browser = Browser::new()?;
+let mut page = browser.new_page().await?;
+
+page.on_response(Arc::new(|info, resp| {
+    if info.resource_type == ResourceType::Fetch {
+        println!("{} -> {} bytes", info.url, resp.body.len());
+    }
+}));
+
+page.goto("https://example.com").await?;
+page.settle(2000).await;   // let in-page fetch() calls resolve
+```
+
+### Active interception
+
+`enable_interception()` returns a channel of every JS `fetch()`/XHR request. Resolve each through its `resolver` to pass, block, mock, or rewrite it.
+
+```rust
+use obscura::{Browser, InterceptResolution};
+
+let mut page = browser.new_page().await?;
+let mut rx = page.enable_interception();
+
+tokio::spawn(async move {
+    while let Some(req) = rx.recv().await {
+        let action = if req.url.contains("/ads") {
+            InterceptResolution::Fail { reason: "blocked".into() }
+        } else if req.url.ends_with("/api/flags") {
+            InterceptResolution::Fulfill {
+                status: 200,
+                headers: Default::default(),
+                body: r#"{"newDashboard":true}"#.into(),
+            }
+        } else {
+            // Pass through, or rewrite by setting url/method/headers/body.
+            InterceptResolution::Continue { url: None, method: None, headers: None, body: None }
+        };
+        let _ = req.resolver.send(action);
+    }
+});
+
+page.goto("https://example.com").await?;
+page.settle(2000).await;
+```
+
+A `Continue` with `url: Some(...)` rewrites the target. The new URL is re-checked against the SSRF / private-network gate, so a rewrite cannot reach an internal address that would otherwise need `--allow-private-network`.
+
+### Preload scripts
+
+`add_preload_script` runs a script before any of the page's own `<script>` tags (the CDP `Page.addScriptToEvaluateOnNewDocument` contract), so it can install hooks before the page bootstraps. Call it before `goto`.
+
+```rust
+let mut page = browser.new_page().await?;
+page.add_preload_script("window.__patched = true;");
+page.goto("https://example.com").await?;
+```
+
+`resource_type` reports `Fetch` for JS-initiated requests and does not yet split `Xhr` from `Fetch`.
 
 ## When to use which interface
 
