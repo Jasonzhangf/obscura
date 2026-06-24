@@ -3,8 +3,11 @@
 ```bash
 obscura fetch https://example.com --stealth
 obscura serve --stealth
+obscura scrape url1 url2 --stealth
 obscura mcp --stealth
 ```
+
+`--stealth` is a global flag, so it works before or after the subcommand and applies to `fetch`, `serve`, `scrape`, and `mcp`. In a `scrape` run each worker inherits it.
 
 What `--stealth` changes:
 

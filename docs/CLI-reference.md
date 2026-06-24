@@ -6,6 +6,7 @@ Top-level flags apply to every subcommand.
 -v, --verbose                Enable info logging
 -p, --port <PORT>            CDP port (default 9222)
     --proxy <URL>            HTTP or SOCKS5 proxy
+    --stealth                Consistent browser fingerprint + tracker blocking
     --obey-robots            Respect robots.txt
     --user-agent <UA>        Override the User-Agent
     --storage-dir <DIR>      Persistent cookies and localStorage
@@ -20,7 +21,7 @@ Top-level flags apply to every subcommand.
 Load a URL and print its content or an evaluated expression.
 
 ```
-    --dump <FORMAT>          html | text | links | markdown | original | assets
+    --dump <FORMAT>          html | text | links | markdown | original | assets | cookies
                              (default html)
     --selector <CSS>         Narrow output to a CSS selector
     --wait <SECONDS>         Extra wait after settle (default 5)
@@ -29,7 +30,7 @@ Load a URL and print its content or an evaluated expression.
                              (default load)
     --user-agent <UA>        Override the User-Agent
     --proxy <URL>            HTTP or SOCKS5 proxy
-    --stealth                TLS fingerprint randomization + tracker blocking
+    --stealth                Consistent browser fingerprint + tracker blocking (global)
 -e, --eval <JS>              Evaluate JS, print the result as JSON
 -o, --output <FILE>          Write to a file instead of stdout
 -q, --quiet                  Suppress info logging
@@ -44,8 +45,9 @@ Load a URL and print its content or an evaluated expression.
 | `text`     | Plain text                                                |
 | `markdown` | Markdown conversion                                       |
 | `links`    | Every `<a href>`, one URL per line                        |
-| `assets`   | Every external resource, one JSON object per line         |
+| `assets`   | Every external resource, one JSON object per line (DOM assets plus `fetch()`/XHR requests) |
 | `original` | Raw HTTP response body (binary-safe, bypasses the engine) |
+| `cookies`  | All cookies in the jar as a JSON array, including HttpOnly cookies invisible to `document.cookie` |
 
 ## `obscura serve`
 
@@ -56,7 +58,7 @@ Run the CDP server. Puppeteer and Playwright connect over WebSocket.
     --host <HOST>            Bind host (default 127.0.0.1)
     --proxy <URL>            HTTP or SOCKS5 proxy
     --user-agent <UA>        Override the User-Agent
-    --stealth                TLS fingerprint randomization + tracker blocking
+    --stealth                Consistent browser fingerprint + tracker blocking (global)
     --workers <N>            Worker processes (default 1)
     --allow-file-access      Permit CDP clients to navigate to file:// URLs
     --storage-dir <DIR>      Persistent cookies and localStorage
@@ -77,10 +79,13 @@ Run a JS expression across many URLs in parallel.
     --format <FORMAT>        Output format (default json)
     --timeout <SECONDS>      Per-URL timeout (default 60)
     --proxy <URL>            HTTP or SOCKS5 proxy
+    --stealth                Consistent browser fingerprint + tracker blocking (global)
     --allow-private-network  Permit loopback / RFC1918 / link-local
 -q, --quiet                  Suppress info logging
 -v, --verbose                Enable verbose logging
 ```
+
+`--stealth`, `--proxy`, and `--allow-private-network` are global flags: they work before or after any subcommand, so each worker in a `scrape` run inherits stealth too.
 
 Read URLs from stdin with `-`:
 
@@ -100,7 +105,7 @@ Run obscura as an MCP server.
     --port <PORT>            HTTP port (default 3000)
     --proxy <URL>            HTTP or SOCKS5 proxy
     --user-agent <UA>        Override the User-Agent
-    --stealth                TLS fingerprint randomization + tracker blocking
+    --stealth                Consistent browser fingerprint + tracker blocking (global)
     --allow-private-network  Permit loopback / RFC1918 / link-local
 -v, --verbose                Enable info logging
 ```

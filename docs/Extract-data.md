@@ -7,6 +7,7 @@ obscura fetch https://example.com --dump markdown
 obscura fetch https://example.com --dump links
 obscura fetch https://example.com --dump assets
 obscura fetch https://example.com --dump original
+obscura fetch https://example.com --dump cookies
 ```
 
 ## `html`
@@ -43,7 +44,7 @@ obscura fetch https://example.com --dump links
 
 ## `assets`
 
-Every external resource (stylesheets, scripts, images, fonts, iframes), one per line.
+Every external resource (stylesheets, scripts, images, fonts, iframes), plus the URLs the page requested through `fetch()`/XHR, one JSON object per line.
 
 ```bash
 obscura fetch https://example.com --dump assets
@@ -57,6 +58,14 @@ The raw HTML the server sent, before JavaScript ran.
 obscura fetch https://my-spa.example --dump original > before.html
 obscura fetch https://my-spa.example --dump html     > after.html
 diff before.html after.html
+```
+
+## `cookies`
+
+Every cookie in the jar as a JSON array, including HttpOnly cookies that `document.cookie` cannot see. Useful for capturing session tokens set by anti-bot challenges.
+
+```bash
+obscura fetch https://example.com --dump cookies
 ```
 
 ## With `--wait-until`
