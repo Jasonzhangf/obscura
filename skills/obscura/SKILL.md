@@ -27,12 +27,12 @@ Obscura is roughly as fast as warm Chrome, ~2× faster cold, parallelizes far be
 ```bash
 git clone https://github.com/h4ckf0r0day/obscura.git
 cd obscura
-CARGO_TARGET_DIR=/tmp/obscura-target cargo build -p obscura-cli --bin obscura --no-default-features
+CARGO_TARGET_DIR=/tmp/obscura-target cargo build -p obscura-cli --bin obscura
 ```
 
 Resulting binary: `/tmp/obscura-target/debug/obscura`
 
-`--no-default-features` skips the stealth build. Stealth needs `cmake` locally because it pulls `wreq` / BoringSSL.
+The default build has no stealth and needs no extra tools. Stealth is opt-in (see below) and pulls `wreq` / BoringSSL, so it needs `cmake` locally.
 
 ### Stealth build
 
@@ -42,11 +42,17 @@ CARGO_TARGET_DIR=/tmp/obscura-target cargo build -p obscura-cli --bin obscura --
 
 What stealth gives you:
 
-- **Per-session randomized fingerprints** — GPU, canvas, audio, battery
+- **Consistent browser fingerprint** so cross-layer checks pass: the TLS ClientHello, User-Agent, `navigator` surfaces, and WebGL renderer all agree on one Chrome identity rather than contradicting each other
 - **3,520 tracker domains blocked** (built-in blocklist)
 - **`navigator.webdriver` masked**
 - **Native functions patched** so common automation detectors can't unmask them via `Function.prototype.toString` inspection
 - **TLS / HTTP-2 fingerprint** matching real Chromium (defeats most JA3/JA4 + ALPN-ordering bot management)
+
+Enable it at runtime with the global `--stealth` flag (works on `fetch`, `serve`, `scrape`, and `mcp`, before or after the subcommand). The flag needs a stealth-feature build for the TLS layer; without it `--stealth` still does tracker blocking.
+
+```bash
+/tmp/obscura-target/debug/obscura fetch https://example.com/ --stealth --dump text
+```
 
 Use stealth against: Cloudflare Turnstile non-interactive, Akamai BMP, PerimeterX, DataDome.
 Stealth still won't clear: hard interactive CAPTCHAs (Turnstile interactive, hCaptcha challenge), and fingerprinters using WebGPU/WebAssembly quirks not yet patched.
@@ -58,10 +64,12 @@ Stealth still won't clear: hard interactive CAPTCHAs (Turnstile interactive, hCa
 ```
 
 Useful flags:
-- `--dump text` — visible text only
-- `--dump html` — full rendered DOM
-- `--quiet` — suppress progress logs
-- `--timeout <ms>` — per-page timeout
+- `--dump text`: visible text only
+- `--dump html`: full rendered DOM
+- `--dump assets`: every external resource plus `fetch()`/XHR URLs, one JSON object per line
+- `--dump cookies`: all cookies as JSON, including HttpOnly
+- `--quiet`: suppress progress logs
+- `--timeout <ms>`: per-page timeout
 
 ## CDP server (Puppeteer / Playwright)
 
@@ -94,6 +102,10 @@ await page.goto("https://example.com/");
 console.log(await page.title());
 await browser.disconnect();
 ```
+
+## Request interception
+
+Over CDP, `page.setRequestInterception(true)` (Puppeteer) or `page.route` (Playwright) block, modify, or mock requests as usual. Embedding the engine with the `obscura` Rust crate gives the same thing as a native `Page` API: `on_request` / `on_response` callbacks (capture SPA API payloads without reverse-engineering the bundle), an `enable_interception()` channel to block, mock, or rewrite, and `add_preload_script` to run code before the page's own scripts.
 
 ## Scaling profile
 
