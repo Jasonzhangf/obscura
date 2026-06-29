@@ -959,7 +959,15 @@ class Element extends Node {
   }
   get id() { return this.getAttribute("id") || ""; }
   set id(v) { this.setAttribute("id", v); }
-  get className() { return this.getAttribute("class") || ""; }
+  get className() {
+    // SVG elements reflect class as an SVGAnimatedString (.baseVal/.animVal),
+    // not a plain string. Anti-fraud sensors read el.className.animVal.
+    if (this.namespaceURI === "http://www.w3.org/2000/svg") {
+      if (!this._svgClassName) this._svgClassName = new SVGAnimatedString(this, "class");
+      return this._svgClassName;
+    }
+    return this.getAttribute("class") || "";
+  }
   set className(v) { this.setAttribute("class", v); }
   get namespaceURI() {
     // createElementNS records the requested namespace on _ns; an empty string
@@ -1581,6 +1589,16 @@ class Element extends Node {
   // members use. Other elements reflect the raw attribute.
   get href() {
     const ln = this.localName;
+    // SVG href-bearing elements reflect href as an SVGAnimatedString (with the
+    // legacy xlink:href as a fallback), not a resolved URL string. Checked
+    // before the HTML <a> path because an SVG <a> also has localName 'a'.
+    if (this.namespaceURI === "http://www.w3.org/2000/svg" &&
+        (ln === 'a' || ln === 'image' || ln === 'use' || ln === 'script' ||
+         ln === 'pattern' || ln === 'filter' || ln === 'textPath' || ln === 'mpath' ||
+         ln === 'linearGradient' || ln === 'radialGradient' || ln === 'feImage' || ln === 'tref')) {
+      if (!this._svgHref) this._svgHref = new SVGAnimatedString(this, "href", "xlink:href");
+      return this._svgHref;
+    }
     if (ln === 'a' || ln === 'area') {
       const raw = this.getAttribute('href');
       if (raw === null) return '';
@@ -4979,6 +4997,31 @@ globalThis.HTMLLegendElement = Element;
 globalThis.HTMLProgressElement = Element;
 globalThis.HTMLDetailsElement = Element;
 globalThis.HTMLDialogElement = Element;
+// SVGAnimatedString backs the className and href reflections on SVG elements.
+// baseVal and animVal both read the live attribute (no SMIL animation), and
+// baseVal is writable. Used by the SVG-aware get className()/get href() above.
+function SVGAnimatedString(el, attr, fallbackAttr) {
+  this._el = el;
+  this._attr = attr;
+  this._fallback = fallbackAttr || null;
+}
+SVGAnimatedString.prototype._read = function() {
+  let v = this._el.getAttribute(this._attr);
+  if (v === null && this._fallback) v = this._el.getAttribute(this._fallback);
+  return v == null ? '' : v;
+};
+Object.defineProperty(SVGAnimatedString.prototype, 'baseVal', {
+  get() { return this._read(); },
+  set(v) { this._el.setAttribute(this._attr, String(v)); },
+  configurable: true, enumerable: true,
+});
+Object.defineProperty(SVGAnimatedString.prototype, 'animVal', {
+  get() { return this._read(); },
+  configurable: true, enumerable: true,
+});
+Object.defineProperty(SVGAnimatedString.prototype, Symbol.toStringTag, { value: 'SVGAnimatedString', configurable: true });
+_markNative(SVGAnimatedString);
+
 globalThis.SVGElement = Element;
 globalThis.SVGSVGElement = Element;
 globalThis.CharacterData = CharacterData;
