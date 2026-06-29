@@ -366,11 +366,33 @@ async fn cdp_processor(
     let mut deferred: std::collections::VecDeque<ServerMessage> =
         std::collections::VecDeque::new();
 
-    // Subscribe to Ctrl-C once. The future is single-shot, so we break out of
-    // the outer loop when it fires and never poll it again. Without this the
-    // accept loop just exits and any cookies set during the session are lost
-    // before `BrowserContext::save_cookies()` runs.
-    let mut shutdown = Box::pin(tokio::signal::ctrl_c());
+    // Subscribe to graceful-shutdown signals once. The future is single-shot,
+    // so we break out of the outer loop when it fires and never poll it again.
+    // Without this the accept loop just exits and any cookies set during the
+    // session are lost before `BrowserContext::save_cookies()` runs. We watch
+    // SIGTERM as well as Ctrl-C (SIGINT) so `docker stop` / `kill`, which send
+    // SIGTERM, also flush cookies to the storage dir (issue #333).
+    let mut shutdown = Box::pin(async {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            match signal(SignalKind::terminate()) {
+                Ok(mut term) => {
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => {}
+                        _ = term.recv() => {}
+                    }
+                }
+                Err(_) => {
+                    let _ = tokio::signal::ctrl_c().await;
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+    });
 
     loop {
         // Drain any deferred messages from the previous interception window
