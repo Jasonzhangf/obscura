@@ -1,0 +1,13 @@
+[package]
+name = "obscura-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Optional scoped render layer for Obscura: layout (taffy) and, with the paint feature, text and raster output for screenshots."
+
+[dependencies]
+taffy = { workspace = true }
+
+[lib]
+path = "src/lib.rs"
