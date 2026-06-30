@@ -103,6 +103,15 @@ pub struct ObscuraState {
     // drained by the Page into its network_events so the CDP layer emits
     // Network.requestWillBeSent / responseReceived for them (issue #406).
     pub js_network_events: Vec<JsNetworkEvent>,
+    /// Lazy layout cache from obscura-render, plus the CSS-pixel viewport. The
+    /// cache is computed on first geometry read and cleared on navigation. It is
+    /// not invalidated on every DOM mutation yet (a follow-up), so geometry read
+    /// mid-script may lag a frame; reading after settle is reliable.
+    #[cfg(feature = "render")]
+    pub layout_cache:
+        Option<std::collections::HashMap<obscura_dom::tree::NodeId, obscura_render::Rect>>,
+    #[cfg(feature = "render")]
+    pub viewport: (f32, f32),
 }
 
 impl ObscuraState {
@@ -128,6 +137,10 @@ impl ObscuraState {
             network_response_body_counter: 0,
             fetched_urls: Vec::new(),
             js_network_events: Vec::new(),
+            #[cfg(feature = "render")]
+            layout_cache: None,
+            #[cfg(feature = "render")]
+            viewport: (1280.0, 720.0),
         }
     }
 }
@@ -1946,32 +1959,70 @@ fn op_url_encode_query(#[string] query: &str, #[string] label: &str, special: bo
 }
 
 pub fn build_extension() -> Extension {
+    let mut ops = vec![
+        op_dom(),
+        op_console_msg(),
+        op_fetch_url(),
+        op_get_cookies(),
+        op_set_cookie(),
+        op_navigate(),
+        op_sleep(),
+        op_binding_called(),
+        op_subtle_digest(),
+        op_subtle_hmac(),
+        op_subtle_aes_gcm(),
+        op_subtle_aes_cbc(),
+        op_subtle_aes_ctr(),
+        op_subtle_pbkdf2(),
+        op_subtle_hkdf(),
+        op_random_bytes(),
+        op_url_parse(),
+        op_url_set(),
+        op_url_resolve(),
+        op_encoding_for_label(),
+        op_text_decode(),
+        op_url_encode_query(),
+    ];
+    // Only registered when the render feature is compiled in. bootstrap.js
+    // probes with typeof before calling, so the op's absence is a clean fallback.
+    #[cfg(feature = "render")]
+    ops.push(op_layout_geometry());
     Extension {
         name: "obscura_dom",
-        ops: std::borrow::Cow::Owned(vec![
-            op_dom(),
-            op_console_msg(),
-            op_fetch_url(),
-            op_get_cookies(),
-            op_set_cookie(),
-            op_navigate(),
-            op_sleep(),
-            op_binding_called(),
-            op_subtle_digest(),
-            op_subtle_hmac(),
-            op_subtle_aes_gcm(),
-            op_subtle_aes_cbc(),
-            op_subtle_aes_ctr(),
-            op_subtle_pbkdf2(),
-            op_subtle_hkdf(),
-            op_random_bytes(),
-            op_url_parse(),
-            op_url_set(),
-            op_url_resolve(),
-            op_encoding_for_label(),
-            op_text_decode(),
-            op_url_encode_query(),
-        ]),
+        ops: std::borrow::Cow::Owned(ops),
         ..Default::default()
     }
+}
+
+/// Real border-box geometry for an element from the obscura-render layout
+/// cache. The cache is computed lazily on first read and cleared on navigation
+/// (see `set_dom`). Returns JSON `{"x","y","width","height"}` in CSS pixels, or
+/// an empty string when the node has no box. Feature-gated.
+#[cfg(feature = "render")]
+#[op2]
+#[string]
+fn op_layout_geometry(state: &OpState, #[string] nid_str: String) -> String {
+    let shared = state.borrow::<SharedState>().clone();
+    {
+        let mut gs = shared.borrow_mut();
+        if gs.layout_cache.is_none() {
+            if let Some(dom) = &gs.dom {
+                let viewport = gs.viewport;
+                gs.layout_cache = Some(obscura_render::layout_dom(dom, viewport).rects);
+            }
+        }
+    }
+    let gs = shared.borrow();
+    let nid: u32 = nid_str.parse().unwrap_or(0);
+    if let Some(rect) = gs
+        .layout_cache
+        .as_ref()
+        .and_then(|c| c.get(&obscura_dom::tree::NodeId::new(nid)))
+    {
+        return format!(
+            "{{\"x\":{},\"y\":{},\"width\":{},\"height\":{}}}",
+            rect.x, rect.y, rect.width, rect.height
+        );
+    }
+    String::new()
 }

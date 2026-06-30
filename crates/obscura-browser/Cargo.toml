@@ -6,6 +6,7 @@ edition.workspace = true
 [features]
 default = []
 stealth = ["obscura-net/stealth", "obscura-js/stealth"]
+render = ["obscura-js/render"]
 
 [dependencies]
 obscura-dom = { workspace = true }

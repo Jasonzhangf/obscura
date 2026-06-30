@@ -2329,9 +2329,16 @@ class Element extends Node {
     });
     return this._dataset;
   }
-  get offsetWidth() { return this._isViewportRoot() ? (globalThis.innerWidth || 1280) : 100; }
-  get offsetHeight() { return this._isViewportRoot() ? (globalThis.innerHeight || 720) : 20; }
-  get offsetTop() { return 0; } get offsetLeft() { return 0; }
+  get offsetWidth() {
+    if (this._isViewportRoot()) return globalThis.innerWidth || 1280;
+    return this.getBoundingClientRect().width;
+  }
+  get offsetHeight() {
+    if (this._isViewportRoot()) return globalThis.innerHeight || 720;
+    return this.getBoundingClientRect().height;
+  }
+  get offsetTop() { return this.getBoundingClientRect().top; }
+  get offsetLeft() { return this.getBoundingClientRect().left; }
   // documentElement / body / window expose VIEWPORT geometry, not their own content box.
   // Puppeteer's #clickableBox clips boxes to document.documentElement.clientWidth/Height;
   // returning 100x20 there made every element appear off-screen and broke .click().
@@ -2380,11 +2387,29 @@ class Element extends Node {
         toJSON() { return this; },
       };
     }
-    // No layout engine, but Playwright's actionability polling needs each
-    // element to occupy a stable, distinct rect so hit-testing can pick the
-    // right one (issue #45). Synthesize a deterministic position from the
-    // node id: every nid maps to a unique cell in a 12-column grid, sized
-    // to fit a 1280x720 viewport. Stable across reads, different per node.
+    // Real layout when the render feature is compiled in: ask the Rust layout
+    // cache for this element's border box. The op is absent in the default
+    // build, so probe with typeof and fall through to the synthetic rect below.
+    if (typeof Deno.core.ops.op_layout_geometry === 'function') {
+      try {
+        var _geom = Deno.core.ops.op_layout_geometry(String(this._nid | 0));
+        if (_geom) {
+          var _r = JSON.parse(_geom);
+          if (_r && typeof _r.width === 'number') {
+            var _x = _r.x, _y = _r.y, _w = _r.width, _h = _r.height;
+            return {
+              x: _x, y: _y, width: _w, height: _h,
+              top: _y, right: _x + _w, bottom: _y + _h, left: _x,
+              toJSON() { return this; },
+            };
+          }
+        }
+      } catch (_e) {}
+    }
+    // No layout engine (default build) or this node has no box: synthesize a
+    // deterministic position from the node id so Playwright's actionability
+    // polling still gets a stable, distinct rect for hit-testing (issue #45).
+    // Every nid maps to a unique cell in a 12-column grid for a 1280x720 viewport.
     const VW = 1280, VH = 720, COLS = 12, CW = 100, CH = 20, GX = 110, GY = 30;
     const rowsPerScreen = Math.max(1, Math.floor((VH - 10) / GY));
     const cell = this._nid | 0;

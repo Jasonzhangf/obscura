@@ -188,7 +188,14 @@ impl ObscuraJsRuntime {
     }
 
     pub fn set_dom(&self, dom: DomTree) {
-        self.state.borrow_mut().dom = Some(dom);
+        let mut gs = self.state.borrow_mut();
+        gs.dom = Some(dom);
+        // A new document invalidates the layout cache; it is recomputed lazily
+        // on the next geometry read.
+        #[cfg(feature = "render")]
+        {
+            gs.layout_cache = None;
+        }
     }
 
     pub fn set_url(&self, url: &str) {
