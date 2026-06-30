@@ -336,7 +336,7 @@ async fn main() -> anyhow::Result<()> {
 
             if workers > 1 {
                 tracing::info!("{} worker processes", workers);
-                run_multi_worker_serve(port, workers, proxy, stealth, user_agent).await?;
+                run_multi_worker_serve(port, host, workers, proxy, stealth, user_agent).await?;
             } else {
                 obscura_cdp::start_with_full_serve_options(
                     port, &host, proxy, stealth, user_agent, allow_file_access, storage_dir,
@@ -372,6 +372,7 @@ async fn main() -> anyhow::Result<()> {
 
 async fn run_multi_worker_serve(
     port: u16,
+    host: String,
     workers: u16,
     proxy: Option<String>,
     stealth: bool,
@@ -406,9 +407,13 @@ async fn run_multi_worker_serve(
 
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-    let listener = TcpListener::bind(&addr).await?;
-    tracing::info!("Load balancer on port {}, {} workers", port, workers);
+    // Bind the load balancer to the requested host, not hardcoded loopback.
+    // With --host 0.0.0.0 (e.g. in Docker) the single-worker path already binds
+    // all interfaces; the multi-worker balancer must too, or the mapped port is
+    // refused from outside the container (issue #336). Workers stay on loopback
+    // and are only reached by the balancer.
+    let listener = TcpListener::bind((host.as_str(), port)).await?;
+    tracing::info!("Load balancer on {}:{}, {} workers", host, port, workers);
 
     let mut next_worker: u16 = 0;
 
