@@ -13,6 +13,9 @@
 
 use taffy::prelude::*;
 
+mod style;
+pub use style::compute_style;
+
 /// An axis-aligned rectangle in CSS pixels, relative to the containing block.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Rect {
