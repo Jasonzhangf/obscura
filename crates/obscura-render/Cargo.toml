@@ -8,6 +8,7 @@ description = "Optional scoped render layer for Obscura: layout (taffy) and, wit
 
 [dependencies]
 taffy = { workspace = true }
+obscura-dom = { workspace = true }
 
 [lib]
 path = "src/lib.rs"
