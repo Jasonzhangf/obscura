@@ -1469,6 +1469,15 @@ class Element extends Node {
       const attr = this.getAttribute('value');
       return attr !== null ? attr : this.textContent;
     }
+    if (tag === 'input') {
+      const itype = (this.getAttribute('type') || '').toLowerCase();
+      if (itype === 'checkbox' || itype === 'radio') {
+        // A checkbox/radio with no value attribute defaults to "on" in a real
+        // browser, not the empty string.
+        const attr = this.getAttribute('value');
+        return attr !== null ? attr : 'on';
+      }
+    }
     return this.getAttribute("value") || "";
   }
   set value(v) {
