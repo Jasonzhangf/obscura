@@ -444,9 +444,7 @@ class Node {
   get parentElement() { const p = this.parentNode; return p && p.nodeType === 1 ? p : null; }
   get childNodes() {
     const ids = _domParse("child_nodes", this._nid) || [];
-    const list = ids.map(_wrap).filter(Boolean);
-    list.item = (i) => list[i] || null;
-    return list;
+    return _nodeList(ids.map(_wrap).filter(Boolean));
   }
   get firstChild() { return _wrap(+_dom("first_child", this._nid)); }
   get lastChild() { return _wrap(+_dom("last_child", this._nid)); }
@@ -1468,6 +1466,15 @@ class Element extends Node {
     if (tag === 'option') {
       const attr = this.getAttribute('value');
       return attr !== null ? attr : this.textContent;
+    }
+    if (tag === 'input') {
+      const itype = (this.getAttribute('type') || '').toLowerCase();
+      if (itype === 'checkbox' || itype === 'radio') {
+        // A checkbox/radio with no value attribute defaults to "on" in a real
+        // browser, not the empty string.
+        const attr = this.getAttribute('value');
+        return attr !== null ? attr : 'on';
+      }
     }
     return this.getAttribute("value") || "";
   }
@@ -5140,17 +5147,36 @@ const _htmlCollectionProxy = {
 function _isHTMLEl(el) {
   return !!el && (el.namespaceURI === undefined || el.namespaceURI === "http://www.w3.org/1999/xhtml");
 }
-// Build a NodeList (no named access, per spec) for querySelectorAll. Kept light
-// on purpose: querySelectorAll is the hottest query API.
+// Build a NodeList (no named access, per spec) for querySelectorAll and
+// childNodes. Kept light on purpose: querySelectorAll is the hottest query API.
 function _nodeList(els) {
   const nl = new NodeList();
-  for (let i = 0; i < els.length; i++) nl[nl.length] = els[i];
+  for (let i = 0; i < els.length; i++) nl[i] = els[i];
+  nl.length = els.length;
   return nl;
 }
 globalThis.DOMTokenList = DOMTokenList;
-globalThis.NodeList = class NodeList extends Array {
-  item(i) { return this[i] != null ? this[i] : null; }
+// NodeList is its own type, not an Array subclass: in a real browser
+// Array.isArray(nodeList) is false and Object.prototype.toString reports
+// "[object NodeList]". Fingerprinting and feature-detection scripts check both.
+// It keeps the array-like surface scripts actually use: indexed access, length,
+// item(), forEach(), entries/keys/values, and iteration (so spread and for..of
+// work).
+globalThis.NodeList = class NodeList {
+  constructor() { this.length = 0; }
+  item(i) { i = i >>> 0; return this[i] != null ? this[i] : null; }
+  forEach(cb, thisArg) {
+    for (let i = 0; i < this.length; i++) cb.call(thisArg, this[i], i, this);
+  }
+  *[Symbol.iterator]() { for (let i = 0; i < this.length; i++) yield this[i]; }
+  *entries() { for (let i = 0; i < this.length; i++) yield [i, this[i]]; }
+  *keys() { for (let i = 0; i < this.length; i++) yield i; }
+  *values() { for (let i = 0; i < this.length; i++) yield this[i]; }
+  get [Symbol.toStringTag]() { return 'NodeList'; }
 };
+_markNative(NodeList);
+_markNative(NodeList.prototype.item);
+_markNative(NodeList.prototype.forEach);
 // Live Range over the real DOM tree. dom/ranges/* tests are pure boundary-point
 // algorithms (no layout, no editing engine), so a property-storing Range with
 // correct tree-order comparison passes them. Mutating ops (extract/delete/
