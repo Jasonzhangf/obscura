@@ -41,6 +41,26 @@ pub fn emit_navigation_events(
         .iter()
         .position(|ev| ev.resource_type == "Document" && ev.url == page_url);
 
+    // The main resource's body is stored under its internal request id, but the
+    // client sees it as `loader_id` (the requestId we report above). Alias it so
+    // Network.getResponseBody(loaderId) resolves, which is the only way a client
+    // navigating straight to an image/PDF/other resource can read the main body
+    // (issue #340). Also read the real Content-Type so frameNavigated reports the
+    // actual mime instead of a hardcoded text/html.
+    let mut nav_mime = "text/html".to_string();
+    if let Some(idx) = nav_idx {
+        let internal_id = &network_events[idx].request_id;
+        if let Some(ct) = network_events[idx].response_headers.get("content-type") {
+            // Strip any `; charset=...` parameter; frameNavigated wants the essence.
+            nav_mime = ct.split(';').next().unwrap_or(ct).trim().to_string();
+        }
+        if internal_id != loader_id {
+            if let Some(page) = ctx.get_page_mut(page_id) {
+                page.alias_response_body(internal_id, loader_id);
+            }
+        }
+    }
+
     // Playwright needs `Network.requestWillBeSent` for the main document to
     // arrive BEFORE `Page.frameNavigated` (issue #190).
     if let Some(idx) = nav_idx {
@@ -56,7 +76,7 @@ pub fn emit_navigation_events(
     let mut phase1 = vec![
         CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "init", "timestamp": ts}), session_id: es.clone() },
         CdpEvent { method: "Runtime.executionContextsCleared".into(), params: json!({}), session_id: es.clone() },
-        CdpEvent { method: "Page.frameNavigated".into(), params: json!({"frame": {"id": frame_id, "loaderId": loader_id, "url": page_url, "domainAndRegistry": "", "securityOrigin": page_url, "mimeType": "text/html", "adFrameStatus": {"adFrameType": "none"}}, "type": "Navigation"}), session_id: es.clone() },
+        CdpEvent { method: "Page.frameNavigated".into(), params: json!({"frame": {"id": frame_id, "loaderId": loader_id, "url": page_url, "domainAndRegistry": "", "securityOrigin": page_url, "mimeType": nav_mime, "adFrameStatus": {"adFrameType": "none"}}, "type": "Navigation"}), session_id: es.clone() },
         CdpEvent { method: "Runtime.executionContextCreated".into(), params: json!({"context": {"id": 2, "origin": page_url, "name": "", "uniqueId": format!("ctx-nav-{}", page_id), "auxData": {"isDefault": true, "type": "default", "frameId": frame_id}}}), session_id: es.clone() },
     ];
     let world_names: Vec<String> = if ctx.isolated_worlds.is_empty() {
@@ -359,6 +379,9 @@ pub async fn handle(
             Ok(json!({}))
         }
         "setInterceptFileChooserDialog" => Ok(json!({})),
+        // Obscura does not download files to disk, so there is no behavior to
+        // configure; ack it so clients that set it do not warn (issue #340).
+        "setDownloadBehavior" => Ok(json!({})),
         "getLayoutMetrics" => {
             // Obscura has no visual layout engine, so we return a fixed
             // 1280x720 viewport (Chrome's default) and try to derive the
