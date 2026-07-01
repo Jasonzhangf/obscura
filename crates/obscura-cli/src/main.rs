@@ -152,6 +152,11 @@ enum Command {
 
         #[arg(long)]
         storage_dir: Option<std::path::PathBuf>,
+
+        /// Render the page to a PNG screenshot at this path. Requires a build
+        /// with the `render` feature.
+        #[arg(long)]
+        screenshot: Option<std::path::PathBuf>,
     },
 
     Scrape {
@@ -370,10 +375,13 @@ async fn main() -> anyhow::Result<()> {
                 ).await?;
             }
         }
-        Some(Command::Fetch { url, dump, selector, wait, timeout, wait_until, user_agent, eval, output, quiet, storage_dir, file, concurrency }) => {
+        Some(Command::Fetch { url, dump, selector, wait, timeout, wait_until, user_agent, eval, output, quiet, storage_dir, file, concurrency, screenshot }) => {
             if let Some(file) = file {
                 if url.is_some() {
                     anyhow::bail!("Pass URLs via a positional argument or --file, not both.");
+                }
+                if screenshot.is_some() {
+                    anyhow::bail!("--screenshot is only supported for a single URL, not --file batch mode.");
                 }
                 // Batch mode is raw HTTP only. Rendering each URL through the
                 // browser/JS stack is what `scrape` is for.
@@ -389,7 +397,7 @@ async fn main() -> anyhow::Result<()> {
                 let url = url.ok_or_else(|| {
                     anyhow::anyhow!("No URL provided. Pass a URL, or a list of URLs with --file <path>.")
                 })?;
-                run_fetch(&url, dump, selector, wait, timeout, &wait_until, user_agent, stealth, eval, output, quiet, global_proxy, storage_dir, args.allow_private_network).await?;
+                run_fetch(&url, dump, selector, wait, timeout, &wait_until, user_agent, stealth, eval, output, quiet, global_proxy, storage_dir, args.allow_private_network, screenshot).await?;
             }
         }
         Some(Command::Scrape { urls, eval, concurrency, format, timeout, quiet }) => {
@@ -566,6 +574,7 @@ async fn run_fetch(
     proxy: Option<String>,
     storage_dir: Option<std::path::PathBuf>,
     allow_private_network: bool,
+    screenshot: Option<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
     // Whether the user explicitly passed --dump. With --eval also present this
     // decides whether we return the eval value or read the page after the
@@ -643,6 +652,31 @@ async fn run_fetch(
     // before we read the page. Returns early once the loop is idle, so static
     // pages stay fast.
     page.settle(wait_secs.saturating_mul(1000)).await;
+
+    // --screenshot renders the settled page to a PNG. Requires the render
+    // feature; without it, page.screenshot is absent and we report clearly.
+    if let Some(ref path) = screenshot {
+        #[cfg(feature = "render")]
+        {
+            // Default CSS-pixel viewport, matching the engine's innerWidth/Height.
+            match page.screenshot((1280.0, 720.0)) {
+                Some(bytes) => std::fs::write(path, &bytes)?,
+                None => anyhow::bail!("screenshot failed: page has no DOM to render"),
+            }
+            if !quiet {
+                eprintln!("Screenshot written: {} ({} bytes)", path.display(), std::fs::metadata(path).map(|m| m.len()).unwrap_or(0));
+            }
+            context.save_cookies();
+            return Ok(());
+        }
+        #[cfg(not(feature = "render"))]
+        {
+            anyhow::bail!(
+                "--screenshot {} requires a build with the render feature (cargo build --features render)",
+                path.display()
+            );
+        }
+    }
 
     if let Some(ref expr) = eval {
         // Bound the eval by the same budget as navigation so a runaway

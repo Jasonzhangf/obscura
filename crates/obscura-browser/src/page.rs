@@ -1281,6 +1281,14 @@ impl Page {
         self.dom.as_ref().map(f)
     }
 
+    /// Rasterize the current DOM to PNG bytes at `viewport` (CSS pixels), when
+    /// the render feature is compiled in. None if the page has no DOM or the
+    /// viewport is zero-sized.
+    #[cfg(feature = "render")]
+    pub fn screenshot(&self, viewport: (f32, f32)) -> Option<Vec<u8>> {
+        self.with_dom(|dom| obscura_js::screenshot_png(dom, viewport)).flatten()
+    }
+
     /// Absolute URLs the page pulled in via fetch()/XHR (issue #301). Empty
     /// when the page has no live JS runtime.
     pub fn fetched_urls(&self) -> Vec<String> {

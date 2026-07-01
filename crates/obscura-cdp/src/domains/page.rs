@@ -524,11 +524,31 @@ pub async fn handle(
                     .to_string(),
             )
         }
-        "captureScreenshot" | "captureSnapshot" => {
-            // Same story as printToPDF: rasterising a page needs a layout and
-            // paint pipeline that Obscura intentionally does not have. Reply
-            // with a clear error so clients can fail fast instead of waiting
-            // on the generic "Unknown Page method" reply.
+        "captureScreenshot" => {
+            #[cfg(feature = "render")]
+            {
+                let page = ctx.get_session_page(session_id).ok_or("No page for session")?;
+                match page.screenshot((1280.0, 720.0)) {
+                    Some(png) => {
+                        use base64::Engine as _;
+                        let data = base64::engine::general_purpose::STANDARD.encode(&png);
+                        Ok(json!({ "data": data }))
+                    }
+                    None => Err(
+                        "Page.captureScreenshot failed: the page has no DOM to render"
+                            .to_string(),
+                    ),
+                }
+            }
+            #[cfg(not(feature = "render"))]
+            Err(
+                "Page.captureScreenshot requires a build with the render feature"
+                    .to_string(),
+            )
+        }
+        "captureSnapshot" => {
+            // A DOM/layer-tree snapshot (not a raster image). Distinct from
+            // captureScreenshot; keep the clear error so clients fail fast.
             Err(format!(
                 "Page.{method} is not supported by Obscura: no layout or paint engine. \
                  For visual snapshots, drive a real headless Chromium for the \

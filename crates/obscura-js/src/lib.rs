@@ -10,3 +10,8 @@ pub mod markdown;
 
 pub use markdown::HTML_TO_MARKDOWN_JS;
 pub use v8_flags::set_v8_flags;
+
+// Screenshot rasterization (PNG bytes) from the render layer. Available when the
+// render feature (which enables obscura-render/paint) is compiled in.
+#[cfg(feature = "render")]
+pub use obscura_render::screenshot_png;

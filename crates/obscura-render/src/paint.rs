@@ -53,6 +53,12 @@ fn bg_color_for(tree: &DomTree, nid: obscura_dom::tree::NodeId) -> Option<[u8; 4
     style.background_color
 }
 
+/// Render `tree` at `viewport` to PNG bytes (RGBA 8-bit). Returns None if the
+/// viewport is zero-sized. Convenience over `paint_dom` + `encode_png`.
+pub fn screenshot_png(tree: &DomTree, viewport: (f32, f32)) -> Option<Vec<u8>> {
+    paint_dom(tree, viewport)?.encode_png().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

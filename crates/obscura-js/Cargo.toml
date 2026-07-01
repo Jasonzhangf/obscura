@@ -10,9 +10,9 @@ default = []
 # TLS fingerprint and client hints as stealth navigation.
 stealth = ["obscura-net/stealth"]
 # Builds the obscura-render layout layer and exposes real box geometry to JS
-# (getBoundingClientRect, elementFromPoint, offset*). Off by default so the
-# scraping build stays lean; the cache is feature-gated and absent otherwise.
-render = ["dep:obscura-render"]
+# (getBoundingClientRect, elementFromPoint, offset*), and with paint enabled,
+# rasterizes screenshots. Off by default so the scraping build stays lean.
+render = ["dep:obscura-render", "obscura-render/paint"]
 
 [build-dependencies]
 deno_core = "0.350"

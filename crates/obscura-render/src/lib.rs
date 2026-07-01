@@ -22,7 +22,7 @@ pub use dom::{layout_dom, DomLayout};
 #[cfg(feature = "paint")]
 mod paint;
 #[cfg(feature = "paint")]
-pub use paint::paint_dom;
+pub use paint::{paint_dom, screenshot_png};
 
 /// An axis-aligned rectangle in CSS pixels, relative to the containing block.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
