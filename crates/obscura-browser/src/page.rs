@@ -984,6 +984,10 @@ impl Page {
             PageError::NetworkError(e.to_string())
         })?;
 
+        // Store binary main resources (images, PDFs, octet-stream) base64 so
+        // Network.getResponseBody returns intact bytes. A UTF-8-lossy text store
+        // corrupts them (issue #340). Text-like types stay as text.
+        let main_is_binary = !is_text_like_content_type(response.content_type());
         self.record_network_event_with_body(
             url.as_str(),
             "GET",
@@ -991,7 +995,7 @@ impl Page {
             response.status,
             &response.headers,
             &response.body,
-            false,
+            main_is_binary,
         );
 
         if !response.redirected_from.is_empty() {
@@ -1469,6 +1473,23 @@ impl Page {
         })
     }
 
+    /// Make the body stored under `from_id` also retrievable under `to_id`.
+    /// The main navigation resource is stored under its internal request id, but
+    /// the CDP layer reports it to clients with the navigation's loaderId as the
+    /// requestId (Chrome's `requestId === loaderId` convention). Without this
+    /// alias, `Network.getResponseBody(loaderId)` misses and a client navigating
+    /// straight to an image or other resource cannot read the main-response body
+    /// (issue #340).
+    pub fn alias_response_body(&mut self, from_id: &str, to_id: &str) {
+        if from_id == to_id || self.response_bodies.contains_key(to_id) {
+            return;
+        }
+        if let Some(body) = self.response_bodies.get(from_id).cloned() {
+            self.response_bodies.insert(to_id.to_string(), body);
+            self.response_body_order.push_back(to_id.to_string());
+        }
+    }
+
     pub fn clear_response_bodies(&mut self) {
         self.response_bodies.clear();
         self.response_body_order.clear();
@@ -1676,6 +1697,29 @@ impl From<ObscuraNetError> for PageError {
     fn from(e: ObscuraNetError) -> Self {
         PageError::NetworkError(e.to_string())
     }
+}
+
+/// Whether a Content-Type is text-like and can be stored/returned as a UTF-8
+/// string. Everything else (images, PDF, fonts, octet-stream) is binary and must
+/// be base64-encoded so Network.getResponseBody returns intact bytes.
+fn is_text_like_content_type(content_type: Option<&str>) -> bool {
+    let ct = match content_type {
+        Some(c) => c.split(';').next().unwrap_or(c).trim().to_ascii_lowercase(),
+        // No Content-Type: assume text (matches the HTML-parse default).
+        None => return true,
+    };
+    if ct.is_empty() {
+        return true;
+    }
+    ct.starts_with("text/")
+        || ct == "application/json"
+        || ct == "application/xml"
+        || ct == "application/xhtml+xml"
+        || ct == "application/javascript"
+        || ct == "application/ecmascript"
+        || ct == "image/svg+xml"
+        || ct.ends_with("+json")
+        || ct.ends_with("+xml")
 }
 
 fn response_body_entry_limit() -> usize {
