@@ -19,6 +19,11 @@ pub use style::compute_style;
 mod dom;
 pub use dom::{layout_dom, DomLayout};
 
+#[cfg(feature = "paint")]
+mod paint;
+#[cfg(feature = "paint")]
+pub use paint::paint_dom;
+
 /// An axis-aligned rectangle in CSS pixels, relative to the containing block.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Rect {
@@ -58,6 +63,8 @@ pub struct LayoutStyle {
     pub margin: Edges,
     pub padding: Edges,
     pub border: Edges,
+    /// RGBA for the paint step. Parsed always (cheap), used only with `paint`.
+    pub background_color: Option<[u8; 4]>,
 }
 
 /// A node in the input layout tree. `text` is carried for the paint phase; it

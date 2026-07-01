@@ -6,9 +6,16 @@ license.workspace = true
 repository.workspace = true
 description = "Optional scoped render layer for Obscura: layout (taffy) and, with the paint feature, text and raster output for screenshots."
 
+[features]
+default = []
+# Rasterize the laid-out tree to a pixmap (tiny-skia). Off by default; the
+# layout core (getBoundingClientRect etc.) works without it.
+paint = ["dep:tiny-skia"]
+
 [dependencies]
 taffy = { workspace = true }
 obscura-dom = { workspace = true }
+tiny-skia = { workspace = true, optional = true }
 
 [lib]
 path = "src/lib.rs"

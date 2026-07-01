@@ -71,8 +71,58 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         "border-right-width" | "border-right" => set_edge(&mut style.border, Side::Right, px(value)),
         "border-bottom-width" | "border-bottom" => set_edge(&mut style.border, Side::Bottom, px(value)),
         "border-left-width" | "border-left" => set_edge(&mut style.border, Side::Left, px(value)),
+        "background-color" | "background" => style.background_color = parse_color(value),
         _ => {}
     }
+}
+
+/// Parse a CSS color to RGBA. Handles #rgb, #rgba, #rrggbb, #rrggbbaa hex and a
+/// small set of named colors. Returns None for anything else (transparent).
+fn parse_color(value: &str) -> Option<[u8; 4]> {
+    let v = value.split_whitespace().next()?.to_ascii_lowercase();
+    if let Some(h) = v.strip_prefix('#') {
+        let (r, g, b, a) = match h.len() {
+            3 => (
+                u8::from_str_radix(&h[0..1].repeat(2), 16).ok()?,
+                u8::from_str_radix(&h[1..2].repeat(2), 16).ok()?,
+                u8::from_str_radix(&h[2..3].repeat(2), 16).ok()?,
+                255u8,
+            ),
+            4 => (
+                u8::from_str_radix(&h[0..1].repeat(2), 16).ok()?,
+                u8::from_str_radix(&h[1..2].repeat(2), 16).ok()?,
+                u8::from_str_radix(&h[2..3].repeat(2), 16).ok()?,
+                u8::from_str_radix(&h[3..4].repeat(2), 16).ok()?,
+            ),
+            6 => (
+                u8::from_str_radix(&h[0..2], 16).ok()?,
+                u8::from_str_radix(&h[2..4], 16).ok()?,
+                u8::from_str_radix(&h[4..6], 16).ok()?,
+                255u8,
+            ),
+            8 => (
+                u8::from_str_radix(&h[0..2], 16).ok()?,
+                u8::from_str_radix(&h[2..4], 16).ok()?,
+                u8::from_str_radix(&h[4..6], 16).ok()?,
+                u8::from_str_radix(&h[6..8], 16).ok()?,
+            ),
+            _ => return None,
+        };
+        return Some([r, g, b, a]);
+    }
+    // Named colors (the common few).
+    let named = match v.as_str() {
+        "transparent" => [0, 0, 0, 0],
+        "black" => [0, 0, 0, 255],
+        "white" => [255, 255, 255, 255],
+        "red" => [255, 0, 0, 255],
+        "green" => [0, 128, 0, 255],
+        "blue" => [0, 0, 255, 255],
+        "yellow" => [255, 255, 0, 255],
+        "gray" | "grey" => [128, 128, 128, 255],
+        _ => return None,
+    };
+    Some(named)
 }
 
 enum Side { Top, Right, Bottom, Left }
