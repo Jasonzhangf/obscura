@@ -72,7 +72,17 @@ impl DomTree {
             }
             NodeData::Comment { contents } => {
                 buf.push_str("<!--");
-                buf.push_str(contents);
+                // The HTML parser can never produce a comment whose data contains
+                // "-->" (that ends the comment), but script can via
+                // document.createComment("a-->b"). Emitting it verbatim would close
+                // the comment early and let the trailing text escape into markup.
+                // Neutralize the terminator so the serialized output round-trips as
+                // a single comment.
+                if contents.contains("-->") {
+                    buf.push_str(&contents.replace("-->", "--&gt;"));
+                } else {
+                    buf.push_str(contents);
+                }
                 buf.push_str("-->");
             }
             NodeData::ProcessingInstruction { target, data } => {
