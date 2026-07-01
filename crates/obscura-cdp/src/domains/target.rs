@@ -195,6 +195,10 @@ pub async fn handle(method: &str, params: &Value, ctx: &mut CdpContext) -> Resul
             Ok(json!({ "success": true }))
         }
         "setAutoAttach" => Ok(json!({})),
+        // No multi-target lifecycle to manage: obscura runs one page per session.
+        // Ack these so Chrome-shaped clients that call them do not warn (issue #340).
+        "detachFromTarget" => Ok(json!({})),
+        "activateTarget" => Ok(json!({})),
         "getBrowserContexts" => {
             Ok(json!({ "browserContextIds": [ctx.default_context.id] }))
         }
