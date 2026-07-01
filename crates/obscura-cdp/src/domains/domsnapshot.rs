@@ -84,21 +84,32 @@ impl Interner {
 }
 
 /// Pre-order DFS from the document, recording each node and its parent's index.
+/// Iterative with an explicit stack: the MAX_NODES cap bounds the node count,
+/// but recursion depth is a separate axis. A deeply nested linear chain (script
+/// can build thousands of nested elements) would recurse that many frames deep
+/// and could overflow the stack before the count guard triggers. An explicit
+/// stack keeps the depth on the heap (issue #341).
 fn walk(
     dom: &DomTree,
-    id: NodeId,
-    parent: i64,
+    root: NodeId,
+    root_parent: i64,
     order: &mut Vec<NodeId>,
     parent_idx: &mut Vec<i64>,
 ) {
-    if order.len() >= MAX_NODES {
-        return;
-    }
-    let my = order.len() as i64;
-    order.push(id);
-    parent_idx.push(parent);
-    for child in dom.children(id) {
-        walk(dom, child, my, order, parent_idx);
+    // (node, parent_index). Children are pushed in reverse so they pop in
+    // document order, preserving the original pre-order traversal.
+    let mut stack: Vec<(NodeId, i64)> = vec![(root, root_parent)];
+    while let Some((id, parent)) = stack.pop() {
+        if order.len() >= MAX_NODES {
+            break;
+        }
+        let my = order.len() as i64;
+        order.push(id);
+        parent_idx.push(parent);
+        let children: Vec<NodeId> = dom.children(id);
+        for child in children.into_iter().rev() {
+            stack.push((child, my));
+        }
     }
 }
 
