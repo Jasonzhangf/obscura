@@ -127,6 +127,7 @@ fn paint_text_node(
     let parent = node.parent?;
     let style = laid.styles.get(&parent)?;
     let color = style.color.unwrap_or([0, 0, 0, 255]);
+    let fsize = style.font_size.unwrap_or(16.0);
     
     // Get geometry of the text node itself!
     let rect = match laid.rects.get(&nid) {
@@ -135,13 +136,13 @@ fn paint_text_node(
     };
     
     // Paint text at rect.x, rect.y
-    draw_text(pixmap, text, rect.x, rect.y, color);
+    draw_text(pixmap, text, rect.x, rect.y, color, fsize);
     Some(())
 }
 
-fn draw_text(pixmap: &mut Pixmap, text: &str, x: f32, y: f32, color: [u8; 4]) {
+fn draw_text(pixmap: &mut Pixmap, text: &str, x: f32, y: f32, color: [u8; 4], size: f32) {
     let font = FontRef::try_from_slice(FONT_BYTES).unwrap();
-    let scale = PxScale::from(16.0); // Default font size
+    let scale = PxScale::from(size);
     let scaled_font = font.as_scaled(scale);
     let mut caret = ab_glyph::point(x, y + scaled_font.ascent());
 

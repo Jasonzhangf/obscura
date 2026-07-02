@@ -54,9 +54,28 @@ pub fn layout_dom(tree: &DomTree, viewport: (f32, f32)) -> DomLayout {
 
     for nid in tree.descendants(tree.document()) {
         if let Some(node) = tree.get_node(nid) {
-            if let Some(inline) = node.get_attribute("style") {
+            if node.is_element() {
                 if let Some(style) = styles.get_mut(&nid) {
-                    crate::style::apply_inline(style, inline);
+                    if let Some(inline) = node.get_attribute("style") {
+                        crate::style::apply_inline(style, inline);
+                    }
+                    if let Some(bgcolor) = node.get_attribute("bgcolor") {
+                        crate::style::apply_inline(style, &format!("background-color: {}", bgcolor));
+                    }
+                    if let Some(width) = node.get_attribute("width") {
+                        if width.chars().all(|c| c.is_ascii_digit()) {
+                            crate::style::apply_inline(style, &format!("width: {}px", width));
+                        } else {
+                            crate::style::apply_inline(style, &format!("width: {}", width));
+                        }
+                    }
+                    if let Some(height) = node.get_attribute("height") {
+                        if height.chars().all(|c| c.is_ascii_digit()) {
+                            crate::style::apply_inline(style, &format!("height: {}px", height));
+                        } else {
+                            crate::style::apply_inline(style, &format!("height: {}", height));
+                        }
+                    }
                 }
             }
         }
@@ -82,22 +101,42 @@ pub fn layout_dom(tree: &DomTree, viewport: (f32, f32)) -> DomLayout {
                     height: taffy::AvailableSpace::Definite(viewport.1),
                 },
             );
-            for (taffy_id, dom_id) in &id_map {
-                if let Ok(layout) = taffy_tree.layout(*taffy_id) {
-                    rects.insert(
-                        *dom_id,
-                        Rect {
-                            x: layout.location.x,
-                            y: layout.location.y,
-                            width: layout.size.width,
-                            height: layout.size.height,
-                        },
-                    );
-                }
-            }
+            compute_absolute_rects(&taffy_tree, taffy_root, 0.0, 0.0, &id_map, &mut rects);
         }
     }
     DomLayout { rects, styles }
+}
+
+fn compute_absolute_rects(
+    taffy_tree: &TaffyTree,
+    taffy_id: taffy::NodeId,
+    abs_x: f32,
+    abs_y: f32,
+    id_map: &HashMap<taffy::NodeId, NodeId>,
+    rects: &mut HashMap<NodeId, Rect>,
+) {
+    if let Ok(layout) = taffy_tree.layout(taffy_id) {
+        let x = abs_x + layout.location.x;
+        let y = abs_y + layout.location.y;
+        
+        if let Some(dom_id) = id_map.get(&taffy_id) {
+            rects.insert(
+                *dom_id,
+                Rect {
+                    x,
+                    y,
+                    width: layout.size.width,
+                    height: layout.size.height,
+                },
+            );
+        }
+        
+        if let Ok(children) = taffy_tree.children(taffy_id) {
+            for child_id in children {
+                compute_absolute_rects(taffy_tree, child_id, x, y, id_map, rects);
+            }
+        }
+    }
 }
 
 fn parse_simple_css(css: &str) -> Vec<(String, String)> {
@@ -146,15 +185,22 @@ fn build(
         if text.is_empty() {
             return None;
         }
-        let width = text.chars().count() as f32 * 9.0;
-        let style = taffy::Style {
+        
+        let parent = node.parent?;
+        let style = styles.get(&parent)?;
+        let fsize = style.font_size.unwrap_or(16.0);
+        
+        let width = text.chars().count() as f32 * (fsize * 0.55); // rough width estimate
+        let height = fsize * 1.2;
+        
+        let taffy_style = taffy::Style {
             size: taffy::Size {
                 width: taffy::Dimension::Length(width),
-                height: taffy::Dimension::Length(19.0),
+                height: taffy::Dimension::Length(height),
             },
             ..Default::default()
         };
-        let taffy_id = taffy_tree.new_leaf(style).ok()?;
+        let taffy_id = taffy_tree.new_leaf(taffy_style).ok()?;
         id_map.insert(taffy_id, id);
         return Some(taffy_id);
     }

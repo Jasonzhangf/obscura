@@ -78,6 +78,7 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         "background-color" | "background" => style.background_color = parse_color(value),
         "color" => style.color = parse_color(value),
         "border-color" => style.border_color = parse_color(value),
+        "font-size" => style.font_size = px(value),
         _ => {}
     }
 }
@@ -156,12 +157,28 @@ fn edges(value: &str) -> Option<Edges> {
 }
 
 fn px_value(tok: &str) -> Option<f32> {
-    let n = tok.strip_suffix("px").unwrap_or(tok);
-    // Reject percentages and other units for phase 1.
+    let mut n = tok;
+    let mut scale = 1.0;
+    
+    if n.ends_with("px") {
+        n = &n[..n.len() - 2];
+    } else if n.ends_with("pt") {
+        n = &n[..n.len() - 2];
+        scale = 1.333; // 1pt ≈ 1.333px
+    } else if n.ends_with("em") || n.ends_with("rem") {
+        n = n.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+        scale = 16.0; // 1em = 16px
+    } else if n.ends_with('%') {
+        n = &n[..n.len() - 1];
+        scale = 16.0 / 100.0;
+    } else {
+        n = n.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+    }
+    
     if n.chars().any(|c| !(c.is_ascii_digit() || c == '.' || c == '-')) {
         return None;
     }
-    n.parse::<f32>().ok()
+    n.parse::<f32>().ok().map(|v| v * scale)
 }
 
 fn token(value: &str) -> Option<&str> {
