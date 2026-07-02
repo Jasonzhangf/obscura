@@ -224,16 +224,33 @@ fn build(
     let node = tree.get_node(id)?;
 
     if let obscura_dom::tree::NodeData::Text { contents } = &node.data {
-        let text = contents.trim();
-        if text.is_empty() {
-            return None;
+        let mut display_text = String::new();
+        let mut in_space = false;
+        for c in contents.chars() {
+            if c.is_whitespace() {
+                if !in_space {
+                    display_text.push(' ');
+                    in_space = true;
+                }
+            } else {
+                display_text.push(c);
+                in_space = false;
+            }
+        }
+        if display_text == " " {
+            display_text = " ".to_string(); // Keep single space
         }
         
-        let parent = node.parent?;
-        let style = styles.get(&parent)?;
-        let fsize = style.font_size.unwrap_or(16.0);
+        let mut fsize = 16.0;
+        let mut is_bold = false;
+        if let Some(parent_id) = node.parent {
+            if let Some(p_style) = styles.get(&parent_id) {
+                fsize = p_style.font_size.unwrap_or(16.0);
+                is_bold = p_style.font_weight.as_deref() == Some("bold");
+            }
+        }
         
-        let width = text.chars().count() as f32 * (fsize * 0.55); // rough width estimate
+        let width = crate::paint::measure_text(&display_text, fsize, is_bold);
         let height = fsize * 1.2;
         
         let taffy_style = taffy::Style {

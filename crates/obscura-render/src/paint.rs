@@ -143,12 +143,25 @@ fn paint_text_node(
     pixmap: &mut Pixmap,
 ) -> Option<()> {
     let node = tree.get_node(nid)?;
+    let mut text_buf = String::new();
     let text = match &node.data {
         obscura_dom::tree::NodeData::Text { contents } => {
-            if contents.trim().is_empty() {
+            let mut in_space = false;
+            for c in contents.chars() {
+                if c.is_whitespace() {
+                    if !in_space {
+                        text_buf.push(' ');
+                        in_space = true;
+                    }
+                } else {
+                    text_buf.push(c);
+                    in_space = false;
+                }
+            }
+            if text_buf.is_empty() {
                 " "
             } else {
-                contents
+                &text_buf
             }
         },
         _ => return None,
@@ -167,9 +180,26 @@ fn paint_text_node(
         None => return None,
     };
     
+    if text.contains("zachtronics") || text.contains("Exapunks") {
+        println!("DEBUG text: {:?} rect: {:?}", text, rect);
+    }
+    
     // Paint text at rect.x, rect.y
     draw_text(pixmap, text, rect.x, rect.y, color, fsize, is_bold);
     Some(())
+}
+
+pub fn measure_text(text: &str, size: f32, is_bold: bool) -> f32 {
+    let font = FontRef::try_from_slice(FONT_BYTES).unwrap();
+    let scale = PxScale::from(size);
+    let scaled_font = font.as_scaled(scale);
+    let mut width = 0.0;
+    for c in text.chars() {
+        if c.is_control() { continue; }
+        width += scaled_font.h_advance(font.glyph_id(c));
+    }
+    if is_bold { width += text.chars().filter(|c| !c.is_control()).count() as f32; }
+    width
 }
 
 fn draw_text(pixmap: &mut Pixmap, text: &str, x: f32, y: f32, color: [u8; 4], size: f32, is_bold: bool) {

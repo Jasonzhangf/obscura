@@ -114,8 +114,10 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         "text-align" => {
             if value == "right" {
                 style.justify_content = Some(taffy::JustifyContent::FlexEnd);
+                style.align_items = Some(taffy::AlignItems::FlexEnd);
             } else if value == "center" {
                 style.justify_content = Some(taffy::JustifyContent::Center);
+                style.align_items = Some(taffy::AlignItems::Center);
             }
         },
         "align-items" => {
