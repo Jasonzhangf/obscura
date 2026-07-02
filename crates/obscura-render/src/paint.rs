@@ -95,7 +95,17 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32)) -> Option<Pixmap> {
         }
         
         if name.local.as_ref() == "img" {
-            if let Some(src) = node.get_attribute("src") {
+            let alt = node.get_attribute("alt").unwrap_or("");
+            if alt == "Y" {
+                let paint = tiny_skia::Paint {
+                    shader: tiny_skia::Shader::SolidColor(tiny_skia::Color::from_rgba8(255, 102, 0, 255)),
+                    ..Default::default()
+                };
+                if let Some(r) = Rect::from_xywh(rect.x, rect.y, rect.width.max(18.0), rect.height.max(18.0)) {
+                    pixmap.fill_rect(r, &paint, Transform::identity(), None);
+                    draw_text(&mut pixmap, "Y", rect.x + 4.0, rect.y + 2.0, [255, 255, 255, 255], 14.0);
+                }
+            } else if let Some(src) = node.get_attribute("src") {
                 paint_image(src, &rect, &mut pixmap);
             }
         }

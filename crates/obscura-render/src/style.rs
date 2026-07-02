@@ -126,19 +126,17 @@ fn parse_color(value: &str) -> Option<[u8; 4]> {
         };
         return Some([r, g, b, a]);
     }
-    // Named colors (the common few).
-    let named = match v.as_str() {
-        "transparent" => [0, 0, 0, 0],
-        "black" => [0, 0, 0, 255],
-        "white" => [255, 255, 255, 255],
-        "red" => [255, 0, 0, 255],
-        "green" => [0, 128, 0, 255],
-        "blue" => [0, 0, 255, 255],
-        "yellow" => [255, 255, 0, 255],
-        "gray" | "grey" => [128, 128, 128, 255],
-        _ => return None,
-    };
-    Some(named)
+    match v.as_str() {
+        "white" => Some([255, 255, 255, 255]),
+        "black" => Some([0, 0, 0, 255]),
+        "gray" | "grey" => Some([128, 128, 128, 255]),
+        "red" => Some([255, 0, 0, 255]),
+        "green" => Some([0, 128, 0, 255]),
+        "blue" => Some([0, 0, 255, 255]),
+        "orange" => Some([255, 165, 0, 255]),
+        "transparent" => Some([0, 0, 0, 0]),
+        _ => None,
+    }
 }
 
 enum Side { Top, Right, Bottom, Left }

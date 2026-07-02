@@ -59,6 +59,9 @@ pub fn layout_dom(tree: &DomTree, viewport: (f32, f32)) -> DomLayout {
                     if let Some(inline) = node.get_attribute("style") {
                         crate::style::apply_inline(style, inline);
                     }
+                    if let Some(color) = node.get_attribute("color") {
+                        crate::style::apply_inline(style, &format!("color: {}", color));
+                    }
                     if let Some(bgcolor) = node.get_attribute("bgcolor") {
                         crate::style::apply_inline(style, &format!("background-color: {}", bgcolor));
                     }
