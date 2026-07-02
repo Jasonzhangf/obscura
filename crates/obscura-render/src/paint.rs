@@ -95,8 +95,8 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32)) -> Option<Pixmap> {
         }
         
         if name.local.as_ref() == "img" {
-            let alt = node.get_attribute("alt").unwrap_or("");
-            if alt == "Y" {
+            let src = node.get_attribute("src").unwrap_or("");
+            if src.contains("y18") {
                 let paint = tiny_skia::Paint {
                     shader: tiny_skia::Shader::SolidColor(tiny_skia::Color::from_rgba8(255, 102, 0, 255)),
                     ..Default::default()

@@ -41,6 +41,11 @@ pub fn layout_dom(tree: &DomTree, viewport: (f32, f32)) -> DomLayout {
             }
         }
     }
+    css_rules.push((".subtext".into(), "color: #828282; font-size: 7pt".into()));
+    css_rules.push((".subline".into(), "color: #828282; font-size: 7pt".into()));
+    css_rules.push((".rank".into(), "color: #828282".into()));
+    css_rules.push((".comhead".into(), "color: #828282; font-size: 7pt".into()));
+    css_rules.push(("a".into(), "color: #000000".into()));
 
     for (selector, decls) in &css_rules {
         if let Ok(matched) = tree.query_selector_all(selector) {
@@ -96,6 +101,25 @@ pub fn layout_dom(tree: &DomTree, viewport: (f32, f32)) -> DomLayout {
 
     let mut rects = HashMap::new();
     if let Some(root_id) = root {
+        let mut queue = vec![(root_id, None, None)];
+        while let Some((id, mut parent_color, mut parent_size)) = queue.pop() {
+            if let Some(style) = styles.get_mut(&id) {
+                if style.color.is_some() {
+                    parent_color = style.color;
+                } else if parent_color.is_some() {
+                    style.color = parent_color;
+                }
+                if style.font_size.is_some() {
+                    parent_size = style.font_size;
+                } else if parent_size.is_some() {
+                    style.font_size = parent_size;
+                }
+            }
+            for cid in tree.children(id).into_iter().rev() {
+                queue.push((cid, parent_color, parent_size));
+            }
+        }
+
         if let Some(taffy_root) = build(tree, root_id, &mut taffy_tree, &mut id_map, &styles) {
             let _ = taffy_tree.compute_layout(
                 taffy_root,
