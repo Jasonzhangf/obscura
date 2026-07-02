@@ -23,11 +23,20 @@ pub fn compute_style(tag: &str, inline_css: Option<&str>) -> LayoutStyle {
 /// Built-in UA defaults. Inline elements currently map to block layout; real
 /// inline/text layout arrives with the text/paint phase.
 pub fn ua_style(tag: &str) -> LayoutStyle {
-    let display = match tag {
-        "span" | "a" | "b" | "i" | "strong" | "em" => Display::Inline,
+    let mut style = LayoutStyle::default();
+    style.display = match tag {
+        "span" | "a" | "b" | "i" | "strong" | "em" | "font" => Display::Inline,
+        "tr" => Display::Flex,
         _ => Display::Block,
     };
-    LayoutStyle { display, ..Default::default() }
+    if tag == "center" {
+        style.display = Display::Flex;
+        style.flex_direction = Some(taffy::FlexDirection::Column);
+        style.align_items = Some(taffy::AlignItems::Center);
+    } else if tag == "body" {
+        style.margin = Edges { top: 8.0, right: 8.0, bottom: 8.0, left: 8.0 };
+    }
+    style
 }
 
 pub fn apply_inline(style: &mut LayoutStyle, css: &str) {
@@ -58,8 +67,8 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
             "none" => style.display = Display::None,
             _ => {}
         },
-        "width" => style.width = px(value),
-        "height" => style.height = px(value),
+        "width" => style.width = dimension_value(value),
+        "height" => style.height = dimension_value(value),
         "margin" => { if let Some(e) = edges(value) { style.margin = e; } }
         "margin-top" => set_edge(&mut style.margin, Side::Top, px(value)),
         "margin-right" => set_edge(&mut style.margin, Side::Right, px(value)),
@@ -150,6 +159,18 @@ fn px(value: &str) -> Option<f32> {
     token(value).and_then(px_value)
 }
 
+fn dimension_value(tok: &str) -> crate::Dimension {
+    let n = tok.trim();
+    if n.ends_with("%") {
+        if let Ok(v) = n[..n.len()-1].parse::<f32>() {
+            return crate::Dimension::Percent(v / 100.0);
+        }
+    } else if let Some(px) = px(tok) {
+        return crate::Dimension::Px(px);
+    }
+    crate::Dimension::Auto
+}
+
 /// Parse every length token in a value as px (for box shorthands).
 fn edges(value: &str) -> Option<Edges> {
     let dims: Vec<f32> = value.split_whitespace().filter_map(px_value).collect();
@@ -205,8 +226,8 @@ mod tests {
     fn parses_display_and_size() {
         let s = compute_style("div", Some("display: flex; width: 200px; height: 50px"));
         assert_eq!(s.display, Display::Flex);
-        assert_eq!(s.width, Some(200.0));
-        assert_eq!(s.height, Some(50.0));
+        assert_eq!(s.width, crate::Dimension::Px(200.0));
+        assert_eq!(s.height, crate::Dimension::Px(50.0));
     }
 
     #[test]
@@ -231,7 +252,7 @@ mod tests {
     #[test]
     fn important_and_auto() {
         let s = compute_style("div", Some("width: 100px !important; height: auto"));
-        assert_eq!(s.width, Some(100.0));
-        assert_eq!(s.height, None);
+        assert_eq!(s.width, crate::Dimension::Px(100.0));
+        assert_eq!(s.height, crate::Dimension::Auto);
     }
 }

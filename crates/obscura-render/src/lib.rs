@@ -54,13 +54,20 @@ pub enum Display {
     None,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub enum Dimension {
+    #[default]
+    Auto,
+    Px(f32),
+    Percent(f32),
+}
+
 /// The subset of CSS that influences box layout. Expanded in later phases.
 #[derive(Debug, Clone, Default)]
 pub struct LayoutStyle {
     pub display: Display,
-    /// Content-box size. None means auto.
-    pub width: Option<f32>,
-    pub height: Option<f32>,
+    pub width: Dimension,
+    pub height: Dimension,
     pub margin: Edges,
     pub padding: Edges,
     pub border: Edges,
@@ -70,6 +77,8 @@ pub struct LayoutStyle {
     pub color: Option<[u8; 4]>,
     pub border_color: Option<[u8; 4]>,
     pub font_size: Option<f32>,
+    pub align_items: Option<taffy::AlignItems>,
+    pub flex_direction: Option<taffy::FlexDirection>,
 }
 
 /// A node in the input layout tree. `text` is carried for the paint phase; it
@@ -148,7 +157,9 @@ pub(crate) fn to_taffy_style(style: &LayoutStyle) -> Style {
         Display::Inline => taffy::style::Display::Flex,
         Display::None => taffy::style::Display::None,
     };
-    if style.display == Display::Inline {
+    if let Some(fd) = style.flex_direction {
+        s.flex_direction = fd;
+    } else if style.display == Display::Inline {
         s.flex_direction = taffy::FlexDirection::Row;
     }
     s.flex_wrap = taffy::FlexWrap::Wrap;
@@ -156,16 +167,20 @@ pub(crate) fn to_taffy_style(style: &LayoutStyle) -> Style {
         width: dimension(style.width),
         height: dimension(style.height),
     };
+    if let Some(ai) = style.align_items {
+        s.align_items = Some(ai);
+    }
     s.margin = rect_auto(style.margin);
     s.padding = rect_lp(style.padding);
     s.border = rect_lp(style.border);
     s
 }
 
-fn dimension(v: Option<f32>) -> taffy::style::Dimension {
+fn dimension(v: Dimension) -> taffy::style::Dimension {
     match v {
-        Some(px) => taffy::style::Dimension::Length(px),
-        None => taffy::style::Dimension::Auto,
+        Dimension::Px(px) => taffy::style::Dimension::Length(px),
+        Dimension::Percent(p) => taffy::style::Dimension::Percent(p),
+        Dimension::Auto => taffy::style::Dimension::Auto,
     }
 }
 
@@ -191,8 +206,8 @@ fn rect_auto(e: Edges) -> taffy::Rect<taffy::style::LengthPercentageAuto> {
 mod tests {
     use super::*;
 
-    fn styled(display: Display, w: Option<f32>, h: Option<f32>) -> LayoutStyle {
-        LayoutStyle { display, width: w, height: h, ..Default::default() }
+    fn make_box(display: Display, w: f32, h: f32) -> LayoutStyle {
+        LayoutStyle { display, width: Dimension::Px(w), height: Dimension::Px(h), ..Default::default() }
     }
 
     #[test]
@@ -200,11 +215,11 @@ mod tests {
         // A 1000px-wide viewport, two fixed-size block children: they should
         // stack top-to-bottom at the expected y offsets.
         let root = LayoutNode {
-            style: styled(Display::Block, Some(1000.0), None),
+            style: make_box(Display::Block, 1000.0, 800.0),
             text: None,
             children: vec![
-                LayoutNode::leaf(styled(Display::Block, Some(1000.0), Some(50.0))),
-                LayoutNode::leaf(styled(Display::Block, Some(1000.0), Some(30.0))),
+                LayoutNode::leaf(make_box(Display::Block, 1000.0, 50.0)),
+                LayoutNode::leaf(make_box(Display::Block, 1000.0, 30.0)),
             ],
         };
         let out = layout(&root, (1000.0, 800.0));
@@ -223,13 +238,13 @@ mod tests {
     }
 
     #[test]
-fn flex_row_lays_out_horizontally() {
+    fn flex_row_lays_out_horizontally() {
         let root = LayoutNode {
-            style: LayoutStyle { display: Display::Flex, width: Some(600.0), height: Some(100.0), ..Default::default() },
+            style: LayoutStyle { display: Display::Flex, width: Dimension::Px(600.0), height: Dimension::Px(100.0), ..Default::default() },
             text: None,
             children: vec![
-                LayoutNode::leaf(styled(Display::Block, Some(200.0), Some(100.0))),
-                LayoutNode::leaf(styled(Display::Block, Some(200.0), Some(100.0))),
+                LayoutNode::leaf(make_box(Display::Block, 200.0, 100.0)),
+                LayoutNode::leaf(make_box(Display::Block, 200.0, 100.0)),
             ],
         };
         let out = layout(&root, (600.0, 400.0));
@@ -249,8 +264,8 @@ fn flex_row_lays_out_horizontally() {
         let root = LayoutNode {
             style: LayoutStyle {
                 display: Display::Block,
-                width: Some(100.0),
-                height: Some(100.0),
+                width: Dimension::Px(100.0),
+                height: Dimension::Px(100.0),
                 padding: Edges { top: 10.0, right: 10.0, bottom: 10.0, left: 10.0 },
                 ..Default::default()
             },
