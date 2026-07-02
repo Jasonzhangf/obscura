@@ -24,6 +24,10 @@ pub fn compute_style(tag: &str, inline_css: Option<&str>) -> LayoutStyle {
 /// inline/text layout arrives with the text/paint phase.
 pub fn ua_style(tag: &str) -> LayoutStyle {
     let mut style = LayoutStyle::default();
+    if tag == "b" || tag == "strong" {
+        style.font_weight = Some("bold".into());
+    }
+
     style.display = match tag {
         "span" | "a" | "b" | "i" | "strong" | "em" | "font" => Display::Inline,
         "tr" => Display::Flex,
@@ -88,7 +92,16 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         "padding-right" => set_edge(&mut style.padding, Side::Right, px(value)),
         "padding-bottom" => set_edge(&mut style.padding, Side::Bottom, px(value)),
         "padding-left" => set_edge(&mut style.padding, Side::Left, px(value)),
-        "border-width" | "border" => { if let Some(e) = edges(value) { style.border = e; } }
+        "border" => {
+            for p in value.split_whitespace() {
+                if let Some(c) = parse_color(p) {
+                    style.border_color = Some(c);
+                } else if p.ends_with("px") || p.chars().all(|c| c.is_ascii_digit()) {
+                    if let Some(e) = edges(p) { style.border = e; }
+                }
+            }
+        }
+        "border-width" => { if let Some(e) = edges(value) { style.border = e; } }
         "border-top-width" | "border-top" => set_edge(&mut style.border, Side::Top, px(value)),
         "border-right-width" | "border-right" => set_edge(&mut style.border, Side::Right, px(value)),
         "border-bottom-width" | "border-bottom" => set_edge(&mut style.border, Side::Bottom, px(value)),
@@ -97,11 +110,21 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         "color" => style.color = parse_color(value),
         "border-color" => style.border_color = parse_color(value),
         "font-size" => style.font_size = px(value),
+        "font-weight" => style.font_weight = Some(value.to_string()),
         "text-align" => {
             if value == "right" {
                 style.justify_content = Some(taffy::JustifyContent::FlexEnd);
             } else if value == "center" {
                 style.justify_content = Some(taffy::JustifyContent::Center);
+            }
+        },
+        "align-items" => {
+            if value == "center" {
+                style.align_items = Some(taffy::AlignItems::Center);
+            } else if value == "flex-start" || value == "start" {
+                style.align_items = Some(taffy::AlignItems::FlexStart);
+            } else if value == "flex-end" || value == "end" {
+                style.align_items = Some(taffy::AlignItems::FlexEnd);
             }
         },
         _ => {}

@@ -43,6 +43,9 @@ pub fn layout_dom(tree: &DomTree, viewport: (f32, f32)) -> DomLayout {
     }
     css_rules.push((".subtext".into(), "color: #828282; font-size: 7pt".into()));
     css_rules.push((".subline".into(), "color: #828282; font-size: 7pt".into()));
+    css_rules.push((".hnname".into(), "margin-right: 10px; margin-left: 2px".into()));
+    css_rules.push((".pagetop".into(), "align-items: center".into()));
+    css_rules.push((".votearrow".into(), "width: 10px; height: 10px; margin-top: 2px".into()));
     css_rules.push((".rank".into(), "color: #828282".into()));
     css_rules.push((".comhead".into(), "color: #828282; font-size: 7pt".into()));
     css_rules.push(("a".into(), "color: #000000".into()));

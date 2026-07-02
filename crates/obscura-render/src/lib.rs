@@ -77,6 +77,7 @@ pub struct LayoutStyle {
     pub color: Option<[u8; 4]>,
     pub border_color: Option<[u8; 4]>,
     pub font_size: Option<f32>,
+    pub font_weight: Option<String>,
     pub align_items: Option<taffy::AlignItems>,
     pub flex_direction: Option<taffy::FlexDirection>,
     pub justify_content: Option<taffy::JustifyContent>,

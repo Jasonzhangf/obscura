@@ -97,16 +97,33 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32)) -> Option<Pixmap> {
         if name.local.as_ref() == "img" {
             let src = node.get_attribute("src").unwrap_or("");
             if src.contains("y18") {
-                let paint = tiny_skia::Paint {
-                    shader: tiny_skia::Shader::SolidColor(tiny_skia::Color::from_rgba8(255, 102, 0, 255)),
+                let mut paint = tiny_skia::Paint {
+                    shader: tiny_skia::Shader::SolidColor(tiny_skia::Color::from_rgba8(255, 255, 255, 255)),
                     ..Default::default()
                 };
+                if let Some(r) = Rect::from_xywh(rect.x - 1.0, rect.y - 1.0, rect.width.max(18.0) + 2.0, rect.height.max(18.0) + 2.0) {
+                    pixmap.fill_rect(r, &paint, Transform::identity(), None);
+                }
+                paint.shader = tiny_skia::Shader::SolidColor(tiny_skia::Color::from_rgba8(255, 102, 0, 255));
                 if let Some(r) = Rect::from_xywh(rect.x, rect.y, rect.width.max(18.0), rect.height.max(18.0)) {
                     pixmap.fill_rect(r, &paint, Transform::identity(), None);
-                    draw_text(&mut pixmap, "Y", rect.x + 4.0, rect.y + 2.0, [255, 255, 255, 255], 14.0);
+                    draw_text(&mut pixmap, "Y", rect.x + 4.0, rect.y + 2.0, [255, 255, 255, 255], 14.0, false);
                 }
             } else if let Some(src) = node.get_attribute("src") {
                 paint_image(src, &rect, &mut pixmap);
+            }
+        }
+        
+        if node.get_attribute("class").unwrap_or_default() == "votearrow" {
+            let mut pb = tiny_skia::PathBuilder::new();
+            pb.move_to(rect.x + rect.width * 0.5, rect.y);
+            pb.line_to(rect.x + rect.width, rect.y + rect.height);
+            pb.line_to(rect.x, rect.y + rect.height);
+            pb.close();
+            if let Some(path) = pb.finish() {
+                let mut paint = tiny_skia::Paint::default();
+                paint.set_color_rgba8(130, 130, 130, 255);
+                pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
             }
         }
     }
@@ -142,6 +159,8 @@ fn paint_text_node(
     let color = style.color.unwrap_or([0, 0, 0, 255]);
     let fsize = style.font_size.unwrap_or(16.0);
     
+    let is_bold = style.font_weight.as_deref() == Some("bold");
+    
     // Get geometry of the text node itself!
     let rect = match laid.rects.get(&nid) {
         Some(r) => r,
@@ -149,11 +168,11 @@ fn paint_text_node(
     };
     
     // Paint text at rect.x, rect.y
-    draw_text(pixmap, text, rect.x, rect.y, color, fsize);
+    draw_text(pixmap, text, rect.x, rect.y, color, fsize, is_bold);
     Some(())
 }
 
-fn draw_text(pixmap: &mut Pixmap, text: &str, x: f32, y: f32, color: [u8; 4], size: f32) {
+fn draw_text(pixmap: &mut Pixmap, text: &str, x: f32, y: f32, color: [u8; 4], size: f32, is_bold: bool) {
     let font = FontRef::try_from_slice(FONT_BYTES).unwrap();
     let scale = PxScale::from(size);
     let scaled_font = font.as_scaled(scale);
@@ -179,25 +198,30 @@ fn draw_text(pixmap: &mut Pixmap, text: &str, x: f32, y: f32, color: [u8; 4], si
                 if px >= 0 && px < width && py >= 0 && py < height {
                     let alpha = (a_full as f32 * c) as u8;
                     if alpha > 0 {
-                        let idx = (py * width + px) as usize;
-                        let dst = pixels[idx];
-                        
-                        let src_a = alpha as u32;
-                        let src_r = (r as u32 * src_a) / 255;
-                        let src_g = (g as u32 * src_a) / 255;
-                        let src_b = (b as u32 * src_a) / 255;
-                        
-                        let dst_a = dst.alpha() as u32;
-                        let out_a = src_a + (dst_a * (255 - src_a) / 255);
-                        
-                        if out_a > 0 {
-                            let out_r = src_r + (dst.red() as u32 * (255 - src_a) / 255);
-                            let out_g = src_g + (dst.green() as u32 * (255 - src_a) / 255);
-                            let out_b = src_b + (dst.blue() as u32 * (255 - src_a) / 255);
+                        let mut px_indices = vec![(py * width + px) as usize];
+                        if is_bold && px + 1 < width {
+                            px_indices.push((py * width + px + 1) as usize);
+                        }
+                        for idx in px_indices {
+                            let dst = pixels[idx];
                             
-                            pixels[idx] = tiny_skia::PremultipliedColorU8::from_rgba(
-                                out_r as u8, out_g as u8, out_b as u8, out_a as u8
-                            ).unwrap_or_else(|| tiny_skia::PremultipliedColorU8::from_rgba(0,0,0,0).unwrap());
+                            let src_a = alpha as u32;
+                            let src_r = (r as u32 * src_a) / 255;
+                            let src_g = (g as u32 * src_a) / 255;
+                            let src_b = (b as u32 * src_a) / 255;
+                            
+                            let dst_a = dst.alpha() as u32;
+                            let out_a = src_a + (dst_a * (255 - src_a) / 255);
+                            
+                            if out_a > 0 {
+                                let out_r = src_r + (dst.red() as u32 * (255 - src_a) / 255);
+                                let out_g = src_g + (dst.green() as u32 * (255 - src_a) / 255);
+                                let out_b = src_b + (dst.blue() as u32 * (255 - src_a) / 255);
+                                
+                                pixels[idx] = tiny_skia::PremultipliedColorU8::from_rgba(
+                                    out_r as u8, out_g as u8, out_b as u8, out_a as u8
+                                ).unwrap_or_else(|| tiny_skia::PremultipliedColorU8::from_rgba(0,0,0,0).unwrap());
+                            }
                         }
                     }
                 }
