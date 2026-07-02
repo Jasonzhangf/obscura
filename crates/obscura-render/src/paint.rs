@@ -117,16 +117,22 @@ fn paint_text_node(
 ) -> Option<()> {
     let node = tree.get_node(nid)?;
     let text = match &node.data {
-        obscura_dom::tree::NodeData::Text { contents } => contents,
+        obscura_dom::tree::NodeData::Text { contents } => contents.trim(),
         _ => return None,
     };
+    if text.is_empty() {
+        return None;
+    }
     
-    // Find parent element to get geometry and color
     let parent = node.parent?;
-    let rect = laid.rects.get(&parent)?;
     let style = laid.styles.get(&parent)?;
-    // Default color to black if not specified.
     let color = style.color.unwrap_or([0, 0, 0, 255]);
+    
+    // Get geometry of the text node itself!
+    let rect = match laid.rects.get(&nid) {
+        Some(r) => r,
+        None => return None,
+    };
     
     // Paint text at rect.x, rect.y
     draw_text(pixmap, text, rect.x, rect.y, color);

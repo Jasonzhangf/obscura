@@ -49,6 +49,7 @@ pub enum Display {
     #[default]
     Block,
     Flex,
+    Inline,
     #[allow(dead_code)]
     None,
 }
@@ -144,8 +145,13 @@ pub(crate) fn to_taffy_style(style: &LayoutStyle) -> Style {
     s.display = match style.display {
         Display::Block => taffy::style::Display::Block,
         Display::Flex => taffy::style::Display::Flex,
+        Display::Inline => taffy::style::Display::Flex,
         Display::None => taffy::style::Display::None,
     };
+    if style.display == Display::Inline {
+        s.flex_direction = taffy::FlexDirection::Row;
+    }
+    s.flex_wrap = taffy::FlexWrap::Wrap;
     s.size = taffy::Size {
         width: dimension(style.width),
         height: dimension(style.height),

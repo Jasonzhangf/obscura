@@ -23,8 +23,11 @@ pub fn compute_style(tag: &str, inline_css: Option<&str>) -> LayoutStyle {
 /// Built-in UA defaults. Inline elements currently map to block layout; real
 /// inline/text layout arrives with the text/paint phase.
 pub fn ua_style(tag: &str) -> LayoutStyle {
-    let _ = tag;
-    LayoutStyle { display: Display::Block, ..Default::default() }
+    let display = match tag {
+        "span" | "a" | "b" | "i" | "strong" | "em" => Display::Inline,
+        _ => Display::Block,
+    };
+    LayoutStyle { display, ..Default::default() }
 }
 
 pub fn apply_inline(style: &mut LayoutStyle, css: &str) {
@@ -51,6 +54,7 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         "display" => match value {
             "block" => style.display = Display::Block,
             "flex" => style.display = Display::Flex,
+            "inline" => style.display = Display::Inline,
             "none" => style.display = Display::None,
             _ => {}
         },

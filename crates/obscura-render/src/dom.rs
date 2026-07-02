@@ -140,6 +140,25 @@ fn build(
     styles: &HashMap<NodeId, crate::LayoutStyle>,
 ) -> Option<taffy::NodeId> {
     let node = tree.get_node(id)?;
+
+    if let obscura_dom::tree::NodeData::Text { contents } = &node.data {
+        let text = contents.trim();
+        if text.is_empty() {
+            return None;
+        }
+        let width = text.chars().count() as f32 * 9.0;
+        let style = taffy::Style {
+            size: taffy::Size {
+                width: taffy::Dimension::Length(width),
+                height: taffy::Dimension::Length(19.0),
+            },
+            ..Default::default()
+        };
+        let taffy_id = taffy_tree.new_leaf(style).ok()?;
+        id_map.insert(taffy_id, id);
+        return Some(taffy_id);
+    }
+
     let _name = node.as_element()?;
     let style = styles.get(&id)?;
     let taffy_style = to_taffy_style(style);
