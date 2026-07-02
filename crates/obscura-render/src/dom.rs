@@ -77,11 +77,24 @@ pub fn layout_dom(tree: &DomTree, viewport: (f32, f32)) -> DomLayout {
                             crate::style::apply_inline(style, &format!("width: {}", width));
                         }
                     }
+                    if let Some(align) = node.get_attribute("align") {
+                        crate::style::apply_inline(style, &format!("text-align: {}", align));
+                    }
                     if let Some(height) = node.get_attribute("height") {
                         if height.chars().all(|c| c.is_ascii_digit()) {
                             crate::style::apply_inline(style, &format!("height: {}px", height));
                         } else {
                             crate::style::apply_inline(style, &format!("height: {}", height));
+                        }
+                    }
+                    // For table cells with right alignment, make them grow to push content to the right
+                    if let Some(elem) = node.as_element() {
+                        let local = elem.local.as_ref();
+                        if local == "td" || local == "th" {
+                            let is_title = node.get_attribute("class").unwrap_or_default().contains("title");
+                            if !is_title && style.justify_content == Some(taffy::JustifyContent::FlexEnd) {
+                                style.flex_grow = Some(1.0);
+                            }
                         }
                     }
                 }
@@ -234,7 +247,28 @@ fn build(
 
     let _name = node.as_element()?;
     let style = styles.get(&id)?;
-    let taffy_style = to_taffy_style(style);
+    let mut taffy_style = to_taffy_style(style);
+    
+    // Emulate HTML table layout by giving the last td in a tr all remaining space
+    if _name.local.as_ref() == "td" || _name.local.as_ref() == "th" {
+        if let Some(parent_id) = node.parent {
+            if let Some(parent) = tree.get_node(parent_id) {
+                if parent.as_element().map_or(false, |e| e.local.as_ref() == "tr") {
+                    let mut last_td = None;
+                    for cid in tree.children(parent_id) {
+                        if let Some(child) = tree.get_node(cid) {
+                            if child.as_element().map_or(false, |e| e.local.as_ref() == "td" || e.local.as_ref() == "th") {
+                                last_td = Some(cid);
+                            }
+                        }
+                    }
+                    if last_td == Some(id) {
+                        taffy_style.flex_grow = 1.0;
+                    }
+                }
+            }
+        }
+    }
 
     let child_ids: Vec<taffy::NodeId> = tree
         .children(id)

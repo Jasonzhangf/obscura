@@ -79,6 +79,8 @@ pub struct LayoutStyle {
     pub font_size: Option<f32>,
     pub align_items: Option<taffy::AlignItems>,
     pub flex_direction: Option<taffy::FlexDirection>,
+    pub justify_content: Option<taffy::JustifyContent>,
+    pub flex_grow: Option<f32>,
 }
 
 /// A node in the input layout tree. `text` is carried for the paint phase; it
@@ -159,16 +161,25 @@ pub(crate) fn to_taffy_style(style: &LayoutStyle) -> Style {
     };
     if let Some(fd) = style.flex_direction {
         s.flex_direction = fd;
+        s.flex_wrap = taffy::FlexWrap::NoWrap;
     } else if style.display == Display::Inline {
         s.flex_direction = taffy::FlexDirection::Row;
+        s.flex_wrap = taffy::FlexWrap::Wrap;
+    } else {
+        s.flex_wrap = taffy::FlexWrap::NoWrap;
     }
-    s.flex_wrap = taffy::FlexWrap::Wrap;
     s.size = taffy::Size {
         width: dimension(style.width),
         height: dimension(style.height),
     };
     if let Some(ai) = style.align_items {
         s.align_items = Some(ai);
+    }
+    if let Some(jc) = style.justify_content {
+        s.justify_content = Some(jc);
+    }
+    if let Some(fg) = style.flex_grow {
+        s.flex_grow = fg;
     }
     s.margin = rect_auto(style.margin);
     s.padding = rect_lp(style.padding);

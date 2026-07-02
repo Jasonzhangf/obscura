@@ -35,6 +35,15 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
         style.align_items = Some(taffy::AlignItems::Center);
     } else if tag == "body" {
         style.margin = Edges { top: 8.0, right: 8.0, bottom: 8.0, left: 8.0 };
+    } else if tag == "table" || tag == "tbody" {
+        style.display = Display::Flex;
+        style.flex_direction = Some(taffy::FlexDirection::Column);
+        style.align_items = Some(taffy::AlignItems::Stretch); // stretch rows to fill table width
+    } else if tag == "td" || tag == "th" {
+        style.display = Display::Flex;
+        style.flex_direction = Some(taffy::FlexDirection::Column);
+        style.align_items = Some(taffy::AlignItems::FlexStart);
+        style.padding = Edges { top: 0.0, right: 5.0, bottom: 0.0, left: 0.0 };
     }
     style
 }
@@ -88,6 +97,13 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         "color" => style.color = parse_color(value),
         "border-color" => style.border_color = parse_color(value),
         "font-size" => style.font_size = px(value),
+        "text-align" => {
+            if value == "right" {
+                style.justify_content = Some(taffy::JustifyContent::FlexEnd);
+            } else if value == "center" {
+                style.justify_content = Some(taffy::JustifyContent::Center);
+            }
+        },
         _ => {}
     }
 }

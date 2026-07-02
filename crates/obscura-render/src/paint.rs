@@ -127,12 +127,15 @@ fn paint_text_node(
 ) -> Option<()> {
     let node = tree.get_node(nid)?;
     let text = match &node.data {
-        obscura_dom::tree::NodeData::Text { contents } => contents.trim(),
+        obscura_dom::tree::NodeData::Text { contents } => {
+            if contents.trim().is_empty() {
+                " "
+            } else {
+                contents
+            }
+        },
         _ => return None,
     };
-    if text.is_empty() {
-        return None;
-    }
     
     let parent = node.parent?;
     let style = laid.styles.get(&parent)?;
