@@ -90,6 +90,12 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32)) -> Option<Pixmap> {
                 pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
             }
         }
+        
+        if name.local.as_ref() == "img" {
+            if let Some(src) = node.get_attribute("src") {
+                paint_image(src, &rect, &mut pixmap);
+            }
+        }
     }
     Some(pixmap)
 }
@@ -179,6 +185,53 @@ fn draw_text(pixmap: &mut Pixmap, text: &str, x: f32, y: f32, color: [u8; 4]) {
             caret.x += scaled_font.h_advance(id);
         } else {
             caret.x += scaled_font.h_advance(id);
+        }
+    }
+}
+
+fn paint_image(src: &str, rect: &crate::Rect, pixmap: &mut Pixmap) {
+    if rect.width <= 0.0 || rect.height <= 0.0 {
+        return;
+    }
+
+    let bytes = if src.starts_with("data:image/") {
+        if let Some(comma_idx) = src.find(',') {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.decode(&src[comma_idx + 1..]).ok()
+        } else { None }
+    } else if src.starts_with("http://") || src.starts_with("https://") {
+        ureq::get(src).call().ok().and_then(|resp| {
+            let mut buf = Vec::new();
+            use std::io::Read;
+            resp.into_reader().read_to_end(&mut buf).ok()?;
+            Some(buf)
+        })
+    } else {
+        None
+    };
+
+    if let Some(bytes) = bytes {
+        if let Ok(img) = image::load_from_memory(&bytes) {
+            let img = img.to_rgba8();
+            let resized = image::imageops::resize(&img, rect.width as u32, rect.height as u32, image::imageops::FilterType::Triangle);
+            
+            let mut raw = resized.into_raw();
+            for pixel in raw.chunks_exact_mut(4) {
+                let a = pixel[3] as u32;
+                pixel[0] = ((pixel[0] as u32 * a) / 255) as u8;
+                pixel[1] = ((pixel[1] as u32 * a) / 255) as u8;
+                pixel[2] = ((pixel[2] as u32 * a) / 255) as u8;
+            }
+            if let Some(img_pixmap) = Pixmap::from_vec(raw, tiny_skia::IntSize::from_wh(rect.width as u32, rect.height as u32).unwrap()) {
+                pixmap.draw_pixmap(
+                    rect.x as i32,
+                    rect.y as i32,
+                    img_pixmap.as_ref(),
+                    &tiny_skia::PixmapPaint::default(),
+                    Transform::identity(),
+                    None,
+                );
+            }
         }
     }
 }

@@ -8,15 +8,17 @@ description = "Optional scoped render layer for Obscura: layout (taffy) and, wit
 
 [features]
 default = []
-# Rasterize the laid-out tree to a pixmap (tiny-skia) with text (ab_glyph).
+# Rasterize the laid-out tree to a pixmap (tiny-skia) with text (ab_glyph) and images.
 # Off by default; the layout core (getBoundingClientRect etc.) works without it.
-paint = ["dep:tiny-skia", "dep:ab_glyph"]
+paint = ["dep:tiny-skia", "dep:ab_glyph", "dep:image", "dep:ureq", "dep:base64"]
 
 [dependencies]
 taffy = { workspace = true }
 obscura-dom = { workspace = true }
 tiny-skia = { workspace = true, optional = true }
 ab_glyph = { workspace = true, optional = true }
-
+image = { version = "0.24", default-features = false, features = ["jpeg", "png", "webp"], optional = true }
+ureq = { version = "2.9", default-features = false, features = ["tls"], optional = true }
+base64 = { workspace = true, optional = true }
 [lib]
 path = "src/lib.rs"
