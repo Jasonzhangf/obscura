@@ -73,6 +73,7 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         "border-left-width" | "border-left" => set_edge(&mut style.border, Side::Left, px(value)),
         "background-color" | "background" => style.background_color = parse_color(value),
         "color" => style.color = parse_color(value),
+        "border-color" => style.border_color = parse_color(value),
         _ => {}
     }
 }

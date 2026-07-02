@@ -11,7 +11,7 @@ use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
 
 static FONT_BYTES: &[u8] = include_bytes!("../assets/dejavu-sans.ttf");
 
-use crate::{compute_style, layout_dom};
+use crate::layout_dom;
 
 /// Render `tree` at `viewport` (width, height) in CSS pixels to a Pixmap, or
 /// None if the viewport is zero-sized.
@@ -33,8 +33,8 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32)) -> Option<Pixmap> {
             continue;
         }
 
-        let bg = match bg_color_for(tree, nid) {
-            Some(c) => c,
+        let name = match node.as_element() {
+            Some(name) => name,
             None => continue,
         };
         let rect = match laid.rects.get(&nid) {
@@ -45,25 +45,53 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32)) -> Option<Pixmap> {
             Some(r) => r,
             None => continue,
         };
-        let mut path = PathBuilder::new();
-        path.push_rect(box_rect);
-        let path = match path.finish() {
-            Some(p) => p,
-            None => continue,
-        };
-        let mut paint = Paint::default();
-        paint.set_color(Color::from_rgba8(bg[0], bg[1], bg[2], bg[3]));
-        paint.anti_alias = false;
-        pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+        
+        let style = crate::compute_style(name.local.as_ref(), node.get_attribute("style"));
+        
+        if let Some(bg) = style.background_color {
+            let mut path = PathBuilder::new();
+            path.push_rect(box_rect);
+            if let Some(path) = path.finish() {
+                let mut paint = Paint::default();
+                paint.set_color(Color::from_rgba8(bg[0], bg[1], bg[2], bg[3]));
+                paint.anti_alias = false;
+                pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+            }
+        }
+        
+        if style.border.top > 0.0 || style.border.right > 0.0 || style.border.bottom > 0.0 || style.border.left > 0.0 {
+            let bc = style.border_color.or(style.color).unwrap_or([0, 0, 0, 255]);
+            let mut paint = Paint::default();
+            paint.set_color(Color::from_rgba8(bc[0], bc[1], bc[2], bc[3]));
+            paint.anti_alias = false;
+            
+            let mut path = PathBuilder::new();
+            if style.border.top > 0.0 {
+                if let Some(r) = Rect::from_xywh(rect.x, rect.y, rect.width, style.border.top) {
+                    path.push_rect(r);
+                }
+            }
+            if style.border.right > 0.0 {
+                if let Some(r) = Rect::from_xywh(rect.x + rect.width - style.border.right, rect.y, style.border.right, rect.height) {
+                    path.push_rect(r);
+                }
+            }
+            if style.border.bottom > 0.0 {
+                if let Some(r) = Rect::from_xywh(rect.x, rect.y + rect.height - style.border.bottom, rect.width, style.border.bottom) {
+                    path.push_rect(r);
+                }
+            }
+            if style.border.left > 0.0 {
+                if let Some(r) = Rect::from_xywh(rect.x, rect.y, style.border.left, rect.height) {
+                    path.push_rect(r);
+                }
+            }
+            if let Some(path) = path.finish() {
+                pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+            }
+        }
     }
     Some(pixmap)
-}
-
-fn bg_color_for(tree: &DomTree, nid: obscura_dom::tree::NodeId) -> Option<[u8; 4]> {
-    let node = tree.get_node(nid)?;
-    let name = node.as_element()?;
-    let style = compute_style(name.local.as_ref(), node.get_attribute("style"));
-    style.background_color
 }
 
 /// Render `tree` at `viewport` to PNG bytes (RGBA 8-bit). Returns None if the
@@ -105,6 +133,11 @@ fn draw_text(pixmap: &mut Pixmap, text: &str, x: f32, y: f32, color: [u8; 4]) {
     let scaled_font = font.as_scaled(scale);
     let mut caret = ab_glyph::point(x, y + scaled_font.ascent());
 
+    let width = pixmap.width() as i32;
+    let height = pixmap.height() as i32;
+    let pixels = pixmap.pixels_mut();
+    let (r, g, b, a_full) = (color[0], color[1], color[2], color[3]);
+
     for c in text.chars() {
         if c.is_control() {
             continue;
@@ -117,10 +150,29 @@ fn draw_text(pixmap: &mut Pixmap, text: &str, x: f32, y: f32, color: [u8; 4]) {
             outlined.draw(|gx, gy, c| {
                 let px = (bounds.min.x + gx as f32) as i32;
                 let py = (bounds.min.y + gy as f32) as i32;
-                if px >= 0 && px < pixmap.width() as i32 && py >= 0 && py < pixmap.height() as i32 {
-                    let alpha = (color[3] as f32 * c) as u8;
+                if px >= 0 && px < width && py >= 0 && py < height {
+                    let alpha = (a_full as f32 * c) as u8;
                     if alpha > 0 {
-                        blend_pixel(pixmap, px as u32, py as u32, color[0], color[1], color[2], alpha);
+                        let idx = (py * width + px) as usize;
+                        let dst = pixels[idx];
+                        
+                        let src_a = alpha as u32;
+                        let src_r = (r as u32 * src_a) / 255;
+                        let src_g = (g as u32 * src_a) / 255;
+                        let src_b = (b as u32 * src_a) / 255;
+                        
+                        let dst_a = dst.alpha() as u32;
+                        let out_a = src_a + (dst_a * (255 - src_a) / 255);
+                        
+                        if out_a > 0 {
+                            let out_r = src_r + (dst.red() as u32 * (255 - src_a) / 255);
+                            let out_g = src_g + (dst.green() as u32 * (255 - src_a) / 255);
+                            let out_b = src_b + (dst.blue() as u32 * (255 - src_a) / 255);
+                            
+                            pixels[idx] = tiny_skia::PremultipliedColorU8::from_rgba(
+                                out_r as u8, out_g as u8, out_b as u8, out_a as u8
+                            ).unwrap_or_else(|| tiny_skia::PremultipliedColorU8::from_rgba(0,0,0,0).unwrap());
+                        }
                     }
                 }
             });
@@ -128,32 +180,6 @@ fn draw_text(pixmap: &mut Pixmap, text: &str, x: f32, y: f32, color: [u8; 4]) {
         } else {
             caret.x += scaled_font.h_advance(id);
         }
-    }
-}
-
-fn blend_pixel(pixmap: &mut Pixmap, x: u32, y: u32, r: u8, g: u8, b: u8, a: u8) {
-    let width = pixmap.width();
-    let pixels = pixmap.pixels_mut();
-    let idx = (y * width + x) as usize;
-    let dst = pixels[idx];
-    
-    // source pre-multiplied
-    let src_a = a as u32;
-    let src_r = (r as u32 * src_a) / 255;
-    let src_g = (g as u32 * src_a) / 255;
-    let src_b = (b as u32 * src_a) / 255;
-    
-    let dst_a = dst.alpha() as u32;
-    
-    let out_a = src_a + (dst_a * (255 - src_a) / 255);
-    if out_a > 0 {
-        let out_r = src_r + (dst.red() as u32 * (255 - src_a) / 255);
-        let out_g = src_g + (dst.green() as u32 * (255 - src_a) / 255);
-        let out_b = src_b + (dst.blue() as u32 * (255 - src_a) / 255);
-        
-        pixels[idx] = tiny_skia::PremultipliedColorU8::from_rgba(
-            out_r as u8, out_g as u8, out_b as u8, out_a as u8
-        ).unwrap_or_else(|| tiny_skia::PremultipliedColorU8::from_rgba(0,0,0,0).unwrap());
     }
 }
 

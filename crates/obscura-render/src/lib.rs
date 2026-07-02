@@ -65,6 +65,10 @@ pub struct LayoutStyle {
     pub border: Edges,
     /// RGBA for the paint step. Parsed always (cheap), used only with `paint`.
     pub background_color: Option<[u8; 4]>,
+    /// Foreground (text) color for the paint step.
+    pub color: Option<[u8; 4]>,
+    /// Border color for the paint step.
+    pub border_color: Option<[u8; 4]>,
 }
 
 /// A node in the input layout tree. `text` is carried for the paint phase; it
