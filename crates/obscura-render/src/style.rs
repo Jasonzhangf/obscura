@@ -37,6 +37,8 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
         style.display = Display::Flex;
         style.flex_direction = Some(taffy::FlexDirection::Column);
         style.align_items = Some(taffy::AlignItems::Center);
+    } else if tag == "head" || tag == "script" || tag == "style" || tag == "title" || tag == "meta" || tag == "link" {
+        style.display = Display::None;
     } else if tag == "body" {
         style.margin = Edges { top: 8.0, right: 8.0, bottom: 8.0, left: 8.0 };
     } else if tag == "table" || tag == "tbody" {

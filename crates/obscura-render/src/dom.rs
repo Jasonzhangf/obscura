@@ -267,6 +267,9 @@ fn build(
 
     let _name = node.as_element()?;
     let style = styles.get(&id)?;
+    if style.display == crate::Display::None {
+        return None;
+    }
     let mut taffy_style = to_taffy_style(style);
     
     // Emulate HTML table layout by giving the last td in a tr all remaining space
