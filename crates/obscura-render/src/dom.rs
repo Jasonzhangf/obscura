@@ -11,15 +11,57 @@ use std::collections::HashMap;
 use obscura_dom::tree::{DomTree, NodeId};
 use taffy::prelude::*;
 
-use crate::{compute_style, Rect, to_taffy_style};
+use crate::{Rect, to_taffy_style};
 
 /// Per-element border boxes after layout, in viewport coordinates.
 pub struct DomLayout {
     pub rects: HashMap<NodeId, Rect>,
+    pub styles: HashMap<NodeId, crate::LayoutStyle>,
 }
 
 /// Lay out a DOM tree within `viewport` (width, height) in CSS pixels.
 pub fn layout_dom(tree: &DomTree, viewport: (f32, f32)) -> DomLayout {
+    let mut css_rules = Vec::new();
+    for nid in tree.descendants(tree.document()) {
+        if let Some(node) = tree.get_node(nid) {
+            if let Some(elem) = node.as_element() {
+                if elem.local.as_ref() == "style" {
+                    let css = tree.text_content(nid);
+                    css_rules.extend(parse_simple_css(&css));
+                }
+            }
+        }
+    }
+
+    let mut styles: HashMap<NodeId, crate::LayoutStyle> = HashMap::new();
+    for nid in tree.descendants(tree.document()) {
+        if let Some(node) = tree.get_node(nid) {
+            if let Some(elem) = node.as_element() {
+                styles.insert(nid, crate::style::ua_style(elem.local.as_ref()));
+            }
+        }
+    }
+
+    for (selector, decls) in &css_rules {
+        if let Ok(matched) = tree.query_selector_all(selector) {
+            for nid in matched {
+                if let Some(style) = styles.get_mut(&nid) {
+                    crate::style::apply_inline(style, decls);
+                }
+            }
+        }
+    }
+
+    for nid in tree.descendants(tree.document()) {
+        if let Some(node) = tree.get_node(nid) {
+            if let Some(inline) = node.get_attribute("style") {
+                if let Some(style) = styles.get_mut(&nid) {
+                    crate::style::apply_inline(style, inline);
+                }
+            }
+        }
+    }
+
     let mut taffy_tree: TaffyTree = TaffyTree::new();
     let mut id_map: HashMap<taffy::NodeId, NodeId> = HashMap::new();
 
@@ -32,7 +74,7 @@ pub fn layout_dom(tree: &DomTree, viewport: (f32, f32)) -> DomLayout {
 
     let mut rects = HashMap::new();
     if let Some(root_id) = root {
-        if let Some(taffy_root) = build(tree, root_id, &mut taffy_tree, &mut id_map) {
+        if let Some(taffy_root) = build(tree, root_id, &mut taffy_tree, &mut id_map, &styles) {
             let _ = taffy_tree.compute_layout(
                 taffy_root,
                 taffy::Size {
@@ -55,7 +97,39 @@ pub fn layout_dom(tree: &DomTree, viewport: (f32, f32)) -> DomLayout {
             }
         }
     }
-    DomLayout { rects }
+    DomLayout { rects, styles }
+}
+
+fn parse_simple_css(css: &str) -> Vec<(String, String)> {
+    let mut rules = Vec::new();
+    let mut current_selector = String::new();
+    let mut current_decls = String::new();
+    let mut in_block = false;
+
+    for c in css.chars() {
+        if c == '{' && !in_block {
+            in_block = true;
+        } else if c == '}' && in_block {
+            in_block = false;
+            let sel = current_selector.trim();
+            let decls = current_decls.trim();
+            for s in sel.split(',') {
+                let s = s.trim();
+                if !s.is_empty() {
+                    rules.push((s.to_string(), decls.to_string()));
+                }
+            }
+            current_selector.clear();
+            current_decls.clear();
+        } else {
+            if in_block {
+                current_decls.push(c);
+            } else {
+                current_selector.push(c);
+            }
+        }
+    }
+    rules
 }
 
 fn build(
@@ -63,17 +137,17 @@ fn build(
     id: NodeId,
     taffy_tree: &mut TaffyTree,
     id_map: &mut HashMap<taffy::NodeId, NodeId>,
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
 ) -> Option<taffy::NodeId> {
     let node = tree.get_node(id)?;
-    let name = node.as_element()?;
-    let tag = name.local.as_ref();
-    let style = compute_style(tag, node.get_attribute("style"));
-    let taffy_style = to_taffy_style(&style);
+    let _name = node.as_element()?;
+    let style = styles.get(&id)?;
+    let taffy_style = to_taffy_style(style);
 
     let child_ids: Vec<taffy::NodeId> = tree
         .children(id)
         .into_iter()
-        .filter_map(|cid| build(tree, cid, taffy_tree, id_map))
+        .filter_map(|cid| build(tree, cid, taffy_tree, id_map, styles))
         .collect();
 
     let taffy_id = if child_ids.is_empty() {

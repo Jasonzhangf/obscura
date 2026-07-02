@@ -1880,6 +1880,7 @@ version = "0.1.0"
 dependencies = [
  "ab_glyph",
  "base64",
+ "cssparser",
  "image",
  "obscura-dom",
  "taffy",

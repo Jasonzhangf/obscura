@@ -20,5 +20,6 @@ ab_glyph = { workspace = true, optional = true }
 image = { version = "0.24", default-features = false, features = ["jpeg", "png", "webp"], optional = true }
 ureq = { version = "2.9", default-features = false, features = ["tls"], optional = true }
 base64 = { workspace = true, optional = true }
+cssparser = "0.34"
 [lib]
 path = "src/lib.rs"

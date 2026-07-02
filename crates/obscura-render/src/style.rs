@@ -22,12 +22,12 @@ pub fn compute_style(tag: &str, inline_css: Option<&str>) -> LayoutStyle {
 
 /// Built-in UA defaults. Inline elements currently map to block layout; real
 /// inline/text layout arrives with the text/paint phase.
-fn ua_style(tag: &str) -> LayoutStyle {
+pub fn ua_style(tag: &str) -> LayoutStyle {
     let _ = tag;
     LayoutStyle { display: Display::Block, ..Default::default() }
 }
 
-fn apply_inline(style: &mut LayoutStyle, css: &str) {
+pub fn apply_inline(style: &mut LayoutStyle, css: &str) {
     for raw in css.split(';') {
         let decl = raw.trim();
         if decl.is_empty() {

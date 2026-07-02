@@ -46,7 +46,10 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32)) -> Option<Pixmap> {
             None => continue,
         };
         
-        let style = crate::compute_style(name.local.as_ref(), node.get_attribute("style"));
+        let style = match laid.styles.get(&nid) {
+            Some(s) => s,
+            None => continue,
+        };
         
         if let Some(bg) = style.background_color {
             let mut path = PathBuilder::new();
@@ -119,12 +122,9 @@ fn paint_text_node(
     };
     
     // Find parent element to get geometry and color
-    let parent_id = node.parent?;
-    let parent = tree.get_node(parent_id)?;
-    let parent_name = parent.as_element()?;
-    
-    let rect = laid.rects.get(&parent_id)?;
-    let style = crate::compute_style(parent_name.local.as_ref(), parent.get_attribute("style"));
+    let parent = node.parent?;
+    let rect = laid.rects.get(&parent)?;
+    let style = laid.styles.get(&parent)?;
     // Default color to black if not specified.
     let color = style.color.unwrap_or([0, 0, 0, 255]);
     
