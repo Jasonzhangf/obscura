@@ -113,6 +113,11 @@ pub struct LayoutStyle {
     /// `background_size`: without a known image size there is no leftover
     /// box space to position within.
     pub background_position: (f32, f32),
+    /// `mask-image`/`-webkit-mask-image: url(...)`: the ubiquitous "colored,
+    /// scalable icon" pattern (an SVG shape used as a stencil, tinted by
+    /// `background-color`/`color` instead of carrying its own colors). Without
+    /// this, every such icon paints as a solid filled square.
+    pub mask_image: Option<String>,
     /// Foreground (text) color for the paint step.
     pub color: Option<[u8; 4]>,
     pub border_color: Option<[u8; 4]>,
@@ -147,6 +152,17 @@ pub struct LayoutStyle {
     /// clipped box used for skip-links and screen-reader-only labels) actually
     /// invisible instead of painting its text wherever it lands.
     pub overflow_hidden: bool,
+
+    /// `float: left|right`. True CSS float needs per-line reflow around the
+    /// float's shape, which taffy's block/flex/grid modes do not do; see
+    /// `dom::group_float_zone` for the bounded approximation this drives.
+    pub float: Option<Float>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Float {
+    Left,
+    Right,
 }
 
 /// A node in the input layout tree. `text` is carried for the paint phase; it

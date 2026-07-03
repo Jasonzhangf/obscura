@@ -79,7 +79,7 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
 }
 
 pub fn apply_inline(style: &mut LayoutStyle, css: &str) {
-    for raw in css.split(';') {
+    for raw in split_declarations(css) {
         let decl = raw.trim();
         if decl.is_empty() {
             continue;
@@ -95,6 +95,39 @@ pub fn apply_inline(style: &mut LayoutStyle, css: &str) {
             .join(" ");
         apply_value(style, &name, &value);
     }
+}
+
+/// Split a declaration list on top-level semicolons, respecting `url(...)`
+/// and quoted strings. A data: URI (`url(data:image/svg+xml;utf8,...)`, an
+/// extremely common way to inline small icon SVGs) or a quoted string
+/// (`content: "a; b"`) routinely contains a literal semicolon that is not a
+/// declaration separator; splitting on every `;` blindly corrupts the
+/// declaration into two malformed halves and silently drops it.
+fn split_declarations(css: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut in_quote: Option<char> = None;
+    let mut start = 0;
+    for (i, c) in css.char_indices() {
+        if let Some(q) = in_quote {
+            if c == q {
+                in_quote = None;
+            }
+            continue;
+        }
+        match c {
+            '\'' | '"' => in_quote = Some(c),
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ';' if depth == 0 => {
+                parts.push(&css[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&css[start..]);
+    parts
 }
 
 fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
@@ -148,6 +181,7 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         "background-image" => style.background_image = parse_url(value),
         "background-size" => style.background_size = parse_background_size(value),
         "background-position" => style.background_position = parse_background_position(value),
+        "mask-image" | "-webkit-mask-image" => style.mask_image = parse_url(value),
         "color" => style.color = parse_color(value),
         "border-color" => style.border_color = parse_color(value),
         "font-size" => style.font_size = px(value),
@@ -207,6 +241,14 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
             match value {
                 "absolute" | "fixed" => style.position = Some(taffy::Position::Absolute),
                 "relative" | "sticky" | "static" => style.position = Some(taffy::Position::Relative),
+                _ => {}
+            }
+        },
+        "float" => {
+            match value {
+                "left" => style.float = Some(crate::Float::Left),
+                "right" => style.float = Some(crate::Float::Right),
+                "none" => style.float = None,
                 _ => {}
             }
         },
@@ -508,10 +550,164 @@ fn set_edge(edges: &mut Edges, side: Side, v: Option<f32>) {
     }
 }
 
-/// Parse the first length in a value as CSS pixels. `auto`, percentages, and
-/// non-numeric values return None (treated as "no explicit size" in phase 1).
+/// Parse the first length in a value as CSS pixels. `auto` and non-numeric
+/// values return None (treated as "no explicit size" in phase 1). Delegates
+/// to `resolve_length` for anything beyond a bare token, since `calc()`,
+/// `var()`, and `min()`/`max()` all contain spaces that would otherwise break
+/// the single-token fast path.
 fn px(value: &str) -> Option<f32> {
+    let trimmed = value.trim();
+    if trimmed.contains('(') {
+        return resolve_length(trimmed);
+    }
     token(value).and_then(px_value)
+}
+
+/// Resolve a CSS length expression to px, recursively handling the small set
+/// of functional forms real stylesheets actually nest in practice:
+/// `var(--x, fallback)` (substitute the fallback; we track no custom
+/// property values), `calc(...)`, and `min()`/`max()`. These commonly nest
+/// inside each other (`calc(max(calc(var(--x,1rem) + 4px),10px))` is a real
+/// example from Wikipedia's icon sizing), so each case recurses back into
+/// this function rather than assuming a flat expression.
+fn resolve_length(value: &str) -> Option<f32> {
+    let v = value.trim();
+    if let Some(rest) = v.strip_prefix("var(") {
+        let end = find_matching_paren(rest)?;
+        let inner = &rest[..end];
+        let (_, fallback) = inner.split_once(',')?;
+        return resolve_length(fallback.trim());
+    }
+    if let Some(rest) = v.strip_prefix("calc(") {
+        let end = find_matching_paren(rest)?;
+        return eval_calc(&rest[..end]);
+    }
+    if let Some(rest) = v.strip_prefix("max(").or_else(|| v.strip_prefix("min(")) {
+        let is_max = v.starts_with("max(");
+        let end = find_matching_paren(rest)?;
+        let args = split_top_level(&rest[..end], ',');
+        let mut values = args.iter().filter_map(|a| resolve_length(a));
+        let mut best = values.next()?;
+        for val in values {
+            if (is_max && val > best) || (!is_max && val < best) {
+                best = val;
+            }
+        }
+        return Some(best);
+    }
+    if v.contains('(') {
+        return None; // an unhandled function (clamp(), env(), ...): no safe fallback
+    }
+    px_value(v).or_else(|| v.parse::<f32>().ok())
+}
+
+/// Find the index (relative to `s`) of the `)` matching an already-consumed
+/// opening `(`, accounting for nesting.
+fn find_matching_paren(s: &str) -> Option<usize> {
+    let mut depth = 1i32;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Split on `sep` at paren-depth 0 only, so `max(a,b)` inside an argument
+/// list is not itself split on its internal comma.
+fn split_top_level(s: &str, sep: char) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            c if c == sep && depth == 0 => {
+                parts.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&s[start..]);
+    parts
+}
+
+/// Evaluate a `calc()` body (already stripped of `calc(` / the matching `)`):
+/// a left-to-right sum of terms, each itself a left-to-right `*`/`/` chain.
+/// Terms may themselves be nested `max()`/`min()`/`var()`/`calc()` calls.
+fn eval_calc(expr: &str) -> Option<f32> {
+    let mut terms: Vec<(f32, String)> = Vec::new();
+    let mut sign = 1.0;
+    let mut cur = String::new();
+    let mut depth = 0i32;
+    for c in expr.chars() {
+        match c {
+            '(' => { depth += 1; cur.push(c); }
+            ')' => { depth -= 1; cur.push(c); }
+            '+' | '-' if depth == 0 => {
+                if !cur.trim().is_empty() {
+                    terms.push((sign, std::mem::take(&mut cur)));
+                }
+                sign = if c == '-' { -1.0 } else { 1.0 };
+            }
+            _ => cur.push(c),
+        }
+    }
+    if !cur.trim().is_empty() {
+        terms.push((sign, cur));
+    }
+    if terms.is_empty() {
+        return None;
+    }
+    let mut total = 0.0;
+    for (term_sign, term) in terms {
+        total += term_sign * eval_product(term.trim())?;
+    }
+    Some(total)
+}
+
+/// Evaluate a `*`/`/` chain within one additive term of a calc() expression,
+/// e.g. `-1 * 22px / 2`, where a factor may itself be a nested function call.
+fn eval_product(term: &str) -> Option<f32> {
+    let mut result: Option<f32> = None;
+    let mut op = '*';
+    let mut depth = 0i32;
+    let mut cur = String::new();
+    let mut factors = Vec::new();
+    for c in term.chars() {
+        match c {
+            '(' => { depth += 1; cur.push(c); }
+            ')' => { depth -= 1; cur.push(c); }
+            ' ' if depth == 0 => {
+                if !cur.is_empty() { factors.push(std::mem::take(&mut cur)); }
+            }
+            _ => cur.push(c),
+        }
+    }
+    if !cur.is_empty() { factors.push(cur); }
+
+    for tok in &factors {
+        if tok == "*" || tok == "/" {
+            op = tok.chars().next()?;
+            continue;
+        }
+        let v = resolve_length(tok)?;
+        result = Some(match result {
+            None => v,
+            Some(r) if op == '/' => r / v,
+            Some(r) => r * v,
+        });
+    }
+    result
 }
 
 fn dimension_value(tok: &str) -> crate::Dimension {
@@ -670,5 +866,47 @@ mod tests {
         let s = compute_style("div", Some("width: 100px !important; height: auto"));
         assert_eq!(s.width, crate::Dimension::Px(100.0));
         assert_eq!(s.height, crate::Dimension::Auto);
+    }
+
+    #[test]
+    fn calc_with_multiply_and_divide() {
+        // The exact shape MediaWiki uses to offset a TOC toggle button into
+        // the left margin: a negative product divided by a constant.
+        assert_eq!(resolve_length("calc(-1 * 22px / 2)"), Some(-11.0));
+    }
+
+    #[test]
+    fn calc_add_and_subtract() {
+        assert_eq!(resolve_length("calc(750px - 1px)"), Some(749.0));
+        assert_eq!(resolve_length("calc(10px + 5px)"), Some(15.0));
+    }
+
+    #[test]
+    fn var_with_fallback_resolves_to_fallback() {
+        assert_eq!(resolve_length("var(--font-size-medium, 1rem)"), Some(16.0));
+    }
+
+    #[test]
+    fn var_without_fallback_is_unresolvable() {
+        assert_eq!(resolve_length("var(--unknown-token)"), None);
+    }
+
+    #[test]
+    fn min_and_max_functions() {
+        assert_eq!(resolve_length("max(5px, 10px)"), Some(10.0));
+        assert_eq!(resolve_length("min(5px, 10px)"), Some(5.0));
+    }
+
+    #[test]
+    fn nested_var_calc_max_like_wikipedia_icon_sizing() {
+        // calc(max(calc(var(--font-size-medium,1rem) + 4px),10px))
+        let expr = "calc(max(calc(var(--font-size-medium,1rem) + 4px),10px))";
+        assert_eq!(resolve_length(expr), Some(20.0));
+    }
+
+    #[test]
+    fn width_property_resolves_calc_with_var() {
+        let s = compute_style("div", Some("width: calc(var(--x, 10px) + 5px)"));
+        assert_eq!(s.width, crate::Dimension::Px(15.0));
     }
 }

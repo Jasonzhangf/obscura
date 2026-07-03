@@ -450,11 +450,13 @@ fn build(
         taffy_style.flex_wrap = taffy::FlexWrap::Wrap;
     }
 
-    let child_ids: Vec<taffy::NodeId> = tree
-        .children(id)
-        .into_iter()
-        .filter_map(|cid| build(tree, cid, taffy_tree, id_map, styles))
-        .collect();
+    let dom_children = tree.children(id);
+    let has_float_child = dom_children.iter().any(|&cid| styles.get(&cid).map(|s| s.float.is_some()).unwrap_or(false));
+    let child_ids: Vec<taffy::NodeId> = if has_float_child {
+        build_children_with_float_zone(tree, &dom_children, taffy_tree, id_map, styles)
+    } else {
+        dom_children.into_iter().filter_map(|cid| build(tree, cid, taffy_tree, id_map, styles)).collect()
+    };
 
     let taffy_id = if child_ids.is_empty() {
         taffy_tree.new_leaf(taffy_style).ok()?
@@ -463,6 +465,99 @@ fn build(
     };
     id_map.insert(taffy_id, id);
     Some(taffy_id)
+}
+
+/// Approximate `float: left|right` without real per-line reflow (which
+/// taffy's block/flex/grid modes do not provide): place the float alongside
+/// the flow siblings that follow it, up to whichever comes first of the next
+/// heading or another floated element, then let everything from there on
+/// revert to normal full-width flow.
+///
+/// This is not a general CSS float implementation (a float taller than its
+/// flow zone, or one that should keep affecting content past a heading,
+/// won't reflow correctly), but it directly targets the overwhelmingly
+/// common real-world shape: a floated image or infobox near the top of an
+/// article, sitting beside the intro text, with the rest of the content
+/// (starting at the next section heading) running full width beneath it.
+fn build_children_with_float_zone(
+    tree: &DomTree,
+    dom_children: &[NodeId],
+    taffy_tree: &mut TaffyTree,
+    id_map: &mut HashMap<taffy::NodeId, NodeId>,
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+) -> Vec<taffy::NodeId> {
+    let is_float = |cid: NodeId| styles.get(&cid).map(|s| s.float.is_some()).unwrap_or(false);
+    let is_heading = |cid: NodeId| {
+        tree.get_node(cid)
+            .and_then(|n| n.as_element().map(|e| e.local.to_string()))
+            .map(|local| matches!(local.as_str(), "h1" | "h2" | "h3" | "h4" | "h5" | "h6"))
+            .unwrap_or(false)
+    };
+
+    let Some(float_idx) = dom_children.iter().position(|&cid| is_float(cid)) else {
+        return dom_children.iter().filter_map(|&cid| build(tree, cid, taffy_tree, id_map, styles)).collect();
+    };
+
+    let mut result: Vec<taffy::NodeId> = dom_children[..float_idx]
+        .iter()
+        .filter_map(|&cid| build(tree, cid, taffy_tree, id_map, styles))
+        .collect();
+
+    let float_side = styles.get(&dom_children[float_idx]).and_then(|s| s.float);
+    let mut zone_end = float_idx + 1;
+    while zone_end < dom_children.len() && !is_heading(dom_children[zone_end]) && !is_float(dom_children[zone_end]) {
+        zone_end += 1;
+    }
+
+    let float_taffy = build(tree, dom_children[float_idx], taffy_tree, id_map, styles);
+    let flow_taffy: Vec<taffy::NodeId> = dom_children[float_idx + 1..zone_end]
+        .iter()
+        .filter_map(|&cid| build(tree, cid, taffy_tree, id_map, styles))
+        .collect();
+
+    match float_taffy {
+        Some(float_id) => {
+            let flow_column_style = taffy::Style {
+                display: taffy::style::Display::Flex,
+                flex_direction: taffy::FlexDirection::Column,
+                flex_grow: 1.0,
+                flex_shrink: 1.0,
+                flex_basis: taffy::Dimension::Length(0.0),
+                min_size: taffy::Size { width: taffy::Dimension::Length(0.0), height: taffy::Dimension::Auto },
+                ..Default::default()
+            };
+            let flow_column = if flow_taffy.is_empty() {
+                taffy_tree.new_leaf(flow_column_style).ok()
+            } else {
+                taffy_tree.new_with_children(flow_column_style, &flow_taffy).ok()
+            };
+
+            let row_style = taffy::Style {
+                display: taffy::style::Display::Flex,
+                flex_direction: taffy::FlexDirection::Row,
+                align_items: Some(taffy::AlignItems::FlexStart),
+                ..Default::default()
+            };
+            let row_children: Vec<taffy::NodeId> = match float_side {
+                Some(crate::Float::Left) => [Some(float_id), flow_column].into_iter().flatten().collect(),
+                _ => [flow_column, Some(float_id)].into_iter().flatten().collect(),
+            };
+            if let Ok(row) = taffy_tree.new_with_children(row_style, &row_children) {
+                result.push(row);
+            }
+        }
+        // The float itself failed to build (e.g. display:none resolved for
+        // it specifically); still build its flow siblings so their content
+        // is not silently lost.
+        None => result.extend(flow_taffy),
+    }
+
+    result.extend(
+        dom_children[zone_end..]
+            .iter()
+            .filter_map(|&cid| build(tree, cid, taffy_tree, id_map, styles)),
+    );
+    result
 }
 
 #[cfg(test)]

@@ -72,7 +72,10 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
             None => continue,
         };
 
-        if let Some(bg) = style.background_color {
+        // A masked element's background-color is the mask's fill color, not
+        // an ordinary box background: it must only show through the mask
+        // shape (painted below), not as a solid rect behind it.
+        if let (Some(bg), None) = (style.background_color, &style.mask_image) {
             let mut path = PathBuilder::new();
             path.push_rect(box_rect);
             if let Some(path) = path.finish() {
@@ -83,7 +86,10 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
             }
         }
 
-        if let Some(bg_url) = &style.background_image {
+        if let Some(mask_url) = &style.mask_image {
+            let fill = style.background_color.or(style.color).unwrap_or([0, 0, 0, 255]);
+            paint_mask(mask_url, base_url, &visible_rect, fill, &mut pixmap, &mut image_cache);
+        } else if let Some(bg_url) = &style.background_image {
             // With an explicit background-size, paint the image at that size
             // positioned within the box per background-position, instead of
             // stretching it to fill the whole element: a small icon
@@ -302,6 +308,102 @@ fn draw_text(pixmap: &mut Pixmap, text: &str, x: f32, y: f32, color: [u8; 4], si
     }
 }
 
+/// Resolve `src` (a `data:` URI, or an absolute/relative URL against
+/// `base_url`) to raw bytes, fetching over the network at most once per
+/// distinct URL per screenshot via `cache`.
+fn fetch_bytes(
+    src: &str,
+    base_url: Option<&str>,
+    cache: &mut std::collections::HashMap<String, Option<Vec<u8>>>,
+) -> Option<Vec<u8>> {
+    if let Some(rest) = src.strip_prefix("data:image/") {
+        let comma_idx = rest.find(',')?;
+        let (meta, data) = (&rest[..comma_idx], &rest[comma_idx + 1..]);
+        // Inline SVGs are very commonly authored as data:image/svg+xml;utf8,
+        // (or with no encoding label at all, which is equivalent): plain,
+        // percent-escaped text, not base64. Only decode as base64 when the
+        // URI actually says so.
+        return if meta.contains("base64") {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.decode(data).ok()
+        } else {
+            Some(percent_decode(data))
+        };
+    }
+    // Resolve relative to the document's base URL: the overwhelming majority
+    // of real markup uses relative image paths ("logo.svg", not
+    // "https://example.com/logo.svg"), so without this every relative <img>
+    // or mask/background reference silently fails to fetch.
+    let resolved = if src.starts_with("http://") || src.starts_with("https://") {
+        Some(src.to_string())
+    } else {
+        base_url
+            .and_then(|b| url::Url::parse(b).ok())
+            .and_then(|base| base.join(src).ok())
+            .map(|u| u.to_string())
+    };
+    // The same icon/sprite/background is routinely referenced by dozens of
+    // elements on one page (every story's vote arrow, every repeated logo);
+    // fetch each distinct URL over the network once per screenshot rather
+    // than once per element.
+    let url = resolved?;
+    cache
+        .entry(url.clone())
+        .or_insert_with(|| {
+            ureq::get(&url).call().ok().and_then(|resp| {
+                let mut buf = Vec::new();
+                use std::io::Read;
+                resp.into_reader().read_to_end(&mut buf).ok()?;
+                Some(buf)
+            })
+        })
+        .clone()
+}
+
+/// Decode a percent-escaped data: URI payload (`%23` -> `#`, etc). Bytes that
+/// are not part of a `%XX` escape pass through unchanged, which is exactly
+/// right for the inline-SVG case: only the characters that would otherwise be
+/// ambiguous in a URI (`#`, `"`, ...) get escaped, everything else is literal
+/// UTF-8 text.
+fn percent_decode(s: &str) -> Vec<u8> {
+    // Operates on raw bytes throughout (never slices `s` as a string): a
+    // stray '%' followed by non-hex bytes could otherwise land a string
+    // slice in the middle of a multi-byte UTF-8 character and panic.
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Decode raster image bytes (jpeg/png/webp) to a premultiplied-alpha pixmap
+/// resized to `w`x`h`.
+fn raster_to_pixmap(bytes: &[u8], w: u32, h: u32) -> Option<Pixmap> {
+    let img = image::load_from_memory(bytes).ok()?.to_rgba8();
+    let resized = image::imageops::resize(&img, w, h, image::imageops::FilterType::Triangle);
+    let mut raw = resized.into_raw();
+    for pixel in raw.chunks_exact_mut(4) {
+        let a = pixel[3] as u32;
+        pixel[0] = ((pixel[0] as u32 * a) / 255) as u8;
+        pixel[1] = ((pixel[1] as u32 * a) / 255) as u8;
+        pixel[2] = ((pixel[2] as u32 * a) / 255) as u8;
+    }
+    let size = tiny_skia::IntSize::from_wh(w, h)?;
+    Pixmap::from_vec(raw, size)
+}
+
 fn paint_image(
     src: &str,
     base_url: Option<&str>,
@@ -312,86 +414,23 @@ fn paint_image(
     if rect.width <= 0.0 || rect.height <= 0.0 {
         return false;
     }
+    let Some(bytes) = fetch_bytes(src, base_url, cache) else { return false };
 
-    let bytes = if src.starts_with("data:image/") {
-        if let Some(comma_idx) = src.find(',') {
-            use base64::Engine;
-            base64::engine::general_purpose::STANDARD.decode(&src[comma_idx + 1..]).ok()
-        } else { None }
+    let content = if is_svg(&bytes) {
+        render_svg(&bytes, rect.width as u32, rect.height as u32)
     } else {
-        // Resolve relative to the document's base URL: the overwhelming
-        // majority of real markup uses relative image paths ("logo.svg", not
-        // "https://example.com/logo.svg"), so without this every relative
-        // <img> silently fails to fetch, not just SVGs.
-        let resolved = if src.starts_with("http://") || src.starts_with("https://") {
-            Some(src.to_string())
-        } else {
-            base_url
-                .and_then(|b| url::Url::parse(b).ok())
-                .and_then(|base| base.join(src).ok())
-                .map(|u| u.to_string())
-        };
-        match resolved {
-            // The same icon/sprite/background is routinely referenced by
-            // dozens of elements on one page (every story's vote arrow, every
-            // repeated logo); fetch each distinct URL over the network once
-            // per screenshot rather than once per element.
-            Some(url) => cache
-                .entry(url.clone())
-                .or_insert_with(|| {
-                    ureq::get(&url).call().ok().and_then(|resp| {
-                        let mut buf = Vec::new();
-                        use std::io::Read;
-                        resp.into_reader().read_to_end(&mut buf).ok()?;
-                        Some(buf)
-                    })
-                })
-                .clone(),
-            None => None,
-        }
+        raster_to_pixmap(&bytes, rect.width as u32, rect.height as u32)
     };
-
-    let Some(bytes) = bytes else { return false };
-
-    if is_svg(&bytes) {
-        if let Some(svg_pixmap) = render_svg(&bytes, rect.width as u32, rect.height as u32) {
-            pixmap.draw_pixmap(
-                rect.x as i32,
-                rect.y as i32,
-                svg_pixmap.as_ref(),
-                &tiny_skia::PixmapPaint::default(),
-                Transform::identity(),
-                None,
-            );
-            return true;
-        }
-        return false;
-    }
-
-    if let Ok(img) = image::load_from_memory(&bytes) {
-        let img = img.to_rgba8();
-        let resized = image::imageops::resize(&img, rect.width as u32, rect.height as u32, image::imageops::FilterType::Triangle);
-
-        let mut raw = resized.into_raw();
-        for pixel in raw.chunks_exact_mut(4) {
-            let a = pixel[3] as u32;
-            pixel[0] = ((pixel[0] as u32 * a) / 255) as u8;
-            pixel[1] = ((pixel[1] as u32 * a) / 255) as u8;
-            pixel[2] = ((pixel[2] as u32 * a) / 255) as u8;
-        }
-        if let Some(size) = tiny_skia::IntSize::from_wh(rect.width as u32, rect.height as u32) {
-            if let Some(img_pixmap) = Pixmap::from_vec(raw, size) {
-                pixmap.draw_pixmap(
-                    rect.x as i32,
-                    rect.y as i32,
-                    img_pixmap.as_ref(),
-                    &tiny_skia::PixmapPaint::default(),
-                    Transform::identity(),
-                    None,
-                );
-                return true;
-            }
-        }
+    if let Some(content) = content {
+        pixmap.draw_pixmap(
+            rect.x as i32,
+            rect.y as i32,
+            content.as_ref(),
+            &tiny_skia::PixmapPaint::default(),
+            Transform::identity(),
+            None,
+        );
+        return true;
     }
     false
 }
@@ -421,6 +460,61 @@ fn render_svg(bytes: &[u8], width: u32, height: u32) -> Option<Pixmap> {
     let transform = Transform::from_scale(width as f32 / size.width(), height as f32 / size.height());
     resvg::render(&tree, transform, &mut svg_pixmap.as_mut());
     Some(svg_pixmap)
+}
+
+/// Paint a `mask-image`: the ubiquitous "colored, scalable icon" pattern,
+/// where an SVG shape is used purely as a stencil and tinted by
+/// `background-color`/`color` rather than carrying its own colors. Fetches
+/// and rasterizes the mask the same way as an ordinary image, then repaints
+/// every pixel it covers as `fill`, weighted by the mask's own alpha there
+/// (its "coverage"), instead of drawing the mask's own pixel colors.
+fn paint_mask(
+    src: &str,
+    base_url: Option<&str>,
+    rect: &crate::Rect,
+    fill: [u8; 4],
+    pixmap: &mut Pixmap,
+    cache: &mut std::collections::HashMap<String, Option<Vec<u8>>>,
+) -> bool {
+    if rect.width <= 0.0 || rect.height <= 0.0 {
+        return false;
+    }
+    let Some(bytes) = fetch_bytes(src, base_url, cache) else { return false };
+    let (w, h) = (rect.width as u32, rect.height as u32);
+    let mask = if is_svg(&bytes) { render_svg(&bytes, w, h) } else { raster_to_pixmap(&bytes, w, h) };
+    let Some(mask) = mask else { return false };
+
+    let recolored = recolor_by_alpha(&mask, fill);
+    pixmap.draw_pixmap(
+        rect.x as i32,
+        rect.y as i32,
+        recolored.as_ref(),
+        &tiny_skia::PixmapPaint::default(),
+        Transform::identity(),
+        None,
+    );
+    true
+}
+
+/// Replace every pixel's color with `fill`, scaling `fill`'s alpha by the
+/// source pixel's own alpha (its mask coverage at that point).
+fn recolor_by_alpha(src: &Pixmap, fill: [u8; 4]) -> Pixmap {
+    let (w, h) = (src.width(), src.height());
+    let mut out = Pixmap::new(w, h).expect("non-zero size, already validated by caller");
+    let dst = out.pixels_mut();
+    for (i, p) in src.pixels().iter().enumerate() {
+        let coverage = p.alpha() as u32;
+        if coverage == 0 {
+            continue;
+        }
+        let a = (fill[3] as u32 * coverage) / 255;
+        let r = (fill[0] as u32 * a) / 255;
+        let g = (fill[1] as u32 * a) / 255;
+        let b = (fill[2] as u32 * a) / 255;
+        dst[i] = tiny_skia::PremultipliedColorU8::from_rgba(r as u8, g as u8, b as u8, a as u8)
+            .unwrap_or_else(|| tiny_skia::PremultipliedColorU8::from_rgba(0, 0, 0, 0).unwrap());
+    }
+    out
 }
 
 #[cfg(test)]
