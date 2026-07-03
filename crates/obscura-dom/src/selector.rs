@@ -105,6 +105,15 @@ pub enum PseudoClass {
     Enabled,
     Disabled,
     Checked,
+    /// `:link` / `:any-link`: an `<a>`/`<area>` with an `href`. Extremely
+    /// common (`a:link { color: ... }` is the standard way sites set their
+    /// base link color), so treating it as unsupported silently drops the
+    /// whole rule from the cascade, not just the pseudo-class.
+    Link,
+    /// `:visited`. We have no browsing history, so this never matches, the
+    /// same fallback real browsers use when history-based styling is
+    /// suppressed for privacy. `:link`/unvisited styling wins by default.
+    Visited,
 }
 
 impl parser::NonTSPseudoClass for PseudoClass {
@@ -138,6 +147,8 @@ impl ToCss for PseudoClass {
             PseudoClass::Enabled => dest.write_str(":enabled"),
             PseudoClass::Disabled => dest.write_str(":disabled"),
             PseudoClass::Checked => dest.write_str(":checked"),
+            PseudoClass::Link => dest.write_str(":link"),
+            PseudoClass::Visited => dest.write_str(":visited"),
         }
     }
 }
@@ -188,6 +199,8 @@ impl<'i> parser::Parser<'i> for ObscuraSelectorParser {
             "enabled" => Ok(PseudoClass::Enabled),
             "disabled" => Ok(PseudoClass::Disabled),
             "checked" => Ok(PseudoClass::Checked),
+            "link" | "any-link" => Ok(PseudoClass::Link),
+            "visited" => Ok(PseudoClass::Visited),
             _ => Err(cssparser::ParseError {
                 kind: cssparser::ParseErrorKind::Custom(
                     SelectorParseErrorKind::UnsupportedPseudoClassOrElement(name),
@@ -394,10 +407,21 @@ impl<'a> Element for DomElement<'a> {
 
     fn match_non_ts_pseudo_class(
         &self,
-        _pc: &PseudoClass,
+        pc: &PseudoClass,
         _context: &mut MatchingContext<'_, Self::Impl>,
     ) -> bool {
-        false
+        match pc {
+            PseudoClass::Link => self.is_link(),
+            PseudoClass::Visited => false,
+            // Dynamic user-interaction and form-state pseudo-classes have no
+            // meaning against a static DOM snapshot with no live user input.
+            PseudoClass::Hover
+            | PseudoClass::Active
+            | PseudoClass::Focus
+            | PseudoClass::Enabled
+            | PseudoClass::Disabled
+            | PseudoClass::Checked => false,
+        }
     }
 
     fn match_pseudo_element(
@@ -661,6 +685,188 @@ impl DomTree {
             }
         }
         Ok(results)
+    }
+
+    /// Parse a single selector once for repeated single-element matching, and
+    /// precompute its specificity, ancestor hashes, and "subject key" (the
+    /// rightmost id/class/tag used to bucket the rule for fast candidate
+    /// lookup). Returns `None` if the selector fails to parse.
+    ///
+    /// This is the primitive a stylesheet cascade builds on: compile every rule
+    /// once, index by key, then only test the handful of candidate rules against
+    /// each element instead of scanning the whole tree per rule.
+    pub fn compile_rule_selector(&self, selector: &str) -> Option<CompiledSelector> {
+        let list = parse_selector(selector).ok()?;
+        let sel = list.slice().first()?.clone();
+        let specificity = sel.specificity();
+        let key = subject_key(&sel);
+        let hashes = parser::AncestorHashes::new(&sel, QuirksMode::NoQuirks);
+        Some(CompiledSelector { sel, specificity, key, hashes })
+    }
+
+    /// Does a single element match a precompiled selector? Allocates a fresh
+    /// match cache each call; for many matches in a row use [`DomTree::matcher`].
+    pub fn element_matches(&self, nid: NodeId, compiled: &CompiledSelector) -> bool {
+        self.matcher().matches(self, nid, compiled)
+    }
+
+    /// A reusable matcher that holds the selector caches and an ancestor bloom
+    /// filter, so a cascade can fast-reject most (element, rule) pairs without
+    /// walking the selector's combinators. Reuse one across a whole cascade
+    /// pass and drive [`Matcher::push_ancestor`] / [`Matcher::pop_ancestor`] as
+    /// you descend/ascend the tree so the filter tracks the current path.
+    pub fn matcher(&self) -> Matcher {
+        Matcher {
+            caches: selectors::context::SelectorCaches::default(),
+            ancestors: AncestorFilter::new(),
+        }
+    }
+}
+
+/// Holds the servo selector match caches plus an incremental ancestor bloom
+/// filter so a treewalk cascade can test thousands of (element, rule) pairs
+/// cheaply: most rules are fast-rejected by the filter before any combinator
+/// walking happens.
+pub struct Matcher {
+    caches: selectors::context::SelectorCaches,
+    ancestors: AncestorFilter,
+}
+
+impl Matcher {
+    /// Match `nid` (matched as if it were the subject element; the ancestor
+    /// filter reflects `nid`'s ancestors, not `nid` itself) against `compiled`.
+    pub fn matches(&mut self, tree: &DomTree, nid: NodeId, compiled: &CompiledSelector) -> bool {
+        if !tree.with_node(nid, |n| n.is_element()).unwrap_or(false) {
+            return false;
+        }
+        let mut context = MatchingContext::new(
+            MatchingMode::Normal,
+            Some(self.ancestors.filter()),
+            &mut self.caches,
+            QuirksMode::NoQuirks,
+            NeedsSelectorFlags::No,
+            MatchingForInvalidation::No,
+        );
+        let element = DomElement::new(tree, nid);
+        selectors::matching::matches_selector(&compiled.sel, 0, Some(&compiled.hashes), &element, &mut context)
+    }
+
+    /// Push `nid`'s hashes onto the ancestor filter before descending into its
+    /// children. Must be paired with a matching [`Matcher::pop_ancestor`].
+    pub fn push_ancestor(&mut self, tree: &DomTree, nid: NodeId) {
+        self.ancestors.push(tree, nid);
+    }
+
+    /// Pop the hashes pushed by the most recent unmatched [`Matcher::push_ancestor`].
+    pub fn pop_ancestor(&mut self) {
+        self.ancestors.pop();
+    }
+}
+
+/// An incremental ancestor bloom filter (the same structure browsers use to
+/// fast-reject selector matches during a treewalk). `push` is called with each
+/// element on the way down the tree, `pop` on the way back up, so at any point
+/// the filter holds exactly the hashes of the current node's ancestor chain.
+struct AncestorFilter {
+    filter: Box<selectors::bloom::BloomFilter>,
+    /// Hashes pushed per tree-depth level, so `pop` knows what to remove.
+    levels: Vec<Vec<u32>>,
+}
+
+impl AncestorFilter {
+    fn new() -> Self {
+        AncestorFilter { filter: Box::default(), levels: Vec::new() }
+    }
+
+    fn filter(&self) -> &selectors::bloom::BloomFilter {
+        &self.filter
+    }
+
+    fn push(&mut self, tree: &DomTree, nid: NodeId) {
+        let mut hashes = Vec::new();
+        tree.with_node(nid, |node| {
+            if let Some(elem) = node.as_element() {
+                push_hash(&mut hashes, &mut self.filter, CssLocalName(elem.local.clone()).precomputed_hash());
+                if let Some(id) = node.get_attribute("id") {
+                    push_hash(&mut hashes, &mut self.filter, CssString(id.to_string()).precomputed_hash());
+                }
+                if let Some(class) = node.get_attribute("class") {
+                    for c in class.split_whitespace() {
+                        push_hash(&mut hashes, &mut self.filter, CssString(c.to_string()).precomputed_hash());
+                    }
+                }
+            }
+        });
+        self.levels.push(hashes);
+    }
+
+    fn pop(&mut self) {
+        if let Some(hashes) = self.levels.pop() {
+            for h in hashes {
+                self.filter.remove_hash(h);
+            }
+        }
+    }
+}
+
+fn push_hash(hashes: &mut Vec<u32>, filter: &mut selectors::bloom::BloomFilter, hash: u32) {
+    let masked = hash & selectors::bloom::BLOOM_HASH_MASK;
+    filter.insert_hash(masked);
+    hashes.push(masked);
+}
+
+/// The rightmost simple selector used to index a rule for fast lookup. A rule is
+/// only tested against elements that carry its key.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum SelectorKey {
+    Id(String),
+    Class(String),
+    Local(String),
+    Universal,
+}
+
+/// A parsed selector plus its cached specificity and subject key.
+pub struct CompiledSelector {
+    sel: parser::Selector<ObscuraSelector>,
+    specificity: u32,
+    key: SelectorKey,
+    hashes: parser::AncestorHashes,
+}
+
+impl CompiledSelector {
+    pub fn key(&self) -> &SelectorKey {
+        &self.key
+    }
+    pub fn specificity(&self) -> u32 {
+        self.specificity
+    }
+}
+
+/// Pick the index key from a selector's rightmost compound: prefer id, then
+/// class, then local name; fall back to Universal for `*`, attribute-only, or
+/// pseudo-only subjects.
+fn subject_key(sel: &parser::Selector<ObscuraSelector>) -> SelectorKey {
+    use parser::Component;
+    let mut local: Option<String> = None;
+    let mut class: Option<String> = None;
+    let mut id: Option<String> = None;
+    for comp in sel.iter_raw_match_order() {
+        match comp {
+            Component::Combinator(_) => break,
+            Component::ID(v) => id = Some(v.0.clone()),
+            Component::Class(v) => class = Some(v.0.clone()),
+            Component::LocalName(l) => local = Some(l.lower_name.0.to_string()),
+            _ => {}
+        }
+    }
+    if let Some(i) = id {
+        SelectorKey::Id(i)
+    } else if let Some(c) = class {
+        SelectorKey::Class(c)
+    } else if let Some(l) = local {
+        SelectorKey::Local(l)
+    } else {
+        SelectorKey::Universal
     }
 }
 

@@ -10,7 +10,7 @@ description = "Optional scoped render layer for Obscura: layout (taffy) and, wit
 default = []
 # Rasterize the laid-out tree to a pixmap (tiny-skia) with text (ab_glyph) and images.
 # Off by default; the layout core (getBoundingClientRect etc.) works without it.
-paint = ["dep:tiny-skia", "dep:ab_glyph", "dep:image", "dep:ureq", "dep:base64"]
+paint = ["dep:tiny-skia", "dep:ab_glyph", "dep:image", "dep:ureq", "dep:base64", "dep:resvg", "dep:usvg", "dep:url"]
 
 [dependencies]
 taffy = { workspace = true }
@@ -20,6 +20,17 @@ ab_glyph = { workspace = true, optional = true }
 image = { version = "0.24", default-features = false, features = ["jpeg", "png", "webp"], optional = true }
 ureq = { version = "2.9", default-features = false, features = ["tls"], optional = true }
 base64 = { workspace = true, optional = true }
+# SVG rasterization for <img src="*.svg">, inline <svg>, and background-image
+# SVGs, all extremely common for logos/icons. Pure Rust, CPU, no system deps,
+# same deterministic-rendering guarantee as the rest of this crate.
+resvg = { version = "0.47", default-features = false, features = ["text", "raster-images"], optional = true }
+usvg = { version = "0.47", default-features = false, optional = true }
+url = { workspace = true, optional = true }
 cssparser = "0.34"
 [lib]
 path = "src/lib.rs"
+
+[[bin]]
+name = "paint_file"
+path = "src/bin/paint_file.rs"
+required-features = ["paint"]

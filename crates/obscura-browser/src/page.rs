@@ -385,6 +385,78 @@ impl Page {
             None => Some(doc_url.clone()),
         }
     }
+    
+    async fn fetch_stylesheets(&mut self) {
+        let all_links = match &self.js {
+            Some(js) => {
+                js.with_dom(|dom| {
+                    let link_ids = dom.query_selector_all("link[rel=\"stylesheet\"]").unwrap_or_default();
+                    let mut links = Vec::new();
+                    for lid in link_ids {
+                        if let Some(node) = dom.get_node(lid) {
+                            if let Some(href) = node.get_attribute("href") {
+                                links.push(href.to_string());
+                            }
+                        }
+                    }
+                    links
+                }).unwrap_or_default()
+            }
+            None => {
+                tracing::info!("fetch_stylesheets: no js runtime");
+                return;
+            }
+        };
+
+        tracing::info!("fetch_stylesheets: found {} stylesheet links", all_links.len());
+
+        let document_base = self.resolve_base_url();
+
+        let mut fetch_tasks = Vec::new();
+        for href in all_links {
+            let full_url = if href.starts_with("http://") || href.starts_with("https://") {
+                href.clone()
+            } else if let Some(base) = &document_base {
+                base.join(&href).map(|u| u.to_string()).unwrap_or_else(|_| href.clone())
+            } else {
+                href.clone()
+            };
+            tracing::info!("fetch_stylesheets: fetching {}", full_url);
+
+            let client = self.http_client.clone();
+            fetch_tasks.push(tokio::spawn(async move {
+                if let Ok(url) = url::Url::parse(&full_url) {
+                    if let Ok(Ok(resp)) = tokio::time::timeout(tokio::time::Duration::from_secs(5), client.fetch(&url)).await {
+                        if let Ok(css) = String::from_utf8(resp.body) {
+                            return Some(css);
+                        }
+                    }
+                }
+                None
+            }));
+        }
+
+        let mut all_css = String::new();
+        for task in fetch_tasks {
+            if let Ok(Some(css)) = task.await {
+                tracing::info!("fetch_stylesheets: fetched {} bytes of CSS", css.len());
+                all_css.push_str(&css);
+                all_css.push('\n');
+            }
+        }
+
+        if !all_css.is_empty() {
+            tracing::info!("fetch_stylesheets: injecting {} bytes of CSS", all_css.len());
+            if let Some(js) = &mut self.js {
+                let escaped_css = all_css.replace('\\', "\\\\").replace('`', "\\`").replace('$', "\\$");
+                let code = format!(
+                    "var style = document.createElement('style'); style.textContent = `{}`; document.head.appendChild(style);",
+                    escaped_css
+                );
+                let _ = js.execute_script("<fetch_stylesheets>", &code);
+            }
+        }
+    }
 
     async fn execute_scripts(&mut self) {
         tracing::info!("execute_scripts called, js runtime exists: {}", self.js.is_some());
@@ -1180,6 +1252,7 @@ impl Page {
         // listeners never registered, frameworks never bootstrapped,
         // page.click() handlers were no-ops. Now scripts run regardless
         // of waitUntil and DCL means "DOM parsed AND scripts executed".
+        self.fetch_stylesheets().await;
         self.execute_scripts().await;
 
         self.lifecycle = LifecycleState::DomContentLoaded;
@@ -1286,7 +1359,11 @@ impl Page {
     /// viewport is zero-sized.
     #[cfg(feature = "render")]
     pub fn screenshot(&self, viewport: (f32, f32)) -> Option<Vec<u8>> {
-        self.with_dom(|dom| obscura_js::screenshot_png(dom, viewport)).flatten()
+        // Needed to resolve the relative image URLs ("logo.svg") that make up
+        // the overwhelming majority of real markup.
+        let base_url = self.resolve_base_url();
+        let base_url = base_url.as_ref().map(|u| u.as_str());
+        self.with_dom(|dom| obscura_js::screenshot_png(dom, viewport, base_url)).flatten()
     }
 
     /// Absolute URLs the page pulled in via fetch()/XHR (issue #301). Empty

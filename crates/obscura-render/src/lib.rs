@@ -13,10 +13,13 @@
 
 use taffy::prelude::*;
 
-mod style;
+pub mod css;
+pub use css::Stylesheet;
+
+pub mod style;
 pub use style::compute_style;
 
-mod dom;
+pub mod dom;
 pub use dom::{layout_dom, DomLayout};
 
 #[cfg(feature = "paint")]
@@ -31,6 +34,23 @@ pub struct Rect {
     pub y: f32,
     pub width: f32,
     pub height: f32,
+}
+
+impl Rect {
+    /// The overlap of two rects, or `None` if they do not intersect (or the
+    /// overlap is degenerate). Used to accumulate an ancestor clip chain for
+    /// `overflow: hidden`.
+    pub fn intersect(&self, other: &Rect) -> Option<Rect> {
+        let x0 = self.x.max(other.x);
+        let y0 = self.y.max(other.y);
+        let x1 = (self.x + self.width).min(other.x + other.width);
+        let y1 = (self.y + self.height).min(other.y + other.height);
+        if x1 > x0 && y1 > y0 {
+            Some(Rect { x: x0, y: y0, width: x1 - x0, height: y1 - y0 })
+        } else {
+            None
+        }
+    }
 }
 
 /// Per-edge box values (margin / padding / border) in CSS pixels.
@@ -49,6 +69,7 @@ pub enum Display {
     #[default]
     Block,
     Flex,
+    Grid,
     Inline,
     #[allow(dead_code)]
     None,
@@ -68,11 +89,30 @@ pub struct LayoutStyle {
     pub display: Display,
     pub width: Dimension,
     pub height: Dimension,
+    pub min_width: Dimension,
+    pub min_height: Dimension,
+    pub max_width: Dimension,
+    pub max_height: Dimension,
     pub margin: Edges,
     pub padding: Edges,
     pub border: Edges,
     /// RGBA for the paint step. Parsed always (cheap), used only with `paint`.
     pub background_color: Option<[u8; 4]>,
+    /// The first `url(...)` reference from `background`/`background-image`
+    /// (gradients and repeat keywords in the same shorthand are ignored: we
+    /// paint the referenced image, not the gradient layer).
+    pub background_image: Option<String>,
+    /// `background-size`, in px, when given as explicit length(s) (a bare
+    /// `10px` applies to both axes, matching how small square icons are
+    /// almost always sized). `None` means "fill the whole box" (our fallback
+    /// when the value is a keyword we don't evaluate, `cover`/`contain`, or
+    /// absent with an already icon-sized box like the HN vote arrow).
+    pub background_size: Option<(f32, f32)>,
+    /// `background-position` as a 0.0-1.0 fraction per axis (0,0 = default
+    /// top-left; 1,0.5 = "right center"). Only meaningful alongside
+    /// `background_size`: without a known image size there is no leftover
+    /// box space to position within.
+    pub background_position: (f32, f32),
     /// Foreground (text) color for the paint step.
     pub color: Option<[u8; 4]>,
     pub border_color: Option<[u8; 4]>,
@@ -80,8 +120,33 @@ pub struct LayoutStyle {
     pub font_weight: Option<String>,
     pub align_items: Option<taffy::AlignItems>,
     pub flex_direction: Option<taffy::FlexDirection>,
+    pub flex_wrap: Option<taffy::FlexWrap>,
     pub justify_content: Option<taffy::JustifyContent>,
     pub flex_grow: Option<f32>,
+    pub flex_shrink: Option<f32>,
+
+    // CSS Grid. Tracks are stored as taffy sizing functions; `grid_areas` is the
+    // parsed `grid-template-areas` matrix (one Vec per row, `.` for a null cell),
+    // resolved to line placements on children in a later pass.
+    pub grid_template_columns: Vec<taffy::TrackSizingFunction>,
+    pub grid_template_rows: Vec<taffy::TrackSizingFunction>,
+    pub grid_areas: Option<Vec<Vec<String>>>,
+    pub grid_area_name: Option<String>,
+    pub grid_column: Option<taffy::Line<taffy::GridPlacement>>,
+    pub grid_row: Option<taffy::Line<taffy::GridPlacement>>,
+    pub column_gap: Option<f32>,
+    pub row_gap: Option<f32>,
+
+    // Positioning. `position: absolute|fixed` takes the box out of normal flow.
+    pub position: Option<taffy::Position>,
+    pub inset: [Option<f32>; 4], // top, right, bottom, left
+
+    /// `overflow`/-x/-y other than `visible`: clips this element's descendants
+    /// to its border box during paint. This is what makes the ubiquitous
+    /// "visually-hidden but accessible" pattern (a 1x1 absolutely-positioned,
+    /// clipped box used for skip-links and screen-reader-only labels) actually
+    /// invisible instead of painting its text wherever it lands.
+    pub overflow_hidden: bool,
 }
 
 /// A node in the input layout tree. `text` is carried for the paint phase; it
@@ -154,15 +219,34 @@ fn read_node(tree: &TaffyTree, id: NodeId) -> NodeRect {
 
 pub(crate) fn to_taffy_style(style: &LayoutStyle) -> Style {
     let mut s = Style::DEFAULT;
+
+    // A block box that wants non-default cross-axis alignment (from
+    // text-align: center/right, the only way our engine currently sets
+    // align_items on a block-level element) needs a flex column to have any
+    // effect at all: taffy's native block algorithm (used for plain
+    // Display::Block) has no align-items concept whatsoever, it only ever
+    // places block children at the start edge. Promote such boxes to a flex
+    // column, matching the same column-flex approximation already used for
+    // elements like <td> and <center>.
+    let promote_for_alignment = style.display == Display::Block
+        && matches!(style.align_items, Some(taffy::AlignItems::Center) | Some(taffy::AlignItems::FlexEnd));
+
     s.display = match style.display {
+        Display::Block if promote_for_alignment => taffy::style::Display::Flex,
         Display::Block => taffy::style::Display::Block,
         Display::Flex => taffy::style::Display::Flex,
+        Display::Grid => taffy::style::Display::Grid,
         Display::Inline => taffy::style::Display::Flex,
         Display::None => taffy::style::Display::None,
     };
+    if promote_for_alignment {
+        s.flex_direction = taffy::FlexDirection::Column;
+    }
     if let Some(fd) = style.flex_direction {
         s.flex_direction = fd;
-        s.flex_wrap = taffy::FlexWrap::NoWrap;
+    }
+    if let Some(fw) = style.flex_wrap {
+        s.flex_wrap = fw;
     } else if style.display == Display::Inline {
         s.flex_direction = taffy::FlexDirection::Row;
         s.flex_wrap = taffy::FlexWrap::Wrap;
@@ -173,6 +257,14 @@ pub(crate) fn to_taffy_style(style: &LayoutStyle) -> Style {
         width: dimension(style.width),
         height: dimension(style.height),
     };
+    s.min_size = taffy::Size {
+        width: dimension(style.min_width),
+        height: dimension(style.min_height),
+    };
+    s.max_size = taffy::Size {
+        width: dimension(style.max_width),
+        height: dimension(style.max_height),
+    };
     if let Some(ai) = style.align_items {
         s.align_items = Some(ai);
     }
@@ -182,10 +274,56 @@ pub(crate) fn to_taffy_style(style: &LayoutStyle) -> Style {
     if let Some(fg) = style.flex_grow {
         s.flex_grow = fg;
     }
+    if let Some(fs) = style.flex_shrink {
+        s.flex_shrink = fs;
+    }
+
+    // Grid container tracks and gaps.
+    if style.display == Display::Grid {
+        if !style.grid_template_columns.is_empty() {
+            s.grid_template_columns = style.grid_template_columns.clone();
+        }
+        if !style.grid_template_rows.is_empty() {
+            s.grid_template_rows = style.grid_template_rows.clone();
+        }
+    }
+    let cg = style.column_gap.unwrap_or(0.0);
+    let rg = style.row_gap.unwrap_or(0.0);
+    s.gap = taffy::Size {
+        width: taffy::style::LengthPercentage::Length(cg),
+        height: taffy::style::LengthPercentage::Length(rg),
+    };
+
+    // Grid item placement (resolved from grid-area names or explicit lines).
+    if let Some(gc) = style.grid_column {
+        s.grid_column = gc;
+    }
+    if let Some(gr) = style.grid_row {
+        s.grid_row = gr;
+    }
+
+    // Positioning. Absolute/fixed take the box out of flow.
+    if let Some(pos) = style.position {
+        s.position = pos;
+        s.inset = taffy::Rect {
+            top: inset_lpa(style.inset[0]),
+            right: inset_lpa(style.inset[1]),
+            bottom: inset_lpa(style.inset[2]),
+            left: inset_lpa(style.inset[3]),
+        };
+    }
+
     s.margin = rect_auto(style.margin);
     s.padding = rect_lp(style.padding);
     s.border = rect_lp(style.border);
     s
+}
+
+fn inset_lpa(v: Option<f32>) -> taffy::style::LengthPercentageAuto {
+    match v {
+        Some(px) => taffy::style::LengthPercentageAuto::Length(px),
+        None => taffy::style::LengthPercentageAuto::Auto,
+    }
 }
 
 fn dimension(v: Dimension) -> taffy::style::Dimension {

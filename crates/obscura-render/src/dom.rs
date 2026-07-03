@@ -13,53 +13,134 @@ use taffy::prelude::*;
 
 use crate::{Rect, to_taffy_style};
 
+/// Text width for layout. With the `paint` feature this is exact (real glyph
+/// metrics from the embedded font, shared with rasterization). Without it
+/// (layout-only builds, e.g. for `getBoundingClientRect`), fall back to a
+/// standard average-character-width heuristic for proportional fonts so
+/// `obscura-render` compiles and gives reasonable geometry with its default
+/// (lightest-weight) feature set, matching RENDER.md's documented "layout
+/// (default)" mode.
+#[cfg(feature = "paint")]
+fn text_width(text: &str, size: f32, is_bold: bool) -> f32 {
+    crate::paint::measure_text(text, size, is_bold)
+}
+
+#[cfg(not(feature = "paint"))]
+fn text_width(text: &str, size: f32, is_bold: bool) -> f32 {
+    const AVG_CHAR_WIDTH_EM: f32 = 0.55;
+    let chars = text.chars().filter(|c| !c.is_control()).count() as f32;
+    let width = chars * size * AVG_CHAR_WIDTH_EM;
+    if is_bold { width * 1.08 } else { width }
+}
+
 /// Per-element border boxes after layout, in viewport coordinates.
 pub struct DomLayout {
     pub rects: HashMap<NodeId, Rect>,
     pub styles: HashMap<NodeId, crate::LayoutStyle>,
+    /// The clip rect inherited from ancestor `overflow: hidden` boxes, keyed
+    /// per node. `None` means unclipped. Does not include the node's own
+    /// overflow (that only clips its children, not itself).
+    pub clip_rects: HashMap<NodeId, Option<Rect>>,
+}
+
+/// Walk the tree top-down accumulating the clip rect imposed by ancestor
+/// `overflow: hidden` boxes. Must run after layout, since it needs border
+/// boxes. This is what makes `overflow: hidden` (used pervasively for the
+/// "visually hidden but accessible" pattern: a 1x1 absolutely-positioned box
+/// with clipped overflow) actually hide its contents instead of letting text
+/// paint wherever the box's static position happens to land.
+fn resolve_clip_rects(
+    tree: &DomTree,
+    id: NodeId,
+    inherited: Option<Rect>,
+    rects: &HashMap<NodeId, Rect>,
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+    clip_rects: &mut HashMap<NodeId, Option<Rect>>,
+) {
+    clip_rects.insert(id, inherited);
+    let next = match (styles.get(&id), rects.get(&id)) {
+        (Some(style), Some(rect)) if style.overflow_hidden => {
+            Some(match inherited {
+                Some(clip) => clip.intersect(rect).unwrap_or(Rect::default()),
+                None => *rect,
+            })
+        }
+        _ => inherited,
+    };
+    for cid in tree.children(id) {
+        resolve_clip_rects(tree, cid, next, rects, styles, clip_rects);
+    }
+}
+
+/// Compute the UA + author style for every element in preorder, maintaining
+/// `matcher`'s ancestor filter as we descend so descendant-combinator rules
+/// fast-reject correctly. Non-element nodes (text, comments) are skipped but
+/// still walked through, since an element may be their descendant.
+fn cascade_walk(
+    tree: &DomTree,
+    id: NodeId,
+    sheet: &crate::css::Stylesheet,
+    matcher: &mut obscura_dom::selector::Matcher,
+    styles: &mut HashMap<NodeId, crate::LayoutStyle>,
+) {
+    let Some(node) = tree.get_node(id) else { return };
+    let is_element = node.as_element().map(|elem| {
+        let mut style = crate::style::ua_style(elem.local.as_ref());
+        if !sheet.is_empty() {
+            let node_id = node.get_attribute("id");
+            let classes: Vec<String> = node
+                .get_attribute("class")
+                .map(|c| c.split_whitespace().map(|s| s.to_string()).collect())
+                .unwrap_or_default();
+            sheet.apply(tree, matcher, id, node_id, &classes, elem.local.as_ref(), &mut style);
+        }
+        styles.insert(id, style);
+    });
+
+    if is_element.is_some() {
+        matcher.push_ancestor(tree, id);
+    }
+    for cid in tree.children(id) {
+        cascade_walk(tree, cid, sheet, matcher, styles);
+    }
+    if is_element.is_some() {
+        matcher.pop_ancestor();
+    }
 }
 
 /// Lay out a DOM tree within `viewport` (width, height) in CSS pixels.
 pub fn layout_dom(tree: &DomTree, viewport: (f32, f32)) -> DomLayout {
-    let mut css_rules = Vec::new();
+    let timing = std::env::var("OBSCURA_RENDER_TIMING").is_ok();
+
+    // Collect the text of every <style> block in document order.
+    let mut css_sources = Vec::new();
     for nid in tree.descendants(tree.document()) {
         if let Some(node) = tree.get_node(nid) {
             if let Some(elem) = node.as_element() {
                 if elem.local.as_ref() == "style" {
-                    let css = tree.text_content(nid);
-                    css_rules.extend(parse_simple_css(&css));
+                    css_sources.push(tree.text_content(nid));
                 }
             }
         }
     }
 
+    let t0 = std::time::Instant::now();
+    let sheet = crate::css::Stylesheet::parse(tree, &css_sources);
+    let t_parse = t0.elapsed();
+
+    let t1 = std::time::Instant::now();
+    let mut matcher = tree.matcher();
     let mut styles: HashMap<NodeId, crate::LayoutStyle> = HashMap::new();
-    for nid in tree.descendants(tree.document()) {
-        if let Some(node) = tree.get_node(nid) {
-            if let Some(elem) = node.as_element() {
-                styles.insert(nid, crate::style::ua_style(elem.local.as_ref()));
-            }
-        }
+    // A real preorder walk (not a flat descendants() scan) so the matcher's
+    // ancestor bloom filter tracks the current path: push before recursing
+    // into children, pop on the way back out. This is what lets descendant
+    // combinators (".mw-body .firstHeading") fast-reject via the filter
+    // instead of falling back to the always-true "can't reject" case.
+    cascade_walk(tree, tree.document(), &sheet, &mut matcher, &mut styles);
+    if timing {
+        let (r, i, c, l, u) = sheet.debug_stats();
+        eprintln!("[timing] parse+index={:?} cascade={:?} rules={} id_keys={} class_keys={} local_keys={} universal={}", t_parse, t1.elapsed(), r, i, c, l, u);
     }
-    css_rules.push((".subtext".into(), "color: #828282; font-size: 7pt".into()));
-    css_rules.push((".subline".into(), "color: #828282; font-size: 7pt".into()));
-    css_rules.push((".hnname".into(), "margin-right: 10px; margin-left: 2px".into()));
-    css_rules.push((".pagetop".into(), "align-items: center".into()));
-    css_rules.push((".votearrow".into(), "width: 10px; height: 10px; margin-top: 2px".into()));
-    css_rules.push((".rank".into(), "color: #828282".into()));
-    css_rules.push((".comhead".into(), "color: #828282; font-size: 7pt".into()));
-    css_rules.push(("a".into(), "color: #000000".into()));
-
-    for (selector, decls) in &css_rules {
-        if let Ok(matched) = tree.query_selector_all(selector) {
-            for nid in matched {
-                if let Some(style) = styles.get_mut(&nid) {
-                    crate::style::apply_inline(style, decls);
-                }
-            }
-        }
-    }
-
     for nid in tree.descendants(tree.document()) {
         if let Some(node) = tree.get_node(nid) {
             if node.is_element() {
@@ -90,20 +171,12 @@ pub fn layout_dom(tree: &DomTree, viewport: (f32, f32)) -> DomLayout {
                             crate::style::apply_inline(style, &format!("height: {}", height));
                         }
                     }
-                    // For table cells with right alignment, make them grow to push content to the right
-                    if let Some(elem) = node.as_element() {
-                        let local = elem.local.as_ref();
-                        if local == "td" || local == "th" {
-                            let is_title = node.get_attribute("class").unwrap_or_default().contains("title");
-                            if !is_title && style.justify_content == Some(taffy::JustifyContent::FlexEnd) {
-                                style.flex_grow = Some(1.0);
-                            }
-                        }
-                    }
                 }
             }
         }
     }
+
+    grow_trailing_auto_cells(tree, &mut styles);
 
     let mut taffy_tree: TaffyTree = TaffyTree::new();
     let mut id_map: HashMap<taffy::NodeId, NodeId> = HashMap::new();
@@ -117,24 +190,26 @@ pub fn layout_dom(tree: &DomTree, viewport: (f32, f32)) -> DomLayout {
 
     let mut rects = HashMap::new();
     if let Some(root_id) = root {
-        let mut queue = vec![(root_id, None, None)];
-        while let Some((id, mut parent_color, mut parent_size)) = queue.pop() {
+        // Top-down inheritance of the properties CSS inherits by default.
+        #[derive(Clone, Default)]
+        struct Inherited {
+            color: Option<[u8; 4]>,
+            font_size: Option<f32>,
+            font_weight: Option<String>,
+        }
+        let mut queue = vec![(root_id, Inherited::default())];
+        while let Some((id, mut inh)) = queue.pop() {
             if let Some(style) = styles.get_mut(&id) {
-                if style.color.is_some() {
-                    parent_color = style.color;
-                } else if parent_color.is_some() {
-                    style.color = parent_color;
-                }
-                if style.font_size.is_some() {
-                    parent_size = style.font_size;
-                } else if parent_size.is_some() {
-                    style.font_size = parent_size;
-                }
+                match style.color { Some(c) => inh.color = Some(c), None => style.color = inh.color }
+                match style.font_size { Some(s) => inh.font_size = Some(s), None => style.font_size = inh.font_size }
+                match &style.font_weight { Some(w) => inh.font_weight = Some(w.clone()), None => style.font_weight = inh.font_weight.clone() }
             }
             for cid in tree.children(id).into_iter().rev() {
-                queue.push((cid, parent_color, parent_size));
+                queue.push((cid, inh.clone()));
             }
         }
+
+        resolve_grid_areas(tree, root_id, &mut styles);
 
         if let Some(taffy_root) = build(tree, root_id, &mut taffy_tree, &mut id_map, &styles) {
             let _ = taffy_tree.compute_layout(
@@ -147,7 +222,105 @@ pub fn layout_dom(tree: &DomTree, viewport: (f32, f32)) -> DomLayout {
             compute_absolute_rects(&taffy_tree, taffy_root, 0.0, 0.0, &id_map, &mut rects);
         }
     }
-    DomLayout { rects, styles }
+
+    let mut clip_rects = HashMap::new();
+    if let Some(root_id) = root {
+        resolve_clip_rects(tree, root_id, None, &rects, &styles, &mut clip_rects);
+    }
+
+    DomLayout { rects, styles, clip_rects }
+}
+
+/// HTML table auto-layout approximation: for each `<tr>`, the last `<td>`/
+/// `<th>` child with no explicit width absorbs the row's leftover space. Real
+/// browsers run a genuine column-width-negotiation algorithm across every row
+/// in a table; giving `flex_grow` to *every* auto-width cell approximates that
+/// badly; multiple growing siblings compete and the split becomes sensitive to
+/// each cell's own content size, which looks like near-random drift row to
+/// row. Growing only the trailing auto cell matches the extremely common
+/// layout intent (fixed-size leading cells, one expanding trailing cell) and
+/// leaves the others shrink-to-fit, matching a shrink-to-fit table exactly
+/// when there is no surplus width to distribute in the first place.
+fn grow_trailing_auto_cells(tree: &DomTree, styles: &mut HashMap<NodeId, crate::LayoutStyle>) {
+    let is_tag = |id: NodeId, tags: &[&str]| -> bool {
+        match tree.get_node(id).and_then(|n| n.as_element().map(|e| e.local.to_string())) {
+            Some(local) => tags.contains(&local.as_str()),
+            None => false,
+        }
+    };
+    for tr in tree.descendants(tree.document()) {
+        if !is_tag(tr, &["tr"]) {
+            continue;
+        }
+        let last_auto_cell = tree.children(tr).into_iter().rev().find(|&cid| {
+            is_tag(cid, &["td", "th"])
+                && styles.get(&cid).map(|s| s.width == crate::Dimension::Auto && s.flex_grow.is_none()).unwrap_or(false)
+        });
+        if let Some(cid) = last_auto_cell {
+            if let Some(style) = styles.get_mut(&cid) {
+                style.flex_grow = Some(1.0);
+            }
+        }
+    }
+}
+
+/// Walk the tree; for each `display: grid` element that declares
+/// `grid-template-areas`, resolve each direct child's `grid-area` name to a
+/// taffy line placement. This is how Vector 2022 (and most grid layouts) place
+/// their header/sidebar/content/footer regions.
+fn resolve_grid_areas(
+    tree: &DomTree,
+    root: NodeId,
+    styles: &mut HashMap<NodeId, crate::LayoutStyle>,
+) {
+    let mut stack = vec![root];
+    while let Some(id) = stack.pop() {
+        for cid in tree.children(id) {
+            stack.push(cid);
+        }
+        let areas = match styles.get(&id) {
+            Some(s) if s.display == crate::Display::Grid => match &s.grid_areas {
+                Some(a) if !a.is_empty() => a.clone(),
+                _ => continue,
+            },
+            _ => continue,
+        };
+
+        // name -> (row_start, row_end, col_start, col_end) in 0-based track indices.
+        let mut spans: HashMap<String, (usize, usize, usize, usize)> = HashMap::new();
+        for (r, row) in areas.iter().enumerate() {
+            for (c, name) in row.iter().enumerate() {
+                if name == "." {
+                    continue;
+                }
+                spans
+                    .entry(name.clone())
+                    .and_modify(|s| {
+                        s.0 = s.0.min(r);
+                        s.1 = s.1.max(r);
+                        s.2 = s.2.min(c);
+                        s.3 = s.3.max(c);
+                    })
+                    .or_insert((r, r, c, c));
+            }
+        }
+
+        for cid in tree.children(id) {
+            let Some(cstyle) = styles.get_mut(&cid) else { continue };
+            let Some(name) = cstyle.grid_area_name.clone() else { continue };
+            if let Some(&(r0, r1, c0, c1)) = spans.get(&name) {
+                use taffy::style_helpers::line;
+                cstyle.grid_row = Some(taffy::Line {
+                    start: line((r0 + 1) as i16),
+                    end: line((r1 + 2) as i16),
+                });
+                cstyle.grid_column = Some(taffy::Line {
+                    start: line((c0 + 1) as i16),
+                    end: line((c1 + 2) as i16),
+                });
+            }
+        }
+    }
 }
 
 fn compute_absolute_rects(
@@ -182,36 +355,18 @@ fn compute_absolute_rects(
     }
 }
 
-fn parse_simple_css(css: &str) -> Vec<(String, String)> {
-    let mut rules = Vec::new();
-    let mut current_selector = String::new();
-    let mut current_decls = String::new();
-    let mut in_block = false;
-
-    for c in css.chars() {
-        if c == '{' && !in_block {
-            in_block = true;
-        } else if c == '}' && in_block {
-            in_block = false;
-            let sel = current_selector.trim();
-            let decls = current_decls.trim();
-            for s in sel.split(',') {
-                let s = s.trim();
-                if !s.is_empty() {
-                    rules.push((s.to_string(), decls.to_string()));
-                }
-            }
-            current_selector.clear();
-            current_decls.clear();
-        } else {
-            if in_block {
-                current_decls.push(c);
-            } else {
-                current_selector.push(c);
-            }
+/// Does `id` have any direct child that is inline-level (a non-whitespace
+/// text node, or an element whose resolved display is `Inline`)? Used to
+/// decide whether a block container needs the flex-row-wrap approximation of
+/// an inline formatting context.
+fn has_inline_content(tree: &DomTree, id: NodeId, styles: &HashMap<NodeId, crate::LayoutStyle>) -> bool {
+    tree.children(id).into_iter().any(|cid| {
+        let Some(node) = tree.get_node(cid) else { return false };
+        match &node.data {
+            obscura_dom::tree::NodeData::Text { contents } => !contents.trim().is_empty(),
+            _ => styles.get(&cid).map(|s| s.display == crate::Display::Inline).unwrap_or(false),
         }
-    }
-    rules
+    })
 }
 
 fn build(
@@ -237,10 +392,8 @@ fn build(
                 in_space = false;
             }
         }
-        if display_text == " " {
-            display_text = " ".to_string(); // Keep single space
-        }
-        
+
+
         let mut fsize = 16.0;
         let mut is_bold = false;
         if let Some(parent_id) = node.parent {
@@ -250,9 +403,18 @@ fn build(
             }
         }
         
-        let width = crate::paint::measure_text(&display_text, fsize, is_bold);
-        let height = fsize * 1.2;
-        
+        let width = text_width(&display_text, fsize, is_bold);
+        // A text node that is pure whitespace is almost always HTML source
+        // formatting (a newline and indentation between sibling tags), not
+        // meaningful content: real browsers collapse it away entirely. We
+        // still give it its natural (small) width, since a bare space
+        // between two inline elements ("<a>Foo</a> <a>Bar</a>") does need to
+        // keep them visually separated, but zero height, so it never adds a
+        // spurious blank row when it lands between block-level siblings
+        // (e.g. formatting whitespace around a run of now-collapsed,
+        // display:none list items).
+        let height = if contents.trim().is_empty() { 0.0 } else { fsize * 1.2 };
+
         let taffy_style = taffy::Style {
             size: taffy::Size {
                 width: taffy::Dimension::Length(width),
@@ -271,26 +433,21 @@ fn build(
         return None;
     }
     let mut taffy_style = to_taffy_style(style);
-    
-    // Emulate HTML table layout by giving the last td in a tr all remaining space
-    if _name.local.as_ref() == "td" || _name.local.as_ref() == "th" {
-        if let Some(parent_id) = node.parent {
-            if let Some(parent) = tree.get_node(parent_id) {
-                if parent.as_element().map_or(false, |e| e.local.as_ref() == "tr") {
-                    let mut last_td = None;
-                    for cid in tree.children(parent_id) {
-                        if let Some(child) = tree.get_node(cid) {
-                            if child.as_element().map_or(false, |e| e.local.as_ref() == "td" || e.local.as_ref() == "th") {
-                                last_td = Some(cid);
-                            }
-                        }
-                    }
-                    if last_td == Some(id) {
-                        taffy_style.flex_grow = 1.0;
-                    }
-                }
-            }
-        }
+
+    // Taffy has no real inline formatting context: its native Block layout
+    // treats every direct child as its own full-width block box, stacked
+    // vertically. That is correct when a block's children are other block
+    // elements (a div full of divs), but wrong the moment a block holds
+    // inline-level content (running text with <a>/<span>/<b> mixed in, i.e.
+    // any ordinary paragraph or list item), where real CSS instead lays
+    // consecutive inline boxes out left-to-right, wrapping at the container's
+    // width. Approximate that inline formatting context by promoting such
+    // blocks to a wrapping flex row, so text and inline elements actually
+    // flow together on shared lines instead of each getting its own row.
+    if style.display == crate::Display::Block && has_inline_content(tree, id, styles) {
+        taffy_style.display = taffy::style::Display::Flex;
+        taffy_style.flex_direction = taffy::FlexDirection::Row;
+        taffy_style.flex_wrap = taffy::FlexWrap::Wrap;
     }
 
     let child_ids: Vec<taffy::NodeId> = tree
