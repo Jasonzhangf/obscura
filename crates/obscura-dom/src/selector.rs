@@ -221,6 +221,31 @@ impl<'a> DomElement<'a> {
     pub fn new(tree: &'a DomTree, node_id: NodeId) -> Self {
         DomElement { tree, node_id }
     }
+
+    /// Is this a form control element that `:enabled`/`:disabled` apply to?
+    fn is_form_control(&self) -> bool {
+        self.tree
+            .with_node(self.node_id, |n| {
+                n.as_element()
+                    .map(|name| {
+                        matches!(
+                            name.local.as_ref(),
+                            "input" | "button" | "select" | "textarea" | "optgroup" | "option" | "fieldset"
+                        )
+                    })
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
+    }
+
+    /// A boolean HTML attribute's presence (its value does not matter: per
+    /// HTML, `disabled=""`, `disabled="disabled"`, and bare `disabled` are
+    /// all equally "set").
+    fn has_boolean_attr(&self, name: &str) -> bool {
+        self.tree
+            .with_node(self.node_id, |n| n.get_attribute(name).is_some())
+            .unwrap_or(false)
+    }
 }
 
 impl<'a> std::fmt::Debug for DomElement<'a> {
@@ -413,14 +438,20 @@ impl<'a> Element for DomElement<'a> {
         match pc {
             PseudoClass::Link => self.is_link(),
             PseudoClass::Visited => false,
-            // Dynamic user-interaction and form-state pseudo-classes have no
-            // meaning against a static DOM snapshot with no live user input.
-            PseudoClass::Hover
-            | PseudoClass::Active
-            | PseudoClass::Focus
-            | PseudoClass::Enabled
-            | PseudoClass::Disabled
-            | PseudoClass::Checked => false,
+            // :enabled/:disabled/:checked reflect real, static DOM state (the
+            // disabled/checked attributes), not live user interaction, so
+            // they resolve the same way against a static snapshot as they
+            // would in a browser that never received an input event. Modern
+            // component systems (Codex, Material, Bootstrap, ...) lean on
+            // :enabled constantly for their default/base styling, so
+            // treating it as unconditionally false (as :hover/:active
+            // correctly are) made every such base rule silently inert.
+            PseudoClass::Enabled => self.is_form_control() && !self.has_boolean_attr("disabled"),
+            PseudoClass::Disabled => self.is_form_control() && self.has_boolean_attr("disabled"),
+            PseudoClass::Checked => self.has_boolean_attr("checked") || self.has_boolean_attr("selected"),
+            // Dynamic user-interaction pseudo-classes have no meaning against
+            // a static DOM snapshot with no live user input.
+            PseudoClass::Hover | PseudoClass::Active | PseudoClass::Focus => false,
         }
     }
 
@@ -920,6 +951,32 @@ mod tests {
         assert_eq!(all.len(), 1, "a:has(p.bt) should match the <a>");
         let none = tree.query_selector_all("a:has(span.bt)").unwrap();
         assert_eq!(none.len(), 0, "a:has(span.bt) should match nothing");
+    }
+
+    #[test]
+    fn test_enabled_matches_form_control_without_disabled_attr() {
+        let tree = parse_html(r#"<button>Click</button><button disabled>Nope</button>"#);
+        let enabled = tree.query_selector_all("button:enabled").unwrap();
+        assert_eq!(enabled.len(), 1, ":enabled should match only the non-disabled button");
+        let disabled = tree.query_selector_all("button:disabled").unwrap();
+        assert_eq!(disabled.len(), 1, ":disabled should match only the disabled button");
+    }
+
+    #[test]
+    fn test_enabled_does_not_match_non_form_elements() {
+        // :enabled/:disabled only apply to form controls; a plain div should
+        // never match either, disabled attribute or not.
+        let tree = parse_html(r#"<div disabled>x</div>"#);
+        assert_eq!(tree.query_selector_all("div:enabled").unwrap().len(), 0);
+        assert_eq!(tree.query_selector_all("div:disabled").unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_checked_matches_checked_attribute() {
+        let tree = parse_html(
+            r#"<input type="checkbox" checked><input type="checkbox">"#,
+        );
+        assert_eq!(tree.query_selector_all("input:checked").unwrap().len(), 1);
     }
 
     #[test]
