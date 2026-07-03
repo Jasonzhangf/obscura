@@ -41,6 +41,12 @@ pub struct DomLayout {
     /// per node. `None` means unclipped. Does not include the node's own
     /// overflow (that only clips its children, not itself).
     pub clip_rects: HashMap<NodeId, Option<Rect>>,
+    /// Per-word geometry for text nodes: a text DOM node lays out as one
+    /// taffy leaf per word (see `build_text_words`), each wrapping
+    /// independently within its container, so its rendered content is a list
+    /// of (box, word text) pairs rather than a single box, unlike every other
+    /// node kind. Keyed by the text node's `NodeId`, in layout order.
+    pub text_runs: HashMap<NodeId, Vec<(Rect, String)>>,
 }
 
 /// Walk the tree top-down accumulating the clip rect imposed by ancestor
@@ -180,6 +186,7 @@ pub fn layout_dom(tree: &DomTree, viewport: (f32, f32)) -> DomLayout {
 
     let mut taffy_tree: TaffyTree = TaffyTree::new();
     let mut id_map: HashMap<taffy::NodeId, NodeId> = HashMap::new();
+    let mut words: HashMap<taffy::NodeId, (NodeId, String)> = HashMap::new();
 
     // The document node itself is not an element; lay out from the first
     // element descendant (the <html> root).
@@ -189,6 +196,7 @@ pub fn layout_dom(tree: &DomTree, viewport: (f32, f32)) -> DomLayout {
         .find(|id| tree.get_node(*id).map(|n| n.is_element()).unwrap_or(false));
 
     let mut rects = HashMap::new();
+    let mut text_runs = HashMap::new();
     if let Some(root_id) = root {
         // Top-down inheritance of the properties CSS inherits by default.
         #[derive(Clone, Default)]
@@ -211,7 +219,7 @@ pub fn layout_dom(tree: &DomTree, viewport: (f32, f32)) -> DomLayout {
 
         resolve_grid_areas(tree, root_id, &mut styles);
 
-        if let Some(taffy_root) = build(tree, root_id, &mut taffy_tree, &mut id_map, &styles) {
+        if let Some(taffy_root) = build(tree, root_id, &mut taffy_tree, &mut id_map, &mut words, &styles) {
             let _ = taffy_tree.compute_layout(
                 taffy_root,
                 taffy::Size {
@@ -219,7 +227,7 @@ pub fn layout_dom(tree: &DomTree, viewport: (f32, f32)) -> DomLayout {
                     height: taffy::AvailableSpace::Definite(viewport.1),
                 },
             );
-            compute_absolute_rects(&taffy_tree, taffy_root, 0.0, 0.0, &id_map, &mut rects);
+            compute_absolute_rects(&taffy_tree, taffy_root, 0.0, 0.0, &id_map, &words, &mut rects, &mut text_runs);
         }
     }
 
@@ -228,7 +236,7 @@ pub fn layout_dom(tree: &DomTree, viewport: (f32, f32)) -> DomLayout {
         resolve_clip_rects(tree, root_id, None, &rects, &styles, &mut clip_rects);
     }
 
-    DomLayout { rects, styles, clip_rects }
+    DomLayout { rects, styles, clip_rects, text_runs }
 }
 
 /// HTML table auto-layout approximation: for each `<tr>`, the last `<td>`/
@@ -329,27 +337,27 @@ fn compute_absolute_rects(
     abs_x: f32,
     abs_y: f32,
     id_map: &HashMap<taffy::NodeId, NodeId>,
+    words: &HashMap<taffy::NodeId, (NodeId, String)>,
     rects: &mut HashMap<NodeId, Rect>,
+    text_runs: &mut HashMap<NodeId, Vec<(Rect, String)>>,
 ) {
     if let Ok(layout) = taffy_tree.layout(taffy_id) {
         let x = abs_x + layout.location.x;
         let y = abs_y + layout.location.y;
-        
+        let rect = Rect { x, y, width: layout.size.width, height: layout.size.height };
+
         if let Some(dom_id) = id_map.get(&taffy_id) {
-            rects.insert(
-                *dom_id,
-                Rect {
-                    x,
-                    y,
-                    width: layout.size.width,
-                    height: layout.size.height,
-                },
-            );
+            rects.insert(*dom_id, rect);
         }
-        
+        // A word leaf's dom_id is its owning text node, shared by every other
+        // word from the same node, so this appends rather than overwrites.
+        if let Some((text_dom_id, word)) = words.get(&taffy_id) {
+            text_runs.entry(*text_dom_id).or_default().push((rect, word.clone()));
+        }
+
         if let Ok(children) = taffy_tree.children(taffy_id) {
             for child_id in children {
-                compute_absolute_rects(taffy_tree, child_id, x, y, id_map, rects);
+                compute_absolute_rects(taffy_tree, child_id, x, y, id_map, words, rects, text_runs);
             }
         }
     }
@@ -369,64 +377,125 @@ fn has_inline_content(tree: &DomTree, id: NodeId, styles: &HashMap<NodeId, crate
     })
 }
 
+/// Build whichever of an element or a text node `id` is, returning every
+/// taffy node it produced (usually one, but a text node fans out to one leaf
+/// per word; see `build_text_words`). Callers collecting a container's
+/// children should use this instead of calling `build` directly, so text
+/// nodes flatten into the same child list as their sibling elements rather
+/// than being skipped or nested a level deeper (either of which would break
+/// wrapping: the whole point is for words from different text nodes and
+/// inline elements to sit as flat, interleaved siblings that a flex-wrap row
+/// can break between anywhere).
+fn build_any(
+    tree: &DomTree,
+    id: NodeId,
+    taffy_tree: &mut TaffyTree,
+    id_map: &mut HashMap<taffy::NodeId, NodeId>,
+    words: &mut HashMap<taffy::NodeId, (NodeId, String)>,
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+) -> Vec<taffy::NodeId> {
+    let is_text = tree
+        .get_node(id)
+        .map(|n| matches!(n.data, obscura_dom::tree::NodeData::Text { .. }))
+        .unwrap_or(false);
+    if is_text {
+        build_text_words(tree, id, taffy_tree, styles, words)
+    } else {
+        build(tree, id, taffy_tree, id_map, words, styles).into_iter().collect()
+    }
+}
+
+/// Split a text node into one taffy leaf per word (a whitespace-delimited
+/// token, each keeping a single trailing space so adjacent words stay
+/// visually separated), so it can wrap across several lines within its
+/// container instead of being one indivisible box. A single leaf per whole
+/// text node cannot wrap internally: flex-wrap only ever breaks *between*
+/// items, so a long run of plain text with no inline elements breaking it up
+/// (a very common shape: prose without a link for several sentences) would
+/// either fit as one giant item or overflow straight past the container's
+/// edge, never wrapping onto a new line the way real text does.
+fn build_text_words(
+    tree: &DomTree,
+    id: NodeId,
+    taffy_tree: &mut TaffyTree,
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+    words: &mut HashMap<taffy::NodeId, (NodeId, String)>,
+) -> Vec<taffy::NodeId> {
+    let Some(node) = tree.get_node(id) else { return Vec::new() };
+    let obscura_dom::tree::NodeData::Text { contents } = &node.data else { return Vec::new() };
+
+    let mut display_text = String::new();
+    let mut in_space = false;
+    for c in contents.chars() {
+        if c.is_whitespace() {
+            if !in_space {
+                display_text.push(' ');
+                in_space = true;
+            }
+        } else {
+            display_text.push(c);
+            in_space = false;
+        }
+    }
+
+    let mut fsize = 16.0;
+    let mut is_bold = false;
+    if let Some(parent_id) = node.parent {
+        if let Some(p_style) = styles.get(&parent_id) {
+            fsize = p_style.font_size.unwrap_or(16.0);
+            is_bold = p_style.font_weight.as_deref() == Some("bold");
+        }
+    }
+
+    tokenize_with_spaces(&display_text)
+        .into_iter()
+        .filter_map(|token| {
+            let width = text_width(&token, fsize, is_bold);
+            // A pure-whitespace token is HTML source formatting or a bare
+            // inter-element space; it keeps its (small) width so adjacent
+            // inline content stays visually separated, but contributes no
+            // height, so it never adds a spurious blank row when it lands
+            // between block-level siblings (e.g. formatting whitespace
+            // around a run of now-collapsed, display:none list items).
+            let height = if token.trim().is_empty() { 0.0 } else { fsize * 1.2 };
+            let taffy_style = taffy::Style {
+                size: taffy::Size { width: taffy::Dimension::Length(width), height: taffy::Dimension::Length(height) },
+                ..Default::default()
+            };
+            let taffy_id = taffy_tree.new_leaf(taffy_style).ok()?;
+            words.insert(taffy_id, (id, token));
+            Some(taffy_id)
+        })
+        .collect()
+}
+
+/// Split already whitespace-collapsed text into tokens, each carrying at most
+/// one trailing space (`"Hello World "` -> `["Hello ", "World "]`), so a
+/// word's own width naturally includes the gap to the next one.
+fn tokenize_with_spaces(text: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut cur = String::new();
+    for c in text.chars() {
+        cur.push(c);
+        if c == ' ' {
+            tokens.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        tokens.push(cur);
+    }
+    tokens
+}
+
 fn build(
     tree: &DomTree,
     id: NodeId,
     taffy_tree: &mut TaffyTree,
     id_map: &mut HashMap<taffy::NodeId, NodeId>,
+    words: &mut HashMap<taffy::NodeId, (NodeId, String)>,
     styles: &HashMap<NodeId, crate::LayoutStyle>,
 ) -> Option<taffy::NodeId> {
     let node = tree.get_node(id)?;
-
-    if let obscura_dom::tree::NodeData::Text { contents } = &node.data {
-        let mut display_text = String::new();
-        let mut in_space = false;
-        for c in contents.chars() {
-            if c.is_whitespace() {
-                if !in_space {
-                    display_text.push(' ');
-                    in_space = true;
-                }
-            } else {
-                display_text.push(c);
-                in_space = false;
-            }
-        }
-
-
-        let mut fsize = 16.0;
-        let mut is_bold = false;
-        if let Some(parent_id) = node.parent {
-            if let Some(p_style) = styles.get(&parent_id) {
-                fsize = p_style.font_size.unwrap_or(16.0);
-                is_bold = p_style.font_weight.as_deref() == Some("bold");
-            }
-        }
-        
-        let width = text_width(&display_text, fsize, is_bold);
-        // A text node that is pure whitespace is almost always HTML source
-        // formatting (a newline and indentation between sibling tags), not
-        // meaningful content: real browsers collapse it away entirely. We
-        // still give it its natural (small) width, since a bare space
-        // between two inline elements ("<a>Foo</a> <a>Bar</a>") does need to
-        // keep them visually separated, but zero height, so it never adds a
-        // spurious blank row when it lands between block-level siblings
-        // (e.g. formatting whitespace around a run of now-collapsed,
-        // display:none list items).
-        let height = if contents.trim().is_empty() { 0.0 } else { fsize * 1.2 };
-
-        let taffy_style = taffy::Style {
-            size: taffy::Size {
-                width: taffy::Dimension::Length(width),
-                height: taffy::Dimension::Length(height),
-            },
-            ..Default::default()
-        };
-        let taffy_id = taffy_tree.new_leaf(taffy_style).ok()?;
-        id_map.insert(taffy_id, id);
-        return Some(taffy_id);
-    }
-
     let _name = node.as_element()?;
     let style = styles.get(&id)?;
     if style.display == crate::Display::None {
@@ -453,9 +522,9 @@ fn build(
     let dom_children = tree.children(id);
     let has_float_child = dom_children.iter().any(|&cid| styles.get(&cid).map(|s| s.float.is_some()).unwrap_or(false));
     let child_ids: Vec<taffy::NodeId> = if has_float_child {
-        build_children_with_float_zone(tree, &dom_children, taffy_tree, id_map, styles)
+        build_children_with_float_zone(tree, &dom_children, taffy_tree, id_map, words, styles)
     } else {
-        dom_children.into_iter().filter_map(|cid| build(tree, cid, taffy_tree, id_map, styles)).collect()
+        dom_children.into_iter().flat_map(|cid| build_any(tree, cid, taffy_tree, id_map, words, styles)).collect()
     };
 
     let taffy_id = if child_ids.is_empty() {
@@ -484,6 +553,7 @@ fn build_children_with_float_zone(
     dom_children: &[NodeId],
     taffy_tree: &mut TaffyTree,
     id_map: &mut HashMap<taffy::NodeId, NodeId>,
+    words: &mut HashMap<taffy::NodeId, (NodeId, String)>,
     styles: &HashMap<NodeId, crate::LayoutStyle>,
 ) -> Vec<taffy::NodeId> {
     let is_float = |cid: NodeId| styles.get(&cid).map(|s| s.float.is_some()).unwrap_or(false);
@@ -495,12 +565,12 @@ fn build_children_with_float_zone(
     };
 
     let Some(float_idx) = dom_children.iter().position(|&cid| is_float(cid)) else {
-        return dom_children.iter().filter_map(|&cid| build(tree, cid, taffy_tree, id_map, styles)).collect();
+        return dom_children.iter().flat_map(|&cid| build_any(tree, cid, taffy_tree, id_map, words, styles)).collect();
     };
 
     let mut result: Vec<taffy::NodeId> = dom_children[..float_idx]
         .iter()
-        .filter_map(|&cid| build(tree, cid, taffy_tree, id_map, styles))
+        .flat_map(|&cid| build_any(tree, cid, taffy_tree, id_map, words, styles))
         .collect();
 
     let float_side = styles.get(&dom_children[float_idx]).and_then(|s| s.float);
@@ -509,10 +579,13 @@ fn build_children_with_float_zone(
         zone_end += 1;
     }
 
-    let float_taffy = build(tree, dom_children[float_idx], taffy_tree, id_map, styles);
+    // The float itself is always an element (only elements get style
+    // entries, and `is_float` above required one), so a direct `build` call
+    // is correct here; only its flow siblings need the word-splitting `build_any`.
+    let float_taffy = build(tree, dom_children[float_idx], taffy_tree, id_map, words, styles);
     let flow_taffy: Vec<taffy::NodeId> = dom_children[float_idx + 1..zone_end]
         .iter()
-        .filter_map(|&cid| build(tree, cid, taffy_tree, id_map, styles))
+        .flat_map(|&cid| build_any(tree, cid, taffy_tree, id_map, words, styles))
         .collect();
 
     match float_taffy {
@@ -555,7 +628,7 @@ fn build_children_with_float_zone(
     result.extend(
         dom_children[zone_end..]
             .iter()
-            .filter_map(|&cid| build(tree, cid, taffy_tree, id_map, styles)),
+            .flat_map(|&cid| build_any(tree, cid, taffy_tree, id_map, words, styles)),
     );
     result
 }

@@ -34,16 +34,23 @@ const HN_HTML: &str = r##"
     </table>
 "##;
 
-fn find_by_text<'a>(
-    tree: &'a obscura_dom::tree::DomTree,
-    layout: &'a obscura_render::DomLayout,
+/// The top-left corner of a text node's overall bounding box: a text node
+/// lays out as one taffy leaf per word (see `dom::build_text_words`), so its
+/// geometry lives in `text_runs` as several (box, word) pairs rather than a
+/// single rect. `needle` is matched against the node's whole original
+/// content, not a single word.
+fn find_by_text(
+    tree: &obscura_dom::tree::DomTree,
+    layout: &obscura_render::DomLayout,
     needle: &str,
-) -> Option<(obscura_dom::tree::NodeId, &'a obscura_render::Rect)> {
-    for (id, rect) in &layout.rects {
+) -> Option<(f32, f32)> {
+    for (id, runs) in &layout.text_runs {
         if let Some(node) = tree.get_node(*id) {
             if let NodeData::Text { contents } = &node.data {
                 if contents.trim() == needle {
-                    return Some((*id, rect));
+                    let x = runs.iter().map(|(r, _)| r.x).fold(f32::INFINITY, f32::min);
+                    let y = runs.iter().map(|(r, _)| r.y).fold(f32::INFINITY, f32::min);
+                    return Some((x, y));
                 }
             }
         }
@@ -62,23 +69,50 @@ fn hn_shaped_table_lays_out_without_site_hardcoding() {
     // "Hacker News" (a bold link in the top bar) sits above the first
     // headline row ("Exapunks (2018)"): normal top-to-bottom flow, not a
     // hardcoded absolute position.
-    let (_, brand_rect) = find_by_text(&tree, &layout, "Hacker News").expect("brand text laid out");
-    let (_, headline_rect) = find_by_text(&tree, &layout, "Exapunks (2018)").expect("headline text laid out");
+    let (brand_x, brand_y) = find_by_text(&tree, &layout, "Hacker News").expect("brand text laid out");
+    let (_, headline_y) = find_by_text(&tree, &layout, "Exapunks (2018)").expect("headline text laid out");
     assert!(
-        headline_rect.y > brand_rect.y,
+        headline_y > brand_y,
         "headline should be below the header bar: brand.y={} headline.y={}",
-        brand_rect.y,
-        headline_rect.y
+        brand_y,
+        headline_y
     );
 
     // Within the header row, "login" (right-aligned cell) sits to the right
     // of "Hacker News" (left cell) — plain flex/table layout, not a magic
     // per-class x-offset.
-    let (_, login_rect) = find_by_text(&tree, &layout, "login").expect("login text laid out");
+    let (login_x, _) = find_by_text(&tree, &layout, "login").expect("login text laid out");
     assert!(
-        login_rect.x > brand_rect.x,
+        login_x > brand_x,
         "login cell should be right of the brand: brand.x={} login.x={}",
-        brand_rect.x,
-        login_rect.x
+        brand_x,
+        login_x
+    );
+}
+
+#[test]
+fn long_text_run_wraps_across_multiple_lines() {
+    // A single text node with no inline elements breaking it up must still
+    // wrap word by word within a narrow container: this is the regression
+    // case for treating a whole text node as one indivisible layout box,
+    // which cannot wrap internally and instead overflows straight past the
+    // container's edge.
+    let html = r##"<div style="width:100px">This sentence has plenty of words to wrap across several lines</div>"##;
+    let tree = parse_html(html);
+    let layout = layout_dom(&tree, (1000.0, 1000.0));
+
+    let text_id = tree
+        .descendants(tree.document())
+        .into_iter()
+        .find(|id| matches!(tree.get_node(*id).map(|n| n.data.clone()), Some(NodeData::Text { .. })))
+        .expect("text node exists");
+    let runs = layout.text_runs.get(&text_id).expect("text node has word runs");
+    assert!(runs.len() > 5, "expected the sentence to split into several word leaves, got {}", runs.len());
+
+    let distinct_y: std::collections::BTreeSet<i32> = runs.iter().map(|(r, _)| r.y.round() as i32).collect();
+    assert!(
+        distinct_y.len() > 1,
+        "words should wrap onto more than one line within a 100px-wide container, got y positions {:?}",
+        distinct_y
     );
 }

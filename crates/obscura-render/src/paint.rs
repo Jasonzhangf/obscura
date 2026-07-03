@@ -172,52 +172,29 @@ pub fn screenshot_png(tree: &DomTree, viewport: (f32, f32), base_url: Option<&st
     paint_dom(tree, viewport, base_url)?.encode_png().ok()
 }
 
+/// Paint every word of a text node at its own laid-out position. A text node
+/// lays out as one taffy leaf per word (see `dom::build_text_words`), each
+/// wrapping independently, so its content is a list of (box, word) pairs
+/// rather than one box for the whole node; color/font/clip come from the
+/// parent element and are the same for every word.
 fn paint_text_node(
     tree: &DomTree,
     nid: obscura_dom::tree::NodeId,
     laid: &crate::DomLayout,
     pixmap: &mut Pixmap,
 ) -> Option<()> {
+    let runs = laid.text_runs.get(&nid)?;
     let node = tree.get_node(nid)?;
-    let mut text_buf = String::new();
-    let text = match &node.data {
-        obscura_dom::tree::NodeData::Text { contents } => {
-            let mut in_space = false;
-            for c in contents.chars() {
-                if c.is_whitespace() {
-                    if !in_space {
-                        text_buf.push(' ');
-                        in_space = true;
-                    }
-                } else {
-                    text_buf.push(c);
-                    in_space = false;
-                }
-            }
-            if text_buf.is_empty() {
-                " "
-            } else {
-                &text_buf
-            }
-        },
-        _ => return None,
-    };
-    
     let parent = node.parent?;
     let style = laid.styles.get(&parent)?;
     let color = style.color.unwrap_or([0, 0, 0, 255]);
     let fsize = style.font_size.unwrap_or(16.0);
-    
     let is_bold = style.font_weight.as_deref() == Some("bold");
-    
-    // Get geometry of the text node itself!
-    let rect = match laid.rects.get(&nid) {
-        Some(r) => r,
-        None => return None,
-    };
-
     let clip = laid.clip_rects.get(&nid).copied().flatten();
-    draw_text(pixmap, text, rect.x, rect.y, color, fsize, is_bold, clip);
+
+    for (rect, word) in runs {
+        draw_text(pixmap, word, rect.x, rect.y, color, fsize, is_bold, clip);
+    }
     Some(())
 }
 
@@ -301,9 +278,14 @@ fn draw_text(pixmap: &mut Pixmap, text: &str, x: f32, y: f32, color: [u8; 4], si
                     }
                 }
             });
-            caret.x += scaled_font.h_advance(id);
+            // Matches measure_text's +1px-per-character bold compensation:
+            // without it, a word's reserved layout width (from measure_text)
+            // is wider than what draw_text actually advances through, and
+            // the difference shows up as a visible gap after every word once
+            // each word is its own independently-positioned box.
+            caret.x += scaled_font.h_advance(id) + if is_bold { 1.0 } else { 0.0 };
         } else {
-            caret.x += scaled_font.h_advance(id);
+            caret.x += scaled_font.h_advance(id) + if is_bold { 1.0 } else { 0.0 };
         }
     }
 }
