@@ -469,6 +469,24 @@ fn is_navigate_method(text: &str) -> bool {
         .unwrap_or(false)
 }
 
+// Parse a CDP header list (`[{"name":..,"value":..}, ..]`, as used by
+// Fetch.continueRequest / fulfillRequest) into a map. Returns None when the
+// `headers` field is absent, so the caller can leave the request's headers
+// untouched rather than clearing them.
+fn parse_cdp_headers(params: &serde_json::Value) -> Option<HashMap<String, String>> {
+    let arr = params.get("headers")?.as_array()?;
+    Some(
+        arr.iter()
+            .filter_map(|h| {
+                Some((
+                    h.get("name")?.as_str()?.to_string(),
+                    h.get("value")?.as_str()?.to_string(),
+                ))
+            })
+            .collect(),
+    )
+}
+
 fn handle_fetch_resolution(
     text: &str,
     _ctx: &mut CdpContext,
@@ -484,7 +502,14 @@ fn handle_fetch_resolution(
             tracing::info!("INTERCEPTION resolved: {}", request_id);
             let resolution = match method {
                 "Fetch.continueRequest" => obscura_js::ops::InterceptResolution::Continue {
-                    url: None, method: None, headers: None, body: None,
+                    // Honor the client's overrides (Playwright route.continue,
+                    // Puppeteer request.continue). op_fetch_url applies each and
+                    // re-validates a rewritten URL through the SSRF gate. Leaving
+                    // these None silently sent the request unmodified (issue #365).
+                    url: req.params.get("url").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    method: req.params.get("method").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    headers: parse_cdp_headers(&req.params),
+                    body: req.params.get("postData").and_then(|v| v.as_str()).map(|s| s.to_string()),
                 },
                 "Fetch.fulfillRequest" => {
                     let status = req.params.get("responseCode").and_then(|v| v.as_u64()).unwrap_or(200) as u16;
@@ -1009,7 +1034,8 @@ async fn handle_connection_ws(
 
 #[cfg(test)]
 mod tests {
-    use super::is_navigate_method;
+    use super::{is_navigate_method, parse_cdp_headers};
+    use serde_json::json;
 
     // Issue #363: only an exact Page.navigate may take the spawn-and-defer
     // navigation path. A substring match also caught Page.navigateToHistoryEntry
@@ -1035,5 +1061,27 @@ mod tests {
             r#"{"id":3,"method":"Runtime.evaluate","params":{"expression":"'Page.navigate'"}}"#
         ));
         assert!(!is_navigate_method("not json"));
+    }
+
+    // Issue #365: Fetch.continueRequest header overrides must be parsed from the
+    // CDP `[{name, value}]` list so they can be applied to the outgoing request.
+    #[test]
+    fn parse_cdp_headers_reads_name_value_pairs() {
+        let params = json!({
+            "headers": [
+                {"name": "X-A", "value": "1"},
+                {"name": "X-B", "value": "2"},
+            ]
+        });
+        let headers = parse_cdp_headers(&params).expect("headers present");
+        assert_eq!(headers.get("X-A").map(String::as_str), Some("1"));
+        assert_eq!(headers.get("X-B").map(String::as_str), Some("2"));
+    }
+
+    // No `headers` field means "leave the request's headers untouched", which is
+    // None, not an empty map that would clear them.
+    #[test]
+    fn parse_cdp_headers_absent_is_none() {
+        assert!(parse_cdp_headers(&json!({"url": "https://example.com"})).is_none());
     }
 }
