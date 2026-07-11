@@ -462,6 +462,29 @@ pub fn layout_dom_with_images(
 
         resolve_grid_areas(tree, root_id, &mut styles);
 
+        // Blockify grid items (CSS Display 3): a direct child of a grid
+        // container is blockified, so an inline `<a>`/`<time>`/`<span>` becomes
+        // a block-level grid item and lays its text out as its own box instead
+        // of being flattened into loose words in the container's cell (which
+        // shattered grid lists like jvns.ca's `.article-list{display:grid}` of
+        // alternating `<time>`/`<a>` into one word per cell). Only grid is done
+        // here, not flex: obscura also uses flex-column as the UA stand-in for
+        // block containers like `<td>`, whose inline text must stay inline.
+        let grid_parents: Vec<NodeId> = styles
+            .iter()
+            .filter(|(_, s)| s.display == crate::Display::Grid)
+            .map(|(&id, _)| id)
+            .collect();
+        for pid in grid_parents {
+            for cid in tree.children(pid) {
+                if let Some(cs) = styles.get_mut(&cid) {
+                    if cs.display == crate::Display::Inline && !cs.is_inline_block {
+                        cs.display = crate::Display::Block;
+                    }
+                }
+            }
+        }
+
         // The initial containing block is modelled by the root taffy node's
         // definite viewport height (set at build), which is what `html,body{
         // height:100%}` chains and sticky-footer app shells resolve against.
