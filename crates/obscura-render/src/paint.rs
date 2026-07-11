@@ -739,6 +739,17 @@ fn fetch_bytes(
     // or mask/background reference silently fails to fetch.
     let resolved = if src.starts_with("http://") || src.starts_with("https://") {
         Some(src.to_string())
+    } else if let Some(rest) = src.strip_prefix("//") {
+        // Protocol-relative URL (`//upload.wikimedia.org/...`, ubiquitous on
+        // Wikipedia and CDN-hosted media): inherit the document scheme, but
+        // never `file:`/other non-network schemes (a `file://` base would give
+        // `file://host/...` and fail), so default to https for those.
+        let scheme = base_url
+            .and_then(|b| url::Url::parse(b).ok())
+            .map(|u| u.scheme().to_string())
+            .filter(|s| s == "http" || s == "https")
+            .unwrap_or_else(|| "https".to_string());
+        Some(format!("{scheme}://{rest}"))
     } else {
         base_url
             .and_then(|b| url::Url::parse(b).ok())
@@ -779,12 +790,17 @@ fn http_get_bytes(url: &str) -> Option<Vec<u8>> {
                 use std::io::Read;
                 return resp.into_reader().read_to_end(&mut buf).ok().map(|_| buf);
             }
-            // 429 (rate limit) and 5xx are transient: back off and retry.
+            // 429 (rate limit) and 5xx are transient: a short backoff clears a
+            // brief blip. A sustained limit (Wikimedia 429s a 60-image burst
+            // from a datacenter IP hard, with `Retry-After: 1`) is NOT worth
+            // waiting out here: honoring the hint stalls the whole render for
+            // minutes, so fast-fail to the grey placeholder instead. Real
+            // fidelity for that case needs an HTTP/2 image client (multiplexing
+            // like Chrome), not blocking retries.
             Err(ureq::Error::Status(code, _)) if matches!(code, 429 | 500 | 502 | 503 | 504) && attempt < 2 => {
                 std::thread::sleep(backoff);
                 backoff *= 2;
             }
-            // A network/transport error is also worth one more try.
             Err(ureq::Error::Transport(_)) if attempt < 2 => {
                 std::thread::sleep(backoff);
                 backoff *= 2;
