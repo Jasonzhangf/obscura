@@ -239,6 +239,10 @@ pub struct LayoutStyle {
     /// root font-sizes. `None` when font-size was absolute or unset.
     pub font_size_raw: Option<Dimension>,
     pub font_weight: Option<String>,
+    /// The computed `font-family` list, lowercased. Inherited. The text engine
+    /// resolves it to a bundled face (Liberation Sans/Serif/Mono) the way
+    /// Chromium picks a generic family on this host.
+    pub font_family: Option<String>,
     pub align_items: Option<taffy::AlignItems>,
     pub flex_direction: Option<taffy::FlexDirection>,
     pub flex_wrap: Option<taffy::FlexWrap>,

@@ -333,6 +333,12 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
             let bold = v == "bold" || v == "bolder" || v.parse::<u32>().map(|n| n >= 600).unwrap_or(false);
             style.font_weight = Some(if bold { "bold".to_string() } else { "normal".to_string() });
         }
+        "font-family" => {
+            let v = value.trim().to_ascii_lowercase();
+            if !v.is_empty() && v != "inherit" {
+                style.font_family = Some(v);
+            }
+        }
         // Our engine has no real inline formatting context, so text-align is
         // approximated the same way as align-items: it positions a block's
         // (or column-flex's) children along the cross axis. See

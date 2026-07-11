@@ -20,15 +20,66 @@ use obscura_dom::tree::{DomTree, NodeId};
 
 use crate::{Display, LayoutStyle, Rect, TextTransform};
 
-static REGULAR: &[u8] = include_bytes!("../assets/dejavu-sans.ttf");
-static BOLD: &[u8] = include_bytes!("../assets/dejavu-sans-bold.ttf");
-static OBLIQUE: &[u8] = include_bytes!("../assets/dejavu-sans-oblique.ttf");
-static BOLD_OBLIQUE: &[u8] = include_bytes!("../assets/dejavu-sans-boldoblique.ttf");
+// Bundled faces. Chrome on this class of host renders `sans-serif` and the
+// ubiquitous Arial/Helvetica/system-ui stacks as Liberation Sans, `serif` as
+// Liberation Serif, and `monospace` as Liberation Mono. Matching those keeps
+// text metrics (advance widths, wrapping, line positions) aligned with Chromium
+// instead of drifting ~12% wider on DejaVu's wider glyphs. DejaVu Sans is kept
+// only as a last-resort fallback for glyphs the Liberation faces lack.
+static SANS_R: &[u8] = include_bytes!("../assets/liberation-sans.ttf");
+static SANS_B: &[u8] = include_bytes!("../assets/liberation-sans-bold.ttf");
+static SANS_O: &[u8] = include_bytes!("../assets/liberation-sans-oblique.ttf");
+static SANS_BO: &[u8] = include_bytes!("../assets/liberation-sans-boldoblique.ttf");
+static SERIF_R: &[u8] = include_bytes!("../assets/liberation-serif.ttf");
+static SERIF_B: &[u8] = include_bytes!("../assets/liberation-serif-bold.ttf");
+static SERIF_O: &[u8] = include_bytes!("../assets/liberation-serif-oblique.ttf");
+static SERIF_BO: &[u8] = include_bytes!("../assets/liberation-serif-boldoblique.ttf");
+static MONO_R: &[u8] = include_bytes!("../assets/liberation-mono.ttf");
+static MONO_B: &[u8] = include_bytes!("../assets/liberation-mono-bold.ttf");
+static MONO_O: &[u8] = include_bytes!("../assets/liberation-mono-oblique.ttf");
+static MONO_BO: &[u8] = include_bytes!("../assets/liberation-mono-boldoblique.ttf");
+static FALLBACK: &[u8] = include_bytes!("../assets/dejavu-sans.ttf");
 
-const FAMILY: &str = "DejaVu Sans";
-/// `line-height: normal` as a multiple of font-size. Browsers derive this
-/// from font metrics (~1.15-1.2 for DejaVu Sans); 1.2 matches closely.
-const NORMAL_LINE_HEIGHT: f32 = 1.2;
+const FAMILY: &str = "Liberation Sans";
+const SERIF_FAMILY: &str = "Liberation Serif";
+const MONO_FAMILY: &str = "Liberation Mono";
+
+/// Map a CSS `font-family` list to a bundled face the way Chromium resolves the
+/// generic families on this host: a monospace/code stack -> Liberation Mono, a
+/// serif stack -> Liberation Serif, everything else (sans-serif, Arial,
+/// Helvetica, system-ui, named sans webfonts, ...) -> Liberation Sans. The first
+/// family whose category is recognizable wins, matching CSS fallback order.
+fn resolve_font_family(fam: Option<&str>) -> &'static str {
+    let Some(f) = fam else { return FAMILY };
+    for tok in f.split(',') {
+        let t = tok.trim().trim_matches(|c| c == '"' || c == '\'').trim();
+        if t.is_empty() {
+            continue;
+        }
+        if t == "monospace" || t.contains("mono") || t.contains("courier")
+            || t.contains("consol") || t == "menlo" || t == "monaco" || t == "code"
+        {
+            return MONO_FAMILY;
+        }
+        if t == "serif" || t == "georgia" || t.contains("times") || t == "cambria"
+            || t.contains("garamond") || t.contains("liberation serif") || t == "roman"
+        {
+            return SERIF_FAMILY;
+        }
+        if t == "sans-serif" || t.contains("sans") || t == "arial" || t == "helvetica"
+            || t == "helvetica neue" || t == "system-ui" || t == "-apple-system"
+            || t == "roboto" || t == "segoe ui" || t == "inter" || t == "verdana"
+            || t == "tahoma" || t == "ui-sans-serif"
+        {
+            return FAMILY;
+        }
+        // Unrecognized named webfont: keep scanning for a generic fallback.
+    }
+    FAMILY
+}
+/// `line-height: normal` as a multiple of font-size. Browsers derive this from
+/// font metrics; ~1.15 matches Liberation Sans (the default face) closely.
+const NORMAL_LINE_HEIGHT: f32 = 1.15;
 /// Underline is flagged per glyph through cosmic-text's `metadata` field.
 const META_UNDERLINE: usize = 1;
 
@@ -68,7 +119,12 @@ impl TextEngine {
         // load_system_fonts: a host's font set would make layout differ
         // machine to machine and add a multi-millisecond startup scan.
         let mut db = cosmic_text::fontdb::Database::new();
-        for bytes in [REGULAR, BOLD, OBLIQUE, BOLD_OBLIQUE] {
+        for bytes in [
+            SANS_R, SANS_B, SANS_O, SANS_BO,
+            SERIF_R, SERIF_B, SERIF_O, SERIF_BO,
+            MONO_R, MONO_B, MONO_O, MONO_BO,
+            FALLBACK,
+        ] {
             db.load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(bytes)));
         }
         db.set_sans_serif_family(FAMILY);
@@ -111,9 +167,10 @@ impl TextEngine {
         let root_underline = base.underline.unwrap_or(false);
         let root_italic = base.font_style_italic.unwrap_or(false);
         let root_bold = base.font_weight.as_deref() == Some("bold");
+        let root_family = resolve_font_family(base.font_family.as_deref());
         let mut spans: Vec<(String, SpanAttrs)> = Vec::new();
         let mut collector = Collector { last_was_space: true };
-        let ctx = SpanCtx { color: default_color, bold: root_bold, italic: root_italic, underline: root_underline, transform: root_transform };
+        let ctx = SpanCtx { color: default_color, bold: root_bold, italic: root_italic, underline: root_underline, transform: root_transform, family: root_family };
         collect_spans(tree, id, styles, ctx, &mut spans, &mut collector);
         // Trim a single trailing space so it does not widen the last line.
         if let Some((text, _)) = spans.last_mut() {
@@ -200,11 +257,12 @@ struct SpanAttrs {
     italic: bool,
     underline: bool,
     color: [u8; 4],
+    family: &'static str,
 }
 
 impl SpanAttrs {
     fn to_attrs(&self) -> Attrs<'_> {
-        let mut a = Attrs::new().family(Family::Name(FAMILY));
+        let mut a = Attrs::new().family(Family::Name(self.family));
         a = a.weight(if self.bold { Weight::BOLD } else { Weight::NORMAL });
         a = a.style(if self.italic { Style::Italic } else { Style::Normal });
         a = a.color(Color::rgba(self.color[0], self.color[1], self.color[2], self.color[3]));
@@ -223,6 +281,7 @@ struct SpanCtx {
     italic: bool,
     underline: bool,
     transform: TextTransform,
+    family: &'static str,
 }
 
 struct Collector {
@@ -246,7 +305,7 @@ fn collect_spans(
         let Some(node) = tree.get_node(cid) else { continue };
         match &node.data {
             obscura_dom::tree::NodeData::Text { contents } => {
-                let attrs = SpanAttrs { bold: ctx.bold, italic: ctx.italic, underline: ctx.underline, color: ctx.color };
+                let attrs = SpanAttrs { bold: ctx.bold, italic: ctx.italic, underline: ctx.underline, color: ctx.color, family: ctx.family };
                 push_text(contents, ctx.transform, &attrs, out, c);
             }
             _ => {
@@ -256,7 +315,7 @@ fn collect_spans(
                     continue;
                 }
                 if elem.local.as_ref() == "br" {
-                    out.push(("\n".to_string(), SpanAttrs { bold: ctx.bold, italic: ctx.italic, underline: ctx.underline, color: ctx.color }));
+                    out.push(("\n".to_string(), SpanAttrs { bold: ctx.bold, italic: ctx.italic, underline: ctx.underline, color: ctx.color, family: ctx.family }));
                     c.last_was_space = true;
                     continue;
                 }
@@ -268,6 +327,10 @@ fn collect_spans(
                     // descendant text; an element only sets its own via CSS.
                     underline: ctx.underline || style.and_then(|s| s.underline).unwrap_or(false),
                     transform: style.and_then(|s| s.text_transform).unwrap_or(ctx.transform),
+                    family: style
+                        .and_then(|s| s.font_family.as_deref())
+                        .map(|f| resolve_font_family(Some(f)))
+                        .unwrap_or(ctx.family),
                 };
                 collect_spans(tree, cid, styles, child, out, c);
             }

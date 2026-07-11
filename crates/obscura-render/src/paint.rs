@@ -9,7 +9,7 @@ use obscura_dom::tree::DomTree;
 use tiny_skia::{Color, FillRule, GradientStop, LinearGradient, Paint, PathBuilder, Pixmap, Point, Rect, SpreadMode, Transform};
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
 
-static FONT_BYTES: &[u8] = include_bytes!("../assets/dejavu-sans.ttf");
+static FONT_BYTES: &[u8] = include_bytes!("../assets/liberation-sans.ttf");
 
 use crate::layout_dom_with_images;
 

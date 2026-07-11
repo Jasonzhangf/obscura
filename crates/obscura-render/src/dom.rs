@@ -309,6 +309,7 @@ pub fn layout_dom_with_images(
             color: Option<[u8; 4]>,
             font_size: Option<f32>,
             font_weight: Option<String>,
+            font_family: Option<String>,
             visibility_hidden: bool,
             opacity_product: f32,
             list_style: crate::ListStyle,
@@ -328,6 +329,7 @@ pub fn layout_dom_with_images(
                     color: None,
                     font_size: None,
                     font_weight: None,
+                    font_family: None,
                     visibility_hidden: false,
                     opacity_product: 1.0,
                     // CSS initial value of list-style-type.
@@ -400,6 +402,7 @@ pub fn layout_dom_with_images(
                     }
                 }
                 match &style.font_weight { Some(w) => inh.font_weight = Some(w.clone()), None => style.font_weight = inh.font_weight.clone() }
+                match &style.font_family { Some(f) => inh.font_family = Some(f.clone()), None => style.font_family = inh.font_family.clone() }
                 inh.visibility_hidden = style.visibility_hidden.unwrap_or(inh.visibility_hidden);
                 inh.opacity_product *= style.opacity.unwrap_or(1.0);
                 style.effectively_invisible = inh.visibility_hidden || inh.opacity_product < 0.02;
