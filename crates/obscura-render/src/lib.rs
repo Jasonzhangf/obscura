@@ -20,12 +20,39 @@ pub mod style;
 pub use style::compute_style;
 
 pub mod dom;
-pub use dom::{layout_dom, DomLayout};
+pub use dom::{layout_dom, layout_dom_with_images, DomLayout};
 
 #[cfg(feature = "paint")]
 mod paint;
 #[cfg(feature = "paint")]
 pub use paint::{paint_dom, screenshot_png};
+
+// Real inline text layout (cosmic-text) lives behind the paint feature; the
+// layout-only build keeps the lighter word-split geometry. The stub lets
+// `dom.rs` name `inline::TextEngine` and call `try_build` unconditionally.
+#[cfg(feature = "paint")]
+pub mod inline;
+
+#[cfg(not(feature = "paint"))]
+pub mod inline {
+    use obscura_dom::tree::{DomTree, NodeId};
+    use std::collections::HashMap;
+
+    #[derive(Default)]
+    pub struct TextEngine;
+
+    impl TextEngine {
+        pub fn new() -> Self {
+            TextEngine
+        }
+        /// Layout-only builds have no shaper, so no container is ever treated
+        /// as a cosmic-text inline formatting context: the word-split path
+        /// handles text geometry for `getBoundingClientRect`.
+        pub fn try_build(&mut self, _tree: &DomTree, _id: NodeId, _styles: &HashMap<NodeId, crate::LayoutStyle>) -> Option<usize> {
+            None
+        }
+    }
+}
 
 /// An axis-aligned rectangle in CSS pixels, relative to the containing block.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -50,6 +77,16 @@ impl Rect {
         } else {
             None
         }
+    }
+
+    /// The smallest rect covering both. Used to derive a table row/section box
+    /// from its cells, since `<tr>`/`<tbody>` are not laid out as taffy boxes.
+    pub fn union(&self, other: &Rect) -> Rect {
+        let x0 = self.x.min(other.x);
+        let y0 = self.y.min(other.y);
+        let x1 = (self.x + self.width).max(other.x + other.width);
+        let y1 = (self.y + self.height).max(other.y + other.height);
+        Rect { x: x0, y: y0, width: x1 - x0, height: y1 - y0 }
     }
 }
 
@@ -80,7 +117,37 @@ pub enum Dimension {
     #[default]
     Auto,
     Px(f32),
+    /// 0.0-1.0 fraction of the containing block.
     Percent(f32),
+    /// Font-relative and viewport-relative units, kept unresolved at parse
+    /// time (the element font-size and viewport are not known then) and
+    /// resolved to `Px` during `dom::layout_dom`'s top-down pass via
+    /// [`Dimension::resolve`]. Resolving em/rem/vw against a hardcoded 16px at
+    /// parse time (the old behavior) silently corrupted every relative length.
+    Em(f32),
+    Rem(f32),
+    Vw(f32),
+    Vh(f32),
+    Vmin(f32),
+    Vmax(f32),
+}
+
+impl Dimension {
+    /// Resolve font/viewport-relative units to `Px`. `em_px` is the element's
+    /// own font-size, `rem_px` the root's, and `vw`/`vh` are one hundredth of
+    /// the viewport width/height. `Px`, `Percent`, and `Auto` pass through
+    /// (`Percent` stays for taffy to resolve against the containing block).
+    pub fn resolve(self, em_px: f32, rem_px: f32, vw: f32, vh: f32) -> Dimension {
+        match self {
+            Dimension::Em(v) => Dimension::Px(v * em_px),
+            Dimension::Rem(v) => Dimension::Px(v * rem_px),
+            Dimension::Vw(v) => Dimension::Px(v * vw),
+            Dimension::Vh(v) => Dimension::Px(v * vh),
+            Dimension::Vmin(v) => Dimension::Px(v * vw.min(vh)),
+            Dimension::Vmax(v) => Dimension::Px(v * vw.max(vh)),
+            other => other,
+        }
+    }
 }
 
 /// The subset of CSS that influences box layout. Expanded in later phases.
@@ -89,15 +156,38 @@ pub struct LayoutStyle {
     pub display: Display,
     pub width: Dimension,
     pub height: Dimension,
+    /// Whether `width`/`height` was set by an author rule (including an explicit
+    /// `auto`). Presentational `width`/`height` HTML attributes are a lower
+    /// priority than author CSS, so they apply only when these are false; an
+    /// explicit `width:auto` must still suppress a `width="408"` attribute so
+    /// the element keeps its aspect-ratio size instead of the intrinsic one.
+    pub width_set: bool,
+    pub height_set: bool,
     pub min_width: Dimension,
     pub min_height: Dimension,
     pub max_width: Dimension,
     pub max_height: Dimension,
+    /// `aspect-ratio` as width/height, or an image's intrinsic ratio resolved
+    /// at layout. Lets a replaced element (or a padding-box card) derive the
+    /// missing dimension from the given one, so a `width:100%` image gets a
+    /// real height instead of collapsing to zero.
+    pub aspect_ratio: Option<f32>,
     pub margin: Edges,
+    /// Which margin sides are `auto` (top, right, bottom, left). `margin: 0
+    /// auto` / `margin-inline: auto` centering needs a real Auto margin, which
+    /// the f32 `margin` cannot express; this flag drives it at taffy mapping.
+    pub margin_auto: [bool; 4],
     pub padding: Edges,
     pub border: Edges,
+    /// `border-radius` (uniform; the first value of the shorthand). Rounds the
+    /// background fill and border. In px after resolution.
+    pub border_radius: f32,
     /// RGBA for the paint step. Parsed always (cheap), used only with `paint`.
     pub background_color: Option<[u8; 4]>,
+    /// `linear-gradient(...)` background: (angle in degrees clockwise from 12
+    /// o'clock per CSS, list of (rgba, optional 0..1 stop position)). Modern
+    /// hero sections use gradients heavily; without this they paint white.
+    pub background_gradient: Option<(f32, Vec<([u8; 4], Option<f32>)>)>,
     /// The first `url(...)` reference from `background`/`background-image`
     /// (gradients and repeat keywords in the same shorthand are ignored: we
     /// paint the referenced image, not the gradient layer).
@@ -122,6 +212,10 @@ pub struct LayoutStyle {
     pub color: Option<[u8; 4]>,
     pub border_color: Option<[u8; 4]>,
     pub font_size: Option<f32>,
+    /// `font-size` given in a font/viewport-relative unit, resolved to
+    /// `font_size` (px) during the inheritance pass against the parent and
+    /// root font-sizes. `None` when font-size was absolute or unset.
+    pub font_size_raw: Option<Dimension>,
     pub font_weight: Option<String>,
     pub align_items: Option<taffy::AlignItems>,
     pub flex_direction: Option<taffy::FlexDirection>,
@@ -129,6 +223,10 @@ pub struct LayoutStyle {
     pub justify_content: Option<taffy::JustifyContent>,
     pub flex_grow: Option<f32>,
     pub flex_shrink: Option<f32>,
+    /// `flex-basis` (longhand, or the length in a `flex:` shorthand). `Auto`
+    /// is the default. Fixed-basis sidebars/columns (`flex: 0 0 260px`)
+    /// collapse to content width without it.
+    pub flex_basis: Dimension,
 
     // CSS Grid. Tracks are stored as taffy sizing functions; `grid_areas` is the
     // parsed `grid-template-areas` matrix (one Vec per row, `.` for a null cell),
@@ -139,12 +237,31 @@ pub struct LayoutStyle {
     pub grid_area_name: Option<String>,
     pub grid_column: Option<taffy::Line<taffy::GridPlacement>>,
     pub grid_row: Option<taffy::Line<taffy::GridPlacement>>,
+    /// `[line-name]` -> 1-based grid line number, parsed from
+    /// `grid-template-columns`/`-rows`. taffy has no native named-line support,
+    /// so children placed by name (`grid-column: content-start / content-end`,
+    /// widely used by the Guardian and other editorial grids) are resolved to
+    /// numeric lines against these maps in `dom::resolve_grid_areas`.
+    pub grid_col_line_names: Option<std::collections::HashMap<String, i16>>,
+    pub grid_row_line_names: Option<std::collections::HashMap<String, i16>>,
+    /// Raw `grid-column`/`grid-row` value when it references a named line (so it
+    /// cannot be resolved to a `taffy::Line` until the parent's line-name map is
+    /// known). Resolved in the same later pass; numeric/`span` values still fill
+    /// `grid_column`/`grid_row` directly at cascade time.
+    pub grid_column_raw: Option<String>,
+    pub grid_row_raw: Option<String>,
     pub column_gap: Option<f32>,
     pub row_gap: Option<f32>,
 
+    /// `border-spacing: <horizontal> <vertical>?` (or the `cellspacing`
+    /// attribute). Only meaningful on a `<table>`; taffy has no native table
+    /// display mode, so `dom::propagate_border_spacing` distributes this down
+    /// as the table's own row gap and each descendant `<tr>`'s column gap.
+    pub border_spacing: Option<(f32, f32)>,
+
     // Positioning. `position: absolute|fixed` takes the box out of normal flow.
     pub position: Option<taffy::Position>,
-    pub inset: [Option<f32>; 4], // top, right, bottom, left
+    pub inset: [Option<Dimension>; 4], // top, right, bottom, left
 
     /// `overflow`/-x/-y other than `visible`: clips this element's descendants
     /// to its border box during paint. This is what makes the ubiquitous
@@ -157,12 +274,111 @@ pub struct LayoutStyle {
     /// float's shape, which taffy's block/flex/grid modes do not do; see
     /// `dom::group_float_zone` for the bounded approximation this drives.
     pub float: Option<Float>,
+
+    /// `visibility: hidden|visible`, own value. `None` means "inherit the
+    /// ancestor's computed value" (visibility, unlike most box properties, is
+    /// a real inherited CSS property). Resolved into `effectively_invisible`
+    /// during `dom::layout_dom`'s inheritance pass.
+    pub visibility_hidden: Option<bool>,
+    /// `opacity`, own (non-inherited) value in 0.0-1.0. `None` means the
+    /// default of 1.0.
+    pub opacity: Option<f32>,
+    /// Resolved during the inheritance pass: true when this element should
+    /// not be painted at all, either from its own or an inherited
+    /// `visibility: hidden`, or because the product of its own and every
+    /// ancestor's `opacity` has collapsed to (near) zero. Real `opacity`
+    /// composites as translucent groups, which our paint step does not do;
+    /// collapsing it to a binary paint/don't-paint decision is enough to
+    /// make the extremely common "opacity:0 + visibility:hidden" collapsed
+    /// dropdown/panel pattern actually invisible, without needing full alpha
+    /// compositing.
+    pub effectively_invisible: bool,
+
+    /// Literal text injected by a `::before`/`::after` rule with a plain
+    /// string-literal `content` (see `css::Stylesheet::pseudo_content`).
+    /// Rendered as an extra word-run at the start/end of this element's
+    /// children, same as if it were real text content.
+    pub before_content: Option<String>,
+    pub after_content: Option<String>,
+
+    /// True for `inline-block`/`inline-flex`/`inline-grid`: participates in
+    /// the surrounding inline flow from the outside, like plain `inline`
+    /// (both currently collapse to `Display::Inline` — this engine has no
+    /// separate inline-block layout mode), but unlike plain `inline` it must
+    /// stay a single atomic box rather than have its own content merge into
+    /// the parent's line-breaking. `dom::is_flattenable_inline` uses this to
+    /// avoid flattening these away: doing so would lose the element as its
+    /// own box (including any `::before`/`::after` content attached to it).
+    pub is_inline_block: bool,
+
+    /// `display: contents`: the element generates no box of its own; its
+    /// children participate in the parent's formatting context directly
+    /// (`dom::build_any` splices them into the parent's child list). Kept as a
+    /// flag beside `display` because the element still carries inherited styles
+    /// for its subtree and `display:none` must still win.
+    pub display_contents: bool,
+
+    /// `list-style-type` (or the `list-style` shorthand). Inherited, like in
+    /// real CSS; `None` means "not set on this element, inherit". Resolved to
+    /// a concrete value during the inheritance pass. Only `<li>` elements draw
+    /// a marker from it, but it is carried on every element because it
+    /// inherits (a `list-style: none` on a `<ul>` must reach its `<li>`
+    /// children, which is how nav menus suppress bullets).
+    pub list_style: Option<ListStyle>,
+
+    /// `line-height`. Inherited. `None` means "not set, inherit"; resolved to
+    /// a concrete value in the inheritance pass. Drives the vertical rhythm of
+    /// shaped text (a fixed ratio made real-site prose noticeably tighter than
+    /// Chromium).
+    pub line_height: Option<LineHeight>,
+
+    /// `text-transform`. Inherited. Applied to span text before shaping.
+    pub text_transform: Option<TextTransform>,
+
+    /// `text-decoration-line: underline` (or the `text-decoration` shorthand).
+    /// Not inherited in CSS, but a decoration visually covers descendant inline
+    /// text, so it is propagated into the shaped spans of the element's subtree
+    /// (this is what underlines links, which are underlined by UA default).
+    pub underline: Option<bool>,
+
+    /// `font-style: italic|oblique`. Inherited. Selects the oblique face when
+    /// shaping (we embed the DejaVu Sans oblique/bold-oblique faces). `None`
+    /// means inherit.
+    pub font_style_italic: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Float {
     Left,
     Right,
+}
+
+/// `line-height`: `normal` (a font-relative default), a unitless multiple of
+/// font-size, or an absolute pixel length.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LineHeight {
+    Normal,
+    Ratio(f32),
+    Px(f32),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextTransform {
+    None,
+    Uppercase,
+    Lowercase,
+    Capitalize,
+}
+
+/// `list-style-type` values we render a marker for. `Decimal` numbers the
+/// item by its position among sibling list items.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListStyle {
+    None,
+    Disc,
+    Circle,
+    Square,
+    Decimal,
 }
 
 /// A node in the input layout tree. `text` is carried for the paint phase; it
@@ -245,7 +461,7 @@ pub(crate) fn to_taffy_style(style: &LayoutStyle) -> Style {
     // column, matching the same column-flex approximation already used for
     // elements like <td> and <center>.
     let promote_for_alignment = style.display == Display::Block
-        && matches!(style.align_items, Some(taffy::AlignItems::Center) | Some(taffy::AlignItems::FlexEnd));
+        && matches!(style.align_items, Some(taffy::AlignItems::CENTER) | Some(taffy::AlignItems::FLEX_END));
 
     s.display = match style.display {
         Display::Block if promote_for_alignment => taffy::style::Display::Flex,
@@ -273,6 +489,16 @@ pub(crate) fn to_taffy_style(style: &LayoutStyle) -> Style {
         width: dimension(style.width),
         height: dimension(style.height),
     };
+    // Tell taffy's own layout algorithm about `overflow: hidden`, not just our
+    // paint-time clip rects: per spec, a flex/grid item's automatic minimum
+    // size is content-based only when its overflow is `visible`, and `0`
+    // otherwise. Without this, an explicit `height: 0; overflow: hidden`
+    // element (the common collapsed-dropdown-panel pattern: hidden until a
+    // sibling checkbox is checked) still grows to fit its content, since
+    // taffy has no way to know it should not.
+    if style.overflow_hidden {
+        s.overflow = taffy::Point { x: taffy::style::Overflow::Hidden, y: taffy::style::Overflow::Hidden };
+    }
     s.min_size = taffy::Size {
         width: dimension(style.min_width),
         height: dimension(style.min_height),
@@ -281,6 +507,11 @@ pub(crate) fn to_taffy_style(style: &LayoutStyle) -> Style {
         width: dimension(style.max_width),
         height: dimension(style.max_height),
     };
+    if let Some(ar) = style.aspect_ratio {
+        if ar.is_finite() && ar > 0.0 {
+            s.aspect_ratio = Some(ar);
+        }
+    }
     if let Some(ai) = style.align_items {
         s.align_items = Some(ai);
     }
@@ -293,29 +524,50 @@ pub(crate) fn to_taffy_style(style: &LayoutStyle) -> Style {
     if let Some(fs) = style.flex_shrink {
         s.flex_shrink = fs;
     }
+    if style.flex_basis != Dimension::Auto {
+        s.flex_basis = dimension(style.flex_basis);
+    }
 
-    // Grid container tracks and gaps.
+    // Grid container tracks and gaps. obscura expands `repeat()` itself during
+    // parsing, so every stored track is a single (non-repeated) `MinMax`; wrap
+    // each as a `GridTemplateComponent::Single` for taffy 0.12. The 0.7-era
+    // fr->Auto row workaround (which stopped `minmax(0,1fr)` image rows from
+    // collapsing to a sliver) is gone: taffy 0.12 treats an in-flow child's
+    // vertical available space as indefinite, so fr rows of an auto-height grid
+    // size to their content the way real CSS does.
     if style.display == Display::Grid {
         if !style.grid_template_columns.is_empty() {
-            s.grid_template_columns = style.grid_template_columns.clone();
+            s.grid_template_columns = style
+                .grid_template_columns
+                .iter()
+                .cloned()
+                .map(taffy::GridTemplateComponent::Single)
+                .collect();
         }
         if !style.grid_template_rows.is_empty() {
-            s.grid_template_rows = style.grid_template_rows.clone();
+            s.grid_template_rows = style
+                .grid_template_rows
+                .iter()
+                .cloned()
+                .map(taffy::GridTemplateComponent::Single)
+                .collect();
         }
     }
     let cg = style.column_gap.unwrap_or(0.0);
     let rg = style.row_gap.unwrap_or(0.0);
     s.gap = taffy::Size {
-        width: taffy::style::LengthPercentage::Length(cg),
-        height: taffy::style::LengthPercentage::Length(rg),
+        width: taffy::style::LengthPercentage::length(cg),
+        height: taffy::style::LengthPercentage::length(rg),
     };
 
     // Grid item placement (resolved from grid-area names or explicit lines).
-    if let Some(gc) = style.grid_column {
-        s.grid_column = gc;
+    // `GridPlacement` is no longer `Copy` in taffy 0.12 (it can carry a named
+    // line), so clone out of the borrowed style.
+    if let Some(gc) = &style.grid_column {
+        s.grid_column = gc.clone();
     }
-    if let Some(gr) = style.grid_row {
-        s.grid_row = gr;
+    if let Some(gr) = &style.grid_row {
+        s.grid_row = gr.clone();
     }
 
     // Positioning. Absolute/fixed take the box out of flow.
@@ -329,42 +581,58 @@ pub(crate) fn to_taffy_style(style: &LayoutStyle) -> Style {
         };
     }
 
-    s.margin = rect_auto(style.margin);
+    s.margin = rect_auto(style.margin, style.margin_auto);
     s.padding = rect_lp(style.padding);
     s.border = rect_lp(style.border);
     s
 }
 
-fn inset_lpa(v: Option<f32>) -> taffy::style::LengthPercentageAuto {
+fn inset_lpa(v: Option<Dimension>) -> taffy::style::LengthPercentageAuto {
     match v {
-        Some(px) => taffy::style::LengthPercentageAuto::Length(px),
-        None => taffy::style::LengthPercentageAuto::Auto,
+        Some(Dimension::Px(px)) => taffy::style::LengthPercentageAuto::length(px),
+        Some(Dimension::Percent(p)) => taffy::style::LengthPercentageAuto::percent(p),
+        // Relative units are resolved to Px before layout; unresolved leftovers
+        // and `auto`/absent both map to Auto.
+        _ => taffy::style::LengthPercentageAuto::auto(),
     }
 }
 
 fn dimension(v: Dimension) -> taffy::style::Dimension {
     match v {
-        Dimension::Px(px) => taffy::style::Dimension::Length(px),
-        Dimension::Percent(p) => taffy::style::Dimension::Percent(p),
-        Dimension::Auto => taffy::style::Dimension::Auto,
+        Dimension::Px(px) => taffy::style::Dimension::length(px),
+        Dimension::Percent(p) => taffy::style::Dimension::percent(p),
+        Dimension::Auto => taffy::style::Dimension::auto(),
+        // Relative units are resolved to Px before layout; if one slips
+        // through unresolved, fall back to its raw magnitude (em/rem ~16px)
+        // rather than panicking.
+        Dimension::Em(v) | Dimension::Rem(v) => taffy::style::Dimension::length(v * 16.0),
+        Dimension::Vw(v) | Dimension::Vh(v) | Dimension::Vmin(v) | Dimension::Vmax(v) => taffy::style::Dimension::length(v),
     }
 }
 
 fn rect_lp(e: Edges) -> taffy::Rect<taffy::style::LengthPercentage> {
     taffy::Rect {
-        top: taffy::style::LengthPercentage::Length(e.top),
-        right: taffy::style::LengthPercentage::Length(e.right),
-        bottom: taffy::style::LengthPercentage::Length(e.bottom),
-        left: taffy::style::LengthPercentage::Length(e.left),
+        top: taffy::style::LengthPercentage::length(e.top),
+        right: taffy::style::LengthPercentage::length(e.right),
+        bottom: taffy::style::LengthPercentage::length(e.bottom),
+        left: taffy::style::LengthPercentage::length(e.left),
     }
 }
 
-fn rect_auto(e: Edges) -> taffy::Rect<taffy::style::LengthPercentageAuto> {
+fn rect_auto(e: Edges, auto: [bool; 4]) -> taffy::Rect<taffy::style::LengthPercentageAuto> {
+    // NOTE: `margin: auto` is parsed (see `margin_auto`) but intentionally not
+    // emitted as taffy `Auto` yet. In our architecture most text containers are
+    // promoted to synthetic flex rows for inline layout, and an auto margin in
+    // a flex row absorbs the row's free space and flings a wide child far to
+    // one side (it mangled Wikipedia taxobox timelines). Honoring auto-margin
+    // centering safely needs a real block formatting context; treat as 0 (the
+    // element's normal-flow position) until then.
+    let _ = auto;
     taffy::Rect {
-        top: taffy::style::LengthPercentageAuto::Length(e.top),
-        right: taffy::style::LengthPercentageAuto::Length(e.right),
-        bottom: taffy::style::LengthPercentageAuto::Length(e.bottom),
-        left: taffy::style::LengthPercentageAuto::Length(e.left),
+        top: taffy::style::LengthPercentageAuto::length(e.top),
+        right: taffy::style::LengthPercentageAuto::length(e.right),
+        bottom: taffy::style::LengthPercentageAuto::length(e.bottom),
+        left: taffy::style::LengthPercentageAuto::length(e.left),
     }
 }
 

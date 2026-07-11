@@ -659,7 +659,11 @@ async fn run_fetch(
         #[cfg(feature = "render")]
         {
             // Default CSS-pixel viewport, matching the engine's innerWidth/Height.
-            match page.screenshot((1280.0, 720.0)) {
+            // OBSCURA_SHOT_W / OBSCURA_SHOT_H override it (e.g. a tall viewport to
+            // capture below-the-fold content in one shot).
+            let shot_w = std::env::var("OBSCURA_SHOT_W").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(1280.0);
+            let shot_h = std::env::var("OBSCURA_SHOT_H").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(720.0);
+            match page.screenshot((shot_w, shot_h)) {
                 Some(bytes) => std::fs::write(path, &bytes)?,
                 None => anyhow::bail!("screenshot failed: page has no DOM to render"),
             }
@@ -1819,6 +1823,7 @@ mod tests {
             quiet: true,
             output: None,
             storage_dir: None,
+            screenshot: None,
         });
         assert!(is_quiet_command(&cmd));
     }

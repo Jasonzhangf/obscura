@@ -655,9 +655,10 @@ mod tests {
             !err.contains("Unknown Page method"),
             "captureScreenshot must NOT fall through to the catch-all: {err}"
         );
+        #[cfg(not(feature = "render"))]
         assert!(
-            err.contains("not supported by Obscura"),
-            "error must clearly state screenshot is unsupported: {err}"
+            err.contains("requires a build with the render feature"),
+            "error must clearly state screenshot needs the render feature: {err}"
         );
         // Same for the MHTML snapshot sibling method.
         let err2 = handle("captureSnapshot", &json!({}), &mut ctx, &None)

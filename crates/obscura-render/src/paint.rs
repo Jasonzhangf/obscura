@@ -6,12 +6,12 @@
 //! dependencies, so a screenshot is reproducible across hosts.
 
 use obscura_dom::tree::DomTree;
-use tiny_skia::{Color, FillRule, Paint, PathBuilder, Pixmap, Rect, Transform};
+use tiny_skia::{Color, FillRule, GradientStop, LinearGradient, Paint, PathBuilder, Pixmap, Point, Rect, SpreadMode, Transform};
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
 
 static FONT_BYTES: &[u8] = include_bytes!("../assets/dejavu-sans.ttf");
 
-use crate::layout_dom;
+use crate::layout_dom_with_images;
 
 /// Render `tree` at `viewport` (width, height) in CSS pixels to a Pixmap, or
 /// None if the viewport is zero-sized. `base_url`, when given, resolves the
@@ -23,12 +23,17 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
     let mut pixmap = Pixmap::new(w, h)?;
     pixmap.fill(Color::WHITE);
 
-    let laid = layout_dom(tree, viewport);
     // The same URL (an icon sprite, a repeated background image) commonly
     // backs many elements on one page; fetch each distinct URL at most once
     // per screenshot. `None` caches a failed fetch too, so a broken image
     // reference does not retry on every element that references it.
     let mut image_cache: std::collections::HashMap<String, Option<Vec<u8>>> = std::collections::HashMap::new();
+    // Fetch <img> bytes up front to learn intrinsic sizes for layout (a
+    // CSS-sized image with no width/height attribute would otherwise be 0x0
+    // and never paint). This seeds the same cache the paint pass reads, so
+    // each URL is still fetched at most once.
+    let intrinsic = collect_image_intrinsics(tree, base_url, &mut image_cache);
+    let mut laid = layout_dom_with_images(tree, viewport, &intrinsic);
     // Tree order so later elements paint over earlier ones (normal flow).
     for nid in tree.descendants(tree.document()) {
         let node = match tree.get_node(nid) {
@@ -55,6 +60,10 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
             None => continue,
         };
 
+        if style.effectively_invisible {
+            continue;
+        }
+
         // Ancestor `overflow: hidden` clip, if any. Skip painting entirely
         // once the box has no visible overlap with it (this is what makes the
         // ubiquitous 1x1 clipped "visually hidden" accessibility pattern
@@ -72,17 +81,32 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
             None => continue,
         };
 
-        // A masked element's background-color is the mask's fill color, not
-        // an ordinary box background: it must only show through the mask
-        // shape (painted below), not as a solid rect behind it.
-        if let (Some(bg), None) = (style.background_color, &style.mask_image) {
-            let mut path = PathBuilder::new();
-            path.push_rect(box_rect);
-            if let Some(path) = path.finish() {
-                let mut paint = Paint::default();
-                paint.set_color(Color::from_rgba8(bg[0], bg[1], bg[2], bg[3]));
-                paint.anti_alias = false;
-                pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+        // Box path (rounded if border-radius), reused for gradient/color fill.
+        let r = style.border_radius;
+        let bg_path = || if r > 0.5 {
+            rounded_rect_path(visible_rect.x, visible_rect.y, visible_rect.width, visible_rect.height, r)
+        } else {
+            let mut pb = PathBuilder::new();
+            pb.push_rect(box_rect);
+            pb.finish()
+        };
+        // A linear-gradient background (heavily used by modern hero sections);
+        // without this it paints white. Takes precedence over a solid color.
+        if style.mask_image.is_none() {
+            if let Some((angle, stops)) = &style.background_gradient {
+                if let Some(path) = bg_path() {
+                    paint_linear_gradient(&mut pixmap, &path, &visible_rect, *angle, stops);
+                }
+            } else if let Some(bg) = style.background_color {
+                // A masked element's background-color is the mask's fill color,
+                // not an ordinary box background (handled below), so this only
+                // runs for unmasked boxes.
+                if let Some(path) = bg_path() {
+                    let mut paint = Paint::default();
+                    paint.set_color(Color::from_rgba8(bg[0], bg[1], bg[2], bg[3]));
+                    paint.anti_alias = r > 0.5;
+                    pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+                }
             }
         }
 
@@ -116,7 +140,23 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
             }
         }
 
-        if style.border.top > 0.0 || style.border.right > 0.0 || style.border.bottom > 0.0 || style.border.left > 0.0 {
+        // Rounded, uniform border: stroke the rounded-rect outline instead of
+        // four sharp edge rects.
+        let uniform_border = style.border.top == style.border.right
+            && style.border.right == style.border.bottom
+            && style.border.bottom == style.border.left
+            && style.border.top > 0.0;
+        if style.border_radius > 0.5 && uniform_border {
+            let bc = style.border_color.or(style.color).unwrap_or([0, 0, 0, 255]);
+            let w = style.border.top;
+            if let Some(path) = rounded_rect_path(rect.x + w / 2.0, rect.y + w / 2.0, rect.width - w, rect.height - w, (style.border_radius - w / 2.0).max(0.0)) {
+                let mut paint = Paint::default();
+                paint.set_color(Color::from_rgba8(bc[0], bc[1], bc[2], bc[3]));
+                paint.anti_alias = true;
+                let stroke = tiny_skia::Stroke { width: w, ..Default::default() };
+                pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+            }
+        } else if style.border.top > 0.0 || style.border.right > 0.0 || style.border.bottom > 0.0 || style.border.left > 0.0 {
             let bc = style.border_color.or(style.color).unwrap_or([0, 0, 0, 255]);
             let mut paint = Paint::default();
             paint.set_color(Color::from_rgba8(bc[0], bc[1], bc[2], bc[3]));
@@ -150,10 +190,20 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
         }
 
         if name.local.as_ref() == "img" {
-            if let Some(src) = node.get_attribute("src") {
-                let painted = paint_image(src, base_url, &rect, &mut pixmap, &mut image_cache);
+            if let Some(src) = resolve_img_url(tree, nid) {
+                let painted = paint_image(&src, base_url, &rect, &mut pixmap, &mut image_cache);
                 // Fall back to alt text only when the image itself did not paint.
                 if !painted {
+                    // A fetch/decode failure paints a neutral grey box (like a
+                    // browser's lazy/broken-image placeholder) so a missing
+                    // image reads as "not loaded", not as a broken render.
+                    // box_rect/visible_rect are already clip-intersected, so
+                    // this never paints outside an overflow:hidden clip.
+                    if visible_rect.width >= 4.0 && visible_rect.height >= 4.0 {
+                        let mut ph = Paint::default();
+                        ph.set_color(Color::from_rgba8(0xE9, 0xEA, 0xEC, 0xFF));
+                        pixmap.fill_rect(box_rect, &ph, Transform::identity(), None);
+                    }
                     if let Some(alt) = node.get_attribute("alt") {
                         if !alt.is_empty() {
                             draw_text(&mut pixmap, alt, rect.x, rect.y, [0, 0, 0, 255], 12.0, false, clip);
@@ -162,8 +212,112 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
                 }
             }
         }
+
+        // List-item marker (bullet or number), drawn in the indent to the left
+        // of the item's content box. `list_style` is inherited and resolved,
+        // so `None` (e.g. a nav `<ul style="list-style:none">`) suppresses it.
+        if name.local.as_ref() == "li" {
+            if let Some(marker) = list_marker_text(tree, nid, style.list_style) {
+                let fsize = style.font_size.unwrap_or(16.0);
+                let color = style.color.unwrap_or([0, 0, 0, 255]);
+                let mw = measure_text(&marker, fsize, false);
+                let mx = rect.x + style.padding.left - mw - 6.0;
+                let my = rect.y + style.border.top + style.padding.top;
+                draw_text(&mut pixmap, &marker, mx, my, color, fsize, false, clip);
+            }
+        }
+
+        // `::before`/`::after` generated text (see `dom::build_pseudo_content`)
+        // has no DOM text node of its own; its word runs are registered under
+        // the host element's own id instead, so paint them here rather than
+        // through `paint_text_node` (which only runs for real text nodes).
+        if let Some(runs) = laid.text_runs.get(&nid) {
+            let color = style.color.unwrap_or([0, 0, 0, 255]);
+            let fsize = style.font_size.unwrap_or(16.0);
+            let is_bold = style.font_weight.as_deref() == Some("bold");
+            for (word_rect, word) in runs {
+                draw_text(&mut pixmap, word, word_rect.x, word_rect.y, color, fsize, is_bold, clip);
+            }
+        }
+
+        // An empty text `<input>`/`<textarea>` shows its `placeholder`
+        // attribute as muted text; there is no DOM text node for it (it is
+        // not real content), so paint it directly from the attribute instead
+        // of going through `paint_text_node`.
+        if name.local.as_ref() == "input" || name.local.as_ref() == "textarea" {
+            let has_value = node.get_attribute("value").map(|v| !v.is_empty()).unwrap_or(false);
+            if !has_value {
+                if let Some(placeholder) = node.get_attribute("placeholder") {
+                    if !placeholder.is_empty() {
+                        let fsize = style.font_size.unwrap_or(16.0);
+                        let text_x = rect.x + style.padding.left + style.border.left;
+                        let text_y = rect.y + style.padding.top + style.border.top;
+                        draw_text(&mut pixmap, placeholder, text_x, text_y, [117, 117, 117, 255], fsize, false, clip);
+                    }
+                }
+            }
+        }
     }
+
+    // Inline formatting contexts shaped by cosmic-text (paragraphs, headings,
+    // cells, labels) draw last, in tree order, so their glyphs sit above the
+    // box backgrounds/borders painted in the loop above. Each item already
+    // carries its final origin and clip from `TextEngine::finalize`.
+    for nid in tree.descendants(tree.document()) {
+        if let Some(&idx) = laid.ifc_items.get(&nid) {
+            if laid.styles.get(&nid).map(|s| s.effectively_invisible).unwrap_or(false) {
+                continue;
+            }
+            laid.text_engine.paint_item(idx, &mut pixmap);
+        }
+    }
+
     Some(pixmap)
+}
+
+/// A closed rounded-rectangle path, corners approximated by quadratic curves
+/// (visually indistinguishable from true arcs at typical UI radii). `r` is
+/// clamped so it never exceeds half the shorter side.
+fn rounded_rect_path(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<tiny_skia::Path> {
+    if w <= 0.0 || h <= 0.0 {
+        return None;
+    }
+    let r = r.min(w / 2.0).min(h / 2.0).max(0.0);
+    let mut pb = PathBuilder::new();
+    pb.move_to(x + r, y);
+    pb.line_to(x + w - r, y);
+    pb.quad_to(x + w, y, x + w, y + r);
+    pb.line_to(x + w, y + h - r);
+    pb.quad_to(x + w, y + h, x + w - r, y + h);
+    pb.line_to(x + r, y + h);
+    pb.quad_to(x, y + h, x, y + h - r);
+    pb.line_to(x, y + r);
+    pb.quad_to(x, y, x + r, y);
+    pb.close();
+    pb.finish()
+}
+
+/// The marker text for a list item, or `None` when markers are suppressed
+/// (`list-style: none`). `Decimal` numbers the item by its position among
+/// sibling list items so `<ol>`s count 1, 2, 3.
+fn list_marker_text(tree: &DomTree, nid: obscura_dom::tree::NodeId, style: Option<crate::ListStyle>) -> Option<String> {
+    match style {
+        Some(crate::ListStyle::Disc) => Some("\u{2022}".to_string()),
+        Some(crate::ListStyle::Circle) => Some("\u{25E6}".to_string()),
+        Some(crate::ListStyle::Square) => Some("\u{25AA}".to_string()),
+        Some(crate::ListStyle::Decimal) => {
+            let mut n = 1usize;
+            let mut cur = tree.get_node(nid).and_then(|node| node.prev_sibling);
+            while let Some(sib) = cur {
+                if tree.get_node(sib).and_then(|s| s.as_element().map(|e| e.local.to_string())).as_deref() == Some("li") {
+                    n += 1;
+                }
+                cur = tree.get_node(sib).and_then(|s| s.prev_sibling);
+            }
+            Some(format!("{}.", n))
+        }
+        Some(crate::ListStyle::None) | None => None,
+    }
 }
 
 /// Render `tree` at `viewport` to PNG bytes (RGBA 8-bit). Returns None if the
@@ -187,6 +341,9 @@ fn paint_text_node(
     let node = tree.get_node(nid)?;
     let parent = node.parent?;
     let style = laid.styles.get(&parent)?;
+    if style.effectively_invisible {
+        return Some(());
+    }
     let color = style.color.unwrap_or([0, 0, 0, 255]);
     let fsize = style.font_size.unwrap_or(16.0);
     let is_bold = style.font_weight.as_deref() == Some("bold");
@@ -331,15 +488,68 @@ fn fetch_bytes(
     let url = resolved?;
     cache
         .entry(url.clone())
-        .or_insert_with(|| {
-            ureq::get(&url).call().ok().and_then(|resp| {
+        .or_insert_with(|| http_get_bytes(&url))
+        .clone()
+}
+
+/// Fetch `url` with a descriptive User-Agent and a bounded timeout, retrying on
+/// rate-limit / transient errors with backoff. Real pages pull dozens of images
+/// from one CDN in a burst (a Wikipedia article references ~60); hosts like
+/// Wikimedia answer a rapid burst with HTTP 429 after ~10 requests. Without a
+/// retry the rate-limited images (e.g. an infobox photo montage fetched late in
+/// the burst) came back blank, and the failure was cached permanently. The
+/// backoff both recovers them and paces the burst back under the limit.
+fn http_get_bytes(url: &str) -> Option<Vec<u8>> {
+    let mut backoff = std::time::Duration::from_millis(200);
+    for attempt in 0..3 {
+        // A browser-like Accept advertises the modern image formats and is what
+        // content-negotiating CDNs expect; some UA-gated hosts also reject a
+        // request with no Accept header outright.
+        let res = image_agent()
+            .get(url)
+            .set("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
+            .call();
+        match res {
+            Ok(resp) => {
                 let mut buf = Vec::new();
                 use std::io::Read;
-                resp.into_reader().read_to_end(&mut buf).ok()?;
-                Some(buf)
-            })
-        })
-        .clone()
+                return resp.into_reader().read_to_end(&mut buf).ok().map(|_| buf);
+            }
+            // 429 (rate limit) and 5xx are transient: back off and retry.
+            Err(ureq::Error::Status(code, _)) if matches!(code, 429 | 500 | 502 | 503 | 504) && attempt < 2 => {
+                std::thread::sleep(backoff);
+                backoff *= 2;
+            }
+            // A network/transport error is also worth one more try.
+            Err(ureq::Error::Transport(_)) if attempt < 2 => {
+                std::thread::sleep(backoff);
+                backoff *= 2;
+            }
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+/// One shared HTTP agent for all image fetches in the process, with a browser
+/// User-Agent and keep-alive connection pooling. A CDN's bot rate-limiter keys
+/// on connection churn as much as on rate: a fresh TLS handshake per image (the
+/// old per-call `ureq::get`) reads as a burst and gets 429'd, whereas reusing
+/// one pooled connection to the same host (as a browser does) both avoids most
+/// throttling and is much faster on an image-heavy page.
+fn image_agent() -> &'static ureq::Agent {
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT.get_or_init(|| {
+        ureq::AgentBuilder::new()
+            .timeout(std::time::Duration::from_secs(10))
+            // Present the same normal browser identity the engine uses for the
+            // document. A bot-identifying UA got image requests filtered by CDNs
+            // that gate on User-Agent (Akamai/Cloudflare image endpoints on
+            // cnbc, techcrunch, arstechnica), so the images Chrome loads came
+            // back blank; a real browser UA loads the same bytes Chrome does.
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36")
+            .build()
+    })
 }
 
 /// Decode a percent-escaped data: URI payload (`%23` -> `#`, etc). Bytes that
@@ -384,6 +594,303 @@ fn raster_to_pixmap(bytes: &[u8], w: u32, h: u32) -> Option<Pixmap> {
     }
     let size = tiny_skia::IntSize::from_wh(w, h)?;
     Pixmap::from_vec(raw, size)
+}
+
+/// Read an image's intrinsic pixel dimensions from its header only, without
+/// decoding the whole thing. Returns None for formats the raster decoder does
+/// not recognize (e.g. SVG, which is sized elsewhere).
+/// Fill `path` with a CSS `linear-gradient`. `angle` is degrees clockwise from
+/// 12 o'clock (0 = to top). The gradient line length uses the CSS formula so
+/// the stops land where a browser puts them. Positionless stops are spread
+/// evenly; positions are clamped monotonic (tiny-skia requires ascending).
+fn paint_linear_gradient(pixmap: &mut Pixmap, path: &tiny_skia::Path, rect: &crate::Rect, angle: f32, stops: &[([u8; 4], Option<f32>)]) {
+    if stops.len() < 2 {
+        return;
+    }
+    let rad = angle.to_radians();
+    let dx = rad.sin();
+    let dy = -rad.cos();
+    let (cx, cy) = (rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
+    let half = (dx.abs() * rect.width + dy.abs() * rect.height) / 2.0;
+    let start = Point::from_xy(cx - dx * half, cy - dy * half);
+    let end = Point::from_xy(cx + dx * half, cy + dy * half);
+    let n = stops.len();
+    let mut gs: Vec<GradientStop> = Vec::with_capacity(n);
+    let mut last = 0.0f32;
+    for (i, (c, pos)) in stops.iter().enumerate() {
+        let p = pos.unwrap_or(i as f32 / (n - 1) as f32).clamp(0.0, 1.0).max(last);
+        last = p;
+        gs.push(GradientStop::new(p, Color::from_rgba8(c[0], c[1], c[2], c[3])));
+    }
+    if let Some(shader) = LinearGradient::new(start, end, gs, SpreadMode::Pad, Transform::identity()) {
+        let mut paint = Paint::default();
+        paint.shader = shader;
+        paint.anti_alias = true;
+        pixmap.fill_path(path, &paint, FillRule::Winding, Transform::identity(), None);
+    }
+}
+
+fn image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()
+}
+
+/// Fetch every `<img>` once (seeding `cache` for the paint pass) and record its
+/// intrinsic (width, height) so layout can size replaced elements that have no
+/// explicit dimensions. Keyed by the `<img>`'s NodeId.
+fn collect_image_intrinsics(
+    tree: &DomTree,
+    base_url: Option<&str>,
+    cache: &mut std::collections::HashMap<String, Option<Vec<u8>>>,
+) -> std::collections::HashMap<obscura_dom::tree::NodeId, (f32, f32)> {
+    let mut out = std::collections::HashMap::new();
+    for nid in tree.descendants(tree.document()) {
+        let Some(node) = tree.get_node(nid) else { continue };
+        if node.as_element().map(|e| e.local.as_ref() != "img").unwrap_or(true) {
+            continue;
+        }
+        let Some(url) = resolve_img_url(tree, nid) else { continue };
+        let Some(bytes) = fetch_bytes(&url, base_url, cache) else { continue };
+        if let Some((w, h)) = image_dimensions(&bytes) {
+            if w > 0 && h > 0 {
+                out.insert(nid, (w as f32, h as f32));
+            }
+        }
+    }
+    out
+}
+
+/// Choose the URL to paint for an `<img>`. Browsers do not use `src` alone:
+/// a wrapping `<picture>`'s `<source>`s, `srcset`, and `sizes` select by
+/// type/media/viewport/density, and lazy-loaded images keep the real URL in
+/// `data-src`/`data-srcset` with `src` holding a 1x1 placeholder until script
+/// swaps it in. Since obscura may not have run the site's lazy-load script,
+/// resolve the same URL the browser would end up with: a matching `<picture>`
+/// source first, then a real candidate from `srcset`/`data-srcset`, then a
+/// non-inline `src`/`data-*` URL, then any `src` (an inlined data: image).
+fn resolve_img_url(tree: &DomTree, nid: obscura_dom::tree::NodeId) -> Option<String> {
+    let node = tree.get_node(nid)?;
+    // A <picture>'s preceding, type/media-matching <source> wins over the
+    // <img>'s own attributes (HTML "update the source set").
+    if let Some(url) = picture_source_url(tree, nid) {
+        return Some(url);
+    }
+    let sizes = node.get_attribute("sizes");
+    for a in ["srcset", "data-srcset"] {
+        if let Some(v) = node.get_attribute(a) {
+            if let Some(u) = best_srcset_candidate(v, sizes) {
+                return Some(u);
+            }
+        }
+    }
+    let url_attrs = ["src", "data-src", "data-lazy-src", "data-original", "data-fallback-src", "data-lazy"];
+    // A non-inline URL first (a data: src is usually the lazy-load placeholder).
+    for a in url_attrs {
+        if let Some(v) = node.get_attribute(a) {
+            let v = v.trim();
+            if !v.is_empty() && !v.starts_with("data:") {
+                return Some(v.to_string());
+            }
+        }
+    }
+    // Otherwise fall back to whatever is there (an inlined data: image).
+    for a in url_attrs {
+        if let Some(v) = node.get_attribute(a) {
+            let v = v.trim();
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// When `img_nid` is an `<img>` inside a `<picture>`, walk its preceding
+/// `<source>` siblings in document order and return the selected URL of the
+/// first supported one (matching `type` and `media`), per WebKit's
+/// `HTMLImageElement::bestFitSourceFromPictureElement`. `None` means no source
+/// applied and the caller should fall back to the `<img>`'s own attributes.
+fn picture_source_url(tree: &DomTree, img_nid: obscura_dom::tree::NodeId) -> Option<String> {
+    let img = tree.get_node(img_nid)?;
+    let parent = img.parent?;
+    let is_picture = tree
+        .get_node(parent)
+        .and_then(|p| p.as_element().map(|e| e.local.as_ref() == "picture"))
+        .unwrap_or(false);
+    if !is_picture {
+        return None;
+    }
+    for cid in tree.children(parent) {
+        // Only sources that precede the <img> contribute.
+        if cid == img_nid {
+            break;
+        }
+        let Some(child) = tree.get_node(cid) else { continue };
+        if child.as_element().map(|e| e.local.as_ref() != "source").unwrap_or(true) {
+            continue;
+        }
+        let Some(srcset) = child.get_attribute("srcset") else { continue };
+        if srcset.trim().is_empty() {
+            continue;
+        }
+        if let Some(t) = child.get_attribute("type") {
+            if !source_type_supported(t) {
+                continue;
+            }
+        }
+        if let Some(m) = child.get_attribute("media") {
+            if !m.trim().is_empty() && !crate::css::media_query_applies(m) {
+                continue;
+            }
+        }
+        let sizes = child.get_attribute("sizes");
+        if let Some(u) = best_srcset_candidate(srcset, sizes) {
+            return Some(u);
+        }
+    }
+    None
+}
+
+/// Whether a `<source type=...>` names an image format this build can decode.
+/// AVIF/JPEG-XL are intentionally excluded: the `image` crate cannot decode
+/// them here, so a decodable `<img>` fallback must win over such a source.
+fn source_type_supported(t: &str) -> bool {
+    matches!(
+        t.trim().to_ascii_lowercase().as_str(),
+        "image/jpeg" | "image/jpg" | "image/png" | "image/gif" | "image/webp"
+            | "image/bmp" | "image/svg+xml" | "image/x-icon" | "image/vnd.microsoft.icon"
+    )
+}
+
+/// Assumed layout viewport width (matches the desktop width the `@media`
+/// cascade evaluates against in `css.rs`). Used to turn `w` descriptors and
+/// `vw`/`%` source sizes into effective pixel densities.
+const SRCSET_VIEWPORT_W: f32 = 1280.0;
+
+/// Pick one URL from a `srcset` list, matching the WebKit/Blink selection:
+/// normalize each `w` descriptor to an effective density (`w / source-size`,
+/// with the source-size taken from `sizes` or falling back to the viewport
+/// width), treat `x` descriptors as-is and a bare candidate as `1x`, then pick
+/// the smallest density at least the device pixel ratio (1 at DPR 1), else the
+/// largest available.
+fn best_srcset_candidate(srcset: &str, sizes: Option<&str>) -> Option<String> {
+    const DPR: f32 = 1.0;
+    let source_size = source_size_px(sizes);
+    let mut cands: Vec<(f32, String)> = Vec::new();
+    // Parse candidates WHATWG-style: a URL is a run of non-whitespace (so a
+    // data: URI's internal commas stay part of it, unlike a naive split on
+    // ','), optionally followed by a descriptor up to the next comma.
+    let is_ws = |c: char| c.is_whitespace();
+    let mut rest = srcset.trim_start_matches(|c: char| is_ws(c) || c == ',');
+    while !rest.is_empty() {
+        let url_end = rest.find(is_ws).unwrap_or(rest.len());
+        let raw_url = &rest[..url_end];
+        rest = &rest[url_end..];
+        // Trailing commas on the URL mean the candidate had no descriptor.
+        let url = raw_url.trim_end_matches(',');
+        let no_desc = url.len() != raw_url.len();
+        rest = rest.trim_start_matches(is_ws);
+        let desc = if no_desc {
+            ""
+        } else {
+            let d_end = rest.find(',').unwrap_or(rest.len());
+            let d = rest[..d_end].trim();
+            rest = &rest[d_end..];
+            d
+        };
+        rest = rest.trim_start_matches(|c: char| c == ',' || is_ws(c));
+        if url.is_empty() {
+            continue;
+        }
+        let density = if desc.is_empty() {
+            1.0
+        } else if let Some(w) = desc.strip_suffix('w').and_then(|s| s.parse::<f32>().ok()) {
+            if source_size > 0.0 { w / source_size } else { continue }
+        } else if let Some(x) = desc.strip_suffix('x').and_then(|s| s.parse::<f32>().ok()) {
+            x
+        } else {
+            // An `h` (height) descriptor or malformed token: skip the candidate.
+            continue;
+        };
+        cands.push((density, url.to_string()));
+    }
+    if cands.is_empty() {
+        return None;
+    }
+    cands.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let pick = cands
+        .iter()
+        .find(|(d, _)| *d >= DPR)
+        .map(|(_, u)| u.clone())
+        .unwrap_or_else(|| cands.last().unwrap().1.clone());
+    Some(pick)
+}
+
+/// Approximate the CSS px size an image will be displayed at, from its `sizes`
+/// attribute: the first entry whose media condition holds at our assumed
+/// desktop viewport (a bare entry always holds), else the viewport width. Used
+/// only to convert `w` descriptors to densities, so a coarse value is fine.
+fn source_size_px(sizes: Option<&str>) -> f32 {
+    let Some(sizes) = sizes else { return SRCSET_VIEWPORT_W };
+    for entry in sizes.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let (cond, len) = split_size_entry(entry);
+        if let Some(cond) = cond {
+            if !crate::css::media_query_applies(&cond) {
+                continue;
+            }
+        }
+        if let Some(px) = length_to_px(&len) {
+            return px;
+        }
+    }
+    SRCSET_VIEWPORT_W
+}
+
+/// Split one `sizes` entry into its optional leading media condition and its
+/// trailing `<length>`. Tokenizes on whitespace at paren depth 0 so a
+/// `calc(...)` length or a parenthesized condition stays intact; the last
+/// token is the length, anything before it is the condition.
+fn split_size_entry(entry: &str) -> (Option<String>, String) {
+    let mut tokens: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut depth = 0i32;
+    for c in entry.chars() {
+        match c {
+            '(' => { depth += 1; cur.push(c); }
+            ')' => { depth -= 1; cur.push(c); }
+            c if c.is_whitespace() && depth == 0 => {
+                if !cur.is_empty() { tokens.push(std::mem::take(&mut cur)); }
+            }
+            c => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        tokens.push(cur);
+    }
+    let len = tokens.pop().unwrap_or_default();
+    let cond = if tokens.is_empty() { None } else { Some(tokens.join(" ")) };
+    (cond, len)
+}
+
+/// Resolve a `sizes` length to px against the assumed viewport. `vw`/`%` scale
+/// by the viewport width; `px` is literal; `em`/`rem` use the 16px root.
+/// `calc()` and other forms return `None` (the caller tries the next entry).
+fn length_to_px(len: &str) -> Option<f32> {
+    let t = len.trim().to_ascii_lowercase();
+    let num = |s: &str| s.trim().parse::<f32>().ok();
+    if let Some(v) = t.strip_suffix("vw").and_then(num) { return Some(v / 100.0 * SRCSET_VIEWPORT_W); }
+    if let Some(v) = t.strip_suffix('%').and_then(num) { return Some(v / 100.0 * SRCSET_VIEWPORT_W); }
+    if let Some(v) = t.strip_suffix("px").and_then(num) { return Some(v); }
+    if let Some(v) = t.strip_suffix("rem").and_then(num) { return Some(v * 16.0); }
+    if let Some(v) = t.strip_suffix("em").and_then(num) { return Some(v * 16.0); }
+    num(&t)
 }
 
 fn paint_image(

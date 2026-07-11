@@ -3,7 +3,6 @@
 //! no per-site hardcoded selectors. This guards against reintroducing the
 //! site-specific hacks that used to live in obscura-render for this exact markup.
 
-use obscura_dom::tree::NodeData;
 use obscura_dom::tree_sink::parse_html;
 use obscura_render::layout_dom;
 
@@ -34,28 +33,28 @@ const HN_HTML: &str = r##"
     </table>
 "##;
 
-/// The top-left corner of a text node's overall bounding box: a text node
-/// lays out as one taffy leaf per word (see `dom::build_text_words`), so its
-/// geometry lives in `text_runs` as several (box, word) pairs rather than a
-/// single rect. `needle` is matched against the node's whole original
-/// content, not a single word.
+/// Top-left of the tightest laid-out element box whose text contains
+/// `needle`. Text geometry is no longer a per-word list: a pure-text
+/// container collapses to a single cosmic-text inline formatting context
+/// (see `inline`), and even in the word-split path the wrapping `<a>`/`<span>`
+/// are flattened into their block, so the smallest element rect enclosing the
+/// text is the meaningful, mode-independent anchor. Picking the smallest-area
+/// match skips the giant ancestor tables that also "contain" the text.
 fn find_by_text(
     tree: &obscura_dom::tree::DomTree,
     layout: &obscura_render::DomLayout,
     needle: &str,
 ) -> Option<(f32, f32)> {
-    for (id, runs) in &layout.text_runs {
-        if let Some(node) = tree.get_node(*id) {
-            if let NodeData::Text { contents } = &node.data {
-                if contents.trim() == needle {
-                    let x = runs.iter().map(|(r, _)| r.x).fold(f32::INFINITY, f32::min);
-                    let y = runs.iter().map(|(r, _)| r.y).fold(f32::INFINITY, f32::min);
-                    return Some((x, y));
-                }
+    let mut best: Option<(f32, obscura_render::Rect)> = None;
+    for (id, rect) in &layout.rects {
+        if tree.text_content(*id).contains(needle) {
+            let area = rect.width * rect.height;
+            if best.as_ref().map(|(a, _)| area < *a).unwrap_or(true) {
+                best = Some((area, *rect));
             }
         }
     }
-    None
+    best.map(|(_, r)| (r.x, r.y))
 }
 
 #[test]
@@ -91,28 +90,42 @@ fn hn_shaped_table_lays_out_without_site_hardcoding() {
 }
 
 #[test]
+fn relative_units_resolve_against_viewport_and_font_size() {
+    // 50vw of a 1000px viewport = 500px; 10em at the default 16px = 160px.
+    // Both were previously mis-resolved (vw kept as raw px, em hardcoded to 16
+    // regardless of context), so this guards the deferred-resolution pass.
+    let html = r##"<div style="width:50vw;height:10em"></div>"##;
+    let tree = parse_html(html);
+    let layout = layout_dom(&tree, (1000.0, 800.0));
+    let hit = layout.rects.values().any(|r| (r.width - 500.0).abs() < 1.0 && (r.height - 160.0).abs() < 1.0);
+    assert!(hit, "expected a 500x160 box from 50vw/10em, rects: {:?}", layout.rects.values().map(|r| (r.width, r.height)).collect::<Vec<_>>());
+}
+
+#[test]
 fn long_text_run_wraps_across_multiple_lines() {
-    // A single text node with no inline elements breaking it up must still
-    // wrap word by word within a narrow container: this is the regression
-    // case for treating a whole text node as one indivisible layout box,
-    // which cannot wrap internally and instead overflows straight past the
-    // container's edge.
+    // A long single text node with no inline elements breaking it up must
+    // wrap within a narrow container instead of overflowing on one line. The
+    // container's height is the mode-independent proof: several wrapped lines
+    // make it much taller than one line, whether text is shaped by cosmic-text
+    // (paint) or split into word boxes (layout-only).
     let html = r##"<div style="width:100px">This sentence has plenty of words to wrap across several lines</div>"##;
     let tree = parse_html(html);
     let layout = layout_dom(&tree, (1000.0, 1000.0));
 
-    let text_id = tree
-        .descendants(tree.document())
-        .into_iter()
-        .find(|id| matches!(tree.get_node(*id).map(|n| n.data.clone()), Some(NodeData::Text { .. })))
-        .expect("text node exists");
-    let runs = layout.text_runs.get(&text_id).expect("text node has word runs");
-    assert!(runs.len() > 5, "expected the sentence to split into several word leaves, got {}", runs.len());
-
-    let distinct_y: std::collections::BTreeSet<i32> = runs.iter().map(|(r, _)| r.y.round() as i32).collect();
+    // Tightest element enclosing the text: the 100px div itself.
+    let mut div_rect: Option<obscura_render::Rect> = None;
+    for (id, rect) in &layout.rects {
+        if tree.text_content(*id).contains("several lines") {
+            if div_rect.as_ref().map(|d| rect.width * rect.height < d.width * d.height).unwrap_or(true) {
+                div_rect = Some(*rect);
+            }
+        }
+    }
+    let div_rect = div_rect.expect("text container laid out");
+    assert!(div_rect.width <= 101.0, "container should hold its 100px width, got {}", div_rect.width);
     assert!(
-        distinct_y.len() > 1,
-        "words should wrap onto more than one line within a 100px-wide container, got y positions {:?}",
-        distinct_y
+        div_rect.height > 60.0,
+        "text should wrap onto several lines in a 100px-wide box (tall container), got height {}",
+        div_rect.height
     );
 }

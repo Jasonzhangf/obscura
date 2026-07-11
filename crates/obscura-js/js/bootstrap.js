@@ -4527,8 +4527,12 @@ if (typeof TextDecoder === 'undefined') {
 globalThis.matchMedia = _markNative(function matchMedia(q) {
   var s = (q || '').toLowerCase().replace(/\s+/g, '');
   var matches = false;
-  if (s.includes('prefers-color-scheme:light')) matches = false;
-  else if (s.includes('prefers-color-scheme:dark')) matches = true;
+  // Match headless Chromium's default: light color scheme. Reporting dark
+  // here made every JS-driven site (mdBook, docs, apps) switch itself into a
+  // dark theme, rendering nothing like a normal headless-Chrome screenshot.
+  if (s.includes('prefers-color-scheme:dark')) matches = false;
+  else if (s.includes('prefers-color-scheme:light')) matches = true;
+  else if (s.includes('prefers-color-scheme:no-preference')) matches = false;
   else if (s.includes('prefers-reduced-motion:no-preference')) matches = true;
   else if (s.includes('prefers-reduced-motion:reduce')) matches = false;
   else if (s.includes('any-pointer:fine')) matches = true;

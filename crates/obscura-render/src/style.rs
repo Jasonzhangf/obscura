@@ -29,16 +29,47 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
     }
 
     style.display = match tag {
-        "span" | "a" | "b" | "i" | "strong" | "em" | "font" => Display::Inline,
+        // Phrasing / inline-level content defaults to inline so a paragraph
+        // that mixes these with text stays one inline formatting context that
+        // cosmic-text can shape and wrap as a whole, instead of each element
+        // becoming its own block box (which forces the flex word-promotion
+        // fallback and its fragile one-word-per-line wrapping). Author CSS
+        // (e.g. `code{display:block}`) still overrides this in the cascade.
+        "span" | "a" | "b" | "i" | "strong" | "em" | "font" | "code" | "small"
+        | "sub" | "sup" | "mark" | "abbr" | "cite" | "var" | "dfn" | "kbd"
+        | "samp" | "q" | "time" | "s" | "u" | "del" | "ins" | "tt" | "big"
+        | "bdi" | "bdo" | "wbr" | "data" | "output" | "label" | "ruby" | "rt"
+        | "rp" => Display::Inline,
         "tr" => Display::Flex,
         _ => Display::Block,
     };
     if tag == "center" {
         style.display = Display::Flex;
         style.flex_direction = Some(taffy::FlexDirection::Column);
-        style.align_items = Some(taffy::AlignItems::Center);
-    } else if tag == "head" || tag == "script" || tag == "style" || tag == "title" || tag == "meta" || tag == "link" {
+        style.align_items = Some(taffy::AlignItems::CENTER);
+    } else if tag == "head" || tag == "script" || tag == "style" || tag == "title" || tag == "meta" || tag == "link" || tag == "noscript" || tag == "template"
+        || tag == "desc" || tag == "metadata" || tag == "option" || tag == "optgroup"
+        || tag == "source" || tag == "track" || tag == "param" || tag == "area" {
+        // `noscript` content is only for scripting-disabled agents; with JS on
+        // (as here) the parser keeps it as raw text and the browser hides it,
+        // so a site's no-JS nav fallback must not paint as literal markup.
+        // `template` content is inert and never rendered. svg `title`/`desc`/
+        // `metadata` are AX/tooltip metadata, never rendered in flow (an inline
+        // <svg> we cannot rasterize would otherwise leak its `<desc>` text).
+        // `option`/`optgroup` render only inside the native select popup, so a
+        // closed <select> must not paint every option label stacked.
+        // `source`/`track`/`param`/`area` are metadata-only children of
+        // picture/video/object/map; a `<picture><source width= height=>` must
+        // not lay out as a real box (news CDNs put dimensions on `<source>`,
+        // which otherwise paints an empty box the size of the image).
         style.display = crate::Display::None;
+    } else if tag == "br" {
+        // Forces a line break inside our flex-row-wrap approximation of
+        // inline flow (see `dom::build`'s "stacks_children_vertically"
+        // promotion): a full-width, zero-height item leaves no room for
+        // anything else on its line, so the next inline item wraps.
+        style.width = crate::Dimension::Percent(1.0);
+        style.height = crate::Dimension::Px(0.0);
     } else if tag == "body" {
         style.margin = Edges { top: 8.0, right: 8.0, bottom: 8.0, left: 8.0 };
     } else if tag == "h1" {
@@ -59,21 +90,57 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
         style.margin = Edges { top: 21.0, bottom: 21.0, left: 0.0, right: 0.0 };
     } else if tag == "p" || tag == "ul" || tag == "ol" {
         style.margin = Edges { top: 16.0, bottom: 16.0, left: 0.0, right: 0.0 };
+        if tag == "ul" {
+            style.list_style = Some(crate::ListStyle::Disc);
+        } else if tag == "ol" {
+            style.list_style = Some(crate::ListStyle::Decimal);
+        }
     } else if tag == "li" {
         style.margin = Edges { top: 0.0, bottom: 0.0, left: 40.0, right: 0.0 };
-    } else if tag == "b" || tag == "strong" || tag == "th" {
+    } else if tag == "b" || tag == "strong" {
         style.font_weight = Some("bold".to_string());
+    } else if tag == "i" || tag == "em" || tag == "cite" || tag == "var" || tag == "dfn" || tag == "address" {
+        style.font_style_italic = Some(true);
     } else if tag == "a" {
         style.color = Some([0, 0, 238, 255]); // blue
+        style.underline = Some(true); // UA default: links are underlined
     } else if tag == "table" || tag == "tbody" {
         style.display = Display::Flex;
         style.flex_direction = Some(taffy::FlexDirection::Column);
-        style.align_items = Some(taffy::AlignItems::Stretch); // stretch rows to fill table width
+        style.align_items = Some(taffy::AlignItems::STRETCH); // stretch rows to fill table width
+        // Rows fill the table width and may shrink below their content's
+        // min-content size (the flexbox automatic-minimum-size gotcha), so a
+        // width-constrained taxobox contains its content instead of blowing
+        // out sideways. (Fully matching CSS auto table layout, where a table
+        // grows to fit unshrinkable content, needs real table layout.)
+        style.min_width = crate::Dimension::Px(0.0);
+        if tag == "tbody" {
+            style.width = crate::Dimension::Percent(1.0);
+        }
+    } else if tag == "tr" {
+        // Rows fill the table width and can shrink below content min-content;
+        // this is exactly why Wikipedia's own responsive CSS uses
+        // `tr{min-width:100%}`. `align-items:stretch` alone did not pin them
+        // once a cell's content (a 250px no-wrap widget) exceeded the box.
+        style.min_width = crate::Dimension::Px(0.0);
+        style.width = crate::Dimension::Percent(1.0);
     } else if tag == "td" || tag == "th" {
         style.display = Display::Flex;
         style.flex_direction = Some(taffy::FlexDirection::Column);
-        style.align_items = Some(taffy::AlignItems::FlexStart);
+        style.align_items = Some(taffy::AlignItems::FLEX_START);
         style.padding = Edges { top: 0.0, right: 5.0, bottom: 0.0, left: 0.0 };
+        style.min_width = crate::Dimension::Px(0.0);
+        if tag == "th" {
+            style.font_weight = Some("bold".to_string());
+        }
+    } else if tag == "img" || tag == "figure" {
+        // Near-universal reset: images fit their container instead of
+        // overflowing. Wikipedia (and most sites) set `img{max-width:100%}`;
+        // making it a UA default prevents a fixed-width thumbnail (e.g. a
+        // 250px infobox image) from spilling out of a narrower box (a 200px
+        // taxobox) when we have not applied the site's own rule.
+        style.max_width = crate::Dimension::Percent(1.0);
+        style.flex_shrink = Some(1.0);
     }
     style
 }
@@ -86,14 +153,18 @@ pub fn apply_inline(style: &mut LayoutStyle, css: &str) {
         }
         let Some((name, value)) = decl.split_once(':') else { continue };
         let name = name.trim().to_ascii_lowercase();
-        // Drop `!important`: it does not change the computed value here.
-        let value: String = value
-            .trim()
-            .split_whitespace()
-            .take_while(|t| !t.eq_ignore_ascii_case("!important") && *t != "!")
-            .collect::<Vec<_>>()
-            .join(" ");
-        apply_value(style, &name, &value);
+        // Drop a trailing `!important` (priority does not change the computed
+        // value here). Strip by position, not by whitespace token: minified CSS
+        // writes it with no space (`width:281px!important`), and splitting on
+        // whitespace left that glued onto the value so the whole declaration
+        // failed to parse and was lost.
+        let mut value = value.trim();
+        if let Some(bang) = value.rfind('!') {
+            if value[bang + 1..].trim().eq_ignore_ascii_case("important") {
+                value = value[..bang].trim_end();
+            }
+        }
+        apply_value(style, &name, value);
     }
 }
 
@@ -103,7 +174,7 @@ pub fn apply_inline(style: &mut LayoutStyle, css: &str) {
 /// (`content: "a; b"`) routinely contains a literal semicolon that is not a
 /// declaration separator; splitting on every `;` blindly corrupts the
 /// declaration into two malformed halves and silently drops it.
-fn split_declarations(css: &str) -> Vec<&str> {
+pub(crate) fn split_declarations(css: &str) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut depth = 0i32;
     let mut in_quote: Option<char> = None;
@@ -117,8 +188,13 @@ fn split_declarations(css: &str) -> Vec<&str> {
         }
         match c {
             '\'' | '"' => in_quote = Some(c),
-            '(' => depth += 1,
-            ')' => depth -= 1,
+            // Track `{...}` too: once @layer bodies are admitted, CSS-nested
+            // rules (`&:hover{a:b}`, nested @media) appear inside declaration
+            // lists. Keeping a nested block as one chunk makes it a single
+            // unparseable declaration that is dropped, rather than leaking its
+            // inner declarations into the parent rule at the first `;`.
+            '(' | '{' => depth += 1,
+            ')' | '}' => depth = (depth - 1).max(0),
             ';' if depth == 0 => {
                 parts.push(&css[start..i]);
                 start = i + 1;
@@ -132,33 +208,69 @@ fn split_declarations(css: &str) -> Vec<&str> {
 
 fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
     match name {
-        "display" => match value {
-            "none" => style.display = crate::Display::None,
-            "flex" => style.display = crate::Display::Flex,
-            "inline-flex" => style.display = crate::Display::Flex,
-            "inline" => style.display = crate::Display::Inline,
-            "inline-block" => style.display = crate::Display::Inline,
-            "grid" => style.display = crate::Display::Grid,
-            "inline-grid" => style.display = crate::Display::Grid,
-            "block" => style.display = crate::Display::Block,
-            _ => {}
-        },
-        "width" => style.width = dimension_value(value),
-        "height" => style.height = dimension_value(value),
+        "display" => {
+            if value != "contents" {
+                style.display_contents = false;
+            }
+            match value {
+                "none" => style.display = crate::Display::None,
+                "flex" => style.display = crate::Display::Flex,
+                "inline-flex" => style.display = crate::Display::Flex,
+                "inline" => style.display = crate::Display::Inline,
+                "inline-block" => {
+                    style.display = crate::Display::Inline;
+                    style.is_inline_block = true;
+                }
+                "grid" => style.display = crate::Display::Grid,
+                "inline-grid" => style.display = crate::Display::Grid,
+                "block" => style.display = crate::Display::Block,
+                "contents" => style.display_contents = true,
+                _ => {}
+            }
+        }
+        "width" => {
+            style.width = dimension_value(value);
+            style.width_set = true;
+        }
+        "height" => {
+            style.height = dimension_value(value);
+            style.height_set = true;
+        }
         "min-width" => style.min_width = dimension_value(value),
         "min-height" => style.min_height = dimension_value(value),
         "max-width" => style.max_width = dimension_value(value),
         "max-height" => style.max_height = dimension_value(value),
-        "margin" => { if let Some(e) = edges(value) { style.margin = e; } }
-        "margin-top" => set_edge(&mut style.margin, Side::Top, px(value)),
-        "margin-right" => set_edge(&mut style.margin, Side::Right, px(value)),
-        "margin-bottom" => set_edge(&mut style.margin, Side::Bottom, px(value)),
-        "margin-left" => set_edge(&mut style.margin, Side::Left, px(value)),
+        "aspect-ratio" => style.aspect_ratio = parse_aspect_ratio(value),
+        "margin" => apply_margin_shorthand(style, value),
+        "margin-top" => set_margin_side(style, 0, value),
+        "margin-right" => set_margin_side(style, 1, value),
+        "margin-bottom" => set_margin_side(style, 2, value),
+        "margin-left" => set_margin_side(style, 3, value),
+        // Logical margins (LTR: inline = left/right, block = top/bottom).
+        "margin-inline" => { let (s, e) = two(value); set_margin_side(style, 3, s); set_margin_side(style, 1, e); }
+        "margin-inline-start" => set_margin_side(style, 3, value),
+        "margin-inline-end" => set_margin_side(style, 1, value),
+        "margin-block" => { let (s, e) = two(value); set_margin_side(style, 0, s); set_margin_side(style, 2, e); }
+        "margin-block-start" => set_margin_side(style, 0, value),
+        "margin-block-end" => set_margin_side(style, 2, value),
         "padding" => { if let Some(e) = edges(value) { style.padding = e; } }
         "padding-top" => set_edge(&mut style.padding, Side::Top, px(value)),
         "padding-right" => set_edge(&mut style.padding, Side::Right, px(value)),
         "padding-bottom" => set_edge(&mut style.padding, Side::Bottom, px(value)),
         "padding-left" => set_edge(&mut style.padding, Side::Left, px(value)),
+        "padding-inline" => { let (s, e) = two(value); set_edge(&mut style.padding, Side::Left, px(s)); set_edge(&mut style.padding, Side::Right, px(e)); }
+        "padding-inline-start" => set_edge(&mut style.padding, Side::Left, px(value)),
+        "padding-inline-end" => set_edge(&mut style.padding, Side::Right, px(value)),
+        "padding-block" => { let (s, e) = two(value); set_edge(&mut style.padding, Side::Top, px(s)); set_edge(&mut style.padding, Side::Bottom, px(e)); }
+        "padding-block-start" => set_edge(&mut style.padding, Side::Top, px(value)),
+        "padding-block-end" => set_edge(&mut style.padding, Side::Bottom, px(value)),
+        "border-radius" => {
+            // Uniform radius from the first value (ignore per-corner / the
+            // `/` vertical-radius form; the common case is one length).
+            if let Some(r) = value.split(['/', ' ']).next().and_then(|t| px(t)) {
+                style.border_radius = r;
+            }
+        }
         "border" => {
             for p in value.split_whitespace() {
                 if let Some(c) = parse_color(p) {
@@ -175,46 +287,75 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         "border-left-width" | "border-left" => set_edge(&mut style.border, Side::Left, px(value)),
         "background-color" => style.background_color = parse_color(value),
         "background" => {
-            style.background_color = parse_color(value);
+            style.background_gradient = parse_linear_gradient(value);
+            if style.background_gradient.is_none() {
+                style.background_color = parse_color(value);
+            }
             style.background_image = parse_url(value);
         }
-        "background-image" => style.background_image = parse_url(value),
+        "background-image" => {
+            style.background_gradient = parse_linear_gradient(value);
+            style.background_image = parse_url(value);
+        }
         "background-size" => style.background_size = parse_background_size(value),
         "background-position" => style.background_position = parse_background_position(value),
         "mask-image" | "-webkit-mask-image" => style.mask_image = parse_url(value),
         "color" => style.color = parse_color(value),
         "border-color" => style.border_color = parse_color(value),
-        "font-size" => style.font_size = px(value),
-        "font-weight" => style.font_weight = Some(value.to_string()),
+        "font-size" => {
+            // Absolute lengths resolve now; font/viewport-relative ones defer
+            // to the inheritance pass (they need parent/root font-size).
+            match dimension_value(value) {
+                crate::Dimension::Px(p) => {
+                    style.font_size = Some(p);
+                    style.font_size_raw = None;
+                }
+                crate::Dimension::Auto => {
+                    // Keyword sizes (medium/small/large/...) or unknown; map the
+                    // common ones, else leave to inherit.
+                    if let Some(px) = font_size_keyword(value.trim()) {
+                        style.font_size = Some(px);
+                    }
+                }
+                rel => style.font_size_raw = Some(rel),
+            }
+        }
+        "font-weight" => {
+            // Normalize to "bold"/"normal" (consumers test for "bold"). Numeric
+            // >= 600 and `bold`/`bolder` are bold; others normal.
+            let v = value.trim().to_ascii_lowercase();
+            let bold = v == "bold" || v == "bolder" || v.parse::<u32>().map(|n| n >= 600).unwrap_or(false);
+            style.font_weight = Some(if bold { "bold".to_string() } else { "normal".to_string() });
+        }
         // Our engine has no real inline formatting context, so text-align is
         // approximated the same way as align-items: it positions a block's
         // (or column-flex's) children along the cross axis. See
         // `to_taffy_style`'s block-to-flex-column promotion, which is what
         // makes this actually take effect on plain block elements.
         "text-align" => match value {
-            "right" => style.align_items = Some(taffy::AlignItems::FlexEnd),
-            "center" => style.align_items = Some(taffy::AlignItems::Center),
-            "left" | "start" | "justify" => style.align_items = Some(taffy::AlignItems::FlexStart),
+            "right" => style.align_items = Some(taffy::AlignItems::FLEX_END),
+            "center" => style.align_items = Some(taffy::AlignItems::CENTER),
+            "left" | "start" | "justify" => style.align_items = Some(taffy::AlignItems::FLEX_START),
             _ => {}
         },
         "align-items" => {
             match value {
-                "center" => style.align_items = Some(taffy::AlignItems::Center),
-                "flex-start" | "start" => style.align_items = Some(taffy::AlignItems::FlexStart),
-                "flex-end" | "end" => style.align_items = Some(taffy::AlignItems::FlexEnd),
-                "stretch" => style.align_items = Some(taffy::AlignItems::Stretch),
-                "baseline" => style.align_items = Some(taffy::AlignItems::Baseline),
+                "center" => style.align_items = Some(taffy::AlignItems::CENTER),
+                "flex-start" | "start" => style.align_items = Some(taffy::AlignItems::FLEX_START),
+                "flex-end" | "end" => style.align_items = Some(taffy::AlignItems::FLEX_END),
+                "stretch" => style.align_items = Some(taffy::AlignItems::STRETCH),
+                "baseline" => style.align_items = Some(taffy::AlignItems::BASELINE),
                 _ => {}
             }
         },
         "justify-content" => {
             match value {
-                "center" => style.justify_content = Some(taffy::JustifyContent::Center),
-                "flex-start" | "start" | "left" => style.justify_content = Some(taffy::JustifyContent::FlexStart),
-                "flex-end" | "end" | "right" => style.justify_content = Some(taffy::JustifyContent::FlexEnd),
-                "space-between" => style.justify_content = Some(taffy::JustifyContent::SpaceBetween),
-                "space-around" => style.justify_content = Some(taffy::JustifyContent::SpaceAround),
-                "space-evenly" => style.justify_content = Some(taffy::JustifyContent::SpaceEvenly),
+                "center" => style.justify_content = Some(taffy::JustifyContent::CENTER),
+                "flex-start" | "start" | "left" => style.justify_content = Some(taffy::JustifyContent::FLEX_START),
+                "flex-end" | "end" | "right" => style.justify_content = Some(taffy::JustifyContent::FLEX_END),
+                "space-between" => style.justify_content = Some(taffy::JustifyContent::SPACE_BETWEEN),
+                "space-around" => style.justify_content = Some(taffy::JustifyContent::SPACE_AROUND),
+                "space-evenly" => style.justify_content = Some(taffy::JustifyContent::SPACE_EVENLY),
                 _ => {}
             }
         },
@@ -237,6 +378,8 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         },
         "flex-grow" => { if let Some(v) = token(value).and_then(|t| t.parse::<f32>().ok()) { style.flex_grow = Some(v); } }
         "flex-shrink" => { if let Some(v) = token(value).and_then(|t| t.parse::<f32>().ok()) { style.flex_shrink = Some(v); } }
+        "flex-basis" => { style.flex_basis = dimension_value(value.trim()); }
+        "flex" => parse_flex_shorthand(style, value),
         "position" => {
             match value {
                 "absolute" | "fixed" => style.position = Some(taffy::Position::Absolute),
@@ -252,12 +395,75 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                 _ => {}
             }
         },
-        "top" => style.inset[0] = px(value),
-        "right" => style.inset[1] = px(value),
-        "bottom" => style.inset[2] = px(value),
-        "left" => style.inset[3] = px(value),
+        "top" => style.inset[0] = inset_dim(value),
+        "right" => style.inset[1] = inset_dim(value),
+        "bottom" => style.inset[2] = inset_dim(value),
+        "left" => style.inset[3] = inset_dim(value),
+        "inset" => {
+            // 1-4 values, CSS shorthand order: all / v h / t h b / t r b l.
+            let parts: Vec<crate::Dimension> = value.split_whitespace().map(dimension_value).collect();
+            let (t, r, b, l) = match parts.as_slice() {
+                [a] => (*a, *a, *a, *a),
+                [v, h] => (*v, *h, *v, *h),
+                [t, h, b] => (*t, *h, *b, *h),
+                [t, r, b, l, ..] => (*t, *r, *b, *l),
+                [] => return,
+            };
+            style.inset = [Some(t), Some(r), Some(b), Some(l)];
+        }
         "overflow" | "overflow-x" | "overflow-y" => {
             style.overflow_hidden = value != "visible";
+        }
+        "visibility" => style.visibility_hidden = Some(value.eq_ignore_ascii_case("hidden")),
+        "opacity" => style.opacity = value.trim().parse::<f32>().ok(),
+        "list-style-type" => {
+            style.list_style = Some(list_style_keyword(value.trim()).unwrap_or(crate::ListStyle::Disc));
+        }
+        "list-style" => {
+            // Shorthand: type | position | image in any order. We only track
+            // the type keyword (and `none`, which suppresses the marker, the
+            // common way nav `<ul>`s drop their bullets).
+            for tok in value.split_whitespace() {
+                if let Some(ls) = list_style_keyword(tok) {
+                    style.list_style = Some(ls);
+                }
+            }
+        }
+        "line-height" => {
+            let v = value.trim();
+            style.line_height = if v.eq_ignore_ascii_case("normal") {
+                Some(crate::LineHeight::Normal)
+            } else if let Some(pct) = v.strip_suffix('%') {
+                pct.trim().parse::<f32>().ok().map(|n| crate::LineHeight::Ratio(n / 100.0))
+            } else if v.ends_with("rem") || v.ends_with("em") {
+                // em/rem in line-height are relative to font-size, i.e. a ratio.
+                v.trim_end_matches("rem").trim_end_matches("em").trim().parse::<f32>().ok().map(crate::LineHeight::Ratio)
+            } else if v.ends_with("px") || v.ends_with("pt") {
+                px_value(v).map(crate::LineHeight::Px)
+            } else {
+                // Unitless number: a multiple of font-size (the common case).
+                v.parse::<f32>().ok().map(crate::LineHeight::Ratio)
+            };
+        }
+        "font-style" => {
+            let v = value.trim().to_ascii_lowercase();
+            style.font_style_italic = Some(v.starts_with("italic") || v.starts_with("oblique"));
+        }
+        "text-transform" => {
+            style.text_transform = Some(match value.trim().to_ascii_lowercase().as_str() {
+                "uppercase" => crate::TextTransform::Uppercase,
+                "lowercase" => crate::TextTransform::Lowercase,
+                "capitalize" => crate::TextTransform::Capitalize,
+                _ => crate::TextTransform::None,
+            });
+        }
+        "text-decoration" | "text-decoration-line" => {
+            // Shorthand can carry color/style/thickness; we only model the
+            // underline line (the dominant case, and the UA default for links).
+            let toks: Vec<String> = value.split_whitespace().map(|t| t.to_ascii_lowercase()).collect();
+            let underline = toks.iter().any(|t| t == "underline");
+            let none = toks.iter().any(|t| t == "none");
+            style.underline = Some(underline && !none);
         }
         "gap" | "grid-gap" => {
             let dims: Vec<f32> = value.split_whitespace().filter_map(px_value).collect();
@@ -265,8 +471,22 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         }
         "row-gap" | "grid-row-gap" => style.row_gap = px(value),
         "column-gap" | "grid-column-gap" => style.column_gap = px(value),
-        "grid-template-columns" => style.grid_template_columns = parse_track_list(value),
-        "grid-template-rows" => style.grid_template_rows = parse_track_list(value),
+        "border-spacing" => {
+            let dims: Vec<f32> = value.split_whitespace().filter_map(px_value).collect();
+            if let Some(&h) = dims.first() {
+                style.border_spacing = Some((h, *dims.get(1).unwrap_or(&h)));
+            }
+        }
+        "grid-template-columns" => {
+            let (tracks, names) = parse_track_list_named(value);
+            style.grid_template_columns = tracks;
+            style.grid_col_line_names = (!names.is_empty()).then(|| build_line_map(names));
+        }
+        "grid-template-rows" => {
+            let (tracks, names) = parse_track_list_named(value);
+            style.grid_template_rows = tracks;
+            style.grid_row_line_names = (!names.is_empty()).then(|| build_line_map(names));
+        }
         "grid-template-areas" => style.grid_areas = Some(parse_grid_areas(value)),
         "grid-template" => parse_grid_template(style, value),
         "grid-area" => {
@@ -277,8 +497,8 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                 style.grid_area_name = Some(v.to_string());
             }
         }
-        "grid-column" => style.grid_column = parse_grid_line(value),
-        "grid-row" => style.grid_row = parse_grid_line(value),
+        "grid-column" => set_grid_placement(style, value, true),
+        "grid-row" => set_grid_placement(style, value, false),
         _ => {}
     }
 }
@@ -286,20 +506,77 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
 /// Parse a CSS grid track list (`min-content 1fr min-content`, `12.25rem
 /// minmax(0,1fr)`) into taffy sizing functions. Tokenizes respecting the
 /// parentheses in `minmax(...)` / `fit-content(...)`.
-pub(crate) fn parse_track_list(value: &str) -> Vec<taffy::TrackSizingFunction> {
-    tokenize_tracks(value).iter().map(|t| track(t)).collect()
+/// Parse a track list into taffy sizing functions plus the `[line-name]` map
+/// (name -> 1-based grid line number). `repeat(n, ...)` is expanded to n copies
+/// (it was previously collapsed to a single phantom `Auto` track, which broke
+/// every `repeat()`-based grid) and `[name]` annotations are captured, not
+/// turned into tracks. First occurrence of a name wins.
+pub(crate) fn parse_track_list_named(value: &str) -> (Vec<taffy::TrackSizingFunction>, Vec<(String, i16)>) {
+    let mut tracks = Vec::new();
+    let mut names = Vec::new();
+    let mut line: i16 = 1;
+    for tok in tokenize_tracks(value) {
+        expand_track_token(&tok, &mut tracks, &mut names, &mut line);
+    }
+    (tracks, names)
 }
 
-/// Split a track list on whitespace while keeping `func(a, b)` groups intact.
+fn expand_track_token(
+    tok: &str,
+    tracks: &mut Vec<taffy::TrackSizingFunction>,
+    names: &mut Vec<(String, i16)>,
+    line: &mut i16,
+) {
+    let t = tok.trim();
+    if t.starts_with('[') {
+        let inner = t.trim_start_matches('[').trim_end_matches(']');
+        for name in inner.split_whitespace() {
+            names.push((name.to_string(), *line));
+        }
+        return;
+    }
+    let lower = t.to_ascii_lowercase();
+    if lower.starts_with("repeat(") && t.ends_with(')') {
+        let inner = &t["repeat(".len()..t.len() - 1];
+        if let Some((cnt, sub)) = inner.split_once(',') {
+            // `auto-fill`/`auto-fit` counts need the container width; fall back
+            // to one repetition (a reasonable minimum) rather than dropping it.
+            let count = cnt.trim().parse::<usize>().unwrap_or(1).min(1000);
+            let subtoks = tokenize_tracks(sub.trim());
+            for _ in 0..count {
+                for st in &subtoks {
+                    expand_track_token(st, tracks, names, line);
+                }
+            }
+        }
+        return;
+    }
+    tracks.push(track(t));
+    *line += 1;
+}
+
+pub(crate) fn build_line_map(pairs: Vec<(String, i16)>) -> std::collections::HashMap<String, i16> {
+    let mut m = std::collections::HashMap::new();
+    for (name, line) in pairs {
+        m.entry(name).or_insert(line);
+    }
+    m
+}
+
+/// Split a track list on whitespace while keeping `func(a, b)` groups and
+/// `[line-name lists]` intact.
 fn tokenize_tracks(value: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut depth = 0i32;
+    let mut in_bracket = false;
     for c in value.chars() {
         match c {
+            '[' => { in_bracket = true; cur.push(c); }
+            ']' => { in_bracket = false; cur.push(c); }
             '(' => { depth += 1; cur.push(c); }
             ')' => { depth -= 1; cur.push(c); }
-            c if c.is_whitespace() && depth == 0 => {
+            c if c.is_whitespace() && depth == 0 && !in_bracket => {
                 if !cur.is_empty() { out.push(std::mem::take(&mut cur)); }
             }
             c => cur.push(c),
@@ -315,38 +592,36 @@ fn track(tok: &str) -> taffy::TrackSizingFunction {
     let lower = t.to_ascii_lowercase();
     if let Some(inner) = lower.strip_prefix("minmax(").and_then(|s| s.strip_suffix(')')) {
         if let Some((a, b)) = inner.split_once(',') {
-            return taffy::TrackSizingFunction::Single(MinMax {
-                min: min_track(a.trim()),
-                max: max_track(b.trim()),
-            });
+            return MinMax { min: min_track(a.trim()), max: max_track(b.trim()) };
         }
     }
     if let Some(inner) = lower.strip_prefix("fit-content(").and_then(|s| s.strip_suffix(')')) {
-        let lp = px_value(inner.trim())
-            .map(taffy::style::LengthPercentage::Length)
-            .unwrap_or(taffy::style::LengthPercentage::Length(0.0));
-        return taffy::TrackSizingFunction::Single(MinMax {
-            min: taffy::MinTrackSizingFunction::Auto,
-            max: taffy::MaxTrackSizingFunction::FitContent(lp),
-        });
+        let px = px_value(inner.trim()).unwrap_or(0.0);
+        return MinMax {
+            min: taffy::MinTrackSizingFunction::auto(),
+            max: taffy::MaxTrackSizingFunction::fit_content_px(px),
+        };
     }
-    taffy::TrackSizingFunction::Single(MinMax { min: min_track(t), max: max_track(t) })
+    MinMax { min: min_track(t), max: max_track(t) }
 }
 
 fn min_track(tok: &str) -> taffy::MinTrackSizingFunction {
     use taffy::MinTrackSizingFunction as M;
-    match tok.to_ascii_lowercase().as_str() {
-        "min-content" => M::MinContent,
-        "max-content" => M::MaxContent,
-        "auto" => M::Auto,
+    let lower = tok.to_ascii_lowercase();
+    match lower.as_str() {
+        "min-content" => M::min_content(),
+        "max-content" => M::max_content(),
+        "auto" => M::auto(),
         other => {
             if other.ends_with("fr") {
                 // Flexible tracks have an automatic minimum.
-                M::Auto
-            } else if let Some(px) = dim_lp(other) {
-                M::Fixed(px)
+                M::auto()
+            } else if let Some(p) = other.strip_suffix('%').and_then(|n| n.trim().parse::<f32>().ok()) {
+                M::percent(p / 100.0)
+            } else if let Some(px) = px_value(other) {
+                M::length(px)
             } else {
-                M::Auto
+                M::auto()
             }
         }
     }
@@ -356,28 +631,21 @@ fn max_track(tok: &str) -> taffy::MaxTrackSizingFunction {
     use taffy::MaxTrackSizingFunction as M;
     let lower = tok.to_ascii_lowercase();
     match lower.as_str() {
-        "min-content" => M::MinContent,
-        "max-content" => M::MaxContent,
-        "auto" => M::Auto,
+        "min-content" => M::min_content(),
+        "max-content" => M::max_content(),
+        "auto" => M::auto(),
         other => {
             if let Some(fr) = other.strip_suffix("fr").and_then(|n| n.trim().parse::<f32>().ok()) {
-                M::Fraction(fr)
-            } else if let Some(px) = dim_lp(other) {
-                M::Fixed(px)
+                M::fr(fr)
+            } else if let Some(p) = other.strip_suffix('%').and_then(|n| n.trim().parse::<f32>().ok()) {
+                M::percent(p / 100.0)
+            } else if let Some(px) = px_value(other) {
+                M::length(px)
             } else {
-                M::Auto
+                M::auto()
             }
         }
     }
-}
-
-/// A length or percentage as a taffy `LengthPercentage`.
-fn dim_lp(tok: &str) -> Option<taffy::style::LengthPercentage> {
-    let t = tok.trim();
-    if let Some(p) = t.strip_suffix('%') {
-        return p.parse::<f32>().ok().map(|v| taffy::style::LengthPercentage::Percent(v / 100.0));
-    }
-    px_value(t).map(taffy::style::LengthPercentage::Length)
 }
 
 /// Parse `grid-template-areas: 'a a' 'b c'` into a matrix of cell names.
@@ -415,11 +683,54 @@ fn parse_grid_template(style: &mut LayoutStyle, value: &str) {
         // Rows side carries area strings interleaved with row track sizes.
         style.grid_areas = Some(parse_grid_areas(rows_part));
     } else if !rows_part.is_empty() {
-        style.grid_template_rows = parse_track_list(rows_part);
+        let (tracks, names) = parse_track_list_named(rows_part);
+        style.grid_template_rows = tracks;
+        style.grid_row_line_names = (!names.is_empty()).then(|| build_line_map(names));
     }
     if let Some(cols) = cols_part {
-        style.grid_template_columns = parse_track_list(cols);
+        let (tracks, names) = parse_track_list_named(cols);
+        style.grid_template_columns = tracks;
+        style.grid_col_line_names = (!names.is_empty()).then(|| build_line_map(names));
     }
+}
+
+/// Store a `grid-column`/`grid-row` value. Numeric/`span` forms resolve to a
+/// `taffy::Line` now; a value that names a grid line (`content-start /
+/// content-end`, or the `grid-column: content` area shorthand) is kept raw and
+/// resolved against the parent's line-name map in `dom::resolve_grid_areas`.
+/// Whichever representation is set, the other is cleared so a later cascade
+/// rule of the opposite kind fully overrides it.
+fn set_grid_placement(style: &mut LayoutStyle, value: &str, is_col: bool) {
+    if grid_line_has_name(value) {
+        let raw = Some(value.trim().to_string());
+        if is_col {
+            style.grid_column_raw = raw;
+            style.grid_column = None;
+        } else {
+            style.grid_row_raw = raw;
+            style.grid_row = None;
+        }
+    } else {
+        let line = parse_grid_line(value);
+        if is_col {
+            style.grid_column = line;
+            style.grid_column_raw = None;
+        } else {
+            style.grid_row = line;
+            style.grid_row_raw = None;
+        }
+    }
+}
+
+/// True when a `grid-column`/`grid-row` value references a named line (any
+/// alphabetic token that is not a bare `span <n>` count), so it must defer to
+/// the parent's line-name map.
+fn grid_line_has_name(value: &str) -> bool {
+    value.split('/').any(|part| {
+        let p = part.trim();
+        let rest = p.strip_prefix("span").map(str::trim).unwrap_or(p);
+        rest.chars().any(|c| c.is_ascii_alphabetic())
+    })
 }
 
 /// Parse `grid-column`/`grid-row` values: `2`, `1 / 3`, `span 2`.
@@ -480,6 +791,99 @@ pub(crate) fn parse_color(value: &str) -> Option<[u8; 4]> {
         }
         return None;
     }
+    // hsl()/hsla() functional notation.
+    if let Some(rest) = lower_full.strip_prefix("hsl(").or_else(|| lower_full.strip_prefix("hsla(")) {
+        let inner = rest.strip_suffix(')').unwrap_or(rest);
+        let parts: Vec<&str> = inner.split([',', '/', ' ']).filter(|p| !p.trim().is_empty()).collect();
+        if parts.len() >= 3 {
+            let h = parts[0].trim().trim_end_matches("deg").parse::<f32>().ok()?;
+            let s = parts[1].trim().trim_end_matches('%').parse::<f32>().ok()? / 100.0;
+            let l = parts[2].trim().trim_end_matches('%').parse::<f32>().ok()? / 100.0;
+            let a = parts.get(3)
+                .and_then(|s| s.trim().trim_end_matches('%').parse::<f32>().ok())
+                .map(|v| if parts[3].contains('%') { (v * 2.55).round() } else { (v * 255.0).round() }.clamp(0.0, 255.0) as u8)
+                .unwrap_or(255);
+            return Some(hsl_to_rgba(h, s.clamp(0.0, 1.0), l.clamp(0.0, 1.0), a));
+        }
+        return None;
+    }
+    // oklch()/oklab() - Tailwind v4's entire palette. Convert through OKLab to
+    // sRGB; without this every modern-framework color resolved to nothing.
+    if lower_full.starts_with("oklch(") || lower_full.starts_with("oklab(") {
+        let is_lch = lower_full.starts_with("oklch(");
+        let inner = &lower_full[if is_lch { 6 } else { 6 }..];
+        let inner = inner.strip_suffix(')').unwrap_or(inner);
+        let (main, alpha) = match inner.split_once('/') {
+            Some((m, a)) => (m, Some(a)),
+            None => (inner, None),
+        };
+        let comps: Vec<&str> = main.split([',', ' ']).filter(|p| !p.trim().is_empty()).collect();
+        if comps.len() >= 3 {
+            let num = |s: &str| -> Option<f32> {
+                let s = s.trim();
+                s.strip_suffix('%').map(|p| p.parse::<f32>().map(|v| v / 100.0)).unwrap_or_else(|| s.parse::<f32>())
+                    .ok()
+            };
+            let l = num(comps[0])?;
+            let c = num(comps[1])?;
+            let a = alpha
+                .and_then(|s| {
+                    let s = s.trim();
+                    s.strip_suffix('%').map(|p| p.parse::<f32>().map(|v| v / 100.0)).unwrap_or_else(|| s.parse::<f32>()).ok()
+                })
+                .unwrap_or(1.0);
+            let (oa, ob) = if is_lch {
+                let h = comps[2].trim().trim_end_matches("deg").parse::<f32>().ok()?;
+                let hr = h.to_radians();
+                (c * hr.cos(), c * hr.sin())
+            } else {
+                (c, comps[2].trim().parse::<f32>().ok()?)
+            };
+            return Some(oklab_to_rgba(l, oa, ob, (a * 255.0).round().clamp(0.0, 255.0) as u8));
+        }
+        return None;
+    }
+    // color-mix(in <space>, c1 p1%, c2 p2%) - Tailwind v4 uses this pervasively,
+    // usually `color-mix(in oklab, <color> N%, transparent)` to apply opacity.
+    if lower_full.starts_with("color-mix(") {
+        let inner = raw[raw.to_ascii_lowercase().find("color-mix(").unwrap() + "color-mix(".len()..].trim_end();
+        let inner = inner.strip_suffix(')').unwrap_or(inner);
+        let args = split_top_commas(inner);
+        if args.len() >= 3 {
+            let parse_arg = |s: &str| -> Option<([u8; 4], Option<f32>)> {
+                let s = s.trim();
+                if let Some(idx) = s.rfind(char::is_whitespace) {
+                    let tail = s[idx + 1..].trim();
+                    if let Some(p) = tail.strip_suffix('%').and_then(|x| x.parse::<f32>().ok()) {
+                        return parse_color(s[..idx].trim()).map(|c| (c, Some(p / 100.0)));
+                    }
+                }
+                parse_color(s).map(|c| (c, None))
+            };
+            if let (Some((c1, p1)), Some((c2, p2))) = (parse_arg(args[1]), parse_arg(args[2])) {
+                let (w1, w2) = match (p1, p2) {
+                    (Some(a), Some(b)) => (a, b),
+                    (Some(a), None) => (a, 1.0 - a),
+                    (None, Some(b)) => (1.0 - b, b),
+                    (None, None) => (0.5, 0.5),
+                };
+                let tot = (w1 + w2).max(1e-6);
+                let (w1, w2) = (w1 / tot, w2 / tot);
+                // Mixing with a fully transparent color is the opacity idiom:
+                // keep the visible color, scale its alpha (not toward black).
+                if c2[3] == 0 {
+                    return Some([c1[0], c1[1], c1[2], (c1[3] as f32 * w1).round().clamp(0.0, 255.0) as u8]);
+                }
+                if c1[3] == 0 {
+                    return Some([c2[0], c2[1], c2[2], (c2[3] as f32 * w2).round().clamp(0.0, 255.0) as u8]);
+                }
+                let m = |i: usize| (c1[i] as f32 * w1 + c2[i] as f32 * w2).round().clamp(0.0, 255.0) as u8;
+                return Some([m(0), m(1), m(2), m(3)]);
+            }
+        }
+        return None;
+    }
+
     let v = value.split_whitespace().next()?.to_ascii_lowercase();
     if let Some(h) = v.strip_prefix('#') {
         let (r, g, b, a) = match h.len() {
@@ -534,8 +938,182 @@ pub(crate) fn parse_color(value: &str) -> Option<[u8; 4]> {
         "fuchsia" | "magenta" => Some([255, 0, 255, 255]),
         "olive" => Some([128, 128, 0, 255]),
         "transparent" => Some([0, 0, 0, 0]),
-        _ => None,
+        _ => named_color(&v),
     }
+}
+
+/// The remaining common CSS named colors (the hot ones from real sites) beyond
+/// the handful spelled out above.
+fn named_color(v: &str) -> Option<[u8; 4]> {
+    let rgb = match v {
+        "darkblue" => [0, 0, 139],
+        "mediumblue" => [0, 0, 205],
+        "royalblue" => [65, 105, 225],
+        "dodgerblue" => [30, 144, 255],
+        "cornflowerblue" => [100, 149, 237],
+        "steelblue" => [70, 130, 180],
+        "deepskyblue" => [0, 191, 255],
+        "skyblue" => [135, 206, 235],
+        "lightskyblue" => [135, 206, 250],
+        "lightblue" => [173, 216, 230],
+        "powderblue" => [176, 224, 230],
+        "cadetblue" => [95, 158, 160],
+        "slateblue" => [106, 90, 205],
+        "darkslateblue" => [72, 61, 139],
+        "midnightblue" => [25, 25, 112],
+        "indigo" => [75, 0, 130],
+        "darkgreen" => [0, 100, 0],
+        "forestgreen" => [34, 139, 34],
+        "seagreen" => [46, 139, 87],
+        "mediumseagreen" => [60, 179, 113],
+        "limegreen" => [50, 205, 50],
+        "yellowgreen" => [154, 205, 50],
+        "olivedrab" => [107, 142, 35],
+        "darkolivegreen" => [85, 107, 47],
+        "greenyellow" => [173, 255, 47],
+        "lightgreen" => [144, 238, 144],
+        "palegreen" => [152, 251, 152],
+        "springgreen" => [0, 255, 127],
+        "mediumaquamarine" => [102, 205, 170],
+        "aquamarine" => [127, 255, 212],
+        "turquoise" => [64, 224, 208],
+        "mediumturquoise" => [72, 209, 204],
+        "darkcyan" => [0, 139, 139],
+        "crimson" => [220, 20, 60],
+        "firebrick" => [178, 34, 34],
+        "darkred" => [139, 0, 0],
+        "indianred" => [205, 92, 92],
+        "tomato" => [255, 99, 71],
+        "orangered" => [255, 69, 0],
+        "coral" => [255, 127, 80],
+        "salmon" => [250, 128, 114],
+        "lightsalmon" => [255, 160, 122],
+        "darksalmon" => [233, 150, 122],
+        "hotpink" => [255, 105, 180],
+        "deeppink" => [255, 20, 147],
+        "pink" => [255, 192, 203],
+        "lightpink" => [255, 182, 193],
+        "palevioletred" => [219, 112, 147],
+        "mediumvioletred" => [199, 21, 133],
+        "violet" => [238, 130, 238],
+        "orchid" => [218, 112, 214],
+        "plum" => [221, 160, 221],
+        "mediumpurple" => [147, 112, 219],
+        "blueviolet" => [138, 43, 226],
+        "darkviolet" => [148, 0, 211],
+        "darkorchid" => [153, 50, 204],
+        "darkmagenta" => [139, 0, 139],
+        "lavender" => [230, 230, 250],
+        "thistle" => [216, 191, 216],
+        "gold" => [255, 215, 0],
+        "goldenrod" => [218, 165, 32],
+        "darkgoldenrod" => [184, 134, 11],
+        "khaki" => [240, 230, 140],
+        "darkkhaki" => [189, 183, 107],
+        "peachpuff" => [255, 218, 185],
+        "moccasin" => [255, 228, 181],
+        "papayawhip" => [255, 239, 213],
+        "wheat" => [245, 222, 179],
+        "tan" => [210, 180, 140],
+        "burlywood" => [222, 184, 135],
+        "sandybrown" => [244, 164, 96],
+        "peru" => [205, 133, 63],
+        "chocolate" => [210, 105, 30],
+        "sienna" => [160, 82, 45],
+        "saddlebrown" => [139, 69, 19],
+        "brown" => [165, 42, 42],
+        "rosybrown" => [188, 143, 143],
+        "darkorange" => [255, 140, 0],
+        "lightyellow" => [255, 255, 224],
+        "lightgoldenrodyellow" => [250, 250, 210],
+        "lemonchiffon" => [255, 250, 205],
+        "beige" => [245, 245, 220],
+        "ivory" => [255, 255, 240],
+        "azure" => [240, 255, 255],
+        "mintcream" => [245, 255, 250],
+        "honeydew" => [240, 255, 240],
+        "snow" => [255, 250, 250],
+        "seashell" => [255, 245, 238],
+        "linen" => [250, 240, 230],
+        "oldlace" => [253, 245, 230],
+        "floralwhite" => [255, 250, 240],
+        "ghostwhite" => [248, 248, 255],
+        "aliceblue" => [240, 248, 255],
+        "lavenderblush" => [255, 240, 245],
+        "mistyrose" => [255, 228, 225],
+        "cornsilk" => [255, 248, 220],
+        "antiquewhite" => [250, 235, 215],
+        "bisque" => [255, 228, 196],
+        "blanchedalmond" => [255, 235, 205],
+        "navajowhite" => [255, 222, 173],
+        "dimgray" | "dimgrey" => [105, 105, 105],
+        "slategray" | "slategrey" => [112, 128, 144],
+        "lightslategray" | "lightslategrey" => [119, 136, 153],
+        "darkslategray" | "darkslategrey" => [47, 79, 79],
+        _ => return None,
+    };
+    Some([rgb[0], rgb[1], rgb[2], 255])
+}
+
+/// Convert `hsl()`/`hsla()` to RGBA. `h` in degrees, `s`/`l` as 0-1.
+/// Convert an OKLab color (L in 0..1, a/b unbounded) to sRGB rgba bytes.
+/// (oklch is converted to oklab by the caller.) Standard Björn Ottosson matrix.
+fn oklab_to_rgba(l: f32, a: f32, b: f32, alpha: u8) -> [u8; 4] {
+    let l_ = l + 0.3963377774 * a + 0.2158037573 * b;
+    let m_ = l - 0.1055613458 * a - 0.0638541728 * b;
+    let s_ = l - 0.0894841775 * a - 1.2914855480 * b;
+    let (lc, mc, sc) = (l_ * l_ * l_, m_ * m_ * m_, s_ * s_ * s_);
+    let lr = 4.0767416621 * lc - 3.3077115913 * mc + 0.2309699292 * sc;
+    let lg = -1.2684380046 * lc + 2.6097574011 * mc - 0.3413193965 * sc;
+    let lb = -0.0041960863 * lc - 0.7034186147 * mc + 1.7076147010 * sc;
+    let enc = |x: f32| {
+        let x = x.clamp(0.0, 1.0);
+        let s = if x <= 0.0031308 { 12.92 * x } else { 1.055 * x.powf(1.0 / 2.4) - 0.055 };
+        (s * 255.0).round().clamp(0.0, 255.0) as u8
+    };
+    [enc(lr), enc(lg), enc(lb), alpha]
+}
+
+/// Split on top-level commas, respecting nested `()` (so a `color-mix` argument
+/// like `oklch(0.7 0.1 20)` or `var(--x, y)` is not shattered).
+fn split_top_commas(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = (depth - 1).max(0),
+            ',' if depth == 0 => {
+                out.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&s[start..]);
+    out
+}
+
+fn hsl_to_rgba(h: f32, s: f32, l: f32, a: u8) -> [u8; 4] {
+    let h = ((h % 360.0) + 360.0) % 360.0;
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let x = c * (1.0 - (((h / 60.0) % 2.0) - 1.0).abs());
+    let m = l - c / 2.0;
+    let (r, g, b) = match h as u32 / 60 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    [
+        (((r + m) * 255.0).round().clamp(0.0, 255.0)) as u8,
+        (((g + m) * 255.0).round().clamp(0.0, 255.0)) as u8,
+        (((b + m) * 255.0).round().clamp(0.0, 255.0)) as u8,
+        a,
+    ]
 }
 
 enum Side { Top, Right, Bottom, Left }
@@ -595,8 +1173,21 @@ fn resolve_length(value: &str) -> Option<f32> {
         }
         return Some(best);
     }
+    if let Some(rest) = v.strip_prefix("clamp(") {
+        // clamp(min, preferred, max) == max(min, min(preferred, max)). Widely
+        // used for responsive widths/font-sizes/gaps; returning None here made
+        // any `width: clamp(...)` element collapse (svelte.dev's hero grid).
+        let end = find_matching_paren(rest)?;
+        let args = split_top_level(&rest[..end], ',');
+        if args.len() == 3 {
+            let lo = resolve_length(args[0].trim())?;
+            let mid = resolve_length(args[1].trim())?;
+            let hi = resolve_length(args[2].trim())?;
+            return Some(mid.min(hi).max(lo));
+        }
+    }
     if v.contains('(') {
-        return None; // an unhandled function (clamp(), env(), ...): no safe fallback
+        return None; // an unhandled function (env(), ...): no safe fallback
     }
     px_value(v).or_else(|| v.parse::<f32>().ok())
 }
@@ -710,22 +1301,119 @@ fn eval_product(term: &str) -> Option<f32> {
     result
 }
 
-fn dimension_value(tok: &str) -> crate::Dimension {
-    let n = tok.trim();
-    if n.ends_with("%") {
-        if let Ok(v) = n[..n.len()-1].parse::<f32>() {
-            return crate::Dimension::Percent(v / 100.0);
-        }
-    } else if let Some(px) = px(tok) {
-        return crate::Dimension::Px(px);
+/// Recognize a `list-style-type` / `list-style` keyword. Returns `None` for
+/// tokens that are not list-style types (positions like `inside`, `url(...)`,
+/// or unknown type names), so a shorthand scan can skip them.
+fn list_style_keyword(tok: &str) -> Option<crate::ListStyle> {
+    match tok.trim() {
+        "none" => Some(crate::ListStyle::None),
+        "disc" => Some(crate::ListStyle::Disc),
+        "circle" => Some(crate::ListStyle::Circle),
+        "square" => Some(crate::ListStyle::Square),
+        "decimal" | "decimal-leading-zero" => Some(crate::ListStyle::Decimal),
+        _ => None,
     }
-    crate::Dimension::Auto
+}
+
+/// An inset component (top/right/bottom/left). `auto` and absent both become
+/// `None`; everything else keeps its (possibly relative) dimension for the
+/// resolution pass.
+fn inset_dim(value: &str) -> Option<crate::Dimension> {
+    match dimension_value(value) {
+        crate::Dimension::Auto => None,
+        d => Some(d),
+    }
+}
+
+/// Absolute keyword font-sizes (the `medium`-anchored scale), for the handful
+/// of pages that still use them.
+fn font_size_keyword(v: &str) -> Option<f32> {
+    Some(match v.to_ascii_lowercase().as_str() {
+        "xx-small" => 9.6,
+        "x-small" => 12.0,
+        "small" => 13.3,
+        "medium" => 16.0,
+        "large" => 18.0,
+        "x-large" => 24.0,
+        "xx-large" => 32.0,
+        _ => return None,
+    })
+}
+
+fn dimension_value(tok: &str) -> crate::Dimension {
+    use crate::Dimension;
+    let n = tok.trim();
+    if n.eq_ignore_ascii_case("auto") || n.is_empty() {
+        return Dimension::Auto;
+    }
+    // calc()/min()/max()/var(): resolve context-free to px where possible
+    // (relative units inside are approximated; rare for these properties).
+    if n.contains('(') {
+        return px(n).map(Dimension::Px).unwrap_or(Dimension::Auto);
+    }
+    let lower = n.to_ascii_lowercase();
+    let parse = |s: &str| s.trim().parse::<f32>().ok();
+    if let Some(v) = lower.strip_suffix('%').and_then(parse) {
+        return Dimension::Percent(v / 100.0);
+    }
+    // Order matters: check `rem` before `em`, `vmin`/`vmax` before `vw`/`vh`.
+    if let Some(v) = lower.strip_suffix("rem").and_then(parse) { return Dimension::Rem(v); }
+    if let Some(v) = lower.strip_suffix("em").and_then(parse) { return Dimension::Em(v); }
+    if let Some(v) = lower.strip_suffix("vmin").and_then(parse) { return Dimension::Vmin(v); }
+    if let Some(v) = lower.strip_suffix("vmax").and_then(parse) { return Dimension::Vmax(v); }
+    if let Some(v) = lower.strip_suffix("vw").and_then(parse) { return Dimension::Vw(v); }
+    if let Some(v) = lower.strip_suffix("vh").and_then(parse) { return Dimension::Vh(v); }
+    if let Some(v) = lower.strip_suffix("px").and_then(parse) { return Dimension::Px(v); }
+    if let Some(v) = lower.strip_suffix("pt").and_then(parse) { return Dimension::Px(v * 1.333); }
+    if let Some(v) = parse(&lower) { return Dimension::Px(v); }
+    Dimension::Auto
 }
 
 /// Parse every length token in a value as px (for box shorthands).
 fn edges(value: &str) -> Option<Edges> {
     let dims: Vec<f32> = value.split_whitespace().filter_map(px_value).collect();
     edges_from(dims)
+}
+
+/// Split a 1-or-2 value shorthand into (start, end); a single value applies to
+/// both. Used by the logical-property axes (`margin-inline`, `padding-block`).
+fn two(value: &str) -> (&str, &str) {
+    let mut it = value.split_whitespace();
+    let a = it.next().unwrap_or("0");
+    let b = it.next().unwrap_or(a);
+    (a, b)
+}
+
+/// Set one margin side (0=top,1=right,2=bottom,3=left), tracking `auto`.
+fn set_margin_side(style: &mut LayoutStyle, idx: usize, value: &str) {
+    let v = value.trim();
+    let is_auto = v.eq_ignore_ascii_case("auto");
+    let px = if is_auto { 0.0 } else { px(value).unwrap_or(0.0) };
+    match idx {
+        0 => style.margin.top = px,
+        1 => style.margin.right = px,
+        2 => style.margin.bottom = px,
+        3 => style.margin.left = px,
+        _ => {}
+    }
+    style.margin_auto[idx] = is_auto;
+}
+
+/// `margin: <t> <r>? <b>? <l>?` with per-side `auto` (so `margin: 0 auto`
+/// centers).
+fn apply_margin_shorthand(style: &mut LayoutStyle, value: &str) {
+    let toks: Vec<&str> = value.split_whitespace().collect();
+    let (t, r, b, l) = match toks.as_slice() {
+        [a] => (*a, *a, *a, *a),
+        [v, h] => (*v, *h, *v, *h),
+        [t, h, b] => (*t, *h, *b, *h),
+        [t, r, b, l, ..] => (*t, *r, *b, *l),
+        [] => return,
+    };
+    set_margin_side(style, 0, t);
+    set_margin_side(style, 1, r);
+    set_margin_side(style, 2, b);
+    set_margin_side(style, 3, l);
 }
 
 fn px_value(tok: &str) -> Option<f32> {
@@ -757,6 +1445,123 @@ fn token(value: &str) -> Option<&str> {
     value.split_whitespace().next()
 }
 
+/// Parse a `linear-gradient(...)` (also `repeating-`/`-webkit-`/`-moz-`) into
+/// (angle-degrees, color stops). Angle is CSS convention (0deg = to top, grows
+/// clockwise); `to <side>` keywords map to their angle. Color stops keep their
+/// optional 0..1 position. Returns None if it is not a linear-gradient or has
+/// no parseable colors. Radial/conic gradients are not handled (None).
+fn parse_linear_gradient(value: &str) -> Option<(f32, Vec<([u8; 4], Option<f32>)>)> {
+    let v = value.trim();
+    let lower = v.to_ascii_lowercase();
+    let start = lower.find("linear-gradient(")?;
+    let open = start + "linear-gradient(".len();
+    // Match the closing paren for this function.
+    let bytes = v.as_bytes();
+    let mut depth = 1;
+    let mut end = open;
+    while end < bytes.len() && depth > 0 {
+        match bytes[end] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            _ => {}
+        }
+        end += 1;
+    }
+    let inner = &v[open..end.saturating_sub(1)];
+    // Split on top-level commas (respect rgb()/rgba()/hsl() parens).
+    let mut parts: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut d = 0i32;
+    for c in inner.chars() {
+        match c {
+            '(' => { d += 1; cur.push(c); }
+            ')' => { d -= 1; cur.push(c); }
+            ',' if d == 0 => { parts.push(std::mem::take(&mut cur)); }
+            _ => cur.push(c),
+        }
+    }
+    if !cur.trim().is_empty() {
+        parts.push(cur);
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    // Leading angle / direction, if present.
+    let mut angle = 180.0f32; // default: to bottom
+    let first = parts[0].trim().to_ascii_lowercase();
+    let mut stop_start = 0;
+    if first.ends_with("deg") {
+        if let Ok(a) = first.trim_end_matches("deg").trim().parse::<f32>() {
+            angle = a;
+        }
+        stop_start = 1;
+    } else if first.starts_with("to ") {
+        angle = match first.as_str() {
+            "to top" => 0.0, "to right" => 90.0, "to bottom" => 180.0, "to left" => 270.0,
+            "to top right" | "to right top" => 45.0, "to bottom right" | "to right bottom" => 135.0,
+            "to bottom left" | "to left bottom" => 225.0, "to top left" | "to left top" => 315.0,
+            _ => 180.0,
+        };
+        stop_start = 1;
+    } else if first.starts_with("turn") || first.ends_with("turn") {
+        stop_start = 1;
+    }
+    let mut stops: Vec<([u8; 4], Option<f32>)> = Vec::new();
+    for p in &parts[stop_start..] {
+        let t = p.trim();
+        if t.is_empty() {
+            continue;
+        }
+        // "color [pos%]" - the color may itself contain spaces (rgb( ... )) so
+        // split off a trailing percentage token if present.
+        let (color_str, pos) = if let Some(idx) = t.rfind(char::is_whitespace) {
+            let tail = t[idx + 1..].trim();
+            if let Some(pct) = tail.strip_suffix('%').and_then(|s| s.parse::<f32>().ok()) {
+                (t[..idx].trim(), Some((pct / 100.0).clamp(0.0, 1.0)))
+            } else {
+                (t, None)
+            }
+        } else {
+            (t, None)
+        };
+        if let Some(c) = parse_color(color_str) {
+            stops.push((c, pos));
+        }
+    }
+    if stops.len() < 2 {
+        // A single-color "gradient" is just that color; let the caller fall back
+        // to background_color instead (return None so parse_color runs).
+        return None;
+    }
+    Some((angle, stops))
+}
+
+/// Parse `aspect-ratio` to a width/height ratio. Accepts `16 / 9`, `1.5`, and
+/// the `auto <ratio>` form (the `auto` keyword alone yields `None`, meaning the
+/// intrinsic ratio, which for images is filled in at layout).
+fn parse_aspect_ratio(value: &str) -> Option<f32> {
+    let v = value.trim();
+    if v.eq_ignore_ascii_case("auto") {
+        return None;
+    }
+    // Drop a leading/trailing `auto` keyword from the `auto <ratio>` form.
+    let ratio_part: String = v
+        .split_whitespace()
+        .filter(|t| !t.eq_ignore_ascii_case("auto"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if let Some((w, h)) = ratio_part.split_once('/') {
+        let w: f32 = w.trim().parse().ok()?;
+        let h: f32 = h.trim().parse().ok()?;
+        if h > 0.0 && w > 0.0 {
+            return Some(w / h);
+        }
+        return None;
+    }
+    let r: f32 = ratio_part.trim().parse().ok()?;
+    (r.is_finite() && r > 0.0).then_some(r)
+}
+
 /// Extract the first `url(...)` reference from a `background`/`background-image`
 /// value, unquoted. Ignores any other layers in the same shorthand (gradients,
 /// `no-repeat`, etc.): we paint the referenced image, not the gradient.
@@ -770,6 +1575,76 @@ fn parse_url(value: &str) -> Option<String> {
     } else {
         Some(unquoted.to_string())
     }
+}
+
+/// `flex: none|auto|<grow>|<grow> <shrink>|<grow> <shrink> <basis>`. This is
+/// the shorthand form almost all real-world flexbox CSS actually uses (far
+/// more often than the flex-grow/flex-shrink longhands); leaving it
+/// unhandled silently drops grow/shrink from every rule written this way.
+/// flex-basis is not modeled as a distinct field from width, so a basis
+/// length in the shorthand is parsed (to keep the number-only forms working)
+/// but otherwise not separately applied; auto is a reasonable approximation
+/// for the common case where basis is 0 or unspecified.
+fn parse_flex_shorthand(style: &mut LayoutStyle, value: &str) {
+    match value.trim() {
+        "none" => {
+            style.flex_grow = Some(0.0);
+            style.flex_shrink = Some(0.0);
+            style.flex_basis = crate::Dimension::Auto;
+            return;
+        }
+        "auto" => {
+            style.flex_grow = Some(1.0);
+            style.flex_shrink = Some(1.0);
+            style.flex_basis = crate::Dimension::Auto;
+            return;
+        }
+        "initial" => {
+            style.flex_grow = Some(0.0);
+            style.flex_shrink = Some(1.0);
+            style.flex_basis = crate::Dimension::Auto;
+            return;
+        }
+        _ => {}
+    }
+    // Grammar: `flex: <grow> <shrink>? || <basis>`. Bare numbers are grow then
+    // shrink; a token with a unit / `auto` / a third numeric is the basis
+    // (e.g. `flex: 0 0 260px`, the fixed-width sidebar idiom).
+    let mut numbers: Vec<f32> = Vec::new();
+    let mut basis: Option<crate::Dimension> = None;
+    for tok in value.split_whitespace() {
+        if let Ok(n) = tok.parse::<f32>() {
+            if numbers.len() < 2 {
+                numbers.push(n);
+            } else {
+                basis = Some(dimension_value(tok));
+            }
+        } else {
+            basis = Some(dimension_value(tok));
+        }
+    }
+    match numbers.as_slice() {
+        [grow] => {
+            style.flex_grow = Some(*grow);
+            style.flex_shrink = Some(1.0);
+        }
+        [grow, shrink, ..] => {
+            style.flex_grow = Some(*grow);
+            style.flex_shrink = Some(*shrink);
+        }
+        [] => {}
+    }
+    // Explicit basis wins; otherwise numbers-only shorthand implies basis 0
+    // (per spec `flex: 1` == `1 1 0%`), while a bare basis keeps grow/shrink 1.
+    style.flex_basis = match basis {
+        Some(b) => b,
+        None if !numbers.is_empty() => crate::Dimension::Px(0.0),
+        None => {
+            style.flex_grow = Some(1.0);
+            style.flex_shrink = Some(1.0);
+            crate::Dimension::Auto
+        }
+    };
 }
 
 /// `background-size: 10px` / `0.857em` / `10px 20px` -> explicit px pair.
@@ -908,5 +1783,34 @@ mod tests {
     fn width_property_resolves_calc_with_var() {
         let s = compute_style("div", Some("width: calc(var(--x, 10px) + 5px)"));
         assert_eq!(s.width, crate::Dimension::Px(15.0));
+    }
+
+    #[test]
+    fn flex_shorthand_two_numbers() {
+        // The exact form Wikipedia's infobox uses for its label/value cells
+        // (`.infobox tbody > tr > th/td{flex:1 0}`): without shorthand
+        // support this was silently dropped, leaving both columns
+        // shrink-to-fit instead of sharing the row's width.
+        let s = compute_style("div", Some("flex: 1 0"));
+        assert_eq!(s.flex_grow, Some(1.0));
+        assert_eq!(s.flex_shrink, Some(0.0));
+    }
+
+    #[test]
+    fn flex_shorthand_keywords() {
+        let none = compute_style("div", Some("flex: none"));
+        assert_eq!(none.flex_grow, Some(0.0));
+        assert_eq!(none.flex_shrink, Some(0.0));
+
+        let auto = compute_style("div", Some("flex: auto"));
+        assert_eq!(auto.flex_grow, Some(1.0));
+        assert_eq!(auto.flex_shrink, Some(1.0));
+    }
+
+    #[test]
+    fn flex_shorthand_single_number_defaults_shrink_to_one() {
+        let s = compute_style("div", Some("flex: 2"));
+        assert_eq!(s.flex_grow, Some(2.0));
+        assert_eq!(s.flex_shrink, Some(1.0));
     }
 }

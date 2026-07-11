@@ -187,6 +187,17 @@ impl<'i> parser::Parser<'i> for ObscuraSelectorParser {
         true
     }
 
+    // Allow `:is()` and `:where()`. The selectors crate gates these on this hook
+    // (default false), so without it every `:where(...)`/`:is(...)` selector
+    // failed to parse and was dropped, discarding those rules from both the
+    // render cascade and querySelectorAll. Tailwind's preflight and most modern
+    // resets wrap their rules in `:where(...)` for zero specificity, so this
+    // blanked large parts of many sites. Matching (Component::Is/Where) is built
+    // into the crate, so enabling parsing is sufficient.
+    fn parse_is_and_where(&self) -> bool {
+        true
+    }
+
     fn parse_non_ts_pseudo_class(
         &self,
         _location: cssparser::SourceLocation,
