@@ -34,15 +34,28 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
     // each URL is still fetched at most once.
     let intrinsic = collect_image_intrinsics(tree, base_url, &mut image_cache);
     let mut laid = layout_dom_with_images(tree, viewport, &intrinsic);
+    // Nodes that live inside an inline `<svg>` we rasterized as one document;
+    // their painting is owned by that raster, so they are skipped in both the
+    // box/text loop below and the inline-formatting loop after it (an svg
+    // `<text>` element must not also paint its glyphs on top of the raster).
+    let mut svg_subtree_skip: std::collections::HashSet<obscura_dom::tree::NodeId> = std::collections::HashSet::new();
+    // Whether any element carries a `transform: translate()`. When none does
+    // (the overwhelmingly common case), every node's accumulated offset is
+    // zero, so skip the per-node ancestor walk entirely and keep the paint
+    // path free of any added cost.
+    let any_transform = laid.styles.values().any(|s| s.transform_translate.is_some());
     // Tree order so later elements paint over earlier ones (normal flow).
     for nid in tree.descendants(tree.document()) {
+        if svg_subtree_skip.contains(&nid) {
+            continue;
+        }
         let node = match tree.get_node(nid) {
             Some(n) => n,
             None => continue,
         };
-        
+
         if node.is_text() {
-            paint_text_node(tree, nid, &laid, &mut pixmap);
+            paint_text_node(tree, nid, &laid, &mut pixmap, any_transform);
             continue;
         }
 
@@ -51,7 +64,7 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
             None => continue,
         };
         let rect = match laid.rects.get(&nid) {
-            Some(r) => r,
+            Some(r) => *r,
             None => continue,
         };
 
@@ -64,17 +77,33 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
             continue;
         }
 
+        // A `transform: translate()` on this element or any ancestor offsets
+        // this element's whole painted box (and, applied per node, its whole
+        // subtree). Shift the border box and the inherited clip by the same
+        // accumulated vector so everything painted for this node moves together.
+        let (ox, oy) = if any_transform {
+            accumulated_translate(tree, nid, &laid)
+        } else {
+            (0.0, 0.0)
+        };
+        let rect = crate::Rect { x: rect.x + ox, y: rect.y + oy, width: rect.width, height: rect.height };
+
         // Ancestor `overflow: hidden` clip, if any. Skip painting entirely
         // once the box has no visible overlap with it (this is what makes the
         // ubiquitous 1x1 clipped "visually hidden" accessibility pattern
         // actually invisible instead of painting text wherever it lands).
-        let clip = laid.clip_rects.get(&nid).copied().flatten();
+        let clip = laid
+            .clip_rects
+            .get(&nid)
+            .copied()
+            .flatten()
+            .map(|c| crate::Rect { x: c.x + ox, y: c.y + oy, width: c.width, height: c.height });
         let visible_rect = match clip {
             Some(c) => match rect.intersect(&c) {
                 Some(r) => r,
                 None => continue,
             },
-            None => *rect,
+            None => rect,
         };
         let box_rect = match Rect::from_xywh(visible_rect.x, visible_rect.y, visible_rect.width, visible_rect.height) {
             Some(r) => r,
@@ -129,14 +158,16 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
                         height: ih,
                     }
                 }
-                None => *rect,
+                None => rect,
             };
             let img_rect = match clip {
                 Some(c) => img_rect.intersect(&c),
                 None => Some(img_rect),
             };
             if let Some(img_rect) = img_rect {
-                paint_image(bg_url, base_url, &img_rect, &mut pixmap, &mut image_cache);
+                // object-fit does not apply to background images (that is
+                // background-size, handled above); paint the layer as-is.
+                paint_image(bg_url, base_url, &img_rect, crate::ObjectFit::Fill, &mut pixmap, &mut image_cache);
             }
         }
 
@@ -191,7 +222,7 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
 
         if name.local.as_ref() == "img" {
             if let Some(src) = resolve_img_url(tree, nid) {
-                let painted = paint_image(&src, base_url, &rect, &mut pixmap, &mut image_cache);
+                let painted = paint_image(&src, base_url, &rect, style.object_fit, &mut pixmap, &mut image_cache);
                 // Fall back to alt text only when the image itself did not paint.
                 if !painted {
                     // A fetch/decode failure paints a neutral grey box (like a
@@ -210,6 +241,31 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
                         }
                     }
                 }
+            }
+        }
+
+        // Inline `<svg>...</svg>`: serialize the whole subtree back to one
+        // standalone SVG document and rasterize it as a unit, so a
+        // `<use href="#id">` resolves against the `<symbol>`/`<defs>` in the
+        // same svg. The raster owns the subtree, so its DOM children are not
+        // painted individually (they are added to `svg_subtree_skip`). The svg
+        // is drawn at its full border-box size (undistorted) and clipped to the
+        // overflow-visible region.
+        if name.local.as_ref() == "svg" {
+            let markup = serialize_svg(tree, nid);
+            if let Some(content) = render_svg(markup.as_bytes(), rect.width as u32, rect.height as u32) {
+                let mask = clip.and_then(|_| rect_clip_mask(pixmap.width(), pixmap.height(), &visible_rect));
+                pixmap.draw_pixmap(
+                    rect.x as i32,
+                    rect.y as i32,
+                    content.as_ref(),
+                    &tiny_skia::PixmapPaint::default(),
+                    Transform::identity(),
+                    mask.as_ref(),
+                );
+            }
+            for child in tree.descendants(nid) {
+                svg_subtree_skip.insert(child);
             }
         }
 
@@ -236,7 +292,7 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
             let fsize = style.font_size.unwrap_or(16.0);
             let is_bold = style.font_weight.as_deref() == Some("bold");
             for (word_rect, word) in runs {
-                draw_text(&mut pixmap, word, word_rect.x, word_rect.y, color, fsize, is_bold, clip);
+                draw_text(&mut pixmap, word, word_rect.x + ox, word_rect.y + oy, color, fsize, is_bold, clip);
             }
         }
 
@@ -264,15 +320,69 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
     // box backgrounds/borders painted in the loop above. Each item already
     // carries its final origin and clip from `TextEngine::finalize`.
     for nid in tree.descendants(tree.document()) {
+        if svg_subtree_skip.contains(&nid) {
+            continue;
+        }
         if let Some(&idx) = laid.ifc_items.get(&nid) {
             if laid.styles.get(&nid).map(|s| s.effectively_invisible).unwrap_or(false) {
                 continue;
             }
-            laid.text_engine.paint_item(idx, &mut pixmap);
+            // Shift the shaped glyphs by the same accumulated translate as the
+            // container's box so text under a transformed ancestor moves with
+            // it. Computed before the mutable `paint_item` borrow.
+            let off = if any_transform {
+                accumulated_translate(tree, nid, &laid)
+            } else {
+                (0.0, 0.0)
+            };
+            laid.text_engine.paint_item(idx, &mut pixmap, off);
         }
     }
 
     Some(pixmap)
+}
+
+/// Sum of `transform: translate()` offsets of `nid` and every ancestor, in CSS
+/// px. A translate shifts an element's own box and its entire subtree by the
+/// same vector, so a node's painted position is its normal-flow position plus
+/// every translate at or above it. Percentage components resolve against each
+/// contributing element's own border box (read from the laid-out rects), per
+/// CSS. Nodes with no style/rect entry (e.g. text nodes) contribute nothing but
+/// are still walked through so element ancestors above them count.
+fn accumulated_translate(
+    tree: &DomTree,
+    nid: obscura_dom::tree::NodeId,
+    laid: &crate::DomLayout,
+) -> (f32, f32) {
+    let (mut ox, mut oy) = (0.0f32, 0.0f32);
+    let mut cur = Some(nid);
+    while let Some(id) = cur {
+        if let (Some(style), Some(rect)) = (laid.styles.get(&id), laid.rects.get(&id)) {
+            if let Some((dx, dy)) = style.transform_translate {
+                ox += resolve_translate(dx, rect.width);
+                oy += resolve_translate(dy, rect.height);
+            }
+        }
+        cur = tree.get_node(id).and_then(|n| n.parent);
+    }
+    (ox, oy)
+}
+
+/// Resolve one translate component to px: a length passes through, a percentage
+/// is taken against `basis` (the element's own border-box extent on that axis).
+/// Font/viewport-relative leftovers fall back to a coarse px value rather than
+/// panicking (translate rarely uses them; px/% are the required forms).
+fn resolve_translate(d: crate::Dimension, basis: f32) -> f32 {
+    match d {
+        crate::Dimension::Px(px) => px,
+        crate::Dimension::Percent(p) => p * basis,
+        crate::Dimension::Em(v) | crate::Dimension::Rem(v) => v * 16.0,
+        crate::Dimension::Vw(v)
+        | crate::Dimension::Vh(v)
+        | crate::Dimension::Vmin(v)
+        | crate::Dimension::Vmax(v) => v,
+        crate::Dimension::Auto => 0.0,
+    }
 }
 
 /// A closed rounded-rectangle path, corners approximated by quadratic curves
@@ -336,6 +446,7 @@ fn paint_text_node(
     nid: obscura_dom::tree::NodeId,
     laid: &crate::DomLayout,
     pixmap: &mut Pixmap,
+    any_transform: bool,
 ) -> Option<()> {
     let runs = laid.text_runs.get(&nid)?;
     let node = tree.get_node(nid)?;
@@ -347,10 +458,22 @@ fn paint_text_node(
     let color = style.color.unwrap_or([0, 0, 0, 255]);
     let fsize = style.font_size.unwrap_or(16.0);
     let is_bold = style.font_weight.as_deref() == Some("bold");
-    let clip = laid.clip_rects.get(&nid).copied().flatten();
+    // A text node has no transform of its own, but any transformed element
+    // ancestor offsets it; the ancestor walk from the text node picks those up.
+    let (ox, oy) = if any_transform {
+        accumulated_translate(tree, nid, laid)
+    } else {
+        (0.0, 0.0)
+    };
+    let clip = laid
+        .clip_rects
+        .get(&nid)
+        .copied()
+        .flatten()
+        .map(|c| crate::Rect { x: c.x + ox, y: c.y + oy, width: c.width, height: c.height });
 
     for (rect, word) in runs {
-        draw_text(pixmap, word, rect.x, rect.y, color, fsize, is_bold, clip);
+        draw_text(pixmap, word, rect.x + ox, rect.y + oy, color, fsize, is_bold, clip);
     }
     Some(())
 }
@@ -897,6 +1020,7 @@ fn paint_image(
     src: &str,
     base_url: Option<&str>,
     rect: &crate::Rect,
+    object_fit: crate::ObjectFit,
     pixmap: &mut Pixmap,
     cache: &mut std::collections::HashMap<String, Option<Vec<u8>>>,
 ) -> bool {
@@ -904,24 +1028,113 @@ fn paint_image(
         return false;
     }
     let Some(bytes) = fetch_bytes(src, base_url, cache) else { return false };
+    let svg = is_svg(&bytes);
 
-    let content = if is_svg(&bytes) {
-        render_svg(&bytes, rect.width as u32, rect.height as u32)
+    // Destination sub-rect within the element box. `Fill` keeps the historical
+    // behavior (stretch the image to the whole box); the other modes need the
+    // image's intrinsic size to preserve its aspect ratio, and fall back to
+    // fill when it cannot be read.
+    let dest = if object_fit == crate::ObjectFit::Fill {
+        *rect
     } else {
-        raster_to_pixmap(&bytes, rect.width as u32, rect.height as u32)
+        let intrinsic = if svg {
+            svg_intrinsic(&bytes)
+        } else {
+            image_dimensions(&bytes).map(|(w, h)| (w as f32, h as f32))
+        };
+        match intrinsic {
+            Some((iw, ih)) => object_fit_dest(rect, iw, ih, object_fit),
+            None => *rect,
+        }
     };
-    if let Some(content) = content {
-        pixmap.draw_pixmap(
-            rect.x as i32,
-            rect.y as i32,
-            content.as_ref(),
-            &tiny_skia::PixmapPaint::default(),
-            Transform::identity(),
-            None,
-        );
-        return true;
+
+    let (dw, dh) = (dest.width.round().max(1.0) as u32, dest.height.round().max(1.0) as u32);
+    let content = if svg {
+        render_svg(&bytes, dw, dh)
+    } else {
+        raster_to_pixmap(&bytes, dw, dh)
+    };
+    let Some(content) = content else { return false };
+
+    // `Cover`/`None` can size the image past the box; clip it to the box so it
+    // does not paint over neighboring content (CSS clips object-fit to the
+    // content box). `Fill`/`Contain`/`scale-down` always fit inside the box, so
+    // they take the faster unclipped path.
+    let clip = if dest.width > rect.width + 0.5 || dest.height > rect.height + 0.5 {
+        box_clip_mask(pixmap.width(), pixmap.height(), rect)
+    } else {
+        None
+    };
+    pixmap.draw_pixmap(
+        dest.x as i32,
+        dest.y as i32,
+        content.as_ref(),
+        &tiny_skia::PixmapPaint::default(),
+        Transform::identity(),
+        clip.as_ref(),
+    );
+    true
+}
+
+/// The destination sub-rect for a replaced element's image within its box,
+/// given the image's intrinsic `(iw, ih)` size and `object-fit`. Centered in
+/// the box; for `Cover`/`None` it can extend past the box edges (the caller
+/// clips it). Aspect ratio is preserved for every mode except `Fill`.
+fn object_fit_dest(box_rect: &crate::Rect, iw: f32, ih: f32, fit: crate::ObjectFit) -> crate::Rect {
+    let (bw, bh) = (box_rect.width, box_rect.height);
+    if iw <= 0.0 || ih <= 0.0 {
+        return *box_rect;
     }
-    false
+    let (dw, dh) = match fit {
+        crate::ObjectFit::Fill => (bw, bh),
+        crate::ObjectFit::Contain => {
+            let s = (bw / iw).min(bh / ih);
+            (iw * s, ih * s)
+        }
+        crate::ObjectFit::Cover => {
+            let s = (bw / iw).max(bh / ih);
+            (iw * s, ih * s)
+        }
+        crate::ObjectFit::None => (iw, ih),
+        crate::ObjectFit::ScaleDown => {
+            // min(Contain-size, intrinsic-size): the Contain fit, but never
+            // scaled up past the image's own pixels.
+            let s = (bw / iw).min(bh / ih).min(1.0);
+            (iw * s, ih * s)
+        }
+    };
+    crate::Rect {
+        x: box_rect.x + (bw - dw) / 2.0,
+        y: box_rect.y + (bh - dh) / 2.0,
+        width: dw,
+        height: dh,
+    }
+}
+
+/// The intrinsic `(width, height)` of an SVG image from its size/`viewBox`,
+/// used to preserve aspect ratio under `object-fit`. Parses the SVG once; the
+/// eventual raster re-parses in `render_svg` (only reached for a non-`fill`
+/// object-fit on an SVG image, which is rare).
+fn svg_intrinsic(bytes: &[u8]) -> Option<(f32, f32)> {
+    let tree = usvg::Tree::from_data(bytes, &usvg::Options::default()).ok()?;
+    let size = tree.size();
+    if size.width() > 0.0 && size.height() > 0.0 {
+        Some((size.width(), size.height()))
+    } else {
+        None
+    }
+}
+
+/// A full-pixmap clip mask admitting only the pixels inside `rect`, used to
+/// crop an `object-fit: cover|none` image to its element box.
+fn box_clip_mask(pw: u32, ph: u32, rect: &crate::Rect) -> Option<tiny_skia::Mask> {
+    let mut mask = tiny_skia::Mask::new(pw, ph)?;
+    let r = Rect::from_xywh(rect.x, rect.y, rect.width, rect.height)?;
+    let mut pb = PathBuilder::new();
+    pb.push_rect(r);
+    let path = pb.finish()?;
+    mask.fill_path(&path, FillRule::Winding, true, Transform::identity());
+    Some(mask)
 }
 
 /// Sniff SVG content: either an XML/SVG prolog, or a bare `<svg` root tag
@@ -949,6 +1162,106 @@ fn render_svg(bytes: &[u8], width: u32, height: u32) -> Option<Pixmap> {
     let transform = Transform::from_scale(width as f32 / size.width(), height as f32 / size.height());
     resvg::render(&tree, transform, &mut svg_pixmap.as_mut());
     Some(svg_pixmap)
+}
+
+/// Serialize an inline `<svg>` subtree (rooted at `root`) back to a standalone
+/// SVG document string. Emits `<tag attr="v">children</tag>` for the element
+/// and every descendant, preserving the root's `viewBox`/`width`/`height` and
+/// all `<defs>`/`<symbol>`/`<use>`/`<path>` structure so resvg can rasterize it
+/// as a self-contained document. SVG is XML-clean, so there are no HTML
+/// void-element or optional-close rules to apply; every element gets an
+/// explicit closing tag. The root gains an `xmlns` declaration when it lacks
+/// one (common for inline svg, whose namespace is implied by the HTML parser
+/// but required for usvg to parse the string on its own).
+fn serialize_svg(tree: &DomTree, root: obscura_dom::tree::NodeId) -> String {
+    let mut buf = String::new();
+    serialize_svg_node(tree, root, true, &mut buf);
+    buf
+}
+
+fn serialize_svg_node(tree: &DomTree, nid: obscura_dom::tree::NodeId, is_root: bool, buf: &mut String) {
+    let node = match tree.get_node(nid) {
+        Some(n) => n,
+        None => return,
+    };
+    if let Some(text) = node.text_content_of_text_node() {
+        svg_escape_text(text, buf);
+        return;
+    }
+    let name = match node.as_element() {
+        Some(n) => n,
+        // Document/comment/PI: no tag of its own, emit only element children.
+        None => {
+            for child in tree.children(nid) {
+                serialize_svg_node(tree, child, false, buf);
+            }
+            return;
+        }
+    };
+    let tag = name.local.as_ref();
+    buf.push('<');
+    buf.push_str(tag);
+    let mut has_xmlns = false;
+    if let Some(attrs) = node.attrs() {
+        for attr in attrs {
+            // Emit the local name only, dropping any prefix (`xlink:href` ->
+            // `href`): resvg reads both, and a bare local avoids needing an
+            // `xmlns:xlink` declaration in the standalone document.
+            let aname = attr.name.local.as_ref();
+            if aname == "xmlns" {
+                has_xmlns = true;
+            }
+            buf.push(' ');
+            buf.push_str(aname);
+            buf.push_str("=\"");
+            svg_escape_attr(&attr.value, buf);
+            buf.push('"');
+        }
+    }
+    if is_root && !has_xmlns {
+        buf.push_str(" xmlns=\"http://www.w3.org/2000/svg\"");
+    }
+    buf.push('>');
+    for child in tree.children(nid) {
+        serialize_svg_node(tree, child, false, buf);
+    }
+    buf.push_str("</");
+    buf.push_str(tag);
+    buf.push('>');
+}
+
+fn svg_escape_text(s: &str, buf: &mut String) {
+    for c in s.chars() {
+        match c {
+            '&' => buf.push_str("&amp;"),
+            '<' => buf.push_str("&lt;"),
+            '>' => buf.push_str("&gt;"),
+            _ => buf.push(c),
+        }
+    }
+}
+
+fn svg_escape_attr(s: &str, buf: &mut String) {
+    for c in s.chars() {
+        match c {
+            '&' => buf.push_str("&amp;"),
+            '<' => buf.push_str("&lt;"),
+            '"' => buf.push_str("&quot;"),
+            _ => buf.push(c),
+        }
+    }
+}
+
+/// A full-pixmap alpha mask that is opaque only inside `rect`, used to clip a
+/// blit (e.g. an inline svg raster) to an ancestor's overflow-hidden region.
+fn rect_clip_mask(width: u32, height: u32, rect: &crate::Rect) -> Option<tiny_skia::Mask> {
+    let mut mask = tiny_skia::Mask::new(width, height)?;
+    let r = Rect::from_xywh(rect.x, rect.y, rect.width, rect.height)?;
+    let mut pb = PathBuilder::new();
+    pb.push_rect(r);
+    let path = pb.finish()?;
+    mask.fill_path(&path, FillRule::Winding, true, Transform::identity());
+    Some(mask)
 }
 
 /// Paint a `mask-image`: the ubiquitous "colored, scalable icon" pattern,
@@ -1012,6 +1325,55 @@ mod tests {
     use obscura_dom::tree_sink::parse_html;
 
     #[test]
+    fn object_fit_contain_and_cover_center_and_preserve_aspect() {
+        // A 200x100 box (2:1) with a square 100x100 image, offset so centering
+        // is checked against the box origin, not (0,0).
+        let box_rect = crate::Rect { x: 10.0, y: 20.0, width: 200.0, height: 100.0 };
+        let (iw, ih) = (100.0f32, 100.0f32);
+
+        // Contain: the largest square fitting inside 200x100 is 100x100,
+        // letterboxed horizontally and centered.
+        let c = object_fit_dest(&box_rect, iw, ih, crate::ObjectFit::Contain);
+        assert!((c.width - 100.0).abs() < 0.01 && (c.height - 100.0).abs() < 0.01, "contain size {:?}", c);
+        assert!((c.width / c.height - iw / ih).abs() < 1e-3, "contain preserves aspect: {:?}", c);
+        assert!((c.x - 60.0).abs() < 0.01, "contain centered x (10 + (200-100)/2): {}", c.x);
+        assert!((c.y - 20.0).abs() < 0.01, "contain centered y (20 + (100-100)/2): {}", c.y);
+        // Contain always fits inside the box.
+        assert!(c.x >= box_rect.x - 0.01 && c.x + c.width <= box_rect.x + box_rect.width + 0.01);
+        assert!(c.y >= box_rect.y - 0.01 && c.y + c.height <= box_rect.y + box_rect.height + 0.01);
+
+        // Cover: the smallest square covering 200x100 is 200x200, centered so
+        // it overflows the box vertically (the paint path clips it).
+        let v = object_fit_dest(&box_rect, iw, ih, crate::ObjectFit::Cover);
+        assert!((v.width - 200.0).abs() < 0.01 && (v.height - 200.0).abs() < 0.01, "cover size {:?}", v);
+        assert!((v.width / v.height - iw / ih).abs() < 1e-3, "cover preserves aspect: {:?}", v);
+        assert!((v.x - 10.0).abs() < 0.01, "cover centered x (10 + (200-200)/2): {}", v.x);
+        assert!((v.y + 30.0).abs() < 0.01, "cover centered y (20 + (100-200)/2 = -30): {}", v.y);
+        // Cover fully covers the box on both axes.
+        assert!(v.x <= box_rect.x + 0.01 && v.x + v.width >= box_rect.x + box_rect.width - 0.01);
+        assert!(v.y <= box_rect.y + 0.01 && v.y + v.height >= box_rect.y + box_rect.height - 0.01);
+
+        // scale-down never upscales: a 100x100 image in a 200x200 box stays
+        // 100x100 (Contain would grow it to 200x200), centered.
+        let box2 = crate::Rect { x: 0.0, y: 0.0, width: 200.0, height: 200.0 };
+        let sd = object_fit_dest(&box2, iw, ih, crate::ObjectFit::ScaleDown);
+        assert!((sd.width - 100.0).abs() < 0.01 && (sd.height - 100.0).abs() < 0.01, "scale-down no upscale: {:?}", sd);
+        assert!((sd.x - 50.0).abs() < 0.01 && (sd.y - 50.0).abs() < 0.01, "scale-down centered: {:?}", sd);
+        let cn = object_fit_dest(&box2, iw, ih, crate::ObjectFit::Contain);
+        assert!((cn.width - 200.0).abs() < 0.01, "contain upscales into the box: {:?}", cn);
+
+        // None uses the intrinsic size regardless of box, centered.
+        let n = object_fit_dest(&box2, iw, ih, crate::ObjectFit::None);
+        assert!((n.width - 100.0).abs() < 0.01 && (n.height - 100.0).abs() < 0.01, "none intrinsic size: {:?}", n);
+        assert!((n.x - 50.0).abs() < 0.01 && (n.y - 50.0).abs() < 0.01, "none centered: {:?}", n);
+
+        // Fill stretches to exactly the box.
+        let f = object_fit_dest(&box_rect, iw, ih, crate::ObjectFit::Fill);
+        assert!((f.width - box_rect.width).abs() < 0.01 && (f.height - box_rect.height).abs() < 0.01, "fill: {:?}", f);
+        assert!((f.x - box_rect.x).abs() < 0.01 && (f.y - box_rect.y).abs() < 0.01, "fill origin: {:?}", f);
+    }
+
+    #[test]
     fn paints_background_color() {
         let tree = parse_html(
             "<html><body><div style=\"background-color: #ff0000; width: 100px; height: 80px\"></div></body></html>",
@@ -1047,6 +1409,93 @@ mod tests {
     }
 
     #[test]
+    fn nested_translate_accumulates_through_subtree() {
+        // Parent red box (position:absolute at 0,0, 20x20) translated by
+        // (50,60). Child blue box (10x10, in-flow at the red box's origin)
+        // translated by an additional (30,0). The child's painted position must
+        // be the SUM of both translates, (50+30, 60+0) = (80,60), proving an
+        // ancestor's translate offsets the whole subtree on top of the node's
+        // own translate.
+        let tree = parse_html(
+            "<html><body style=\"margin:0\">\
+             <div style=\"position:relative; width:200px; height:200px\">\
+               <div style=\"position:absolute; top:0; left:0; width:20px; height:20px; \
+                            background:#ff0000; transform:translate(50px,60px)\">\
+                 <div style=\"width:10px; height:10px; background:#0000ff; \
+                              transform:translate(30px,0)\"></div>\
+               </div>\
+             </div>\
+             </body></html>",
+        );
+        let pixmap = paint_dom(&tree, (200.0, 200.0), None).expect("pixmap");
+        // Child blue lands at (80..90, 60..70).
+        let blue = pixmap.pixel(85, 65).expect("pixel");
+        assert!(
+            blue.blue() > 200 && blue.red() < 60,
+            "expected blue child at accumulated offset (80,60), got {:?}",
+            blue
+        );
+        // Parent red lands at (50..70, 60..80); sample where the blue child does
+        // not cover.
+        let red = pixmap.pixel(55, 75).expect("pixel");
+        assert!(
+            red.red() > 200 && red.blue() < 60,
+            "expected red parent at its own translate (50,60), got {:?}",
+            red
+        );
+        // Nothing painted at the pre-transform origin: both boxes moved away.
+        let origin = pixmap.pixel(5, 5).expect("pixel");
+        assert_eq!((origin.red(), origin.green(), origin.blue()), (255, 255, 255));
+    }
+
+    #[test]
+    fn translate_offscreen_box_is_not_painted() {
+        // translate(-10000px,0) shoves the box far off the left edge (the old
+        // hidden skip-link idiom); it must not paint anywhere on the canvas.
+        let tree = parse_html(
+            "<html><body>\
+             <div style=\"position:absolute; top:0; left:0; width:50px; height:50px; \
+                          background:#ff0000; transform:translate(-10000px,0)\"></div>\
+             </body></html>",
+        );
+        let pixmap = paint_dom(&tree, (200.0, 200.0), None).expect("pixmap");
+        let mut any_red = false;
+        'scan: for y in 0..200 {
+            for x in 0..200 {
+                let p = pixmap.pixel(x, y).expect("pixel");
+                if p.red() > 200 && p.green() < 60 && p.blue() < 60 {
+                    any_red = true;
+                    break 'scan;
+                }
+            }
+        }
+        assert!(!any_red, "translate(-10000px,0) box should be off-screen and unpainted");
+    }
+
+    #[test]
+    fn translate_percent_centers_absolute_box() {
+        // The canonical centering idiom: an absolutely-positioned box at
+        // top:50%/left:50% of its containing block pulled back by
+        // translate(-50%,-50%) of its own size centers within it. In a 200x200
+        // container a 40x40 box centers at (100,100), so its border box (with
+        // top-left at 100,100 before the transform) becomes (80..120, 80..120).
+        let tree = parse_html(
+            "<html><body style=\"margin:0\">\
+             <div style=\"position:relative; width:200px; height:200px\">\
+               <div style=\"position:absolute; top:50%; left:50%; width:40px; height:40px; \
+                            background:#ff0000; transform:translate(-50%,-50%)\"></div>\
+             </div>\
+             </body></html>",
+        );
+        let pixmap = paint_dom(&tree, (200.0, 200.0), None).expect("pixmap");
+        let center = pixmap.pixel(100, 100).expect("pixel");
+        assert!(center.red() > 200 && center.blue() < 60, "expected centered red box, got {:?}", center);
+        // Just outside the centered box stays white.
+        let outside = pixmap.pixel(70, 70).expect("pixel");
+        assert_eq!((outside.red(), outside.green(), outside.blue()), (255, 255, 255));
+    }
+
+    #[test]
     fn paints_text_color() {
         let tree = parse_html(
             "<html><body><div style=\"color: #00ff00; width: 100px; height: 100px\">Hello</div></body></html>",
@@ -1064,5 +1513,81 @@ mod tests {
             if found_green { break; }
         }
         assert!(found_green, "expected green text to be painted");
+    }
+
+    #[test]
+    fn serializes_inline_svg_subtree() {
+        // A sprite-style svg: a <use> that references a <symbol> in the same
+        // document must survive serialization so resvg can resolve it.
+        let tree = parse_html(
+            r##"<html><body><svg viewBox="0 0 10 10"><use href="#a"/><symbol id="a"><path d="M0 0h10v10z"/></symbol></svg></body></html>"##,
+        );
+        let svg = tree.query_selector("svg").unwrap().unwrap();
+        let out = serialize_svg(&tree, svg);
+        assert!(out.starts_with("<svg"), "root svg tag: {out}");
+        assert!(out.contains(r#"viewBox="0 0 10 10""#), "viewBox preserved: {out}");
+        assert!(out.contains(r#"xmlns="http://www.w3.org/2000/svg""#), "xmlns injected: {out}");
+        assert!(out.contains("<use") && out.contains(r##"href="#a""##), "use + href: {out}");
+        assert!(out.contains("<symbol") && out.contains(r#"id="a""#), "symbol id: {out}");
+        assert!(out.contains("<path") && out.contains("</path>"), "path opened + closed: {out}");
+        assert!(out.trim_end().ends_with("</svg>"), "root closed: {out}");
+        // The serialized string parses as a standalone SVG document.
+        let opts = usvg::Options::default();
+        assert!(
+            usvg::Tree::from_data(out.as_bytes(), &opts).is_ok(),
+            "usvg should parse serialized svg: {out}",
+        );
+    }
+
+    #[test]
+    fn injects_xmlns_only_when_absent() {
+        let tree = parse_html(
+            r#"<html><body><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 4 4"><rect width="4" height="4"/></svg></body></html>"#,
+        );
+        let svg = tree.query_selector("svg").unwrap().unwrap();
+        let out = serialize_svg(&tree, svg);
+        assert_eq!(out.matches("xmlns=").count(), 1, "no duplicate xmlns: {out}");
+    }
+
+    #[test]
+    fn paints_inline_svg() {
+        // The <rect> inside an inline svg must rasterize (it is not an <img>).
+        let tree = parse_html(
+            r##"<html><body><svg width="40" height="40" viewBox="0 0 40 40"><rect x="0" y="0" width="40" height="40" fill="#ff0000"/></svg></body></html>"##,
+        );
+        let pixmap = paint_dom(&tree, (200.0, 200.0), None).expect("pixmap");
+        let mut found_red = false;
+        'outer: for y in 0..80 {
+            for x in 0..80 {
+                let p = pixmap.pixel(x, y).expect("pixel");
+                if p.red() > 200 && p.green() < 60 && p.blue() < 60 {
+                    found_red = true;
+                    break 'outer;
+                }
+            }
+        }
+        assert!(found_red, "expected inline svg <rect> to paint red");
+    }
+
+    #[test]
+    fn paints_inline_svg_use_reference() {
+        // The icon-sprite pattern: <use href="#id"> resolves against a <defs>
+        // element in the same svg only because the whole subtree is serialized
+        // and handed to resvg as one document.
+        let tree = parse_html(
+            r##"<html><body><svg width="40" height="40" viewBox="0 0 40 40"><defs><rect id="a" width="40" height="40" fill="#0000ff"/></defs><use href="#a"/></svg></body></html>"##,
+        );
+        let pixmap = paint_dom(&tree, (200.0, 200.0), None).expect("pixmap");
+        let mut found_blue = false;
+        'outer: for y in 0..80 {
+            for x in 0..80 {
+                let p = pixmap.pixel(x, y).expect("pixel");
+                if p.blue() > 200 && p.red() < 60 && p.green() < 60 {
+                    found_blue = true;
+                    break 'outer;
+                }
+            }
+        }
+        assert!(found_blue, "expected <use> to instantiate the referenced <rect>");
     }
 }

@@ -416,12 +416,16 @@ pub fn content_width(rect: &Rect, style: &LayoutStyle) -> f32 {
 impl TextEngine {
     /// Rasterize inline context `idx` into `pixmap`, honoring its clip. Uses
     /// cosmic-text's swash-backed rasterizer (anti-aliased, per-glyph color
-    /// from the span attributes).
-    pub fn paint_item(&mut self, idx: usize, pixmap: &mut tiny_skia::Pixmap) {
+    /// from the span attributes). `offset` is the accumulated `transform:
+    /// translate()` of the container's ancestors, shifting both the glyph
+    /// origin and the clip so shaped text moves with a transformed box.
+    pub fn paint_item(&mut self, idx: usize, pixmap: &mut tiny_skia::Pixmap, offset: (f32, f32)) {
         let TextEngine { font_system, swash, items } = self;
         let Some(item) = items.get_mut(idx) else { return };
-        let (ox, oy) = item.origin;
-        let clip = item.clip;
+        let (ox, oy) = (item.origin.0 + offset.0, item.origin.1 + offset.1);
+        let clip = item
+            .clip
+            .map(|c| Rect { x: c.x + offset.0, y: c.y + offset.1, width: c.width, height: c.height });
         let pw = pixmap.width() as i32;
         let ph = pixmap.height() as i32;
         let clip_bounds = clip.map(|c| (c.x, c.y, c.x + c.width, c.y + c.height));

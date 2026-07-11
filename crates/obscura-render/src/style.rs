@@ -395,6 +395,16 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                 _ => {}
             }
         },
+        "object-fit" => {
+            match value.trim().to_ascii_lowercase().as_str() {
+                "fill" => style.object_fit = crate::ObjectFit::Fill,
+                "contain" => style.object_fit = crate::ObjectFit::Contain,
+                "cover" => style.object_fit = crate::ObjectFit::Cover,
+                "scale-down" => style.object_fit = crate::ObjectFit::ScaleDown,
+                "none" => style.object_fit = crate::ObjectFit::None,
+                _ => {}
+            }
+        },
         "top" => style.inset[0] = inset_dim(value),
         "right" => style.inset[1] = inset_dim(value),
         "bottom" => style.inset[2] = inset_dim(value),
@@ -499,8 +509,123 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         }
         "grid-column" => set_grid_placement(style, value, true),
         "grid-row" => set_grid_placement(style, value, false),
+        "transform" => parse_transform(style, value),
         _ => {}
     }
+}
+
+/// Parse the subset of `transform` obscura applies at paint time: `translate`,
+/// `translateX`, `translateY` (px and %, stored unresolved so % can resolve
+/// against the element's own border box later) and `scale`/`scaleX`/`scaleY`.
+/// `rotate`, `skew`, `matrix`, and `perspective` are ignored (left unhandled)
+/// rather than erroring, so a value that mixes them still contributes its
+/// translate and scale parts.
+fn parse_transform(style: &mut LayoutStyle, value: &str) {
+    let v = value.trim();
+    if v.is_empty() || v.eq_ignore_ascii_case("none") {
+        return;
+    }
+    let zero = crate::Dimension::Px(0.0);
+    let (mut tx, mut ty): (Option<crate::Dimension>, Option<crate::Dimension>) = (None, None);
+    let (mut sx, mut sy): (Option<f32>, Option<f32>) = (None, None);
+    for (func, args) in transform_functions(v) {
+        let parts: Vec<&str> = args.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+        match func.to_ascii_lowercase().as_str() {
+            "translate" => {
+                if let Some(a) = parts.first() {
+                    tx = Some(dimension_value(a));
+                }
+                // A missing second component is 0 (translateY), not inherited.
+                ty = Some(parts.get(1).map(|a| dimension_value(a)).unwrap_or(zero));
+            }
+            "translatex" => {
+                if let Some(a) = parts.first() {
+                    tx = Some(dimension_value(a));
+                }
+            }
+            "translatey" => {
+                if let Some(a) = parts.first() {
+                    ty = Some(dimension_value(a));
+                }
+            }
+            "scale" => {
+                if let Some(a) = parts.first().and_then(|s| scale_number(s)) {
+                    // scale(s) is uniform; scale(sx, sy) sets each axis.
+                    sy = Some(parts.get(1).and_then(|s| scale_number(s)).unwrap_or(a));
+                    sx = Some(a);
+                }
+            }
+            "scalex" => {
+                if let Some(a) = parts.first().and_then(|s| scale_number(s)) {
+                    sx = Some(a);
+                }
+            }
+            "scaley" => {
+                if let Some(a) = parts.first().and_then(|s| scale_number(s)) {
+                    sy = Some(a);
+                }
+            }
+            // rotate / skew / matrix / perspective: not modeled, skip.
+            _ => {}
+        }
+    }
+    if tx.is_some() || ty.is_some() {
+        style.transform_translate = Some((tx.unwrap_or(zero), ty.unwrap_or(zero)));
+    }
+    if sx.is_some() || sy.is_some() {
+        style.transform_scale = Some((sx.unwrap_or(1.0), sy.unwrap_or(1.0)));
+    }
+}
+
+/// Split a `transform` value into its `name(args)` functions, in source order.
+/// Tokenizes on parentheses (tracking depth so a nested `calc(...)` inside an
+/// argument stays intact); the function name is the trailing identifier run
+/// just before each `(`.
+fn transform_functions(value: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut rest = value;
+    while let Some(open) = rest.find('(') {
+        let name: String = rest[..open]
+            .chars()
+            .rev()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        let after = &rest[open + 1..];
+        let mut depth = 1i32;
+        let mut end = None;
+        for (i, c) in after.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(e) = end else { break };
+        if !name.is_empty() {
+            out.push((name, after[..e].to_string()));
+        }
+        rest = &after[e + 1..];
+    }
+    out
+}
+
+/// Parse a unitless scale factor. A trailing `%` (`scale(50%)`) is accepted and
+/// divided by 100, matching the individual `scale` property's percentage form.
+fn scale_number(s: &str) -> Option<f32> {
+    let t = s.trim();
+    if let Some(p) = t.strip_suffix('%') {
+        return p.trim().parse::<f32>().ok().map(|v| v / 100.0);
+    }
+    t.parse::<f32>().ok()
 }
 
 /// Parse a CSS grid track list (`min-content 1fr min-content`, `12.25rem

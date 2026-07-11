@@ -345,12 +345,49 @@ pub struct LayoutStyle {
     /// shaping (we embed the DejaVu Sans oblique/bold-oblique faces). `None`
     /// means inherit.
     pub font_style_italic: Option<bool>,
+
+    /// `object-fit` for a replaced element (`<img>`). Controls how the decoded
+    /// image is scaled into the element's box when their aspect ratios differ;
+    /// `Fill` (default) stretches to the box, the rest preserve aspect ratio.
+    /// Only consulted in the image paint path.
+    pub object_fit: ObjectFit,
+    /// `transform: translate(x[, y])` / `translateX` / `translateY`, stored
+    /// unresolved as (dx, dy). Applied at paint time as an offset to the
+    /// element's own box AND its whole descendant subtree; percentages resolve
+    /// against the element's own border-box size then. This is what makes the
+    /// canonical `translate(-50%,-50%)` centering of an absolutely-positioned
+    /// box land in the right place, and moves a `translate(-9999px,0)`
+    /// off-screen skip-link out of view instead of painting it on-screen. Not
+    /// inherited (transform is a non-inherited property).
+    pub transform_translate: Option<(Dimension, Dimension)>,
+    /// `transform: scale(sx[, sy])` / `scaleX` / `scaleY`, captured as (sx, sy).
+    /// Parsed and stored so a value that mixes scale with translate still yields
+    /// its translate part; scale is not yet folded into paint geometry (doing so
+    /// correctly would require scaling every descendant's size and text, outside
+    /// the paint-time translate-offset model used here).
+    pub transform_scale: Option<(f32, f32)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Float {
     Left,
     Right,
+}
+
+/// `object-fit` for replaced elements (`<img>`): how the image's intrinsic
+/// content is scaled into its box when their aspect ratios differ. `Fill` (the
+/// default) stretches to the whole box; the others preserve the image's aspect
+/// ratio, either letterboxing inside the box (`Contain`), cropping to cover it
+/// (`Cover`), or using the intrinsic size (`None`, or `ScaleDown` which is
+/// `Contain` capped at the intrinsic size so it never upscales).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ObjectFit {
+    #[default]
+    Fill,
+    Contain,
+    Cover,
+    ScaleDown,
+    None,
 }
 
 /// `line-height`: `normal` (a font-relative default), a unitless multiple of
