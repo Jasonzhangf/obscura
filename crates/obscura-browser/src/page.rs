@@ -394,6 +394,16 @@ impl Page {
                     let mut links = Vec::new();
                     for lid in link_ids {
                         if let Some(node) = dom.get_node(lid) {
+                            // Skip print-only stylesheets: a `<link media="print">`
+                            // must not apply on screen. Some sites (e.g. the
+                            // Guardian) ship a print sheet whose rules otherwise
+                            // overrode the screen masthead/section styling.
+                            if let Some(media) = node.get_attribute("media") {
+                                let m = media.to_ascii_lowercase();
+                                if m.contains("print") && !m.contains("screen") && !m.contains("all") {
+                                    continue;
+                                }
+                            }
                             if let Some(href) = node.get_attribute("href") {
                                 links.push(href.to_string());
                             }
