@@ -102,6 +102,27 @@ fn relative_units_resolve_against_viewport_and_font_size() {
 }
 
 #[test]
+fn percentage_padding_top_reserves_aspect_ratio_box() {
+    // The responsive aspect-ratio trick: an empty box with padding-top:56.25%
+    // inside a 1000px-wide block reserves a 16:9 area (~562px tall), the room a
+    // `position:absolute; inset:0` media child fills. Percentage padding
+    // resolves against the containing block WIDTH on every side, so the box
+    // gains real height instead of collapsing to zero.
+    let html = r##"<div style="width:1000px"><div style="padding-top:56.25%"></div></div>"##;
+    let tree = parse_html(html);
+    let layout = layout_dom(&tree, (1200.0, 800.0));
+    let hit = layout
+        .rects
+        .values()
+        .any(|r| (r.width - 1000.0).abs() < 1.0 && (r.height - 562.5).abs() < 2.0);
+    assert!(
+        hit,
+        "expected a ~1000x562 aspect-ratio box from padding-top:56.25%, rects: {:?}",
+        layout.rects.values().map(|r| (r.width, r.height)).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn long_text_run_wraps_across_multiple_lines() {
     // A long single text node with no inline elements breaking it up must
     // wrap within a narrow container instead of overflowing on one line. The

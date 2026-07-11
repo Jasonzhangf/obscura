@@ -315,6 +315,12 @@ pub fn layout_dom_with_images(
             line_height: crate::LineHeight,
             text_transform: crate::TextTransform,
             italic: bool,
+            /// Containing-block width in px for the current element, carried
+            /// down so percentage padding/margin (which resolve against the
+            /// containing block WIDTH, all sides) can be turned into px before
+            /// taffy layout. Not a CSS-inherited property; it is recomputed to
+            /// the element's own content width for its children.
+            cb_width: f32,
         }
         impl Default for Inherited {
             fn default() -> Self {
@@ -329,6 +335,7 @@ pub fn layout_dom_with_images(
                     line_height: crate::LineHeight::Normal,
                     text_transform: crate::TextTransform::None,
                     italic: false,
+                    cb_width: 0.0,
                 }
             }
         }
@@ -351,8 +358,15 @@ pub fn layout_dom_with_images(
             }
         };
 
-        let mut queue = vec![(root_id, Inherited::default())];
+        // The root element's containing block is the initial containing block,
+        // i.e. the viewport width.
+        let mut root_inh = Inherited::default();
+        root_inh.cb_width = viewport.0;
+        let mut queue = vec![(root_id, root_inh)];
         while let Some((id, mut inh)) = queue.pop() {
+            // Default the child containing-block width to this element's own
+            // (updated to its content width inside the block below).
+            let mut child_cb_width = inh.cb_width;
             if let Some(style) = styles.get_mut(&id) {
                 match style.color { Some(c) => inh.color = Some(c), None => style.color = inh.color }
                 // Resolve a relative font-size against the PARENT (em/%) or
@@ -393,7 +407,51 @@ pub fn layout_dom_with_images(
                 match style.line_height { Some(v) => inh.line_height = v, None => style.line_height = Some(inh.line_height) }
                 match style.text_transform { Some(v) => inh.text_transform = v, None => style.text_transform = Some(inh.text_transform) }
                 match style.font_style_italic { Some(v) => inh.italic = v, None => style.font_style_italic = Some(inh.italic) }
+
+                // Percentage padding/margin resolve against the containing
+                // block WIDTH on every side (per CSS: `padding-top:56.25%` in a
+                // 1000px block is 562.5px, not a fraction of the height). The
+                // f32 Edges cannot carry a percentage, so bake the resolved px
+                // back into `padding`/`margin`, which then feed taffy.
+                let cb_w = inh.cb_width;
+                for i in 0..4 {
+                    if let Some(frac) = style.padding_percent[i] {
+                        let px = (frac * cb_w).max(0.0);
+                        match i {
+                            0 => style.padding.top = px,
+                            1 => style.padding.right = px,
+                            2 => style.padding.bottom = px,
+                            _ => style.padding.left = px,
+                        }
+                    }
+                    if let Some(frac) = style.margin_percent[i] {
+                        let px = frac * cb_w;
+                        match i {
+                            0 => style.margin.top = px,
+                            1 => style.margin.right = px,
+                            2 => style.margin.bottom = px,
+                            _ => style.margin.left = px,
+                        }
+                    }
+                }
+
+                // Containing-block width handed to this element's children is
+                // its own content-box width. taffy sizes width as border-box
+                // (its default box_sizing), so subtract this element's resolved
+                // padding and border; an auto width fills the containing block.
+                let used_w = match style.width {
+                    crate::Dimension::Px(w) => w,
+                    crate::Dimension::Percent(p) => p * cb_w,
+                    _ => (cb_w - style.margin.left - style.margin.right).max(0.0),
+                };
+                child_cb_width = (used_w
+                    - style.padding.left
+                    - style.padding.right
+                    - style.border.left
+                    - style.border.right)
+                    .max(0.0);
             }
+            inh.cb_width = child_cb_width;
             for cid in tree.children(id).into_iter().rev() {
                 queue.push((cid, inh.clone()));
             }

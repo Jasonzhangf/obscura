@@ -40,6 +40,11 @@ pub struct InlineItem {
     origin: (f32, f32),
     /// Ancestor `overflow: hidden` clip, set by `finalize`.
     clip: Option<Rect>,
+    /// `-webkit-background-clip: text` fill: when set, the glyphs are painted
+    /// with this background (a linear gradient sampled across the text box, or a
+    /// solid color as a flat two-stop gradient) instead of the transparent text
+    /// color that would make them invisible. See [`clip_text_fill`].
+    clip_fill: Option<(f32, Vec<([u8; 4], Option<f32>)>)>,
 }
 
 /// Owns the font set and shaping caches for one render pass, plus every
@@ -90,7 +95,17 @@ impl TextEngine {
         }
         let base = styles.get(&id)?;
         let base_size = base.font_size.unwrap_or(16.0);
-        let default_color = base.color.unwrap_or([0, 0, 0, 255]);
+        // `-webkit-background-clip: text` on a transparent-colored element paints
+        // its background *through* the glyphs (gradient/solid text). When active,
+        // shape the glyphs in opaque white so their coverage renders, then recolor
+        // them from the background at paint time; otherwise transparent text stays
+        // transparent (and invisible), unchanged.
+        let clip_fill = clip_text_fill(base);
+        let default_color = if clip_fill.is_some() {
+            [255, 255, 255, 255]
+        } else {
+            base.color.unwrap_or([0, 0, 0, 255])
+        };
 
         let root_transform = base.text_transform.unwrap_or(TextTransform::None);
         let root_underline = base.underline.unwrap_or(false);
@@ -150,7 +165,7 @@ impl TextEngine {
         }
 
         let idx = self.items.len();
-        self.items.push(InlineItem { buffer, origin: (0.0, 0.0), clip: None });
+        self.items.push(InlineItem { buffer, origin: (0.0, 0.0), clip: None, clip_fill });
         Some(idx)
     }
 
@@ -413,6 +428,67 @@ pub fn content_width(rect: &Rect, style: &LayoutStyle) -> f32 {
     (rect.width - style.border.left - style.border.right - style.padding.left - style.padding.right).max(0.0)
 }
 
+/// The background to paint through the glyphs for `-webkit-background-clip: text`
+/// when the element's own text color is transparent (the common gradient-text
+/// technique on hero headings and buttons). Returns the background gradient as
+/// is, or a solid background color as a flat two-stop gradient. `None` when the
+/// element is not a transparent-text clip-to-text box, so ordinary transparent
+/// text still renders invisibly.
+fn clip_text_fill(style: &LayoutStyle) -> Option<(f32, Vec<([u8; 4], Option<f32>)>)> {
+    if !style.background_clip_text {
+        return None;
+    }
+    // Only when the text itself is transparent: an opaque color paints normally
+    // and the clip is a no-op we would otherwise recolor incorrectly.
+    if style.color.map(|c| c[3] != 0).unwrap_or(true) {
+        return None;
+    }
+    if let Some(g) = &style.background_gradient {
+        if g.1.len() >= 2 {
+            return Some(g.clone());
+        }
+    }
+    let bg = style.background_color.filter(|c| c[3] != 0)?;
+    Some((180.0, vec![(bg, Some(0.0)), (bg, Some(1.0))]))
+}
+
+/// Sample a CSS linear gradient at point `(x, y)` inside a `w` x `h` text box,
+/// returning an rgba color. `angle` is CSS degrees clockwise from 12 o'clock
+/// (0 = to top, 90 = to right, 180 = to bottom), matching `parse_linear_gradient`
+/// and `paint::paint_linear_gradient`. Positionless stops are spread evenly.
+fn sample_gradient(fill: &(f32, Vec<([u8; 4], Option<f32>)>), x: f32, y: f32, w: f32, h: f32) -> [u8; 4] {
+    let (angle, stops) = fill;
+    match stops.len() {
+        0 => return [0, 0, 0, 255],
+        1 => return stops[0].0,
+        _ => {}
+    }
+    let rad = angle.to_radians();
+    let (dx, dy) = (rad.sin(), -rad.cos());
+    let (w, h) = (w.max(1.0), h.max(1.0));
+    // Full extent of the box along the gradient direction (the CSS gradient-line
+    // length), so the endpoints land at the box's projected corners.
+    let len = (w * dx).abs() + (h * dy).abs();
+    let t = if len <= 0.0 {
+        0.5
+    } else {
+        (((x - w / 2.0) * dx + (y - h / 2.0) * dy) / len + 0.5).clamp(0.0, 1.0)
+    };
+    let n = stops.len();
+    let pos = |i: usize| stops[i].1.unwrap_or(i as f32 / (n as f32 - 1.0)).clamp(0.0, 1.0);
+    // Walk to the pair of stops surrounding t, then interpolate between them.
+    let mut lo = 0usize;
+    while lo + 1 < n && pos(lo + 1) < t {
+        lo += 1;
+    }
+    let hi = (lo + 1).min(n - 1);
+    let (p0, p1) = (pos(lo), pos(hi));
+    let f = if (p1 - p0).abs() < 1e-6 { 0.0 } else { ((t - p0) / (p1 - p0)).clamp(0.0, 1.0) };
+    let (c0, c1) = (stops[lo].0, stops[hi].0);
+    let lerp = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * f).round().clamp(0.0, 255.0) as u8;
+    [lerp(c0[0], c1[0]), lerp(c0[1], c1[1]), lerp(c0[2], c1[2]), lerp(c0[3], c1[3])]
+}
+
 impl TextEngine {
     /// Rasterize inline context `idx` into `pixmap`, honoring its clip. Uses
     /// cosmic-text's swash-backed rasterizer (anti-aliased, per-glyph color
@@ -466,13 +542,26 @@ impl TextEngine {
         // Fallback color if a glyph carries none (shouldn't happen: every span
         // sets one), black.
         let default = Color::rgba(0, 0, 0, 255);
+        // `-webkit-background-clip: text`: recolor each glyph pixel from the
+        // background gradient sampled across the shaped text box, keeping the
+        // glyph's coverage as alpha. The glyphs were shaped opaque (see
+        // `try_build`) so this coverage exists; without a clip fill the per-span
+        // colors pass through unchanged.
+        let clip_fill = item.clip_fill.clone();
+        let fill_extent = clip_fill.as_ref().map(|_| buffer_size(&item.buffer));
         let pixels = pixmap.pixels_mut();
         item.buffer.draw(font_system, swash, default, |gx, gy, gw, gh, color| {
             let a = color.a() as u32;
             if a == 0 {
                 return;
             }
-            let (r, g, b) = (color.r(), color.g(), color.b());
+            let (r, g, b) = match (&clip_fill, fill_extent) {
+                (Some(fill), Some((tw, th))) => {
+                    let c = sample_gradient(fill, gx as f32 + gw as f32 / 2.0, gy as f32 + gh as f32 / 2.0, tw, th);
+                    (c[0], c[1], c[2])
+                }
+                _ => (color.r(), color.g(), color.b()),
+            };
             for dy in 0..gh as i32 {
                 for dx in 0..gw as i32 {
                     let px = ox as i32 + gx + dx;
@@ -532,5 +621,53 @@ impl TextEngine {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const RED: [u8; 4] = [255, 0, 0, 255];
+    const BLUE: [u8; 4] = [0, 0, 255, 255];
+
+    #[test]
+    fn clip_fill_only_for_transparent_clip_text() {
+        let mut s = LayoutStyle::default();
+        // Gradient + clip-to-text + transparent color: fills through the glyphs.
+        s.background_clip_text = true;
+        s.color = Some([0, 0, 0, 0]);
+        s.background_gradient = Some((90.0, vec![(RED, None), (BLUE, None)]));
+        assert!(clip_text_fill(&s).is_some());
+
+        // Same, but opaque text: paints normally, no clip fill.
+        s.color = Some([10, 20, 30, 255]);
+        assert!(clip_text_fill(&s).is_none());
+
+        // Clip-to-text off: ordinary transparent text stays invisible.
+        s.color = Some([0, 0, 0, 0]);
+        s.background_clip_text = false;
+        assert!(clip_text_fill(&s).is_none());
+
+        // Solid background color becomes a flat two-stop gradient.
+        s.background_clip_text = true;
+        s.background_gradient = None;
+        s.background_color = Some([12, 34, 56, 255]);
+        let fill = clip_text_fill(&s).expect("solid bg clip fill");
+        assert_eq!(fill.1.len(), 2);
+        assert_eq!(fill.1[0].0, [12, 34, 56, 255]);
+    }
+
+    #[test]
+    fn sample_gradient_tints_left_to_right() {
+        // 90deg (to right): left edge is the first stop, right edge the last.
+        let fill = (90.0f32, vec![(RED, None), (BLUE, None)]);
+        let left = sample_gradient(&fill, 0.0, 5.0, 100.0, 10.0);
+        let right = sample_gradient(&fill, 100.0, 5.0, 100.0, 10.0);
+        assert!(left[0] > left[2], "left end should be reddish: {left:?}");
+        assert!(right[2] > right[0], "right end should be bluish: {right:?}");
+        // A single-color list samples to that color everywhere.
+        let flat = (0.0f32, vec![([7, 8, 9, 255], None)]);
+        assert_eq!(sample_gradient(&flat, 3.0, 3.0, 20.0, 20.0), [7, 8, 9, 255]);
     }
 }

@@ -177,7 +177,21 @@ pub struct LayoutStyle {
     /// auto` / `margin-inline: auto` centering needs a real Auto margin, which
     /// the f32 `margin` cannot express; this flag drives it at taffy mapping.
     pub margin_auto: [bool; 4],
+    /// Percentage margin per side (top, right, bottom, left) as a 0..1 fraction,
+    /// `None` when the side is a fixed length. Like padding, every side resolves
+    /// against the containing block's WIDTH; the f32 `margin` cannot carry a
+    /// percentage, so this is resolved to px during `dom::layout_dom`'s top-down
+    /// pass once the containing-block width is known.
+    pub margin_percent: [Option<f32>; 4],
     pub padding: Edges,
+    /// Percentage padding per side (top, right, bottom, left) as a 0..1
+    /// fraction, `None` when the side is a fixed length. All four sides resolve
+    /// against the containing block's WIDTH (per CSS, including top/bottom): this
+    /// is the responsive aspect-ratio-box trick (`padding-top:56.25%` reserves a
+    /// 16:9 area). The f32 `padding` cannot carry a percentage, so it is
+    /// resolved to px in `dom::layout_dom`'s top-down pass and written back into
+    /// `padding`, which then feeds taffy as a fixed length.
+    pub padding_percent: [Option<f32>; 4],
     pub border: Edges,
     /// `border-radius` (uniform; the first value of the shorthand). Rounds the
     /// background fill and border. In px after resolution.
@@ -203,6 +217,14 @@ pub struct LayoutStyle {
     /// `background_size`: without a known image size there is no leftover
     /// box space to position within.
     pub background_position: (f32, f32),
+    /// `background-clip: text` / `-webkit-background-clip: text`: the background
+    /// paints only through the element's glyphs, not as a filled box. Combined
+    /// with a transparent text color this is the common gradient-text technique
+    /// (hero headings, buttons like astro.build's "Get Started"); without
+    /// honoring it those labels paint invisible. Consumed in the text paint path
+    /// (`inline::TextEngine` fills glyphs from the background; `paint` suppresses
+    /// the box fill so the gradient does not paint as a rectangle).
+    pub background_clip_text: bool,
     /// `mask-image`/`-webkit-mask-image: url(...)`: the ubiquitous "colored,
     /// scalable icon" pattern (an SVG shape used as a stencil, tinted by
     /// `background-color`/`color` instead of carrying its own colors). Without
@@ -366,12 +388,32 @@ pub struct LayoutStyle {
     /// correctly would require scaling every descendant's size and text, outside
     /// the paint-time translate-offset model used here).
     pub transform_scale: Option<(f32, f32)>,
+    /// `box-shadow` (first layer only). Painted behind the element's own
+    /// background/border box: cards, buttons, menus, and modals across the
+    /// modern web rely on it for depth, and without it those elements paint
+    /// flat. See [`BoxShadow`] and `paint::paint_box_shadow`.
+    pub box_shadow: Option<BoxShadow>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Float {
     Left,
     Right,
+}
+
+/// One `box-shadow` layer. Offsets, blur, and spread are in CSS px; `color` is
+/// the resolved RGBA (falling back to the element's text color, per CSS
+/// `currentColor`, when the value omits a color); `inset` distinguishes an
+/// inner shadow from the default outer (drop) shadow. Only the first layer of a
+/// comma-separated list is modeled.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BoxShadow {
+    pub offset_x: f32,
+    pub offset_y: f32,
+    pub blur: f32,
+    pub spread: f32,
+    pub color: [u8; 4],
+    pub inset: bool,
 }
 
 /// `object-fit` for replaced elements (`<img>`): how the image's intrinsic

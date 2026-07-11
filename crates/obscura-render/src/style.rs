@@ -253,17 +253,17 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         "margin-block" => { let (s, e) = two(value); set_margin_side(style, 0, s); set_margin_side(style, 2, e); }
         "margin-block-start" => set_margin_side(style, 0, value),
         "margin-block-end" => set_margin_side(style, 2, value),
-        "padding" => { if let Some(e) = edges(value) { style.padding = e; } }
-        "padding-top" => set_edge(&mut style.padding, Side::Top, px(value)),
-        "padding-right" => set_edge(&mut style.padding, Side::Right, px(value)),
-        "padding-bottom" => set_edge(&mut style.padding, Side::Bottom, px(value)),
-        "padding-left" => set_edge(&mut style.padding, Side::Left, px(value)),
-        "padding-inline" => { let (s, e) = two(value); set_edge(&mut style.padding, Side::Left, px(s)); set_edge(&mut style.padding, Side::Right, px(e)); }
-        "padding-inline-start" => set_edge(&mut style.padding, Side::Left, px(value)),
-        "padding-inline-end" => set_edge(&mut style.padding, Side::Right, px(value)),
-        "padding-block" => { let (s, e) = two(value); set_edge(&mut style.padding, Side::Top, px(s)); set_edge(&mut style.padding, Side::Bottom, px(e)); }
-        "padding-block-start" => set_edge(&mut style.padding, Side::Top, px(value)),
-        "padding-block-end" => set_edge(&mut style.padding, Side::Bottom, px(value)),
+        "padding" => apply_padding_shorthand(style, value),
+        "padding-top" => set_padding_side(style, 0, value),
+        "padding-right" => set_padding_side(style, 1, value),
+        "padding-bottom" => set_padding_side(style, 2, value),
+        "padding-left" => set_padding_side(style, 3, value),
+        "padding-inline" => { let (s, e) = two(value); set_padding_side(style, 3, s); set_padding_side(style, 1, e); }
+        "padding-inline-start" => set_padding_side(style, 3, value),
+        "padding-inline-end" => set_padding_side(style, 1, value),
+        "padding-block" => { let (s, e) = two(value); set_padding_side(style, 0, s); set_padding_side(style, 2, e); }
+        "padding-block-start" => set_padding_side(style, 0, value),
+        "padding-block-end" => set_padding_side(style, 2, value),
         "border-radius" => {
             // Uniform radius from the first value (ignore per-corner / the
             // `/` vertical-radius form; the common case is one length).
@@ -300,6 +300,12 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         "background-size" => style.background_size = parse_background_size(value),
         "background-position" => style.background_position = parse_background_position(value),
         "mask-image" | "-webkit-mask-image" => style.mask_image = parse_url(value),
+        "background-clip" | "-webkit-background-clip" => {
+            // `text` clips the background to the element's glyphs (the gradient/
+            // solid-color text technique). Any box value (border-box/padding-box/
+            // content-box) is an ordinary background, so clear the flag.
+            style.background_clip_text = value.trim().eq_ignore_ascii_case("text");
+        }
         "color" => style.color = parse_color(value),
         "border-color" => style.border_color = parse_color(value),
         "font-size" => {
@@ -510,6 +516,9 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         "grid-column" => set_grid_placement(style, value, true),
         "grid-row" => set_grid_placement(style, value, false),
         "transform" => parse_transform(style, value),
+        "box-shadow" | "-webkit-box-shadow" => {
+            style.box_shadow = parse_box_shadow(value, style.color);
+        }
         _ => {}
     }
 }
@@ -1509,19 +1518,86 @@ fn two(value: &str) -> (&str, &str) {
     (a, b)
 }
 
-/// Set one margin side (0=top,1=right,2=bottom,3=left), tracking `auto`.
+/// Set one margin side (0=top,1=right,2=bottom,3=left), tracking `auto` and, for
+/// a percentage, deferring resolution to the containing-block width in the
+/// top-down pass (recorded in `margin_percent`).
 fn set_margin_side(style: &mut LayoutStyle, idx: usize, value: &str) {
     let v = value.trim();
     let is_auto = v.eq_ignore_ascii_case("auto");
+    if let Some(frac) = percent_fraction(v) {
+        style.margin_percent[idx] = Some(frac);
+        set_margin_px(&mut style.margin, idx, 0.0);
+        style.margin_auto[idx] = false;
+        return;
+    }
     let px = if is_auto { 0.0 } else { px(value).unwrap_or(0.0) };
+    set_margin_px(&mut style.margin, idx, px);
+    style.margin_auto[idx] = is_auto;
+    style.margin_percent[idx] = None;
+}
+
+fn set_margin_px(margin: &mut Edges, idx: usize, px: f32) {
     match idx {
-        0 => style.margin.top = px,
-        1 => style.margin.right = px,
-        2 => style.margin.bottom = px,
-        3 => style.margin.left = px,
+        0 => margin.top = px,
+        1 => margin.right = px,
+        2 => margin.bottom = px,
+        3 => margin.left = px,
         _ => {}
     }
-    style.margin_auto[idx] = is_auto;
+}
+
+/// Set one padding side (0=top,1=right,2=bottom,3=left). A percentage is
+/// recorded in `padding_percent` and resolved against the containing-block
+/// width during the top-down pass; a length is stored directly.
+fn set_padding_side(style: &mut LayoutStyle, idx: usize, value: &str) {
+    if let Some(frac) = percent_fraction(value.trim()) {
+        style.padding_percent[idx] = Some(frac);
+        set_padding_px(&mut style.padding, idx, 0.0);
+        return;
+    }
+    if let Some(px) = px(value) {
+        set_padding_px(&mut style.padding, idx, px);
+        style.padding_percent[idx] = None;
+    }
+}
+
+fn set_padding_px(padding: &mut Edges, idx: usize, px: f32) {
+    match idx {
+        0 => padding.top = px,
+        1 => padding.right = px,
+        2 => padding.bottom = px,
+        3 => padding.left = px,
+        _ => {}
+    }
+}
+
+/// `padding: <t> <r>? <b>? <l>?`, percentage-aware per side.
+fn apply_padding_shorthand(style: &mut LayoutStyle, value: &str) {
+    let toks: Vec<&str> = value.split_whitespace().collect();
+    let (t, r, b, l) = match toks.as_slice() {
+        [a] => (*a, *a, *a, *a),
+        [v, h] => (*v, *h, *v, *h),
+        [t, h, b] => (*t, *h, *b, *h),
+        [t, r, b, l, ..] => (*t, *r, *b, *l),
+        [] => return,
+    };
+    set_padding_side(style, 0, t);
+    set_padding_side(style, 1, r);
+    set_padding_side(style, 2, b);
+    set_padding_side(style, 3, l);
+}
+
+/// A bare `<number>%` token as a 0..1 fraction (`56.25%` -> `0.5625`). Returns
+/// `None` for anything that is not a plain percentage (lengths, `calc(...%)`,
+/// keywords), so those keep their existing length handling.
+fn percent_fraction(tok: &str) -> Option<f32> {
+    let num = tok.trim().strip_suffix('%')?;
+    let v: f32 = num.trim().parse().ok()?;
+    if v.is_finite() {
+        Some(v / 100.0)
+    } else {
+        None
+    }
 }
 
 /// `margin: <t> <r>? <b>? <l>?` with per-side `auto` (so `margin: 0 auto`
@@ -1818,6 +1894,86 @@ fn parse_background_position(value: &str) -> (f32, f32) {
     (x.unwrap_or(0.5), y.unwrap_or(0.5))
 }
 
+/// Parse a `box-shadow` value into its first layer:
+/// `[inset]? <offset-x> <offset-y> <blur>? <spread>? <color>?`. The `inset`
+/// keyword and the color may each lead or trail the lengths; comma-separated
+/// multiples are accepted but only the first layer is stored. `current_color`
+/// supplies the default when the color is omitted (CSS `currentColor`).
+fn parse_box_shadow(value: &str, current_color: Option<[u8; 4]>) -> Option<crate::BoxShadow> {
+    let v = value.trim();
+    if v.is_empty() || v.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    // Only the first comma-separated layer is modeled; split at paren depth 0 so
+    // the commas inside an rgba()/hsl() color are not treated as separators.
+    let layer = split_top_level(v, ',').into_iter().next()?;
+    let mut inset = false;
+    let mut color: Option<[u8; 4]> = None;
+    let mut lengths: Vec<f32> = Vec::new();
+    for tok in split_ws_paren(layer.trim()) {
+        let t = tok.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if t.eq_ignore_ascii_case("inset") {
+            inset = true;
+            continue;
+        }
+        // Try a length first so a bare `0` is an offset, not a failed color;
+        // px_value rejects color tokens (`#ccc`, `red`, `rgba(...)`) so they
+        // fall through to parse_color.
+        if lengths.len() < 4 {
+            if let Some(px) = px_value(t) {
+                lengths.push(px);
+                continue;
+            }
+        }
+        if let Some(c) = parse_color(t) {
+            color = Some(c);
+        }
+    }
+    if lengths.len() < 2 {
+        return None;
+    }
+    Some(crate::BoxShadow {
+        offset_x: lengths[0],
+        offset_y: lengths[1],
+        blur: lengths.get(2).copied().unwrap_or(0.0),
+        spread: lengths.get(3).copied().unwrap_or(0.0),
+        color: color.or(current_color).unwrap_or([0, 0, 0, 255]),
+        inset,
+    })
+}
+
+/// Split on ASCII whitespace at paren depth 0, so a functional color like
+/// `rgba(0, 0, 0, .15)` (whose internal spaces are not token separators) stays
+/// one token.
+fn split_ws_paren(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut start: Option<usize> = None;
+    for (i, c) in s.char_indices() {
+        if c.is_whitespace() && depth == 0 {
+            if let Some(st) = start.take() {
+                out.push(&s[st..i]);
+            }
+            continue;
+        }
+        match c {
+            '(' => depth += 1,
+            ')' => depth = (depth - 1).max(0),
+            _ => {}
+        }
+        if start.is_none() {
+            start = Some(i);
+        }
+    }
+    if let Some(st) = start {
+        out.push(&s[st..]);
+    }
+    out
+}
+
 /// CSS box shorthand: 1 value applies to all sides; 2 values are (v, h);
 /// 3 values are (top, h, bottom); 4 values are (top, right, bottom, left).
 fn edges_from(dims: Vec<f32>) -> Option<Edges> {
@@ -1856,9 +2012,43 @@ mod tests {
     }
 
     #[test]
+    fn percentage_padding_recorded_not_pixelized() {
+        // A percentage padding must be deferred (recorded as a 0..1 fraction),
+        // not eagerly converted to a bogus px value: it resolves against the
+        // containing block width later, in the top-down pass.
+        let s = compute_style("div", Some("padding-top: 56.25%"));
+        assert_eq!(s.padding_percent[0], Some(0.5625));
+        assert_eq!(s.padding.top, 0.0);
+
+        // The shorthand splits per side, so a mix of length and percent lands
+        // in the right buckets.
+        let s = compute_style("div", Some("padding: 10px 25%"));
+        assert_eq!(s.padding.top, 10.0);
+        assert_eq!(s.padding_percent[0], None);
+        assert_eq!(s.padding_percent[1], Some(0.25));
+    }
+
+    #[test]
+    fn percentage_margin_recorded() {
+        let s = compute_style("div", Some("margin-left: 10%"));
+        assert_eq!(s.margin_percent[3], Some(0.1));
+        assert!(!s.margin_auto[3]);
+    }
+
+    #[test]
     fn ua_defaults_and_ignore_unknown() {
         let s = compute_style("span", Some("color: red; ; bogus: ; display: none"));
         assert_eq!(s.display, Display::None);
+    }
+
+    #[test]
+    fn background_clip_text_flag() {
+        let s = compute_style("h1", Some("color: transparent; -webkit-background-clip: text"));
+        assert!(s.background_clip_text);
+        let n = compute_style("h1", Some("background-clip: border-box"));
+        assert!(!n.background_clip_text);
+        let l = compute_style("h1", Some("background-clip: text"));
+        assert!(l.background_clip_text);
     }
 
     #[test]
@@ -1937,5 +2127,43 @@ mod tests {
         let s = compute_style("div", Some("flex: 2"));
         assert_eq!(s.flex_grow, Some(2.0));
         assert_eq!(s.flex_shrink, Some(1.0));
+    }
+
+    #[test]
+    fn box_shadow_outset_parses() {
+        let s = compute_style("div", Some("box-shadow: 0 2px 8px rgba(0,0,0,.15)"));
+        let sh = s.box_shadow.expect("box-shadow parsed");
+        assert!(!sh.inset);
+        assert_eq!(sh.offset_x, 0.0);
+        assert_eq!(sh.offset_y, 2.0);
+        assert_eq!(sh.blur, 8.0);
+        assert_eq!(sh.spread, 0.0);
+        assert_eq!(sh.color, [0, 0, 0, 38]);
+    }
+
+    #[test]
+    fn box_shadow_inset_parses() {
+        let s = compute_style("div", Some("box-shadow: inset 0 0 0 1px #ccc"));
+        let sh = s.box_shadow.expect("box-shadow parsed");
+        assert!(sh.inset);
+        assert_eq!(sh.offset_x, 0.0);
+        assert_eq!(sh.offset_y, 0.0);
+        assert_eq!(sh.blur, 0.0);
+        assert_eq!(sh.spread, 1.0);
+        assert_eq!(sh.color, [204, 204, 204, 255]);
+    }
+
+    #[test]
+    fn box_shadow_color_defaults_to_current_color() {
+        // No explicit color: falls back to the element's text color.
+        let s = compute_style("div", Some("color: red; box-shadow: 1px 1px 2px"));
+        let sh = s.box_shadow.expect("box-shadow parsed");
+        assert_eq!(sh.color, [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn box_shadow_none_clears() {
+        let s = compute_style("div", Some("box-shadow: none"));
+        assert!(s.box_shadow.is_none());
     }
 }

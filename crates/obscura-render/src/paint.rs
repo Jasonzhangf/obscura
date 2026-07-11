@@ -39,6 +39,11 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
     // box/text loop below and the inline-formatting loop after it (an svg
     // `<text>` element must not also paint its glyphs on top of the raster).
     let mut svg_subtree_skip: std::collections::HashSet<obscura_dom::tree::NodeId> = std::collections::HashSet::new();
+    // External sprite symbols, keyed by "url#id", extracted from a fetched
+    // sprite file so a `<use href="url#id">` resolves. One sprite backs many
+    // icons (a whole logo/icon band), so cache the parsed symbol across every
+    // inline svg on the page rather than re-parsing the sprite per icon.
+    let mut sprite_cache: std::collections::HashMap<String, Option<String>> = std::collections::HashMap::new();
     // Whether any element carries a `transform: translate()`. When none does
     // (the overwhelmingly common case), every node's accumulated offset is
     // zero, so skip the per-node ancestor walk entirely and keep the paint
@@ -110,6 +115,14 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
             None => continue,
         };
 
+        // Outset box-shadow paints behind this element's own background/border.
+        // Geometry comes from the full (translate-adjusted) border box; the
+        // ancestor overflow clip is reapplied inside so the shadow is clipped by
+        // an ancestor exactly as the box itself is.
+        if let Some(shadow) = style.box_shadow {
+            paint_box_shadow(&mut pixmap, &shadow, &rect, style.border_radius, clip);
+        }
+
         // Box path (rounded if border-radius), reused for gradient/color fill.
         let r = style.border_radius;
         let bg_path = || if r > 0.5 {
@@ -121,7 +134,9 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
         };
         // A linear-gradient background (heavily used by modern hero sections);
         // without this it paints white. Takes precedence over a solid color.
-        if style.mask_image.is_none() {
+        // `background-clip: text` clips the background to the glyphs, so it must
+        // not paint as a box here; the text paint path fills the glyphs instead.
+        if style.mask_image.is_none() && !style.background_clip_text {
             if let Some((angle, stops)) = &style.background_gradient {
                 if let Some(path) = bg_path() {
                     paint_linear_gradient(&mut pixmap, &path, &visible_rect, *angle, stops);
@@ -252,7 +267,13 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
         // is drawn at its full border-box size (undistorted) and clipped to the
         // overflow-visible region.
         if name.local.as_ref() == "svg" {
-            let markup = serialize_svg(tree, nid);
+            let mut markup = serialize_svg(tree, nid);
+            // `<use href="url#id">` pointing at an EXTERNAL sprite file resolves
+            // to nothing in resvg (the symbol lives in another document). Fetch
+            // the sprite, splice the referenced `<symbol>` into a local `<defs>`,
+            // and rewrite the href to a same-document `#id`. Same-document
+            // `<use href="#id">` (empty url) is untouched.
+            inject_external_sprites(tree, nid, base_url, &mut markup, &mut image_cache, &mut sprite_cache);
             if let Some(content) = render_svg(markup.as_bytes(), rect.width as u32, rect.height as u32) {
                 let mask = clip.and_then(|_| rect_clip_mask(pixmap.width(), pixmap.height(), &visible_rect));
                 pixmap.draw_pixmap(
@@ -407,6 +428,105 @@ fn rounded_rect_path(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<tiny_skia
     pb.finish()
 }
 
+/// Paint an outset `box-shadow` layer behind the element's own box. `rect` is
+/// the element's (translate-adjusted) border box; the shadow is that box offset
+/// by (offset_x, offset_y), expanded by `spread`, with a `blur`-wide soft edge.
+/// tiny-skia has no gaussian blur, so the blur is approximated by nested
+/// rounded rects from a solid core out to the blur radius, each at a fraction of
+/// the shadow alpha so source-over accumulation ramps the coverage from full at
+/// the core to near-zero at the outer edge. `inset` shadows are parsed but not
+/// painted (an inner shadow needs a hole-punched fill this box model does not
+/// build). `clip`, when set, is the ancestor `overflow: hidden` region and is
+/// applied as a mask so the shadow is clipped like the element itself.
+fn paint_box_shadow(
+    pixmap: &mut Pixmap,
+    shadow: &crate::BoxShadow,
+    rect: &crate::Rect,
+    border_radius: f32,
+    clip: Option<crate::Rect>,
+) {
+    if shadow.inset || shadow.color[3] == 0 {
+        return;
+    }
+    let spread = shadow.spread;
+    let x0 = rect.x + shadow.offset_x - spread;
+    let y0 = rect.y + shadow.offset_y - spread;
+    let w0 = rect.width + 2.0 * spread;
+    let h0 = rect.height + 2.0 * spread;
+    if w0 <= 0.0 || h0 <= 0.0 {
+        return;
+    }
+    let r0 = (border_radius + spread).max(0.0);
+    let blur = shadow.blur.max(0.0);
+    // Ancestor overflow clip: build a mask once and reuse it for every layer.
+    let mask = match clip {
+        Some(c) => {
+            if c.width <= 0.0 || c.height <= 0.0 {
+                return;
+            }
+            box_clip_mask(pixmap.width(), pixmap.height(), &c)
+        }
+        None => None,
+    };
+    let color = shadow.color;
+    if blur < 0.5 {
+        // No blur: a single crisp, offset (and spread) rounded rect.
+        fill_shadow_rect(pixmap, x0, y0, w0, h0, r0, color, mask.as_ref());
+        return;
+    }
+    let steps: u32 = (blur.ceil() as u32).clamp(2, 24);
+    // Per-layer alpha chosen so `steps` source-over composites reach the target
+    // alpha at the core: 1 - (1 - a)^steps == A  =>  a = 1 - (1 - A)^(1/steps).
+    let a_frac = color[3] as f32 / 255.0;
+    let per = 1.0 - (1.0 - a_frac).powf(1.0 / steps as f32);
+    let layer_alpha = (per * 255.0).round().clamp(1.0, 255.0) as u8;
+    let layer_color = [color[0], color[1], color[2], layer_alpha];
+    for j in 0..steps {
+        // j = 0 is the solid core (expansion 0); j = steps-1 reaches the blur
+        // radius. Larger rects paint first, smaller (more-covered) ones on top.
+        let e = blur * (j as f32) / ((steps - 1) as f32);
+        fill_shadow_rect(pixmap, x0 - e, y0 - e, w0 + 2.0 * e, h0 + 2.0 * e, r0 + e, layer_color, mask.as_ref());
+    }
+}
+
+/// Fill one (possibly rounded) shadow rectangle with a flat color, optionally
+/// masked to an ancestor clip region. A helper for `paint_box_shadow`'s layers.
+fn fill_shadow_rect(
+    pixmap: &mut Pixmap,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    radius: f32,
+    color: [u8; 4],
+    mask: Option<&tiny_skia::Mask>,
+) {
+    if w <= 0.0 || h <= 0.0 || color[3] == 0 {
+        return;
+    }
+    let path = if radius > 0.5 {
+        match rounded_rect_path(x, y, w, h, radius) {
+            Some(p) => p,
+            None => return,
+        }
+    } else {
+        let r = match Rect::from_xywh(x, y, w, h) {
+            Some(r) => r,
+            None => return,
+        };
+        let mut pb = PathBuilder::new();
+        pb.push_rect(r);
+        match pb.finish() {
+            Some(p) => p,
+            None => return,
+        }
+    };
+    let mut paint = Paint::default();
+    paint.set_color(Color::from_rgba8(color[0], color[1], color[2], color[3]));
+    paint.anti_alias = true;
+    pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), mask);
+}
+
 /// The marker text for a list item, or `None` when markers are suppressed
 /// (`list-style: none`). `Decimal` numbers the item by its position among
 /// sibling list items so `<ol>`s count 1, 2, 3.
@@ -436,6 +556,27 @@ pub fn screenshot_png(tree: &DomTree, viewport: (f32, f32), base_url: Option<&st
     paint_dom(tree, viewport, base_url)?.encode_png().ok()
 }
 
+/// A representative visible color for `background-clip: text` text whose own
+/// color is transparent, used on the word-split paint path (the cosmic-text IFC
+/// path samples the gradient per glyph in `inline`). Returns the gradient's mid
+/// stop or the background color so a transparent-colored label still paints;
+/// `None` when the element is not a transparent-text clip-to-text box.
+fn clip_text_fill_color(style: &crate::LayoutStyle) -> Option<[u8; 4]> {
+    if !style.background_clip_text {
+        return None;
+    }
+    if style.color.map(|c| c[3] != 0).unwrap_or(true) {
+        return None;
+    }
+    if let Some((_, stops)) = &style.background_gradient {
+        if !stops.is_empty() {
+            let mid = stops[stops.len() / 2].0;
+            return Some([mid[0], mid[1], mid[2], 255]);
+        }
+    }
+    style.background_color.filter(|c| c[3] != 0).map(|c| [c[0], c[1], c[2], 255])
+}
+
 /// Paint every word of a text node at its own laid-out position. A text node
 /// lays out as one taffy leaf per word (see `dom::build_text_words`), each
 /// wrapping independently, so its content is a list of (box, word) pairs
@@ -455,7 +596,7 @@ fn paint_text_node(
     if style.effectively_invisible {
         return Some(());
     }
-    let color = style.color.unwrap_or([0, 0, 0, 255]);
+    let color = clip_text_fill_color(style).unwrap_or_else(|| style.color.unwrap_or([0, 0, 0, 255]));
     let fsize = style.font_size.unwrap_or(16.0);
     let is_bold = style.font_weight.as_deref() == Some("bold");
     // A text node has no transform of its own, but any transformed element
@@ -1252,6 +1393,259 @@ fn svg_escape_attr(s: &str, buf: &mut String) {
     }
 }
 
+/// Resolve `<use>` elements in an inline `<svg>` subtree that point at an
+/// EXTERNAL sprite file (`href`/`xlink:href` = `url#id` with a non-empty url),
+/// splicing the referenced symbol into the already-serialized `markup` so resvg
+/// can rasterize it. For each distinct external reference, fetch the sprite
+/// (once, via the shared image cache and resolving relative urls against
+/// `base_url`), pull out the element carrying `id="id"`, inject it inside a
+/// `<defs>` right after the opening `<svg>` tag, and rewrite the `<use>` href to
+/// a now-local `#id`. Same-document `<use href="#id">` (empty url) is ignored
+/// and left to resvg's own resolution. A fetch or parse failure is a silent
+/// no-op: the affected `<use>` simply renders nothing, exactly as before.
+fn inject_external_sprites(
+    tree: &DomTree,
+    root: obscura_dom::tree::NodeId,
+    base_url: Option<&str>,
+    markup: &mut String,
+    cache: &mut std::collections::HashMap<String, Option<Vec<u8>>>,
+    sprite_cache: &mut std::collections::HashMap<String, Option<String>>,
+) {
+    // Distinct external references (full href, url, fragment id), in first-seen
+    // order. Dedupe so one symbol referenced by several `<use>` is fetched and
+    // injected once (the rewrite below still fixes every occurrence).
+    let mut refs: Vec<(String, String, String)> = Vec::new();
+    for nid in tree.descendants(root) {
+        let Some(node) = tree.get_node(nid) else { continue };
+        let Some(el) = node.as_element() else { continue };
+        if el.local.as_ref() != "use" {
+            continue;
+        }
+        // `get_attribute` matches by local name, so a single "href" lookup
+        // already covers both `href` and `xlink:href`; check the prefixed form
+        // too for completeness.
+        let Some(href) = node
+            .get_attribute("href")
+            .or_else(|| node.get_attribute("xlink:href"))
+        else {
+            continue;
+        };
+        let Some(hash) = href.find('#') else { continue };
+        let (url, frag) = (&href[..hash], &href[hash + 1..]);
+        if url.is_empty() || frag.is_empty() {
+            // Same-document `#id` (or a malformed ref): nothing to fetch.
+            continue;
+        }
+        let entry = (href.to_string(), url.to_string(), frag.to_string());
+        if !refs.contains(&entry) {
+            refs.push(entry);
+        }
+    }
+    if refs.is_empty() {
+        return;
+    }
+
+    let mut defs = String::new();
+    let mut rewrites: Vec<(String, String)> = Vec::new();
+    for (href, url, frag) in &refs {
+        let key = format!("{url}#{frag}");
+        let symbol = sprite_cache
+            .entry(key)
+            .or_insert_with(|| {
+                let bytes = fetch_bytes(url, base_url, cache)?;
+                let text = String::from_utf8_lossy(&bytes);
+                // Drop `xlink:` prefixes in the fetched fragment (resvg reads a
+                // bare `href`), matching how the local subtree is serialized and
+                // avoiding an undeclared-namespace parse error in the standalone
+                // document.
+                extract_svg_element_by_id(&text, frag).map(|s| s.replace("xlink:href", "href"))
+            })
+            .clone();
+        let Some(symbol) = symbol else { continue };
+        defs.push_str(&symbol);
+        rewrites.push((href.clone(), format!("#{frag}")));
+    }
+    if defs.is_empty() {
+        return;
+    }
+
+    // Splice the fetched symbols into a `<defs>` immediately after the opening
+    // `<svg ...>` tag (the first `>` in the serialized document).
+    if let Some(gt) = markup.find('>') {
+        markup.insert_str(gt + 1, &format!("<defs>{defs}</defs>"));
+    }
+    // Point each external `<use>` at the injected local symbol. The serialized
+    // href is attribute-escaped, so match against the escaped form.
+    for (href, local) in rewrites {
+        let from = format!("href=\"{}\"", svg_escape_attr_str(&href));
+        let to = format!("href=\"{}\"", svg_escape_attr_str(&local));
+        *markup = markup.replace(&from, &to);
+    }
+}
+
+/// Escape a string for use as an SVG attribute value (`&`, `<`, `"`), returning
+/// it as an owned `String` (the buffer-writing `svg_escape_attr` in one call).
+fn svg_escape_attr_str(s: &str) -> String {
+    let mut buf = String::new();
+    svg_escape_attr(s, &mut buf);
+    buf
+}
+
+/// Pull the element carrying `id="id"` (a `<symbol>`, `<g>`, `<path>`, ...) out
+/// of an external sprite document, returned as a verbatim serialized substring
+/// (its start tag through the matching end tag, or the self-closing tag alone).
+/// A lightweight namespace-agnostic XML scan, not a full parse: usvg would
+/// flatten `<symbol>`/`<use>` structure, and we want to re-inject the element
+/// unchanged. Returns None when no element has that id.
+fn extract_svg_element_by_id(sprite: &str, id: &str) -> Option<String> {
+    let mut i = 0usize;
+    while i < sprite.len() {
+        let rest = &sprite[i..];
+        if !rest.starts_with('<') {
+            // Advance to the next tag (skips text/whitespace between elements).
+            i += rest.find('<')?;
+            continue;
+        }
+        if rest.starts_with("<!--") {
+            i += rest.find("-->").map(|p| p + 3)?;
+            continue;
+        }
+        if rest.starts_with("<![CDATA[") {
+            i += rest.find("]]>").map(|p| p + 3)?;
+            continue;
+        }
+        if rest.starts_with("<!") || rest.starts_with("<?") || rest.starts_with("</") {
+            i += rest.find('>').map(|p| p + 1)?;
+            continue;
+        }
+        // A start tag: inner spans between '<' and '>'.
+        let gt = i + rest.find('>')?;
+        let inner = &sprite[i + 1..gt];
+        if tag_attr(inner, "id") == Some(id) {
+            if inner.trim_end().ends_with('/') {
+                return Some(sprite[i..=gt].to_string());
+            }
+            let name = tag_name(inner);
+            let end = element_end(sprite, gt + 1, name)?;
+            return Some(sprite[i..end].to_string());
+        }
+        i = gt + 1;
+    }
+    None
+}
+
+/// The tag name from a tag's inner text (the bytes between `<` and `>`),
+/// dropping any leading `/` of an end tag and stopping at the first whitespace
+/// or self-close slash.
+fn tag_name(inner: &str) -> &str {
+    let inner = inner.trim_start().trim_start_matches('/');
+    let end = inner
+        .find(|c: char| c.is_ascii_whitespace() || c == '/')
+        .unwrap_or(inner.len());
+    &inner[..end]
+}
+
+/// The value of attribute `want` in a tag's inner text, or None if absent.
+/// Matches attribute names whole (so `id` does not match `data-id`/`xml:id`)
+/// and handles single/double quoted and bare values.
+fn tag_attr<'a>(inner: &'a str, want: &str) -> Option<&'a str> {
+    let b = inner.as_bytes();
+    let mut i = 0usize;
+    // Skip the tag name.
+    while i < b.len() && !b[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    while i < b.len() {
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= b.len() || b[i] == b'/' {
+            break;
+        }
+        let name_start = i;
+        while i < b.len() && b[i] != b'=' && !b[i].is_ascii_whitespace() && b[i] != b'/' {
+            i += 1;
+        }
+        let name = &inner[name_start..i];
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i < b.len() && b[i] == b'=' {
+            i += 1;
+            while i < b.len() && b[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            let value = if i < b.len() && (b[i] == b'"' || b[i] == b'\'') {
+                let quote = b[i];
+                i += 1;
+                let vstart = i;
+                while i < b.len() && b[i] != quote {
+                    i += 1;
+                }
+                let v = &inner[vstart..i.min(b.len())];
+                if i < b.len() {
+                    i += 1;
+                }
+                v
+            } else {
+                let vstart = i;
+                while i < b.len() && !b[i].is_ascii_whitespace() && b[i] != b'/' {
+                    i += 1;
+                }
+                &inner[vstart..i]
+            };
+            if name == want {
+                return Some(value);
+            }
+        } else if name == want {
+            // Valueless (boolean) attribute.
+            return Some("");
+        }
+    }
+    None
+}
+
+/// The byte offset just past the `</name>` that closes an element whose content
+/// starts at `start`, tracking nesting of same-named tags (e.g. `<g>` inside
+/// `<g>`). None if the document ends without a matching close.
+fn element_end(sprite: &str, start: usize, name: &str) -> Option<usize> {
+    let mut i = start;
+    let mut depth = 1usize;
+    while i < sprite.len() {
+        let rest = &sprite[i..];
+        if !rest.starts_with('<') {
+            i += rest.find('<')?;
+            continue;
+        }
+        if rest.starts_with("<!--") {
+            i += rest.find("-->").map(|p| p + 3)?;
+            continue;
+        }
+        if rest.starts_with("<![CDATA[") {
+            i += rest.find("]]>").map(|p| p + 3)?;
+            continue;
+        }
+        if rest.starts_with("<!") || rest.starts_with("<?") {
+            i += rest.find('>').map(|p| p + 1)?;
+            continue;
+        }
+        let gt = i + rest.find('>')?;
+        let inner = &sprite[i + 1..gt];
+        if rest.starts_with("</") {
+            if tag_name(inner) == name {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(gt + 1);
+                }
+            }
+        } else if tag_name(inner) == name && !inner.trim_end().ends_with('/') {
+            depth += 1;
+        }
+        i = gt + 1;
+    }
+    None
+}
+
 /// A full-pixmap alpha mask that is opaque only inside `rect`, used to clip a
 /// blit (e.g. an inline svg raster) to an ancestor's overflow-hidden region.
 fn rect_clip_mask(width: u32, height: u32, rect: &crate::Rect) -> Option<tiny_skia::Mask> {
@@ -1589,5 +1983,55 @@ mod tests {
             }
         }
         assert!(found_blue, "expected <use> to instantiate the referenced <rect>");
+    }
+
+    #[test]
+    fn extracts_symbol_by_id_from_sprite() {
+        // The external-sprite core: given a fetched sprite, pull out just the
+        // referenced <symbol> verbatim so it can be spliced into the local svg.
+        let sprite = r##"<svg xmlns="http://www.w3.org/2000/svg"><defs><symbol id="a" viewBox="0 0 10 10"><path d="M0 0h10v10z"/></symbol><symbol id="b"><rect width="4" height="4"/></symbol></defs></svg>"##;
+        let out = extract_svg_element_by_id(sprite, "a").expect("symbol a found");
+        assert!(out.starts_with("<symbol"), "starts at the symbol tag: {out}");
+        assert!(out.contains(r#"id="a""#), "keeps the id: {out}");
+        assert!(out.contains("<path") && out.contains("h10v10z"), "keeps children: {out}");
+        assert!(out.trim_end().ends_with("</symbol>"), "closed at matching end: {out}");
+        assert!(!out.contains(r#"id="b""#), "stops before the sibling symbol: {out}");
+        assert!(!out.contains("<rect"), "no sibling content leaks in: {out}");
+    }
+
+    #[test]
+    fn extract_handles_self_closing_nesting_and_absent() {
+        // A self-closing element carrying the id returns just that tag.
+        let s1 = r#"<svg><rect id="x" width="4" height="4"/></svg>"#;
+        assert_eq!(
+            extract_svg_element_by_id(s1, "x").as_deref(),
+            Some(r#"<rect id="x" width="4" height="4"/>"#),
+        );
+        // Same-name nesting: the matching close is the outer one, not the inner.
+        let s2 = r#"<svg><g id="grp"><g><path/></g></g></svg>"#;
+        assert_eq!(
+            extract_svg_element_by_id(s2, "grp").as_deref(),
+            Some(r#"<g id="grp"><g><path/></g></g>"#),
+        );
+        // `data-id` / a missing id must not be mistaken for `id`.
+        let s3 = r#"<svg><symbol data-id="a"><path/></symbol></svg>"#;
+        assert!(extract_svg_element_by_id(s3, "a").is_none(), "data-id is not id");
+        assert!(extract_svg_element_by_id(s2, "nope").is_none(), "absent id");
+    }
+
+    #[test]
+    fn same_document_use_left_unchanged_by_inject() {
+        // A same-document `<use href="#a">` has an empty url, so inject does no
+        // network work and leaves the serialized markup byte-for-byte unchanged.
+        let tree = parse_html(
+            r##"<html><body><svg viewBox="0 0 10 10"><use href="#a"/><symbol id="a"><path d="M0 0h10v10z"/></symbol></svg></body></html>"##,
+        );
+        let svg = tree.query_selector("svg").unwrap().unwrap();
+        let mut markup = serialize_svg(&tree, svg);
+        let before = markup.clone();
+        let mut cache = std::collections::HashMap::new();
+        let mut sprite_cache = std::collections::HashMap::new();
+        inject_external_sprites(&tree, svg, None, &mut markup, &mut cache, &mut sprite_cache);
+        assert_eq!(markup, before, "same-document use must be untouched");
     }
 }
