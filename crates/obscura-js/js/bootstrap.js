@@ -15,6 +15,7 @@
     '__obscura_objects', '__obscura_oid', '__obscura_ua',
     '__obscura_platform', '__obscura_ua_platform', '__obscura_ua_platform_version',
     '__obscura_stealth', '__obscura_markTrusted',
+    '__obscura_hw', '__obscura_mem',
     '__documentReadyState__', '__currentUrl',
     // internal helpers (var-declared throughout the file)
     '__processDynScriptQueue', '_markNative', '_fpRand', '_fpNoise',
@@ -3019,32 +3020,15 @@ function _uaBrands() {
   return [ordered[p[0]], ordered[p[1]], ordered[p[2]]];
 }
 
+// Fingerprint surfaces (UA, plugins, webdriver, etc.) live on the prototype
+// hop below, not as own props here: own accessors are a bot tell.
 globalThis.navigator = {
-  get userAgent() { return globalThis.__obscura_ua || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"; },
-  get appVersion() { return this.userAgent.replace('Mozilla/', ''); },
-  language: "en-US", languages: ["en-US","en"], get platform() { return globalThis.__obscura_platform || "Win32"; },
-  onLine: true, cookieEnabled: true, hardwareConcurrency: 8,
+  onLine: true, cookieEnabled: true,
   maxTouchPoints: 0,
   vendor: "Google Inc.", product: "Gecko", productSub: "20030107",
   doNotTrack: null,
-  deviceMemory: 8,
   connection: new NetworkInformation(),
   pdfViewerEnabled: true,
-  get plugins() {
-    return new PluginArray([
-      new Plugin("PDF Viewer", "internal-pdf-viewer", "Portable Document Format", []),
-      new Plugin("Chrome PDF Viewer", "internal-pdf-viewer", "Portable Document Format", []),
-      new Plugin("Chromium PDF Viewer", "internal-pdf-viewer", "Portable Document Format", []),
-      new Plugin("Microsoft Edge PDF Viewer", "internal-pdf-viewer", "Portable Document Format", []),
-      new Plugin("WebKit built-in PDF", "internal-pdf-viewer", "Portable Document Format", []),
-    ]);
-  },
-  get mimeTypes() {
-    return new MimeTypeArray([
-      new MimeType("application/pdf", "Portable Document Format", "pdf", null),
-      new MimeType("text/pdf", "Portable Document Format", "pdf", null),
-    ]);
-  },
   userAgentData: {
     mobile: false,
     get brands() { return _uaBrands(); },
@@ -3131,16 +3115,61 @@ globalThis.navigator = {
   },
 };
 
-// Move navigator.webdriver off the instance and onto a thin prototype so that
-// Object.getOwnPropertyDescriptor(navigator, 'webdriver') returns undefined,
-// matching Chrome where the property lives on Navigator.prototype.
-// Use Navigator.prototype as the chain base so navigator instanceof Navigator === true.
+// Put spoofed navigator props on a thin prototype above Navigator.prototype
+// so hasOwnProperty/getOwnPropertyDescriptor on the instance match Chrome.
+// Getters read __obscura_* lazily (snapshot vs per-page) and are _markNative'd.
 (function() {
-  var _wdGetter = function() { return false; };
-  _markNative(_wdGetter);
-  var _wdProto = Object.create(Navigator.prototype);
-  Object.defineProperty(_wdProto, 'webdriver', {get: _wdGetter, set: undefined, enumerable: true, configurable: true});
-  Object.setPrototypeOf(globalThis.navigator, _wdProto);
+  var _navProto = Object.create(Navigator.prototype);
+
+  function defGetter(key, fn) {
+    _markNative(fn);
+    Object.defineProperty(_navProto, key, {
+      get: fn, set: undefined, enumerable: true, configurable: true,
+    });
+  }
+
+  defGetter('webdriver', function() { return false; });
+  defGetter('userAgent', function() {
+    return globalThis.__obscura_ua ||
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+      "(KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
+  });
+  defGetter('appVersion', function() {
+    return (globalThis.__obscura_ua ||
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+      "(KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36").replace('Mozilla/', '');
+  });
+  defGetter('platform', function() {
+    return globalThis.__obscura_platform || "Win32";
+  });
+  defGetter('language', function() { return "en-US"; });
+  defGetter('languages', function() { return ["en-US", "en"]; });
+
+  // Cache plugins/mimeTypes so navigator.plugins === navigator.plugins.
+  var _plugins = new PluginArray([
+    new Plugin("PDF Viewer", "internal-pdf-viewer", "Portable Document Format", []),
+    new Plugin("Chrome PDF Viewer", "internal-pdf-viewer", "Portable Document Format", []),
+    new Plugin("Chromium PDF Viewer", "internal-pdf-viewer", "Portable Document Format", []),
+    new Plugin("Microsoft Edge PDF Viewer", "internal-pdf-viewer", "Portable Document Format", []),
+    new Plugin("WebKit built-in PDF", "internal-pdf-viewer", "Portable Document Format", []),
+  ]);
+  var _mimeTypes = new MimeTypeArray([
+    new MimeType("application/pdf", "Portable Document Format", "pdf", null),
+    new MimeType("text/pdf", "Portable Document Format", "pdf", null),
+  ]);
+  defGetter('plugins', function() { return _plugins; });
+  defGetter('mimeTypes', function() { return _mimeTypes; });
+
+  // Values set per-page by __obscura_init (avoids own data props on navigator).
+  defGetter('hardwareConcurrency', function() { return globalThis.__obscura_hw || 8; });
+  defGetter('deviceMemory', function() { return globalThis.__obscura_mem || 8; });
+
+  _navProto.share = _markNative(function share(data) {
+    return Promise.reject(new DOMException('Not allowed', 'NotAllowedError'));
+  });
+  _navProto.canShare = _markNative(function canShare() { return false; });
+
+  Object.setPrototypeOf(globalThis.navigator, _navProto);
 })();
 
 globalThis.chrome = {
@@ -6672,8 +6701,6 @@ navigator.keyboard = {
 };
 navigator.gpu = { requestAdapter() { return Promise.resolve(null); } };
 navigator.wakeLock = { request() { return Promise.reject(new DOMException('Not allowed', 'NotAllowedError')); } };
-navigator.share = function(data) { return Promise.reject(new DOMException('Not allowed', 'NotAllowedError')); };
-navigator.canShare = function() { return false; };
 
 globalThis.opener = null;
 
@@ -7597,9 +7624,9 @@ globalThis.__obscura_init = function() {
   globalThis.outerWidth = sw; globalThis.outerHeight = sh - 40;
 
   var hwValues = globalThis.__obscura_stealth ? [4, 6, 8, 12, 16] : [2, 4, 6, 8, 12, 16];
-  globalThis.navigator.hardwareConcurrency = hwValues[Math.floor(_fpRand(400) * hwValues.length)];
+  globalThis.__obscura_hw = hwValues[Math.floor(_fpRand(400) * hwValues.length)];
   var memValues = globalThis.__obscura_stealth ? [4, 8] : [0.25, 0.5, 1, 2, 4, 8];
-  globalThis.navigator.deviceMemory = memValues[Math.floor(_fpRand(401) * memValues.length)];
+  globalThis.__obscura_mem = memValues[Math.floor(_fpRand(401) * memValues.length)];
 
   const t0 = Date.now() + Math.floor(_fpRand(641) * 100) - 50;
   globalThis.performance.timeOrigin = t0;
