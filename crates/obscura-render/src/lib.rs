@@ -320,6 +320,11 @@ pub struct LayoutStyle {
     /// `opacity`, own (non-inherited) value in 0.0-1.0. `None` means the
     /// default of 1.0.
     pub opacity: Option<f32>,
+    /// `vertical-align` for a table cell's content. Cells effectively default
+    /// to `middle` in browsers (the HTML UA sheet sets it on row groups and
+    /// cells inherit it); obscura applies it as main-axis alignment of the
+    /// cell's flex-column stand-in. `None` on non-cell elements.
+    pub vertical_align: Option<VerticalAlign>,
     /// Resolved during the inheritance pass: true when this element should
     /// not be painted at all, either from its own or an inherited
     /// `visibility: hidden`, or because the product of its own and every
@@ -445,6 +450,17 @@ pub enum ObjectFit {
     Cover,
     ScaleDown,
     None,
+}
+
+/// `vertical-align` positions for table-cell content. `baseline` (and the
+/// text-level values like sub/super, which do not apply to cells) map to
+/// `Top` as an approximation: real per-row baseline alignment needs shared
+/// ascent metrics across the row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerticalAlign {
+    Top,
+    Middle,
+    Bottom,
 }
 
 /// `line-height`: `normal` (a font-relative default), a unitless multiple of

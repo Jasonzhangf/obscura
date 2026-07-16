@@ -78,6 +78,11 @@ pub struct DomLayout {
 struct IfcRegistry {
     whole: HashMap<NodeId, usize>,
     runs: HashMap<NodeId, Vec<usize>>,
+    /// Specified column widths per table grid node, from `<col>` elements and
+    /// colspan-1 cells: `(px, percent)` per column index. Consumed by the
+    /// table column-balancing pass in `layout_dom_with_images`, which pins
+    /// specified columns instead of sizing them purely from content.
+    table_cols: HashMap<taffy::NodeId, (Vec<Option<f32>>, Vec<Option<f32>>)>,
 }
 
 /// Walk the tree top-down accumulating the clip rect imposed by ancestor
@@ -764,12 +769,36 @@ pub fn layout_dom_with_images(
                                 col_max[j] = col_min[j];
                             }
                         }
+                        // overhead = table border + padding + inter-column spacing,
+                        // recovered from the whole-table min-content width
+                        // (from the content mins, before specified widths pin
+                        // any column).
+                        let sum_min_content: f32 = col_min.iter().sum();
+                        let overhead = (min_c - sum_min_content).max(0.0);
+                        let target = (used - overhead).max(0.0);
+                        // Specified column widths (a `<col>` or colspan-1 cell
+                        // width, recorded at build time) pin their columns:
+                        // px directly, percent against the table's content
+                        // width. Content min-content still floors them, so a
+                        // too-narrow spec never crushes its content. The
+                        // remaining space interpolates across the auto
+                        // columns exactly as before.
+                        if let Some((spec_px, spec_pct)) = ifc_items.table_cols.get(&tnode) {
+                            for j in 0..ncols {
+                                let spec = spec_px
+                                    .get(j)
+                                    .copied()
+                                    .flatten()
+                                    .or_else(|| spec_pct.get(j).copied().flatten().map(|p| p * target));
+                                if let Some(w) = spec {
+                                    let w = w.max(col_min[j]);
+                                    col_min[j] = w;
+                                    col_max[j] = w;
+                                }
+                            }
+                        }
                         let sum_min: f32 = col_min.iter().sum();
                         let sum_max: f32 = col_max.iter().sum();
-                        // overhead = table border + padding + inter-column spacing,
-                        // recovered from the whole-table min-content width.
-                        let overhead = (min_c - sum_min).max(0.0);
-                        let target = (used - overhead).max(0.0);
                         let widths: Vec<f32> = if sum_max <= sum_min || target <= sum_min {
                             col_min.clone()
                         } else if target >= sum_max {
@@ -828,8 +857,22 @@ pub fn layout_dom_with_images(
     #[cfg(feature = "paint")]
     for (nid, &idx) in &ifc_items.whole {
         if let (Some(rect), Some(style)) = (rects.get(nid), styles.get(nid)) {
-            let origin = crate::inline::content_origin(rect, style);
+            let mut origin = crate::inline::content_origin(rect, style);
             let cw = crate::inline::content_width(rect, style);
+            // A table cell stretched taller than its text (row height from a
+            // neighbor) aligns its content per vertical-align; the pure-text
+            // leaf path has no inner box to align, so shift the pinned origin
+            // by the leftover space instead.
+            if let Some(va @ (crate::VerticalAlign::Middle | crate::VerticalAlign::Bottom)) = style.vertical_align {
+                let (_, th) = engine.measure(idx, Some(cw));
+                let content_h = rect.height
+                    - style.padding.top
+                    - style.padding.bottom
+                    - style.border.top
+                    - style.border.bottom;
+                let free = (content_h - th).max(0.0);
+                origin.1 += if va == crate::VerticalAlign::Middle { free / 2.0 } else { free };
+            }
             // The shaped text is this container's own content, so an
             // `overflow: hidden` on the container clips it (this is what keeps
             // the 1x1 "visually hidden" skip-link box from painting its text,
@@ -1534,6 +1577,11 @@ fn build_table(
             // Grid does the sizing; a leftover flex_grow from the flex-table
             // heuristic would be ignored anyway, but clear it to be explicit.
             cstyle.flex_grow = 0.0;
+            // A cell's specified width sizes its COLUMN (fed into the track
+            // by the pre-pass above); the cell box itself always fills its
+            // grid area. Left in place, a `width:50%` cell would shrink to
+            // half of its own already-halved track.
+            cstyle.size.width = Dimension::auto();
             let _ = taffy_tree.set_style(cell_node, cstyle);
         }
         children.push(cell_node);
@@ -1542,20 +1590,116 @@ fn build_table(
         return None;
     }
 
-    // The grid container inherits the table's own box (border, padding,
-    // background, margin) but is forced to width:auto so the intrinsic-sizing
-    // pass in layout_dom can measure content before choosing the used width.
-    let col = || {
-        taffy::GridTemplateComponent::Single(taffy::MinMax {
-            min: taffy::MinTrackSizingFunction::min_content(),
-            max: taffy::MaxTrackSizingFunction::max_content(),
-        })
+    // Column sizing pre-pass: specified widths on `<col>` elements and on
+    // colspan-1 cells feed the tracks, so author column sizing actually
+    // applies (a `td{width:200px}` must size the COLUMN, across every row).
+    // A percent width becomes a percent track (resolving against the table),
+    // a px width caps the track at that length (min-content still protects
+    // the content), and unspecified columns keep content sizing with an
+    // `auto` max so they stretch to fill a definite table width instead of
+    // leaving a dead strip of bare table background.
+    let mut col_px: Vec<Option<f32>> = vec![None; ncols];
+    let mut col_pct: Vec<Option<f32>> = vec![None; ncols];
+    let attr_width = |cid: NodeId| -> (Option<f32>, Option<f32>) {
+        let Some(v) = tree.get_node(cid).and_then(|n| n.get_attribute("width").map(|s| s.trim().to_string())) else {
+            return (None, None);
+        };
+        if let Some(p) = v.strip_suffix('%').and_then(|s| s.trim().parse::<f32>().ok()) {
+            (None, Some(p / 100.0))
+        } else {
+            (v.trim_end_matches("px").trim().parse::<f32>().ok(), None)
+        }
     };
-    let row_track = || {
-        taffy::GridTemplateComponent::Single(taffy::MinMax {
-            min: taffy::MinTrackSizingFunction::auto(),
-            max: taffy::MaxTrackSizingFunction::auto(),
-        })
+    let style_width = |cid: NodeId| -> (Option<f32>, Option<f32>) {
+        match styles.get(&cid).map(|s| s.width) {
+            Some(crate::Dimension::Px(w)) if w > 0.0 => (Some(w), None),
+            Some(crate::Dimension::Percent(p)) if p > 0.0 => (None, Some(p)),
+            _ => attr_width(cid),
+        }
+    };
+    // <col> elements (direct or under <colgroup>), each spanning `span` columns.
+    let mut next_col = 0usize;
+    let mut col_elems: Vec<NodeId> = Vec::new();
+    for cid in tree.children(id) {
+        match tree.get_node(cid).and_then(|n| n.as_element().map(|e| e.local.to_string())).as_deref() {
+            Some("col") => col_elems.push(cid),
+            Some("colgroup") => {
+                for gc in tree.children(cid) {
+                    if tree.get_node(gc).and_then(|n| n.as_element().map(|e| e.local.as_ref() == "col")).unwrap_or(false) {
+                        col_elems.push(gc);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for col_el in col_elems {
+        let span = tree
+            .get_node(col_el)
+            .and_then(|n| n.get_attribute("span").and_then(|v| v.trim().parse::<usize>().ok()))
+            .unwrap_or(1)
+            .clamp(1, MAX_SPAN);
+        let (px, pct) = style_width(col_el);
+        for _ in 0..span {
+            if next_col >= ncols {
+                break;
+            }
+            col_px[next_col] = px;
+            col_pct[next_col] = pct;
+            next_col += 1;
+        }
+    }
+    // colspan-1 cells override <col> (they are closer to the content).
+    for (cid, _r, c, _rs, cs) in &placed {
+        if *cs != 1 || *c >= ncols {
+            continue;
+        }
+        let (px, pct) = style_width(*cid);
+        if let Some(w) = px {
+            col_px[*c] = Some(col_px[*c].map_or(w, |cur| cur.max(w)));
+        }
+        if let Some(p) = pct {
+            col_pct[*c] = Some(col_pct[*c].map_or(p, |cur| cur.max(p)));
+        }
+    }
+
+    // Row sizing: a `height` on the row or a rowspan-1 cell is a MINIMUM
+    // (content can always grow a row), matching how tables treat heights.
+    let mut row_min: Vec<Option<f32>> = vec![None; nrows];
+    for (r, &tr) in rows.iter().enumerate() {
+        if let Some(crate::Dimension::Px(h)) = styles.get(&tr).map(|s| s.height) {
+            if h > 0.0 {
+                row_min[r] = Some(h);
+            }
+        }
+    }
+    for (cid, r, _c, rs, _cs) in &placed {
+        if *rs != 1 {
+            continue;
+        }
+        if let Some(crate::Dimension::Px(h)) = styles.get(cid).map(|s| s.height) {
+            if h > 0.0 {
+                row_min[*r] = Some(row_min[*r].map_or(h, |cur| cur.max(h)));
+            }
+        }
+    }
+
+    let col = |i: usize| {
+        let max = if let Some(p) = col_pct[i] {
+            taffy::MaxTrackSizingFunction::percent(p)
+        } else if let Some(px) = col_px[i] {
+            taffy::MaxTrackSizingFunction::length(px)
+        } else {
+            taffy::MaxTrackSizingFunction::auto()
+        };
+        taffy::GridTemplateComponent::Single(taffy::MinMax { min: taffy::MinTrackSizingFunction::min_content(), max })
+    };
+    let row_track = |r: usize| {
+        let min = match row_min[r] {
+            Some(h) => taffy::MinTrackSizingFunction::length(h),
+            None => taffy::MinTrackSizingFunction::auto(),
+        };
+        taffy::GridTemplateComponent::Single(taffy::MinMax { min, max: taffy::MaxTrackSizingFunction::auto() })
     };
     let mut tstyle = to_taffy_style(style);
     tstyle.display = Display::Grid;
@@ -1565,13 +1709,16 @@ fn build_table(
     if !matches!(style.width, crate::Dimension::Percent(_)) {
         tstyle.size.width = Dimension::auto();
     }
-    tstyle.grid_template_columns = (0..ncols).map(|_| col()).collect();
-    tstyle.grid_template_rows = (0..nrows).map(|_| row_track()).collect();
+    tstyle.grid_template_columns = (0..ncols).map(col).collect();
+    tstyle.grid_template_rows = (0..nrows).map(row_track).collect();
     if let Some((h, v)) = style.border_spacing {
         tstyle.gap = taffy::Size { width: length(h), height: length(v) };
     }
     let table_node = taffy_tree.new_with_children(tstyle, &children).ok()?;
     id_map.insert(table_node, id);
+    if col_px.iter().any(Option::is_some) || col_pct.iter().any(Option::is_some) {
+        ifc_items.table_cols.insert(table_node, (col_px, col_pct));
+    }
     Some(table_node)
 }
 
@@ -1689,6 +1836,31 @@ fn build(
             };
         }
         taffy_style.align_items = Some(taffy::AlignItems::FLEX_START);
+    }
+
+    // Table-cell vertical alignment: place the cell's content along the
+    // vertical axis of whichever shape the cell took, the flex-column
+    // stand-in's main axis or the wrapped lines of a promoted inline
+    // context. (The pure-text leaf path is aligned at finalize instead,
+    // where the shaped text height is known.)
+    if let Some(va) = style.vertical_align {
+        if taffy_style.display == taffy::style::Display::Flex {
+            if taffy_style.flex_direction == taffy::FlexDirection::Column {
+                if style.justify_content.is_none() {
+                    taffy_style.justify_content = Some(match va {
+                        crate::VerticalAlign::Top => taffy::JustifyContent::FLEX_START,
+                        crate::VerticalAlign::Middle => taffy::JustifyContent::CENTER,
+                        crate::VerticalAlign::Bottom => taffy::JustifyContent::FLEX_END,
+                    });
+                }
+            } else {
+                taffy_style.align_content = Some(match va {
+                    crate::VerticalAlign::Top => taffy::AlignContent::FLEX_START,
+                    crate::VerticalAlign::Middle => taffy::AlignContent::CENTER,
+                    crate::VerticalAlign::Bottom => taffy::AlignContent::FLEX_END,
+                });
+            }
+        }
     }
 
     let mut child_ids: Vec<taffy::NodeId> = if has_float_child {

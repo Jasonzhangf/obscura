@@ -130,6 +130,10 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
         style.align_items = Some(taffy::AlignItems::FLEX_START);
         style.padding = Edges { top: 0.0, right: 5.0, bottom: 0.0, left: 0.0 };
         style.min_width = crate::Dimension::Px(0.0);
+        // Cells are effectively middle-aligned by default in browsers (the
+        // HTML UA sheet's row-group vertical-align inherited into cells);
+        // an author `vertical-align` on the cell overrides this.
+        style.vertical_align = Some(crate::VerticalAlign::Middle);
         if tag == "th" {
             style.font_weight = Some("bold".to_string());
         }
@@ -438,6 +442,15 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         }
         "visibility" => style.visibility_hidden = Some(value.eq_ignore_ascii_case("hidden")),
         "opacity" => style.opacity = value.trim().parse::<f32>().ok(),
+        "vertical-align" => {
+            style.vertical_align = match value.trim().to_ascii_lowercase().as_str() {
+                "top" | "baseline" | "text-top" => Some(crate::VerticalAlign::Top),
+                "middle" => Some(crate::VerticalAlign::Middle),
+                "bottom" | "text-bottom" => Some(crate::VerticalAlign::Bottom),
+                // sub/super/lengths are text-level; leave the cell default.
+                _ => style.vertical_align,
+            };
+        }
         "list-style-type" => {
             style.list_style = Some(list_style_keyword(value.trim()).unwrap_or(crate::ListStyle::Disc));
         }
