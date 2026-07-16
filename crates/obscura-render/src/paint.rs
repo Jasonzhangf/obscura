@@ -230,7 +230,7 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
         }
 
         if name.local.as_ref() == "img" {
-            if let Some(src) = resolve_img_url(tree, nid) {
+            if let Some((src, _density)) = resolve_img_url(tree, nid) {
                 let painted = paint_image(&src, base_url, &rect, style.object_fit, &mut pixmap, &mut image_cache);
                 // Fall back to alt text only when the image itself did not paint.
                 if !painted {
@@ -883,11 +883,14 @@ fn collect_image_intrinsics(
         if node.as_element().map(|e| e.local.as_ref() != "img").unwrap_or(true) {
             continue;
         }
-        let Some(url) = resolve_img_url(tree, nid) else { continue };
+        let Some((url, density)) = resolve_img_url(tree, nid) else { continue };
         let Some(bytes) = fetch_bytes(&url, base_url, cache) else { continue };
         if let Some((w, h)) = image_dimensions(&bytes) {
             if w > 0 && h > 0 {
-                out.insert(nid, (w as f32, h as f32));
+                // A 2x (or w-descriptor) candidate's raw pixels are density
+                // times its CSS size; divide so layout sees CSS px, or every
+                // responsive image occupies twice its design size.
+                out.insert(nid, (w as f32 / density, h as f32 / density));
             }
         }
     }
@@ -902,18 +905,18 @@ fn collect_image_intrinsics(
 /// resolve the same URL the browser would end up with: a matching `<picture>`
 /// source first, then a real candidate from `srcset`/`data-srcset`, then a
 /// non-inline `src`/`data-*` URL, then any `src` (an inlined data: image).
-fn resolve_img_url(tree: &DomTree, nid: obscura_dom::tree::NodeId) -> Option<String> {
+fn resolve_img_url(tree: &DomTree, nid: obscura_dom::tree::NodeId) -> Option<(String, f32)> {
     let node = tree.get_node(nid)?;
     // A <picture>'s preceding, type/media-matching <source> wins over the
     // <img>'s own attributes (HTML "update the source set").
-    if let Some(url) = picture_source_url(tree, nid) {
-        return Some(url);
+    if let Some(pick) = picture_source_url(tree, nid) {
+        return Some(pick);
     }
     let sizes = node.get_attribute("sizes");
     for a in ["srcset", "data-srcset"] {
         if let Some(v) = node.get_attribute(a) {
-            if let Some(u) = best_srcset_candidate(v, sizes) {
-                return Some(u);
+            if let Some(pick) = best_srcset_candidate(v, sizes) {
+                return Some(pick);
             }
         }
     }
@@ -923,7 +926,7 @@ fn resolve_img_url(tree: &DomTree, nid: obscura_dom::tree::NodeId) -> Option<Str
         if let Some(v) = node.get_attribute(a) {
             let v = v.trim();
             if !v.is_empty() && !v.starts_with("data:") {
-                return Some(v.to_string());
+                return Some((v.to_string(), 1.0));
             }
         }
     }
@@ -932,7 +935,7 @@ fn resolve_img_url(tree: &DomTree, nid: obscura_dom::tree::NodeId) -> Option<Str
         if let Some(v) = node.get_attribute(a) {
             let v = v.trim();
             if !v.is_empty() {
-                return Some(v.to_string());
+                return Some((v.to_string(), 1.0));
             }
         }
     }
@@ -944,7 +947,7 @@ fn resolve_img_url(tree: &DomTree, nid: obscura_dom::tree::NodeId) -> Option<Str
 /// first supported one (matching `type` and `media`), per WebKit's
 /// `HTMLImageElement::bestFitSourceFromPictureElement`. `None` means no source
 /// applied and the caller should fall back to the `<img>`'s own attributes.
-fn picture_source_url(tree: &DomTree, img_nid: obscura_dom::tree::NodeId) -> Option<String> {
+fn picture_source_url(tree: &DomTree, img_nid: obscura_dom::tree::NodeId) -> Option<(String, f32)> {
     let img = tree.get_node(img_nid)?;
     let parent = img.parent?;
     let is_picture = tree
@@ -1007,7 +1010,11 @@ const SRCSET_VIEWPORT_W: f32 = 1280.0;
 /// width), treat `x` descriptors as-is and a bare candidate as `1x`, then pick
 /// the smallest density at least the device pixel ratio (1 at DPR 1), else the
 /// largest available.
-fn best_srcset_candidate(srcset: &str, sizes: Option<&str>) -> Option<String> {
+/// Returns the picked candidate URL and its pixel density. The density is the
+/// x-descriptor (or, for w-descriptors, width / source-size): the factor the
+/// file's raw pixels must be divided by to get CSS px. Laying out with raw
+/// pixels made every 2x responsive image occupy twice its design size.
+fn best_srcset_candidate(srcset: &str, sizes: Option<&str>) -> Option<(String, f32)> {
     const DPR: f32 = 1.0;
     let source_size = source_size_px(sizes);
     let mut cands: Vec<(f32, String)> = Vec::new();
@@ -1055,9 +1062,12 @@ fn best_srcset_candidate(srcset: &str, sizes: Option<&str>) -> Option<String> {
     let pick = cands
         .iter()
         .find(|(d, _)| *d >= DPR)
-        .map(|(_, u)| u.clone())
-        .unwrap_or_else(|| cands.last().unwrap().1.clone());
-    Some(pick)
+        .map(|(d, u)| (u.clone(), *d))
+        .unwrap_or_else(|| {
+            let (d, u) = cands.last().unwrap();
+            (u.clone(), *d)
+        });
+    Some((pick.0, pick.1.max(0.01)))
 }
 
 /// Approximate the CSS px size an image will be displayed at, from its `sizes`
