@@ -763,13 +763,13 @@ impl Page {
                 if tokio::time::Instant::now() >= deadline {
                     break;
                 }
-                let result = tokio::time::timeout(
-                    tokio::time::Duration::from_millis(10),
-                    js.run_event_loop(),
-                ).await;
-
-                match result {
-                    Ok(Ok(())) => {
+                // Cancellation-safe single tick: a per-poll `tokio::time::timeout`
+                // wrapping `run_event_loop` would drop that future mid-poll and
+                // leave this isolate entered on the thread, aborting the process
+                // under concurrent pages (#430). `poll_event_loop_once` exits the
+                // isolate before returning, so the tick is safe to bound.
+                match js.poll_event_loop_once().await {
+                    Some(Ok(())) => {
                         if self.http_client.active_requests() == 0 {
                             idle_count += 1;
                             if idle_count >= 2 {
@@ -781,9 +781,10 @@ impl Page {
                             tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
                         }
                     }
-                    Ok(Err(_)) => break,
-                    Err(_) => {
+                    Some(Err(_)) => break,
+                    None => {
                         idle_count = 0;
+                        tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
                     }
                 }
             }
@@ -1226,10 +1227,11 @@ impl Page {
                 }
 
                 if let Some(js) = &mut self.js {
-                    let _ = tokio::time::timeout(
-                        tokio::time::Duration::from_millis(50),
-                        js.run_event_loop(),
-                    ).await;
+                    // Cancellation-safe tick (see #430): never drop a
+                    // `run_event_loop` future mid-poll, which leaks the entered
+                    // isolate. `poll_event_loop_once` exits the isolate per tick.
+                    let _ = js.poll_event_loop_once().await;
+                    tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
                 } else {
                     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 }

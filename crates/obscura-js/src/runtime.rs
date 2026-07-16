@@ -672,37 +672,47 @@ impl ObscuraJsRuntime {
             }
         };
 
-        let result = self.runtime.mod_evaluate(module_id);
-        tokio::pin!(result);
+        let mut result = Box::pin(self.runtime.mod_evaluate(module_id));
+        let deadline = tokio::time::Instant::now() + budget;
 
         // Return as soon as the module finishes evaluating instead of waiting
         // for the event loop to go fully idle: a page timer (setInterval) keeps
         // the loop busy forever and would otherwise burn the whole budget, so a
         // module that had already evaluated got abandoned (issue #374).
-        let outcome = tokio::time::timeout(budget, async {
-            let event_loop = self
-                .runtime
-                .run_event_loop(deno_core::PollEventLoopOptions::default());
-            tokio::pin!(event_loop);
-            tokio::select! {
-                biased;
-                r = &mut result => r,
-                e = &mut event_loop => { e?; (&mut result).await }
-            }
-        })
-        .await;
-
-        match outcome {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => {
-                tracing::warn!("Module eval error: {}", e);
-                Ok(())
-            }
-            Err(_) => {
-                tracing::warn!("Module evaluation timed out after {}ms: {}", budget_ms, url);
-                Ok(())
+        //
+        // Drive it WITHOUT the #430 isolate leak: pump the event loop one
+        // self-contained tick at a time (poll_event_loop exits the isolate per
+        // call) and poll mod_evaluate alongside it, instead of cancelling a
+        // `run_event_loop` future with a tokio timeout — a fired timeout drops
+        // that future mid-poll and leaves the isolate entered on the thread,
+        // aborting the process once a second page enters its own isolate.
+        loop {
+            let done = std::future::poll_fn(|cx| {
+                let _ = self
+                    .runtime
+                    .poll_event_loop(cx, deno_core::PollEventLoopOptions::default());
+                std::task::Poll::Ready(match std::future::Future::poll(result.as_mut(), cx) {
+                    std::task::Poll::Ready(r) => Some(r),
+                    std::task::Poll::Pending => None,
+                })
+            })
+            .await;
+            match done {
+                Some(Ok(())) => break,
+                Some(Err(e)) => {
+                    tracing::warn!("Module eval error: {}", e);
+                    break;
+                }
+                None => {
+                    if tokio::time::Instant::now() >= deadline {
+                        tracing::warn!("Module evaluation timed out after {}ms: {}", budget_ms, url);
+                        break;
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+                }
             }
         }
+        Ok(())
     }
 
     pub async fn load_inline_module(&mut self, code: &str, base_url: &str, budget_ms: u64) -> Result<(), String> {
@@ -729,8 +739,8 @@ impl ObscuraJsRuntime {
             }
         };
 
-        let result = self.runtime.mod_evaluate(module_id);
-        tokio::pin!(result);
+        let mut result = Box::pin(self.runtime.mod_evaluate(module_id));
+        let deadline = tokio::time::Instant::now() + budget;
 
         // Drive the event loop, but return as soon as the module finishes
         // evaluating rather than waiting for the loop to go fully idle. A page
@@ -738,30 +748,37 @@ impl ObscuraJsRuntime {
         // the loop busy forever; waiting for idle burned the whole budget on this
         // preamble module and starved the later module that mounts the app,
         // leaving #root empty (issue #374).
-        let outcome = tokio::time::timeout(budget, async {
-            let event_loop = self
-                .runtime
-                .run_event_loop(deno_core::PollEventLoopOptions::default());
-            tokio::pin!(event_loop);
-            tokio::select! {
-                biased;
-                r = &mut result => r,
-                e = &mut event_loop => { e?; (&mut result).await }
-            }
-        })
-        .await;
-
-        match outcome {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => {
-                tracing::warn!("Inline module eval error: {}", e);
-                Ok(())
-            }
-            Err(_) => {
-                tracing::warn!("Inline module timed out after {}ms", budget_ms);
-                Ok(())
+        //
+        // Cancellation-safe pump (see #430 / load_module): never cancel a
+        // `run_event_loop` future with a tokio timeout, which drops it mid-poll
+        // and leaves the isolate entered on the thread.
+        loop {
+            let done = std::future::poll_fn(|cx| {
+                let _ = self
+                    .runtime
+                    .poll_event_loop(cx, deno_core::PollEventLoopOptions::default());
+                std::task::Poll::Ready(match std::future::Future::poll(result.as_mut(), cx) {
+                    std::task::Poll::Ready(r) => Some(r),
+                    std::task::Poll::Pending => None,
+                })
+            })
+            .await;
+            match done {
+                Some(Ok(())) => break,
+                Some(Err(e)) => {
+                    tracing::warn!("Inline module eval error: {}", e);
+                    break;
+                }
+                None => {
+                    if tokio::time::Instant::now() >= deadline {
+                        tracing::warn!("Inline module timed out after {}ms", budget_ms);
+                        break;
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+                }
             }
         }
+        Ok(())
     }
 
     pub fn execute_script(&mut self, _name: &str, source: &str) -> Result<(), String> {
@@ -853,6 +870,31 @@ impl ObscuraJsRuntime {
             .map_err(|e| format!("Event loop error: {}", e))
     }
 
+    /// One self-contained event-loop poll (cancellation-safe). `poll_event_loop`
+    /// creates and drops its own isolate scope within the call, so this future
+    /// holds no V8 scope across its (single, immediate) await point: dropping it
+    /// can never leave the isolate ENTERED on the thread. Callers that pump in a
+    /// loop with a per-tick tokio timeout MUST use this instead of
+    /// `run_event_loop`, whose future, dropped mid-poll, leaks the entered
+    /// isolate and aborts the process under concurrent pages (#430).
+    ///
+    /// Returns `Some(result)` if the loop settled this tick, `None` if work is
+    /// still pending.
+    pub async fn poll_event_loop_once(&mut self) -> Option<Result<(), String>> {
+        std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(
+                match self
+                    .runtime
+                    .poll_event_loop(cx, deno_core::PollEventLoopOptions::default())
+                {
+                    std::task::Poll::Ready(r) => Some(r.map_err(|e| e.to_string())),
+                    std::task::Poll::Pending => None,
+                },
+            )
+        })
+        .await
+    }
+
     /// Arm a hard wall-clock backstop on synchronous V8 work. A page stuck in a
     /// synchronous loop or a microtask storm pins the OS thread inside V8, so
     /// `tokio::time::timeout` (which can only cancel at await points) never
@@ -893,20 +935,50 @@ impl ObscuraJsRuntime {
     /// idle (tokio timeout) and synchronous hangs (V8 watchdog). A microtask
     /// storm that pins the thread is terminated ~500ms past the budget; a
     /// well-behaved page returns as soon as the loop goes idle.
+    /// Drive the event loop until it settles (idle or error) or `deadline`
+    /// passes, WITHOUT the isolate-leak hazard of cancelling `run_event_loop`
+    /// with a tokio timeout. `JsRuntime::poll_event_loop` creates and drops its
+    /// own isolate scope on every call, so a `poll_fn` that only calls it holds
+    /// no V8 scope between polls; racing that `poll_fn` against a timer and
+    /// dropping the loser can never leave the isolate ENTERED on the OS thread.
+    /// Dropping a `run_event_loop` future mid-poll can, and that is the #430
+    /// abort (`heap->isolate() == Isolate::TryGetCurrent()`) once a second page
+    /// enters its own isolate on the same thread.
+    ///
+    /// Returns `Some(result)` if the loop settled within the deadline, `None`
+    /// if the deadline fired first (the normal "page still has live timers"
+    /// exit).
+    async fn pump_event_loop_until(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> Option<Result<(), String>> {
+        let pump = std::future::poll_fn(|cx| {
+            self.runtime
+                .poll_event_loop(cx, deno_core::PollEventLoopOptions::default())
+        });
+        tokio::pin!(pump);
+        tokio::select! {
+            biased;
+            r = &mut pump => Some(r.map_err(|e| e.to_string())),
+            _ = tokio::time::sleep_until(deadline) => None,
+        }
+    }
+
     pub async fn run_event_loop_bounded(&mut self, budget_ms: u64) -> Result<(), String> {
         if budget_ms == 0 {
             return self.run_event_loop().await;
         }
         let budget = std::time::Duration::from_millis(budget_ms);
+        let deadline = tokio::time::Instant::now() + budget;
         let token = self.arm_watchdog(budget + std::time::Duration::from_millis(500));
-        let result = tokio::time::timeout(budget, self.run_event_loop()).await;
+        let result = self.pump_event_loop_until(deadline).await;
         self.disarm_watchdog(token);
         match result {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) if e.contains("execution terminated") => Ok(()),
-            Ok(Err(e)) => Err(e),
-            // tokio idle-timeout is the normal "settled" exit, not an error.
-            Err(_) => Ok(()),
+            // deadline fired: the normal "settled / live timers remain" exit.
+            None => Ok(()),
+            Some(Ok(())) => Ok(()),
+            Some(Err(e)) if e.contains("execution terminated") => Ok(()),
+            Some(Err(e)) => Err(e),
         }
     }
 
@@ -940,11 +1012,11 @@ impl ObscuraJsRuntime {
     }
 
     pub async fn resolve_promises(&mut self) {
-        // Default settle: just pump until idle or 5s.
-        let _ = tokio::time::timeout(
-            tokio::time::Duration::from_secs(5),
-            self.runtime.run_event_loop(deno_core::PollEventLoopOptions::default()),
-        ).await;
+        // Default settle: pump until idle or 5s, cancellation-safe so the
+        // isolate is never left entered on the thread (#430, see
+        // pump_event_loop_until).
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+        let _ = self.pump_event_loop_until(deadline).await;
     }
 
     /// Pump the event loop until `done_check` returns true (e.g. an IIFE
@@ -971,14 +1043,28 @@ impl ObscuraJsRuntime {
             if tokio::time::Instant::now() >= deadline {
                 return;
             }
-            // Pump for a short slice. If the loop returns idle in <tick_ms,
-            // run_event_loop returns Ok and we check the predicate again.
-            let _ = tokio::time::timeout(
-                tokio::time::Duration::from_millis(tick_ms),
-                self.runtime.run_event_loop(deno_core::PollEventLoopOptions::default()),
-            ).await;
-            // Backoff so a hung promise doesn't burn CPU. Caps at 50ms;
-            // worst case we miss the result by <50ms.
+            // Drive the event loop one self-contained tick at a time via
+            // `poll_event_loop` instead of cancelling `run_event_loop` with a
+            // tokio timeout. A timeout that fires DROPS the `run_event_loop`
+            // future mid-poll and can leave this isolate ENTERED on the OS
+            // thread; the next page's `execute_script` then trips V8's
+            // `heap->isolate() == Isolate::TryGetCurrent()` and aborts the whole
+            // process under concurrent CDP work (#430). `poll_event_loop`
+            // creates and drops its own isolate scope within the call, so the
+            // isolate is always exited between ticks — the only await point
+            // below (the sleep) runs with no isolate entered.
+            let _ = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(
+                    self.runtime
+                        .poll_event_loop(cx, deno_core::PollEventLoopOptions::default())
+                        .is_ready(),
+                )
+            })
+            .await;
+            // Backoff so a hung promise doesn't burn CPU, and so long-lived
+            // timers don't starve the predicate re-check (why this helper
+            // exists). Caps at 50ms; worst case we miss the result by <50ms.
+            tokio::time::sleep(tokio::time::Duration::from_millis(tick_ms)).await;
             if tick_ms < 50 { tick_ms = (tick_ms * 2).min(50); }
         }
     }
