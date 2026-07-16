@@ -14,6 +14,15 @@ use crate::ops::{build_extension, ObscuraState, StoredNetworkResponseBody};
 
 static SNAPSHOT: &[u8] = include_bytes!(env!("OBSCURA_SNAPSHOT_PATH"));
 
+/// Serializes V8 isolate construction across OS threads. The thread-per-
+/// connection server (issue #430 "Option 2") builds isolates on many threads;
+/// the V8 platform is process-global and concurrent first-time isolate setup is
+/// not safe to run from several threads at once (it segfaults). Construction is
+/// fast and rare (once per page), so serializing it costs nothing measurable.
+/// Isolate *execution* stays fully parallel: once built, each isolate runs on
+/// its own thread with no shared lock.
+static ISOLATE_CREATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[derive(Debug, Clone)]
 pub struct RemoteObjectInfo {
     pub js_type: String,
@@ -118,23 +127,32 @@ impl ObscuraJsRuntime {
 
         let module_loader = Rc::new(ObscuraModuleLoader::with_proxy(base_url, proxy_url));
 
-        let mut runtime = JsRuntime::new(RuntimeOptions {
-            extensions: vec![build_extension()],
-            module_loader: Some(module_loader),
-            startup_snapshot: Some(SNAPSHOT),
-            ..Default::default()
-        });
+        // Build the isolate under the process-wide creation lock so two
+        // connection threads never construct isolates concurrently (#430).
+        let (runtime, isolate_handle) = {
+            let _create_guard = ISOLATE_CREATE_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        runtime.op_state().borrow_mut().put(state_clone);
+            let mut runtime = JsRuntime::new(RuntimeOptions {
+                extensions: vec![build_extension()],
+                module_loader: Some(module_loader),
+                startup_snapshot: Some(SNAPSHOT),
+                ..Default::default()
+            });
 
-        runtime
-            .execute_script(
-                "<obscura:init>",
-                "globalThis.__obscura_objects = {}; globalThis.__obscura_oid = 0;".to_string(),
-            )
-            .expect("init should not fail");
+            runtime.op_state().borrow_mut().put(state_clone);
 
-        let isolate_handle = runtime.v8_isolate().thread_safe_handle();
+            runtime
+                .execute_script(
+                    "<obscura:init>",
+                    "globalThis.__obscura_objects = {}; globalThis.__obscura_oid = 0;".to_string(),
+                )
+                .expect("init should not fail");
+
+            let isolate_handle = runtime.v8_isolate().thread_safe_handle();
+            (runtime, isolate_handle)
+        };
 
         ObscuraJsRuntime {
             runtime,

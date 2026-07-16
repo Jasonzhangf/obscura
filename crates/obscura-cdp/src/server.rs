@@ -174,61 +174,152 @@ pub async fn start_with_full_serve_options(
             }
         })?;
 
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            let (msg_tx, msg_rx) = mpsc::unbounded_channel::<ServerMessage>();
+    // Build the shared browser context once. Every connection's processor
+    // reuses it (one cookie jar, one HTTP client) while running on its own OS
+    // thread, so each page's V8 isolate is confined to a single thread and the
+    // #430 cross-page abort cannot happen (V8's TryGetCurrent check is
+    // per-thread). This is the "Option 2" fix named in obscura-js/src/v8_lock.rs.
+    let mut bctx = obscura_browser::BrowserContext::with_storage_and_network(
+        "default".to_string(),
+        proxy,
+        stealth,
+        user_agent,
+        storage_dir,
+        allow_private_network,
+    );
+    bctx.allow_file_access = allow_file_access;
+    let shared_ctx = Arc::new(bctx);
 
-            let _processor_handle = tokio::task::spawn_local(cdp_processor(
-                msg_rx, proxy, stealth, user_agent, allow_file_access, storage_dir,
-                allow_private_network,
-                shutdown_flag,
-                shutdown_notify.clone(),
-            ));
+    // One graceful-shutdown watcher for the whole server. It flips the accept
+    // flag (stopping the accept thread) and wakes every connection processor via
+    // `notify_waiters()`. On its own thread so it needs no LocalSet and cannot be
+    // starved by a connection's V8 work. Watches SIGTERM as well as Ctrl-C so
+    // `docker stop` / `kill` also flush cookies (issue #333).
+    {
+        let sf = shutdown_flag.clone();
+        let sn = shutdown_notify.clone();
+        std::thread::Builder::new()
+            .name("obscura-cdp-signal".into())
+            .spawn(move || {
+                if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    rt.block_on(async {
+                        #[cfg(unix)]
+                        {
+                            use tokio::signal::unix::{signal, SignalKind};
+                            match signal(SignalKind::terminate()) {
+                                Ok(mut term) => {
+                                    tokio::select! {
+                                        _ = tokio::signal::ctrl_c() => {}
+                                        _ = term.recv() => {}
+                                    }
+                                }
+                                Err(_) => {
+                                    let _ = tokio::signal::ctrl_c().await;
+                                }
+                            }
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            let _ = tokio::signal::ctrl_c().await;
+                        }
+                    });
+                }
+                sf.store(true, Ordering::Relaxed);
+                sn.notify_waiters();
+            })
+            .ok();
+    }
 
-            loop {
-                let stream = tokio::select! {
-                    stream = ws_rx.recv() => stream,
-                    _ = shutdown_notify.notified() => None,
-                };
-                let stream = match stream {
-                    Some(s) => s,
-                    None => break,
-                };
-                // Convert std TcpStream → tokio TcpStream inside the LocalSet
-                // where the tokio runtime is active.
-                stream
-                    .set_nonblocking(true)
-                    .map_err(|e| error!("set_nonblocking on WS stream: {}", e))
-                    .ok();
-                // Disable Nagle on the CDP socket. CDP exchanges many small
-                // (~100-byte) request/response frames during browser.newPage()
-                // and Page.navigate; with Nagle on, every small write either
-                // waits for an ACK from the previous one or hits the 40ms
-                // delayed-ACK timer. Measured impact: ~90ms shaved off
-                // newPage on localhost, ~30ms shaved off goto.
-                stream
-                    .set_nodelay(true)
-                    .map_err(|e| error!("set_nodelay on WS stream: {}", e))
-                    .ok();
-                let tokio_stream = match TcpStream::from_std(stream) {
+    // Force V8 and its process-global isolate tables (the leaptiering
+    // JSDispatchTable / external-pointer tables) to initialize once on this main
+    // thread before any connection thread creates an isolate. Creating the very
+    // first isolate off the main thread segfaults inside
+    // InitializeBuiltinJSDispatchTable (#430 thread-per-connection). Building and
+    // dropping one runtime here does the one-time setup single-threaded.
+    drop(obscura_js::runtime::ObscuraJsRuntime::new());
+
+    // Accept loop: hand each WebSocket connection to its own OS thread so its
+    // pages' isolates live on a dedicated thread.
+    loop {
+        let stream = tokio::select! {
+            stream = ws_rx.recv() => stream,
+            _ = shutdown_notify.notified() => None,
+        };
+        let stream = match stream {
+            Some(s) => s,
+            None => break,
+        };
+        // Nagle off + nonblocking on the std socket before it moves to the
+        // connection thread. CDP exchanges many small (~100-byte) frames during
+        // newPage()/navigate; with Nagle on, each small write waits on an ACK or
+        // the 40ms delayed-ACK timer (~90ms on newPage, ~30ms on goto).
+        stream
+            .set_nonblocking(true)
+            .map_err(|e| error!("set_nonblocking on WS stream: {}", e))
+            .ok();
+        stream
+            .set_nodelay(true)
+            .map_err(|e| error!("set_nodelay on WS stream: {}", e))
+            .ok();
+        run_connection(stream, shared_ctx.clone(), shutdown_notify.clone());
+    }
+
+    // Server is shutting down: persist the shared cookie jar once.
+    shared_ctx.save_cookies();
+    Ok(())
+}
+
+/// Run one WebSocket connection on its own OS thread: a `current_thread` tokio
+/// runtime + `LocalSet` hosting this connection's `cdp_processor` (with its own
+/// `CdpContext` and pages) and its frame reader. Confining a connection's pages
+/// to one thread is what removes the #430 abort; the interception handshake and
+/// the nav `spawn_local` all stay on this one thread, so no cross-thread V8
+/// plumbing is needed.
+fn run_connection(
+    std_stream: std::net::TcpStream,
+    default_context: Arc<obscura_browser::BrowserContext>,
+    shutdown_notify: Arc<Notify>,
+) {
+    std::thread::Builder::new()
+        .name("obscura-cdp-conn".into())
+        .spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    error!("connection runtime build failed: {}", e);
+                    return;
+                }
+            };
+            let local = tokio::task::LocalSet::new();
+            local.block_on(&rt, async move {
+                let tokio_stream = match TcpStream::from_std(std_stream) {
                     Ok(s) => s,
                     Err(e) => {
                         error!("TcpStream::from_std failed: {}", e);
-                        continue;
+                        return;
                     }
                 };
-                let tx = msg_tx.clone();
-                tokio::task::spawn_local(async move {
-                    if let Err(e) = handle_connection_ws(tokio_stream, tx).await {
-                        error!("WebSocket connection error: {}", e);
-                    }
-                });
-            }
+                let (msg_tx, msg_rx) = mpsc::unbounded_channel::<ServerMessage>();
+                let processor = tokio::task::spawn_local(cdp_processor(
+                    msg_rx,
+                    default_context,
+                    shutdown_notify,
+                ));
+                if let Err(e) = handle_connection_ws(tokio_stream, msg_tx).await {
+                    error!("WebSocket connection error: {}", e);
+                }
+                // Connection closed (or shutting down): stop this connection's
+                // processor so the thread can exit.
+                processor.abort();
+            });
         })
-        .await;
-
-    Ok(())
+        .ok();
 }
 
 const HTTP_PEEK_BUF: usize = 4096;
@@ -333,25 +424,19 @@ fn handle_http_json_blocking(
     Ok(())
 }
 
+/// Per-connection CDP processor. Each connection runs its own processor (with
+/// its own `CdpContext` and pages) on its own OS thread, so every page's V8
+/// isolate is confined to a single thread. This removes the #430 abort by
+/// construction: V8's `heap->isolate() == Isolate::TryGetCurrent()` invariant is
+/// per-thread, so two connections' isolates can never collide. All processors
+/// share one `Arc<BrowserContext>` (one cookie jar, one HTTP client). The shared
+/// context's cookies are persisted once by the accept side on shutdown.
 async fn cdp_processor(
     mut rx: mpsc::UnboundedReceiver<ServerMessage>,
-    proxy: Option<String>,
-    stealth: bool,
-    user_agent: Option<String>,
-    allow_file_access: bool,
-    storage_dir: Option<std::path::PathBuf>,
-    allow_private_network: bool,
-    shutdown_flag: Arc<AtomicBool>,
+    default_context: Arc<obscura_browser::BrowserContext>,
     shutdown_notify: Arc<Notify>,
 ) {
-    let mut ctx = CdpContext::new_full(
-        proxy,
-        stealth,
-        user_agent,
-        storage_dir,
-        allow_file_access,
-        allow_private_network,
-    );
+    let mut ctx = CdpContext::new_with_shared_context(default_context);
     let (itx, irx) = mpsc::unbounded_channel::<obscura_js::ops::InterceptedRequest>();
     ctx.intercept_tx = Some(itx);
     let mut intercept_rx: Option<mpsc::UnboundedReceiver<obscura_js::ops::InterceptedRequest>> = Some(irx);
@@ -366,33 +451,11 @@ async fn cdp_processor(
     let mut deferred: std::collections::VecDeque<ServerMessage> =
         std::collections::VecDeque::new();
 
-    // Subscribe to graceful-shutdown signals once. The future is single-shot,
-    // so we break out of the outer loop when it fires and never poll it again.
-    // Without this the accept loop just exits and any cookies set during the
-    // session are lost before `BrowserContext::save_cookies()` runs. We watch
-    // SIGTERM as well as Ctrl-C (SIGINT) so `docker stop` / `kill`, which send
-    // SIGTERM, also flush cookies to the storage dir (issue #333).
-    let mut shutdown = Box::pin(async {
-        #[cfg(unix)]
-        {
-            use tokio::signal::unix::{signal, SignalKind};
-            match signal(SignalKind::terminate()) {
-                Ok(mut term) => {
-                    tokio::select! {
-                        _ = tokio::signal::ctrl_c() => {}
-                        _ = term.recv() => {}
-                    }
-                }
-                Err(_) => {
-                    let _ = tokio::signal::ctrl_c().await;
-                }
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = tokio::signal::ctrl_c().await;
-        }
-    });
+    // Graceful shutdown: one signal watcher on the accept side flips the flag
+    // and calls `notify_waiters()`. Polled once here (via the select! below) it
+    // registers and stays registered across iterations, so a later
+    // `notify_waiters()` wakes this processor even while it is mid-dispatch.
+    let mut shutdown = Box::pin(shutdown_notify.notified());
 
     loop {
         // Drain any deferred messages from the previous interception window
@@ -408,9 +471,7 @@ async fn cdp_processor(
                     None => break,
                 },
                 _ = &mut shutdown => {
-                    tracing::info!("Shutdown signal received");
-                    shutdown_flag.store(true, Ordering::Relaxed);
-                    shutdown_notify.notify_one();
+                    tracing::info!("Shutdown signal received (connection processor)");
                     break;
                 }
             }
@@ -451,10 +512,10 @@ async fn cdp_processor(
 
     }
 
-    // Single exit point handles both Ctrl-C shutdown and the channel being
-    // closed by the accept thread. Without this any cookies set during the
-    // session are dropped on the floor.
-    ctx.default_context.save_cookies();
+    // Cookies live in the shared BrowserContext and are persisted once by the
+    // accept side when the whole server shuts down, so a single connection
+    // closing (or its processor being aborted) does not need to save here.
+    let _ = &ctx;
 }
 
 // Whether a raw CDP frame is exactly a `Page.navigate` call, and so should take

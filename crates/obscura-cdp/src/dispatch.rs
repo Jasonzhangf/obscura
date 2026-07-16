@@ -107,6 +107,33 @@ impl CdpContext {
         )
     }
 
+    /// Build a context that reuses an already-constructed, shared
+    /// [`BrowserContext`]. The thread-per-connection server (issue #430 /
+    /// "Option 2") gives each connection its own `CdpContext` on its own OS
+    /// thread so that each page's V8 isolate is confined to one thread, but all
+    /// connections must still share one cookie jar and one HTTP client. Passing
+    /// the same `Arc<BrowserContext>` to every connection's context does that.
+    pub fn new_with_shared_context(default_context: Arc<BrowserContext>) -> Self {
+        let mut valid_context_ids = HashSet::new();
+        valid_context_ids.insert(1);
+        valid_context_ids.insert(2);
+        CdpContext {
+            pages: Vec::new(),
+            sessions: HashMap::new(),
+            pending_events: Vec::new(),
+            default_context,
+            page_counter: 0,
+            preload_scripts: Vec::new(),
+            preload_counter: 0,
+            fetch_intercept: FetchInterceptState::new(),
+            intercept_tx: None,
+            isolated_worlds: Vec::new(),
+            valid_context_ids,
+            next_isolated_context_id: 100,
+            io_streams: crate::domains::io::IoStreamStore::default(),
+        }
+    }
+
     fn _new_inner(
         proxy: Option<String>,
         stealth: bool,
