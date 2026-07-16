@@ -150,28 +150,55 @@ impl TextEngine {
             return None;
         }
         let base = styles.get(&id)?;
-        let base_size = base.font_size.unwrap_or(16.0);
-        // `-webkit-background-clip: text` on a transparent-colored element paints
-        // its background *through* the glyphs (gradient/solid text). When active,
-        // shape the glyphs in opaque white so their coverage renders, then recolor
-        // them from the background at paint time; otherwise transparent text stays
-        // transparent (and invisible), unchanged.
-        let clip_fill = clip_text_fill(base);
-        let default_color = if clip_fill.is_some() {
-            [255, 255, 255, 255]
-        } else {
-            base.color.unwrap_or([0, 0, 0, 255])
-        };
-
-        let root_transform = base.text_transform.unwrap_or(TextTransform::None);
-        let root_underline = base.underline.unwrap_or(false);
-        let root_italic = base.font_style_italic.unwrap_or(false);
-        let root_bold = base.font_weight.as_deref() == Some("bold");
-        let root_family = resolve_font_family(base.font_family.as_deref());
+        let (ctx, clip_fill) = base_span_ctx(base);
         let mut spans: Vec<(String, SpanAttrs)> = Vec::new();
         let mut collector = Collector { last_was_space: true };
-        let ctx = SpanCtx { color: default_color, bold: root_bold, italic: root_italic, underline: root_underline, transform: root_transform, family: root_family };
         collect_spans(tree, id, styles, ctx, &mut spans, &mut collector);
+        self.push_shaped_item(base, spans, clip_fill)
+    }
+
+    /// Build an inline formatting context from a *run* of consecutive
+    /// inline-level siblings inside `parent` (a mixed-content block whose
+    /// other children are block-level). The run folds to one shaped buffer
+    /// exactly like a whole-container IFC, using the parent's style as the
+    /// base. Returns `None` when any node in the run cannot fold (atomic
+    /// inline, replaced element, ...) or the run has no visible text; the
+    /// caller then falls back to the flex-wrap wrapper for that run.
+    pub fn try_build_run(
+        &mut self,
+        tree: &DomTree,
+        parent: NodeId,
+        run: &[NodeId],
+        styles: &std::collections::HashMap<NodeId, LayoutStyle>,
+    ) -> Option<usize> {
+        let mut has_text = false;
+        for &cid in run {
+            if !inline_child_ok(tree, cid, styles, &mut has_text) {
+                return None;
+            }
+        }
+        if !has_text {
+            return None;
+        }
+        let base = styles.get(&parent)?;
+        let (ctx, clip_fill) = base_span_ctx(base);
+        let mut spans: Vec<(String, SpanAttrs)> = Vec::new();
+        let mut collector = Collector { last_was_space: true };
+        for &cid in run {
+            collect_node_spans(tree, cid, styles, ctx, &mut spans, &mut collector);
+        }
+        self.push_shaped_item(base, spans, clip_fill)
+    }
+
+    /// Shared tail of [`try_build`] / [`try_build_run`]: shape the collected
+    /// spans into a cosmic-text buffer under `base`'s font metrics and
+    /// alignment, and store it as a new inline item.
+    fn push_shaped_item(
+        &mut self,
+        base: &LayoutStyle,
+        mut spans: Vec<(String, SpanAttrs)>,
+        clip_fill: Option<(f32, Vec<([u8; 4], Option<f32>)>)>,
+    ) -> Option<usize> {
         // Trim a single trailing space so it does not widen the last line.
         if let Some((text, _)) = spans.last_mut() {
             if text.ends_with(' ') {
@@ -182,6 +209,7 @@ impl TextEngine {
             return None;
         }
 
+        let base_size = base.font_size.unwrap_or(16.0);
         // Real `line-height` drives vertical rhythm; a fixed ratio made
         // real-site prose (e.g. Wikipedia's 1.6) noticeably tighter than
         // Chromium. `normal` is font-relative; ~1.2 matches DejaVu closely.
@@ -293,6 +321,32 @@ struct Collector {
 /// spans. Collapsing spans HTML's insignificant whitespace (runs of spaces,
 /// tabs, and newlines fold to one space; leading space at the start of the
 /// context is dropped) exactly as `white-space: normal` requires.
+/// Root span context (and background-clip-text fill, when active) for an IFC
+/// whose base style is `base`.
+///
+/// `-webkit-background-clip: text` on a transparent-colored element paints
+/// its background *through* the glyphs (gradient/solid text). When active,
+/// shape the glyphs in opaque white so their coverage renders, then recolor
+/// them from the background at paint time; otherwise transparent text stays
+/// transparent (and invisible), unchanged.
+fn base_span_ctx(base: &LayoutStyle) -> (SpanCtx, Option<(f32, Vec<([u8; 4], Option<f32>)>)>) {
+    let clip_fill = clip_text_fill(base);
+    let default_color = if clip_fill.is_some() {
+        [255, 255, 255, 255]
+    } else {
+        base.color.unwrap_or([0, 0, 0, 255])
+    };
+    let ctx = SpanCtx {
+        color: default_color,
+        bold: base.font_weight.as_deref() == Some("bold"),
+        italic: base.font_style_italic.unwrap_or(false),
+        underline: base.underline.unwrap_or(false),
+        transform: base.text_transform.unwrap_or(TextTransform::None),
+        family: resolve_font_family(base.font_family.as_deref()),
+    };
+    (ctx, clip_fill)
+}
+
 fn collect_spans(
     tree: &DomTree,
     id: NodeId,
@@ -302,38 +356,53 @@ fn collect_spans(
     c: &mut Collector,
 ) {
     for cid in tree.children(id) {
-        let Some(node) = tree.get_node(cid) else { continue };
-        match &node.data {
-            obscura_dom::tree::NodeData::Text { contents } => {
-                let attrs = SpanAttrs { bold: ctx.bold, italic: ctx.italic, underline: ctx.underline, color: ctx.color, family: ctx.family };
-                push_text(contents, ctx.transform, &attrs, out, c);
+        collect_node_spans(tree, cid, styles, ctx, out, c);
+    }
+}
+
+/// Collect the spans contributed by one node (a text node's runs, or an
+/// element's whole subtree with its style threaded through). Split out of
+/// [`collect_spans`] so an inline *run* (a slice of siblings, not a whole
+/// container) can also be folded into one shaped buffer.
+fn collect_node_spans(
+    tree: &DomTree,
+    cid: NodeId,
+    styles: &std::collections::HashMap<NodeId, LayoutStyle>,
+    ctx: SpanCtx,
+    out: &mut Vec<(String, SpanAttrs)>,
+    c: &mut Collector,
+) {
+    let Some(node) = tree.get_node(cid) else { return };
+    match &node.data {
+        obscura_dom::tree::NodeData::Text { contents } => {
+            let attrs = SpanAttrs { bold: ctx.bold, italic: ctx.italic, underline: ctx.underline, color: ctx.color, family: ctx.family };
+            push_text(contents, ctx.transform, &attrs, out, c);
+        }
+        _ => {
+            let Some(elem) = node.as_element() else { return };
+            let style = styles.get(&cid);
+            if style.map(|s| s.display == Display::None).unwrap_or(false) {
+                return;
             }
-            _ => {
-                let Some(elem) = node.as_element() else { continue };
-                let style = styles.get(&cid);
-                if style.map(|s| s.display == Display::None).unwrap_or(false) {
-                    continue;
-                }
-                if elem.local.as_ref() == "br" {
-                    out.push(("\n".to_string(), SpanAttrs { bold: ctx.bold, italic: ctx.italic, underline: ctx.underline, color: ctx.color, family: ctx.family }));
-                    c.last_was_space = true;
-                    continue;
-                }
-                let child = SpanCtx {
-                    color: style.and_then(|s| s.color).unwrap_or(ctx.color),
-                    bold: ctx.bold || style.map(|s| s.font_weight.as_deref() == Some("bold")).unwrap_or(false),
-                    italic: ctx.italic || style.and_then(|s| s.font_style_italic).unwrap_or(false),
-                    // Underline propagates in: an ancestor's underline covers
-                    // descendant text; an element only sets its own via CSS.
-                    underline: ctx.underline || style.and_then(|s| s.underline).unwrap_or(false),
-                    transform: style.and_then(|s| s.text_transform).unwrap_or(ctx.transform),
-                    family: style
-                        .and_then(|s| s.font_family.as_deref())
-                        .map(|f| resolve_font_family(Some(f)))
-                        .unwrap_or(ctx.family),
-                };
-                collect_spans(tree, cid, styles, child, out, c);
+            if elem.local.as_ref() == "br" {
+                out.push(("\n".to_string(), SpanAttrs { bold: ctx.bold, italic: ctx.italic, underline: ctx.underline, color: ctx.color, family: ctx.family }));
+                c.last_was_space = true;
+                return;
             }
+            let child = SpanCtx {
+                color: style.and_then(|s| s.color).unwrap_or(ctx.color),
+                bold: ctx.bold || style.map(|s| s.font_weight.as_deref() == Some("bold")).unwrap_or(false),
+                italic: ctx.italic || style.and_then(|s| s.font_style_italic).unwrap_or(false),
+                // Underline propagates in: an ancestor's underline covers
+                // descendant text; an element only sets its own via CSS.
+                underline: ctx.underline || style.and_then(|s| s.underline).unwrap_or(false),
+                transform: style.and_then(|s| s.text_transform).unwrap_or(ctx.transform),
+                family: style
+                    .and_then(|s| s.font_family.as_deref())
+                    .map(|f| resolve_font_family(Some(f)))
+                    .unwrap_or(ctx.family),
+            };
+            collect_spans(tree, cid, styles, child, out, c);
         }
     }
 }
@@ -562,9 +631,11 @@ impl TextEngine {
         let TextEngine { font_system, swash, items } = self;
         let Some(item) = items.get_mut(idx) else { return };
         let (ox, oy) = (item.origin.0 + offset.0, item.origin.1 + offset.1);
-        let clip = item
-            .clip
-            .map(|c| Rect { x: c.x + offset.0, y: c.y + offset.1, width: c.width, height: c.height });
+        // The glyph origin shifts by the container's accumulated translate,
+        // but the clip is already in screen space (owner-shifted at
+        // `resolve_clip_rects`) and must not move with the container, or a
+        // translated slide would drag its viewport's clip along with it.
+        let clip = item.clip;
         let pw = pixmap.width() as i32;
         let ph = pixmap.height() as i32;
         let clip_bounds = clip.map(|c| (c.x, c.y, c.x + c.width, c.y + c.height));

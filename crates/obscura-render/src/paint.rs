@@ -48,7 +48,7 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
     // (the overwhelmingly common case), every node's accumulated offset is
     // zero, so skip the per-node ancestor walk entirely and keep the paint
     // path free of any added cost.
-    let any_transform = laid.styles.values().any(|s| s.transform_translate.is_some());
+
     // Tree order so later elements paint over earlier ones (normal flow).
     for nid in tree.descendants(tree.document()) {
         if svg_subtree_skip.contains(&nid) {
@@ -60,7 +60,7 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
         };
 
         if node.is_text() {
-            paint_text_node(tree, nid, &laid, &mut pixmap, any_transform);
+            paint_text_node(tree, nid, &laid, &mut pixmap);
             continue;
         }
 
@@ -84,25 +84,19 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
 
         // A `transform: translate()` on this element or any ancestor offsets
         // this element's whole painted box (and, applied per node, its whole
-        // subtree). Shift the border box and the inherited clip by the same
-        // accumulated vector so everything painted for this node moves together.
-        let (ox, oy) = if any_transform {
-            accumulated_translate(tree, nid, &laid)
-        } else {
-            (0.0, 0.0)
-        };
+        // subtree). The box shifts into screen space; the inherited clip is
+        // ALREADY in screen space (shifted by its own owner's translate at
+        // `resolve_clip_rects`), so it must not move with this descendant:
+        // that is what lets a clip cull a slide the carousel track has
+        // translated out of its viewport.
+        let (ox, oy) = laid.translates.get(&nid).copied().unwrap_or((0.0, 0.0));
         let rect = crate::Rect { x: rect.x + ox, y: rect.y + oy, width: rect.width, height: rect.height };
 
         // Ancestor `overflow: hidden` clip, if any. Skip painting entirely
         // once the box has no visible overlap with it (this is what makes the
         // ubiquitous 1x1 clipped "visually hidden" accessibility pattern
         // actually invisible instead of painting text wherever it lands).
-        let clip = laid
-            .clip_rects
-            .get(&nid)
-            .copied()
-            .flatten()
-            .map(|c| crate::Rect { x: c.x + ox, y: c.y + oy, width: c.width, height: c.height });
+        let clip = laid.clip_rects.get(&nid).copied().flatten();
         let visible_rect = match clip {
             Some(c) => match rect.intersect(&c) {
                 Some(r) => r,
@@ -344,66 +338,31 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
         if svg_subtree_skip.contains(&nid) {
             continue;
         }
-        if let Some(&idx) = laid.ifc_items.get(&nid) {
-            if laid.styles.get(&nid).map(|s| s.effectively_invisible).unwrap_or(false) {
-                continue;
-            }
-            // Shift the shaped glyphs by the same accumulated translate as the
-            // container's box so text under a transformed ancestor moves with
-            // it. Computed before the mutable `paint_item` borrow.
-            let off = if any_transform {
-                accumulated_translate(tree, nid, &laid)
-            } else {
-                (0.0, 0.0)
-            };
+        let whole = laid.ifc_items.get(&nid).copied();
+        let run_items = laid.run_ifc_items.get(&nid).cloned();
+        if whole.is_none() && run_items.is_none() {
+            continue;
+        }
+        if laid.styles.get(&nid).map(|s| s.effectively_invisible).unwrap_or(false) {
+            continue;
+        }
+        // Shift the shaped glyphs by the same accumulated translate as the
+        // container's box so text under a transformed ancestor moves with
+        // it. Computed before the mutable `paint_item` borrow.
+        let off = laid.translates.get(&nid).copied().unwrap_or((0.0, 0.0));
+        if let Some(idx) = whole {
             laid.text_engine.paint_item(idx, &mut pixmap, off);
+        }
+        // Anonymous inline-run leaves of a mixed block (see
+        // `build_mixed_block`), pinned to their own boxes at finalize.
+        if let Some(items) = run_items {
+            for idx in items {
+                laid.text_engine.paint_item(idx, &mut pixmap, off);
+            }
         }
     }
 
     Some(pixmap)
-}
-
-/// Sum of `transform: translate()` offsets of `nid` and every ancestor, in CSS
-/// px. A translate shifts an element's own box and its entire subtree by the
-/// same vector, so a node's painted position is its normal-flow position plus
-/// every translate at or above it. Percentage components resolve against each
-/// contributing element's own border box (read from the laid-out rects), per
-/// CSS. Nodes with no style/rect entry (e.g. text nodes) contribute nothing but
-/// are still walked through so element ancestors above them count.
-fn accumulated_translate(
-    tree: &DomTree,
-    nid: obscura_dom::tree::NodeId,
-    laid: &crate::DomLayout,
-) -> (f32, f32) {
-    let (mut ox, mut oy) = (0.0f32, 0.0f32);
-    let mut cur = Some(nid);
-    while let Some(id) = cur {
-        if let (Some(style), Some(rect)) = (laid.styles.get(&id), laid.rects.get(&id)) {
-            if let Some((dx, dy)) = style.transform_translate {
-                ox += resolve_translate(dx, rect.width);
-                oy += resolve_translate(dy, rect.height);
-            }
-        }
-        cur = tree.get_node(id).and_then(|n| n.parent);
-    }
-    (ox, oy)
-}
-
-/// Resolve one translate component to px: a length passes through, a percentage
-/// is taken against `basis` (the element's own border-box extent on that axis).
-/// Font/viewport-relative leftovers fall back to a coarse px value rather than
-/// panicking (translate rarely uses them; px/% are the required forms).
-fn resolve_translate(d: crate::Dimension, basis: f32) -> f32 {
-    match d {
-        crate::Dimension::Px(px) => px,
-        crate::Dimension::Percent(p) => p * basis,
-        crate::Dimension::Em(v) | crate::Dimension::Rem(v) => v * 16.0,
-        crate::Dimension::Vw(v)
-        | crate::Dimension::Vh(v)
-        | crate::Dimension::Vmin(v)
-        | crate::Dimension::Vmax(v) => v,
-        crate::Dimension::Auto => 0.0,
-    }
 }
 
 /// A closed rounded-rectangle path, corners approximated by quadratic curves
@@ -587,7 +546,7 @@ fn paint_text_node(
     nid: obscura_dom::tree::NodeId,
     laid: &crate::DomLayout,
     pixmap: &mut Pixmap,
-    any_transform: bool,
+
 ) -> Option<()> {
     let runs = laid.text_runs.get(&nid)?;
     let node = tree.get_node(nid)?;
@@ -600,18 +559,10 @@ fn paint_text_node(
     let fsize = style.font_size.unwrap_or(16.0);
     let is_bold = style.font_weight.as_deref() == Some("bold");
     // A text node has no transform of its own, but any transformed element
-    // ancestor offsets it; the ancestor walk from the text node picks those up.
-    let (ox, oy) = if any_transform {
-        accumulated_translate(tree, nid, laid)
-    } else {
-        (0.0, 0.0)
-    };
-    let clip = laid
-        .clip_rects
-        .get(&nid)
-        .copied()
-        .flatten()
-        .map(|c| crate::Rect { x: c.x + ox, y: c.y + oy, width: c.width, height: c.height });
+    // ancestor offsets it (the accumulation covers text nodes too). The clip
+    // is already in screen space and stays put.
+    let (ox, oy) = laid.translates.get(&nid).copied().unwrap_or((0.0, 0.0));
+    let clip = laid.clip_rects.get(&nid).copied().flatten();
 
     for (rect, word) in runs {
         draw_text(pixmap, word, rect.x + ox, rect.y + oy, color, fsize, is_bold, clip);

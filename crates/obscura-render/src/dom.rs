@@ -38,9 +38,15 @@ pub struct DomLayout {
     pub rects: HashMap<NodeId, Rect>,
     pub styles: HashMap<NodeId, crate::LayoutStyle>,
     /// The clip rect inherited from ancestor `overflow: hidden` boxes, keyed
-    /// per node. `None` means unclipped. Does not include the node's own
-    /// overflow (that only clips its children, not itself).
+    /// per node, in SCREEN space (the clip owner's box shifted by the owner's
+    /// accumulated translate; see `resolve_clip_rects`). `None` means
+    /// unclipped. Does not include the node's own overflow (that only clips
+    /// its children, not itself).
     pub clip_rects: HashMap<NodeId, Option<Rect>>,
+    /// Accumulated `transform: translate()` per node (own + ancestors), in CSS
+    /// px. Only nodes with a non-zero accumulation are present; paint shifts
+    /// each box by this to reach screen space.
+    pub translates: HashMap<NodeId, (f32, f32)>,
     /// Per-word geometry for text nodes: a text DOM node lays out as one
     /// taffy leaf per word (see `build_text_words`), each wrapping
     /// independently within its container, so its rendered content is a list
@@ -55,6 +61,23 @@ pub struct DomLayout {
     pub text_engine: crate::inline::TextEngine,
     #[cfg(feature = "paint")]
     pub ifc_items: HashMap<NodeId, usize>,
+    /// Anonymous inline-run contexts: a mixed block's consecutive inline
+    /// children folded to one shaped leaf each (see `build_mixed_block`).
+    /// Keyed by the parent block's `NodeId`, in document order; the leaves
+    /// have no DOM node of their own.
+    #[cfg(feature = "paint")]
+    pub run_ifc_items: HashMap<NodeId, Vec<usize>>,
+}
+
+/// Registry of cosmic-text inline formatting contexts created during the
+/// taffy-tree build: `whole` holds single-leaf containers keyed by the
+/// container's own DOM id, `runs` holds anonymous inline-run leaves keyed by
+/// the parent block's DOM id (those leaves have no DOM node, so their final
+/// rects are captured separately; see `compute_absolute_rects`).
+#[derive(Default)]
+struct IfcRegistry {
+    whole: HashMap<NodeId, usize>,
+    runs: HashMap<NodeId, Vec<usize>>,
 }
 
 /// Walk the tree top-down accumulating the clip rect imposed by ancestor
@@ -63,26 +86,66 @@ pub struct DomLayout {
 /// "visually hidden but accessible" pattern: a 1x1 absolutely-positioned box
 /// with clipped overflow) actually hide its contents instead of letting text
 /// paint wherever the box's static position happens to land.
+/// Clips are stored in SCREEN space: the clip owner's border box offset by the
+/// owner's own accumulated `transform: translate()`. A clip belongs to its
+/// owner's coordinate space, not the painted descendant's; shifting an
+/// inherited clip by the descendant's translate (the old behavior) let a
+/// carousel track's `translateX` drag the viewport's clip along with every
+/// slide, so all slides stayed visible inside their own shifted clip.
+///
+/// The same walk records each node's accumulated translate in `translates`
+/// (one pass here instead of an ancestor walk per painted node).
 fn resolve_clip_rects(
     tree: &DomTree,
     id: NodeId,
     inherited: Option<Rect>,
+    tx: f32,
+    ty: f32,
     rects: &HashMap<NodeId, Rect>,
     styles: &HashMap<NodeId, crate::LayoutStyle>,
     clip_rects: &mut HashMap<NodeId, Option<Rect>>,
+    translates: &mut HashMap<NodeId, (f32, f32)>,
 ) {
     clip_rects.insert(id, inherited);
+    // This node's own translate joins the accumulation for its box and its
+    // whole subtree (percentages resolve against its own border box).
+    let (tx, ty) = match (styles.get(&id).and_then(|s| s.transform_translate), rects.get(&id)) {
+        (Some((dx, dy)), Some(rect)) => (tx + resolve_translate(dx, rect.width), ty + resolve_translate(dy, rect.height)),
+        (Some((dx, dy)), None) => (tx + resolve_translate(dx, 0.0), ty + resolve_translate(dy, 0.0)),
+        _ => (tx, ty),
+    };
+    if tx != 0.0 || ty != 0.0 {
+        translates.insert(id, (tx, ty));
+    }
     let next = match (styles.get(&id), rects.get(&id)) {
         (Some(style), Some(rect)) if style.overflow_hidden => {
+            let own = Rect { x: rect.x + tx, y: rect.y + ty, width: rect.width, height: rect.height };
             Some(match inherited {
-                Some(clip) => clip.intersect(rect).unwrap_or(Rect::default()),
-                None => *rect,
+                Some(clip) => clip.intersect(&own).unwrap_or(Rect::default()),
+                None => own,
             })
         }
         _ => inherited,
     };
     for cid in tree.children(id) {
-        resolve_clip_rects(tree, cid, next, rects, styles, clip_rects);
+        resolve_clip_rects(tree, cid, next, tx, ty, rects, styles, clip_rects, translates);
+    }
+}
+
+/// Resolve one `transform: translate()` component to px: a length passes
+/// through, a percentage is taken against `basis` (the element's own
+/// border-box extent on that axis). Font/viewport-relative leftovers fall
+/// back to a coarse px value (translate rarely uses them).
+pub(crate) fn resolve_translate(d: crate::Dimension, basis: f32) -> f32 {
+    match d {
+        crate::Dimension::Px(px) => px,
+        crate::Dimension::Percent(p) => p * basis,
+        crate::Dimension::Em(v) | crate::Dimension::Rem(v) => v * 16.0,
+        crate::Dimension::Vw(v)
+        | crate::Dimension::Vh(v)
+        | crate::Dimension::Vmin(v)
+        | crate::Dimension::Vmax(v) => v,
+        crate::Dimension::Auto => 0.0,
     }
 }
 
@@ -291,7 +354,7 @@ pub fn layout_dom_with_images(
     let mut id_map: HashMap<taffy::NodeId, NodeId> = HashMap::new();
     let mut words: HashMap<taffy::NodeId, (NodeId, String)> = HashMap::new();
     let mut engine = crate::inline::TextEngine::new();
-    let mut ifc_items: HashMap<NodeId, usize> = HashMap::new();
+    let mut ifc_items = IfcRegistry::default();
 
     // The document node itself is not an element; lay out from the first
     // element descendant (the <html> root).
@@ -302,6 +365,9 @@ pub fn layout_dom_with_images(
 
     let mut rects = HashMap::new();
     let mut text_runs = HashMap::new();
+    // Final absolute rects of anonymous inline-run leaves, keyed by the
+    // engine item index (they have no DOM id to key `rects` by).
+    let mut anon_rects: HashMap<usize, Rect> = HashMap::new();
     if let Some(root_id) = root {
         // Top-down inheritance of the properties CSS inherits by default.
         #[derive(Clone)]
@@ -746,20 +812,21 @@ pub fn layout_dom_with_images(
             {
                 let _ = taffy_tree.compute_layout(taffy_root, available);
             }
-            compute_absolute_rects(&taffy_tree, taffy_root, 0.0, 0.0, &id_map, &words, &mut rects, &mut text_runs);
+            compute_absolute_rects(&taffy_tree, taffy_root, 0.0, 0.0, &id_map, &words, &mut rects, &mut text_runs, &mut anon_rects);
             synthesize_row_rects(tree, &mut rects);
         }
     }
 
     let mut clip_rects = HashMap::new();
+    let mut translates = HashMap::new();
     if let Some(root_id) = root {
-        resolve_clip_rects(tree, root_id, None, &rects, &styles, &mut clip_rects);
+        resolve_clip_rects(tree, root_id, None, 0.0, 0.0, &rects, &styles, &mut clip_rects, &mut translates);
     }
 
     // Pin each shaped inline context to its final content-box origin/width now
     // that layout is done, so paint draws the same line breaks it was sized for.
     #[cfg(feature = "paint")]
-    for (nid, &idx) in &ifc_items {
+    for (nid, &idx) in &ifc_items.whole {
         if let (Some(rect), Some(style)) = (rects.get(nid), styles.get(nid)) {
             let origin = crate::inline::content_origin(rect, style);
             let cw = crate::inline::content_width(rect, style);
@@ -767,11 +834,15 @@ pub fn layout_dom_with_images(
             // `overflow: hidden` on the container clips it (this is what keeps
             // the 1x1 "visually hidden" skip-link box from painting its text,
             // now that the text is one leaf rather than clipped word boxes).
+            // Clips live in screen space; the container's own box joins the
+            // chain shifted by its accumulated translate.
             let inherited = clip_rects.get(nid).copied().flatten();
             let clip = if style.overflow_hidden {
+                let (tx, ty) = translates.get(nid).copied().unwrap_or((0.0, 0.0));
+                let own = crate::Rect { x: rect.x + tx, y: rect.y + ty, width: rect.width, height: rect.height };
                 Some(match inherited {
-                    Some(c) => c.intersect(rect).unwrap_or(crate::Rect::default()),
-                    None => *rect,
+                    Some(c) => c.intersect(&own).unwrap_or(crate::Rect::default()),
+                    None => own,
                 })
             } else {
                 inherited
@@ -779,16 +850,42 @@ pub fn layout_dom_with_images(
             engine.finalize(idx, origin, cw, clip);
         }
     }
+    // Anonymous run leaves have no DOM node and no border/padding of their
+    // own: the leaf rect IS the content box. Clipping comes from the parent
+    // block (its inherited chain, plus its own overflow like any child).
+    #[cfg(feature = "paint")]
+    for (parent, items) in &ifc_items.runs {
+        let inherited = clip_rects.get(parent).copied().flatten();
+        let clip = match (styles.get(parent), rects.get(parent)) {
+            (Some(style), Some(prect)) if style.overflow_hidden => {
+                let (tx, ty) = translates.get(parent).copied().unwrap_or((0.0, 0.0));
+                let own = crate::Rect { x: prect.x + tx, y: prect.y + ty, width: prect.width, height: prect.height };
+                Some(match inherited {
+                    Some(c) => c.intersect(&own).unwrap_or(crate::Rect::default()),
+                    None => own,
+                })
+            }
+            _ => inherited,
+        };
+        for &idx in items {
+            if let Some(rect) = anon_rects.get(&idx) {
+                engine.finalize(idx, (rect.x, rect.y), rect.width, clip);
+            }
+        }
+    }
 
     DomLayout {
         rects,
         styles,
         clip_rects,
+        translates,
         text_runs,
         #[cfg(feature = "paint")]
         text_engine: engine,
         #[cfg(feature = "paint")]
-        ifc_items,
+        ifc_items: ifc_items.whole,
+        #[cfg(feature = "paint")]
+        run_ifc_items: ifc_items.runs,
     }
 }
 
@@ -996,6 +1093,7 @@ fn compute_absolute_rects(
     words: &HashMap<taffy::NodeId, (NodeId, String)>,
     rects: &mut HashMap<NodeId, Rect>,
     text_runs: &mut HashMap<NodeId, Vec<(Rect, String)>>,
+    anon_rects: &mut HashMap<usize, Rect>,
 ) {
     if let Ok(layout) = taffy_tree.layout(taffy_id) {
         let x = abs_x + layout.location.x;
@@ -1004,6 +1102,11 @@ fn compute_absolute_rects(
 
         if let Some(dom_id) = id_map.get(&taffy_id) {
             rects.insert(*dom_id, rect);
+        } else if let Some(&item) = taffy_tree.get_node_context(taffy_id) {
+            // A taffy leaf with an engine-item context but no DOM id is an
+            // anonymous inline-run leaf (see `build_mixed_block`); record its
+            // final rect by item index so the finalize pass can pin it.
+            anon_rects.insert(item, rect);
         }
         // A word leaf's dom_id is its owning text node, shared by every other
         // word from the same node, so this appends rather than overwrites.
@@ -1013,7 +1116,7 @@ fn compute_absolute_rects(
 
         if let Ok(children) = taffy_tree.children(taffy_id) {
             for child_id in children {
-                compute_absolute_rects(taffy_tree, child_id, x, y, id_map, words, rects, text_runs);
+                compute_absolute_rects(taffy_tree, child_id, x, y, id_map, words, rects, text_runs, anon_rects);
             }
         }
     }
@@ -1036,7 +1139,13 @@ fn has_inline_content(tree: &DomTree, id: NodeId, styles: &HashMap<NodeId, crate
                     if s.display_contents && s.display != crate::Display::None {
                         has_inline_content(tree, cid, styles)
                     } else {
+                        // Out-of-flow boxes (absolutely positioned, floated)
+                        // are not inline content: an inline that is the sole
+                        // child of a hero wrapper must not drag the wrapper
+                        // into the inline-formatting path.
                         s.display == crate::Display::Inline
+                            && !matches!(s.position, Some(taffy::Position::Absolute))
+                            && s.float.is_none()
                     }
                 })
                 .unwrap_or(false),
@@ -1060,7 +1169,7 @@ fn build_any(
     id_map: &mut HashMap<taffy::NodeId, NodeId>,
     words: &mut HashMap<taffy::NodeId, (NodeId, String)>,
     engine: &mut crate::inline::TextEngine,
-    ifc_items: &mut HashMap<NodeId, usize>,
+    ifc_items: &mut IfcRegistry,
     styles: &HashMap<NodeId, crate::LayoutStyle>,
 ) -> Vec<taffy::NodeId> {
     let is_text = tree
@@ -1341,7 +1450,7 @@ fn build_table(
     id_map: &mut HashMap<taffy::NodeId, NodeId>,
     words: &mut HashMap<taffy::NodeId, (NodeId, String)>,
     engine: &mut crate::inline::TextEngine,
-    ifc_items: &mut HashMap<NodeId, usize>,
+    ifc_items: &mut IfcRegistry,
     styles: &HashMap<NodeId, crate::LayoutStyle>,
 ) -> Option<taffy::NodeId> {
     let style = styles.get(&id)?;
@@ -1473,7 +1582,7 @@ fn build(
     id_map: &mut HashMap<taffy::NodeId, NodeId>,
     words: &mut HashMap<taffy::NodeId, (NodeId, String)>,
     engine: &mut crate::inline::TextEngine,
-    ifc_items: &mut HashMap<NodeId, usize>,
+    ifc_items: &mut IfcRegistry,
     styles: &HashMap<NodeId, crate::LayoutStyle>,
 ) -> Option<taffy::NodeId> {
     let node = tree.get_node(id)?;
@@ -1504,7 +1613,7 @@ fn build(
     if let Some(item) = engine.try_build(tree, id, styles) {
         let leaf = taffy_tree.new_leaf_with_context(taffy_style, item).ok()?;
         id_map.insert(leaf, id);
-        ifc_items.insert(id, item);
+        ifc_items.whole.insert(id, item);
         return Some(leaf);
     }
 
@@ -1529,6 +1638,35 @@ fn build(
         || (style.display == crate::Display::Flex && style.flex_direction == Some(taffy::FlexDirection::Column));
     let has_inline_ish_content =
         has_inline_content(tree, id, styles) || style.before_content.is_some() || style.after_content.is_some();
+
+    let mut dom_children = tree.children(id);
+    // In a grid formatting context, whitespace-only text between items does not
+    // generate an anonymous grid item (CSS Grid). taffy 0.12 places each stray
+    // whitespace text node in its own cell, which offsets every real item, so a
+    // Tailwind `grid-cols-3` block with newlines between its children lays out
+    // diagonally instead of in one row (this collapsed the whole modern
+    // framework cluster after the taffy upgrade). Drop them before building.
+    if style.display == crate::Display::Grid {
+        dom_children.retain(|&cid| {
+            tree.get_node(cid).map_or(false, |n| n.is_element()) || !tree.text_content(cid).trim().is_empty()
+        });
+    }
+    let has_float_child = dom_children.iter().any(|&cid| styles.get(&cid).map(|s| s.float.is_some()).unwrap_or(false));
+
+    // A block with mixed inline + block children keeps real block layout:
+    // block-level children become direct block children (full available
+    // width, exactly what CSS block layout gives them), while each maximal
+    // run of consecutive inline-level siblings is wrapped in one anonymous
+    // block-level box that carries the inline formatting context. This is
+    // how real engines structure mixed content, and it replaces the old
+    // whole-container flex-row-wrap promotion, which collapsed contentless
+    // block children (e.g. a `position:relative` hero wrapper whose only
+    // child is out-of-flow) to width 0 and let text and blocks share lines.
+    // Floats still take the legacy zone path below.
+    if style.display == crate::Display::Block && has_inline_ish_content && !has_float_child {
+        return build_mixed_block(tree, id, style, taffy_style, &dom_children, taffy_tree, id_map, words, engine, ifc_items, styles);
+    }
+
     if stacks_children_vertically && has_inline_ish_content {
         taffy_style.display = taffy::style::Display::Flex;
         taffy_style.flex_direction = taffy::FlexDirection::Row;
@@ -1553,19 +1691,6 @@ fn build(
         taffy_style.align_items = Some(taffy::AlignItems::FLEX_START);
     }
 
-    let mut dom_children = tree.children(id);
-    // In a grid formatting context, whitespace-only text between items does not
-    // generate an anonymous grid item (CSS Grid). taffy 0.12 places each stray
-    // whitespace text node in its own cell, which offsets every real item, so a
-    // Tailwind `grid-cols-3` block with newlines between its children lays out
-    // diagonally instead of in one row (this collapsed the whole modern
-    // framework cluster after the taffy upgrade). Drop them before building.
-    if style.display == crate::Display::Grid {
-        dom_children.retain(|&cid| {
-            tree.get_node(cid).map_or(false, |n| n.is_element()) || !tree.text_content(cid).trim().is_empty()
-        });
-    }
-    let has_float_child = dom_children.iter().any(|&cid| styles.get(&cid).map(|s| s.float.is_some()).unwrap_or(false));
     let mut child_ids: Vec<taffy::NodeId> = if has_float_child {
         build_children_with_float_zone(tree, &dom_children, taffy_tree, id_map, words, engine, ifc_items, styles)
     } else {
@@ -1587,6 +1712,202 @@ fn build(
     };
     id_map.insert(taffy_id, id);
     Some(taffy_id)
+}
+
+/// Build a block container whose children mix inline-level and block-level
+/// content, preserving real block layout for the block children.
+///
+/// Structure produced (mirroring how CSS block containers actually work):
+/// - block-level in-flow children stay direct children of the (taffy Block)
+///   parent, so an auto width fills the containing block even when the child
+///   has no in-flow content of its own;
+/// - each maximal run of consecutive inline-level siblings becomes ONE
+///   anonymous block-level box carrying the inline formatting context. A run
+///   of pure text and foldable inline wrappers collapses to a single shaped
+///   cosmic-text leaf (one taffy node for the whole run instead of one per
+///   word: faster and lighter than the old whole-container promotion). Runs
+///   holding atomic inline boxes (img, inline-block, ...) fall back to an
+///   anonymous flex-wrap wrapper around the run's boxes;
+/// - out-of-flow (absolutely positioned) children neither join nor break a
+///   run; they are appended after the flow children so their containing
+///   block is this parent, whose used width they resolve percentages against.
+#[allow(clippy::too_many_arguments)]
+fn build_mixed_block(
+    tree: &DomTree,
+    id: NodeId,
+    style: &crate::LayoutStyle,
+    mut taffy_style: taffy::Style,
+    dom_children: &[NodeId],
+    taffy_tree: &mut TaffyTree<usize>,
+    id_map: &mut HashMap<taffy::NodeId, NodeId>,
+    words: &mut HashMap<taffy::NodeId, (NodeId, String)>,
+    engine: &mut crate::inline::TextEngine,
+    ifc_items: &mut IfcRegistry,
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+) -> Option<taffy::NodeId> {
+    // The parent is a genuine block container. `to_taffy_style` may have
+    // promoted it to a flex column for `text-align` (taffy block layout has
+    // no align-items); undo that: text-align moves line content, never
+    // block children, so it is applied to the runs below instead.
+    taffy_style.display = taffy::style::Display::Block;
+
+    // Splice display:contents children and drop nothing else, so runs
+    // partition over the child list exactly as CSS sees it.
+    let mut flat: Vec<NodeId> = Vec::new();
+    flatten_contents_children(tree, dom_children, styles, &mut flat);
+
+    enum Seg {
+        Run(Vec<NodeId>),
+        Block(NodeId),
+    }
+    let mut segs: Vec<Seg> = Vec::new();
+    let mut out_of_flow: Vec<NodeId> = Vec::new();
+    for &cid in &flat {
+        let Some(node) = tree.get_node(cid) else { continue };
+        let is_text = matches!(node.data, obscura_dom::tree::NodeData::Text { .. });
+        let inline_level = if is_text {
+            true
+        } else if let Some(s) = styles.get(&cid) {
+            if s.display == crate::Display::None {
+                continue;
+            }
+            if matches!(s.position, Some(taffy::Position::Absolute)) {
+                out_of_flow.push(cid);
+                continue;
+            }
+            s.display == crate::Display::Inline
+        } else {
+            false
+        };
+        if inline_level {
+            match segs.last_mut() {
+                Some(Seg::Run(run)) => run.push(cid),
+                _ => segs.push(Seg::Run(vec![cid])),
+            }
+        } else {
+            segs.push(Seg::Block(cid));
+        }
+    }
+
+    // ::before joins the first inline run and ::after the last (a list
+    // marker must share its item text's lines); when the adjacent segment
+    // is a block, the pseudo content gets its own anonymous run instead.
+    let before_leaves = style.before_content.as_ref().map(|c| build_pseudo_content(id, c, style, taffy_tree, words)).unwrap_or_default();
+    let after_leaves = style.after_content.as_ref().map(|c| build_pseudo_content(id, c, style, taffy_tree, words)).unwrap_or_default();
+    let mut before_pending = !before_leaves.is_empty();
+    let mut after_pending = !after_leaves.is_empty();
+
+    let n_segs = segs.len();
+    let mut child_ids: Vec<taffy::NodeId> = Vec::new();
+    for (i, seg) in segs.into_iter().enumerate() {
+        match seg {
+            Seg::Block(cid) => {
+                child_ids.extend(build_any(tree, cid, taffy_tree, id_map, words, engine, ifc_items, styles));
+            }
+            Seg::Run(run) => {
+                let join_before = before_pending && i == 0;
+                let join_after = after_pending && i + 1 == n_segs;
+                // Fast path: the whole run folds to one shaped leaf, unless
+                // pseudo-content word leaves must share its lines.
+                if !join_before && !join_after {
+                    if let Some(item) = engine.try_build_run(tree, id, &run, styles) {
+                        let leaf = taffy_tree.new_leaf_with_context(run_leaf_style(), item).ok()?;
+                        ifc_items.runs.entry(id).or_default().push(item);
+                        child_ids.push(leaf);
+                        continue;
+                    }
+                }
+                let mut atoms: Vec<taffy::NodeId> = Vec::new();
+                if join_before {
+                    atoms.extend(before_leaves.iter().copied());
+                    before_pending = false;
+                }
+                for &rc in &run {
+                    atoms.extend(build_any(tree, rc, taffy_tree, id_map, words, engine, ifc_items, styles));
+                }
+                if join_after {
+                    atoms.extend(after_leaves.iter().copied());
+                    after_pending = false;
+                }
+                if atoms.is_empty() {
+                    // Whitespace-only run between blocks: no anonymous box.
+                    continue;
+                }
+                let wrapper = taffy_tree.new_with_children(run_wrapper_style(style), &atoms).ok()?;
+                child_ids.push(wrapper);
+            }
+        }
+    }
+    // Pseudo content that found no adjacent run to join.
+    if before_pending {
+        let wrapper = taffy_tree.new_with_children(run_wrapper_style(style), &before_leaves).ok()?;
+        child_ids.insert(0, wrapper);
+    }
+    if after_pending {
+        let wrapper = taffy_tree.new_with_children(run_wrapper_style(style), &after_leaves).ok()?;
+        child_ids.push(wrapper);
+    }
+    for cid in out_of_flow {
+        child_ids.extend(build_any(tree, cid, taffy_tree, id_map, words, engine, ifc_items, styles));
+    }
+
+    let taffy_id = if child_ids.is_empty() {
+        taffy_tree.new_leaf(taffy_style).ok()?
+    } else {
+        taffy_tree.new_with_children(taffy_style, &child_ids).ok()?
+    };
+    id_map.insert(taffy_id, id);
+    Some(taffy_id)
+}
+
+/// Expand `display: contents` wrappers so their children partition into the
+/// caller's segment list as if they were direct children (CSS Display 3).
+fn flatten_contents_children(
+    tree: &DomTree,
+    children: &[NodeId],
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+    out: &mut Vec<NodeId>,
+) {
+    for &cid in children {
+        let splices = styles.get(&cid).map(|s| s.display_contents && s.display != crate::Display::None).unwrap_or(false);
+        if splices {
+            let kids = tree.children(cid);
+            flatten_contents_children(tree, &kids, styles, out);
+        } else {
+            out.push(cid);
+        }
+    }
+}
+
+/// Style for a single-leaf inline run: a block-level box that fills the
+/// containing block's width, with height from the shaped text (measure fn).
+fn run_leaf_style() -> taffy::Style {
+    taffy::Style {
+        size: taffy::Size { width: taffy::style::Dimension::percent(1.0), height: taffy::style::Dimension::auto() },
+        ..Default::default()
+    }
+}
+
+/// Style for an anonymous inline-run wrapper: a full-width block-level box
+/// whose interior is the flex-wrap approximation of an inline formatting
+/// context. The parent's `text-align` stand-in (align_items) moves the run's
+/// line content via justify-content, exactly as the old whole-container
+/// promotion did, but scoped to the run so sibling blocks stay full width.
+fn run_wrapper_style(parent: &crate::LayoutStyle) -> taffy::Style {
+    let justify = match parent.align_items {
+        Some(taffy::AlignItems::FLEX_END) => Some(taffy::JustifyContent::FLEX_END),
+        Some(taffy::AlignItems::CENTER) => Some(taffy::JustifyContent::CENTER),
+        _ => None,
+    };
+    taffy::Style {
+        display: taffy::style::Display::Flex,
+        flex_direction: taffy::FlexDirection::Row,
+        flex_wrap: taffy::FlexWrap::Wrap,
+        align_items: Some(taffy::AlignItems::FLEX_START),
+        justify_content: justify,
+        size: taffy::Size { width: taffy::style::Dimension::percent(1.0), height: taffy::style::Dimension::auto() },
+        ..Default::default()
+    }
 }
 
 /// Approximate `float: left|right` without real per-line reflow (which
@@ -1679,7 +2000,7 @@ fn build_children_with_float_zone(
     id_map: &mut HashMap<taffy::NodeId, NodeId>,
     words: &mut HashMap<taffy::NodeId, (NodeId, String)>,
     engine: &mut crate::inline::TextEngine,
-    ifc_items: &mut HashMap<NodeId, usize>,
+    ifc_items: &mut IfcRegistry,
     styles: &HashMap<NodeId, crate::LayoutStyle>,
 ) -> Vec<taffy::NodeId> {
     let is_float = |cid: NodeId| styles.get(&cid).map(|s| s.float.is_some()).unwrap_or(false);

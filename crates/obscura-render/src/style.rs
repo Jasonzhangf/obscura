@@ -537,7 +537,15 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
 /// translate and scale parts.
 fn parse_transform(style: &mut LayoutStyle, value: &str) {
     let v = value.trim();
-    if v.is_empty() || v.eq_ignore_ascii_case("none") {
+    if v.is_empty() {
+        return;
+    }
+    // `transform: none` resets any transform from a lower-priority rule (the
+    // carousel idiom: a class translates the track, an inline style clears it
+    // for the untransformed state).
+    if v.eq_ignore_ascii_case("none") {
+        style.transform_translate = None;
+        style.transform_scale = None;
         return;
     }
     let zero = crate::Dimension::Px(0.0);
@@ -546,7 +554,10 @@ fn parse_transform(style: &mut LayoutStyle, value: &str) {
     for (func, args) in transform_functions(v) {
         let parts: Vec<&str> = args.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
         match func.to_ascii_lowercase().as_str() {
-            "translate" => {
+            // translate3d's z component is ignored (no perspective model);
+            // Swiper and similar carousels position their track exclusively
+            // through translate3d, so dropping it left every slide stacked.
+            "translate" | "translate3d" => {
                 if let Some(a) = parts.first() {
                     tx = Some(dimension_value(a));
                 }

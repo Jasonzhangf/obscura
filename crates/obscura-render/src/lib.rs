@@ -51,6 +51,17 @@ pub mod inline {
         pub fn try_build(&mut self, _tree: &DomTree, _id: NodeId, _styles: &HashMap<NodeId, crate::LayoutStyle>) -> Option<usize> {
             None
         }
+        /// See `try_build`: inline runs likewise fall back to word-split
+        /// geometry in layout-only builds.
+        pub fn try_build_run(
+            &mut self,
+            _tree: &DomTree,
+            _parent: NodeId,
+            _run: &[NodeId],
+            _styles: &HashMap<NodeId, crate::LayoutStyle>,
+        ) -> Option<usize> {
+            None
+        }
     }
 }
 
