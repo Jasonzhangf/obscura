@@ -202,6 +202,116 @@ pub struct Page {
     pub stealth_client: Option<Arc<StealthHttpClient>>,
 }
 
+/// Fetch an external stylesheet and inline any `@import`ed sheets it references,
+/// recursively, so the imported CSS actually reaches the cascade. Sphinx docs
+/// (and other older/theme-chained sites) ship the real layout in a base sheet
+/// pulled in with `@import url("basic.css")` from the linked `classic.css`;
+/// dropping it left the page effectively unstyled. Imports resolve against the
+/// importing sheet's own URL and are inlined before its rules (CSS orders every
+/// `@import` ahead of the sheet's other statements). A depth cap guards against
+/// import cycles.
+fn fetch_css_with_imports(
+    client: Arc<ObscuraHttpClient>,
+    url: String,
+    depth: u8,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>> {
+    Box::pin(async move {
+        let parsed = url::Url::parse(&url).ok()?;
+        let resp = tokio::time::timeout(tokio::time::Duration::from_secs(5), client.fetch(&parsed))
+            .await
+            .ok()?
+            .ok()?;
+        let css = String::from_utf8(resp.body).ok()?;
+        // Stop recursing at the cap but keep this level's CSS as-is.
+        if depth >= 4 {
+            return Some(css);
+        }
+        let (imports, stripped) = split_css_imports(&css);
+        if imports.is_empty() {
+            return Some(css);
+        }
+        let mut out = String::new();
+        for imp in imports {
+            if let Ok(iu) = parsed.join(&imp) {
+                if let Some(sub) = fetch_css_with_imports(client.clone(), iu.to_string(), depth + 1).await {
+                    out.push_str(&sub);
+                    out.push('\n');
+                }
+            }
+        }
+        out.push_str(&stripped);
+        Some(out)
+    })
+}
+
+/// Pull leading `@import` rules out of a stylesheet. Returns each import target
+/// URL (skipping print-only and `prefers-color-scheme: dark` conditional
+/// imports, which must not apply in our light desktop context) plus the CSS
+/// with those `@import` statements removed. Handles `@import "x.css";`,
+/// `@import url("x.css");`, `@import url(x.css);` and an optional trailing
+/// media query.
+fn split_css_imports(css: &str) -> (Vec<String>, String) {
+    let mut urls = Vec::new();
+    let mut stripped = String::with_capacity(css.len());
+    let mut rest = css;
+    loop {
+        let Some(pos) = rest.find("@import") else {
+            stripped.push_str(rest);
+            break;
+        };
+        // Real sheets place `@import` at the top (after an optional @charset), so
+        // scanning for it anywhere is safe in practice and tolerates minified
+        // whitespace. Text before this match carries through unchanged.
+        stripped.push_str(&rest[..pos]);
+        let after = &rest[pos + "@import".len()..];
+        let Some(semi) = after.find(';') else {
+            // Malformed; keep the remainder verbatim.
+            stripped.push_str(&rest[pos..]);
+            break;
+        };
+        let stmt = &after[..semi];
+        if let Some(target) = parse_import_url(stmt) {
+            urls.push(target);
+        } else {
+            // Could not parse a URL; preserve the statement so we don't lose it.
+            stripped.push_str("@import");
+            stripped.push_str(&after[..=semi]);
+        }
+        rest = &after[semi + 1..];
+    }
+    (urls, stripped)
+}
+
+/// Extract the URL from an `@import` statement body (the text between `@import`
+/// and `;`), or `None` when the import is media-gated to print / dark and must
+/// be skipped.
+fn parse_import_url(stmt: &str) -> Option<String> {
+    let s = stmt.trim();
+    let is_url_fn = s.len() >= 4 && s[..4].eq_ignore_ascii_case("url(");
+    let (url, media) = if is_url_fn {
+        let rest = &s[4..];
+        let end = rest.find(')')?;
+        let inner = rest[..end].trim().trim_matches(|c| c == '"' || c == '\'');
+        (inner.to_string(), rest[end + 1..].trim())
+    } else {
+        let quote = s.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+        let rest = &s[1..];
+        let end = rest.find(quote)?;
+        (rest[..end].to_string(), rest[end + 1..].trim())
+    };
+    if !media.is_empty() {
+        let compact: String = media.chars().filter(|c| !c.is_whitespace()).flat_map(|c| c.to_lowercase()).collect();
+        let print_only = compact.contains("print") && !compact.contains("screen") && !compact.contains("all");
+        if print_only || compact.contains("prefers-color-scheme:dark") {
+            return None;
+        }
+    }
+    if url.is_empty() {
+        return None;
+    }
+    Some(url)
+}
+
 impl Page {
     pub fn new(id: String, context: Arc<BrowserContext>) -> Self {
         let http_client = context.http_client.clone();
@@ -394,13 +504,30 @@ impl Page {
                     let mut links = Vec::new();
                     for lid in link_ids {
                         if let Some(node) = dom.get_node(lid) {
-                            // Skip print-only stylesheets: a `<link media="print">`
-                            // must not apply on screen. Some sites (e.g. the
-                            // Guardian) ship a print sheet whose rules otherwise
-                            // overrode the screen masthead/section styling.
+                            // Skip disabled stylesheets: a `<link ... disabled>`
+                            // does not apply until JS clears the attribute. Sites
+                            // ship alternate themes this way (e.g. Google devsite's
+                            // dark-theme.css is linked `disabled` and toggled by a
+                            // theme switcher); applying it painted whole pages dark
+                            // when Chromium renders them light. `disabled` is a
+                            // boolean attribute, so any presence means off.
+                            if node.get_attribute("disabled").is_some() {
+                                continue;
+                            }
+                            // Respect the link's `media` gate. A `<link
+                            // media="print">` must not apply on screen (the
+                            // Guardian ships a print sheet that otherwise
+                            // overrode the screen masthead), and a `<link
+                            // media="(prefers-color-scheme: dark)">` must not
+                            // apply in our light desktop context (docs.python and
+                            // other Sphinx sites link pydoctheme_dark.css this way;
+                            // injecting it painted the page dark under a light
+                            // Chromium). We render the default light context, so
+                            // skip sheets gated to print-only or dark preference.
                             if let Some(media) = node.get_attribute("media") {
-                                let m = media.to_ascii_lowercase();
-                                if m.contains("print") && !m.contains("screen") && !m.contains("all") {
+                                let compact: String = media.chars().filter(|c| !c.is_whitespace()).flat_map(|c| c.to_lowercase()).collect();
+                                let print_only = compact.contains("print") && !compact.contains("screen") && !compact.contains("all");
+                                if print_only || compact.contains("prefers-color-scheme:dark") {
                                     continue;
                                 }
                             }
@@ -435,14 +562,7 @@ impl Page {
 
             let client = self.http_client.clone();
             fetch_tasks.push(tokio::spawn(async move {
-                if let Ok(url) = url::Url::parse(&full_url) {
-                    if let Ok(Ok(resp)) = tokio::time::timeout(tokio::time::Duration::from_secs(5), client.fetch(&url)).await {
-                        if let Ok(css) = String::from_utf8(resp.body) {
-                            return Some(css);
-                        }
-                    }
-                }
-                None
+                fetch_css_with_imports(client, full_url, 0).await
             }));
         }
 
@@ -1865,7 +1985,9 @@ fn url_matches_cdp_pattern(pattern: &str, url: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{truncate_on_char_boundary, url_matches_cdp_pattern};
+    use super::{
+        parse_import_url, split_css_imports, truncate_on_char_boundary, url_matches_cdp_pattern,
+    };
 
     #[test]
     fn truncate_never_splits_a_multibyte_char() {
@@ -1877,6 +1999,41 @@ mod tests {
         assert!(s.starts_with(t));
         assert_eq!(t.len(), 79, "should stop right before the € char");
         assert_eq!(truncate_on_char_boundary("short", 80), "short");
+    }
+
+    #[test]
+    fn parse_import_url_extracts_url_forms() {
+        assert_eq!(parse_import_url(" url(\"basic.css\")").as_deref(), Some("basic.css"));
+        assert_eq!(parse_import_url(" url(basic.css)").as_deref(), Some("basic.css"));
+        assert_eq!(parse_import_url(" \"basic.css\"").as_deref(), Some("basic.css"));
+        assert_eq!(parse_import_url(" 'theme.css'").as_deref(), Some("theme.css"));
+        assert_eq!(parse_import_url(" URL('x.css')").as_deref(), Some("x.css"));
+    }
+
+    #[test]
+    fn parse_import_url_skips_print_and_dark_media() {
+        assert_eq!(parse_import_url("url(\"p.css\") print"), None);
+        assert_eq!(parse_import_url("url(\"d.css\") (prefers-color-scheme: dark)"), None);
+        // screen / all and light preference still apply.
+        assert_eq!(parse_import_url("url(\"s.css\") screen").as_deref(), Some("s.css"));
+        assert_eq!(parse_import_url("url(\"a.css\") print, screen").as_deref(), Some("a.css"));
+    }
+
+    #[test]
+    fn split_css_imports_pulls_imports_and_strips_them() {
+        let css = "@import url(\"basic.css\");\nbody { color: red; }";
+        let (imports, stripped) = split_css_imports(css);
+        assert_eq!(imports, vec!["basic.css".to_string()]);
+        assert!(!stripped.contains("@import"));
+        assert!(stripped.contains("body { color: red; }"));
+    }
+
+    #[test]
+    fn split_css_imports_leaves_import_free_css_untouched() {
+        let css = "body { color: red; }";
+        let (imports, stripped) = split_css_imports(css);
+        assert!(imports.is_empty());
+        assert_eq!(stripped, css);
     }
 
     #[test]
