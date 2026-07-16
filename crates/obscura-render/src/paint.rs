@@ -176,7 +176,9 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
             if let Some(img_rect) = img_rect {
                 // object-fit does not apply to background images (that is
                 // background-size, handled above); paint the layer as-is.
-                paint_image(bg_url, base_url, &img_rect, crate::ObjectFit::Fill, &mut pixmap, &mut image_cache);
+                // img_rect is already clip-intersected, so it doubles as the
+                // visible bound.
+                paint_image(bg_url, base_url, &img_rect, &img_rect, crate::ObjectFit::Fill, &mut pixmap, &mut image_cache);
             }
         }
 
@@ -231,22 +233,32 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
 
         if name.local.as_ref() == "img" {
             if let Some((src, _density)) = resolve_img_url(tree, nid) {
-                let painted = paint_image(&src, base_url, &rect, style.object_fit, &mut pixmap, &mut image_cache);
-                // Fall back to alt text only when the image itself did not paint.
+                // `visible_rect` is the border box already intersected with the
+                // ancestor overflow clip: the raster must not paint past it (a
+                // half-scrolled carousel slide's image otherwise bleeds over
+                // the viewport edge).
+                let painted =
+                    paint_image(&src, base_url, &rect, &visible_rect, style.object_fit, &mut pixmap, &mut image_cache);
+                // Fall back when the image itself did not paint, following
+                // what browsers show for a broken image: a non-empty alt
+                // renders as text in place of the image (no placeholder box),
+                // alt="" renders nothing at all (the author declared the
+                // image decorative), and only a MISSING alt keeps the neutral
+                // grey placeholder. box_rect/visible_rect are already
+                // clip-intersected, so none of this paints outside an
+                // overflow:hidden clip.
                 if !painted {
-                    // A fetch/decode failure paints a neutral grey box (like a
-                    // browser's lazy/broken-image placeholder) so a missing
-                    // image reads as "not loaded", not as a broken render.
-                    // box_rect/visible_rect are already clip-intersected, so
-                    // this never paints outside an overflow:hidden clip.
-                    if visible_rect.width >= 4.0 && visible_rect.height >= 4.0 {
-                        let mut ph = Paint::default();
-                        ph.set_color(Color::from_rgba8(0xE9, 0xEA, 0xEC, 0xFF));
-                        pixmap.fill_rect(box_rect, &ph, Transform::identity(), None);
-                    }
-                    if let Some(alt) = node.get_attribute("alt") {
-                        if !alt.is_empty() {
-                            draw_text(&mut pixmap, alt, rect.x, rect.y, [0, 0, 0, 255], 12.0, false, clip);
+                    match node.get_attribute("alt") {
+                        Some(alt) if !alt.trim().is_empty() => {
+                            draw_text(&mut pixmap, &alt, rect.x, rect.y, [0, 0, 0, 255], 12.0, false, clip);
+                        }
+                        Some(_) => {}
+                        None => {
+                            if visible_rect.width >= 4.0 && visible_rect.height >= 4.0 {
+                                let mut ph = Paint::default();
+                                ph.set_color(Color::from_rgba8(0xE9, 0xEA, 0xEC, 0xFF));
+                                pixmap.fill_rect(box_rect, &ph, Transform::identity(), None);
+                            }
                         }
                     }
                 }
@@ -1138,6 +1150,7 @@ fn paint_image(
     src: &str,
     base_url: Option<&str>,
     rect: &crate::Rect,
+    visible_rect: &crate::Rect,
     object_fit: crate::ObjectFit,
     pixmap: &mut Pixmap,
     cache: &mut std::collections::HashMap<String, Option<Vec<u8>>>,
@@ -1174,12 +1187,16 @@ fn paint_image(
     };
     let Some(content) = content else { return false };
 
-    // `Cover`/`None` can size the image past the box; clip it to the box so it
-    // does not paint over neighboring content (CSS clips object-fit to the
-    // content box). `Fill`/`Contain`/`scale-down` always fit inside the box, so
-    // they take the faster unclipped path.
-    let clip = if dest.width > rect.width + 0.5 || dest.height > rect.height + 0.5 {
-        box_clip_mask(pixmap.width(), pixmap.height(), rect)
+    // The raster may not paint past `visible_rect` (the border box already
+    // intersected with the ancestor overflow clip): `Cover`/`None` can size
+    // the image past the box, and an ancestor clip can cut into the box
+    // itself. Only the fully-inside case takes the unmasked fast path.
+    let clip = if dest.width > visible_rect.width + 0.5
+        || dest.height > visible_rect.height + 0.5
+        || dest.x < visible_rect.x - 0.5
+        || dest.y < visible_rect.y - 0.5
+    {
+        box_clip_mask(pixmap.width(), pixmap.height(), visible_rect)
     } else {
         None
     };
