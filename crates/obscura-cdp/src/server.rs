@@ -673,13 +673,15 @@ async fn process_with_interception(
 
     let (nav_done_tx, mut nav_done_rx) = mpsc::channel::<(obscura_browser::Page, Result<(), String>)>(1);
     let url_owned = url.to_string();
+    let nav_v8_lock = ctx.v8_lock.clone();
 
     tokio::task::spawn_local(async move {
-        // Issue #19: serialize V8 work across pages. The interception path
-        // spawns navigation here while the parent task continues to pump
-        // CDP messages via `dispatch` (which also acquires this lock); both
-        // sides must coordinate or V8 aborts the process at concurrency >= 5.
-        let _v8_guard = obscura_js::v8_lock::global().lock().await;
+        // Issue #19: serialize this connection's V8 work across its pages. This
+        // nav task runs while the connection's processor keeps pumping other CDP
+        // messages via `dispatch` (which takes the same per-connection lock), so
+        // both sides coordinate on one page's isolate at a time on this thread.
+        // The lock is per-connection, so other connections are unaffected (#430).
+        let _v8_guard = nav_v8_lock.lock_owned().await;
         // Preloads (addBinding shims, addScriptToEvaluateOnNewDocument sources)
         // must run BEFORE the page's own scripts (CDP contract). Hand them
         // to the page so navigate_single can inject them at the right point.

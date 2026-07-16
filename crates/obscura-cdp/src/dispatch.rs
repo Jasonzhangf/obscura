@@ -51,6 +51,14 @@ pub struct CdpContext {
     // caps how many bodies (and how many bytes) can be held at once, evicting
     // the oldest, so an abandoned or disconnected stream cannot leak unbounded.
     pub io_streams: crate::domains::io::IoStreamStore,
+    /// Serializes V8 work within THIS connection. With the thread-per-connection
+    /// server (#430) each connection runs on its own OS thread, so isolates never
+    /// collide across connections; this per-connection lock keeps a connection's
+    /// own nav task and command dispatch from interleaving two of its pages'
+    /// isolates on that one thread. It is deliberately per-connection, not a
+    /// process-wide lock, so connections run in parallel (measured ~2x at
+    /// concurrency 2, ~3x at 4) instead of serializing all V8 on one mutex.
+    pub v8_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl CdpContext {
@@ -131,6 +139,7 @@ impl CdpContext {
             valid_context_ids,
             next_isolated_context_id: 100,
             io_streams: crate::domains::io::IoStreamStore::default(),
+            v8_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -175,6 +184,7 @@ impl CdpContext {
             valid_context_ids,
             next_isolated_context_id: 100,
             io_streams: crate::domains::io::IoStreamStore::default(),
+            v8_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -323,7 +333,10 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
     let _v8_guard = if is_v8_free_method(&req.method) {
         None
     } else {
-        Some(obscura_js::v8_lock::global().lock().await)
+        // Per-connection lock (owned guard, so it does not borrow `ctx`): keeps
+        // this connection's own V8 work contiguous on its thread without
+        // serializing other connections (#430).
+        Some(ctx.v8_lock.clone().lock_owned().await)
     };
 
     // Per-command V8 watchdog. The lock above keeps each handler contiguous on
