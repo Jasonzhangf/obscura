@@ -2250,9 +2250,24 @@ fn build_children_with_float_zone(
     // approximate bound beats an unbounded one.
     let float_height_budget = estimate_float_height(tree, dom_children[float_idx], styles);
     const ASSUMED_FLOW_WIDTH: f32 = 500.0;
+    // `clear` on a sibling ends the zone: the cleared element moves below the
+    // float (the clearfix idiom), so it must not join the flow column beside it.
+    let clears_this_float = |cid: NodeId| {
+        let Some(c) = styles.get(&cid).and_then(|s| s.clear) else { return false };
+        match (float_side, c) {
+            (_, crate::Clear::Both) => true,
+            (Some(crate::Float::Left), crate::Clear::Left) => true,
+            (Some(crate::Float::Right), crate::Clear::Right) => true,
+            _ => false,
+        }
+    };
     let mut zone_end = float_idx + 1;
     let mut flow_height_estimate = 0.0f32;
-    while zone_end < dom_children.len() && !is_heading(dom_children[zone_end]) && !is_float(dom_children[zone_end]) {
+    while zone_end < dom_children.len()
+        && !is_heading(dom_children[zone_end])
+        && !is_float(dom_children[zone_end])
+        && !clears_this_float(dom_children[zone_end])
+    {
         flow_height_estimate += estimate_text_height(tree, dom_children[zone_end], styles, ASSUMED_FLOW_WIDTH);
         zone_end += 1;
         if flow_height_estimate >= float_height_budget {

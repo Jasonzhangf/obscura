@@ -325,6 +325,13 @@ pub struct LayoutStyle {
     /// cells inherit it); obscura applies it as main-axis alignment of the
     /// cell's flex-column stand-in. `None` on non-cell elements.
     pub vertical_align: Option<VerticalAlign>,
+    /// `z-index` on a positioned element. `None` is `auto` (tree order). A
+    /// non-zero value lifts the element's whole subtree into a separate paint
+    /// layer: negatives under the normal flow, positives above it, sorted.
+    pub z_index: Option<i32>,
+    /// `clear`, when set: this element moves below preceding floats on the
+    /// given side(s), ending their float zone.
+    pub clear: Option<Clear>,
     /// Resolved during the inheritance pass: true when this element should
     /// not be painted at all, either from its own or an inherited
     /// `visibility: hidden`, or because the product of its own and every
@@ -461,6 +468,15 @@ pub enum VerticalAlign {
     Top,
     Middle,
     Bottom,
+}
+
+/// `clear`: which floated side(s) an element moves below. Ends the float
+/// zone in `dom::build_children_with_float_zone` (the clearfix idiom).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Clear {
+    Left,
+    Right,
+    Both,
 }
 
 /// `line-height`: `normal` (a font-relative default), a unitless multiple of

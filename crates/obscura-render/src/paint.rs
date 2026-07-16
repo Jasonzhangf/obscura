@@ -49,8 +49,54 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
     // zero, so skip the per-node ancestor walk entirely and keep the paint
     // path free of any added cost.
 
-    // Tree order so later elements paint over earlier ones (normal flow).
+    // Paint order: tree order for the normal flow (later elements paint over
+    // earlier ones), except that a positioned element with a non-zero
+    // z-index lifts its whole subtree into a separate layer: negative layers
+    // paint under the normal flow, positive ones above it, each sorted by
+    // z-index ascending (stable, so equal z keeps tree order). This is the
+    // pragmatic core of CSS stacking contexts: dropdowns/overlays/badges
+    // (z>0) stop losing to later siblings, and z:-1 decorative backdrops
+    // stop covering their content. Nested z roots paint inside their
+    // ancestor root's subtree in tree order.
+    let mut neg_layers: Vec<(i32, Vec<obscura_dom::tree::NodeId>)> = Vec::new();
+    let mut pos_layers: Vec<(i32, Vec<obscura_dom::tree::NodeId>)> = Vec::new();
+    let mut normal: Vec<obscura_dom::tree::NodeId> = Vec::new();
+    let mut consumed: std::collections::HashSet<obscura_dom::tree::NodeId> = std::collections::HashSet::new();
     for nid in tree.descendants(tree.document()) {
+        if consumed.contains(&nid) {
+            continue;
+        }
+        let z = laid
+            .styles
+            .get(&nid)
+            .filter(|s| s.position.is_some())
+            .and_then(|s| s.z_index)
+            .filter(|&z| z != 0);
+        if let Some(z) = z {
+            let mut sub = vec![nid];
+            sub.extend(tree.descendants(nid));
+            for &m in &sub {
+                consumed.insert(m);
+            }
+            if z < 0 {
+                neg_layers.push((z, sub));
+            } else {
+                pos_layers.push((z, sub));
+            }
+        } else {
+            normal.push(nid);
+        }
+    }
+    neg_layers.sort_by_key(|(z, _)| *z);
+    pos_layers.sort_by_key(|(z, _)| *z);
+    let paint_order: Vec<obscura_dom::tree::NodeId> = neg_layers
+        .into_iter()
+        .flat_map(|(_, sub)| sub)
+        .chain(normal)
+        .chain(pos_layers.into_iter().flat_map(|(_, sub)| sub))
+        .collect();
+
+    for nid in paint_order {
         if svg_subtree_skip.contains(&nid) {
             continue;
         }

@@ -442,6 +442,20 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         }
         "visibility" => style.visibility_hidden = Some(value.eq_ignore_ascii_case("hidden")),
         "opacity" => style.opacity = value.trim().parse::<f32>().ok(),
+        "z-index" => {
+            style.z_index = match value.trim() {
+                "auto" | "inherit" | "initial" => None,
+                v => v.parse::<i32>().ok(),
+            };
+        }
+        "clear" => {
+            style.clear = match value.trim().to_ascii_lowercase().as_str() {
+                "left" | "inline-start" => Some(crate::Clear::Left),
+                "right" | "inline-end" => Some(crate::Clear::Right),
+                "both" => Some(crate::Clear::Both),
+                _ => None,
+            };
+        }
         "vertical-align" => {
             style.vertical_align = match value.trim().to_ascii_lowercase().as_str() {
                 "top" | "baseline" | "text-top" => Some(crate::VerticalAlign::Top),
