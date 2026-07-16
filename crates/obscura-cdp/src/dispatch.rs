@@ -100,21 +100,6 @@ impl CdpContext {
         Self::_new_inner(proxy, stealth, user_agent, None, allow_file_access, false)
     }
 
-    /// Kitchen-sink constructor that also threads `allow_private_network`
-    /// (issue #33). Older `new_with_*` builders stay as-is.
-    pub fn new_full(
-        proxy: Option<String>,
-        stealth: bool,
-        user_agent: Option<String>,
-        storage_dir: Option<std::path::PathBuf>,
-        allow_file_access: bool,
-        allow_private_network: bool,
-    ) -> Self {
-        Self::_new_inner(
-            proxy, stealth, user_agent, storage_dir, allow_file_access, allow_private_network,
-        )
-    }
-
     /// Build a context that reuses an already-constructed, shared
     /// [`BrowserContext`]. The thread-per-connection server (issue #430 /
     /// "Option 2") gives each connection its own `CdpContext` on its own OS
@@ -122,6 +107,11 @@ impl CdpContext {
     /// connections must still share one cookie jar and one HTTP client. Passing
     /// the same `Arc<BrowserContext>` to every connection's context does that.
     pub fn new_with_shared_context(default_context: Arc<BrowserContext>) -> Self {
+        // Pre-seed with the default-frame execution context ids that
+        // `Runtime.enable` (1) and post-navigation re-emission (2) advertise via
+        // Runtime.executionContextCreated. Anything else has to be registered
+        // explicitly (Page.createIsolatedWorld), otherwise
+        // Runtime.{evaluate,callFunctionOn} should reject it per CDP spec.
         let mut valid_context_ids = HashSet::new();
         valid_context_ids.insert(1);
         valid_context_ids.insert(2);
@@ -160,32 +150,7 @@ impl CdpContext {
             allow_private_network,
         );
         ctx.allow_file_access = allow_file_access;
-        let default_context = Arc::new(ctx);
-        // Pre-seed with the default-frame execution context ids that
-        // `Runtime.enable` (1) and post-navigation re-emission (2) advertise
-        // via Runtime.executionContextCreated. Anything else has to be
-        // registered explicitly (Page.createIsolatedWorld), otherwise
-        // Runtime.{evaluate,callFunctionOn} should reject it per CDP spec.
-        let mut valid_context_ids = HashSet::new();
-        valid_context_ids.insert(1);
-        valid_context_ids.insert(2);
-
-        CdpContext {
-            pages: Vec::new(),
-            sessions: HashMap::new(),
-            pending_events: Vec::new(),
-            default_context,
-            page_counter: 0,
-            preload_scripts: Vec::new(),
-            preload_counter: 0,
-            fetch_intercept: FetchInterceptState::new(),
-            intercept_tx: None,
-            isolated_worlds: Vec::new(),
-            valid_context_ids,
-            next_isolated_context_id: 100,
-            io_streams: crate::domains::io::IoStreamStore::default(),
-            v8_lock: Arc::new(tokio::sync::Mutex::new(())),
-        }
+        Self::new_with_shared_context(Arc::new(ctx))
     }
 
     /// Claim the next isolated-world execution context id and register it as
@@ -250,7 +215,7 @@ impl CdpContext {
     }
 }
 
-/// Whether a CDP method can be served WITHOUT acquiring the global V8 lock.
+/// Whether a CDP method can be served WITHOUT acquiring the per-connection V8 lock.
 ///
 /// Methods listed here were audited to confirm they do not transitively
 /// call into a `JsRuntime`. They either don't touch any `Page` at all, or
@@ -295,41 +260,31 @@ fn is_v8_free_method(method: &str) -> bool {
 pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
     // headless_chrome (and older Puppeteer) wrap every CDP call inside
     // Target.sendMessageToTarget. Unwrap and recurse BEFORE acquiring the
-    // V8 lock — the recursive dispatch will acquire it for the inner call,
-    // and tokio Mutex is not reentrant.
+    // per-connection V8 lock — the recursive dispatch will acquire it for the
+    // inner call, and tokio Mutex is not reentrant.
     if req.method == "Target.sendMessageToTarget" {
         return dispatch_send_message_to_target(req, ctx).await;
     }
 
-    // Issue #19: V8 fatal abort under concurrent CDP work.
+    // Issue #430: keep this connection's V8 work serialized on its own thread.
     //
-    // Every CDP handler below may end up calling into a per-Page `JsRuntime`
-    // (each owning its own V8 Isolate). All of them run on a single OS
-    // thread (current_thread tokio + LocalSet). When two pages' V8-touching
-    // futures interleave across an `.await` (which `process_with_interception`
-    // can trigger by handling new CDP messages while a navigation task is in
-    // flight on `spawn_local`), V8 trips the
-    // `heap->isolate() == Isolate::TryGetCurrent()` invariant and aborts the
-    // process via `V8_Fatal` — no Rust panic, just `abort(3)`.
+    // Every CDP handler below may call into a per-Page `JsRuntime` (each owning
+    // its own V8 Isolate). With the thread-per-connection server each connection
+    // runs on its own OS thread, so isolates never collide across connections.
+    // Within one connection, though, a nav task spawned by
+    // `process_with_interception` runs while this processor keeps pumping other
+    // CDP messages, so two of this connection's pages could still interleave V8
+    // work on this one thread and trip
+    // `heap->isolate() == Isolate::TryGetCurrent()`. The per-connection lock
+    // (`ctx.v8_lock`) keeps each handler contiguous: V8 fully exits one Isolate
+    // before the next of this connection's pages is allowed in. It is
+    // per-connection, not process-wide, so other connections run in parallel.
     //
-    // Holding the process-wide V8 lock around the entire dispatch keeps each
-    // handler contiguous on the thread: V8 fully exits one Isolate before
-    // the next page is allowed in. This converts the abort into latency.
-    // It overshoots — non-V8 handlers (Browser.*, Storage.*, Emulation.*)
-    // also serialize — but those are cheap and the safety win dominates.
-    //
-    // The properly concurrent fix is to pin each `JsRuntime` to its own OS
-    // thread and message-pass; that's tracked as the larger #19 follow-up.
-    //
-    // Optimization: methods that demonstrably never touch V8 bypass the
-    // lock. During Puppeteer's newPage() setup ~8 such calls (Page.enable,
-    // Runtime.enable, Page.getFrameTree, Page.addScriptToEvaluateOnNewDocument,
-    // Page.createIsolatedWorld, etc.) used to serialize behind any
-    // in-flight V8 work on a sibling page. Bypassing keeps the setup chain
-    // running while a separate nav executes. Each listed method was audited
-    // to confirm it never reaches `JsRuntime::execute_script` or DOM
-    // mutation that re-enters V8; `get_session_page_mut` (which can
-    // trigger `suspend_js`/`resume_js`) is NOT in the list.
+    // Optimization: methods that demonstrably never touch V8 bypass the lock
+    // (Puppeteer's newPage() setup issues ~8 such calls). Each listed method was
+    // audited to confirm it never reaches `JsRuntime::execute_script` or DOM
+    // mutation that re-enters V8; `get_session_page_mut` (which can trigger
+    // `suspend_js`/`resume_js`) is NOT in the list.
     let _v8_guard = if is_v8_free_method(&req.method) {
         None
     } else {
@@ -341,8 +296,8 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
 
     // Per-command V8 watchdog. The lock above keeps each handler contiguous on
     // the thread, but it does not bound how long a handler runs: a hung page (a
-    // runaway Runtime.evaluate, a synchronous DOM op) would hold the
-    // process-wide V8 lock and wedge every other session forever. The one-shot
+    // runaway Runtime.evaluate, a synchronous DOM op) would hold this
+    // connection's V8 lock and wedge its other sessions forever. The one-shot
     // CLI uses a process-level hard deadline for this; the long-running server
     // cannot force-exit, so we terminate just the offending isolate instead.
     // OBSCURA_CDP_COMMAND_TIMEOUT_MS tunes the bound (0 disables); the default

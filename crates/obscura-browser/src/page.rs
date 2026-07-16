@@ -1308,7 +1308,7 @@ impl Page {
 
     /// V8 isolate handle for this page's runtime, if it has been initialized.
     /// Lets the CDP dispatcher arm a per-command watchdog (which bounds any one
-    /// command so a hung page cannot hold the process-wide V8 lock forever)
+    /// command so a hung page cannot hold this connection's V8 lock forever)
     /// without taking `&mut self`.
     pub fn isolate_handle(&self) -> Option<obscura_js::runtime::IsolateHandle> {
         self.js.as_ref().map(|js| js.isolate_handle())

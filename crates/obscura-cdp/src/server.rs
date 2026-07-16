@@ -178,7 +178,7 @@ pub async fn start_with_full_serve_options(
     // reuses it (one cookie jar, one HTTP client) while running on its own OS
     // thread, so each page's V8 isolate is confined to a single thread and the
     // #430 cross-page abort cannot happen (V8's TryGetCurrent check is
-    // per-thread). This is the "Option 2" fix named in obscura-js/src/v8_lock.rs.
+    // per-thread). This is the thread-per-runtime fix for #430.
     let mut bctx = obscura_browser::BrowserContext::with_storage_and_network(
         "default".to_string(),
         proxy,
@@ -460,8 +460,8 @@ async fn cdp_processor(
     loop {
         // Drain any deferred messages from the previous interception window
         // before pulling new ones off the wire. Each is processed with no
-        // nav-task spawn_local in flight, so dispatch's v8_lock can claim
-        // the only Isolate cleanly.
+        // nav-task spawn_local in flight, so this connection's only entered
+        // Isolate is the one dispatch is about to touch.
         let msg = if let Some(d) = deferred.pop_front() {
             d
         } else {
@@ -710,7 +710,7 @@ async fn process_with_interception(
     // `heap->isolate() == Isolate::TryGetCurrent()` invariant and aborts
     // the process via `V8_Fatal`.
     //
-    // The `obscura_js::v8_lock` mutex doesn't save us here: it's a
+    // This connection's `ctx.v8_lock` doesn't save us here: it's a
     // `tokio::sync::Mutex` that is released around `.await`s inside V8
     // ops, so it doesn't actually keep the V8 enter/exit pair contiguous
     // on the thread.

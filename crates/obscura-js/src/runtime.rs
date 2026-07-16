@@ -15,12 +15,15 @@ use crate::ops::{build_extension, ObscuraState, StoredNetworkResponseBody};
 static SNAPSHOT: &[u8] = include_bytes!(env!("OBSCURA_SNAPSHOT_PATH"));
 
 /// Serializes V8 isolate construction across OS threads. The thread-per-
-/// connection server (issue #430 "Option 2") builds isolates on many threads;
-/// the V8 platform is process-global and concurrent first-time isolate setup is
-/// not safe to run from several threads at once (it segfaults). Construction is
-/// fast and rare (once per page), so serializing it costs nothing measurable.
-/// Isolate *execution* stays fully parallel: once built, each isolate runs on
-/// its own thread with no shared lock.
+/// connection server (issue #430) builds isolates on many threads. The main
+/// thread already warms up V8 once before any connection thread starts (see the
+/// `ObscuraJsRuntime::new` warmup in `obscura-cdp` server startup), which is
+/// what actually prevents the `InitializeBuiltinJSDispatchTable` segfault of a
+/// first isolate built off the main thread. This lock is defense-in-depth: it
+/// keeps two connections from running V8's isolate setup concurrently in case
+/// any residual first-time process init races. Construction is rare and fast, so
+/// serializing it costs nothing measurable; isolate *execution* stays fully
+/// parallel, each isolate on its own thread with no shared lock.
 static ISOLATE_CREATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[derive(Debug, Clone)]
@@ -55,7 +58,7 @@ pub struct WatchdogToken {
 
 /// Arm a V8 termination watchdog directly from an isolate handle, with no
 /// runtime borrow. The CDP dispatcher uses this to bound every command so a
-/// hung page cannot hold the process-wide V8 lock forever. Pair with
+/// hung page cannot hold this connection's V8 lock forever. Pair with
 /// [`WatchdogToken::stop`]; if `stop` returns true, clear the termination flag
 /// via [`ObscuraJsRuntime::cancel_termination`] before reusing the isolate.
 pub fn spawn_watchdog(handle: IsolateHandle, budget: std::time::Duration) -> WatchdogToken {
@@ -690,20 +693,25 @@ impl ObscuraJsRuntime {
             }
         };
 
-        let mut result = Box::pin(self.runtime.mod_evaluate(module_id));
-        let deadline = tokio::time::Instant::now() + budget;
+        // Return as soon as the module finishes evaluating rather than waiting
+        // for the loop to go fully idle: a page timer (setInterval) keeps the
+        // loop busy forever and would otherwise burn the whole budget (#374).
+        self.drive_module_eval(module_id, budget_ms, &format!("Module {}", url))
+            .await;
+        Ok(())
+    }
 
-        // Return as soon as the module finishes evaluating instead of waiting
-        // for the event loop to go fully idle: a page timer (setInterval) keeps
-        // the loop busy forever and would otherwise burn the whole budget, so a
-        // module that had already evaluated got abandoned (issue #374).
-        //
-        // Drive it WITHOUT the #430 isolate leak: pump the event loop one
-        // self-contained tick at a time (poll_event_loop exits the isolate per
-        // call) and poll mod_evaluate alongside it, instead of cancelling a
-        // `run_event_loop` future with a tokio timeout — a fired timeout drops
-        // that future mid-poll and leaves the isolate entered on the thread,
-        // aborting the process once a second page enters its own isolate.
+    /// Drive a just-started module evaluation to completion, or up to
+    /// `budget_ms`, WITHOUT the #430 isolate leak: pump the event loop one
+    /// self-contained tick at a time (`poll_event_loop` exits the isolate per
+    /// call) and poll the `mod_evaluate` future alongside it, instead of
+    /// cancelling a `run_event_loop` future with a tokio timeout (a fired timeout
+    /// drops that future mid-poll and leaves the isolate entered on the thread).
+    /// A module eval error or timeout is logged under `what` and swallowed:
+    /// neither is fatal to rendering the rest of the page.
+    async fn drive_module_eval(&mut self, module_id: deno_core::ModuleId, budget_ms: u64, what: &str) {
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(budget_ms);
+        let mut result = Box::pin(self.runtime.mod_evaluate(module_id));
         loop {
             let done = std::future::poll_fn(|cx| {
                 let _ = self
@@ -718,19 +726,18 @@ impl ObscuraJsRuntime {
             match done {
                 Some(Ok(())) => break,
                 Some(Err(e)) => {
-                    tracing::warn!("Module eval error: {}", e);
+                    tracing::warn!("{} eval error: {}", what, e);
                     break;
                 }
                 None => {
                     if tokio::time::Instant::now() >= deadline {
-                        tracing::warn!("Module evaluation timed out after {}ms: {}", budget_ms, url);
+                        tracing::warn!("{} evaluation timed out after {}ms", what, budget_ms);
                         break;
                     }
                     tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
                 }
             }
         }
-        Ok(())
     }
 
     pub async fn load_inline_module(&mut self, code: &str, base_url: &str, budget_ms: u64) -> Result<(), String> {
@@ -757,45 +764,12 @@ impl ObscuraJsRuntime {
             }
         };
 
-        let mut result = Box::pin(self.runtime.mod_evaluate(module_id));
-        let deadline = tokio::time::Instant::now() + budget;
-
-        // Drive the event loop, but return as soon as the module finishes
-        // evaluating rather than waiting for the loop to go fully idle. A page
-        // timer (Vite's HMR / React-Refresh client installs a setInterval) keeps
-        // the loop busy forever; waiting for idle burned the whole budget on this
-        // preamble module and starved the later module that mounts the app,
-        // leaving #root empty (issue #374).
-        //
-        // Cancellation-safe pump (see #430 / load_module): never cancel a
-        // `run_event_loop` future with a tokio timeout, which drops it mid-poll
-        // and leaves the isolate entered on the thread.
-        loop {
-            let done = std::future::poll_fn(|cx| {
-                let _ = self
-                    .runtime
-                    .poll_event_loop(cx, deno_core::PollEventLoopOptions::default());
-                std::task::Poll::Ready(match std::future::Future::poll(result.as_mut(), cx) {
-                    std::task::Poll::Ready(r) => Some(r),
-                    std::task::Poll::Pending => None,
-                })
-            })
-            .await;
-            match done {
-                Some(Ok(())) => break,
-                Some(Err(e)) => {
-                    tracing::warn!("Inline module eval error: {}", e);
-                    break;
-                }
-                None => {
-                    if tokio::time::Instant::now() >= deadline {
-                        tracing::warn!("Inline module timed out after {}ms", budget_ms);
-                        break;
-                    }
-                    tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
-                }
-            }
-        }
+        // Return as soon as the module finishes evaluating rather than waiting
+        // for idle: Vite's HMR / React-Refresh client installs a setInterval that
+        // keeps the loop busy forever, and waiting for idle burned the whole
+        // budget on this preamble module and starved the module that mounts the
+        // app, leaving #root empty (issue #374).
+        self.drive_module_eval(module_id, budget_ms, "Inline module").await;
         Ok(())
     }
 
