@@ -553,6 +553,35 @@ impl DomTree {
         result
     }
 
+    /// Returns the node after `current` in document order, without leaving the
+    /// subtree rooted at `root`.
+    ///
+    /// Keeping the ancestor climb inside the DOM avoids one JS/native crossing
+    /// per ancestor when a TreeWalker reaches a deep leaf.
+    pub fn next_in_subtree(&self, root: NodeId, current: NodeId) -> Option<NodeId> {
+        let inner = self.inner.borrow();
+        let current_node = inner.nodes.get(current.index())?.as_ref()?;
+        if let Some(child) = current_node.first_child {
+            return Some(child);
+        }
+
+        let mut node_id = current;
+        for _ in 0..=inner.nodes.len() {
+            if node_id == root {
+                return None;
+            }
+            let node = inner.nodes.get(node_id.index())?.as_ref()?;
+            if let Some(sibling) = node.next_sibling {
+                return Some(sibling);
+            }
+            node_id = node.parent?;
+        }
+
+        // Parent cycles are prevented by the mutation APIs. Keep a hard bound
+        // here as defense in depth for a malformed tree.
+        None
+    }
+
     pub fn ancestors(&self, node_id: NodeId) -> Vec<NodeId> {
         let inner = self.inner.borrow();
         let mut result = Vec::new();
@@ -978,6 +1007,24 @@ mod tests {
         assert_eq!(tree.len(), 3);
         tree.remove(div);
         assert_eq!(tree.len(), 1);
+    }
+
+    #[test]
+    fn test_next_in_subtree_follows_document_order_and_stays_within_root() {
+        let tree = DomTree::new();
+        let root = tree.new_node(NodeData::Text { contents: "root".into() });
+        let first = tree.new_node(NodeData::Text { contents: "first".into() });
+        let nested = tree.new_node(NodeData::Text { contents: "nested".into() });
+        let second = tree.new_node(NodeData::Text { contents: "second".into() });
+        tree.append_child(tree.document(), root);
+        tree.append_child(root, first);
+        tree.append_child(first, nested);
+        tree.append_child(root, second);
+
+        assert_eq!(tree.next_in_subtree(root, root), Some(first));
+        assert_eq!(tree.next_in_subtree(root, first), Some(nested));
+        assert_eq!(tree.next_in_subtree(root, nested), Some(second));
+        assert_eq!(tree.next_in_subtree(root, second), None);
     }
 
     // Builds a chain of `depth` nested <div> elements under the document and

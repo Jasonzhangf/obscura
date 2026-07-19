@@ -268,6 +268,13 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                 "prev_sibling" => n.prev_sibling, _ => None,
             }).flatten().map(|id| id.index().to_string()).unwrap_or("-1".into())
         }
+        "next_in_subtree" => {
+            let root = NodeId::new(arg1.parse::<u32>().unwrap_or(0));
+            let current = NodeId::new(arg2.parse::<u32>().unwrap_or(0));
+            dom.next_in_subtree(root, current)
+                .map(|id| id.index().to_string())
+                .unwrap_or("-1".into())
+        }
         "child_nodes" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
             let ids: Vec<i32> = dom.children(NodeId::new(nid)).iter().map(|id| id.index() as i32).collect();

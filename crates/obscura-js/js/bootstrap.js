@@ -2611,18 +2611,10 @@ class Document extends Node {
         return true;
       },
       nextNode() {
-        let node = this.currentNode;
-        let child = node.firstChild;
-        while (child) {
-          if (this._accept(child)) { this.currentNode = child; return child; }
-          if (child.firstChild) { child = child.firstChild; continue; }
-          if (child.nextSibling) { child = child.nextSibling; continue; }
-          let parent = child.parentNode;
-          while (parent && parent !== this.root) {
-            if (parent.nextSibling) { child = parent.nextSibling; break; }
-            parent = parent.parentNode;
-          }
-          if (!parent || parent === this.root) return null;
+        let node = _wrap(+_dom("next_in_subtree", this.root._nid, this.currentNode._nid));
+        while (node) {
+          if (this._accept(node)) { this.currentNode = node; return node; }
+          node = _wrap(+_dom("next_in_subtree", this.root._nid, node._nid));
         }
         return null;
       },
