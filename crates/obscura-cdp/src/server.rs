@@ -40,6 +40,10 @@ const MAX_PENDING_WS_HANDOFFS: usize = 128;
 // which is there at zero connections. Override with `--max-connections`.
 pub const DEFAULT_MAX_CONNECTIONS: usize = 128;
 
+// How long shutdown waits for connection threads to finish before persisting
+// the cookie jar. Well under the 10s `docker stop` gives us before SIGKILL.
+const SHUTDOWN_DRAIN_MS: u64 = 3_000;
+
 // Sent to a client that arrives while the server is at `max_connections`, in
 // place of dropping the socket unexplained. The client sees a refusal it can
 // retry rather than a bare connection reset.
@@ -343,7 +347,31 @@ pub async fn start_with_serve_options_and_limit(
         );
     }
 
-    // Server is shutting down: persist the shared cookie jar once.
+    // Server is shutting down. Connection threads are detached, so saving the
+    // jar right here would race them: a connection still writing a Set-Cookie
+    // loses it, and the process then exits and kills the thread mid-flight.
+    // Before the per-connection move, the single processor saved on its own way
+    // out, ordered against all connection work on one LocalSet -- draining here
+    // is what restores that ordering. `notify_waiters` above has already woken
+    // every processor, so this is bounded in practice; the deadline only covers
+    // a connection wedged in V8, where its own command watchdog is the backstop.
+    let drain_deadline =
+        tokio::time::Instant::now() + tokio::time::Duration::from_millis(SHUTDOWN_DRAIN_MS);
+    loop {
+        let live = live_connections.load(Ordering::Acquire);
+        if live == 0 {
+            break;
+        }
+        if tokio::time::Instant::now() >= drain_deadline {
+            warn!(
+                "shutting down with {} connection(s) still live after {}ms; \
+                 cookies they write from here are lost",
+                live, SHUTDOWN_DRAIN_MS
+            );
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+    }
     shared_ctx.save_cookies();
     Ok(())
 }
