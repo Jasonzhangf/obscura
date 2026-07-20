@@ -241,6 +241,8 @@ pub async fn start_with_full_serve_options(
     // dropping one runtime here does the one-time setup single-threaded.
     drop(obscura_js::runtime::ObscuraJsRuntime::new());
 
+    cap_malloc_arenas();
+
     // Accept loop: hand each WebSocket connection to its own OS thread so its
     // pages' isolates live on a dedicated thread.
     loop {
@@ -270,6 +272,49 @@ pub async fn start_with_full_serve_options(
     // Server is shutting down: persist the shared cookie jar once.
     shared_ctx.save_cookies();
     Ok(())
+}
+
+/// Cap the number of per-thread malloc arenas glibc will create.
+///
+/// glibc hands each new thread its own 64 MiB arena (up to 8x cores). With one
+/// thread per connection that is the dominant per-connection memory term:
+/// measured with `reliability/conn-scale.py`, 100 connections each running JS
+/// reserve 90.0 GiB of address space uncapped and 83.5 GiB capped, and 100 idle
+/// connections go from 65 MiB of reserved address space per connection to
+/// 2.0 MiB.
+///
+/// For scale: at the same 100-connection JS workload `main` (one shared
+/// isolate) reserves 83.6 GiB, so with the cap this server is level with it on
+/// address space. Most of that total is V8's process-wide sandbox, which `main`
+/// pays too as soon as it runs any JS at all.
+///
+/// The resident-set effect matters more than the reservation: freed chunks stay
+/// in their arena rather than returning to the OS, so RSS tracks the *peak*
+/// number of concurrent connections and never comes back down, which reads as a
+/// leak. Measured in the container image against Google Maps, four concurrent
+/// connections per round: 350 / 619 / 826 MiB over three rounds uncapped and
+/// still climbing linearly, versus 166 / 235 / 269 MiB capped, on a
+/// decelerating curve.
+///
+/// Two arenas cost no measurable throughput here (8 concurrent connections x 12
+/// navigations: 1.53s uncapped, 1.50s capped): V8 allocates the JS heap through
+/// its own allocator, and the Rust side is dominated by network I/O rather than
+/// malloc traffic. Only `serve` calls this, and it owns the process. Respects a
+/// caller-set `MALLOC_ARENA_MAX`.
+fn cap_malloc_arenas() {
+    #[cfg(target_env = "gnu")]
+    {
+        if std::env::var_os("MALLOC_ARENA_MAX").is_some() {
+            return;
+        }
+        // M_ARENA_MAX is not exported by the libc crate.
+        const M_ARENA_MAX: libc::c_int = -8;
+        // SAFETY: mallopt is thread-safe; called once here before any
+        // connection thread exists.
+        if unsafe { libc::mallopt(M_ARENA_MAX, 2) } != 1 {
+            warn!("mallopt(M_ARENA_MAX) failed; memory will scale with peak concurrency");
+        }
+    }
 }
 
 /// Run one WebSocket connection on its own OS thread: a `current_thread` tokio
