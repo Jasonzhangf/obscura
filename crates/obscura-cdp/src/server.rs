@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
@@ -27,6 +27,25 @@ const MAX_DEFERRED_MESSAGES: usize = 256;
 // backlog still absorbs short-term spikes, but a long-term stall now
 // fails loudly at accept time rather than silently piling up FDs.
 const MAX_PENDING_WS_HANDOFFS: usize = 128;
+
+// Cap on *live* CDP connections, each of which costs one OS thread and its own
+// V8 isolates. `MAX_PENDING_WS_HANDOFFS` above bounds only the handoff queue —
+// connections that have already been handed off are unbounded without this.
+//
+// 128 matches the handoff bound and is well above any real client fan-out
+// (Playwright/Puppeteer use one connection per browser). Threads are what this
+// actually bounds: with arenas capped by `cap_malloc_arenas`, 128 idle
+// connections cost 146 threads, 33.2 GiB of reserved address space and 51 MiB
+// resident -- and nearly all of that 33.2 GiB is V8's process-wide sandbox,
+// which is there at zero connections. Override with `--max-connections`.
+pub const DEFAULT_MAX_CONNECTIONS: usize = 128;
+
+// Sent to a client that arrives while the server is at `max_connections`, in
+// place of dropping the socket unexplained. The client sees a refusal it can
+// retry rather than a bare connection reset.
+const CONNECTION_LIMIT_RESPONSE: &str = "HTTP/1.1 503 Service Unavailable\r\n\
+    Content-Length: 0\r\nConnection: close\r\n\
+    X-Obscura-Reason: max-connections\r\n\r\n";
 use crate::types::CdpRequest;
 
 struct CdpMessage {
@@ -116,6 +135,35 @@ pub async fn start_with_full_serve_options(
     allow_file_access: bool,
     storage_dir: Option<std::path::PathBuf>,
     allow_private_network: bool,
+) -> anyhow::Result<()> {
+    start_with_serve_options_and_limit(
+        port,
+        host,
+        proxy,
+        stealth,
+        user_agent,
+        allow_file_access,
+        storage_dir,
+        allow_private_network,
+        DEFAULT_MAX_CONNECTIONS,
+    )
+    .await
+}
+
+/// As `start_with_full_serve_options`, with an explicit cap on live CDP
+/// connections. Each connection owns an OS thread and its pages' V8 isolates,
+/// so this is what bounds the server's thread and memory footprint.
+#[allow(clippy::too_many_arguments)]
+pub async fn start_with_serve_options_and_limit(
+    port: u16,
+    host: &str,
+    proxy: Option<String>,
+    stealth: bool,
+    user_agent: Option<String>,
+    allow_file_access: bool,
+    storage_dir: Option<std::path::PathBuf>,
+    allow_private_network: bool,
+    max_connections: usize,
 ) -> anyhow::Result<()> {
     let ip: std::net::IpAddr = host
         .parse()
@@ -243,6 +291,11 @@ pub async fn start_with_full_serve_options(
 
     cap_malloc_arenas();
 
+    // Live CDP connections, incremented on accept and decremented when a
+    // connection thread exits (see `run_connection`).
+    let live_connections = Arc::new(AtomicUsize::new(0));
+    info!("Connection limit: {}", max_connections);
+
     // Accept loop: hand each WebSocket connection to its own OS thread so its
     // pages' isolates live on a dedicated thread.
     loop {
@@ -266,7 +319,28 @@ pub async fn start_with_full_serve_options(
             .set_nodelay(true)
             .map_err(|e| error!("set_nodelay on WS stream: {}", e))
             .ok();
-        run_connection(stream, shared_ctx.clone(), shutdown_notify.clone());
+        // Reserve a slot before spawning. `fetch_update` (rather than a load
+        // then a store) keeps the check atomic against the accept thread
+        // handing off the next stream concurrently.
+        let reserved = live_connections
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < max_connections).then_some(n + 1)
+            })
+            .is_ok();
+        if !reserved {
+            warn!(
+                "refusing CDP connection: at --max-connections ({})",
+                max_connections
+            );
+            refuse_connection(stream);
+            continue;
+        }
+        run_connection(
+            stream,
+            shared_ctx.clone(),
+            shutdown_notify.clone(),
+            live_connections.clone(),
+        );
     }
 
     // Server is shutting down: persist the shared cookie jar once.
@@ -327,10 +401,24 @@ fn run_connection(
     std_stream: std::net::TcpStream,
     default_context: Arc<obscura_browser::BrowserContext>,
     shutdown_notify: Arc<Notify>,
+    live_connections: Arc<AtomicUsize>,
 ) {
-    std::thread::Builder::new()
+    // Releases the slot reserved by the accept loop when the thread unwinds,
+    // however it exits — clean close, error return, or panic. A plain
+    // decrement at the end of the closure would leak slots on the early
+    // returns below until the cap wedged the server shut.
+    struct SlotGuard(Arc<AtomicUsize>);
+    impl Drop for SlotGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    let slot = live_connections.clone();
+    let spawned = std::thread::Builder::new()
         .name("obscura-cdp-conn".into())
         .spawn(move || {
+            let _slot = SlotGuard(slot);
             let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -363,8 +451,27 @@ fn run_connection(
                 // processor so the thread can exit.
                 processor.abort();
             });
-        })
-        .ok();
+        });
+
+    // The closure never ran, so its `SlotGuard` never existed: release the
+    // reserved slot here or the cap drifts down on every failed spawn.
+    if let Err(e) = spawned {
+        error!("connection thread spawn failed: {}", e);
+        live_connections.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Turn away a connection that arrived while the server was at its limit.
+///
+/// Best-effort: the socket is going away either way, so a failed write just
+/// means the client sees a reset instead of the 503.
+fn refuse_connection(stream: std::net::TcpStream) {
+    use std::io::Write;
+    let mut stream = stream;
+    let _ = stream.set_nonblocking(false);
+    let _ = stream.write_all(CONNECTION_LIMIT_RESPONSE.as_bytes());
+    let _ = stream.flush();
+    let _ = stream.shutdown(std::net::Shutdown::Both);
 }
 
 const HTTP_PEEK_BUF: usize = 4096;
