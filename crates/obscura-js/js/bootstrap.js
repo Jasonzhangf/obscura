@@ -663,6 +663,11 @@ class Node {
   get previousSibling() { return _wrap(+_dom("prev_sibling", this._nid)); }
   appendChild(c) {
     if (!c) return c;
+    if (c instanceof DocumentFragment) {
+      const children = Array.from(c.childNodes);
+      for (const child of children) this.appendChild(child);
+      return c;
+    }
     _dom("append_child", this._nid, c._nid);
     if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('childList', this._nid, [c._nid], []);
     if (c instanceof Element && c.tagName === 'SCRIPT') {
@@ -745,6 +750,12 @@ class Node {
   }
   replaceChild(newChild, oldChild) {
     if (!oldChild || !newChild) return oldChild;
+    if (newChild instanceof DocumentFragment) {
+      const children = Array.from(newChild.childNodes);
+      for (const child of children) this.insertBefore(child, oldChild);
+      this.removeChild(oldChild);
+      return oldChild;
+    }
     _dom("insert_before", newChild._nid, oldChild._nid);
     _dom("remove_child", oldChild._nid);
     return oldChild;
@@ -752,6 +763,11 @@ class Node {
   insertBefore(n, ref) {
     if (!n) return n;
     if (!ref) { this.appendChild(n); return n; }
+    if (n instanceof DocumentFragment) {
+      const children = Array.from(n.childNodes);
+      for (const child of children) this.insertBefore(child, ref);
+      return n;
+    }
     _dom("insert_before", n._nid, ref._nid);
     return n;
   }
