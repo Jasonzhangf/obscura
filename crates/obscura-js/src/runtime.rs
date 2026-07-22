@@ -1378,6 +1378,112 @@ mod tests {
     }
 
     #[test]
+    fn append_child_flattens_document_fragment() {
+        let mut rt = setup_runtime(r#"<main id="host"></main>"#);
+        rt.run_page_init();
+        let result = rt
+            .evaluate(
+                r#"
+                const host = document.getElementById('host');
+                const fragment = document.createDocumentFragment();
+                const first = document.createElement('article');
+                const second = document.createElement('article');
+                first.id = 'first';
+                second.id = 'second';
+                first.className = second.className = 'quote';
+                fragment.appendChild(first);
+                fragment.appendChild(second);
+
+                const returned = host.appendChild(fragment);
+                return [
+                    returned === fragment,
+                    Array.from(host.children).map(node => node.id),
+                    host.querySelectorAll('.quote').length,
+                    fragment.childNodes.length,
+                    first.parentNode === host,
+                    first.parentElement === host,
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([true, ["first", "second"], 2, 0, true, true])
+        );
+    }
+
+    #[test]
+    fn insert_before_flattens_document_fragment_in_order() {
+        let mut rt = setup_runtime(r#"<main id="host"><article id="last"></article></main>"#);
+        rt.run_page_init();
+        let result = rt
+            .evaluate(
+                r#"
+                const host = document.getElementById('host');
+                const last = document.getElementById('last');
+                const fragment = document.createDocumentFragment();
+                const first = document.createElement('article');
+                const second = document.createElement('article');
+                first.id = 'first';
+                second.id = 'second';
+                fragment.appendChild(first);
+                fragment.appendChild(second);
+
+                const returned = host.insertBefore(fragment, last);
+                return [
+                    returned === fragment,
+                    Array.from(host.children).map(node => node.id),
+                    fragment.childNodes.length,
+                    first.parentElement === host,
+                    second.parentElement === host,
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([true, ["first", "second", "last"], 0, true, true])
+        );
+    }
+
+    #[test]
+    fn replace_child_flattens_document_fragment_and_removes_old_child() {
+        let mut rt = setup_runtime(
+            r#"<main id="host"><article id="old"></article><article id="tail"></article></main>"#,
+        );
+        rt.run_page_init();
+        let result = rt
+            .evaluate(
+                r#"
+                const host = document.getElementById('host');
+                const old = document.getElementById('old');
+                const fragment = document.createDocumentFragment();
+                const first = document.createElement('article');
+                const second = document.createElement('article');
+                first.id = 'first';
+                second.id = 'second';
+                fragment.appendChild(first);
+                fragment.appendChild(second);
+
+                const returned = host.replaceChild(fragment, old);
+                return [
+                    returned === old,
+                    Array.from(host.children).map(node => node.id),
+                    fragment.childNodes.length,
+                    old.parentNode === null,
+                    first.parentElement === host,
+                    second.parentElement === host,
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([true, ["first", "second", "tail"], 0, true, true, true])
+        );
+    }
+
+    #[test]
     fn test_inner_html() {
         let mut rt = setup_runtime(r#"<div id="x"><p>Hello</p></div>"#);
         let html = rt.evaluate("document.getElementById('x').innerHTML").unwrap();
