@@ -59,18 +59,25 @@ pub async fn handle(method: &str, params: &Value, ctx: &mut CdpContext) -> Resul
         }
         "createTarget" => {
             let url = params.get("url").and_then(|v| v.as_str()).unwrap_or("about:blank");
+            let context_id = params.get("browserContextId").and_then(|v| v.as_str());
+            let context = match context_id {
+                Some(id) => ctx
+                    .browser_context(id)
+                    .ok_or_else(|| format!("Browser context not found: {}", id))?,
+                None => &ctx.default_context,
+            };
 
             // Same gate as Page.navigate (GHSA-q55h-vfv9-qcr5). Without this,
             // a CDP client can call Target.createTarget {url:"file:///etc/passwd"}
             // and then Runtime.evaluate the body off the created target,
             // bypassing the page-domain check entirely.
-            if url_is_file_scheme(url) && !ctx.default_context.allow_file_access {
+            if url_is_file_scheme(url) && !context.allow_file_access {
                 return Err(
                     "Target.createTarget to file:// is disabled. Restart with `obscura serve --allow-file-access` to enable.".to_string()
                 );
             }
 
-            let page_id = ctx.create_page();
+            let page_id = ctx.create_page_in_context(context_id)?;
             let session_id = format!("{}-session", page_id);
 
             if let Some(page) = ctx.get_page_mut(&page_id) {
@@ -200,14 +207,41 @@ pub async fn handle(method: &str, params: &Value, ctx: &mut CdpContext) -> Resul
         "detachFromTarget" => Ok(json!({})),
         "activateTarget" => Ok(json!({})),
         "getBrowserContexts" => {
-            Ok(json!({ "browserContextIds": [ctx.default_context.id] }))
+            let mut ids: Vec<&String> = ctx.browser_contexts.keys().collect();
+            ids.sort();
+            Ok(json!({ "browserContextIds": ids }))
         }
         "createBrowserContext" => {
-            ctx.default_context.cookie_jar.clear();
-            Ok(json!({ "browserContextId": ctx.default_context.id }))
+            let id = ctx.create_browser_context();
+            Ok(json!({ "browserContextId": id }))
         }
         "disposeBrowserContext" => {
-            ctx.default_context.cookie_jar.clear();
+            let context_id = params
+                .get("browserContextId")
+                .and_then(|v| v.as_str())
+                .ok_or("browserContextId required")?;
+            let sessions: Vec<(String, String)> = ctx
+                .sessions
+                .iter()
+                .filter_map(|(session_id, page_id)| {
+                    ctx.get_page(page_id)
+                        .filter(|page| page.context.id == context_id)
+                        .map(|_| (session_id.clone(), page_id.clone()))
+                })
+                .collect();
+            let page_ids = ctx.dispose_browser_context(context_id)?;
+            for (session_id, page_id) in sessions {
+                ctx.pending_events.push(CdpEvent::new(
+                    "Target.detachedFromTarget",
+                    json!({ "sessionId": session_id, "targetId": page_id }),
+                ));
+            }
+            for page_id in page_ids {
+                ctx.pending_events.push(CdpEvent::new(
+                    "Target.targetDestroyed",
+                    json!({ "targetId": page_id }),
+                ));
+            }
             Ok(json!({}))
         }
         "getTargetInfo" => {
@@ -251,6 +285,48 @@ pub async fn handle(method: &str, params: &Value, ctx: &mut CdpContext) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn browser_contexts_are_real_and_do_not_clear_default_cookies() {
+        let mut ctx = CdpContext::new();
+        ctx.default_context.cookie_jar.set_cookie(
+            "sid=default",
+            &url::Url::parse("https://example.com").unwrap(),
+        );
+
+        let created = handle("createBrowserContext", &json!({}), &mut ctx)
+            .await
+            .expect("context creation should succeed");
+        let context_id = created["browserContextId"].as_str().unwrap();
+        assert_ne!(context_id, "default");
+        assert!(ctx.browser_context(context_id).unwrap().cookie_jar.get_all_cookies().is_empty());
+        assert_eq!(ctx.default_context.cookie_jar.get_all_cookies().len(), 1);
+
+        let listed = handle("getBrowserContexts", &json!({}), &mut ctx)
+            .await
+            .expect("context listing should succeed");
+        assert_eq!(listed["browserContextIds"], json!([context_id]));
+    }
+
+    #[tokio::test]
+    async fn disposing_context_removes_only_its_pages() {
+        let mut ctx = CdpContext::new();
+        let context_id = ctx.create_browser_context();
+        let isolated_page = ctx.create_page_in_context(Some(&context_id)).unwrap();
+        let default_page = ctx.create_page();
+
+        handle(
+            "disposeBrowserContext",
+            &json!({"browserContextId": context_id}),
+            &mut ctx,
+        )
+        .await
+        .expect("context disposal should succeed");
+
+        assert!(ctx.get_page(&isolated_page).is_none());
+        assert!(ctx.get_page(&default_page).is_some());
+        assert!(ctx.browser_contexts.is_empty());
+    }
 
     #[tokio::test]
     async fn attach_to_browser_target_returns_session_id() {
