@@ -1410,6 +1410,106 @@ mod tests {
         assert_eq!(result, serde_json::json!([["A"], ["P", "A"]]));
     }
 
+    /// Issue #462: previousNode() must walk reverse document order until a node
+    /// is accepted, not give up as soon as the first candidate is filtered out.
+    #[test]
+    fn previous_node_walks_reverse_document_order() {
+        let mut rt = setup_runtime(r#"<div id="root"><a><b></b></a><c></c></div>"#);
+        rt.run_page_init();
+        let result = rt
+            .evaluate(
+                r#"
+                const root = document.getElementById('root');
+                const w = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, {
+                    acceptNode(node) {
+                        return node.tagName === 'B'
+                            ? NodeFilter.FILTER_SKIP
+                            : NodeFilter.FILTER_ACCEPT;
+                    }
+                });
+                const forward = [];
+                let node;
+                while ((node = w.nextNode())) forward.push(node.tagName);
+                const backward = [];
+                while ((node = w.previousNode())) backward.push(node.tagName);
+                return [forward, backward];
+                "#,
+            )
+            .unwrap();
+        // From <c>, the previous sibling's deepest last child <b> is skipped, so
+        // the walk must keep going up to <a> instead of returning null.
+        assert_eq!(result, serde_json::json!([["A", "C"], ["A"]]));
+    }
+
+    /// Issue #462: a backward walk must retrace a forward walk exactly, and stop
+    /// at the root without ever returning it.
+    #[test]
+    fn previous_node_retraces_a_full_forward_walk() {
+        let mut rt = setup_runtime(
+            r#"<div id="root"><section><p>one</p><span></span></section><a><b></b></a></div>"#,
+        );
+        rt.run_page_init();
+        let result = rt
+            .evaluate(
+                r#"
+                const root = document.getElementById('root');
+                const w = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+                const forward = [];
+                let node;
+                while ((node = w.nextNode())) forward.push(node.tagName);
+                const backward = [];
+                while ((node = w.previousNode())) backward.push(node.tagName);
+                backward.reverse();
+                // previousNode never yields root, and never yields the node the
+                // forward walk ended on, so compare against forward minus its last.
+                // A failed traversal leaves currentNode untouched (DOM 6.1), so
+                // it stays on the last node previousNode did return.
+                return [forward, backward, w.currentNode.tagName];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                ["SECTION", "P", "SPAN", "A", "B"],
+                ["SECTION", "P", "SPAN", "A"],
+                "SECTION"
+            ])
+        );
+    }
+
+    /// Issue #462: FILTER_REJECT prunes a subtree in the backward direction too
+    /// — the descent into a rejected node's last children must stop.
+    #[test]
+    fn previous_node_honours_filter_reject_subtree_pruning() {
+        let mut rt = setup_runtime(
+            r#"<div id="root"><a></a><section><p>deep</p></section><c></c></div>"#,
+        );
+        rt.run_page_init();
+        let result = rt
+            .evaluate(
+                r#"
+                const root = document.getElementById('root');
+                const w = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, {
+                    acceptNode(node) {
+                        return node.tagName === 'SECTION'
+                            ? NodeFilter.FILTER_REJECT
+                            : NodeFilter.FILTER_ACCEPT;
+                    }
+                });
+                while (w.nextNode()) { /* advance to the last accepted node */ }
+                const backward = [];
+                let node;
+                while ((node = w.previousNode())) backward.push(node.tagName);
+                return backward;
+                "#,
+            )
+            .unwrap();
+        // <p> lives inside the rejected <section>, so the backward walk from <c>
+        // must jump straight to <a>.
+        assert_eq!(result, serde_json::json!(["A"]));
+    }
+
     /// Issue #461: NodeIterator has no subtree pruning — DOM 6.2 says
     /// FILTER_REJECT behaves as FILTER_SKIP there. The shared walker must not
     /// leak TreeWalker's pruning into it.

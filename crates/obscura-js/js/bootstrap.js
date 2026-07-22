@@ -2646,18 +2646,38 @@ class Document extends Node {
         }
         return null;
       },
+      // DOM 6.1 "previousNode", implemented as specified (issue #462). The old
+      // version looked at exactly one candidate — the previous sibling's
+      // deepest last child — and returned null the moment it was filtered out,
+      // so a backward walk died mid-tree the way nextNode used to before #432.
+      //
+      // Unlike nextNode this stays in JS rather than using a DOM traversal op:
+      // the descent into last children has to stop on FILTER_REJECT, so the
+      // filter is consulted at every step anyway and there is no run of
+      // crossings for a native helper to collapse.
       previousNode() {
         let node = this.currentNode;
-        if (node === this.root) return null;
-        let sibling = node.previousSibling;
-        if (sibling) {
-          while (sibling.lastChild) sibling = sibling.lastChild;
-          if (this._accept(sibling)) { this.currentNode = sibling; return sibling; }
-        }
-        let parent = node.parentNode;
-        if (parent && parent !== this.root && this._accept(parent)) {
-          this.currentNode = parent;
-          return parent;
+        while (node !== this.root) {
+          let sibling = node.previousSibling;
+          while (sibling) {
+            node = sibling;
+            let verdict = this._filter(node);
+            // Descend to the deepest last descendant, but never into a rejected
+            // subtree — that is what makes REJECT prune backwards as well.
+            while (verdict !== 2 && node.lastChild) {
+              node = node.lastChild;
+              verdict = this._filter(node);
+            }
+            if (verdict === 1) { this.currentNode = node; return node; }
+            sibling = node.previousSibling;
+          }
+          const parent = node.parentNode;
+          // Reaching root (or a detached node) ends the walk: root is never
+          // returned by a backward traversal.
+          if (!parent || node === this.root) return null;
+          node = parent;
+          if (node === this.root) return null;
+          if (this._filter(node) === 1) { this.currentNode = node; return node; }
         }
         return null;
       },
