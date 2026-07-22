@@ -14,6 +14,18 @@ use crate::ops::{build_extension, ObscuraState, StoredNetworkResponseBody};
 
 static SNAPSHOT: &[u8] = include_bytes!(env!("OBSCURA_SNAPSHOT_PATH"));
 
+/// Serializes V8 isolate construction across OS threads. The thread-per-
+/// connection server (issue #430) builds isolates on many threads. The main
+/// thread already warms up V8 once before any connection thread starts (see the
+/// `ObscuraJsRuntime::new` warmup in `obscura-cdp` server startup), which is
+/// what actually prevents the `InitializeBuiltinJSDispatchTable` segfault of a
+/// first isolate built off the main thread. This lock is defense-in-depth: it
+/// keeps two connections from running V8's isolate setup concurrently in case
+/// any residual first-time process init races. Construction is rare and fast, so
+/// serializing it costs nothing measurable; isolate *execution* stays fully
+/// parallel, each isolate on its own thread with no shared lock.
+static ISOLATE_CREATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[derive(Debug, Clone)]
 pub struct RemoteObjectInfo {
     pub js_type: String,
@@ -46,7 +58,7 @@ pub struct WatchdogToken {
 
 /// Arm a V8 termination watchdog directly from an isolate handle, with no
 /// runtime borrow. The CDP dispatcher uses this to bound every command so a
-/// hung page cannot hold the process-wide V8 lock forever. Pair with
+/// hung page cannot hold this connection's V8 lock forever. Pair with
 /// [`WatchdogToken::stop`]; if `stop` returns true, clear the termination flag
 /// via [`ObscuraJsRuntime::cancel_termination`] before reusing the isolate.
 pub fn spawn_watchdog(handle: IsolateHandle, budget: std::time::Duration) -> WatchdogToken {
@@ -118,23 +130,32 @@ impl ObscuraJsRuntime {
 
         let module_loader = Rc::new(ObscuraModuleLoader::with_proxy(base_url, proxy_url));
 
-        let mut runtime = JsRuntime::new(RuntimeOptions {
-            extensions: vec![build_extension()],
-            module_loader: Some(module_loader),
-            startup_snapshot: Some(SNAPSHOT),
-            ..Default::default()
-        });
+        // Build the isolate under the process-wide creation lock so two
+        // connection threads never construct isolates concurrently (#430).
+        let (runtime, isolate_handle) = {
+            let _create_guard = ISOLATE_CREATE_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        runtime.op_state().borrow_mut().put(state_clone);
+            let mut runtime = JsRuntime::new(RuntimeOptions {
+                extensions: vec![build_extension()],
+                module_loader: Some(module_loader),
+                startup_snapshot: Some(SNAPSHOT),
+                ..Default::default()
+            });
 
-        runtime
-            .execute_script(
-                "<obscura:init>",
-                "globalThis.__obscura_objects = {}; globalThis.__obscura_oid = 0;".to_string(),
-            )
-            .expect("init should not fail");
+            runtime.op_state().borrow_mut().put(state_clone);
 
-        let isolate_handle = runtime.v8_isolate().thread_safe_handle();
+            runtime
+                .execute_script(
+                    "<obscura:init>",
+                    "globalThis.__obscura_objects = {}; globalThis.__obscura_oid = 0;".to_string(),
+                )
+                .expect("init should not fail");
+
+            let isolate_handle = runtime.v8_isolate().thread_safe_handle();
+            (runtime, isolate_handle)
+        };
 
         ObscuraJsRuntime {
             runtime,
@@ -672,13 +693,30 @@ impl ObscuraJsRuntime {
             }
         };
 
+        // Return as soon as the module finishes evaluating rather than waiting
+        // for the loop to go fully idle: a page timer (setInterval) keeps the
+        // loop busy forever and would otherwise burn the whole budget (#374).
+        self.drive_module_eval(module_id, budget_ms, &format!("Module {}", url))
+            .await;
+        Ok(())
+    }
+
+    /// Drive a just-started module evaluation to completion, or up to
+    /// `budget_ms`. Returns as soon as the module finishes rather than waiting
+    /// for the event loop to go idle: a page timer (setInterval) keeps the loop
+    /// busy forever and would otherwise burn the whole budget, abandoning a
+    /// module that had already evaluated (issue #374).
+    ///
+    /// A module eval error or a timeout is logged under `what` and swallowed:
+    /// neither is fatal to rendering the rest of the page. An event-loop error
+    /// is propagated out of the select and handled the same way -- it must not
+    /// be discarded, or a module stalled on a top-level await spins here for the
+    /// whole budget with nothing logged.
+    async fn drive_module_eval(&mut self, module_id: deno_core::ModuleId, budget_ms: u64, what: &str) {
+        let budget = tokio::time::Duration::from_millis(budget_ms);
         let result = self.runtime.mod_evaluate(module_id);
         tokio::pin!(result);
 
-        // Return as soon as the module finishes evaluating instead of waiting
-        // for the event loop to go fully idle: a page timer (setInterval) keeps
-        // the loop busy forever and would otherwise burn the whole budget, so a
-        // module that had already evaluated got abandoned (issue #374).
         let outcome = tokio::time::timeout(budget, async {
             let event_loop = self
                 .runtime
@@ -693,15 +731,9 @@ impl ObscuraJsRuntime {
         .await;
 
         match outcome {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => {
-                tracing::warn!("Module eval error: {}", e);
-                Ok(())
-            }
-            Err(_) => {
-                tracing::warn!("Module evaluation timed out after {}ms: {}", budget_ms, url);
-                Ok(())
-            }
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!("{} eval error: {}", what, e),
+            Err(_) => tracing::warn!("{} evaluation timed out after {}ms", what, budget_ms),
         }
     }
 
@@ -729,39 +761,13 @@ impl ObscuraJsRuntime {
             }
         };
 
-        let result = self.runtime.mod_evaluate(module_id);
-        tokio::pin!(result);
-
-        // Drive the event loop, but return as soon as the module finishes
-        // evaluating rather than waiting for the loop to go fully idle. A page
-        // timer (Vite's HMR / React-Refresh client installs a setInterval) keeps
-        // the loop busy forever; waiting for idle burned the whole budget on this
-        // preamble module and starved the later module that mounts the app,
-        // leaving #root empty (issue #374).
-        let outcome = tokio::time::timeout(budget, async {
-            let event_loop = self
-                .runtime
-                .run_event_loop(deno_core::PollEventLoopOptions::default());
-            tokio::pin!(event_loop);
-            tokio::select! {
-                biased;
-                r = &mut result => r,
-                e = &mut event_loop => { e?; (&mut result).await }
-            }
-        })
-        .await;
-
-        match outcome {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => {
-                tracing::warn!("Inline module eval error: {}", e);
-                Ok(())
-            }
-            Err(_) => {
-                tracing::warn!("Inline module timed out after {}ms", budget_ms);
-                Ok(())
-            }
-        }
+        // Return as soon as the module finishes evaluating rather than waiting
+        // for idle: Vite's HMR / React-Refresh client installs a setInterval that
+        // keeps the loop busy forever, and waiting for idle burned the whole
+        // budget on this preamble module and starved the module that mounts the
+        // app, leaving #root empty (issue #374).
+        self.drive_module_eval(module_id, budget_ms, "Inline module").await;
+        Ok(())
     }
 
     pub fn execute_script(&mut self, _name: &str, source: &str) -> Result<(), String> {

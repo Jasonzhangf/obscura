@@ -78,6 +78,13 @@ enum Command {
         #[arg(long, default_value_t = 1)]
         workers: u16,
 
+        /// Maximum live CDP connections. Each connection runs on its own OS
+        /// thread with its own V8 isolates, so this bounds the server's thread
+        /// and memory footprint. Connections beyond the limit are refused with
+        /// a 503 rather than queued.
+        #[arg(long, default_value_t = obscura_cdp::DEFAULT_MAX_CONNECTIONS)]
+        max_connections: usize,
+
         /// Allow CDP clients to navigate to file:// URLs. Off by
         /// default so a CDP connection cannot read arbitrary local
         /// files. Enable only when serving local HTML for testing
@@ -328,7 +335,7 @@ async fn main() -> anyhow::Result<()> {
     let stealth = args.stealth;
 
     match args.command {
-        Some(Command::Serve { port, host, proxy, user_agent, workers, allow_file_access, storage_dir, quiet: _ }) => {
+        Some(Command::Serve { port, host, proxy, user_agent, workers, max_connections, allow_file_access, storage_dir, quiet: _ }) => {
             // Fall back to OBSCURA_PROXY so a proxy can be supplied without
             // putting credentials on the command line. The multi-worker load
             // balancer passes the proxy to each worker this way (issue #366).
@@ -357,9 +364,9 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!("{} worker processes", workers);
                 run_multi_worker_serve(port, host, workers, proxy, stealth, user_agent).await?;
             } else {
-                obscura_cdp::start_with_full_serve_options(
+                obscura_cdp::start_with_serve_options_and_limit(
                     port, &host, proxy, stealth, user_agent, allow_file_access, storage_dir,
-                    args.allow_private_network,
+                    args.allow_private_network, max_connections,
                 ).await?;
             }
         }
