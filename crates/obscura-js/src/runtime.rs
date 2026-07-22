@@ -2689,14 +2689,35 @@ mod tests {
         let result = rt
             .evaluate(
                 r#"
+                const connection = navigator.connection;
+                let calls = 0;
+                let receiverMatches = false;
+                function listener(event) {
+                    calls += 1;
+                    receiverMatches = this === connection && event.type === 'change';
+                }
+                connection.addEventListener('change', listener);
+                const dispatchResult = connection.dispatchEvent(new Event('change'));
+                connection.removeEventListener('change', listener);
+                connection.dispatchEvent(new Event('change'));
                 return [
-                    typeof navigator.connection.addEventListener,
+                    typeof connection.addEventListener,
+                    typeof connection.removeEventListener,
+                    typeof connection.dispatchEvent,
                     typeof navigator.serviceWorker.addEventListener,
+                    dispatchResult,
+                    calls,
+                    receiverMatches,
                 ];
                 "#,
             )
             .unwrap();
-        assert_eq!(result, serde_json::json!(["function", "function"]));
+        assert_eq!(
+            result,
+            serde_json::json!([
+                "function", "function", "function", "function", true, 1, true
+            ])
+        );
     }
 
     /// Regression test for #285: DDoS-Guard's challenge calls

@@ -3108,6 +3108,7 @@ _markNative(MimeTypeArray.prototype.item);
 _markNative(MimeTypeArray.prototype.namedItem);
 
 class NetworkInformation {
+  constructor() { _makeListenerBox(this); }
   get downlink() { return 10; }
   get downlinkMax() { return Infinity; }
   get effectiveType() { return '4g'; }
