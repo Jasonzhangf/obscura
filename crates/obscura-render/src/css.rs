@@ -15,7 +15,8 @@ use crate::LayoutStyle;
 
 struct Rule {
     sel: CompiledSelector,
-    decls: String,
+    normal_decls: String,
+    important_decls: String,
     /// Source order, for breaking specificity ties (later wins).
     order: usize,
 }
@@ -70,6 +71,7 @@ impl Stylesheet {
                     continue;
                 }
                 let Some(sel) = tree.compile_rule_selector(&selector) else { continue };
+                let (normal_decls, important_decls) = crate::style::partition_declarations(&decls);
                 let idx = sheet.rules.len();
                 match sel.key() {
                     SelectorKey::Id(v) => sheet.by_id.entry(v.clone()).or_default().push(idx),
@@ -77,7 +79,7 @@ impl Stylesheet {
                     SelectorKey::Local(v) => sheet.by_local.entry(v.clone()).or_default().push(idx),
                     SelectorKey::Universal => sheet.universal.push(idx),
                 }
-                sheet.rules.push(Rule { sel, decls, order });
+                sheet.rules.push(Rule { sel, normal_decls, important_decls, order });
                 order += 1;
             }
         }
@@ -132,6 +134,7 @@ impl Stylesheet {
         local: &str,
         style: &mut LayoutStyle,
         parent_props: &HashMap<String, String>,
+        inline_css: Option<&str>,
     ) -> Option<HashMap<String, String>> {
         // (specificity, order, rule index) for each matching rule.
         let mut matched: Vec<(u32, usize, usize)> = Vec::new();
@@ -157,17 +160,18 @@ impl Stylesheet {
             consider(Some(&self.universal), &mut matched);
         }
 
-        if matched.is_empty() {
-            return None;
-        }
         matched.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+
+        let (inline_normal, inline_important) = inline_css
+            .map(crate::style::partition_declarations)
+            .unwrap_or_default();
 
         // Pass 1: collect this element's own custom properties (`--x: value`),
         // in cascade order (last wins), layered over the inherited map. Custom
         // properties cascade fully before any `var()` is substituted.
         let mut own: Vec<(String, String)> = Vec::new();
-        for &(_, _, i) in &matched {
-            for decl in crate::style::split_declarations(&self.rules[i].decls) {
+        let mut collect_custom = |css: &str| {
+            for decl in crate::style::split_declarations(css) {
                 if let Some((name, val)) = decl.split_once(':') {
                     let name = name.trim();
                     if name.starts_with("--") && name.len() > 2 {
@@ -175,7 +179,15 @@ impl Stylesheet {
                     }
                 }
             }
+        };
+        for &(_, _, i) in &matched {
+            collect_custom(&self.rules[i].normal_decls);
         }
+        collect_custom(&inline_normal);
+        for &(_, _, i) in &matched {
+            collect_custom(&self.rules[i].important_decls);
+        }
+        collect_custom(&inline_important);
         let effective = if own.is_empty() {
             None
         } else {
@@ -189,10 +201,18 @@ impl Stylesheet {
 
         // Pass 2: apply normal declarations with `var()` substituted against
         // the resolved custom-property map.
-        for (_, _, i) in matched {
-            let expanded = substitute_vars(&self.rules[i].decls, props, 0);
-            crate::style::apply_inline(style, &expanded);
+        for &(_, _, i) in &matched {
+            let expanded = substitute_vars(&self.rules[i].normal_decls, props, 0);
+            crate::style::apply_declarations(style, &expanded);
         }
+        let expanded = substitute_vars(&inline_normal, props, 0);
+        crate::style::apply_declarations(style, &expanded);
+        for &(_, _, i) in &matched {
+            let expanded = substitute_vars(&self.rules[i].important_decls, props, 0);
+            crate::style::apply_declarations(style, &expanded);
+        }
+        let expanded = substitute_vars(&inline_important, props, 0);
+        crate::style::apply_declarations(style, &expanded);
         effective
     }
 }

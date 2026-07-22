@@ -154,6 +154,48 @@ pub(crate) fn resolve_translate(d: crate::Dimension, basis: f32) -> f32 {
     }
 }
 
+/// Apply HTML presentational attributes at their cascade origin: above the UA
+/// defaults, but below every author stylesheet and style attribute.
+fn apply_presentational_hints(node: &obscura_dom::tree::Node, style: &mut crate::LayoutStyle) {
+    if let Some(color) = node.get_attribute("color") {
+        crate::style::apply_inline(style, &format!("color: {}", color));
+    }
+    if let Some(bgcolor) = node.get_attribute("bgcolor") {
+        crate::style::apply_inline(style, &format!("background-color: {}", bgcolor));
+    }
+    if let Some(width) = node.get_attribute("width") {
+        if width.chars().all(|c| c.is_ascii_digit()) {
+            crate::style::apply_inline(style, &format!("width: {}px", width));
+        } else {
+            crate::style::apply_inline(style, &format!("width: {}", width));
+        }
+    }
+    if let Some(align) = node.get_attribute("align") {
+        crate::style::apply_inline(style, &format!("text-align: {}", align));
+    }
+    if let Some(cellspacing) = node.get_attribute("cellspacing") {
+        if cellspacing.chars().all(|c| c.is_ascii_digit()) {
+            crate::style::apply_inline(style, &format!("border-spacing: {}px", cellspacing));
+        }
+    }
+    if let Some(height) = node.get_attribute("height") {
+        if height.chars().all(|c| c.is_ascii_digit()) {
+            crate::style::apply_inline(style, &format!("height: {}px", height));
+        } else {
+            crate::style::apply_inline(style, &format!("height: {}", height));
+        }
+    }
+    if style.aspect_ratio.is_none() {
+        let aw = node.get_attribute("width").and_then(|w| w.parse::<f32>().ok());
+        let ah = node.get_attribute("height").and_then(|h| h.parse::<f32>().ok());
+        if let (Some(w), Some(h)) = (aw, ah) {
+            if w > 0.0 && h > 0.0 {
+                style.aspect_ratio = Some(w / h);
+            }
+        }
+    }
+}
+
 /// Compute the UA + author style for every element in preorder, maintaining
 /// `matcher`'s ancestor filter as we descend so descendant-combinator rules
 /// fast-reject correctly. Non-element nodes (text, comments) are skipped but
@@ -165,7 +207,6 @@ fn cascade_walk(
     matcher: &mut obscura_dom::selector::Matcher,
     styles: &mut HashMap<NodeId, crate::LayoutStyle>,
     parent_props: &std::rc::Rc<HashMap<String, String>>,
-    node_props: &mut HashMap<NodeId, std::rc::Rc<HashMap<String, String>>>,
 ) {
     let Some(node) = tree.get_node(id) else { return };
     let is_element = node.is_element();
@@ -186,28 +227,36 @@ fn cascade_walk(
                 style.display = crate::Display::None;
             }
         }
-        if !sheet.is_empty() {
-            let node_id = node.get_attribute("id");
-            let classes: Vec<String> = node
-                .get_attribute("class")
-                .map(|c| c.split_whitespace().map(|s| s.to_string()).collect())
-                .unwrap_or_default();
-            if let Some(m) = sheet.apply(tree, matcher, id, node_id, &classes, elem.local.as_ref(), &mut style, parent_props) {
-                this_props = std::rc::Rc::new(m);
-            }
+        apply_presentational_hints(&node, &mut style);
+        let node_id = node.get_attribute("id");
+        let classes: Vec<String> = node
+            .get_attribute("class")
+            .map(|c| c.split_whitespace().map(|s| s.to_string()).collect())
+            .unwrap_or_default();
+        if let Some(m) = sheet.apply(
+            tree,
+            matcher,
+            id,
+            node_id,
+            &classes,
+            elem.local.as_ref(),
+            &mut style,
+            parent_props,
+            node.get_attribute("style"),
+        ) {
+            this_props = std::rc::Rc::new(m);
         }
         let (before, after) = sheet.pseudo_content(tree, matcher, id);
         style.before_content = before;
         style.after_content = after;
         styles.insert(id, style);
-        node_props.insert(id, this_props.clone());
     }
 
     if is_element {
         matcher.push_ancestor(tree, id);
     }
     for cid in tree.children(id) {
-        cascade_walk(tree, cid, sheet, matcher, styles, &this_props, node_props);
+        cascade_walk(tree, cid, sheet, matcher, styles, &this_props);
     }
     if is_element {
         matcher.pop_ancestor();
@@ -250,106 +299,17 @@ pub fn layout_dom_with_images(
     let t1 = std::time::Instant::now();
     let mut matcher = tree.matcher();
     let mut styles: HashMap<NodeId, crate::LayoutStyle> = HashMap::new();
-    // Custom-property (`--x`) map per element, inherited down the tree and
-    // shared via Rc so only elements that declare their own tokens allocate a
-    // new map. Used to resolve `var()` here and in the inline-style pass.
-    let mut node_props: HashMap<NodeId, std::rc::Rc<HashMap<String, String>>> = HashMap::new();
     let root_props = std::rc::Rc::new(HashMap::new());
     // A real preorder walk (not a flat descendants() scan) so the matcher's
     // ancestor bloom filter tracks the current path: push before recursing
     // into children, pop on the way back out. This is what lets descendant
     // combinators (".mw-body .firstHeading") fast-reject via the filter
     // instead of falling back to the always-true "can't reject" case.
-    cascade_walk(tree, tree.document(), &sheet, &mut matcher, &mut styles, &root_props, &mut node_props);
+    cascade_walk(tree, tree.document(), &sheet, &mut matcher, &mut styles, &root_props);
     if timing {
         let (r, i, c, l, u) = sheet.debug_stats();
         eprintln!("[timing] parse+index={:?} cascade={:?} rules={} id_keys={} class_keys={} local_keys={} universal={}", t_parse, t1.elapsed(), r, i, c, l, u);
     }
-    for nid in tree.descendants(tree.document()) {
-        if let Some(node) = tree.get_node(nid) {
-            if node.is_element() {
-                if let Some(style) = styles.get_mut(&nid) {
-                    if let Some(inline) = node.get_attribute("style") {
-                        // Resolve var() in inline styles against this element's
-                        // custom-property map (design systems set tokens then
-                        // reference them inline). Fold in custom properties
-                        // declared in this same inline style: they are applied
-                        // after the cascade built node_props, so a `--x` set and
-                        // referenced inline (e.g. `--bg:url(a.png);
-                        // background-image:var(--bg)`) is otherwise unresolved.
-                        let inline_vars: Vec<(String, String)> = crate::style::split_declarations(inline)
-                            .into_iter()
-                            .filter_map(|d| d.split_once(':').map(|(n, v)| (n.trim().to_string(), v.trim().to_string())))
-                            .filter(|(n, _)| n.starts_with("--") && n.len() > 2)
-                            .collect();
-                        let base = node_props.get(&nid);
-                        let expanded = if base.is_some() || !inline_vars.is_empty() {
-                            let mut map = base.map(|p| (**p).clone()).unwrap_or_default();
-                            for (k, v) in inline_vars {
-                                map.insert(k, v);
-                            }
-                            crate::css::substitute_vars(inline, &map, 0)
-                        } else {
-                            inline.to_string()
-                        };
-                        crate::style::apply_inline(style, &expanded);
-                    }
-                    if let Some(color) = node.get_attribute("color") {
-                        crate::style::apply_inline(style, &format!("color: {}", color));
-                    }
-                    if let Some(bgcolor) = node.get_attribute("bgcolor") {
-                        crate::style::apply_inline(style, &format!("background-color: {}", bgcolor));
-                    }
-                    // `width`/`height` HTML attributes are presentational hints:
-                    // they rank BELOW author CSS, so a class that sizes the
-                    // element (`.logo{height:2rem}` over `<img ... height="250">`)
-                    // must win. Apply the attribute only when the cascade left
-                    // the dimension unset, else the intrinsic attribute size
-                    // wrongly overrides the CSS and the element renders oversized.
-                    // Regardless, both attributes together establish the intrinsic
-                    // aspect ratio, so a CSS-sized-on-one-axis image (`.logo{
-                    // width:auto;height:100%}`) still derives the other axis from
-                    // the ratio instead of collapsing to zero.
-                    if style.aspect_ratio.is_none() {
-                        let aw = node.get_attribute("width").and_then(|w| w.parse::<f32>().ok());
-                        let ah = node.get_attribute("height").and_then(|h| h.parse::<f32>().ok());
-                        if let (Some(w), Some(h)) = (aw, ah) {
-                            if w > 0.0 && h > 0.0 {
-                                style.aspect_ratio = Some(w / h);
-                            }
-                        }
-                    }
-                    if !style.width_set {
-                        if let Some(width) = node.get_attribute("width") {
-                            if width.chars().all(|c| c.is_ascii_digit()) {
-                                crate::style::apply_inline(style, &format!("width: {}px", width));
-                            } else {
-                                crate::style::apply_inline(style, &format!("width: {}", width));
-                            }
-                        }
-                    }
-                    if let Some(align) = node.get_attribute("align") {
-                        crate::style::apply_inline(style, &format!("text-align: {}", align));
-                    }
-                    if let Some(cellspacing) = node.get_attribute("cellspacing") {
-                        if cellspacing.chars().all(|c| c.is_ascii_digit()) {
-                            crate::style::apply_inline(style, &format!("border-spacing: {}px", cellspacing));
-                        }
-                    }
-                    if !style.height_set {
-                        if let Some(height) = node.get_attribute("height") {
-                            if height.chars().all(|c| c.is_ascii_digit()) {
-                                crate::style::apply_inline(style, &format!("height: {}px", height));
-                            } else {
-                                crate::style::apply_inline(style, &format!("height: {}", height));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     grow_trailing_auto_cells(tree, &mut styles);
     propagate_border_spacing(tree, &mut styles);
 
@@ -2388,5 +2348,36 @@ mod tests {
         let tree = parse_html("");
         let laid = layout_dom(&tree, (1280.0, 720.0));
         assert!(laid.rects.len() <= 4, "got {}", laid.rects.len());
+    }
+
+    #[test]
+    fn author_cascade_honors_important_and_presentational_hint_order() {
+        let tree = parse_html(
+            r#"<style>
+                #sheet { width: 320px !important; background: green !important }
+                .case#sheet { width: 80px; background: red }
+                .inline-normal { width: 320px !important; background: green !important }
+                #inline-important { width: 80px !important; background: red !important }
+                .custom { --w: 320px !important; --w: 80px; width: var(--w) }
+                .hint { background: green }
+            </style>
+            <div id="sheet" class="case"></div>
+            <div id="inline-normal" class="inline-normal" style="width:80px;background:red"></div>
+            <div id="inline-important" style="width:320px!important;background:green!important"></div>
+            <div id="inline-order" style="width:320px!important;width:80px;background:green!important;background:red"></div>
+            <div id="custom" class="custom"></div>
+            <div id="hint" class="hint" bgcolor="red"></div>"#,
+        );
+        let laid = layout_dom(&tree, (1280.0, 720.0));
+        for id in ["sheet", "inline-normal", "inline-important", "inline-order", "custom"] {
+            let nid = tree.query_selector(&format!("#{id}")).unwrap().unwrap();
+            let style = laid.styles.get(&nid).unwrap();
+            assert_eq!(style.width, crate::Dimension::Px(320.0), "wrong cascade width for {id}");
+        }
+        for id in ["sheet", "inline-normal", "inline-important", "inline-order", "hint"] {
+            let nid = tree.query_selector(&format!("#{id}")).unwrap().unwrap();
+            let style = laid.styles.get(&nid).unwrap();
+            assert_eq!(style.background_color, Some([0, 128, 0, 255]), "wrong cascade color for {id}");
+        }
     }
 }

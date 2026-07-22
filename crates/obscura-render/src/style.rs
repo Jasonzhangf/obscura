@@ -150,25 +150,50 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
 }
 
 pub fn apply_inline(style: &mut LayoutStyle, css: &str) {
+    let (normal, important) = partition_declarations(css);
+    apply_declarations(style, &normal);
+    apply_declarations(style, &important);
+}
+
+/// Split a declaration block into normal and `!important` declarations while
+/// preserving source order inside each priority. The returned declarations
+/// have the priority marker removed, ready for [`apply_declarations`].
+pub(crate) fn partition_declarations(css: &str) -> (String, String) {
+    let mut normal = String::new();
+    let mut important = String::new();
     for raw in split_declarations(css) {
         let decl = raw.trim();
         if decl.is_empty() {
             continue;
         }
         let Some((name, value)) = decl.split_once(':') else { continue };
-        let name = name.trim().to_ascii_lowercase();
-        // Drop a trailing `!important` (priority does not change the computed
-        // value here). Strip by position, not by whitespace token: minified CSS
-        // writes it with no space (`width:281px!important`), and splitting on
-        // whitespace left that glued onto the value so the whole declaration
-        // failed to parse and was lost.
         let mut value = value.trim();
+        let mut is_important = false;
         if let Some(bang) = value.rfind('!') {
             if value[bang + 1..].trim().eq_ignore_ascii_case("important") {
                 value = value[..bang].trim_end();
+                is_important = true;
             }
         }
-        apply_value(style, &name, value);
+        let out = if is_important { &mut important } else { &mut normal };
+        out.push_str(name.trim());
+        out.push(':');
+        out.push_str(value);
+        out.push(';');
+    }
+    (normal, important)
+}
+
+/// Apply declarations in the order provided. Priority ordering must already
+/// have been resolved by the caller.
+pub(crate) fn apply_declarations(style: &mut LayoutStyle, css: &str) {
+    for raw in split_declarations(css) {
+        let decl = raw.trim();
+        if decl.is_empty() {
+            continue;
+        }
+        let Some((name, value)) = decl.split_once(':') else { continue };
+        apply_value(style, &name.trim().to_ascii_lowercase(), value.trim());
     }
 }
 
