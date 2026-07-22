@@ -2616,21 +2616,33 @@ class Document extends Node {
       currentNode: root,
       whatToShow: whatToShow,
       filter: filter || null,
-      _accept(node) {
+      // Three-valued per NodeFilter: 1 ACCEPT, 2 REJECT, 3 SKIP. REJECT and
+      // SKIP both mean "don't return this node", but only REJECT prunes its
+      // descendants, so nextNode() needs to tell them apart (issue #461).
+      // A node filtered out by whatToShow is a SKIP: the spec never consults
+      // the filter for it, and its descendants stay eligible.
+      _filter(node) {
         const nodeType = node.nodeType;
-        const show = (whatToShow >> (nodeType - 1)) & 1;
-        if (!show) return false;
+        if (!((whatToShow >> (nodeType - 1)) & 1)) return 3;
         if (this.filter) {
-          if (typeof this.filter === 'function') return this.filter(node) === 1;
-          if (this.filter.acceptNode) return this.filter.acceptNode(node) === 1;
+          if (typeof this.filter === 'function') return this.filter(node);
+          if (this.filter.acceptNode) return this.filter.acceptNode(node);
         }
-        return true;
+        return 1;
       },
+      _accept(node) { return this._filter(node) === 1; },
       nextNode() {
         let node = _wrap(+_dom("next_in_subtree", this.root._nid, this.currentNode._nid));
         while (node) {
-          if (this._accept(node)) { this.currentNode = node; return node; }
-          node = _wrap(+_dom("next_in_subtree", this.root._nid, node._nid));
+          const verdict = this._filter(node);
+          if (verdict === 1) { this.currentNode = node; return node; }
+          // FILTER_REJECT skips the node AND its subtree; FILTER_SKIP (and any
+          // other non-accept value) skips only the node. NodeIterator has no
+          // pruning at all, so `_rejectIsSkip` keeps it on the plain step.
+          const step = (verdict === 2 && !this._rejectIsSkip)
+            ? "next_after_subtree"
+            : "next_in_subtree";
+          node = _wrap(+_dom(step, this.root._nid, node._nid));
         }
         return null;
       },
@@ -2693,7 +2705,11 @@ class Document extends Node {
     return walker;
   }
   createNodeIterator(root, whatToShow, filter) {
-    return this.createTreeWalker(root, whatToShow, filter);
+    // Shares the TreeWalker implementation, but DOM 6.2 gives NodeIterator no
+    // subtree pruning: FILTER_REJECT behaves exactly as FILTER_SKIP there.
+    const iterator = this.createTreeWalker(root, whatToShow, filter);
+    iterator._rejectIsSkip = true;
+    return iterator;
   }
   getSelection() { return this.defaultView ? _selectionFor(this) : null; }
   get activeElement() { return globalThis.__obscura_focused || this.body; }

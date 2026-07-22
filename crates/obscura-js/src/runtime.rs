@@ -1377,6 +1377,69 @@ mod tests {
         );
     }
 
+    /// Issue #461: FILTER_REJECT must prune the rejected node's whole subtree,
+    /// while FILTER_SKIP only skips the node and leaves descendants eligible.
+    /// Collapsing both into "not accepted" let a TreeWalker yield nodes from
+    /// inside a subtree the page explicitly rejected.
+    #[test]
+    fn tree_walker_filter_reject_prunes_the_whole_subtree() {
+        let mut rt = setup_runtime(
+            r#"<div id="root"><section><p>deep</p></section><a></a></div>"#,
+        );
+        rt.run_page_init();
+        let result = rt
+            .evaluate(
+                r#"
+                const root = document.getElementById('root');
+                function walk(verdict) {
+                    const w = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, {
+                        acceptNode(node) {
+                            return node.tagName === 'SECTION' ? verdict : NodeFilter.FILTER_ACCEPT;
+                        }
+                    });
+                    const seen = [];
+                    let node;
+                    while ((node = w.nextNode())) seen.push(node.tagName);
+                    return seen;
+                }
+                return [walk(NodeFilter.FILTER_REJECT), walk(NodeFilter.FILTER_SKIP)];
+                "#,
+            )
+            .unwrap();
+        // REJECT drops <p> with its <section> parent; SKIP drops only <section>.
+        assert_eq!(result, serde_json::json!([["A"], ["P", "A"]]));
+    }
+
+    /// Issue #461: NodeIterator has no subtree pruning — DOM 6.2 says
+    /// FILTER_REJECT behaves as FILTER_SKIP there. The shared walker must not
+    /// leak TreeWalker's pruning into it.
+    #[test]
+    fn node_iterator_treats_filter_reject_as_skip() {
+        let mut rt = setup_runtime(
+            r#"<div id="root"><section><p>deep</p></section><a></a></div>"#,
+        );
+        rt.run_page_init();
+        let result = rt
+            .evaluate(
+                r#"
+                const root = document.getElementById('root');
+                const it = document.createNodeIterator(root, NodeFilter.SHOW_ELEMENT, {
+                    acceptNode(node) {
+                        return node.tagName === 'SECTION'
+                            ? NodeFilter.FILTER_REJECT
+                            : NodeFilter.FILTER_ACCEPT;
+                    }
+                });
+                const seen = [];
+                let node;
+                while ((node = it.nextNode())) seen.push(node.tagName);
+                return seen;
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!(["P", "A"]));
+    }
+
     #[test]
     fn append_child_flattens_document_fragment() {
         let mut rt = setup_runtime(r#"<main id="host"></main>"#);
