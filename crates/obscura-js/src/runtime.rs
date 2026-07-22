@@ -1541,6 +1541,99 @@ mod tests {
         assert_eq!(result, serde_json::json!(["P", "A"]));
     }
 
+    /// Issue #469: FILTER_SKIP leaves a skipped node's children eligible, so
+    /// firstChild()/lastChild() must descend into them. FILTER_REJECT must not.
+    #[test]
+    fn tree_walker_child_movers_descend_on_skip_but_not_on_reject() {
+        let mut rt = setup_runtime(
+            r#"<div id="root"><section><a></a><b></b></section></div>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+                const root = document.getElementById('root');
+                function mover(verdict, method) {
+                    const w = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, {
+                        acceptNode(node) {
+                            return node.tagName === 'SECTION' ? verdict : NodeFilter.FILTER_ACCEPT;
+                        }
+                    });
+                    const found = w[method]();
+                    return found ? found.tagName : null;
+                }
+                return [
+                    mover(NodeFilter.FILTER_SKIP, 'firstChild'),
+                    mover(NodeFilter.FILTER_SKIP, 'lastChild'),
+                    mover(NodeFilter.FILTER_REJECT, 'firstChild'),
+                    mover(NodeFilter.FILTER_REJECT, 'lastChild'),
+                ];
+                "#,
+            )
+            .unwrap();
+        // SKIP descends into <section>; REJECT prunes it and finds nothing else.
+        assert_eq!(result, serde_json::json!(["A", "B", null, null]));
+    }
+
+    /// Issue #469: nextSibling()/previousSibling() must descend into a skipped
+    /// sibling's subtree rather than stepping straight over it.
+    #[test]
+    fn tree_walker_sibling_movers_descend_into_skipped_siblings() {
+        let mut rt = setup_runtime(
+            r#"<div id="root"><p id="start"></p><section><a></a></section><q></q></div>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+                const root = document.getElementById('root');
+                function mover(verdict, method, from) {
+                    const w = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, {
+                        acceptNode(node) {
+                            return node.tagName === 'SECTION' ? verdict : NodeFilter.FILTER_ACCEPT;
+                        }
+                    });
+                    w.currentNode = document.getElementById(from);
+                    const found = w[method]();
+                    return found ? found.tagName : null;
+                }
+                return [
+                    // <section> is skipped, so its child <a> is the next sibling.
+                    mover(NodeFilter.FILTER_SKIP, 'nextSibling', 'start'),
+                    // Rejected: the subtree is off-limits, so skip past to <q>.
+                    mover(NodeFilter.FILTER_REJECT, 'nextSibling', 'start'),
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!(["A", "Q"]));
+    }
+
+    /// Issue #469: the backward sibling mover descends to *last* children.
+    #[test]
+    fn tree_walker_previous_sibling_descends_to_last_child() {
+        let mut rt = setup_runtime(
+            r#"<div id="root"><section><a></a><b></b></section><p id="start"></p></div>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+                const root = document.getElementById('root');
+                const w = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, {
+                    acceptNode(node) {
+                        return node.tagName === 'SECTION'
+                            ? NodeFilter.FILTER_SKIP
+                            : NodeFilter.FILTER_ACCEPT;
+                    }
+                });
+                w.currentNode = document.getElementById('start');
+                const found = w.previousSibling();
+                return found ? found.tagName : null;
+                "#,
+            )
+            .unwrap();
+        // Reverse order descends to <section>'s last child, not its first.
+        assert_eq!(result, serde_json::json!("B"));
+    }
+
     #[test]
     fn append_child_flattens_document_fragment() {
         let mut rt = setup_runtime(r#"<main id="host"></main>"#);
