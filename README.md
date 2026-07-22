@@ -73,6 +73,22 @@ Want to sponsor? Email [hello@obscura.sh](mailto:hello@obscura.sh).
       Stable proxies. Fewer blocks. Most reliable Obscura automation.
     </td>
   </tr>
+   <tr>
+    <td width="200" align="center" valign="middle">
+      <a href="https://go.nodemaven.com/obscura" target="_blank">
+        <img alt="NodeMaven" src="assets/sponsors/nodemaven.svg" width="180"/>
+      </a>
+    </td>
+    <td valign="middle">
+      <a href="https://go.nodemaven.com/obscuraread"><b>NodeMaven</b></a> — the most reliable proxy provider with the highest quality IPs on the market. Built for automation, web scraping, SEO research, and social media management.<br><br>
+      <b>99.9% uptime<br>
+      Sticky sessions up to 7 days<br>
+      IP filtering on every proxy<br>
+      No KYC required<br>
+      Cashback on traffic — earn up to 10% back<br><br></b>
+      🎁 Use code <b>OBSCURA35</b> for 35% off Mobile & Residential, or <b>OBSCURA40</b> for 40% off ISP (Static) proxies.
+    </td>
+  </tr>
   <tr>
     <td width="200" align="center" valign="middle">
       <a href="https://proxyempire.io/?ref=obscura&utm_source=obscuragithub" target="_blank">
@@ -101,22 +117,6 @@ Want to sponsor? Email [hello@obscura.sh](mailto:hello@obscura.sh).
   just $0.018/IP or $0.68/GB. 20M+ IPs across 90+ countries. Sticky or rotating sessions, managed from desktop or mobile app.
       </td>
     </tr>
-  <tr>
-    <td width="200" align="center" valign="middle">
-      <a href="https://go.nodemaven.com/obscura" target="_blank">
-        <img alt="NodeMaven" src="assets/sponsors/nodemaven.svg" width="180"/>
-      </a>
-    </td>
-    <td valign="middle">
-      <a href="https://go.nodemaven.com/obscura"><b>NodeMaven</b></a> — the most reliable proxy provider with the highest quality IPs on the market. Built for automation, web scraping, SEO research, and social media management.<br><br>
-      <b>99.9% uptime<br>
-      Sticky sessions up to 7 days<br>
-      IP filtering on every proxy<br>
-      No KYC required<br>
-      Cashback on traffic — earn up to 10% back<br><br></b>
-      🎁 Use code <b>OBSCURA35</b> for 35% off Mobile & Residential, or <b>OBSCURA40</b> for 40% off ISP (Static) proxies.
-    </td>
-  </tr>
   <tr>
     <td width="200" align="center" valign="middle">
       <a href="https://www.rapidproxy.io/?ref=obscura" target="_blank">
