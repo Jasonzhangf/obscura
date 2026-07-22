@@ -226,11 +226,10 @@ pub async fn start_with_serve_options_and_limit(
             }
         })?;
 
-    // Build the shared browser context once. Every connection's processor
-    // reuses it (one cookie jar, one HTTP client) while running on its own OS
-    // thread, so each page's V8 isolate is confined to a single thread and the
-    // #430 cross-page abort cannot happen (V8's TryGetCurrent check is
-    // per-thread). This is the thread-per-runtime fix for #430.
+    // This context is a configuration and persistence template. Each WebSocket
+    // gets an isolated copy with its own cookie jar and HTTP client (#449),
+    // while the thread-per-connection layout from #430 still confines that
+    // connection's V8 isolates to one OS thread.
     let mut bctx = obscura_browser::BrowserContext::with_storage_and_network(
         "default".to_string(),
         proxy,
@@ -241,6 +240,12 @@ pub async fn start_with_serve_options_and_limit(
     );
     bctx.allow_file_access = allow_file_access;
     let shared_ctx = Arc::new(bctx);
+    // Persistence is deliberately separate from the connection template.
+    // Cookie deltas are merged here, but new connections always clone the
+    // immutable startup snapshot and can never inherit another live client's
+    // session state.
+    let persistence_ctx = Arc::new(shared_ctx.isolated_copy("persistence".to_string(), true));
+    let persistence_lock = Arc::new(std::sync::Mutex::new(()));
 
     // One graceful-shutdown watcher for the whole server. It flips the accept
     // flag (stopping the accept thread) and wakes every connection processor via
@@ -342,6 +347,8 @@ pub async fn start_with_serve_options_and_limit(
         run_connection(
             stream,
             shared_ctx.clone(),
+            persistence_ctx.clone(),
+            persistence_lock.clone(),
             shutdown_notify.clone(),
             live_connections.clone(),
         );
@@ -372,7 +379,7 @@ pub async fn start_with_serve_options_and_limit(
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
     }
-    shared_ctx.save_cookies();
+    persistence_ctx.save_cookies();
     Ok(())
 }
 
@@ -427,7 +434,9 @@ fn cap_malloc_arenas() {
 /// plumbing is needed.
 fn run_connection(
     std_stream: std::net::TcpStream,
-    default_context: Arc<obscura_browser::BrowserContext>,
+    context_template: Arc<obscura_browser::BrowserContext>,
+    persistence_context: Arc<obscura_browser::BrowserContext>,
+    persistence_lock: Arc<std::sync::Mutex<()>>,
     shutdown_notify: Arc<Notify>,
     live_connections: Arc<AtomicUsize>,
 ) {
@@ -447,6 +456,11 @@ fn run_connection(
         .name("obscura-cdp-conn".into())
         .spawn(move || {
             let _slot = SlotGuard(slot);
+            let default_context = Arc::new(
+                context_template.isolated_copy("default".to_string(), true),
+            );
+            let initial_cookies = default_context.cookie_jar.get_all_cookies();
+            let persisted_context = default_context.clone();
             let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -478,7 +492,21 @@ fn run_connection(
                 // Connection closed (or shutting down): stop this connection's
                 // processor so the thread can exit.
                 processor.abort();
+                let _ = processor.await;
             });
+
+            // Apply only this connection's cookie changes to the persistence
+            // template. Unchanged cookies cannot overwrite another connection's
+            // updates, while explicit deletes and replacements still persist.
+            if persistence_context.storage_dir.is_some() {
+                let _guard = persistence_lock.lock().unwrap_or_else(|e| e.into_inner());
+                merge_cookie_delta(
+                    &persistence_context.cookie_jar,
+                    &initial_cookies,
+                    &persisted_context.cookie_jar.get_all_cookies(),
+                );
+                persistence_context.save_cookies();
+            }
         });
 
     // The closure never ran, so its `SlotGuard` never existed: release the
@@ -487,6 +515,53 @@ fn run_connection(
         error!("connection thread spawn failed: {}", e);
         live_connections.fetch_sub(1, Ordering::AcqRel);
     }
+}
+
+fn cookie_key(cookie: &obscura_net::CookieInfo) -> (String, String, String) {
+    (
+        cookie.domain.clone(),
+        cookie.name.clone(),
+        cookie.path.clone(),
+    )
+}
+
+fn cookie_values_match(
+    left: &obscura_net::CookieInfo,
+    right: &obscura_net::CookieInfo,
+) -> bool {
+    left.value == right.value
+        && left.secure == right.secure
+        && left.http_only == right.http_only
+        && left.same_site == right.same_site
+        && left.expires == right.expires
+}
+
+fn merge_cookie_delta(
+    destination: &obscura_net::CookieJar,
+    initial: &[obscura_net::CookieInfo],
+    current: &[obscura_net::CookieInfo],
+) {
+    let initial: HashMap<_, _> = initial.iter().map(|cookie| (cookie_key(cookie), cookie)).collect();
+    let current: HashMap<_, _> = current.iter().map(|cookie| (cookie_key(cookie), cookie)).collect();
+
+    for (key, cookie) in &initial {
+        if !current.contains_key(key) {
+            destination.delete_cookies_filtered(
+                &cookie.name,
+                &cookie.domain,
+                Some(&cookie.path),
+            );
+        }
+    }
+
+    let changed: Vec<_> = current
+        .iter()
+        .filter_map(|(key, cookie)| match initial.get(key) {
+            Some(previous) if cookie_values_match(previous, cookie) => None,
+            _ => Some((*cookie).clone()),
+        })
+        .collect();
+    destination.set_cookies_from_cdp(changed);
 }
 
 /// Turn away a connection that arrived while the server was at its limit.
@@ -609,8 +684,8 @@ fn handle_http_json_blocking(
 /// isolate is confined to a single thread. This removes the #430 abort by
 /// construction: V8's `heap->isolate() == Isolate::TryGetCurrent()` invariant is
 /// per-thread, so two connections' isolates can never collide. All processors
-/// share one `Arc<BrowserContext>` (one cookie jar, one HTTP client). The shared
-/// context's cookies are persisted once by the accept side on shutdown.
+/// own isolated `BrowserContext` (cookie jar and HTTP client). Cookie deltas are
+/// merged into the persistence template when the connection thread exits.
 async fn cdp_processor(
     mut rx: mpsc::UnboundedReceiver<ServerMessage>,
     default_context: Arc<obscura_browser::BrowserContext>,
@@ -692,9 +767,8 @@ async fn cdp_processor(
 
     }
 
-    // Cookies live in the shared BrowserContext and are persisted once by the
-    // accept side when the whole server shuts down, so a single connection
-    // closing (or its processor being aborted) does not need to save here.
+    // The connection thread merges this context's cookie delta into the
+    // persistence template after the processor stops.
     let _ = &ctx;
 }
 
@@ -1172,15 +1246,6 @@ fn fast_path_response(text: &str) -> Option<String> {
         "Browser.setDownloadBehavior" | "Browser.getWindowBounds" => {
             Some(json!({}))
         }
-        // Critical: Puppeteer calls this as the *first* CDP command on connect
-        // (`BrowserConnector._connectToCdpBrowser`). If another client or a long
-        // `Page.navigate` / interception holds the single `cdp_processor` task,
-        // queued Target commands starve and Puppeteer hits protocolTimeout on
-        // `Target.getBrowserContexts`. Fast-path bypasses the queue — same payload
-        // as `domains::target::handle` when default context id is `"default"`.
-        "Target.getBrowserContexts" => {
-            Some(json!({ "browserContextIds": ["default"] }))
-        }
         _ => None,
     };
 
@@ -1281,8 +1346,38 @@ async fn handle_connection_ws(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_navigate_method, parse_cdp_headers};
+    use super::{is_navigate_method, merge_cookie_delta, parse_cdp_headers};
+    use obscura_net::{CookieInfo, CookieJar};
     use serde_json::json;
+
+    fn cookie(name: &str, value: &str) -> CookieInfo {
+        CookieInfo {
+            name: name.to_string(),
+            value: value.to_string(),
+            domain: "example.com".to_string(),
+            path: "/".to_string(),
+            secure: false,
+            http_only: false,
+            same_site: "Lax".to_string(),
+            expires: None,
+        }
+    }
+
+    #[test]
+    fn cookie_delta_merges_changes_without_reverting_other_connections() {
+        let destination = CookieJar::new();
+        destination.set_cookies_from_cdp(vec![cookie("sid", "newer"), cookie("other", "kept")]);
+        let initial = vec![cookie("sid", "old"), cookie("removed", "old")];
+        let current = vec![cookie("sid", "old"), cookie("added", "value")];
+
+        merge_cookie_delta(&destination, &initial, &current);
+
+        let cookies = destination.get_all_cookies();
+        assert!(cookies.iter().any(|c| c.name == "sid" && c.value == "newer"));
+        assert!(cookies.iter().any(|c| c.name == "other"));
+        assert!(cookies.iter().any(|c| c.name == "added"));
+        assert!(!cookies.iter().any(|c| c.name == "removed"));
+    }
 
     // Issue #363: only an exact Page.navigate may take the spawn-and-defer
     // navigation path. A substring match also caught Page.navigateToHistoryEntry

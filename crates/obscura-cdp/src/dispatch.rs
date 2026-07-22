@@ -14,7 +14,9 @@ pub struct CdpContext {
     pub sessions: HashMap<String, String>, // session_id -> page_id
     pub pending_events: Vec<CdpEvent>,
     pub default_context: Arc<BrowserContext>,
+    pub browser_contexts: HashMap<String, Arc<BrowserContext>>,
     page_counter: u32,
+    browser_context_counter: u32,
     pub preload_scripts: Vec<(String, String)>, // (identifier, source)
     pub preload_counter: u32,
     // World names registered via Page.createIsolatedWorld. After every
@@ -100,12 +102,9 @@ impl CdpContext {
         Self::_new_inner(proxy, stealth, user_agent, None, allow_file_access, false)
     }
 
-    /// Build a context that reuses an already-constructed, shared
-    /// [`BrowserContext`]. The thread-per-connection server (issue #430 /
-    /// "Option 2") gives each connection its own `CdpContext` on its own OS
-    /// thread so that each page's V8 isolate is confined to one thread, but all
-    /// connections must still share one cookie jar and one HTTP client. Passing
-    /// the same `Arc<BrowserContext>` to every connection's context does that.
+    /// Build a CDP context around an already-constructed default browser
+    /// context. The server passes a fresh isolated context per WebSocket; tests
+    /// and embedders may construct their own.
     pub fn new_with_shared_context(default_context: Arc<BrowserContext>) -> Self {
         // Pre-seed with the default-frame execution context ids that
         // `Runtime.enable` (1) and post-navigation re-emission (2) advertise via
@@ -120,7 +119,9 @@ impl CdpContext {
             sessions: HashMap::new(),
             pending_events: Vec::new(),
             default_context,
+            browser_contexts: HashMap::new(),
             page_counter: 0,
+            browser_context_counter: 0,
             preload_scripts: Vec::new(),
             preload_counter: 0,
             fetch_intercept: FetchInterceptState::new(),
@@ -163,12 +164,60 @@ impl CdpContext {
     }
 
     pub fn create_page(&mut self) -> String {
+        self.create_page_in_context(None)
+            .expect("default browser context must exist")
+    }
+
+    pub fn create_page_in_context(&mut self, context_id: Option<&str>) -> Result<String, String> {
+        let context = match context_id {
+            Some(id) => self
+                .browser_context(id)
+                .cloned()
+                .ok_or_else(|| format!("Browser context not found: {}", id))?,
+            None => self.default_context.clone(),
+        };
         self.page_counter += 1;
         let page_id = format!("page-{}", self.page_counter);
-        let mut page = Page::new(page_id.clone(), self.default_context.clone());
+        let mut page = Page::new(page_id.clone(), context);
         page.navigate_blank();
         self.pages.push(page);
-        page_id
+        Ok(page_id)
+    }
+
+    pub fn browser_context(&self, id: &str) -> Option<&Arc<BrowserContext>> {
+        if id == self.default_context.id {
+            Some(&self.default_context)
+        } else {
+            self.browser_contexts.get(id)
+        }
+    }
+
+    pub fn create_browser_context(&mut self) -> String {
+        self.browser_context_counter += 1;
+        let id = format!("context-{}", self.browser_context_counter);
+        let context = Arc::new(self.default_context.isolated_copy(id.clone(), false));
+        self.browser_contexts.insert(id.clone(), context);
+        id
+    }
+
+    pub fn dispose_browser_context(&mut self, id: &str) -> Result<Vec<String>, String> {
+        if id == self.default_context.id {
+            return Err("The default browser context cannot be disposed".to_string());
+        }
+        if self.browser_contexts.remove(id).is_none() {
+            return Err(format!("Browser context not found: {}", id));
+        }
+
+        let page_ids: Vec<String> = self
+            .pages
+            .iter()
+            .filter(|page| page.context.id == id)
+            .map(|page| page.id.clone())
+            .collect();
+        for page_id in &page_ids {
+            self.remove_page(page_id);
+        }
+        Ok(page_ids)
     }
 
     pub fn get_page(&self, id: &str) -> Option<&Page> {

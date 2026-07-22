@@ -236,7 +236,11 @@ async fn do_navigate(
     // any file the obscura process can read. Opt in via
     // `obscura serve --allow-file-access` when local-HTML
     // testing is the intended workflow.
-    if url_is_file_scheme(url) && !ctx.default_context.allow_file_access {
+    let allow_file_access = ctx
+        .get_session_page(session_id)
+        .map(|page| page.context.allow_file_access)
+        .unwrap_or(ctx.default_context.allow_file_access);
+    if url_is_file_scheme(url) && !allow_file_access {
         return Err(
             "Page.navigate to file:// is disabled. Restart with `obscura serve --allow-file-access` to enable.".to_string()
         );
