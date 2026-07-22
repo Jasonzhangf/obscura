@@ -145,7 +145,7 @@ obscura --proxy socks5://USER:PASS@gate.nodemaven.com:1080 scrape url1 url2 --co
 The targeting options (country, region, session id) live in the proxy username,
 so a sticky session keeps the same exit IP across requests.
 
-Sign up: https://go.nodemaven.com/obscura
+Sign up: https://go.nodemaven.com/obscuraagent
 
 Obscura discount codes: `OBSCURA35` (35% off mobile and residential),
 `OBSCURA40` (40% off ISP / static).
