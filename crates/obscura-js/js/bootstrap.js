@@ -1216,6 +1216,8 @@ class Element extends Node {
     if (this.localName === "svg") return "http://www.w3.org/2000/svg";
     return "http://www.w3.org/1999/xhtml";
   }
+  // `inner_html` resolves a <template> to its contents document on the Rust
+  // side (issue #463), so this needs no template special case.
   get innerHTML() { return _domParse("inner_html", this._nid) ?? ""; }
   set innerHTML(v) {
     if (this.localName === 'template') {
@@ -1254,6 +1256,18 @@ class Element extends Node {
     // infinite retry loop (issue #210).
     const tag = this.localName;
     if (tag === 'template') {
+      // Back the fragment with the node's real template contents (issue #463).
+      // The parser stores template children in a separate contents document
+      // instead of under the element, so without this the getter handed back a
+      // fabricated empty fragment and the parsed markup was unreachable.
+      // `template_contents` allocates one on demand for created templates.
+      const nid = +_dom("template_contents", this._nid);
+      if (nid >= 0) {
+        // Cache by node id so `.content` keeps a stable identity across reads —
+        // frameworks stash the fragment and compare it later.
+        if (!_cache.has(nid)) _cache.set(nid, new DocumentFragment(nid));
+        return _cache.get(nid);
+      }
       if (!this._templateContent) this._templateContent = document.createDocumentFragment();
       return this._templateContent;
     }

@@ -392,6 +392,15 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
             });
             "true".into()
         }
+        // A <template>'s children live in a separate contents document, so this
+        // is the only route to them from JS. Allocates one on demand for
+        // templates built via createElement.
+        "template_contents" => {
+            let nid = arg1.parse::<u32>().unwrap_or(0);
+            dom.template_contents(NodeId::new(nid))
+                .map(|id| id.index().to_string())
+                .unwrap_or("-1".into())
+        }
         "create_document_fragment" => {
             dom.new_node(NodeData::Document).index().to_string()
         }
