@@ -265,3 +265,70 @@ fn long_text_run_wraps_across_multiple_lines() {
         div_rect.height
     );
 }
+
+#[test]
+fn negative_flex_margin_overlays_at_container_start() {
+    let html = r##"
+        <html><head><style>
+          html,body{margin:0}
+          #document{display:flex;width:900px;height:220px}
+          #main{width:100%;height:200px}
+          #body{margin-left:225px;height:200px}
+          #sidebar{display:flex;width:225px;height:180px;margin-left:-100%}
+        </style></head><body>
+          <div id="document">
+            <div id="main"><div id="body"></div></div>
+            <div id="sidebar"></div>
+          </div>
+        </body></html>
+    "##;
+    let tree = parse_html(html);
+    let layout = layout_dom(&tree, (900.0, 1000.0));
+    let document = layout.rects[&tree.get_element_by_id("document").unwrap()];
+    let main = layout.rects[&tree.get_element_by_id("main").unwrap()];
+    let body = layout.rects[&tree.get_element_by_id("body").unwrap()];
+    let sidebar = layout.rects[&tree.get_element_by_id("sidebar").unwrap()];
+    assert!((document.x - 0.0).abs() < 0.01, "document: {document:?}");
+    assert!((main.x - 0.0).abs() < 0.01, "main: {main:?}");
+    assert!((body.x - 225.0).abs() < 0.01, "body: {body:?}");
+    assert!((sidebar.x - 0.0).abs() < 0.01, "sidebar: {sidebar:?}");
+}
+
+#[test]
+fn percentage_flex_overlay_uses_auto_width_parent_content_box() {
+    let html = r##"
+        <html><head><style>
+          html,body{margin:0}
+          body{margin-left:1em;margin-right:1em}
+          #document{display:flex}
+          #main{float:left;width:100%;height:200px}
+          #body{margin-left:min(25vw,350px);height:200px}
+          #sidebar{
+            display:flex;
+            width:min(25vw,350px);
+            height:180px;
+            margin-left:-100%;
+            float:none;
+            position:sticky;
+            top:0
+          }
+        </style></head><body>
+          <div id="document">
+            <div id="main"><div id="body"></div></div>
+            <div id="sidebar"></div>
+          </div>
+        </body></html>
+    "##;
+    let tree = parse_html(html);
+    let layout = layout_dom(&tree, (1280.0, 1400.0));
+    let document = layout.rects[&tree.get_element_by_id("document").unwrap()];
+    let main = layout.rects[&tree.get_element_by_id("main").unwrap()];
+    let body = layout.rects[&tree.get_element_by_id("body").unwrap()];
+    let sidebar = layout.rects[&tree.get_element_by_id("sidebar").unwrap()];
+    assert!((document.x - 16.0).abs() < 0.01, "document: {document:?}");
+    assert!((document.width - 1248.0).abs() < 0.01, "document: {document:?}");
+    assert!((main.x - 16.0).abs() < 0.01, "main: {main:?}");
+    assert!((body.x - 336.0).abs() < 0.01, "body: {body:?}");
+    assert!((sidebar.x - 16.0).abs() < 0.01, "sidebar: {sidebar:?}");
+    assert!((sidebar.width - 320.0).abs() < 0.01, "sidebar: {sidebar:?}");
+}

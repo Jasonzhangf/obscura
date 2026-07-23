@@ -875,6 +875,37 @@ mod tests {
     }
 
     #[test]
+    fn negative_flex_margin_overlays_without_shifting_items() {
+        let main = make_box(Display::Block, 900.0, 200.0);
+        let sidebar = LayoutStyle {
+            display: Display::Flex,
+            width: Dimension::Px(225.0),
+            height: Dimension::Px(180.0),
+            margin: Edges {
+                left: -900.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let root = LayoutNode {
+            style: make_box(Display::Flex, 900.0, 220.0),
+            text: None,
+            children: vec![LayoutNode::leaf(main), LayoutNode::leaf(sidebar)],
+        };
+        let out = layout(&root, (900.0, 220.0));
+        assert!(
+            out.children[0].border_box.x.abs() < 0.01,
+            "main shifted to {:?}",
+            out.children[0].border_box
+        );
+        assert!(
+            out.children[1].border_box.x.abs() < 0.01,
+            "overlay shifted to {:?}",
+            out.children[1].border_box
+        );
+    }
+
+    #[test]
     fn flex_row_lays_out_horizontally() {
         let root = LayoutNode {
             style: LayoutStyle { display: Display::Flex, width: Dimension::Px(600.0), height: Dimension::Px(100.0), ..Default::default() },
