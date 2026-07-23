@@ -1,0 +1,35 @@
+{
+  "abs-fill": [
+    {"name": "blue fill", "color": "#0000ff", "width": 400, "height": 100},
+    {"name": "teal fill", "color": "#008080", "width": 400, "height": 100},
+    {"name": "purple fill", "color": "#800080", "width": 400, "height": 100}
+  ],
+  "box-sizing": [
+    {"name": "content-box fixed", "color": "#22aa55", "width": 220, "height": 90},
+    {"name": "border-box fixed", "color": "#228866", "width": 190, "height": 60},
+    {"name": "content-box percent", "color": "#668822", "width": 220, "height": 70},
+    {"name": "border-box percent", "color": "#668822", "width": 190, "height": 40},
+    {"name": "inherited reset border-box", "color": "#aa3377", "width": 190, "height": 60}
+  ],
+  "carousel-clip": [
+    {"name": "visible translated slide", "color": "#33aa33", "width": 300, "height": 100},
+    {"name": "visible control slide", "color": "#ee3333", "width": 300, "height": 100}
+  ],
+  "cascade-priority": [
+    {"name": "important winners", "color": "#008000", "width": 320, "height": 36, "count": 6}
+  ],
+  "clear-float": [
+    {"name": "float", "color": "#88bbdd", "width": 120, "height": 80},
+    {"name": "cleared block", "color": "#ffcc66", "width": 500, "height": 40}
+  ],
+  "mixed-content-block": [
+    {"name": "full-width block child", "color": "#ccddff", "width": 400}
+  ],
+  "tables": [
+    {"name": "content-box fixed cell column", "color": "#ffcc99", "width": 208}
+  ],
+  "z-index": [
+    {"name": "positive layer", "color": "#008000", "width": 200, "height": 100},
+    {"name": "negative layer", "color": "#ffa500", "width": 260, "height": 110}
+  ]
+}

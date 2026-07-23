@@ -5,6 +5,7 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${OBSCURA_BIN:-$ROOT/target/release/obscura}"
 CHROME="${CHROME_BIN:-chromium}"
+PYTHON="${PYTHON_BIN:-python3}"
 DIR="$(cd "$(dirname "$0")" && pwd)"
 OUT="${1:-$DIR/out}"
 mkdir -p "$OUT"
@@ -36,6 +37,11 @@ for f in "$DIR"/*.html; do
   mv "$chrome_shot" "$OUT/$n.chrome.png"
   echo "rendered $n"
 done
+if [[ "$status" -eq 0 ]]; then
+  if ! PYTHONDONTWRITEBYTECODE=1 "$PYTHON" "$DIR/check.py" "$OUT"; then
+    status=1
+  fi
+fi
 if [[ "$status" -eq 0 ]]; then
   echo "output in $OUT"
 else
