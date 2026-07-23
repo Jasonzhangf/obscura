@@ -13,7 +13,7 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
-from scipy.ndimage import find_objects, label
+from scipy.ndimage import find_objects, gaussian_filter, gaussian_filter1d, label, sobel
 
 
 def rgb(value):
@@ -51,6 +51,15 @@ def bbox(mask):
     return [int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1]
 
 
+def structural_edges(array):
+    """Return major luminance edges while suppressing texture and antialiasing."""
+    rgb = array.astype(np.float32)
+    luminance = rgb[:, :, 0] * 0.2126 + rgb[:, :, 1] * 0.7152 + rgb[:, :, 2] * 0.0722
+    smoothed = gaussian_filter(luminance, sigma=1.0)
+    magnitude = np.hypot(sobel(smoothed, axis=0), sobel(smoothed, axis=1))
+    return magnitude > 48.0
+
+
 def pair_metrics(ours, chromium):
     if ours.shape != chromium.shape:
         return {"size_mismatch": [list(ours.shape), list(chromium.shape)]}
@@ -70,6 +79,30 @@ def pair_metrics(ours, chromium):
     col_projection = float(
         np.abs(ours_ink.sum(axis=0) - chromium_ink.sum(axis=0)).mean() / height
     )
+    # A fixed `<245` "ink" threshold is useful on white fixtures but treats a
+    # uniform #eee page background as content covering the entire canvas. Major
+    # blurred edges are a better structural signal for live pages: they retain
+    # box boundaries and glyph rows while largely ignoring background color,
+    # low-amplitude texture, and font antialiasing differences.
+    ours_edges = structural_edges(ours)
+    chromium_edges = structural_edges(chromium)
+    ours_edge_bbox = bbox(ours_edges)
+    chromium_edge_bbox = bbox(chromium_edges)
+    edge_bbox_delta = None
+    if ours_edge_bbox and chromium_edge_bbox:
+        edge_bbox_delta = max(
+            abs(a - b) for a, b in zip(ours_edge_bbox, chromium_edge_bbox)
+        )
+    ours_edge_rows = gaussian_filter1d(ours_edges.sum(axis=1).astype(float), sigma=2.0)
+    chromium_edge_rows = gaussian_filter1d(
+        chromium_edges.sum(axis=1).astype(float), sigma=2.0
+    )
+    ours_edge_cols = gaussian_filter1d(ours_edges.sum(axis=0).astype(float), sigma=2.0)
+    chromium_edge_cols = gaussian_filter1d(
+        chromium_edges.sum(axis=0).astype(float), sigma=2.0
+    )
+    edge_row_projection = float(np.abs(ours_edge_rows - chromium_edge_rows).mean() / width)
+    edge_col_projection = float(np.abs(ours_edge_cols - chromium_edge_cols).mean() / height)
     return {
         "rgb_mae": round(float(delta.mean() / 255.0), 6),
         "pixels_gt_10": round(float((max_channel > 10).mean()), 6),
@@ -79,6 +112,11 @@ def pair_metrics(ours, chromium):
         "content_bbox_max_delta": bbox_delta,
         "row_projection_delta": round(row_projection, 6),
         "column_projection_delta": round(col_projection, 6),
+        "ours_edge_bbox": ours_edge_bbox,
+        "chromium_edge_bbox": chromium_edge_bbox,
+        "edge_bbox_max_delta": edge_bbox_delta,
+        "edge_row_projection_delta": round(edge_row_projection, 6),
+        "edge_column_projection_delta": round(edge_col_projection, 6),
     }
 
 
@@ -131,9 +169,9 @@ def main():
         print(
             f"{name:24} rgb_mae={metrics.get('rgb_mae', 'size-mismatch'):>8} "
             f"p>50={metrics.get('pixels_gt_50', '-'):>8} "
-            f"bbox={metrics.get('content_bbox_max_delta', '-'):>3} "
-            f"row={metrics.get('row_projection_delta', '-'):>8} "
-            f"col={metrics.get('column_projection_delta', '-'):>8}"
+            f"edge_bbox={metrics.get('edge_bbox_max_delta', '-'):>3} "
+            f"edge_row={metrics.get('edge_row_projection_delta', '-'):>8} "
+            f"edge_col={metrics.get('edge_column_projection_delta', '-'):>8}"
         )
 
     report["failures"] = failures

@@ -2,10 +2,11 @@
 """Capture Obscura and Chromium concurrently with the same real settle delay.
 
 Every run uses a new output directory, checks process status and non-empty
-screenshots, records browser versions and timings, and reports the raw
-full-canvas metrics from check.py. It deliberately emits no aggregate parity
-verdict. An optional pre-change Obscura binary can be captured concurrently so
-regressions are compared against the same live-page moment.
+screenshots, records browser versions and timings, and reports raw full-canvas
+pixel diagnostics plus background-tolerant structural-edge diagnostics from
+check.py. It deliberately emits no aggregate parity verdict. An optional
+pre-change Obscura binary can be captured concurrently so regressions are
+compared against the same live-page moment.
 """
 
 import argparse
@@ -205,18 +206,36 @@ def main():
                     if baseline_future and page_result["baseline"]["ok"]:
                         baseline_metrics = pair_metrics(load_rgb(baseline_path), chrome_rgb)
                         page_result["baseline_metrics"] = baseline_metrics
-                        for key in ("rgb_mae", "pixels_gt_10", "pixels_gt_50"):
+                        for key in (
+                            "rgb_mae",
+                            "pixels_gt_10",
+                            "pixels_gt_50",
+                            "edge_bbox_max_delta",
+                            "edge_row_projection_delta",
+                            "edge_column_projection_delta",
+                        ):
                             if key in current_metrics and key in baseline_metrics:
+                                if current_metrics[key] is None or baseline_metrics[key] is None:
+                                    continue
                                 page_result.setdefault("delta_vs_baseline", {})[key] = round(
                                     current_metrics[key] - baseline_metrics[key], 6
                                 )
                 manifest["pages"].append(page_result)
                 write_results(results_path, manifest)
                 metric = page_result.get("metrics", {}).get("pixels_gt_50")
-                delta = page_result.get("delta_vs_baseline", {}).get("pixels_gt_50")
+                edge_bbox = page_result.get("metrics", {}).get("edge_bbox_max_delta")
+                edge_row = page_result.get("metrics", {}).get("edge_row_projection_delta")
+                edge_col = page_result.get("metrics", {}).get("edge_column_projection_delta")
+                edge_delta = page_result.get("delta_vs_baseline", {}).get(
+                    "edge_column_projection_delta"
+                )
                 print(
-                    f"{name:84} p>50={metric if metric is not None else 'capture-fail'} "
-                    f"delta={delta if delta is not None else '-'}",
+                    f"{name:84} "
+                    f"p>50={metric if metric is not None else 'capture-fail'} "
+                    f"edge_bbox={edge_bbox if edge_bbox is not None else '-'} "
+                    f"edge_row={edge_row if edge_row is not None else '-'} "
+                    f"edge_col={edge_col if edge_col is not None else '-'} "
+                    f"edge_col_delta={edge_delta if edge_delta is not None else '-'}",
                     flush=True,
                 )
         browser.close()
