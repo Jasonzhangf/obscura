@@ -1953,18 +1953,29 @@ fn build(
         has_inline_content(tree, id, styles) || style.before_content.is_some() || style.after_content.is_some();
 
     let mut dom_children = tree.children(id);
-    // In a grid formatting context, whitespace-only text between items does not
-    // generate an anonymous grid item (CSS Grid). taffy 0.12 places each stray
-    // whitespace text node in its own cell, which offsets every real item, so a
-    // Tailwind `grid-cols-3` block with newlines between its children lays out
-    // diagonally instead of in one row (this collapsed the whole modern
-    // framework cluster after the taffy upgrade). Drop them before building.
-    if style.display == crate::Display::Grid {
+    // In flex and grid formatting contexts, collapsible whitespace-only text
+    // between items does not generate an anonymous item. Taffy places each
+    // stray whitespace leaf in the item sequence, shifting every real child.
+    // This is especially visible in pretty-printed HTML: indentation before a
+    // flex child becomes several pixels of unexplained leading space.
+    //
+    // Flatten display:contents first because its children participate as direct
+    // flex/grid items. Otherwise formatting whitespace inside the transparent
+    // wrapper would survive this filter and become an item in `build_any`.
+    if matches!(style.display, crate::Display::Flex | crate::Display::Grid) {
+        let mut flat = Vec::new();
+        flatten_contents_children(tree, &dom_children, styles, &mut flat);
+        dom_children = flat;
         dom_children.retain(|&cid| {
             tree.get_node(cid).map_or(false, |n| n.is_element()) || !tree.text_content(cid).trim().is_empty()
         });
     }
-    let has_float_child = dom_children.iter().any(|&cid| styles.get(&cid).map(|s| s.float.is_some()).unwrap_or(false));
+    // `float` has no effect on a flex or grid item. Legacy stylesheets often
+    // leave floats on children after a newer rule turns their parent into a
+    // flex container; routing those children through the block float-zone
+    // approximation corrupts flex sizing and percentage-margin placement.
+    let has_float_child = style.display == crate::Display::Block
+        && dom_children.iter().any(|&cid| styles.get(&cid).map(|s| s.float.is_some()).unwrap_or(false));
 
     // A block with mixed inline + block children keeps real block layout:
     // block-level children become direct block children (full available
