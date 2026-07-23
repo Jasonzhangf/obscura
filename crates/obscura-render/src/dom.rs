@@ -83,6 +83,20 @@ struct IfcRegistry {
     /// table column-balancing pass in `layout_dom_with_images`, which pins
     /// specified columns instead of sizing them purely from content.
     table_cols: HashMap<taffy::NodeId, (Vec<Option<f32>>, Vec<Option<f32>>)>,
+    /// Floats whose direct block parent does not establish a block formatting
+    /// context and whose exclusion can therefore continue through later
+    /// descendant blocks of the same BFC. The first layout pass gives these
+    /// nodes real geometry; `apply_float_continuations` uses it to narrow the
+    /// later intersecting bands before the final layout.
+    float_continuations: Vec<FloatContinuation>,
+}
+
+#[derive(Clone, Copy)]
+struct FloatContinuation {
+    owner: NodeId,
+    float: taffy::NodeId,
+    flow: taffy::NodeId,
+    side: crate::Float,
 }
 
 /// Walk the tree top-down accumulating the clip rect imposed by ancestor
@@ -942,6 +956,19 @@ pub fn layout_dom_with_images(
                     );
                 }
                 let _ = taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
+                if apply_float_continuations(
+                    tree,
+                    &mut taffy_tree,
+                    &id_map,
+                    &styles,
+                    &ifc_items,
+                ) {
+                    let _ = taffy_tree.compute_layout_with_measure(
+                        taffy_root,
+                        available,
+                        &mut measure,
+                    );
+                }
             }
             #[cfg(not(feature = "paint"))]
             {
@@ -953,6 +980,15 @@ pub fn layout_dom_with_images(
                     );
                 }
                 let _ = taffy_tree.compute_layout(taffy_root, available);
+                if apply_float_continuations(
+                    tree,
+                    &mut taffy_tree,
+                    &id_map,
+                    &styles,
+                    &ifc_items,
+                ) {
+                    let _ = taffy_tree.compute_layout(taffy_root, available);
+                }
             }
             compute_absolute_rects(&taffy_tree, taffy_root, 0.0, 0.0, &id_map, &words, &mut rects, &mut text_runs, &mut anon_rects);
             synthesize_row_rects(tree, &mut rects);
@@ -1382,6 +1418,307 @@ fn taffy_global_origin(
         current = taffy_tree.parent(id);
     }
     Some((x, y))
+}
+
+fn collect_taffy_global_rects(
+    taffy_tree: &TaffyTree<usize>,
+    node: taffy::NodeId,
+    parent_x: f32,
+    parent_y: f32,
+    rects: &mut HashMap<taffy::NodeId, Rect>,
+) {
+    let Ok(layout) = taffy_tree.layout(node) else {
+        return;
+    };
+    let x = parent_x + layout.location.x;
+    let y = parent_y + layout.location.y;
+    rects.insert(
+        node,
+        Rect {
+            x,
+            y,
+            width: layout.size.width,
+            height: layout.size.height,
+        },
+    );
+    for child in taffy_tree.children(node).unwrap_or_default() {
+        collect_taffy_global_rects(taffy_tree, child, x, y, rects);
+    }
+}
+
+#[derive(Clone, Copy)]
+struct FloatBand {
+    top: f32,
+    bottom: f32,
+    left: f32,
+    right: f32,
+    side: crate::Float,
+}
+
+fn narrow_node_to_float_band(
+    taffy_tree: &mut TaffyTree<usize>,
+    node: taffy::NodeId,
+    preliminary_rects: &HashMap<taffy::NodeId, Rect>,
+    band: FloatBand,
+) -> bool {
+    let Some(&rect) = preliminary_rects.get(&node) else {
+        return false;
+    };
+    if rect.y >= band.bottom
+        || rect.y + rect.height <= band.top
+        || rect.width <= 0.0
+    {
+        return false;
+    }
+    let Ok(current) = taffy_tree.style(node) else {
+        return false;
+    };
+    let Ok(layout) = taffy_tree.layout(node) else {
+        return false;
+    };
+    let mut narrowed = current.clone();
+    let (available, left_shift) = match band.side {
+        crate::Float::Right => {
+            if band.left >= rect.x + rect.width {
+                return false;
+            }
+            ((band.left - rect.x).max(0.0), 0.0)
+        }
+        crate::Float::Left => {
+            if band.right <= rect.x {
+                return false;
+            }
+            let shift = (band.right - rect.x).max(0.0);
+            ((rect.width - shift).max(0.0), shift)
+        }
+    };
+    if available >= rect.width - 0.01 {
+        return false;
+    }
+    let specified = if current.box_sizing == taffy::BoxSizing::ContentBox {
+        (available
+            - layout.padding.left
+            - layout.padding.right
+            - layout.border.left
+            - layout.border.right)
+            .max(0.0)
+    } else {
+        available
+    };
+    narrowed.size.width = taffy::Dimension::length(specified);
+    narrowed.max_size.width = taffy::Dimension::length(specified);
+    if left_shift > 0.0 {
+        narrowed.margin.left =
+            taffy::LengthPercentageAuto::length(layout.margin.left + left_shift);
+    }
+    taffy_tree.set_style(node, narrowed).is_ok()
+}
+
+fn grow_bfc_to_float_bottom(
+    taffy_tree: &mut TaffyTree<usize>,
+    node: taffy::NodeId,
+    preliminary_rects: &HashMap<taffy::NodeId, Rect>,
+    float_bottom: f32,
+) -> bool {
+    let Some(&rect) = preliminary_rects.get(&node) else {
+        return false;
+    };
+    let desired_border_height = (float_bottom - rect.y).max(0.0);
+    if desired_border_height <= rect.height + 0.01 {
+        return false;
+    }
+    let Ok(current) = taffy_tree.style(node) else {
+        return false;
+    };
+    let Ok(layout) = taffy_tree.layout(node) else {
+        return false;
+    };
+    let specified = if current.box_sizing == taffy::BoxSizing::ContentBox {
+        (desired_border_height
+            - layout.padding.top
+            - layout.padding.bottom
+            - layout.border.top
+            - layout.border.bottom)
+            .max(0.0)
+    } else {
+        desired_border_height
+    };
+    let mut grown = current.clone();
+    grown.min_size.height = taffy::Dimension::length(specified);
+    taffy_tree.set_style(node, grown).is_ok()
+}
+
+fn narrow_intersecting_descendants(
+    tree: &DomTree,
+    id: NodeId,
+    taffy_tree: &mut TaffyTree<usize>,
+    reverse: &HashMap<NodeId, taffy::NodeId>,
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+    ifc_items: &IfcRegistry,
+    preliminary_rects: &HashMap<taffy::NodeId, Rect>,
+    band: FloatBand,
+) -> bool {
+    let Some(&node) = reverse.get(&id) else {
+        return false;
+    };
+    let Some(&rect) = preliminary_rects.get(&node) else {
+        return false;
+    };
+    if rect.y >= band.bottom || rect.y + rect.height <= band.top {
+        return false;
+    }
+    let Some(style) = styles.get(&id) else {
+        return false;
+    };
+    if style.display == crate::Display::None
+        || style.float.is_some()
+        || matches!(style.position, Some(taffy::Position::Absolute))
+    {
+        return false;
+    }
+
+    // Float-avoiding formatting contexts move as one box. A shaped IFC or a
+    // leaf has no deeper block boundary at which its width can change, so it
+    // also consumes the current band as a unit.
+    let in_flow_element_children: Vec<NodeId> = tree
+        .children(id)
+        .into_iter()
+        .filter(|child| {
+            styles.get(child).map_or(false, |child_style| {
+                child_style.display != crate::Display::None
+                    && child_style.float.is_none()
+                    && !matches!(
+                        child_style.position,
+                        Some(taffy::Position::Absolute)
+                    )
+            })
+        })
+        .collect();
+    if establishes_block_formatting_context(style)
+        || ifc_items.whole.contains_key(&id)
+        || in_flow_element_children.is_empty()
+    {
+        return narrow_node_to_float_band(
+            taffy_tree,
+            node,
+            preliminary_rects,
+            band,
+        );
+    }
+
+    let mut changed = false;
+    for child in in_flow_element_children {
+        changed |= narrow_intersecting_descendants(
+            tree,
+            child,
+            taffy_tree,
+            reverse,
+            styles,
+            ifc_items,
+            preliminary_rects,
+            band,
+        );
+    }
+    changed
+}
+
+fn apply_float_continuations(
+    tree: &DomTree,
+    taffy_tree: &mut TaffyTree<usize>,
+    id_map: &HashMap<taffy::NodeId, NodeId>,
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+    ifc_items: &IfcRegistry,
+) -> bool {
+    let reverse: HashMap<NodeId, taffy::NodeId> =
+        id_map.iter().map(|(&taffy, &dom)| (dom, taffy)).collect();
+    let Some(root) = id_map
+        .keys()
+        .copied()
+        .find(|node| taffy_tree.parent(*node).is_none())
+    else {
+        return false;
+    };
+    let mut preliminary_rects = HashMap::with_capacity(id_map.len());
+    collect_taffy_global_rects(
+        taffy_tree,
+        root,
+        0.0,
+        0.0,
+        &mut preliminary_rects,
+    );
+    let mut changed = false;
+    for continuation in &ifc_items.float_continuations {
+        let Some(&float_rect) = preliminary_rects.get(&continuation.float) else {
+            continue;
+        };
+        let Ok(float_layout) = taffy_tree.layout(continuation.float) else {
+            continue;
+        };
+        let Some(&flow_rect) = preliminary_rects.get(&continuation.flow) else {
+            continue;
+        };
+        let band = FloatBand {
+            top: float_rect.y - float_layout.margin.top,
+            bottom: float_rect.y + float_rect.height + float_layout.margin.bottom,
+            left: float_rect.x - float_layout.margin.left,
+            right: float_rect.x + float_rect.width + float_layout.margin.right,
+            side: continuation.side,
+        };
+        if band.bottom <= flow_rect.y + flow_rect.height + 0.01 {
+            continue;
+        }
+
+        // A non-BFC wrapper is transparent to the BFC's float manager. Visit
+        // the wrapper's following siblings, then repeat at each ancestor until
+        // (and including) the nearest ancestor BFC. Descend through ordinary
+        // blocks so only the leaf/block bands that actually intersect the
+        // float are narrowed; later siblings below the float stay full width.
+        let mut current = continuation.owner;
+        while let Some(parent) = tree.get_node(current).and_then(|node| node.parent)
+        {
+            let siblings = tree.children(parent);
+            let Some(index) = siblings.iter().position(|candidate| *candidate == current)
+            else {
+                break;
+            };
+            for sibling in &siblings[index + 1..] {
+                changed |= narrow_intersecting_descendants(
+                    tree,
+                    *sibling,
+                    taffy_tree,
+                    &reverse,
+                    styles,
+                    ifc_items,
+                    &preliminary_rects,
+                    band,
+                );
+            }
+            let reached_bfc = styles
+                .get(&parent)
+                .map(establishes_block_formatting_context)
+                .unwrap_or(false);
+            if reached_bfc {
+                if styles
+                    .get(&parent)
+                    .map(|style| matches!(style.height, crate::Dimension::Auto))
+                    .unwrap_or(false)
+                {
+                    if let Some(&bfc_node) = reverse.get(&parent) {
+                        changed |=
+                            grow_bfc_to_float_bottom(
+                                taffy_tree,
+                                bfc_node,
+                                &preliminary_rects,
+                                band.bottom,
+                            );
+                    }
+                }
+                break;
+            }
+            current = parent;
+        }
+    }
+    changed
 }
 
 fn resolve_static_positions_and_reparent(
@@ -2757,6 +3094,15 @@ fn max_definite_descendant_width(tree: &DomTree, id: NodeId, styles: &HashMap<No
     best
 }
 
+fn establishes_block_formatting_context(style: &crate::LayoutStyle) -> bool {
+    matches!(style.display, crate::Display::Flex | crate::Display::Grid)
+        || style.flow_root
+        || style.overflow_hidden
+        || style.is_inline_block
+        || style.float.is_some()
+        || matches!(style.position, Some(taffy::Position::Absolute))
+}
+
 fn build_children_with_float_zone(
     tree: &DomTree,
     parent_id: NodeId,
@@ -3148,7 +3494,6 @@ fn build_children_with_float_zone(
             break;
         }
     }
-
     // The float itself is always an element (only elements get style
     // entries, and `is_float` above required one), so a direct `build` call
     // is correct here; only its flow siblings need the word-splitting `build_any`.
@@ -3227,12 +3572,52 @@ fn build_children_with_float_zone(
                 },
                 ..Default::default()
             };
+            // A float does not contribute to the height of a non-BFC block
+            // that contains it. Put an escaping float inside a zero-height,
+            // overflow-visible wrapper: its real width still reserves the
+            // current band, but its height can protrude into later descendant
+            // blocks of the ancestor BFC. A matching `clear` or any remaining
+            // direct full-width sibling keeps the old containing row, since
+            // that content explicitly terminates the local float zone.
+            let can_escape = zone_end == dom_children.len()
+                && styles
+                    .get(&parent_id)
+                    .map(|style| !establishes_block_formatting_context(style))
+                    .unwrap_or(false);
+            let row_float = if can_escape {
+                let wrapper_style = taffy::Style {
+                    display: taffy::style::Display::Block,
+                    flex_grow: 0.0,
+                    flex_shrink: 0.0,
+                    size: taffy::Size {
+                        width: taffy::Dimension::auto(),
+                        height: taffy::Dimension::length(0.0),
+                    },
+                    ..Default::default()
+                };
+                taffy_tree
+                    .new_with_children(wrapper_style, &[float_id])
+                    .ok()
+                    .unwrap_or(float_id)
+            } else {
+                float_id
+            };
             let row_children: Vec<taffy::NodeId> = match float_side {
-                Some(crate::Float::Left) => [Some(float_id), flow_column].into_iter().flatten().collect(),
-                _ => [flow_column, Some(float_id)].into_iter().flatten().collect(),
+                Some(crate::Float::Left) => [Some(row_float), flow_column].into_iter().flatten().collect(),
+                _ => [flow_column, Some(row_float)].into_iter().flatten().collect(),
             };
             if let Ok(row) = taffy_tree.new_with_children(row_style, &row_children) {
                 result.push(row);
+                if can_escape {
+                    if let (Some(flow), Some(side)) = (flow_column, float_side) {
+                        ifc_items.float_continuations.push(FloatContinuation {
+                            owner: parent_id,
+                            float: float_id,
+                            flow,
+                            side,
+                        });
+                    }
+                }
             }
         }
         // The float itself failed to build (e.g. display:none resolved for

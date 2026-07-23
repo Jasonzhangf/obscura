@@ -257,9 +257,12 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                     | "grid"
                     | "inline-grid"
                     | "block"
+                    | "flow-root"
                     | "contents"
             ) {
                 style.internal_flex_container = false;
+                style.is_inline_block = false;
+                style.flow_root = false;
             }
             match value {
                 "none" => style.display = crate::Display::None,
@@ -273,6 +276,10 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                 "grid" => style.display = crate::Display::Grid,
                 "inline-grid" => style.display = crate::Display::Grid,
                 "block" => style.display = crate::Display::Block,
+                "flow-root" => {
+                    style.display = crate::Display::Block;
+                    style.flow_root = true;
+                }
                 "contents" => style.display_contents = true,
                 _ => {}
             }
@@ -2742,6 +2749,10 @@ mod tests {
         assert_eq!(s.display, Display::Flex);
         assert_eq!(s.width, crate::Dimension::Px(200.0));
         assert_eq!(s.height, crate::Dimension::Px(50.0));
+
+        let flow_root = compute_style("div", Some("display: flow-root"));
+        assert_eq!(flow_root.display, Display::Block);
+        assert!(flow_root.flow_root);
     }
 
     #[test]

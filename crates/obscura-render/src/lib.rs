@@ -413,6 +413,11 @@ pub struct LayoutStyle {
     /// own box (including any `::before`/`::after` content attached to it).
     pub is_inline_block: bool,
 
+    /// `display: flow-root`: generates a normal block box but establishes a
+    /// new block formatting context, containing descendant floats and stopping
+    /// their exclusion bands from propagating into outside siblings.
+    pub flow_root: bool,
+
     /// `display: contents`: the element generates no box of its own; its
     /// children participate in the parent's formatting context directly
     /// (`dom::build_any` splices them into the parent's child list). Kept as a
