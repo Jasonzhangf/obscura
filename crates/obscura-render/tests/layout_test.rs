@@ -193,6 +193,71 @@ fn absolute_auto_axes_preserve_static_position_after_reparenting() {
 }
 
 #[test]
+fn legacy_center_keeps_block_flow_and_centers_descendants() {
+    let tree = parse_html(include_str!("../../../render-repros/legacy-center.html"));
+    let layout = layout_dom(&tree, (900.0, 1000.0));
+    let rect = |selector| {
+        let id = tree.query_selector_all(selector).unwrap()[0];
+        layout.rects[&id]
+    };
+    let inline = rect(".inline-box");
+    let block = rect(".block-box");
+    let nested = rect(".nested-inline");
+    let auto = rect(".auto-block");
+    let table = rect(".center-table");
+    let table_inline = rect(".table-inline");
+    let cell_center = rect(".cell-center");
+    let overridden = rect(".override-box");
+    let pure = rect("#pure-center");
+
+    assert!(
+        (inline.x - 150.0).abs() < 0.01 && (inline.y - 0.0).abs() < 0.01,
+        "centered inline content: {inline:?}"
+    );
+    assert!(
+        (block.x - 150.0).abs() < 0.01 && (block.y - 20.0).abs() < 0.01,
+        "centered block descendant: {block:?}"
+    );
+    assert!(
+        (nested.x - 170.0).abs() < 0.01 && (nested.y - 40.0).abs() < 0.01,
+        "inherited nested alignment: {nested:?}"
+    );
+    assert!(
+        (auto.x - 0.0).abs() < 0.01
+            && (auto.y - 60.0).abs() < 0.01
+            && (auto.width - 400.0).abs() < 0.01,
+        "auto-width block remains fill-available: {auto:?}"
+    );
+    assert!(
+        (table.x - 100.0).abs() < 0.01
+            && (table.y - 80.0).abs() < 0.01
+            && (table.width - 200.0).abs() < 0.01,
+        "table outer box is centered: {table:?}"
+    );
+    assert!(
+        (table_inline.x - 100.0).abs() < 0.01
+            && (table_inline.y - 80.0).abs() < 0.01,
+        "table contents reset legacy alignment: {table_inline:?}"
+    );
+    assert!(
+        (cell_center.x - 100.0).abs() < 0.01
+            && (cell_center.y - 100.0).abs() < 0.01
+            && (cell_center.width - 200.0).abs() < 0.01,
+        "center in table cell fills the cell: {cell_center:?}"
+    );
+    assert!(
+        (overridden.x - 0.0).abs() < 0.01 && (overridden.y - 120.0).abs() < 0.01,
+        "author text-align override: {overridden:?}"
+    );
+    assert!(
+        (pure.x - 0.0).abs() < 0.01
+            && (pure.y - 240.0).abs() < 0.01
+            && (pure.width - 400.0).abs() < 0.01,
+        "pure-text center remains fill-available: {pure:?}"
+    );
+}
+
+#[test]
 fn transforms_establish_absolute_and_fixed_containing_blocks() {
     let html = r##"
         <body style="margin:0">
