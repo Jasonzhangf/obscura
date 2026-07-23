@@ -97,6 +97,11 @@
     {"name": "vmin margin resolves against smaller viewport axis", "color": "#f08c00", "x": 90, "y": 440, "width": 100, "height": 40},
     {"name": "vmax margin resolves against larger viewport axis", "color": "#1098ad", "x": 100, "y": 520, "width": 100, "height": 40}
   ],
+  "replaced-grid-order": [
+    {"name": "order-modified description occupies the first grid cell", "color": "#e8590c", "x": 0, "y": 0, "width": 300, "height": 200},
+    {"name": "media wrapper shares the first row", "color": "#1971c2", "x": 300, "y": 0, "width": 300, "height": 300},
+    {"name": "percentage image uses the wrapper content box", "color": "#c2255c", "x": 320, "y": 20, "width": 260, "height": 260}
+  ],
   "tables": [
     {"name": "content-box fixed cell column", "color": "#ffcc99", "width": 208}
   ],

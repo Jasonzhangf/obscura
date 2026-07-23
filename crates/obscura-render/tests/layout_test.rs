@@ -4,7 +4,8 @@
 //! site-specific hacks that used to live in obscura-render for this exact markup.
 
 use obscura_dom::tree_sink::parse_html;
-use obscura_render::layout_dom;
+use obscura_render::{layout_dom, layout_dom_with_images};
+use std::collections::HashMap;
 
 const HN_HTML: &str = r##"
     <table border="0" cellpadding="0" cellspacing="0" width="85%" bgcolor="#f6f6ef">
@@ -357,5 +358,36 @@ fn float_flow_zone_preserves_blocks_inline_runs_and_clearance() {
     assert!(
         !layout.rects.contains_key(&tree.get_element_by_id("mobile-duplicate").unwrap()),
         "display:none duplicate generated a box"
+    );
+}
+
+#[test]
+fn replaced_image_contributes_intrinsic_size_in_ordered_grid() {
+    let tree = parse_html(include_str!("../../../render-repros/replaced-grid-order.html"));
+    let image_id = tree.get_element_by_id("image").unwrap();
+    let intrinsic = HashMap::from([(image_id, (1.0, 1.0))]);
+    let layout = layout_dom_with_images(&tree, (900.0, 1000.0), &intrinsic);
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    let description = rect("description");
+    let media = rect("media");
+    let image = rect("image");
+    assert!(
+        (description.x - 0.0).abs() < 0.01
+            && (description.y - 0.0).abs() < 0.01
+            && (description.width - 300.0).abs() < 0.01,
+        "description: {description:?}"
+    );
+    assert!(
+        (media.x - 300.0).abs() < 0.01
+            && (media.y - 0.0).abs() < 0.01
+            && (media.height - 300.0).abs() < 0.01,
+        "media: {media:?}"
+    );
+    assert!(
+        (image.x - 320.0).abs() < 0.01
+            && (image.y - 20.0).abs() < 0.01
+            && (image.width - 260.0).abs() < 0.01
+            && (image.height - 260.0).abs() < 0.01,
+        "image: {image:?}"
     );
 }
