@@ -73,11 +73,44 @@
       height: 30px;
       background: #2b8a3e;
     }
+    #flex-content {
+      display: flex;
+      flex-wrap: wrap;
+      align-content: space-between;
+      width: 120px;
+      height: 120px;
+      margin-top: 20px;
+      background: #d0ebff;
+    }
+    #line-one, #line-two {
+      width: 70px;
+      height: 20px;
+    }
+    #line-one { background: #f76707; }
+    #line-two { background: #1098ad; }
+    #grid-content {
+      display: grid;
+      grid-template-columns: 100px;
+      grid-template-rows: 50px 50px;
+      place-content: center end;
+      width: 200px;
+      height: 200px;
+      margin-top: 20px;
+      background: #fff3bf;
+    }
+    #track-one, #track-two {
+      width: 100px;
+      height: 50px;
+    }
+    #track-one { background: #7048e8; }
+    #track-two { background: #37b24d; }
   </style>
 </head>
 <body>
   <div id="flex"><div id="flex-center"></div><div id="flex-end"></div></div>
   <div id="grid"><div id="grid-end"></div><div id="grid-center"></div><div id="grid-place"></div></div>
   <div id="grid-items"><div id="parent-one"></div><div id="parent-two"></div></div>
+  <div id="flex-content"><div id="line-one"></div><div id="line-two"></div></div>
+  <div id="grid-content"><div id="track-one"></div><div id="track-two"></div></div>
 </body>
 </html>

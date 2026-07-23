@@ -504,6 +504,10 @@ fn item_self_alignment_places_flex_and_grid_items() {
     let grid_place = rect("grid-place");
     let parent_one = rect("parent-one");
     let parent_two = rect("parent-two");
+    let line_one = rect("line-one");
+    let line_two = rect("line-two");
+    let track_one = rect("track-one");
+    let track_two = rect("track-two");
     assert!(
         (flex_center.x - 0.0).abs() < 0.01
             && (flex_center.y - 40.0).abs() < 0.01
@@ -526,6 +530,20 @@ fn item_self_alignment_places_flex_and_grid_items() {
             && (parent_two.x - 195.0).abs() < 0.01
             && (parent_two.y - 330.0).abs() < 0.01,
         "parent-aligned grid items: {parent_one:?} {parent_two:?}"
+    );
+    assert!(
+        (line_one.x - 0.0).abs() < 0.01
+            && (line_one.y - 380.0).abs() < 0.01
+            && (line_two.x - 0.0).abs() < 0.01
+            && (line_two.y - 480.0).abs() < 0.01,
+        "aligned flex lines: {line_one:?} {line_two:?}"
+    );
+    assert!(
+        (track_one.x - 100.0).abs() < 0.01
+            && (track_one.y - 570.0).abs() < 0.01
+            && (track_two.x - 100.0).abs() < 0.01
+            && (track_two.y - 620.0).abs() < 0.01,
+        "aligned grid tracks: {track_one:?} {track_two:?}"
     );
 }
 
