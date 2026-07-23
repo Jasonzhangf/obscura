@@ -35,6 +35,14 @@
     {"name": "float", "color": "#88bbdd", "width": 120, "height": 80},
     {"name": "cleared block", "color": "#ffcc66", "width": 500, "height": 40}
   ],
+  "grid-auto-repeat": [
+    {"name": "auto-fill creates all fitting tracks", "color": "#087f5b", "width": 210, "height": 60, "count": 4},
+    {"name": "auto-fit collapses empty tracks", "color": "#1971c2", "width": 287, "height": 60, "count": 3}
+  ],
+  "grid-shorthand": [
+    {"name": "grid shorthand creates explicit columns", "color": "#087f5b", "width": 287, "height": 60, "count": 3},
+    {"name": "custom property grid shorthand creates explicit columns", "color": "#1971c2", "width": 287, "height": 60, "count": 3}
+  ],
   "mixed-content-block": [
     {"name": "full-width block child", "color": "#ccddff", "width": 400}
   ],
