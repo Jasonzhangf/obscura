@@ -2064,7 +2064,34 @@ fn build(
     // measure callback derives the other axis through the intrinsic ratio.
     if _name.local.as_ref() == "img" {
         if let Some((width, height)) = style.intrinsic_size {
-            let context = engine.register_replaced(width, height);
+            // When an auto axis has a definite min/max constraint, the
+            // measured replaced leaf must own intrinsic-ratio transfer so it
+            // can clamp the derived size. Leaving the same ratio on taffy's
+            // style lets taffy synthesize that axis before measurement and
+            // bypass the constraint (width:100%; height:auto;
+            // max-height:200px became the uncapped intrinsic height).
+            //
+            // Keep taffy's ratio in the unconstrained case: percentage-sized
+            // images in auto wrappers can be measured at intrinsic size before
+            // their percentage width becomes definite, and taffy then needs
+            // the ratio to transfer that final width to height.
+            let measured_axis_constraint =
+                (!matches!(style.height, crate::Dimension::Auto)
+                    && matches!(style.width, crate::Dimension::Auto)
+                    && matches!(
+                        (style.min_width, style.max_width),
+                        (crate::Dimension::Px(_), _) | (_, crate::Dimension::Px(_))
+                    ))
+                    || (!matches!(style.width, crate::Dimension::Auto)
+                        && matches!(style.height, crate::Dimension::Auto)
+                        && matches!(
+                            (style.min_height, style.max_height),
+                            (crate::Dimension::Px(_), _) | (_, crate::Dimension::Px(_))
+                        ));
+            if measured_axis_constraint {
+                taffy_style.aspect_ratio = None;
+            }
+            let context = engine.register_replaced(width, height, style);
             let leaf = taffy_tree.new_leaf_with_context(taffy_style, context).ok()?;
             id_map.insert(leaf, id);
             return Some(leaf);

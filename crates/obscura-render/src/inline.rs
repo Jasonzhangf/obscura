@@ -18,7 +18,7 @@ use cosmic_text::{Align, Attrs, Buffer, Color, Family, FontSystem, Metrics, Shap
 
 use obscura_dom::tree::{DomTree, NodeId};
 
-use crate::{Display, LayoutStyle, Rect, TextTransform};
+use crate::{Dimension, Display, LayoutStyle, Rect, TextTransform};
 
 // Bundled faces. Chrome on this class of host renders `sans-serif` and the
 // ubiquitous Arial/Helvetica/system-ui stacks as Liberation Sans, `serif` as
@@ -105,10 +105,62 @@ pub struct TextEngine {
     font_system: FontSystem,
     swash: SwashCache,
     items: Vec<InlineItem>,
-    replaced: Vec<(f32, f32)>,
+    replaced: Vec<ReplacedItem>,
 }
 
 const REPLACED_CONTEXT_BIT: usize = 1usize << (usize::BITS - 1);
+
+#[derive(Clone, Copy)]
+struct ReplacedItem {
+    intrinsic_width: f32,
+    intrinsic_height: f32,
+    min_width: Option<f32>,
+    min_height: Option<f32>,
+    max_width: Option<f32>,
+    max_height: Option<f32>,
+}
+
+impl ReplacedItem {
+    fn from_style(width: f32, height: f32, style: &LayoutStyle) -> Self {
+        let px = |dimension| match dimension {
+            Dimension::Px(value) => Some(value.max(0.0)),
+            _ => None,
+        };
+        ReplacedItem {
+            intrinsic_width: width,
+            intrinsic_height: height,
+            min_width: px(style.min_width),
+            min_height: px(style.min_height),
+            max_width: px(style.max_width),
+            max_height: px(style.max_height),
+        }
+    }
+
+    fn clamp(value: f32, min: Option<f32>, max: Option<f32>) -> f32 {
+        // CSS sizing gives the minimum precedence when min > max.
+        let value = max.map_or(value, |max| value.min(max));
+        min.map_or(value, |min| value.max(min))
+    }
+
+    fn size(self, known: taffy::Size<Option<f32>>) -> taffy::Size<f32> {
+        let (width, height) = match (known.width, known.height) {
+            (Some(width), Some(height)) => (width, height),
+            (Some(width), None) => (
+                width,
+                width * self.intrinsic_height / self.intrinsic_width,
+            ),
+            (None, Some(height)) => (
+                height * self.intrinsic_width / self.intrinsic_height,
+                height,
+            ),
+            (None, None) => (self.intrinsic_width, self.intrinsic_height),
+        };
+        taffy::Size {
+            width: Self::clamp(width, self.min_width, self.max_width),
+            height: Self::clamp(height, self.min_height, self.max_height),
+        }
+    }
+}
 
 impl Default for TextEngine {
     fn default() -> Self {
@@ -267,10 +319,9 @@ impl TextEngine {
     /// taffy's measure function during layout.
     pub fn measure(&mut self, idx: usize, width: Option<f32>) -> (f32, f32) {
         if idx & REPLACED_CONTEXT_BIT != 0 {
-            let (iw, ih) = self.replaced[idx & !REPLACED_CONTEXT_BIT];
-            return width
-                .map(|width| (width, width * ih / iw))
-                .unwrap_or((iw, ih));
+            let size = self.replaced[idx & !REPLACED_CONTEXT_BIT]
+                .size(taffy::Size { width, height: None });
+            return (size.width, size.height);
         }
         let TextEngine { font_system, items, .. } = self;
         let item = &mut items[idx];
@@ -282,9 +333,15 @@ impl TextEngine {
     /// Register a replaced element's intrinsic size as a taffy measure
     /// context. Percentage-sized image leaves still need their intrinsic
     /// max-content contribution while an auto-sized ancestor is measured.
-    pub fn register_replaced(&mut self, width: f32, height: f32) -> usize {
+    pub fn register_replaced(
+        &mut self,
+        width: f32,
+        height: f32,
+        style: &LayoutStyle,
+    ) -> usize {
         let index = self.replaced.len();
-        self.replaced.push((width, height));
+        self.replaced
+            .push(ReplacedItem::from_style(width, height, style));
         REPLACED_CONTEXT_BIT | index
     }
 
@@ -298,22 +355,7 @@ impl TextEngine {
         available: taffy::Size<taffy::AvailableSpace>,
     ) -> taffy::Size<f32> {
         if idx & REPLACED_CONTEXT_BIT != 0 {
-            let (iw, ih) = self.replaced[idx & !REPLACED_CONTEXT_BIT];
-            return match (known.width, known.height) {
-                (Some(width), Some(height)) => taffy::Size { width, height },
-                (Some(width), None) => taffy::Size {
-                    width,
-                    height: width * ih / iw,
-                },
-                (None, Some(height)) => taffy::Size {
-                    width: height * iw / ih,
-                    height,
-                },
-                (None, None) => taffy::Size {
-                    width: iw,
-                    height: ih,
-                },
-            };
+            return self.replaced[idx & !REPLACED_CONTEXT_BIT].size(known);
         }
         let width = known.width.or(match available.width {
             taffy::AvailableSpace::Definite(width) => Some(width),
