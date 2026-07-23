@@ -48,6 +48,16 @@
     {"name": "display contents flex sidebar starts at container edge", "color": "#7048e8", "x": 0, "y": 260, "width": 150, "height": 140},
     {"name": "display contents flex body keeps its intended inset", "color": "#c2255c", "x": 150, "y": 260, "width": 450, "height": 160}
   ],
+  "float-flow-bands": [
+    {"name": "right float occupies its band", "color": "#1971c2", "x": 650, "y": 0, "width": 250, "height": 400},
+    {"name": "float-avoiding intro uses available band", "color": "#087f5b", "x": 0, "y": 0, "width": 650, "height": 100},
+    {"name": "heading remains beside float", "color": "#e8590c", "x": 0, "y": 100, "width": 650, "height": 50},
+    {"name": "first inline atomic box shares one line", "color": "#c2255c", "x": 0, "y": 150, "width": 60, "height": 30},
+    {"name": "second inline atomic box shares one line", "color": "#7048e8", "x": 60, "y": 150, "width": 90, "height": 30},
+    {"name": "hidden duplicate consumes no flow height", "color": "#f08c00", "x": 0, "y": 180, "width": 650, "height": 50},
+    {"name": "later block remains in float band", "color": "#1098ad", "x": 0, "y": 230, "width": 650, "height": 70},
+    {"name": "clear moves below float bottom", "color": "#a61e4d", "x": 0, "y": 400, "width": 900, "height": 50}
+  ],
   "grid-auto-repeat": [
     {"name": "auto-fill creates all fitting tracks", "color": "#087f5b", "width": 210, "height": 60, "count": 4},
     {"name": "auto-fit collapses empty tracks", "color": "#1971c2", "width": 287, "height": 60, "count": 3}

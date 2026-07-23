@@ -332,3 +332,30 @@ fn percentage_flex_overlay_uses_auto_width_parent_content_box() {
     assert!((sidebar.x - 16.0).abs() < 0.01, "sidebar: {sidebar:?}");
     assert!((sidebar.width - 320.0).abs() < 0.01, "sidebar: {sidebar:?}");
 }
+
+#[test]
+fn float_flow_zone_preserves_blocks_inline_runs_and_clearance() {
+    let tree = parse_html(include_str!("../../../render-repros/float-flow-bands.html"));
+    let layout = layout_dom(&tree, (900.0, 1000.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    let float = rect("float");
+    let intro = rect("intro");
+    let release = rect("release");
+    let download = rect("download");
+    let archive = rect("archive");
+    let sponsors = rect("sponsors");
+    let logos = rect("logos");
+    let cleared = rect("cleared");
+    assert!((float.x - 650.0).abs() < 0.01 && (float.height - 400.0).abs() < 0.01, "float: {float:?}");
+    assert!((intro.x - 0.0).abs() < 0.01 && (intro.width - 650.0).abs() < 0.01, "intro: {intro:?}");
+    assert!((release.y - 100.0).abs() < 0.01 && (release.width - 650.0).abs() < 0.01, "release: {release:?}");
+    assert!((download.x - 0.0).abs() < 0.01 && (download.y - 150.0).abs() < 0.01, "download: {download:?}");
+    assert!((archive.x - 60.0).abs() < 0.01 && (archive.y - 150.0).abs() < 0.01, "archive: {archive:?}");
+    assert!((sponsors.y - 180.0).abs() < 0.01, "sponsors: {sponsors:?}");
+    assert!((logos.y - 230.0).abs() < 0.01, "logos: {logos:?}");
+    assert!((cleared.y - 400.0).abs() < 0.01 && (cleared.width - 900.0).abs() < 0.01, "cleared: {cleared:?}");
+    assert!(
+        !layout.rects.contains_key(&tree.get_element_by_id("mobile-duplicate").unwrap()),
+        "display:none duplicate generated a box"
+    );
+}
