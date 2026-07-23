@@ -133,7 +133,7 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
         };
         style.border_color = Some([118, 118, 118, 255]);
         style.background_color = Some([255, 255, 255, 255]);
-    } else if tag == "table" || tag == "tbody" {
+    } else if matches!(tag, "table" | "tbody" | "thead" | "tfoot") {
         style.display = Display::Flex;
         style.internal_flex_container = true;
         style.flex_direction = Some(taffy::FlexDirection::Column);
@@ -144,8 +144,19 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
         // out sideways. (Fully matching CSS auto table layout, where a table
         // grows to fit unshrinkable content, needs real table layout.)
         style.min_width = crate::Dimension::Px(0.0);
-        if tag == "tbody" {
+        if tag == "table" {
+            // Chromium's HTML UA sheet makes the table grid border-box and
+            // supplies the traditional two-pixel separate-border spacing.
+            // Author declarations and the legacy `cellspacing` hint cascade
+            // over these values.
+            style.box_sizing = crate::BoxSizing::BorderBox;
+            style.border_spacing = Some((2.0, 2.0));
+            style.border_collapse = Some(false);
+        } else {
             style.width = crate::Dimension::Percent(1.0);
+            // The row-group UA rule is the source of the effective default
+            // middle alignment; rows and cells inherit it below.
+            style.vertical_align = Some(crate::VerticalAlign::Middle);
         }
     } else if tag == "tr" {
         style.internal_flex_container = true;
@@ -160,12 +171,13 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
         style.internal_flex_container = true;
         style.flex_direction = Some(taffy::FlexDirection::Column);
         style.align_items = Some(taffy::AlignItems::FLEX_START);
-        style.padding = Edges { top: 0.0, right: 5.0, bottom: 0.0, left: 0.0 };
+        style.padding = Edges {
+            top: 1.0,
+            right: 1.0,
+            bottom: 1.0,
+            left: 1.0,
+        };
         style.min_width = crate::Dimension::Px(0.0);
-        // Cells are effectively middle-aligned by default in browsers (the
-        // HTML UA sheet's row-group vertical-align inherited into cells);
-        // an author `vertical-align` on the cell overrides this.
-        style.vertical_align = Some(crate::VerticalAlign::Middle);
         if tag == "th" {
             style.font_weight = Some("bold".to_string());
         }
@@ -687,6 +699,16 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
             if let Some(&h) = dims.first() {
                 style.border_spacing = Some((h, *dims.get(1).unwrap_or(&h)));
             }
+        }
+        "border-collapse" => {
+            style.border_collapse = match value.trim().to_ascii_lowercase().as_str() {
+                "collapse" => Some(true),
+                "separate" | "initial" | "revert" | "revert-layer" => Some(false),
+                // This is an inherited property, so both an omitted value and
+                // an explicit inherit/unset are resolved in the top-down pass.
+                "inherit" | "unset" => None,
+                _ => style.border_collapse,
+            };
         }
         "grid-template-columns" => {
             let (tracks, names) = parse_track_list_named(value);

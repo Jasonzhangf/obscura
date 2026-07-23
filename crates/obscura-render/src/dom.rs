@@ -188,6 +188,9 @@ fn apply_presentational_hints(node: &obscura_dom::tree::Node, style: &mut crate:
     if let Some(align) = node.get_attribute("align") {
         crate::style::apply_inline(style, &format!("text-align: {}", align));
     }
+    if let Some(valign) = node.get_attribute("valign") {
+        crate::style::apply_inline(style, &format!("vertical-align: {}", valign));
+    }
     if let Some(cellspacing) = node.get_attribute("cellspacing") {
         if cellspacing.chars().all(|c| c.is_ascii_digit()) {
             crate::style::apply_inline(style, &format!("border-spacing: {}px", cellspacing));
@@ -223,14 +226,35 @@ fn cascade_walk(
     styles: &mut HashMap<NodeId, crate::LayoutStyle>,
     parent_props: &std::rc::Rc<HashMap<String, String>>,
     quirks_mode: bool,
+    inherited_cell_padding: Option<f32>,
 ) {
     let Some(node) = tree.get_node(id) else { return };
     let is_element = node.is_element();
     // The custom-property map in force for this node's subtree: the parent's,
     // unless this element declares its own `--x` (then a richer map).
     let mut this_props = parent_props.clone();
+    let mut descendant_cell_padding = inherited_cell_padding;
     if let Some(elem) = node.as_element() {
+        if elem.local.as_ref() == "table" {
+            // `cellpadding` is a table-scoped presentational hint applied to
+            // its cells, below author CSS. Entering any nested table resets
+            // the outer table's value before reading the nested attribute.
+            descendant_cell_padding = node
+                .get_attribute("cellpadding")
+                .and_then(|value| value.trim().parse::<f32>().ok())
+                .filter(|value| value.is_finite() && *value >= 0.0);
+        }
         let mut style = crate::style::ua_style(elem.local.as_ref());
+        if matches!(elem.local.as_ref(), "td" | "th") {
+            if let Some(padding) = inherited_cell_padding {
+                style.padding = crate::Edges {
+                    top: padding,
+                    right: padding,
+                    bottom: padding,
+                    left: padding,
+                };
+            }
+        }
         if quirks_mode && elem.local.as_ref() == "form" {
             // Legacy HTML/quirks rendering keeps one em after forms. Standards
             // mode does not; Hacker News and many old document templates omit
@@ -319,6 +343,7 @@ fn cascade_walk(
             styles,
             &this_props,
             quirks_mode,
+            descendant_cell_padding,
         );
     }
     if is_element {
@@ -384,13 +409,13 @@ pub fn layout_dom_with_images(
         &mut styles,
         &root_props,
         quirks_mode,
+        None,
     );
     if timing {
         let (r, i, c, l, u) = sheet.debug_stats();
         eprintln!("[timing] parse+index={:?} cascade={:?} rules={} id_keys={} class_keys={} local_keys={} universal={}", t_parse, t1.elapsed(), r, i, c, l, u);
     }
     grow_trailing_auto_cells(tree, &mut styles);
-    propagate_border_spacing(tree, &mut styles);
 
     // The leaf context is the index of a cosmic-text inline formatting
     // context in `engine`; leaves without text carry no context.
@@ -429,6 +454,8 @@ pub fn layout_dom_with_images(
             text_transform: crate::TextTransform,
             italic: bool,
             box_sizing: crate::BoxSizing,
+            border_collapse: bool,
+            table_vertical_align: Option<crate::VerticalAlign>,
             /// Containing-block width in px for the current element, carried
             /// down so percentage padding/margin (which resolve against the
             /// containing block WIDTH, all sides) can be turned into px before
@@ -453,6 +480,8 @@ pub fn layout_dom_with_images(
                     text_transform: crate::TextTransform::None,
                     italic: false,
                     box_sizing: crate::BoxSizing::ContentBox,
+                    border_collapse: false,
+                    table_vertical_align: None,
                     cb_width: 0.0,
                 }
             }
@@ -586,6 +615,24 @@ pub fn layout_dom_with_images(
                     style.box_sizing = inh.box_sizing;
                 }
                 inh.box_sizing = style.box_sizing;
+                match style.border_collapse {
+                    Some(value) => inh.border_collapse = value,
+                    None => style.border_collapse = Some(inh.border_collapse),
+                }
+                let is_table_part = tree.get_node(id).map_or(false, |node| {
+                    node.as_element().map_or(false, |name| {
+                        matches!(
+                            name.local.as_ref(),
+                            "tbody" | "thead" | "tfoot" | "tr" | "td" | "th"
+                        )
+                    })
+                });
+                if is_table_part {
+                    match style.vertical_align {
+                        Some(value) => inh.table_vertical_align = Some(value),
+                        None => style.vertical_align = inh.table_vertical_align,
+                    }
+                }
 
                 // Resolve font/viewport-relative box edges now that their
                 // reference sizes are known. Percentage padding/margin then
@@ -701,6 +748,11 @@ pub fn layout_dom_with_images(
                 queue.push((cid, inh.clone()));
             }
         }
+
+        // Border-collapse is inherited, so only distribute a table's
+        // effective spacing to the legacy flex fallback after the computed
+        // top-down values are known.
+        propagate_border_spacing(tree, &mut styles);
 
         // Resolve native input-control intrinsic border-box geometry after
         // inheritance and author cascading. Text-like inputs use the HTML
@@ -902,9 +954,12 @@ pub fn layout_dom_with_images(
                 // id_map iteration order is not.
                 tables.sort_by(|a, b| b.2.cmp(&a.2));
                 for (tnode, dom, _depth) in tables {
+                    let Some(table_style) = styles.get(&dom) else {
+                        continue;
+                    };
                     // A percentage-width table resolves against its container, so
                     // leave taffy's percentage handling in place.
-                    let width_style = styles.get(&dom).map(|s| s.width.clone());
+                    let width_style = Some(table_style.width);
                     if matches!(width_style, Some(crate::Dimension::Percent(_))) {
                         continue;
                     }
@@ -935,21 +990,30 @@ pub fn layout_dom_with_images(
                         );
                         taffy_tree.layout(tnode).map(|l| l.size.width).unwrap_or(0.0)
                     };
-                    let preferred = match width_style {
+                    let inline_outer_edges = table_inline_outer_edges(table_style);
+                    let preferred_outer = match width_style {
+                        Some(crate::Dimension::Px(w))
+                            if table_style.box_sizing == crate::BoxSizing::ContentBox =>
+                        {
+                            w + inline_outer_edges
+                        }
                         Some(crate::Dimension::Px(w)) => w,
                         _ => max_c,
                     };
-                    let used = preferred.max(min_c).min(viewport.0.max(min_c));
-                    // Distribute `used` across the columns proportionally between
-                    // each column's own min-content and max-content width, the way
-                    // CSS tables do, instead of letting the grid hand every auto
-                    // track an equal share of the surplus (which over-widens narrow
-                    // label columns and starves wide prose columns). NetSurf
-                    // layout.c layout_table: col.width = col.min + (col.max - col.min)
-                    // * (used - min) / (max - min). The table's border, padding, and
-                    // inter-column border-spacing are layout-invariant, so they are
-                    // recovered once from the whole-table min-content width and kept
-                    // out of the interpolation.
+                    let used_outer = preferred_outer
+                        .max(min_c)
+                        .min(viewport.0.max(min_c));
+                    let used_declaration =
+                        if table_style.box_sizing == crate::BoxSizing::ContentBox {
+                            (used_outer - inline_outer_edges).max(0.0)
+                        } else {
+                            used_outer
+                        };
+                    // Distribute the used track space proportionally between
+                    // each column's own min-content and max-content width, the
+                    // way CSS tables do, instead of letting the grid hand every
+                    // auto track an equal share of the surplus (which over-widens
+                    // narrow label columns and starves wide prose columns).
                     let cells: Vec<(taffy::NodeId, usize, usize)> = taffy_tree
                         .children(tnode)
                         .unwrap_or_default()
@@ -1033,13 +1097,19 @@ pub fn layout_dom_with_images(
                                 col_max[j] = col_min[j];
                             }
                         }
-                        // overhead = table border + padding + inter-column spacing,
-                        // recovered from the whole-table min-content width
-                        // (from the content mins, before specified widths pin
-                        // any column).
-                        let sum_min_content: f32 = col_min.iter().sum();
-                        let overhead = (min_c - sum_min_content).max(0.0);
-                        let target = (used - overhead).max(0.0);
+                        // Track space is the final table border box minus its
+                        // actual border/padding, the two outer spacing bands,
+                        // and the spacing between columns. Inferring this from
+                        // min-content is wrong when a specified cell/column
+                        // width already inflated that measurement: the fixed
+                        // width gets counted as "overhead", starving later
+                        // auto columns and forcing avoidable text wrapping.
+                        let (horizontal_spacing, _) = table_spacing(table_style);
+                        let interior_spacing =
+                            horizontal_spacing * ncols.saturating_sub(1) as f32;
+                        let target =
+                            (used_outer - inline_outer_edges - interior_spacing)
+                                .max(0.0);
                         // Specified column widths (a `<col>` or colspan-1 cell
                         // width, recorded at build time) pin their columns:
                         // px directly, percent against the table's content
@@ -1047,7 +1117,8 @@ pub fn layout_dom_with_images(
                         // too-narrow spec never crushes its content. The
                         // remaining space interpolates across the auto
                         // columns exactly as before.
-                        if let Some((spec_px, spec_pct)) = ifc_items.table_cols.get(&tnode) {
+                        let specified_columns = ifc_items.table_cols.get(&tnode);
+                        if let Some((spec_px, spec_pct)) = specified_columns {
                             for j in 0..ncols {
                                 let spec = spec_px
                                     .get(j)
@@ -1063,13 +1134,58 @@ pub fn layout_dom_with_images(
                         }
                         let sum_min: f32 = col_min.iter().sum();
                         let sum_max: f32 = col_max.iter().sum();
-                        let widths: Vec<f32> = if sum_max <= sum_min || target <= sum_min {
+                        let widths: Vec<f32> = if target <= sum_min {
                             col_min.clone()
                         } else if target >= sum_max {
-                            // Table wider than max-content (explicit/percentage-ish
-                            // width): hand the extra out equally, as real tables do.
-                            let extra = (target - sum_max) / ncols as f32;
-                            col_max.iter().map(|m| m + extra).collect()
+                            // Surplus follows the table-layout priority: auto
+                            // columns absorb it before fixed and percentage
+                            // columns. This is important even when every
+                            // column has min==max (a one-word auto cell still
+                            // fills the remainder of a definite-width table).
+                            let mut result = col_max.clone();
+                            let extra = target - sum_max;
+                            let is_px = |j: usize| {
+                                specified_columns
+                                    .and_then(|(px, _)| px.get(j))
+                                    .copied()
+                                    .flatten()
+                                    .is_some()
+                            };
+                            let is_pct = |j: usize| {
+                                specified_columns
+                                    .and_then(|(_, pct)| pct.get(j))
+                                    .copied()
+                                    .flatten()
+                                    .is_some()
+                            };
+                            let mut candidates: Vec<usize> = (0..ncols)
+                                .filter(|&j| !is_px(j) && !is_pct(j) && col_max[j] > 0.0)
+                                .collect();
+                            if candidates.is_empty() {
+                                candidates = (0..ncols)
+                                    .filter(|&j| !is_px(j) && !is_pct(j))
+                                    .collect();
+                            }
+                            if candidates.is_empty() {
+                                candidates = (0..ncols).filter(|&j| is_px(j)).collect();
+                            }
+                            if candidates.is_empty() {
+                                candidates = (0..ncols).filter(|&j| is_pct(j)).collect();
+                            }
+                            if candidates.is_empty() {
+                                candidates = (0..ncols).collect();
+                            }
+                            let weight_sum: f32 =
+                                candidates.iter().map(|&j| col_max[j]).sum();
+                            for &j in &candidates {
+                                let share = if weight_sum > 0.0 {
+                                    extra * col_max[j] / weight_sum
+                                } else {
+                                    extra / candidates.len() as f32
+                                };
+                                result[j] += share;
+                            }
+                            result
                         } else {
                             let scale = (target - sum_min) / (sum_max - sum_min);
                             col_min
@@ -1080,7 +1196,7 @@ pub fn layout_dom_with_images(
                         };
                         if let Ok(cur) = taffy_tree.style(tnode) {
                             let mut s = cur.clone();
-                            s.size.width = length(used);
+                            s.size.width = length(used_declaration);
                             s.grid_template_columns = widths
                                 .iter()
                                 .map(|w| {
@@ -1094,7 +1210,7 @@ pub fn layout_dom_with_images(
                         }
                     } else if let Ok(cur) = taffy_tree.style(tnode) {
                         let mut s = cur.clone();
-                        s.size.width = length(used);
+                        s.size.width = length(used_declaration);
                         let _ = taffy_tree.set_style(tnode, s);
                     }
                 }
@@ -1296,7 +1412,10 @@ fn propagate_border_spacing(tree: &DomTree, styles: &mut HashMap<NodeId, crate::
         if local_name(tree, id).as_deref() != Some("table") {
             continue;
         }
-        let Some((h, v)) = styles.get(&id).and_then(|s| s.border_spacing) else { continue };
+        let Some(table_style) = styles.get(&id) else {
+            continue;
+        };
+        let (h, v) = table_spacing(table_style);
         if let Some(s) = styles.get_mut(&id) {
             s.row_gap = Some(v);
         }
@@ -2228,6 +2347,28 @@ fn collect_table_rows(tree: &DomTree, id: NodeId, rows: &mut Vec<NodeId>) {
     }
 }
 
+/// Effective separate-border spacing. Collapsed tables contribute no spacing
+/// at either the outer table edges or between tracks.
+fn table_spacing(style: &crate::LayoutStyle) -> (f32, f32) {
+    if style.border_collapse.unwrap_or(false) {
+        (0.0, 0.0)
+    } else {
+        style.border_spacing.unwrap_or((0.0, 0.0))
+    }
+}
+
+/// Horizontal non-track area in the table's border box, excluding the gaps
+/// *between* columns: authored border/padding plus one border-spacing unit at
+/// each outer edge.
+fn table_inline_outer_edges(style: &crate::LayoutStyle) -> f32 {
+    let (spacing, _) = table_spacing(style);
+    style.border.left
+        + style.border.right
+        + style.padding.left
+        + style.padding.right
+        + spacing * 2.0
+}
+
 /// Build a `<table>` as a CSS grid. Modeling the table as a grid is what makes
 /// columns negotiate a shared width across every row (min-content/max-content
 /// track sizing), which the old flex-row-per-`<tr>` stack could not do: each
@@ -2469,7 +2610,17 @@ fn build_table(
         };
         taffy::GridTemplateComponent::Single(taffy::MinMax { min, max: taffy::MaxTrackSizingFunction::auto() })
     };
-    let mut tstyle = to_taffy_style(style);
+    // In the separate-border model, border-spacing also exists between the
+    // table edge and the first/last row and column. Grid `gap` only covers
+    // interior tracks, so model the two outer spacing bands as internal
+    // layout padding while leaving the computed CSS padding unchanged.
+    let (horizontal_spacing, vertical_spacing) = table_spacing(style);
+    let mut grid_style = style.clone();
+    grid_style.padding.left += horizontal_spacing;
+    grid_style.padding.right += horizontal_spacing;
+    grid_style.padding.top += vertical_spacing;
+    grid_style.padding.bottom += vertical_spacing;
+    let mut tstyle = to_taffy_style(&grid_style);
     tstyle.display = Display::Grid;
     // A percentage width resolves against the container, so keep it and let the
     // used-width pass leave it to taffy. Any other width (px or auto) is forced
@@ -2479,9 +2630,10 @@ fn build_table(
     }
     tstyle.grid_template_columns = (0..ncols).map(col).collect();
     tstyle.grid_template_rows = (0..nrows).map(row_track).collect();
-    if let Some((h, v)) = style.border_spacing {
-        tstyle.gap = taffy::Size { width: length(h), height: length(v) };
-    }
+    tstyle.gap = taffy::Size {
+        width: length(horizontal_spacing),
+        height: length(vertical_spacing),
+    };
     let table_node = taffy_tree.new_with_children(tstyle, &children).ok()?;
     id_map.insert(table_node, id);
     if col_px.iter().any(Option::is_some) || col_pct.iter().any(Option::is_some) {

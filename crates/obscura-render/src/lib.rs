@@ -345,6 +345,12 @@ pub struct LayoutStyle {
     /// display mode, so `dom::propagate_border_spacing` distributes this down
     /// as the table's own row gap and each descendant `<tr>`'s column gap.
     pub border_spacing: Option<(f32, f32)>,
+    /// Computed `border-collapse`. This property is inherited; `None` means
+    /// no value was specified on this node yet and is resolved top-down
+    /// before table construction. The collapsed-border conflict/paint model
+    /// is still approximate, but collapsed tables must at minimum contribute
+    /// no border-spacing to their geometry.
+    pub border_collapse: Option<bool>,
 
     // Positioning. `position: absolute|fixed` takes the box out of normal flow.
     pub position: Option<taffy::Position>,
