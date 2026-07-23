@@ -301,6 +301,9 @@ pub struct LayoutStyle {
 
     // Positioning. `position: absolute|fixed` takes the box out of normal flow.
     pub position: Option<taffy::Position>,
+    /// Distinguishes `fixed` from `absolute`; both map to taffy's absolute
+    /// layout mode, but fixed boxes use the initial containing block.
+    pub position_fixed: bool,
     pub inset: [Option<Dimension>; 4], // top, right, bottom, left
 
     /// `overflow`/-x/-y other than `visible`: clips this element's descendants

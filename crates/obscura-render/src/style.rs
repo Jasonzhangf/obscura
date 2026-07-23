@@ -434,8 +434,22 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         "flex" => parse_flex_shorthand(style, value),
         "position" => {
             match value {
-                "absolute" | "fixed" => style.position = Some(taffy::Position::Absolute),
-                "relative" | "sticky" | "static" => style.position = Some(taffy::Position::Relative),
+                "absolute" => {
+                    style.position = Some(taffy::Position::Absolute);
+                    style.position_fixed = false;
+                }
+                "fixed" => {
+                    style.position = Some(taffy::Position::Absolute);
+                    style.position_fixed = true;
+                }
+                "relative" | "sticky" => {
+                    style.position = Some(taffy::Position::Relative);
+                    style.position_fixed = false;
+                }
+                "static" => {
+                    style.position = None;
+                    style.position_fixed = false;
+                }
                 _ => {}
             }
         },

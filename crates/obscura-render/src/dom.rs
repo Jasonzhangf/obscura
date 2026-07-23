@@ -530,6 +530,18 @@ pub fn layout_dom_with_images(
             }
         }
 
+        // CSS Display blockification: absolute/fixed boxes and floats compute
+        // an inline outside display to block. This affects how their own mixed
+        // children form lines and blocks; they remain shrink-to-fit where the
+        // positioning/float algorithm requires it.
+        for style in styles.values_mut() {
+            if (matches!(style.position, Some(taffy::Position::Absolute)) || style.float.is_some())
+                && style.display == crate::Display::Inline
+            {
+                style.display = crate::Display::Block;
+            }
+        }
+
         // The initial containing block is modelled by the root taffy node's
         // definite viewport height (set at build), which is what `html,body{
         // height:100%}` chains and sticky-footer app shells resolve against.
@@ -563,6 +575,7 @@ pub fn layout_dom_with_images(
         }
 
         if let Some(taffy_root) = build(tree, root_id, &mut taffy_tree, &mut id_map, &mut words, &mut engine, &mut ifc_items, &styles) {
+            reparent_inset_positioned_nodes(tree, &mut taffy_tree, taffy_root, &id_map, &styles);
             let available = taffy::Size {
                 width: taffy::AvailableSpace::Definite(viewport.0),
                 height: taffy::AvailableSpace::Definite(viewport.1),
@@ -1135,6 +1148,69 @@ fn compute_absolute_rects(
             for child_id in children {
                 compute_absolute_rects(taffy_tree, child_id, x, y, id_map, words, rects, text_runs, anon_rects);
             }
+        }
+    }
+}
+
+/// Attach inset-positioned boxes to their CSS containing block rather than
+/// their immediate DOM parent.
+///
+/// Taffy resolves an absolute child's insets against its direct layout-tree
+/// parent. CSS instead uses the nearest non-static ancestor, or the initial
+/// containing block for `position:fixed`. Gecko represents that distinction
+/// by reparenting the absolute frame and leaving a placeholder in normal
+/// flow. We can safely do the same without a placeholder when each axis has
+/// at least one specified inset: no static-position coordinate is needed.
+/// Boxes with an entirely auto axis stay under their DOM parent until the
+/// placeholder/static-position path is implemented.
+fn reparent_inset_positioned_nodes(
+    tree: &DomTree,
+    taffy_tree: &mut TaffyTree<usize>,
+    taffy_root: taffy::NodeId,
+    id_map: &HashMap<taffy::NodeId, NodeId>,
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+) {
+    let reverse: HashMap<NodeId, taffy::NodeId> =
+        id_map.iter().map(|(&taffy_id, &dom_id)| (dom_id, taffy_id)).collect();
+    let mut nearest_cb_for_children: HashMap<NodeId, taffy::NodeId> = HashMap::new();
+
+    for dom_id in tree.descendants(tree.document()) {
+        let Some(style) = styles.get(&dom_id) else { continue };
+        let parent = tree.get_node(dom_id).and_then(|node| node.parent);
+        let inherited_cb = parent
+            .and_then(|id| nearest_cb_for_children.get(&id).copied())
+            .unwrap_or(taffy_root);
+
+        // Record this before any candidate early-exit so all descendants get
+        // an O(1) nearest-containing-block lookup. The full walk stays O(n)
+        // even on deeply nested or absolute-heavy documents.
+        let child_cb = if style.position.is_some() {
+            reverse.get(&dom_id).copied().unwrap_or(inherited_cb)
+        } else {
+            inherited_cb
+        };
+        nearest_cb_for_children.insert(dom_id, child_cb);
+
+        if !matches!(style.position, Some(taffy::Position::Absolute)) {
+            continue;
+        }
+        let has_block_inset = style.inset[0].is_some() || style.inset[2].is_some();
+        let has_inline_inset = style.inset[1].is_some() || style.inset[3].is_some();
+        if !has_block_inset || !has_inline_inset {
+            continue;
+        }
+        let Some(&child) = reverse.get(&dom_id) else { continue };
+        let target = if style.position_fixed {
+            taffy_root
+        } else {
+            inherited_cb
+        };
+        let Some(current) = taffy_tree.parent(child) else { continue };
+        if current == target {
+            continue;
+        }
+        if taffy_tree.remove_child(current, child).is_ok() {
+            let _ = taffy_tree.add_child(target, child);
         }
     }
 }

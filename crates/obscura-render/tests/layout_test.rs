@@ -123,6 +123,45 @@ fn percentage_padding_top_reserves_aspect_ratio_box() {
 }
 
 #[test]
+fn inset_absolute_uses_nearest_positioned_ancestor() {
+    let html = r##"
+        <body style="margin:0">
+          <div id="cb" style="position:relative;margin:40px 0 0 60px;width:400px;height:240px;padding:20px;border:10px solid black;box-sizing:border-box">
+            <div style="position:static;margin:50px 0 0 70px;width:120px;height:80px">
+              <span id="abs" style="position:absolute;left:15px;top:25px;width:80px;height:60px"></span>
+              <div id="abs-end" style="position:absolute;right:30px;bottom:20px;width:70px;height:50px"></div>
+              <div id="abs-percent" style="position:absolute;left:50%;top:50%;width:30px;height:30px"></div>
+              <div id="fixed" style="position:fixed;left:520px;top:40px;width:90px;height:55px"></div>
+            </div>
+          </div>
+        </body>
+    "##;
+    let tree = parse_html(html);
+    let layout = layout_dom(&tree, (900.0, 700.0));
+    let cb = layout.rects[&tree.get_element_by_id("cb").expect("containing block")];
+    let abs = layout.rects[&tree.get_element_by_id("abs").expect("absolute child")];
+    let abs_end = layout.rects[&tree.get_element_by_id("abs-end").expect("end-inset child")];
+    let abs_percent = layout.rects[&tree.get_element_by_id("abs-percent").expect("percent-inset child")];
+    let fixed = layout.rects[&tree.get_element_by_id("fixed").expect("fixed child")];
+
+    // Absolute insets are measured from the positioned ancestor's padding
+    // edge, not from the intervening static wrapper.
+    assert!((abs.x - cb.x - 25.0).abs() < 1.0, "wrong absolute x: cb={cb:?} abs={abs:?}");
+    assert!((abs.y - cb.y - 35.0).abs() < 1.0, "wrong absolute y: cb={cb:?} abs={abs:?}");
+    assert_eq!(
+        layout.styles[&tree.get_element_by_id("abs").unwrap()].display,
+        obscura_render::Display::Block,
+        "positioned inline should be blockified"
+    );
+    assert!((abs_end.x - 350.0).abs() < 1.0, "wrong right-inset x: {abs_end:?}");
+    assert!((abs_end.y - 200.0).abs() < 1.0, "wrong bottom-inset y: {abs_end:?}");
+    assert!((abs_percent.x - 260.0).abs() < 1.0, "wrong percent-inset x: {abs_percent:?}");
+    assert!((abs_percent.y - 160.0).abs() < 1.0, "wrong percent-inset y: {abs_percent:?}");
+    assert!((fixed.x - 520.0).abs() < 1.0, "fixed box did not use viewport x: {fixed:?}");
+    assert!((fixed.y - 40.0).abs() < 1.0, "fixed box did not use viewport y: {fixed:?}");
+}
+
+#[test]
 fn long_text_run_wraps_across_multiple_lines() {
     // A long single text node with no inline elements breaking it up must
     // wrap within a narrow container instead of overflowing on one line. The
