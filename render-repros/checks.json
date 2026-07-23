@@ -40,6 +40,12 @@
   "tables": [
     {"name": "content-box fixed cell column", "color": "#ffcc99", "width": 208}
   ],
+  "transform-containing-block": [
+    {"name": "absolute captured by transform", "color": "#087f5b", "x": 205, "y": 160, "width": 70, "height": 55},
+    {"name": "fixed captured by transform", "color": "#1971c2", "x": 335, "y": 235, "width": 80, "height": 50},
+    {"name": "unsupported identity transform still establishes containing block", "color": "#7048e8", "x": 550, "y": 280, "width": 20, "height": 20},
+    {"name": "positioned ancestor does not capture fixed", "color": "#a61e4d", "x": 700, "y": 40, "width": 90, "height": 60}
+  ],
   "z-index": [
     {"name": "positive layer", "color": "#008000", "width": 200, "height": 100},
     {"name": "negative layer", "color": "#ffa500", "width": 260, "height": 110}
