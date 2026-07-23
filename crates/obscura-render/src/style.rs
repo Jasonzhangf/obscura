@@ -265,6 +265,17 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
             style.height = dimension_value(value);
             style.height_set = true;
         }
+        "box-sizing" => {
+            style.box_sizing = if value.eq_ignore_ascii_case("border-box") {
+                crate::BoxSizing::BorderBox
+            } else if value.eq_ignore_ascii_case("content-box") {
+                crate::BoxSizing::ContentBox
+            } else if value.eq_ignore_ascii_case("inherit") {
+                crate::BoxSizing::Inherit
+            } else {
+                style.box_sizing
+            };
+        }
         "min-width" => style.min_width = dimension_value(value),
         "min-height" => style.min_height = dimension_value(value),
         "max-width" => style.max_width = dimension_value(value),
@@ -2125,6 +2136,30 @@ mod tests {
         let s = compute_style("div", Some("width: 100px !important; height: auto"));
         assert_eq!(s.width, crate::Dimension::Px(100.0));
         assert_eq!(s.height, crate::Dimension::Auto);
+    }
+
+    #[test]
+    fn box_sizing_defaults_to_content_box_and_parses_both_keywords() {
+        assert_eq!(
+            compute_style("div", None).box_sizing,
+            crate::BoxSizing::ContentBox
+        );
+        assert_eq!(
+            compute_style("div", Some("box-sizing:border-box")).box_sizing,
+            crate::BoxSizing::BorderBox
+        );
+        assert_eq!(
+            compute_style(
+                "div",
+                Some("box-sizing:border-box;box-sizing:content-box")
+            )
+            .box_sizing,
+            crate::BoxSizing::ContentBox
+        );
+        assert_eq!(
+            compute_style("div", Some("box-sizing:inherit")).box_sizing,
+            crate::BoxSizing::Inherit
+        );
     }
 
     #[test]

@@ -347,6 +347,7 @@ pub fn layout_dom_with_images(
             line_height: crate::LineHeight,
             text_transform: crate::TextTransform,
             italic: bool,
+            box_sizing: crate::BoxSizing,
             /// Containing-block width in px for the current element, carried
             /// down so percentage padding/margin (which resolve against the
             /// containing block WIDTH, all sides) can be turned into px before
@@ -368,6 +369,7 @@ pub fn layout_dom_with_images(
                     line_height: crate::LineHeight::Normal,
                     text_transform: crate::TextTransform::None,
                     italic: false,
+                    box_sizing: crate::BoxSizing::ContentBox,
                     cb_width: 0.0,
                 }
             }
@@ -441,6 +443,10 @@ pub fn layout_dom_with_images(
                 match style.line_height { Some(v) => inh.line_height = v, None => style.line_height = Some(inh.line_height) }
                 match style.text_transform { Some(v) => inh.text_transform = v, None => style.text_transform = Some(inh.text_transform) }
                 match style.font_style_italic { Some(v) => inh.italic = v, None => style.font_style_italic = Some(inh.italic) }
+                if style.box_sizing == crate::BoxSizing::Inherit {
+                    style.box_sizing = inh.box_sizing;
+                }
+                inh.box_sizing = style.box_sizing;
 
                 // Percentage padding/margin resolve against the containing
                 // block WIDTH on every side (per CSS: `padding-top:56.25%` in a
@@ -470,20 +476,28 @@ pub fn layout_dom_with_images(
                 }
 
                 // Containing-block width handed to this element's children is
-                // its own content-box width. taffy sizes width as border-box
-                // (its default box_sizing), so subtract this element's resolved
-                // padding and border; an auto width fills the containing block.
+                // its own content-box width. A definite content-box width is
+                // already that value; a border-box or auto width includes
+                // padding and border, which must be removed.
                 let used_w = match style.width {
                     crate::Dimension::Px(w) => w,
                     crate::Dimension::Percent(p) => p * cb_w,
                     _ => (cb_w - style.margin.left - style.margin.right).max(0.0),
                 };
-                child_cb_width = (used_w
-                    - style.padding.left
-                    - style.padding.right
-                    - style.border.left
-                    - style.border.right)
-                    .max(0.0);
+                let definite_content_box = matches!(
+                    style.width,
+                    crate::Dimension::Px(_) | crate::Dimension::Percent(_)
+                ) && style.box_sizing == crate::BoxSizing::ContentBox;
+                child_cb_width = if definite_content_box {
+                    used_w.max(0.0)
+                } else {
+                    (used_w
+                        - style.padding.left
+                        - style.padding.right
+                        - style.border.left
+                        - style.border.right)
+                        .max(0.0)
+                };
             }
             inh.cb_width = child_cb_width;
             for cid in tree.children(id).into_iter().rev() {
@@ -1614,7 +1628,22 @@ fn build_table(
         if *cs != 1 || *c >= ncols {
             continue;
         }
-        let (px, pct) = style_width(*cid);
+        let (mut px, pct) = style_width(*cid);
+        // A fixed width declared on a cell describes its content box unless
+        // the author opted into border-box. Grid tracks describe the cell's
+        // outer border box, so carry padding and border into the pinned track.
+        // `<col>` widths above already describe the column track and must not
+        // receive a particular cell's box edges.
+        if let (Some(w), Some(s)) = (px, styles.get(cid)) {
+            if s.box_sizing == crate::BoxSizing::ContentBox {
+                px = Some(
+                    w + s.padding.left
+                        + s.padding.right
+                        + s.border.left
+                        + s.border.right,
+                );
+            }
+        }
         if let Some(w) = px {
             col_px[*c] = Some(col_px[*c].map_or(w, |cur| cur.max(w)));
         }
@@ -2380,4 +2409,60 @@ mod tests {
             assert_eq!(style.background_color, Some([0, 128, 0, 255]), "wrong cascade color for {id}");
         }
     }
+
+    #[test]
+    fn box_sizing_controls_the_declared_size_edge() {
+        let tree = parse_html(
+            r#"<style>
+                body { margin: 0 }
+                .box { width:100px; height:50px; padding:10px; border:2px solid black }
+                .border { box-sizing:border-box }
+                .parent { width:400px }
+                .half { width:50%; padding:10px; border:2px solid black }
+                .limited { width:200px; max-width:100px; padding:10px; border:2px solid black }
+                .inherit-parent { box-sizing:border-box }
+                .inherit-child { box-sizing:inherit; width:100px; padding:10px; border:2px solid black }
+            </style>
+            <div id="content" class="box"></div>
+            <div id="border" class="box border"></div>
+            <div class="parent"><div id="half-content" class="half"></div><div id="half-border" class="half border"></div></div>
+            <div id="max-content" class="limited"></div>
+            <div id="max-border" class="limited border"></div>
+            <div class="inherit-parent"><div id="inherited-border" class="inherit-child"></div></div>"#,
+        );
+        let laid = layout_dom(&tree, (1280.0, 720.0));
+        let size = |id: &str| {
+            let nid = tree.query_selector(&format!("#{id}")).unwrap().unwrap();
+            let rect = laid.rects.get(&nid).unwrap();
+            (rect.width, rect.height)
+        };
+        assert_eq!(size("content"), (124.0, 74.0));
+        assert_eq!(size("border"), (100.0, 50.0));
+        assert_eq!(size("half-content").0, 224.0);
+        assert_eq!(size("half-border").0, 200.0);
+        assert_eq!(size("max-content").0, 124.0);
+        assert_eq!(size("max-border").0, 100.0);
+        assert_eq!(size("inherited-border").0, 100.0);
+    }
+
+    #[test]
+    fn table_cell_content_box_width_includes_padding_and_border_in_track() {
+        let tree = parse_html(
+            r#"<style>
+                table { border-spacing:0 }
+                td { width:100px; padding:10px; border:2px solid black }
+                .border { box-sizing:border-box }
+            </style>
+            <table><tr><td id="content-cell">content</td></tr></table>
+            <table><tr><td id="border-cell" class="border">border</td></tr></table>"#,
+        );
+        let laid = layout_dom(&tree, (1280.0, 720.0));
+        let width = |id: &str| {
+            let nid = tree.query_selector(&format!("#{id}")).unwrap().unwrap();
+            laid.rects.get(&nid).unwrap().width
+        };
+        assert_eq!(width("content-cell"), 124.0);
+        assert_eq!(width("border-cell"), 100.0);
+    }
+
 }

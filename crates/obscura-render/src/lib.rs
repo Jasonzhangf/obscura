@@ -167,6 +167,9 @@ pub struct LayoutStyle {
     pub display: Display,
     pub width: Dimension,
     pub height: Dimension,
+    /// Which box edge `width`/`height` and min/max sizes describe. CSS starts
+    /// at `content-box`; many modern reset sheets opt into `border-box`.
+    pub box_sizing: BoxSizing,
     /// Whether `width`/`height` was set by an author rule (including an explicit
     /// `auto`). Presentational `width`/`height` HTML attributes are a lower
     /// priority than author CSS, so they apply only when these are false; an
@@ -428,6 +431,16 @@ pub enum Float {
     Right,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BoxSizing {
+    #[default]
+    ContentBox,
+    BorderBox,
+    /// A specified CSS-wide `inherit` value. The DOM's top-down computed-style
+    /// pass resolves this to the parent's computed value before layout.
+    Inherit,
+}
+
 /// One `box-shadow` layer. Offsets, blur, and spread are in CSS px; `color` is
 /// the resolved RGBA (falling back to the element's text color, per CSS
 /// `currentColor`, when the value omits a color); `inset` distinguishes an
@@ -577,6 +590,13 @@ fn read_node(tree: &TaffyTree, id: NodeId) -> NodeRect {
 
 pub(crate) fn to_taffy_style(style: &LayoutStyle) -> Style {
     let mut s = Style::DEFAULT;
+    s.box_sizing = match style.box_sizing {
+        BoxSizing::ContentBox => taffy::BoxSizing::ContentBox,
+        BoxSizing::BorderBox => taffy::BoxSizing::BorderBox,
+        // Programmatic LayoutStyle users do not have a DOM inheritance pass;
+        // fall back to the property's CSS initial value in that case.
+        BoxSizing::Inherit => taffy::BoxSizing::ContentBox,
+    };
 
     // A block box that wants non-default cross-axis alignment (from
     // text-align: center/right, the only way our engine currently sets
@@ -820,8 +840,8 @@ mod tests {
     }
 
     #[test]
-    fn padding_insets_the_box() {
-        let root = LayoutNode {
+    fn padding_expands_content_box_but_not_border_box() {
+        let content_box = LayoutNode {
             style: LayoutStyle {
                 display: Display::Block,
                 width: Dimension::Px(100.0),
@@ -832,9 +852,12 @@ mod tests {
             text: None,
             children: vec![],
         };
-        let out = layout(&root, (1000.0, 800.0));
-        // Border box still matches the requested size; padding affects content,
-        // not the outer border box here.
-        assert_eq!(out.border_box.width, 100.0);
+        let content_out = layout(&content_box, (1000.0, 800.0));
+        assert_eq!(content_out.border_box.width, 120.0);
+
+        let mut border_box = content_box;
+        border_box.style.box_sizing = BoxSizing::BorderBox;
+        let border_out = layout(&border_box, (1000.0, 800.0));
+        assert_eq!(border_out.border_box.width, 100.0);
     }
 }
