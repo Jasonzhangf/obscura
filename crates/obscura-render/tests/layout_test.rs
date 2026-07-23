@@ -741,3 +741,33 @@ fn mixed_float_run_shares_one_band() {
         "right float: {right_one:?}"
     );
 }
+
+#[test]
+fn right_float_navigation_shares_inline_band() {
+    let tree = parse_html(include_str!(
+        "../../../render-repros/right-float-navigation.html"
+    ));
+    let layout = layout_dom(&tree, (900.0, 1000.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    let left_one = rect("left-one");
+    let left_two = rect("left-two");
+    let right_one = rect("right-one");
+    let right_two = rect("right-two");
+    let right_three = rect("right-three");
+    assert!(
+        (left_one.x - 0.0).abs() < 0.01
+            && (left_one.y - 0.0).abs() < 0.01
+            && (left_two.x - 64.0).abs() < 0.01
+            && (left_two.y - 0.0).abs() < 0.01,
+        "inline flow: {left_one:?} {left_two:?}"
+    );
+    assert!(
+        (right_three.x - 280.0).abs() < 0.01
+            && (right_three.y - 0.0).abs() < 0.01
+            && (right_two.x - 310.0).abs() < 0.01
+            && (right_two.y - 0.0).abs() < 0.01
+            && (right_one.x - 360.0).abs() < 0.01
+            && (right_one.y - 0.0).abs() < 0.01,
+        "right float order: {right_three:?} {right_two:?} {right_one:?}"
+    );
+}

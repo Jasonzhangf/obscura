@@ -160,6 +160,13 @@
     {"name": "text alignment leaves the block frame at available width", "color": "#1971c2", "x": 450, "y": 0, "width": 450, "height": 304},
     {"name": "auto block wrapper contains its percentage image", "color": "#c2255c", "x": 498, "y": 48, "width": 354, "height": 208}
   ],
+  "right-float-navigation": [
+    {"name": "first inline item stays at band start", "color": "#087f5b", "x": 0, "y": 0, "width": 60, "height": 30},
+    {"name": "second inline item keeps source order", "color": "#1971c2", "x": 64, "y": 0, "width": 80, "height": 30},
+    {"name": "last right float is visually first", "color": "#2f9e44", "x": 280, "y": 0, "width": 30, "height": 30},
+    {"name": "middle right float follows inward", "color": "#862e9c", "x": 310, "y": 0, "width": 50, "height": 30},
+    {"name": "first right float reaches band end", "color": "#e8590c", "x": 360, "y": 0, "width": 40, "height": 30}
+  ],
   "tables": [
     {"name": "content-box fixed cell column", "color": "#ffcc99", "width": 208}
   ],
