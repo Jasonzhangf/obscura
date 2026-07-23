@@ -4,13 +4,11 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${OBSCURA_BIN:-$ROOT/target/release/obscura}"
-CHROME="${CHROME_BIN:-chromium}"
+CHROME="${CHROME_BIN:-}"
 PYTHON="${PYTHON_BIN:-python3}"
 DIR="$(cd "$(dirname "$0")" && pwd)"
 OUT="${1:-$DIR/out}"
 mkdir -p "$OUT"
-STAGE="$(mktemp -d "$ROOT/.render-repros-chrome.XXXXXX")"
-trap 'rm -rf -- "$STAGE"' EXIT
 status=0
 for f in "$DIR"/*.html; do
   n=$(basename "$f" .html)
@@ -22,19 +20,16 @@ for f in "$DIR"/*.html; do
     continue
   fi
 
-  # Chromium's snap package has a private /tmp, so stage under the checkout
-  # and move the completed screenshot into OUT. A fresh profile prevents an
-  # existing browser process from capturing the command and masking failure.
-  chrome_shot="$STAGE/$n.png"
-  if ! timeout 60 "$CHROME" --headless --disable-gpu --no-sandbox --hide-scrollbars \
-    --disable-background-networking --user-data-dir="$STAGE/$n-profile" \
-    --virtual-time-budget=2000 --force-device-scale-factor=1 --window-size=900,1000 \
-    --screenshot="$chrome_shot" "file://$f" >"$OUT/$n.chrome.log" 2>&1 || [[ ! -s "$chrome_shot" ]]; then
+  chrome_args=("$DIR/capture_chromium.py" "file://$f" "$OUT/$n.chrome.png")
+  if [[ -n "$CHROME" ]]; then
+    chrome_args+=(--executable "$CHROME")
+  fi
+  if ! PYTHONDONTWRITEBYTECODE=1 timeout 60 "$PYTHON" "${chrome_args[@]}" \
+    >"$OUT/$n.chrome.log" 2>&1 || [[ ! -s "$OUT/$n.chrome.png" ]]; then
     echo "FAILED chromium: $n (see $OUT/$n.chrome.log)" >&2
     status=1
     continue
   fi
-  mv "$chrome_shot" "$OUT/$n.chrome.png"
   echo "rendered $n"
 done
 if [[ "$status" -eq 0 ]]; then

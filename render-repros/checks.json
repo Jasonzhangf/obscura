@@ -25,6 +25,12 @@
   "mixed-content-block": [
     {"name": "full-width block child", "color": "#ccddff", "width": 400}
   ],
+  "modern-hydration-contracts": [
+    {"name": "modern hydration contracts", "color": "#16803c", "width": 360, "height": 90}
+  ],
+  "modern-streams": [
+    {"name": "streamed hydration contracts", "color": "#186aa5", "width": 360, "height": 90}
+  ],
   "tables": [
     {"name": "content-box fixed cell column", "color": "#ffcc99", "width": 208}
   ],
