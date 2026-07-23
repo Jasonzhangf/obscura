@@ -297,6 +297,32 @@ fn list_indentation_is_reset_from_the_container() {
 }
 
 #[test]
+fn replaced_max_height_clamps_intrinsic_aspect_transfer() {
+    let tree = parse_html(include_str!(
+        "../../../render-repros/max-height-replaced.html"
+    ));
+    let image_id = tree.get_element_by_id("image").unwrap();
+    let intrinsic = HashMap::from([(image_id, (648.0, 440.0))]);
+    let layout = layout_dom_with_images(&tree, (900.0, 1000.0), &intrinsic);
+    let card = layout.rects[&tree.get_element_by_id("card").unwrap()];
+    let image = layout.rects[&image_id];
+    assert!(
+        (card.x - 0.0).abs() < 0.01
+            && (card.y - 0.0).abs() < 0.01
+            && (card.width - 394.0).abs() < 0.01
+            && (card.height - 608.0).abs() < 0.01,
+        "card: {card:?}"
+    );
+    assert!(
+        (image.x - 32.0).abs() < 0.01
+            && (image.y - 64.0).abs() < 0.01
+            && (image.width - 330.0).abs() < 0.01
+            && (image.height - 200.0).abs() < 0.01,
+        "image: {image:?}"
+    );
+}
+
+#[test]
 fn transforms_establish_absolute_and_fixed_containing_blocks() {
     let html = r##"
         <body style="margin:0">

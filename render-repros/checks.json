@@ -114,6 +114,9 @@
     {"name": "ordered list reset removes indentation", "color": "#862e9c", "x": 0, "y": 80, "width": 400, "height": 20},
     {"name": "ex padding follows font x height", "color": "#e8590c", "x": 0, "y": 120, "width": 44, "height": 22}
   ],
+  "max-height-replaced": [
+    {"name": "max height clamps intrinsic aspect transfer", "color": "#1971c2", "x": 32, "y": 64, "width": 330, "height": 200}
+  ],
   "mixed-content-block": [
     {"name": "full-width block child", "color": "#ccddff", "width": 400}
   ],
