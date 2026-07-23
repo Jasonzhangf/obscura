@@ -422,13 +422,19 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
             _ => {}
         },
         "align-items" => {
-            match value {
-                "center" => style.align_items = Some(taffy::AlignItems::CENTER),
-                "flex-start" | "start" => style.align_items = Some(taffy::AlignItems::FLEX_START),
-                "flex-end" | "end" => style.align_items = Some(taffy::AlignItems::FLEX_END),
-                "stretch" => style.align_items = Some(taffy::AlignItems::STRETCH),
-                "baseline" => style.align_items = Some(taffy::AlignItems::BASELINE),
-                _ => {}
+            if let Some(Some(value)) = self_alignment_value(value) {
+                style.align_items = Some(value);
+            }
+        },
+        "justify-items" => {
+            if let Some(Some(value)) = self_alignment_value(value) {
+                style.justify_items = Some(value);
+            }
+        },
+        "place-items" => {
+            if let Some((Some(align), Some(justify))) = self_alignment_pair(value) {
+                style.align_items = Some(align);
+                style.justify_items = Some(justify);
             }
         },
         "align-self" => {
@@ -2699,6 +2705,13 @@ mod tests {
         let shorthand = compute_style("div", Some("place-self:safe center flex-end"));
         assert_eq!(shorthand.align_self, Some(taffy::AlignSelf::SAFE_CENTER));
         assert_eq!(shorthand.justify_self, Some(taffy::JustifySelf::FLEX_END));
+
+        let parent = compute_style(
+            "div",
+            Some("align-items:start;justify-items:safe end;place-items:end center"),
+        );
+        assert_eq!(parent.align_items, Some(taffy::AlignItems::END));
+        assert_eq!(parent.justify_items, Some(taffy::JustifyItems::CENTER));
     }
 
     #[test]
