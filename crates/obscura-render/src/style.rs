@@ -431,6 +431,22 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                 _ => {}
             }
         },
+        "align-self" => {
+            if let Some(value) = self_alignment_value(value) {
+                style.align_self = value;
+            }
+        },
+        "justify-self" => {
+            if let Some(value) = self_alignment_value(value) {
+                style.justify_self = value;
+            }
+        },
+        "place-self" => {
+            if let Some((align, justify)) = self_alignment_pair(value) {
+                style.align_self = align;
+                style.justify_self = justify;
+            }
+        },
         "justify-content" => {
             match value {
                 "center" => style.justify_content = Some(taffy::JustifyContent::CENTER),
@@ -675,6 +691,57 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         }
         _ => {}
     }
+}
+
+/// Parse the common CSS Box Alignment values that taffy can represent.
+///
+/// The outer option distinguishes an invalid declaration from `auto`, which
+/// resets a preceding declaration to the inherited item-alignment behavior.
+fn self_alignment_value(value: &str) -> Option<Option<taffy::AlignSelf>> {
+    let normalized = value.trim().to_ascii_lowercase();
+    let alignment = match normalized.as_str() {
+        "auto" => return Some(None),
+        "normal" => taffy::AlignSelf::STRETCH,
+        "start" | "self-start" => taffy::AlignSelf::START,
+        "end" | "self-end" => taffy::AlignSelf::END,
+        "flex-start" => taffy::AlignSelf::FLEX_START,
+        "flex-end" => taffy::AlignSelf::FLEX_END,
+        "center" => taffy::AlignSelf::CENTER,
+        "baseline" | "first baseline" => taffy::AlignSelf::BASELINE,
+        "stretch" => taffy::AlignSelf::STRETCH,
+        "safe start" | "safe self-start" => taffy::AlignSelf::SAFE_START,
+        "safe end" | "safe self-end" => taffy::AlignSelf::SAFE_END,
+        "safe flex-start" => taffy::AlignSelf::SAFE_FLEX_START,
+        "safe flex-end" => taffy::AlignSelf::SAFE_FLEX_END,
+        "safe center" => taffy::AlignSelf::SAFE_CENTER,
+        "unsafe start" | "unsafe self-start" => taffy::AlignSelf::START,
+        "unsafe end" | "unsafe self-end" => taffy::AlignSelf::END,
+        "unsafe flex-start" => taffy::AlignSelf::FLEX_START,
+        "unsafe flex-end" => taffy::AlignSelf::FLEX_END,
+        "unsafe center" => taffy::AlignSelf::CENTER,
+        _ => return None,
+    };
+    Some(Some(alignment))
+}
+
+fn self_alignment_pair(
+    value: &str,
+) -> Option<(Option<taffy::AlignSelf>, Option<taffy::JustifySelf>)> {
+    if let Some(alignment) = self_alignment_value(value) {
+        return Some((alignment, alignment));
+    }
+    let tokens: Vec<&str> = value.split_whitespace().collect();
+    for split in 1..tokens.len() {
+        let align = tokens[..split].join(" ");
+        let justify = tokens[split..].join(" ");
+        if let (Some(align), Some(justify)) = (
+            self_alignment_value(&align),
+            self_alignment_value(&justify),
+        ) {
+            return Some((align, justify));
+        }
+    }
+    None
 }
 
 /// Parse the subset of `transform` obscura applies at paint time: `translate`,
@@ -2607,6 +2674,31 @@ mod tests {
 
         let invalid = compute_style("td", Some("display:bogus"));
         assert!(invalid.internal_flex_container);
+    }
+
+    #[test]
+    fn item_self_alignment_parses_and_resets() {
+        let aligned = compute_style(
+            "div",
+            Some("align-self:safe center;justify-self:flex-end"),
+        );
+        assert_eq!(aligned.align_self, Some(taffy::AlignSelf::SAFE_CENTER));
+        assert_eq!(aligned.justify_self, Some(taffy::JustifySelf::FLEX_END));
+
+        let reset = compute_style(
+            "div",
+            Some("align-self:center;align-self:auto;justify-self:end;justify-self:auto"),
+        );
+        assert_eq!(reset.align_self, None);
+        assert_eq!(reset.justify_self, None);
+
+        let normal = compute_style("div", Some("align-self:normal;justify-self:normal"));
+        assert_eq!(normal.align_self, Some(taffy::AlignSelf::STRETCH));
+        assert_eq!(normal.justify_self, Some(taffy::JustifySelf::STRETCH));
+
+        let shorthand = compute_style("div", Some("place-self:safe center flex-end"));
+        assert_eq!(shorthand.align_self, Some(taffy::AlignSelf::SAFE_CENTER));
+        assert_eq!(shorthand.justify_self, Some(taffy::JustifySelf::FLEX_END));
     }
 
     #[test]

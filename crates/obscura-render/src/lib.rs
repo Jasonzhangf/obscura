@@ -287,6 +287,8 @@ pub struct LayoutStyle {
     /// one field for both made `text-align:left` shrink-wrap flex children.
     pub text_align: Option<taffy::AlignItems>,
     pub align_items: Option<taffy::AlignItems>,
+    pub align_self: Option<taffy::AlignSelf>,
+    pub justify_self: Option<taffy::JustifySelf>,
     pub flex_direction: Option<taffy::FlexDirection>,
     pub flex_wrap: Option<taffy::FlexWrap>,
     pub justify_content: Option<taffy::JustifyContent>,
@@ -717,6 +719,8 @@ pub(crate) fn to_taffy_style(style: &LayoutStyle) -> Style {
         // `align-items` has no effect on a block formatting context.
         s.align_items = None;
     }
+    s.align_self = style.align_self;
+    s.justify_self = style.justify_self;
     if let Some(jc) = style.justify_content {
         s.justify_content = Some(jc);
     }
