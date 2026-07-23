@@ -1979,6 +1979,18 @@ fn build(
         // the CSS tie-break. Taffy has no CSS `order` style field, so feeding
         // it the correctly ordered item sequence is the missing translation.
         dom_children.sort_by_key(|cid| styles.get(cid).map(|style| style.order).unwrap_or(0));
+    } else if style.display == crate::Display::Block {
+        // A float nested directly in a transparent inline wrapper (the common
+        // `<a><img style="float:left"></a>` logo pattern) belongs to the
+        // ancestor block formatting context. Gecko reparents that out-of-flow
+        // frame to the BFC and leaves only a placeholder in the inline. Expose
+        // the same item to our float-band builder instead of charging the
+        // wrapper a full normal-flow row.
+        for child in &mut dom_children {
+            if let Some(float) = inline_wrapper_float(tree, *child, styles) {
+                *child = float;
+            }
+        }
     }
     // `float` has no effect on a flex or grid item. Legacy stylesheets often
     // leave floats on children after a newer rule turns their parent into a
@@ -2071,6 +2083,39 @@ fn build(
     };
     id_map.insert(taffy_id, id);
     Some(taffy_id)
+}
+
+fn inline_wrapper_float(
+    tree: &DomTree,
+    wrapper: NodeId,
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+) -> Option<NodeId> {
+    let wrapper_style = styles.get(&wrapper)?;
+    if wrapper_style.display != crate::Display::Inline
+        || wrapper_style.margin != crate::Edges::default()
+        || wrapper_style.padding != crate::Edges::default()
+        || wrapper_style.border != crate::Edges::default()
+        || wrapper_style.before_content.is_some()
+        || wrapper_style.after_content.is_some()
+    {
+        return None;
+    }
+    let visible: Vec<NodeId> = tree
+        .children(wrapper)
+        .into_iter()
+        .filter(|&child| {
+            let Some(node) = tree.get_node(child) else { return false };
+            if !node.is_element() {
+                return !tree.text_content(child).trim().is_empty();
+            }
+            styles
+                .get(&child)
+                .map(|style| style.display != crate::Display::None)
+                .unwrap_or(false)
+        })
+        .collect();
+    let [child] = visible.as_slice() else { return None };
+    styles.get(child).and_then(|style| style.float).map(|_| *child)
 }
 
 /// Build a block container whose children mix inline-level and block-level
@@ -2466,6 +2511,90 @@ fn build_children_with_float_zone(
         .collect();
 
     let float_side = styles.get(&dom_children[float_idx]).and_then(|s| s.float);
+
+    // Opposing header floats share one float band even when an empty legacy
+    // compatibility box sits between them. This is the classic left-logo /
+    // right-tagline header: serializing the two synthetic rows doubles the
+    // header height and pushes every later box down. Real float placement
+    // scans the same BFC band and puts the second float against the opposite
+    // edge when both margin boxes fit.
+    let is_empty_bridge = |cid: NodeId| {
+        let Some(node) = tree.get_node(cid) else { return true };
+        if !node.is_element() {
+            return tree.text_content(cid).trim().is_empty();
+        }
+        let style = styles.get(&cid);
+        let no_size = style
+            .map(|style| {
+                matches!(style.width, crate::Dimension::Auto)
+                    && matches!(style.height, crate::Dimension::Auto)
+                    && matches!(style.min_width, crate::Dimension::Auto)
+                    && matches!(style.min_height, crate::Dimension::Auto)
+                    && matches!(style.max_width, crate::Dimension::Auto)
+                    && matches!(style.max_height, crate::Dimension::Auto)
+                    && style.margin == crate::Edges::default()
+                    && style.padding == crate::Edges::default()
+                    && style.border == crate::Edges::default()
+                    && style.before_content.is_none()
+                    && style.after_content.is_none()
+            })
+            .unwrap_or(true);
+        no_size && tree.text_content(cid).trim().is_empty()
+    };
+    let mut opposite_idx = float_idx + 1;
+    while opposite_idx < dom_children.len() && is_empty_bridge(dom_children[opposite_idx]) {
+        opposite_idx += 1;
+    }
+    let opposite_side = dom_children
+        .get(opposite_idx)
+        .and_then(|cid| styles.get(cid))
+        .and_then(|style| style.float);
+    if opposite_side.is_some() && opposite_side != float_side {
+        let first = build(
+            tree,
+            dom_children[float_idx],
+            taffy_tree,
+            id_map,
+            words,
+            engine,
+            ifc_items,
+            styles,
+        );
+        let second = build(
+            tree,
+            dom_children[opposite_idx],
+            taffy_tree,
+            id_map,
+            words,
+            engine,
+            ifc_items,
+            styles,
+        );
+        let row_children: Vec<taffy::NodeId> = match float_side {
+            Some(crate::Float::Left) => [first, second].into_iter().flatten().collect(),
+            _ => [second, first].into_iter().flatten().collect(),
+        };
+        let row_style = taffy::Style {
+            display: taffy::style::Display::Flex,
+            flex_direction: taffy::FlexDirection::Row,
+            justify_content: Some(taffy::JustifyContent::SPACE_BETWEEN),
+            align_items: Some(taffy::AlignItems::FLEX_START),
+            size: taffy::Size {
+                width: taffy::Dimension::percent(1.0),
+                height: taffy::Dimension::auto(),
+            },
+            ..Default::default()
+        };
+        if let Ok(row) = taffy_tree.new_with_children(row_style, &row_children) {
+            result.push(row);
+        }
+        result.extend(
+            dom_children[opposite_idx + 1..]
+                .iter()
+                .flat_map(|&cid| build_any(tree, cid, taffy_tree, id_map, words, engine, ifc_items, styles)),
+        );
+        return result;
+    }
 
     // A run of two or more consecutively floated siblings (the classic
     // float-grid idiom: several `float:left; width:N%` boxes forming columns,
