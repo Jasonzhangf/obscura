@@ -259,10 +259,12 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         }
         "width" => {
             style.width = dimension_value(value);
+            style.size_expressions[0] = deferred_length_expression(value);
             style.width_set = true;
         }
         "height" => {
             style.height = dimension_value(value);
+            style.size_expressions[1] = deferred_length_expression(value);
             style.height_set = true;
         }
         "box-sizing" => {
@@ -276,10 +278,22 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                 style.box_sizing
             };
         }
-        "min-width" => style.min_width = dimension_value(value),
-        "min-height" => style.min_height = dimension_value(value),
-        "max-width" => style.max_width = dimension_value(value),
-        "max-height" => style.max_height = dimension_value(value),
+        "min-width" => {
+            style.min_width = dimension_value(value);
+            style.size_expressions[2] = deferred_length_expression(value);
+        }
+        "min-height" => {
+            style.min_height = dimension_value(value);
+            style.size_expressions[3] = deferred_length_expression(value);
+        }
+        "max-width" => {
+            style.max_width = dimension_value(value);
+            style.size_expressions[4] = deferred_length_expression(value);
+        }
+        "max-height" => {
+            style.max_height = dimension_value(value);
+            style.size_expressions[5] = deferred_length_expression(value);
+        }
         "aspect-ratio" => style.aspect_ratio = parse_aspect_ratio(value),
         "margin" => apply_margin_shorthand(style, value),
         "margin-top" => set_margin_side(style, 0, value),
@@ -1494,6 +1508,196 @@ fn px(value: &str) -> Option<f32> {
     token(value).and_then(px_value)
 }
 
+fn deferred_length_expression(value: &str) -> Option<String> {
+    value.trim().contains('(').then(|| value.trim().to_string())
+}
+
+/// Resolve functional CSS lengths once the actual layout context is known.
+/// `vw`/`vh` are one-percent viewport units and `percent_base` is the relevant
+/// containing-block dimension. Custom properties have already been substituted
+/// by the cascade before this function sees the expression.
+pub(crate) fn resolve_contextual_length(
+    value: &str,
+    em_px: f32,
+    rem_px: f32,
+    vw: f32,
+    vh: f32,
+    percent_base: f32,
+) -> Option<f32> {
+    let context = LengthContext {
+        em_px,
+        rem_px,
+        vw,
+        vh,
+        percent_base,
+    };
+    resolve_contextual(value, &context)
+}
+
+#[derive(Clone, Copy)]
+struct LengthContext {
+    em_px: f32,
+    rem_px: f32,
+    vw: f32,
+    vh: f32,
+    percent_base: f32,
+}
+
+fn resolve_contextual(value: &str, context: &LengthContext) -> Option<f32> {
+    let value = value.trim();
+    if let Some(rest) = value.strip_prefix("var(") {
+        let end = find_matching_paren(rest)?;
+        let inner = &rest[..end];
+        let (_, fallback) = inner.split_once(',')?;
+        return resolve_contextual(fallback.trim(), context);
+    }
+    if let Some(rest) = value.strip_prefix("calc(") {
+        let end = find_matching_paren(rest)?;
+        return eval_contextual_calc(&rest[..end], context);
+    }
+    if let Some(rest) = value
+        .strip_prefix("max(")
+        .or_else(|| value.strip_prefix("min("))
+    {
+        let is_max = value.starts_with("max(");
+        let end = find_matching_paren(rest)?;
+        let args = split_top_level(&rest[..end], ',');
+        let mut values = args
+            .iter()
+            .filter_map(|arg| resolve_contextual(arg, context));
+        let mut best = values.next()?;
+        for candidate in values {
+            if (is_max && candidate > best) || (!is_max && candidate < best) {
+                best = candidate;
+            }
+        }
+        return Some(best);
+    }
+    if let Some(rest) = value.strip_prefix("clamp(") {
+        let end = find_matching_paren(rest)?;
+        let args = split_top_level(&rest[..end], ',');
+        if args.len() == 3 {
+            let low = resolve_contextual(args[0], context)?;
+            let preferred = resolve_contextual(args[1], context)?;
+            let high = resolve_contextual(args[2], context)?;
+            return Some(preferred.min(high).max(low));
+        }
+    }
+    contextual_atom(value, context)
+}
+
+fn contextual_atom(value: &str, context: &LengthContext) -> Option<f32> {
+    let lower = value.trim().to_ascii_lowercase();
+    let parse = |number: &str| number.trim().parse::<f32>().ok();
+    if let Some(value) = lower.strip_suffix("rem").and_then(parse) {
+        return Some(value * context.rem_px);
+    }
+    if let Some(value) = lower.strip_suffix("em").and_then(parse) {
+        return Some(value * context.em_px);
+    }
+    if let Some(value) = lower.strip_suffix("vmin").and_then(parse) {
+        return Some(value * context.vw.min(context.vh));
+    }
+    if let Some(value) = lower.strip_suffix("vmax").and_then(parse) {
+        return Some(value * context.vw.max(context.vh));
+    }
+    if let Some(value) = lower.strip_suffix("vw").and_then(parse) {
+        return Some(value * context.vw);
+    }
+    if let Some(value) = lower.strip_suffix("vh").and_then(parse) {
+        return Some(value * context.vh);
+    }
+    if let Some(value) = lower.strip_suffix('%').and_then(parse) {
+        return Some(value * context.percent_base / 100.0);
+    }
+    if let Some(value) = lower.strip_suffix("px").and_then(parse) {
+        return Some(value);
+    }
+    if let Some(value) = lower.strip_suffix("pt").and_then(parse) {
+        return Some(value * 1.333);
+    }
+    parse(&lower)
+}
+
+fn eval_contextual_calc(expr: &str, context: &LengthContext) -> Option<f32> {
+    let mut terms: Vec<(f32, String)> = Vec::new();
+    let mut sign = 1.0;
+    let mut current = String::new();
+    let mut depth = 0i32;
+    for character in expr.chars() {
+        match character {
+            '(' => {
+                depth += 1;
+                current.push(character);
+            }
+            ')' => {
+                depth -= 1;
+                current.push(character);
+            }
+            '+' | '-' if depth == 0 => {
+                if !current.trim().is_empty() {
+                    terms.push((sign, std::mem::take(&mut current)));
+                }
+                sign = if character == '-' { -1.0 } else { 1.0 };
+            }
+            _ => current.push(character),
+        }
+    }
+    if !current.trim().is_empty() {
+        terms.push((sign, current));
+    }
+    if terms.is_empty() {
+        return None;
+    }
+    let mut total = 0.0;
+    for (term_sign, term) in terms {
+        total += term_sign * eval_contextual_product(term.trim(), context)?;
+    }
+    Some(total)
+}
+
+fn eval_contextual_product(term: &str, context: &LengthContext) -> Option<f32> {
+    let mut result = None;
+    let mut operator = '*';
+    let mut depth = 0i32;
+    let mut current = String::new();
+    let mut factors = Vec::new();
+    for character in term.chars() {
+        match character {
+            '(' => {
+                depth += 1;
+                current.push(character);
+            }
+            ')' => {
+                depth -= 1;
+                current.push(character);
+            }
+            ' ' if depth == 0 => {
+                if !current.is_empty() {
+                    factors.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(character),
+        }
+    }
+    if !current.is_empty() {
+        factors.push(current);
+    }
+    for factor in &factors {
+        if factor == "*" || factor == "/" {
+            operator = factor.chars().next()?;
+            continue;
+        }
+        let value = resolve_contextual(factor, context)?;
+        result = Some(match result {
+            None => value,
+            Some(previous) if operator == '/' => previous / value,
+            Some(previous) => previous * value,
+        });
+    }
+    result
+}
+
 /// Resolve a CSS length expression to px, recursively handling the small set
 /// of functional forms real stylesheets actually nest in practice:
 /// `var(--x, fallback)` (substitute the fallback; we track no custom
@@ -1743,6 +1947,15 @@ fn two(value: &str) -> (&str, &str) {
 fn set_margin_side(style: &mut LayoutStyle, idx: usize, value: &str) {
     let v = value.trim();
     let is_auto = v.eq_ignore_ascii_case("auto");
+    if let Some(expression) = deferred_length_expression(v) {
+        style.margin_expressions[idx] = Some(expression);
+        style.margin_percent[idx] = None;
+        style.margin_relative[idx] = None;
+        style.margin_auto[idx] = false;
+        set_margin_px(&mut style.margin, idx, 0.0);
+        return;
+    }
+    style.margin_expressions[idx] = None;
     if let Some(frac) = percent_fraction(v) {
         style.margin_percent[idx] = Some(frac);
         style.margin_relative[idx] = None;
@@ -1789,6 +2002,14 @@ fn set_margin_px(margin: &mut Edges, idx: usize, px: f32) {
 /// width during the top-down pass; a length is stored directly.
 fn set_padding_side(style: &mut LayoutStyle, idx: usize, value: &str) {
     let value = value.trim();
+    if let Some(expression) = deferred_length_expression(value) {
+        style.padding_expressions[idx] = Some(expression);
+        style.padding_percent[idx] = None;
+        style.padding_relative[idx] = None;
+        set_padding_px(&mut style.padding, idx, 0.0);
+        return;
+    }
+    style.padding_expressions[idx] = None;
     if let Some(frac) = percent_fraction(value) {
         style.padding_percent[idx] = Some(frac);
         style.padding_relative[idx] = None;
@@ -2347,6 +2568,44 @@ mod tests {
         );
         assert_eq!(shorthand.grid_auto_flow, Some(taffy::GridAutoFlow::Row));
         assert_eq!(shorthand.grid_template_columns.len(), 3);
+    }
+
+    #[test]
+    fn contextual_css_math_uses_runtime_geometry() {
+        let context = (20.0, 16.0, 9.0, 10.0, 900.0);
+        assert_eq!(
+            resolve_contextual_length(
+                "min(25vw,350px)",
+                context.0,
+                context.1,
+                context.2,
+                context.3,
+                context.4,
+            ),
+            Some(225.0)
+        );
+        assert_eq!(
+            resolve_contextual_length(
+                "clamp(200px,30vw,320px)",
+                context.0,
+                context.1,
+                context.2,
+                context.3,
+                context.4,
+            ),
+            Some(270.0)
+        );
+        assert_eq!(
+            resolve_contextual_length(
+                "calc(10vw + 2rem)",
+                context.0,
+                context.1,
+                context.2,
+                context.3,
+                context.4,
+            ),
+            Some(122.0)
+        );
     }
 
     #[test]

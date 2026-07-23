@@ -181,6 +181,11 @@ pub struct LayoutStyle {
     pub min_height: Dimension,
     pub max_width: Dimension,
     pub max_height: Dimension,
+    /// Deferred CSS math expressions for width, height, min-width, min-height,
+    /// max-width, and max-height. Functional lengths can depend on the actual
+    /// viewport, containing block, or computed font size and cannot be safely
+    /// collapsed to pixels during stylesheet parsing.
+    pub size_expressions: [Option<String>; 6],
     /// `aspect-ratio` as width/height, or an image's intrinsic ratio resolved
     /// at layout. Lets a replaced element (or a padding-box card) derive the
     /// missing dimension from the given one, so a `width:100%` image gets a
@@ -201,6 +206,8 @@ pub struct LayoutStyle {
     /// These retain their unit until the top-down pass knows the element font
     /// size, root font size, and viewport dimensions.
     pub margin_relative: [Option<Dimension>; 4],
+    /// Deferred `calc()`/`min()`/`max()`/`clamp()` margin expressions.
+    pub margin_expressions: [Option<String>; 4],
     pub padding: Edges,
     /// Percentage padding per side (top, right, bottom, left) as a 0..1
     /// fraction, `None` when the side is a fixed length. All four sides resolve
@@ -213,6 +220,8 @@ pub struct LayoutStyle {
     /// Font- and viewport-relative padding lengths (top, right, bottom, left),
     /// resolved alongside `margin_relative` during the top-down pass.
     pub padding_relative: [Option<Dimension>; 4],
+    /// Deferred `calc()`/`min()`/`max()`/`clamp()` padding expressions.
+    pub padding_expressions: [Option<String>; 4],
     pub border: Edges,
     /// `border-radius` (uniform; the first value of the shorthand). Rounds the
     /// background fill and border. In px after resolution.

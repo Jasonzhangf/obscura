@@ -422,6 +422,36 @@ pub fn layout_dom_with_images(
                 // em in non-font-size properties is relative to this element's
                 // OWN computed font-size; resolve every relative length now.
                 let em_px = style.font_size.unwrap_or(parent_fs);
+                let cb_w = inh.cb_width;
+                for index in 0..6 {
+                    let Some(expression) = style.size_expressions[index].as_deref() else {
+                        continue;
+                    };
+                    let percent_base = if matches!(index, 1 | 3 | 5) {
+                        viewport.1
+                    } else {
+                        cb_w
+                    };
+                    let Some(px) = crate::style::resolve_contextual_length(
+                        expression,
+                        em_px,
+                        root_fs,
+                        vw,
+                        vh,
+                        percent_base,
+                    ) else {
+                        continue;
+                    };
+                    let resolved = crate::Dimension::Px(px);
+                    match index {
+                        0 => style.width = resolved,
+                        1 => style.height = resolved,
+                        2 => style.min_width = resolved,
+                        3 => style.min_height = resolved,
+                        4 => style.max_width = resolved,
+                        _ => style.max_height = resolved,
+                    }
+                }
                 style.width = style.width.resolve(em_px, root_fs, vw, vh);
                 style.height = style.height.resolve(em_px, root_fs, vw, vh);
                 style.min_width = style.min_width.resolve(em_px, root_fs, vw, vh);
@@ -454,8 +484,41 @@ pub fn layout_dom_with_images(
                 // (per CSS: `padding-top:56.25%` in a 1000px block is 562.5px,
                 // not a fraction of the height). Bake the resolved px back into
                 // `padding`/`margin`, which then feed taffy.
-                let cb_w = inh.cb_width;
                 for i in 0..4 {
+                    if let Some(expression) = style.padding_expressions[i].as_deref() {
+                        if let Some(px) = crate::style::resolve_contextual_length(
+                            expression,
+                            em_px,
+                            root_fs,
+                            vw,
+                            vh,
+                            cb_w,
+                        ) {
+                            match i {
+                                0 => style.padding.top = px.max(0.0),
+                                1 => style.padding.right = px.max(0.0),
+                                2 => style.padding.bottom = px.max(0.0),
+                                _ => style.padding.left = px.max(0.0),
+                            }
+                        }
+                    }
+                    if let Some(expression) = style.margin_expressions[i].as_deref() {
+                        if let Some(px) = crate::style::resolve_contextual_length(
+                            expression,
+                            em_px,
+                            root_fs,
+                            vw,
+                            vh,
+                            cb_w,
+                        ) {
+                            match i {
+                                0 => style.margin.top = px,
+                                1 => style.margin.right = px,
+                                2 => style.margin.bottom = px,
+                                _ => style.margin.left = px,
+                            }
+                        }
+                    }
                     if let Some(relative) = style.padding_relative[i] {
                         if let crate::Dimension::Px(px) =
                             relative.resolve(em_px, root_fs, vw, vh)
