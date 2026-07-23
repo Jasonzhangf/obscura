@@ -1783,6 +1783,78 @@ mod tests {
     }
 
     #[test]
+    fn attributes_named_node_map_is_live() {
+        let mut rt = setup_runtime(r#"<div id="test" class="card" data-state="ready"></div>"#);
+        let result = rt
+            .evaluate(
+                r#"
+                const element = document.getElementById("test");
+                const attributes = element.attributes;
+                const sameObject = attributes === element.attributes;
+                const firstName = attributes[0].name;
+                let removed = 0;
+                while (attributes.length) {
+                    element.removeAttributeNode(attributes[0]);
+                    removed++;
+                    if (removed > 10) throw new Error("NamedNodeMap is not live");
+                }
+                return {
+                    sameObject,
+                    namedNodeMap: attributes instanceof NamedNodeMap,
+                    firstName,
+                    removed,
+                    length: attributes.length,
+                    hasAttributes: element.hasAttributes(),
+                };
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "sameObject": true,
+                "namedNodeMap": true,
+                "firstName": "id",
+                "removed": 3,
+                "length": 0,
+                "hasAttributes": false,
+            })
+        );
+    }
+
+    #[test]
+    fn element_scroll_methods_update_scroll_offsets() {
+        let mut rt = setup_runtime(r#"<div id="scroller"></div>"#);
+        let result = rt
+            .evaluate(
+                r#"
+                const element = document.getElementById("scroller");
+                element.scrollTo({left: 12, top: 20, behavior: "smooth"});
+                element.scrollBy(3, -5);
+                element.scroll({left: 7});
+                return {
+                    left: element.scrollLeft,
+                    top: element.scrollTop,
+                    methods: [
+                        typeof element.scroll,
+                        typeof element.scrollTo,
+                        typeof element.scrollBy,
+                    ],
+                };
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "left": 7,
+                "top": 15,
+                "methods": ["function", "function", "function"],
+            })
+        );
+    }
+
+    #[test]
     fn document_fragment_get_element_by_id_searches_descendants() {
         let mut rt = setup_runtime(r#"<div id="target">document</div>"#);
         let result = rt
@@ -3999,6 +4071,78 @@ mod tests {
             serde_json::json!([
                 "function", "function", "function", "function", true, 1, true
             ])
+        );
+    }
+
+    #[test]
+    fn text_codec_streams_expose_browser_shape() {
+        let mut rt = setup_runtime("<div></div>");
+        let result = rt
+            .evaluate(
+                r#"
+                const encoder = new TextEncoderStream();
+                const decoder = new TextDecoderStream();
+                return {
+                    encoder: encoder.encoding,
+                    encoderReadable: typeof encoder.readable.getReader,
+                    encoderWritable: typeof encoder.writable.getWriter,
+                    decoder: decoder.encoding,
+                    decoderReadable: typeof decoder.readable.getReader,
+                    decoderWritable: typeof decoder.writable.getWriter,
+                };
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "encoder": "utf-8",
+                "encoderReadable": "function",
+                "encoderWritable": "function",
+                "decoder": "utf-8",
+                "decoderReadable": "function",
+                "decoderWritable": "function",
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn text_encoder_stream_pipe_through_delivers_hydration_data() {
+        let mut rt = setup_runtime("<div></div>");
+        let result = rt
+            .evaluate_for_cdp(
+                r#"
+                (async () => {
+                    let sourceController;
+                    const source = new ReadableStream({
+                        start(controller) { sourceController = controller; },
+                    });
+                    const encoded = source.pipeThrough(new TextEncoderStream());
+                    sourceController.enqueue('["server",{"hydrated":true}]\n');
+                    sourceController.close();
+
+                    const decoder = new TextDecoder();
+                    let tail = "";
+                    const lines = encoded.pipeThrough(new TransformStream({
+                        transform(chunk, controller) {
+                            const complete = (tail + decoder.decode(chunk, {stream: true})).split("\n");
+                            tail = complete.pop() || "";
+                            for (const line of complete) controller.enqueue(line);
+                        },
+                        flush(controller) { if (tail) controller.enqueue(tail); },
+                    }));
+                    const first = await lines.getReader().read();
+                    return JSON.parse(first.value);
+                })()
+                "#,
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!(["server", {"hydrated": true}])
         );
     }
 

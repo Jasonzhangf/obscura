@@ -16,7 +16,7 @@
     '__obscura_objects', '__obscura_oid', '__obscura_ua',
     '__obscura_platform', '__obscura_ua_platform', '__obscura_ua_platform_version',
     '__obscura_stealth', '__obscura_markTrusted',
-    '__obscura_hw', '__obscura_mem',
+    '__obscura_hw', '__obscura_mem', '__markParserScripts',
     '__documentReadyState__', '__currentUrl',
     // internal helpers (var-declared throughout the file)
     '__processDynScriptQueue', '_decodeDataScriptUrl', '_markNative', '_fpRand', '_fpNoise',
@@ -45,7 +45,7 @@
     // the later `globalThis.X = X` assignments only update the value.
     'Node', 'Element', 'Document', 'DocumentFragment', 'DocumentType',
     'Text', 'Comment', 'CDATASection', 'ProcessingInstruction', 'CharacterData',
-    'CSSStyleDeclaration', 'DOMTokenList', 'Screen', 'NetworkInformation',
+    'CSSStyleDeclaration', 'DOMTokenList', 'NamedNodeMap', 'Screen', 'NetworkInformation',
     'MessageChannel', 'MessagePort', 'CustomElementRegistry',
     'XMLHttpRequestEventTarget', 'HTMLMediaElement', 'HTMLVideoElement',
     'HTMLAudioElement', 'WebGL2RenderingContext',
@@ -227,6 +227,14 @@ function _decodeDataScriptUrl(url) {
   }
   return new TextDecoder().decode(new Uint8Array(bytes));
 }
+// A script element executes at most once. Parser-discovered scripts are marked
+// before page execution starts, and dynamically inserted scripts are marked
+// when they are queued. Framework hydration may move existing <script> nodes;
+// moving one must not execute its source or inline body a second time.
+let __startedScriptNids = new Set();
+globalThis.__markParserScripts = function(nids) {
+  for (const nid of nids || []) __startedScriptNids.add(+nid);
+};
 async function __processDynScriptQueue() {
   if (__dynScriptBusy) return;
   __dynScriptBusy = true;
@@ -832,12 +840,16 @@ class Node {
     _dom("append_child", this._nid, c._nid);
     if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('childList', this._nid, [c._nid], []);
     if (c instanceof Element && c.tagName === 'SCRIPT') {
+      if (__startedScriptNids.has(c._nid)) return c;
       const scriptType = c.getAttribute('type') || '';
       const isModule = scriptType === 'module';
       if (scriptType && !isModule && scriptType !== 'text/javascript' && scriptType !== 'application/javascript') {
         return c;
       }
       const src = c.getAttribute('src');
+      const code = src ? "" : c.textContent;
+      if (!src && !code) return c;
+      __startedScriptNids.add(c._nid);
       const prevNid = globalThis.__currentScriptNid;
       if (src) {
         // Resolve against <base href> when present, else the document URL.
@@ -876,25 +888,22 @@ class Node {
         });
         __processDynScriptQueue();
       } else {
-        const code = c.textContent;
-        if (code) {
-          if (isModule) {
-            const dataUrl = 'data:text/javascript;base64,' + btoa(unescape(encodeURIComponent(code)));
-            __dynScriptQueue.push({
-              url: dataUrl,
-              isModule: true,
-              nid: c._nid,
-              prevNid,
-              pageOrigin: "",
-              dispatchEvent: (ev) => { try { c.dispatchEvent(ev); } catch(e) {} },
-            });
-            __processDynScriptQueue();
-          } else {
-            globalThis.__currentScriptNid = c._nid;
-            try { (0, eval)(code); }
-            catch(e) { console.error('Dynamic inline script error:', e.message); }
-            finally { globalThis.__currentScriptNid = prevNid || 0; }
-          }
+        if (isModule) {
+          const dataUrl = 'data:text/javascript;base64,' + btoa(unescape(encodeURIComponent(code)));
+          __dynScriptQueue.push({
+            url: dataUrl,
+            isModule: true,
+            nid: c._nid,
+            prevNid,
+            pageOrigin: "",
+            dispatchEvent: (ev) => { try { c.dispatchEvent(ev); } catch(e) {} },
+          });
+          __processDynScriptQueue();
+        } else {
+          globalThis.__currentScriptNid = c._nid;
+          try { (0, eval)(code); }
+          catch(e) { console.error('Dynamic inline script error:', e.message); }
+          finally { globalThis.__currentScriptNid = prevNid || 0; }
         }
       }
     }
@@ -1361,6 +1370,79 @@ function _parseHTMLFragment(html, context) {
   return out;
 }
 
+class NamedNodeMap {
+  constructor(element) {
+    Object.defineProperty(this, "_element", {
+      value: element,
+      configurable: false,
+      enumerable: false,
+      writable: false,
+    });
+    return new Proxy(this, {
+      get(target, prop, receiver) {
+        if (typeof prop === "string" && /^(?:0|[1-9]\d*)$/.test(prop)) {
+          return target.item(+prop);
+        }
+        if (Reflect.has(target, prop)) return Reflect.get(target, prop, receiver);
+        if (typeof prop === "string") return target.getNamedItem(prop);
+        return undefined;
+      },
+      ownKeys(target) {
+        const names = target._names();
+        return Reflect.ownKeys(target).concat(
+          names.map((_, i) => String(i)),
+          names.filter((name) => !Reflect.has(target, name))
+        );
+      },
+      getOwnPropertyDescriptor(target, prop) {
+        if (typeof prop === "string" && (/^(?:0|[1-9]\d*)$/.test(prop) || target._names().includes(prop))) {
+          return { configurable: true, enumerable: true, value: target[prop], writable: false };
+        }
+        return Reflect.getOwnPropertyDescriptor(target, prop);
+      },
+    });
+  }
+  _names() {
+    return _domParse("attribute_names", this._element._nid) || [];
+  }
+  _attr(name) {
+    const value = this._element.getAttribute(name);
+    if (value === null) return null;
+    const attr = new Attr(name, value, null, null);
+    attr.ownerElement = this._element;
+    return attr;
+  }
+  get length() { return this._names().length; }
+  item(index) {
+    const name = this._names()[Number(index)];
+    return name === undefined ? null : this._attr(name);
+  }
+  getNamedItem(name) {
+    name = String(name);
+    return this._names().includes(name) ? this._attr(name) : null;
+  }
+  getNamedItemNS(namespaceURI, localName) {
+    return this.getNamedItem(localName);
+  }
+  setNamedItem(attr) {
+    if (!attr || typeof attr.name !== "string") return null;
+    return this._element.setAttributeNode(attr);
+  }
+  setNamedItemNS(attr) { return this.setNamedItem(attr); }
+  removeNamedItem(name) {
+    const attr = this.getNamedItem(name);
+    if (!attr) throw new DOMException("Attribute not found", "NotFoundError");
+    return this._element.removeAttributeNode(attr);
+  }
+  removeNamedItemNS(namespaceURI, localName) {
+    return this.removeNamedItem(localName);
+  }
+  *[Symbol.iterator]() {
+    for (let i = 0; i < this.length; i++) yield this.item(i);
+  }
+}
+globalThis.NamedNodeMap = NamedNodeMap;
+
 class Element extends Node {
   constructor(nid) {
     super(nid);
@@ -1554,35 +1636,11 @@ class Element extends Node {
     if (ns === "" && n === "style") this._style._replaceFromAttribute("");
   }
   hasAttribute(n) { return this.getAttribute(n) !== null; }
-  hasAttributes() { return true; } // Simplified
+  hasAttributes() { return this.attributes.length > 0; }
   getAttributeNames() { return _domParse("attribute_names", this._nid) || []; }
   get attributes() {
-    const el = this;
-    const names = _domParse("attribute_names", el._nid) || [];
-    const list = names.map((name) => {
-      const v = el.getAttribute(name) ?? "";
-      return {
-        name,
-        localName: name,
-        value: v,
-        namespaceURI: null,
-        prefix: null,
-        specified: true,
-        ownerElement: el,
-        nodeName: name,
-        nodeValue: v,
-        nodeType: 2,
-      };
-    });
-    list.length = names.length;
-    list.getNamedItem = (n) => names.includes(n) ? list[names.indexOf(n)] : null;
-    list.setNamedItem = (a) => { if (a && a.name) el.setAttribute(a.name, a.value); return a; };
-    list.removeNamedItem = (n) => { const a = list.getNamedItem(n); if (a) el.removeAttribute(n); return a; };
-    list.item = (i) => list[i] || null;
-    for (let i = 0; i < names.length; i++) {
-      Object.defineProperty(list, names[i], { value: list[i], configurable: true, enumerable: false });
-    }
-    return list;
+    if (!this._attributes) this._attributes = new NamedNodeMap(this);
+    return this._attributes;
   }
   getAttributeNS(ns, n) { return _domParse("get_attribute_ns", this._nid, String(ns == null ? "" : ns) + "\0" + String(n)); }
   querySelector(s) { return _wrapEl(+_dom("query_selector_scoped", this._nid, s)); }
@@ -3508,17 +3566,36 @@ _markNative(MimeTypeArray.prototype.item);
 _markNative(MimeTypeArray.prototype.namedItem);
 
 class NetworkInformation {
-  constructor() { _makeListenerBox(this); }
+  constructor() { this._listeners = Object.create(null); }
   get downlink() { return 10; }
   get downlinkMax() { return Infinity; }
   get effectiveType() { return '4g'; }
   get rtt() { return 50; }
   get saveData() { return false; }
   get type() { return 'wifi'; }
-  get onchange() { return null; }
-  set onchange(v) {}
-  get ontypechange() { return null; }
-  set ontypechange(v) {}
+  get onchange() { return this._onchange || null; }
+  set onchange(v) { this._onchange = typeof v === "function" ? v : null; }
+  get ontypechange() { return this._ontypechange || null; }
+  set ontypechange(v) { this._ontypechange = typeof v === "function" ? v : null; }
+  addEventListener(type, listener) {
+    if (typeof listener !== "function") return;
+    (this._listeners[type] || (this._listeners[type] = [])).push(listener);
+  }
+  removeEventListener(type, listener) {
+    const listeners = this._listeners[type];
+    if (listeners) this._listeners[type] = listeners.filter((item) => item !== listener);
+  }
+  dispatchEvent(event) {
+    if (!event || !event.type) return true;
+    for (const listener of this._listeners[event.type] || []) {
+      try { listener.call(this, event); } catch (error) { console.error(error); }
+    }
+    const handler = this["on" + event.type];
+    if (typeof handler === "function") {
+      try { handler.call(this, event); } catch (error) { console.error(error); }
+    }
+    return !event.defaultPrevented;
+  }
 }
 _markNative(NetworkInformation);
 globalThis.NetworkInformation = NetworkInformation;
@@ -7696,28 +7773,124 @@ globalThis.cancelIdleCallback = globalThis.cancelIdleCallback || function(id) { 
 if (typeof ReadableStream === 'undefined') {
   globalThis.ReadableStream = class ReadableStream {
     constructor(source = {}, strategy = {}) {
-      this._source = source; this._queue = []; this._closed = false;
+      this._source = source;
+      this._queue = [];
+      this._reads = [];
+      this._state = "readable";
+      this._error = null;
       this.locked = false;
-      if (source.start) source.start({ enqueue: (chunk) => this._queue.push(chunk), close: () => { this._closed = true; }, error: () => {} });
+      const stream = this;
+      this._controller = {
+        enqueue(chunk) {
+          if (stream._state !== "readable") return;
+          const pending = stream._reads.shift();
+          if (pending) pending.resolve({value: chunk, done: false});
+          else stream._queue.push(chunk);
+        },
+        close() {
+          if (stream._state !== "readable") return;
+          stream._state = "closed";
+          while (stream._reads.length) {
+            stream._reads.shift().resolve({value: undefined, done: true});
+          }
+        },
+        error(error) {
+          if (stream._state !== "readable") return;
+          stream._state = "errored";
+          stream._error = error;
+          while (stream._reads.length) stream._reads.shift().reject(error);
+        },
+        get desiredSize() { return Math.max(0, 1 - stream._queue.length); },
+      };
+      try {
+        const started = source.start?.(this._controller);
+        if (started && typeof started.then === "function") {
+          started.catch((error) => this._controller.error(error));
+        }
+      } catch (error) {
+        this._controller.error(error);
+      }
     }
     getReader() {
+      if (this.locked) throw new TypeError("ReadableStream is locked");
       this.locked = true;
       const stream = this;
       return {
         read() {
           if (stream._queue.length > 0) return Promise.resolve({ value: stream._queue.shift(), done: false });
-          if (stream._closed) return Promise.resolve({ value: undefined, done: true });
-          return Promise.resolve({ value: undefined, done: true });
+          if (stream._state === "closed") return Promise.resolve({ value: undefined, done: true });
+          if (stream._state === "errored") return Promise.reject(stream._error);
+          return new Promise((resolve, reject) => stream._reads.push({resolve, reject}));
         },
         releaseLock() { stream.locked = false; },
-        cancel() { stream._closed = true; return Promise.resolve(); },
-        get closed() { return stream._closed ? Promise.resolve() : new Promise(() => {}); },
+        cancel(reason) { return stream.cancel(reason); },
+        get closed() {
+          if (stream._state === "closed") return Promise.resolve();
+          if (stream._state === "errored") return Promise.reject(stream._error);
+          return new Promise((resolve, reject) => {
+            const poll = () => {
+              if (stream._state === "closed") resolve();
+              else if (stream._state === "errored") reject(stream._error);
+              else setTimeout(poll, 0);
+            };
+            poll();
+          });
+        },
       };
     }
-    cancel() { this._closed = true; return Promise.resolve(); }
-    pipeTo(dest) { return Promise.resolve(); }
-    pipeThrough(transform) { return transform.readable || new ReadableStream(); }
-    tee() { return [new ReadableStream(), new ReadableStream()]; }
+    cancel(reason) {
+      this._queue.length = 0;
+      this._controller.close();
+      try { return Promise.resolve(this._source.cancel?.(reason)); }
+      catch (error) { return Promise.reject(error); }
+    }
+    async pipeTo(destination) {
+      const reader = this.getReader();
+      const writer = destination.getWriter();
+      try {
+        while (true) {
+          const {value, done} = await reader.read();
+          if (done) break;
+          await writer.write(value);
+        }
+        await writer.close();
+      } catch (error) {
+        try { await writer.abort(error); } catch {}
+        throw error;
+      } finally {
+        reader.releaseLock();
+        writer.releaseLock();
+      }
+    }
+    pipeThrough(transform) {
+      this.pipeTo(transform.writable).catch((error) => {
+        try { transform.readable._controller?.error(error); } catch {}
+      });
+      return transform.readable;
+    }
+    tee() {
+      let leftController;
+      let rightController;
+      const left = new ReadableStream({start(controller) { leftController = controller; }});
+      const right = new ReadableStream({start(controller) { rightController = controller; }});
+      (async () => {
+        try {
+          const reader = this.getReader();
+          while (true) {
+            const {value, done} = await reader.read();
+            if (done) break;
+            leftController.enqueue(value);
+            rightController.enqueue(value);
+          }
+          leftController.close();
+          rightController.close();
+        } catch (error) {
+          leftController.error(error);
+          rightController.error(error);
+        }
+      })();
+      return [left, right];
+    }
     [Symbol.asyncIterator]() {
       const reader = this.getReader();
       return { next: () => reader.read(), return: () => { reader.releaseLock(); return Promise.resolve({done:true}); } };
@@ -7726,30 +7899,111 @@ if (typeof ReadableStream === 'undefined') {
 }
 if (typeof WritableStream === 'undefined') {
   globalThis.WritableStream = class WritableStream {
-    constructor(sink = {}) { this._sink = sink; this.locked = false; }
+    constructor(sink = {}) {
+      this._sink = sink;
+      this._state = "writable";
+      this._error = null;
+      this._chain = Promise.resolve();
+      this.locked = false;
+      try {
+        const started = sink.start?.({});
+        if (started && typeof started.then === "function") this._chain = Promise.resolve(started);
+      } catch (error) {
+        this._state = "errored";
+        this._error = error;
+        this._chain = Promise.reject(error);
+      }
+    }
     getWriter() {
+      if (this.locked) throw new TypeError("WritableStream is locked");
       this.locked = true;
       const stream = this;
       return {
-        write(chunk) { if (stream._sink.write) stream._sink.write(chunk); return Promise.resolve(); },
-        close() { if (stream._sink.close) stream._sink.close(); return Promise.resolve(); },
-        abort() { return Promise.resolve(); },
+        write(chunk) {
+          if (stream._state !== "writable") return Promise.reject(stream._error || new TypeError("WritableStream is closed"));
+          stream._chain = stream._chain.then(() => stream._sink.write?.(chunk));
+          return stream._chain;
+        },
+        close() {
+          if (stream._state !== "writable") return stream._chain;
+          stream._state = "closed";
+          stream._chain = stream._chain.then(() => stream._sink.close?.());
+          return stream._chain;
+        },
+        abort(reason) {
+          stream._state = "errored";
+          stream._error = reason;
+          stream._chain = stream._chain.then(() => stream._sink.abort?.(reason));
+          return stream._chain;
+        },
         releaseLock() { stream.locked = false; },
-        get ready() { return Promise.resolve(); },
-        get closed() { return Promise.resolve(); },
+        get ready() { return stream._chain.then(() => undefined); },
+        get closed() { return stream._chain.then(() => undefined); },
         get desiredSize() { return 1; },
       };
     }
-    close() { return Promise.resolve(); }
-    abort() { return Promise.resolve(); }
+    close() { const writer = this.getWriter(); return writer.close().finally(() => writer.releaseLock()); }
+    abort(reason) { const writer = this.getWriter(); return writer.abort(reason).finally(() => writer.releaseLock()); }
   };
 }
 if (typeof TransformStream === 'undefined') {
   globalThis.TransformStream = class TransformStream {
     constructor(transformer = {}) {
-      this.readable = new ReadableStream();
-      this.writable = new WritableStream();
+      let controller;
+      this.readable = new ReadableStream({
+        start(readableController) { controller = readableController; },
+      });
+      this.writable = new WritableStream({
+        async write(chunk) {
+          if (transformer.transform) await transformer.transform(chunk, controller);
+          else controller.enqueue(chunk);
+        },
+        async close() {
+          if (transformer.flush) await transformer.flush(controller);
+          controller.close();
+        },
+        abort(reason) { controller.error(reason); },
+      });
+      try { transformer.start?.(controller); }
+      catch (error) { controller.error(error); }
     }
+  };
+}
+if (typeof TextEncoderStream === 'undefined') {
+  globalThis.TextEncoderStream = class TextEncoderStream {
+    constructor() {
+      const encoder = new TextEncoder();
+      const transform = new TransformStream({
+        transform(chunk, controller) {
+          controller.enqueue(encoder.encode(String(chunk)));
+        },
+      });
+      this.readable = transform.readable;
+      this.writable = transform.writable;
+    }
+    get encoding() { return "utf-8"; }
+  };
+}
+if (typeof TextDecoderStream === 'undefined') {
+  globalThis.TextDecoderStream = class TextDecoderStream {
+    constructor(label = "utf-8", options = {}) {
+      const decoder = new TextDecoder(label, options);
+      const transform = new TransformStream({
+        transform(chunk, controller) {
+          controller.enqueue(decoder.decode(chunk, {stream: true}));
+        },
+        flush(controller) {
+          const tail = decoder.decode();
+          if (tail) controller.enqueue(tail);
+        },
+      });
+      this.readable = transform.readable;
+      this.writable = transform.writable;
+      this._decoder = decoder;
+    }
+    get encoding() { return this._decoder.encoding; }
+    get fatal() { return this._decoder.fatal; }
+    get ignoreBOM() { return this._decoder.ignoreBOM; }
   };
 }
 
@@ -8487,6 +8741,7 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
 globalThis.__obscura_init = function() {
   _fpSeed = Date.now() ^ (Math.random() * 0xFFFFFFFF >>> 0);
   _fpCache = null;
+  __startedScriptNids.clear();
   // A real navigation just completed (this runs after set_url), so drop any
   // URL a location setter previewed synchronously and let document_url drive
   // location.href again, including any redirect target.

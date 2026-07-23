@@ -679,6 +679,22 @@ impl Page {
             None => return,
         };
 
+        // HTML scripts have an "already started" flag. Mark every
+        // parser-discovered script before running page code so React/Next
+        // hydration can move or hoist those nodes without appendChild
+        // executing them a second time.
+        if let Some(js) = &mut self.js {
+            let ids = all_scripts
+                .iter()
+                .map(|script| script.nid.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let _ = js.execute_script(
+                "<parser-scripts>",
+                &format!("globalThis.__markParserScripts([{}]);", ids),
+            );
+        }
+
         let mut regular = Vec::new();
         let mut deferred = Vec::new();
         let mut async_scripts = Vec::new();
