@@ -84,7 +84,9 @@
     {"name": "flex item aligns itself to cross end", "color": "#1971c2", "x": 40, "y": 70, "width": 50, "height": 30},
     {"name": "grid item aligns center and inline end", "color": "#c2255c", "x": 110, "y": 165, "width": 40, "height": 30},
     {"name": "grid item aligns block end and inline center", "color": "#6741d9", "x": 200, "y": 220, "width": 50, "height": 20},
-    {"name": "place self sets both grid axes", "color": "#0b7285", "x": 420, "y": 160, "width": 30, "height": 40}
+    {"name": "place self sets both grid axes", "color": "#0b7285", "x": 420, "y": 160, "width": 30, "height": 40},
+    {"name": "place items aligns first grid child", "color": "#e03131", "x": 55, "y": 340, "width": 40, "height": 20},
+    {"name": "place items aligns second grid child", "color": "#2b8a3e", "x": 195, "y": 330, "width": 60, "height": 30}
   ],
   "mixed-content-block": [
     {"name": "full-width block child", "color": "#ccddff", "width": 400}

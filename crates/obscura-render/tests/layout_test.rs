@@ -502,6 +502,8 @@ fn item_self_alignment_places_flex_and_grid_items() {
     let grid_end = rect("grid-end");
     let grid_center = rect("grid-center");
     let grid_place = rect("grid-place");
+    let parent_one = rect("parent-one");
+    let parent_two = rect("parent-two");
     assert!(
         (flex_center.x - 0.0).abs() < 0.01
             && (flex_center.y - 40.0).abs() < 0.01
@@ -517,6 +519,13 @@ fn item_self_alignment_places_flex_and_grid_items() {
             && (grid_place.x - 420.0).abs() < 0.01
             && (grid_place.y - 160.0).abs() < 0.01,
         "grid items: {grid_end:?} {grid_center:?} {grid_place:?}"
+    );
+    assert!(
+        (parent_one.x - 55.0).abs() < 0.01
+            && (parent_one.y - 340.0).abs() < 0.01
+            && (parent_two.x - 195.0).abs() < 0.01
+            && (parent_two.y - 330.0).abs() < 0.01,
+        "parent-aligned grid items: {parent_one:?} {parent_two:?}"
     );
 }
 

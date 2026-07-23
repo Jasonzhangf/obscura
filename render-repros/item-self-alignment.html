@@ -53,10 +53,31 @@
       height: 40px;
       background: #0b7285;
     }
+    #grid-items {
+      display: grid;
+      grid-template-columns: 150px 150px;
+      grid-template-rows: 100px;
+      place-items: end center;
+      width: 300px;
+      height: 100px;
+      margin-top: 20px;
+      background: #e9fac8;
+    }
+    #parent-one {
+      width: 40px;
+      height: 20px;
+      background: #e03131;
+    }
+    #parent-two {
+      width: 60px;
+      height: 30px;
+      background: #2b8a3e;
+    }
   </style>
 </head>
 <body>
   <div id="flex"><div id="flex-center"></div><div id="flex-end"></div></div>
   <div id="grid"><div id="grid-end"></div><div id="grid-center"></div><div id="grid-place"></div></div>
+  <div id="grid-items"><div id="parent-one"></div><div id="parent-two"></div></div>
 </body>
 </html>
