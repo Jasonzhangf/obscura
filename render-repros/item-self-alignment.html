@@ -1,0 +1,62 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>flex and grid items honor self alignment</title>
+  <style>
+    html, body { margin: 0; }
+    #flex {
+      display: flex;
+      align-items: flex-start;
+      width: 300px;
+      height: 100px;
+      background: #f08c00;
+    }
+    #flex-center {
+      align-self: center;
+      width: 40px;
+      height: 20px;
+      background: #087f5b;
+    }
+    #flex-end {
+      align-self: flex-end;
+      width: 50px;
+      height: 30px;
+      background: #1971c2;
+    }
+    #grid {
+      display: grid;
+      grid-template-columns: 150px 150px 150px;
+      grid-template-rows: 120px;
+      width: 450px;
+      height: 120px;
+      margin-top: 20px;
+      background: #ffd43b;
+    }
+    #grid-end {
+      align-self: center;
+      justify-self: end;
+      width: 40px;
+      height: 30px;
+      background: #c2255c;
+    }
+    #grid-center {
+      align-self: end;
+      justify-self: center;
+      width: 50px;
+      height: 20px;
+      background: #6741d9;
+    }
+    #grid-place {
+      place-self: center end;
+      width: 30px;
+      height: 40px;
+      background: #0b7285;
+    }
+  </style>
+</head>
+<body>
+  <div id="flex"><div id="flex-center"></div><div id="flex-end"></div></div>
+  <div id="grid"><div id="grid-end"></div><div id="grid-center"></div><div id="grid-place"></div></div>
+</body>
+</html>

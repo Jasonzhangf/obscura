@@ -79,6 +79,13 @@
     {"name": "inline block list shrink wraps and stacks children", "color": "#1971c2", "x": 525, "y": 0, "width": 90, "height": 60},
     {"name": "table stand-in does not blockify inline-block list", "color": "#c2255c", "x": 0, "y": 140, "width": 90, "height": 20}
   ],
+  "item-self-alignment": [
+    {"name": "flex item centers itself on cross axis", "color": "#087f5b", "x": 0, "y": 40, "width": 40, "height": 20},
+    {"name": "flex item aligns itself to cross end", "color": "#1971c2", "x": 40, "y": 70, "width": 50, "height": 30},
+    {"name": "grid item aligns center and inline end", "color": "#c2255c", "x": 110, "y": 165, "width": 40, "height": 30},
+    {"name": "grid item aligns block end and inline center", "color": "#6741d9", "x": 200, "y": 220, "width": 50, "height": 20},
+    {"name": "place self sets both grid axes", "color": "#0b7285", "x": 420, "y": 160, "width": 30, "height": 40}
+  ],
   "mixed-content-block": [
     {"name": "full-width block child", "color": "#ccddff", "width": 400}
   ],

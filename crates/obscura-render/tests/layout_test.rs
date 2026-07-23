@@ -493,6 +493,34 @@ fn inline_block_flex_items_keep_block_inner_flow() {
 }
 
 #[test]
+fn item_self_alignment_places_flex_and_grid_items() {
+    let tree = parse_html(include_str!("../../../render-repros/item-self-alignment.html"));
+    let layout = layout_dom(&tree, (900.0, 1000.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    let flex_center = rect("flex-center");
+    let flex_end = rect("flex-end");
+    let grid_end = rect("grid-end");
+    let grid_center = rect("grid-center");
+    let grid_place = rect("grid-place");
+    assert!(
+        (flex_center.x - 0.0).abs() < 0.01
+            && (flex_center.y - 40.0).abs() < 0.01
+            && (flex_end.x - 40.0).abs() < 0.01
+            && (flex_end.y - 70.0).abs() < 0.01,
+        "flex items: {flex_center:?} {flex_end:?}"
+    );
+    assert!(
+        (grid_end.x - 110.0).abs() < 0.01
+            && (grid_end.y - 165.0).abs() < 0.01
+            && (grid_center.x - 200.0).abs() < 0.01
+            && (grid_center.y - 220.0).abs() < 0.01
+            && (grid_place.x - 420.0).abs() < 0.01
+            && (grid_place.y - 160.0).abs() < 0.01,
+        "grid items: {grid_end:?} {grid_center:?} {grid_place:?}"
+    );
+}
+
+#[test]
 fn opposing_floats_share_header_band_through_inline_wrapper() {
     let tree = parse_html(include_str!("../../../render-repros/opposing-header-floats.html"));
     let layout = layout_dom(&tree, (900.0, 1000.0));
