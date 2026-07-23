@@ -1190,12 +1190,13 @@ fn reparent_inset_positioned_nodes(
         // boxes capture absolute descendants; only transformed boxes capture
         // fixed descendants. The full walk stays O(n).
         let own_box = reverse.get(&dom_id).copied();
-        let abs_child_cb = if style.position.is_some() || style.transform_establishes_containing_block {
+        let establishes_cb = style.establishes_positioning_containing_block();
+        let abs_child_cb = if style.position.is_some() || establishes_cb {
             own_box.unwrap_or(inherited_abs_cb)
         } else {
             inherited_abs_cb
         };
-        let fixed_child_cb = if style.transform_establishes_containing_block {
+        let fixed_child_cb = if establishes_cb {
             own_box.unwrap_or(inherited_fixed_cb)
         } else {
             inherited_fixed_cb

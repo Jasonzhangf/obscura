@@ -204,6 +204,40 @@ fn transforms_establish_absolute_and_fixed_containing_blocks() {
 }
 
 #[test]
+fn modern_effects_establish_containing_blocks_independently() {
+    let tree = parse_html(include_str!("../../../render-repros/modern-containing-block-triggers.html"));
+    let layout = layout_dom(&tree, (900.0, 700.0));
+    let cases = [
+        ("filter-cb", "filter-badge"),
+        ("perspective-cb", "perspective-badge"),
+        ("contain-cb", "contain-badge"),
+        ("will-change-cb", "will-change-badge"),
+        ("visibility-cb", "visibility-badge"),
+    ];
+    for (cb_id, badge_id) in cases {
+        let cb = layout.rects[&tree.get_element_by_id(cb_id).unwrap()];
+        let badge = layout.rects[&tree.get_element_by_id(badge_id).unwrap()];
+        assert!((badge.x - cb.x - 75.0).abs() < 1.0, "{badge_id} wrong x: cb={cb:?} badge={badge:?}");
+        assert!((badge.y - cb.y - 55.0).abs() < 1.0, "{badge_id} wrong y: cb={cb:?} badge={badge:?}");
+    }
+
+    let filter_cb = layout.rects[&tree.get_element_by_id("filter-cb").unwrap()];
+    let filter_fixed = layout.rects[&tree.get_element_by_id("filter-fixed").unwrap()];
+    assert!((filter_fixed.x - filter_cb.x - 5.0).abs() < 1.0);
+    assert!((filter_fixed.y - filter_cb.y - 5.0).abs() < 1.0);
+    let contain_cb = layout.rects[&tree.get_element_by_id("contain-cb").unwrap()];
+    let contain_fixed = layout.rects[&tree.get_element_by_id("contain-fixed").unwrap()];
+    assert!((contain_fixed.x - contain_cb.x - 5.0).abs() < 1.0);
+    assert!((contain_fixed.y - contain_cb.y - 5.0).abs() < 1.0);
+
+    // Pinned Chromium 145 does not make container-type:inline-size a
+    // positioning containing block. Keep it as a negative control.
+    let container_badge = layout.rects[&tree.get_element_by_id("container-badge").unwrap()];
+    assert!((container_badge.x - 775.0).abs() < 1.0, "container-type control x: {container_badge:?}");
+    assert!((container_badge.y - 175.0).abs() < 1.0, "container-type control y: {container_badge:?}");
+}
+
+#[test]
 fn long_text_run_wraps_across_multiple_lines() {
     // A long single text node with no inline elements breaking it up must
     // wrap within a narrow container instead of overflowing on one line. The

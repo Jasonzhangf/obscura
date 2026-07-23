@@ -415,10 +415,10 @@ pub struct LayoutStyle {
     /// off-screen skip-link out of view instead of painting it on-screen. Not
     /// inherited (transform is a non-inherited property).
     pub transform_translate: Option<(Dimension, Dimension)>,
-    /// Any computed transform other than `none` establishes containing blocks
-    /// for absolute and fixed descendants, even when its visual transform
-    /// function is not yet supported by the paint engine.
-    pub transform_establishes_containing_block: bool,
+    /// Independent CSS-property triggers that establish containing blocks for
+    /// absolute and fixed descendants. Kept as a bitset so `filter:none`
+    /// cannot clear a transform/containment trigger from another property.
+    pub containing_block_triggers: u16,
     /// `transform: scale(sx[, sy])` / `scaleX` / `scaleY`, captured as (sx, sy).
     /// Parsed and stored so a value that mixes scale with translate still yields
     /// its translate part; scale is not yet folded into paint geometry (doing so
@@ -430,6 +430,20 @@ pub struct LayoutStyle {
     /// modern web rely on it for depth, and without it those elements paint
     /// flat. See [`BoxShadow`] and `paint::paint_box_shadow`.
     pub box_shadow: Option<BoxShadow>,
+}
+
+pub(crate) const CB_TRIGGER_TRANSFORM: u16 = 1 << 0;
+pub(crate) const CB_TRIGGER_FILTER: u16 = 1 << 1;
+pub(crate) const CB_TRIGGER_BACKDROP_FILTER: u16 = 1 << 2;
+pub(crate) const CB_TRIGGER_PERSPECTIVE: u16 = 1 << 3;
+pub(crate) const CB_TRIGGER_CONTAIN: u16 = 1 << 4;
+pub(crate) const CB_TRIGGER_WILL_CHANGE: u16 = 1 << 5;
+pub(crate) const CB_TRIGGER_CONTENT_VISIBILITY: u16 = 1 << 6;
+
+impl LayoutStyle {
+    pub(crate) fn establishes_positioning_containing_block(&self) -> bool {
+        self.containing_block_triggers != 0
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

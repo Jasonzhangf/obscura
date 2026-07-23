@@ -599,6 +599,39 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         "grid-column" => set_grid_placement(style, value, true),
         "grid-row" => set_grid_placement(style, value, false),
         "transform" => parse_transform(style, value),
+        "filter" => set_containing_block_trigger(
+            style,
+            crate::CB_TRIGGER_FILTER,
+            non_none_value(value),
+        ),
+        "backdrop-filter" | "-webkit-backdrop-filter" => set_containing_block_trigger(
+            style,
+            crate::CB_TRIGGER_BACKDROP_FILTER,
+            non_none_value(value),
+        ),
+        "perspective" => set_containing_block_trigger(
+            style,
+            crate::CB_TRIGGER_PERSPECTIVE,
+            non_none_value(value),
+        ),
+        "contain" => {
+            let establishes = value
+                .split_whitespace()
+                .any(|v| matches!(v.to_ascii_lowercase().as_str(), "layout" | "paint" | "strict" | "content"));
+            set_containing_block_trigger(style, crate::CB_TRIGGER_CONTAIN, establishes);
+        }
+        "will-change" => {
+            let establishes = value
+                .split([',', ' '])
+                .map(str::trim)
+                .any(|v| matches!(v.to_ascii_lowercase().as_str(), "transform" | "filter" | "backdrop-filter" | "perspective" | "contain"));
+            set_containing_block_trigger(style, crate::CB_TRIGGER_WILL_CHANGE, establishes);
+        }
+        "content-visibility" => set_containing_block_trigger(
+            style,
+            crate::CB_TRIGGER_CONTENT_VISIBILITY,
+            value.trim().eq_ignore_ascii_case("auto"),
+        ),
         "box-shadow" | "-webkit-box-shadow" => {
             style.box_shadow = parse_box_shadow(value, style.color);
         }
@@ -623,14 +656,14 @@ fn parse_transform(style: &mut LayoutStyle, value: &str) {
     if v.eq_ignore_ascii_case("none") {
         style.transform_translate = None;
         style.transform_scale = None;
-        style.transform_establishes_containing_block = false;
+        set_containing_block_trigger(style, crate::CB_TRIGGER_TRANSFORM, false);
         return;
     }
     let functions = transform_functions(v);
     if functions.is_empty() {
         return;
     }
-    style.transform_establishes_containing_block = true;
+    set_containing_block_trigger(style, crate::CB_TRIGGER_TRANSFORM, true);
     let zero = crate::Dimension::Px(0.0);
     let (mut tx, mut ty): (Option<crate::Dimension>, Option<crate::Dimension>) = (None, None);
     let (mut sx, mut sy): (Option<f32>, Option<f32>) = (None, None);
@@ -683,6 +716,19 @@ fn parse_transform(style: &mut LayoutStyle, value: &str) {
     }
     if sx.is_some() || sy.is_some() {
         style.transform_scale = Some((sx.unwrap_or(1.0), sy.unwrap_or(1.0)));
+    }
+}
+
+fn non_none_value(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty() && !value.eq_ignore_ascii_case("none")
+}
+
+fn set_containing_block_trigger(style: &mut LayoutStyle, trigger: u16, enabled: bool) {
+    if enabled {
+        style.containing_block_triggers |= trigger;
+    } else {
+        style.containing_block_triggers &= !trigger;
     }
 }
 
@@ -2096,6 +2142,27 @@ mod tests {
         assert_eq!(s.display, Display::Flex);
         assert_eq!(s.width, crate::Dimension::Px(200.0));
         assert_eq!(s.height, crate::Dimension::Px(50.0));
+    }
+
+    #[test]
+    fn containing_block_property_triggers_are_independent() {
+        let s = compute_style("div", Some("transform:rotate(0deg);filter:none"));
+        assert!(s.establishes_positioning_containing_block());
+
+        let s = compute_style("div", Some("filter:blur(0);transform:none"));
+        assert!(s.establishes_positioning_containing_block());
+
+        let s = compute_style(
+            "div",
+            Some("contain:layout;content-visibility:visible;filter:none"),
+        );
+        assert!(s.establishes_positioning_containing_block());
+
+        let s = compute_style(
+            "div",
+            Some("contain:none;content-visibility:visible;filter:none;perspective:none"),
+        );
+        assert!(!s.establishes_positioning_containing_block());
     }
 
     #[test]
