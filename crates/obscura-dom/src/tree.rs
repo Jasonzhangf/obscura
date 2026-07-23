@@ -564,7 +564,28 @@ impl DomTree {
         if let Some(child) = current_node.first_child {
             return Some(child);
         }
+        Self::climb_to_next_sibling(&inner, root, current)
+    }
 
+    /// Returns the node after the whole subtree rooted at `current`, in document
+    /// order, without leaving the subtree rooted at `root`.
+    ///
+    /// This is `next_in_subtree` minus the descend-into-children step, which is
+    /// what `NodeFilter.FILTER_REJECT` needs: it rejects a node *and* its
+    /// descendants, unlike `FILTER_SKIP`, which only skips the node itself and
+    /// is served by `next_in_subtree`.
+    pub fn next_after_subtree(&self, root: NodeId, current: NodeId) -> Option<NodeId> {
+        let inner = self.inner.borrow();
+        Self::climb_to_next_sibling(&inner, root, current)
+    }
+
+    /// Follow `current`'s next sibling, climbing ancestors until one has a next
+    /// sibling — without stepping outside `root`.
+    fn climb_to_next_sibling(
+        inner: &DomTreeInner,
+        root: NodeId,
+        current: NodeId,
+    ) -> Option<NodeId> {
         let mut node_id = current;
         for _ in 0..=inner.nodes.len() {
             if node_id == root {
@@ -1025,6 +1046,29 @@ mod tests {
         assert_eq!(tree.next_in_subtree(root, first), Some(nested));
         assert_eq!(tree.next_in_subtree(root, nested), Some(second));
         assert_eq!(tree.next_in_subtree(root, second), None);
+    }
+
+    #[test]
+    fn test_next_after_subtree_skips_descendants() {
+        // Same shape as above: root > [first > nested, second]. Stepping past
+        // `first` must land on `second`, not descend into `nested` — that is
+        // what NodeFilter.FILTER_REJECT needs.
+        let tree = DomTree::new();
+        let root = tree.new_node(NodeData::Text { contents: "root".into() });
+        let first = tree.new_node(NodeData::Text { contents: "first".into() });
+        let nested = tree.new_node(NodeData::Text { contents: "nested".into() });
+        let second = tree.new_node(NodeData::Text { contents: "second".into() });
+        tree.append_child(tree.document(), root);
+        tree.append_child(root, first);
+        tree.append_child(first, nested);
+        tree.append_child(root, second);
+
+        assert_eq!(tree.next_after_subtree(root, first), Some(second));
+        // A leaf behaves identically to next_in_subtree: there is no subtree.
+        assert_eq!(tree.next_after_subtree(root, nested), Some(second));
+        assert_eq!(tree.next_after_subtree(root, second), None);
+        // Rejecting the root itself exhausts the walk rather than escaping it.
+        assert_eq!(tree.next_after_subtree(root, root), None);
     }
 
     // Builds a chain of `depth` nested <div> elements under the document and

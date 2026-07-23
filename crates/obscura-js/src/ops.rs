@@ -275,6 +275,15 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                 .map(|id| id.index().to_string())
                 .unwrap_or("-1".into())
         }
+        // Step past a whole subtree rather than into it: NodeFilter.FILTER_REJECT
+        // prunes the rejected node's descendants, unlike FILTER_SKIP.
+        "next_after_subtree" => {
+            let root = NodeId::new(arg1.parse::<u32>().unwrap_or(0));
+            let current = NodeId::new(arg2.parse::<u32>().unwrap_or(0));
+            dom.next_after_subtree(root, current)
+                .map(|id| id.index().to_string())
+                .unwrap_or("-1".into())
+        }
         "child_nodes" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
             let ids: Vec<i32> = dom.children(NodeId::new(nid)).iter().map(|id| id.index() as i32).collect();
