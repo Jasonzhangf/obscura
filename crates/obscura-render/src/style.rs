@@ -588,6 +588,8 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         }
         "grid-template-areas" => style.grid_areas = Some(parse_grid_areas(value)),
         "grid-template" => parse_grid_template(style, value),
+        "grid" => parse_grid_shorthand(style, value),
+        "grid-auto-flow" => style.grid_auto_flow = parse_grid_auto_flow(value),
         "grid-area" => {
             // Named area (single ident) or line form `r/c/r/c`. We only resolve
             // the named-area case here; line forms are handled by grid-row/column.
@@ -787,11 +789,16 @@ fn scale_number(s: &str) -> Option<f32> {
 /// minmax(0,1fr)`) into taffy sizing functions. Tokenizes respecting the
 /// parentheses in `minmax(...)` / `fit-content(...)`.
 /// Parse a track list into taffy sizing functions plus the `[line-name]` map
-/// (name -> 1-based grid line number). `repeat(n, ...)` is expanded to n copies
-/// (it was previously collapsed to a single phantom `Auto` track, which broke
-/// every `repeat()`-based grid) and `[name]` annotations are captured, not
+/// (name -> 1-based grid line number). `repeat(n, ...)` is expanded to n copies;
+/// auto-fill/auto-fit remain typed repetitions so layout can derive their count
+/// from the used container width. `[name]` annotations are captured rather than
 /// turned into tracks. First occurrence of a name wins.
-pub(crate) fn parse_track_list_named(value: &str) -> (Vec<taffy::TrackSizingFunction>, Vec<(String, i16)>) {
+pub(crate) fn parse_track_list_named(
+    value: &str,
+) -> (
+    Vec<taffy::GridTemplateComponent<String>>,
+    Vec<(String, i16)>,
+) {
     let mut tracks = Vec::new();
     let mut names = Vec::new();
     let mut line: i16 = 1;
@@ -803,7 +810,7 @@ pub(crate) fn parse_track_list_named(value: &str) -> (Vec<taffy::TrackSizingFunc
 
 fn expand_track_token(
     tok: &str,
-    tracks: &mut Vec<taffy::TrackSizingFunction>,
+    tracks: &mut Vec<taffy::GridTemplateComponent<String>>,
     names: &mut Vec<(String, i16)>,
     line: &mut i16,
 ) {
@@ -819,10 +826,29 @@ fn expand_track_token(
     if lower.starts_with("repeat(") && t.ends_with(')') {
         let inner = &t["repeat(".len()..t.len() - 1];
         if let Some((cnt, sub)) = inner.split_once(',') {
-            // `auto-fill`/`auto-fit` counts need the container width; fall back
-            // to one repetition (a reasonable minimum) rather than dropping it.
-            let count = cnt.trim().parse::<usize>().unwrap_or(1).min(1000);
             let subtoks = tokenize_tracks(sub.trim());
+            let repetition = match cnt.trim().to_ascii_lowercase().as_str() {
+                "auto-fill" => Some(taffy::RepetitionCount::AutoFill),
+                "auto-fit" => Some(taffy::RepetitionCount::AutoFit),
+                _ => None,
+            };
+            if let Some(count) = repetition {
+                let repeated_tracks = subtoks
+                    .iter()
+                    .filter(|st| !st.trim_start().starts_with('['))
+                    .map(|st| track(st))
+                    .collect();
+                tracks.push(taffy::GridTemplateComponent::Repeat(
+                    taffy::GridTemplateRepetition {
+                        count,
+                        tracks: repeated_tracks,
+                        line_names: Vec::new(),
+                    },
+                ));
+                *line += 1;
+                return;
+            }
+            let count = cnt.trim().parse::<usize>().unwrap_or(1).min(1000);
             for _ in 0..count {
                 for st in &subtoks {
                     expand_track_token(st, tracks, names, line);
@@ -831,7 +857,7 @@ fn expand_track_token(
         }
         return;
     }
-    tracks.push(track(t));
+    tracks.push(taffy::GridTemplateComponent::Single(track(t)));
     *line += 1;
 }
 
@@ -972,6 +998,53 @@ fn parse_grid_template(style: &mut LayoutStyle, value: &str) {
         style.grid_template_columns = tracks;
         style.grid_col_line_names = (!names.is_empty()).then(|| build_line_map(names));
     }
+}
+
+/// Parse the common `grid` shorthand forms. A side containing `auto-flow`
+/// defines the implicit placement axis; the opposite side is the explicit
+/// track list. Without `auto-flow`, this is the `grid-template` shorthand.
+fn parse_grid_shorthand(style: &mut LayoutStyle, value: &str) {
+    let Some((rows, columns)) = value.split_once('/') else {
+        parse_grid_template(style, value);
+        return;
+    };
+    let rows = rows.trim();
+    let columns = columns.trim();
+    if rows.to_ascii_lowercase().contains("auto-flow") {
+        style.grid_template_rows.clear();
+        let (tracks, names) = parse_track_list_named(columns);
+        style.grid_template_columns = tracks;
+        style.grid_col_line_names = (!names.is_empty()).then(|| build_line_map(names));
+        style.grid_auto_flow = Some(if rows.to_ascii_lowercase().contains("dense") {
+            taffy::GridAutoFlow::RowDense
+        } else {
+            taffy::GridAutoFlow::Row
+        });
+    } else if columns.to_ascii_lowercase().contains("auto-flow") {
+        style.grid_template_columns.clear();
+        let (tracks, names) = parse_track_list_named(rows);
+        style.grid_template_rows = tracks;
+        style.grid_row_line_names = (!names.is_empty()).then(|| build_line_map(names));
+        style.grid_auto_flow = Some(if columns.to_ascii_lowercase().contains("dense") {
+            taffy::GridAutoFlow::ColumnDense
+        } else {
+            taffy::GridAutoFlow::Column
+        });
+    } else {
+        parse_grid_template(style, value);
+    }
+}
+
+fn parse_grid_auto_flow(value: &str) -> Option<taffy::GridAutoFlow> {
+    let lower = value.trim().to_ascii_lowercase();
+    let dense = lower.split_whitespace().any(|token| token == "dense");
+    let column = lower.split_whitespace().any(|token| token == "column");
+    Some(match (column, dense) {
+        (false, false) => taffy::GridAutoFlow::Row,
+        (false, true) => taffy::GridAutoFlow::RowDense,
+        (true, false) => taffy::GridAutoFlow::Column,
+        (true, true) => taffy::GridAutoFlow::ColumnDense,
+    })
 }
 
 /// Store a `grid-column`/`grid-row` value. Numeric/`span` forms resolve to a
@@ -2250,6 +2323,30 @@ mod tests {
         assert_eq!(s.margin_relative[3], Some(crate::Dimension::Vw(10.0)));
         assert_eq!(s.padding_relative[0], Some(crate::Dimension::Rem(1.0)));
         assert_eq!(s.padding_relative[1], Some(crate::Dimension::Vmin(2.0)));
+    }
+
+    #[test]
+    fn responsive_grid_repetitions_and_shorthand_remain_typed() {
+        let auto = compute_style(
+            "div",
+            Some("display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr))"),
+        );
+        assert!(matches!(
+            auto.grid_template_columns.as_slice(),
+            [taffy::GridTemplateComponent::Repeat(
+                taffy::GridTemplateRepetition {
+                    count: taffy::RepetitionCount::AutoFit,
+                    ..
+                }
+            )]
+        ));
+
+        let shorthand = compute_style(
+            "div",
+            Some("display:grid;grid:auto-flow/repeat(3,1fr)"),
+        );
+        assert_eq!(shorthand.grid_auto_flow, Some(taffy::GridAutoFlow::Row));
+        assert_eq!(shorthand.grid_template_columns.len(), 3);
     }
 
     #[test]

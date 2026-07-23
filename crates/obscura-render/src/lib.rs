@@ -278,8 +278,9 @@ pub struct LayoutStyle {
     // CSS Grid. Tracks are stored as taffy sizing functions; `grid_areas` is the
     // parsed `grid-template-areas` matrix (one Vec per row, `.` for a null cell),
     // resolved to line placements on children in a later pass.
-    pub grid_template_columns: Vec<taffy::TrackSizingFunction>,
-    pub grid_template_rows: Vec<taffy::TrackSizingFunction>,
+    pub grid_template_columns: Vec<taffy::GridTemplateComponent<String>>,
+    pub grid_template_rows: Vec<taffy::GridTemplateComponent<String>>,
+    pub grid_auto_flow: Option<taffy::GridAutoFlow>,
     pub grid_areas: Option<Vec<Vec<String>>>,
     pub grid_area_name: Option<String>,
     pub grid_column: Option<taffy::Line<taffy::GridPlacement>>,
@@ -702,29 +703,22 @@ pub(crate) fn to_taffy_style(style: &LayoutStyle) -> Style {
         s.flex_basis = dimension(style.flex_basis);
     }
 
-    // Grid container tracks and gaps. obscura expands `repeat()` itself during
-    // parsing, so every stored track is a single (non-repeated) `MinMax`; wrap
-    // each as a `GridTemplateComponent::Single` for taffy 0.12. The 0.7-era
+    // Grid container tracks and gaps. Numeric repeat() values are expanded
+    // during parsing, while auto-fill/auto-fit remain native taffy repetition
+    // components so their count can use the final container size. The 0.7-era
     // fr->Auto row workaround (which stopped `minmax(0,1fr)` image rows from
     // collapsing to a sliver) is gone: taffy 0.12 treats an in-flow child's
     // vertical available space as indefinite, so fr rows of an auto-height grid
     // size to their content the way real CSS does.
     if style.display == Display::Grid {
         if !style.grid_template_columns.is_empty() {
-            s.grid_template_columns = style
-                .grid_template_columns
-                .iter()
-                .cloned()
-                .map(taffy::GridTemplateComponent::Single)
-                .collect();
+            s.grid_template_columns = style.grid_template_columns.clone();
         }
         if !style.grid_template_rows.is_empty() {
-            s.grid_template_rows = style
-                .grid_template_rows
-                .iter()
-                .cloned()
-                .map(taffy::GridTemplateComponent::Single)
-                .collect();
+            s.grid_template_rows = style.grid_template_rows.clone();
+        }
+        if let Some(flow) = style.grid_auto_flow {
+            s.grid_auto_flow = flow;
         }
     }
     let cg = style.column_gap.unwrap_or(0.0);
