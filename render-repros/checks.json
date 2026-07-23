@@ -10,6 +10,12 @@
     {"name": "percent insets use padding box", "color": "#f08c00", "x": 260, "y": 160, "width": 30, "height": 30},
     {"name": "fixed viewport containing block", "color": "#a61e4d", "x": 520, "y": 40, "width": 90, "height": 55}
   ],
+  "absolute-static-position": [
+    {"name": "absolute top uses real containing block and keeps static inline position", "color": "#087f5b", "x": 125, "y": 60, "width": 40, "height": 30},
+    {"name": "absolute left uses real containing block and keeps static block position", "color": "#1971c2", "x": 210, "y": 97, "width": 50, "height": 20},
+    {"name": "outer static candidate is reparented after coordinate harvest", "color": "#862e9c", "x": 84, "y": 390, "width": 160, "height": 100},
+    {"name": "nested static candidate survives outer reparenting", "color": "#0b7285", "x": 154, "y": 413, "width": 20, "height": 20}
+  ],
   "block-auto-margins": [
     {"name": "two auto margins center a fixed-width block", "color": "#087f5b", "x": 300, "y": 20, "width": 300, "height": 40},
     {"name": "two auto margins center a max-width block", "color": "#1971c2", "x": 200, "y": 100, "width": 500, "height": 40},

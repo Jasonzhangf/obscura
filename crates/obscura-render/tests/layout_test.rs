@@ -163,6 +163,36 @@ fn inset_absolute_uses_nearest_positioned_ancestor() {
 }
 
 #[test]
+fn absolute_auto_axes_preserve_static_position_after_reparenting() {
+    let tree = parse_html(include_str!("../../../render-repros/absolute-static-position.html"));
+    let layout = layout_dom(&tree, (900.0, 1000.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    let static_inline = rect("top-static-inline");
+    let static_block = rect("left-static-block");
+    let outer_static = rect("outer-static");
+    let nested_static = rect("nested-static");
+    assert!(
+        (static_inline.x - 125.0).abs() < 0.01
+            && (static_inline.y - 60.0).abs() < 0.01,
+        "static inline axis: {static_inline:?}"
+    );
+    assert!(
+        (static_block.x - 210.0).abs() < 0.01
+            && (static_block.y - 97.0).abs() < 0.01,
+        "static block axis: {static_block:?}"
+    );
+    assert!(
+        (outer_static.x - 84.0).abs() < 0.01 && (outer_static.y - 390.0).abs() < 0.01,
+        "outer static candidate: {outer_static:?}"
+    );
+    assert!(
+        (nested_static.x - 154.0).abs() < 0.01
+            && (nested_static.y - 413.0).abs() < 0.01,
+        "nested static candidate: {nested_static:?}"
+    );
+}
+
+#[test]
 fn transforms_establish_absolute_and_fixed_containing_blocks() {
     let html = r##"
         <body style="margin:0">
