@@ -222,6 +222,7 @@ fn cascade_walk(
     matcher: &mut obscura_dom::selector::Matcher,
     styles: &mut HashMap<NodeId, crate::LayoutStyle>,
     parent_props: &std::rc::Rc<HashMap<String, String>>,
+    quirks_mode: bool,
 ) {
     let Some(node) = tree.get_node(id) else { return };
     let is_element = node.is_element();
@@ -230,6 +231,45 @@ fn cascade_walk(
     let mut this_props = parent_props.clone();
     if let Some(elem) = node.as_element() {
         let mut style = crate::style::ua_style(elem.local.as_ref());
+        if quirks_mode && elem.local.as_ref() == "form" {
+            // Legacy HTML/quirks rendering keeps one em after forms. Standards
+            // mode does not; Hacker News and many old document templates omit
+            // a doctype and rely on this spacing.
+            style.margin_relative[2] = Some(crate::Dimension::Em(1.0));
+        }
+        if elem.local.as_ref() == "input" {
+            let input_type = node
+                .get_attribute("type")
+                .unwrap_or("text")
+                .trim()
+                .to_ascii_lowercase();
+            if quirks_mode {
+                style.box_sizing = crate::BoxSizing::BorderBox;
+            }
+            match input_type.as_str() {
+                "checkbox" | "radio" => {
+                    style.margin = crate::Edges {
+                        top: 3.0,
+                        right: 3.0,
+                        bottom: 3.0,
+                        left: 4.0,
+                    };
+                    style.padding = crate::Edges::default();
+                    style.border = crate::Edges::default();
+                }
+                "range" | "color" => {
+                    style.margin = crate::Edges {
+                        top: 2.0,
+                        right: 2.0,
+                        bottom: 2.0,
+                        left: 2.0,
+                    };
+                    style.padding = crate::Edges::default();
+                    style.border = crate::Edges::default();
+                }
+                _ => {}
+            }
+        }
         // UA rule `[hidden]:not([hidden=until-found]) { display: none }`.
         // Applied before the author cascade so a matching author `display`
         // still wins (UA origin, per the HTML rendering spec). Sites ship
@@ -271,7 +311,15 @@ fn cascade_walk(
         matcher.push_ancestor(tree, id);
     }
     for cid in tree.children(id) {
-        cascade_walk(tree, cid, sheet, matcher, styles, &this_props);
+        cascade_walk(
+            tree,
+            cid,
+            sheet,
+            matcher,
+            styles,
+            &this_props,
+            quirks_mode,
+        );
     }
     if is_element {
         matcher.pop_ancestor();
@@ -320,7 +368,23 @@ pub fn layout_dom_with_images(
     // into children, pop on the way back out. This is what lets descendant
     // combinators (".mw-body .firstHeading") fast-reject via the filter
     // instead of falling back to the always-true "can't reject" case.
-    cascade_walk(tree, tree.document(), &sheet, &mut matcher, &mut styles, &root_props);
+    let quirks_mode = !tree
+        .descendants(tree.document())
+        .into_iter()
+        .any(|id| {
+            tree.get_node(id).map_or(false, |node| {
+                matches!(node.data, obscura_dom::tree::NodeData::Doctype { .. })
+            })
+        });
+    cascade_walk(
+        tree,
+        tree.document(),
+        &sheet,
+        &mut matcher,
+        &mut styles,
+        &root_props,
+        quirks_mode,
+    );
     if timing {
         let (r, i, c, l, u) = sheet.debug_stats();
         eprintln!("[timing] parse+index={:?} cascade={:?} rules={} id_keys={} class_keys={} local_keys={} universal={}", t_parse, t1.elapsed(), r, i, c, l, u);
@@ -635,6 +699,93 @@ pub fn layout_dom_with_images(
             inh.cb_width = child_cb_width;
             for cid in tree.children(id).into_iter().rev() {
                 queue.push((cid, inh.clone()));
+            }
+        }
+
+        // Resolve native input-control intrinsic border-box geometry after
+        // inheritance and author cascading. Text-like inputs use the HTML
+        // `size` attribute (20 by default) and the control's own computed
+        // font; author CSS widths/heights remain authoritative. Without this
+        // replaced-control sizing, every input is an empty auto-sized leaf
+        // (0px tall and often stretched to its container).
+        for (&id, style) in styles.iter_mut() {
+            let Some(node) = tree.get_node(id) else { continue };
+            let Some(element) = node.as_element() else { continue };
+            if element.local.as_ref() != "input" {
+                continue;
+            }
+            let input_type = node
+                .get_attribute("type")
+                .unwrap_or("text")
+                .trim()
+                .to_ascii_lowercase();
+            if input_type == "hidden" {
+                style.display = crate::Display::None;
+                continue;
+            }
+
+            let font_size = style.font_size.unwrap_or(13.333_333).max(1.0);
+            let horizontal_edges = style.padding.left
+                + style.padding.right
+                + style.border.left
+                + style.border.right;
+            let vertical_edges = style.padding.top
+                + style.padding.bottom
+                + style.border.top
+                + style.border.bottom;
+            let default_height =
+                crate::inline::used_line_height(style).max(1.0) + vertical_edges;
+
+            let (intrinsic_width, intrinsic_height) = match input_type.as_str() {
+                "checkbox" | "radio" => (13.0, 13.0),
+                "range" => (129.0, 16.0),
+                "color" => (50.0, 27.0),
+                "file" => (253.0, default_height.max(22.0)),
+                "submit" | "reset" | "button" => {
+                    let fallback = match input_type.as_str() {
+                        "reset" => "Reset",
+                        "button" => "",
+                        _ => "Submit Query",
+                    };
+                    let label = node.get_attribute("value").unwrap_or(fallback);
+                    (
+                        (label.chars().count() as f32 * font_size * 0.55
+                            + font_size * 1.5
+                            + horizontal_edges)
+                            .max(20.0),
+                        default_height,
+                    )
+                }
+                "image" => (horizontal_edges, vertical_edges),
+                _ => {
+                    let size = node
+                        .get_attribute("size")
+                        .and_then(|value| value.parse::<u32>().ok())
+                        .filter(|&value| value > 0)
+                        .unwrap_or(20) as f32;
+                    (
+                        size * font_size * 0.6
+                            + font_size * 0.675
+                            + horizontal_edges,
+                        default_height,
+                    )
+                }
+            };
+            if style.width == crate::Dimension::Auto {
+                let declared_width = if style.box_sizing == crate::BoxSizing::ContentBox {
+                    (intrinsic_width - horizontal_edges).max(0.0)
+                } else {
+                    intrinsic_width
+                };
+                style.width = crate::Dimension::Px(declared_width);
+            }
+            if style.height == crate::Dimension::Auto {
+                let declared_height = if style.box_sizing == crate::BoxSizing::ContentBox {
+                    (intrinsic_height - vertical_edges).max(0.0)
+                } else {
+                    intrinsic_height
+                };
+                style.height = crate::Dimension::Px(declared_height);
             }
         }
 

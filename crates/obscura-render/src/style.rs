@@ -107,6 +107,32 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
     } else if tag == "a" {
         style.color = Some([0, 0, 238, 255]); // blue
         style.underline = Some(true); // UA default: links are underlined
+    } else if tag == "input" {
+        // Native text controls are atomic inline-level boxes with their own
+        // platform font and intrinsic border-box dimensions; they do not
+        // inherit the page's font shorthand by default. The declared CSS box
+        // remains content-box in standards mode and switches in quirks mode.
+        // Size-dependent geometry is resolved after cascading, once the input
+        // type and `size` attribute are available (dom::layout_dom).
+        style.display = Display::Inline;
+        style.is_inline_block = true;
+        style.font_size = Some(13.333_333);
+        style.font_family = Some("arial".to_string());
+        style.line_height = Some(crate::LineHeight::Normal);
+        style.padding = Edges {
+            top: 1.0,
+            right: 2.0,
+            bottom: 1.0,
+            left: 2.0,
+        };
+        style.border = Edges {
+            top: 2.0,
+            right: 2.0,
+            bottom: 2.0,
+            left: 2.0,
+        };
+        style.border_color = Some([118, 118, 118, 255]);
+        style.background_color = Some([255, 255, 255, 255]);
     } else if tag == "table" || tag == "tbody" {
         style.display = Display::Flex;
         style.internal_flex_container = true;
