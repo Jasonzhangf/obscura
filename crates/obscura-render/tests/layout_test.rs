@@ -427,6 +427,30 @@ fn auto_block_wrapper_contains_percentage_replaced_child() {
 }
 
 #[test]
+fn text_alignment_does_not_shrink_flex_items() {
+    let tree = parse_html(include_str!("../../../render-repros/text-align-flex-items.html"));
+    let layout = layout_dom(&tree, (900.0, 1000.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    let stack = rect("stack");
+    let media = rect("media");
+    let label = rect("label");
+    let chip = rect("chip");
+    assert!(
+        (stack.width - 400.0).abs() < 0.01
+            && (media.x - 20.0).abs() < 0.01
+            && (media.width - 360.0).abs() < 0.01,
+        "stack: {stack:?}, media: {media:?}"
+    );
+    assert!(
+        (label.x - 20.0).abs() < 0.01
+            && (label.width - 360.0).abs() < 0.01
+            && (chip.x - 150.0).abs() < 0.01
+            && (chip.width - 100.0).abs() < 0.01,
+        "label: {label:?}, chip: {chip:?}"
+    );
+}
+
+#[test]
 fn opposing_floats_share_header_band_through_inline_wrapper() {
     let tree = parse_html(include_str!("../../../render-repros/opposing-header-floats.html"));
     let layout = layout_dom(&tree, (900.0, 1000.0));
