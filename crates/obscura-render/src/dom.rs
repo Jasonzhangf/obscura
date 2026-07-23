@@ -2041,7 +2041,7 @@ fn build(
     }
 
     let mut child_ids: Vec<taffy::NodeId> = if has_float_child {
-        build_children_with_float_zone(tree, &dom_children, taffy_tree, id_map, words, engine, ifc_items, styles)
+        build_children_with_float_zone(tree, id, &dom_children, taffy_tree, id_map, words, engine, ifc_items, styles)
     } else {
         dom_children.into_iter().flat_map(|cid| build_any(tree, cid, taffy_tree, id_map, words, engine, ifc_items, styles)).collect()
     };
@@ -2154,12 +2154,29 @@ fn build_mixed_block(
                 child_ids.extend(build_any(tree, cid, taffy_tree, id_map, words, engine, ifc_items, styles));
             }
             Seg::Run(run) => {
+                // Collapsible source formatting at the start/end of an inline
+                // run does not create line width. Preserve whitespace between
+                // inline siblings, but trim indentation adjacent to block
+                // boundaries so pretty-printed markup starts at the line edge.
+                let is_whitespace_text = |cid: NodeId| {
+                    tree.get_node(cid).map_or(false, |node| {
+                        matches!(node.data, obscura_dom::tree::NodeData::Text { .. })
+                            && tree.text_content(cid).trim().is_empty()
+                    })
+                };
+                let start = run.iter().position(|&cid| !is_whitespace_text(cid)).unwrap_or(run.len());
+                let end = run
+                    .iter()
+                    .rposition(|&cid| !is_whitespace_text(cid))
+                    .map(|index| index + 1)
+                    .unwrap_or(start);
+                let run = &run[start..end];
                 let join_before = before_pending && i == 0;
                 let join_after = after_pending && i + 1 == n_segs;
                 // Fast path: the whole run folds to one shaped leaf, unless
                 // pseudo-content word leaves must share its lines.
                 if !join_before && !join_after {
-                    if let Some(item) = engine.try_build_run(tree, id, &run, styles) {
+                    if let Some(item) = engine.try_build_run(tree, id, run, styles) {
                         let leaf = taffy_tree.new_leaf_with_context(run_leaf_style(), item).ok()?;
                         ifc_items.runs.entry(id).or_default().push(item);
                         child_ids.push(leaf);
@@ -2171,7 +2188,7 @@ fn build_mixed_block(
                     atoms.extend(before_leaves.iter().copied());
                     before_pending = false;
                 }
-                for &rc in &run {
+                for &rc in run {
                     atoms.extend(build_any(tree, rc, taffy_tree, id_map, words, engine, ifc_items, styles));
                 }
                 if join_after {
@@ -2261,16 +2278,16 @@ fn run_wrapper_style(parent: &crate::LayoutStyle) -> taffy::Style {
 
 /// Approximate `float: left|right` without real per-line reflow (which
 /// taffy's block/flex/grid modes do not provide): place the float alongside
-/// the flow siblings that follow it, up to whichever comes first of the next
-/// heading or another floated element, then let everything from there on
-/// revert to normal full-width flow.
+/// the flow siblings that follow it until their estimated height reaches the
+/// float's estimated bottom, a matching `clear` is encountered, or another
+/// float begins, then let everything from there on revert to normal full-width
+/// flow.
 ///
 /// This is not a general CSS float implementation (a float taller than its
-/// flow zone, or one that should keep affecting content past a heading,
-/// won't reflow correctly), but it directly targets the overwhelmingly
+/// estimated flow zone won't reflow correctly), but it directly targets the overwhelmingly
 /// common real-world shape: a floated image or infobox near the top of an
 /// article, sitting beside the intro text, with the rest of the content
-/// (starting at the next section heading) running full width beneath it.
+/// running full width once normal flow passes the float.
 /// Rough height budget for a float with no explicit size and no images
 /// (an icon-only or empty float, rare in practice): enough for a couple of
 /// lines of caption-sized text without being so generous it drags in a
@@ -2303,7 +2320,29 @@ fn estimate_float_height(tree: &DomTree, float_id: NodeId, styles: &HashMap<Node
         .sum();
     const ASSUMED_FLOAT_WIDTH: f32 = 280.0;
     let text_height = estimate_text_height(tree, float_id, styles, ASSUMED_FLOAT_WIDTH);
-    (image_height + text_height).max(DEFAULT_FLOAT_HEIGHT_ESTIMATE)
+    // Flattened character count misses forced rows. A sidebar list with twenty
+    // short `<li>`s or an infobox table with many `<tr>`s is much taller than
+    // the same text treated as one wrapping paragraph. Add one line for each
+    // structural row; the continuous-text estimate still accounts for extra
+    // wrapping within those rows.
+    let structural_height: f32 = tree
+        .descendants(float_id)
+        .into_iter()
+        .filter(|&id| {
+            tree.get_node(id)
+                .and_then(|node| node.as_element().map(|element| element.local.to_string()))
+                .map(|local| {
+                    matches!(
+                        local.as_str(),
+                        "li" | "tr" | "dt" | "dd" | "p" | "figcaption" | "h1" | "h2" | "h3" | "h4"
+                            | "h5" | "h6"
+                    )
+                })
+                .unwrap_or(false)
+        })
+        .map(|id| styles.get(&id).and_then(|style| style.font_size).unwrap_or(16.0) * 1.2)
+        .sum();
+    (image_height + text_height + structural_height).max(DEFAULT_FLOAT_HEIGHT_ESTIMATE)
 }
 
 /// Estimate how tall `id`'s text content would render at `assumed_width`,
@@ -2321,6 +2360,58 @@ fn estimate_text_height(tree: &DomTree, id: NodeId, styles: &HashMap<NodeId, cra
     let chars_per_line = (assumed_width / (fsize * AVG_CHAR_WIDTH_EM)).max(1.0);
     let lines = (char_count / chars_per_line).ceil().max(1.0);
     lines * fsize * 1.2 + 16.0
+}
+
+/// Estimate the normal-flow height consumed by one sibling alongside a float.
+/// Text alone is insufficient for image grids and fixed-height boxes, which
+/// otherwise cost zero budget and remain squeezed beside a float long after
+/// they should have passed its bottom.
+fn estimate_flow_sibling_height(
+    tree: &DomTree,
+    id: NodeId,
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+    assumed_width: f32,
+) -> f32 {
+    let style = styles.get(&id);
+    if style.map(|style| style.display == crate::Display::None).unwrap_or(false)
+        || style
+            .and_then(|style| style.position)
+            .map(|position| position == taffy::Position::Absolute)
+            .unwrap_or(false)
+    {
+        return 0.0;
+    }
+    let explicit_height = match style.map(|style| style.height) {
+        Some(crate::Dimension::Px(height)) => height.max(0.0),
+        _ => 0.0,
+    };
+    let descendant_image_height: f32 = tree
+        .descendants(id)
+        .into_iter()
+        .filter(|&descendant| {
+            tree.get_node(descendant)
+                .and_then(|node| node.as_element().map(|element| element.local.as_ref() == "img"))
+                .unwrap_or(false)
+        })
+        .filter_map(|descendant| match styles.get(&descendant).map(|style| style.height) {
+            Some(crate::Dimension::Px(height)) => Some(height.max(0.0)),
+            _ => None,
+        })
+        .sum();
+    let own_image_height = if tree
+        .get_node(id)
+        .and_then(|node| node.as_element().map(|element| element.local.as_ref() == "img"))
+        .unwrap_or(false)
+    {
+        explicit_height
+    } else {
+        0.0
+    };
+    let content_height = estimate_text_height(tree, id, styles, assumed_width)
+        .max(explicit_height)
+        .max(descendant_image_height + own_image_height);
+    let margins = style.map(|style| (style.margin.top + style.margin.bottom).max(0.0)).unwrap_or(0.0);
+    content_height + margins
 }
 
 /// Largest definite (px) width among `id` and its descendants. Used to cap an
@@ -2344,6 +2435,7 @@ fn max_definite_descendant_width(tree: &DomTree, id: NodeId, styles: &HashMap<No
 
 fn build_children_with_float_zone(
     tree: &DomTree,
+    parent_id: NodeId,
     dom_children: &[NodeId],
     taffy_tree: &mut TaffyTree<usize>,
     id_map: &mut HashMap<taffy::NodeId, NodeId>,
@@ -2353,12 +2445,6 @@ fn build_children_with_float_zone(
     styles: &HashMap<NodeId, crate::LayoutStyle>,
 ) -> Vec<taffy::NodeId> {
     let is_float = |cid: NodeId| styles.get(&cid).map(|s| s.float.is_some()).unwrap_or(false);
-    let is_heading = |cid: NodeId| {
-        tree.get_node(cid)
-            .and_then(|n| n.as_element().map(|e| e.local.to_string()))
-            .map(|local| matches!(local.as_str(), "h1" | "h2" | "h3" | "h4" | "h5" | "h6"))
-            .unwrap_or(false)
-    };
 
     let Some(float_idx) = dom_children.iter().position(|&cid| is_float(cid)) else {
         return dom_children.iter().flat_map(|&cid| build_any(tree, cid, taffy_tree, id_map, words, engine, ifc_items, styles)).collect();
@@ -2409,7 +2495,8 @@ fn build_children_with_float_zone(
             result.push(row);
         }
         result.extend(build_children_with_float_zone(
-            tree, &dom_children[run_end..], taffy_tree, id_map, words, engine, ifc_items, styles,
+            tree, parent_id, &dom_children[run_end..], taffy_tree, id_map, words, engine, ifc_items,
+            styles,
         ));
         return result;
     }
@@ -2417,7 +2504,7 @@ fn build_children_with_float_zone(
     // Stop growing the zone once the flow siblings collected so far would
     // already fill (an estimate of) the float's own height: real float
     // reflow ends when normal-flow content passes the float's bottom edge,
-    // not at the next heading regardless of how tall the float actually is.
+    // Headings do not terminate a CSS float's influence by themselves.
     // Without this, a short floated thumbnail (a few hundred px) dragged an
     // entire multi-paragraph section into a narrow flow column alongside it
     // — visibly wrong wrapping plus a large empty gap once the (much
@@ -2441,11 +2528,11 @@ fn build_children_with_float_zone(
     let mut zone_end = float_idx + 1;
     let mut flow_height_estimate = 0.0f32;
     while zone_end < dom_children.len()
-        && !is_heading(dom_children[zone_end])
         && !is_float(dom_children[zone_end])
         && !clears_this_float(dom_children[zone_end])
     {
-        flow_height_estimate += estimate_text_height(tree, dom_children[zone_end], styles, ASSUMED_FLOW_WIDTH);
+        flow_height_estimate +=
+            estimate_flow_sibling_height(tree, dom_children[zone_end], styles, ASSUMED_FLOW_WIDTH);
         zone_end += 1;
         if flow_height_estimate >= float_height_budget {
             break;
@@ -2477,32 +2564,57 @@ fn build_children_with_float_zone(
             }
         }
     }
-    let flow_taffy: Vec<taffy::NodeId> = dom_children[float_idx + 1..zone_end]
-        .iter()
-        .flat_map(|&cid| build_any(tree, cid, taffy_tree, id_map, words, engine, ifc_items, styles))
-        .collect();
-
     match float_taffy {
         Some(float_id) => {
             let flow_column_style = taffy::Style {
-                display: taffy::style::Display::Flex,
-                flex_direction: taffy::FlexDirection::Column,
+                display: taffy::style::Display::Block,
                 flex_grow: 1.0,
                 flex_shrink: 1.0,
                 flex_basis: taffy::Dimension::length(0.0),
                 min_size: taffy::Size { width: taffy::Dimension::length(0.0), height: taffy::Dimension::auto() },
                 ..Default::default()
             };
-            let flow_column = if flow_taffy.is_empty() {
+            let flow_dom = &dom_children[float_idx + 1..zone_end];
+            let flow_column = if flow_dom.is_empty() {
                 taffy_tree.new_leaf(flow_column_style).ok()
             } else {
-                taffy_tree.new_with_children(flow_column_style, &flow_taffy).ok()
+                // The zone is still an ordinary block formatting context:
+                // consecutive text/inline siblings must share inline runs,
+                // while block siblings stack. Building each sibling directly
+                // into a flex column makes every link a separate stretched
+                // row. Reuse the mixed-block builder, but leave this anonymous
+                // wrapper out of the DOM id map so it cannot overwrite the
+                // real parent's rectangle.
+                let mut flow_style = styles.get(&parent_id).cloned().unwrap_or_default();
+                flow_style.before_content = None;
+                flow_style.after_content = None;
+                let column = build_mixed_block(
+                    tree,
+                    parent_id,
+                    &flow_style,
+                    flow_column_style,
+                    flow_dom,
+                    taffy_tree,
+                    id_map,
+                    words,
+                    engine,
+                    ifc_items,
+                    styles,
+                );
+                if let Some(column_id) = column {
+                    id_map.remove(&column_id);
+                }
+                column
             };
 
             let row_style = taffy::Style {
                 display: taffy::style::Display::Flex,
                 flex_direction: taffy::FlexDirection::Row,
                 align_items: Some(taffy::AlignItems::FLEX_START),
+                size: taffy::Size {
+                    width: taffy::Dimension::percent(1.0),
+                    height: taffy::Dimension::auto(),
+                },
                 ..Default::default()
             };
             let row_children: Vec<taffy::NodeId> = match float_side {
@@ -2516,7 +2628,11 @@ fn build_children_with_float_zone(
         // The float itself failed to build (e.g. display:none resolved for
         // it specifically); still build its flow siblings so their content
         // is not silently lost.
-        None => result.extend(flow_taffy),
+        None => result.extend(
+            dom_children[float_idx + 1..zone_end]
+                .iter()
+                .flat_map(|&cid| build_any(tree, cid, taffy_tree, id_map, words, engine, ifc_items, styles)),
+        ),
     }
 
     result.extend(
