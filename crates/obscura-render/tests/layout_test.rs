@@ -393,6 +393,40 @@ fn replaced_image_contributes_intrinsic_size_in_ordered_grid() {
 }
 
 #[test]
+fn auto_block_wrapper_contains_percentage_replaced_child() {
+    let tree = parse_html(include_str!("../../../render-repros/replaced-block-wrapper.html"));
+    let image_id = tree.get_element_by_id("image").unwrap();
+    let intrinsic = HashMap::from([(image_id, (720.0, 424.0))]);
+    let layout = layout_dom_with_images(&tree, (900.0, 1000.0), &intrinsic);
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    let media = rect("media");
+    let frame = rect("frame");
+    let wrapper = rect("wrapper");
+    let image = rect("image");
+    assert!(
+        (media.x - 450.0).abs() < 0.01
+            && (media.width - 450.0).abs() < 0.01,
+        "media: {media:?}"
+    );
+    assert!(
+        (frame.x - 450.0).abs() < 0.01
+            && (frame.width - 450.0).abs() < 0.01,
+        "frame: {frame:?}"
+    );
+    assert!(
+        (wrapper.x - 498.0).abs() < 0.01
+            && (wrapper.width - 354.0).abs() < 0.01,
+        "wrapper: {wrapper:?}"
+    );
+    assert!(
+        (image.x - 498.0).abs() < 0.01
+            && (image.width - 354.0).abs() < 0.01
+            && (image.height - 208.0).abs() < 0.02,
+        "image: {image:?}"
+    );
+}
+
+#[test]
 fn opposing_floats_share_header_band_through_inline_wrapper() {
     let tree = parse_html(include_str!("../../../render-repros/opposing-header-floats.html"));
     let layout = layout_dom(&tree, (900.0, 1000.0));

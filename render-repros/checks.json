@@ -107,6 +107,10 @@
     {"name": "media wrapper shares the first row", "color": "#1971c2", "x": 300, "y": 0, "width": 300, "height": 300},
     {"name": "percentage image uses the wrapper content box", "color": "#c2255c", "x": 320, "y": 20, "width": 260, "height": 260}
   ],
+  "replaced-block-wrapper": [
+    {"name": "text alignment leaves the block frame at available width", "color": "#1971c2", "x": 450, "y": 0, "width": 450, "height": 304},
+    {"name": "auto block wrapper contains its percentage image", "color": "#c2255c", "x": 498, "y": 48, "width": 354, "height": 208}
+  ],
   "tables": [
     {"name": "content-box fixed cell column", "color": "#ffcc99", "width": 208}
   ],
