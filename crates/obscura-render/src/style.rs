@@ -1752,7 +1752,35 @@ fn resolve_contextual(value: &str, context: &LengthContext) -> Option<f32> {
             return Some(preferred.min(high).max(low));
         }
     }
+    if let Some(rest) = value.strip_prefix("round(") {
+        let end = find_matching_paren(rest)?;
+        let args = split_top_level(&rest[..end], ',');
+        let (strategy, value_index) = match args.first()?.trim() {
+            "nearest" | "up" | "down" | "to-zero" => (args[0].trim(), 1),
+            _ => ("nearest", 0),
+        };
+        let resolved = eval_contextual_calc(args.get(value_index)?.trim(), context)?;
+        let step = match args.get(value_index + 1) {
+            Some(step) => eval_contextual_calc(step.trim(), context)?,
+            None => 1.0,
+        };
+        return round_css_value(resolved, step, strategy);
+    }
     contextual_atom(value, context)
+}
+
+fn round_css_value(value: f32, step: f32, strategy: &str) -> Option<f32> {
+    if !value.is_finite() || !step.is_finite() || step == 0.0 {
+        return None;
+    }
+    let quotient = value / step.abs();
+    let rounded = match strategy {
+        "up" => quotient.ceil(),
+        "down" => quotient.floor(),
+        "to-zero" => quotient.trunc(),
+        _ => quotient.round(),
+    };
+    Some(rounded * step.abs())
 }
 
 fn contextual_atom(value: &str, context: &LengthContext) -> Option<f32> {
@@ -1914,6 +1942,20 @@ fn resolve_length(value: &str) -> Option<f32> {
             let hi = resolve_length(args[2].trim())?;
             return Some(mid.min(hi).max(lo));
         }
+    }
+    if let Some(rest) = v.strip_prefix("round(") {
+        let end = find_matching_paren(rest)?;
+        let args = split_top_level(&rest[..end], ',');
+        let (strategy, value_index) = match args.first()?.trim() {
+            "nearest" | "up" | "down" | "to-zero" => (args[0].trim(), 1),
+            _ => ("nearest", 0),
+        };
+        let resolved = eval_calc(args.get(value_index)?.trim())?;
+        let step = match args.get(value_index + 1) {
+            Some(step) => eval_calc(step.trim())?,
+            None => 1.0,
+        };
+        return round_css_value(resolved, step, strategy);
     }
     if v.contains('(') {
         return None; // an unhandled function (env(), ...): no safe fallback
@@ -2964,6 +3006,17 @@ mod tests {
                 context.4,
             ),
             Some(122.0)
+        );
+        assert_eq!(
+            resolve_contextual_length(
+                "calc(round(247px * 1, 10px))",
+                context.0,
+                context.1,
+                context.2,
+                context.3,
+                context.4,
+            ),
+            Some(250.0)
         );
     }
 
