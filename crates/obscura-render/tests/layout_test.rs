@@ -258,6 +258,45 @@ fn legacy_center_keeps_block_flow_and_centers_descendants() {
 }
 
 #[test]
+fn list_indentation_is_reset_from_the_container() {
+    let tree = parse_html(include_str!("../../../render-repros/list-indentation.html"));
+    let layout = layout_dom(&tree, (900.0, 1000.0));
+    let rect = |selector| {
+        let id = tree.query_selector_all(selector).unwrap()[0];
+        layout.rects[&id]
+    };
+    let default_item = rect("#default li");
+    let reset_item = rect("#reset li");
+    let ordered_item = rect("#ordered-reset li");
+    let ex_box = rect("#ex-box");
+
+    assert!(
+        (default_item.x - 40.0).abs() < 0.01
+            && (default_item.width - 360.0).abs() < 0.01,
+        "default list indentation: {default_item:?}"
+    );
+    assert!(
+        (reset_item.x - 0.0).abs() < 0.01
+            && (reset_item.y - 40.0).abs() < 0.01
+            && (reset_item.width - 400.0).abs() < 0.01,
+        "reset unordered list: {reset_item:?}"
+    );
+    assert!(
+        (ordered_item.x - 0.0).abs() < 0.01
+            && (ordered_item.y - 80.0).abs() < 0.01
+            && (ordered_item.width - 400.0).abs() < 0.01,
+        "reset ordered list: {ordered_item:?}"
+    );
+    assert!(
+        (ex_box.x - 0.0).abs() < 0.01
+            && (ex_box.y - 120.0).abs() < 0.01
+            && (ex_box.width - 44.0).abs() < 0.01
+            && (ex_box.height - 22.0).abs() < 0.01,
+        "ex padding: {ex_box:?}"
+    );
+}
+
+#[test]
 fn transforms_establish_absolute_and_fixed_containing_blocks() {
     let html = r##"
         <body style="margin:0">
@@ -669,5 +708,36 @@ fn opposing_floats_share_header_band_through_inline_wrapper() {
             && (menu.y - 100.0).abs() < 0.01
             && (menu.width - 900.0).abs() < 0.01,
         "menu: {menu:?}"
+    );
+}
+
+#[test]
+fn mixed_float_run_shares_one_band() {
+    let tree = parse_html(include_str!("../../../render-repros/mixed-float-run.html"));
+    let layout = layout_dom(&tree, (900.0, 1000.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    let left_one = rect("left-one");
+    let left_two = rect("left-two");
+    let right_one = rect("right-one");
+    assert!(
+        (left_one.x - 0.0).abs() < 0.01
+            && (left_one.y - 0.0).abs() < 0.01
+            && (left_one.width - 80.0).abs() < 0.01
+            && (left_one.height - 30.0).abs() < 0.01,
+        "first left float: {left_one:?}"
+    );
+    assert!(
+        (left_two.x - 80.0).abs() < 0.01
+            && (left_two.y - 0.0).abs() < 0.01
+            && (left_two.width - 80.0).abs() < 0.01
+            && (left_two.height - 30.0).abs() < 0.01,
+        "second left float: {left_two:?}"
+    );
+    assert!(
+        (right_one.x - 340.0).abs() < 0.01
+            && (right_one.y - 0.0).abs() < 0.01
+            && (right_one.width - 60.0).abs() < 0.01
+            && (right_one.height - 30.0).abs() < 0.01,
+        "right float: {right_one:?}"
     );
 }

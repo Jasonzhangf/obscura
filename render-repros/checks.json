@@ -108,8 +108,19 @@
     {"name": "author text alignment overrides the UA rule", "color": "#e8590c", "x": 0, "y": 120, "width": 80, "height": 20},
     {"name": "pure text center remains fill available", "color": "#2f9e44", "x": 0, "y": 240, "width": 400, "height": 20}
   ],
+  "list-indentation": [
+    {"name": "default list keeps UA indentation", "color": "#087f5b", "x": 40, "y": 0, "width": 360, "height": 20},
+    {"name": "unordered list reset removes indentation", "color": "#1971c2", "x": 0, "y": 40, "width": 400, "height": 20},
+    {"name": "ordered list reset removes indentation", "color": "#862e9c", "x": 0, "y": 80, "width": 400, "height": 20},
+    {"name": "ex padding follows font x height", "color": "#e8590c", "x": 0, "y": 120, "width": 44, "height": 22}
+  ],
   "mixed-content-block": [
     {"name": "full-width block child", "color": "#ccddff", "width": 400}
+  ],
+  "mixed-float-run": [
+    {"name": "first left float starts the band", "color": "#087f5b", "x": 0, "y": 0, "width": 80, "height": 30},
+    {"name": "same-side floats remain adjacent", "color": "#1971c2", "x": 80, "y": 0, "width": 80, "height": 30},
+    {"name": "trailing right float shares the band", "color": "#e8590c", "x": 340, "y": 0, "width": 60, "height": 30}
   ],
   "modern-hydration-contracts": [
     {"name": "modern hydration contracts", "color": "#16803c", "width": 360, "height": 90}
