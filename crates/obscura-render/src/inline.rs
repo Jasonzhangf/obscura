@@ -77,9 +77,24 @@ fn resolve_font_family(fam: Option<&str>) -> &'static str {
     }
     FAMILY
 }
-/// `line-height: normal` as a multiple of font-size. Browsers derive this from
-/// font metrics; ~1.15 matches Liberation Sans (the default face) closely.
-const NORMAL_LINE_HEIGHT: f32 = 1.15;
+/// Resolve `line-height: normal` from the selected face's horizontal header.
+///
+/// Chromium's FreeType-backed Linux path grid-fits the ascent, descent, and
+/// line gap independently before adding them. Multiplying their sum by the
+/// font size (or rounding the final line height) is observably different at
+/// fractional and small sizes: Liberation Sans at 9.333px is 10px in
+/// Chromium, not 11px. Keep these metrics beside the embedded faces so normal
+/// line boxes follow the same device-pixel rhythm without consulting host
+/// fonts.
+fn normal_line_height(font_size: f32, family: &str) -> f32 {
+    let (ascent, descent, line_gap) = match family {
+        SERIF_FAMILY => (1825.0, 443.0, 87.0),
+        MONO_FAMILY => (1705.0, 615.0, 0.0),
+        _ => (1854.0, 434.0, 67.0),
+    };
+    let scale = font_size / 2048.0;
+    (ascent * scale).round() + (descent * scale).round() + (line_gap * scale).round()
+}
 /// Underline is flagged per glyph through cosmic-text's `metadata` field.
 const META_UNDERLINE: usize = 1;
 
@@ -270,20 +285,21 @@ impl TextEngine {
         }
 
         let base_size = base.font_size.unwrap_or(16.0);
-        // Real `line-height` drives vertical rhythm; a fixed ratio made
-        // real-site prose (e.g. Wikipedia's 1.6) noticeably tighter than
-        // Chromium. `normal` is font-relative; ~1.2 matches DejaVu closely.
+        // Explicit line-height stays fractional. `normal` is derived from the
+        // embedded face metrics with the same per-component pixel fitting as
+        // Chromium's Linux font path.
+        let family = resolve_font_family(base.font_family.as_deref());
         let line_h = match base.line_height {
             Some(crate::LineHeight::Px(px)) => px,
             Some(crate::LineHeight::Ratio(r)) => base_size * r,
-            _ => base_size * NORMAL_LINE_HEIGHT,
+            _ => normal_line_height(base_size, family),
         };
         // cosmic-text asserts (an uncatchable process abort) if font size OR
         // line height is 0. `font-size:0` is a common whitespace-collapse trick
         // and drives both to 0, so floor both at 1px here. The glyphs stay
         // ~invisible, matching the intent, and one page can never abort a worker.
         let cosmic_size = base_size.max(1.0);
-        let metrics = Metrics::new(cosmic_size, line_h.max(cosmic_size).ceil());
+        let metrics = Metrics::new(cosmic_size, line_h.max(1.0));
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
         // Break only at word boundaries, never mid-word. This keeps the
         // min-content width (measured at width 0) equal to the longest word,
@@ -549,7 +565,7 @@ fn buffer_size(buffer: &Buffer) -> (f32, f32) {
         w = w.max(run.line_w);
         h = h.max(run.line_top + run.line_height);
     }
-    (w.ceil(), h.ceil())
+    (w.ceil(), h)
 }
 
 /// Does `id` establish an inline formatting context made purely of text and
@@ -870,6 +886,17 @@ mod tests {
 
     const RED: [u8; 4] = [255, 0, 0, 255];
     const BLUE: [u8; 4] = [0, 0, 255, 255];
+
+    #[test]
+    fn normal_line_height_grid_fits_each_face_metric() {
+        // Values measured from Chromium 145 using the same bundled Linux
+        // platform faces. Small fractional sizes expose the difference from
+        // rounding a single 1.15 multiplier.
+        assert_eq!(normal_line_height(9.3333, FAMILY), 10.0);
+        assert_eq!(normal_line_height(12.0, FAMILY), 14.0);
+        assert_eq!(normal_line_height(13.0, SERIF_FAMILY), 16.0);
+        assert_eq!(normal_line_height(13.0, MONO_FAMILY), 15.0);
+    }
 
     #[test]
     fn clip_fill_only_for_transparent_clip_text() {
