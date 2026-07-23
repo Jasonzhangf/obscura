@@ -432,6 +432,11 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         },
         "flex-grow" => { if let Some(v) = token(value).and_then(|t| t.parse::<f32>().ok()) { style.flex_grow = Some(v); } }
         "flex-shrink" => { if let Some(v) = token(value).and_then(|t| t.parse::<f32>().ok()) { style.flex_shrink = Some(v); } }
+        "order" => {
+            if let Ok(order) = value.trim().parse::<i32>() {
+                style.order = order;
+            }
+        }
         "flex-basis" => { style.flex_basis = dimension_value(value.trim()); }
         "flex" => parse_flex_shorthand(style, value),
         "position" => {

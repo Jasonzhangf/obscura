@@ -191,6 +191,11 @@ pub struct LayoutStyle {
     /// missing dimension from the given one, so a `width:100%` image gets a
     /// real height instead of collapsing to zero.
     pub aspect_ratio: Option<f32>,
+    /// Fetched intrinsic CSS-pixel size for a replaced element. Kept alongside
+    /// `aspect_ratio` so its taffy leaf can contribute a real min/max-content
+    /// size when percentage dimensions are resolved through an auto-sized
+    /// wrapper (`img { width:100%; height:auto }`).
+    pub intrinsic_size: Option<(f32, f32)>,
     pub margin: Edges,
     /// Which margin sides are `auto` (top, right, bottom, left). `margin: 0
     /// auto` / `margin-inline: auto` centering needs a real Auto margin, which
@@ -279,6 +284,9 @@ pub struct LayoutStyle {
     pub justify_content: Option<taffy::JustifyContent>,
     pub flex_grow: Option<f32>,
     pub flex_shrink: Option<f32>,
+    /// Flex/grid item order. The formatting algorithm consumes children in
+    /// order-modified document order, with source order breaking ties.
+    pub order: i32,
     /// `flex-basis` (longhand, or the length in a `flex:` shorthand). `Auto`
     /// is the default. Fixed-basis sidebars/columns (`flex: 0 0 260px`)
     /// collapse to content width without it.

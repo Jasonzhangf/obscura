@@ -105,7 +105,10 @@ pub struct TextEngine {
     font_system: FontSystem,
     swash: SwashCache,
     items: Vec<InlineItem>,
+    replaced: Vec<(f32, f32)>,
 }
+
+const REPLACED_CONTEXT_BIT: usize = 1usize << (usize::BITS - 1);
 
 impl Default for TextEngine {
     fn default() -> Self {
@@ -129,7 +132,12 @@ impl TextEngine {
         }
         db.set_sans_serif_family(FAMILY);
         let font_system = FontSystem::new_with_locale_and_db("en-US".to_string(), db);
-        TextEngine { font_system, swash: SwashCache::new(), items: Vec::new() }
+        TextEngine {
+            font_system,
+            swash: SwashCache::new(),
+            items: Vec::new(),
+            replaced: Vec::new(),
+        }
     }
 
     /// Number of inline formatting contexts collected (for debug/stats).
@@ -258,11 +266,62 @@ impl TextEngine {
     /// None for max-content), returning its shaped (width, height). Called by
     /// taffy's measure function during layout.
     pub fn measure(&mut self, idx: usize, width: Option<f32>) -> (f32, f32) {
+        if idx & REPLACED_CONTEXT_BIT != 0 {
+            let (iw, ih) = self.replaced[idx & !REPLACED_CONTEXT_BIT];
+            return width
+                .map(|width| (width, width * ih / iw))
+                .unwrap_or((iw, ih));
+        }
         let TextEngine { font_system, items, .. } = self;
         let item = &mut items[idx];
         item.buffer.set_size(font_system, width.map(|w| w.max(0.0)), None);
         item.buffer.shape_until_scroll(font_system, false);
         buffer_size(&item.buffer)
+    }
+
+    /// Register a replaced element's intrinsic size as a taffy measure
+    /// context. Percentage-sized image leaves still need their intrinsic
+    /// max-content contribution while an auto-sized ancestor is measured.
+    pub fn register_replaced(&mut self, width: f32, height: f32) -> usize {
+        let index = self.replaced.len();
+        self.replaced.push((width, height));
+        REPLACED_CONTEXT_BIT | index
+    }
+
+    /// Measure either a shaped text context or an intrinsic replaced element.
+    /// Replaced boxes transfer a definite axis through their intrinsic ratio;
+    /// with neither axis definite they contribute their natural size.
+    pub fn measure_taffy(
+        &mut self,
+        idx: usize,
+        known: taffy::Size<Option<f32>>,
+        available: taffy::Size<taffy::AvailableSpace>,
+    ) -> taffy::Size<f32> {
+        if idx & REPLACED_CONTEXT_BIT != 0 {
+            let (iw, ih) = self.replaced[idx & !REPLACED_CONTEXT_BIT];
+            return match (known.width, known.height) {
+                (Some(width), Some(height)) => taffy::Size { width, height },
+                (Some(width), None) => taffy::Size {
+                    width,
+                    height: width * ih / iw,
+                },
+                (None, Some(height)) => taffy::Size {
+                    width: height * iw / ih,
+                    height,
+                },
+                (None, None) => taffy::Size {
+                    width: iw,
+                    height: ih,
+                },
+            };
+        }
+        let width = known.width.or(match available.width {
+            taffy::AvailableSpace::Definite(width) => Some(width),
+            taffy::AvailableSpace::MinContent => Some(0.0),
+            taffy::AvailableSpace::MaxContent => None,
+        });
+        let (width, height) = self.measure(idx, width);
+        taffy::Size { width, height }
     }
 
     /// After layout, pin each context to its final content-box origin and
@@ -628,7 +687,12 @@ impl TextEngine {
     /// translate()` of the container's ancestors, shifting both the glyph
     /// origin and the clip so shaped text moves with a transformed box.
     pub fn paint_item(&mut self, idx: usize, pixmap: &mut tiny_skia::Pixmap, offset: (f32, f32)) {
-        let TextEngine { font_system, swash, items } = self;
+        let TextEngine {
+            font_system,
+            swash,
+            items,
+            ..
+        } = self;
         let Some(item) = items.get_mut(idx) else { return };
         let (ox, oy) = (item.origin.0 + offset.0, item.origin.1 + offset.1);
         // The glyph origin shifts by the container's accumulated translate,

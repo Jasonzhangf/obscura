@@ -943,12 +943,14 @@ fn collect_image_intrinsics(
         }
         let Some((url, density)) = resolve_img_url(tree, nid) else { continue };
         let Some(bytes) = fetch_bytes(&url, base_url, cache) else { continue };
-        if let Some((w, h)) = image_dimensions(&bytes) {
-            if w > 0 && h > 0 {
+        let dimensions = image_dimensions(&bytes).map(|(width, height)| (width as f32, height as f32))
+            .or_else(|| svg_intrinsic(&bytes));
+        if let Some((w, h)) = dimensions {
+            if w > 0.0 && h > 0.0 {
                 // A 2x (or w-descriptor) candidate's raw pixels are density
                 // times its CSS size; divide so layout sees CSS px, or every
                 // responsive image occupies twice its design size.
-                out.insert(nid, (w as f32 / density, h as f32 / density));
+                out.insert(nid, (w / density, h / density));
             }
         }
     }

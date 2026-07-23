@@ -650,6 +650,7 @@ pub fn layout_dom_with_images(
                 continue;
             }
             if let Some(s) = styles.get_mut(&nid) {
+                s.intrinsic_size = Some((iw, ih));
                 if s.aspect_ratio.is_none() {
                     s.aspect_ratio = Some(iw / ih);
                 }
@@ -675,16 +676,7 @@ pub fn layout_dom_with_images(
                     |known: taffy::Size<Option<f32>>, avail: taffy::Size<taffy::AvailableSpace>, _node, ctx: Option<&mut usize>, _style: &taffy::Style| {
                         match ctx {
                             Some(&mut idx) => {
-                                // Width to line-break at: a known definite width,
-                                // else the available width; MinContent -> narrowest
-                                // (longest word), MaxContent -> unbounded (one line).
-                                let width = known.width.or(match avail.width {
-                                    taffy::AvailableSpace::Definite(w) => Some(w),
-                                    taffy::AvailableSpace::MinContent => Some(0.0),
-                                    taffy::AvailableSpace::MaxContent => None,
-                                });
-                                let (w, h) = engine.measure(idx, width);
-                                taffy::Size { width: w, height: h }
+                                engine.measure_taffy(idx, known, avail)
                             }
                             None => taffy::Size::ZERO,
                         }
@@ -1917,6 +1909,19 @@ fn build(
 
     let mut taffy_style = to_taffy_style(style);
 
+    // A replaced image is a measured leaf, even when CSS gives it a percentage
+    // width. Its intrinsic dimensions participate in an auto-sized ancestor's
+    // max-content measurement; once the percentage axis becomes definite, the
+    // measure callback derives the other axis through the intrinsic ratio.
+    if _name.local.as_ref() == "img" {
+        if let Some((width, height)) = style.intrinsic_size {
+            let context = engine.register_replaced(width, height);
+            let leaf = taffy_tree.new_leaf_with_context(taffy_style, context).ok()?;
+            id_map.insert(leaf, id);
+            return Some(leaf);
+        }
+    }
+
     // If this container is a pure-text inline formatting context, collapse its
     // whole subtree to one leaf shaped and line-broken by cosmic-text (real
     // text layout), sized on demand by the measure function. This is the fast,
@@ -1969,6 +1974,11 @@ fn build(
         dom_children.retain(|&cid| {
             tree.get_node(cid).map_or(false, |n| n.is_element()) || !tree.text_content(cid).trim().is_empty()
         });
+        // Flex and grid placement consume the order-modified document order.
+        // Rust's stable sort preserves source order for equal values, exactly
+        // the CSS tie-break. Taffy has no CSS `order` style field, so feeding
+        // it the correctly ordered item sequence is the missing translation.
+        dom_children.sort_by_key(|cid| styles.get(cid).map(|style| style.order).unwrap_or(0));
     }
     // `float` has no effect on a flex or grid item. Legacy stylesheets often
     // leave floats on children after a newer rule turns their parent into a
