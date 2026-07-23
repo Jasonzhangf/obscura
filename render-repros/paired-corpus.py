@@ -40,6 +40,14 @@ def binary_version(binary):
     return {"status": result.returncode, "text": text}
 
 
+def diagnostic_text(value):
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode(errors="replace")
+    return value
+
+
 def capture_obscura(binary, url, screenshot, log, width, height, settle_ms):
     env = dict(
         os.environ,
@@ -71,8 +79,9 @@ def capture_obscura(binary, url, screenshot, log, width, height, settle_ms):
             "elapsed_s": round(time.time() - started, 3),
         }
     except subprocess.TimeoutExpired as error:
-        text = (error.stdout or "") + (error.stderr or "")
-        log.write_text(text if isinstance(text, str) else text.decode(errors="replace"))
+        log.write_text(
+            diagnostic_text(error.stdout) + diagnostic_text(error.stderr)
+        )
         return {"ok": False, "status": "timeout", "elapsed_s": round(time.time() - started, 3)}
 
 
