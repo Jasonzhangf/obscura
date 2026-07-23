@@ -1998,6 +1998,14 @@ fn build(
     // approximation corrupts flex sizing and percentage-margin placement.
     let has_float_child = style.display == crate::Display::Block
         && dom_children.iter().any(|&cid| styles.get(&cid).map(|s| s.float.is_some()).unwrap_or(false));
+    let has_in_flow_block_child = style.display == crate::Display::Block
+        && dom_children.iter().any(|cid| {
+            styles.get(cid).map_or(false, |child| {
+                child.display == crate::Display::Block
+                    && child.float.is_none()
+                    && !matches!(child.position, Some(taffy::Position::Absolute))
+            })
+        });
 
     // A block with mixed inline + block children keeps real block layout:
     // block-level children become direct block children (full available
@@ -2013,7 +2021,10 @@ fn build(
         return build_mixed_block(tree, id, style, taffy_style, &dom_children, taffy_tree, id_map, words, engine, ifc_items, styles);
     }
 
-    if stacks_children_vertically && has_inline_ish_content {
+    if stacks_children_vertically
+        && has_inline_ish_content
+        && !(has_float_child && has_in_flow_block_child)
+    {
         taffy_style.display = taffy::style::Display::Flex;
         taffy_style.flex_direction = taffy::FlexDirection::Row;
         taffy_style.flex_wrap = taffy::FlexWrap::Wrap;
