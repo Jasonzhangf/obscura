@@ -667,7 +667,8 @@ pub fn layout_dom_with_images(
         }
 
         if let Some(taffy_root) = build(tree, root_id, &mut taffy_tree, &mut id_map, &mut words, &mut engine, &mut ifc_items, &styles) {
-            reparent_inset_positioned_nodes(tree, &mut taffy_tree, taffy_root, &id_map, &styles);
+            let static_position_candidates =
+                reparent_inset_positioned_nodes(tree, &mut taffy_tree, taffy_root, &id_map, &styles);
             let available = taffy::Size {
                 width: taffy::AvailableSpace::Definite(viewport.0),
                 height: taffy::AvailableSpace::Definite(viewport.1),
@@ -905,10 +906,24 @@ pub fn layout_dom_with_images(
                     }
                 }
 
+                if !static_position_candidates.is_empty() {
+                    let _ = taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
+                    resolve_static_positions_and_reparent(
+                        &mut taffy_tree,
+                        &static_position_candidates,
+                    );
+                }
                 let _ = taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
             }
             #[cfg(not(feature = "paint"))]
             {
+                if !static_position_candidates.is_empty() {
+                    let _ = taffy_tree.compute_layout(taffy_root, available);
+                    resolve_static_positions_and_reparent(
+                        &mut taffy_tree,
+                        &static_position_candidates,
+                    );
+                }
                 let _ = taffy_tree.compute_layout(taffy_root, available);
             }
             compute_absolute_rects(&taffy_tree, taffy_root, 0.0, 0.0, &id_map, &words, &mut rects, &mut text_runs, &mut anon_rects);
@@ -1235,28 +1250,35 @@ fn compute_absolute_rects(
     }
 }
 
-/// Attach inset-positioned boxes to their CSS containing block rather than
-/// their immediate DOM parent.
+#[derive(Clone, Copy)]
+struct StaticPositionCandidate {
+    child: taffy::NodeId,
+    target: taffy::NodeId,
+    inline_axis: bool,
+    block_axis: bool,
+}
+
+/// Attach positioned boxes to their CSS containing block rather than their
+/// immediate DOM parent.
 ///
 /// Taffy resolves an absolute child's insets against its direct layout-tree
 /// parent. CSS instead uses the nearest positioned or transformed ancestor;
 /// fixed boxes use the nearest transformed ancestor or the initial containing
-/// block. Gecko represents that distinction by reparenting the positioned
-/// frame and leaving a placeholder in normal flow. We can safely do the same
-/// without a placeholder when each axis has at least one specified inset: no
-/// static-position coordinate is needed. Boxes with an entirely auto axis
-/// stay under their DOM parent until the placeholder path is implemented.
+/// block. A box with a fully-auto axis first remains in its original formatting
+/// context so taffy can produce the placeholder-like static coordinate. The
+/// caller harvests that coordinate and reparents it in a bounded second pass.
 fn reparent_inset_positioned_nodes(
     tree: &DomTree,
     taffy_tree: &mut TaffyTree<usize>,
     taffy_root: taffy::NodeId,
     id_map: &HashMap<taffy::NodeId, NodeId>,
     styles: &HashMap<NodeId, crate::LayoutStyle>,
-) {
+) -> Vec<StaticPositionCandidate> {
     let reverse: HashMap<NodeId, taffy::NodeId> =
         id_map.iter().map(|(&taffy_id, &dom_id)| (dom_id, taffy_id)).collect();
     let mut nearest_abs_cb_for_children: HashMap<NodeId, taffy::NodeId> = HashMap::new();
     let mut nearest_fixed_cb_for_children: HashMap<NodeId, taffy::NodeId> = HashMap::new();
+    let mut static_candidates = Vec::new();
 
     for dom_id in tree.descendants(tree.document()) {
         let Some(style) = styles.get(&dom_id) else { continue };
@@ -1292,9 +1314,6 @@ fn reparent_inset_positioned_nodes(
         }
         let has_block_inset = style.inset[0].is_some() || style.inset[2].is_some();
         let has_inline_inset = style.inset[1].is_some() || style.inset[3].is_some();
-        if !has_block_inset || !has_inline_inset {
-            continue;
-        }
         let Some(&child) = reverse.get(&dom_id) else { continue };
         let target = if style.position_fixed {
             inherited_fixed_cb
@@ -1305,8 +1324,80 @@ fn reparent_inset_positioned_nodes(
         if current == target {
             continue;
         }
+        if !has_block_inset || !has_inline_inset {
+            static_candidates.push(StaticPositionCandidate {
+                child,
+                target,
+                inline_axis: !has_inline_inset,
+                block_axis: !has_block_inset,
+            });
+            continue;
+        }
         if taffy_tree.remove_child(current, child).is_ok() {
             let _ = taffy_tree.add_child(target, child);
+        }
+    }
+    static_candidates
+}
+
+fn taffy_global_origin(
+    taffy_tree: &TaffyTree<usize>,
+    node: taffy::NodeId,
+) -> Option<(f32, f32)> {
+    let mut current = Some(node);
+    let mut x = 0.0;
+    let mut y = 0.0;
+    while let Some(id) = current {
+        let layout = taffy_tree.layout(id).ok()?;
+        x += layout.location.x;
+        y += layout.location.y;
+        current = taffy_tree.parent(id);
+    }
+    Some((x, y))
+}
+
+fn resolve_static_positions_and_reparent(
+    taffy_tree: &mut TaffyTree<usize>,
+    candidates: &[StaticPositionCandidate],
+) {
+    // Harvest every placeholder coordinate before mutating parent links.
+    // Otherwise reparenting an outer candidate changes the global-origin walk
+    // for a nested candidate while both still contain preliminary-pass layout
+    // coordinates.
+    let mut resolved = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let Some(child_origin) = taffy_global_origin(taffy_tree, candidate.child) else { continue };
+        let Some(target_origin) = taffy_global_origin(taffy_tree, candidate.target) else { continue };
+        let Ok(child_layout) = taffy_tree.layout(candidate.child) else { continue };
+        let child_margin = child_layout.margin;
+        let Ok(target_layout) = taffy_tree.layout(candidate.target) else { continue };
+        let target_border = target_layout.border;
+        let Ok(current_style) = taffy_tree.style(candidate.child) else { continue };
+        let mut style = current_style.clone();
+
+        if candidate.inline_axis {
+            style.inset.left =
+                length(child_origin.0 - target_origin.0 - target_border.left - child_margin.left);
+        }
+        if candidate.block_axis {
+            style.inset.top =
+                length(child_origin.1 - target_origin.1 - target_border.top - child_margin.top);
+        }
+        resolved.push((*candidate, style));
+    }
+
+    for (candidate, style) in resolved {
+        let Some(current) = taffy_tree.parent(candidate.child) else { continue };
+        if taffy_tree.remove_child(current, candidate.child).is_err() {
+            continue;
+        }
+        if taffy_tree.add_child(candidate.target, candidate.child).is_err() {
+            let _ = taffy_tree.add_child(current, candidate.child);
+            continue;
+        }
+        if taffy_tree.set_style(candidate.child, style).is_err() {
+            let _ = taffy_tree.remove_child(candidate.target, candidate.child);
+            let _ = taffy_tree.add_child(current, candidate.child);
         }
     }
 }
