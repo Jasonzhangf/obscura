@@ -2860,6 +2860,33 @@ mod tests {
     }
 
     #[test]
+    fn table_ua_geometry_and_border_collapse_parse() {
+        let table = compute_style("table", None);
+        assert_eq!(table.box_sizing, crate::BoxSizing::BorderBox);
+        assert_eq!(table.border_spacing, Some((2.0, 2.0)));
+        assert_eq!(table.border_collapse, Some(false));
+
+        let cell = compute_style("td", None);
+        assert_eq!(
+            cell.padding,
+            Edges {
+                top: 1.0,
+                right: 1.0,
+                bottom: 1.0,
+                left: 1.0,
+            }
+        );
+        assert_eq!(cell.vertical_align, None);
+
+        let collapsed = compute_style(
+            "table",
+            Some("border-spacing:8px; border-collapse:collapse"),
+        );
+        assert_eq!(collapsed.border_spacing, Some((8.0, 8.0)));
+        assert_eq!(collapsed.border_collapse, Some(true));
+    }
+
+    #[test]
     fn item_self_alignment_parses_and_resets() {
         let aligned = compute_style(
             "div",
