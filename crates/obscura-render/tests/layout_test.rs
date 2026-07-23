@@ -522,6 +522,55 @@ fn float_flow_zone_preserves_blocks_inline_runs_and_clearance() {
 }
 
 #[test]
+fn float_exclusion_continues_through_non_bfc_block_wrappers() {
+    let tree = parse_html(include_str!(
+        "../../../render-repros/float-bfc-continuation.html"
+    ));
+    let layout = layout_dom(&tree, (900.0, 1000.0));
+    let rect = |name| layout.rects[&tree.get_element_by_id(name).unwrap()];
+    let float = rect("intro-float");
+    let lead = rect("lead");
+    let heading = rect("heading");
+    let beside = rect("beside");
+    let after = rect("after");
+    assert!(
+        (float.x - 650.0).abs() < 0.01
+            && (float.y - 0.0).abs() < 0.01
+            && (float.width - 250.0).abs() < 0.01
+            && (float.height - 400.0).abs() < 0.01,
+        "float: {float:?}"
+    );
+    assert!(
+        (lead.x - 0.0).abs() < 0.01
+            && (lead.y - 0.0).abs() < 0.01
+            && (lead.width - 650.0).abs() < 0.01
+            && (lead.height - 250.0).abs() < 0.01,
+        "lead: {lead:?}"
+    );
+    assert!(
+        (heading.x - 0.0).abs() < 0.01
+            && (heading.y - 250.0).abs() < 0.01
+            && (heading.width - 650.0).abs() < 0.01
+            && (heading.height - 50.0).abs() < 0.01,
+        "heading: {heading:?}"
+    );
+    assert!(
+        (beside.x - 0.0).abs() < 0.01
+            && (beside.y - 300.0).abs() < 0.01
+            && (beside.width - 650.0).abs() < 0.01
+            && (beside.height - 100.0).abs() < 0.01,
+        "beside: {beside:?}"
+    );
+    assert!(
+        (after.x - 0.0).abs() < 0.01
+            && (after.y - 400.0).abs() < 0.01
+            && (after.width - 900.0).abs() < 0.01
+            && (after.height - 70.0).abs() < 0.01,
+        "after: {after:?}"
+    );
+}
+
+#[test]
 fn replaced_image_contributes_intrinsic_size_in_ordered_grid() {
     let tree = parse_html(include_str!("../../../render-repros/replaced-grid-order.html"));
     let image_id = tree.get_element_by_id("image").unwrap();

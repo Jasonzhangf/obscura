@@ -72,6 +72,13 @@
     {"name": "later block remains in float band", "color": "#1098ad", "x": 0, "y": 230, "width": 650, "height": 70},
     {"name": "clear moves below float bottom", "color": "#a61e4d", "x": 0, "y": 400, "width": 900, "height": 50}
   ],
+  "float-bfc-continuation": [
+    {"name": "float keeps its BFC band across wrappers", "color": "#1971c2", "x": 650, "y": 0, "width": 250, "height": 400},
+    {"name": "direct flow uses the first available band", "color": "#087f5b", "x": 0, "y": 0, "width": 650, "height": 250},
+    {"name": "later wrapper heading remains beside float", "color": "#e8590c", "x": 0, "y": 250, "width": 650, "height": 50},
+    {"name": "later wrapper block remains beside float", "color": "#7048e8", "x": 0, "y": 300, "width": 650, "height": 100},
+    {"name": "band widens after float bottom", "color": "#a61e4d", "x": 0, "y": 400, "width": 900, "height": 70}
+  ],
   "grid-auto-repeat": [
     {"name": "auto-fill creates all fitting tracks", "color": "#087f5b", "width": 210, "height": 60, "count": 4},
     {"name": "auto-fit collapses empty tracks", "color": "#1971c2", "width": 287, "height": 60, "count": 3}
