@@ -2743,6 +2743,142 @@ fn build_children_with_float_zone(
 ) -> Vec<taffy::NodeId> {
     let is_float = |cid: NodeId| styles.get(&cid).map(|s| s.float.is_some()).unwrap_or(false);
 
+    // A block made entirely from inline-ish flow content and two or more
+    // right floats is the classic utility/navigation bar. Right floats are
+    // placed from the inline end inward, so their visual order is the reverse
+    // of source order, while ordinary inline content keeps filling from the
+    // start of the same band. Serializing each encountered float into its own
+    // synthetic row reverses those two groups and can leave the entire bar
+    // shrink-wrapped at the start.
+    //
+    // Model this bounded one-band case as [flow | reversed right-float group].
+    // A nested group preserves every float's authored margins; only the
+    // anonymous group receives the auto margin used to represent the free
+    // space between the two sides.
+    let right_floats: Vec<NodeId> = dom_children
+        .iter()
+        .copied()
+        .filter(|cid| {
+            styles.get(cid).map_or(false, |style| {
+                style.float == Some(crate::Float::Right)
+                    && style.display != crate::Display::None
+            })
+        })
+        .collect();
+    let has_left_float = dom_children.iter().any(|cid| {
+        styles.get(cid).map_or(false, |style| {
+            style.float == Some(crate::Float::Left)
+                && style.display != crate::Display::None
+        })
+    });
+    let flow_is_inline = dom_children.iter().all(|cid| {
+        let Some(node) = tree.get_node(*cid) else {
+            return true;
+        };
+        if !node.is_element() || is_float(*cid) {
+            return true;
+        }
+        styles
+            .get(cid)
+            .map_or(true, |style| style.display != crate::Display::Block)
+    });
+    if right_floats.len() >= 2 && !has_left_float && flow_is_inline {
+        // Removing out-of-flow items must not remove the one collapsible
+        // space between the inline items on either side of them. Collapse
+        // any run of formatting whitespace to one representative node, while
+        // dropping leading/trailing whitespace at the band edges.
+        let mut flow_dom = Vec::new();
+        let mut pending_whitespace = None;
+        let mut has_flow_content = false;
+        for &cid in dom_children {
+            if is_float(cid) {
+                continue;
+            }
+            let is_whitespace = tree.get_node(cid).map_or(false, |node| {
+                !node.is_element() && tree.text_content(cid).trim().is_empty()
+            });
+            if is_whitespace {
+                if has_flow_content && pending_whitespace.is_none() {
+                    pending_whitespace = Some(cid);
+                }
+                continue;
+            }
+            if has_flow_content {
+                if let Some(whitespace) = pending_whitespace.take() {
+                    flow_dom.push(whitespace);
+                }
+            }
+            flow_dom.push(cid);
+            has_flow_content = true;
+        }
+        let mut row_children: Vec<taffy::NodeId> = flow_dom
+            .into_iter()
+            .flat_map(|cid| {
+                build_any(
+                    tree,
+                    cid,
+                    taffy_tree,
+                    id_map,
+                    words,
+                    engine,
+                    ifc_items,
+                    styles,
+                )
+            })
+            .collect();
+        let right_children: Vec<taffy::NodeId> = right_floats
+            .iter()
+            .rev()
+            .filter_map(|cid| {
+                build(
+                    tree,
+                    *cid,
+                    taffy_tree,
+                    id_map,
+                    words,
+                    engine,
+                    ifc_items,
+                    styles,
+                )
+            })
+            .collect();
+        if !row_children.is_empty() && !right_children.is_empty() {
+            let right_group_style = taffy::Style {
+                display: taffy::style::Display::Flex,
+                flex_direction: taffy::FlexDirection::Row,
+                flex_wrap: taffy::FlexWrap::Wrap,
+                margin: taffy::Rect {
+                    top: taffy::style::LengthPercentageAuto::length(0.0),
+                    right: taffy::style::LengthPercentageAuto::length(0.0),
+                    bottom: taffy::style::LengthPercentageAuto::length(0.0),
+                    left: taffy::style::LengthPercentageAuto::auto(),
+                },
+                ..Default::default()
+            };
+            if let Ok(right_group) =
+                taffy_tree.new_with_children(right_group_style, &right_children)
+            {
+                row_children.push(right_group);
+                let row_style = taffy::Style {
+                    display: taffy::style::Display::Flex,
+                    flex_direction: taffy::FlexDirection::Row,
+                    flex_wrap: taffy::FlexWrap::Wrap,
+                    align_items: Some(taffy::AlignItems::FLEX_START),
+                    size: taffy::Size {
+                        width: taffy::Dimension::percent(1.0),
+                        height: taffy::Dimension::auto(),
+                    },
+                    ..Default::default()
+                };
+                if let Ok(row) =
+                    taffy_tree.new_with_children(row_style, &row_children)
+                {
+                    return vec![row];
+                }
+            }
+        }
+    }
+
     let Some(float_idx) = dom_children.iter().position(|&cid| is_float(cid)) else {
         return dom_children.iter().flat_map(|&cid| build_any(tree, cid, taffy_tree, id_map, words, engine, ifc_items, styles)).collect();
     };
