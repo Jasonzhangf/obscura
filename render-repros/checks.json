@@ -209,6 +209,17 @@
   "tables": [
     {"name": "content-box fixed cell column", "color": "#ffcc99", "width": 208}
   ],
+  "table-row-geometry": [
+    {"name": "cell height remains a minimum below block content", "color": "#1971c2", "x": 0, "y": 0, "width": 40, "height": 30},
+    {"name": "sibling cell stretches to the content-sized row", "color": "#f783ac", "x": 40, "y": 0, "width": 50, "height": 30},
+    {"name": "text line box grows beyond the cell height", "color": "#2b8a3e", "x": 0, "y": 60, "width": 100, "height": 15},
+    {"name": "row height remains a minimum above short content", "color": "#e8590c", "x": 0, "y": 110, "width": 70, "height": 40},
+    {"name": "rowspan content sizes the complete span", "color": "#7048e8", "x": 0, "y": 180, "width": 30, "height": 80},
+    {"name": "rowspan excess reaches the first row", "color": "#15aabf", "x": 30, "y": 190, "width": 60, "height": 20},
+    {"name": "rowspan excess reaches the second row", "color": "#fab005", "x": 30, "y": 230, "width": 60, "height": 20},
+    {"name": "final-width nested table determines header row height", "color": "#ff6600", "x": 180, "y": 0, "width": 700, "height": 24},
+    {"name": "later nested row starts after the final header height", "color": "#f6f6ef", "x": 180, "y": 24, "width": 700, "height": 15}
+  ],
   "table-track-geometry": [
     {"name": "separate spacing reserves the outer table edges", "color": "#ffcc99", "x": 2, "y": 2, "width": 208, "height": 23},
     {"name": "auto column receives max-content width", "color": "#74c0fc", "x": 212, "y": 2, "width": 54, "height": 23},
