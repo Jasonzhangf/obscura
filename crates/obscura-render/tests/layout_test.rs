@@ -391,3 +391,33 @@ fn replaced_image_contributes_intrinsic_size_in_ordered_grid() {
         "image: {image:?}"
     );
 }
+
+#[test]
+fn opposing_floats_share_header_band_through_inline_wrapper() {
+    let tree = parse_html(include_str!("../../../render-repros/opposing-header-floats.html"));
+    let layout = layout_dom(&tree, (900.0, 1000.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    let logo = rect("logo");
+    let tagline = rect("tagline");
+    let menu = rect("menu");
+    assert!(
+        (logo.x - 0.0).abs() < 0.01
+            && (logo.y - 0.0).abs() < 0.01
+            && (logo.width - 200.0).abs() < 0.01
+            && (logo.height - 100.0).abs() < 0.01,
+        "logo: {logo:?}"
+    );
+    assert!(
+        (tagline.x - 600.0).abs() < 0.01
+            && (tagline.y - 60.0).abs() < 0.01
+            && (tagline.width - 300.0).abs() < 0.01
+            && (tagline.height - 40.0).abs() < 0.01,
+        "tagline: {tagline:?}"
+    );
+    assert!(
+        (menu.x - 0.0).abs() < 0.01
+            && (menu.y - 100.0).abs() < 0.01
+            && (menu.width - 900.0).abs() < 0.01,
+        "menu: {menu:?}"
+    );
+}

@@ -89,6 +89,11 @@
   "modern-streams": [
     {"name": "streamed hydration contracts", "color": "#186aa5", "width": 360, "height": 90}
   ],
+  "opposing-header-floats": [
+    {"name": "inline wrapper exposes left float to header BFC", "color": "#1971c2", "x": 0, "y": 0, "width": 200, "height": 100},
+    {"name": "opposing float shares the same band", "color": "#e8590c", "x": 600, "y": 60, "width": 300, "height": 40},
+    {"name": "cleared navigation follows the float band", "color": "#087f5b", "x": 0, "y": 100, "width": 900, "height": 50}
+  ],
   "relative-box-edges": [
     {"name": "vh margin resolves against viewport height", "color": "#087f5b", "x": 0, "y": 150, "width": 100, "height": 40},
     {"name": "vw margin resolves against viewport width", "color": "#1971c2", "x": 90, "y": 200, "width": 100, "height": 40},
