@@ -67,10 +67,10 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
         // which otherwise paints an empty box the size of the image).
         style.display = crate::Display::None;
     } else if tag == "br" {
-        // Forces a line break inside our flex-row-wrap approximation of
-        // inline flow (see `dom::build`'s "stacks_children_vertically"
-        // promotion): a full-width, zero-height item leaves no room for
-        // anything else on its line, so the next inline item wraps.
+        // Keep forced breaks as full-width sentinels in the general
+        // flex/block fallback. The builder replaces the zero height with the
+        // inherited used line-height; pure and mixed inline runs fold the tag
+        // into the shaped line stream instead.
         style.width = crate::Dimension::Percent(1.0);
         style.height = crate::Dimension::Px(0.0);
     } else if tag == "body" {

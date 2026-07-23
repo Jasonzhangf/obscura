@@ -2368,6 +2368,20 @@ fn build(
 
     let mut taffy_style = to_taffy_style(style);
 
+    // A forced break that reaches the general box builder sits between block
+    // or atomic siblings, so it cannot be folded into a shaped inline run.
+    // Give that sentinel the inherited used line-height instead of the UA
+    // style's zero placeholder. This is the block/flex analogue of BRFrame's
+    // empty-line contribution; break tags inside text and mixed block runs
+    // are handled by the inline collector below.
+    if _name.local.as_ref() == "br" {
+        let height = crate::inline::used_line_height(style).max(0.0);
+        taffy_style.size.height = taffy::style::Dimension::length(height);
+        let leaf = taffy_tree.new_leaf(taffy_style).ok()?;
+        id_map.insert(leaf, id);
+        return Some(leaf);
+    }
+
     // CSS has separate outer and inner display types, while taffy exposes one
     // display value. An inline-block normally needs our wrapping inline
     // approximation so it remains atomic in an inline formatting context.
@@ -2763,7 +2777,10 @@ fn build_mixed_block(
                 out_of_flow.push(cid);
                 continue;
             }
-            s.display == crate::Display::Inline
+            let is_forced_break = node
+                .as_element()
+                .map_or(false, |element| element.local.as_ref() == "br");
+            is_forced_break || s.display == crate::Display::Inline
         } else {
             false
         };

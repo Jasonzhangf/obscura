@@ -95,6 +95,21 @@ fn normal_line_height(font_size: f32, family: &str) -> f32 {
     let scale = font_size / 2048.0;
     (ascent * scale).round() + (descent * scale).round() + (line_gap * scale).round()
 }
+
+/// Computed used line-height shared by shaped inline runs and forced-break
+/// sentinels that cannot join a run.
+pub(crate) fn used_line_height(style: &LayoutStyle) -> f32 {
+    let font_size = style.font_size.unwrap_or(16.0);
+    match style.line_height {
+        Some(crate::LineHeight::Px(px)) => px,
+        Some(crate::LineHeight::Ratio(ratio)) => font_size * ratio,
+        None | Some(crate::LineHeight::Normal) => normal_line_height(
+            font_size,
+            resolve_font_family(style.font_family.as_deref()),
+        ),
+    }
+}
+
 /// Underline is flagged per glyph through cosmic-text's `metadata` field.
 const META_UNDERLINE: usize = 1;
 
@@ -102,6 +117,10 @@ const META_UNDERLINE: usize = 1;
 /// paint it (filled in after layout).
 pub struct InlineItem {
     buffer: Buffer,
+    /// Minimum block-size contributed by explicit `<br>` breaks. cosmic-text
+    /// omits the final empty run for a trailing newline, while CSS still gives
+    /// a break-only or consecutive-break line the parent's used line-height.
+    forced_min_height: f32,
     /// Content-box top-left in viewport coordinates, set by `finalize`.
     origin: (f32, f32),
     /// Ancestor `overflow: hidden` clip, set by `finalize`.
@@ -280,7 +299,10 @@ impl TextEngine {
                 text.pop();
             }
         }
-        if spans.iter().all(|(t, _)| t.trim().is_empty()) {
+        if spans
+            .iter()
+            .all(|(text, _)| text.trim().is_empty() && !text.contains('\n'))
+        {
             return None;
         }
 
@@ -288,12 +310,22 @@ impl TextEngine {
         // Explicit line-height stays fractional. `normal` is derived from the
         // embedded face metrics with the same per-component pixel fitting as
         // Chromium's Linux font path.
-        let family = resolve_font_family(base.font_family.as_deref());
-        let line_h = match base.line_height {
-            Some(crate::LineHeight::Px(px)) => px,
-            Some(crate::LineHeight::Ratio(r)) => base_size * r,
-            _ => normal_line_height(base_size, family),
-        };
+        let line_h = used_line_height(base);
+        let mut forced_breaks = 0usize;
+        let mut visible_after_last_break = false;
+        for (text, _) in &spans {
+            for ch in text.chars() {
+                if ch == '\n' {
+                    forced_breaks += 1;
+                    visible_after_last_break = false;
+                } else if !ch.is_whitespace() {
+                    visible_after_last_break = true;
+                }
+            }
+        }
+        let forced_lines =
+            forced_breaks + usize::from(forced_breaks > 0 && visible_after_last_break);
+        let forced_min_height = forced_lines as f32 * line_h.max(1.0);
         // cosmic-text asserts (an uncatchable process abort) if font size OR
         // line height is 0. `font-size:0` is a common whitespace-collapse trick
         // and drives both to 0, so floor both at 1px here. The glyphs stay
@@ -326,7 +358,13 @@ impl TextEngine {
         }
 
         let idx = self.items.len();
-        self.items.push(InlineItem { buffer, origin: (0.0, 0.0), clip: None, clip_fill });
+        self.items.push(InlineItem {
+            buffer,
+            forced_min_height,
+            origin: (0.0, 0.0),
+            clip: None,
+            clip_fill,
+        });
         Some(idx)
     }
 
@@ -343,7 +381,8 @@ impl TextEngine {
         let item = &mut items[idx];
         item.buffer.set_size(font_system, width.map(|w| w.max(0.0)), None);
         item.buffer.shape_until_scroll(font_system, false);
-        buffer_size(&item.buffer)
+        let (width, height) = buffer_size(&item.buffer);
+        (width, height.max(item.forced_min_height))
     }
 
     /// Register a replaced element's intrinsic size as a taffy measure
@@ -636,6 +675,7 @@ fn inline_child_ok(tree: &DomTree, cid: NodeId, styles: &std::collections::HashM
                 return true; // removed from flow; ignore its subtree
             }
             if elem.local.as_ref() == "br" {
+                *has_text = true;
                 return true;
             }
             // A replaced element or an atomic inline-block has its own box with
@@ -804,7 +844,10 @@ impl TextEngine {
         // `try_build`) so this coverage exists; without a clip fill the per-span
         // colors pass through unchanged.
         let clip_fill = item.clip_fill.clone();
-        let fill_extent = clip_fill.as_ref().map(|_| buffer_size(&item.buffer));
+        let fill_extent = clip_fill.as_ref().map(|_| {
+            let (width, height) = buffer_size(&item.buffer);
+            (width, height.max(item.forced_min_height))
+        });
         let pixels = pixmap.pixels_mut();
         item.buffer.draw(font_system, swash, default, |gx, gy, gw, gh, color| {
             let a = color.a() as u32;
