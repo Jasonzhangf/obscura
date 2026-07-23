@@ -415,6 +415,10 @@ pub struct LayoutStyle {
     /// off-screen skip-link out of view instead of painting it on-screen. Not
     /// inherited (transform is a non-inherited property).
     pub transform_translate: Option<(Dimension, Dimension)>,
+    /// Any computed transform other than `none` establishes containing blocks
+    /// for absolute and fixed descendants, even when its visual transform
+    /// function is not yet supported by the paint engine.
+    pub transform_establishes_containing_block: bool,
     /// `transform: scale(sx[, sy])` / `scaleX` / `scaleY`, captured as (sx, sy).
     /// Parsed and stored so a value that mixes scale with translate still yields
     /// its translate part; scale is not yet folded into paint geometry (doing so

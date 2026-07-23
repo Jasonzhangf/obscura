@@ -623,12 +623,18 @@ fn parse_transform(style: &mut LayoutStyle, value: &str) {
     if v.eq_ignore_ascii_case("none") {
         style.transform_translate = None;
         style.transform_scale = None;
+        style.transform_establishes_containing_block = false;
         return;
     }
+    let functions = transform_functions(v);
+    if functions.is_empty() {
+        return;
+    }
+    style.transform_establishes_containing_block = true;
     let zero = crate::Dimension::Px(0.0);
     let (mut tx, mut ty): (Option<crate::Dimension>, Option<crate::Dimension>) = (None, None);
     let (mut sx, mut sy): (Option<f32>, Option<f32>) = (None, None);
-    for (func, args) in transform_functions(v) {
+    for (func, args) in functions {
         let parts: Vec<&str> = args.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
         match func.to_ascii_lowercase().as_str() {
             // translate3d's z component is ignored (no perspective model);

@@ -1156,13 +1156,13 @@ fn compute_absolute_rects(
 /// their immediate DOM parent.
 ///
 /// Taffy resolves an absolute child's insets against its direct layout-tree
-/// parent. CSS instead uses the nearest non-static ancestor, or the initial
-/// containing block for `position:fixed`. Gecko represents that distinction
-/// by reparenting the absolute frame and leaving a placeholder in normal
-/// flow. We can safely do the same without a placeholder when each axis has
-/// at least one specified inset: no static-position coordinate is needed.
-/// Boxes with an entirely auto axis stay under their DOM parent until the
-/// placeholder/static-position path is implemented.
+/// parent. CSS instead uses the nearest positioned or transformed ancestor;
+/// fixed boxes use the nearest transformed ancestor or the initial containing
+/// block. Gecko represents that distinction by reparenting the positioned
+/// frame and leaving a placeholder in normal flow. We can safely do the same
+/// without a placeholder when each axis has at least one specified inset: no
+/// static-position coordinate is needed. Boxes with an entirely auto axis
+/// stay under their DOM parent until the placeholder path is implemented.
 fn reparent_inset_positioned_nodes(
     tree: &DomTree,
     taffy_tree: &mut TaffyTree<usize>,
@@ -1172,24 +1172,36 @@ fn reparent_inset_positioned_nodes(
 ) {
     let reverse: HashMap<NodeId, taffy::NodeId> =
         id_map.iter().map(|(&taffy_id, &dom_id)| (dom_id, taffy_id)).collect();
-    let mut nearest_cb_for_children: HashMap<NodeId, taffy::NodeId> = HashMap::new();
+    let mut nearest_abs_cb_for_children: HashMap<NodeId, taffy::NodeId> = HashMap::new();
+    let mut nearest_fixed_cb_for_children: HashMap<NodeId, taffy::NodeId> = HashMap::new();
 
     for dom_id in tree.descendants(tree.document()) {
         let Some(style) = styles.get(&dom_id) else { continue };
         let parent = tree.get_node(dom_id).and_then(|node| node.parent);
-        let inherited_cb = parent
-            .and_then(|id| nearest_cb_for_children.get(&id).copied())
+        let inherited_abs_cb = parent
+            .and_then(|id| nearest_abs_cb_for_children.get(&id).copied())
+            .unwrap_or(taffy_root);
+        let inherited_fixed_cb = parent
+            .and_then(|id| nearest_fixed_cb_for_children.get(&id).copied())
             .unwrap_or(taffy_root);
 
         // Record this before any candidate early-exit so all descendants get
-        // an O(1) nearest-containing-block lookup. The full walk stays O(n)
-        // even on deeply nested or absolute-heavy documents.
-        let child_cb = if style.position.is_some() {
-            reverse.get(&dom_id).copied().unwrap_or(inherited_cb)
+        // O(1) nearest-containing-block lookups. Positioned and transformed
+        // boxes capture absolute descendants; only transformed boxes capture
+        // fixed descendants. The full walk stays O(n).
+        let own_box = reverse.get(&dom_id).copied();
+        let abs_child_cb = if style.position.is_some() || style.transform_establishes_containing_block {
+            own_box.unwrap_or(inherited_abs_cb)
         } else {
-            inherited_cb
+            inherited_abs_cb
         };
-        nearest_cb_for_children.insert(dom_id, child_cb);
+        let fixed_child_cb = if style.transform_establishes_containing_block {
+            own_box.unwrap_or(inherited_fixed_cb)
+        } else {
+            inherited_fixed_cb
+        };
+        nearest_abs_cb_for_children.insert(dom_id, abs_child_cb);
+        nearest_fixed_cb_for_children.insert(dom_id, fixed_child_cb);
 
         if !matches!(style.position, Some(taffy::Position::Absolute)) {
             continue;
@@ -1201,9 +1213,9 @@ fn reparent_inset_positioned_nodes(
         }
         let Some(&child) = reverse.get(&dom_id) else { continue };
         let target = if style.position_fixed {
-            taffy_root
+            inherited_fixed_cb
         } else {
-            inherited_cb
+            inherited_abs_cb
         };
         let Some(current) = taffy_tree.parent(child) else { continue };
         if current == target {

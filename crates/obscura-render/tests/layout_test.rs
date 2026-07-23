@@ -162,6 +162,48 @@ fn inset_absolute_uses_nearest_positioned_ancestor() {
 }
 
 #[test]
+fn transforms_establish_absolute_and_fixed_containing_blocks() {
+    let html = r##"
+        <body style="margin:0">
+          <div id="outer" style="position:relative;margin:40px 0 0 50px;width:600px;height:400px;border:10px solid black;padding:20px;box-sizing:border-box">
+            <div id="transformer" style="transform:translate(30px,20px);margin:40px 0 0 70px;width:300px;height:200px;border:5px solid black;padding:10px;box-sizing:border-box">
+              <div style="position:static;margin:20px;width:80px;height:50px">
+                <span id="abs" style="position:absolute;left:20px;top:25px;width:70px;height:55px"></span>
+                <div id="fixed-transformed" style="position:fixed;left:150px;top:100px;width:80px;height:50px"></div>
+              </div>
+            </div>
+            <div id="identity-transform" style="transform:rotate(0deg);margin:-80px 0 0 400px;width:100px;height:80px">
+              <div id="identity-abs" style="position:absolute;right:10px;bottom:10px;width:20px;height:20px"></div>
+            </div>
+            <div id="fixed-viewport" style="position:fixed;left:700px;top:40px;width:90px;height:60px"></div>
+          </div>
+        </body>
+    "##;
+    let tree = parse_html(html);
+    let layout = layout_dom(&tree, (900.0, 700.0));
+    let transformer_id = tree.get_element_by_id("transformer").unwrap();
+    let transformer = layout.rects[&transformer_id];
+    let abs = layout.rects[&tree.get_element_by_id("abs").unwrap()];
+    let fixed_transformed = layout.rects[&tree.get_element_by_id("fixed-transformed").unwrap()];
+    let identity_transform = layout.rects[&tree.get_element_by_id("identity-transform").unwrap()];
+    let identity_abs = layout.rects[&tree.get_element_by_id("identity-abs").unwrap()];
+    let fixed_viewport = layout.rects[&tree.get_element_by_id("fixed-viewport").unwrap()];
+
+    // Layout rects precede paint transforms. Insets use the transformer's
+    // padding box; the shared translate is recorded separately for the whole
+    // DOM subtree.
+    assert!((abs.x - transformer.x - 25.0).abs() < 1.0, "wrong transformed abs x: transformer={transformer:?} abs={abs:?}");
+    assert!((abs.y - transformer.y - 30.0).abs() < 1.0, "wrong transformed abs y: transformer={transformer:?} abs={abs:?}");
+    assert!((fixed_transformed.x - transformer.x - 155.0).abs() < 1.0, "wrong transformed fixed x: {fixed_transformed:?}");
+    assert!((fixed_transformed.y - transformer.y - 105.0).abs() < 1.0, "wrong transformed fixed y: {fixed_transformed:?}");
+    assert_eq!(layout.translates[&transformer_id], (30.0, 20.0));
+    assert!((identity_abs.x - identity_transform.x - 70.0).abs() < 1.0, "unsupported transform did not establish abs x: {identity_abs:?}");
+    assert!((identity_abs.y - identity_transform.y - 50.0).abs() < 1.0, "unsupported transform did not establish abs y: {identity_abs:?}");
+    assert!((fixed_viewport.x - 700.0).abs() < 1.0, "positioned ancestor captured fixed x: {fixed_viewport:?}");
+    assert!((fixed_viewport.y - 40.0).abs() < 1.0, "positioned ancestor captured fixed y: {fixed_viewport:?}");
+}
+
+#[test]
 fn long_text_run_wraps_across_multiple_lines() {
     // A long single text node with no inline elements breaking it up must
     // wrap within a narrow container instead of overflowing on one line. The
