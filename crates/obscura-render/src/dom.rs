@@ -1912,6 +1912,33 @@ fn build(
 
     let mut taffy_style = to_taffy_style(style);
 
+    // CSS has separate outer and inner display types, while taffy exposes one
+    // display value. An inline-block normally needs our wrapping inline
+    // approximation so it remains atomic in an inline formatting context.
+    // As a direct flex/grid item, however, its outer display is blockified and
+    // its flow-root inner display must stack block children. Apply the block
+    // inner mode only in that formatting context; doing it globally turns
+    // inline-block lists into one full-width item per line.
+    if style.is_inline_block {
+        let mut parent = node.parent;
+        let flex_or_grid_item = loop {
+            let Some(parent_id) = parent else { break false };
+            let Some(parent_style) = styles.get(&parent_id) else { break false };
+            if parent_style.display_contents {
+                parent = tree.get_node(parent_id).and_then(|node| node.parent);
+                continue;
+            }
+            break matches!(
+                parent_style.display,
+                crate::Display::Flex | crate::Display::Grid
+            ) && !parent_style.internal_flex_container;
+        };
+        if flex_or_grid_item {
+            taffy_style.display = taffy::style::Display::Block;
+            taffy_style.flex_wrap = taffy::FlexWrap::NoWrap;
+        }
+    }
+
     // A replaced image is a measured leaf, even when CSS gives it a percentage
     // width. Its intrinsic dimensions participate in an auto-sized ancestor's
     // max-content measurement; once the percentage axis becomes definite, the

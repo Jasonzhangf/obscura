@@ -45,6 +45,7 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
     };
     if tag == "center" {
         style.display = Display::Flex;
+        style.internal_flex_container = true;
         style.flex_direction = Some(taffy::FlexDirection::Column);
         style.align_items = Some(taffy::AlignItems::CENTER);
     } else if tag == "head" || tag == "script" || tag == "style" || tag == "title" || tag == "meta" || tag == "link" || tag == "noscript" || tag == "template"
@@ -106,6 +107,7 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
         style.underline = Some(true); // UA default: links are underlined
     } else if tag == "table" || tag == "tbody" {
         style.display = Display::Flex;
+        style.internal_flex_container = true;
         style.flex_direction = Some(taffy::FlexDirection::Column);
         style.align_items = Some(taffy::AlignItems::STRETCH); // stretch rows to fill table width
         // Rows fill the table width and may shrink below their content's
@@ -118,6 +120,7 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
             style.width = crate::Dimension::Percent(1.0);
         }
     } else if tag == "tr" {
+        style.internal_flex_container = true;
         // Rows fill the table width and can shrink below content min-content;
         // this is exactly why Wikipedia's own responsive CSS uses
         // `tr{min-width:100%}`. `align-items:stretch` alone did not pin them
@@ -126,6 +129,7 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
         style.width = crate::Dimension::Percent(1.0);
     } else if tag == "td" || tag == "th" {
         style.display = Display::Flex;
+        style.internal_flex_container = true;
         style.flex_direction = Some(taffy::FlexDirection::Column);
         style.align_items = Some(taffy::AlignItems::FLEX_START);
         style.padding = Edges { top: 0.0, right: 5.0, bottom: 0.0, left: 0.0 };
@@ -240,6 +244,20 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         "display" => {
             if value != "contents" {
                 style.display_contents = false;
+            }
+            if matches!(
+                value,
+                "none"
+                    | "flex"
+                    | "inline-flex"
+                    | "inline"
+                    | "inline-block"
+                    | "grid"
+                    | "inline-grid"
+                    | "block"
+                    | "contents"
+            ) {
+                style.internal_flex_container = false;
             }
             match value {
                 "none" => style.display = crate::Display::None,
@@ -2575,6 +2593,20 @@ mod tests {
         assert_eq!(s.display, Display::Flex);
         assert_eq!(s.width, crate::Dimension::Px(200.0));
         assert_eq!(s.height, crate::Dimension::Px(50.0));
+    }
+
+    #[test]
+    fn authored_display_replaces_internal_flex_provenance() {
+        let native_cell = compute_style("td", None);
+        assert_eq!(native_cell.display, Display::Flex);
+        assert!(native_cell.internal_flex_container);
+
+        let authored_cell = compute_style("td", Some("display:flex"));
+        assert_eq!(authored_cell.display, Display::Flex);
+        assert!(!authored_cell.internal_flex_container);
+
+        let invalid = compute_style("td", Some("display:bogus"));
+        assert!(invalid.internal_flex_container);
     }
 
     #[test]
