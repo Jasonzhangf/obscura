@@ -341,11 +341,24 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         "border-left-width" | "border-left" => set_edge(&mut style.border, Side::Left, px(value)),
         "background-color" => style.background_color = parse_color(value),
         "background" => {
-            style.background_gradient = parse_linear_gradient(value);
-            if style.background_gradient.is_none() {
-                style.background_color = parse_color(value);
+            // A shorthand resets every omitted background longhand to its
+            // initial value before applying the layers it does name.
+            // `background:0` is a valid position-only shorthand commonly used
+            // to clear a component background; merely assigning the fields we
+            // can parse leaves an earlier color/image painting underneath it.
+            // An empty value is invalid (for example an unresolved `var()`),
+            // so leave the prior cascade winner untouched in that case.
+            if !value.trim().is_empty() {
+                style.background_color = None;
+                style.background_gradient = parse_linear_gradient(value);
+                if style.background_gradient.is_none() {
+                    style.background_color = parse_color(value);
+                }
+                style.background_image = parse_url(value);
+                style.background_size = None;
+                style.background_position = (0.0, 0.0);
+                style.background_clip_text = false;
             }
-            style.background_image = parse_url(value);
         }
         "background-image" => {
             style.background_gradient = parse_linear_gradient(value);
@@ -2739,6 +2752,23 @@ mod tests {
         assert!(!n.background_clip_text);
         let l = compute_style("h1", Some("background-clip: text"));
         assert!(l.background_clip_text);
+    }
+
+    #[test]
+    fn background_shorthand_resets_omitted_layers() {
+        let s = compute_style(
+            "div",
+            Some(
+                "background:#1971c2 url(icon.png);background-size:20px 20px;\
+                 background-position:center;background-clip:text;background:0",
+            ),
+        );
+        assert_eq!(s.background_color, None);
+        assert_eq!(s.background_gradient, None);
+        assert_eq!(s.background_image, None);
+        assert_eq!(s.background_size, None);
+        assert_eq!(s.background_position, (0.0, 0.0));
+        assert!(!s.background_clip_text);
     }
 
     #[test]
