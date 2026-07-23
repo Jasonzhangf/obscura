@@ -453,15 +453,25 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                 style.justify_self = justify;
             }
         },
+        "align-content" => {
+            if let Some(value) = content_alignment_value(value) {
+                style.align_content = Some(value);
+            }
+        },
         "justify-content" => {
-            match value {
-                "center" => style.justify_content = Some(taffy::JustifyContent::CENTER),
-                "flex-start" | "start" | "left" => style.justify_content = Some(taffy::JustifyContent::FLEX_START),
-                "flex-end" | "end" | "right" => style.justify_content = Some(taffy::JustifyContent::FLEX_END),
-                "space-between" => style.justify_content = Some(taffy::JustifyContent::SPACE_BETWEEN),
-                "space-around" => style.justify_content = Some(taffy::JustifyContent::SPACE_AROUND),
-                "space-evenly" => style.justify_content = Some(taffy::JustifyContent::SPACE_EVENLY),
-                _ => {}
+            let value = match value.trim().to_ascii_lowercase().as_str() {
+                "left" => Some(taffy::JustifyContent::START),
+                "right" => Some(taffy::JustifyContent::END),
+                _ => content_alignment_value(value),
+            };
+            if let Some(value) = value {
+                style.justify_content = Some(value);
+            }
+        },
+        "place-content" => {
+            if let Some((align, justify)) = content_alignment_pair(value) {
+                style.align_content = Some(align);
+                style.justify_content = Some(justify);
             }
         },
         "flex-direction" => {
@@ -743,6 +753,52 @@ fn self_alignment_pair(
         if let (Some(align), Some(justify)) = (
             self_alignment_value(&align),
             self_alignment_value(&justify),
+        ) {
+            return Some((align, justify));
+        }
+    }
+    None
+}
+
+fn content_alignment_value(value: &str) -> Option<taffy::AlignContent> {
+    let normalized = value.trim().to_ascii_lowercase();
+    Some(match normalized.as_str() {
+        "normal" | "stretch" => taffy::AlignContent::STRETCH,
+        "start" => taffy::AlignContent::START,
+        "end" => taffy::AlignContent::END,
+        "flex-start" => taffy::AlignContent::FLEX_START,
+        "flex-end" => taffy::AlignContent::FLEX_END,
+        "center" => taffy::AlignContent::CENTER,
+        "space-between" => taffy::AlignContent::SPACE_BETWEEN,
+        "space-around" => taffy::AlignContent::SPACE_AROUND,
+        "space-evenly" => taffy::AlignContent::SPACE_EVENLY,
+        "safe start" => taffy::AlignContent::SAFE_START,
+        "safe end" => taffy::AlignContent::SAFE_END,
+        "safe flex-start" => taffy::AlignContent::SAFE_FLEX_START,
+        "safe flex-end" => taffy::AlignContent::SAFE_FLEX_END,
+        "safe center" => taffy::AlignContent::SAFE_CENTER,
+        "unsafe start" => taffy::AlignContent::START,
+        "unsafe end" => taffy::AlignContent::END,
+        "unsafe flex-start" => taffy::AlignContent::FLEX_START,
+        "unsafe flex-end" => taffy::AlignContent::FLEX_END,
+        "unsafe center" => taffy::AlignContent::CENTER,
+        _ => return None,
+    })
+}
+
+fn content_alignment_pair(
+    value: &str,
+) -> Option<(taffy::AlignContent, taffy::JustifyContent)> {
+    if let Some(alignment) = content_alignment_value(value) {
+        return Some((alignment, alignment));
+    }
+    let tokens: Vec<&str> = value.split_whitespace().collect();
+    for split in 1..tokens.len() {
+        let align = tokens[..split].join(" ");
+        let justify = tokens[split..].join(" ");
+        if let (Some(align), Some(justify)) = (
+            content_alignment_value(&align),
+            content_alignment_value(&justify),
         ) {
             return Some((align, justify));
         }
@@ -2712,6 +2768,13 @@ mod tests {
         );
         assert_eq!(parent.align_items, Some(taffy::AlignItems::END));
         assert_eq!(parent.justify_items, Some(taffy::JustifyItems::CENTER));
+
+        let content = compute_style(
+            "div",
+            Some("align-content:space-between;place-content:safe center end"),
+        );
+        assert_eq!(content.align_content, Some(taffy::AlignContent::SAFE_CENTER));
+        assert_eq!(content.justify_content, Some(taffy::JustifyContent::END));
     }
 
     #[test]

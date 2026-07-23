@@ -290,6 +290,7 @@ pub struct LayoutStyle {
     pub justify_items: Option<taffy::JustifyItems>,
     pub align_self: Option<taffy::AlignSelf>,
     pub justify_self: Option<taffy::JustifySelf>,
+    pub align_content: Option<taffy::AlignContent>,
     pub flex_direction: Option<taffy::FlexDirection>,
     pub flex_wrap: Option<taffy::FlexWrap>,
     pub justify_content: Option<taffy::JustifyContent>,
@@ -723,6 +724,7 @@ pub(crate) fn to_taffy_style(style: &LayoutStyle) -> Style {
     s.justify_items = style.justify_items;
     s.align_self = style.align_self;
     s.justify_self = style.justify_self;
+    s.align_content = style.align_content;
     if let Some(jc) = style.justify_content {
         s.justify_content = Some(jc);
     }
