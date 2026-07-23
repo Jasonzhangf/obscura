@@ -44,10 +44,12 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
         _ => Display::Block,
     };
     if tag == "center" {
-        style.display = Display::Flex;
-        style.internal_flex_container = true;
-        style.flex_direction = Some(taffy::FlexDirection::Column);
-        style.align_items = Some(taffy::AlignItems::CENTER);
+        // Browser UA sheets keep <center> block-level and give it a special
+        // inherited text alignment which also centers fixed-width block
+        // descendants. Keep that provenance separate from ordinary authored
+        // text-align:center.
+        style.text_align = Some(taffy::AlignItems::CENTER);
+        style.legacy_center = true;
     } else if tag == "head" || tag == "script" || tag == "style" || tag == "title" || tag == "meta" || tag == "link" || tag == "noscript" || tag == "template"
         || tag == "desc" || tag == "metadata" || tag == "option" || tag == "optgroup"
         || tag == "source" || tag == "track" || tag == "param" || tag == "area" {
@@ -416,9 +418,18 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         // deliberately separate from flex/grid `align-items`, which positions
         // child boxes rather than text inside them.
         "text-align" => match value {
-            "right" | "end" => style.text_align = Some(taffy::AlignItems::FLEX_END),
-            "center" => style.text_align = Some(taffy::AlignItems::CENTER),
-            "left" | "start" | "justify" => style.text_align = Some(taffy::AlignItems::FLEX_START),
+            "right" | "end" => {
+                style.text_align = Some(taffy::AlignItems::FLEX_END);
+                style.legacy_center = false;
+            }
+            "center" => {
+                style.text_align = Some(taffy::AlignItems::CENTER);
+                style.legacy_center = false;
+            }
+            "left" | "start" | "justify" => {
+                style.text_align = Some(taffy::AlignItems::FLEX_START);
+                style.legacy_center = false;
+            }
             _ => {}
         },
         "align-items" => {

@@ -342,6 +342,7 @@ pub fn layout_dom_with_images(
             font_weight: Option<String>,
             font_family: Option<String>,
             text_align: Option<taffy::AlignItems>,
+            legacy_center: bool,
             visibility_hidden: bool,
             opacity_product: f32,
             list_style: crate::ListStyle,
@@ -364,6 +365,7 @@ pub fn layout_dom_with_images(
                     font_weight: None,
                     font_family: None,
                     text_align: None,
+                    legacy_center: false,
                     visibility_hidden: false,
                     opacity_product: 1.0,
                     // CSS initial value of list-style-type.
@@ -468,7 +470,32 @@ pub fn layout_dom_with_images(
                 }
                 match &style.font_weight { Some(w) => inh.font_weight = Some(w.clone()), None => style.font_weight = inh.font_weight.clone() }
                 match &style.font_family { Some(f) => inh.font_family = Some(f.clone()), None => style.font_family = inh.font_family.clone() }
-                match style.text_align { Some(a) => inh.text_align = Some(a), None => style.text_align = inh.text_align }
+                let is_table = tree
+                    .get_node(id)
+                    .map_or(false, |node| {
+                        node.as_element()
+                            .map_or(false, |name| name.local.as_ref() == "table")
+                    });
+                if is_table && inh.legacy_center && style.text_align.is_none() {
+                    // The vendor alignment used by <center> centers the table
+                    // outer box but does not leak into its internal formatting
+                    // context. Browser UA table layout resets it to start.
+                    style.text_align = Some(taffy::AlignItems::FLEX_START);
+                    style.legacy_center = false;
+                    inh.text_align = style.text_align;
+                    inh.legacy_center = false;
+                } else {
+                    match style.text_align {
+                        Some(a) => {
+                            inh.text_align = Some(a);
+                            inh.legacy_center = style.legacy_center;
+                        }
+                        None => {
+                            style.text_align = inh.text_align;
+                            style.legacy_center = inh.legacy_center;
+                        }
+                    }
+                }
                 inh.visibility_hidden = style.visibility_hidden.unwrap_or(inh.visibility_hidden);
                 inh.opacity_product *= style.opacity.unwrap_or(1.0);
                 style.effectively_invisible = inh.visibility_hidden || inh.opacity_product < 0.02;
@@ -2050,6 +2077,13 @@ fn build(
     // approximation below only handles the leftovers (mixed inline + atomic
     // boxes, and layout-only builds where `try_build` always declines).
     if let Some(item) = engine.try_build(tree, id, styles) {
+        if style.display == crate::Display::Block && style.width == crate::Dimension::Auto {
+            // A pure-text block is still a fill-available block. Its shaped
+            // inline context performs text alignment internally; retaining
+            // the flex alignment stand-in here shrink-wraps the leaf to its
+            // text, leaving no free width in which center/end can move it.
+            taffy_style.display = taffy::style::Display::Block;
+        }
         let leaf = taffy_tree.new_leaf_with_context(taffy_style, item).ok()?;
         id_map.insert(leaf, id);
         ifc_items.whole.insert(id, item);
@@ -2229,6 +2263,38 @@ fn build(
         child_ids.append(&mut build_pseudo_content(id, content, style, taffy_tree, words));
     }
 
+    if style.internal_flex_container
+        && taffy_style.display == taffy::style::Display::Flex
+        && taffy_style.flex_direction == taffy::FlexDirection::Column
+    {
+        // Table cells and the other native block-layout stand-ins are not
+        // genuine CSS flex containers. A direct in-flow block with auto width
+        // must fill their inline size; `align-items:flex-start` would otherwise
+        // shrink-wrap it like a flex item (notably a pure-text <center> in a
+        // table cell).
+        for child in &child_ids {
+            let fills_inline_axis = id_map
+                .get(child)
+                .and_then(|dom_id| styles.get(dom_id))
+                .map_or(false, |child_style| {
+                    child_style.display == crate::Display::Block
+                        && child_style.width == crate::Dimension::Auto
+                        && child_style.float.is_none()
+                        && !matches!(
+                            child_style.position,
+                            Some(taffy::Position::Absolute)
+                        )
+                });
+            if fills_inline_axis {
+                if let Ok(current) = taffy_tree.style(*child) {
+                    let mut fill = current.clone();
+                    fill.size.width = taffy::style::Dimension::percent(1.0);
+                    let _ = taffy_tree.set_style(*child, fill);
+                }
+            }
+        }
+    }
+
     let taffy_id = if child_ids.is_empty() {
         taffy_tree.new_leaf(taffy_style).ok()?
     } else {
@@ -2359,7 +2425,29 @@ fn build_mixed_block(
     for (i, seg) in segs.into_iter().enumerate() {
         match seg {
             Seg::Block(cid) => {
-                child_ids.extend(build_any(tree, cid, taffy_tree, id_map, words, engine, ifc_items, styles));
+                let built =
+                    build_any(tree, cid, taffy_tree, id_map, words, engine, ifc_items, styles);
+                if style.legacy_center {
+                    let has_default_horizontal_margins = styles.get(&cid).map_or(false, |child| {
+                        child.margin.left == 0.0
+                            && child.margin.right == 0.0
+                            && !child.margin_auto[1]
+                            && !child.margin_auto[3]
+                    });
+                    if has_default_horizontal_margins {
+                        for child in &built {
+                            if let Ok(current) = taffy_tree.style(*child) {
+                                let mut centered = current.clone();
+                                centered.margin.left =
+                                    taffy::style::LengthPercentageAuto::auto();
+                                centered.margin.right =
+                                    taffy::style::LengthPercentageAuto::auto();
+                                let _ = taffy_tree.set_style(*child, centered);
+                            }
+                        }
+                    }
+                }
+                child_ids.extend(built);
             }
             Seg::Run(run) => {
                 // Collapsible source formatting at the start/end of an inline

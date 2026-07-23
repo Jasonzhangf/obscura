@@ -166,9 +166,13 @@ impl Dimension {
 pub struct LayoutStyle {
     pub display: Display,
     /// True when `display:flex` is only an internal stand-in for native HTML
-    /// layout such as table cells or `<center>`, rather than the computed CSS
-    /// display. Descendants are not CSS flex items in these containers.
+    /// layout such as table cells, rather than the computed CSS display.
+    /// Descendants are not CSS flex items in these containers.
     pub internal_flex_container: bool,
+    /// The HTML UA sheet's vendor `text-align` behavior for `<center>`.
+    /// Unlike ordinary `text-align:center`, it also centers fixed-width block
+    /// descendants while leaving auto-width blocks fill-available.
+    pub legacy_center: bool,
     pub width: Dimension,
     pub height: Dimension,
     /// Which box edge `width`/`height` and min/max sizes describe. CSS starts
