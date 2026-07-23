@@ -50,7 +50,8 @@
     {"name": "min margin uses actual viewport", "color": "#1971c2", "x": 225, "y": 60, "width": 100, "height": 40},
     {"name": "clamp width uses actual viewport", "color": "#e8590c", "x": 0, "y": 120, "width": 270, "height": 40},
     {"name": "calc combines viewport and root font units", "color": "#7048e8", "x": 122, "y": 180, "width": 100, "height": 40},
-    {"name": "max padding uses actual viewport", "color": "#c2255c", "x": 60, "y": 240, "width": 20, "height": 40}
+    {"name": "max padding uses actual viewport", "color": "#c2255c", "x": 60, "y": 240, "width": 20, "height": 40},
+    {"name": "round quantizes nested custom property math", "color": "#2f9e44", "x": 0, "y": 300, "width": 250, "height": 40}
   ],
   "flex-whitespace-items": [
     {"name": "direct flex sidebar starts at container edge", "color": "#1971c2", "x": 0, "y": 0, "width": 225, "height": 180},

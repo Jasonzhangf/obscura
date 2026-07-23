@@ -12,6 +12,12 @@
     .calculated { width: 100px; height: 40px; margin-left: calc(10vw + 2rem); background: #7048e8; }
     .padded { box-sizing: border-box; width: 200px; height: 40px; padding-left: max(5vw, 60px); background: #f08c00; }
     .inner { width: 20px; height: 40px; background: #c2255c; }
+    .rounded {
+      --media-width: 247px;
+      width: calc(round(var(--media-width) * 1, 10px));
+      height: 40px;
+      background: #2f9e44;
+    }
   </style>
 </head>
 <body>
@@ -20,5 +26,6 @@
   <div class="row"><div class="clamped"></div></div>
   <div class="row"><div class="calculated"></div></div>
   <div class="row"><div class="padded"><div class="inner"></div></div></div>
+  <div class="row"><div class="rounded"></div></div>
 </body>
 </html>
