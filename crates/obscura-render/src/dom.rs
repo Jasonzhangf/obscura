@@ -2006,6 +2006,33 @@ fn build(
                     && !matches!(child.position, Some(taffy::Position::Absolute))
             })
         });
+    let has_replaced_block_child = style.display == crate::Display::Block
+        && dom_children.iter().any(|cid| {
+            let replaced_wrapper = tree
+                .get_node(*cid)
+                .and_then(|node| node.as_element().map(|name| matches!(name.local.as_ref(), "picture" | "img")))
+                .unwrap_or(false);
+            replaced_wrapper
+                && styles.get(cid).map_or(false, |child| {
+                    child.display == crate::Display::Block
+                        && child.float.is_none()
+                        && !matches!(child.position, Some(taffy::Position::Absolute))
+                })
+        });
+
+    // `text-align` affects inline content, never the used width or placement
+    // of an in-flow block child. `to_taffy_style` promotes a centered/right
+    // block to a flex column as an inline-alignment stand-in, but retaining
+    // that promotion for a block-level replaced wrapper makes its auto width
+    // shrink to max-content. A responsive `<picture><img width:100%>` then
+    // overflows a padded figure at its intrinsic width instead of filling the
+    // figure's content box. Preserve block formatting for that concrete
+    // modern-media shape. Mixed inline/block content is handled separately by
+    // `build_mixed_block` below; keeping this guard narrow avoids changing the
+    // legacy shrink-wrap approximation for unrelated centered block children.
+    if has_replaced_block_child {
+        taffy_style.display = taffy::style::Display::Block;
+    }
 
     // A block with mixed inline + block children keeps real block layout:
     // block-level children become direct block children (full available
