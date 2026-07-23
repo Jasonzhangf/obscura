@@ -83,6 +83,10 @@ struct IfcRegistry {
     /// table column-balancing pass in `layout_dom_with_images`, which pins
     /// specified columns instead of sizing them purely from content.
     table_cols: HashMap<taffy::NodeId, (Vec<Option<f32>>, Vec<Option<f32>>)>,
+    /// Minimum row heights per table grid node, one entry per source row.
+    /// The post-width row-sizing pass combines these with each cell's final
+    /// content height and pins the tracks before vertical alignment.
+    table_rows: HashMap<taffy::NodeId, Vec<Option<f32>>>,
     /// Floats whose direct block parent does not establish a block formatting
     /// context and whose exclusion can therefore continue through later
     /// descendant blocks of the same BFC. The first layout pass gives these
@@ -1236,6 +1240,30 @@ pub fn layout_dom_with_images(
                         &mut measure,
                     );
                 }
+                if apply_table_row_geometry(
+                    &mut taffy_tree,
+                    &id_map,
+                    &styles,
+                    &ifc_items,
+                ) {
+                    let _ = taffy_tree.compute_layout_with_measure(
+                        taffy_root,
+                        available,
+                        &mut measure,
+                    );
+                }
+                if apply_table_cell_block_alignment(
+                    tree,
+                    &mut taffy_tree,
+                    &id_map,
+                    &styles,
+                ) {
+                    let _ = taffy_tree.compute_layout_with_measure(
+                        taffy_root,
+                        available,
+                        &mut measure,
+                    );
+                }
             }
             #[cfg(not(feature = "paint"))]
             {
@@ -1253,6 +1281,22 @@ pub fn layout_dom_with_images(
                     &id_map,
                     &styles,
                     &ifc_items,
+                ) {
+                    let _ = taffy_tree.compute_layout(taffy_root, available);
+                }
+                if apply_table_row_geometry(
+                    &mut taffy_tree,
+                    &id_map,
+                    &styles,
+                    &ifc_items,
+                ) {
+                    let _ = taffy_tree.compute_layout(taffy_root, available);
+                }
+                if apply_table_cell_block_alignment(
+                    tree,
+                    &mut taffy_tree,
+                    &id_map,
+                    &styles,
                 ) {
                     let _ = taffy_tree.compute_layout(taffy_root, available);
                 }
@@ -1991,6 +2035,256 @@ fn apply_float_continuations(
     changed
 }
 
+/// Recompute table row tracks from the cells' content at their final column
+/// widths. Generic grid intrinsic sizing can retain a taller contribution
+/// from an earlier, narrower nested-table measurement even after that child
+/// resolves to a shorter final box. CSS tables instead finish columns first,
+/// measure cells at those widths, then derive rows bottom-up.
+fn apply_table_row_geometry(
+    taffy_tree: &mut TaffyTree<usize>,
+    id_map: &HashMap<taffy::NodeId, NodeId>,
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+    ifc_items: &IfcRegistry,
+) -> bool {
+    let mut changed = false;
+    for (&table_node, row_minimums) in &ifc_items.table_rows {
+        let nrows = row_minimums.len();
+        if nrows == 0 {
+            continue;
+        }
+        let mut row_heights: Vec<f32> = row_minimums
+            .iter()
+            .map(|height| height.unwrap_or(0.0).max(0.0))
+            .collect();
+        let mut cells = Vec::new();
+        for cell in taffy_tree.children(table_node).unwrap_or_default() {
+            let (Ok(cell_style), Ok(layout)) =
+                (taffy_tree.style(cell), taffy_tree.layout(cell))
+            else {
+                continue;
+            };
+            let row = match cell_style.grid_row.start {
+                GridPlacement::Line(line) => (line.as_i16().max(1) as usize) - 1,
+                _ => continue,
+            };
+            let span = match cell_style.grid_row.end {
+                GridPlacement::Span(span) => (span as usize).max(1),
+                _ => 1,
+            };
+            if row >= nrows {
+                continue;
+            }
+            let edges = layout.padding.top
+                + layout.padding.bottom
+                + layout.border.top
+                + layout.border.bottom;
+            // Taffy's content_size is the furthest content/child overflow in
+            // border-box coordinates (an empty padded cell reports its padding
+            // extent), so it is already the right natural border-box floor.
+            let mut natural = layout.content_size.height.max(edges);
+            if let Some(dom_id) = id_map.get(&cell) {
+                if let Some(style) = styles.get(dom_id) {
+                    if let crate::Dimension::Px(height) = style.height {
+                        let specified = if style.box_sizing == crate::BoxSizing::ContentBox {
+                            height + style.padding.top
+                                + style.padding.bottom
+                                + style.border.top
+                                + style.border.bottom
+                        } else {
+                            height
+                        };
+                        natural = natural.max(specified);
+                    }
+                }
+            }
+            cells.push((cell, row, span.min(nrows - row), natural.max(0.0)));
+        }
+
+        // Non-spanning cells define their row directly.
+        for &(_, row, span, natural) in &cells {
+            if span == 1 {
+                row_heights[row] = row_heights[row].max(natural);
+            }
+        }
+
+        let table_dom = id_map.get(&table_node).copied();
+        let (row_gap, table_has_height) = table_dom
+            .and_then(|dom_id| styles.get(&dom_id))
+            .map(|style| {
+                (
+                    table_spacing(style).1,
+                    matches!(style.height, crate::Dimension::Px(_)),
+                )
+            })
+            .unwrap_or((0.0, false));
+
+        // A rowspan contributes only the shortfall beyond the rows and gaps
+        // it spans. Prefer unstyled rows; when they already have content,
+        // distribute proportionally, matching the table row-group algorithm.
+        for &(_, row, span, natural) in &cells {
+            if span <= 1 {
+                continue;
+            }
+            let end = row + span;
+            let current: f32 = row_heights[row..end].iter().sum::<f32>()
+                + row_gap * span.saturating_sub(1) as f32;
+            let extra = natural - current;
+            if extra <= 0.0 {
+                continue;
+            }
+            let mut targets: Vec<usize> = (row..end)
+                .filter(|&index| row_minimums[index].is_none())
+                .collect();
+            if targets.is_empty() {
+                targets = (row..end).collect();
+            }
+            let weight: f32 = targets.iter().map(|&index| row_heights[index]).sum();
+            for &index in &targets {
+                let share = if weight > 0.0 {
+                    extra * row_heights[index] / weight
+                } else {
+                    extra / targets.len() as f32
+                };
+                row_heights[index] += share;
+            }
+        }
+
+        // A definite table height distributes surplus into rows; an auto
+        // table must not preserve stale free space from the generic grid pass.
+        if table_has_height {
+            if let Ok(table_layout) = taffy_tree.layout(table_node) {
+                let track_target = (table_layout.size.height
+                    - table_layout.padding.top
+                    - table_layout.padding.bottom
+                    - table_layout.border.top
+                    - table_layout.border.bottom
+                    - row_gap * nrows.saturating_sub(1) as f32)
+                    .max(0.0);
+                let current: f32 = row_heights.iter().sum();
+                let extra = track_target - current;
+                if extra > 0.0 {
+                    let mut targets: Vec<usize> = (0..nrows)
+                        .filter(|&index| row_minimums[index].is_none())
+                        .collect();
+                    if targets.is_empty() {
+                        targets = (0..nrows).collect();
+                    }
+                    let weight: f32 =
+                        targets.iter().map(|&index| row_heights[index]).sum();
+                    for &index in &targets {
+                        let share = if weight > 0.0 {
+                            extra * row_heights[index] / weight
+                        } else {
+                            extra / targets.len() as f32
+                        };
+                        row_heights[index] += share;
+                    }
+                }
+            }
+        }
+
+        if let Ok(current) = taffy_tree.style(table_node) {
+            let mut fixed = current.clone();
+            fixed.grid_template_rows = row_heights
+                .iter()
+                .map(|height| {
+                    taffy::GridTemplateComponent::Single(taffy::MinMax {
+                        min: taffy::MinTrackSizingFunction::length(*height),
+                        max: taffy::MaxTrackSizingFunction::length(*height),
+                    })
+                })
+                .collect();
+            if taffy_tree.set_style(table_node, fixed).is_ok() {
+                changed = true;
+            }
+        }
+        // A CSS height on a cell is a row minimum, not a smaller final cell
+        // box. Once the tracks are pinned, restore auto block-size so every
+        // cell stretches to its complete (possibly spanned) grid area.
+        for (cell, _, _, _) in cells {
+            if let Ok(current) = taffy_tree.style(cell) {
+                let mut stretched = current.clone();
+                stretched.size.height = taffy::Dimension::auto();
+                let _ = taffy_tree.set_style(cell, stretched);
+            }
+        }
+    }
+    changed
+}
+
+/// Table-cell block alignment is a post-row-sizing operation. Feeding
+/// `justify-content:center/end` into a cell while grid is still computing its
+/// auto row tracks lets alignment offsets contaminate the cell's intrinsic
+/// block-size (a nested 24px table can incorrectly demand a 29px row). Measure
+/// cells from block-start first, freeze each final cell border-box height, then
+/// enable middle/bottom alignment for the final layout pass.
+fn apply_table_cell_block_alignment(
+    tree: &DomTree,
+    taffy_tree: &mut TaffyTree<usize>,
+    id_map: &HashMap<taffy::NodeId, NodeId>,
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+) -> bool {
+    let mut changed = false;
+    for (&node, &dom_id) in id_map {
+        let Some(style) = styles.get(&dom_id) else {
+            continue;
+        };
+        if !style.internal_flex_container
+            || !matches!(
+                style.vertical_align,
+                Some(crate::VerticalAlign::Middle | crate::VerticalAlign::Bottom)
+            )
+        {
+            continue;
+        }
+        let is_cell = tree.get_node(dom_id).map_or(false, |dom_node| {
+            dom_node.as_element().map_or(false, |element| {
+                matches!(element.local.as_ref(), "td" | "th")
+            })
+        });
+        if !is_cell || taffy_tree.children(node).map_or(true, |children| children.is_empty()) {
+            // Pure-text cells are aligned after shaping in the text finalize
+            // path, where their actual line box height is available.
+            continue;
+        }
+        let (Ok(current), Ok(layout)) = (taffy_tree.style(node), taffy_tree.layout(node)) else {
+            continue;
+        };
+        if current.display != taffy::style::Display::Flex {
+            continue;
+        }
+        let mut aligned = current.clone();
+        let border_padding = layout.border.top
+            + layout.border.bottom
+            + layout.padding.top
+            + layout.padding.bottom;
+        let declared_height = if aligned.box_sizing == taffy::BoxSizing::ContentBox {
+            (layout.size.height - border_padding).max(0.0)
+        } else {
+            layout.size.height
+        };
+        aligned.size.height = length(declared_height);
+        let is_middle = style.vertical_align == Some(crate::VerticalAlign::Middle);
+        if aligned.flex_direction == taffy::FlexDirection::Column {
+            aligned.justify_content = Some(if is_middle {
+                taffy::JustifyContent::CENTER
+            } else {
+                taffy::JustifyContent::FLEX_END
+            });
+        } else {
+            aligned.align_content = Some(if is_middle {
+                taffy::AlignContent::CENTER
+            } else {
+                taffy::AlignContent::FLEX_END
+            });
+        }
+        if taffy_tree.set_style(node, aligned).is_ok() {
+            changed = true;
+        }
+    }
+    changed
+}
+
 fn resolve_static_positions_and_reparent(
     taffy_tree: &mut TaffyTree<usize>,
     candidates: &[StaticPositionCandidate],
@@ -2278,42 +2572,131 @@ fn tokenize_with_spaces(text: &str) -> Vec<String> {
     tokens
 }
 
-/// Give each `<tr>`/`<tbody>`/`<thead>`/`<tfoot>` a rect equal to the union of
-/// its descendant cell rects. In the grid table model these wrappers are not
-/// taffy boxes, so without this their backgrounds and borders (zebra striping,
-/// a `thead` background, a per-row border) would never paint. Skips a wrapper
-/// that already has a rect (a table that fell back to the flex path keeps its
-/// real box).
+/// Give each `<tr>`/`<tbody>`/`<thead>`/`<tfoot>` its CSS table-grid band. In
+/// the grid table model these wrappers are not taffy boxes, so without this
+/// their backgrounds, borders, and DOM geometry would disappear.
+///
+/// A row's inline extent includes all cells that start in it, but its block
+/// extent must ignore the portion of a `rowspan` that continues through later
+/// rows. Nested-table cells must not participate at all. Sections are then the
+/// union of their already-synthesized direct rows.
 fn synthesize_row_rects(tree: &DomTree, rects: &mut HashMap<NodeId, Rect>) {
+    let mut rows = Vec::new();
+    let mut sections = Vec::new();
+    let mut table_inline: HashMap<NodeId, Rect> = HashMap::new();
     for id in tree.descendants(tree.document()) {
         let local = match tree.get_node(id).and_then(|n| n.as_element().map(|e| e.local.to_string())) {
             Some(l) => l,
             None => continue,
         };
-        if !matches!(local.as_str(), "tr" | "tbody" | "thead" | "tfoot") {
-            continue;
+        match local.as_str() {
+            "tr" => rows.push(id),
+            "tbody" | "thead" | "tfoot" => sections.push(id),
+            "td" | "th" => {
+                let mut ancestor = tree.get_node(id).and_then(|node| node.parent);
+                while let Some(parent) = ancestor {
+                    let is_table = tree.get_node(parent).map_or(false, |node| {
+                        node.as_element()
+                            .map_or(false, |element| element.local.as_ref() == "table")
+                    });
+                    if is_table {
+                        if let Some(rect) = rects.get(&id) {
+                            table_inline
+                                .entry(parent)
+                                .and_modify(|current| *current = current.union(rect))
+                                .or_insert(*rect);
+                        }
+                        break;
+                    }
+                    ancestor = tree.get_node(parent).and_then(|node| node.parent);
+                }
+            }
+            _ => {}
         }
+    }
+
+    for id in rows {
         if rects.contains_key(&id) {
             continue;
         }
-        let mut acc: Option<Rect> = None;
-        for d in tree.descendants(id) {
+        let mut inline: Option<Rect> = None;
+        let mut block: Option<Rect> = None;
+        for cell in tree.children(id) {
             let is_cell = tree
-                .get_node(d)
+                .get_node(cell)
                 .and_then(|n| n.as_element().map(|e| matches!(e.local.as_ref(), "td" | "th")))
                 .unwrap_or(false);
             if !is_cell {
                 continue;
             }
-            if let Some(r) = rects.get(&d) {
-                acc = Some(match acc {
+            let Some(r) = rects.get(&cell) else {
+                continue;
+            };
+            inline = Some(match inline {
+                Some(a) => a.union(r),
+                None => *r,
+            });
+            let spans_one_row = tree
+                .get_node(cell)
+                .and_then(|node| {
+                    node.get_attribute("rowspan")
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                })
+                .map_or(true, |span| span == 1);
+            if spans_one_row {
+                block = Some(match block {
                     Some(a) => a.union(r),
                     None => *r,
                 });
             }
         }
-        if let Some(r) = acc {
-            rects.insert(id, r);
+        if let Some(mut inline) = inline {
+            let mut ancestor = tree.get_node(id).and_then(|node| node.parent);
+            while let Some(parent) = ancestor {
+                if let Some(table_band) = table_inline.get(&parent) {
+                    inline.x = table_band.x;
+                    inline.width = table_band.width;
+                    break;
+                }
+                ancestor = tree.get_node(parent).and_then(|node| node.parent);
+            }
+            let block = block.unwrap_or(inline);
+            rects.insert(
+                id,
+                Rect {
+                    x: inline.x,
+                    y: block.y,
+                    width: inline.width,
+                    height: block.height,
+                },
+            );
+        }
+    }
+
+    for id in sections {
+        if rects.contains_key(&id) {
+            continue;
+        }
+        let mut section: Option<Rect> = None;
+        for row in tree.children(id) {
+            let is_row = tree
+                .get_node(row)
+                .map_or(false, |node| {
+                    node.as_element()
+                        .map_or(false, |element| element.local.as_ref() == "tr")
+                });
+            if !is_row {
+                continue;
+            }
+            if let Some(rect) = rects.get(&row) {
+                section = Some(match section {
+                    Some(current) => current.union(rect),
+                    None => *rect,
+                });
+            }
+        }
+        if let Some(rect) = section {
+            rects.insert(id, rect);
         }
     }
 }
@@ -2636,6 +3019,7 @@ fn build_table(
     };
     let table_node = taffy_tree.new_with_children(tstyle, &children).ok()?;
     id_map.insert(table_node, id);
+    ifc_items.table_rows.insert(table_node, row_min);
     if col_px.iter().any(Option::is_some) || col_pct.iter().any(Option::is_some) {
         ifc_items.table_cols.insert(table_node, (col_px, col_pct));
     }
@@ -2906,31 +3290,6 @@ fn build(
         taffy_style.align_items = Some(taffy::AlignItems::FLEX_START);
     }
 
-    // Table-cell vertical alignment: place the cell's content along the
-    // vertical axis of whichever shape the cell took, the flex-column
-    // stand-in's main axis or the wrapped lines of a promoted inline
-    // context. (The pure-text leaf path is aligned at finalize instead,
-    // where the shaped text height is known.)
-    if let Some(va) = style.vertical_align {
-        if taffy_style.display == taffy::style::Display::Flex {
-            if taffy_style.flex_direction == taffy::FlexDirection::Column {
-                if style.justify_content.is_none() {
-                    taffy_style.justify_content = Some(match va {
-                        crate::VerticalAlign::Top => taffy::JustifyContent::FLEX_START,
-                        crate::VerticalAlign::Middle => taffy::JustifyContent::CENTER,
-                        crate::VerticalAlign::Bottom => taffy::JustifyContent::FLEX_END,
-                    });
-                }
-            } else {
-                taffy_style.align_content = Some(match va {
-                    crate::VerticalAlign::Top => taffy::AlignContent::FLEX_START,
-                    crate::VerticalAlign::Middle => taffy::AlignContent::CENTER,
-                    crate::VerticalAlign::Bottom => taffy::AlignContent::FLEX_END,
-                });
-            }
-        }
-    }
-
     let mut child_ids: Vec<taffy::NodeId> = if has_float_child {
         build_children_with_float_zone(tree, id, &dom_children, taffy_tree, id_map, words, engine, ifc_items, styles)
     } else {
@@ -2950,10 +3309,11 @@ fn build(
         && taffy_style.flex_direction == taffy::FlexDirection::Column
     {
         // Table cells and the other native block-layout stand-ins are not
-        // genuine CSS flex containers. A direct in-flow block with auto width
-        // must fill their inline size; `align-items:flex-start` would otherwise
-        // shrink-wrap it like a flex item (notably a pure-text <center> in a
-        // table cell).
+        // genuine CSS flex containers. Their block children neither flex-shrink
+        // to an authored container height nor shrink-wrap along the inline
+        // axis. Preserving the children's block sizes is particularly
+        // important for table cells, where `height` is only a row minimum and
+        // taller content must grow the row.
         for child in &child_ids {
             let fills_inline_axis = id_map
                 .get(child)
@@ -2967,12 +3327,13 @@ fn build(
                             Some(taffy::Position::Absolute)
                         )
                 });
-            if fills_inline_axis {
-                if let Ok(current) = taffy_tree.style(*child) {
-                    let mut fill = current.clone();
-                    fill.size.width = taffy::style::Dimension::percent(1.0);
-                    let _ = taffy_tree.set_style(*child, fill);
+            if let Ok(current) = taffy_tree.style(*child) {
+                let mut block_item = current.clone();
+                block_item.flex_shrink = 0.0;
+                if fills_inline_axis {
+                    block_item.size.width = taffy::style::Dimension::percent(1.0);
                 }
+                let _ = taffy_tree.set_style(*child, block_item);
             }
         }
     }
