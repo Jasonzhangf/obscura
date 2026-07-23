@@ -34,6 +34,16 @@
   "modern-hydration-contracts": [
     {"name": "modern hydration contracts", "color": "#16803c", "width": 360, "height": 90}
   ],
+  "modern-containing-block-triggers": [
+    {"name": "filter containing block", "color": "#087f5b", "x": 95, "y": 75, "width": 20, "height": 20},
+    {"name": "perspective containing block", "color": "#1971c2", "x": 215, "y": 75, "width": 20, "height": 20},
+    {"name": "contain layout containing block", "color": "#e8590c", "x": 335, "y": 75, "width": 20, "height": 20},
+    {"name": "container-type negative control", "color": "#7048e8", "x": 775, "y": 175, "width": 20, "height": 20},
+    {"name": "will-change containing block", "color": "#c2255c", "x": 575, "y": 75, "width": 20, "height": 20},
+    {"name": "content-visibility containing block", "color": "#2b8a3e", "x": 695, "y": 75, "width": 20, "height": 20},
+    {"name": "filter fixed containing block", "color": "#f08c00", "x": 25, "y": 25, "width": 10, "height": 10},
+    {"name": "contain fixed containing block", "color": "#1098ad", "x": 265, "y": 25, "width": 10, "height": 10}
+  ],
   "modern-streams": [
     {"name": "streamed hydration contracts", "color": "#186aa5", "width": 360, "height": 90}
   ],
