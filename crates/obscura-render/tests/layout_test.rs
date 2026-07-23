@@ -451,6 +451,48 @@ fn text_alignment_does_not_shrink_flex_items() {
 }
 
 #[test]
+fn inline_block_flex_items_keep_block_inner_flow() {
+    let tree = parse_html(include_str!("../../../render-repros/inline-block-flex-items.html"));
+    let layout = layout_dom(&tree, (900.0, 1000.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    let brand = rect("brand");
+    let title = rect("title");
+    let links = rect("links");
+    let one = rect("one");
+    let two = rect("two");
+    let three = rect("three");
+    let chips = rect("chips");
+    let alpha = rect("alpha");
+    let beta = rect("beta");
+    let gamma = rect("gamma");
+    assert!(
+        (brand.x - 0.0).abs() < 0.01
+            && (brand.width - 382.0).abs() < 0.01
+            && (title.x - 32.0).abs() < 0.01
+            && (title.width - 350.0).abs() < 0.01,
+        "brand: {brand:?}, title: {title:?}"
+    );
+    assert!(
+        (links.x - 525.0).abs() < 0.01
+            && (links.width - 90.0).abs() < 0.01
+            && (one.y - 0.0).abs() < 0.01
+            && (two.y - 20.0).abs() < 0.01
+            && (three.y - 40.0).abs() < 0.01,
+        "links: {links:?}, items: {one:?} {two:?} {three:?}"
+    );
+    assert!(
+        (chips.x - 0.0).abs() < 0.01
+            && (chips.y - 140.0).abs() < 0.01
+            && (chips.width - 90.0).abs() < 0.01
+            && (chips.height - 20.0).abs() < 0.01
+            && (alpha.x - 0.0).abs() < 0.01
+            && (beta.x - 30.0).abs() < 0.01
+            && (gamma.x - 60.0).abs() < 0.01,
+        "chips: {chips:?}, items: {alpha:?} {beta:?} {gamma:?}"
+    );
+}
+
+#[test]
 fn opposing_floats_share_header_band_through_inline_wrapper() {
     let tree = parse_html(include_str!("../../../render-repros/opposing-header-floats.html"));
     let layout = layout_dom(&tree, (900.0, 1000.0));

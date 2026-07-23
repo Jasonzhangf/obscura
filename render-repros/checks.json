@@ -74,6 +74,11 @@
     {"name": "grid shorthand creates explicit columns", "color": "#087f5b", "width": 287, "height": 60, "count": 3},
     {"name": "custom property grid shorthand creates explicit columns", "color": "#1971c2", "width": 287, "height": 60, "count": 3}
   ],
+  "inline-block-flex-items": [
+    {"name": "inline block title keeps its max content width", "color": "#087f5b", "x": 32, "y": 0, "width": 350, "height": 20},
+    {"name": "inline block list shrink wraps and stacks children", "color": "#1971c2", "x": 525, "y": 0, "width": 90, "height": 60},
+    {"name": "table stand-in does not blockify inline-block list", "color": "#c2255c", "x": 0, "y": 140, "width": 90, "height": 20}
+  ],
   "mixed-content-block": [
     {"name": "full-width block child", "color": "#ccddff", "width": 400}
   ],
