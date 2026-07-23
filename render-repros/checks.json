@@ -48,6 +48,10 @@
     {"name": "display contents flex sidebar starts at container edge", "color": "#7048e8", "x": 0, "y": 260, "width": 150, "height": 140},
     {"name": "display contents flex body keeps its intended inset", "color": "#c2255c", "x": 150, "y": 260, "width": 450, "height": 160}
   ],
+  "font-shorthand": [
+    {"name": "custom property font shorthand sets em geometry", "color": "#1971c2", "x": 0, "y": 0, "width": 200, "height": 80},
+    {"name": "later font shorthand replaces prior longhands", "color": "#e8590c", "x": 0, "y": 80, "width": 200, "height": 40}
+  ],
   "float-flow-bands": [
     {"name": "right float occupies its band", "color": "#1971c2", "x": 650, "y": 0, "width": 250, "height": 400},
     {"name": "float-avoiding intro uses available band", "color": "#087f5b", "x": 0, "y": 0, "width": 650, "height": 100},
