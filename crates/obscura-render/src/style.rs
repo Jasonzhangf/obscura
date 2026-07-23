@@ -91,15 +91,15 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
         style.font_size = Some(16.0);
         style.font_weight = Some("bold".to_string());
         style.margin = Edges { top: 21.0, bottom: 21.0, left: 0.0, right: 0.0 };
-    } else if tag == "p" || tag == "ul" || tag == "ol" {
+    } else if matches!(tag, "p" | "ul" | "ol" | "menu" | "dir") {
         style.margin = Edges { top: 16.0, bottom: 16.0, left: 0.0, right: 0.0 };
-        if tag == "ul" {
+        if matches!(tag, "ul" | "menu" | "dir") {
             style.list_style = Some(crate::ListStyle::Disc);
+            style.padding.left = 40.0;
         } else if tag == "ol" {
             style.list_style = Some(crate::ListStyle::Decimal);
+            style.padding.left = 40.0;
         }
-    } else if tag == "li" {
-        style.margin = Edges { top: 0.0, bottom: 0.0, left: 40.0, right: 0.0 };
     } else if tag == "b" || tag == "strong" {
         style.font_weight = Some("bold".to_string());
     } else if tag == "i" || tag == "em" || tag == "cite" || tag == "var" || tag == "dfn" || tag == "address" {
@@ -1757,6 +1757,9 @@ fn contextual_atom(value: &str, context: &LengthContext) -> Option<f32> {
     if let Some(value) = lower.strip_suffix("em").and_then(parse) {
         return Some(value * context.em_px);
     }
+    if let Some(value) = lower.strip_suffix("ex").and_then(parse) {
+        return Some(value * context.em_px * 0.528_320_3);
+    }
     if let Some(value) = lower.strip_suffix("vmin").and_then(parse) {
         return Some(value * context.vw.min(context.vh));
     }
@@ -2153,7 +2156,7 @@ fn is_font_size_token(value: &str) -> bool {
     {
         return true;
     }
-    ["px", "pt", "em", "rem", "vw", "vh", "vmin", "vmax", "%"]
+    ["px", "pt", "em", "ex", "rem", "vw", "vh", "vmin", "vmax", "%"]
     .iter()
     .any(|unit| lower.strip_suffix(unit).and_then(|number| number.parse::<f32>().ok()).is_some())
 }
@@ -2177,6 +2180,7 @@ fn dimension_value(tok: &str) -> crate::Dimension {
     // Order matters: check `rem` before `em`, `vmin`/`vmax` before `vw`/`vh`.
     if let Some(v) = lower.strip_suffix("rem").and_then(parse) { return Dimension::Rem(v); }
     if let Some(v) = lower.strip_suffix("em").and_then(parse) { return Dimension::Em(v); }
+    if let Some(v) = lower.strip_suffix("ex").and_then(parse) { return Dimension::Ex(v); }
     if let Some(v) = lower.strip_suffix("vmin").and_then(parse) { return Dimension::Vmin(v); }
     if let Some(v) = lower.strip_suffix("vmax").and_then(parse) { return Dimension::Vmax(v); }
     if let Some(v) = lower.strip_suffix("vw").and_then(parse) { return Dimension::Vw(v); }
@@ -2231,6 +2235,7 @@ fn set_margin_side(style: &mut LayoutStyle, idx: usize, value: &str) {
             style.margin_relative[idx] = None;
         }
         crate::Dimension::Em(_)
+        | crate::Dimension::Ex(_)
         | crate::Dimension::Rem(_)
         | crate::Dimension::Vw(_)
         | crate::Dimension::Vh(_)
@@ -2285,6 +2290,7 @@ fn set_padding_side(style: &mut LayoutStyle, idx: usize, value: &str) {
             style.padding_percent[idx] = None;
         }
         crate::Dimension::Em(_)
+        | crate::Dimension::Ex(_)
         | crate::Dimension::Rem(_)
         | crate::Dimension::Vw(_)
         | crate::Dimension::Vh(_)
@@ -2366,6 +2372,9 @@ fn px_value(tok: &str) -> Option<f32> {
     } else if n.ends_with("em") || n.ends_with("rem") {
         n = n.trim_end_matches(|c: char| c.is_ascii_alphabetic());
         scale = 16.0; // 1em = 16px
+    } else if n.ends_with("ex") {
+        n = n.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+        scale = 16.0 * 0.528_320_3;
     } else if n.ends_with('%') {
         n = &n[..n.len() - 1];
         scale = 16.0 / 100.0;

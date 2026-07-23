@@ -133,9 +133,11 @@ pub enum Dimension {
     /// Font-relative and viewport-relative units, kept unresolved at parse
     /// time (the element font-size and viewport are not known then) and
     /// resolved to `Px` during `dom::layout_dom`'s top-down pass via
-    /// [`Dimension::resolve`]. Resolving em/rem/vw against a hardcoded 16px at
+    /// [`Dimension::resolve`]. Resolving font/viewport units against a
+    /// hardcoded 16px at
     /// parse time (the old behavior) silently corrupted every relative length.
     Em(f32),
+    Ex(f32),
     Rem(f32),
     Vw(f32),
     Vh(f32),
@@ -151,6 +153,10 @@ impl Dimension {
     pub fn resolve(self, em_px: f32, rem_px: f32, vw: f32, vh: f32) -> Dimension {
         match self {
             Dimension::Em(v) => Dimension::Px(v * em_px),
+            // Liberation Sans is the deterministic generic sans face used by
+            // the renderer. This is its x-height as a fraction of the em,
+            // matching Chromium's generic sans face on the capture host.
+            Dimension::Ex(v) => Dimension::Px(v * em_px * 0.528_320_3),
             Dimension::Rem(v) => Dimension::Px(v * rem_px),
             Dimension::Vw(v) => Dimension::Px(v * vw),
             Dimension::Vh(v) => Dimension::Px(v * vh),
@@ -813,6 +819,7 @@ fn dimension(v: Dimension) -> taffy::style::Dimension {
         // through unresolved, fall back to its raw magnitude (em/rem ~16px)
         // rather than panicking.
         Dimension::Em(v) | Dimension::Rem(v) => taffy::style::Dimension::length(v * 16.0),
+        Dimension::Ex(v) => taffy::style::Dimension::length(v * 16.0 * 0.528_320_3),
         Dimension::Vw(v) | Dimension::Vh(v) | Dimension::Vmin(v) | Dimension::Vmax(v) => taffy::style::Dimension::length(v),
     }
 }

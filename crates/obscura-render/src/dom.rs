@@ -146,6 +146,7 @@ pub(crate) fn resolve_translate(d: crate::Dimension, basis: f32) -> f32 {
         crate::Dimension::Px(px) => px,
         crate::Dimension::Percent(p) => p * basis,
         crate::Dimension::Em(v) | crate::Dimension::Rem(v) => v * 16.0,
+        crate::Dimension::Ex(v) => v * 16.0 * 0.528_320_3,
         crate::Dimension::Vw(v)
         | crate::Dimension::Vh(v)
         | crate::Dimension::Vmin(v)
@@ -2860,10 +2861,76 @@ fn build_children_with_float_zone(
         }
     }
     if float_count >= 2 {
-        let run_children: Vec<taffy::NodeId> = dom_children[float_idx..run_end]
+        let mut run_children: Vec<taffy::NodeId> = dom_children[float_idx..run_end]
             .iter()
+            // Formatting whitespace between floats does not generate an
+            // in-flow flex item or consume horizontal space.
+            .filter(|&&cid| styles.get(&cid).and_then(|s| s.float) == float_side)
             .flat_map(|&cid| build_any(tree, cid, taffy_tree, id_map, words, engine, ifc_items, styles))
             .collect();
+        // A common navigation-bar shape is a run of left floats followed by
+        // one right float. The right float still scans the current float band:
+        // it does not start a new row merely because multiple left floats
+        // precede it. Keep the run in one wrapping row and use an auto inline
+        // margin to reserve all remaining space before the opposing float.
+        //
+        // This stays deliberately narrower than a general float manager. In
+        // particular, multiple right floats have reverse source-order
+        // placement semantics and need their own representation.
+        let trailing_right = (float_side == Some(crate::Float::Left)
+            && dom_children
+                .get(run_end)
+                .and_then(|cid| styles.get(cid))
+                .and_then(|style| style.float)
+                == Some(crate::Float::Right))
+        .then(|| dom_children[run_end]);
+        if let Some(right_dom) = trailing_right {
+            let right = build(
+                tree,
+                right_dom,
+                taffy_tree,
+                id_map,
+                words,
+                engine,
+                ifc_items,
+                styles,
+            );
+            if let Some(right) = right {
+                if let Ok(current) = taffy_tree.style(right) {
+                    let mut pushed_right = current.clone();
+                    pushed_right.margin.left =
+                        taffy::style::LengthPercentageAuto::auto();
+                    let _ = taffy_tree.set_style(right, pushed_right);
+                }
+                run_children.push(right);
+                let row_style = taffy::Style {
+                    display: taffy::style::Display::Flex,
+                    flex_direction: taffy::FlexDirection::Row,
+                    flex_wrap: taffy::FlexWrap::Wrap,
+                    align_items: Some(taffy::AlignItems::FLEX_START),
+                    size: taffy::Size {
+                        width: taffy::Dimension::percent(1.0),
+                        height: taffy::Dimension::auto(),
+                    },
+                    ..Default::default()
+                };
+                if let Ok(row) = taffy_tree.new_with_children(row_style, &run_children) {
+                    result.push(row);
+                }
+                result.extend(build_children_with_float_zone(
+                    tree,
+                    parent_id,
+                    &dom_children[run_end + 1..],
+                    taffy_tree,
+                    id_map,
+                    words,
+                    engine,
+                    ifc_items,
+                    styles,
+                ));
+                return result;
+            }
+        }
         let row_style = taffy::Style {
             display: taffy::style::Display::Flex,
             flex_direction: taffy::FlexDirection::Row,
