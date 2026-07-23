@@ -787,19 +787,18 @@ fn rect_lp(e: Edges) -> taffy::Rect<taffy::style::LengthPercentage> {
 }
 
 fn rect_auto(e: Edges, auto: [bool; 4]) -> taffy::Rect<taffy::style::LengthPercentageAuto> {
-    // NOTE: `margin: auto` is parsed (see `margin_auto`) but intentionally not
-    // emitted as taffy `Auto` yet. In our architecture most text containers are
-    // promoted to synthetic flex rows for inline layout, and an auto margin in
-    // a flex row absorbs the row's free space and flings a wide child far to
-    // one side (it mangled Wikipedia taxobox timelines). Honoring auto-margin
-    // centering safely needs a real block formatting context; treat as 0 (the
-    // element's normal-flow position) until then.
-    let _ = auto;
+    let side = |value, is_auto| {
+        if is_auto {
+            taffy::style::LengthPercentageAuto::auto()
+        } else {
+            taffy::style::LengthPercentageAuto::length(value)
+        }
+    };
     taffy::Rect {
-        top: taffy::style::LengthPercentageAuto::length(e.top),
-        right: taffy::style::LengthPercentageAuto::length(e.right),
-        bottom: taffy::style::LengthPercentageAuto::length(e.bottom),
-        left: taffy::style::LengthPercentageAuto::length(e.left),
+        top: side(e.top, auto[0]),
+        right: side(e.right, auto[1]),
+        bottom: side(e.bottom, auto[2]),
+        left: side(e.left, auto[3]),
     }
 }
 
@@ -836,6 +835,33 @@ mod tests {
             out.children[0].border_box.y,
             out.children[1].border_box.y
         );
+    }
+
+    #[test]
+    fn block_auto_margins_absorb_horizontal_free_space() {
+        let centered = LayoutStyle {
+            display: Display::Block,
+            width: Dimension::Px(300.0),
+            height: Dimension::Px(40.0),
+            margin_auto: [false, true, false, true],
+            ..Default::default()
+        };
+        let pushed_end = LayoutStyle {
+            display: Display::Block,
+            width: Dimension::Px(200.0),
+            height: Dimension::Px(40.0),
+            margin: Edges { right: 50.0, ..Default::default() },
+            margin_auto: [false, false, false, true],
+            ..Default::default()
+        };
+        let root = LayoutNode {
+            style: make_box(Display::Block, 900.0, 200.0),
+            text: None,
+            children: vec![LayoutNode::leaf(centered), LayoutNode::leaf(pushed_end)],
+        };
+        let out = layout(&root, (900.0, 200.0));
+        assert!((out.children[0].border_box.x - 300.0).abs() < 0.01);
+        assert!((out.children[1].border_box.x - 650.0).abs() < 0.01);
     }
 
     #[test]
