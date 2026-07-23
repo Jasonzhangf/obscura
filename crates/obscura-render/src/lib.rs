@@ -197,6 +197,10 @@ pub struct LayoutStyle {
     /// percentage, so this is resolved to px during `dom::layout_dom`'s top-down
     /// pass once the containing-block width is known.
     pub margin_percent: [Option<f32>; 4],
+    /// Font- and viewport-relative margin lengths (top, right, bottom, left).
+    /// These retain their unit until the top-down pass knows the element font
+    /// size, root font size, and viewport dimensions.
+    pub margin_relative: [Option<Dimension>; 4],
     pub padding: Edges,
     /// Percentage padding per side (top, right, bottom, left) as a 0..1
     /// fraction, `None` when the side is a fixed length. All four sides resolve
@@ -206,6 +210,9 @@ pub struct LayoutStyle {
     /// resolved to px in `dom::layout_dom`'s top-down pass and written back into
     /// `padding`, which then feeds taffy as a fixed length.
     pub padding_percent: [Option<f32>; 4],
+    /// Font- and viewport-relative padding lengths (top, right, bottom, left),
+    /// resolved alongside `margin_relative` during the top-down pass.
+    pub padding_relative: [Option<Dimension>; 4],
     pub border: Edges,
     /// `border-radius` (uniform; the first value of the shorthand). Rounds the
     /// background fill and border. In px after resolution.

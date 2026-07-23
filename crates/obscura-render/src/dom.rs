@@ -448,13 +448,38 @@ pub fn layout_dom_with_images(
                 }
                 inh.box_sizing = style.box_sizing;
 
-                // Percentage padding/margin resolve against the containing
-                // block WIDTH on every side (per CSS: `padding-top:56.25%` in a
-                // 1000px block is 562.5px, not a fraction of the height). The
-                // f32 Edges cannot carry a percentage, so bake the resolved px
-                // back into `padding`/`margin`, which then feed taffy.
+                // Resolve font/viewport-relative box edges now that their
+                // reference sizes are known. Percentage padding/margin then
+                // resolve against the containing block WIDTH on every side
+                // (per CSS: `padding-top:56.25%` in a 1000px block is 562.5px,
+                // not a fraction of the height). Bake the resolved px back into
+                // `padding`/`margin`, which then feed taffy.
                 let cb_w = inh.cb_width;
                 for i in 0..4 {
+                    if let Some(relative) = style.padding_relative[i] {
+                        if let crate::Dimension::Px(px) =
+                            relative.resolve(em_px, root_fs, vw, vh)
+                        {
+                            match i {
+                                0 => style.padding.top = px.max(0.0),
+                                1 => style.padding.right = px.max(0.0),
+                                2 => style.padding.bottom = px.max(0.0),
+                                _ => style.padding.left = px.max(0.0),
+                            }
+                        }
+                    }
+                    if let Some(relative) = style.margin_relative[i] {
+                        if let crate::Dimension::Px(px) =
+                            relative.resolve(em_px, root_fs, vw, vh)
+                        {
+                            match i {
+                                0 => style.margin.top = px,
+                                1 => style.margin.right = px,
+                                2 => style.margin.bottom = px,
+                                _ => style.margin.left = px,
+                            }
+                        }
+                    }
                     if let Some(frac) = style.padding_percent[i] {
                         let px = (frac * cb_w).max(0.0);
                         match i {

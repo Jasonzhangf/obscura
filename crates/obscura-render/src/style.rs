@@ -1672,12 +1672,31 @@ fn set_margin_side(style: &mut LayoutStyle, idx: usize, value: &str) {
     let is_auto = v.eq_ignore_ascii_case("auto");
     if let Some(frac) = percent_fraction(v) {
         style.margin_percent[idx] = Some(frac);
+        style.margin_relative[idx] = None;
         set_margin_px(&mut style.margin, idx, 0.0);
         style.margin_auto[idx] = false;
         return;
     }
-    let px = if is_auto { 0.0 } else { px(value).unwrap_or(0.0) };
-    set_margin_px(&mut style.margin, idx, px);
+    let dimension = dimension_value(v);
+    match dimension {
+        crate::Dimension::Px(px) => {
+            set_margin_px(&mut style.margin, idx, px);
+            style.margin_relative[idx] = None;
+        }
+        crate::Dimension::Em(_)
+        | crate::Dimension::Rem(_)
+        | crate::Dimension::Vw(_)
+        | crate::Dimension::Vh(_)
+        | crate::Dimension::Vmin(_)
+        | crate::Dimension::Vmax(_) => {
+            set_margin_px(&mut style.margin, idx, 0.0);
+            style.margin_relative[idx] = Some(dimension);
+        }
+        _ => {
+            set_margin_px(&mut style.margin, idx, 0.0);
+            style.margin_relative[idx] = None;
+        }
+    }
     style.margin_auto[idx] = is_auto;
     style.margin_percent[idx] = None;
 }
@@ -1696,14 +1715,31 @@ fn set_margin_px(margin: &mut Edges, idx: usize, px: f32) {
 /// recorded in `padding_percent` and resolved against the containing-block
 /// width during the top-down pass; a length is stored directly.
 fn set_padding_side(style: &mut LayoutStyle, idx: usize, value: &str) {
-    if let Some(frac) = percent_fraction(value.trim()) {
+    let value = value.trim();
+    if let Some(frac) = percent_fraction(value) {
         style.padding_percent[idx] = Some(frac);
+        style.padding_relative[idx] = None;
         set_padding_px(&mut style.padding, idx, 0.0);
         return;
     }
-    if let Some(px) = px(value) {
-        set_padding_px(&mut style.padding, idx, px);
-        style.padding_percent[idx] = None;
+    let dimension = dimension_value(value);
+    match dimension {
+        crate::Dimension::Px(px) => {
+            set_padding_px(&mut style.padding, idx, px);
+            style.padding_relative[idx] = None;
+            style.padding_percent[idx] = None;
+        }
+        crate::Dimension::Em(_)
+        | crate::Dimension::Rem(_)
+        | crate::Dimension::Vw(_)
+        | crate::Dimension::Vh(_)
+        | crate::Dimension::Vmin(_)
+        | crate::Dimension::Vmax(_) => {
+            set_padding_px(&mut style.padding, idx, 0.0);
+            style.padding_relative[idx] = Some(dimension);
+            style.padding_percent[idx] = None;
+        }
+        _ => {}
     }
 }
 
@@ -2200,6 +2236,20 @@ mod tests {
         let s = compute_style("div", Some("margin-left: 10%"));
         assert_eq!(s.margin_percent[3], Some(0.1));
         assert!(!s.margin_auto[3]);
+    }
+
+    #[test]
+    fn relative_box_edges_remain_unresolved() {
+        let s = compute_style(
+            "div",
+            Some("font-size:20px;margin:15vh auto 2em 10vw;padding:1rem 2vmin"),
+        );
+        assert_eq!(s.margin_relative[0], Some(crate::Dimension::Vh(15.0)));
+        assert!(s.margin_auto[1]);
+        assert_eq!(s.margin_relative[2], Some(crate::Dimension::Em(2.0)));
+        assert_eq!(s.margin_relative[3], Some(crate::Dimension::Vw(10.0)));
+        assert_eq!(s.padding_relative[0], Some(crate::Dimension::Rem(1.0)));
+        assert_eq!(s.padding_relative[1], Some(crate::Dimension::Vmin(2.0)));
     }
 
     #[test]
