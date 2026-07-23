@@ -394,15 +394,13 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                 style.font_family = Some(v);
             }
         }
-        // Our engine has no real inline formatting context, so text-align is
-        // approximated the same way as align-items: it positions a block's
-        // (or column-flex's) children along the cross axis. See
-        // `to_taffy_style`'s block-to-flex-column promotion, which is what
-        // makes this actually take effect on plain block elements.
+        // Text alignment is inherited and applies to inline line boxes. It is
+        // deliberately separate from flex/grid `align-items`, which positions
+        // child boxes rather than text inside them.
         "text-align" => match value {
-            "right" => style.align_items = Some(taffy::AlignItems::FLEX_END),
-            "center" => style.align_items = Some(taffy::AlignItems::CENTER),
-            "left" | "start" | "justify" => style.align_items = Some(taffy::AlignItems::FLEX_START),
+            "right" | "end" => style.text_align = Some(taffy::AlignItems::FLEX_END),
+            "center" => style.text_align = Some(taffy::AlignItems::CENTER),
+            "left" | "start" | "justify" => style.text_align = Some(taffy::AlignItems::FLEX_START),
             _ => {}
         },
         "align-items" => {

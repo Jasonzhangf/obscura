@@ -341,6 +341,7 @@ pub fn layout_dom_with_images(
             font_size: Option<f32>,
             font_weight: Option<String>,
             font_family: Option<String>,
+            text_align: Option<taffy::AlignItems>,
             visibility_hidden: bool,
             opacity_product: f32,
             list_style: crate::ListStyle,
@@ -362,6 +363,7 @@ pub fn layout_dom_with_images(
                     font_size: None,
                     font_weight: None,
                     font_family: None,
+                    text_align: None,
                     visibility_hidden: false,
                     opacity_product: 1.0,
                     // CSS initial value of list-style-type.
@@ -466,6 +468,7 @@ pub fn layout_dom_with_images(
                 }
                 match &style.font_weight { Some(w) => inh.font_weight = Some(w.clone()), None => style.font_weight = inh.font_weight.clone() }
                 match &style.font_family { Some(f) => inh.font_family = Some(f.clone()), None => style.font_family = inh.font_family.clone() }
+                match style.text_align { Some(a) => inh.text_align = Some(a), None => style.text_align = inh.text_align }
                 inh.visibility_hidden = style.visibility_hidden.unwrap_or(inh.visibility_hidden);
                 inh.opacity_product *= style.opacity.unwrap_or(1.0);
                 style.effectively_invisible = inh.visibility_hidden || inh.opacity_product < 0.02;
@@ -2056,17 +2059,11 @@ fn build(
         taffy_style.flex_direction = taffy::FlexDirection::Row;
         taffy_style.flex_wrap = taffy::FlexWrap::Wrap;
 
-        // Before promotion, `align_items` was the horizontal-position stand-in
-        // for a column container (from `text-align` or `<center>`; see
-        // `style::apply_value`'s "text-align" arm): correct there, since a
-        // column's cross axis is horizontal. The promoted container's *main*
-        // axis is horizontal instead, so that same "where should content sit
-        // horizontally" intent now belongs on `justify_content`, not
-        // `align_items` — otherwise e.g. `text-align: right` shoves wrapped
-        // text to the bottom of its line (the new cross axis) rather than to
-        // the right. Real `justify-content` from actual CSS wins if present.
+        // The promoted container's main axis is horizontal, so text alignment
+        // belongs on `justify_content`. Real `justify-content` from actual CSS
+        // wins if present.
         if style.justify_content.is_none() {
-            taffy_style.justify_content = match style.align_items {
+            taffy_style.justify_content = match style.text_align {
                 Some(taffy::AlignItems::FLEX_END) => Some(taffy::JustifyContent::FLEX_END),
                 Some(taffy::AlignItems::CENTER) => Some(taffy::JustifyContent::CENTER),
                 _ => taffy_style.justify_content,
@@ -2349,11 +2346,11 @@ fn run_leaf_style() -> taffy::Style {
 
 /// Style for an anonymous inline-run wrapper: a full-width block-level box
 /// whose interior is the flex-wrap approximation of an inline formatting
-/// context. The parent's `text-align` stand-in (align_items) moves the run's
-/// line content via justify-content, exactly as the old whole-container
+/// context. The parent's `text-align` moves the run's line content via
+/// justify-content, exactly as the old whole-container
 /// promotion did, but scoped to the run so sibling blocks stay full width.
 fn run_wrapper_style(parent: &crate::LayoutStyle) -> taffy::Style {
-    let justify = match parent.align_items {
+    let justify = match parent.text_align {
         Some(taffy::AlignItems::FLEX_END) => Some(taffy::JustifyContent::FLEX_END),
         Some(taffy::AlignItems::CENTER) => Some(taffy::JustifyContent::CENTER),
         _ => None,

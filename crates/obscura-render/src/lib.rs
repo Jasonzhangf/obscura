@@ -278,6 +278,10 @@ pub struct LayoutStyle {
     /// resolves it to a bundled face (Liberation Sans/Serif/Mono) the way
     /// Chromium picks a generic family on this host.
     pub font_family: Option<String>,
+    /// Inherited `text-align`, represented with the matching horizontal
+    /// alignment keywords. Kept separate from flex/grid `align-items`: using
+    /// one field for both made `text-align:left` shrink-wrap flex children.
+    pub text_align: Option<taffy::AlignItems>,
     pub align_items: Option<taffy::AlignItems>,
     pub flex_direction: Option<taffy::FlexDirection>,
     pub flex_wrap: Option<taffy::FlexWrap>,
@@ -644,16 +648,12 @@ pub(crate) fn to_taffy_style(style: &LayoutStyle) -> Style {
         BoxSizing::Inherit => taffy::BoxSizing::ContentBox,
     };
 
-    // A block box that wants non-default cross-axis alignment (from
-    // text-align: center/right, the only way our engine currently sets
-    // align_items on a block-level element) needs a flex column to have any
-    // effect at all: taffy's native block algorithm (used for plain
-    // Display::Block) has no align-items concept whatsoever, it only ever
-    // places block children at the start edge. Promote such boxes to a flex
-    // column, matching the same column-flex approximation already used for
-    // elements like <td> and <center>.
+    // A block box with centered/right inline content needs a flex-column
+    // stand-in because taffy's native block algorithm has no line alignment.
+    // `text_align` is separate from real flex/grid `align-items`, so a
+    // text-align declaration never changes how flex children are sized.
     let promote_for_alignment = style.display == Display::Block
-        && matches!(style.align_items, Some(taffy::AlignItems::CENTER) | Some(taffy::AlignItems::FLEX_END));
+        && matches!(style.text_align, Some(taffy::AlignItems::CENTER) | Some(taffy::AlignItems::FLEX_END));
 
     s.display = match style.display {
         Display::Block if promote_for_alignment => taffy::style::Display::Flex,
@@ -665,6 +665,7 @@ pub(crate) fn to_taffy_style(style: &LayoutStyle) -> Style {
     };
     if promote_for_alignment {
         s.flex_direction = taffy::FlexDirection::Column;
+        s.align_items = style.text_align;
     }
     if let Some(fd) = style.flex_direction {
         s.flex_direction = fd;
@@ -704,8 +705,13 @@ pub(crate) fn to_taffy_style(style: &LayoutStyle) -> Style {
             s.aspect_ratio = Some(ar);
         }
     }
-    if let Some(ai) = style.align_items {
-        s.align_items = Some(ai);
+    if style.display != Display::Block {
+        if let Some(ai) = style.align_items {
+            s.align_items = Some(ai);
+        }
+    } else if !promote_for_alignment {
+        // `align-items` has no effect on a block formatting context.
+        s.align_items = None;
     }
     if let Some(jc) = style.justify_content {
         s.justify_content = Some(jc);
