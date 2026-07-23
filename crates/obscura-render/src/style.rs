@@ -365,21 +365,9 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         "font-size" => {
             // Absolute lengths resolve now; font/viewport-relative ones defer
             // to the inheritance pass (they need parent/root font-size).
-            match dimension_value(value) {
-                crate::Dimension::Px(p) => {
-                    style.font_size = Some(p);
-                    style.font_size_raw = None;
-                }
-                crate::Dimension::Auto => {
-                    // Keyword sizes (medium/small/large/...) or unknown; map the
-                    // common ones, else leave to inherit.
-                    if let Some(px) = font_size_keyword(value.trim()) {
-                        style.font_size = Some(px);
-                    }
-                }
-                rel => style.font_size_raw = Some(rel),
-            }
+            apply_font_size(style, value);
         }
+        "font" => apply_font_shorthand(style, value),
         "font-weight" => {
             // Normalize to "bold"/"normal" (consumers test for "bold"). Numeric
             // >= 600 and `bold`/`bolder` are bold; others normal.
@@ -1897,6 +1885,105 @@ fn font_size_keyword(v: &str) -> Option<f32> {
     })
 }
 
+fn apply_font_size(style: &mut LayoutStyle, value: &str) {
+    match dimension_value(value) {
+        crate::Dimension::Px(p) => {
+            style.font_size = Some(p);
+            style.font_size_raw = None;
+        }
+        crate::Dimension::Auto => {
+            // Keyword sizes (medium/small/large/...) or unknown; map the
+            // common ones, else leave to inherit.
+            if let Some(px) = font_size_keyword(value.trim()) {
+                style.font_size = Some(px);
+                style.font_size_raw = None;
+            }
+        }
+        rel => {
+            style.font_size = None;
+            style.font_size_raw = Some(rel);
+        }
+    }
+}
+
+/// Parse the layout-relevant portion of the CSS `font` shorthand:
+/// `[style || variant || weight || stretch]? size [/ line-height]? family`.
+///
+/// As in Gecko's shorthand expansion, omitted longhands reset to their
+/// initial values instead of inheriting a previously cascaded declaration.
+/// We do not model variant/stretch, but still accept their keywords before
+/// the required size so modern design-system declarations reach the size,
+/// line-height, weight, style, and family fields that affect our layout.
+fn apply_font_shorthand(style: &mut LayoutStyle, value: &str) {
+    let tokens = split_ws_paren(value);
+    let Some((size_index, size, attached_line_height)) =
+        tokens.iter().enumerate().find_map(|(index, token)| {
+            let (candidate, line_height) = token.split_once('/').unwrap_or((token, ""));
+            is_font_size_token(candidate).then_some((index, candidate, line_height))
+        })
+    else {
+        return;
+    };
+
+    let mut family_index = size_index + 1;
+    let mut line_height = (!attached_line_height.is_empty()).then_some(attached_line_height);
+    if line_height.is_none() && family_index < tokens.len() {
+        if tokens[family_index] == "/" {
+            family_index += 1;
+            if family_index < tokens.len() {
+                line_height = Some(tokens[family_index]);
+                family_index += 1;
+            }
+        } else if let Some(after_slash) = tokens[family_index].strip_prefix('/') {
+            if !after_slash.is_empty() {
+                line_height = Some(after_slash);
+            }
+            family_index += 1;
+        }
+    }
+    if family_index >= tokens.len() {
+        return;
+    }
+
+    // The shorthand resets every constituent before applying supplied values.
+    style.font_style_italic = Some(false);
+    style.font_weight = Some("normal".to_string());
+    style.line_height = Some(crate::LineHeight::Normal);
+    for token in &tokens[..size_index] {
+        let lower = token.to_ascii_lowercase();
+        if lower == "italic" || lower.starts_with("oblique") {
+            style.font_style_italic = Some(true);
+        } else if lower == "bold"
+            || lower == "bolder"
+            || lower.parse::<u32>().map(|weight| weight >= 600).unwrap_or(false)
+        {
+            style.font_weight = Some("bold".to_string());
+        }
+    }
+    apply_font_size(style, size);
+    if let Some(line_height) = line_height {
+        apply_value(style, "line-height", line_height);
+    }
+    style.font_family = Some(tokens[family_index..].join(" ").to_ascii_lowercase());
+}
+
+fn is_font_size_token(value: &str) -> bool {
+    let lower = value.trim().to_ascii_lowercase();
+    if lower == "0" || font_size_keyword(&lower).is_some() {
+        return true;
+    }
+    if lower.starts_with("calc(")
+        || lower.starts_with("min(")
+        || lower.starts_with("max(")
+        || lower.starts_with("clamp(")
+    {
+        return true;
+    }
+    ["px", "pt", "em", "rem", "vw", "vh", "vmin", "vmax", "%"]
+    .iter()
+    .any(|unit| lower.strip_suffix(unit).and_then(|number| number.parse::<f32>().ok()).is_some())
+}
+
 fn dimension_value(tok: &str) -> crate::Dimension {
     use crate::Dimension;
     let n = tok.trim();
@@ -2472,6 +2559,31 @@ mod tests {
         assert_eq!(s.display, Display::Flex);
         assert_eq!(s.width, crate::Dimension::Px(200.0));
         assert_eq!(s.height, crate::Dimension::Px(50.0));
+    }
+
+    #[test]
+    fn font_shorthand_expands_layout_fields_and_resets_omissions() {
+        let s = compute_style(
+            "div",
+            Some(
+                "font-style:italic;font-weight:bold;line-height:2;\
+                 font:normal small-caps 500 64px/60px \"Google Sans\", sans-serif",
+            ),
+        );
+        assert_eq!(s.font_size, Some(64.0));
+        assert_eq!(s.line_height, Some(crate::LineHeight::Px(60.0)));
+        assert_eq!(s.font_weight.as_deref(), Some("normal"));
+        assert_eq!(s.font_style_italic, Some(false));
+        assert_eq!(s.font_family.as_deref(), Some("\"google sans\", sans-serif"));
+
+        let reset = compute_style(
+            "div",
+            Some("font-style:italic;font-weight:bold;line-height:2;font:20px Arial"),
+        );
+        assert_eq!(reset.font_size, Some(20.0));
+        assert_eq!(reset.line_height, Some(crate::LineHeight::Normal));
+        assert_eq!(reset.font_weight.as_deref(), Some("normal"));
+        assert_eq!(reset.font_style_italic, Some(false));
     }
 
     #[test]
