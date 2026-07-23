@@ -32,7 +32,15 @@ def components(array, color):
         width = slices[1].stop - slices[1].start
         area = int(mask[slices].sum())
         if area >= 20:
-            found.append({"width": width, "height": height, "area": area})
+            found.append(
+                {
+                    "x": slices[1].start,
+                    "y": slices[0].start,
+                    "width": width,
+                    "height": height,
+                    "area": area,
+                }
+            )
     return found
 
 
@@ -99,9 +107,11 @@ def main():
                 expected_count = check.get("count", 1)
                 matches = []
                 for component in components(array, rgb(check["color"])):
+                    x_ok = "x" not in check or abs(component["x"] - check["x"]) <= 1
+                    y_ok = "y" not in check or abs(component["y"] - check["y"]) <= 1
                     width_ok = "width" not in check or abs(component["width"] - check["width"]) <= 1
                     height_ok = "height" not in check or abs(component["height"] - check["height"]) <= 1
-                    if width_ok and height_ok:
+                    if x_ok and y_ok and width_ok and height_ok:
                         matches.append(component)
                 passed = len(matches) >= expected_count
                 fixture["behavior"][engine].append(

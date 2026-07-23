@@ -4,6 +4,12 @@
     {"name": "teal fill", "color": "#008080", "width": 400, "height": 100},
     {"name": "purple fill", "color": "#800080", "width": 400, "height": 100}
   ],
+  "absolute-containing-block": [
+    {"name": "nearest positioned ancestor", "color": "#087f5b", "x": 85, "y": 75, "width": 80, "height": 60},
+    {"name": "end insets use padding box", "color": "#1971c2", "x": 350, "y": 200, "width": 70, "height": 50},
+    {"name": "percent insets use padding box", "color": "#f08c00", "x": 260, "y": 160, "width": 30, "height": 30},
+    {"name": "fixed viewport containing block", "color": "#a61e4d", "x": 520, "y": 40, "width": 90, "height": 55}
+  ],
   "box-sizing": [
     {"name": "content-box fixed", "color": "#22aa55", "width": 220, "height": 90},
     {"name": "border-box fixed", "color": "#228866", "width": 190, "height": 60},
