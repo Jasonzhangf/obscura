@@ -2122,13 +2122,29 @@ class Element extends Node {
     const t = this.tagName;
     return t === 'HTML' || t === 'BODY';
   }
-  // No layout engine, so there is no real overflow to scroll. We still track a
-  // scroll offset so scrollTop/scrollLeft round-trip and the scroll methods
-  // below can report a position, which is what infinite-scroll code reads back.
+  // No layout engine, so there is no real overflow to scroll and the offset is
+  // deliberately NOT clamped: without real geometry any synthetic max is a
+  // guess, and a max derived from a stub scroll box pins scrollTop at 0, which
+  // deadlocks scroll-driven lazy loaders (no scroll -> no content -> no scroll).
+  // We track the offset so scrollTop/scrollLeft round-trip, and fire a scroll
+  // event on direct assignment -- lazy loaders that set `el.scrollTop = N` rely
+  // on that event, and scrollTo/scrollBy below would otherwise be its only source.
   get scrollTop() { return this._scrollTop || 0; }
-  set scrollTop(v) { v = +v; this._scrollTop = Number.isFinite(v) && v > 0 ? v : 0; }
+  set scrollTop(v) {
+    v = +v;
+    const nv = Number.isFinite(v) && v > 0 ? v : 0;
+    const changed = nv !== (this._scrollTop || 0);
+    this._scrollTop = nv;
+    if (changed && !this._scrollSuppress) this._fireScroll();
+  }
   get scrollLeft() { return this._scrollLeft || 0; }
-  set scrollLeft(v) { v = +v; this._scrollLeft = Number.isFinite(v) && v > 0 ? v : 0; }
+  set scrollLeft(v) {
+    v = +v;
+    const nv = Number.isFinite(v) && v > 0 ? v : 0;
+    const changed = nv !== (this._scrollLeft || 0);
+    this._scrollLeft = nv;
+    if (changed && !this._scrollSuppress) this._fireScroll();
+  }
   getBoundingClientRect() {
     globalThis.__obscura_click_target = this;
     // documentElement and body span the full viewport. Without this every
@@ -2187,15 +2203,17 @@ class Element extends Node {
   set ariaSelected(v) { if (v == null) this.removeAttribute('aria-selected'); else this.setAttribute('aria-selected', String(v)); }
   scrollIntoView() { globalThis.__obscura_click_target = this; }
   // scrollTo/scrollBy/scroll accept either (x, y) or a ScrollToOptions object.
-  // Without layout the offset cannot be clamped to a real max, but updating it
-  // and firing a scroll event lets scroll-driven lazy loaders advance instead
-  // of throwing "scrollBy is not a function".
+  // The setters fire a scroll event of their own, so suppress the per-axis ones
+  // here and emit a single event for the whole movement, the way a real browser
+  // coalesces one scroll per scroll operation rather than one per axis.
   scrollTo(x, y) {
     let left, top;
     if (x !== null && typeof x === 'object') { left = x.left; top = x.top; }
     else { left = x; top = y; }
+    this._scrollSuppress = true;
     if (left !== undefined) this.scrollLeft = +left || 0;
     if (top !== undefined) this.scrollTop = +top || 0;
+    this._scrollSuppress = false;
     this._fireScroll();
   }
   scroll(x, y) { this.scrollTo(x, y); }
@@ -2203,8 +2221,10 @@ class Element extends Node {
     let dl, dt;
     if (x !== null && typeof x === 'object') { dl = x.left; dt = x.top; }
     else { dl = x; dt = y; }
+    this._scrollSuppress = true;
     this.scrollLeft = (this.scrollLeft || 0) + (+dl || 0);
     this.scrollTop = (this.scrollTop || 0) + (+dt || 0);
+    this._scrollSuppress = false;
     this._fireScroll();
   }
   _fireScroll() {
