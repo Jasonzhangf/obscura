@@ -1943,17 +1943,15 @@ class Element extends Node {
         el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
       }
 
-      if (typeof el.onload === 'function') {
-        try { el.onload(); } catch(e) {}
-      } else {
-        var onloadAttr = el.getAttribute('onload');
-        if (onloadAttr) try { (0, eval)(onloadAttr); } catch(e) {}
-      }
+      // Dispatch through the element so the onload property/attribute and any
+      // addEventListener('load', ...) listeners all run. Calling el.onload()
+      // directly bypasses listeners registered via addEventListener.
+      el.dispatchEvent(new Event('load'));
     }).catch(() => {
       el._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', fullUrl, el);
       el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
 
-      if (typeof el.onload === 'function') try { el.onload(); } catch(e) {}
+      el.dispatchEvent(new Event('load'));
     });
   }
   get contentDocument() {
@@ -6198,9 +6196,33 @@ class _IframeDocument {
   get implementation() { return document.implementation; }
   get styleSheets() { return []; }
 
-  addEventListener() {}
-  removeEventListener() {}
-  dispatchEvent() { return true; }
+  addEventListener(type, listener) {
+    if (typeof listener !== 'function') return;
+    if (!this._listeners) this._listeners = Object.create(null);
+    const list = this._listeners[type] || (this._listeners[type] = []);
+    if (!list.includes(listener)) list.push(listener);
+  }
+  removeEventListener(type, listener) {
+    const list = this._listeners && this._listeners[type];
+    if (!list) return;
+    const index = list.indexOf(listener);
+    if (index !== -1) list.splice(index, 1);
+  }
+  dispatchEvent(event) {
+    const type = event && event.type;
+    if (!type) return true;
+    const list = this._listeners && this._listeners[type];
+    if (list) {
+      for (const listener of list.slice()) {
+        try { listener.call(this, event); } catch (error) { console.error(error); }
+      }
+    }
+    const handler = this['on' + type];
+    if (typeof handler === 'function') {
+      try { handler.call(this, event); } catch (error) { console.error(error); }
+    }
+    return !event.defaultPrevented;
+  }
 
   write(html) {
     if (this._body) this._body.innerHTML += html;
