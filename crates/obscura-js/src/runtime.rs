@@ -1541,6 +1541,132 @@ mod tests {
         assert_eq!(result, serde_json::json!(["P", "A"]));
     }
 
+    /// Issue #463: `<template>` contents are parsed into the node's
+    /// `template_contents` document, but no op exposed it, so `.content` handed
+    /// back a fabricated empty fragment and the parsed markup was unreachable.
+    #[test]
+    fn template_content_exposes_parsed_markup() {
+        let mut rt = setup_runtime(
+            r#"<body><template id="t"><p class="row">a</p><p class="row">b</p></template></body>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+                const t = document.getElementById('t');
+                return [
+                    t.content.childNodes.length,
+                    t.content.querySelectorAll('.row').length,
+                    t.content.firstElementChild.textContent,
+                    t.innerHTML,
+                    t.content.nodeType,
+                    t.content instanceof DocumentFragment,
+                    // Identity is stable: frameworks stash `.content` and reuse it.
+                    t.content === t.content,
+                    // The children stay off the element itself, per the HTML spec.
+                    t.childNodes.length,
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                2,
+                2,
+                "a",
+                r#"<p class="row">a</p><p class="row">b</p>"#,
+                11,
+                true,
+                true,
+                0
+            ])
+        );
+    }
+
+    /// Issue #463: the same must hold for a template that arrives via innerHTML
+    /// rather than the initial document parse — that is how most frameworks
+    /// inject templates.
+    #[test]
+    fn template_content_works_for_templates_added_via_inner_html() {
+        let mut rt = setup_runtime(r#"<body><div id="host"></div></body>"#);
+        let result = rt
+            .evaluate(
+                r#"
+                const host = document.getElementById('host');
+                host.innerHTML = '<template id="t2"><li class="item">x</li></template>';
+                const t = document.getElementById('t2');
+                const stamped = t.content.cloneNode(true);
+                host.appendChild(stamped);
+                return [
+                    t.content.childNodes.length,
+                    t.content.querySelector('.item').textContent,
+                    host.querySelectorAll('li.item').length,
+                ];
+                "#,
+            )
+            .unwrap();
+        // cloneNode(true) of the content is the canonical stamping idiom.
+        assert_eq!(result, serde_json::json!([1, "x", 1]));
+    }
+
+    /// Issue #463: a template built with createElement has no parsed contents,
+    /// so `.content` must allocate a backing fragment on demand and round-trip
+    /// through innerHTML.
+    #[test]
+    fn template_content_round_trips_for_created_templates() {
+        let mut rt = setup_runtime(r#"<body></body>"#);
+        let result = rt
+            .evaluate(
+                r#"
+                const t = document.createElement('template');
+                t.innerHTML = '<span class="s">hi</span>';
+                return [
+                    t.content.childNodes.length,
+                    t.content.querySelector('.s').textContent,
+                    t.innerHTML,
+                    t.childNodes.length,
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([1, "hi", r#"<span class="s">hi</span>"#, 0])
+        );
+    }
+
+    /// Issue #463: serializing a `<template>` must emit its contents, or the
+    /// markup silently disappears from outerHTML/innerHTML round-trips — and
+    /// `cloneNode(true)`, which round-trips through outer_html, yields an empty
+    /// template.
+    #[test]
+    fn template_contents_survive_serialization_and_clone() {
+        let mut rt = setup_runtime(
+            r#"<body><template id="t"><li class="item">x</li></template></body>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+                const t = document.getElementById('t');
+                const clone = t.cloneNode(true);
+                return [
+                    t.outerHTML,
+                    document.body.innerHTML,
+                    clone.content.childNodes.length,
+                    clone.content.querySelector('.item').textContent,
+                    // The clone's contents are its own, not shared with the original.
+                    (clone.content.firstElementChild === t.content.firstElementChild),
+                ];
+                "#,
+            )
+            .unwrap();
+        let expected = r#"<template id="t"><li class="item">x</li></template>"#;
+        assert_eq!(
+            result,
+            serde_json::json!([expected, expected, 1, "x", false])
+        );
+    }
+
     #[test]
     fn append_child_flattens_document_fragment() {
         let mut rt = setup_runtime(r#"<main id="host"></main>"#);

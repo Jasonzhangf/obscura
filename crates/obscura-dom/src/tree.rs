@@ -603,6 +603,41 @@ impl DomTree {
         None
     }
 
+    /// The node holding a `<template>` element's contents.
+    ///
+    /// The parser puts template children in a separate contents document rather
+    /// than under the element (HTML spec), so this is the only way to reach
+    /// them. Templates built with `createElement` have no contents node yet, so
+    /// one is allocated on demand — `.content` must be usable either way.
+    ///
+    /// Returns `None` for a non-element node.
+    pub fn template_contents(&self, node_id: NodeId) -> Option<NodeId> {
+        {
+            let inner = self.inner.borrow();
+            let node = inner.nodes.get(node_id.index())?.as_ref()?;
+            match &node.data {
+                NodeData::Element { template_contents, .. } => {
+                    if let Some(existing) = *template_contents {
+                        return Some(existing);
+                    }
+                }
+                _ => return None,
+            }
+        }
+
+        // Borrow released above: `new_node` takes its own mutable borrow.
+        // Matches what the tree sink allocates for a parsed template.
+        let contents = self.new_node(NodeData::Document);
+        let mut inner = self.inner.borrow_mut();
+        if let Some(Some(node)) = inner.nodes.get_mut(node_id.index()) {
+            if let NodeData::Element { template_contents, .. } = &mut node.data {
+                *template_contents = Some(contents);
+                return Some(contents);
+            }
+        }
+        None
+    }
+
     pub fn ancestors(&self, node_id: NodeId) -> Vec<NodeId> {
         let inner = self.inner.borrow();
         let mut result = Vec::new();
@@ -726,6 +761,38 @@ impl DomTree {
 
             let new_id = self.new_node(node_data);
             self.append_child(dest_parent, new_id);
+
+            // A <template>'s children hang off a separate contents document, so
+            // the child walk below never reaches them. Worse, the cloned data
+            // carries the *source* tree's contents NodeId, which here indexes
+            // whatever unrelated node occupies that slot. Allocate a real
+            // contents node and queue the source contents' children into it, so
+            // the reference is remapped rather than left dangling (issue #463).
+            let src_contents = {
+                let inner = self.inner.borrow();
+                match inner.nodes.get(new_id.index()).and_then(|n| n.as_ref()) {
+                    Some(node) => match &node.data {
+                        NodeData::Element { template_contents, .. } => *template_contents,
+                        _ => None,
+                    },
+                    None => None,
+                }
+            };
+            if let Some(src_contents) = src_contents {
+                let dest_contents = self.new_node(NodeData::Document);
+                {
+                    let mut inner = self.inner.borrow_mut();
+                    if let Some(Some(node)) = inner.nodes.get_mut(new_id.index()) {
+                        if let NodeData::Element { template_contents, .. } = &mut node.data {
+                            *template_contents = Some(dest_contents);
+                        }
+                    }
+                }
+                // Onto the same stack, so nested templates stay iterative.
+                for child_id in source.children(src_contents).into_iter().rev() {
+                    stack.push((dest_contents, child_id));
+                }
+            }
 
             for child_id in source.children(src_id).into_iter().rev() {
                 stack.push((new_id, child_id));
