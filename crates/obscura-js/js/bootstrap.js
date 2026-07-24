@@ -2710,42 +2710,63 @@ class Document extends Node {
         }
         return null;
       },
-      firstChild() {
-        let child = this.currentNode.firstChild;
-        while (child) {
-          if (this._accept(child)) { this.currentNode = child; return child; }
-          child = child.nextSibling;
+      // DOM 6.1 "traverse children" (issue #469). The movers used to step
+      // straight to the next sibling when a node was not accepted, so a
+      // FILTER_SKIP node hid its children instead of exposing them. `edge` and
+      // `step` pick the direction: first/next for forward, last/previous for
+      // backward.
+      _traverseChildren(edge, step) {
+        let node = this.currentNode[edge];
+        while (node) {
+          const verdict = this._filter(node);
+          if (verdict === 1) { this.currentNode = node; return node; }
+          // Only SKIP leaves the children eligible; REJECT prunes the subtree.
+          if (verdict === 3) {
+            const child = node[edge];
+            if (child) { node = child; continue; }
+          }
+          // Subtree exhausted: step sideways, climbing out without passing
+          // root or the node the walk started from.
+          while (node) {
+            const sibling = node[step];
+            if (sibling) { node = sibling; break; }
+            const parent = node.parentNode;
+            if (!parent || parent === this.root || parent === this.currentNode) return null;
+            node = parent;
+          }
         }
         return null;
       },
-      lastChild() {
-        let child = this.currentNode.lastChild;
-        while (child) {
-          if (this._accept(child)) { this.currentNode = child; return child; }
-          child = child.previousSibling;
+      // DOM 6.1 "traverse siblings" (issue #469).
+      _traverseSiblings(edge, step) {
+        let node = this.currentNode;
+        if (node === this.root) return null;
+        for (;;) {
+          let sibling = node[step];
+          while (sibling) {
+            node = sibling;
+            const verdict = this._filter(node);
+            if (verdict === 1) { this.currentNode = node; return node; }
+            // Descend into a skipped sibling's subtree; a rejected one is
+            // off-limits, and a childless one has nothing to descend into.
+            sibling = node[edge];
+            if (verdict === 2 || !sibling) sibling = node[step];
+          }
+          node = node.parentNode;
+          if (!node || node === this.root) return null;
+          // An accepted parent is where the walk would go next, so there is no
+          // sibling to return.
+          if (this._filter(node) === 1) return null;
         }
-        return null;
       },
-      nextSibling() {
-        let sibling = this.currentNode.nextSibling;
-        while (sibling) {
-          if (this._accept(sibling)) { this.currentNode = sibling; return sibling; }
-          sibling = sibling.nextSibling;
-        }
-        return null;
-      },
-      previousSibling() {
-        let sibling = this.currentNode.previousSibling;
-        while (sibling) {
-          if (this._accept(sibling)) { this.currentNode = sibling; return sibling; }
-          sibling = sibling.previousSibling;
-        }
-        return null;
-      },
+      firstChild() { return this._traverseChildren('firstChild', 'nextSibling'); },
+      lastChild() { return this._traverseChildren('lastChild', 'previousSibling'); },
+      nextSibling() { return this._traverseSiblings('firstChild', 'nextSibling'); },
+      previousSibling() { return this._traverseSiblings('lastChild', 'previousSibling'); },
       // DOM 6.1 "parentNode" (issue #475). The old version looked only at the
       // immediate parent, so it couldn't climb past a skipped ancestor; it also
       // excluded `root` as a result yet stepped to root's own parent when
-      // currentNode was root — returning a node OUTSIDE the walker's subtree.
+      // currentNode was root, returning a node OUTSIDE the walker's subtree.
       // The loop's `node !== this.root` guard is what keeps the walk inside
       // root while still allowing root itself to be returned.
       parentNode() {
