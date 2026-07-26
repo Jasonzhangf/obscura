@@ -2247,8 +2247,19 @@ fn render_svg(bytes: &[u8], width: u32, height: u32) -> Option<Pixmap> {
     if width == 0 || height == 0 {
         return None;
     }
-    let opts = usvg::Options::default();
-    let tree = usvg::Tree::from_data(bytes, &opts).ok()?;
+    let mut opts = usvg::Options::default();
+    // The outer replaced element supplies the SVG document viewport. Force
+    // that used CSS size onto the root before usvg resolves `viewBox`:
+    // a missing height is represented as 100%, which usvg otherwise resolves
+    // against the viewBox height itself. `<svg width=32 viewBox="0 0 223
+    // 236">` would therefore become a 32x236 viewport; its artwork is fitted
+    // into a thin centered strip and then the whole strip is scaled to 32x34.
+    // Author `preserveAspectRatio` still controls fitting inside this viewport.
+    // usvg resolves root dimensions before an injected stylesheet can
+    // override them, so provide the used viewport as actual root attributes.
+    let viewport_svg = svg_with_root_viewport(bytes, width, height)?;
+    opts.default_size = usvg::Size::from_wh(width as f32, height as f32)?;
+    let tree = usvg::Tree::from_data(&viewport_svg, &opts).ok()?;
     let size = tree.size();
     if size.width() <= 0.0 || size.height() <= 0.0 {
         return None;
@@ -2257,6 +2268,108 @@ fn render_svg(bytes: &[u8], width: u32, height: u32) -> Option<Pixmap> {
     let transform = Transform::from_scale(width as f32 / size.width(), height as f32 / size.height());
     resvg::render(&tree, transform, &mut svg_pixmap.as_mut());
     Some(svg_pixmap)
+}
+
+/// Return SVG XML whose root `width`/`height` are the resolved CSS viewport.
+///
+/// This is deliberately a narrow XML start-tag rewrite rather than a DOM
+/// reserialization: all namespaces, styles, definitions, and source order
+/// remain byte-for-byte intact. Existing attribute values are replaced;
+/// missing ones are appended. Quoted `>` characters are respected while
+/// finding the end of the root tag.
+fn svg_with_root_viewport(bytes: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
+    let source = std::str::from_utf8(bytes).ok()?;
+    let start = source.find("<svg")?;
+    let tail = &source[start..];
+    let mut quote = None;
+    let mut tag_end = None;
+    for (offset, ch) in tail.char_indices() {
+        match (quote, ch) {
+            (Some(open), close) if close == open => quote = None,
+            (None, '"' | '\'') => quote = Some(ch),
+            (None, '>') => {
+                tag_end = Some(start + offset);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let tag_end = tag_end?;
+    let mut root = source[start..=tag_end].to_string();
+    for (name, value) in [("width", width), ("height", height)] {
+        if let Some((value_start, value_end)) = svg_root_attr_value_range(&root, name) {
+            root.replace_range(value_start..value_end, &value.to_string());
+        } else {
+            root.insert_str(root.len() - 1, &format!(" {name}=\"{value}\""));
+        }
+    }
+
+    let mut output = String::with_capacity(source.len() + 32);
+    output.push_str(&source[..start]);
+    output.push_str(&root);
+    output.push_str(&source[tag_end + 1..]);
+    Some(output.into_bytes())
+}
+
+/// Value byte range for one attribute in an `<svg ...>` start tag.
+fn svg_root_attr_value_range(tag: &str, wanted: &str) -> Option<(usize, usize)> {
+    let bytes = tag.as_bytes();
+    let mut index = "<svg".len();
+    while index < bytes.len() {
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if index >= bytes.len() || bytes[index] == b'>' || bytes[index] == b'/' {
+            return None;
+        }
+        let name_start = index;
+        while index < bytes.len()
+            && !bytes[index].is_ascii_whitespace()
+            && bytes[index] != b'='
+            && bytes[index] != b'>'
+            && bytes[index] != b'/'
+        {
+            index += 1;
+        }
+        let name_end = index;
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if index >= bytes.len() || bytes[index] != b'=' {
+            continue;
+        }
+        index += 1;
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        let (value_start, value_end) = if index < bytes.len()
+            && matches!(bytes[index], b'"' | b'\'')
+        {
+            let delimiter = bytes[index];
+            index += 1;
+            let start = index;
+            while index < bytes.len() && bytes[index] != delimiter {
+                index += 1;
+            }
+            let end = index;
+            index = (index + 1).min(bytes.len());
+            (start, end)
+        } else {
+            let start = index;
+            while index < bytes.len()
+                && !bytes[index].is_ascii_whitespace()
+                && bytes[index] != b'>'
+                && bytes[index] != b'/'
+            {
+                index += 1;
+            }
+            (start, index)
+        };
+        if &tag[name_start..name_end] == wanted {
+            return Some((value_start, value_end));
+        }
+    }
+    None
 }
 
 /// Serialize an inline `<svg>` subtree (rooted at `root`) back to a standalone
@@ -3196,6 +3309,30 @@ mod tests {
             }
         }
         assert!(found_red, "expected inline svg <rect> to paint red");
+    }
+
+    #[test]
+    fn svg_missing_root_height_uses_the_final_css_viewport() {
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg"
+            width="32" viewBox="0 0 223 236">
+            <rect width="223" height="236" fill="#ed174c"/>
+        </svg>"##;
+        let pixmap = render_svg(svg, 32, 34).expect("svg raster");
+        let mut min_y = 34u32;
+        let mut max_y = 0u32;
+        for y in 0..34 {
+            for x in 0..32 {
+                let pixel = pixmap.pixel(x, y).unwrap();
+                if pixel.alpha() > 0 {
+                    min_y = min_y.min(y);
+                    max_y = max_y.max(y);
+                }
+            }
+        }
+        assert!(
+            max_y.saturating_sub(min_y) >= 30,
+            "viewBox artwork should fill the resolved 32x34 viewport, got rows {min_y}..{max_y}"
+        );
     }
 
     #[test]
