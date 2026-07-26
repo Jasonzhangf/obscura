@@ -103,6 +103,45 @@ fn relative_units_resolve_against_viewport_and_font_size() {
 }
 
 #[test]
+fn dynamic_viewport_units_use_the_live_viewport() {
+    let tree = parse_html(
+        r#"<body style="margin:0"><div style="width:25dvw;height:15dvh"></div></body>"#,
+    );
+    let layout = layout_dom(&tree, (1000.0, 800.0));
+    assert!(
+        layout
+            .rects
+            .values()
+            .any(|rect| (rect.width - 250.0).abs() < 0.01
+                && (rect.height - 120.0).abs() < 0.01),
+        "dvw/dvh should resolve against the capture viewport"
+    );
+}
+
+#[test]
+fn fixed_inset_box_uses_viewport_not_document_height() {
+    let tree = parse_html(
+        r#"
+        <body style="margin:0">
+          <div style="height:5000px"></div>
+          <div id="overlay" style="position:fixed;inset:0">
+            <canvas id="surface" style="width:100%;height:100%"></canvas>
+          </div>
+        </body>
+        "#,
+    );
+    let layout = layout_dom(&tree, (900.0, 1000.0));
+    for id in ["overlay", "surface"] {
+        let rect = layout.rects[&tree.get_element_by_id(id).unwrap()];
+        assert!(
+            (rect.width - 900.0).abs() < 0.01
+                && (rect.height - 1000.0).abs() < 0.01,
+            "{id} should fill the viewport rather than the 5000px document: {rect:?}"
+        );
+    }
+}
+
+#[test]
 fn percentage_padding_top_reserves_aspect_ratio_box() {
     // The responsive aspect-ratio trick: an empty box with padding-top:56.25%
     // inside a 1000px-wide block reserves a 16:9 area (~562px tall), the room a
@@ -997,5 +1036,36 @@ fn length_line_height_computes_before_inheritance() {
     assert_eq!(
         layout.styles[&ratio].line_height,
         Some(obscura_render::LineHeight::Ratio(2.0))
+    );
+}
+
+#[test]
+fn contextual_right_inset_uses_root_font_tokens() {
+    let tree = parse_html(
+        r#"
+        <style>
+          :root { --spacing: .25rem }
+          body { margin: 0 }
+          #header { position: relative; width: 900px; height: 80px }
+          #search {
+            position: absolute;
+            right: calc(var(--spacing)*14);
+            width: 100px;
+            height: 36px;
+          }
+        </style>
+        <div id="header"><button id="search">Search</button></div>
+        "#,
+    );
+    let layout = layout_dom(&tree, (900.0, 1000.0));
+    let search = tree.get_element_by_id("search").unwrap();
+    assert_eq!(
+        layout.styles[&search].inset[1],
+        Some(obscura_render::Dimension::Px(56.0))
+    );
+    let rect = layout.rects[&search];
+    assert!(
+        (rect.x - 744.0).abs() < 0.01,
+        "right inset should place 100px box at 900 - 56 - 100: {rect:?}"
     );
 }

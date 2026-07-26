@@ -676,10 +676,67 @@ pub fn layout_dom_with_images(
                     style.height,
                     crate::Dimension::Px(_) | crate::Dimension::Percent(_)
                 );
+                for index in 0..4 {
+                    let Some(expression) =
+                        style.inset_expressions[index].as_deref()
+                    else {
+                        continue;
+                    };
+                    let percent_base = if matches!(index, 1 | 3) {
+                        cb_w
+                    } else {
+                        viewport.1
+                    };
+                    style.inset[index] =
+                        crate::style::resolve_contextual_length(
+                            expression,
+                            em_px,
+                            root_fs,
+                            vw,
+                            vh,
+                            percent_base,
+                        )
+                        .map(crate::Dimension::Px);
+                }
                 for i in style.inset.iter_mut() {
                     if let Some(d) = i {
                         *i = Some(d.resolve(em_px, root_fs, vw, vh));
                     }
+                }
+                // A fixed box is positioned against the initial containing
+                // block, whose dimensions are the viewport, not the full
+                // scrollable root element. Taffy attaches out-of-flow boxes to
+                // a layout node, and the root node can grow to the document's
+                // full content height. Make the CSS 2.1 stretch equation
+                // explicit for the ubiquitous `position:fixed; inset:0` case
+                // so overlays/canvases remain exactly viewport-sized.
+                if style.position_fixed {
+                    if style.width == crate::Dimension::Auto {
+                        if let (
+                            Some(crate::Dimension::Px(right)),
+                            Some(crate::Dimension::Px(left)),
+                        ) = (style.inset[1], style.inset[3])
+                        {
+                            style.width = crate::Dimension::Px(
+                                (viewport.0 - left - right).max(0.0),
+                            );
+                        }
+                    }
+                    if style.height == crate::Dimension::Auto {
+                        if let (
+                            Some(crate::Dimension::Px(top)),
+                            Some(crate::Dimension::Px(bottom)),
+                        ) = (style.inset[0], style.inset[2])
+                        {
+                            style.height = crate::Dimension::Px(
+                                (viewport.1 - top - bottom).max(0.0),
+                            );
+                        }
+                    }
+                    child_cb_height_definite = matches!(
+                        style.height,
+                        crate::Dimension::Px(_) | crate::Dimension::Percent(_)
+                    );
                 }
                 match &style.font_weight { Some(w) => inh.font_weight = Some(w.clone()), None => style.font_weight = inh.font_weight.clone() }
                 match &style.font_family { Some(f) => inh.font_family = Some(f.clone()), None => style.font_family = inh.font_family.clone() }

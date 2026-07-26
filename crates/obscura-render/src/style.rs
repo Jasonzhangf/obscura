@@ -625,13 +625,13 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                 _ => {}
             }
         },
-        "top" => style.inset[0] = inset_dim(value),
-        "right" => style.inset[1] = inset_dim(value),
-        "bottom" => style.inset[2] = inset_dim(value),
-        "left" => style.inset[3] = inset_dim(value),
+        "top" => set_inset_side(style, 0, value),
+        "right" => set_inset_side(style, 1, value),
+        "bottom" => set_inset_side(style, 2, value),
+        "left" => set_inset_side(style, 3, value),
         "inset" => {
             // 1-4 values, CSS shorthand order: all / v h / t h b / t r b l.
-            let parts: Vec<crate::Dimension> = value.split_whitespace().map(dimension_value).collect();
+            let parts = split_ws_paren(value);
             let (t, r, b, l) = match parts.as_slice() {
                 [a] => (*a, *a, *a, *a),
                 [v, h] => (*v, *h, *v, *h),
@@ -639,7 +639,10 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                 [t, r, b, l, ..] => (*t, *r, *b, *l),
                 [] => return,
             };
-            style.inset = [Some(t), Some(r), Some(b), Some(l)];
+            set_inset_side(style, 0, t);
+            set_inset_side(style, 1, r);
+            set_inset_side(style, 2, b);
+            set_inset_side(style, 3, l);
         }
         "overflow" | "overflow-x" | "overflow-y" => {
             style.overflow_hidden = value != "visible";
@@ -1876,6 +1879,12 @@ struct LengthContext {
 
 fn resolve_contextual(value: &str, context: &LengthContext) -> Option<f32> {
     let value = value.trim();
+    if let Some(rest) = value.strip_prefix('(') {
+        let end = find_matching_paren(rest)?;
+        if end + 2 == value.len() {
+            return eval_contextual_calc(&rest[..end], context);
+        }
+    }
     if let Some(rest) = value.strip_prefix("var(") {
         let end = find_matching_paren(rest)?;
         let inner = &rest[..end];
@@ -1895,7 +1904,7 @@ fn resolve_contextual(value: &str, context: &LengthContext) -> Option<f32> {
         let args = split_top_level(&rest[..end], ',');
         let mut values = args
             .iter()
-            .filter_map(|arg| resolve_contextual(arg, context));
+            .filter_map(|arg| eval_contextual_calc(arg, context));
         let mut best = values.next()?;
         for candidate in values {
             if (is_max && candidate > best) || (!is_max && candidate < best) {
@@ -1908,9 +1917,9 @@ fn resolve_contextual(value: &str, context: &LengthContext) -> Option<f32> {
         let end = find_matching_paren(rest)?;
         let args = split_top_level(&rest[..end], ',');
         if args.len() == 3 {
-            let low = resolve_contextual(args[0], context)?;
-            let preferred = resolve_contextual(args[1], context)?;
-            let high = resolve_contextual(args[2], context)?;
+            let low = eval_contextual_calc(args[0], context)?;
+            let preferred = eval_contextual_calc(args[1], context)?;
+            let high = eval_contextual_calc(args[2], context)?;
             return Some(preferred.min(high).max(low));
         }
     }
@@ -1962,6 +1971,22 @@ fn contextual_atom(value: &str, context: &LengthContext) -> Option<f32> {
     }
     if let Some(value) = lower.strip_suffix("vmax").and_then(parse) {
         return Some(value * context.vw.max(context.vh));
+    }
+    if let Some(value) = lower
+        .strip_suffix("dvw")
+        .or_else(|| lower.strip_suffix("svw"))
+        .or_else(|| lower.strip_suffix("lvw"))
+        .and_then(parse)
+    {
+        return Some(value * context.vw);
+    }
+    if let Some(value) = lower
+        .strip_suffix("dvh")
+        .or_else(|| lower.strip_suffix("svh"))
+        .or_else(|| lower.strip_suffix("lvh"))
+        .and_then(parse)
+    {
+        return Some(value * context.vh);
     }
     if let Some(value) = lower.strip_suffix("vw").and_then(parse) {
         return Some(value * context.vw);
@@ -2019,11 +2044,11 @@ fn eval_contextual_calc(expr: &str, context: &LengthContext) -> Option<f32> {
 }
 
 fn eval_contextual_product(term: &str, context: &LengthContext) -> Option<f32> {
-    let mut result = None;
+    let mut result: Option<f32> = None;
     let mut operator = '*';
     let mut depth = 0i32;
     let mut current = String::new();
-    let mut factors = Vec::new();
+    let mut factors: Vec<(char, String)> = Vec::new();
     for character in term.chars() {
         match character {
             '(' => {
@@ -2034,26 +2059,25 @@ fn eval_contextual_product(term: &str, context: &LengthContext) -> Option<f32> {
                 depth -= 1;
                 current.push(character);
             }
-            ' ' if depth == 0 => {
-                if !current.is_empty() {
-                    factors.push(std::mem::take(&mut current));
+            '*' | '/' if depth == 0 => {
+                if current.trim().is_empty() {
+                    return None;
                 }
+                factors.push((operator, std::mem::take(&mut current)));
+                operator = character;
             }
             _ => current.push(character),
         }
     }
-    if !current.is_empty() {
-        factors.push(current);
+    if current.trim().is_empty() {
+        return None;
     }
-    for factor in &factors {
-        if factor == "*" || factor == "/" {
-            operator = factor.chars().next()?;
-            continue;
-        }
+    factors.push((operator, current));
+    for (operator, factor) in &factors {
         let value = resolve_contextual(factor, context)?;
         result = Some(match result {
             None => value,
-            Some(previous) if operator == '/' => previous / value,
+            Some(previous) if *operator == '/' => previous / value,
             Some(previous) => previous * value,
         });
     }
@@ -2069,6 +2093,12 @@ fn eval_contextual_product(term: &str, context: &LengthContext) -> Option<f32> {
 /// this function rather than assuming a flat expression.
 fn resolve_length(value: &str) -> Option<f32> {
     let v = value.trim();
+    if let Some(rest) = v.strip_prefix('(') {
+        let end = find_matching_paren(rest)?;
+        if end + 2 == v.len() {
+            return eval_calc(&rest[..end]);
+        }
+    }
     if let Some(rest) = v.strip_prefix("var(") {
         let end = find_matching_paren(rest)?;
         let inner = &rest[..end];
@@ -2083,7 +2113,7 @@ fn resolve_length(value: &str) -> Option<f32> {
         let is_max = v.starts_with("max(");
         let end = find_matching_paren(rest)?;
         let args = split_top_level(&rest[..end], ',');
-        let mut values = args.iter().filter_map(|a| resolve_length(a));
+        let mut values = args.iter().filter_map(|a| eval_calc(a));
         let mut best = values.next()?;
         for val in values {
             if (is_max && val > best) || (!is_max && val < best) {
@@ -2099,9 +2129,9 @@ fn resolve_length(value: &str) -> Option<f32> {
         let end = find_matching_paren(rest)?;
         let args = split_top_level(&rest[..end], ',');
         if args.len() == 3 {
-            let lo = resolve_length(args[0].trim())?;
-            let mid = resolve_length(args[1].trim())?;
-            let hi = resolve_length(args[2].trim())?;
+            let lo = eval_calc(args[0].trim())?;
+            let mid = eval_calc(args[1].trim())?;
+            let hi = eval_calc(args[2].trim())?;
             return Some(mid.min(hi).max(lo));
         }
     }
@@ -2206,28 +2236,31 @@ fn eval_product(term: &str) -> Option<f32> {
     let mut op = '*';
     let mut depth = 0i32;
     let mut cur = String::new();
-    let mut factors = Vec::new();
+    let mut factors: Vec<(char, String)> = Vec::new();
     for c in term.chars() {
         match c {
             '(' => { depth += 1; cur.push(c); }
             ')' => { depth -= 1; cur.push(c); }
-            ' ' if depth == 0 => {
-                if !cur.is_empty() { factors.push(std::mem::take(&mut cur)); }
+            '*' | '/' if depth == 0 => {
+                if cur.trim().is_empty() {
+                    return None;
+                }
+                factors.push((op, std::mem::take(&mut cur)));
+                op = c;
             }
             _ => cur.push(c),
         }
     }
-    if !cur.is_empty() { factors.push(cur); }
+    if cur.trim().is_empty() {
+        return None;
+    }
+    factors.push((op, cur));
 
-    for tok in &factors {
-        if tok == "*" || tok == "/" {
-            op = tok.chars().next()?;
-            continue;
-        }
+    for (op, tok) in &factors {
         let v = resolve_length(tok)?;
         result = Some(match result {
             None => v,
-            Some(r) if op == '/' => r / v,
+            Some(r) if *op == '/' => r / v,
             Some(r) => r * v,
         });
     }
@@ -2255,6 +2288,17 @@ fn inset_dim(value: &str) -> Option<crate::Dimension> {
     match dimension_value(value) {
         crate::Dimension::Auto => None,
         d => Some(d),
+    }
+}
+
+fn set_inset_side(style: &mut LayoutStyle, index: usize, value: &str) {
+    let value = value.trim();
+    if let Some(expression) = deferred_length_expression(value) {
+        style.inset[index] = None;
+        style.inset_expressions[index] = Some(expression);
+    } else {
+        style.inset[index] = inset_dim(value);
+        style.inset_expressions[index] = None;
     }
 }
 
@@ -2383,7 +2427,10 @@ fn is_font_size_token(value: &str) -> bool {
     {
         return true;
     }
-    ["px", "pt", "em", "ex", "rem", "vw", "vh", "vmin", "vmax", "%"]
+    [
+        "px", "pt", "em", "ex", "rem", "vw", "vh", "dvw", "dvh", "svw",
+        "svh", "lvw", "lvh", "vmin", "vmax", "%",
+    ]
     .iter()
     .any(|unit| lower.strip_suffix(unit).and_then(|number| number.parse::<f32>().ok()).is_some())
 }
@@ -2410,6 +2457,22 @@ fn dimension_value(tok: &str) -> crate::Dimension {
     if let Some(v) = lower.strip_suffix("ex").and_then(parse) { return Dimension::Ex(v); }
     if let Some(v) = lower.strip_suffix("vmin").and_then(parse) { return Dimension::Vmin(v); }
     if let Some(v) = lower.strip_suffix("vmax").and_then(parse) { return Dimension::Vmax(v); }
+    if let Some(v) = lower
+        .strip_suffix("dvw")
+        .or_else(|| lower.strip_suffix("svw"))
+        .or_else(|| lower.strip_suffix("lvw"))
+        .and_then(parse)
+    {
+        return Dimension::Vw(v);
+    }
+    if let Some(v) = lower
+        .strip_suffix("dvh")
+        .or_else(|| lower.strip_suffix("svh"))
+        .or_else(|| lower.strip_suffix("lvh"))
+        .and_then(parse)
+    {
+        return Dimension::Vh(v);
+    }
     if let Some(v) = lower.strip_suffix("vw").and_then(parse) { return Dimension::Vw(v); }
     if let Some(v) = lower.strip_suffix("vh").and_then(parse) { return Dimension::Vh(v); }
     if let Some(v) = lower.strip_suffix("px").and_then(parse) { return Dimension::Px(v); }
@@ -3406,6 +3469,19 @@ mod tests {
                 context.4,
             ),
             Some(250.0)
+        );
+        let grouped = resolve_contextual_length(
+            "calc(clamp(128px,92px + 7vw,188px) + (100vw - 48px)*43/440)",
+            context.0,
+            context.1,
+            context.2,
+            context.3,
+            context.4,
+        )
+        .unwrap();
+        assert!(
+            (grouped - 238.263_64).abs() < 0.001,
+            "grouped calc should preserve the nested subtraction: {grouped}"
         );
     }
 

@@ -375,6 +375,8 @@ pub struct LayoutStyle {
     /// layout mode, but fixed boxes use the initial containing block.
     pub position_fixed: bool,
     pub inset: [Option<Dimension>; 4], // top, right, bottom, left
+    /// Deferred functional inset expressions in top/right/bottom/left order.
+    pub inset_expressions: [Option<String>; 4],
 
     /// `overflow`/-x/-y other than `visible`: clips this element's descendants
     /// to its border box during paint. This is what makes the ubiquitous
