@@ -691,6 +691,21 @@ fn text_alignment_does_not_shrink_block_children_or_wrap_inline_block_rows() {
 }
 
 #[test]
+fn inline_svg_derives_auto_height_from_view_box() {
+    let tree = parse_html(
+        r#"<html><head><style>html,body{margin:0}#logo{width:112px}</style></head>
+           <body><svg id="logo" viewBox="-10.5 -9.45 21 18.9"></svg></body></html>"#,
+    );
+    let layout = layout_dom(&tree, (900.0, 1000.0));
+    let logo = layout.rects[&tree.get_element_by_id("logo").unwrap()];
+    assert!((logo.width - 112.0).abs() < 0.01, "svg width: {logo:?}");
+    assert!(
+        (logo.height - 101.0).abs() < 0.01,
+        "viewBox should supply the intrinsic auto-height (device-pixel rounded): {logo:?}"
+    );
+}
+
+#[test]
 fn inline_block_flex_items_keep_block_inner_flow() {
     let tree = parse_html(include_str!("../../../render-repros/inline-block-flex-items.html"));
     let layout = layout_dom(&tree, (900.0, 1000.0));

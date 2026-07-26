@@ -216,6 +216,29 @@ fn apply_presentational_hints(node: &obscura_dom::tree::Node, style: &mut crate:
             }
         }
     }
+    // An inline SVG with one CSS axis and a viewBox derives the other axis
+    // from the viewBox's intrinsic aspect ratio. Framework logos commonly set
+    // only a responsive utility width (`w-24 lg:w-28`) and rely on this rule;
+    // without it the SVG border box had zero height and paint skipped it.
+    if style.aspect_ratio.is_none()
+        && node
+            .as_element()
+            .map_or(false, |element| element.local.as_ref() == "svg")
+    {
+        if let Some(view_box) = node
+            .get_attribute("viewBox")
+            .or_else(|| node.get_attribute("viewbox"))
+        {
+            let values: Vec<f32> = view_box
+                .split(|c: char| c.is_ascii_whitespace() || c == ',')
+                .filter(|part| !part.is_empty())
+                .filter_map(|part| part.parse::<f32>().ok())
+                .collect();
+            if values.len() == 4 && values[2] > 0.0 && values[3] > 0.0 {
+                style.aspect_ratio = Some(values[2] / values[3]);
+            }
+        }
+    }
 }
 
 /// Compute the UA + author style for every element in preorder, maintaining

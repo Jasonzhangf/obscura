@@ -320,6 +320,14 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
         // overflow-visible region.
         if name.local.as_ref() == "svg" {
             let mut markup = serialize_svg(tree, nid);
+            // resvg parses the serialized subtree as a standalone SVG
+            // document, outside the page's author stylesheet. Preserve the
+            // host element's computed `color` so paths using `currentColor`
+            // (the standard framework-logo/icon pattern) do not fall back to
+            // black.
+            if let Some(color) = style.color {
+                inject_svg_current_color(&mut markup, color);
+            }
             // `<use href="url#id">` pointing at an EXTERNAL sprite file resolves
             // to nothing in resvg (the symbol lives in another document). Fetch
             // the sprite, splice the referenced `<symbol>` into a local `<defs>`,
@@ -1362,6 +1370,22 @@ fn serialize_svg(tree: &DomTree, root: obscura_dom::tree::NodeId) -> String {
     buf
 }
 
+fn inject_svg_current_color(markup: &mut String, color: [u8; 4]) {
+    let Some(start) = markup.find("<svg") else { return };
+    let Some(end) = markup[start..].find('>').map(|offset| start + offset) else { return };
+    let root = &markup[start..end];
+    // An explicit presentation attribute already survives serialization and
+    // is the correct local currentColor source.
+    if root.contains(" color=") {
+        return;
+    }
+    let attribute = format!(
+        " color=\"#{:02x}{:02x}{:02x}\"",
+        color[0], color[1], color[2]
+    );
+    markup.insert_str(start + "<svg".len(), &attribute);
+}
+
 fn serialize_svg_node(tree: &DomTree, nid: obscura_dom::tree::NodeId, is_root: bool, buf: &mut String) {
     let node = match tree.get_node(nid) {
         Some(n) => n,
@@ -2044,6 +2068,19 @@ mod tests {
             }
         }
         assert!(found_red, "expected inline svg <rect> to paint red");
+    }
+
+    #[test]
+    fn paints_inline_svg_current_color_from_computed_style() {
+        let tree = parse_html(
+            r##"<html><body><svg style="color:#0784aa" width="40" height="40" viewBox="0 0 40 40"><circle cx="20" cy="20" r="18" fill="currentColor"/></svg></body></html>"##,
+        );
+        let pixmap = paint_dom(&tree, (80.0, 80.0), None).expect("pixmap");
+        let mut found = false;
+        for pixel in pixmap.pixels() {
+            found |= pixel.blue() > 120 && pixel.green() > 80 && pixel.red() < 40;
+        }
+        assert!(found, "computed color should resolve currentColor in inline svg");
     }
 
     #[test]
