@@ -56,6 +56,10 @@ thiserror = "2"
 anyhow = "1"
 base64 = "0.22"
 
+[patch.crates-io]
+# Keep the grid shrink-to-fit correction local until it lands upstream.
+taffy = { path = "vendor/taffy" }
+
 # Unwinding (the Rust default) is REQUIRED for the anti-panic protocol: ops wrap
 # their bodies in std::panic::catch_unwind so a panic degrades to an error return
 # instead of unwinding into V8's FFI frame and aborting the process. panic="abort"

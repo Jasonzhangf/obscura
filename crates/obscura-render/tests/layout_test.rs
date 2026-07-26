@@ -857,6 +857,80 @@ fn item_self_alignment_places_flex_and_grid_items() {
 }
 
 #[test]
+fn non_stretched_auto_grid_item_shrink_wraps_inside_grid_area() {
+    let tree = parse_html(
+        r#"
+        <style>
+          body { margin: 0 }
+          .panel {
+            display: grid;
+            align-items: start;
+            justify-items: center;
+            box-sizing: border-box;
+          }
+          demo-wrap { display: block }
+          #wide-panel {
+            margin-left: 112px;
+            width: 1168px;
+            padding: 16px 48px;
+          }
+          #wide-inner {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            box-sizing: border-box;
+            width: 100%;
+            max-width: 1200px;
+            padding: 32px;
+          }
+          #wide-inner span {
+            display: inline-block;
+            width: 56px;
+            height: 20px;
+          }
+          #narrow-panel { width: 400px }
+          #narrow-inner { width: 200px; height: 20px }
+        </style>
+        <div id="wide-panel" class="panel">
+          <demo-wrap id="wide-wrapper">
+            <div id="wide-inner">
+              <div>
+                <span></span><span></span><span></span><span></span><span></span><span></span>
+                <span></span><span></span><span></span><span></span><span></span>
+              </div>
+              <div>
+                <span></span><span></span><span></span><span></span><span></span><span></span>
+                <span></span><span></span><span></span><span></span><span></span>
+              </div>
+            </div>
+          </demo-wrap>
+        </div>
+        <div id="narrow-panel" class="panel">
+          <demo-wrap id="narrow-wrapper"><div id="narrow-inner"></div></demo-wrap>
+        </div>
+        "#,
+    );
+    let layout = layout_dom(&tree, (1280.0, 1000.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    let wide_panel = rect("wide-panel");
+    let wide_wrapper = rect("wide-wrapper");
+    let wide_inner = rect("wide-inner");
+    let narrow_wrapper = rect("narrow-wrapper");
+    assert!(
+        (wide_wrapper.x - 160.0).abs() < 0.01
+            && (wide_wrapper.width - 1072.0).abs() < 0.01
+            && (wide_inner.x - 160.0).abs() < 0.01
+            && (wide_inner.width - 1072.0).abs() < 0.01,
+        "wide shrink-wrapped item should be clamped to the grid area: \
+         panel={wide_panel:?} wrapper={wide_wrapper:?} inner={wide_inner:?}"
+    );
+    assert!(
+        (narrow_wrapper.x - 100.0).abs() < 0.01
+            && (narrow_wrapper.width - 200.0).abs() < 0.01,
+        "a narrower item should keep its intrinsic width and remain centered: {narrow_wrapper:?}"
+    );
+}
+
+#[test]
 fn opposing_floats_share_header_band_through_inline_wrapper() {
     let tree = parse_html(include_str!("../../../render-repros/opposing-header-floats.html"));
     let layout = layout_dom(&tree, (900.0, 1000.0));
