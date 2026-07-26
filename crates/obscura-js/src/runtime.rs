@@ -3839,6 +3839,71 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn dynamic_linked_stylesheet_enters_the_live_dom_with_imports_rebased() {
+        let mut rt = setup_runtime(
+            "<html><head></head><body><div class=\"card\"></div></body></html>",
+        );
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const originalFetchOp = Deno.core.ops.op_fetch_url;
+                    try {
+                        Deno.core.ops.op_fetch_url = (url) => JSON.stringify({
+                            status: 200,
+                            headers: { "content-type": "text/css" },
+                            body: url.endsWith("/assets/route.css")
+                                ? '@import "./theme/base.css"; .card { display:grid; background-image:url("../img/card.png") }'
+                                : '.card { color:red; background-image:url("./grain.png") }',
+                            url,
+                        });
+                        const link = document.createElement("link");
+                        link.setAttribute("rel", "stylesheet");
+                        link.setAttribute("href", "/assets/route.css");
+                        const loaded = new Promise(resolve => {
+                            link.onload = () => resolve();
+                        });
+                        document.head.appendChild(link);
+                        await loaded;
+                        const style = document.querySelector("style[data-obscura-linked]");
+                        const css = style.textContent;
+                        const afterLink = link.nextSibling === style;
+                        link.remove();
+                        return {
+                            afterLink,
+                            importedBeforeRoute:
+                                css.indexOf("color:red") < css.indexOf("display:grid"),
+                            importedUrl:
+                                css.includes("http://example.com/assets/theme/grain.png"),
+                            routeUrl:
+                                css.includes("http://example.com/img/card.png"),
+                            removedWithLink:
+                                !document.querySelector("style[data-obscura-linked]"),
+                        };
+                    } finally {
+                        Deno.core.ops.op_fetch_url = originalFetchOp;
+                    }
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({
+                "afterLink": true,
+                "importedBeforeRoute": true,
+                "importedUrl": true,
+                "routeUrl": true,
+                "removedWithLink": true,
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn test_response_array_buffer_preserves_typed_array_view() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt.call_function_on_for_cdp(

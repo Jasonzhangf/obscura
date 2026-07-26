@@ -295,11 +295,127 @@ function _resolveResourceUrl(src) {
   } catch(e) { return src; }
 }
 
-// A dynamically-inserted <link rel="stylesheet" href> must fetch and fire
-// load/error so frameworks awaiting the link's onload (Promise.all of lazy
-// CSS + JS, antd/bootstrap loaders, etc.) resolve instead of hanging forever.
-// There is no layout engine to apply the CSS, but the load-event contract
-// matches Chrome. Issue #409.
+const _linkedStylesheetNodes = new WeakMap();
+
+// A fetched sheet becomes an inline <style>, so relative url() references
+// must keep resolving against the stylesheet URL rather than document.URL.
+// Scan instead of using a regexp: data URLs and quoted URLs can contain
+// parentheses, quotes, and whitespace.
+function _rebaseCssUrls(css, baseUrl) {
+  let out = "";
+  let i = 0;
+  let quote = "";
+  let comment = false;
+  while (i < css.length) {
+    if (comment) {
+      if (css[i] === "*" && css[i + 1] === "/") {
+        out += "*/"; i += 2; comment = false;
+      } else {
+        out += css[i++];
+      }
+      continue;
+    }
+    if (quote) {
+      const ch = css[i++];
+      out += ch;
+      if (ch === "\\" && i < css.length) out += css[i++];
+      else if (ch === quote) quote = "";
+      continue;
+    }
+    if (css[i] === "/" && css[i + 1] === "*") {
+      out += "/*"; i += 2; comment = true; continue;
+    }
+    if (css[i] === '"' || css[i] === "'") {
+      quote = css[i]; out += css[i++]; continue;
+    }
+    if (css.slice(i, i + 4).toLowerCase() !== "url(") {
+      out += css[i++]; continue;
+    }
+    let end = i + 4;
+    let innerQuote = "";
+    while (end < css.length) {
+      const ch = css[end];
+      if (innerQuote) {
+        if (ch === "\\") { end += 2; continue; }
+        if (ch === innerQuote) innerQuote = "";
+      } else if (ch === '"' || ch === "'") {
+        innerQuote = ch;
+      } else if (ch === ")") {
+        break;
+      }
+      end++;
+    }
+    if (end >= css.length) {
+      out += css.slice(i);
+      break;
+    }
+    const raw = css.slice(i + 4, end).trim();
+    const value = raw.length >= 2
+      && ((raw[0] === '"' && raw[raw.length - 1] === '"')
+        || (raw[0] === "'" && raw[raw.length - 1] === "'"))
+      ? raw.slice(1, -1)
+      : raw;
+    let resolved = value;
+    if (value && !/^(?:[a-z][a-z0-9+.-]*:|\/\/|#)/i.test(value)) {
+      try { resolved = new URL(value, baseUrl).href; } catch(e) {}
+    }
+    out += `url("${resolved.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}")`;
+    i = end + 1;
+  }
+  return out;
+}
+
+function _cssImportApplies(media) {
+  const compact = media.replace(/\s+/g, "").toLowerCase();
+  if (!compact) return true;
+  if (compact.includes("prefers-color-scheme:dark")) return false;
+  if (compact.includes("print")
+    && !compact.includes("screen")
+    && !compact.includes("all")) return false;
+  if (compact.includes("min-width") || compact.includes("max-width")
+      || compact.includes("prefers-")) {
+    try { return matchMedia(media).matches; } catch(e) {}
+  }
+  return true;
+}
+
+async function _fetchLinkedCss(url, pageOrigin, depth = 0, seen = new Set()) {
+  if (depth > 4 || seen.has(url)) return "";
+  seen.add(url);
+  const raw = await Deno.core.ops.op_fetch_url(
+    url, "GET", "{}", "", pageOrigin, "no-cors"
+  );
+  const parsed = JSON.parse(raw);
+  if (parsed.blocked || parsed.status >= 400 || parsed.status === 0) {
+    throw new Error("Stylesheet fetch failed: " + url);
+  }
+  let css = parsed.body || "";
+  const imports = [];
+  // @import is only valid before ordinary rules. Removing it here lets the
+  // renderer consume the imported rules from the materialized <style>.
+  css = css.replace(
+    /@import\s+(?:url\(\s*)?(?:"([^"]+)"|'([^']+)'|([^'"\s;)]+))\s*\)?\s*([^;]*);/gi,
+    (statement, doubleQuoted, singleQuoted, bare, media) => {
+      const target = doubleQuoted || singleQuoted || bare || "";
+      if (_cssImportApplies(media || "")) {
+        try {
+          imports.push(new URL(target, url).href);
+        } catch(e) {}
+      }
+      return "";
+    }
+  );
+  const imported = await Promise.all(imports.map(importUrl =>
+    _fetchLinkedCss(importUrl, pageOrigin, depth + 1, new Set(seen))
+  ));
+  imported.push(_rebaseCssUrls(css, url));
+  return imported.filter(Boolean).join("\n");
+}
+
+// A dynamically-inserted <link rel="stylesheet" href> must fetch, enter the
+// live cascade, and then fire load. Framework route chunks commonly await this
+// event before revealing their content; firing it while discarding the CSS
+// left the DOM loaded but unstyled. Issue #409.
 async function _loadLinkedStylesheet(c) {
   // obscura does not yet reflect the `rel` IDL attribute back to the content
   // attribute, so `link.rel = "stylesheet"` leaves getAttribute('rel') null.
@@ -313,7 +429,17 @@ async function _loadLinkedStylesheet(c) {
   let pageOrigin = "";
   try { pageOrigin = new URL(fullUrl).origin; } catch(e) {}
   try {
-    await Deno.core.ops.op_fetch_url(fullUrl, "GET", "{}", "", pageOrigin, "no-cors");
+    const css = await _fetchLinkedCss(fullUrl, pageOrigin);
+    const previous = _linkedStylesheetNodes.get(c);
+    if (previous?.parentNode) previous.parentNode.removeChild(previous);
+    const media = c.getAttribute("media") || "";
+    if (c.parentNode && !c.disabled && _cssImportApplies(media)) {
+      const style = document.createElement("style");
+      style.setAttribute("data-obscura-linked", fullUrl);
+      style.textContent = css;
+      c.parentNode.insertBefore(style, c.nextSibling);
+      _linkedStylesheetNodes.set(c, style);
+    }
     try { c.dispatchEvent(new Event('load', { bubbles: true })); } catch(e) {}
   } catch(e) {
     try { c.dispatchEvent(new Event('error', { bubbles: true })); } catch(e) {}
@@ -1003,6 +1129,13 @@ class Node {
   }
   removeChild(c) {
     if (!c) return c;
+    const linkedStyle = c instanceof Element
+      ? _linkedStylesheetNodes.get(c)
+      : null;
+    if (linkedStyle?.parentNode === this) {
+      _dom("remove_child", linkedStyle._nid);
+      _linkedStylesheetNodes.delete(c);
+    }
     _dom("remove_child", c._nid);
     if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('childList', this._nid, [], [c._nid]);
     return c;
