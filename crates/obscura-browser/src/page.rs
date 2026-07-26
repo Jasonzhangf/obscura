@@ -224,14 +224,14 @@ fn fetch_css_with_imports(
             .await
             .ok()?
             .ok()?;
-        let css = String::from_utf8(resp.body).ok()?;
+        let css = obscura_net::decode_non_html(&resp.body, resp.content_type());
         // Stop recursing at the cap but keep this level's CSS as-is.
         if depth >= 4 {
-            return Some(css);
+            return Some(rebase_css_urls(&css, &parsed));
         }
         let (imports, stripped) = split_css_imports(&css);
         if imports.is_empty() {
-            return Some(css);
+            return Some(rebase_css_urls(&css, &parsed));
         }
         let mut out = String::new();
         for imp in imports {
@@ -242,9 +242,119 @@ fn fetch_css_with_imports(
                 }
             }
         }
-        out.push_str(&stripped);
+        out.push_str(&rebase_css_urls(&stripped, &parsed));
         Some(out)
     })
+}
+
+/// Preserve the URL base of a fetched stylesheet after it is materialized as
+/// inline CSS. Relative `url(...)` values resolve against the stylesheet's
+/// URL in browsers, not the document URL; failing to rebase them drops common
+/// background, mask, cursor, and font assets from nested theme directories.
+fn rebase_css_urls(css: &str, base: &url::Url) -> String {
+    let mut out = String::with_capacity(css.len());
+    let mut index = 0usize;
+    while index < css.len() {
+        let rest = &css[index..];
+        if rest.starts_with("/*") {
+            if let Some(end) = rest[2..].find("*/") {
+                let length = end + 4;
+                out.push_str(&rest[..length]);
+                index += length;
+            } else {
+                out.push_str(rest);
+                break;
+            }
+            continue;
+        }
+        let Some(first) = rest.chars().next() else { break };
+        if first == '"' || first == '\'' {
+            let quote = first;
+            let mut escaped = false;
+            let mut length = quote.len_utf8();
+            for ch in rest[quote.len_utf8()..].chars() {
+                length += ch.len_utf8();
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == quote {
+                    break;
+                }
+            }
+            out.push_str(&rest[..length]);
+            index += length;
+            continue;
+        }
+        let is_url = rest
+            .get(..4)
+            .map_or(false, |prefix| prefix.eq_ignore_ascii_case("url("));
+        if !is_url {
+            out.push(first);
+            index += first.len_utf8();
+            continue;
+        }
+
+        let mut quote = None;
+        let mut escaped = false;
+        let mut end = None;
+        for (offset, ch) in rest[4..].char_indices() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            match quote {
+                Some(open) if ch == open => quote = None,
+                Some(_) => {}
+                None if ch == '"' || ch == '\'' => quote = Some(ch),
+                None if ch == ')' => {
+                    end = Some(4 + offset);
+                    break;
+                }
+                None => {}
+            }
+        }
+        let Some(end) = end else {
+            out.push_str(rest);
+            break;
+        };
+        let raw = rest[4..end].trim();
+        let value = if raw.len() >= 2
+            && ((raw.starts_with('"') && raw.ends_with('"'))
+                || (raw.starts_with('\'') && raw.ends_with('\'')))
+        {
+            &raw[1..raw.len() - 1]
+        } else {
+            raw
+        };
+        let resolved = if value.is_empty()
+            || value.starts_with('#')
+            || value.contains("var(")
+            || url::Url::parse(value).is_ok()
+        {
+            None
+        } else {
+            base.join(value).ok().map(|url| url.to_string())
+        };
+        if let Some(resolved) = resolved {
+            out.push_str("url(\"");
+            for ch in resolved.chars() {
+                if ch == '\\' || ch == '"' {
+                    out.push('\\');
+                }
+                out.push(ch);
+            }
+            out.push_str("\")");
+        } else {
+            out.push_str(&rest[..=end]);
+        }
+        index += end + 1;
+    }
+    out
 }
 
 /// Pull leading `@import` rules out of a stylesheet. Returns each import target
@@ -2173,7 +2283,7 @@ fn url_matches_cdp_pattern(pattern: &str, url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_import_url, should_restore_hydration_snapshot, split_css_imports,
+        parse_import_url, rebase_css_urls, should_restore_hydration_snapshot, split_css_imports,
         truncate_on_char_boundary, url_matches_cdp_pattern, HydrationStats,
     };
     use obscura_dom::parse_html;
@@ -2223,6 +2333,31 @@ mod tests {
         let (imports, stripped) = split_css_imports(css);
         assert!(imports.is_empty());
         assert_eq!(stripped, css);
+    }
+
+    #[test]
+    fn stylesheet_asset_urls_keep_the_importing_sheets_base() {
+        let base = url::Url::parse("https://example.com/css/theme/app.css").unwrap();
+        let css = r#"
+            .hero { background:url("../img/hero.png") }
+            .icon { mask-image:URL('./icons/mark.svg') }
+            .data { background:url("data:image/svg+xml,<svg></svg>") }
+            .fragment { mask:url(#shape) }
+            .copy::before { content:"url(../not-an-asset.png)" }
+            /* url(../not-an-asset-either.png) */
+        "#;
+        let rebased = rebase_css_urls(css, &base);
+
+        assert!(rebased.contains(
+            r#"url("https://example.com/css/img/hero.png")"#
+        ));
+        assert!(rebased.contains(
+            r#"url("https://example.com/css/theme/icons/mark.svg")"#
+        ));
+        assert!(rebased.contains(r#"url("data:image/svg+xml,<svg></svg>")"#));
+        assert!(rebased.contains("url(#shape)"));
+        assert!(rebased.contains(r#"content:"url(../not-an-asset.png)""#));
+        assert!(rebased.contains("/* url(../not-an-asset-either.png) */"));
     }
 
     #[test]
