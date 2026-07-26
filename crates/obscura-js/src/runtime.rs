@@ -2795,6 +2795,36 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_webgl_context_does_not_claim_success() {
+        let mut rt = setup_runtime("<html><body><canvas></canvas></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                (() => {
+                    const canvas = document.querySelector('canvas');
+                    const fallback = document.createElement('p');
+                    if (!canvas.getContext('webgl')) {
+                        fallback.textContent = 'static fallback';
+                        document.body.appendChild(fallback);
+                    }
+                    return [
+                        canvas.getContext('webgl'),
+                        canvas.getContext('webgl2'),
+                        canvas.getContext('experimental-webgl'),
+                        fallback.isConnected,
+                        fallback.textContent,
+                    ];
+                })()
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([null, null, null, true, "static fallback"])
+        );
+    }
+
+    #[test]
     fn test_script_execution() {
         let mut rt = setup_runtime("<ul><li>A</li><li>B</li></ul>");
         rt.execute_script(
