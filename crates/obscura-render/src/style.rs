@@ -2639,7 +2639,13 @@ fn dimension_value(tok: &str) -> crate::Dimension {
     if let Some(v) = lower.strip_suffix("vh").and_then(parse) { return Dimension::Vh(v); }
     if let Some(v) = lower.strip_suffix("px").and_then(parse) { return Dimension::Px(v); }
     if let Some(v) = lower.strip_suffix("pt").and_then(parse) { return Dimension::Px(v * 1.333); }
-    if let Some(v) = parse(&lower) { return Dimension::Px(v); }
+    // CSS lengths accept a unitless number only when it is zero. Treating
+    // arbitrary numbers as pixels changes invalid declarations into tiny
+    // geometry (for example `font-size:.813` must be ignored and inherited,
+    // not rendered at 0.813px).
+    if let Some(v) = parse(&lower).filter(|v| *v == 0.0) {
+        return Dimension::Px(v);
+    }
     Dimension::Auto
 }
 
@@ -3581,6 +3587,15 @@ mod tests {
         assert_eq!(computed_font_weight(Some("lighter"), 550), 400);
         assert_eq!(computed_font_weight(Some("lighter"), 750), 700);
         assert_eq!(computed_font_weight(Some("lighter"), 900), 700);
+    }
+
+    #[test]
+    fn nonzero_unitless_font_size_is_invalid() {
+        let inherited = compute_style("div", Some("font-size:14px;font-size:.813"));
+        assert_eq!(inherited.font_size, Some(14.0));
+
+        let zero = compute_style("div", Some("font-size:0"));
+        assert_eq!(zero.font_size, Some(0.0));
     }
 
     #[test]
