@@ -1318,6 +1318,19 @@ mod tests {
     }
 
     #[test]
+    fn performance_now_is_monotonic_under_bursty_calls() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        // Hammer performance.now() so many calls land in the same millisecond and
+        // the wall clock rolls over repeatedly; the value must never go backwards.
+        let violations = rt
+            .evaluate(
+                "(function(){var prev=-Infinity, bad=0; for(var i=0;i<500000;i++){var t=performance.now(); if(t<prev) bad++; prev=t;} return bad;})()",
+            )
+            .unwrap();
+        assert_eq!(violations.as_f64(), Some(0.0), "performance.now() went backwards");
+    }
+
+    #[test]
     fn test_document_title() {
         let mut rt = setup_runtime("<html><head><title>Test</title></head><body></body></html>");
         let title = rt.evaluate("document.title").unwrap();
