@@ -1318,6 +1318,28 @@ mod tests {
     }
 
     #[test]
+    fn replace_state_without_url_preserves_current_location() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let path = rt
+            .evaluate(
+                "(function(){history.pushState({}, '', '/dashboard'); history.replaceState({scroll:1}); return location.pathname;})()",
+            )
+            .unwrap();
+        assert_eq!(path, serde_json::json!("/dashboard"));
+    }
+
+    #[test]
+    fn push_state_without_url_preserves_current_location() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let path = rt
+            .evaluate(
+                "(function(){history.pushState({}, '', '/a'); history.pushState({b:1}); return location.pathname;})()",
+            )
+            .unwrap();
+        assert_eq!(path, serde_json::json!("/a"));
+    }
+
+    #[test]
     fn test_document_title() {
         let mut rt = setup_runtime("<html><head><title>Test</title></head><body></body></html>");
         let title = rt.evaluate("document.title").unwrap();

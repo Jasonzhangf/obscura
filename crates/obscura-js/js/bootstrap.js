@@ -5613,7 +5613,10 @@ globalThis.atob = globalThis.atob || ((s) => { const c="ABCDEFGHIJKLMNOPQRSTUVWX
   const stack = [{state: null, url: undefined}]; // initial entry; url=undefined means "use document URL"
   let idx = 0;
   const resolveOrFallback = (url) => {
-    if (url === null || url === undefined) return undefined;
+    // A missing url (pushState/replaceState called with < 3 args) keeps the
+    // current document URL per the HTML spec — capture it so the entry does not
+    // reset location back to the original document URL.
+    if (url === null || url === undefined) return __currentUrl();
     try { return new URL(String(url), __currentUrl()).href; } catch (e) { return String(url); }
   };
   const applyVirtual = () => {
