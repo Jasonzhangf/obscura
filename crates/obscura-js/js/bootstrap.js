@@ -3715,6 +3715,17 @@ Object.defineProperty(globalThis.Window, Symbol.hasInstance, {
   value(obj) { return obj === globalThis || (obj && obj.window === obj); },
   configurable: true,
 });
+// A browser global is a Window object, not merely an object accepted by
+// `Window[Symbol.hasInstance]`. Framework environment gates (including Ember's)
+// also require the direct identity `self.constructor === Window`; leaving the
+// inherited Object constructor makes them enter their server-rendering path
+// and hand string selectors to DOM render operations.
+Object.defineProperty(globalThis, 'constructor', {
+  value: globalThis.Window,
+  writable: true,
+  configurable: true,
+  enumerable: false,
+});
 
 
 // Remove the static _iframeRegistry and replace with dynamic getters.

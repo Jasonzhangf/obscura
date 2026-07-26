@@ -1810,6 +1810,23 @@ mod tests {
     }
 
     #[test]
+    fn global_window_has_browser_constructor_identity() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                "return [window === self, self.constructor === Window,\
+                         window instanceof Window, self.document === document,\
+                         self.location === location, self.history === history,\
+                         self.navigator === navigator];",
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([true, true, true, true, true, true, true])
+        );
+    }
+
+    #[test]
     fn explicit_viewport_is_distinct_from_fingerprinted_screen() {
         let dom = parse_html("<html><body></body></html>");
         let mut rt = ObscuraJsRuntime::new();
