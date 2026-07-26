@@ -907,3 +907,95 @@ fn right_float_navigation_shares_inline_band() {
         "right float order: {right_three:?} {right_two:?} {right_one:?}"
     );
 }
+
+#[test]
+fn functional_font_sizes_resolve_against_live_viewport() {
+    let tree = parse_html(
+        r#"
+        <style>
+          #feature { font-size: clamp(1rem, 9vw, 38pt) }
+          #subtitle { font-size: clamp(.5rem, 4vw, 1rem) }
+        </style>
+        <h2 id="feature">Features</h2>
+        <h3 id="subtitle">Subtitle</h3>
+        "#,
+    );
+    let wide = layout_dom(&tree, (900.0, 1000.0));
+    let feature = tree.get_element_by_id("feature").unwrap();
+    let subtitle = tree.get_element_by_id("subtitle").unwrap();
+    assert!(
+        (wide.styles[&feature].font_size.unwrap() - 50.654).abs() < 0.05,
+        "wide feature font: {:?}",
+        wide.styles[&feature].font_size
+    );
+    assert_eq!(wide.styles[&subtitle].font_size, Some(16.0));
+
+    let narrow = layout_dom(&tree, (320.0, 640.0));
+    assert!(
+        (narrow.styles[&feature].font_size.unwrap() - 28.8).abs() < 0.05,
+        "narrow feature font: {:?}",
+        narrow.styles[&feature].font_size
+    );
+    assert!(
+        (narrow.styles[&subtitle].font_size.unwrap() - 12.8).abs() < 0.05,
+        "narrow subtitle font: {:?}",
+        narrow.styles[&subtitle].font_size
+    );
+}
+
+#[test]
+fn responsive_grid_child_spans_all_tracks_via_end_longhand() {
+    let tree = parse_html(
+        r#"
+        <style>
+          .layout {
+            display: grid;
+            width: 800px;
+            grid-template-columns: repeat(4, 1fr);
+            column-gap: 20px;
+          }
+          @media (max-width: 1007px) {
+            .layout > * { grid-column-end: span 4 }
+          }
+        </style>
+        <div class="layout"><section id="hero">Full-width content</section></div>
+        "#,
+    );
+    let layout = layout_dom(&tree, (900.0, 1000.0));
+    let hero = layout.rects[&tree.get_element_by_id("hero").unwrap()];
+    assert!(
+        (hero.width - 800.0).abs() < 0.01,
+        "span-4 child should fill all four tracks: {hero:?}"
+    );
+}
+
+#[test]
+fn length_line_height_computes_before_inheritance() {
+    let tree = parse_html(
+        r#"
+        <style>
+          #parent { font-size: 64px; line-height: 5rem }
+          #child { font-size: 20px }
+          #ratio { font-size: 20px; line-height: 2 }
+        </style>
+        <div id="parent"><span id="child">Inherited length</span></div>
+        <div id="ratio">Unitless ratio</div>
+        "#,
+    );
+    let layout = layout_dom(&tree, (900.0, 1000.0));
+    let parent = tree.get_element_by_id("parent").unwrap();
+    let child = tree.get_element_by_id("child").unwrap();
+    let ratio = tree.get_element_by_id("ratio").unwrap();
+    assert_eq!(
+        layout.styles[&parent].line_height,
+        Some(obscura_render::LineHeight::Px(80.0))
+    );
+    assert_eq!(
+        layout.styles[&child].line_height,
+        Some(obscura_render::LineHeight::Px(80.0))
+    );
+    assert_eq!(
+        layout.styles[&ratio].line_height,
+        Some(obscura_render::LineHeight::Ratio(2.0))
+    );
+}

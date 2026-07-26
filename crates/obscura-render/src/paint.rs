@@ -181,6 +181,16 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
                 if let Some(path) = bg_path() {
                     paint_linear_gradient(&mut pixmap, &path, &visible_rect, *angle, stops);
                 }
+            } else if let Some((angle, center, stops)) =
+                &style.background_conic_gradient
+            {
+                paint_conic_gradient(
+                    &mut pixmap,
+                    &visible_rect,
+                    *angle,
+                    *center,
+                    stops,
+                );
             } else if let Some(bg) = style.background_color {
                 // A masked element's background-color is the mask's fill color,
                 // not an ordinary box background (handled below), so this only
@@ -196,7 +206,18 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
 
         if let Some(mask_url) = &style.mask_image {
             let fill = style.background_color.or(style.color).unwrap_or([0, 0, 0, 255]);
-            paint_mask(mask_url, base_url, &visible_rect, fill, &mut pixmap, &mut image_cache);
+            paint_mask(
+                mask_url,
+                base_url,
+                &visible_rect,
+                fill,
+                style.background_gradient.as_ref(),
+                style.background_conic_gradient.as_ref(),
+                style.mask_size,
+                style.mask_repeat,
+                &mut pixmap,
+                &mut image_cache,
+            );
         } else if let Some(bg_url) = &style.background_image {
             // With an explicit background-size, paint the image at that size
             // positioned within the box per background-position, instead of
@@ -925,6 +946,156 @@ fn paint_linear_gradient(pixmap: &mut Pixmap, path: &tiny_skia::Path, rect: &cra
         paint.anti_alias = true;
         pixmap.fill_path(path, &paint, FillRule::Winding, Transform::identity(), None);
     }
+}
+
+fn paint_conic_gradient(
+    pixmap: &mut Pixmap,
+    rect: &crate::Rect,
+    angle: f32,
+    center: (f32, f32),
+    stops: &[([u8; 4], Option<f32>)],
+) {
+    if rect.width <= 0.0 || rect.height <= 0.0 || stops.len() < 2 {
+        return;
+    }
+    let width = rect.width.ceil() as u32;
+    let height = rect.height.ceil() as u32;
+    let Some(mut layer) = Pixmap::new(width, height) else {
+        return;
+    };
+    let normalized = normalized_stops(stops);
+    for y in 0..height {
+        for x in 0..width {
+            let color = conic_color_at(
+                rect,
+                angle,
+                center,
+                &normalized,
+                rect.x + x as f32 + 0.5,
+                rect.y + y as f32 + 0.5,
+            );
+            layer.pixels_mut()[(y * width + x) as usize] = premultiplied(color);
+        }
+    }
+    pixmap.draw_pixmap(
+        rect.x.floor() as i32,
+        rect.y.floor() as i32,
+        layer.as_ref(),
+        &tiny_skia::PixmapPaint::default(),
+        Transform::identity(),
+        None,
+    );
+}
+
+fn normalized_stops(
+    stops: &[([u8; 4], Option<f32>)],
+) -> Vec<(f32, [u8; 4])> {
+    let count = stops.len();
+    let mut normalized = Vec::with_capacity(count);
+    let mut last = 0.0f32;
+    for (index, (color, position)) in stops.iter().enumerate() {
+        let position = position
+            .unwrap_or_else(|| {
+                if count <= 1 {
+                    0.0
+                } else {
+                    index as f32 / (count - 1) as f32
+                }
+            })
+            .clamp(0.0, 1.0)
+            .max(last);
+        last = position;
+        normalized.push((position, *color));
+    }
+    normalized
+}
+
+fn sample_normalized_stops(stops: &[(f32, [u8; 4])], t: f32) -> [u8; 4] {
+    let t = t.clamp(0.0, 1.0);
+    let Some(&(first_position, first_color)) = stops.first() else {
+        return [0, 0, 0, 0];
+    };
+    if t <= first_position {
+        return first_color;
+    }
+    for pair in stops.windows(2) {
+        let (start_position, start_color) = pair[0];
+        let (end_position, end_color) = pair[1];
+        if t <= end_position {
+            let span = end_position - start_position;
+            let fraction = if span <= f32::EPSILON {
+                1.0
+            } else {
+                ((t - start_position) / span).clamp(0.0, 1.0)
+            };
+            let interpolate = |start: u8, end: u8| {
+                (start as f32 + (end as f32 - start as f32) * fraction)
+                    .round()
+                    .clamp(0.0, 255.0) as u8
+            };
+            return [
+                interpolate(start_color[0], end_color[0]),
+                interpolate(start_color[1], end_color[1]),
+                interpolate(start_color[2], end_color[2]),
+                interpolate(start_color[3], end_color[3]),
+            ];
+        }
+    }
+    stops.last().map(|(_, color)| *color).unwrap_or(first_color)
+}
+
+fn conic_color_at(
+    rect: &crate::Rect,
+    angle: f32,
+    center: (f32, f32),
+    stops: &[(f32, [u8; 4])],
+    x: f32,
+    y: f32,
+) -> [u8; 4] {
+    let center_x = rect.x + rect.width * center.0;
+    let center_y = rect.y + rect.height * center.1;
+    let point_angle = (x - center_x)
+        .atan2(-(y - center_y))
+        .to_degrees()
+        .rem_euclid(360.0);
+    let position = (point_angle - angle).rem_euclid(360.0) / 360.0;
+    sample_normalized_stops(stops, position)
+}
+
+fn linear_color_at(
+    rect: &crate::Rect,
+    angle: f32,
+    stops: &[(f32, [u8; 4])],
+    x: f32,
+    y: f32,
+) -> [u8; 4] {
+    let radians = angle.to_radians();
+    let dx = radians.sin();
+    let dy = -radians.cos();
+    let center_x = rect.x + rect.width / 2.0;
+    let center_y = rect.y + rect.height / 2.0;
+    let half = (dx.abs() * rect.width + dy.abs() * rect.height) / 2.0;
+    if half <= f32::EPSILON {
+        return sample_normalized_stops(stops, 0.5);
+    }
+    let start_x = center_x - dx * half;
+    let start_y = center_y - dy * half;
+    let position = ((x - start_x) * dx + (y - start_y) * dy) / (2.0 * half);
+    sample_normalized_stops(stops, position)
+}
+
+fn premultiplied(color: [u8; 4]) -> tiny_skia::PremultipliedColorU8 {
+    let alpha = color[3] as u32;
+    tiny_skia::PremultipliedColorU8::from_rgba(
+        ((color[0] as u32 * alpha) / 255) as u8,
+        ((color[1] as u32 * alpha) / 255) as u8,
+        ((color[2] as u32 * alpha) / 255) as u8,
+        color[3],
+    )
+    .unwrap_or_else(|| {
+        tiny_skia::PremultipliedColorU8::from_rgba(0, 0, 0, 0)
+            .expect("transparent premultiplied color")
+    })
 }
 
 fn image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
@@ -1744,6 +1915,10 @@ fn paint_mask(
     base_url: Option<&str>,
     rect: &crate::Rect,
     fill: [u8; 4],
+    linear_gradient: Option<&(f32, Vec<([u8; 4], Option<f32>)>)>,
+    conic_gradient: Option<&(f32, (f32, f32), Vec<([u8; 4], Option<f32>)>)>,
+    mask_size: Option<(f32, f32)>,
+    mask_repeat: Option<(bool, bool)>,
     pixmap: &mut Pixmap,
     cache: &mut std::collections::HashMap<String, Option<Vec<u8>>>,
 ) -> bool {
@@ -1751,41 +1926,76 @@ fn paint_mask(
         return false;
     }
     let Some(bytes) = fetch_bytes(src, base_url, cache) else { return false };
-    let (w, h) = (rect.width as u32, rect.height as u32);
-    let mask = if is_svg(&bytes) { render_svg(&bytes, w, h) } else { raster_to_pixmap(&bytes, w, h) };
+    let (box_width, box_height) = (rect.width.ceil() as u32, rect.height.ceil() as u32);
+    let (tile_width, tile_height) = mask_size
+        .map(|(width, height)| {
+            (
+                width.max(1.0).ceil() as u32,
+                height.max(1.0).ceil() as u32,
+            )
+        })
+        .unwrap_or((box_width, box_height));
+    let mask = if is_svg(&bytes) {
+        render_svg(&bytes, tile_width, tile_height)
+    } else {
+        raster_to_pixmap(&bytes, tile_width, tile_height)
+    };
     let Some(mask) = mask else { return false };
 
-    let recolored = recolor_by_alpha(&mask, fill);
+    let repeat = if mask_size.is_some() {
+        mask_repeat.unwrap_or((true, true))
+    } else {
+        mask_repeat.unwrap_or((false, false))
+    };
+    let normalized_linear =
+        linear_gradient.map(|(_, stops)| normalized_stops(stops));
+    let normalized_conic =
+        conic_gradient.map(|(_, _, stops)| normalized_stops(stops));
+    let Some(mut recolored) = Pixmap::new(box_width, box_height) else {
+        return false;
+    };
+    for y in 0..box_height {
+        if !repeat.1 && y >= tile_height {
+            continue;
+        }
+        let tile_y = if repeat.1 { y % tile_height } else { y };
+        for x in 0..box_width {
+            if !repeat.0 && x >= tile_width {
+                continue;
+            }
+            let tile_x = if repeat.0 { x % tile_width } else { x };
+            let coverage =
+                mask.pixels()[(tile_y * tile_width + tile_x) as usize].alpha() as u32;
+            if coverage == 0 {
+                continue;
+            }
+            let sample_x = rect.x + x as f32 + 0.5;
+            let sample_y = rect.y + y as f32 + 0.5;
+            let mut color = if let (Some((angle, center, _)), Some(stops)) =
+                (conic_gradient, normalized_conic.as_deref())
+            {
+                conic_color_at(rect, *angle, *center, stops, sample_x, sample_y)
+            } else if let (Some((angle, _)), Some(stops)) =
+                (linear_gradient, normalized_linear.as_deref())
+            {
+                linear_color_at(rect, *angle, stops, sample_x, sample_y)
+            } else {
+                fill
+            };
+            color[3] = ((color[3] as u32 * coverage) / 255) as u8;
+            recolored.pixels_mut()[(y * box_width + x) as usize] =
+                premultiplied(color);
+        }
+    }
     pixmap.draw_pixmap(
-        rect.x as i32,
-        rect.y as i32,
+        rect.x.floor() as i32,
+        rect.y.floor() as i32,
         recolored.as_ref(),
         &tiny_skia::PixmapPaint::default(),
         Transform::identity(),
         None,
     );
     true
-}
-
-/// Replace every pixel's color with `fill`, scaling `fill`'s alpha by the
-/// source pixel's own alpha (its mask coverage at that point).
-fn recolor_by_alpha(src: &Pixmap, fill: [u8; 4]) -> Pixmap {
-    let (w, h) = (src.width(), src.height());
-    let mut out = Pixmap::new(w, h).expect("non-zero size, already validated by caller");
-    let dst = out.pixels_mut();
-    for (i, p) in src.pixels().iter().enumerate() {
-        let coverage = p.alpha() as u32;
-        if coverage == 0 {
-            continue;
-        }
-        let a = (fill[3] as u32 * coverage) / 255;
-        let r = (fill[0] as u32 * a) / 255;
-        let g = (fill[1] as u32 * a) / 255;
-        let b = (fill[2] as u32 * a) / 255;
-        dst[i] = tiny_skia::PremultipliedColorU8::from_rgba(r as u8, g as u8, b as u8, a as u8)
-            .unwrap_or_else(|| tiny_skia::PremultipliedColorU8::from_rgba(0, 0, 0, 0).unwrap());
-    }
-    out
 }
 
 #[cfg(test)]

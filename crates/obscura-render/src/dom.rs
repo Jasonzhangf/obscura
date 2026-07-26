@@ -527,9 +527,24 @@ pub fn layout_dom_with_images(
         let vh = viewport.1 / 100.0;
         let root_fs = {
             let s = styles.get(&root_id);
-            match (s.and_then(|s| s.font_size), s.and_then(|s| s.font_size_raw)) {
-                (Some(px), _) => px,
-                (None, Some(d)) => match d.resolve(16.0, 16.0, vw, vh) {
+            match (
+                s.and_then(|s| s.font_size),
+                s.and_then(|s| s.font_size_raw),
+                s.and_then(|s| s.font_size_expression.as_deref()),
+            ) {
+                (Some(px), _, _) => px,
+                (None, _, Some(expression)) => {
+                    crate::style::resolve_contextual_length(
+                        expression,
+                        16.0,
+                        16.0,
+                        vw,
+                        vh,
+                        16.0,
+                    )
+                    .unwrap_or(16.0)
+                }
+                (None, Some(d), _) => match d.resolve(16.0, 16.0, vw, vh) {
                     crate::Dimension::Px(p) => p,
                     crate::Dimension::Percent(p) => 16.0 * p,
                     _ => 16.0,
@@ -554,7 +569,16 @@ pub fn layout_dom_with_images(
                 // Resolve a relative font-size against the PARENT (em/%) or
                 // ROOT (rem) font-size before inheriting it downward.
                 let parent_fs = inh.font_size.unwrap_or(16.0);
-                if let Some(raw) = style.font_size_raw {
+                if let Some(expression) = style.font_size_expression.as_deref() {
+                    style.font_size = crate::style::resolve_contextual_length(
+                        expression,
+                        parent_fs,
+                        root_fs,
+                        vw,
+                        vh,
+                        parent_fs,
+                    );
+                } else if let Some(raw) = style.font_size_raw {
                     let resolved = match raw {
                         crate::Dimension::Percent(p) => parent_fs * p,
                         crate::Dimension::Em(v) => parent_fs * v,
@@ -569,6 +593,42 @@ pub fn layout_dom_with_images(
                 // em in non-font-size properties is relative to this element's
                 // OWN computed font-size; resolve every relative length now.
                 let em_px = style.font_size.unwrap_or(parent_fs);
+                if let Some(expression) = style.line_height_expression.as_deref() {
+                    if let Some(resolved) = crate::style::resolve_contextual_length(
+                        expression,
+                        em_px,
+                        root_fs,
+                        vw,
+                        vh,
+                        em_px,
+                    ) {
+                        style.line_height = Some(
+                            if crate::style::line_height_expression_is_length(
+                                expression,
+                            ) {
+                                crate::LineHeight::Px(resolved)
+                            } else {
+                                crate::LineHeight::Ratio(resolved)
+                            },
+                        );
+                    }
+                } else if let Some(crate::LineHeight::Relative(relative)) =
+                    style.line_height
+                {
+                    let pixels = match relative {
+                        crate::Dimension::Percent(percent) => em_px * percent,
+                        dimension => match dimension.resolve(
+                            em_px,
+                            root_fs,
+                            vw,
+                            vh,
+                        ) {
+                            crate::Dimension::Px(pixels) => pixels,
+                            _ => em_px,
+                        },
+                    };
+                    style.line_height = Some(crate::LineHeight::Px(pixels));
+                }
                 let cb_w = inh.cb_width;
                 for index in 0..6 {
                     let Some(expression) = style.size_expressions[index].as_deref() else {

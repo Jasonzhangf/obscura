@@ -506,6 +506,19 @@ pub(crate) fn media_query_applies_for_viewport(
     query: &str,
     viewport: (f32, f32),
 ) -> bool {
+    // A media-query list is an OR, not an AND. Evaluate each top-level comma
+    // arm independently (commas inside functions such as rgb() / calc() are
+    // not list separators). This also keeps an inapplicable `print` arm from
+    // suppressing a later screen/feature arm.
+    split_media_query_list(query)
+        .into_iter()
+        .any(|query| single_media_query_applies_for_viewport(query, viewport))
+}
+
+fn single_media_query_applies_for_viewport(
+    query: &str,
+    viewport: (f32, f32),
+) -> bool {
     let viewport_w = viewport.0;
     let viewport_h = viewport.1;
     if query.contains("print") {
@@ -540,63 +553,103 @@ pub(crate) fn media_query_applies_for_viewport(
 
     // Width constraints, both `min-width:`/`max-width:` and the modern range
     // forms `width>=Npx` / `(Npx<=width)`.
-    if let Some(px) = extract_px(&compact, "max-width:") {
+    if let Some(px) = extract_length(&compact, "max-width:", viewport, LengthAxis::Width) {
         if viewport_w > px {
             return false;
         }
     }
-    if let Some(px) = extract_px(&compact, "min-width:") {
+    if let Some(px) = extract_length(&compact, "min-width:", viewport, LengthAxis::Width) {
         if viewport_w < px {
             return false;
         }
     }
-    if let Some(px) = extract_px(&compact, "width<=") {
+    if let Some(px) = extract_length(&compact, "width<=", viewport, LengthAxis::Width) {
         if viewport_w > px {
             return false;
         }
     }
-    if let Some(px) = extract_px(&compact, "width>=") {
+    if let Some(px) = extract_length(&compact, "width>=", viewport, LengthAxis::Width) {
         if viewport_w < px {
             return false;
         }
     }
-    if let Some(px) = extract_px(&compact, "width>") {
+    if let Some(px) = extract_length(&compact, "width>", viewport, LengthAxis::Width) {
         if viewport_w <= px {
             return false;
         }
     }
-    if let Some(px) = extract_px(&compact, "width<") {
+    if let Some(px) = extract_length(&compact, "width<", viewport, LengthAxis::Width) {
+        if viewport_w >= px {
+            return false;
+        }
+    }
+    if let Some(px) = extract_length_before(&compact, "<=width", viewport, LengthAxis::Width) {
+        if viewport_w < px {
+            return false;
+        }
+    }
+    if let Some(px) = extract_length_before(&compact, "<width", viewport, LengthAxis::Width) {
+        if viewport_w <= px {
+            return false;
+        }
+    }
+    if let Some(px) = extract_length_before(&compact, ">=width", viewport, LengthAxis::Width) {
+        if viewport_w > px {
+            return false;
+        }
+    }
+    if let Some(px) = extract_length_before(&compact, ">width", viewport, LengthAxis::Width) {
         if viewport_w >= px {
             return false;
         }
     }
 
-    if let Some(px) = extract_px(&compact, "max-height:") {
+    if let Some(px) = extract_length(&compact, "max-height:", viewport, LengthAxis::Height) {
         if viewport_h > px {
             return false;
         }
     }
-    if let Some(px) = extract_px(&compact, "min-height:") {
+    if let Some(px) = extract_length(&compact, "min-height:", viewport, LengthAxis::Height) {
         if viewport_h < px {
             return false;
         }
     }
-    if let Some(px) = extract_px(&compact, "height<=") {
+    if let Some(px) = extract_length(&compact, "height<=", viewport, LengthAxis::Height) {
         if viewport_h > px {
             return false;
         }
     }
-    if let Some(px) = extract_px(&compact, "height>=") {
+    if let Some(px) = extract_length(&compact, "height>=", viewport, LengthAxis::Height) {
         if viewport_h < px {
             return false;
         }
     }
-    if let Some(px) = extract_px(&compact, "height>") {
+    if let Some(px) = extract_length(&compact, "height>", viewport, LengthAxis::Height) {
         if viewport_h <= px {
             return false;
         }
     }
-    if let Some(px) = extract_px(&compact, "height<") {
+    if let Some(px) = extract_length(&compact, "height<", viewport, LengthAxis::Height) {
+        if viewport_h >= px {
+            return false;
+        }
+    }
+    if let Some(px) = extract_length_before(&compact, "<=height", viewport, LengthAxis::Height) {
+        if viewport_h < px {
+            return false;
+        }
+    }
+    if let Some(px) = extract_length_before(&compact, "<height", viewport, LengthAxis::Height) {
+        if viewport_h <= px {
+            return false;
+        }
+    }
+    if let Some(px) = extract_length_before(&compact, ">=height", viewport, LengthAxis::Height) {
+        if viewport_h > px {
+            return false;
+        }
+    }
+    if let Some(px) = extract_length_before(&compact, ">height", viewport, LengthAxis::Height) {
         if viewport_h >= px {
             return false;
         }
@@ -818,47 +871,143 @@ fn split_selector_list(sel: &str) -> Vec<String> {
     out
 }
 
-/// Read the number immediately following `prop` in `s`. Callers pass a
-/// whitespace-stripped `s`, so the first non-digit character always ends the
-/// number. Handles a bare px value (`750px`) and the extremely common
-/// responsive-breakpoint idiom `calc(750px - 1px)` (real stylesheets use this
-/// constantly to express "one pixel narrower than the next breakpoint"):
-/// evaluated as a simple left-to-right sum of every px term, since css media
-/// feature calc() expressions in practice are always plain +/- of px values,
-/// never nested, multiplied, or mixed-unit.
-fn extract_px(s: &str, prop: &str) -> Option<f32> {
+#[derive(Clone, Copy)]
+enum LengthAxis {
+    Width,
+    Height,
+}
+
+/// Read a CSS length immediately following `prop`. Media-query `em` and `rem`
+/// units resolve against the initial font size (16 CSS px), not an element's
+/// computed font. Modern utility frameworks deliberately use those units for
+/// breakpoints, so treating only `px` as typed made every `min-width:64rem`
+/// desktop rule unconditional.
+fn extract_length(
+    s: &str,
+    prop: &str,
+    viewport: (f32, f32),
+    axis: LengthAxis,
+) -> Option<f32> {
     let start = s.find(prop)? + prop.len();
     let rest = &s[start..];
     if let Some(inner) = rest.strip_prefix("calc(") {
         let end = inner.find(')')?;
-        return Some(eval_px_sum(&inner[..end]));
+        return eval_length_sum(&inner[..end], viewport, axis);
     }
-    let num: String = rest.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
-    num.parse::<f32>().ok()
+    parse_length_prefix(rest, viewport, axis)
 }
 
-/// Sum a sequence of signed px terms like `1120px-1px` (whitespace already
-/// stripped by the caller) left to right.
-fn eval_px_sum(expr: &str) -> f32 {
+/// Read the length immediately before a range marker (`64rem<=width`).
+fn extract_length_before(
+    s: &str,
+    marker: &str,
+    viewport: (f32, f32),
+    axis: LengthAxis,
+) -> Option<f32> {
+    let end = s.find(marker)?;
+    let prefix = &s[..end];
+    let start = prefix
+        .rfind(|c: char| matches!(c, '(' | ')' | ':' | ','))
+        .map_or(0, |idx| idx + 1);
+    let value = &prefix[start..];
+    if let Some(inner) = value.strip_prefix("calc(") {
+        return eval_length_sum(inner, viewport, axis);
+    }
+    parse_length_prefix(value, viewport, axis)
+}
+
+fn parse_length_prefix(
+    input: &str,
+    viewport: (f32, f32),
+    axis: LengthAxis,
+) -> Option<f32> {
+    let numeric_len = input
+        .char_indices()
+        .take_while(|(_, c)| c.is_ascii_digit() || matches!(c, '.' | '+' | '-'))
+        .last()
+        .map_or(0, |(idx, c)| idx + c.len_utf8());
+    if numeric_len == 0 {
+        return None;
+    }
+    let value = input[..numeric_len].parse::<f32>().ok()?;
+    let unit: String = input[numeric_len..]
+        .chars()
+        .take_while(|c| c.is_ascii_alphabetic() || *c == '%')
+        .collect();
+    let px = match unit.as_str() {
+        "" | "px" => value,
+        "em" | "rem" => value * 16.0,
+        "vw" => value * viewport.0 / 100.0,
+        "vh" => value * viewport.1 / 100.0,
+        "vmin" => value * viewport.0.min(viewport.1) / 100.0,
+        "vmax" => value * viewport.0.max(viewport.1) / 100.0,
+        "in" => value * 96.0,
+        "cm" => value * 96.0 / 2.54,
+        "mm" => value * 96.0 / 25.4,
+        "q" => value * 96.0 / 101.6,
+        "pt" => value * 96.0 / 72.0,
+        "pc" => value * 16.0,
+        "%" => match axis {
+            LengthAxis::Width => value * viewport.0 / 100.0,
+            LengthAxis::Height => value * viewport.1 / 100.0,
+        },
+        _ => return None,
+    };
+    px.is_finite().then_some(px)
+}
+
+/// Sum the common media-query `calc()` form (`64rem - 1px`) left to right.
+fn eval_length_sum(
+    expr: &str,
+    viewport: (f32, f32),
+    axis: LengthAxis,
+) -> Option<f32> {
     let mut total = 0.0;
     let mut sign = 1.0;
-    let mut num = String::new();
-    let flush = |num: &mut String, sign: f32, total: &mut f32| {
-        if let Ok(v) = num.parse::<f32>() {
-            *total += sign * v;
-        }
-        num.clear();
+    let mut term = String::new();
+    let flush = |term: &mut String, sign: f32, total: &mut f32| -> Option<()> {
+        let value = parse_length_prefix(term, viewport, axis)?;
+        *total += sign * value;
+        term.clear();
+        Some(())
     };
-    for c in expr.chars() {
+    for (idx, c) in expr.char_indices() {
         match c {
-            '+' => { flush(&mut num, sign, &mut total); sign = 1.0; }
-            '-' => { flush(&mut num, sign, &mut total); sign = -1.0; }
-            c if c.is_ascii_digit() || c == '.' => num.push(c),
-            _ => {} // unit suffix (px) or anything else: not part of the number
+            '+' if idx > 0 => {
+                flush(&mut term, sign, &mut total)?;
+                sign = 1.0;
+            }
+            '-' if idx > 0 => {
+                flush(&mut term, sign, &mut total)?;
+                sign = -1.0;
+            }
+            _ => term.push(c),
         }
     }
-    flush(&mut num, sign, &mut total);
-    total
+    flush(&mut term, sign, &mut total)?;
+    Some(total)
+}
+
+fn split_media_query_list(query: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut quote: Option<char> = None;
+    let mut start = 0usize;
+    for (idx, c) in query.char_indices() {
+        match c {
+            _ if quote == Some(c) => quote = None,
+            '\'' | '"' if quote.is_none() => quote = Some(c),
+            '(' if quote.is_none() => depth += 1,
+            ')' if quote.is_none() => depth = (depth - 1).max(0),
+            ',' if quote.is_none() && depth == 0 => {
+                parts.push(query[start..idx].trim());
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(query[start..].trim());
+    parts
 }
 
 #[cfg(test)]
@@ -909,5 +1058,55 @@ mod tests {
                 .iter()
                 .any(|(_, declarations)| declarations.contains("width:100%"))
         );
+    }
+
+    #[test]
+    fn media_breakpoints_support_font_relative_lengths_and_ranges() {
+        assert!(!media_query_applies_for_viewport(
+            "@media (min-width: 64rem)",
+            (900.0, 1000.0)
+        ));
+        assert!(media_query_applies_for_viewport(
+            "@media (min-width: 64rem)",
+            (1024.0, 768.0)
+        ));
+        assert!(media_query_applies_for_viewport(
+            "@media (56.25rem <= width)",
+            (900.0, 1000.0)
+        ));
+        assert!(!media_query_applies_for_viewport(
+            "@media (width > calc(60em - 1px))",
+            (900.0, 1000.0)
+        ));
+    }
+
+    #[test]
+    fn media_query_lists_are_or_conditions() {
+        assert!(media_query_applies_for_viewport(
+            "@media print, (min-width: 64rem)",
+            (1280.0, 720.0)
+        ));
+        assert!(!media_query_applies_for_viewport(
+            "@media print, (min-width: 64rem)",
+            (900.0, 1000.0)
+        ));
+    }
+
+    #[test]
+    fn rem_breakpoint_does_not_reveal_desktop_menu_on_narrow_viewport() {
+        let css = r#"
+            header .menu-toolkit { display: none }
+            @media (min-width: 64rem) {
+                header .menu-toolkit { display: flex }
+            }
+        "#;
+        let narrow = parse_stylesheet_for_viewport(css, (900.0, 1000.0));
+        assert!(narrow.iter().any(|(selector, declarations)| {
+            selector == "header .menu-toolkit" && declarations.contains("display: none")
+        }));
+        assert!(!narrow.iter().any(|(_, declarations)| declarations.contains("display: flex")));
+
+        let wide = parse_stylesheet_for_viewport(css, (1024.0, 768.0));
+        assert!(wide.iter().any(|(_, declarations)| declarations.contains("display: flex")));
     }
 }

@@ -103,6 +103,13 @@ pub(crate) fn used_line_height(style: &LayoutStyle) -> f32 {
     match style.line_height {
         Some(crate::LineHeight::Px(px)) => px,
         Some(crate::LineHeight::Ratio(ratio)) => font_size * ratio,
+        Some(crate::LineHeight::Relative(relative)) => match relative {
+            crate::Dimension::Percent(percent) => font_size * percent,
+            dimension => match dimension.resolve(font_size, 16.0, 0.0, 0.0) {
+                crate::Dimension::Px(px) => px,
+                _ => font_size,
+            },
+        },
         None | Some(crate::LineHeight::Normal) => normal_line_height(
             font_size,
             resolve_font_family(style.font_family.as_deref()),

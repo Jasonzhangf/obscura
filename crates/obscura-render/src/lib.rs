@@ -251,6 +251,12 @@ pub struct LayoutStyle {
     /// o'clock per CSS, list of (rgba, optional 0..1 stop position)). Modern
     /// hero sections use gradients heavily; without this they paint white.
     pub background_gradient: Option<(f32, Vec<([u8; 4], Option<f32>)>)>,
+    /// `conic-gradient(...)` background. The angle is the CSS `from` angle,
+    /// the center is a fraction of the border box, and stops are normalized
+    /// during paint. Conic gradients commonly provide the color source for a
+    /// repeated SVG mask in modern hero artwork.
+    pub background_conic_gradient:
+        Option<(f32, (f32, f32), Vec<([u8; 4], Option<f32>)>)>,
     /// The first `url(...)` reference from `background`/`background-image`
     /// (gradients and repeat keywords in the same shorthand are ignored: we
     /// paint the referenced image, not the gradient layer).
@@ -279,6 +285,12 @@ pub struct LayoutStyle {
     /// `background-color`/`color` instead of carrying its own colors). Without
     /// this, every such icon paints as a solid filled square.
     pub mask_image: Option<String>,
+    /// Explicit `mask-size` / `-webkit-mask-size` in CSS px.
+    pub mask_size: Option<(f32, f32)>,
+    /// Explicit `(repeat-x, repeat-y)` choice. `None` retains the CSS default
+    /// (`repeat` on both axes) when an explicit tile size exists, while
+    /// preserving the legacy fill-box fallback for unsized icon masks.
+    pub mask_repeat: Option<(bool, bool)>,
     /// Foreground (text) color for the paint step.
     pub color: Option<[u8; 4]>,
     pub border_color: Option<[u8; 4]>,
@@ -287,6 +299,11 @@ pub struct LayoutStyle {
     /// `font_size` (px) during the inheritance pass against the parent and
     /// root font-sizes. `None` when font-size was absolute or unset.
     pub font_size_raw: Option<Dimension>,
+    /// Deferred functional `font-size` (`clamp()`, `min()`, `max()`, `calc()`).
+    /// These expressions must see the live viewport and parent font size;
+    /// eagerly treating `9vw` as the number 9 made responsive headings pin to
+    /// the minimum arm of their clamp.
+    pub font_size_expression: Option<String>,
     pub font_weight: Option<String>,
     /// The computed `font-family` list, lowercased. Inherited. The text engine
     /// resolves it to a bundled face (Liberation Sans/Serif/Mono) the way
@@ -444,6 +461,9 @@ pub struct LayoutStyle {
     /// shaped text (a fixed ratio made real-site prose noticeably tighter than
     /// Chromium).
     pub line_height: Option<LineHeight>,
+    /// Deferred functional line-height (`calc()`, `min()`, `clamp()`) resolved
+    /// after the element font and live viewport are known.
+    pub line_height_expression: Option<String>,
 
     /// `text-transform`. Inherited. Applied to span text before shaping.
     pub text_transform: Option<TextTransform>,
@@ -576,8 +596,13 @@ pub enum Clear {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum LineHeight {
     Normal,
+    /// Unitless number. Unlike length/percentage values, this remains a ratio
+    /// when inherited and therefore scales with each descendant's font size.
     Ratio(f32),
     Px(f32),
+    /// A specified length or percentage awaiting computed-value resolution.
+    /// It becomes `Px` on the declaring element before inheritance.
+    Relative(Dimension),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

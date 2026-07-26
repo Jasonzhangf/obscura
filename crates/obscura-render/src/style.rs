@@ -426,7 +426,10 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
             if !value.trim().is_empty() {
                 style.background_color = None;
                 style.background_gradient = parse_linear_gradient(value);
-                if style.background_gradient.is_none() {
+                style.background_conic_gradient = parse_conic_gradient(value);
+                if style.background_gradient.is_none()
+                    && style.background_conic_gradient.is_none()
+                {
                     style.background_color = parse_color(value);
                 }
                 style.background_image = parse_url(value);
@@ -437,11 +440,24 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         }
         "background-image" => {
             style.background_gradient = parse_linear_gradient(value);
+            style.background_conic_gradient = parse_conic_gradient(value);
             style.background_image = parse_url(value);
         }
         "background-size" => style.background_size = parse_background_size(value),
         "background-position" => style.background_position = parse_background_position(value),
         "mask-image" | "-webkit-mask-image" => style.mask_image = parse_url(value),
+        "mask-size" | "-webkit-mask-size" => {
+            style.mask_size = parse_background_size(value)
+        }
+        "mask-repeat" | "-webkit-mask-repeat" => {
+            style.mask_repeat = match value.trim() {
+                "repeat" | "space" | "round" => Some((true, true)),
+                "repeat-x" => Some((true, false)),
+                "repeat-y" => Some((false, true)),
+                "no-repeat" => Some((false, false)),
+                _ => None,
+            }
+        }
         "background-clip" | "-webkit-background-clip" => {
             // `text` clips the background to the element's glyphs (the gradient/
             // solid-color text technique). Any box value (border-box/padding-box/
@@ -668,15 +684,30 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         }
         "line-height" => {
             let v = value.trim();
+            if v.contains('(') {
+                style.line_height = None;
+                style.line_height_expression = Some(v.to_string());
+                return;
+            }
+            style.line_height_expression = None;
             style.line_height = if v.eq_ignore_ascii_case("normal") {
                 Some(crate::LineHeight::Normal)
             } else if let Some(pct) = v.strip_suffix('%') {
-                pct.trim().parse::<f32>().ok().map(|n| crate::LineHeight::Ratio(n / 100.0))
-            } else if v.ends_with("rem") || v.ends_with("em") {
-                // em/rem in line-height are relative to font-size, i.e. a ratio.
-                v.trim_end_matches("rem").trim_end_matches("em").trim().parse::<f32>().ok().map(crate::LineHeight::Ratio)
+                pct.trim()
+                    .parse::<f32>()
+                    .ok()
+                    .map(|number| {
+                        crate::LineHeight::Relative(crate::Dimension::Percent(
+                            number / 100.0,
+                        ))
+                    })
             } else if v.ends_with("px") || v.ends_with("pt") {
                 px_value(v).map(crate::LineHeight::Px)
+            } else if ["rem", "em", "ex", "vw", "vh", "vmin", "vmax"]
+                .iter()
+                .any(|unit| v.ends_with(unit))
+            {
+                Some(crate::LineHeight::Relative(dimension_value(v)))
             } else {
                 // Unitless number: a multiple of font-size (the common case).
                 v.parse::<f32>().ok().map(crate::LineHeight::Ratio)
@@ -748,6 +779,10 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         }
         "grid-column" => set_grid_placement(style, value, true),
         "grid-row" => set_grid_placement(style, value, false),
+        "grid-column-start" => set_grid_placement_side(style, value, true, true),
+        "grid-column-end" => set_grid_placement_side(style, value, true, false),
+        "grid-row-start" => set_grid_placement_side(style, value, false, true),
+        "grid-row-end" => set_grid_placement_side(style, value, false, false),
         "transform" => parse_transform(style, value),
         "filter" => set_containing_block_trigger(
             style,
@@ -1320,6 +1355,64 @@ fn set_grid_placement(style: &mut LayoutStyle, value: &str, is_col: bool) {
     }
 }
 
+/// Apply one grid-placement longhand without clearing the opposite side.
+/// Responsive grid systems commonly establish a default span with
+/// `.layout > * { grid-column-end: span 4 }` and override only the start/end
+/// on selected children; dropping these longhands traps every item in one
+/// auto-placed track.
+fn set_grid_placement_side(
+    style: &mut LayoutStyle,
+    value: &str,
+    is_col: bool,
+    is_start: bool,
+) {
+    if grid_line_has_name(value) {
+        let raw_slot = if is_col {
+            &mut style.grid_column_raw
+        } else {
+            &mut style.grid_row_raw
+        };
+        let (mut start, mut end) = raw_slot
+            .as_deref()
+            .and_then(|raw| raw.split_once('/'))
+            .map(|(start, end)| {
+                (start.trim().to_string(), end.trim().to_string())
+            })
+            .unwrap_or_else(|| ("auto".to_string(), "auto".to_string()));
+        if is_start {
+            start = value.trim().to_string();
+        } else {
+            end = value.trim().to_string();
+        }
+        *raw_slot = Some(format!("{start} / {end}"));
+        if is_col {
+            style.grid_column = None;
+        } else {
+            style.grid_row = None;
+        }
+        return;
+    }
+
+    let placement = parse_grid_placement(value);
+    let line_slot = if is_col {
+        style.grid_column_raw = None;
+        &mut style.grid_column
+    } else {
+        style.grid_row_raw = None;
+        &mut style.grid_row
+    };
+    let mut line = line_slot.clone().unwrap_or(taffy::Line {
+        start: taffy::GridPlacement::Auto,
+        end: taffy::GridPlacement::Auto,
+    });
+    if is_start {
+        line.start = placement;
+    } else {
+        line.end = placement;
+    }
+    *line_slot = Some(line);
+}
+
 /// True when a `grid-column`/`grid-row` value references a named line (any
 /// alphabetic token that is not a bare `span <n>` count), so it must defer to
 /// the parent's line-name map.
@@ -1333,21 +1426,28 @@ fn grid_line_has_name(value: &str) -> bool {
 
 /// Parse `grid-column`/`grid-row` values: `2`, `1 / 3`, `span 2`.
 fn parse_grid_line(value: &str) -> Option<taffy::Line<taffy::GridPlacement>> {
-    let place = |tok: &str| -> taffy::GridPlacement {
-        let tok = tok.trim();
-        if let Some(n) = tok.strip_prefix("span").map(|s| s.trim()) {
-            if let Ok(s) = n.parse::<u16>() { return taffy::style_helpers::span(s); }
-        }
-        if let Ok(i) = tok.parse::<i16>() { return taffy::style_helpers::line(i); }
-        taffy::GridPlacement::Auto
-    };
     let (a, b) = match value.split_once('/') {
         Some((a, b)) => (a, Some(b)),
         None => (value, None),
     };
-    let start = place(a);
-    let end = b.map(place).unwrap_or(taffy::GridPlacement::Auto);
+    let start = parse_grid_placement(a);
+    let end = b
+        .map(parse_grid_placement)
+        .unwrap_or(taffy::GridPlacement::Auto);
     Some(taffy::Line { start, end })
+}
+
+fn parse_grid_placement(value: &str) -> taffy::GridPlacement {
+    let value = value.trim();
+    if let Some(span) = value.strip_prefix("span").map(str::trim) {
+        if let Ok(span) = span.parse::<u16>() {
+            return taffy::style_helpers::span(span);
+        }
+    }
+    if let Ok(line) = value.parse::<i16>() {
+        return taffy::style_helpers::line(line);
+    }
+    taffy::GridPlacement::Auto
 }
 
 /// Parse a CSS color to RGBA. Handles #rgb, #rgba, #rrggbb, #rrggbbaa hex,
@@ -2174,6 +2274,13 @@ fn font_size_keyword(v: &str) -> Option<f32> {
 }
 
 fn apply_font_size(style: &mut LayoutStyle, value: &str) {
+    if value.trim().contains('(') {
+        style.font_size = None;
+        style.font_size_raw = None;
+        style.font_size_expression = Some(value.trim().to_string());
+        return;
+    }
+    style.font_size_expression = None;
     match dimension_value(value) {
         crate::Dimension::Px(p) => {
             style.font_size = Some(p);
@@ -2192,6 +2299,14 @@ fn apply_font_size(style: &mut LayoutStyle, value: &str) {
             style.font_size_raw = Some(rel);
         }
     }
+}
+
+pub(crate) fn line_height_expression_is_length(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.contains('%')
+        || ["px", "pt", "pc", "in", "cm", "mm", "rem", "em", "ex", "vw", "vh", "vmin", "vmax"]
+            .iter()
+            .any(|unit| lower.contains(unit))
 }
 
 /// Parse the layout-relevant portion of the CSS `font` shorthand:
@@ -2237,6 +2352,7 @@ fn apply_font_shorthand(style: &mut LayoutStyle, value: &str) {
     style.font_style_italic = Some(false);
     style.font_weight = Some("normal".to_string());
     style.line_height = Some(crate::LineHeight::Normal);
+    style.line_height_expression = None;
     for token in &tokens[..size_index] {
         let lower = token.to_ascii_lowercase();
         if lower == "italic" || lower.starts_with("oblique") {
@@ -2605,6 +2721,115 @@ fn parse_linear_gradient(value: &str) -> Option<(f32, Vec<([u8; 4], Option<f32>)
     Some((angle, stops))
 }
 
+/// Parse the common `conic-gradient(from A at X Y, color P%, ...)` form.
+/// Angles follow CSS convention (0deg at 12 o'clock, clockwise); the center
+/// is retained as box-relative fractions for paint-time resolution.
+fn parse_conic_gradient(
+    value: &str,
+) -> Option<(f32, (f32, f32), Vec<([u8; 4], Option<f32>)>)> {
+    let v = value.trim();
+    let lower = v.to_ascii_lowercase();
+    let start = lower.find("conic-gradient(")?;
+    let open = start + "conic-gradient(".len();
+    let end = find_matching_paren(&v[open..])? + open;
+    let inner = &v[open..end];
+    let parts = split_top_level(inner, ',');
+    if parts.is_empty() {
+        return None;
+    }
+
+    let mut angle = 0.0f32;
+    let mut center = (0.5f32, 0.5f32);
+    let mut stop_start = 0usize;
+    let prelude = parts[0].trim().to_ascii_lowercase();
+    if prelude.starts_with("from ") || prelude.starts_with("at ") {
+        if let Some(from) = prelude.find("from ") {
+            let token = prelude[from + 5..]
+                .split_whitespace()
+                .next()
+                .unwrap_or_default();
+            angle = parse_css_angle(token).unwrap_or(0.0).rem_euclid(360.0);
+        }
+        if let Some(at) = prelude.find(" at ") {
+            let coords: Vec<&str> = prelude[at + 4..].split_whitespace().collect();
+            if let Some(x) = coords.first().and_then(|value| percent_fraction(value)) {
+                center.0 = x;
+            }
+            if let Some(y) = coords.get(1).and_then(|value| percent_fraction(value)) {
+                center.1 = y;
+            }
+        } else if let Some(at) = prelude.strip_prefix("at ") {
+            let coords: Vec<&str> = at.split_whitespace().collect();
+            if let Some(x) = coords.first().and_then(|value| percent_fraction(value)) {
+                center.0 = x;
+            }
+            if let Some(y) = coords.get(1).and_then(|value| percent_fraction(value)) {
+                center.1 = y;
+            }
+        }
+        stop_start = 1;
+    }
+
+    let mut stops = Vec::new();
+    for part in &parts[stop_start..] {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let (color, position) = split_color_stop(part);
+        if let Some(color) = parse_color(color) {
+            stops.push((color, position));
+        }
+    }
+    (stops.len() >= 2).then_some((angle, center, stops))
+}
+
+fn parse_css_angle(value: &str) -> Option<f32> {
+    let value = value.trim();
+    if let Some(degrees) = value.strip_suffix("deg") {
+        return degrees.trim().parse::<f32>().ok();
+    }
+    if let Some(turns) = value.strip_suffix("turn") {
+        return turns.trim().parse::<f32>().ok().map(|turns| turns * 360.0);
+    }
+    if let Some(gradians) = value.strip_suffix("grad") {
+        return gradians.trim().parse::<f32>().ok().map(|grad| grad * 0.9);
+    }
+    if let Some(radians) = value.strip_suffix("rad") {
+        return radians
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .map(f32::to_degrees);
+    }
+    None
+}
+
+fn split_color_stop(value: &str) -> (&str, Option<f32>) {
+    if let Some(idx) = value.rfind(char::is_whitespace) {
+        let tail = value[idx + 1..].trim();
+        if let Some(percent) = tail
+            .strip_suffix('%')
+            .and_then(|number| number.parse::<f32>().ok())
+        {
+            return (
+                value[..idx].trim(),
+                Some((percent / 100.0).clamp(0.0, 1.0)),
+            );
+        }
+        if let Some(degrees) = tail
+            .strip_suffix("deg")
+            .and_then(|number| number.parse::<f32>().ok())
+        {
+            return (
+                value[..idx].trim(),
+                Some((degrees / 360.0).clamp(0.0, 1.0)),
+            );
+        }
+    }
+    (value, None)
+}
+
 /// Parse `aspect-ratio` to a width/height ratio. Accepts `16 / 9`, `1.5`, and
 /// the `auto <ratio>` form (the `auto` keyword alone yields `None`, meaning the
 /// intrinsic ratio, which for images is filled in at layout).
@@ -2636,8 +2861,39 @@ fn parse_aspect_ratio(value: &str) -> Option<f32> {
 /// `no-repeat`, etc.): we paint the referenced image, not the gradient.
 fn parse_url(value: &str) -> Option<String> {
     let start = value.find("url(")? + 4;
-    let end = value[start..].find(')')?;
-    let inner = value[start..start + end].trim();
+    let mut depth = 1i32;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut end = None;
+    for (offset, character) in value[start..].char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(active) = quote {
+            if character == active {
+                quote = None;
+            }
+            continue;
+        }
+        match character {
+            '\'' | '"' => quote = Some(character),
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(start + offset);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let inner = value[start..end?].trim();
     let unquoted = inner.trim_matches(|c| c == '"' || c == '\'');
     if unquoted.is_empty() {
         None
@@ -3080,6 +3336,31 @@ mod tests {
     }
 
     #[test]
+    fn grid_placement_longhands_preserve_the_opposite_side() {
+        let style = compute_style(
+            "div",
+            Some(
+                "grid-column-start:2;grid-column-end:span 4;\
+                 grid-row-start:3;grid-row-end:5",
+            ),
+        );
+        assert_eq!(
+            style.grid_column,
+            Some(taffy::Line {
+                start: taffy::style_helpers::line(2),
+                end: taffy::style_helpers::span(4),
+            })
+        );
+        assert_eq!(
+            style.grid_row,
+            Some(taffy::Line {
+                start: taffy::style_helpers::line(3),
+                end: taffy::style_helpers::line(5),
+            })
+        );
+    }
+
+    #[test]
     fn contextual_css_math_uses_runtime_geometry() {
         let context = (20.0, 16.0, 9.0, 10.0, 900.0);
         assert_eq!(
@@ -3174,10 +3455,36 @@ mod tests {
         );
         assert_eq!(s.background_color, None);
         assert_eq!(s.background_gradient, None);
+        assert_eq!(s.background_conic_gradient, None);
         assert_eq!(s.background_image, None);
         assert_eq!(s.background_size, None);
         assert_eq!(s.background_position, (0.0, 0.0));
         assert!(!s.background_clip_text);
+    }
+
+    #[test]
+    fn conic_background_and_repeated_data_svg_mask_are_preserved() {
+        let style = compute_style(
+            "div",
+            Some(
+                "background:conic-gradient(from 122deg at 50% 50%,\
+                 transparent 17%,#f627e3 25%,#6911d2 32%,transparent 91%);\
+                 mask-image:url(\"data:image/svg+xml,<svg viewBox='0 0 72 72'>\
+                 <g transform='translate(36 36) rotate(-60)'></g></svg>\");\
+                 mask-size:22px 22px;mask-repeat:repeat",
+            ),
+        );
+        let (angle, center, stops) = style
+            .background_conic_gradient
+            .expect("conic gradient should parse");
+        assert_eq!(angle, 122.0);
+        assert_eq!(center, (0.5, 0.5));
+        assert_eq!(stops.len(), 4);
+        assert_eq!(style.mask_size, Some((22.0, 22.0)));
+        assert_eq!(style.mask_repeat, Some((true, true)));
+        let mask = style.mask_image.expect("data SVG mask should parse");
+        assert!(mask.ends_with("</svg>"));
+        assert!(mask.contains("rotate(-60)"));
     }
 
     #[test]
