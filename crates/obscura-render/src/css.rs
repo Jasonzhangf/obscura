@@ -24,6 +24,10 @@ struct Rule {
 /// An indexed set of author rules ready for fast per-element matching.
 pub struct Stylesheet {
     rules: Vec<Rule>,
+    /// Final declarations from `@keyframes name { ... 100%/to { ... } }`.
+    /// Static screenshots are taken after the requested settle interval, so a
+    /// finite forwards-filled animation contributes this declaration block.
+    keyframe_ends: HashMap<String, String>,
     by_id: HashMap<String, Vec<usize>>,
     by_class: HashMap<String, Vec<usize>>,
     by_local: HashMap<String, Vec<usize>>,
@@ -59,6 +63,7 @@ impl Stylesheet {
     ) -> Self {
         let mut sheet = Stylesheet {
             rules: Vec::new(),
+            keyframe_ends: HashMap::new(),
             by_id: HashMap::new(),
             by_class: HashMap::new(),
             by_local: HashMap::new(),
@@ -68,6 +73,9 @@ impl Stylesheet {
         };
         let mut order = 0usize;
         for src in sources {
+            for (name, decls) in extract_keyframe_end_states(src) {
+                sheet.keyframe_ends.insert(name, decls);
+            }
             for (selector, decls) in parse_stylesheet_for_viewport(src, viewport) {
                 let sel_trim = selector.trim();
                 if let Some(base) = strip_pseudo_element(sel_trim, "before") {
@@ -219,6 +227,21 @@ impl Stylesheet {
         }
         let expanded = substitute_vars(&inline_normal, props, 0);
         crate::style::apply_declarations(style, &expanded);
+
+        // CSS animations form a cascade origin above normal author rules and
+        // below author !important. A static renderer has no compositor clock;
+        // after page settling, the useful deterministic state for a finite
+        // forwards/both animation is its final keyframe. Infinite animations
+        // intentionally keep their ordinary computed values.
+        if style.animation_fill_forwards && !style.animation_iteration_infinite {
+            if let Some(name) = style.animation_name.as_deref() {
+                if let Some(decls) = self.keyframe_ends.get(name) {
+                    let expanded = substitute_vars(decls, props, 0);
+                    crate::style::apply_declarations(style, &expanded);
+                }
+            }
+        }
+
         for &(_, _, i) in &matched {
             let expanded = substitute_vars(&self.rules[i].important_decls, props, 0);
             crate::style::apply_declarations(style, &expanded);
@@ -227,6 +250,85 @@ impl Stylesheet {
         crate::style::apply_declarations(style, &expanded);
         effective
     }
+}
+
+/// Collect the declaration block for each keyframes rule's `to`/`100%` stop.
+/// This is deliberately independent of selector parsing: keyframe selectors
+/// are percentages, not DOM selectors, and must never enter the rule index.
+fn extract_keyframe_end_states(css: &str) -> Vec<(String, String)> {
+    let lower = css.to_ascii_lowercase();
+    let mut found = Vec::new();
+    let mut cursor = 0usize;
+
+    while cursor < css.len() {
+        let standard = lower[cursor..].find("@keyframes").map(|offset| {
+            (cursor + offset, "@keyframes".len())
+        });
+        let webkit = lower[cursor..].find("@-webkit-keyframes").map(|offset| {
+            (cursor + offset, "@-webkit-keyframes".len())
+        });
+        let Some((start, keyword_len)) = (match (standard, webkit) {
+            (Some(a), Some(b)) => Some(if a.0 <= b.0 { a } else { b }),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }) else {
+            break;
+        };
+
+        let after_keyword = start + keyword_len;
+        let Some(open_rel) = css[after_keyword..].find('{') else { break };
+        let open = after_keyword + open_rel;
+        let name = css[after_keyword..open].trim();
+        if name.is_empty() {
+            cursor = open + 1;
+            continue;
+        }
+
+        let mut depth = 1i32;
+        let mut in_quote: Option<char> = None;
+        let mut escaped = false;
+        let mut close = None;
+        for (offset, ch) in css[open + 1..].char_indices() {
+            if let Some(quote) = in_quote {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == quote {
+                    in_quote = None;
+                }
+                continue;
+            }
+            if ch == '"' || ch == '\'' {
+                in_quote = Some(ch);
+            } else if ch == '{' {
+                depth += 1;
+            } else if ch == '}' {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(open + 1 + offset);
+                    break;
+                }
+            }
+        }
+        let Some(close) = close else { break };
+        let inner = &css[open + 1..close];
+        let mut final_decls = None;
+        for (selector, decls) in parse_stylesheet_for_viewport(inner, (1280.0, 720.0)) {
+            if selector
+                .split(',')
+                .any(|part| matches!(part.trim().to_ascii_lowercase().as_str(), "to" | "100%"))
+            {
+                final_decls = Some(decls);
+            }
+        }
+        if let Some(decls) = final_decls {
+            found.push((name.to_string(), decls));
+        }
+        cursor = close + 1;
+    }
+    found
 }
 
 /// Substitute every `var(--name, fallback?)` in `input` with its resolved
@@ -1013,6 +1115,26 @@ fn split_media_query_list(query: &str) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keyframes_extract_only_the_final_animation_state() {
+        let css = r#"
+            @keyframes dismiss {
+                from { opacity: 1; visibility: visible; }
+                50% { opacity: .5; }
+                to { opacity: 0; visibility: hidden; }
+            }
+            @-webkit-keyframes slide {
+                0% { transform: translateX(0); }
+                100% { transform: translateX(20px); }
+            }
+        "#;
+        let ends: HashMap<_, _> = extract_keyframe_end_states(css).into_iter().collect();
+        assert!(ends["dismiss"].contains("opacity: 0"));
+        assert!(ends["dismiss"].contains("visibility: hidden"));
+        assert!(!ends["dismiss"].contains("opacity: 1"));
+        assert!(ends["slide"].contains("translateX(20px)"));
+    }
 
     #[test]
     fn media_rules_use_the_live_width_and_height() {

@@ -649,6 +649,24 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         }
         "visibility" => style.visibility_hidden = Some(value.eq_ignore_ascii_case("hidden")),
         "opacity" => style.opacity = value.trim().parse::<f32>().ok(),
+        "animation" => apply_animation_shorthand(style, value),
+        "animation-name" => {
+            let first = split_top_level(value, ',').into_iter().next().unwrap_or("").trim();
+            style.animation_name = if first.is_empty() || first.eq_ignore_ascii_case("none") {
+                None
+            } else {
+                Some(first.to_string())
+            };
+        }
+        "animation-fill-mode" => {
+            let first = split_top_level(value, ',').into_iter().next().unwrap_or("").trim();
+            style.animation_fill_forwards =
+                first.eq_ignore_ascii_case("forwards") || first.eq_ignore_ascii_case("both");
+        }
+        "animation-iteration-count" => {
+            let first = split_top_level(value, ',').into_iter().next().unwrap_or("").trim();
+            style.animation_iteration_infinite = first.eq_ignore_ascii_case("infinite");
+        }
         "z-index" => {
             style.z_index = match value.trim() {
                 "auto" | "inherit" | "initial" => None,
@@ -824,6 +842,56 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
             style.box_shadow = parse_box_shadow(value, style.color);
         }
         _ => {}
+    }
+}
+
+fn apply_animation_shorthand(style: &mut LayoutStyle, value: &str) {
+    style.animation_name = None;
+    style.animation_fill_forwards = false;
+    style.animation_iteration_infinite = false;
+
+    let first = split_top_level(value, ',').into_iter().next().unwrap_or("").trim();
+    if first.is_empty() || first.eq_ignore_ascii_case("none") {
+        return;
+    }
+
+    for token in split_ws_paren(first) {
+        let lower = token.to_ascii_lowercase();
+        let timing_keyword = matches!(
+            lower.as_str(),
+            "linear" | "ease" | "ease-in" | "ease-out" | "ease-in-out"
+        ) || lower.starts_with("cubic-bezier(")
+            || lower.starts_with("steps(")
+            || lower.starts_with("linear(");
+        let time = lower
+            .strip_suffix("ms")
+            .or_else(|| lower.strip_suffix('s'))
+            .and_then(|number| number.parse::<f32>().ok())
+            .is_some();
+        let control_keyword = matches!(
+            lower.as_str(),
+            "normal"
+                | "reverse"
+                | "alternate"
+                | "alternate-reverse"
+                | "backwards"
+                | "running"
+                | "paused"
+        );
+        if lower == "forwards" || lower == "both" {
+            style.animation_fill_forwards = true;
+        } else if lower == "infinite" {
+            style.animation_iteration_infinite = true;
+        } else if time
+            || timing_keyword
+            || control_keyword
+            || lower.parse::<f32>().is_ok()
+            || lower == "none"
+        {
+            continue;
+        } else if style.animation_name.is_none() {
+            style.animation_name = Some(token.to_string());
+        }
     }
 }
 
@@ -3187,6 +3255,25 @@ mod tests {
         let flow_root = compute_style("div", Some("display: flow-root"));
         assert_eq!(flow_root.display, Display::Block);
         assert!(flow_root.flow_root);
+    }
+
+    #[test]
+    fn animation_shorthand_preserves_settled_forward_fill_contract() {
+        let finite = compute_style(
+            "div",
+            Some("animation: dismiss-overlay .6s ease-out forwards"),
+        );
+        assert_eq!(finite.animation_name.as_deref(), Some("dismiss-overlay"));
+        assert!(finite.animation_fill_forwards);
+        assert!(!finite.animation_iteration_infinite);
+
+        let infinite = compute_style(
+            "div",
+            Some("animation: pulse 1s linear infinite"),
+        );
+        assert_eq!(infinite.animation_name.as_deref(), Some("pulse"));
+        assert!(!infinite.animation_fill_forwards);
+        assert!(infinite.animation_iteration_infinite);
     }
 
     #[test]

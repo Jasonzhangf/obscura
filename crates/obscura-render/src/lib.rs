@@ -398,6 +398,13 @@ pub struct LayoutStyle {
     /// `opacity`, own (non-inherited) value in 0.0-1.0. `None` means the
     /// default of 1.0.
     pub opacity: Option<f32>,
+    /// First CSS animation name and the parts of its timing contract needed by
+    /// a settled, static screenshot. A finite animation with a forwards/both
+    /// fill mode contributes its 100% keyframe after normal declarations and
+    /// before author `!important`, matching the animation cascade origin.
+    pub animation_name: Option<String>,
+    pub animation_fill_forwards: bool,
+    pub animation_iteration_infinite: bool,
     /// `vertical-align` for a table cell's content. Cells effectively default
     /// to `middle` in browsers (the HTML UA sheet sets it on row groups and
     /// cells inherit it); obscura applies it as main-axis alignment of the
