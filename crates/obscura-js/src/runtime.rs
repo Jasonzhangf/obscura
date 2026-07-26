@@ -881,10 +881,18 @@ impl ObscuraJsRuntime {
     }
 
     pub async fn run_event_loop(&mut self) -> Result<(), String> {
-        self.runtime
+        // A browser performs a microtask checkpoint at the end of each task.
+        // deno_core's event loop may return immediately when no async op is
+        // pending, leaving an already-resolved Promise continuation stranded
+        // (document.fonts.load(...).then(...), framework post-render hooks,
+        // and hydration follow-ups all rely on this boundary).
+        self.runtime.v8_isolate().perform_microtask_checkpoint();
+        let result = self.runtime
             .run_event_loop(deno_core::PollEventLoopOptions::default())
             .await
-            .map_err(|e| format!("Event loop error: {}", e))
+            .map_err(|e| format!("Event loop error: {}", e));
+        self.runtime.v8_isolate().perform_microtask_checkpoint();
+        result
     }
 
     /// Whether the serialized dynamic-script queue is still fetching or
@@ -1842,6 +1850,24 @@ mod tests {
         assert_eq!(
             result,
             serde_json::json!([1024, 768, 1024, 768, true, true])
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn idle_event_loop_flushes_resolved_promise_continuations() {
+        let mut rt = setup_runtime("<html><body><div id='state'>pending</div></body></html>");
+        rt.execute_script(
+            "font-ready",
+            "document.fonts.load('normal 1px Example').then(() => {\
+                 document.getElementById('state').textContent = 'ready';\
+             });",
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("document.getElementById('state').textContent")
+                .unwrap(),
+            serde_json::json!("ready")
         );
     }
 
@@ -3021,7 +3047,8 @@ mod tests {
                         datasetKeys: Object.keys(el.dataset),
                         cssText: el.style.cssText,
                         length: el.style.length,
-                        getByDash: el.style.getPropertyValue('font-size')
+                        getByDash: el.style.getPropertyValue('font-size'),
+                        reflectedAttribute: el.getAttribute('style')
                     });
                 })()"#,
             )
@@ -3036,6 +3063,35 @@ mod tests {
         assert_eq!(p["cssText"], "color: red; font-size: 14px;");
         assert_eq!(p["length"], 2);
         assert_eq!(p["getByDash"], "14px");
+        assert_eq!(p["reflectedAttribute"], "color: red; font-size: 14px;");
+    }
+
+    #[test]
+    fn style_declaration_reflects_and_removes_parsed_attributes() {
+        let mut rt = setup_runtime(
+            "<html><body><div id='icon' style='font-size: 0px; color: red'></div></body></html>",
+        );
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const el = document.getElementById('icon');
+                    const before = [el.style.fontSize, el.style.color, el.style.length];
+                    const removed = el.style.removeProperty('font-size');
+                    return JSON.stringify({
+                        before,
+                        removed,
+                        after: el.style.cssText,
+                        attribute: el.getAttribute('style')
+                    });
+                })()"#,
+            )
+            .unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(result.as_str().unwrap()).unwrap();
+        assert_eq!(value["before"], serde_json::json!(["0px", "red", 2]));
+        assert_eq!(value["removed"], "0px");
+        assert_eq!(value["after"], "color: red;");
+        assert_eq!(value["attribute"], "color: red;");
     }
 
     /// Regression for #105: `element.querySelector` and `querySelectorAll`

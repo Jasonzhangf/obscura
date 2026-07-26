@@ -693,7 +693,8 @@ const _styleProxy = (decl) => new Proxy(decl, {
     if (typeof p === "symbol") { t[p] = v; return true; }
     if (p === "_loaded") { t._loaded = v; return true; }
     if (p === "cssText") { t.cssText = v; return true; }
-    if (/^\d+$/.test(p) || p in Object.getPrototypeOf(t)) return true;
+    if (p in t) { Reflect.set(t, p, v); return true; }
+    if (/^\d+$/.test(p)) return true;
     t.setProperty(p, v);
     return true;
   },
