@@ -442,6 +442,7 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                 }
                 style.background_image = parse_url(value);
                 style.background_size = None;
+                style.background_size_fit = parse_background_size_fit(value);
                 style.background_position = (0.0, 0.0);
                 style.background_clip_text = false;
             }
@@ -451,7 +452,10 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
             style.background_conic_gradient = parse_conic_gradient(value);
             style.background_image = parse_url(value);
         }
-        "background-size" => style.background_size = parse_background_size(value),
+        "background-size" => {
+            style.background_size = parse_background_size(value);
+            style.background_size_fit = parse_background_size_fit(value);
+        }
         "background-position" => style.background_position = parse_background_position(value),
         "mask-image" | "-webkit-mask-image" => style.mask_image = parse_url(value),
         "mask-size" | "-webkit-mask-size" => {
@@ -3158,6 +3162,17 @@ fn parse_background_size(value: &str) -> Option<(f32, f32)> {
     }
 }
 
+fn parse_background_size_fit(value: &str) -> Option<crate::ObjectFit> {
+    let size = value.rsplit_once('/').map_or(value, |(_, size)| size);
+    if size.split_whitespace().any(|token| token == "cover") {
+        Some(crate::ObjectFit::Cover)
+    } else if size.split_whitespace().any(|token| token == "contain") {
+        Some(crate::ObjectFit::Contain)
+    } else {
+        None
+    }
+}
+
 /// `background-position` keywords/lengths -> a 0.0-1.0 fraction per axis (the
 /// fraction of the box's leftover space, after the image's own size, to
 /// offset by: 0 = start edge, 1 = end edge, 0.5 = centered).
@@ -3669,8 +3684,20 @@ mod tests {
         assert_eq!(s.background_conic_gradient, None);
         assert_eq!(s.background_image, None);
         assert_eq!(s.background_size, None);
+        assert_eq!(s.background_size_fit, None);
         assert_eq!(s.background_position, (0.0, 0.0));
         assert!(!s.background_clip_text);
+
+        let cover = compute_style(
+            "div",
+            Some("background:url(hero.svg) center/cover no-repeat"),
+        );
+        assert_eq!(cover.background_size_fit, Some(crate::ObjectFit::Cover));
+        let contain = compute_style("div", Some("background-size:contain"));
+        assert_eq!(
+            contain.background_size_fit,
+            Some(crate::ObjectFit::Contain)
+        );
     }
 
     #[test]

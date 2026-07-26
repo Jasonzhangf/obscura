@@ -263,14 +263,14 @@ pub struct LayoutStyle {
     pub background_image: Option<String>,
     /// `background-size`, in px, when given as explicit length(s) (a bare
     /// `10px` applies to both axes, matching how small square icons are
-    /// almost always sized). `None` means "fill the whole box" (our fallback
-    /// when the value is a keyword we don't evaluate, `cover`/`contain`, or
-    /// absent with an already icon-sized box like the HN vote arrow).
+    /// almost always sized).
     pub background_size: Option<(f32, f32)>,
+    /// Keyword `background-size` behavior. `None` is CSS `auto`, which uses
+    /// the image's intrinsic dimensions rather than stretching it to the box.
+    pub background_size_fit: Option<ObjectFit>,
     /// `background-position` as a 0.0-1.0 fraction per axis (0,0 = default
-    /// top-left; 1,0.5 = "right center"). Only meaningful alongside
-    /// `background_size`: without a known image size there is no leftover
-    /// box space to position within.
+    /// top-left; 1,0.5 = "right center"). The fraction applies to the leftover
+    /// space after resolving explicit, intrinsic, cover, or contain size.
     pub background_position: (f32, f32),
     /// `background-clip: text` / `-webkit-background-clip: text`: the background
     /// paints only through the element's glyphs, not as a filled box. Combined

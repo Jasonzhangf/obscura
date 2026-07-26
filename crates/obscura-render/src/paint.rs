@@ -10,6 +10,8 @@ use tiny_skia::{Color, FillRule, GradientStop, LinearGradient, Paint, PathBuilde
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
 
 static FONT_BYTES: &[u8] = include_bytes!("../assets/liberation-sans.ttf");
+static SERIF_FONT_BYTES: &[u8] = include_bytes!("../assets/liberation-serif.ttf");
+static MONO_FONT_BYTES: &[u8] = include_bytes!("../assets/liberation-mono.ttf");
 
 use crate::layout_dom_with_resources;
 
@@ -220,33 +222,34 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
                 &mut image_cache,
             );
         } else if let Some(bg_url) = &style.background_image {
-            // With an explicit background-size, paint the image at that size
-            // positioned within the box per background-position, instead of
-            // stretching it to fill the whole element: a small icon
-            // (background-size: 0.857em) on a wide text link must stay small
-            // and corner-positioned, not balloon to the link's full width.
-            let img_rect = match style.background_size {
-                Some((iw, ih)) => {
-                    let (px, py) = style.background_position;
-                    crate::Rect {
-                        x: rect.x + (rect.width - iw).max(0.0) * px,
-                        y: rect.y + (rect.height - ih).max(0.0) * py,
-                        width: iw,
-                        height: ih,
-                    }
+            if let Some(img_rect) = background_image_rect(
+                bg_url,
+                base_url,
+                &rect,
+                style.background_size,
+                style.background_size_fit,
+                style.background_position,
+                &mut image_cache,
+            ) {
+                // A background layer is always clipped to its owner's border
+                // box and then to inherited overflow. Keep its full destination
+                // rect separate from that clip: intersecting first and then
+                // scaling would resize a partially clipped image.
+                let visible = match clip {
+                    Some(c) => rect.intersect(&c),
+                    None => Some(rect),
+                };
+                if let Some(visible) = visible {
+                    paint_image(
+                        bg_url,
+                        base_url,
+                        &img_rect,
+                        &visible,
+                        crate::ObjectFit::Fill,
+                        &mut pixmap,
+                        &mut image_cache,
+                    );
                 }
-                None => rect,
-            };
-            let img_rect = match clip {
-                Some(c) => img_rect.intersect(&c),
-                None => Some(img_rect),
-            };
-            if let Some(img_rect) = img_rect {
-                // object-fit does not apply to background images (that is
-                // background-size, handled above); paint the layer as-is.
-                // img_rect is already clip-intersected, so it doubles as the
-                // visible bound.
-                paint_image(bg_url, base_url, &img_rect, &img_rect, crate::ObjectFit::Fill, &mut pixmap, &mut image_cache);
             }
         }
 
@@ -318,7 +321,17 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
                 if !painted {
                     match node.get_attribute("alt") {
                         Some(alt) if !alt.trim().is_empty() => {
-                            draw_text(&mut pixmap, &alt, rect.x, rect.y, [0, 0, 0, 255], 12.0, false, clip);
+                            draw_text(
+                                &mut pixmap,
+                                &alt,
+                                rect.x,
+                                rect.y,
+                                [0, 0, 0, 255],
+                                12.0,
+                                false,
+                                None,
+                                clip,
+                            );
                         }
                         Some(_) => {}
                         None => {
@@ -379,10 +392,20 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
             if let Some(marker) = list_marker_text(tree, nid, style.list_style) {
                 let fsize = style.font_size.unwrap_or(16.0);
                 let color = style.color.unwrap_or([0, 0, 0, 255]);
-                let mw = measure_text(&marker, fsize, false);
+                let mw = measure_text(&marker, fsize, false, style.font_family.as_deref());
                 let mx = rect.x + style.padding.left - mw - 6.0;
                 let my = rect.y + style.border.top + style.padding.top;
-                draw_text(&mut pixmap, &marker, mx, my, color, fsize, false, clip);
+                draw_text(
+                    &mut pixmap,
+                    &marker,
+                    mx,
+                    my,
+                    color,
+                    fsize,
+                    false,
+                    style.font_family.as_deref(),
+                    clip,
+                );
             }
         }
 
@@ -395,7 +418,17 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
             let fsize = style.font_size.unwrap_or(16.0);
             let is_bold = style.font_weight.as_deref() == Some("bold");
             for (word_rect, word) in runs {
-                draw_text(&mut pixmap, word, word_rect.x + ox, word_rect.y + oy, color, fsize, is_bold, clip);
+                draw_text(
+                    &mut pixmap,
+                    word,
+                    word_rect.x + ox,
+                    word_rect.y + oy,
+                    color,
+                    fsize,
+                    is_bold,
+                    style.font_family.as_deref(),
+                    clip,
+                );
             }
         }
 
@@ -411,7 +444,17 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
                         let fsize = style.font_size.unwrap_or(16.0);
                         let text_x = rect.x + style.padding.left + style.border.left;
                         let text_y = rect.y + style.padding.top + style.border.top;
-                        draw_text(&mut pixmap, placeholder, text_x, text_y, [117, 117, 117, 255], fsize, false, clip);
+                        draw_text(
+                            &mut pixmap,
+                            placeholder,
+                            text_x,
+                            text_y,
+                            [117, 117, 117, 255],
+                            fsize,
+                            false,
+                            style.font_family.as_deref(),
+                            clip,
+                        );
                     }
                 }
             }
@@ -653,13 +696,70 @@ fn paint_text_node(
     let clip = laid.clip_rects.get(&nid).copied().flatten();
 
     for (rect, word) in runs {
-        draw_text(pixmap, word, rect.x + ox, rect.y + oy, color, fsize, is_bold, clip);
+        draw_text(
+            pixmap,
+            word,
+            rect.x + ox,
+            rect.y + oy,
+            color,
+            fsize,
+            is_bold,
+            style.font_family.as_deref(),
+            clip,
+        );
     }
     Some(())
 }
 
-pub fn measure_text(text: &str, size: f32, is_bold: bool) -> f32 {
-    let font = FontRef::try_from_slice(FONT_BYTES).unwrap();
+fn fallback_font_bytes(family: Option<&str>) -> &'static [u8] {
+    let Some(family) = family else { return FONT_BYTES };
+    for token in family.split(',') {
+        let token = token
+            .trim()
+            .trim_matches(|c| c == '"' || c == '\'')
+            .to_ascii_lowercase();
+        if token == "monospace"
+            || token.contains("mono")
+            || token.contains("courier")
+            || token.contains("consol")
+            || token == "menlo"
+            || token == "monaco"
+            || token == "code"
+        {
+            return MONO_FONT_BYTES;
+        }
+        if token == "serif"
+            || token == "georgia"
+            || token.contains("times")
+            || token == "cambria"
+            || token.contains("garamond")
+            || token.contains("liberation serif")
+            || token == "roman"
+        {
+            return SERIF_FONT_BYTES;
+        }
+        if token == "sans-serif"
+            || token.contains("sans")
+            || token == "arial"
+            || token == "helvetica"
+            || token == "helvetica neue"
+            || token == "system-ui"
+            || token == "-apple-system"
+            || token == "roboto"
+            || token == "segoe ui"
+            || token == "inter"
+            || token == "verdana"
+            || token == "tahoma"
+            || token == "ui-sans-serif"
+        {
+            return FONT_BYTES;
+        }
+    }
+    FONT_BYTES
+}
+
+pub fn measure_text(text: &str, size: f32, is_bold: bool, family: Option<&str>) -> f32 {
+    let font = FontRef::try_from_slice(fallback_font_bytes(family)).unwrap();
     let scale = PxScale::from(size);
     let scaled_font = font.as_scaled(scale);
     let mut width = 0.0;
@@ -671,7 +771,17 @@ pub fn measure_text(text: &str, size: f32, is_bold: bool) -> f32 {
     width
 }
 
-fn draw_text(pixmap: &mut Pixmap, text: &str, x: f32, y: f32, color: [u8; 4], size: f32, is_bold: bool, clip: Option<crate::Rect>) {
+fn draw_text(
+    pixmap: &mut Pixmap,
+    text: &str,
+    x: f32,
+    y: f32,
+    color: [u8; 4],
+    size: f32,
+    is_bold: bool,
+    family: Option<&str>,
+    clip: Option<crate::Rect>,
+) {
     // A fully clipped-away run (the common "visually hidden" accessibility
     // pattern: a 1x1 box with overflow: hidden) paints nothing at all.
     if let Some(c) = clip {
@@ -679,7 +789,7 @@ fn draw_text(pixmap: &mut Pixmap, text: &str, x: f32, y: f32, color: [u8; 4], si
             return;
         }
     }
-    let font = FontRef::try_from_slice(FONT_BYTES).unwrap();
+    let font = FontRef::try_from_slice(fallback_font_bytes(family)).unwrap();
     let scale = PxScale::from(size);
     let scaled_font = font.as_scaled(scale);
     let mut caret = ab_glyph::point(x, y + scaled_font.ascent());
@@ -1355,6 +1465,45 @@ fn image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
         .ok()?
         .into_dimensions()
         .ok()
+}
+
+fn background_image_rect(
+    src: &str,
+    base_url: Option<&str>,
+    box_rect: &crate::Rect,
+    explicit_size: Option<(f32, f32)>,
+    fit: Option<crate::ObjectFit>,
+    position: (f32, f32),
+    cache: &mut std::collections::HashMap<String, Option<Vec<u8>>>,
+) -> Option<crate::Rect> {
+    let bytes = fetch_bytes(src, base_url, cache)?;
+    let intrinsic = if is_svg(&bytes) {
+        svg_intrinsic(&bytes)
+    } else {
+        image_dimensions(&bytes).map(|(width, height)| (width as f32, height as f32))
+    };
+    let (width, height) = if let Some(size) = explicit_size {
+        size
+    } else if let Some(fit) = fit {
+        let (iw, ih) = intrinsic?;
+        let scale = match fit {
+            crate::ObjectFit::Cover => (box_rect.width / iw).max(box_rect.height / ih),
+            crate::ObjectFit::Contain => (box_rect.width / iw).min(box_rect.height / ih),
+            _ => 1.0,
+        };
+        (iw * scale, ih * scale)
+    } else {
+        intrinsic.unwrap_or((box_rect.width, box_rect.height))
+    };
+    if width <= 0.0 || height <= 0.0 {
+        return None;
+    }
+    Some(crate::Rect {
+        x: box_rect.x + (box_rect.width - width) * position.0,
+        y: box_rect.y + (box_rect.height - height) * position.1,
+        width,
+        height,
+    })
 }
 
 /// Fetch every `<img>` once (seeding `cache` for the paint pass) and record its
@@ -2339,6 +2488,28 @@ mod tests {
     }
 
     #[test]
+    fn auto_background_size_uses_intrinsic_dimensions_and_position() {
+        let tree = parse_html(
+            r#"<html><body style="margin:0">
+               <div style="width:100px;height:100px;background-color:red;
+                 background-image:url(&quot;data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='20'%20height='10'%3E%3Crect%20width='20'%20height='10'%20fill='blue'/%3E%3C/svg%3E&quot;);
+                 background-position:right bottom;background-repeat:no-repeat"></div>
+               </body></html>"#,
+        );
+        let pixmap = paint_dom(&tree, (120.0, 120.0), None).expect("pixmap");
+        let background = pixmap.pixel(10, 10).expect("pixel");
+        assert!(
+            background.red() > 200 && background.blue() < 60,
+            "the intrinsic image must not stretch across the owner"
+        );
+        let image = pixmap.pixel(90, 95).expect("pixel");
+        assert!(
+            image.blue() > 200 && image.red() < 60,
+            "the 20x10 intrinsic image must anchor at bottom right"
+        );
+    }
+
+    #[test]
     fn later_element_paints_over_earlier() {
         // A blue div nested inside a red one: both cover the origin, and blue
         // (a descendant, later in tree order) paints over red.
@@ -2459,6 +2630,16 @@ mod tests {
             if found_green { break; }
         }
         assert!(found_green, "expected green text to be painted");
+    }
+
+    #[test]
+    fn word_measurement_honors_generic_font_family() {
+        let sans = measure_text("iiiiiiii", 16.0, false, Some("sans-serif"));
+        let mono = measure_text("iiiiiiii", 16.0, false, Some("monospace"));
+        assert!(
+            mono > sans * 1.5,
+            "monospace advances must be used for code text: sans={sans}, mono={mono}"
+        );
     }
 
     #[test]

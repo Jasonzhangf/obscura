@@ -21,12 +21,12 @@ use crate::{Rect, to_taffy_style};
 /// (lightest-weight) feature set, matching RENDER.md's documented "layout
 /// (default)" mode.
 #[cfg(feature = "paint")]
-fn text_width(text: &str, size: f32, is_bold: bool) -> f32 {
-    crate::paint::measure_text(text, size, is_bold)
+fn text_width(text: &str, size: f32, is_bold: bool, family: Option<&str>) -> f32 {
+    crate::paint::measure_text(text, size, is_bold, family)
 }
 
 #[cfg(not(feature = "paint"))]
-fn text_width(text: &str, size: f32, is_bold: bool) -> f32 {
+fn text_width(text: &str, size: f32, is_bold: bool, _family: Option<&str>) -> f32 {
     const AVG_CHAR_WIDTH_EM: f32 = 0.55;
     let chars = text.chars().filter(|c| !c.is_control()).count() as f32;
     let width = chars * size * AVG_CHAR_WIDTH_EM;
@@ -2727,11 +2727,15 @@ fn build_text_words(
 
     let mut fsize = 16.0;
     let mut is_bold = false;
+    let mut family = None;
+    let mut line_height = fsize * 1.2;
     let mut transform = crate::TextTransform::None;
     if let Some(parent_id) = node.parent {
         if let Some(p_style) = styles.get(&parent_id) {
             fsize = p_style.font_size.unwrap_or(16.0);
             is_bold = p_style.font_weight.as_deref() == Some("bold");
+            family = p_style.font_family.as_deref();
+            line_height = crate::inline::used_line_height(p_style);
             transform = p_style
                 .text_transform
                 .unwrap_or(crate::TextTransform::None);
@@ -2739,7 +2743,16 @@ fn build_text_words(
     }
     display_text = transform_word_leaf_text(&display_text, transform);
 
-    build_word_leaves(id, &display_text, fsize, is_bold, taffy_tree, words)
+    build_word_leaves(
+        id,
+        &display_text,
+        fsize,
+        line_height,
+        is_bold,
+        family,
+        taffy_tree,
+        words,
+    )
 }
 
 fn transform_word_leaf_text(text: &str, transform: crate::TextTransform) -> String {
@@ -2774,21 +2787,27 @@ fn build_word_leaves(
     source_id: NodeId,
     text: &str,
     fsize: f32,
+    line_height: f32,
     is_bold: bool,
+    family: Option<&str>,
     taffy_tree: &mut TaffyTree<usize>,
     words: &mut HashMap<taffy::NodeId, (NodeId, String)>,
 ) -> Vec<taffy::NodeId> {
     tokenize_with_spaces(text)
         .into_iter()
         .filter_map(|token| {
-            let width = text_width(&token, fsize, is_bold);
+            let width = text_width(&token, fsize, is_bold, family);
             // A pure-whitespace token is HTML source formatting or a bare
             // inter-element space; it keeps its (small) width so adjacent
             // inline content stays visually separated, but contributes no
             // height, so it never adds a spurious blank row when it lands
             // between block-level siblings (e.g. formatting whitespace
             // around a run of now-collapsed, display:none list items).
-            let height = if token.trim().is_empty() { 0.0 } else { fsize * 1.2 };
+            let height = if token.trim().is_empty() {
+                0.0
+            } else {
+                line_height.max(0.0)
+            };
             let taffy_style = taffy::Style {
                 size: taffy::Size { width: taffy::Dimension::length(width), height: taffy::Dimension::length(height) },
                 ..Default::default()
@@ -2814,7 +2833,16 @@ fn build_pseudo_content(
 ) -> Vec<taffy::NodeId> {
     let fsize = style.font_size.unwrap_or(16.0);
     let is_bold = style.font_weight.as_deref() == Some("bold");
-    build_word_leaves(id, content, fsize, is_bold, taffy_tree, words)
+    build_word_leaves(
+        id,
+        content,
+        fsize,
+        crate::inline::used_line_height(style),
+        is_bold,
+        style.font_family.as_deref(),
+        taffy_tree,
+        words,
+    )
 }
 
 /// Split already whitespace-collapsed text into tokens, each carrying at most
@@ -4836,6 +4864,22 @@ mod tests {
             transform_word_leaf_text("hELLO wORLD", crate::TextTransform::Capitalize),
             "HELLO WORLD"
         );
+    }
+
+    #[test]
+    fn word_leaves_use_the_computed_line_height() {
+        let tree = parse_html(
+            r#"<div style="display:flex;font:16px/32px monospace">code</div>"#,
+        );
+        let text = tree
+            .descendants(tree.document())
+            .into_iter()
+            .find(|id| tree.get_node(*id).is_some_and(|node| node.is_text()))
+            .unwrap();
+        let laid = layout_dom(&tree, (1280.0, 720.0));
+        let runs = laid.text_runs.get(&text).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].0.height, 32.0);
     }
 
     #[test]
