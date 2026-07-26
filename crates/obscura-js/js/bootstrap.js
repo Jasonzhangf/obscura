@@ -24,7 +24,7 @@
     '_isSpecialScheme', '_applyDocQueryEncoding', '_anchorBase',
     '_elemHrefURL', '_setElemHrefPart', '_pad', '_daysInMonth',
     '_isoWeek1Monday', '_inputParseNumber', '_inputFormatNumber',
-    '_htmlAttrName', '_convertNodes', '_elementClassFor', '_wrap', '_wrapEl',
+    '_htmlAttrName', '_convertNodes', '_parseHTMLFragment', '_elementClassFor', '_wrap', '_wrapEl',
     '_resolveUrl', '_registerIframe', '_base64ToUint8Array',
     '_bodyToUint8Array', '_arrayBufferFromBytes',
     '_installWasmStreamingFallback', '_urlParseOp', '_urlSetOp',
@@ -1177,6 +1177,47 @@ function _isSubmitButton(el) {
   return false;
 }
 
+// Ancestor chains required to parse table/select children, which the fragment
+// parser drops when parsed loosely (it uses a fixed <body> context). Each entry
+// is [openTags, closeTags, depth] — depth is how many lastChild hops reach the
+// container holding the parsed rows/cells/options. Classic jQuery wrapMap.
+const _wrapMap = {
+  option:   ['<select multiple="">', '</select>', 1],
+  optgroup: ['<select multiple="">', '</select>', 1],
+  tr:       ['<table><tbody>', '</tbody></table>', 2],
+  td:       ['<table><tbody><tr>', '</tr></tbody></table>', 3],
+  th:       ['<table><tbody><tr>', '</tr></tbody></table>', 3],
+  tbody:    ['<table>', '</table>', 1],
+  thead:    ['<table>', '</table>', 1],
+  tfoot:    ['<table>', '</table>', 1],
+  caption:  ['<table>', '</table>', 1],
+  colgroup: ['<table>', '</table>', 1],
+  col:      ['<table><colgroup>', '</colgroup></table>', 2],
+};
+// Parse an HTML string into an array of detached nodes. Table/select fragments
+// are wrapped in the required ancestor chain and dug back out so their children
+// survive; the wrapper is chosen from the fragment's own leading tag, falling
+// back to the insertion context element's tag.
+function _parseHTMLFragment(html, contextTag) {
+  html = String(html == null ? '' : html);
+  const m = /^\s*<\s*([a-zA-Z][a-zA-Z0-9]*)/.exec(html);
+  const lead = m ? m[1].toLowerCase() : '';
+  const key = _wrapMap[lead] ? lead : (contextTag ? String(contextTag).toLowerCase() : '');
+  const wrap = _wrapMap[key];
+  const tmp = document.createElement('div');
+  let container = tmp;
+  if (wrap) {
+    tmp.innerHTML = wrap[0] + html + wrap[1];
+    for (let d = 0; d < wrap[2]; d++) container = container.lastChild || container;
+  } else {
+    tmp.innerHTML = html;
+  }
+  const out = [];
+  let child;
+  while ((child = container.firstChild)) out.push(container.removeChild(child));
+  return out;
+}
+
 class Element extends Node {
   constructor(nid) {
     super(nid);
@@ -1429,20 +1470,35 @@ class Element extends Node {
     return null;
   }
   insertAdjacentHTML(position, html) {
+    // Position is matched ASCII-case-insensitively; an unknown value throws
+    // SyntaxError (both were silent no-ops before). Sibling insertions parse
+    // against the parent's context, child insertions against this element, so
+    // table/select fragments keep the right parsing context (_parseHTMLFragment).
+    const pos = String(position).toLowerCase();
     const parent = this.parentNode;
-    switch (position) {
+    const contextTag = (pos === 'beforebegin' || pos === 'afterend')
+      ? (parent && parent.nodeType === 1 ? parent.tagName : 'body')
+      : this.tagName;
+    switch (pos) {
       case 'beforebegin':
-        if (parent) { const tmp = document.createElement('div'); tmp.innerHTML = html; const children = tmp.childNodes; for (let i = 0; i < children.length; i++) parent.insertBefore(children[i], this); }
+        if (parent) for (const n of _parseHTMLFragment(html, contextTag)) parent.insertBefore(n, this);
         break;
-      case 'afterbegin':
-        { const tmp = document.createElement('div'); tmp.innerHTML = html; const children = tmp.childNodes; const first = this.firstChild; for (let i = children.length - 1; i >= 0; i--) this.insertBefore(children[i], first); }
+      case 'afterbegin': {
+        const first = this.firstChild;
+        for (const n of _parseHTMLFragment(html, contextTag)) this.insertBefore(n, first);
         break;
+      }
       case 'beforeend':
-        { const tmp = document.createElement('div'); tmp.innerHTML = html; const children = tmp.childNodes; for (let i = 0; i < children.length; i++) this.appendChild(children[i]); }
+        for (const n of _parseHTMLFragment(html, contextTag)) this.appendChild(n);
         break;
       case 'afterend':
-        if (parent) { const tmp = document.createElement('div'); tmp.innerHTML = html; const children = tmp.childNodes; const next = this.nextSibling; for (let i = 0; i < children.length; i++) parent.insertBefore(children[i], next); }
+        if (parent) { const next = this.nextSibling; for (const n of _parseHTMLFragment(html, contextTag)) parent.insertBefore(n, next); }
         break;
+      default:
+        throw new DOMException(
+          "Failed to execute 'insertAdjacentHTML' on 'Element': The value provided ('" + position + "') is not one of 'beforeBegin', 'afterBegin', 'beforeEnd', or 'afterEnd'.",
+          "SyntaxError"
+        );
     }
   }
   // Like insertAdjacentHTML but inserts a Text node instead of parsing markup,

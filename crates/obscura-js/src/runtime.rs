@@ -1318,6 +1318,35 @@ mod tests {
     }
 
     #[test]
+    fn insert_adjacent_html_parses_table_fragments() {
+        let mut rt = setup_runtime(
+            r#"<html><body><table id="t"><tbody id="tb"></tbody></table></body></html>"#,
+        );
+        let out = rt
+            .evaluate("(function(){var tb=document.getElementById('tb'); tb.insertAdjacentHTML('beforeend','<tr><td>1</td><td>2</td></tr>'); var tr=tb.firstElementChild; return tr ? (tr.tagName+':'+tr.children.length) : 'NULL';})()")
+            .unwrap();
+        assert_eq!(out, serde_json::json!("TR:2"));
+    }
+
+    #[test]
+    fn insert_adjacent_html_position_is_case_insensitive() {
+        let mut rt = setup_runtime(r#"<html><body><div id="host"><span>base</span></div></body></html>"#);
+        let out = rt
+            .evaluate("(function(){var h=document.getElementById('host'); h.insertAdjacentHTML('BeforeEnd','<b>x</b>'); return h.lastElementChild ? h.lastElementChild.tagName : 'NULL';})()")
+            .unwrap();
+        assert_eq!(out, serde_json::json!("B"));
+    }
+
+    #[test]
+    fn insert_adjacent_html_rejects_invalid_position() {
+        let mut rt = setup_runtime(r#"<html><body><div id="host"></div></body></html>"#);
+        let out = rt
+            .evaluate("(function(){var h=document.getElementById('host'); try { h.insertAdjacentHTML('nope','<b>x</b>'); return 'no-throw'; } catch(e){ return e.name; }})()")
+            .unwrap();
+        assert_eq!(out, serde_json::json!("SyntaxError"));
+    }
+
+    #[test]
     fn test_document_title() {
         let mut rt = setup_runtime("<html><head><title>Test</title></head><body></body></html>");
         let title = rt.evaluate("document.title").unwrap();
