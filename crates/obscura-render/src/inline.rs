@@ -80,14 +80,31 @@ fn resolve_font_family(fam: Option<&str>) -> &'static str {
 
 #[derive(Clone)]
 struct LoadedFamily {
+    faces: Vec<LoadedFace>,
+}
+
+#[derive(Clone)]
+struct LoadedFace {
     name: Arc<str>,
-    weights: Vec<u16>,
+    min_weight: u16,
+    max_weight: u16,
+    shape_weight: u16,
+    italic: bool,
     variable: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct WebFont {
+    pub data: Vec<u8>,
+    pub family: Option<String>,
+    pub weight: Option<(u16, u16)>,
+    pub italic: Option<bool>,
 }
 
 fn resolve_loaded_font(
     fam: Option<&str>,
     requested_weight: u16,
+    requested_italic: bool,
     loaded: &HashMap<String, LoadedFamily>,
 ) -> (Arc<str>, u16) {
     if let Some(stack) = fam {
@@ -97,12 +114,35 @@ fn resolve_loaded_font(
                 .trim_matches(|c| c == '"' || c == '\'')
                 .trim();
             if let Some(family) = loaded.get(&name.to_ascii_lowercase()) {
-                let weight = if family.variable {
-                    requested_weight
+                let exact_style: Vec<_> = family
+                    .faces
+                    .iter()
+                    .filter(|face| face.italic == requested_italic)
+                    .collect();
+                let candidates: Vec<_> = if exact_style.is_empty() {
+                    family.faces.iter().collect()
                 } else {
-                    match_font_weight(requested_weight, &family.weights)
+                    exact_style
                 };
-                return (Arc::clone(&family.name), weight);
+                if let Some(face) = candidates.iter().copied().find(|face| {
+                    (face.min_weight..=face.max_weight).contains(&requested_weight)
+                }) {
+                    let weight = if face.variable {
+                        requested_weight
+                    } else {
+                        face.shape_weight
+                    };
+                    return (Arc::clone(&face.name), weight);
+                }
+                let available: Vec<_> =
+                    candidates.iter().map(|face| face.min_weight).collect();
+                let matched = match_font_weight(requested_weight, &available);
+                if let Some(face) = candidates
+                    .into_iter()
+                    .find(|face| face.min_weight == matched)
+                {
+                    return (Arc::clone(&face.name), face.shape_weight);
+                }
             }
         }
     }
@@ -316,42 +356,76 @@ impl TextEngine {
     }
 
     pub fn new_with_fonts(fonts: &[Vec<u8>]) -> Self {
-        // Build a database from our four embedded faces only. Never call
+        let fonts: Vec<_> = fonts
+            .iter()
+            .map(|data| WebFont {
+                data: data.clone(),
+                family: None,
+                weight: None,
+                italic: None,
+            })
+            .collect();
+        Self::new_with_web_fonts(&fonts)
+    }
+
+    pub(crate) fn new_with_web_fonts(fonts: &[WebFont]) -> Self {
+        // Build a database from embedded and page-provided faces. Never call
         // load_system_fonts: a host's font set would make layout differ
         // machine to machine and add a multi-millisecond startup scan.
         let mut db = cosmic_text::fontdb::Database::new();
+        let mut declarations = Vec::new();
         for bytes in [
             SANS_R, SANS_B, SANS_O, SANS_BO,
             SERIF_R, SERIF_B, SERIF_O, SERIF_BO,
             MONO_R, MONO_B, MONO_O, MONO_BO,
             FALLBACK,
         ] {
-            db.load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(bytes)));
+            for id in db.load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(bytes))) {
+                declarations.push((id, None, None, None));
+            }
         }
-        for bytes in fonts {
-            db.load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(
-                bytes.clone(),
-            )));
+        for font in fonts {
+            for id in db.load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(
+                font.data.clone(),
+            ))) {
+                declarations.push((
+                    id,
+                    font.family.clone(),
+                    font.weight,
+                    font.italic,
+                ));
+            }
         }
         let mut loaded_families = HashMap::new();
-        let faces: Vec<_> = db
-            .faces()
-            .map(|face| (face.id, face.families.clone(), face.weight.0))
-            .collect();
-        for (id, names, weight) in faces {
+        for (id, declared_family, declared_weight, declared_italic) in declarations {
+            let Some(face) = db.face(id) else { continue };
+            let names = face.families.clone();
+            let internal_name = names
+                .first()
+                .map(|(name, _)| Arc::<str>::from(name.as_str()))
+                .unwrap_or_else(|| Arc::from(FAMILY));
+            let shape_weight = face.weight.0;
+            let italic = declared_italic
+                .unwrap_or(!matches!(face.style, cosmic_text::fontdb::Style::Normal));
             let variable = db
                 .with_face_data(id, face_is_variable)
                 .unwrap_or(false);
-            for (name, _) in names {
+            let weight = declared_weight.unwrap_or((shape_weight, shape_weight));
+            let declared_names: Vec<String> = declared_family
+                .map(|name| vec![name])
+                .unwrap_or_else(|| names.into_iter().map(|(name, _)| name).collect());
+            for name in declared_names {
                 let family = loaded_families
                     .entry(name.to_ascii_lowercase())
-                    .or_insert_with(|| LoadedFamily {
-                        name: Arc::from(name.as_str()),
-                        weights: Vec::new(),
-                        variable: false,
-                    });
-                family.weights.push(weight);
-                family.variable |= variable;
+                    .or_insert_with(|| LoadedFamily { faces: Vec::new() });
+                family.faces.push(LoadedFace {
+                    name: Arc::clone(&internal_name),
+                    min_weight: weight.0,
+                    max_weight: weight.1,
+                    shape_weight,
+                    italic,
+                    variable,
+                });
             }
         }
         db.set_sans_serif_family(FAMILY);
@@ -387,6 +461,7 @@ impl TextEngine {
         let (family, weight) = resolve_loaded_font(
             base.font_family.as_deref(),
             crate::style::used_font_weight(base),
+            base.font_style_italic.unwrap_or(false),
             &self.loaded_families,
         );
         let ctx = base_span_ctx(
@@ -436,6 +511,7 @@ impl TextEngine {
         let (family, weight) = resolve_loaded_font(
             base.font_family.as_deref(),
             crate::style::used_font_weight(base),
+            base.font_style_italic.unwrap_or(false),
             &self.loaded_families,
         );
         let ctx = base_span_ctx(
@@ -775,6 +851,9 @@ fn collect_node_spans(
                     resolve_loaded_font(
                         Some(family),
                         requested_weight,
+                        style
+                            .and_then(|style| style.font_style_italic)
+                            .unwrap_or(ctx.italic),
                         loaded_families,
                     )
                 })
@@ -1222,6 +1301,45 @@ mod tests {
         assert_eq!(match_font_weight(300, &[100, 400, 700]), 100);
         assert_eq!(match_font_weight(800, &[400, 700]), 700);
         assert_eq!(match_font_weight(500, &[400, 500, 700]), 500);
+    }
+
+    #[test]
+    fn declared_family_selects_a_face_with_a_different_internal_name() {
+        let family = LoadedFamily {
+            faces: vec![
+                LoadedFace {
+                    name: Arc::from("Poppins"),
+                    min_weight: 400,
+                    max_weight: 400,
+                    shape_weight: 400,
+                    italic: false,
+                    variable: false,
+                },
+                LoadedFace {
+                    name: Arc::from("Poppins Medium"),
+                    min_weight: 500,
+                    max_weight: 500,
+                    shape_weight: 500,
+                    italic: false,
+                    variable: false,
+                },
+                LoadedFace {
+                    name: Arc::from("Poppins"),
+                    min_weight: 700,
+                    max_weight: 700,
+                    shape_weight: 700,
+                    italic: false,
+                    variable: false,
+                },
+            ],
+        };
+        let loaded = HashMap::from([("poppins".to_string(), family)]);
+        let medium = resolve_loaded_font(Some("Poppins, sans-serif"), 500, false, &loaded);
+        assert_eq!(medium.0.as_ref(), "Poppins Medium");
+        assert_eq!(medium.1, 500);
+        let semibold = resolve_loaded_font(Some("Poppins"), 600, false, &loaded);
+        assert_eq!(semibold.0.as_ref(), "Poppins");
+        assert_eq!(semibold.1, 700);
     }
 
     #[test]

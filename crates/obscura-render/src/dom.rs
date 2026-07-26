@@ -411,6 +411,24 @@ pub fn layout_dom_with_resources(
     intrinsic: &HashMap<NodeId, (f32, f32)>,
     fonts: &[Vec<u8>],
 ) -> DomLayout {
+    let fonts: Vec<_> = fonts
+        .iter()
+        .map(|data| crate::inline::WebFont {
+            data: data.clone(),
+            family: None,
+            weight: None,
+            italic: None,
+        })
+        .collect();
+    layout_dom_with_web_fonts(tree, viewport, intrinsic, &fonts)
+}
+
+pub(crate) fn layout_dom_with_web_fonts(
+    tree: &DomTree,
+    viewport: (f32, f32),
+    intrinsic: &HashMap<NodeId, (f32, f32)>,
+    fonts: &[crate::inline::WebFont],
+) -> DomLayout {
     let timing = std::env::var("OBSCURA_RENDER_TIMING").is_ok();
 
     // Collect the text of every <style> block in document order.
@@ -467,7 +485,7 @@ pub fn layout_dom_with_resources(
     let mut taffy_tree: TaffyTree<usize> = TaffyTree::new();
     let mut id_map: HashMap<taffy::NodeId, NodeId> = HashMap::new();
     let mut words: HashMap<taffy::NodeId, (NodeId, String)> = HashMap::new();
-    let mut engine = crate::inline::TextEngine::new_with_fonts(fonts);
+    let mut engine = crate::inline::TextEngine::new_with_web_fonts(fonts);
     let mut ifc_items = IfcRegistry::default();
 
     // The document node itself is not an element; lay out from the first

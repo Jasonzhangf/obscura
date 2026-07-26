@@ -13,7 +13,7 @@ static FONT_BYTES: &[u8] = include_bytes!("../assets/liberation-sans.ttf");
 static SERIF_FONT_BYTES: &[u8] = include_bytes!("../assets/liberation-serif.ttf");
 static MONO_FONT_BYTES: &[u8] = include_bytes!("../assets/liberation-mono.ttf");
 
-use crate::layout_dom_with_resources;
+use crate::dom::layout_dom_with_web_fonts;
 
 /// Render `tree` at `viewport` (width, height) in CSS pixels to a Pixmap, or
 /// None if the viewport is zero-sized. `base_url`, when given, resolves the
@@ -36,7 +36,7 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
     // each URL is still fetched at most once.
     let intrinsic = collect_image_intrinsics(tree, base_url, &mut image_cache);
     let fonts = collect_web_fonts(tree, base_url);
-    let mut laid = layout_dom_with_resources(tree, viewport, &intrinsic, &fonts);
+    let mut laid = layout_dom_with_web_fonts(tree, viewport, &intrinsic, &fonts);
     let root_font_size = tree
         .query_selector("html")
         .ok()
@@ -953,15 +953,42 @@ fn fetch_bytes(
 /// filtering is load-bearing for performance: generated font packages commonly
 /// emit six or seven script subsets per face, while an English page needs only
 /// the subset containing ASCII.
-fn collect_web_fonts(tree: &DomTree, base_url: Option<&str>) -> Vec<Vec<u8>> {
+fn collect_web_fonts(tree: &DomTree, base_url: Option<&str>) -> Vec<crate::inline::WebFont> {
     let mut cache = std::collections::HashMap::new();
     let mut seen = std::collections::HashSet::new();
     let mut fonts = Vec::new();
+    let mut rules = Vec::new();
+
+    for nid in tree.descendants(tree.document()) {
+        let Some(node) = tree.get_node(nid) else { continue };
+        if node
+            .as_element()
+            .map(|element| element.local.as_ref() != "style")
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        let css = tree.text_content(nid);
+        for face in font_face_blocks(&css) {
+            if !font_face_covers_ascii(face) {
+                continue;
+            }
+            let Some(src) = font_face_urls(face).into_iter().next() else {
+                continue;
+            };
+            rules.push((
+                font_resource_key(&src, base_url),
+                src,
+                font_face_family(face),
+                font_face_weight(face),
+                font_face_italic(face),
+            ));
+        }
+    }
 
     // Critical web fonts are normally preloaded from the document with a URL
-    // already resolved relative to the HTML. Prefer that browser-authored list:
-    // CSS gathered from external stylesheets is flattened into <style> text in
-    // the live DOM, where a relative src no longer carries its stylesheet URL.
+    // already resolved relative to the HTML. Fetch those first, while retaining
+    // the matching @font-face descriptors needed for CSS family/weight lookup.
     let mut preloads = Vec::new();
     for nid in tree.descendants(tree.document()) {
         let Some(node) = tree.get_node(nid) else { continue };
@@ -985,48 +1012,50 @@ fn collect_web_fonts(tree: &DomTree, base_url: Option<&str>) -> Vec<Vec<u8>> {
         }
     }
     for src in preloads.iter().take(16) {
-        if !seen.insert(src.clone()) {
+        let key = font_resource_key(src, base_url);
+        if !seen.insert(key.clone()) {
             continue;
         }
         if let Some(decoded) = fetch_and_decode_font(src, base_url, &mut cache) {
-            fonts.push(decoded);
+            let metadata = rules.iter().find(|rule| rule.0 == key);
+            fonts.push(crate::inline::WebFont {
+                data: decoded,
+                family: metadata.and_then(|rule| rule.2.clone()),
+                weight: metadata.and_then(|rule| rule.3),
+                italic: metadata.and_then(|rule| rule.4),
+            });
         }
-    }
-    if !preloads.is_empty() {
-        return fonts;
     }
 
-    for nid in tree.descendants(tree.document()) {
-        let Some(node) = tree.get_node(nid) else { continue };
-        if node
-            .as_element()
-            .map(|element| element.local.as_ref() != "style")
-            .unwrap_or(true)
-        {
+    for (key, src, family, weight, italic) in rules {
+        if fonts.len() >= 16 {
+            break;
+        }
+        if !seen.insert(key) {
             continue;
         }
-        let css = tree.text_content(nid);
-        for face in font_face_blocks(&css) {
-            if !font_face_covers_ascii(face) {
-                continue;
-            }
-            let Some(src) = font_face_urls(face).into_iter().next() else {
-                continue;
-            };
-            if !seen.insert(src.clone()) {
-                continue;
-            }
-            // Bound pathological pages without penalizing normal generated
-            // font packages (family x weight x style usually stays under 20).
-            if fonts.len() >= 12 {
-                return fonts;
-            }
-            if let Some(decoded) = fetch_and_decode_font(&src, base_url, &mut cache) {
-                fonts.push(decoded);
-            }
+        if let Some(decoded) = fetch_and_decode_font(&src, base_url, &mut cache) {
+            fonts.push(crate::inline::WebFont {
+                data: decoded,
+                family,
+                weight,
+                italic,
+            });
         }
     }
     fonts
+}
+
+fn font_resource_key(src: &str, base_url: Option<&str>) -> String {
+    url::Url::parse(src)
+        .ok()
+        .or_else(|| {
+            base_url
+                .and_then(|base| url::Url::parse(base).ok())
+                .and_then(|base| base.join(src).ok())
+        })
+        .map(|url| url.to_string())
+        .unwrap_or_else(|| src.to_string())
 }
 
 fn fetch_and_decode_font(
@@ -1105,6 +1134,45 @@ fn font_face_declaration<'a>(face: &'a str, name: &str) -> Option<&'a str> {
     split_css_top_level(face, ';').into_iter().find_map(|declaration| {
         let (property, value) = declaration.split_once(':')?;
         property.trim().eq_ignore_ascii_case(name).then_some(value.trim())
+    })
+}
+
+fn font_face_family(face: &str) -> Option<String> {
+    font_face_declaration(face, "font-family")
+        .map(|family| family.trim().trim_matches(|ch| matches!(ch, '"' | '\'')).to_string())
+        .filter(|family| !family.is_empty())
+}
+
+fn font_face_weight(face: &str) -> Option<(u16, u16)> {
+    fn parse(value: &str) -> Option<u16> {
+        match value.to_ascii_lowercase().as_str() {
+            "normal" => Some(400),
+            "bold" => Some(700),
+            value => value
+                .parse::<f32>()
+                .ok()
+                .filter(|weight| weight.is_finite() && (1.0..=1000.0).contains(weight))
+                .map(|weight| weight.round() as u16),
+        }
+    }
+    let mut values = font_face_declaration(face, "font-weight")?
+        .split_ascii_whitespace()
+        .filter_map(parse);
+    let first = values.next()?;
+    let second = values.next().unwrap_or(first);
+    Some((first.min(second), first.max(second)))
+}
+
+fn font_face_italic(face: &str) -> Option<bool> {
+    font_face_declaration(face, "font-style").and_then(|style| {
+        let style = style.trim().to_ascii_lowercase();
+        if style == "normal" {
+            Some(false)
+        } else if style == "italic" || style.starts_with("oblique") {
+            Some(true)
+        } else {
+            None
+        }
     })
 }
 
@@ -3187,6 +3255,8 @@ mod tests {
             }
             @font-face {
                 font-family: "Example";
+                font-style: italic;
+                font-weight: 350 650;
                 src: url(data:font/woff2;base64,d09GMg==) format("woff2"),
                      url("./example-latin.woff") format("woff");
                 unicode-range: U+??, U+2000-206F;
@@ -3196,6 +3266,9 @@ mod tests {
         assert_eq!(faces.len(), 2);
         assert!(!font_face_covers_ascii(faces[0]));
         assert!(font_face_covers_ascii(faces[1]));
+        assert_eq!(font_face_family(faces[1]).as_deref(), Some("Example"));
+        assert_eq!(font_face_weight(faces[1]), Some((350, 650)));
+        assert_eq!(font_face_italic(faces[1]), Some(true));
         assert_eq!(
             font_face_urls(faces[1]),
             vec![
