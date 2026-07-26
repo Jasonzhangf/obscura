@@ -535,6 +535,48 @@ impl TextEngine {
         self.push_shaped_item(base, spans, collector.clip_fills)
     }
 
+    /// Shape generated text that owns a positioned pseudo box.
+    ///
+    /// Positioned `::before`/`::after` boxes do not participate in the taffy
+    /// tree, but their text still uses the same authored webfonts, variable
+    /// weight selection, transformations, and glyph rasterizer as an ordinary
+    /// inline formatting context. The caller measures/finalizes/paints the
+    /// returned item immediately against the pseudo's resolved content box.
+    pub(crate) fn push_generated_text(
+        &mut self,
+        text: &str,
+        style: &LayoutStyle,
+    ) -> Option<usize> {
+        let mut collector = Collector {
+            last_was_space: true,
+            clip_fills: Vec::new(),
+        };
+        let (family, weight) = resolve_loaded_font(
+            style.font_family.as_deref(),
+            crate::style::used_font_weight(style),
+            style.font_style_italic.unwrap_or(false),
+            &self.loaded_families,
+        );
+        let context = base_span_ctx(style, family, weight, &mut collector);
+        let attrs = SpanAttrs {
+            weight: context.weight,
+            italic: context.italic,
+            underline: context.underline,
+            color: context.color,
+            family: context.family,
+            clip_fill: context.clip_fill,
+        };
+        let mut spans = Vec::new();
+        push_text(
+            text,
+            context.transform,
+            &attrs,
+            &mut spans,
+            &mut collector,
+        );
+        self.push_shaped_item(style, spans, collector.clip_fills)
+    }
+
     /// Shared tail of [`try_build`] / [`try_build_run`]: shape the collected
     /// spans into a cosmic-text buffer under `base`'s font metrics and
     /// alignment, and store it as a new inline item.
@@ -936,7 +978,9 @@ fn is_pure_text_ifc(tree: &DomTree, id: NodeId, styles: &std::collections::HashM
     // the flex-column stand-ins our UA sheet uses for td/th/center). A real
     // flex/grid row with inline children is rare and better left to taffy.
     let flow = style.display == Display::Block
-        || (style.display == Display::Flex && style.flex_direction == Some(taffy::FlexDirection::Column));
+        || style.is_inline_block
+        || (style.display == Display::Flex
+            && style.flex_direction == Some(taffy::FlexDirection::Column));
     if !flow {
         return false;
     }
@@ -1340,6 +1384,23 @@ mod tests {
         let semibold = resolve_loaded_font(Some("Poppins"), 600, false, &loaded);
         assert_eq!(semibold.0.as_ref(), "Poppins");
         assert_eq!(semibold.1, 700);
+    }
+
+    #[test]
+    fn text_only_inline_block_keeps_an_internal_shaping_context() {
+        let tree = obscura_dom::parse_html(
+            "<span id='icon'>ligature_name</span>",
+        );
+        let icon = tree.get_element_by_id("icon").unwrap();
+        let mut style = LayoutStyle::default();
+        style.display = Display::Inline;
+        style.is_inline_block = true;
+        let styles = HashMap::from([(icon, style)]);
+
+        assert!(
+            is_pure_text_ifc(&tree, icon, &styles),
+            "atomic inline participation must not disable shaping inside the box"
+        );
     }
 
     #[test]

@@ -804,6 +804,16 @@ pub(crate) fn to_taffy_style(style: &LayoutStyle) -> Style {
     s.align_content = style.align_content;
     if let Some(jc) = style.justify_content {
         s.justify_content = Some(jc);
+    } else if style.is_inline_block {
+        // Taffy's inline-box stand-in is a wrapping flex row. `text-align`
+        // aligns each line of an inline-block's internal formatting context;
+        // map that inherited value onto the row axis without affecting how
+        // the atomic box itself participates in its parent's inline flow.
+        s.justify_content = match style.text_align {
+            Some(taffy::AlignItems::CENTER) => Some(taffy::JustifyContent::CENTER),
+            Some(taffy::AlignItems::FLEX_END) => Some(taffy::JustifyContent::FLEX_END),
+            _ => None,
+        };
     }
     if let Some(fg) = style.flex_grow {
         s.flex_grow = fg;

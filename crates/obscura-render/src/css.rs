@@ -128,7 +128,6 @@ impl Stylesheet {
         tree: &DomTree,
         matcher: &mut Matcher,
         nid: NodeId,
-        host: &LayoutStyle,
         props: &HashMap<String, String>,
     ) -> (Option<LayoutStyle>, Option<LayoutStyle>) {
         let build = |rules: &[PseudoRule], matcher: &mut Matcher| {
@@ -142,12 +141,6 @@ impl Stylesheet {
             }
             matched.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
             let mut style = LayoutStyle::default();
-            style.color = host.color;
-            style.font_size = host.font_size;
-            style.font_weight = host.font_weight.clone();
-            style.font_family = host.font_family.clone();
-            style.line_height = host.line_height;
-            style.text_transform = host.text_transform;
             let mut content = None;
             for &(_, _, rule) in &matched {
                 let expanded = substitute_vars(&rule.normal_decls, props, 0);

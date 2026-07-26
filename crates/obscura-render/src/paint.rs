@@ -276,6 +276,7 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
             .flatten()
         {
             paint_positioned_pseudo(
+                &mut laid.text_engine,
                 &mut pixmap,
                 pseudo,
                 &rect,
@@ -1745,6 +1746,7 @@ fn split_background_size_components(value: &str) -> Vec<&str> {
 }
 
 fn paint_positioned_pseudo(
+    text_engine: &mut crate::inline::TextEngine,
     pixmap: &mut Pixmap,
     style: &crate::LayoutStyle,
     containing_block: &crate::Rect,
@@ -1816,10 +1818,8 @@ fn paint_positioned_pseudo(
         paint_linear_gradient(pixmap, &path, &rect, *angle, stops);
     }
     if let Some(content) = style.before_content.as_deref().filter(|content| !content.is_empty()) {
-        let font_size = style.font_size.unwrap_or(16.0);
-        let bold = crate::style::used_font_weight(style) >= 600;
-        let text_width = measure_text(content, font_size, bold, style.font_family.as_deref());
-        let line_height = crate::inline::used_line_height(style);
+        let Some(item) = text_engine.push_generated_text(content, style) else { return };
+        let (text_width, text_height) = text_engine.measure(item, None);
         let x = match style.justify_content {
             Some(taffy::JustifyContent::CENTER) => rect.x + (rect.width - text_width) / 2.0,
             Some(taffy::JustifyContent::FLEX_END | taffy::JustifyContent::END) => {
@@ -1828,23 +1828,14 @@ fn paint_positioned_pseudo(
             _ => rect.x + style.padding.left,
         };
         let y = match style.align_items {
-            Some(taffy::AlignItems::CENTER) => rect.y + (rect.height - line_height) / 2.0,
+            Some(taffy::AlignItems::CENTER) => rect.y + (rect.height - text_height) / 2.0,
             Some(taffy::AlignItems::FLEX_END | taffy::AlignItems::END) => {
-                rect.y + rect.height - style.padding.bottom - line_height
+                rect.y + rect.height - style.padding.bottom - text_height
             }
             _ => rect.y + style.padding.top,
         };
-        draw_text(
-            pixmap,
-            content,
-            x,
-            y,
-            style.color.unwrap_or([0, 0, 0, 255]),
-            font_size,
-            bold,
-            style.font_family.as_deref(),
-            Some(visible),
-        );
+        text_engine.finalize(item, (x, y), text_width, Some(visible));
+        text_engine.paint_item(item, pixmap, (0.0, 0.0));
     }
 }
 
@@ -2946,6 +2937,46 @@ mod tests {
             })
             .count();
         assert!(dark_pixels > 10, "generated attr() text must be painted");
+    }
+
+    #[test]
+    fn later_positioned_pseudo_opaquely_covers_the_earlier_one() {
+        let tree = parse_html(
+            r#"<html><head><style>
+               body { margin:0 }
+               #cta {
+                 position:relative; width:120px; height:40px; padding:0;
+                 color:transparent; background:black;
+               }
+               #cta::before {
+                 content:"before";
+                 position:absolute; inset:1px;
+                 display:flex; align-items:center; justify-content:center;
+                 color:red; background:red;
+               }
+               #cta::after {
+                 content:"after";
+                 position:absolute; inset:1px;
+                 display:flex; align-items:center; justify-content:center;
+                 color:blue; background:white;
+               }
+               </style></head><body><button id="cta">host</button></body></html>"#,
+        );
+        let pixmap = paint_dom(&tree, (140.0, 60.0), None).expect("pixmap");
+        let inner = pixmap.pixel(5, 5).expect("inner pixel");
+        assert_eq!(
+            (inner.red(), inner.green(), inner.blue()),
+            (255, 255, 255),
+            "::after's opaque background must cover ::before"
+        );
+        let red_pixels = (1..119)
+            .flat_map(|x| (1..39).map(move |y| (x, y)))
+            .filter(|&(x, y)| {
+                let pixel = pixmap.pixel(x, y).unwrap();
+                pixel.red() > 180 && pixel.green() < 80 && pixel.blue() < 80
+            })
+            .count();
+        assert_eq!(red_pixels, 0, "::before must not bleed through ::after");
     }
 
     #[test]

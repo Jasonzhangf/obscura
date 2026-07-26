@@ -107,6 +107,14 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
     } else if tag == "a" {
         style.color = Some([0, 0, 238, 255]); // blue
         style.underline = Some(true); // UA default: links are underlined
+    } else if tag == "button" {
+        // HTML buttons are inline-block controls whose anonymous inner
+        // content is centered by the browser UA sheet. Keep the atomic outer
+        // participation separate from the internal text alignment: authored
+        // display/text-align declarations still cascade over both values.
+        style.display = Display::Inline;
+        style.is_inline_block = true;
+        style.text_align = Some(taffy::AlignItems::CENTER);
     } else if tag == "input" {
         // Native text controls are atomic inline-level boxes with their own
         // platform font and intrinsic border-box dimensions; they do not
@@ -3526,6 +3534,14 @@ mod tests {
         );
         assert_eq!(collapsed.border_spacing, Some((8.0, 8.0)));
         assert_eq!(collapsed.border_collapse, Some(true));
+    }
+
+    #[test]
+    fn button_ua_style_is_a_centered_atomic_inline_box() {
+        let button = ua_style("button");
+        assert_eq!(button.display, crate::Display::Inline);
+        assert!(button.is_inline_block);
+        assert_eq!(button.text_align, Some(taffy::AlignItems::CENTER));
     }
 
     #[test]

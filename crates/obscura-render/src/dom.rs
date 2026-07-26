@@ -353,7 +353,7 @@ fn cascade_walk(
             this_props = std::rc::Rc::new(m);
         }
         let (before_pseudo, after_pseudo) =
-            sheet.pseudo_styles(tree, matcher, id, &style, &this_props);
+            sheet.pseudo_styles(tree, matcher, id, &this_props);
         style.before_content = before_pseudo
             .as_ref()
             .filter(|pseudo| pseudo.position != Some(taffy::Position::Absolute))
@@ -942,6 +942,116 @@ pub(crate) fn layout_dom_with_web_fonts(
                             _ => style.margin.left = px,
                         }
                     }
+                }
+
+                // Pseudo-elements inherit the originating element's COMPUTED
+                // values. They were cascaded beside the host before this
+                // top-down pass, so inheriting its still-unresolved specified
+                // values there made `font-size:.875rem` disappear and left a
+                // positioned generated label at the 16px paint fallback.
+                // Resolve pseudo-authored relative values against the host,
+                // then fill every omitted inherited property from the host's
+                // now-final computed style.
+                let host_color = style.color;
+                let host_font_size = style.font_size.unwrap_or(parent_fs);
+                let host_weight = crate::style::used_font_weight(style);
+                let host_family = style.font_family.clone();
+                let host_line_height = style.line_height;
+                let host_transform = style.text_transform;
+                let host_italic = style.font_style_italic;
+                let host_text_align = style.text_align;
+                let host_invisible = style.effectively_invisible;
+                let settle_pseudo = |pseudo: &mut crate::LayoutStyle| {
+                    if let Some(expression) = pseudo.font_size_expression.as_deref() {
+                        pseudo.font_size = crate::style::resolve_contextual_length(
+                            expression,
+                            host_font_size,
+                            root_fs,
+                            vw,
+                            vh,
+                            host_font_size,
+                        );
+                    } else if let Some(raw) = pseudo.font_size_raw {
+                        pseudo.font_size = Some(match raw {
+                            crate::Dimension::Percent(percent) => host_font_size * percent,
+                            crate::Dimension::Em(value) => host_font_size * value,
+                            dimension => match dimension.resolve(
+                                host_font_size,
+                                root_fs,
+                                vw,
+                                vh,
+                            ) {
+                                crate::Dimension::Px(pixels) => pixels,
+                                _ => host_font_size,
+                            },
+                        });
+                    } else if pseudo.font_size.is_none() {
+                        pseudo.font_size = Some(host_font_size);
+                    }
+                    let pseudo_em = pseudo.font_size.unwrap_or(host_font_size);
+                    let weight = crate::style::computed_font_weight(
+                        pseudo.font_weight.as_deref(),
+                        host_weight,
+                    );
+                    pseudo.font_weight = Some(weight.to_string());
+                    if pseudo.font_family.is_none() {
+                        pseudo.font_family = host_family.clone();
+                    }
+                    if let Some(expression) = pseudo.line_height_expression.as_deref() {
+                        if let Some(resolved) = crate::style::resolve_contextual_length(
+                            expression,
+                            pseudo_em,
+                            root_fs,
+                            vw,
+                            vh,
+                            pseudo_em,
+                        ) {
+                            pseudo.line_height = Some(
+                                if crate::style::line_height_expression_is_length(expression) {
+                                    crate::LineHeight::Px(resolved)
+                                } else {
+                                    crate::LineHeight::Ratio(resolved)
+                                },
+                            );
+                        }
+                    } else if let Some(crate::LineHeight::Relative(relative)) =
+                        pseudo.line_height
+                    {
+                        let pixels = match relative {
+                            crate::Dimension::Percent(percent) => pseudo_em * percent,
+                            dimension => match dimension.resolve(
+                                pseudo_em,
+                                root_fs,
+                                vw,
+                                vh,
+                            ) {
+                                crate::Dimension::Px(pixels) => pixels,
+                                _ => pseudo_em,
+                            },
+                        };
+                        pseudo.line_height = Some(crate::LineHeight::Px(pixels));
+                    } else if pseudo.line_height.is_none() {
+                        pseudo.line_height = host_line_height;
+                    }
+                    if pseudo.color.is_none() {
+                        pseudo.color = host_color;
+                    }
+                    if pseudo.text_transform.is_none() {
+                        pseudo.text_transform = host_transform;
+                    }
+                    if pseudo.font_style_italic.is_none() {
+                        pseudo.font_style_italic = host_italic;
+                    }
+                    if pseudo.text_align.is_none() {
+                        pseudo.text_align = host_text_align;
+                    }
+                    pseudo.effectively_invisible = host_invisible;
+                };
+                if let Some(pseudo) = style.before_pseudo.as_deref_mut() {
+                    settle_pseudo(pseudo);
+                }
+                if let Some(pseudo) = style.after_pseudo.as_deref_mut() {
+                    settle_pseudo(pseudo);
                 }
 
                 // Containing-block width handed to this element's children is
@@ -4959,6 +5069,30 @@ mod tests {
         };
         assert_eq!(width("content-cell"), 124.0);
         assert_eq!(width("border-cell"), 100.0);
+    }
+
+    #[test]
+    fn positioned_pseudo_inherits_the_hosts_computed_font_metrics() {
+        let tree = parse_html(
+            r#"<style>
+                html { font-size:16px }
+                button { font-size:.875rem; line-height:1.5 }
+                button::after {
+                    content:attr(text); position:absolute; inset:1px;
+                }
+            </style>
+            <button id="cta" text="Get Started">Get Started</button>"#,
+        );
+        let laid = layout_dom(&tree, (1280.0, 720.0));
+        let cta = tree.get_element_by_id("cta").unwrap();
+        let host = &laid.styles[&cta];
+        let pseudo = host.after_pseudo.as_ref().unwrap();
+
+        assert_eq!(host.font_size, Some(14.0));
+        assert_eq!(pseudo.font_size, host.font_size);
+        assert_eq!(pseudo.font_family, host.font_family);
+        assert_eq!(pseudo.font_weight, host.font_weight);
+        assert_eq!(pseudo.line_height, host.line_height);
     }
 
 }
