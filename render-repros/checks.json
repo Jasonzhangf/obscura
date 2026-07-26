@@ -53,6 +53,9 @@
     {"name": "max padding uses actual viewport", "color": "#c2255c", "x": 60, "y": 240, "width": 20, "height": 40},
     {"name": "round quantizes nested custom property math", "color": "#2f9e44", "x": 0, "y": 300, "width": 250, "height": 40}
   ],
+  "eventtarget-lifecycle": [
+    {"name": "framework lifecycle EventTarget completes", "color": "#18723a", "x": 0, "y": 0, "width": 420, "height": 120}
+  ],
   "flex-whitespace-items": [
     {"name": "direct flex sidebar starts at container edge", "color": "#1971c2", "x": 0, "y": 0, "width": 225, "height": 180},
     {"name": "direct flex body keeps its intended inset", "color": "#2b8a3e", "x": 225, "y": 0, "width": 675, "height": 200},

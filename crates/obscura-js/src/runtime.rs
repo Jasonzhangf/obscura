@@ -4457,4 +4457,60 @@ mod tests {
             .unwrap();
         assert_eq!(result, serde_json::json!(["menu", "true"]));
     }
+
+    /// Framework schedulers commonly subclass EventTarget for their own
+    /// lifecycle events. These targets have no backing DOM node, but must
+    /// still deliver callbacks (including object, once, and signal listeners).
+    #[test]
+    fn standalone_event_target_delivers_framework_lifecycle_events() {
+        let mut rt = setup_runtime("<div></div>");
+        let result = rt
+            .evaluate(
+                r#"
+                const TypedEventTarget = class extends EventTarget {};
+                const target = new TypedEventTarget();
+                const calls = [];
+                const removed = () => calls.push("removed");
+                const controller = new AbortController();
+                const node = { id: "canvas-ref" };
+
+                target.addEventListener("insert", (event) => calls.push(event.node.id));
+                target.addEventListener("insert", { handleEvent() { calls.push("object"); } });
+                target.addEventListener("insert", () => calls.push("once"), { once: true });
+                target.addEventListener("insert", removed);
+                target.removeEventListener("insert", removed);
+                target.addEventListener("insert", () => calls.push("aborted"), {
+                    signal: controller.signal,
+                });
+                controller.abort();
+
+                const first = new Event("insert", { cancelable: true });
+                first.node = node;
+                const firstResult = target.dispatchEvent(first);
+                const second = new Event("insert");
+                second.node = node;
+                const secondResult = target.dispatchEvent(second);
+                return [
+                    target instanceof EventTarget,
+                    calls,
+                    firstResult,
+                    secondResult,
+                    first.target === target,
+                    first.currentTarget === null,
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                true,
+                ["canvas-ref", "object", "once", "canvas-ref", "object"],
+                true,
+                true,
+                true,
+                true
+            ])
+        );
+    }
 }
