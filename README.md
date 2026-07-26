@@ -169,6 +169,10 @@ No Chrome, no Node.js, no dependencies. Release archives include both
 `obscura` and `obscura-worker`; keep them in the same directory for the
 parallel `scrape` command.
 
+Default archive names contain the lean binary. Archives ending in
+`-stealth.tar.gz` or `-stealth.zip` additionally include the wreq/BoringSSL
+transport used for TLS impersonation.
+
 Linux release builds target Ubuntu 22.04 so the downloaded binary remains
 usable on common LTS servers with glibc 2.35+.
 
@@ -192,6 +196,14 @@ cargo build --release --features stealth
 ```
 
 Requires Rust 1.75+ ([rustup.rs](https://rustup.rs)). First build takes ~5 min (V8 compiles from source, cached after).
+The stealth build also compiles BoringSSL and generates bindings, so it needs
+CMake, Clang, and the libclang/LLVM development libraries. On Ubuntu/Debian:
+
+```bash
+sudo apt-get install build-essential cmake clang libclang-dev llvm-dev
+```
+
+The default build does not require these additional stealth dependencies.
 
 ## Quick Start
 
