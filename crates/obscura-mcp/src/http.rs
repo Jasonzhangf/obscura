@@ -169,7 +169,14 @@ async fn handle_connection(
             }
 
             "GET" if accept_sse => {
-                // SSE stream: hold open and send periodic keep-alive comments
+                // SSE stream: hold open and send periodic keep-alive comments.
+                // Connections are served sequentially (the browser session is
+                // `!Send`), so holding this infinite keep-alive loop inline would
+                // never return to the accept loop and would wedge every later
+                // request. The keep-alive touches no browser state and the write
+                // half is `Send + 'static`, so detach the ping loop onto its own
+                // task and return — the accept loop stays free while the stream
+                // lives on independently.
                 let hdr = format!(
                     "HTTP/1.1 200 OK\r\n\
                     Content-Type: text/event-stream\r\n\
@@ -179,14 +186,16 @@ async fn handle_connection(
                     \r\n"
                 );
                 writer.write_all(hdr.as_bytes()).await?;
-                loop {
-                    tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
-                    if writer.write_all(b": ping\n\n").await.is_err() {
-                        break;
+                tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
+                        if writer.write_all(b": ping\n\n").await.is_err() {
+                            break;
+                        }
+                        let _ = writer.flush().await;
                     }
-                    let _ = writer.flush().await;
-                }
-                break;
+                });
+                return Ok(());
             }
 
             "POST" => {
