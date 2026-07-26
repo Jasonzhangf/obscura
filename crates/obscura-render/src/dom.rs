@@ -466,6 +466,11 @@ pub fn layout_dom_with_images(
             /// taffy layout. Not a CSS-inherited property; it is recomputed to
             /// the element's own content width for its children.
             cb_width: f32,
+            /// Whether the containing block has a definite height. Percentage
+            /// heights in ordinary flow compute to auto when this is false;
+            /// resolving them against a synthetic zero height collapses
+            /// content-heavy modern UI wrappers such as code editors.
+            cb_height_definite: bool,
         }
         impl Default for Inherited {
             fn default() -> Self {
@@ -487,6 +492,7 @@ pub fn layout_dom_with_images(
                     border_collapse: false,
                     table_vertical_align: None,
                     cb_width: 0.0,
+                    cb_height_definite: false,
                 }
             }
         }
@@ -513,11 +519,13 @@ pub fn layout_dom_with_images(
         // i.e. the viewport width.
         let mut root_inh = Inherited::default();
         root_inh.cb_width = viewport.0;
+        root_inh.cb_height_definite = true;
         let mut queue = vec![(root_id, root_inh)];
         while let Some((id, mut inh)) = queue.pop() {
             // Default the child containing-block width to this element's own
             // (updated to its content width inside the block below).
             let mut child_cb_width = inh.cb_width;
+            let mut child_cb_height_definite = false;
             if let Some(style) = styles.get_mut(&id) {
                 match style.color { Some(c) => inh.color = Some(c), None => style.color = inh.color }
                 // Resolve a relative font-size against the PARENT (em/%) or
@@ -575,6 +583,16 @@ pub fn layout_dom_with_images(
                 style.max_width = style.max_width.resolve(em_px, root_fs, vw, vh);
                 style.max_height = style.max_height.resolve(em_px, root_fs, vw, vh);
                 style.flex_basis = style.flex_basis.resolve(em_px, root_fs, vw, vh);
+                if matches!(style.height, crate::Dimension::Percent(_))
+                    && !inh.cb_height_definite
+                    && !matches!(style.position, Some(taffy::Position::Absolute))
+                {
+                    style.height = crate::Dimension::Auto;
+                }
+                child_cb_height_definite = matches!(
+                    style.height,
+                    crate::Dimension::Px(_) | crate::Dimension::Percent(_)
+                );
                 for i in style.inset.iter_mut() {
                     if let Some(d) = i {
                         *i = Some(d.resolve(em_px, root_fs, vw, vh));
@@ -748,6 +766,7 @@ pub fn layout_dom_with_images(
                 };
             }
             inh.cb_width = child_cb_width;
+            inh.cb_height_definite = child_cb_height_definite;
             for cid in tree.children(id).into_iter().rev() {
                 queue.push((cid, inh.clone()));
             }
@@ -847,25 +866,66 @@ pub fn layout_dom_with_images(
 
         resolve_grid_areas(tree, root_id, &mut styles);
 
-        // Blockify grid items (CSS Display 3): a direct child of a grid
-        // container is blockified, so an inline `<a>`/`<time>`/`<span>` becomes
-        // a block-level grid item and lays its text out as its own box instead
-        // of being flattened into loose words in the container's cell (which
-        // shattered grid lists like jvns.ca's `.article-list{display:grid}` of
-        // alternating `<time>`/`<a>` into one word per cell). Only grid is done
-        // here, not flex: obscura also uses flex-column as the UA stand-in for
-        // block containers like `<td>`, whose inline text must stay inline.
-        let grid_parents: Vec<NodeId> = styles
+        // Blockify flex/grid items (CSS Display 3): a direct inline child of a
+        // genuine flex or grid container gets a blockified outer display while
+        // retaining its own inner formatting context. Without the flex half,
+        // `<pre class=flex><code>...</code></pre>` collapses the code item and
+        // navigation bars treat direct `<a>` children as wrapping inline
+        // containers instead of flex items.
+        //
+        // `internal_flex_container` is deliberately excluded: table cells use
+        // a flex column only as our block-layout stand-in, and their ordinary
+        // inline text must continue to form an inline formatting context.
+        let item_parents: Vec<NodeId> = styles
             .iter()
-            .filter(|(_, s)| s.display == crate::Display::Grid)
+            .filter(|(_, s)| {
+                s.display == crate::Display::Grid
+                    || (s.display == crate::Display::Flex
+                        && !s.internal_flex_container)
+            })
             .map(|(&id, _)| id)
             .collect();
-        for pid in grid_parents {
+        for pid in item_parents {
             for cid in tree.children(pid) {
                 if let Some(cs) = styles.get_mut(&cid) {
-                    if cs.display == crate::Display::Inline && !cs.is_inline_block {
+                    if cs.display == crate::Display::Inline {
                         cs.display = crate::Display::Block;
                     }
+                }
+            }
+        }
+
+        // In an auto-height column flex container, a zero flex basis still
+        // participates in intrinsic main-size calculation through the item's
+        // automatic minimum size. Taffy otherwise treats `flex: 1 1` plus
+        // overflow:auto as an unconditional zero contribution, collapsing the
+        // entire ancestor chain even when the item contains many lines. Use
+        // an auto basis for this indefinite-size phase; definite-height flex
+        // containers keep the authored zero basis and normal free-space math.
+        let intrinsic_column_flex_parents: Vec<NodeId> = styles
+            .iter()
+            .filter(|(_, style)| {
+                style.display == crate::Display::Flex
+                    && style.flex_direction == Some(taffy::FlexDirection::Column)
+                    && style.height == crate::Dimension::Auto
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        for parent in intrinsic_column_flex_parents {
+            for child in tree.children(parent) {
+                let Some(style) = styles.get_mut(&child) else {
+                    continue;
+                };
+                let zero_basis = matches!(
+                    style.flex_basis,
+                    crate::Dimension::Px(value) | crate::Dimension::Percent(value)
+                        if value == 0.0
+                );
+                if zero_basis
+                    && style.height == crate::Dimension::Auto
+                    && style.min_height == crate::Dimension::Auto
+                {
+                    style.flex_basis = crate::Dimension::Auto;
                 }
             }
         }
@@ -3179,6 +3239,17 @@ fn build(
         has_inline_content(tree, id, styles) || style.before_content.is_some() || style.after_content.is_some();
 
     let mut dom_children = tree.children(id);
+    let internal_mixed_block_flow = style.internal_flex_container
+        && dom_children.iter().any(|cid| {
+            styles.get(cid).map_or(false, |child| {
+                child.display == crate::Display::Block
+                    && child.float.is_none()
+                    && !matches!(
+                        child.position,
+                        Some(taffy::Position::Absolute)
+                    )
+            })
+        });
     // In flex and grid formatting contexts, collapsible whitespace-only text
     // between items does not generate an anonymous item. Taffy places each
     // stray whitespace leaf in the item sequence, shifting every real child.
@@ -3188,7 +3259,9 @@ fn build(
     // Flatten display:contents first because its children participate as direct
     // flex/grid items. Otherwise formatting whitespace inside the transparent
     // wrapper would survive this filter and become an item in `build_any`.
-    if matches!(style.display, crate::Display::Flex | crate::Display::Grid) {
+    if matches!(style.display, crate::Display::Flex | crate::Display::Grid)
+        && !internal_mixed_block_flow
+    {
         let mut flat = Vec::new();
         flatten_contents_children(tree, &dom_children, styles, &mut flat);
         dom_children = flat;
@@ -3219,8 +3292,7 @@ fn build(
     // approximation corrupts flex sizing and percentage-margin placement.
     let has_float_child = style.display == crate::Display::Block
         && dom_children.iter().any(|&cid| styles.get(&cid).map(|s| s.float.is_some()).unwrap_or(false));
-    let has_in_flow_block_child = style.display == crate::Display::Block
-        && dom_children.iter().any(|cid| {
+    let has_in_flow_block_child = dom_children.iter().any(|cid| {
             styles.get(cid).map_or(false, |child| {
                 child.display == crate::Display::Block
                     && child.float.is_none()
@@ -3240,6 +3312,10 @@ fn build(
                         && !matches!(child.position, Some(taffy::Position::Absolute))
                 })
         });
+    let is_native_table_cell = node.as_element().map_or(false, |element| {
+        matches!(element.local.as_ref(), "td" | "th")
+            && style.internal_flex_container
+    });
 
     // `text-align` affects inline content, never the used width or placement
     // of an in-flow block child. `to_taffy_style` promotes a centered/right
@@ -3265,7 +3341,11 @@ fn build(
     // block children (e.g. a `position:relative` hero wrapper whose only
     // child is out-of-flow) to width 0 and let text and blocks share lines.
     // Floats still take the legacy zone path below.
-    if style.display == crate::Display::Block && has_inline_ish_content && !has_float_child {
+    if (style.display == crate::Display::Block
+        || (is_native_table_cell && has_in_flow_block_child))
+        && has_inline_ish_content
+        && !has_float_child
+    {
         return build_mixed_block(tree, id, style, taffy_style, &dom_children, taffy_tree, id_map, words, engine, ifc_items, styles);
     }
 
@@ -3496,6 +3576,14 @@ fn build_mixed_block(
                 child_ids.extend(built);
             }
             Seg::Run(run) => {
+                let has_text_strut = run.iter().any(|&cid| {
+                    tree.get_node(cid).map_or(false, |node| {
+                        matches!(
+                            node.data,
+                            obscura_dom::tree::NodeData::Text { .. }
+                        )
+                    })
+                });
                 // Collapsible source formatting at the start/end of an inline
                 // run does not create line width. Preserve whitespace between
                 // inline siblings, but trim indentation adjacent to block
@@ -3541,18 +3629,27 @@ fn build_mixed_block(
                     // Whitespace-only run between blocks: no anonymous box.
                     continue;
                 }
-                let wrapper = taffy_tree.new_with_children(run_wrapper_style(style), &atoms).ok()?;
+                let wrapper = taffy_tree
+                    .new_with_children(
+                        run_wrapper_style(style, has_text_strut),
+                        &atoms,
+                    )
+                    .ok()?;
                 child_ids.push(wrapper);
             }
         }
     }
     // Pseudo content that found no adjacent run to join.
     if before_pending {
-        let wrapper = taffy_tree.new_with_children(run_wrapper_style(style), &before_leaves).ok()?;
+        let wrapper = taffy_tree
+            .new_with_children(run_wrapper_style(style, true), &before_leaves)
+            .ok()?;
         child_ids.insert(0, wrapper);
     }
     if after_pending {
-        let wrapper = taffy_tree.new_with_children(run_wrapper_style(style), &after_leaves).ok()?;
+        let wrapper = taffy_tree
+            .new_with_children(run_wrapper_style(style, true), &after_leaves)
+            .ok()?;
         child_ids.push(wrapper);
     }
     for cid in out_of_flow {
@@ -3601,11 +3698,19 @@ fn run_leaf_style() -> taffy::Style {
 /// context. The parent's `text-align` moves the run's line content via
 /// justify-content, exactly as the old whole-container
 /// promotion did, but scoped to the run so sibling blocks stay full width.
-fn run_wrapper_style(parent: &crate::LayoutStyle) -> taffy::Style {
+fn run_wrapper_style(
+    parent: &crate::LayoutStyle,
+    has_text_strut: bool,
+) -> taffy::Style {
     let justify = match parent.text_align {
         Some(taffy::AlignItems::FLEX_END) => Some(taffy::JustifyContent::FLEX_END),
         Some(taffy::AlignItems::CENTER) => Some(taffy::JustifyContent::CENTER),
         _ => None,
+    };
+    let line_height = if has_text_strut {
+        crate::inline::used_line_height(parent).max(0.0)
+    } else {
+        0.0
     };
     taffy::Style {
         display: taffy::style::Display::Flex,
@@ -3614,6 +3719,12 @@ fn run_wrapper_style(parent: &crate::LayoutStyle) -> taffy::Style {
         align_items: Some(taffy::AlignItems::FLEX_START),
         justify_content: justify,
         size: taffy::Size { width: taffy::style::Dimension::percent(1.0), height: taffy::style::Dimension::auto() },
+        // Every CSS line box starts with the parent's font/line-height strut,
+        // even when its only atomic inline is shorter (or zero-sized).
+        min_size: taffy::Size {
+            width: taffy::style::Dimension::auto(),
+            height: taffy::style::Dimension::length(line_height),
+        },
         ..Default::default()
     }
 }

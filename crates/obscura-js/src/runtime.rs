@@ -1015,6 +1015,40 @@ impl ObscuraJsRuntime {
         state.dom.as_ref().map(f)
     }
 
+    /// Replace the body's children while preserving the body node itself.
+    ///
+    /// Keeping the document/body node IDs stable matters because JavaScript
+    /// wrappers cache those IDs. This is used by the browser's narrowly
+    /// guarded hydration recovery path after a framework catastrophically
+    /// clears an otherwise complete server-rendered document.
+    pub fn replace_body_inner_html(&self, html: &str) -> bool {
+        #[allow(unused_mut)]
+        let mut state = self.state.borrow_mut();
+        let Some(dom) = state.dom.as_ref() else {
+            return false;
+        };
+        let Ok(Some(body)) = dom.query_selector("body") else {
+            return false;
+        };
+
+        for child in dom.children(body) {
+            // Detach instead of recycling the node slot: wrappers held by a
+            // failed hydration attempt must not start referring to a newly
+            // restored, unrelated node that reused the same ID.
+            dom.detach(child);
+        }
+        if !html.is_empty() {
+            let fragment = obscura_dom::parse_fragment(html);
+            let root = fragment.fragment_root();
+            dom.import_children_from(body, &fragment, root);
+        }
+        #[cfg(feature = "render")]
+        {
+            state.layout_cache = None;
+        }
+        true
+    }
+
     /// Absolute URLs the page requested via fetch()/XHR, in request order
     /// (issue #301). Backs `--dump assets`.
     pub fn fetched_urls(&self) -> Vec<String> {
@@ -2655,6 +2689,109 @@ mod tests {
         let mut rt = setup_runtime(r#"<div id="x"><p>Hello</p></div>"#);
         let html = rt.evaluate("document.getElementById('x').innerHTML").unwrap();
         assert!(html.as_str().unwrap().contains("<p>"));
+    }
+
+    #[test]
+    fn template_inner_html_preserves_table_fragments() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                const template = document.createElement('template');
+                template.innerHTML = '<tr><td>first</td><td>second</td></tr>';
+                const clone = template.content.firstChild.cloneNode(true);
+                return [
+                    clone.tagName,
+                    clone.firstElementChild.tagName,
+                    clone.firstElementChild.children.length,
+                    clone.textContent,
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!(["TR", "TD", 0, "firstsecond"]));
+    }
+
+    #[test]
+    fn document_exposes_parent_node_element_children_api() {
+        let mut rt = setup_runtime("<html><head></head><body></body></html>");
+        let result = rt
+            .evaluate(
+                "return [document.firstElementChild === document.documentElement,\
+                         document.lastElementChild === document.documentElement,\
+                         document.children.length, document.childElementCount];",
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([true, true, 1, 1]));
+    }
+
+    #[test]
+    fn atob_decodes_large_payload_without_argument_stack_overflow() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        // 60k four-character groups decode to 180k bytes, comfortably above
+        // V8's maximum argument count for a single fromCharCode(...bytes).
+        let encoded = "QUFB".repeat(60_000);
+        let result = rt
+            .evaluate(&format!("atob('{}').length", encoded))
+            .unwrap();
+        assert_eq!(result.as_f64().unwrap() as usize, 180_000);
+    }
+
+    #[test]
+    fn navigation_api_updates_current_entry_state() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                (() => {
+                    navigation.updateCurrentEntry({state: {route: 'home'}});
+                    const first = navigation.currentEntry;
+                    navigation.navigate('/docs', {state: {route: 'docs'}});
+                    return [
+                        typeof navigation.updateCurrentEntry,
+                        first.getState().route,
+                        navigation.currentEntry.getState().route,
+                        navigation.currentEntry.url,
+                    ];
+                })()
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                "function",
+                "home",
+                "docs",
+                "http://example.com/docs"
+            ])
+        );
+    }
+
+    #[test]
+    fn adopted_stylesheets_materialize_into_the_document() {
+        let mut rt = setup_runtime("<html><head></head><body><div class=\"card\"></div></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                (() => {
+                    const sheet = new CSSStyleSheet();
+                    document.adoptedStyleSheets.push(sheet);
+                    sheet.insertRule('.card { display: flex; color: red; }', 0);
+                    const node = document.querySelector('style[data-obscura-adopted]');
+                    const inserted = node.textContent;
+                    sheet.deleteRule(0);
+                    return [
+                        document.adoptedStyleSheets.length,
+                        document.querySelectorAll('style[data-obscura-adopted]').length,
+                        inserted.includes('display: flex'),
+                        node.textContent,
+                    ];
+                })()
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([1, 1, true, ""]));
     }
 
     #[test]

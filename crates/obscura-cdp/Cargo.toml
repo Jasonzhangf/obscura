@@ -24,7 +24,6 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 base64 = { workspace = true }
 futures-util = "0.3"
-base64 = "0.22"
 obscura-net = { workspace = true }
 
 [target.'cfg(target_env = "gnu")'.dependencies]

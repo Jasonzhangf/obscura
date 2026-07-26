@@ -121,6 +121,14 @@
     {"name": "inline block list shrink wraps and stacks children", "color": "#1971c2", "x": 525, "y": 0, "width": 90, "height": 60},
     {"name": "table stand-in does not blockify inline-block list", "color": "#c2255c", "x": 0, "y": 140, "width": 90, "height": 20}
   ],
+  "inline-replaced-flow": [
+    {"name": "default image stays in its inline formatting context", "color": "#1971c2", "x": 60, "y": 0, "width": 40, "height": 20},
+    {"name": "following inline content remains on the image line", "color": "#e8590c", "x": 100, "y": 0, "width": 70, "height": 20},
+    {"name": "authored block image still starts a block row", "color": "#1971c2", "x": 0, "y": 80, "width": 40, "height": 20},
+    {"name": "content after authored block image follows below", "color": "#e8590c", "x": 0, "y": 100, "width": 70, "height": 20},
+    {"name": "atomic inline run retains its line-height strut", "color": "#7048e8", "x": 0, "y": 178, "width": 300, "height": 4},
+    {"name": "mixed cell keeps block child full width and centered", "color": "#2b8a3e", "x": 100, "y": 182, "width": 100, "height": 20}
+  ],
   "item-self-alignment": [
     {"name": "flex item centers itself on cross axis", "color": "#087f5b", "x": 0, "y": 40, "width": 40, "height": 20},
     {"name": "flex item aligns itself to cross end", "color": "#1971c2", "x": 40, "y": 70, "width": 50, "height": 30},

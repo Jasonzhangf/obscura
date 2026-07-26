@@ -1542,9 +1542,14 @@ class Element extends Node {
         // Cache by node id so `.content` keeps a stable identity across reads —
         // frameworks stash the fragment and compare it later.
         if (!_cache.has(nid)) _cache.set(nid, new DocumentFragment(nid));
-        return _cache.get(nid);
+        const content = _cache.get(nid);
+        content._fragmentContext = 'template';
+        return content;
       }
-      if (!this._templateContent) this._templateContent = document.createDocumentFragment();
+      if (!this._templateContent) {
+        this._templateContent = document.createDocumentFragment();
+        this._templateContent._fragmentContext = 'template';
+      }
       return this._templateContent;
     }
     if (tag === 'meta') return this.getAttribute('content') || '';
@@ -2774,6 +2779,13 @@ function _makeXPathResult(type, nodes) {
 
 class Document extends Node {
   get documentElement() { return _wrapEl(+_dom("document_element")); }
+  get children() {
+    const root = this.documentElement;
+    return HTMLCollection._from(root ? [root] : []);
+  }
+  get childElementCount() { return this.documentElement ? 1 : 0; }
+  get firstElementChild() { return this.documentElement; }
+  get lastElementChild() { return this.documentElement; }
   get head() { return this.querySelector("head"); }
   get body() { return this.querySelector("body"); }
   get doctype() {
@@ -2850,6 +2862,7 @@ class Document extends Node {
     const el = _wrapEl(+_dom("create_element", t.toLowerCase()));
     if (el && t.toLowerCase() === 'template') {
       el._templateContent = this.createDocumentFragment();
+      el._templateContent._fragmentContext = 'template';
     }
     return el;
   }
@@ -3258,7 +3271,14 @@ class DocumentFragment extends Node {
   get nodeType() { return 11; }
   get nodeName() { return "#document-fragment"; }
   get innerHTML() { return _domParse("inner_html", this._nid) ?? ""; }
-  set innerHTML(v) { _dom("set_inner_html", this._nid, String(v ?? "")); }
+  set innerHTML(v) {
+    const html = String(v ?? "");
+    if (this._fragmentContext) {
+      _dom("set_inner_html_context", this._nid, this._fragmentContext + "\0" + html);
+    } else {
+      _dom("set_inner_html", this._nid, html);
+    }
+  }
   querySelector(s) { return _wrapEl(+_dom("query_selector_scoped", this._nid, s)); }
   querySelectorAll(s) {
     const ids = _domParse("query_selector_all_scoped", this._nid, s) || [];
@@ -4736,11 +4756,13 @@ globalThis.CSSStyleSheet = class CSSStyleSheet {
     const idx = index ?? this._rules.length;
     this._rules.splice(idx, 0, { cssText: rule, type: 1 });
     this.cssRules = this._rules;
+    _syncAdoptedStyleSheet(this);
     return idx;
   }
   deleteRule(index) {
     this._rules.splice(index, 1);
     this.cssRules = this._rules;
+    _syncAdoptedStyleSheet(this);
   }
   addRule(selector, style, index) {
     return this.insertRule(selector + '{' + style + '}', index);
@@ -4749,17 +4771,73 @@ globalThis.CSSStyleSheet = class CSSStyleSheet {
   replace(text) {
     this._rules = [{ cssText: text, type: 1 }];
     this.cssRules = this._rules;
+    _syncAdoptedStyleSheet(this);
     return Promise.resolve(this);
   }
   replaceSync(text) {
     this._rules = [{ cssText: text, type: 1 }];
     this.cssRules = this._rules;
+    _syncAdoptedStyleSheet(this);
   }
 };
 
+function _syncAdoptedStyleSheet(sheet) {
+  const doc = globalThis.document;
+  if (doc && doc._adoptedStyleSheets?.includes(sheet)) {
+    _syncDocumentAdoptedStyles(doc);
+  }
+}
+
+function _syncDocumentAdoptedStyles(doc) {
+  const sheets = doc._adoptedStyleSheets || [];
+  const nodes = doc._adoptedStyleNodes || (doc._adoptedStyleNodes = new Map());
+  for (const [sheet, node] of Array.from(nodes.entries())) {
+    if (!sheets.includes(sheet)) {
+      node.remove();
+      nodes.delete(sheet);
+    }
+  }
+  for (const sheet of sheets) {
+    if (!(sheet instanceof CSSStyleSheet)) continue;
+    let node = nodes.get(sheet);
+    if (!node || !node.parentNode) {
+      node = doc.createElement("style");
+      node.setAttribute("data-obscura-adopted", "");
+      (doc.head || doc.documentElement).appendChild(node);
+      nodes.set(sheet, node);
+    }
+    const css = Array.from(sheet.cssRules || [], rule => rule.cssText || "").join("\n");
+    if (node.textContent !== css) node.textContent = css;
+  }
+}
+
+function _makeAdoptedSheetList(doc, values) {
+  const target = Array.from(values || []);
+  return new Proxy(target, {
+    set(array, property, value) {
+      Reflect.set(array, property, value);
+      _syncDocumentAdoptedStyles(doc);
+      return true;
+    },
+    deleteProperty(array, property) {
+      Reflect.deleteProperty(array, property);
+      _syncDocumentAdoptedStyles(doc);
+      return true;
+    },
+  });
+}
+
 Object.defineProperty(Document.prototype, 'adoptedStyleSheets', {
-  get() { return this._adoptedStyleSheets || []; },
-  set(sheets) { this._adoptedStyleSheets = sheets; },
+  get() {
+    if (!this._adoptedStyleSheets) {
+      this._adoptedStyleSheets = _makeAdoptedSheetList(this, []);
+    }
+    return this._adoptedStyleSheets;
+  },
+  set(sheets) {
+    this._adoptedStyleSheets = _makeAdoptedSheetList(this, sheets);
+    _syncDocumentAdoptedStyles(this);
+  },
 });
 
 globalThis.__mutationObservers = [];
@@ -6014,7 +6092,24 @@ globalThis.localStorage = _mkStore();
 globalThis.sessionStorage = _mkStore();
 
 globalThis.btoa = globalThis.btoa || ((s) => { const b = new TextEncoder().encode(s); const c="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"; let r=""; for(let i=0;i<b.length;i+=3){const a=b[i],bb=b[i+1]??0,cc=b[i+2]??0; r+=c[a>>2]+c[((a&3)<<4)|(bb>>4)]+(i+1<b.length?c[((bb&15)<<2)|(cc>>6)]:"=")+(i+2<b.length?c[cc&63]:"=");} return r; });
-globalThis.atob = globalThis.atob || ((s) => { const c="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"; let r=[]; for(let i=0;i<s.length;i+=4){const a=c.indexOf(s[i]),b=c.indexOf(s[i+1]),cc=c.indexOf(s[i+2]),d=c.indexOf(s[i+3]); r.push((a<<2)|(b>>4)); if(cc>=0)r.push(((b&15)<<4)|(cc>>2)); if(d>=0)r.push(((cc&3)<<6)|d);} return String.fromCharCode(...r); });
+globalThis.atob = globalThis.atob || ((s) => {
+  const c="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  const r=[];
+  s=String(s).replace(/[\t\n\f\r ]/g,"");
+  for(let i=0;i<s.length;i+=4){
+    const a=c.indexOf(s[i]),b=c.indexOf(s[i+1]),cc=c.indexOf(s[i+2]),d=c.indexOf(s[i+3]);
+    r.push((a<<2)|(b>>4));
+    if(cc>=0)r.push(((b&15)<<4)|(cc>>2));
+    if(d>=0)r.push(((cc&3)<<6)|d);
+  }
+  // Spreading a large decoded payload into one call overflows V8's argument
+  // stack. Angular and other SSR frameworks routinely decode blobs large
+  // enough to hit that ceiling.
+  let out="";
+  const chunk=0x8000;
+  for(let i=0;i<r.length;i+=chunk) out+=String.fromCharCode(...r.slice(i,i+chunk));
+  return out;
+});
 
 // Functional History API. The earlier stub returned constant state and was a
 // no-op on push/replace, so any SPA that tried to update its URL (Next.js
@@ -6093,6 +6188,105 @@ globalThis.atob = globalThis.atob || ((s) => { const c="ABCDEFGHIJKLMNOPQRSTUVWX
     forward() { this.go(1); },
   };
 })();
+
+// Navigation API. New framework routers increasingly prefer `navigation`
+// over popstate/history. Keep it backed by the functional History API above
+// so both surfaces agree about the current URL and state.
+(() => {
+  const listeners = Object.create(null);
+  const nav = {
+    addEventListener(type, callback) {
+      if (typeof callback !== "function") return;
+      (listeners[String(type)] ||= []).push(callback);
+    },
+    removeEventListener(type, callback) {
+      const list = listeners[String(type)];
+      if (!list) return;
+      const index = list.indexOf(callback);
+      if (index >= 0) list.splice(index, 1);
+    },
+    dispatchEvent(event) {
+      if (!event || !event.type) return true;
+      const list = (listeners[String(event.type)] || []).slice();
+      for (const callback of list) {
+        try { callback.call(nav, event); } catch (error) { console.error(error); }
+      }
+      return !event.defaultPrevented;
+    },
+  };
+  let serial = 0;
+  const makeEntry = () => {
+    const key = "obscura-" + serial;
+    const state = history.state;
+    return {
+      id: key,
+      key,
+      index: Math.max(0, history.length - 1),
+      sameDocument: true,
+      url: __currentUrl(),
+      getState() { return state; },
+      addEventListener() {},
+      removeEventListener() {},
+    };
+  };
+  let entry = makeEntry();
+  const changed = (from) => {
+    const old = from || entry;
+    serial++;
+    entry = makeEntry();
+    try {
+      const ev = new Event("currententrychange");
+      ev.from = old;
+      nav.dispatchEvent(ev);
+    } catch {}
+    return entry;
+  };
+  Object.defineProperties(nav, {
+    currentEntry: { configurable: true, enumerable: true, get: () => entry },
+    canGoBack: { configurable: true, enumerable: true, get: () => history.length > 1 },
+    canGoForward: { configurable: true, enumerable: true, get: () => false },
+    transition: { configurable: true, enumerable: true, get: () => null },
+    activation: { configurable: true, enumerable: true, get: () => null },
+  });
+  nav.entries = () => [entry];
+  nav.updateCurrentEntry = (options) => {
+    const old = entry;
+    const state = options && Object.prototype.hasOwnProperty.call(options, "state")
+      ? options.state : history.state;
+    history.replaceState(state, "", __currentUrl());
+    return changed(old);
+  };
+  nav.navigate = (url, options) => {
+    const old = entry;
+    const state = options && Object.prototype.hasOwnProperty.call(options, "state")
+      ? options.state : null;
+    if (options && options.history === "replace") history.replaceState(state, "", url);
+    else history.pushState(state, "", url);
+    const next = changed(old);
+    const done = Promise.resolve(next);
+    return { committed: done, finished: done };
+  };
+  nav.reload = () => {
+    const done = Promise.resolve(entry);
+    return { committed: done, finished: done };
+  };
+  nav.traverseTo = () => {
+    const done = Promise.resolve(entry);
+    return { committed: done, finished: done };
+  };
+  nav.back = () => {
+    history.back();
+    const done = Promise.resolve(changed());
+    return { committed: done, finished: done };
+  };
+  nav.forward = () => {
+    history.forward();
+    const done = Promise.resolve(changed());
+    return { committed: done, finished: done };
+  };
+  globalThis.navigation = nav;
+})();
+
 globalThis.screenX = 0; globalThis.screenY = 0;
 globalThis.screenLeft = 0; globalThis.screenTop = 0;
 globalThis.pageXOffset = 0; globalThis.pageYOffset = 0;

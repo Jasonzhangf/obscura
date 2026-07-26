@@ -449,6 +449,30 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
             }
             "true".into()
         }
+        "set_inner_html_context" => {
+            let nid = match arg1.parse::<u32>() {
+                Ok(n) if n > 0 => n,
+                _ => return "false".into(),
+            };
+            let target = NodeId::new(nid);
+            let (context, html) = arg2
+                .split_once('\0')
+                .unwrap_or(("body", arg2.as_str()));
+            for child in dom.children(target) {
+                dom.detach(child);
+            }
+            if !html.is_empty() {
+                let context_name = html5ever::QualName::new(
+                    None,
+                    html5ever::ns!(html),
+                    html5ever::LocalName::from(context.to_ascii_lowercase()),
+                );
+                let fragment = obscura_dom::parse_fragment_with_context(html, context_name);
+                let import_root = fragment.fragment_root();
+                dom.import_children_from(target, &fragment, import_root);
+            }
+            "true".into()
+        }
         "set_text_content" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
             dom.with_node_mut(NodeId::new(nid), |n| {

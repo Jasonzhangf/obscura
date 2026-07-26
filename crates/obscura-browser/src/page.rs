@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use obscura_dom::{parse_html, DomTree};
+use obscura_dom::{parse_html, DomTree, NodeData, NodeId};
 use obscura_js::runtime::ObscuraJsRuntime;
 use obscura_net::{CallbackRegistry, ObscuraHttpClient, ObscuraNetError, RequestCallback, Response, ResponseCallback};
 use url::Url;
@@ -312,6 +312,127 @@ fn parse_import_url(stmt: &str) -> Option<String> {
     Some(url)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HydrationStats {
+    elements: usize,
+    text_chars: usize,
+}
+
+struct HydrationSnapshot {
+    body_html: String,
+    stats: HydrationStats,
+}
+
+fn capture_hydration_snapshot(js: &ObscuraJsRuntime) -> Option<HydrationSnapshot> {
+    js.with_dom(|dom| {
+        let body = dom.query_selector("body").ok().flatten()?;
+        Some(HydrationSnapshot {
+            body_html: dom.inner_html(body),
+            stats: hydration_stats(dom, body),
+        })
+    })
+    .flatten()
+}
+
+fn capture_hydration_stats(js: &ObscuraJsRuntime) -> Option<HydrationStats> {
+    js.with_dom(|dom| {
+        let body = dom.query_selector("body").ok().flatten()?;
+        Some(hydration_stats(dom, body))
+    })
+    .flatten()
+}
+
+fn hydration_stats(dom: &DomTree, body: NodeId) -> HydrationStats {
+    let mut elements = 0;
+    let mut text_chars = 0;
+
+    for node_id in dom.descendants(body) {
+        let Some(node) = dom.get_node(node_id) else {
+            continue;
+        };
+        match &node.data {
+            NodeData::Element { name, .. } => {
+                if !matches!(
+                    name.local.as_ref(),
+                    "script" | "style" | "link" | "meta" | "template" | "noscript"
+                ) {
+                    elements += 1;
+                }
+            }
+            NodeData::Text { contents } => {
+                if !has_non_content_ancestor(dom, node.parent, body) {
+                    text_chars += contents.chars().filter(|c| !c.is_whitespace()).count();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    HydrationStats {
+        elements,
+        text_chars,
+    }
+}
+
+fn has_non_content_ancestor(
+    dom: &DomTree,
+    mut current: Option<NodeId>,
+    body: NodeId,
+) -> bool {
+    while let Some(node_id) = current {
+        if node_id == body {
+            return false;
+        }
+        let Some(node) = dom.get_node(node_id) else {
+            return false;
+        };
+        if node
+            .as_element()
+            .is_some_and(|name| matches!(name.local.as_ref(), "script" | "style" | "template" | "noscript"))
+        {
+            return true;
+        }
+        current = node.parent;
+    }
+    false
+}
+
+/// A server-rendered body should only be restored for an unmistakable wipe:
+/// a substantial document lost at least seven eighths of its real elements
+/// and visible text, leaving almost no content. This deliberately does not
+/// second-guess ordinary framework rerenders or client-only application shells.
+fn should_restore_hydration_snapshot(
+    before: HydrationStats,
+    after: HydrationStats,
+) -> bool {
+    before.elements >= 40
+        && before.text_chars >= 200
+        && after.elements <= 12
+        && after.text_chars <= 128
+        && after.elements.saturating_mul(8) < before.elements
+        && after.text_chars.saturating_mul(8) < before.text_chars
+}
+
+fn restore_hydration_snapshot_if_needed(
+    js: &ObscuraJsRuntime,
+    before: HydrationSnapshot,
+) -> bool {
+    let Some(after) = capture_hydration_stats(js) else {
+        return false;
+    };
+    if !should_restore_hydration_snapshot(before.stats, after) {
+        return false;
+    }
+    tracing::warn!(
+        before_elements = before.stats.elements,
+        after_elements = after.elements,
+        before_text_chars = before.stats.text_chars,
+        after_text_chars = after.text_chars,
+        "restoring server-rendered body after catastrophic hydration wipe"
+    );
+    js.replace_body_inner_html(&before.body_html)
+}
+
 impl Page {
     pub fn new(id: String, context: Arc<BrowserContext>) -> Self {
         let http_client = context.http_client.clone();
@@ -500,7 +621,13 @@ impl Page {
         let all_links = match &self.js {
             Some(js) => {
                 js.with_dom(|dom| {
-                    let link_ids = dom.query_selector_all("link[rel=\"stylesheet\"]").unwrap_or_default();
+                    // `rel` is a space-separated token list. VitePress and
+                    // other modern generators combine preload and stylesheet
+                    // (`rel="preload stylesheet"`); exact-value matching
+                    // silently skipped their entire CSS payload.
+                    let link_ids = dom
+                        .query_selector_all("link[rel~=\"stylesheet\"]")
+                        .unwrap_or_default();
                     let mut links = Vec::new();
                     for lid in link_ids {
                         if let Some(node) = dom.get_node(lid) {
@@ -1091,12 +1218,17 @@ impl Page {
         if max_ms == 0 {
             return;
         }
+        let hydration_snapshot = self.js.as_ref().and_then(capture_hydration_snapshot);
         if let Some(js) = &mut self.js {
             // Bounded against both async idle and synchronous microtask storms:
             // a plain tokio timeout cannot preempt a page that pins the thread
             // inside V8 (the real-world SPA hang), so settle drives the loop
             // through the watchdog-guarded path.
             let _ = js.run_event_loop_bounded(max_ms).await;
+
+            if let Some(before) = hydration_snapshot {
+                let _ = restore_hydration_snapshot_if_needed(js, before);
+            }
         }
     }
 
@@ -1399,7 +1531,11 @@ impl Page {
         // page.click() handlers were no-ops. Now scripts run regardless
         // of waitUntil and DCL means "DOM parsed AND scripts executed".
         self.fetch_stylesheets().await;
+        let hydration_snapshot = self.js.as_ref().and_then(capture_hydration_snapshot);
         self.execute_scripts().await;
+        if let (Some(js), Some(before)) = (&self.js, hydration_snapshot) {
+            let _ = restore_hydration_snapshot_if_needed(js, before);
+        }
 
         self.lifecycle = LifecycleState::DomContentLoaded;
 
@@ -2002,8 +2138,10 @@ fn url_matches_cdp_pattern(pattern: &str, url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_import_url, split_css_imports, truncate_on_char_boundary, url_matches_cdp_pattern,
+        parse_import_url, should_restore_hydration_snapshot, split_css_imports,
+        truncate_on_char_boundary, url_matches_cdp_pattern, HydrationStats,
     };
+    use obscura_dom::parse_html;
 
     #[test]
     fn truncate_never_splits_a_multibyte_char() {
@@ -2050,6 +2188,61 @@ mod tests {
         let (imports, stripped) = split_css_imports(css);
         assert!(imports.is_empty());
         assert_eq!(stripped, css);
+    }
+
+    #[test]
+    fn stylesheet_rel_token_selector_includes_preloaded_stylesheets() {
+        let dom = parse_html(
+            r#"<link rel="preload stylesheet" href="app.css">
+               <link rel="preload" href="font.woff2">"#,
+        );
+        let links = dom
+            .query_selector_all(r#"link[rel~="stylesheet"]"#)
+            .expect("valid selector");
+        assert_eq!(links.len(), 1);
+        assert_eq!(
+            dom.get_node(links[0])
+                .and_then(|node| node.get_attribute("href").map(str::to_owned)),
+            Some("app.css".to_string())
+        );
+    }
+
+    #[test]
+    fn hydration_recovery_requires_a_catastrophic_content_wipe() {
+        assert!(should_restore_hydration_snapshot(
+            HydrationStats {
+                elements: 520,
+                text_chars: 8_000,
+            },
+            HydrationStats {
+                elements: 4,
+                text_chars: 0,
+            },
+        ));
+    }
+
+    #[test]
+    fn hydration_recovery_does_not_override_normal_rerenders() {
+        assert!(!should_restore_hydration_snapshot(
+            HydrationStats {
+                elements: 520,
+                text_chars: 8_000,
+            },
+            HydrationStats {
+                elements: 180,
+                text_chars: 3_000,
+            },
+        ));
+        assert!(!should_restore_hydration_snapshot(
+            HydrationStats {
+                elements: 12,
+                text_chars: 80,
+            },
+            HydrationStats {
+                elements: 1,
+                text_chars: 0,
+            },
+        ));
     }
 
     #[test]

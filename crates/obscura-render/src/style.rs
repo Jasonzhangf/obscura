@@ -182,6 +182,16 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
             style.font_weight = Some("bold".to_string());
         }
     } else if tag == "img" || tag == "figure" {
+        if tag == "img" {
+            // Images are inline-level replaced elements by default. Model the
+            // atomic inner box with the same inline-block marker used by
+            // native controls, so an icon between text fragments participates
+            // in their line instead of splitting the parent into block runs.
+            // An authored display declaration clears this marker in the
+            // cascade before applying its requested display.
+            style.display = Display::Inline;
+            style.is_inline_block = true;
+        }
         // Near-universal reset: images fit their container instead of
         // overflowing. Wikipedia (and most sites) set `img{max-width:100%}`;
         // making it a UA default prevents a fixed-width thumbnail (e.g. a
@@ -2857,6 +2867,14 @@ mod tests {
 
         let invalid = compute_style("td", Some("display:bogus"));
         assert!(invalid.internal_flex_container);
+
+        let native_image = compute_style("img", None);
+        assert_eq!(native_image.display, Display::Inline);
+        assert!(native_image.is_inline_block);
+
+        let block_image = compute_style("img", Some("display:block"));
+        assert_eq!(block_image.display, Display::Block);
+        assert!(!block_image.is_inline_block);
     }
 
     #[test]

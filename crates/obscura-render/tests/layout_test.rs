@@ -702,6 +702,21 @@ fn inline_block_flex_items_keep_block_inner_flow() {
 }
 
 #[test]
+fn percentage_height_under_indefinite_parent_uses_content_height() {
+    let tree = parse_html(include_str!(
+        "../../../render-repros/percentage-height-indefinite-parent.html"
+    ));
+    let layout = layout_dom(&tree, (900.0, 1000.0));
+    for id in ["wrapper", "stack", "editor", "pre", "code"] {
+        let rect = layout.rects[&tree.get_element_by_id(id).unwrap()];
+        assert!(
+            rect.height >= 24.0,
+            "{id} collapsed despite its indefinite percentage height: {rect:?}"
+        );
+    }
+}
+
+#[test]
 fn item_self_alignment_places_flex_and_grid_items() {
     let tree = parse_html(include_str!("../../../render-repros/item-self-alignment.html"));
     let layout = layout_dom(&tree, (900.0, 1000.0));

@@ -250,10 +250,15 @@ pub fn parse_fragment(html: &str) -> DomTree {
     parse_fragment_with_context(html, context_name)
 }
 
+/// Parse an HTML fragment using the supplied context element.
+///
+/// The tree builder's insertion mode depends on this context. Treating every
+/// `innerHTML` assignment as body content drops table-only elements such as a
+/// top-level `<tr>` and mis-parses select/template fragments. Browsers instead
+/// use the receiver element as the fragment parsing context.
 pub fn parse_fragment_with_context(html: &str, context_name: QualName) -> DomTree {
     use html5ever::tendril::TendrilSink;
     use html5ever::{parse_fragment, ParseOpts};
-
     let tree = DomTree::new();
     parse_fragment(tree, ParseOpts::default(), context_name, vec![])
         .from_utf8()
@@ -326,5 +331,16 @@ mod tests {
         let text = tree.text_content(tree.document());
         assert!(text.contains("Hello"));
         assert!(text.contains("World"));
+    }
+
+    #[test]
+    fn test_parse_fragment_uses_table_context() {
+        let context_name = QualName::new(None, ns!(html), local_name!("template"));
+        let tree = parse_fragment_with_context("<tr><td>cell</td></tr>", context_name);
+        let row = tree
+            .query_selector("tr")
+            .expect("valid selector")
+            .expect("template context preserves the row");
+        assert_eq!(tree.text_content(row), "cell");
     }
 }
