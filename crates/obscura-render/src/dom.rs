@@ -1090,15 +1090,79 @@ pub(crate) fn layout_dom_with_web_fonts(
         // top-down values are known.
         propagate_border_spacing(tree, &mut styles);
 
-        // Resolve native input-control intrinsic border-box geometry after
+        // Resolve native form-control intrinsic border-box geometry after
         // inheritance and author cascading. Text-like inputs use the HTML
         // `size` attribute (20 by default) and the control's own computed
         // font; author CSS widths/heights remain authoritative. Without this
-        // replaced-control sizing, every input is an empty auto-sized leaf
-        // (0px tall and often stretched to its container).
+        // replaced-control sizing, inputs/selects are empty auto-sized leaves
+        // (0px tall and often stretched to their container).
         for (&id, style) in styles.iter_mut() {
             let Some(node) = tree.get_node(id) else { continue };
             let Some(element) = node.as_element() else { continue };
+            if element.local.as_ref() == "select" {
+                let option_labels: Vec<String> = tree
+                    .descendants(id)
+                    .into_iter()
+                    .filter(|option_id| {
+                        tree.get_node(*option_id)
+                            .map_or(false, |option| {
+                                option
+                                    .as_element()
+                                    .map_or(false, |name| name.local.as_ref() == "option")
+                            })
+                    })
+                    .map(|option_id| tree.text_content(option_id).trim().to_string())
+                    .collect();
+                let font_size = style.font_size.unwrap_or(13.333_333).max(1.0);
+                let bold = crate::style::used_font_weight(style) >= 600;
+                let label_width = option_labels
+                    .iter()
+                    .map(|label| {
+                        text_width(
+                            label,
+                            font_size,
+                            bold,
+                            style.font_family.as_deref(),
+                        )
+                    })
+                    .fold(0.0f32, f32::max);
+                let horizontal_edges = style.padding.left
+                    + style.padding.right
+                    + style.border.left
+                    + style.border.right;
+                let vertical_edges = style.padding.top
+                    + style.padding.bottom
+                    + style.border.top
+                    + style.border.bottom;
+                let rows = node
+                    .get_attribute("size")
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .filter(|&value| value > 1)
+                    .unwrap_or(1) as f32;
+                let intrinsic_width = label_width + horizontal_edges;
+                let intrinsic_height =
+                    crate::inline::used_line_height(style).max(1.0) * rows
+                        + vertical_edges;
+                if style.width == crate::Dimension::Auto {
+                    style.width = crate::Dimension::Px(
+                        if style.box_sizing == crate::BoxSizing::ContentBox {
+                            label_width
+                        } else {
+                            intrinsic_width
+                        },
+                    );
+                }
+                if style.height == crate::Dimension::Auto {
+                    style.height = crate::Dimension::Px(
+                        if style.box_sizing == crate::BoxSizing::ContentBox {
+                            (intrinsic_height - vertical_edges).max(0.0)
+                        } else {
+                            intrinsic_height
+                        },
+                    );
+                }
+                continue;
+            }
             if element.local.as_ref() != "input" {
                 continue;
             }
@@ -5093,6 +5157,25 @@ mod tests {
         assert_eq!(pseudo.font_family, host.font_family);
         assert_eq!(pseudo.font_weight, host.font_weight);
         assert_eq!(pseudo.line_height, host.line_height);
+    }
+
+    #[test]
+    fn native_select_sizes_for_its_widest_option() {
+        let tree = parse_html(
+            r#"<select id="language">
+                <option selected>En</option>
+                <option>Brazilian Portuguese</option>
+            </select>"#,
+        );
+        let laid = layout_dom(&tree, (500.0, 200.0));
+        let select = tree.get_element_by_id("language").unwrap();
+        let rect = laid.rects[&select];
+
+        assert!(rect.width > 120.0, "widest option should set width: {rect:?}");
+        assert!(
+            (18.0..=22.0).contains(&rect.height),
+            "closed native select should have one-line control height: {rect:?}"
+        );
     }
 
 }

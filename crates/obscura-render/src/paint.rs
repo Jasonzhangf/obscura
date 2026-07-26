@@ -469,6 +469,52 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
             }
         }
 
+        // A closed native `<select>` paints only its selected option. Options
+        // themselves are popup content (`display:none` in the layout tree),
+        // so the label and disclosure arrow belong to the atomic control.
+        if name.local.as_ref() == "select" {
+            if let Some(label) = selected_option_label(tree, nid) {
+                let fsize = style.font_size.unwrap_or(13.333_333);
+                let line_height = crate::inline::used_line_height(style);
+                let text_x = rect.x + style.border.left + style.padding.left;
+                let text_y = rect.y + (rect.height - line_height) / 2.0;
+                draw_text(
+                    &mut pixmap,
+                    &label,
+                    text_x,
+                    text_y,
+                    style.color.unwrap_or([0, 0, 0, 255]),
+                    fsize,
+                    crate::style::used_font_weight(style) >= 600,
+                    style.font_family.as_deref(),
+                    Some(visible_rect),
+                );
+            }
+            if rect.width >= 12.0 && rect.height >= 8.0 {
+                let center_x = rect.x + rect.width - style.border.right - 8.0;
+                let center_y = rect.y + rect.height / 2.0;
+                let mut arrow = PathBuilder::new();
+                arrow.move_to(center_x - 3.5, center_y - 2.0);
+                arrow.line_to(center_x + 3.5, center_y - 2.0);
+                arrow.line_to(center_x, center_y + 2.5);
+                arrow.close();
+                if let Some(arrow) = arrow.finish() {
+                    let mut arrow_paint = Paint::default();
+                    let color = style.color.unwrap_or([0, 0, 0, 255]);
+                    arrow_paint.set_color(Color::from_rgba8(
+                        color[0], color[1], color[2], color[3],
+                    ));
+                    pixmap.fill_path(
+                        &arrow,
+                        &arrow_paint,
+                        FillRule::Winding,
+                        Transform::identity(),
+                        None,
+                    );
+                }
+            }
+        }
+
         // An empty text `<input>`/`<textarea>` shows its `placeholder`
         // attribute as muted text; there is no DOM text node for it (it is
         // not real content), so paint it directly from the attribute instead
@@ -675,6 +721,33 @@ fn list_marker_text(tree: &DomTree, nid: obscura_dom::tree::NodeId, style: Optio
         }
         Some(crate::ListStyle::None) | None => None,
     }
+}
+
+fn selected_option_label(
+    tree: &DomTree,
+    select: obscura_dom::tree::NodeId,
+) -> Option<String> {
+    let mut first = None;
+    for option_id in tree.descendants(select) {
+        let Some(option) = tree.get_node(option_id) else { continue };
+        if option
+            .as_element()
+            .map_or(true, |name| name.local.as_ref() != "option")
+        {
+            continue;
+        }
+        let label = option
+            .get_attribute("label")
+            .map(str::to_owned)
+            .unwrap_or_else(|| tree.text_content(option_id).trim().to_string());
+        if first.is_none() {
+            first = Some(label.clone());
+        }
+        if option.get_attribute("selected").is_some() {
+            return Some(label);
+        }
+    }
+    first
 }
 
 /// Render `tree` at `viewport` to PNG bytes (RGBA 8-bit). Returns None if the
@@ -3090,6 +3163,32 @@ mod tests {
             })
             .count();
         assert_eq!(red_pixels, 0, "::before must not bleed through ::after");
+    }
+
+    #[test]
+    fn native_select_paints_only_the_selected_label_and_arrow() {
+        let tree = parse_html(
+            r#"<html><body style="margin:0">
+                <select id="theme">
+                    <option>Light</option>
+                    <option selected>Dark</option>
+                </select>
+            </body></html>"#,
+        );
+        let pixmap = paint_dom(&tree, (160.0, 60.0), None).expect("pixmap");
+        let dark_pixels = (0..120)
+            .flat_map(|x| (0..30).map(move |y| (x, y)))
+            .filter(|&(x, y)| {
+                let pixel = pixmap.pixel(x, y).unwrap();
+                pixel.red() < 100 && pixel.green() < 100 && pixel.blue() < 100
+            })
+            .count();
+        assert!(
+            dark_pixels > 20,
+            "selected label, border, and disclosure arrow should paint"
+        );
+        let select = tree.get_element_by_id("theme").unwrap();
+        assert_eq!(selected_option_label(&tree, select).as_deref(), Some("Dark"));
     }
 
     #[test]

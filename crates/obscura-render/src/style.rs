@@ -115,6 +115,30 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
         style.display = Display::Inline;
         style.is_inline_block = true;
         style.text_align = Some(taffy::AlignItems::CENTER);
+    } else if tag == "select" {
+        // A closed native select is an atomic inline control. Its option
+        // children belong to the popup (and remain display:none in our frame
+        // tree); the select itself gets intrinsic geometry and paints the
+        // selected label.
+        style.display = Display::Inline;
+        style.is_inline_block = true;
+        style.font_size = Some(13.333_333);
+        style.font_family = Some("arial".to_string());
+        style.line_height = Some(crate::LineHeight::Normal);
+        style.padding = Edges {
+            top: 1.0,
+            right: 20.0,
+            bottom: 1.0,
+            left: 2.0,
+        };
+        style.border = Edges {
+            top: 1.0,
+            right: 1.0,
+            bottom: 1.0,
+            left: 1.0,
+        };
+        style.border_color = Some([118, 118, 118, 255]);
+        style.background_color = Some([255, 255, 255, 255]);
     } else if tag == "input" {
         // Native text controls are atomic inline-level boxes with their own
         // platform font and intrinsic border-box dimensions; they do not
