@@ -514,35 +514,77 @@ const _CSS_PROPERTY_NAMES = [
 ];
 const _CSS_PROP_SET = new Set(_CSS_PROPERTY_NAMES);
 
+// Parse a `style` attribute string (`"color: red; margin: 5px"`) into the given
+// dashed-key store, replacing its contents in place.
+function _parseCssInto(props, text) {
+  for (const k in props) delete props[k];
+  if (text) String(text).split(";").forEach((p) => {
+    const i = p.indexOf(":");
+    if (i > 0) { const k = p.slice(0, i).trim(); const v = p.slice(i + 1).trim(); if (k && v) props[_cssCamelToKebab(k)] = v; }
+  });
+}
+function _serializeCss(props) {
+  const e = Object.entries(props);
+  return e.length ? e.map(([k, v]) => `${k}: ${v}`).join("; ") + ";" : "";
+}
+
 class CSSStyleDeclaration {
-  constructor() {
-    // Non-enumerable so it never leaks through the proxy's own-key traps.
+  constructor(owner) {
+    // Non-enumerable so they never leak through the proxy's own-key traps.
     Object.defineProperty(this, "_props", { value: {}, writable: true, enumerable: false, configurable: true });
+    // The owner Element, if any. A live declaration reflects that element's
+    // `style` content attribute in both directions; an owner-less declaration
+    // (getComputedStyle fallback, stylesheet rules) is purely in-memory.
+    Object.defineProperty(this, "_owner", { value: owner || null, writable: true, enumerable: false, configurable: true });
+    // Last `style` attribute string we parsed/wrote, so a read can skip the
+    // reparse when the attribute has not changed underneath us. Held in a
+    // one-field object so the sync helpers can mutate it without a bare
+    // `this._x = …` assignment (which the style proxy would reroute into
+    // setProperty).
+    Object.defineProperty(this, "_sync", { value: { last: null }, writable: true, enumerable: false, configurable: true });
+  }
+  // Pull the owner's `style` attribute into `_props` if it changed since our
+  // last read/write. Keeps parsed HTML and setAttribute('style', …) visible via
+  // el.style.*. No-op when owner-less.
+  _pull() {
+    const o = this._owner;
+    if (!o) return;
+    const attr = o.getAttribute("style");
+    if (attr === this._sync.last) return;
+    _parseCssInto(this._props, attr);
+    this._sync.last = attr;
+  }
+  // Serialize `_props` back onto the owner's `style` attribute after a mutation,
+  // so el.style.x = … and cssText reflect into getAttribute('style') and
+  // serialization. No-op when owner-less.
+  _push() {
+    const o = this._owner;
+    if (!o) return;
+    const text = _serializeCss(this._props);
+    this._sync.last = text;
+    if (text) o.setAttribute("style", text);
+    else o.removeAttribute("style");
   }
   // Storage is keyed by the dashed CSS name, matching CSSOM. The proxy maps the
   // camelCase IDL access (el.style.fontSize) onto the dashed key (font-size), so
   // getPropertyValue('font-size') and el.style.fontSize stay in sync.
   setProperty(name, value) {
+    this._pull();
     const k = _cssCamelToKebab(String(name));
-    if (value === "" || value == null) { delete this._props[k]; return; }
-    this._props[k] = String(value);
+    if (value === "" || value == null) delete this._props[k];
+    else this._props[k] = String(value);
+    this._push();
   }
-  removeProperty(name) { const k = _cssCamelToKebab(String(name)); const old = this._props[k]; delete this._props[k]; return old || ""; }
-  getPropertyValue(name) { return this._props[_cssCamelToKebab(String(name))] || ""; }
+  removeProperty(name) { this._pull(); const k = _cssCamelToKebab(String(name)); const old = this._props[k]; delete this._props[k]; this._push(); return old || ""; }
+  getPropertyValue(name) { this._pull(); return this._props[_cssCamelToKebab(String(name))] || ""; }
   getPropertyPriority() { return ""; }
-  get cssText() {
-    const e = Object.entries(this._props);
-    return e.length ? e.map(([k, v]) => `${k}: ${v}`).join("; ") + ";" : "";
-  }
+  get cssText() { this._pull(); return _serializeCss(this._props); }
   set cssText(v) {
-    for (const k in this._props) delete this._props[k];
-    if (v) String(v).split(";").forEach((p) => {
-      const i = p.indexOf(":");
-      if (i > 0) { const k = p.slice(0, i).trim(); const val = p.slice(i + 1).trim(); if (k && val) this._props[_cssCamelToKebab(k)] = val; }
-    });
+    _parseCssInto(this._props, v);
+    this._push();
   }
-  get length() { return Object.keys(this._props).length; }
-  item(i) { return Object.keys(this._props)[i] || ""; }
+  get length() { this._pull(); return Object.keys(this._props).length; }
+  item(i) { this._pull(); return Object.keys(this._props)[i] || ""; }
 }
 
 const _styleProxy = (decl) => new Proxy(decl, {
@@ -561,11 +603,13 @@ const _styleProxy = (decl) => new Proxy(decl, {
   has(t, p) {
     if (typeof p !== "string") return Reflect.has(t, p);
     if (p in Object.getPrototypeOf(t)) return true;
+    t._pull();
     if (_cssCamelToKebab(p) in t._props) return true;
     if (_CSS_PROP_SET.has(p) || _CSS_PROP_SET.has(_cssKebabToCamel(p))) return true;
     return /^\d+$/.test(p) && +p < t.length;
   },
   ownKeys(t) {
+    t._pull();
     const keys = [];
     const n = t.length;
     for (let i = 0; i < n; i++) keys.push(String(i));
@@ -576,6 +620,7 @@ const _styleProxy = (decl) => new Proxy(decl, {
   },
   getOwnPropertyDescriptor(t, p) {
     if (typeof p !== "string") return Reflect.getOwnPropertyDescriptor(t, p);
+    t._pull();
     if (/^\d+$/.test(p) && +p < t.length) return { value: t.item(+p), writable: false, enumerable: true, configurable: true };
     if (_cssCamelToKebab(p) in t._props || _CSS_PROP_SET.has(p) || _CSS_PROP_SET.has(_cssKebabToCamel(p))) {
       return { value: t.getPropertyValue(p), writable: true, enumerable: true, configurable: true };
@@ -1180,7 +1225,7 @@ function _isSubmitButton(el) {
 class Element extends Node {
   constructor(nid) {
     super(nid);
-    this._style = _styleProxy(new CSSStyleDeclaration());
+    this._style = _styleProxy(new CSSStyleDeclaration(this));
   }
   // Element wrappers always back a nodeType-1 node (_wrap/_wrapEl only build an
   // Element for element nodes, and node ids are never freed-and-reused), so this

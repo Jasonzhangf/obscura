@@ -1318,6 +1318,66 @@ mod tests {
     }
 
     #[test]
+    fn style_attribute_parses_into_style_object() {
+        // Inline styles present in the parsed HTML must be visible via el.style.*
+        let mut rt = setup_runtime(
+            r#"<html><body><div id="d" style="color: red; display: none">hi</div></body></html>"#,
+        );
+        assert_eq!(
+            rt.evaluate("document.getElementById('d').style.color").unwrap(),
+            serde_json::json!("red")
+        );
+        assert_eq!(
+            rt.evaluate("document.getElementById('d').style.display").unwrap(),
+            serde_json::json!("none")
+        );
+    }
+
+    #[test]
+    fn set_style_attribute_updates_style_object() {
+        let mut rt = setup_runtime(r#"<html><body><div id="d">hi</div></body></html>"#);
+        let margin = rt
+            .evaluate(
+                "(function(){var e=document.getElementById('d'); e.setAttribute('style','margin: 5px'); return e.style.margin;})()",
+            )
+            .unwrap();
+        assert_eq!(margin, serde_json::json!("5px"));
+    }
+
+    #[test]
+    fn setting_style_property_updates_the_attribute_and_serialization() {
+        let mut rt = setup_runtime(r#"<html><body><div id="d">hi</div></body></html>"#);
+        let attr = rt
+            .evaluate(
+                "(function(){var e=document.getElementById('d'); e.style.color='blue'; return e.getAttribute('style');})()",
+            )
+            .unwrap();
+        assert_eq!(attr, serde_json::json!("color: blue;"));
+        let html = rt
+            .evaluate("document.getElementById('d').outerHTML")
+            .unwrap();
+        assert!(
+            html.as_str().unwrap().contains("color: blue"),
+            "outerHTML should carry the style set via el.style: {html}"
+        );
+    }
+
+    #[test]
+    fn style_object_reflects_external_attribute_change() {
+        // A later setAttribute('style', …) must supersede an earlier value read
+        // through el.style (the declaration re-syncs from the attribute).
+        let mut rt = setup_runtime(
+            r#"<html><body><div id="d" style="color: red">hi</div></body></html>"#,
+        );
+        let color = rt
+            .evaluate(
+                "(function(){var e=document.getElementById('d'); e.style.color; e.setAttribute('style','color: green'); return e.style.color;})()",
+            )
+            .unwrap();
+        assert_eq!(color, serde_json::json!("green"));
+    }
+
+    #[test]
     fn test_document_title() {
         let mut rt = setup_runtime("<html><head><title>Test</title></head><body></body></html>");
         let title = rt.evaluate("document.title").unwrap();
