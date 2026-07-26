@@ -50,41 +50,90 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Build
+      - name: Install stealth build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake clang libclang-dev llvm-dev
+
+      - name: Configure libclang (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          SDK_PATH="$(xcrun --show-sdk-path)"
+          echo "SDKROOT=$SDK_PATH" >> "$GITHUB_ENV"
+          echo "CXXFLAGS=-isystem $SDK_PATH/usr/include/c++/v1" >> "$GITHUB_ENV"
+          echo "LIBCLANG_PATH=$(xcode-select -p)/Toolchains/XcodeDefault.xctoolchain/usr/lib" >> "$GITHUB_ENV"
+
+      - name: Configure libclang (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Build default release binary
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Build stealth
-        run: cargo build --release --target ${{ matrix.target }} --features stealth
-        continue-on-error: true
+      - name: Stage default release binary
+        shell: bash
+        run: |
+          BIN_DIR=target/${{ matrix.target }}/release
+          mkdir -p dist/default
+          if [ -f "$BIN_DIR/obscura.exe" ]; then
+            cp "$BIN_DIR/obscura.exe" "$BIN_DIR/obscura-worker.exe" dist/default/
+          else
+            cp "$BIN_DIR/obscura" "$BIN_DIR/obscura-worker" dist/default/
+          fi
 
-      - name: Smoke test (V8 snapshot)
+      # Build and package stealth separately so the default download keeps its
+      # lower RSS while the advertised wreq/BoringSSL variant cannot silently
+      # fall back to a non-stealth binary.
+      - name: Build stealth release binary
+        run: cargo build --release --target ${{ matrix.target }} --features stealth
+
+      - name: Stage stealth release binary
+        shell: bash
+        run: |
+          BIN_DIR=target/${{ matrix.target }}/release
+          mkdir -p dist/stealth
+          if [ -f "$BIN_DIR/obscura.exe" ]; then
+            cp "$BIN_DIR/obscura.exe" "$BIN_DIR/obscura-worker.exe" dist/stealth/
+          else
+            cp "$BIN_DIR/obscura" "$BIN_DIR/obscura-worker" dist/stealth/
+          fi
+
+      - name: Smoke test release binaries (V8 snapshot)
         # Run the V8 path once so a release never ships a binary that crashes at
         # isolate init from a mismatched snapshot (issue #290). The data: URL
         # keeps it offline. Every target here is native, so the runner can
-        # execute what it just built.
+        # execute both variants it just built.
         shell: bash
         run: |
-          BIN=target/${{ matrix.target }}/release/obscura
-          [ -f "$BIN.exe" ] && BIN="$BIN.exe"
-          "$BIN" fetch "data:text/html,<title>ok</title>" --eval "1+1"
+          for VARIANT in default stealth; do
+            BIN=dist/$VARIANT/obscura
+            [ -f "$BIN.exe" ] && BIN="$BIN.exe"
+            "$BIN" fetch "data:text/html,<title>ok</title>" --eval "1+1"
+          done
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
         run: |
-          cd target/${{ matrix.target }}/release
-          tar czf ../../../${{ matrix.name }}.tar.gz obscura obscura-worker
-          cd ../../..
+          tar czf ${{ matrix.name }}.tar.gz -C dist/default obscura obscura-worker
+          tar czf ${{ matrix.name }}-stealth.tar.gz -C dist/stealth obscura obscura-worker
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
         run: |
-          cd target/${{ matrix.target }}/release
-          7z a ../../../${{ matrix.name }}.zip obscura.exe obscura-worker.exe
-          cd ../../..
+          cd dist/default
+          7z a ../../${{ matrix.name }}.zip obscura.exe obscura-worker.exe
+          cd ../stealth
+          7z a ../../${{ matrix.name }}-stealth.zip obscura.exe obscura-worker.exe
 
       - name: Upload
         uses: softprops/action-gh-release@v2
         with:
           files: |
             ${{ matrix.name }}.tar.gz
+            ${{ matrix.name }}-stealth.tar.gz
             ${{ matrix.name }}.zip
+            ${{ matrix.name }}-stealth.zip
