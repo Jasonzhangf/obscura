@@ -970,7 +970,18 @@ async fn wait_for_selector(page: &mut Page, selector: &str, timeout_secs: u64) -
             return false;
         }
 
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        // The selector may be created by a timer, dynamic import, or fetch
+        // completion. Sleeping without pumping V8 makes those callbacks unable
+        // to run, so a valid selector wait always times out. Drive one bounded
+        // event-loop slice, then retain a 100ms polling cadence if it returned
+        // idle immediately.
+        let slice_started = tokio::time::Instant::now();
+        page.settle(100).await;
+        let spent = slice_started.elapsed();
+        let cadence = tokio::time::Duration::from_millis(100);
+        if spent < cadence {
+            tokio::time::sleep(cadence - spent).await;
+        }
     }
 }
 

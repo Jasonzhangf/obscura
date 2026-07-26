@@ -54,6 +54,13 @@ def capture_obscura(binary, url, screenshot, log, width, height, settle_ms):
         OBSCURA_SHOT_W=str(width),
         OBSCURA_SHOT_H=str(height),
         OBSCURA_ALLOW_PRIVATE_NETWORK="1",
+        # Product fetches return early when the event loop becomes idle. Paired
+        # captures instead need the same complete post-load wall interval that
+        # Playwright's wait_for_timeout below uses.
+        OBSCURA_STRICT_SETTLE="1",
+        # Match Playwright's 50-second goto allowance. This is the browser
+        # engine's millisecond ceiling, distinct from the CLI's seconds unit.
+        OBSCURA_NAV_TIMEOUT_MS="50000",
     )
     command = [
         binary,
@@ -62,7 +69,7 @@ def capture_obscura(binary, url, screenshot, log, width, height, settle_ms):
         "--screenshot",
         str(screenshot),
         "--timeout",
-        "50000",
+        "50",
         "--wait",
         f"{settle_ms / 1000:g}",
     ]
@@ -119,6 +126,8 @@ def main():
         "started_utc": datetime.now(timezone.utc).isoformat(),
         "viewport": {"width": args.width, "height": args.height, "dpr": 1},
         "settle_ms_after_load": args.settle_ms,
+        "settle_semantics": "full wall-clock interval while pumping each engine",
+        "navigation_timeout_ms": 50000,
         "obscura": binary_version(args.obscura_bin),
         "baseline": binary_version(args.baseline_bin) if args.baseline_bin else None,
         "pages": [],

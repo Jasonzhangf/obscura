@@ -1242,11 +1242,24 @@ impl Page {
         }
         let hydration_snapshot = self.js.as_ref().and_then(capture_hydration_snapshot);
         if let Some(js) = &mut self.js {
-            // Bounded against both async idle and synchronous microtask storms:
-            // a plain tokio timeout cannot preempt a page that pins the thread
-            // inside V8 (the real-world SPA hang), so settle drives the loop
-            // through the watchdog-guarded path.
-            let _ = js.run_event_loop_bounded(max_ms).await;
+            if std::env::var_os("OBSCURA_STRICT_SETTLE").is_some() {
+                // Paired browser measurements need the same wall-clock interval
+                // after load in both engines. The ordinary product path returns
+                // as soon as the loop is idle for speed; strict mode pumps all
+                // pending work, then retains the remaining wall-clock delay.
+                let started = tokio::time::Instant::now();
+                let _ = js.run_event_loop_bounded(max_ms).await;
+                let requested = tokio::time::Duration::from_millis(max_ms);
+                let elapsed = started.elapsed();
+                if elapsed < requested {
+                    tokio::time::sleep(requested - elapsed).await;
+                }
+            } else {
+                // Bounded against both async idle and synchronous microtask
+                // storms: a plain tokio timeout cannot preempt a page that pins
+                // the thread inside V8, so settle uses the watchdog path.
+                let _ = js.run_event_loop_bounded(max_ms).await;
+            }
 
             if let Some(before) = hydration_snapshot {
                 let _ = restore_hydration_snapshot_if_needed(js, before);
