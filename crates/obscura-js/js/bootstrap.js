@@ -1352,9 +1352,9 @@ class Element extends Node {
     if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev);
     if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('attributes', this._nid, [], [], n);
   }
-  setAttributeNS(ns, n, v) { _dom("set_attribute", this._nid, String(n) + "\0" + String(v)); } // exact name, no HTML folding
+  setAttributeNS(ns, n, v) { _dom("set_attribute_ns", this._nid, String(ns == null ? "" : ns) + "\0" + String(n) + "\0" + String(v)); } // n is the qualified name; stored with its namespace
   removeAttribute(n) { n = _htmlAttrName(this, n); const popoverPrev = (n === "popover") ? this.popover : undefined; _dom("remove_attribute", this._nid, n); if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev); }
-  removeAttributeNS(ns, n) { _dom("remove_attribute", this._nid, String(n)); }
+  removeAttributeNS(ns, n) { _dom("remove_attribute_ns", this._nid, String(ns == null ? "" : ns) + "\0" + String(n)); }
   hasAttribute(n) { return this.getAttribute(n) !== null; }
   hasAttributes() { return true; } // Simplified
   getAttributeNames() { return _domParse("attribute_names", this._nid) || []; }
@@ -1386,7 +1386,7 @@ class Element extends Node {
     }
     return list;
   }
-  getAttributeNS(ns, n) { return _domParse("get_attribute", this._nid, String(n)); }
+  getAttributeNS(ns, n) { return _domParse("get_attribute_ns", this._nid, String(ns == null ? "" : ns) + "\0" + String(n)); }
   querySelector(s) { return _wrapEl(+_dom("query_selector_scoped", this._nid, s)); }
   querySelectorAll(s) {
     const ids = _domParse("query_selector_all_scoped", this._nid, s) || [];

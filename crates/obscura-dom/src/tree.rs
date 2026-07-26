@@ -32,6 +32,16 @@ pub struct Attribute {
     pub value: String,
 }
 
+/// The local-name portion of an attribute name, i.e. the part after any prefix.
+/// `"xlink:href"` -> `"href"`, `"href"` -> `"href"`. Used for namespace-aware
+/// attribute lookup, which keys on `(namespace, localName)`.
+fn attr_local_suffix(name: &str) -> &str {
+    match name.rfind(':') {
+        Some(i) => &name[i + 1..],
+        None => name,
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum NodeData {
     Document,
@@ -123,6 +133,49 @@ impl Node {
                     value,
                 });
             }
+        }
+    }
+
+    // Read a namespaced attribute by (namespace, localName). The stored local
+    // name may be qualified (e.g. "xlink:href" for setAttributeNS-created attrs)
+    // or a bare local (e.g. "href" for parser-created ones), so compare against
+    // the part after any prefix.
+    pub fn get_attribute_ns(&self, ns: &str, local: &str) -> Option<&str> {
+        self.attrs()?.iter().find_map(|a| {
+            if a.name.ns.as_ref() == ns && attr_local_suffix(a.name.local.as_ref()) == local {
+                Some(a.value.as_str())
+            } else {
+                None
+            }
+        })
+    }
+
+    // Set a namespaced attribute. `qualified` is the qualified name
+    // (e.g. "xlink:href"); it is stored as the local name with the namespace
+    // recorded, matching how the non-namespaced path stores names, so
+    // getAttribute(qualified) and serialization keep working unchanged.
+    pub fn set_attribute_ns(&mut self, ns: &str, qualified: &str, value: String) {
+        if let NodeData::Element { attrs, .. } = &mut self.data {
+            let local = attr_local_suffix(qualified);
+            if let Some(attr) = attrs
+                .iter_mut()
+                .find(|a| a.name.ns.as_ref() == ns && attr_local_suffix(a.name.local.as_ref()) == local)
+            {
+                attr.value = value;
+            } else {
+                attrs.push(Attribute {
+                    name: QualName::new(None, Namespace::from(ns), LocalName::from(qualified)),
+                    value,
+                });
+            }
+        }
+    }
+
+    pub fn remove_attribute_ns(&mut self, ns: &str, local: &str) {
+        if let NodeData::Element { attrs, .. } = &mut self.data {
+            attrs.retain(|a| {
+                !(a.name.ns.as_ref() == ns && attr_local_suffix(a.name.local.as_ref()) == local)
+            });
         }
     }
 

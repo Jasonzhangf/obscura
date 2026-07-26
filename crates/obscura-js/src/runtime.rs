@@ -1318,6 +1318,34 @@ mod tests {
     }
 
     #[test]
+    fn set_attribute_ns_is_retrievable_by_namespace_and_local_name() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let v = rt
+            .evaluate("(function(){var s=document.createElementNS('http://www.w3.org/2000/svg','svg'); s.setAttributeNS('http://www.w3.org/1999/xlink','xlink:href','#g'); return s.getAttributeNS('http://www.w3.org/1999/xlink','href');})()")
+            .unwrap();
+        assert_eq!(v, serde_json::json!("#g"));
+    }
+
+    #[test]
+    fn remove_attribute_ns_removes_by_namespace() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let v = rt
+            .evaluate("(function(){var s=document.createElementNS('http://www.w3.org/2000/svg','svg'); s.setAttributeNS('http://www.w3.org/1999/xlink','xlink:href','#g'); s.removeAttributeNS('http://www.w3.org/1999/xlink','href'); return s.getAttributeNS('http://www.w3.org/1999/xlink','href');})()")
+            .unwrap();
+        assert_eq!(v, serde_json::json!(null));
+    }
+
+    #[test]
+    fn get_attribute_ns_reads_plain_attributes_with_null_namespace() {
+        // Backward-compat: getAttributeNS(null, name) still reads a plain attr.
+        let mut rt = setup_runtime(r#"<html><body><div id="d" title="hi"></div></body></html>"#);
+        let v = rt
+            .evaluate("document.getElementById('d').getAttributeNS(null,'title')")
+            .unwrap();
+        assert_eq!(v, serde_json::json!("hi"));
+    }
+
+    #[test]
     fn test_document_title() {
         let mut rt = setup_runtime("<html><head><title>Test</title></head><body></body></html>");
         let title = rt.evaluate("document.title").unwrap();
