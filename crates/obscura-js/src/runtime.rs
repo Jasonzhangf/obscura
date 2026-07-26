@@ -4513,4 +4513,44 @@ mod tests {
             ])
         );
     }
+
+    #[test]
+    fn media_text_tracks_expose_loaded_webvtt_cues() {
+        let mut rt = setup_runtime(
+            r#"<video><track id="captions" kind="captions" srclang="en" default
+                src="data:text/vtt,WEBVTT%0A%0A00%3A00%3A01.000%20--%3E%2000%3A00%3A03.000%0AHello"></video>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+                const element = document.getElementById("captions");
+                const video = document.querySelector("video");
+                const cue = element.track.cues[0];
+                const added = video.addTextTrack("metadata", "Data", "en");
+                cue.line = -2;
+                cue.size = 80;
+                return [
+                    element instanceof HTMLTrackElement,
+                    element.readyState === HTMLTrackElement.LOADED,
+                    element.track instanceof TextTrack,
+                    element.track.cues.length,
+                    cue.startTime,
+                    cue.endTime,
+                    cue.text,
+                    cue.line,
+                    cue.size,
+                    video.textTracks.length,
+                    video.textTracks.getTrackById("captions") === element.track,
+                    added.kind,
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                true, true, true, 1, 1, 3, "Hello", -2, 80, 1, true, "metadata"
+            ])
+        );
+    }
 }

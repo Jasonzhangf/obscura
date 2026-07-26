@@ -167,6 +167,9 @@
   "max-height-replaced": [
     {"name": "max height clamps intrinsic aspect transfer", "color": "#1971c2", "x": 32, "y": 64, "width": 330, "height": 200}
   ],
+  "media-text-track": [
+    {"name": "media text track exposes parsed cues", "color": "#18723a", "x": 0, "y": 0, "width": 420, "height": 120}
+  ],
   "mixed-content-block": [
     {"name": "full-width block child", "color": "#ccddff", "width": 400}
   ],

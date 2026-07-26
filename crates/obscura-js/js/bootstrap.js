@@ -3424,6 +3424,103 @@ class DocumentType extends Node {
 
 const _cache = new Map();
 
+class TextTrackCue {
+  constructor(startTime, endTime, text) {
+    this.id = "";
+    this.startTime = Number(startTime);
+    this.endTime = Number(endTime);
+    this.text = String(text ?? "");
+    this.pauseOnExit = false;
+    this.vertical = "";
+    this.snapToLines = true;
+    this.line = "auto";
+    this.lineAlign = "start";
+    this.position = "auto";
+    this.positionAlign = "auto";
+    this.size = 100;
+    this.align = "center";
+    this.region = null;
+    this.onenter = null;
+    this.onexit = null;
+  }
+  getCueAsHTML() {
+    const fragment = document.createDocumentFragment();
+    fragment.appendChild(document.createTextNode(this.text));
+    return fragment;
+  }
+}
+class VTTCue extends TextTrackCue {}
+class TextTrackCueList extends Array {
+  getCueById(id) {
+    return this.find((cue) => cue && cue.id === String(id)) || null;
+  }
+  item(index) { return this[index] || null; }
+}
+class TextTrack extends Node {
+  constructor(element, kind, label, language) {
+    super();
+    this._element = element || null;
+    this.kind = kind || "subtitles";
+    this.label = label || "";
+    this.language = language || "";
+    this.id = element?.id || "";
+    this.mode = element?.hasAttribute?.("default") ? "showing" : "disabled";
+    this.inBandMetadataTrackDispatchType = "";
+    this._parsedSrc = null;
+    this._cues = new TextTrackCueList();
+    this.activeCues = new TextTrackCueList();
+    this.oncuechange = null;
+  }
+  get cues() {
+    const src = this._element?.getAttribute?.("src") || "";
+    if (src !== this._parsedSrc) {
+      this._parsedSrc = src;
+      this._cues = _parseWebVttCues(src);
+    }
+    return this._cues;
+  }
+}
+class TextTrackList extends Array {
+  item(index) { return this[index] || null; }
+  getTrackById(id) {
+    return this.find((track) => track && track.id === String(id)) || null;
+  }
+}
+function _vttTime(value) {
+  const parts = String(value).trim().split(":").map(Number);
+  if (parts.some((part) => !Number.isFinite(part))) return 0;
+  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+  if (parts.length === 2) return parts[0] * 60 + parts[1];
+  return parts[0] || 0;
+}
+function _parseWebVttCues(src) {
+  const cues = new TextTrackCueList();
+  if (!src || !src.startsWith("data:text/vtt")) return cues;
+  let text = "";
+  try {
+    const comma = src.indexOf(",");
+    if (comma < 0) return cues;
+    const meta = src.slice(0, comma);
+    const body = src.slice(comma + 1);
+    text = /;base64(?:;|$)/i.test(meta) ? atob(body) : decodeURIComponent(body);
+  } catch (_error) {
+    return cues;
+  }
+  const blocks = text.replace(/\r\n?/g, "\n").split(/\n{2,}/);
+  for (const block of blocks) {
+    const lines = block.split("\n").filter((line) => line.length > 0);
+    if (!lines.length || lines[0].trim() === "WEBVTT" || lines[0].trim().startsWith("NOTE")) continue;
+    let timingIndex = lines.findIndex((line) => line.includes("-->"));
+    if (timingIndex < 0) continue;
+    const timing = lines[timingIndex].split("-->");
+    const endToken = (timing[1] || "").trim().split(/\s+/)[0];
+    const cue = new VTTCue(_vttTime(timing[0]), _vttTime(endToken), lines.slice(timingIndex + 1).join("\n"));
+    if (timingIndex > 0) cue.id = lines[timingIndex - 1].trim();
+    cues.push(cue);
+  }
+  return cues;
+}
+
 // Media elements need canPlayType for codec detection fingerprinting.
 // Values match Chrome 145 on Linux x86_64 without proprietary codecs.
 class HTMLMediaElement extends Element {
@@ -3452,6 +3549,14 @@ class HTMLMediaElement extends Element {
   set muted(v) {}
   get src() { return this.getAttribute('src') || ''; }
   set src(v) { this.setAttribute('src', v); }
+  get textTracks() {
+    return TextTrackList.from(
+      Array.from(this.querySelectorAll("track")).map((element) => element.track)
+    );
+  }
+  addTextTrack(kind, label = "", language = "") {
+    return new TextTrack(null, String(kind), String(label), String(language));
+  }
 }
 _markNative(HTMLMediaElement.prototype.canPlayType);
 _markNative(HTMLMediaElement.prototype.play);
@@ -3459,15 +3564,45 @@ _markNative(HTMLMediaElement.prototype.load);
 _markNative(HTMLMediaElement.prototype.pause);
 class HTMLVideoElement extends HTMLMediaElement {}
 class HTMLAudioElement extends HTMLMediaElement {}
+class HTMLTrackElement extends Element {
+  static NONE = 0;
+  static LOADING = 1;
+  static LOADED = 2;
+  static ERROR = 3;
+  get kind() { return this.getAttribute("kind") || "subtitles"; }
+  set kind(value) { this.setAttribute("kind", value); }
+  get src() { return this.getAttribute("src") || ""; }
+  set src(value) { this.setAttribute("src", value); }
+  get srclang() { return this.getAttribute("srclang") || ""; }
+  set srclang(value) { this.setAttribute("srclang", value); }
+  get label() { return this.getAttribute("label") || ""; }
+  set label(value) { this.setAttribute("label", value); }
+  get default() { return this.hasAttribute("default"); }
+  set default(value) { value ? this.setAttribute("default", "") : this.removeAttribute("default"); }
+  get readyState() { return HTMLTrackElement.LOADED; }
+  get track() {
+    if (!this._textTrack) {
+      this._textTrack = new TextTrack(this, this.kind, this.label, this.srclang);
+    }
+    return this._textTrack;
+  }
+}
 globalThis.HTMLMediaElement = HTMLMediaElement;
 globalThis.HTMLVideoElement = HTMLVideoElement;
 globalThis.HTMLAudioElement = HTMLAudioElement;
+globalThis.HTMLTrackElement = HTMLTrackElement;
+globalThis.TextTrack = TextTrack;
+globalThis.TextTrackList = TextTrackList;
+globalThis.TextTrackCue = TextTrackCue;
+globalThis.TextTrackCueList = TextTrackCueList;
+globalThis.VTTCue = VTTCue;
 
 function _elementClassFor(nid) {
   const tag = _domParse("tag_name", nid);
   if (tag === "FORM" && globalThis.HTMLFormElement) return globalThis.HTMLFormElement;
   if (tag === "AUDIO") return HTMLAudioElement;
   if (tag === "VIDEO") return HTMLVideoElement;
+  if (tag === "TRACK") return HTMLTrackElement;
   return Element;
 }
 function _wrap(nid) {
