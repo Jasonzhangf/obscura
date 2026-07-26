@@ -11,7 +11,7 @@ use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
 
 static FONT_BYTES: &[u8] = include_bytes!("../assets/liberation-sans.ttf");
 
-use crate::layout_dom_with_images;
+use crate::layout_dom_with_resources;
 
 /// Render `tree` at `viewport` (width, height) in CSS pixels to a Pixmap, or
 /// None if the viewport is zero-sized. `base_url`, when given, resolves the
@@ -33,7 +33,8 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
     // and never paint). This seeds the same cache the paint pass reads, so
     // each URL is still fetched at most once.
     let intrinsic = collect_image_intrinsics(tree, base_url, &mut image_cache);
-    let mut laid = layout_dom_with_images(tree, viewport, &intrinsic);
+    let fonts = collect_web_fonts(tree, base_url);
+    let mut laid = layout_dom_with_resources(tree, viewport, &intrinsic, &fonts);
     // Nodes that live inside an inline `<svg>` we rasterized as one document;
     // their painting is owned by that raster, so they are skipped in both the
     // box/text loop below and the inline-formatting loop after it (an svg
@@ -757,13 +758,12 @@ fn fetch_bytes(
     base_url: Option<&str>,
     cache: &mut std::collections::HashMap<String, Option<Vec<u8>>>,
 ) -> Option<Vec<u8>> {
-    if let Some(rest) = src.strip_prefix("data:image/") {
+    if let Some(rest) = src.strip_prefix("data:") {
         let comma_idx = rest.find(',')?;
         let (meta, data) = (&rest[..comma_idx], &rest[comma_idx + 1..]);
-        // Inline SVGs are very commonly authored as data:image/svg+xml;utf8,
-        // (or with no encoding label at all, which is equivalent): plain,
-        // percent-escaped text, not base64. Only decode as base64 when the
-        // URI actually says so.
+        // Data-backed SVGs and web fonts may be base64 or percent-escaped.
+        // Decode from the encoding label rather than assuming every data URI
+        // is base64.
         return if meta.contains("base64") {
             use base64::Engine;
             base64::engine::general_purpose::STANDARD.decode(data).ok()
@@ -803,6 +803,257 @@ fn fetch_bytes(
         .entry(url.clone())
         .or_insert_with(|| http_get_bytes(&url))
         .clone()
+}
+
+/// Fetch the Latin/ASCII face from each authored `@font-face` rule and decode
+/// WOFF/WOFF2 into the sfnt bytes consumed by fontdb/cosmic-text. Unicode-range
+/// filtering is load-bearing for performance: generated font packages commonly
+/// emit six or seven script subsets per face, while an English page needs only
+/// the subset containing ASCII.
+fn collect_web_fonts(tree: &DomTree, base_url: Option<&str>) -> Vec<Vec<u8>> {
+    let mut cache = std::collections::HashMap::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut fonts = Vec::new();
+
+    // Critical web fonts are normally preloaded from the document with a URL
+    // already resolved relative to the HTML. Prefer that browser-authored list:
+    // CSS gathered from external stylesheets is flattened into <style> text in
+    // the live DOM, where a relative src no longer carries its stylesheet URL.
+    let mut preloads = Vec::new();
+    for nid in tree.descendants(tree.document()) {
+        let Some(node) = tree.get_node(nid) else { continue };
+        if node
+            .as_element()
+            .map(|element| element.local.as_ref() != "link")
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        let rel = node.get_attribute("rel").unwrap_or("");
+        let as_value = node.get_attribute("as").unwrap_or("");
+        if rel
+            .split_ascii_whitespace()
+            .any(|token| token.eq_ignore_ascii_case("preload"))
+            && as_value.eq_ignore_ascii_case("font")
+        {
+            if let Some(href) = node.get_attribute("href") {
+                preloads.push(href.to_string());
+            }
+        }
+    }
+    for src in preloads.iter().take(16) {
+        if !seen.insert(src.clone()) {
+            continue;
+        }
+        if let Some(decoded) = fetch_and_decode_font(src, base_url, &mut cache) {
+            fonts.push(decoded);
+        }
+    }
+    if !preloads.is_empty() {
+        return fonts;
+    }
+
+    for nid in tree.descendants(tree.document()) {
+        let Some(node) = tree.get_node(nid) else { continue };
+        if node
+            .as_element()
+            .map(|element| element.local.as_ref() != "style")
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        let css = tree.text_content(nid);
+        for face in font_face_blocks(&css) {
+            if !font_face_covers_ascii(face) {
+                continue;
+            }
+            let Some(src) = font_face_urls(face).into_iter().next() else {
+                continue;
+            };
+            if !seen.insert(src.clone()) {
+                continue;
+            }
+            // Bound pathological pages without penalizing normal generated
+            // font packages (family x weight x style usually stays under 20).
+            if fonts.len() >= 12 {
+                return fonts;
+            }
+            if let Some(decoded) = fetch_and_decode_font(&src, base_url, &mut cache) {
+                fonts.push(decoded);
+            }
+        }
+    }
+    fonts
+}
+
+fn fetch_and_decode_font(
+    src: &str,
+    base_url: Option<&str>,
+    cache: &mut std::collections::HashMap<String, Option<Vec<u8>>>,
+) -> Option<Vec<u8>> {
+    let compressed = fetch_bytes(src, base_url, cache)?;
+    if compressed.len() > 8 * 1024 * 1024 {
+        return None;
+    }
+    let decoded = match compressed.get(..4) {
+        Some(b"wOF2") => wuff::decompress_woff2(&compressed).ok(),
+        Some(b"wOFF") => wuff::decompress_woff1(&compressed).ok(),
+        // TrueType/OpenType collections and raw sfnt fonts already have the
+        // representation fontdb expects.
+        Some(b"\0\x01\0\0" | b"OTTO" | b"ttcf") => Some(compressed),
+        _ => None,
+    }?;
+    (decoded.len() <= 32 * 1024 * 1024).then_some(decoded)
+}
+
+fn font_face_blocks(css: &str) -> Vec<&str> {
+    let lower = css.to_ascii_lowercase();
+    let mut out = Vec::new();
+    let mut cursor = 0;
+    while let Some(relative) = lower[cursor..].find("@font-face") {
+        let at = cursor + relative;
+        let Some(open_relative) = lower[at..].find('{') else {
+            break;
+        };
+        let open = at + open_relative;
+        let mut depth = 1i32;
+        let mut quote = None;
+        let mut escaped = false;
+        let mut close = None;
+        for (offset, ch) in css[open + 1..].char_indices() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if let Some(active) = quote {
+                if ch == active {
+                    quote = None;
+                }
+                continue;
+            }
+            if matches!(ch, '"' | '\'') {
+                quote = Some(ch);
+                continue;
+            }
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(open + 1 + offset);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(close) = close else { break };
+        out.push(&css[open + 1..close]);
+        cursor = close + 1;
+    }
+    out
+}
+
+fn font_face_declaration<'a>(face: &'a str, name: &str) -> Option<&'a str> {
+    split_css_top_level(face, ';').into_iter().find_map(|declaration| {
+        let (property, value) = declaration.split_once(':')?;
+        property.trim().eq_ignore_ascii_case(name).then_some(value.trim())
+    })
+}
+
+fn font_face_covers_ascii(face: &str) -> bool {
+    let Some(range) = font_face_declaration(face, "unicode-range") else {
+        return true;
+    };
+    range.split(',').any(|part| {
+        let token = part.trim().to_ascii_lowercase();
+        let Some(value) = token.strip_prefix("u+") else {
+            return false;
+        };
+        let (start, end) = if value.contains('?') {
+            (
+                u32::from_str_radix(&value.replace('?', "0"), 16).ok(),
+                u32::from_str_radix(&value.replace('?', "f"), 16).ok(),
+            )
+        } else if let Some((start, end)) = value.split_once('-') {
+            (
+                u32::from_str_radix(start, 16).ok(),
+                u32::from_str_radix(end, 16).ok(),
+            )
+        } else {
+            let point = u32::from_str_radix(value, 16).ok();
+            (point, point)
+        };
+        matches!((start, end), (Some(start), Some(end)) if start <= 0x7e && end >= 0x20)
+    })
+}
+
+fn font_face_urls(face: &str) -> Vec<String> {
+    let Some(src) = font_face_declaration(face, "src") else {
+        return Vec::new();
+    };
+    let lower = src.to_ascii_lowercase();
+    let mut out = Vec::new();
+    let mut cursor = 0;
+    while let Some(relative) = lower[cursor..].find("url(") {
+        let start = cursor + relative + 4;
+        let Some(end_relative) = src[start..].find(')') else {
+            break;
+        };
+        let end = start + end_relative;
+        let value = src[start..end]
+            .trim()
+            .trim_matches(|ch| ch == '"' || ch == '\'')
+            .trim();
+        if !value.is_empty() {
+            out.push(value.to_string());
+        }
+        cursor = end + 1;
+    }
+    out
+}
+
+fn split_css_top_level(value: &str, separator: char) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut depth = 0i32;
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, ch) in value.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(active) = quote {
+            if ch == active {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(ch, '"' | '\'') {
+            quote = Some(ch);
+            continue;
+        }
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = (depth - 1).max(0),
+            ch if ch == separator && depth == 0 => {
+                out.push(&value[start..index]);
+                start = index + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    out.push(&value[start..]);
+    out
 }
 
 /// Fetch `url` with a descriptive User-Agent and a bounded timeout, retrying on
@@ -2381,5 +2632,41 @@ mod tests {
         let mut sprite_cache = std::collections::HashMap::new();
         inject_external_sprites(&tree, svg, None, &mut markup, &mut cache, &mut sprite_cache);
         assert_eq!(markup, before, "same-document use must be untouched");
+    }
+
+    #[test]
+    fn font_face_parser_selects_ascii_subset_and_preserves_functional_src() {
+        let css = r#"
+            @font-face {
+                font-family: "Example";
+                src: local("Example"), url("./example-cyrillic.woff2") format("woff2");
+                unicode-range: U+0400-04FF;
+            }
+            @font-face {
+                font-family: "Example";
+                src: url(data:font/woff2;base64,d09GMg==) format("woff2"),
+                     url("./example-latin.woff") format("woff");
+                unicode-range: U+??, U+2000-206F;
+            }
+        "#;
+        let faces = font_face_blocks(css);
+        assert_eq!(faces.len(), 2);
+        assert!(!font_face_covers_ascii(faces[0]));
+        assert!(font_face_covers_ascii(faces[1]));
+        assert_eq!(
+            font_face_urls(faces[1]),
+            vec![
+                "data:font/woff2;base64,d09GMg==".to_string(),
+                "./example-latin.woff".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn font_face_without_unicode_range_is_general_purpose() {
+        let css = r#"@font-face{font-family:Example;src:url(example.otf)}"#;
+        let face = font_face_blocks(css)[0];
+        assert!(font_face_covers_ascii(face));
+        assert_eq!(font_face_urls(face), vec!["example.otf"]);
     }
 }

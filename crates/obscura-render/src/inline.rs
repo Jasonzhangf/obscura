@@ -12,7 +12,7 @@
 //! Fonts are loaded from embedded bytes only, never the OS, so layout is
 //! byte-for-byte deterministic across hosts (the whole engine's guarantee).
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use cosmic_text::{Align, Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, Style, SwashCache, Weight, Wrap};
 
@@ -76,6 +76,24 @@ fn resolve_font_family(fam: Option<&str>) -> &'static str {
         // Unrecognized named webfont: keep scanning for a generic fallback.
     }
     FAMILY
+}
+
+fn resolve_loaded_font_family(
+    fam: Option<&str>,
+    loaded: &HashMap<String, Arc<str>>,
+) -> Arc<str> {
+    if let Some(stack) = fam {
+        for token in stack.split(',') {
+            let name = token
+                .trim()
+                .trim_matches(|c| c == '"' || c == '\'')
+                .trim();
+            if let Some(family) = loaded.get(&name.to_ascii_lowercase()) {
+                return Arc::clone(family);
+            }
+        }
+    }
+    Arc::from(resolve_font_family(fam))
 }
 /// Resolve `line-height: normal` from the selected face's horizontal header.
 ///
@@ -148,6 +166,7 @@ pub struct InlineItem {
 /// [`crate::DomLayout`] so paint can rasterize the shaped glyphs.
 pub struct TextEngine {
     font_system: FontSystem,
+    loaded_families: HashMap<String, Arc<str>>,
     swash: SwashCache,
     items: Vec<InlineItem>,
     replaced: Vec<ReplacedItem>,
@@ -215,6 +234,10 @@ impl Default for TextEngine {
 
 impl TextEngine {
     pub fn new() -> Self {
+        Self::new_with_fonts(&[])
+    }
+
+    pub fn new_with_fonts(fonts: &[Vec<u8>]) -> Self {
         // Build a database from our four embedded faces only. Never call
         // load_system_fonts: a host's font set would make layout differ
         // machine to machine and add a multi-millisecond startup scan.
@@ -227,10 +250,24 @@ impl TextEngine {
         ] {
             db.load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(bytes)));
         }
+        for bytes in fonts {
+            db.load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(
+                bytes.clone(),
+            )));
+        }
+        let mut loaded_families = HashMap::new();
+        for face in db.faces() {
+            for (name, _) in &face.families {
+                loaded_families
+                    .entry(name.to_ascii_lowercase())
+                    .or_insert_with(|| Arc::from(name.as_str()));
+            }
+        }
         db.set_sans_serif_family(FAMILY);
         let font_system = FontSystem::new_with_locale_and_db("en-US".to_string(), db);
         TextEngine {
             font_system,
+            loaded_families,
             swash: SwashCache::new(),
             items: Vec::new(),
             replaced: Vec::new(),
@@ -256,9 +293,21 @@ impl TextEngine {
         }
         let base = styles.get(&id)?;
         let mut collector = Collector { last_was_space: true, clip_fills: Vec::new() };
-        let ctx = base_span_ctx(base, &mut collector);
+        let ctx = base_span_ctx(
+            base,
+            resolve_loaded_font_family(base.font_family.as_deref(), &self.loaded_families),
+            &mut collector,
+        );
         let mut spans: Vec<(String, SpanAttrs)> = Vec::new();
-        collect_spans(tree, id, styles, ctx, &mut spans, &mut collector);
+        collect_spans(
+            tree,
+            id,
+            styles,
+            ctx,
+            &mut spans,
+            &mut collector,
+            &self.loaded_families,
+        );
         self.push_shaped_item(base, spans, collector.clip_fills)
     }
 
@@ -287,10 +336,22 @@ impl TextEngine {
         }
         let base = styles.get(&parent)?;
         let mut collector = Collector { last_was_space: true, clip_fills: Vec::new() };
-        let ctx = base_span_ctx(base, &mut collector);
+        let ctx = base_span_ctx(
+            base,
+            resolve_loaded_font_family(base.font_family.as_deref(), &self.loaded_families),
+            &mut collector,
+        );
         let mut spans: Vec<(String, SpanAttrs)> = Vec::new();
         for &cid in run {
-            collect_node_spans(tree, cid, styles, ctx, &mut spans, &mut collector);
+            collect_node_spans(
+                tree,
+                cid,
+                styles,
+                ctx.clone(),
+                &mut spans,
+                &mut collector,
+                &self.loaded_families,
+            );
         }
         self.push_shaped_item(base, spans, collector.clip_fills)
     }
@@ -452,13 +513,13 @@ struct SpanAttrs {
     italic: bool,
     underline: bool,
     color: [u8; 4],
-    family: &'static str,
+    family: Arc<str>,
     clip_fill: Option<usize>,
 }
 
 impl SpanAttrs {
     fn to_attrs(&self) -> Attrs<'_> {
-        let mut a = Attrs::new().family(Family::Name(self.family));
+        let mut a = Attrs::new().family(Family::Name(self.family.as_ref()));
         a = a.weight(if self.bold { Weight::BOLD } else { Weight::NORMAL });
         a = a.style(if self.italic { Style::Italic } else { Style::Normal });
         // Clip-text glyphs must be shaped with an opaque fill so their coverage
@@ -473,14 +534,14 @@ impl SpanAttrs {
 }
 
 /// Inherited inline context threaded down the subtree while collecting spans.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct SpanCtx {
     color: [u8; 4],
     bold: bool,
     italic: bool,
     underline: bool,
     transform: TextTransform,
-    family: &'static str,
+    family: Arc<str>,
     clip_fill: Option<usize>,
 }
 
@@ -502,7 +563,11 @@ struct Collector {
 /// shape the glyphs in opaque white so their coverage renders, then recolor
 /// them from the background at paint time; otherwise transparent text stays
 /// transparent (and invisible), unchanged.
-fn base_span_ctx(base: &LayoutStyle, collector: &mut Collector) -> SpanCtx {
+fn base_span_ctx(
+    base: &LayoutStyle,
+    family: Arc<str>,
+    collector: &mut Collector,
+) -> SpanCtx {
     let clip_fill = clip_text_fill(base).map(|fill| {
         let index = collector.clip_fills.len();
         collector.clip_fills.push(fill);
@@ -514,7 +579,7 @@ fn base_span_ctx(base: &LayoutStyle, collector: &mut Collector) -> SpanCtx {
         italic: base.font_style_italic.unwrap_or(false),
         underline: base.underline.unwrap_or(false),
         transform: base.text_transform.unwrap_or(TextTransform::None),
-        family: resolve_font_family(base.font_family.as_deref()),
+        family,
         clip_fill,
     }
 }
@@ -526,9 +591,18 @@ fn collect_spans(
     ctx: SpanCtx,
     out: &mut Vec<(String, SpanAttrs)>,
     c: &mut Collector,
+    loaded_families: &HashMap<String, Arc<str>>,
 ) {
     for cid in tree.children(id) {
-        collect_node_spans(tree, cid, styles, ctx, out, c);
+        collect_node_spans(
+            tree,
+            cid,
+            styles,
+            ctx.clone(),
+            out,
+            c,
+            loaded_families,
+        );
     }
 }
 
@@ -543,6 +617,7 @@ fn collect_node_spans(
     ctx: SpanCtx,
     out: &mut Vec<(String, SpanAttrs)>,
     c: &mut Collector,
+    loaded_families: &HashMap<String, Arc<str>>,
 ) {
     let Some(node) = tree.get_node(cid) else { return };
     match &node.data {
@@ -552,7 +627,7 @@ fn collect_node_spans(
                 italic: ctx.italic,
                 underline: ctx.underline,
                 color: ctx.color,
-                family: ctx.family,
+                family: Arc::clone(&ctx.family),
                 clip_fill: ctx.clip_fill,
             };
             push_text(contents, ctx.transform, &attrs, out, c);
@@ -569,7 +644,7 @@ fn collect_node_spans(
                     italic: ctx.italic,
                     underline: ctx.underline,
                     color: ctx.color,
-                    family: ctx.family,
+                    family: Arc::clone(&ctx.family),
                     clip_fill: ctx.clip_fill,
                 }));
                 c.last_was_space = true;
@@ -597,11 +672,21 @@ fn collect_node_spans(
                 transform: style.and_then(|s| s.text_transform).unwrap_or(ctx.transform),
                 family: style
                     .and_then(|s| s.font_family.as_deref())
-                    .map(|f| resolve_font_family(Some(f)))
-                    .unwrap_or(ctx.family),
+                    .map(|family| {
+                        resolve_loaded_font_family(Some(family), loaded_families)
+                    })
+                    .unwrap_or_else(|| Arc::clone(&ctx.family)),
                 clip_fill,
             };
-            collect_spans(tree, cid, styles, child, out, c);
+            collect_spans(
+                tree,
+                cid,
+                styles,
+                child,
+                out,
+                c,
+                loaded_families,
+            );
         }
     }
 }

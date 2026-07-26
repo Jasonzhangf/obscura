@@ -11,7 +11,7 @@ default = []
 # Rasterize the laid-out tree to a pixmap (tiny-skia) with text (cosmic-text
 # shaping + line breaking, ab_glyph fallback) and images.
 # Off by default; the layout core (getBoundingClientRect etc.) works without it.
-paint = ["dep:tiny-skia", "dep:ab_glyph", "dep:cosmic-text", "dep:image", "dep:ureq", "dep:base64", "dep:resvg", "dep:usvg", "dep:url"]
+paint = ["dep:tiny-skia", "dep:ab_glyph", "dep:cosmic-text", "dep:image", "dep:ureq", "dep:base64", "dep:resvg", "dep:usvg", "dep:url", "dep:wuff"]
 
 [dependencies]
 taffy = { workspace = true }
@@ -32,6 +32,7 @@ resvg = { version = "0.47", default-features = false, features = ["text", "raste
 usvg = { version = "0.47", default-features = false, optional = true }
 url = { workspace = true, optional = true }
 cssparser = "0.34"
+wuff = { version = "0.2.7", optional = true }
 [lib]
 path = "src/lib.rs"
 

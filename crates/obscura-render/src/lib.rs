@@ -20,7 +20,7 @@ pub mod style;
 pub use style::compute_style;
 
 pub mod dom;
-pub use dom::{layout_dom, layout_dom_with_images, DomLayout};
+pub use dom::{layout_dom, layout_dom_with_images, layout_dom_with_resources, DomLayout};
 
 #[cfg(feature = "paint")]
 mod paint;
