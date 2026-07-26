@@ -303,6 +303,14 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
             let name = dom.with_node(NodeId::new(nid), |n| n.as_element().map(|name| name.local.as_ref().to_ascii_uppercase())).flatten().unwrap_or_default();
             serde_json::to_string(&name).unwrap_or("\"\"".into())
         }
+        // The tree builder already assigns foreign content (an <svg>/<math>
+        // subtree) its own namespace; expose it so JS does not have to guess
+        // the namespace from the tag name.
+        "namespace_uri" => {
+            let nid = arg1.parse::<u32>().unwrap_or(0);
+            let ns = dom.with_node(NodeId::new(nid), |n| n.as_element().map(|name| name.ns.as_ref().to_string())).flatten().unwrap_or_default();
+            serde_json::to_string(&ns).unwrap_or("\"\"".into())
+        }
         "get_attribute" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
             let val = dom.with_node(NodeId::new(nid), |n| n.get_attribute(&arg2).map(|s| s.to_string())).flatten();

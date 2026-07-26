@@ -1210,11 +1210,21 @@ class Element extends Node {
   set className(v) { this.setAttribute("class", v); }
   get namespaceURI() {
     // createElementNS records the requested namespace on _ns; an empty string
-    // maps to the null namespace per spec. Elements made via createElement (or
-    // parsed) have no _ns: default to XHTML, except <svg> which is SVG.
+    // maps to the null namespace per spec.
     if (this._ns !== undefined) return this._ns === "" ? null : this._ns;
-    if (this.localName === "svg") return "http://www.w3.org/2000/svg";
-    return "http://www.w3.org/1999/xhtml";
+    // Otherwise use the namespace the HTML tree builder assigned. Foreign
+    // content puts the WHOLE <svg>/<math> subtree in that namespace, not just
+    // the root, so deriving it from the tag name (the old `localName === "svg"`
+    // check) left every descendant looking like HTML and skipped the SVG-only
+    // reflections -- notably `get href()`, which then returned a plain string
+    // instead of an SVGAnimatedString. An element's namespace never changes,
+    // so cache it like _lname.
+    if (this._nsCache !== undefined) return this._nsCache;
+    let ns = _domParse("namespace_uri", this._nid) || "";
+    // Nodes with no element name recorded fall back to the previous heuristic.
+    if (!ns) ns = this.localName === "svg" ? "http://www.w3.org/2000/svg" : "http://www.w3.org/1999/xhtml";
+    this._nsCache = ns;
+    return ns;
   }
   // `inner_html` resolves a <template> to its contents document on the Rust
   // side (issue #463), so this needs no template special case.
