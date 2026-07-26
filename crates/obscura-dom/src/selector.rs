@@ -102,6 +102,8 @@ pub enum PseudoClass {
     Hover,
     Active,
     Focus,
+    FocusVisible,
+    FocusWithin,
     Enabled,
     Disabled,
     Checked,
@@ -126,7 +128,11 @@ impl parser::NonTSPseudoClass for PseudoClass {
     fn is_user_action_state(&self) -> bool {
         matches!(
             self,
-            PseudoClass::Hover | PseudoClass::Active | PseudoClass::Focus
+            PseudoClass::Hover
+                | PseudoClass::Active
+                | PseudoClass::Focus
+                | PseudoClass::FocusVisible
+                | PseudoClass::FocusWithin
         )
     }
 
@@ -144,6 +150,8 @@ impl ToCss for PseudoClass {
             PseudoClass::Hover => dest.write_str(":hover"),
             PseudoClass::Active => dest.write_str(":active"),
             PseudoClass::Focus => dest.write_str(":focus"),
+            PseudoClass::FocusVisible => dest.write_str(":focus-visible"),
+            PseudoClass::FocusWithin => dest.write_str(":focus-within"),
             PseudoClass::Enabled => dest.write_str(":enabled"),
             PseudoClass::Disabled => dest.write_str(":disabled"),
             PseudoClass::Checked => dest.write_str(":checked"),
@@ -207,6 +215,8 @@ impl<'i> parser::Parser<'i> for ObscuraSelectorParser {
             "hover" => Ok(PseudoClass::Hover),
             "active" => Ok(PseudoClass::Active),
             "focus" => Ok(PseudoClass::Focus),
+            "focus-visible" => Ok(PseudoClass::FocusVisible),
+            "focus-within" => Ok(PseudoClass::FocusWithin),
             "enabled" => Ok(PseudoClass::Enabled),
             "disabled" => Ok(PseudoClass::Disabled),
             "checked" => Ok(PseudoClass::Checked),
@@ -462,7 +472,11 @@ impl<'a> Element for DomElement<'a> {
             PseudoClass::Checked => self.has_boolean_attr("checked") || self.has_boolean_attr("selected"),
             // Dynamic user-interaction pseudo-classes have no meaning against
             // a static DOM snapshot with no live user input.
-            PseudoClass::Hover | PseudoClass::Active | PseudoClass::Focus => false,
+            PseudoClass::Hover
+            | PseudoClass::Active
+            | PseudoClass::Focus
+            | PseudoClass::FocusVisible
+            | PseudoClass::FocusWithin => false,
         }
     }
 
@@ -988,6 +1002,23 @@ mod tests {
             r#"<input type="checkbox" checked><input type="checkbox">"#,
         );
         assert_eq!(tree.query_selector_all("input:checked").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn unfocused_snapshot_matches_focus_negation_selectors() {
+        let tree = parse_html(
+            r#"<div class="visually-hidden-focusable">Skip</div>"#,
+        );
+        let hidden = tree
+            .query_selector_all(
+                ".visually-hidden-focusable:not(:focus):not(:focus-within)",
+            )
+            .unwrap();
+        assert_eq!(hidden.len(), 1);
+        assert_eq!(
+            tree.query_selector_all(":focus-visible").unwrap().len(),
+            0
+        );
     }
 
     #[test]
