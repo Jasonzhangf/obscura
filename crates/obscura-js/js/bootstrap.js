@@ -8907,10 +8907,18 @@ globalThis.__obscura_init = function() {
 
   const scr = _fp('screen');
   const sw = scr[0], sh = scr[1];
+  // The OS screen and the page viewport are different browser concepts.
+  // Keep the fingerprinted screen, but let the embedding browser provide the
+  // actual CSS viewport so responsive JavaScript, layout, and screenshots all
+  // observe the same dimensions.
+  const vw = Number.isFinite(globalThis.__obscura_viewport_w) && globalThis.__obscura_viewport_w > 0
+    ? globalThis.__obscura_viewport_w : sw;
+  const vh = Number.isFinite(globalThis.__obscura_viewport_h) && globalThis.__obscura_viewport_h > 0
+    ? globalThis.__obscura_viewport_h : sh - 80;
   globalThis.screen = new Screen(sw, sh);
-  globalThis.visualViewport = { width:sw, height:sh-80, offsetLeft:0, offsetTop:0, scale:1, addEventListener(){}, removeEventListener(){} };
+  globalThis.visualViewport = { width:vw, height:vh, offsetLeft:0, offsetTop:0, scale:1, addEventListener(){}, removeEventListener(){} };
   globalThis.devicePixelRatio = sw >= 2560 ? 2 : 1;
-  globalThis.innerWidth = sw; globalThis.innerHeight = sh - 80;
+  globalThis.innerWidth = vw; globalThis.innerHeight = vh;
   globalThis.outerWidth = sw; globalThis.outerHeight = sh - 40;
 
   var hwValues = globalThis.__obscura_stealth ? [4, 6, 8, 12, 16] : [2, 4, 6, 8, 12, 16];

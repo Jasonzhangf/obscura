@@ -45,6 +45,18 @@ impl Stylesheet {
     /// Parse and index a set of raw CSS sources (the text of each `<style>`
     /// block, in document order). Selectors that fail to parse are dropped.
     pub fn parse(tree: &DomTree, sources: &[String]) -> Self {
+        Self::parse_for_viewport(tree, sources, (1280.0, 720.0))
+    }
+
+    /// Parse author CSS for the live CSS viewport. Media queries must use the
+    /// same dimensions as layout and page JavaScript; filtering them against a
+    /// fixed desktop width made responsive frameworks build one DOM while the
+    /// renderer applied another breakpoint.
+    pub fn parse_for_viewport(
+        tree: &DomTree,
+        sources: &[String],
+        viewport: (f32, f32),
+    ) -> Self {
         let mut sheet = Stylesheet {
             rules: Vec::new(),
             by_id: HashMap::new(),
@@ -56,7 +68,7 @@ impl Stylesheet {
         };
         let mut order = 0usize;
         for src in sources {
-            for (selector, decls) in parse_stylesheet(src) {
+            for (selector, decls) in parse_stylesheet_for_viewport(src, viewport) {
                 let sel_trim = selector.trim();
                 if let Some(base) = strip_pseudo_element(sel_trim, "before") {
                     if let (Some(content), Some(sel)) = (extract_string_content(&decls), tree.compile_rule_selector(base)) {
@@ -359,6 +371,13 @@ fn unescape_css_string(s: &str) -> String {
 /// (`@media`, `@supports`, `@layer`); other at-rules (`@font-face`, `@keyframes`, ...) are
 /// skipped since they do not contribute layout-relevant declarations here.
 pub fn parse_stylesheet(css: &str) -> Vec<(String, String)> {
+    parse_stylesheet_for_viewport(css, (1280.0, 720.0))
+}
+
+fn parse_stylesheet_for_viewport(
+    css: &str,
+    viewport: (f32, f32),
+) -> Vec<(String, String)> {
     let mut rules = Vec::new();
     let mut current_selector = String::new();
     let mut current_decls = String::new();
@@ -397,13 +416,13 @@ pub fn parse_stylesheet(css: &str) -> Vec<(String, String)> {
                 let sel = current_selector.trim();
                 let decls = current_decls.trim();
                 if let Some(at) = sel.strip_prefix('@') {
-                    flush_at_rule(at, sel, decls, &mut rules);
+                    flush_at_rule(at, sel, decls, &mut rules, viewport);
                 } else {
                     // The body may contain nested rules (CSS Nesting, ubiquitous
                     // in Tailwind v4 / modern frameworks: `.a{ &:hover{} .b{} }`).
                     // Flatten them against this selector; denest also handles the
                     // no-nesting case (just emits the rule's own declarations).
-                    denest(sel, decls, &mut rules);
+                    denest(sel, decls, &mut rules, viewport);
                 }
                 current_selector.clear();
                 current_decls.clear();
@@ -427,13 +446,19 @@ pub fn parse_stylesheet(css: &str) -> Vec<(String, String)> {
 
 /// Handle the at-rules whose bodies contain ordinary rules. For `@media`, apply
 /// the inner rules only when the query holds for a desktop 1280px viewport.
-fn flush_at_rule(at: &str, sel: &str, inner: &str, rules: &mut Vec<(String, String)>) {
+fn flush_at_rule(
+    at: &str,
+    sel: &str,
+    inner: &str,
+    rules: &mut Vec<(String, String)>,
+    viewport: (f32, f32),
+) {
     if at.starts_with("media") {
-        if media_query_applies(sel) {
-            rules.extend(parse_stylesheet(inner));
+        if media_query_applies_for_viewport(sel, viewport) {
+            rules.extend(parse_stylesheet_for_viewport(inner, viewport));
         }
     } else if at.starts_with("supports") {
-        rules.extend(parse_stylesheet(inner));
+        rules.extend(parse_stylesheet_for_viewport(inner, viewport));
     } else if at.starts_with("property") {
         // `@property --x { syntax:..; initial-value: V }` declares a custom
         // property and its default. Register the initial-value as a `:root`
@@ -460,7 +485,7 @@ fn flush_at_rule(at: &str, sel: &str, inner: &str, rules: &mut Vec<(String, Stri
         // left whole pages unstyled (white backgrounds, collapsed layout). The
         // `@layer a, b;` ordering-statement form has no block and is discarded
         // by parse_stylesheet's top-level `;` handling.
-        rules.extend(parse_stylesheet(inner));
+        rules.extend(parse_stylesheet_for_viewport(inner, viewport));
     }
     // Other at-rules (@font-face, @keyframes, @import, ...) carry no
     // layout-relevant rules for us, so drop them.
@@ -474,7 +499,15 @@ fn flush_at_rule(at: &str, sel: &str, inner: &str, rules: &mut Vec<(String, Stri
 /// inside `(feature: value)`, so it's safe to discard them wholesale rather
 /// than special-case every formatting variant a site might use.
 pub(crate) fn media_query_applies(query: &str) -> bool {
-    const VIEWPORT_W: f32 = 1280.0;
+    media_query_applies_for_viewport(query, (1280.0, 720.0))
+}
+
+pub(crate) fn media_query_applies_for_viewport(
+    query: &str,
+    viewport: (f32, f32),
+) -> bool {
+    let viewport_w = viewport.0;
+    let viewport_h = viewport.1;
     if query.contains("print") {
         return false;
     }
@@ -508,34 +541,71 @@ pub(crate) fn media_query_applies(query: &str) -> bool {
     // Width constraints, both `min-width:`/`max-width:` and the modern range
     // forms `width>=Npx` / `(Npx<=width)`.
     if let Some(px) = extract_px(&compact, "max-width:") {
-        if VIEWPORT_W > px {
+        if viewport_w > px {
             return false;
         }
     }
     if let Some(px) = extract_px(&compact, "min-width:") {
-        if VIEWPORT_W < px {
+        if viewport_w < px {
             return false;
         }
     }
     if let Some(px) = extract_px(&compact, "width<=") {
-        if VIEWPORT_W > px {
+        if viewport_w > px {
             return false;
         }
     }
     if let Some(px) = extract_px(&compact, "width>=") {
-        if VIEWPORT_W < px {
+        if viewport_w < px {
             return false;
         }
     }
     if let Some(px) = extract_px(&compact, "width>") {
-        if VIEWPORT_W <= px {
+        if viewport_w <= px {
             return false;
         }
     }
     if let Some(px) = extract_px(&compact, "width<") {
-        if VIEWPORT_W >= px {
+        if viewport_w >= px {
             return false;
         }
+    }
+
+    if let Some(px) = extract_px(&compact, "max-height:") {
+        if viewport_h > px {
+            return false;
+        }
+    }
+    if let Some(px) = extract_px(&compact, "min-height:") {
+        if viewport_h < px {
+            return false;
+        }
+    }
+    if let Some(px) = extract_px(&compact, "height<=") {
+        if viewport_h > px {
+            return false;
+        }
+    }
+    if let Some(px) = extract_px(&compact, "height>=") {
+        if viewport_h < px {
+            return false;
+        }
+    }
+    if let Some(px) = extract_px(&compact, "height>") {
+        if viewport_h <= px {
+            return false;
+        }
+    }
+    if let Some(px) = extract_px(&compact, "height<") {
+        if viewport_h >= px {
+            return false;
+        }
+    }
+    if compact.contains("orientation:portrait") && viewport_w > viewport_h {
+        return false;
+    }
+    if compact.contains("orientation:landscape") && viewport_h > viewport_w {
+        return false;
     }
     true
 }
@@ -573,7 +643,12 @@ fn combine_selectors(parent: &str, child: &str) -> String {
 /// selector), emit `(sel, own-declarations)`, and recurse into each nested rule
 /// with the combined selector. Without this, Tailwind v4 / modern-framework CSS
 /// (which nests almost everything) loses the nested utility rules entirely.
-fn denest(sel: &str, body: &str, rules: &mut Vec<(String, String)>) {
+fn denest(
+    sel: &str,
+    body: &str,
+    rules: &mut Vec<(String, String)>,
+    viewport: (f32, f32),
+) {
     let chars: Vec<char> = body.chars().collect();
     let n = chars.len();
     let mut i = 0;
@@ -645,15 +720,15 @@ fn denest(sel: &str, body: &str, rules: &mut Vec<(String, String)>) {
                 if let Some(at) = pre.strip_prefix('@') {
                     // A nested at-rule keeps the enclosing selector for its body.
                     if at.starts_with("media") {
-                        if media_query_applies(pre) {
-                            denest(sel, &inner, rules);
+                        if media_query_applies_for_viewport(pre, viewport) {
+                            denest(sel, &inner, rules, viewport);
                         }
                     } else if at.starts_with("supports") || at.starts_with("layer") {
-                        denest(sel, &inner, rules);
+                        denest(sel, &inner, rules, viewport);
                     }
                 } else if !pre.is_empty() {
                     let full = combine_selectors(sel, pre);
-                    denest(&full, &inner, rules);
+                    denest(&full, &inner, rules, viewport);
                 }
                 i = j;
                 seg = i;
@@ -784,4 +859,55 @@ fn eval_px_sum(expr: &str) -> f32 {
     }
     flush(&mut num, sign, &mut total);
     total
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn media_rules_use_the_live_width_and_height() {
+        let css = r#"
+            .base { color: black; }
+            @media (max-width: 950px) { .narrow { color: green; } }
+            @media (min-height: 900px) { .tall { color: blue; } }
+            @media (orientation: portrait) { .portrait { color: red; } }
+        "#;
+        let selectors = |viewport| {
+            parse_stylesheet_for_viewport(css, viewport)
+                .into_iter()
+                .map(|(selector, _)| selector)
+                .collect::<Vec<_>>()
+        };
+
+        let narrow_tall = selectors((900.0, 1000.0));
+        assert!(narrow_tall.iter().any(|s| s == ".base"));
+        assert!(narrow_tall.iter().any(|s| s == ".narrow"));
+        assert!(narrow_tall.iter().any(|s| s == ".tall"));
+        assert!(narrow_tall.iter().any(|s| s == ".portrait"));
+
+        let wide_short = selectors((1280.0, 720.0));
+        assert!(wide_short.iter().any(|s| s == ".base"));
+        assert!(!wide_short.iter().any(|s| s == ".narrow"));
+        assert!(!wide_short.iter().any(|s| s == ".tall"));
+        assert!(!wide_short.iter().any(|s| s == ".portrait"));
+    }
+
+    #[test]
+    fn nested_media_rules_use_the_live_viewport() {
+        let css = ".card { display:block; @media (max-width: 950px) { width:100%; } }";
+        let narrow = parse_stylesheet_for_viewport(css, (900.0, 1000.0));
+        let wide = parse_stylesheet_for_viewport(css, (1280.0, 720.0));
+        assert!(
+            narrow
+                .iter()
+                .any(|(selector, declarations)| selector == ".card"
+                    && declarations.contains("width:100%"))
+        );
+        assert!(
+            !wide
+                .iter()
+                .any(|(_, declarations)| declarations.contains("width:100%"))
+        );
+    }
 }

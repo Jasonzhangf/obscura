@@ -448,7 +448,11 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
             // content-box) is an ordinary background, so clear the flag.
             style.background_clip_text = value.trim().eq_ignore_ascii_case("text");
         }
-        "color" => style.color = parse_color(value),
+        // Blink/WebKit gradient text commonly makes the glyph fill
+        // transparent through this inherited property while clipping a
+        // background gradient to the text. We model one effective text color,
+        // so the vendor fill color is the paint-time color winner.
+        "color" | "-webkit-text-fill-color" => style.color = parse_color(value),
         "border-color" => style.border_color = parse_color(value),
         "font-size" => {
             // Absolute lengths resolve now; font/viewport-relative ones defer
@@ -2508,6 +2512,13 @@ fn parse_linear_gradient(value: &str) -> Option<(f32, Vec<([u8; 4], Option<f32>)
     let v = value.trim();
     let lower = v.to_ascii_lowercase();
     let start = lower.find("linear-gradient(")?;
+    // The original prefixed WebKit gradient syntax predates the standardized
+    // angle system: 0deg points right and positive angles turn
+    // counter-clockwise. Blink still accepts that syntax for compatibility.
+    // Convert it to our standard CSS angle (0deg up, clockwise) before paint.
+    let prefix = &lower[..start];
+    let legacy_webkit_angle =
+        prefix.ends_with("-webkit-") || prefix.ends_with("-webkit-repeating-");
     let open = start + "linear-gradient(".len();
     // Match the closing paren for this function.
     let bytes = v.as_bytes();
@@ -2546,7 +2557,11 @@ fn parse_linear_gradient(value: &str) -> Option<(f32, Vec<([u8; 4], Option<f32>)
     let mut stop_start = 0;
     if first.ends_with("deg") {
         if let Ok(a) = first.trim_end_matches("deg").trim().parse::<f32>() {
-            angle = a;
+            angle = if legacy_webkit_angle {
+                (90.0 - a).rem_euclid(360.0)
+            } else {
+                a.rem_euclid(360.0)
+            };
         }
         stop_start = 1;
     } else if first.starts_with("to ") {
@@ -3123,6 +3138,25 @@ mod tests {
     fn background_clip_text_flag() {
         let s = compute_style("h1", Some("color: transparent; -webkit-background-clip: text"));
         assert!(s.background_clip_text);
+        let vendor_fill = compute_style(
+            "h1",
+            Some(
+                "color: black; -webkit-text-fill-color: transparent;\
+                 background: linear-gradient(90deg, red, blue);\
+                 -webkit-background-clip: text",
+            ),
+        );
+        assert_eq!(vendor_fill.color, Some([0, 0, 0, 0]));
+        assert!(vendor_fill.background_clip_text);
+        assert!(vendor_fill.background_gradient.is_some());
+        let legacy_angle = compute_style(
+            "span",
+            Some("background:-webkit-linear-gradient(315deg,#42d392 25%,#647eff)"),
+        )
+        .background_gradient
+        .expect("prefixed gradient")
+        .0;
+        assert_eq!(legacy_angle, 135.0);
         let n = compute_style("h1", Some("background-clip: border-box"));
         assert!(!n.background_clip_text);
         let l = compute_style("h1", Some("background-clip: text"));

@@ -1227,7 +1227,7 @@ fn fast_path_response(text: &str) -> Option<String> {
         "Page.enable" | "Page.setLifecycleEventsEnabled" | "Page.setInterceptFileChooserDialog" |
         "Runtime.runIfWaitingForDebugger" | "Runtime.discardConsoleEntries" |
         "Performance.enable" | "Log.enable" | "Security.enable" |
-        "Emulation.setDeviceMetricsOverride" | "Emulation.setTouchEmulationEnabled" |
+        "Emulation.setTouchEmulationEnabled" |
         "CSS.enable" | "Accessibility.enable" | "ServiceWorker.enable" |
         "Inspector.enable" | "Debugger.enable" | "Profiler.enable" |
         "HeapProfiler.enable" | "Overlay.enable" | "Storage.enable" |

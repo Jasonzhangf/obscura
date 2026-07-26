@@ -400,13 +400,12 @@ pub async fn handle(
         // configure; ack it so clients that set it do not warn (issue #340).
         "setDownloadBehavior" => Ok(json!({})),
         "getLayoutMetrics" => {
-            // Obscura has no visual layout engine, so we return a fixed
-            // 1280x720 viewport (Chrome's default) and try to derive the
-            // content height from document.documentElement.scrollHeight.
-            // Playwright calls this before every page.screenshot() and
-            // would otherwise fail with "Unknown Page method".
-            let width = 1280.0_f64;
-            let height = 720.0_f64;
+            // Playwright calls this before every page.screenshot(). Report the
+            // same live CSS viewport that responsive page code and paint use.
+            let (width, height) = ctx
+                .get_session_page(session_id)
+                .map(|page| (page.viewport.0 as f64, page.viewport.1 as f64))
+                .unwrap_or((1280.0, 720.0));
             let content_height = ctx
                 .get_session_page_mut(session_id)
                 .map(|p| p.evaluate("document.documentElement && document.documentElement.scrollHeight"))
@@ -528,7 +527,7 @@ pub async fn handle(
             #[cfg(feature = "render")]
             {
                 let page = ctx.get_session_page(session_id).ok_or("No page for session")?;
-                match page.screenshot((1280.0, 720.0)) {
+                match page.screenshot(page.viewport) {
                     Some(png) => {
                         use base64::Engine as _;
                         let data = base64::engine::general_purpose::STANDARD.encode(&png);

@@ -253,6 +253,11 @@
     {"name": "unsupported identity transform still establishes containing block", "color": "#7048e8", "x": 550, "y": 280, "width": 20, "height": 20},
     {"name": "positioned ancestor does not capture fixed", "color": "#a61e4d", "x": 700, "y": 40, "width": 90, "height": 60}
   ],
+  "viewport-consistency": [
+    {"name": "width media query uses the screenshot viewport", "color": "#087f5b", "x": 10, "y": 10, "width": 200, "height": 80},
+    {"name": "height media query uses the screenshot viewport", "color": "#1971c2", "x": 10, "y": 110, "width": 200, "height": 80},
+    {"name": "page JavaScript sees the screenshot viewport", "color": "#7048e8", "x": 10, "y": 210, "width": 200, "height": 80}
+  ],
   "z-index": [
     {"name": "positive layer", "color": "#008000", "width": 200, "height": 100},
     {"name": "negative layer", "color": "#ffa500", "width": 260, "height": 110}

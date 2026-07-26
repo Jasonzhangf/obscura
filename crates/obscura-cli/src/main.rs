@@ -607,6 +607,24 @@ async fn run_fetch(
         allow_private_network,
     ));
     let mut page = Page::new("fetch-page".to_string(), context.clone());
+    // A screenshot viewport is also the navigation viewport: responsive
+    // frameworks must build the DOM for the same dimensions we later paint.
+    // Previously page JS saw a randomized screen-sized innerWidth while the
+    // screenshot used these values only at the final raster step.
+    let screenshot_viewport = screenshot.as_ref().map(|_| {
+        let width = std::env::var("OBSCURA_SHOT_W")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(1280.0);
+        let height = std::env::var("OBSCURA_SHOT_H")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(720.0);
+        (width, height)
+    });
+    if let Some(viewport) = screenshot_viewport {
+        page.set_viewport(viewport);
+    }
 
     if let Some(ref ua) = user_agent {
         page.http_client.set_user_agent(ua).await;
@@ -661,9 +679,8 @@ async fn run_fetch(
             // Default CSS-pixel viewport, matching the engine's innerWidth/Height.
             // OBSCURA_SHOT_W / OBSCURA_SHOT_H override it (e.g. a tall viewport to
             // capture below-the-fold content in one shot).
-            let shot_w = std::env::var("OBSCURA_SHOT_W").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(1280.0);
-            let shot_h = std::env::var("OBSCURA_SHOT_H").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(720.0);
-            match page.screenshot((shot_w, shot_h)) {
+            let viewport = screenshot_viewport.unwrap_or((1280.0, 720.0));
+            match page.screenshot(viewport) {
                 Some(bytes) => std::fs::write(path, &bytes)?,
                 None => anyhow::bail!("screenshot failed: page has no DOM to render"),
             }

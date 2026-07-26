@@ -110,8 +110,13 @@ pub(crate) fn used_line_height(style: &LayoutStyle) -> f32 {
     }
 }
 
-/// Underline is flagged per glyph through cosmic-text's `metadata` field.
+/// Per-glyph flags carried through cosmic-text's `metadata` field. Bit zero is
+/// the underline flag; the remaining bits encode an optional one-based index
+/// into an [`InlineItem`]'s clip-text fills.
 const META_UNDERLINE: usize = 1;
+const META_FILL_SHIFT: usize = 1;
+
+type ClipTextFill = (f32, Vec<([u8; 4], Option<f32>)>);
 
 /// One inline formatting context: a shaped cosmic-text buffer plus where to
 /// paint it (filled in after layout).
@@ -125,11 +130,10 @@ pub struct InlineItem {
     origin: (f32, f32),
     /// Ancestor `overflow: hidden` clip, set by `finalize`.
     clip: Option<Rect>,
-    /// `-webkit-background-clip: text` fill: when set, the glyphs are painted
-    /// with this background (a linear gradient sampled across the text box, or a
-    /// solid color as a flat two-stop gradient) instead of the transparent text
-    /// color that would make them invisible. See [`clip_text_fill`].
-    clip_fill: Option<(f32, Vec<([u8; 4], Option<f32>)>)>,
+    /// Per-span `-webkit-background-clip: text` fills. Glyph metadata selects
+    /// one entry, allowing an inline accent span to own a gradient without
+    /// recoloring the rest of its heading.
+    clip_fills: Vec<ClipTextFill>,
 }
 
 /// Owns the font set and shaping caches for one render pass, plus every
@@ -244,11 +248,11 @@ impl TextEngine {
             return None;
         }
         let base = styles.get(&id)?;
-        let (ctx, clip_fill) = base_span_ctx(base);
+        let mut collector = Collector { last_was_space: true, clip_fills: Vec::new() };
+        let ctx = base_span_ctx(base, &mut collector);
         let mut spans: Vec<(String, SpanAttrs)> = Vec::new();
-        let mut collector = Collector { last_was_space: true };
         collect_spans(tree, id, styles, ctx, &mut spans, &mut collector);
-        self.push_shaped_item(base, spans, clip_fill)
+        self.push_shaped_item(base, spans, collector.clip_fills)
     }
 
     /// Build an inline formatting context from a *run* of consecutive
@@ -275,13 +279,13 @@ impl TextEngine {
             return None;
         }
         let base = styles.get(&parent)?;
-        let (ctx, clip_fill) = base_span_ctx(base);
+        let mut collector = Collector { last_was_space: true, clip_fills: Vec::new() };
+        let ctx = base_span_ctx(base, &mut collector);
         let mut spans: Vec<(String, SpanAttrs)> = Vec::new();
-        let mut collector = Collector { last_was_space: true };
         for &cid in run {
             collect_node_spans(tree, cid, styles, ctx, &mut spans, &mut collector);
         }
-        self.push_shaped_item(base, spans, clip_fill)
+        self.push_shaped_item(base, spans, collector.clip_fills)
     }
 
     /// Shared tail of [`try_build`] / [`try_build_run`]: shape the collected
@@ -291,7 +295,7 @@ impl TextEngine {
         &mut self,
         base: &LayoutStyle,
         mut spans: Vec<(String, SpanAttrs)>,
-        clip_fill: Option<(f32, Vec<([u8; 4], Option<f32>)>)>,
+        clip_fills: Vec<ClipTextFill>,
     ) -> Option<usize> {
         // Trim a single trailing space so it does not widen the last line.
         if let Some((text, _)) = spans.last_mut() {
@@ -363,7 +367,7 @@ impl TextEngine {
             forced_min_height,
             origin: (0.0, 0.0),
             clip: None,
-            clip_fill,
+            clip_fills,
         });
         Some(idx)
     }
@@ -442,6 +446,7 @@ struct SpanAttrs {
     underline: bool,
     color: [u8; 4],
     family: &'static str,
+    clip_fill: Option<usize>,
 }
 
 impl SpanAttrs {
@@ -449,10 +454,13 @@ impl SpanAttrs {
         let mut a = Attrs::new().family(Family::Name(self.family));
         a = a.weight(if self.bold { Weight::BOLD } else { Weight::NORMAL });
         a = a.style(if self.italic { Style::Italic } else { Style::Normal });
-        a = a.color(Color::rgba(self.color[0], self.color[1], self.color[2], self.color[3]));
-        // Underline has no native cosmic-text attribute; carry it through the
-        // per-glyph metadata so paint can stroke it (see `paint_item`).
-        a = a.metadata(if self.underline { META_UNDERLINE } else { 0 });
+        // Clip-text glyphs must be shaped with an opaque fill so their coverage
+        // reaches paint; the real gradient is selected through metadata.
+        let color = if self.clip_fill.is_some() { [255, 255, 255, 255] } else { self.color };
+        a = a.color(Color::rgba(color[0], color[1], color[2], color[3]));
+        // Underline and the optional fill index share the per-glyph metadata.
+        let fill = self.clip_fill.map_or(0, |index| (index + 1) << META_FILL_SHIFT);
+        a = a.metadata(fill | usize::from(self.underline));
         a
     }
 }
@@ -466,10 +474,12 @@ struct SpanCtx {
     underline: bool,
     transform: TextTransform,
     family: &'static str,
+    clip_fill: Option<usize>,
 }
 
 struct Collector {
     last_was_space: bool,
+    clip_fills: Vec<ClipTextFill>,
 }
 
 /// DFS the inline subtree, appending whitespace-collapsed text runs. Adjacent
@@ -485,22 +495,21 @@ struct Collector {
 /// shape the glyphs in opaque white so their coverage renders, then recolor
 /// them from the background at paint time; otherwise transparent text stays
 /// transparent (and invisible), unchanged.
-fn base_span_ctx(base: &LayoutStyle) -> (SpanCtx, Option<(f32, Vec<([u8; 4], Option<f32>)>)>) {
-    let clip_fill = clip_text_fill(base);
-    let default_color = if clip_fill.is_some() {
-        [255, 255, 255, 255]
-    } else {
-        base.color.unwrap_or([0, 0, 0, 255])
-    };
-    let ctx = SpanCtx {
-        color: default_color,
+fn base_span_ctx(base: &LayoutStyle, collector: &mut Collector) -> SpanCtx {
+    let clip_fill = clip_text_fill(base).map(|fill| {
+        let index = collector.clip_fills.len();
+        collector.clip_fills.push(fill);
+        index
+    });
+    SpanCtx {
+        color: base.color.unwrap_or([0, 0, 0, 255]),
         bold: base.font_weight.as_deref() == Some("bold"),
         italic: base.font_style_italic.unwrap_or(false),
         underline: base.underline.unwrap_or(false),
         transform: base.text_transform.unwrap_or(TextTransform::None),
         family: resolve_font_family(base.font_family.as_deref()),
-    };
-    (ctx, clip_fill)
+        clip_fill,
+    }
 }
 
 fn collect_spans(
@@ -531,7 +540,14 @@ fn collect_node_spans(
     let Some(node) = tree.get_node(cid) else { return };
     match &node.data {
         obscura_dom::tree::NodeData::Text { contents } => {
-            let attrs = SpanAttrs { bold: ctx.bold, italic: ctx.italic, underline: ctx.underline, color: ctx.color, family: ctx.family };
+            let attrs = SpanAttrs {
+                bold: ctx.bold,
+                italic: ctx.italic,
+                underline: ctx.underline,
+                color: ctx.color,
+                family: ctx.family,
+                clip_fill: ctx.clip_fill,
+            };
             push_text(contents, ctx.transform, &attrs, out, c);
         }
         _ => {
@@ -541,12 +557,31 @@ fn collect_node_spans(
                 return;
             }
             if elem.local.as_ref() == "br" {
-                out.push(("\n".to_string(), SpanAttrs { bold: ctx.bold, italic: ctx.italic, underline: ctx.underline, color: ctx.color, family: ctx.family }));
+                out.push(("\n".to_string(), SpanAttrs {
+                    bold: ctx.bold,
+                    italic: ctx.italic,
+                    underline: ctx.underline,
+                    color: ctx.color,
+                    family: ctx.family,
+                    clip_fill: ctx.clip_fill,
+                }));
                 c.last_was_space = true;
                 return;
             }
+            let own_clip_fill = style.and_then(clip_text_fill).map(|fill| {
+                let index = c.clip_fills.len();
+                c.clip_fills.push(fill);
+                index
+            });
+            let color = style.and_then(|s| s.color).unwrap_or(ctx.color);
+            // A descendant with its own clip-text background replaces the
+            // inherited fill. Transparent descendants otherwise continue an
+            // ancestor's fill; an opaque text color paints normally.
+            let clip_fill = own_clip_fill.or_else(|| {
+                if color[3] == 0 { ctx.clip_fill } else { None }
+            });
             let child = SpanCtx {
-                color: style.and_then(|s| s.color).unwrap_or(ctx.color),
+                color,
                 bold: ctx.bold || style.map(|s| s.font_weight.as_deref() == Some("bold")).unwrap_or(false),
                 italic: ctx.italic || style.and_then(|s| s.font_style_italic).unwrap_or(false),
                 // Underline propagates in: an ancestor's underline covers
@@ -557,6 +592,7 @@ fn collect_node_spans(
                     .and_then(|s| s.font_family.as_deref())
                     .map(|f| resolve_font_family(Some(f)))
                     .unwrap_or(ctx.family),
+                clip_fill,
             };
             collect_spans(tree, cid, styles, child, out, c);
         }
@@ -807,11 +843,32 @@ impl TextEngine {
         // consecutive underlined glyphs on a line into one stroke below the
         // baseline. Done first so the draw() mutable borrow does not overlap.
         let mut underlines: Vec<(f32, f32, f32, f32, [u8; 4])> = Vec::new(); // x0, x1, y, thickness, color
+        let mut fill_bounds: Vec<Option<(f32, f32, f32, f32)>> =
+            vec![None; item.clip_fills.len()];
         for run in item.buffer.layout_runs() {
             let base_y = run.line_y;
             let mut seg: Option<(f32, f32, f32, [u8; 4])> = None; // x0, x1, font_size, color
             for g in run.glyphs {
-                let underlined = g.metadata == META_UNDERLINE as usize;
+                let underlined = g.metadata & META_UNDERLINE != 0;
+                if let Some(fill_index) = (g.metadata >> META_FILL_SHIFT).checked_sub(1) {
+                    if let Some(bounds) = fill_bounds.get_mut(fill_index) {
+                        let glyph_bounds = (
+                            g.x,
+                            run.line_top,
+                            g.x + g.w,
+                            run.line_top + run.line_height,
+                        );
+                        *bounds = Some(match *bounds {
+                            Some((x0, y0, x1, y1)) => (
+                                x0.min(glyph_bounds.0),
+                                y0.min(glyph_bounds.1),
+                                x1.max(glyph_bounds.2),
+                                y1.max(glyph_bounds.3),
+                            ),
+                            None => glyph_bounds,
+                        });
+                    }
+                }
                 let col = g.color_opt.map(|c| [c.r(), c.g(), c.b(), c.a()]).unwrap_or([0, 0, 0, 255]);
                 if underlined {
                     match &mut seg {
@@ -838,40 +895,52 @@ impl TextEngine {
         // Fallback color if a glyph carries none (shouldn't happen: every span
         // sets one), black.
         let default = Color::rgba(0, 0, 0, 255);
-        // `-webkit-background-clip: text`: recolor each glyph pixel from the
-        // background gradient sampled across the shaped text box, keeping the
-        // glyph's coverage as alpha. The glyphs were shaped opaque (see
-        // `try_build`) so this coverage exists; without a clip fill the per-span
-        // colors pass through unchanged.
-        let clip_fill = item.clip_fill.clone();
-        let fill_extent = clip_fill.as_ref().map(|_| {
-            let (width, height) = buffer_size(&item.buffer);
-            (width, height.max(item.forced_min_height))
-        });
+        // `-webkit-background-clip: text`: rasterize each glyph while its
+        // metadata is still available, then sample that span's background
+        // gradient across the span's own shaped bounds. Buffer::draw omits
+        // metadata from its callback, so using it here would force one fill
+        // over the entire heading and lose inline accent gradients.
+        let clip_fills = item.clip_fills.clone();
         let pixels = pixmap.pixels_mut();
-        item.buffer.draw(font_system, swash, default, |gx, gy, gw, gh, color| {
-            let a = color.a() as u32;
-            if a == 0 {
-                return;
-            }
-            let (r, g, b) = match (&clip_fill, fill_extent) {
-                (Some(fill), Some((tw, th))) => {
-                    let c = sample_gradient(fill, gx as f32 + gw as f32 / 2.0, gy as f32 + gh as f32 / 2.0, tw, th);
-                    (c[0], c[1], c[2])
-                }
-                _ => (color.r(), color.g(), color.b()),
-            };
-            for dy in 0..gh as i32 {
-                for dx in 0..gw as i32 {
-                    let px = ox as i32 + gx + dx;
-                    let py = oy as i32 + gy + dy;
+        for run in item.buffer.layout_runs() {
+            for glyph in run.glyphs {
+                let physical = glyph.physical((0.0, 0.0), 1.0);
+                let glyph_color = glyph.color_opt.unwrap_or(default);
+                let fill_index = (glyph.metadata >> META_FILL_SHIFT).checked_sub(1);
+                swash.with_pixels(
+                    font_system,
+                    physical.cache_key,
+                    glyph_color,
+                    |x, y, color| {
+                    let a = color.a() as u32;
+                    if a == 0 {
+                        return;
+                    }
+                    let gx = physical.x + x;
+                    let gy = run.line_y as i32 + physical.y + y;
+                    let (r, g, b) = fill_index
+                        .and_then(|index| {
+                            let fill = clip_fills.get(index)?;
+                            let (x0, y0, x1, y1) = fill_bounds.get(index).copied().flatten()?;
+                            let sampled = sample_gradient(
+                                fill,
+                                gx as f32 + 0.5 - x0,
+                                gy as f32 + 0.5 - y0,
+                                x1 - x0,
+                                y1 - y0,
+                            );
+                            Some((sampled[0], sampled[1], sampled[2]))
+                        })
+                        .unwrap_or_else(|| (color.r(), color.g(), color.b()));
+                    let px = ox as i32 + gx;
+                    let py = oy as i32 + gy;
                     if let Some((cx0, cy0, cx1, cy1)) = clip_bounds {
                         if (px as f32) < cx0 || (px as f32) >= cx1 || (py as f32) < cy0 || (py as f32) >= cy1 {
-                            continue;
+                            return;
                         }
                     }
                     if px < 0 || px >= pw || py < 0 || py >= ph {
-                        continue;
+                        return;
                     }
                     let idx = (py * pw + px) as usize;
                     let dst = pixels[idx];
@@ -882,16 +951,17 @@ impl TextEngine {
                     let inv = 255 - sa;
                     let out_a = sa + (dst.alpha() as u32 * inv / 255);
                     if out_a == 0 {
-                        continue;
+                        return;
                     }
                     let out_r = sr + (dst.red() as u32 * inv / 255);
                     let out_g = sg + (dst.green() as u32 * inv / 255);
                     let out_b = sb + (dst.blue() as u32 * inv / 255);
                     pixels[idx] = tiny_skia::PremultipliedColorU8::from_rgba(out_r as u8, out_g as u8, out_b as u8, out_a as u8)
                         .unwrap_or(dst);
-                }
+                    },
+                );
             }
-        });
+        }
 
         // Stroke the underline segments (opaque; text is already drawn above).
         for (x0, x1, y, thick, col) in underlines {

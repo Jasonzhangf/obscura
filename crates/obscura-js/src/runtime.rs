@@ -278,6 +278,27 @@ impl ObscuraJsRuntime {
         );
     }
 
+    /// Set the CSS viewport exposed to page JavaScript. This must run before
+    /// `run_page_init` for navigation-time responsive code; it may also be
+    /// called later by CDP emulation to update the live window surfaces.
+    pub fn set_viewport(&mut self, width: f64, height: f64) {
+        if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
+            return;
+        }
+        let _ = self.runtime.execute_script(
+            "<set-viewport>",
+            format!(
+                "globalThis.__obscura_viewport_w={width};\
+                 globalThis.__obscura_viewport_h={height};\
+                 globalThis.innerWidth={width};globalThis.innerHeight={height};\
+                 if(globalThis.visualViewport){{\
+                   globalThis.visualViewport.width={width};\
+                   globalThis.visualViewport.height={height};\
+                 }}",
+            ),
+        );
+    }
+
     /// Run __obscura_init() after all per-page properties (UA, platform, stealth, etc.)
     /// have been set. Must be called once per page setup, after all set_* methods.
     pub fn run_page_init(&mut self) {
@@ -1786,6 +1807,25 @@ mod tests {
         let mut rt = setup_runtime("<html><head><title>Test</title></head><body></body></html>");
         let title = rt.evaluate("document.title").unwrap();
         assert_eq!(title, serde_json::json!("Test Page"));
+    }
+
+    #[test]
+    fn explicit_viewport_is_distinct_from_fingerprinted_screen() {
+        let dom = parse_html("<html><body></body></html>");
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_viewport(1024.0, 768.0);
+        rt.run_page_init();
+        let result = rt
+            .evaluate(
+                "return [innerWidth, innerHeight, visualViewport.width,\
+                         visualViewport.height, screen.width > 0, screen.height > 0];",
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([1024, 768, 1024, 768, true, true])
+        );
     }
 
     #[test]

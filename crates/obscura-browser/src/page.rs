@@ -171,6 +171,9 @@ pub struct Page {
     pub http_client: Arc<ObscuraHttpClient>,
     pub context: Arc<BrowserContext>,
     pub title: String,
+    /// CSS viewport used by responsive page JavaScript and CDP screenshots.
+    /// The physical `screen` fingerprint remains independent.
+    pub viewport: (f32, f32),
     /// WHATWG canonical name of the current document's character encoding
     /// (e.g. "UTF-8", "EUC-JP"), detected when the response body is decoded.
     /// Exposed to JS as `document.characterSet` and used for the URL query
@@ -468,6 +471,7 @@ impl Page {
             http_client,
             context,
             title: String::new(),
+            viewport: (1280.0, 720.0),
             encoding: "UTF-8".to_string(),
             history: Vec::new(),
             history_index: 0,
@@ -500,6 +504,23 @@ impl Page {
             }
         }
         false
+    }
+
+    /// Update the page's CSS viewport. Calling this before navigation makes
+    /// responsive scripts observe it from their first instruction; calling it
+    /// on a live page mirrors CDP's device-metrics override surfaces.
+    pub fn set_viewport(&mut self, viewport: (f32, f32)) {
+        if !viewport.0.is_finite()
+            || !viewport.1.is_finite()
+            || viewport.0 <= 0.0
+            || viewport.1 <= 0.0
+        {
+            return;
+        }
+        self.viewport = viewport;
+        if let Some(js) = &mut self.js {
+            js.set_viewport(viewport.0 as f64, viewport.1 as f64);
+        }
     }
 
     async fn do_fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
@@ -568,6 +589,7 @@ impl Page {
         if let Some((lat, lon)) = env_geolocation() {
             rt.set_geolocation(lat, lon);
         }
+        rt.set_viewport(self.viewport.0 as f64, self.viewport.1 as f64);
 
         rt.set_cookie_jar(self.context.cookie_jar.clone());
         rt.set_http_client(self.http_client.clone());

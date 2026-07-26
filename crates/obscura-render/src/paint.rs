@@ -1961,6 +1961,38 @@ mod tests {
     }
 
     #[test]
+    fn paints_vendor_gradient_on_inline_text_span() {
+        // Vue and many other framework sites put the gradient on an inline
+        // accent span, not on the whole heading. The surrounding text must
+        // keep its normal color while this span samples both gradient ends.
+        let tree = parse_html(
+            r#"<html><head><style>
+               h1 { color:#17233c; font-size:50px; margin:0 }
+               html:not(.dark) .accent[data-v-x] {
+                 -webkit-text-fill-color:transparent;
+                 background:-webkit-linear-gradient(315deg,#42d392 25%,#647eff);
+                 -webkit-background-clip:text;
+                 background-clip:text
+               }
+               </style></head><body style="margin:0">
+               <h1>The <span class="accent" data-v-x>Progressive</span></h1>
+               </body></html>"#,
+        );
+        let pixmap = paint_dom(&tree, (500.0, 100.0), None).expect("pixmap");
+        let mut green = false;
+        let mut blue = false;
+        let mut normal = false;
+        for pixel in pixmap.pixels() {
+            let (r, g, b) = (pixel.red(), pixel.green(), pixel.blue());
+            green |= g > r.saturating_add(20) && g > b.saturating_add(10);
+            blue |= b > r.saturating_add(20) && b > g.saturating_add(5);
+            normal |= b > g.saturating_add(10) && r < 80 && g < 100;
+        }
+        assert!(normal, "surrounding heading text should retain its normal color");
+        assert!(green && blue, "inline accent should contain both gradient colors");
+    }
+
+    #[test]
     fn serializes_inline_svg_subtree() {
         // A sprite-style svg: a <use> that references a <symbol> in the same
         // document must survive serialization so resvg can resolve it.

@@ -385,7 +385,7 @@ pub fn layout_dom_with_images(
     }
 
     let t0 = std::time::Instant::now();
-    let sheet = crate::css::Stylesheet::parse(tree, &css_sources);
+    let sheet = crate::css::Stylesheet::parse_for_viewport(tree, &css_sources, viewport);
     let t_parse = t0.elapsed();
 
     let t1 = std::time::Instant::now();
