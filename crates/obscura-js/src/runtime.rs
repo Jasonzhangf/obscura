@@ -3094,6 +3094,44 @@ mod tests {
         assert_eq!(value["attribute"], "color: red;");
     }
 
+    #[test]
+    fn select_add_and_option_text_update_the_live_dom() {
+        let mut rt = setup_runtime("<html><body><select id='language'></select></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const select = document.getElementById('language');
+                    const english = document.createElement('option');
+                    english.value = 'en';
+                    english.text = 'English';
+                    english.selected = true;
+                    select.add(english);
+                    const greek = document.createElement('option');
+                    greek.value = 'el';
+                    greek.text = 'Greek';
+                    select.add(greek, 0);
+                    return JSON.stringify({
+                        labels: [...select.options].map(option => option.textContent),
+                        selectedIndex: select.selectedIndex,
+                        value: select.value,
+                        html: select.outerHTML
+                    });
+                })()"#,
+            )
+            .unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(result.as_str().unwrap()).unwrap();
+        assert_eq!(value["labels"], serde_json::json!(["Greek", "English"]));
+        assert_eq!(value["selectedIndex"], 1);
+        assert_eq!(value["value"], "en");
+        assert!(
+            value["html"]
+                .as_str()
+                .unwrap()
+                .contains(r#"<option value="en" selected="">English</option>"#)
+        );
+    }
+
     /// Regression for #105: `element.querySelector` and `querySelectorAll`
     /// must scope to the receiver's subtree, not the whole document.
     #[test]

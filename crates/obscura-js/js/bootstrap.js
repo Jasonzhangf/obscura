@@ -2135,6 +2135,10 @@ class Element extends Node {
   }
   set value(v) {
     const tag = this.localName;
+    if (tag === 'option') {
+      this.setAttribute('value', String(v));
+      return;
+    }
     if (tag === 'select') {
       // Set selected on matching option, clear on others. Puppeteer's
       // page.select(selector, value) round-trips through this setter.
@@ -2236,7 +2240,36 @@ class Element extends Node {
     if (this._selected !== undefined) return this._selected;
     return this.hasAttribute("selected");
   }
-  set selected(v) { this._selected = !!v; }
+  set selected(v) {
+    this._selected = !!v;
+    // Keep the native DOM tree in sync so layout/paint observes live form
+    // state after scripts construct or change an option.
+    if (this.localName === 'option') {
+      if (this._selected) this.setAttribute('selected', '');
+      else this.removeAttribute('selected');
+    }
+  }
+  get text() {
+    if (['option', 'script', 'title', 'a'].includes(this.localName)) {
+      return this.textContent;
+    }
+    return undefined;
+  }
+  set text(v) {
+    if (['option', 'script', 'title', 'a'].includes(this.localName)) {
+      this.textContent = String(v);
+      return;
+    }
+    // Most elements have no platform `text` reflector. Preserve ordinary
+    // expando semantics for them even though all HTML element interfaces
+    // currently share this prototype.
+    Object.defineProperty(this, 'text', {
+      value: v,
+      writable: true,
+      enumerable: true,
+      configurable: true
+    });
+  }
   get disabled() { return this.hasAttribute("disabled"); }
   set disabled(v) { if (v) this.setAttribute("disabled", ""); else this.removeAttribute("disabled"); }
   get type() { return this.getAttribute("type") || (this.localName === "input" ? "text" : ""); }
@@ -2375,12 +2408,29 @@ class Element extends Node {
     if (this.localName !== 'select') return [];
     return HTMLCollection._from(this.querySelectorAll('option'));
   }
+  add(item, before = null) {
+    if (this.localName !== 'select') {
+      throw new TypeError("Illegal invocation");
+    }
+    if (!item || item.nodeType !== 1
+        || (item.localName !== 'option' && item.localName !== 'optgroup')) {
+      throw new TypeError("Failed to execute 'add' on 'HTMLSelectElement': parameter 1 is not of type 'HTMLOptionElement' or 'HTMLOptGroupElement'.");
+    }
+    if (typeof before === 'number') {
+      const reference = this.options[before] || null;
+      this.insertBefore(item, reference);
+    } else if (before == null) {
+      this.appendChild(item);
+    } else {
+      this.insertBefore(item, before);
+    }
+  }
   get selectedIndex() {
     const opts = this.options;
     for (let i = 0; i < opts.length; i++) {
       if (opts[i].selected || opts[i].hasAttribute('selected')) return i;
     }
-    return -1;
+    return opts.length ? 0 : -1;
   }
   set selectedIndex(v) {
     const opts = this.options;
