@@ -2727,14 +2727,43 @@ fn build_text_words(
 
     let mut fsize = 16.0;
     let mut is_bold = false;
+    let mut transform = crate::TextTransform::None;
     if let Some(parent_id) = node.parent {
         if let Some(p_style) = styles.get(&parent_id) {
             fsize = p_style.font_size.unwrap_or(16.0);
             is_bold = p_style.font_weight.as_deref() == Some("bold");
+            transform = p_style
+                .text_transform
+                .unwrap_or(crate::TextTransform::None);
         }
     }
+    display_text = transform_word_leaf_text(&display_text, transform);
 
     build_word_leaves(id, &display_text, fsize, is_bold, taffy_tree, words)
+}
+
+fn transform_word_leaf_text(text: &str, transform: crate::TextTransform) -> String {
+    match transform {
+        crate::TextTransform::None => text.to_string(),
+        crate::TextTransform::Uppercase => text.chars().flat_map(char::to_uppercase).collect(),
+        crate::TextTransform::Lowercase => text.chars().flat_map(char::to_lowercase).collect(),
+        crate::TextTransform::Capitalize => {
+            let mut at_word_start = true;
+            let mut out = String::with_capacity(text.len());
+            for ch in text.chars() {
+                if ch.is_whitespace() {
+                    at_word_start = true;
+                    out.push(ch);
+                } else if at_word_start {
+                    out.extend(ch.to_uppercase());
+                    at_word_start = false;
+                } else {
+                    out.push(ch);
+                }
+            }
+            out
+        }
+    }
 }
 
 /// Split `text` into one taffy leaf per word and register each against
@@ -4782,6 +4811,31 @@ mod tests {
         let laid = layout_dom(&tree, (1280.0, 720.0));
         let b = tree.query_selector("#b").unwrap().unwrap();
         assert_eq!(laid.rects.get(&b).unwrap().y, 50.0);
+    }
+
+    #[test]
+    fn text_transform_applies_to_word_leaves_in_flex_ui() {
+        let tree = parse_html(
+            r#"<div id="cta" style="display:flex;text-transform:uppercase">get started</div>"#,
+        );
+        let text = tree
+            .descendants(tree.document())
+            .into_iter()
+            .find(|id| tree.get_node(*id).is_some_and(|node| node.is_text()))
+            .unwrap();
+        let laid = layout_dom(&tree, (1280.0, 720.0));
+        let painted = laid
+            .text_runs
+            .get(&text)
+            .unwrap()
+            .iter()
+            .map(|(_, word)| word.as_str())
+            .collect::<String>();
+        assert_eq!(painted, "GET STARTED");
+        assert_eq!(
+            transform_word_leaf_text("hELLO wORLD", crate::TextTransform::Capitalize),
+            "HELLO WORLD"
+        );
     }
 
     #[test]
