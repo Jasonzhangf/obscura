@@ -271,7 +271,10 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
                 }
             }
         }
-        if let Some(pseudo) = style.before_pseudo.as_deref() {
+        for pseudo in [style.before_pseudo.as_deref(), style.after_pseudo.as_deref()]
+            .into_iter()
+            .flatten()
+        {
             paint_positioned_pseudo(
                 &mut pixmap,
                 pseudo,
@@ -1788,12 +1791,16 @@ fn paint_positioned_pseudo(
         None => Some(rect),
     };
     let Some(visible) = visible else { return };
-    let Some(sk_rect) = Rect::from_xywh(visible.x, visible.y, visible.width, visible.height) else {
-        return;
+    let path = if style.border_radius > 0.5 {
+        rounded_rect_path(visible.x, visible.y, visible.width, visible.height, style.border_radius)
+    } else {
+        Rect::from_xywh(visible.x, visible.y, visible.width, visible.height).and_then(|rect| {
+            let mut builder = PathBuilder::new();
+            builder.push_rect(rect);
+            builder.finish()
+        })
     };
-    let mut builder = PathBuilder::new();
-    builder.push_rect(sk_rect);
-    let Some(path) = builder.finish() else { return };
+    let Some(path) = path else { return };
     if let Some(color) = style.background_color {
         let mut paint = Paint::default();
         paint.set_color(Color::from_rgba8(color[0], color[1], color[2], color[3]));
@@ -1807,6 +1814,37 @@ fn paint_positioned_pseudo(
     }
     if let Some((angle, stops)) = &style.background_gradient {
         paint_linear_gradient(pixmap, &path, &rect, *angle, stops);
+    }
+    if let Some(content) = style.before_content.as_deref().filter(|content| !content.is_empty()) {
+        let font_size = style.font_size.unwrap_or(16.0);
+        let bold = crate::style::used_font_weight(style) >= 600;
+        let text_width = measure_text(content, font_size, bold, style.font_family.as_deref());
+        let line_height = crate::inline::used_line_height(style);
+        let x = match style.justify_content {
+            Some(taffy::JustifyContent::CENTER) => rect.x + (rect.width - text_width) / 2.0,
+            Some(taffy::JustifyContent::FLEX_END | taffy::JustifyContent::END) => {
+                rect.x + rect.width - style.padding.right - text_width
+            }
+            _ => rect.x + style.padding.left,
+        };
+        let y = match style.align_items {
+            Some(taffy::AlignItems::CENTER) => rect.y + (rect.height - line_height) / 2.0,
+            Some(taffy::AlignItems::FLEX_END | taffy::AlignItems::END) => {
+                rect.y + rect.height - style.padding.bottom - line_height
+            }
+            _ => rect.y + style.padding.top,
+        };
+        draw_text(
+            pixmap,
+            content,
+            x,
+            y,
+            style.color.unwrap_or([0, 0, 0, 255]),
+            font_size,
+            bold,
+            style.font_family.as_deref(),
+            Some(visible),
+        );
     }
 }
 
@@ -2872,6 +2910,42 @@ mod tests {
             (outside.red(), outside.green(), outside.blue()),
             (255, 255, 255)
         );
+    }
+
+    #[test]
+    fn paints_positioned_attr_content_over_the_host_background() {
+        let tree = parse_html(
+            r#"<html><head><style>
+               body { margin:0 }
+               #cta {
+                 position:relative; width:120px; height:40px; border:0;
+                 padding:0; color:transparent; background:red;
+               }
+               #cta::before {
+                 content:attr(data-label);
+                 position:absolute; inset:1px;
+                 display:flex; align-items:center; justify-content:center;
+                 border-radius:4px; color:black; background:white;
+               }
+               </style></head><body>
+               <button id="cta" data-label="Get Started">Get Started</button>
+               </body></html>"#,
+        );
+        let pixmap = paint_dom(&tree, (140.0, 60.0), None).expect("pixmap");
+        let inner = pixmap.pixel(5, 5).expect("inner pixel");
+        assert_eq!(
+            (inner.red(), inner.green(), inner.blue()),
+            (255, 255, 255),
+            "the generated box must cover the red host background"
+        );
+        let dark_pixels = (35..85)
+            .flat_map(|x| (8..32).map(move |y| (x, y)))
+            .filter(|&(x, y)| {
+                let pixel = pixmap.pixel(x, y).unwrap();
+                pixel.red() < 100 && pixel.green() < 100 && pixel.blue() < 100
+            })
+            .count();
+        assert!(dark_pixels > 10, "generated attr() text must be painted");
     }
 
     #[test]

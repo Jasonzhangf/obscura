@@ -356,9 +356,11 @@ fn cascade_walk(
             sheet.pseudo_styles(tree, matcher, id, &style, &this_props);
         style.before_content = before_pseudo
             .as_ref()
+            .filter(|pseudo| pseudo.position != Some(taffy::Position::Absolute))
             .and_then(|pseudo| pseudo.before_content.clone());
         style.after_content = after_pseudo
             .as_ref()
+            .filter(|pseudo| pseudo.position != Some(taffy::Position::Absolute))
             .and_then(|pseudo| pseudo.before_content.clone());
         style.before_pseudo = before_pseudo.map(Box::new);
         style.after_pseudo = after_pseudo.map(Box::new);

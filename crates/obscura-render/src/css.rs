@@ -152,15 +152,15 @@ impl Stylesheet {
             for &(_, _, rule) in &matched {
                 let expanded = substitute_vars(&rule.normal_decls, props, 0);
                 crate::style::apply_declarations(&mut style, &expanded);
-                if let Some(value) = extract_string_content(&expanded) {
-                    content = Some(value);
+                if let Some(value) = extract_content(&expanded, tree, nid) {
+                    content = value;
                 }
             }
             for &(_, _, rule) in &matched {
                 let expanded = substitute_vars(&rule.important_decls, props, 0);
                 crate::style::apply_declarations(&mut style, &expanded);
-                if let Some(value) = extract_string_content(&expanded) {
-                    content = Some(value);
+                if let Some(value) = extract_content(&expanded, tree, nid) {
+                    content = value;
                 }
             }
             style.before_content = content;
@@ -447,30 +447,44 @@ fn strip_pseudo_element<'a>(selector: &'a str, which: &str) -> Option<&'a str> {
     None
 }
 
-/// Pull a plain quoted-string `content` value out of a declaration list
-/// (`content: ", "` -> `Some(", ")`). Deliberately narrow: real `content`
-/// also accepts `counter()`, `attr()`, `url()` and concatenations of these,
-/// none of which apply here (no counters or `attr()`-driven content on the
-/// pages this targets), so anything other than a single quoted string is
-/// left unhandled rather than guessed at. When `content` is declared more
-/// than once (the `content: X; content: X / Y` accessible-alt-text pattern),
-/// the last one wins, matching normal CSS declaration order.
-fn extract_string_content(decls: &str) -> Option<String> {
+/// Return the final valid `content` declaration in a declaration list.
+///
+/// The outer option says whether a declaration was found; the inner option is
+/// the generated text (`none`/`normal` suppress the pseudo). Along with quoted
+/// strings, support the common `attr(name)` form used by component-library
+/// buttons and badges. The attribute is resolved against the originating
+/// element, as CSS generated content requires.
+fn extract_content(decls: &str, tree: &DomTree, nid: NodeId) -> Option<Option<String>> {
     let mut result = None;
-    let mut search_from = 0;
-    while let Some(rel_idx) = decls[search_from..].find("content") {
-        let idx = search_from + rel_idx;
-        search_from = idx + "content".len();
-        let after = decls[search_from..].trim_start();
-        let Some(after_colon) = after.strip_prefix(':') else { continue };
-        let after_colon = after_colon.trim_start();
-        let Some(quote) = after_colon.chars().next() else { continue };
-        if quote != '"' && quote != '\'' {
+    for raw in crate::style::split_declarations(decls) {
+        let Some((name, value)) = raw.split_once(':') else { continue };
+        if !name.trim().eq_ignore_ascii_case("content") {
             continue;
         }
-        let rest = &after_colon[quote.len_utf8()..];
-        let Some(end) = rest.find(quote) else { continue };
-        result = Some(unescape_css_string(&rest[..end]));
+        let value = value.trim();
+        if value.eq_ignore_ascii_case("none") || value.eq_ignore_ascii_case("normal") {
+            result = Some(None);
+            continue;
+        }
+        let parsed = if let Some(quote) =
+            value.chars().next().filter(|ch| matches!(ch, '"' | '\''))
+        {
+            let rest = &value[quote.len_utf8()..];
+            rest.find(quote).map(|end| unescape_css_string(&rest[..end]))
+        } else if let Some(rest) = value.strip_prefix("attr(") {
+            rest.find(')').map(|end| {
+                tree.get_node(nid)
+                    .and_then(|node| {
+                        node.get_attribute(rest[..end].trim()).map(str::to_owned)
+                    })
+                    .unwrap_or_default()
+            })
+        } else {
+            None
+        };
+        if let Some(parsed) = parsed {
+            result = Some(Some(parsed));
+        }
     }
     result
 }
@@ -1163,6 +1177,22 @@ fn split_media_query_list(query: &str) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generated_content_resolves_host_attributes_and_resets() {
+        let tree = obscura_dom::parse_html(
+            r#"<button id="cta" data-label="Get Started"></button>"#,
+        );
+        let cta = tree.query_selector("#cta").unwrap().unwrap();
+        assert_eq!(
+            extract_content("content:attr(data-label)", &tree, cta),
+            Some(Some("Get Started".to_string()))
+        );
+        assert_eq!(
+            extract_content(r#"content:"fallback";content:none"#, &tree, cta),
+            Some(None)
+        );
+    }
 
     #[test]
     fn keyframes_extract_only_the_final_animation_state() {

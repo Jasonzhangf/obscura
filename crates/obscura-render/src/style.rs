@@ -409,6 +409,13 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
             }
         }
         "border" => {
+            if value.split_whitespace().any(|token| {
+                token.eq_ignore_ascii_case("none") || token.eq_ignore_ascii_case("hidden")
+            }) {
+                style.border = Edges::default();
+                style.border_color = None;
+                return;
+            }
             for p in value.split_whitespace() {
                 if let Some(c) = parse_color(p) {
                     style.border_color = Some(c);
@@ -418,10 +425,18 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
             }
         }
         "border-width" => { if let Some(e) = edges(value) { style.border = e; } }
-        "border-top-width" | "border-top" => set_edge(&mut style.border, Side::Top, px(value)),
-        "border-right-width" | "border-right" => set_edge(&mut style.border, Side::Right, px(value)),
-        "border-bottom-width" | "border-bottom" => set_edge(&mut style.border, Side::Bottom, px(value)),
-        "border-left-width" | "border-left" => set_edge(&mut style.border, Side::Left, px(value)),
+        "border-top-width" | "border-top" => {
+            set_edge(&mut style.border, Side::Top, border_side_width(value))
+        }
+        "border-right-width" | "border-right" => {
+            set_edge(&mut style.border, Side::Right, border_side_width(value))
+        }
+        "border-bottom-width" | "border-bottom" => {
+            set_edge(&mut style.border, Side::Bottom, border_side_width(value))
+        }
+        "border-left-width" | "border-left" => {
+            set_edge(&mut style.border, Side::Left, border_side_width(value))
+        }
         "background-color" => style.background_color = parse_color(value),
         "background" => {
             // A shorthand resets every omitted background longhand to its
@@ -1905,6 +1920,16 @@ fn hsl_to_rgba(h: f32, s: f32, l: f32, a: u8) -> [u8; 4] {
 }
 
 enum Side { Top, Right, Bottom, Left }
+
+fn border_side_width(value: &str) -> Option<f32> {
+    if value.split_whitespace().any(|token| {
+        token.eq_ignore_ascii_case("none") || token.eq_ignore_ascii_case("hidden")
+    }) {
+        Some(0.0)
+    } else {
+        px(value)
+    }
+}
 
 fn set_edge(edges: &mut Edges, side: Side, v: Option<f32>) {
     let v = match v { Some(v) => v, None => return };
@@ -3501,6 +3526,21 @@ mod tests {
         );
         assert_eq!(collapsed.border_spacing, Some((8.0, 8.0)));
         assert_eq!(collapsed.border_collapse, Some(true));
+    }
+
+    #[test]
+    fn border_none_clears_native_and_per_side_widths() {
+        let input = compute_style("input", Some("border:none"));
+        assert_eq!(input.border, Edges::default());
+
+        let side = compute_style(
+            "div",
+            Some("border:3px solid red;border-left:none"),
+        );
+        assert_eq!(side.border.top, 3.0);
+        assert_eq!(side.border.right, 3.0);
+        assert_eq!(side.border.bottom, 3.0);
+        assert_eq!(side.border.left, 0.0);
     }
 
     #[test]
