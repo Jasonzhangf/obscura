@@ -763,11 +763,14 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
             style.underline = Some(underline && !none);
         }
         "gap" | "grid-gap" => {
-            let dims: Vec<f32> = value.split_whitespace().filter_map(px_value).collect();
-            if let Some(&r) = dims.first() { style.row_gap = Some(r); style.column_gap = Some(*dims.get(1).unwrap_or(&r)); }
+            let values = split_ws_paren(value);
+            if let Some(row) = values.first() {
+                apply_gap_value(style, true, row);
+                apply_gap_value(style, false, values.get(1).copied().unwrap_or(row));
+            }
         }
-        "row-gap" | "grid-row-gap" => style.row_gap = px(value),
-        "column-gap" | "grid-column-gap" => style.column_gap = px(value),
+        "row-gap" | "grid-row-gap" => apply_gap_value(style, true, value),
+        "column-gap" | "grid-column-gap" => apply_gap_value(style, false, value),
         "border-spacing" => {
             let dims: Vec<f32> = value.split_whitespace().filter_map(px_value).collect();
             if let Some(&h) = dims.first() {
@@ -2418,6 +2421,36 @@ fn apply_font_size(style: &mut LayoutStyle, value: &str) {
             style.font_size = None;
             style.font_size_raw = Some(rel);
         }
+    }
+}
+
+fn apply_gap_value(style: &mut LayoutStyle, row: bool, value: &str) {
+    let value = value.trim();
+    let lower = value.to_ascii_lowercase();
+    let contextual = lower.contains('(')
+        || lower.ends_with('%')
+        || ["rem", "em", "ex", "vw", "vh", "vmin", "vmax"]
+            .iter()
+            .any(|unit| lower.ends_with(unit));
+    let expression = if value.eq_ignore_ascii_case("normal")
+        || value.is_empty()
+        || !contextual
+    {
+        None
+    } else {
+        Some(value.to_string())
+    };
+    let immediate = if value.eq_ignore_ascii_case("normal") || value.is_empty() {
+        None
+    } else {
+        px(value)
+    };
+    if row {
+        style.row_gap = immediate;
+        style.row_gap_expression = expression;
+    } else {
+        style.column_gap = immediate;
+        style.column_gap_expression = expression;
     }
 }
 

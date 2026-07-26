@@ -211,6 +211,16 @@
     {"name": "vmin margin resolves against smaller viewport axis", "color": "#f08c00", "x": 90, "y": 440, "width": 100, "height": 40},
     {"name": "vmax margin resolves against larger viewport axis", "color": "#1098ad", "x": 100, "y": 520, "width": 100, "height": 40}
   ],
+  "contextual-grid-gap": [
+    {"name": "first cell starts at the grid origin", "color": "#e03131", "x": 0, "y": 0, "width": 10, "height": 20},
+    {"name": "functional column gap uses root and viewport context", "color": "#2f9e44", "x": 38, "y": 0, "width": 10, "height": 20},
+    {"name": "rem row gap uses the computed root font size", "color": "#1971c2", "x": 0, "y": 60, "width": 10, "height": 20},
+    {"name": "both contextual gaps place the final cell", "color": "#f08c00", "x": 38, "y": 60, "width": 10, "height": 20}
+  ],
+  "block-whitespace-margin-collapse": [
+    {"name": "first block keeps its declared geometry", "color": "#087f5b", "x": 0, "y": 0, "width": 900, "height": 20},
+    {"name": "formatting whitespace does not interrupt sibling margin collapse", "color": "#1971c2", "x": 0, "y": 60, "width": 900, "height": 20}
+  ],
   "replaced-grid-order": [
     {"name": "order-modified description occupies the first grid cell", "color": "#e8590c", "x": 0, "y": 0, "width": 300, "height": 200},
     {"name": "media wrapper shares the first row", "color": "#1971c2", "x": 300, "y": 0, "width": 300, "height": 300},

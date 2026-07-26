@@ -593,6 +593,26 @@ pub fn layout_dom_with_images(
                 // em in non-font-size properties is relative to this element's
                 // OWN computed font-size; resolve every relative length now.
                 let em_px = style.font_size.unwrap_or(parent_fs);
+                if let Some(expression) = style.row_gap_expression.as_deref() {
+                    style.row_gap = crate::style::resolve_contextual_length(
+                        expression,
+                        em_px,
+                        root_fs,
+                        vw,
+                        vh,
+                        inh.cb_width,
+                    );
+                }
+                if let Some(expression) = style.column_gap_expression.as_deref() {
+                    style.column_gap = crate::style::resolve_contextual_length(
+                        expression,
+                        em_px,
+                        root_fs,
+                        vw,
+                        vh,
+                        inh.cb_width,
+                    );
+                }
                 if let Some(expression) = style.line_height_expression.as_deref() {
                     if let Some(resolved) = crate::style::resolve_contextual_length(
                         expression,
@@ -1646,6 +1666,8 @@ fn propagate_border_spacing(tree: &DomTree, styles: &mut HashMap<NodeId, crate::
                 if let Some(s) = styles.get_mut(&cid) {
                     s.column_gap = Some(h);
                     s.row_gap = Some(v);
+                    s.column_gap_expression = None;
+                    s.row_gap_expression = None;
                 }
             }
             apply_to_rows(tree, cid, h, v, styles);
@@ -1662,6 +1684,7 @@ fn propagate_border_spacing(tree: &DomTree, styles: &mut HashMap<NodeId, crate::
         let (h, v) = table_spacing(table_style);
         if let Some(s) = styles.get_mut(&id) {
             s.row_gap = Some(v);
+            s.row_gap_expression = None;
         }
         apply_to_rows(tree, id, h, v, styles);
     }
@@ -3434,6 +3457,18 @@ fn build(
         // it the correctly ordered item sequence is the missing translation.
         dom_children.sort_by_key(|cid| styles.get(cid).map(|style| style.order).unwrap_or(0));
     } else if style.display == crate::Display::Block {
+        // Formatting whitespace between block lines does not generate an
+        // inline line box. Keeping a zero-height taffy leaf here still breaks
+        // sibling margin adjacency, turning `margin-bottom:30px` followed by
+        // `margin-top:40px` into 70px instead of the collapsed 40px. Preserve
+        // whitespace only when this parent actually has inline content, where
+        // the inter-element space belongs to the inline formatting context.
+        if !has_inline_ish_content {
+            dom_children.retain(|&cid| {
+                tree.get_node(cid).map_or(false, |node| node.is_element())
+                    || !tree.text_content(cid).trim().is_empty()
+            });
+        }
         // A float nested directly in a transparent inline wrapper (the common
         // `<a><img style="float:left"></a>` logo pattern) belongs to the
         // ancestor block formatting context. Gecko reparents that out-of-flow
@@ -4692,6 +4727,50 @@ mod tests {
         assert_eq!(size("max-content").0, 124.0);
         assert_eq!(size("max-border").0, 100.0);
         assert_eq!(size("inherited-border").0, 100.0);
+    }
+
+    #[test]
+    fn root_percentage_font_size_controls_rem_lengths() {
+        let tree = parse_html(
+            r#"<style>
+                html { font-size: 62.5% }
+                body { margin: 0 }
+                #box {
+                    display: grid;
+                    width: 4rem;
+                    margin-top: 3rem;
+                    row-gap: 4rem;
+                    column-gap: calc(1rem + 2vw);
+                }
+                #box > div { height: 2rem }
+            </style>
+            <div id="box"><div></div><div></div></div>"#,
+        );
+        let laid = layout_dom(&tree, (1280.0, 720.0));
+        let html = tree.query_selector("html").unwrap().unwrap();
+        let box_id = tree.query_selector("#box").unwrap().unwrap();
+        assert_eq!(laid.styles.get(&html).unwrap().font_size, Some(10.0));
+        assert_eq!(laid.styles.get(&box_id).unwrap().row_gap, Some(40.0));
+        assert_eq!(laid.styles.get(&box_id).unwrap().column_gap, Some(35.6));
+        assert_eq!(laid.rects.get(&box_id).unwrap().width, 40.0);
+        assert_eq!(laid.rects.get(&box_id).unwrap().height, 80.0);
+        assert_eq!(laid.rects.get(&box_id).unwrap().y, 30.0);
+    }
+
+    #[test]
+    fn block_and_grid_sibling_margins_collapse() {
+        let tree = parse_html(
+            r#"<style>
+                body { margin: 0 }
+                .a { position: relative; height: 10px; margin-bottom: 30px }
+                .b { position: relative; display: grid; height: 10px; margin-top: 40px }
+            </style>
+            <div class="a"></div>
+            <div id="b" class="b"></div>"#,
+        );
+        let laid = layout_dom(&tree, (1280.0, 720.0));
+        let b = tree.query_selector("#b").unwrap().unwrap();
+        assert_eq!(laid.rects.get(&b).unwrap().y, 50.0);
     }
 
     #[test]

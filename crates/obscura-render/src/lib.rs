@@ -356,6 +356,12 @@ pub struct LayoutStyle {
     pub grid_row_raw: Option<String>,
     pub column_gap: Option<f32>,
     pub row_gap: Option<f32>,
+    /// Deferred gap values. Font- and viewport-relative units cannot be
+    /// converted until the element's computed font-size and the live viewport
+    /// are known; eagerly treating `rem` as 16px breaks pages that customize
+    /// the root font-size.
+    pub column_gap_expression: Option<String>,
+    pub row_gap_expression: Option<String>,
 
     /// `border-spacing: <horizontal> <vertical>?` (or the `cellspacing`
     /// attribute). Only meaningful on a `<table>`; taffy has no native table
