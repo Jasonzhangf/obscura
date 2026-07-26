@@ -328,7 +328,15 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                     style.display = crate::Display::Block;
                     style.flow_root = true;
                 }
-                "contents" => style.display_contents = true,
+                "contents" => {
+                    // `display:contents` can override an earlier `display:none`
+                    // in the cascade (responsive desktop/mobile wrappers do
+                    // this constantly). It suppresses only this element's box;
+                    // its children remain generated and are flattened into the
+                    // parent formatting context.
+                    style.display = crate::Display::Block;
+                    style.display_contents = true;
+                }
                 _ => {}
             }
         }
@@ -3274,6 +3282,13 @@ mod tests {
         assert_eq!(infinite.animation_name.as_deref(), Some("pulse"));
         assert!(!infinite.animation_fill_forwards);
         assert!(infinite.animation_iteration_infinite);
+    }
+
+    #[test]
+    fn display_contents_overrides_an_earlier_display_none() {
+        let style = compute_style("div", Some("display:none; display:contents"));
+        assert_eq!(style.display, Display::Block);
+        assert!(style.display_contents);
     }
 
     #[test]

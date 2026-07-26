@@ -56,6 +56,10 @@
     {"name": "max padding uses actual viewport", "color": "#c2255c", "x": 60, "y": 240, "width": 20, "height": 40},
     {"name": "round quantizes nested custom property math", "color": "#2f9e44", "x": 0, "y": 300, "width": 250, "height": 40}
   ],
+  "display-contents-cascade": [
+    {"name": "display contents overrides hidden responsive wrapper", "color": "#087f5b", "x": 0, "y": 0, "width": 200, "height": 80},
+    {"name": "flattened sibling remains in parent flex flow", "color": "#1971c2", "x": 200, "y": 0, "width": 200, "height": 80}
+  ],
   "eventtarget-lifecycle": [
     {"name": "framework lifecycle EventTarget completes", "color": "#18723a", "x": 0, "y": 0, "width": 420, "height": 120}
   ],
