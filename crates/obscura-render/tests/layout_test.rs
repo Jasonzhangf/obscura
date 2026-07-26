@@ -1114,6 +1114,31 @@ fn length_line_height_computes_before_inheritance() {
 }
 
 #[test]
+fn font_weight_computes_numerically_through_inheritance() {
+    let tree = parse_html(
+        r#"
+        <div id="medium" style="font-weight:500">
+          <span id="inherited">medium</span>
+          <strong id="normal" style="font-weight:normal">normal</strong>
+          <span id="bolder" style="font-weight:bolder">bolder</span>
+          <span id="lighter" style="font-weight:lighter">lighter</span>
+        </div>
+        "#,
+    );
+    let layout = layout_dom(&tree, (900.0, 1000.0));
+    let weight = |id| {
+        layout.styles[&tree.get_element_by_id(id).unwrap()]
+            .font_weight
+            .as_deref()
+    };
+    assert_eq!(weight("medium"), Some("500"));
+    assert_eq!(weight("inherited"), Some("500"));
+    assert_eq!(weight("normal"), Some("400"));
+    assert_eq!(weight("bolder"), Some("700"));
+    assert_eq!(weight("lighter"), Some("100"));
+}
+
+#[test]
 fn contextual_right_inset_uses_root_font_tokens() {
     let tree = parse_html(
         r#"

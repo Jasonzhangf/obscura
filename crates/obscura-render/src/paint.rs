@@ -449,7 +449,7 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
         if let Some(runs) = laid.text_runs.get(&nid) {
             let color = style.color.unwrap_or([0, 0, 0, 255]);
             let fsize = style.font_size.unwrap_or(16.0);
-            let is_bold = style.font_weight.as_deref() == Some("bold");
+            let is_bold = crate::style::used_font_weight(style) >= 600;
             for (word_rect, word) in runs {
                 draw_text(
                     &mut pixmap,
@@ -721,7 +721,7 @@ fn paint_text_node(
     }
     let color = clip_text_fill_color(style).unwrap_or_else(|| style.color.unwrap_or([0, 0, 0, 255]));
     let fsize = style.font_size.unwrap_or(16.0);
-    let is_bold = style.font_weight.as_deref() == Some("bold");
+    let is_bold = crate::style::used_font_weight(style) >= 600;
     // A text node has no transform of its own, but any transformed element
     // ancestor offsets it (the accumulation covers text nodes too). The clip
     // is already in screen space and stays put.

@@ -78,10 +78,18 @@ fn resolve_font_family(fam: Option<&str>) -> &'static str {
     FAMILY
 }
 
-fn resolve_loaded_font_family(
+#[derive(Clone)]
+struct LoadedFamily {
+    name: Arc<str>,
+    weights: Vec<u16>,
+    variable: bool,
+}
+
+fn resolve_loaded_font(
     fam: Option<&str>,
-    loaded: &HashMap<String, Arc<str>>,
-) -> Arc<str> {
+    requested_weight: u16,
+    loaded: &HashMap<String, LoadedFamily>,
+) -> (Arc<str>, u16) {
     if let Some(stack) = fam {
         for token in stack.split(',') {
             let name = token
@@ -89,11 +97,81 @@ fn resolve_loaded_font_family(
                 .trim_matches(|c| c == '"' || c == '\'')
                 .trim();
             if let Some(family) = loaded.get(&name.to_ascii_lowercase()) {
-                return Arc::clone(family);
+                let weight = if family.variable {
+                    requested_weight
+                } else {
+                    match_font_weight(requested_weight, &family.weights)
+                };
+                return (Arc::clone(&family.name), weight);
             }
         }
     }
-    Arc::from(resolve_font_family(fam))
+    let fallback = resolve_font_family(fam);
+    let weights: &[u16] = &[400, 700];
+    (Arc::from(fallback), match_font_weight(requested_weight, weights))
+}
+
+/// CSS Fonts' asymmetric missing-weight search. In particular, 600 selects
+/// 700 (not 400) when a family only provides regular and bold faces.
+fn match_font_weight(requested: u16, available: &[u16]) -> u16 {
+    if available.contains(&requested) {
+        return requested;
+    }
+    let mut weights = available.to_vec();
+    weights.sort_unstable();
+    weights.dedup();
+    if weights.is_empty() {
+        return requested;
+    }
+    if (400..=500).contains(&requested) {
+        weights
+            .iter()
+            .copied()
+            .filter(|weight| *weight >= requested && *weight <= 500)
+            .min()
+            .or_else(|| weights.iter().copied().filter(|weight| *weight < requested).max())
+            .or_else(|| weights.iter().copied().filter(|weight| *weight > 500).min())
+            .unwrap_or(requested)
+    } else if requested < 400 {
+        weights
+            .iter()
+            .copied()
+            .filter(|weight| *weight <= requested)
+            .max()
+            .or_else(|| weights.iter().copied().filter(|weight| *weight > requested).min())
+            .unwrap_or(requested)
+    } else {
+        weights
+            .iter()
+            .copied()
+            .filter(|weight| *weight >= requested)
+            .min()
+            .or_else(|| weights.iter().copied().filter(|weight| *weight < requested).max())
+            .unwrap_or(requested)
+    }
+}
+
+fn face_is_variable(data: &[u8], face_index: u32) -> bool {
+    let base = if data.get(..4) == Some(b"ttcf") {
+        let offset = 12usize.saturating_add(face_index as usize * 4);
+        data.get(offset..offset + 4)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(u32::from_be_bytes)
+            .unwrap_or(0) as usize
+    } else {
+        0
+    };
+    let Some(count) = data
+        .get(base + 4..base + 6)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(u16::from_be_bytes)
+    else {
+        return false;
+    };
+    (0..count as usize).any(|index| {
+        let start = base + 12 + index * 16;
+        data.get(start..start + 4) == Some(b"fvar")
+    })
 }
 /// Resolve `line-height: normal` from the selected face's horizontal header.
 ///
@@ -166,7 +244,7 @@ pub struct InlineItem {
 /// [`crate::DomLayout`] so paint can rasterize the shaped glyphs.
 pub struct TextEngine {
     font_system: FontSystem,
-    loaded_families: HashMap<String, Arc<str>>,
+    loaded_families: HashMap<String, LoadedFamily>,
     swash: SwashCache,
     items: Vec<InlineItem>,
     replaced: Vec<ReplacedItem>,
@@ -256,11 +334,24 @@ impl TextEngine {
             )));
         }
         let mut loaded_families = HashMap::new();
-        for face in db.faces() {
-            for (name, _) in &face.families {
-                loaded_families
+        let faces: Vec<_> = db
+            .faces()
+            .map(|face| (face.id, face.families.clone(), face.weight.0))
+            .collect();
+        for (id, names, weight) in faces {
+            let variable = db
+                .with_face_data(id, face_is_variable)
+                .unwrap_or(false);
+            for (name, _) in names {
+                let family = loaded_families
                     .entry(name.to_ascii_lowercase())
-                    .or_insert_with(|| Arc::from(name.as_str()));
+                    .or_insert_with(|| LoadedFamily {
+                        name: Arc::from(name.as_str()),
+                        weights: Vec::new(),
+                        variable: false,
+                    });
+                family.weights.push(weight);
+                family.variable |= variable;
             }
         }
         db.set_sans_serif_family(FAMILY);
@@ -293,9 +384,15 @@ impl TextEngine {
         }
         let base = styles.get(&id)?;
         let mut collector = Collector { last_was_space: true, clip_fills: Vec::new() };
+        let (family, weight) = resolve_loaded_font(
+            base.font_family.as_deref(),
+            crate::style::used_font_weight(base),
+            &self.loaded_families,
+        );
         let ctx = base_span_ctx(
             base,
-            resolve_loaded_font_family(base.font_family.as_deref(), &self.loaded_families),
+            family,
+            weight,
             &mut collector,
         );
         let mut spans: Vec<(String, SpanAttrs)> = Vec::new();
@@ -336,9 +433,15 @@ impl TextEngine {
         }
         let base = styles.get(&parent)?;
         let mut collector = Collector { last_was_space: true, clip_fills: Vec::new() };
+        let (family, weight) = resolve_loaded_font(
+            base.font_family.as_deref(),
+            crate::style::used_font_weight(base),
+            &self.loaded_families,
+        );
         let ctx = base_span_ctx(
             base,
-            resolve_loaded_font_family(base.font_family.as_deref(), &self.loaded_families),
+            family,
+            weight,
             &mut collector,
         );
         let mut spans: Vec<(String, SpanAttrs)> = Vec::new();
@@ -509,7 +612,7 @@ impl TextEngine {
 /// A run of same-styled inline text.
 #[derive(Clone, PartialEq)]
 struct SpanAttrs {
-    bold: bool,
+    weight: u16,
     italic: bool,
     underline: bool,
     color: [u8; 4],
@@ -520,7 +623,7 @@ struct SpanAttrs {
 impl SpanAttrs {
     fn to_attrs(&self) -> Attrs<'_> {
         let mut a = Attrs::new().family(Family::Name(self.family.as_ref()));
-        a = a.weight(if self.bold { Weight::BOLD } else { Weight::NORMAL });
+        a = a.weight(Weight(self.weight));
         a = a.style(if self.italic { Style::Italic } else { Style::Normal });
         // Clip-text glyphs must be shaped with an opaque fill so their coverage
         // reaches paint; the real gradient is selected through metadata.
@@ -537,7 +640,7 @@ impl SpanAttrs {
 #[derive(Clone)]
 struct SpanCtx {
     color: [u8; 4],
-    bold: bool,
+    weight: u16,
     italic: bool,
     underline: bool,
     transform: TextTransform,
@@ -566,6 +669,7 @@ struct Collector {
 fn base_span_ctx(
     base: &LayoutStyle,
     family: Arc<str>,
+    weight: u16,
     collector: &mut Collector,
 ) -> SpanCtx {
     let clip_fill = clip_text_fill(base).map(|fill| {
@@ -575,7 +679,7 @@ fn base_span_ctx(
     });
     SpanCtx {
         color: base.color.unwrap_or([0, 0, 0, 255]),
-        bold: base.font_weight.as_deref() == Some("bold"),
+        weight,
         italic: base.font_style_italic.unwrap_or(false),
         underline: base.underline.unwrap_or(false),
         transform: base.text_transform.unwrap_or(TextTransform::None),
@@ -591,7 +695,7 @@ fn collect_spans(
     ctx: SpanCtx,
     out: &mut Vec<(String, SpanAttrs)>,
     c: &mut Collector,
-    loaded_families: &HashMap<String, Arc<str>>,
+    loaded_families: &HashMap<String, LoadedFamily>,
 ) {
     for cid in tree.children(id) {
         collect_node_spans(
@@ -617,13 +721,13 @@ fn collect_node_spans(
     ctx: SpanCtx,
     out: &mut Vec<(String, SpanAttrs)>,
     c: &mut Collector,
-    loaded_families: &HashMap<String, Arc<str>>,
+    loaded_families: &HashMap<String, LoadedFamily>,
 ) {
     let Some(node) = tree.get_node(cid) else { return };
     match &node.data {
         obscura_dom::tree::NodeData::Text { contents } => {
             let attrs = SpanAttrs {
-                bold: ctx.bold,
+                weight: ctx.weight,
                 italic: ctx.italic,
                 underline: ctx.underline,
                 color: ctx.color,
@@ -640,7 +744,7 @@ fn collect_node_spans(
             }
             if elem.local.as_ref() == "br" {
                 out.push(("\n".to_string(), SpanAttrs {
-                    bold: ctx.bold,
+                    weight: ctx.weight,
                     italic: ctx.italic,
                     underline: ctx.underline,
                     color: ctx.color,
@@ -662,20 +766,28 @@ fn collect_node_spans(
             let clip_fill = own_clip_fill.or_else(|| {
                 if color[3] == 0 { ctx.clip_fill } else { None }
             });
+            let requested_weight = style
+                .map(crate::style::used_font_weight)
+                .unwrap_or(ctx.weight);
+            let (family, weight) = style
+                .and_then(|style| style.font_family.as_deref())
+                .map(|family| {
+                    resolve_loaded_font(
+                        Some(family),
+                        requested_weight,
+                        loaded_families,
+                    )
+                })
+                .unwrap_or_else(|| (Arc::clone(&ctx.family), requested_weight));
             let child = SpanCtx {
                 color,
-                bold: ctx.bold || style.map(|s| s.font_weight.as_deref() == Some("bold")).unwrap_or(false),
+                weight,
                 italic: ctx.italic || style.and_then(|s| s.font_style_italic).unwrap_or(false),
                 // Underline propagates in: an ancestor's underline covers
                 // descendant text; an element only sets its own via CSS.
                 underline: ctx.underline || style.and_then(|s| s.underline).unwrap_or(false),
                 transform: style.and_then(|s| s.text_transform).unwrap_or(ctx.transform),
-                family: style
-                    .and_then(|s| s.font_family.as_deref())
-                    .map(|family| {
-                        resolve_loaded_font_family(Some(family), loaded_families)
-                    })
-                    .unwrap_or_else(|| Arc::clone(&ctx.family)),
+                family,
                 clip_fill,
             };
             collect_spans(
@@ -1101,6 +1213,15 @@ mod tests {
         assert_eq!(normal_line_height(12.0, FAMILY), 14.0);
         assert_eq!(normal_line_height(13.0, SERIF_FAMILY), 16.0);
         assert_eq!(normal_line_height(13.0, MONO_FAMILY), 15.0);
+    }
+
+    #[test]
+    fn missing_font_weights_follow_css_search_order() {
+        assert_eq!(match_font_weight(500, &[400, 700]), 400);
+        assert_eq!(match_font_weight(600, &[400, 500, 700]), 700);
+        assert_eq!(match_font_weight(300, &[100, 400, 700]), 100);
+        assert_eq!(match_font_weight(800, &[400, 700]), 700);
+        assert_eq!(match_font_weight(500, &[400, 500, 700]), 500);
     }
 
     #[test]

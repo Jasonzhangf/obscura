@@ -488,7 +488,7 @@ pub fn layout_dom_with_resources(
         struct Inherited {
             color: Option<[u8; 4]>,
             font_size: Option<f32>,
-            font_weight: Option<String>,
+            font_weight: u16,
             font_family: Option<String>,
             text_align: Option<taffy::AlignItems>,
             legacy_center: bool,
@@ -518,7 +518,7 @@ pub fn layout_dom_with_resources(
                 Inherited {
                     color: None,
                     font_size: None,
-                    font_weight: None,
+                    font_weight: 400,
                     font_family: None,
                     text_align: None,
                     legacy_center: false,
@@ -776,7 +776,12 @@ pub fn layout_dom_with_resources(
                         crate::Dimension::Px(_) | crate::Dimension::Percent(_)
                     );
                 }
-                match &style.font_weight { Some(w) => inh.font_weight = Some(w.clone()), None => style.font_weight = inh.font_weight.clone() }
+                let computed_weight = crate::style::computed_font_weight(
+                    style.font_weight.as_deref(),
+                    inh.font_weight,
+                );
+                style.font_weight = Some(computed_weight.to_string());
+                inh.font_weight = computed_weight;
                 match &style.font_family { Some(f) => inh.font_family = Some(f.clone()), None => style.font_family = inh.font_family.clone() }
                 let is_table = tree
                     .get_node(id)
@@ -2740,7 +2745,7 @@ fn build_text_words(
     if let Some(parent_id) = node.parent {
         if let Some(p_style) = styles.get(&parent_id) {
             fsize = p_style.font_size.unwrap_or(16.0);
-            is_bold = p_style.font_weight.as_deref() == Some("bold");
+            is_bold = crate::style::used_font_weight(p_style) >= 600;
             family = p_style.font_family.as_deref();
             line_height = crate::inline::used_line_height(p_style);
             transform = p_style
@@ -2839,7 +2844,7 @@ fn build_pseudo_content(
     words: &mut HashMap<taffy::NodeId, (NodeId, String)>,
 ) -> Vec<taffy::NodeId> {
     let fsize = style.font_size.unwrap_or(16.0);
-    let is_bold = style.font_weight.as_deref() == Some("bold");
+    let is_bold = crate::style::used_font_weight(style) >= 600;
     build_word_leaves(
         id,
         content,

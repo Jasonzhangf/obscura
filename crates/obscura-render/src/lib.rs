@@ -312,6 +312,9 @@ pub struct LayoutStyle {
     /// eagerly treating `9vw` as the number 9 made responsive headings pin to
     /// the minimum arm of their clamp.
     pub font_size_expression: Option<String>,
+    /// Specified CSS font weight during cascade (`1..1000`, `bolder`, or
+    /// `lighter`), normalized to its numeric computed value by the inheritance
+    /// pass before layout and shaping.
     pub font_weight: Option<String>,
     /// The computed `font-family` list, lowercased. Inherited. The text engine
     /// resolves it to a bundled face (Liberation Sans/Serif/Mono) the way

@@ -495,11 +495,9 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         }
         "font" => apply_font_shorthand(style, value),
         "font-weight" => {
-            // Normalize to "bold"/"normal" (consumers test for "bold"). Numeric
-            // >= 600 and `bold`/`bolder` are bold; others normal.
-            let v = value.trim().to_ascii_lowercase();
-            let bold = v == "bold" || v == "bolder" || v.parse::<u32>().map(|n| n >= 600).unwrap_or(false);
-            style.font_weight = Some(if bold { "bold".to_string() } else { "normal".to_string() });
+            if let Some(weight) = specified_font_weight(value) {
+                style.font_weight = Some(weight);
+            }
         }
         "font-family" => {
             let v = value.trim().to_ascii_lowercase();
@@ -2513,18 +2511,15 @@ fn apply_font_shorthand(style: &mut LayoutStyle, value: &str) {
 
     // The shorthand resets every constituent before applying supplied values.
     style.font_style_italic = Some(false);
-    style.font_weight = Some("normal".to_string());
+    style.font_weight = Some("400".to_string());
     style.line_height = Some(crate::LineHeight::Normal);
     style.line_height_expression = None;
     for token in &tokens[..size_index] {
         let lower = token.to_ascii_lowercase();
         if lower == "italic" || lower.starts_with("oblique") {
             style.font_style_italic = Some(true);
-        } else if lower == "bold"
-            || lower == "bolder"
-            || lower.parse::<u32>().map(|weight| weight >= 600).unwrap_or(false)
-        {
-            style.font_weight = Some("bold".to_string());
+        } else if let Some(weight) = specified_font_weight(&lower) {
+            style.font_weight = Some(weight);
         }
     }
     apply_font_size(style, size);
@@ -2532,6 +2527,54 @@ fn apply_font_shorthand(style: &mut LayoutStyle, value: &str) {
         apply_value(style, "line-height", line_height);
     }
     style.font_family = Some(tokens[family_index..].join(" ").to_ascii_lowercase());
+}
+
+/// Normalize a specified CSS font weight while preserving relative keywords
+/// until the top-down inheritance pass can see the parent's computed weight.
+fn specified_font_weight(value: &str) -> Option<String> {
+    let lower = value.trim().to_ascii_lowercase();
+    match lower.as_str() {
+        "normal" => Some("400".to_string()),
+        "bold" => Some("700".to_string()),
+        "bolder" | "lighter" => Some(lower),
+        _ => lower
+            .parse::<f32>()
+            .ok()
+            .filter(|weight| weight.is_finite() && (1.0..=1000.0).contains(weight))
+            .map(|weight| weight.round().to_string()),
+    }
+}
+
+/// Resolve `font-weight` to the numeric computed value defined by CSS Fonts.
+/// Relative keywords use the inherited weight table rather than a binary
+/// normal/bold threshold.
+pub(crate) fn computed_font_weight(specified: Option<&str>, inherited: u16) -> u16 {
+    match specified {
+        None => inherited,
+        Some("normal") => 400,
+        Some("bold") => 700,
+        Some("bolder") if inherited < 100 => 400,
+        Some("bolder") if inherited < 350 => 400,
+        Some("bolder") if inherited < 550 => 700,
+        Some("bolder") if inherited < 900 => 900,
+        Some("bolder") => inherited,
+        Some("lighter") if inherited < 100 => inherited,
+        Some("lighter") if inherited < 350 => 100,
+        Some("lighter") if inherited < 550 => 100,
+        Some("lighter") if inherited < 750 => 400,
+        Some("lighter") if inherited < 900 => 700,
+        Some("lighter") => 700,
+        Some(weight) => weight
+            .parse::<f32>()
+            .ok()
+            .filter(|weight| weight.is_finite())
+            .map(|weight| weight.round().clamp(1.0, 1000.0) as u16)
+            .unwrap_or(inherited),
+    }
+}
+
+pub(crate) fn used_font_weight(style: &LayoutStyle) -> u16 {
+    computed_font_weight(style.font_weight.as_deref(), 400)
 }
 
 fn is_font_size_token(value: &str) -> bool {
@@ -3504,7 +3547,7 @@ mod tests {
         );
         assert_eq!(s.font_size, Some(64.0));
         assert_eq!(s.line_height, Some(crate::LineHeight::Px(60.0)));
-        assert_eq!(s.font_weight.as_deref(), Some("normal"));
+        assert_eq!(s.font_weight.as_deref(), Some("500"));
         assert_eq!(s.font_style_italic, Some(false));
         assert_eq!(s.font_family.as_deref(), Some("\"google sans\", sans-serif"));
 
@@ -3514,8 +3557,30 @@ mod tests {
         );
         assert_eq!(reset.font_size, Some(20.0));
         assert_eq!(reset.line_height, Some(crate::LineHeight::Normal));
-        assert_eq!(reset.font_weight.as_deref(), Some("normal"));
+        assert_eq!(reset.font_weight.as_deref(), Some("400"));
         assert_eq!(reset.font_style_italic, Some(false));
+    }
+
+    #[test]
+    fn font_weight_preserves_numeric_values_and_resolves_relative_keywords() {
+        let medium = compute_style("div", Some("font-weight:500"));
+        assert_eq!(medium.font_weight.as_deref(), Some("500"));
+        let semibold = compute_style("div", Some("font-weight:600"));
+        assert_eq!(semibold.font_weight.as_deref(), Some("600"));
+        let normal = compute_style("strong", Some("font-weight:normal"));
+        assert_eq!(normal.font_weight.as_deref(), Some("400"));
+
+        assert_eq!(computed_font_weight(Some("bolder"), 99), 400);
+        assert_eq!(computed_font_weight(Some("bolder"), 349), 400);
+        assert_eq!(computed_font_weight(Some("bolder"), 350), 700);
+        assert_eq!(computed_font_weight(Some("bolder"), 550), 900);
+        assert_eq!(computed_font_weight(Some("bolder"), 900), 900);
+        assert_eq!(computed_font_weight(Some("lighter"), 99), 99);
+        assert_eq!(computed_font_weight(Some("lighter"), 100), 100);
+        assert_eq!(computed_font_weight(Some("lighter"), 350), 100);
+        assert_eq!(computed_font_weight(Some("lighter"), 550), 400);
+        assert_eq!(computed_font_weight(Some("lighter"), 750), 700);
+        assert_eq!(computed_font_weight(Some("lighter"), 900), 700);
     }
 
     #[test]
