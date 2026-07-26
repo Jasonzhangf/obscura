@@ -1391,6 +1391,15 @@ fn serialize_svg_node(tree: &DomTree, nid: obscura_dom::tree::NodeId, is_root: b
             // `href`): resvg reads both, and a bare local avoids needing an
             // `xmlns:xlink` declaration in the standalone document.
             let aname = attr.name.local.as_ref();
+            // HTML frameworks commonly stamp hydration attributes such as
+            // `q:id` onto inline SVG. In an HTML document that name is fine,
+            // but our standalone XML serialization has no matching `xmlns:q`,
+            // so one irrelevant attribute makes usvg reject the entire logo.
+            // Namespace-aware attributes arrive with a clean local name;
+            // discard only literal, unbound colon names from the HTML parser.
+            if aname.contains(':') {
+                continue;
+            }
             if aname == "xmlns" {
                 has_xmlns = true;
             }
@@ -2003,6 +2012,24 @@ mod tests {
             }
         }
         assert!(found_red, "expected inline svg <rect> to paint red");
+    }
+
+    #[test]
+    fn paints_inline_svg_with_framework_colon_attribute() {
+        let tree = obscura_dom::parse_html(
+            r##"<html><body><svg q:id="f" width="40" height="40" viewBox="0 0 40 40"><rect width="40" height="40" fill="#18b6f6"/></svg></body></html>"##,
+        );
+        let output = paint_dom(&tree, (80.0, 80.0), None).expect("pixmap");
+        let found_blue = (0..80).any(|y| {
+            (0..80).any(|x| {
+                let pixel = output.pixel(x, y).expect("pixel");
+                pixel.blue() > 200 && pixel.green() > 120 && pixel.red() < 80
+            })
+        });
+        assert!(
+            found_blue,
+            "framework hydration attributes must not invalidate inline SVG XML"
+        );
     }
 
     #[test]
