@@ -559,6 +559,8 @@ impl TextEngine {
         );
         let context = base_span_ctx(style, family, weight, &mut collector);
         let attrs = SpanAttrs {
+            font_size: context.font_size,
+            line_height: context.line_height,
             weight: context.weight,
             italic: context.italic,
             underline: context.underline,
@@ -730,6 +732,8 @@ impl TextEngine {
 /// A run of same-styled inline text.
 #[derive(Clone, PartialEq)]
 struct SpanAttrs {
+    font_size: f32,
+    line_height: f32,
     weight: u16,
     italic: bool,
     underline: bool,
@@ -741,6 +745,14 @@ struct SpanAttrs {
 impl SpanAttrs {
     fn to_attrs(&self) -> Attrs<'_> {
         let mut a = Attrs::new().family(Family::Name(self.family.as_ref()));
+        // Inline descendants keep their own computed font metrics inside the
+        // enclosing line box. Without per-span metrics, an `<a>`/`<span>`
+        // with a relative font-size was shaped at the block container's size
+        // even though cascade had resolved the descendant correctly.
+        a = a.metrics(Metrics::new(
+            self.font_size.max(1.0),
+            self.line_height.max(1.0),
+        ));
         a = a.weight(Weight(self.weight));
         a = a.style(if self.italic { Style::Italic } else { Style::Normal });
         // Clip-text glyphs must be shaped with an opaque fill so their coverage
@@ -757,6 +769,8 @@ impl SpanAttrs {
 /// Inherited inline context threaded down the subtree while collecting spans.
 #[derive(Clone)]
 struct SpanCtx {
+    font_size: f32,
+    line_height: f32,
     color: [u8; 4],
     weight: u16,
     italic: bool,
@@ -796,6 +810,8 @@ fn base_span_ctx(
         index
     });
     SpanCtx {
+        font_size: base.font_size.unwrap_or(16.0),
+        line_height: used_line_height(base),
         color: base.color.unwrap_or([0, 0, 0, 255]),
         weight,
         italic: base.font_style_italic.unwrap_or(false),
@@ -845,6 +861,8 @@ fn collect_node_spans(
     match &node.data {
         obscura_dom::tree::NodeData::Text { contents } => {
             let attrs = SpanAttrs {
+                font_size: ctx.font_size,
+                line_height: ctx.line_height,
                 weight: ctx.weight,
                 italic: ctx.italic,
                 underline: ctx.underline,
@@ -862,6 +880,8 @@ fn collect_node_spans(
             }
             if elem.local.as_ref() == "br" {
                 out.push(("\n".to_string(), SpanAttrs {
+                    font_size: ctx.font_size,
+                    line_height: ctx.line_height,
                     weight: ctx.weight,
                     italic: ctx.italic,
                     underline: ctx.underline,
@@ -901,6 +921,12 @@ fn collect_node_spans(
                 })
                 .unwrap_or_else(|| (Arc::clone(&ctx.family), requested_weight));
             let child = SpanCtx {
+                font_size: style
+                    .and_then(|style| style.font_size)
+                    .unwrap_or(ctx.font_size),
+                line_height: style
+                    .map(used_line_height)
+                    .unwrap_or(ctx.line_height),
                 color,
                 weight,
                 italic: ctx.italic || style.and_then(|s| s.font_style_italic).unwrap_or(false),
@@ -1400,6 +1426,36 @@ mod tests {
         assert!(
             is_pure_text_ifc(&tree, icon, &styles),
             "atomic inline participation must not disable shaping inside the box"
+        );
+    }
+
+    #[test]
+    fn inline_descendant_keeps_its_computed_font_metrics() {
+        let tree = obscura_dom::parse_html(
+            r#"<style>
+                #copy { font-size:16px; line-height:20px }
+                #big { font-size:2em; line-height:1.5 }
+            </style>
+            <p id="copy">small <a id="big">large</a></p>"#,
+        );
+        let copy = tree.get_element_by_id("copy").unwrap();
+        let big = tree.get_element_by_id("big").unwrap();
+        let laid = crate::dom::layout_dom(&tree, (500.0, 200.0));
+
+        assert_eq!(laid.styles[&big].font_size, Some(32.0));
+        let item = laid.ifc_items[&copy];
+        let glyph_sizes = laid.text_engine.items[item]
+            .buffer
+            .layout_runs()
+            .flat_map(|run| run.glyphs.iter().map(|glyph| glyph.font_size))
+            .collect::<Vec<_>>();
+        assert!(
+            glyph_sizes.iter().any(|size| (*size - 16.0).abs() < 0.01),
+            "base text should shape at 16px: {glyph_sizes:?}"
+        );
+        assert!(
+            glyph_sizes.iter().any(|size| (*size - 32.0).abs() < 0.01),
+            "inline descendant should shape at 32px: {glyph_sizes:?}"
         );
     }
 
