@@ -1890,16 +1890,10 @@ fn svg_escape_attr(s: &str, buf: &mut String) {
     }
 }
 
-/// Resolve `<use>` elements in an inline `<svg>` subtree that point at an
-/// EXTERNAL sprite file (`href`/`xlink:href` = `url#id` with a non-empty url),
-/// splicing the referenced symbol into the already-serialized `markup` so resvg
-/// can rasterize it. For each distinct external reference, fetch the sprite
-/// (once, via the shared image cache and resolving relative urls against
-/// `base_url`), pull out the element carrying `id="id"`, inject it inside a
-/// `<defs>` right after the opening `<svg>` tag, and rewrite the `<use>` href to
-/// a now-local `#id`. Same-document `<use href="#id">` (empty url) is ignored
-/// and left to resvg's own resolution. A fetch or parse failure is a silent
-/// no-op: the affected `<use>` simply renders nothing, exactly as before.
+/// Resolve `<use>` elements in an inline `<svg>` subtree against either a
+/// document-level symbol sprite (`href="#id"`) or an external sprite file
+/// (`href="url#id"`), splicing the referenced symbol into the standalone SVG
+/// handed to resvg. Symbols already inside `root` need no injection.
 fn inject_external_sprites(
     tree: &DomTree,
     root: obscura_dom::tree::NodeId,
@@ -1911,7 +1905,9 @@ fn inject_external_sprites(
     // Distinct external references (full href, url, fragment id), in first-seen
     // order. Dedupe so one symbol referenced by several `<use>` is fetched and
     // injected once (the rewrite below still fixes every occurrence).
+    let root_descendants = tree.descendants(root);
     let mut refs: Vec<(String, String, String)> = Vec::new();
+    let mut local_fragments = Vec::new();
     for nid in tree.descendants(root) {
         let Some(node) = tree.get_node(nid) else { continue };
         let Some(el) = node.as_element() else { continue };
@@ -1929,8 +1925,13 @@ fn inject_external_sprites(
         };
         let Some(hash) = href.find('#') else { continue };
         let (url, frag) = (&href[..hash], &href[hash + 1..]);
-        if url.is_empty() || frag.is_empty() {
-            // Same-document `#id` (or a malformed ref): nothing to fetch.
+        if frag.is_empty() {
+            continue;
+        }
+        if url.is_empty() {
+            if !local_fragments.iter().any(|existing| existing == frag) {
+                local_fragments.push(frag.to_string());
+            }
             continue;
         }
         let entry = (href.to_string(), url.to_string(), frag.to_string());
@@ -1938,12 +1939,27 @@ fn inject_external_sprites(
             refs.push(entry);
         }
     }
-    if refs.is_empty() {
-        return;
-    }
-
     let mut defs = String::new();
     let mut rewrites: Vec<(String, String)> = Vec::new();
+    let wanted_local: std::collections::HashSet<&str> =
+        local_fragments.iter().map(String::as_str).collect();
+    let mut local_nodes = std::collections::HashMap::new();
+    if !wanted_local.is_empty() {
+        for nid in tree.descendants(tree.document()) {
+            let Some(node) = tree.get_node(nid) else { continue };
+            let Some(id) = node.get_attribute("id") else { continue };
+            if wanted_local.contains(id) {
+                local_nodes.entry(id.to_string()).or_insert(nid);
+            }
+        }
+    }
+    for frag in local_fragments {
+        let Some(&symbol_id) = local_nodes.get(&frag) else { continue };
+        if symbol_id == root || root_descendants.contains(&symbol_id) {
+            continue;
+        }
+        serialize_svg_node(tree, symbol_id, false, &mut defs);
+    }
     for (href, url, frag) in &refs {
         let key = format!("{url}#{frag}");
         let symbol = sprite_cache
@@ -2620,8 +2636,8 @@ mod tests {
 
     #[test]
     fn same_document_use_left_unchanged_by_inject() {
-        // A same-document `<use href="#a">` has an empty url, so inject does no
-        // network work and leaves the serialized markup byte-for-byte unchanged.
+        // A same-document symbol already inside the target SVG needs no
+        // injection and leaves the serialized markup byte-for-byte unchanged.
         let tree = parse_html(
             r##"<html><body><svg viewBox="0 0 10 10"><use href="#a"/><symbol id="a"><path d="M0 0h10v10z"/></symbol></svg></body></html>"##,
         );
@@ -2632,6 +2648,31 @@ mod tests {
         let mut sprite_cache = std::collections::HashMap::new();
         inject_external_sprites(&tree, svg, None, &mut markup, &mut cache, &mut sprite_cache);
         assert_eq!(markup, before, "same-document use must be untouched");
+    }
+
+    #[test]
+    fn injects_document_level_symbol_into_target_svg() {
+        // Frameworks commonly keep one hidden sprite beside the application
+        // root and reference it from otherwise independent inline SVGs.
+        let tree = parse_html(
+            r##"<html><body>
+                <svg style="display:none"><symbol id="arrow" viewBox="0 0 10 10"><path d="M0 0h10v10z"/></symbol></svg>
+                <svg id="icon" viewBox="0 0 10 10"><use href="#arrow"/></svg>
+            </body></html>"##,
+        );
+        let svg = tree.query_selector("#icon").unwrap().unwrap();
+        let mut markup = serialize_svg(&tree, svg);
+        let mut cache = std::collections::HashMap::new();
+        let mut sprite_cache = std::collections::HashMap::new();
+        inject_external_sprites(&tree, svg, None, &mut markup, &mut cache, &mut sprite_cache);
+        assert!(
+            markup.contains(r#"<defs><symbol id="arrow""#),
+            "document-level symbol must be copied into target SVG: {markup}"
+        );
+        assert!(
+            markup.contains(r##"<use href="#arrow""##),
+            "local use reference must remain intact: {markup}"
+        );
     }
 
     #[test]
