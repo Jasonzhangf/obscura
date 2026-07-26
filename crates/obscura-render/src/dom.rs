@@ -3153,6 +3153,26 @@ fn build(
         if flex_or_grid_item {
             taffy_style.display = taffy::style::Display::Block;
             taffy_style.flex_wrap = taffy::FlexWrap::NoWrap;
+        } else if style.width == crate::Dimension::Auto {
+            // An auto-width inline-block shrink-fits to its max-content width
+            // when that fits the available line. Taffy's wrapping flex
+            // approximation otherwise chooses a min-content width first,
+            // turning ordinary two-word buttons into two-line controls. Keep
+            // wrapping for explicitly constrained inline-blocks and for ones
+            // with real in-flow block children; those need their inner block
+            // formatting rather than a single max-content line.
+            let has_in_flow_block_child = tree.children(id).iter().any(|child| {
+                styles.get(child).map_or(false, |child_style| {
+                    child_style.display == crate::Display::Block
+                        && !matches!(
+                            child_style.position,
+                            Some(taffy::Position::Absolute)
+                        )
+                })
+            });
+            if !has_in_flow_block_child {
+                taffy_style.flex_wrap = taffy::FlexWrap::NoWrap;
+            }
         }
     }
 
@@ -3299,19 +3319,6 @@ fn build(
                     && !matches!(child.position, Some(taffy::Position::Absolute))
             })
         });
-    let has_replaced_block_child = style.display == crate::Display::Block
-        && dom_children.iter().any(|cid| {
-            let replaced_wrapper = tree
-                .get_node(*cid)
-                .and_then(|node| node.as_element().map(|name| matches!(name.local.as_ref(), "picture" | "img")))
-                .unwrap_or(false);
-            replaced_wrapper
-                && styles.get(cid).map_or(false, |child| {
-                    child.display == crate::Display::Block
-                        && child.float.is_none()
-                        && !matches!(child.position, Some(taffy::Position::Absolute))
-                })
-        });
     let is_native_table_cell = node.as_element().map_or(false, |element| {
         matches!(element.local.as_ref(), "td" | "th")
             && style.internal_flex_container
@@ -3319,15 +3326,18 @@ fn build(
 
     // `text-align` affects inline content, never the used width or placement
     // of an in-flow block child. `to_taffy_style` promotes a centered/right
-    // block to a flex column as an inline-alignment stand-in, but retaining
-    // that promotion for a block-level replaced wrapper makes its auto width
-    // shrink to max-content. A responsive `<picture><img width:100%>` then
-    // overflows a padded figure at its intrinsic width instead of filling the
-    // figure's content box. Preserve block formatting for that concrete
-    // modern-media shape. Mixed inline/block content is handled separately by
-    // `build_mixed_block` below; keeping this guard narrow avoids changing the
-    // legacy shrink-wrap approximation for unrelated centered block children.
-    if has_replaced_block_child {
+    // block to a flex column as an inline-alignment stand-in; retaining that
+    // promotion when the container has real block children makes every auto
+    // width child shrink to max-content. That turns full-width paragraphs,
+    // responsive picture wrappers, and rows of inline-block buttons into
+    // narrow columns that wrap even though their containing block has room.
+    //
+    // Keep the legacy `<center>` behavior: unlike CSS text-align, that element
+    // historically centers block descendants as well.
+    if style.display == crate::Display::Block
+        && has_in_flow_block_child
+        && !style.legacy_center
+    {
         taffy_style.display = taffy::style::Display::Block;
     }
 
@@ -3511,6 +3521,14 @@ fn build_mixed_block(
     for &cid in &flat {
         let Some(node) = tree.get_node(cid) else { continue };
         let is_text = matches!(node.data, obscura_dom::tree::NodeData::Text { .. });
+        // Comments, doctypes, and other non-rendered DOM nodes generate no CSS
+        // box and cannot interrupt an inline formatting context. Hydrating
+        // frameworks place marker comments between adjacent inline controls;
+        // treating each marker as a block segment split one button row into
+        // multiple anonymous block wrappers.
+        if !is_text && !node.is_element() {
+            continue;
+        }
         let inline_level = if is_text {
             true
         } else if let Some(s) = styles.get(&cid) {

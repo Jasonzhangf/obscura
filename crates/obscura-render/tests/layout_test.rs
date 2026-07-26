@@ -660,6 +660,37 @@ fn text_alignment_does_not_shrink_flex_items() {
 }
 
 #[test]
+fn text_alignment_does_not_shrink_block_children_or_wrap_inline_block_rows() {
+    let tree = parse_html(
+        r#"<html><head><style>
+           html,body{margin:0}
+           section{width:900px;text-align:center}
+           p{margin:0}
+           a{display:inline-block;width:100px;height:40px;margin-right:10px}
+           </style></head><body><section>
+           <p id="row"><!--[--><a id="one">Why Vue</a><!--]--><a id="two"></a><!--marker--><a id="three"></a><a id="four"></a></p>
+           </section></body></html>"#,
+    );
+    let layout = layout_dom(&tree, (900.0, 1000.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    let row = rect("row");
+    let items = [rect("one"), rect("two"), rect("three"), rect("four")];
+    assert!(
+        (row.width - 900.0).abs() < 0.01,
+        "text-align must not shrink-wrap an auto-width block child: {row:?}"
+    );
+    assert!(
+        items.windows(2).all(|pair| (pair[0].y - pair[1].y).abs() < 0.01),
+        "inline-block items should share one line when the block has room: {items:?}"
+    );
+    assert!(
+        items[0].height <= 40.01,
+        "auto-width inline-block text should use one max-content line: {:?}",
+        items[0]
+    );
+}
+
+#[test]
 fn inline_block_flex_items_keep_block_inner_flow() {
     let tree = parse_html(include_str!("../../../render-repros/inline-block-flex-items.html"));
     let layout = layout_dom(&tree, (900.0, 1000.0));
