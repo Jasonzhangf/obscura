@@ -466,6 +466,15 @@ impl ObscuraHttpClient {
         }).await
     }
 
+    /// Clone the request client owned by this browser context.
+    ///
+    /// Scripted fetch/XHR uses the same pool as navigation instead of a
+    /// process-global client. This keeps its async network state inside the
+    /// same ownership boundary as the V8 runtime (issue #453).
+    pub async fn request_client(&self) -> Client {
+        self.get_client().await.clone()
+    }
+
     /// Read-only accessor for the proxy URL the client was configured with
     /// (if any). Exposed so callers outside the `obscura-net` crate — notably
     /// `op_fetch_url` in `obscura-js` (#139) — can route their own reqwest

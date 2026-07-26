@@ -578,24 +578,9 @@ fn op_console_msg(state: &OpState, #[string] level: &str, #[string] msg: &str) {
     }
 }
 
-// op_fetch_url backs JS-level `fetch()` and XHR. Pre-#139 it used a
-// process-wide `OnceLock<reqwest::Client>` initialised with no proxy, so
-// every JS network call bypassed the configured upstream proxy. We now
-// build a client per request, threading whatever `proxy_url` the page's
-// ObscuraHttpClient was configured with.
-//
-// The per-request build cost is negligible (≪1ms) compared with the actual
-// network round-trip; the simplification is worth not having to invalidate
-// a cache when the proxy is reconfigured between fetches.
-//
-// Process-wide cache keyed by proxy URL. Previously we built a fresh
-// reqwest::Client on every op_fetch_url call (every JS fetch(), XHR,
-// dynamic script load). Each build re-initialised TLS roots and a
-// fresh connection pool with zero reuse, costing ~5ms per fetch on top
-// of any real network work. On an asset-heavy page with 30+ subresources
-// that adds ~150ms of pure waste. With the cache, the first fetch on a
-// given proxy pays the build cost once and every subsequent fetch reuses
-// the same connection pool.
+// Fallback cache for runtimes that have no owning ObscuraHttpClient, such as
+// a standalone module loader. Browser pages use their context-scoped client
+// below so sequential V8 runtimes never share an async network pool (#453).
 static FETCH_CLIENT_CACHE: std::sync::OnceLock<
     std::sync::RwLock<std::collections::HashMap<String, reqwest::Client>>,
 > = std::sync::OnceLock::new();
@@ -634,13 +619,9 @@ fn build_request_client(proxy_url: Option<&str>) -> Result<reqwest::Client, Stri
     // send().await errors, which op_fetch_url propagates and the fetch shim turns
     // into an XHR `error`/`loadend`. 30s matches the other clients in the
     // workspace; OBSCURA_FETCH_TIMEOUT_MS overrides it for tighter cloud limits.
-    let timeout_ms: u64 = std::env::var("OBSCURA_FETCH_TIMEOUT_MS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(30_000);
     let mut builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
-        .timeout(std::time::Duration::from_millis(timeout_ms))
+        .timeout(fetch_timeout())
         // SSRF guard: also reject hostnames that resolve to a private/loopback IP.
         .dns_resolver(std::sync::Arc::new(obscura_net::SsrfGuardResolver::new(false)))
         // Be explicit about pool size: default is unbounded which is fine,
@@ -657,6 +638,14 @@ fn build_request_client(proxy_url: Option<&str>) -> Result<reqwest::Client, Stri
     builder
         .build()
         .map_err(|e| format!("failed to build reqwest::Client: {}", e))
+}
+
+fn fetch_timeout() -> std::time::Duration {
+    let timeout_ms = std::env::var("OBSCURA_FETCH_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30_000);
+    std::time::Duration::from_millis(timeout_ms)
 }
 
 /// Cap on the number of redirect hops op_fetch_url will follow.
@@ -689,7 +678,7 @@ async fn op_fetch_url(
         }
     }
 
-    let (cookie_jar, in_flight, intercept_tx, proxy_url, callbacks) = {
+    let (cookie_jar, in_flight, intercept_tx, proxy_url, callbacks, http_client) = {
         let state_borrow = state.borrow();
         let gs = state_borrow.borrow::<SharedState>().clone();
         let mut gs = gs.borrow_mut();
@@ -721,7 +710,14 @@ async fn op_fetch_url(
         } else {
             None
         };
-        (jar, in_flight, itx, proxy_url, gs.callbacks.clone())
+        (
+            jar,
+            in_flight,
+            itx,
+            proxy_url,
+            gs.callbacks.clone(),
+            gs.http_client.clone(),
+        )
     };
 
     // Slots the interception channel can override via Continue so a consumer
@@ -804,8 +800,11 @@ async fn op_fetch_url(
     let method = override_method.unwrap_or(method);
     let body = override_body.unwrap_or(body);
 
-    let client = cached_request_client(proxy_url.as_deref())
-        .map_err(deno_error::JsErrorBox::generic)?;
+    let client = match &http_client {
+        Some(client) => client.request_client().await,
+        None => cached_request_client(proxy_url.as_deref())
+            .map_err(deno_error::JsErrorBox::generic)?,
+    };
 
     let request_origin = url::Url::parse(&url)
         .ok()
@@ -886,6 +885,7 @@ async fn op_fetch_url(
     if needs_preflight {
         let preflight = client
             .request(reqwest::Method::OPTIONS, &url)
+            .timeout(fetch_timeout())
             .header("Origin", &page_origin)
             .header("Access-Control-Request-Method", method.as_str())
             .header(
@@ -919,7 +919,9 @@ async fn op_fetch_url(
     let mut current_body = body;
     let mut redirects_followed: usize = 0;
     let response = loop {
-        let mut req = client.request(current_method.clone(), &current_url);
+        let mut req = client
+            .request(current_method.clone(), &current_url)
+            .timeout(fetch_timeout());
 
         if is_cross_origin {
             req = req.header("Origin", &page_origin);
