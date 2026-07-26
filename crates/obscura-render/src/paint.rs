@@ -6,7 +6,7 @@
 //! dependencies, so a screenshot is reproducible across hosts.
 
 use obscura_dom::tree::DomTree;
-use tiny_skia::{Color, FillRule, GradientStop, LinearGradient, Paint, PathBuilder, Pixmap, Point, Rect, SpreadMode, Transform};
+use tiny_skia::{Color, FillRule, GradientStop, LinearGradient, Paint, PathBuilder, Pixmap, Point, RadialGradient, Rect, SpreadMode, Transform};
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
 
 static FONT_BYTES: &[u8] = include_bytes!("../assets/liberation-sans.ttf");
@@ -37,6 +37,13 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
     let intrinsic = collect_image_intrinsics(tree, base_url, &mut image_cache);
     let fonts = collect_web_fonts(tree, base_url);
     let mut laid = layout_dom_with_resources(tree, viewport, &intrinsic, &fonts);
+    let root_font_size = tree
+        .query_selector("html")
+        .ok()
+        .flatten()
+        .and_then(|root| laid.styles.get(&root))
+        .and_then(|style| style.font_size)
+        .unwrap_or(16.0);
     // Nodes that live inside an inline `<svg>` we rasterized as one document;
     // their painting is owned by that raster, so they are skipped in both the
     // box/text loop below and the inline-formatting loop after it (an svg
@@ -180,29 +187,37 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
         // `background-clip: text` clips the background to the glyphs, so it must
         // not paint as a box here; the text paint path fills the glyphs instead.
         if style.mask_image.is_none() && !style.background_clip_text {
-            if let Some((angle, stops)) = &style.background_gradient {
-                if let Some(path) = bg_path() {
-                    paint_linear_gradient(&mut pixmap, &path, &visible_rect, *angle, stops);
-                }
-            } else if let Some((angle, center, stops)) =
-                &style.background_conic_gradient
-            {
-                paint_conic_gradient(
-                    &mut pixmap,
-                    &visible_rect,
-                    *angle,
-                    *center,
-                    stops,
-                );
-            } else if let Some(bg) = style.background_color {
-                // A masked element's background-color is the mask's fill color,
-                // not an ordinary box background (handled below), so this only
-                // runs for unmasked boxes.
+            if let Some(bg) = style.background_color {
                 if let Some(path) = bg_path() {
                     let mut paint = Paint::default();
                     paint.set_color(Color::from_rgba8(bg[0], bg[1], bg[2], bg[3]));
                     paint.anti_alias = r > 0.5;
-                    pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+                    pixmap.fill_path(
+                        &path,
+                        &paint,
+                        FillRule::Winding,
+                        Transform::identity(),
+                        None,
+                    );
+                }
+            }
+            if let Some((center, stops)) = &style.background_radial_gradient {
+                if let Some(path) = bg_path() {
+                    paint_radial_gradient(
+                        &mut pixmap,
+                        &path,
+                        &visible_rect,
+                        *center,
+                        stops,
+                    );
+                }
+            }
+            if let Some((angle, center, stops)) = &style.background_conic_gradient {
+                paint_conic_gradient(&mut pixmap, &visible_rect, *angle, *center, stops);
+            }
+            if let Some((angle, stops)) = &style.background_gradient {
+                if let Some(path) = bg_path() {
+                    paint_linear_gradient(&mut pixmap, &path, &visible_rect, *angle, stops);
                 }
             }
         }
@@ -227,8 +242,12 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
                 base_url,
                 &rect,
                 style.background_size,
+                style.background_size_expression.as_deref(),
                 style.background_size_fit,
                 style.background_position,
+                style.font_size.unwrap_or(16.0),
+                root_font_size,
+                viewport,
                 &mut image_cache,
             ) {
                 // A background layer is always clipped to its owner's border
@@ -251,6 +270,16 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
                     );
                 }
             }
+        }
+        if let Some(pseudo) = style.before_pseudo.as_deref() {
+            paint_positioned_pseudo(
+                &mut pixmap,
+                pseudo,
+                &rect,
+                viewport,
+                root_font_size,
+                clip,
+            );
         }
 
         // Rounded, uniform border: stroke the rounded-rect outline instead of
@@ -355,6 +384,11 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
         // overflow-visible region.
         if name.local.as_ref() == "svg" {
             let mut markup = serialize_svg(tree, nid);
+            // Resolve referenced symbols before carrying the host color into
+            // the standalone document. A document-level/external symbol may
+            // itself contain `currentColor`, and therefore has to be present
+            // when the root color is established.
+            inject_external_sprites(tree, nid, base_url, &mut markup, &mut image_cache, &mut sprite_cache);
             // resvg parses the serialized subtree as a standalone SVG
             // document, outside the page's author stylesheet. Preserve the
             // host element's computed `color` so paths using `currentColor`
@@ -368,7 +402,6 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
             // the sprite, splice the referenced `<symbol>` into a local `<defs>`,
             // and rewrite the href to a same-document `#id`. Same-document
             // `<use href="#id">` (empty url) is untouched.
-            inject_external_sprites(tree, nid, base_url, &mut markup, &mut image_cache, &mut sprite_cache);
             if let Some(content) = render_svg(markup.as_bytes(), rect.width as u32, rect.height as u32) {
                 let mask = clip.and_then(|_| rect_clip_mask(pixmap.width(), pixmap.height(), &visible_rect));
                 pixmap.draw_pixmap(
@@ -1296,12 +1329,61 @@ fn paint_linear_gradient(pixmap: &mut Pixmap, path: &tiny_skia::Path, rect: &cra
     let n = stops.len();
     let mut gs: Vec<GradientStop> = Vec::with_capacity(n);
     let mut last = 0.0f32;
-    for (i, (c, pos)) in stops.iter().enumerate() {
+    for (i, (_, pos)) in stops.iter().enumerate() {
+        let c = gradient_stop_color(stops, i);
         let p = pos.unwrap_or(i as f32 / (n - 1) as f32).clamp(0.0, 1.0).max(last);
         last = p;
         gs.push(GradientStop::new(p, Color::from_rgba8(c[0], c[1], c[2], c[3])));
     }
     if let Some(shader) = LinearGradient::new(start, end, gs, SpreadMode::Pad, Transform::identity()) {
+        let mut paint = Paint::default();
+        paint.shader = shader;
+        paint.anti_alias = true;
+        pixmap.fill_path(path, &paint, FillRule::Winding, Transform::identity(), None);
+    }
+}
+
+fn paint_radial_gradient(
+    pixmap: &mut Pixmap,
+    path: &tiny_skia::Path,
+    rect: &crate::Rect,
+    center: (f32, f32),
+    stops: &[([u8; 4], Option<f32>)],
+) {
+    if stops.len() < 2 {
+        return;
+    }
+    let center = Point::from_xy(
+        rect.x + rect.width * center.0,
+        rect.y + rect.height * center.1,
+    );
+    let radius = [
+        (rect.x - center.x).hypot(rect.y - center.y),
+        (rect.x + rect.width - center.x).hypot(rect.y - center.y),
+        (rect.x - center.x).hypot(rect.y + rect.height - center.y),
+        (rect.x + rect.width - center.x).hypot(rect.y + rect.height - center.y),
+    ]
+    .into_iter()
+    .fold(0.0, f32::max);
+    let normalized = normalized_stops(stops);
+    let gradient_stops = normalized
+        .into_iter()
+        .map(|(position, color)| {
+            GradientStop::new(
+                position,
+                Color::from_rgba8(color[0], color[1], color[2], color[3]),
+            )
+        })
+        .collect();
+    if let Some(shader) = RadialGradient::new(
+        center,
+        0.0,
+        center,
+        radius,
+        gradient_stops,
+        SpreadMode::Pad,
+        Transform::identity(),
+    ) {
         let mut paint = Paint::default();
         paint.shader = shader;
         paint.anti_alias = true;
@@ -1354,7 +1436,8 @@ fn normalized_stops(
     let count = stops.len();
     let mut normalized = Vec::with_capacity(count);
     let mut last = 0.0f32;
-    for (index, (color, position)) in stops.iter().enumerate() {
+    for (index, (_, position)) in stops.iter().enumerate() {
+        let color = gradient_stop_color(stops, index);
         let position = position
             .unwrap_or_else(|| {
                 if count <= 1 {
@@ -1366,9 +1449,26 @@ fn normalized_stops(
             .clamp(0.0, 1.0)
             .max(last);
         last = position;
-        normalized.push((position, *color));
+        normalized.push((position, color));
     }
     normalized
+}
+
+fn gradient_stop_color(
+    stops: &[([u8; 4], Option<f32>)],
+    index: usize,
+) -> [u8; 4] {
+    let color = stops[index].0;
+    if color[3] != 0 {
+        return color;
+    }
+    let neighbor = stops[index + 1..]
+        .iter()
+        .find(|(candidate, _)| candidate[3] != 0)
+        .or_else(|| stops[..index].iter().rev().find(|(candidate, _)| candidate[3] != 0));
+    neighbor
+        .map(|(neighbor, _)| [neighbor[0], neighbor[1], neighbor[2], 0])
+        .unwrap_or(color)
 }
 
 fn sample_normalized_stops(stops: &[(f32, [u8; 4])], t: f32) -> [u8; 4] {
@@ -1472,8 +1572,12 @@ fn background_image_rect(
     base_url: Option<&str>,
     box_rect: &crate::Rect,
     explicit_size: Option<(f32, f32)>,
+    size_expression: Option<&str>,
     fit: Option<crate::ObjectFit>,
     position: (f32, f32),
+    em: f32,
+    rem: f32,
+    viewport: (f32, f32),
     cache: &mut std::collections::HashMap<String, Option<Vec<u8>>>,
 ) -> Option<crate::Rect> {
     let bytes = fetch_bytes(src, base_url, cache)?;
@@ -1482,7 +1586,43 @@ fn background_image_rect(
     } else {
         image_dimensions(&bytes).map(|(width, height)| (width as f32, height as f32))
     };
-    let (width, height) = if let Some(size) = explicit_size {
+    let expression_size = size_expression.and_then(|expression| {
+        let components = split_background_size_components(expression);
+        let width = components.first().and_then(|value| {
+            (!value.eq_ignore_ascii_case("auto")).then(|| {
+                crate::style::resolve_contextual_length(
+                    value,
+                    em,
+                    rem,
+                    viewport.0 / 100.0,
+                    viewport.1 / 100.0,
+                    box_rect.width,
+                )
+            })?
+        });
+        let height = components.get(1).and_then(|value| {
+            (!value.eq_ignore_ascii_case("auto")).then(|| {
+                crate::style::resolve_contextual_length(
+                    value,
+                    em,
+                    rem,
+                    viewport.0 / 100.0,
+                    viewport.1 / 100.0,
+                    box_rect.height,
+                )
+            })?
+        });
+        match (width, height, intrinsic) {
+            (Some(width), Some(height), _) => Some((width, height)),
+            (Some(width), None, Some((iw, ih))) => Some((width, width * ih / iw)),
+            (None, Some(height), Some((iw, ih))) => Some((height * iw / ih, height)),
+            (None, None, Some(intrinsic)) => Some(intrinsic),
+            _ => None,
+        }
+    });
+    let (width, height) = if let Some(size) = expression_size {
+        size
+    } else if let Some(size) = explicit_size {
         size
     } else if let Some(fit) = fit {
         let (iw, ih) = intrinsic?;
@@ -1504,6 +1644,102 @@ fn background_image_rect(
         width,
         height,
     })
+}
+
+fn split_background_size_components(value: &str) -> Vec<&str> {
+    let mut components = Vec::new();
+    let mut depth = 0i32;
+    let mut start = None;
+    for (index, ch) in value.char_indices() {
+        match ch {
+            '(' => {
+                depth += 1;
+                start.get_or_insert(index);
+            }
+            ')' => depth = (depth - 1).max(0),
+            ch if ch.is_whitespace() && depth == 0 => {
+                if let Some(start) = start.take() {
+                    components.push(value[start..index].trim());
+                }
+            }
+            _ => {
+                start.get_or_insert(index);
+            }
+        }
+    }
+    if let Some(start) = start {
+        components.push(value[start..].trim());
+    }
+    components
+}
+
+fn paint_positioned_pseudo(
+    pixmap: &mut Pixmap,
+    style: &crate::LayoutStyle,
+    containing_block: &crate::Rect,
+    viewport: (f32, f32),
+    root_font_size: f32,
+    ancestor_clip: Option<crate::Rect>,
+) {
+    if style.position != Some(taffy::Position::Absolute) {
+        return;
+    }
+    let em = style.font_size.unwrap_or(16.0);
+    let resolve = |dimension: crate::Dimension, basis: f32| {
+        match dimension.resolve(em, root_font_size, viewport.0 / 100.0, viewport.1 / 100.0) {
+            crate::Dimension::Px(value) => Some(value),
+            crate::Dimension::Percent(value) => Some(value * basis),
+            _ => None,
+        }
+    };
+    let top = style.inset[0].and_then(|value| resolve(value, containing_block.height));
+    let right = style.inset[1].and_then(|value| resolve(value, containing_block.width));
+    let bottom = style.inset[2].and_then(|value| resolve(value, containing_block.height));
+    let left = style.inset[3].and_then(|value| resolve(value, containing_block.width));
+    let width = resolve(style.width, containing_block.width).or_else(|| {
+        Some(containing_block.width - left? - right?)
+    });
+    let height = resolve(style.height, containing_block.height).or_else(|| {
+        Some(containing_block.height - top? - bottom?)
+    });
+    let (Some(width), Some(height)) = (width, height) else { return };
+    if width <= 0.0 || height <= 0.0 {
+        return;
+    }
+    let x = left
+        .map(|value| containing_block.x + value)
+        .or_else(|| right.map(|value| containing_block.x + containing_block.width - value - width))
+        .unwrap_or(containing_block.x);
+    let y = top
+        .map(|value| containing_block.y + value)
+        .or_else(|| bottom.map(|value| containing_block.y + containing_block.height - value - height))
+        .unwrap_or(containing_block.y);
+    let rect = crate::Rect { x, y, width, height };
+    let visible = match ancestor_clip {
+        Some(clip) => rect.intersect(&clip),
+        None => Some(rect),
+    };
+    let Some(visible) = visible else { return };
+    let Some(sk_rect) = Rect::from_xywh(visible.x, visible.y, visible.width, visible.height) else {
+        return;
+    };
+    let mut builder = PathBuilder::new();
+    builder.push_rect(sk_rect);
+    let Some(path) = builder.finish() else { return };
+    if let Some(color) = style.background_color {
+        let mut paint = Paint::default();
+        paint.set_color(Color::from_rgba8(color[0], color[1], color[2], color[3]));
+        pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+    }
+    if let Some((center, stops)) = &style.background_radial_gradient {
+        paint_radial_gradient(pixmap, &path, &rect, *center, stops);
+    }
+    if let Some((angle, center, stops)) = &style.background_conic_gradient {
+        paint_conic_gradient(pixmap, &rect, *angle, *center, stops);
+    }
+    if let Some((angle, stops)) = &style.background_gradient {
+        paint_linear_gradient(pixmap, &path, &rect, *angle, stops);
+    }
 }
 
 /// Fetch every `<img>` once (seeding `cache` for the paint pass) and record its
@@ -2510,6 +2746,67 @@ mod tests {
     }
 
     #[test]
+    fn contextual_background_size_preserves_auto_axis_ratio() {
+        let source = "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='200'%20height='50'%3E%3C/svg%3E";
+        let owner = crate::Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 132.0,
+            height: 60.0,
+        };
+        let mut cache = std::collections::HashMap::new();
+        let image = background_image_rect(
+            source,
+            None,
+            &owner,
+            None,
+            Some("calc(100% - 2rem) auto"),
+            None,
+            (0.0, 0.5),
+            10.0,
+            10.0,
+            (1280.0, 720.0),
+            &mut cache,
+        )
+        .unwrap();
+        assert_eq!(image.width, 112.0);
+        assert_eq!(image.height, 28.0);
+        assert_eq!(image.y, 16.0);
+    }
+
+    #[test]
+    fn paints_positioned_empty_pseudo_background_box() {
+        let tree = parse_html(
+            r#"<html><head><style>
+               body { margin:0 }
+               #host { position:relative; width:100px; height:50px }
+               #host::before {
+                 content:"";
+                 position:absolute;
+                 top:10px;
+                 left:20px;
+                 width:40px;
+                 height:30px;
+                 background:
+                   linear-gradient(to bottom, transparent, #ffffff),
+                   radial-gradient(circle at 50% 50%, #ebf3f9, #d6dee4);
+               }
+               </style></head><body><div id="host"></div></body></html>"#,
+        );
+        let pixmap = paint_dom(&tree, (120.0, 80.0), None).expect("pixmap");
+        let center = pixmap.pixel(40, 25).expect("pixel");
+        assert!(
+            center.red() >= 214 && center.green() >= 222 && center.blue() >= 228,
+            "transparent-to-white over a light radial layer must not darken it: {center:?}"
+        );
+        let outside = pixmap.pixel(5, 5).expect("pixel");
+        assert_eq!(
+            (outside.red(), outside.green(), outside.blue()),
+            (255, 255, 255)
+        );
+    }
+
+    #[test]
     fn later_element_paints_over_earlier() {
         // A blue div nested inside a red one: both cover the origin, and blue
         // (a descendant, later in tree order) paints over red.
@@ -2853,6 +3150,30 @@ mod tests {
         assert!(
             markup.contains(r##"<use href="#arrow""##),
             "local use reference must remain intact: {markup}"
+        );
+    }
+
+    #[test]
+    fn injected_document_symbol_inherits_target_current_color() {
+        let tree = parse_html(
+            r##"<html><body>
+                <svg style="display:none"><symbol id="arrow" viewBox="0 0 10 10"><rect width="10" height="10" fill="currentColor"/></symbol></svg>
+                <svg id="icon" viewBox="0 0 10 10"><use href="#arrow"/></svg>
+            </body></html>"##,
+        );
+        let svg = tree.query_selector("#icon").unwrap().unwrap();
+        let mut markup = serialize_svg(&tree, svg);
+        let mut cache = std::collections::HashMap::new();
+        let mut sprite_cache = std::collections::HashMap::new();
+        inject_external_sprites(&tree, svg, None, &mut markup, &mut cache, &mut sprite_cache);
+        inject_svg_current_color(&mut markup, [220, 20, 60, 255]);
+        let pixmap = render_svg(markup.as_bytes(), 20, 20).expect("injected svg renders");
+        assert!(
+            pixmap
+                .pixels()
+                .iter()
+                .any(|pixel| pixel.red() > 180 && pixel.green() < 60 && pixel.blue() < 100),
+            "injected currentColor symbol should inherit target SVG color: {markup}",
         );
     }
 

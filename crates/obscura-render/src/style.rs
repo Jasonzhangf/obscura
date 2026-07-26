@@ -434,14 +434,17 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
             if !value.trim().is_empty() {
                 style.background_color = None;
                 style.background_gradient = parse_linear_gradient(value);
+                style.background_radial_gradient = parse_radial_gradient(value);
                 style.background_conic_gradient = parse_conic_gradient(value);
                 if style.background_gradient.is_none()
+                    && style.background_radial_gradient.is_none()
                     && style.background_conic_gradient.is_none()
                 {
                     style.background_color = parse_color(value);
                 }
                 style.background_image = parse_url(value);
                 style.background_size = None;
+                style.background_size_expression = background_size_expression(value);
                 style.background_size_fit = parse_background_size_fit(value);
                 style.background_position = (0.0, 0.0);
                 style.background_clip_text = false;
@@ -449,11 +452,14 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         }
         "background-image" => {
             style.background_gradient = parse_linear_gradient(value);
+            style.background_radial_gradient = parse_radial_gradient(value);
             style.background_conic_gradient = parse_conic_gradient(value);
             style.background_image = parse_url(value);
         }
         "background-size" => {
             style.background_size = parse_background_size(value);
+            style.background_size_expression =
+                (!value.trim().is_empty()).then(|| value.trim().to_string());
             style.background_size_fit = parse_background_size_fit(value);
         }
         "background-position" => style.background_position = parse_background_position(value),
@@ -2897,6 +2903,47 @@ fn parse_linear_gradient(value: &str) -> Option<(f32, Vec<([u8; 4], Option<f32>)
     Some((angle, stops))
 }
 
+fn parse_radial_gradient(
+    value: &str,
+) -> Option<((f32, f32), Vec<([u8; 4], Option<f32>)>)> {
+    let lower = value.to_ascii_lowercase();
+    let start = lower.find("radial-gradient(")?;
+    let open = start + "radial-gradient(".len();
+    let end = find_matching_paren(&value[open..])? + open;
+    let parts = split_top_level(&value[open..end], ',');
+    if parts.is_empty() {
+        return None;
+    }
+    let mut center = (0.5, 0.5);
+    let mut stop_start = 0;
+    let prelude = parts[0].trim().to_ascii_lowercase();
+    if prelude.contains(" at ") || prelude.starts_with("at ") {
+        let coords = prelude
+            .split_once(" at ")
+            .map(|(_, coords)| coords)
+            .or_else(|| prelude.strip_prefix("at "))
+            .unwrap_or_default();
+        let mut coords = coords.split_whitespace();
+        if let Some(x) = coords.next().and_then(percent_fraction) {
+            center.0 = x;
+        }
+        if let Some(y) = coords.next().and_then(percent_fraction) {
+            center.1 = y;
+        }
+        stop_start = 1;
+    } else if parse_color(parts[0].trim()).is_none() {
+        stop_start = 1;
+    }
+    let mut stops = Vec::new();
+    for part in &parts[stop_start..] {
+        let (color, position) = split_color_stop(part.trim());
+        if let Some(color) = parse_color(color) {
+            stops.push((color, position));
+        }
+    }
+    (stops.len() >= 2).then_some((center, stops))
+}
+
 /// Parse the common `conic-gradient(from A at X Y, color P%, ...)` form.
 /// Angles follow CSS convention (0deg at 12 o'clock, clockwise); the center
 /// is retained as box-relative fractions for paint-time resolution.
@@ -3171,6 +3218,25 @@ fn parse_background_size_fit(value: &str) -> Option<crate::ObjectFit> {
     } else {
         None
     }
+}
+
+fn background_size_expression(value: &str) -> Option<String> {
+    let (_, size) = value.rsplit_once('/')?;
+    let mut depth = 0i32;
+    let mut end = size.len();
+    for (index, ch) in size.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = (depth - 1).max(0),
+            _ if depth == 0 && ch == ',' => {
+                end = index;
+                break;
+            }
+            _ => {}
+        }
+    }
+    let size = size[..end].trim();
+    (!size.is_empty()).then(|| size.to_string())
 }
 
 /// `background-position` keywords/lengths -> a 0.0-1.0 fraction per axis (the
@@ -3684,6 +3750,7 @@ mod tests {
         assert_eq!(s.background_conic_gradient, None);
         assert_eq!(s.background_image, None);
         assert_eq!(s.background_size, None);
+        assert_eq!(s.background_size_expression, None);
         assert_eq!(s.background_size_fit, None);
         assert_eq!(s.background_position, (0.0, 0.0));
         assert!(!s.background_clip_text);
@@ -3697,6 +3764,16 @@ mod tests {
         assert_eq!(
             contain.background_size_fit,
             Some(crate::ObjectFit::Contain)
+        );
+        let contextual = compute_style(
+            "a",
+            Some(
+                "background:url(icon.svg) no-repeat 0 50% / calc(100% - 2rem) auto",
+            ),
+        );
+        assert_eq!(
+            contextual.background_size_expression.as_deref(),
+            Some("calc(100% - 2rem) auto")
         );
     }
 

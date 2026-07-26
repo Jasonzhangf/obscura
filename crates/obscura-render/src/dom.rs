@@ -352,9 +352,16 @@ fn cascade_walk(
         ) {
             this_props = std::rc::Rc::new(m);
         }
-        let (before, after) = sheet.pseudo_content(tree, matcher, id);
-        style.before_content = before;
-        style.after_content = after;
+        let (before_pseudo, after_pseudo) =
+            sheet.pseudo_styles(tree, matcher, id, &style, &this_props);
+        style.before_content = before_pseudo
+            .as_ref()
+            .and_then(|pseudo| pseudo.before_content.clone());
+        style.after_content = after_pseudo
+            .as_ref()
+            .and_then(|pseudo| pseudo.before_content.clone());
+        style.before_pseudo = before_pseudo.map(Box::new);
+        style.after_pseudo = after_pseudo.map(Box::new);
         styles.insert(id, style);
     }
 
@@ -4880,6 +4887,33 @@ mod tests {
         let runs = laid.text_runs.get(&text).unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].0.height, 32.0);
+    }
+
+    #[test]
+    fn light_root_rejects_dark_pseudo_gradient_variants() {
+        let tree = parse_html(
+            r#"<html class="light"><head><style>
+               .hero::before {
+                 content:"";
+                 position:absolute;
+                 background:radial-gradient(circle, #ebf3f9, #d6dee4);
+               }
+               @media (prefers-color-scheme:dark) {
+                 :root:not(.light) .hero::before {
+                   background:radial-gradient(circle, #111111, #222222);
+                 }
+               }
+               :root.dark .hero::before {
+                 background:radial-gradient(circle, #333333, #444444);
+               }
+               </style></head><body><div class="hero"></div></body></html>"#,
+        );
+        let laid = layout_dom(&tree, (1280.0, 720.0));
+        let hero = tree.query_selector(".hero").unwrap().unwrap();
+        let pseudo = laid.styles[&hero].before_pseudo.as_ref().unwrap();
+        let (_, stops) = pseudo.background_radial_gradient.as_ref().unwrap();
+        assert_eq!(stops[0].0, [0xeb, 0xf3, 0xf9, 255]);
+        assert_eq!(stops[1].0, [0xd6, 0xde, 0xe4, 255]);
     }
 
     #[test]

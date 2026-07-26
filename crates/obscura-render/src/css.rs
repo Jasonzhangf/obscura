@@ -21,6 +21,13 @@ struct Rule {
     order: usize,
 }
 
+struct PseudoRule {
+    sel: CompiledSelector,
+    normal_decls: String,
+    important_decls: String,
+    order: usize,
+}
+
 /// An indexed set of author rules ready for fast per-element matching.
 pub struct Stylesheet {
     rules: Vec<Rule>,
@@ -32,17 +39,11 @@ pub struct Stylesheet {
     by_class: HashMap<String, Vec<usize>>,
     by_local: HashMap<String, Vec<usize>>,
     universal: Vec<usize>,
-    /// `sel::before{content:"..."}` / `sel::after{...}` rules with a plain
-    /// string-literal `content`, matched separately from the main cascade:
-    /// our selector engine has no pseudo-element matching machinery, but a
-    /// `::before`/`::after` selector's *base* (everything before the
-    /// pseudo-element) is an ordinary selector we can already compile and
-    /// match. Extremely common on Wikipedia (`.hlist`/`.cslist` render as
-    /// comma-separated lists purely via `li::before{content:", "}`); without
-    /// this, adjacent list items with no real whitespace between them in the
-    /// DOM run together with no separator at all.
-    before_content: Vec<(CompiledSelector, String)>,
-    after_content: Vec<(CompiledSelector, String)>,
+    /// `sel::before` / `sel::after` rules matched against their ordinary base
+    /// selector. Keeping their full declaration cascade supports both literal
+    /// generated text and positioned decorative boxes.
+    before_rules: Vec<PseudoRule>,
+    after_rules: Vec<PseudoRule>,
 }
 
 impl Stylesheet {
@@ -68,8 +69,8 @@ impl Stylesheet {
             by_class: HashMap::new(),
             by_local: HashMap::new(),
             universal: Vec::new(),
-            before_content: Vec::new(),
-            after_content: Vec::new(),
+            before_rules: Vec::new(),
+            after_rules: Vec::new(),
         };
         let mut order = 0usize;
         for src in sources {
@@ -79,15 +80,31 @@ impl Stylesheet {
             for (selector, decls) in parse_stylesheet_for_viewport(src, viewport) {
                 let sel_trim = selector.trim();
                 if let Some(base) = strip_pseudo_element(sel_trim, "before") {
-                    if let (Some(content), Some(sel)) = (extract_string_content(&decls), tree.compile_rule_selector(base)) {
-                        sheet.before_content.push((sel, content));
+                    if let Some(sel) = tree.compile_rule_selector(base) {
+                        let (normal_decls, important_decls) =
+                            crate::style::partition_declarations(&decls);
+                        sheet.before_rules.push(PseudoRule {
+                            sel,
+                            normal_decls,
+                            important_decls,
+                            order,
+                        });
                     }
+                    order += 1;
                     continue;
                 }
                 if let Some(base) = strip_pseudo_element(sel_trim, "after") {
-                    if let (Some(content), Some(sel)) = (extract_string_content(&decls), tree.compile_rule_selector(base)) {
-                        sheet.after_content.push((sel, content));
+                    if let Some(sel) = tree.compile_rule_selector(base) {
+                        let (normal_decls, important_decls) =
+                            crate::style::partition_declarations(&decls);
+                        sheet.after_rules.push(PseudoRule {
+                            sel,
+                            normal_decls,
+                            important_decls,
+                            order,
+                        });
                     }
+                    order += 1;
                     continue;
                 }
                 let Some(sel) = tree.compile_rule_selector(&selector) else { continue };
@@ -106,26 +123,57 @@ impl Stylesheet {
         sheet
     }
 
-    /// The literal text (if any) that `::before`/`::after` rules inject for
-    /// `nid`, as `(before, after)`. Last matching rule wins, approximating
-    /// cascade order without tracking specificity for this small side table.
-    pub fn pseudo_content(&self, tree: &DomTree, matcher: &mut Matcher, nid: NodeId) -> (Option<String>, Option<String>) {
-        if self.before_content.is_empty() && self.after_content.is_empty() {
-            return (None, None);
-        }
-        let mut before = None;
-        for (sel, content) in &self.before_content {
-            if matcher.matches(tree, nid, sel) {
-                before = Some(content.clone());
+    pub fn pseudo_styles(
+        &self,
+        tree: &DomTree,
+        matcher: &mut Matcher,
+        nid: NodeId,
+        host: &LayoutStyle,
+        props: &HashMap<String, String>,
+    ) -> (Option<LayoutStyle>, Option<LayoutStyle>) {
+        let build = |rules: &[PseudoRule], matcher: &mut Matcher| {
+            let mut matched: Vec<(u32, usize, &PseudoRule)> = rules
+                .iter()
+                .filter(|rule| matcher.matches(tree, nid, &rule.sel))
+                .map(|rule| (rule.sel.specificity(), rule.order, rule))
+                .collect();
+            if matched.is_empty() {
+                return None;
             }
-        }
-        let mut after = None;
-        for (sel, content) in &self.after_content {
-            if matcher.matches(tree, nid, sel) {
-                after = Some(content.clone());
+            matched.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+            let mut style = LayoutStyle::default();
+            style.color = host.color;
+            style.font_size = host.font_size;
+            style.font_weight = host.font_weight.clone();
+            style.font_family = host.font_family.clone();
+            style.line_height = host.line_height;
+            style.text_transform = host.text_transform;
+            let mut content = None;
+            for &(_, _, rule) in &matched {
+                let expanded = substitute_vars(&rule.normal_decls, props, 0);
+                crate::style::apply_declarations(&mut style, &expanded);
+                if let Some(value) = extract_string_content(&expanded) {
+                    content = Some(value);
+                }
             }
-        }
-        (before, after)
+            for &(_, _, rule) in &matched {
+                let expanded = substitute_vars(&rule.important_decls, props, 0);
+                crate::style::apply_declarations(&mut style, &expanded);
+                if let Some(value) = extract_string_content(&expanded) {
+                    content = Some(value);
+                }
+            }
+            style.before_content = content;
+            if style.before_content.is_some() {
+                Some(style)
+            } else {
+                None
+            }
+        };
+        (
+            build(&self.before_rules, matcher),
+            build(&self.after_rules, matcher),
+        )
     }
 
     pub fn is_empty(&self) -> bool {
