@@ -2627,6 +2627,8 @@ class Document extends Node {
       'popstateevent': PopStateEvent,
       'animationevent': AnimationEvent,
       'transitionevent': TransitionEvent,
+      'promiserejectionevent': PromiseRejectionEvent,
+      'storageevent': StorageEvent,
     };
     const Cls = map[String(type || '').toLowerCase()] || Event;
     return new Cls('');
@@ -5006,6 +5008,35 @@ globalThis.ToggleEvent = class ToggleEvent extends Event {
   }
 };
 _markNative(globalThis.ToggleEvent);
+
+globalThis.PromiseRejectionEvent = class PromiseRejectionEvent extends Event {
+  constructor(type, init = {}) {
+    super(type, init);
+    this.promise = init.promise;
+    this.reason = init.reason;
+  }
+};
+_markNative(globalThis.PromiseRejectionEvent);
+
+globalThis.StorageEvent = class StorageEvent extends Event {
+  constructor(type, init = {}) {
+    super(type, init);
+    this.key = init.key !== undefined ? init.key : null;
+    this.oldValue = init.oldValue !== undefined ? init.oldValue : null;
+    this.newValue = init.newValue !== undefined ? init.newValue : null;
+    this.url = init.url || "";
+    this.storageArea = init.storageArea || null;
+  }
+  initStorageEvent(type, bubbles, cancelable, key, oldValue, newValue, url, storageArea) {
+    this.initEvent(type, bubbles, cancelable);
+    this.key = key !== undefined ? key : null;
+    this.oldValue = oldValue !== undefined ? oldValue : null;
+    this.newValue = newValue !== undefined ? newValue : null;
+    this.url = url || "";
+    this.storageArea = storageArea || null;
+  }
+};
+_markNative(globalThis.StorageEvent);
 
 // AbortController / AbortSignal. AbortSignal is a real constructor with a
 // prototype, so feature-detection and `AbortSignal.prototype` access work. It
