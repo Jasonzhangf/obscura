@@ -36,7 +36,11 @@ tokio-tungstenite = "0.26"
 # (obscura-net/src/cookies.rs) and never uses reqwest's cookie store. Pulling
 # it in only added the cookie/cookie_store crates, and cookie 0.18.1's blanket
 # From impl fails to compile under coherence on some toolchains (issue #295).
-reqwest = { version = "0.12", features = ["gzip", "brotli", "deflate", "rustls-tls", "socks"], default-features = false }
+# "rustls-tls-native-roots" adds the platform trust store (and SSL_CERT_FILE /
+# SSL_CERT_DIR) on top of the bundled webpki roots, so deployments behind a
+# corporate CA or an inspecting egress proxy can trust their own roots. The
+# two root sets merge, so the default trust surface only grows.
+reqwest = { version = "0.12", features = ["gzip", "brotli", "deflate", "rustls-tls", "rustls-tls-native-roots", "socks"], default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 url = "2"

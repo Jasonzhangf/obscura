@@ -764,10 +764,12 @@ pub enum ObscuraNetError {
 
 #[cfg(test)]
 mod ssrf_tests {
-    use super::{is_forbidden_ip, validate_url, SsrfGuardResolver};
+    use super::{is_forbidden_ip, validate_url, ObscuraHttpClient, SsrfGuardResolver};
+    use crate::cookies::CookieJar;
     use reqwest::dns::{Name, Resolve};
     use std::net::IpAddr;
     use std::str::FromStr;
+    use std::sync::Arc;
     use url::Url;
 
     fn ip(s: &str) -> IpAddr {
@@ -851,5 +853,93 @@ mod ssrf_tests {
                 "example.com wrongly SSRF-blocked: {e}"
             ),
         }
+    }
+
+    /// Mint a throwaway CA plus a 127.0.0.1 leaf it signed, and serve one
+    /// canned HTTPS response with the leaf on an ephemeral port. Returns the
+    /// port and the CA certificate as PEM.
+    async fn https_fixture_with_private_ca() -> (u16, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let mut ca_params = rcgen::CertificateParams::new(Vec::new()).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        let leaf_key = rcgen::KeyPair::generate().unwrap();
+        let leaf_params =
+            rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()]).unwrap();
+        let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_cert, &ca_key).unwrap();
+
+        let certs = vec![tokio_rustls::rustls::pki_types::CertificateDer::from(
+            leaf_cert.der().to_vec(),
+        )];
+        let key = tokio_rustls::rustls::pki_types::PrivateKeyDer::Pkcs8(
+            tokio_rustls::rustls::pki_types::PrivatePkcs8KeyDer::from(
+                leaf_key.serialize_der(),
+            ),
+        );
+        let config = tokio_rustls::rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(mut tls) = acceptor.accept(stream).await else {
+                        return; // Handshake rejection is the point of one test.
+                    };
+                    let mut buf = [0u8; 1024];
+                    let _ = tls.read(&mut buf).await;
+                    let body = "private ca ok";
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = tls.write_all(resp.as_bytes()).await;
+                    let _ = tls.shutdown().await;
+                });
+            }
+        });
+
+        (port, ca_cert.pem())
+    }
+
+    // The two native-roots tests set/rely on SSL_CERT_FILE, which
+    // rustls-native-certs reads once per process at client build. They are
+    // only correct under `cargo nextest` (one process per test) — the same
+    // constraint the whole workspace already has.
+
+    #[tokio::test]
+    async fn native_roots_trusts_a_private_ca_via_ssl_cert_file() {
+        let (port, ca_pem) = https_fixture_with_private_ca().await;
+        let ca_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(ca_file.path(), ca_pem).unwrap();
+        std::env::set_var("SSL_CERT_FILE", ca_file.path());
+
+        let client =
+            ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
+        let url = Url::parse(&format!("https://127.0.0.1:{port}/")).unwrap();
+        let resp = client.fetch(&url).await.expect("private CA in SSL_CERT_FILE must be trusted");
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.text(), "private ca ok");
+    }
+
+    #[tokio::test]
+    async fn private_ca_is_still_rejected_without_ssl_cert_file() {
+        // Guards against the native-roots feature weakening verification: the
+        // same fixture that the SSL_CERT_FILE test trusts must fail here. The
+        // listener is reachable (same setup), so an Err can only be TLS.
+        let (port, _ca_pem) = https_fixture_with_private_ca().await;
+        let client =
+            ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
+        let url = Url::parse(&format!("https://127.0.0.1:{port}/")).unwrap();
+        assert!(client.fetch(&url).await.is_err(), "unknown CA must be rejected");
     }
 }
