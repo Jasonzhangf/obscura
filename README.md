@@ -132,6 +132,26 @@ Want to sponsor? Email [hello@obscura.sh](mailto:hello@obscura.sh).
       🎁 Use discount code <b>RAPID10</b> to get <b>10% off</b>.<br><br></b>
     </td>
   </tr>
+  <tr>
+    <td width="200" align="center" valign="middle">
+      <a href="https://www.thordata.com/?ls=dob&lk=dob" target="_blank">
+        <img alt="Thordata" src="/assets/sponsors/thordatalogo.png" width="180"/>
+      </a>
+    </td>
+    <td valign="middle">
+      🚀 <b>Obscura × Thordata</b><br>
+      Need more stable proxies for automation, public web scraping, SEO, or ad verification? Power your workflow with <a href="https://www.thordata.com/?ls=dob&lk=dob"><b>Thordata</b></a>.<br><br>
+      <b>🌍 Residential Proxies: 100M+ real residential IPs in 190+ countries<br>
+      ♾️ Unlimited Proxies: for heavy traffic and high concurrency<br>
+      ✨ Recently upgraded residential IP pool<br>
+      ✨ Unlimited Concurrent Sessions<br>
+      🔁 Rotating & Sticky Sessions<br>
+      📍 Flexible GEO targeting<br>
+      ⚡ Stable HTTP(S) connections<br><br>
+      🎁 Use code <b>obscura</b> for <b>10% off</b>.<br><br></b>
+      Get started with a 3-day free trial and test Thordata with your own workflow.
+    </td>
+  </tr>
 </table>
 
 ## Install
