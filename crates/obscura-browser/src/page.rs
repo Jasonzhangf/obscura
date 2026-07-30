@@ -1790,6 +1790,13 @@ impl Page {
         // the overwhelming majority of real markup.
         let base_url = self.resolve_base_url();
         let base_url = base_url.as_ref().map(|u| u.as_str());
+        if let Some(js) = &self.js {
+            if let Some(png) = js.screenshot_prepared(viewport, base_url) {
+                return Some(png);
+            }
+        }
+        // Compatibility path for a page without a JS runtime or an ad-hoc
+        // viewport/base that does not match the runtime's CSSOM render key.
         let scroll = self
             .js
             .as_ref()

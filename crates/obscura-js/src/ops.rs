@@ -64,14 +64,6 @@ pub struct JsNetworkEvent {
     pub timestamp: f64,
 }
 
-#[cfg(feature = "render")]
-pub struct LayoutCache {
-    rects: std::collections::HashMap<obscura_dom::tree::NodeId, obscura_render::Rect>,
-    viewport_fixed: std::collections::HashSet<obscura_dom::tree::NodeId>,
-    sticky: obscura_render::StickyLayout,
-    content_size: (f32, f32),
-}
-
 pub struct ObscuraState {
     pub dom: Option<DomTree>,
     pub url: String,
@@ -111,11 +103,14 @@ pub struct ObscuraState {
     // drained by the Page into its network_events so the CDP layer emits
     // Network.requestWillBeSent / responseReceived for them (issue #406).
     pub js_network_events: Vec<JsNetworkEvent>,
-    /// Lazy layout cache from obscura-render, plus the CSS-pixel viewport. The
-    /// cache is computed on first geometry read and cleared on navigation,
-    /// viewport changes, and DOM/style mutations that can affect layout.
+    /// Final image/font-aware layout shared by CSSOM geometry and screenshots.
+    /// DOM/style/viewport changes clear this value but retain resource bytes.
     #[cfg(feature = "render")]
-    pub layout_cache: Option<LayoutCache>,
+    pub prepared_render: Option<obscura_render::PreparedRender>,
+    /// Page-lifetime raw image/font bytes. A new document resets this cache;
+    /// relayout of the same document reuses it without refetching.
+    #[cfg(feature = "render")]
+    pub render_resources: obscura_render::RenderResourceCache,
     #[cfg(feature = "render")]
     pub viewport: (f32, f32),
     /// Root scrolling offset in CSS pixels. With render enabled this is
@@ -149,7 +144,9 @@ impl ObscuraState {
             fetched_urls: Vec::new(),
             js_network_events: Vec::new(),
             #[cfg(feature = "render")]
-            layout_cache: None,
+            prepared_render: None,
+            #[cfg(feature = "render")]
+            render_resources: obscura_render::RenderResourceCache::default(),
             #[cfg(feature = "render")]
             viewport: (1280.0, 720.0),
             #[cfg(feature = "render")]
@@ -210,7 +207,7 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
         // seemingly non-geometric attribute may change computed layout.
         // Detached-node creation and every read-only op deliberately skip this
         // invalidation; the next geometry/scroll read rebuilds at most once.
-        shared.borrow_mut().layout_cache = None;
+        shared.borrow_mut().prepared_render = None;
     }
     let gs = shared.borrow();
     let dom = match &gs.dom {
@@ -2055,49 +2052,52 @@ pub fn build_extension() -> Extension {
 }
 
 #[cfg(feature = "render")]
-fn ensure_layout_cache(state: &mut ObscuraState) -> Option<&LayoutCache> {
-    if state.layout_cache.is_none() {
-        let dom = state.dom.as_ref()?;
-        let laid = obscura_render::layout_dom(dom, state.viewport);
-        let viewport_fixed = laid.viewport_fixed_nodes(dom);
-        let sticky = laid.root_sticky_layout(dom, state.viewport);
-        let content_size = laid.scrolling_content_size(dom, state.viewport);
-        let mut rects = laid.rects;
-        for (&id, rect) in &mut rects {
-            if let Some((tx, ty)) = laid.translates.get(&id) {
-                rect.x += tx;
-                rect.y += ty;
-            }
-        }
-        state.layout_cache = Some(LayoutCache {
-            rects,
-            viewport_fixed,
-            sticky,
-            content_size,
-        });
+pub(crate) fn document_base_url(state: &ObscuraState) -> Option<String> {
+    let document_url = url::Url::parse(&state.url).ok()?;
+    let base_href = state.dom.as_ref().and_then(|dom| {
+        dom.query_selector("base[href]")
+            .ok()
+            .flatten()
+            .and_then(|id| {
+                dom.get_node(id)
+                    .and_then(|node| node.get_attribute("href").map(str::to_string))
+            })
+    });
+    match base_href {
+        Some(href) => document_url.join(&href).ok().map(|url| url.to_string()),
+        None => Some(document_url.to_string()),
     }
-    state.layout_cache.as_ref()
+}
+
+#[cfg(feature = "render")]
+pub(crate) fn ensure_prepared_render(
+    state: &mut ObscuraState,
+) -> Option<&obscura_render::PreparedRender> {
+    let base_url = document_base_url(state);
+    let viewport = state.viewport;
+    let stale = state.prepared_render.as_ref().map_or(true, |prepared| {
+        prepared.viewport() != viewport || prepared.base_url() != base_url.as_deref()
+    });
+    if stale {
+        let prepared = {
+            let dom = state.dom.as_ref()?;
+            obscura_render::prepare_dom(
+                dom,
+                viewport,
+                base_url.as_deref(),
+                &mut state.render_resources,
+            )?
+        };
+        state.prepared_render = Some(prepared);
+    }
+    state.prepared_render.as_ref()
 }
 
 #[cfg(feature = "render")]
 pub(crate) fn clamp_scroll_offset(state: &mut ObscuraState, requested: (f32, f32)) -> (f32, f32) {
-    let viewport = state.viewport;
-    let content_size = ensure_layout_cache(state)
-        .map(|cache| cache.content_size)
-        .unwrap_or(viewport);
-    let max_x = (content_size.0 - viewport.0).max(0.0);
-    let max_y = (content_size.1 - viewport.1).max(0.0);
-    let x = if requested.0.is_finite() {
-        requested.0.clamp(0.0, max_x)
-    } else {
-        0.0
-    };
-    let y = if requested.1.is_finite() {
-        requested.1.clamp(0.0, max_y)
-    } else {
-        0.0
-    };
-    state.scroll_offset = (x, y);
+    state.scroll_offset = ensure_prepared_render(state)
+        .map(|prepared| prepared.clamp_scroll(requested))
+        .unwrap_or((0.0, 0.0));
     state.scroll_offset
 }
 
@@ -2116,24 +2116,14 @@ fn op_layout_geometry(state: &OpState, #[string] nid_str: String) -> String {
     let nid = obscura_dom::tree::NodeId::new(nid);
     let mut gs = shared.borrow_mut();
     let scroll = gs.scroll_offset;
-    let viewport = gs.viewport;
-    if let Some(cache) = ensure_layout_cache(&mut gs) {
-        let Some(rect) = cache.rects.get(&nid) else {
+    if let Some(prepared) = ensure_prepared_render(&mut gs) {
+        let Some(rect) = prepared.viewport_rect(nid, scroll) else {
             return String::new();
         };
-        let sticky_offset = cache.sticky.translation_for(nid, viewport, scroll);
-        let (x, y) = if cache.viewport_fixed.contains(&nid) {
-            (rect.x, rect.y)
-        } else {
-            (
-                rect.x + sticky_offset.0 - scroll.0,
-                rect.y + sticky_offset.1 - scroll.1,
-            )
-        };
-        let viewport_fixed = cache.viewport_fixed.contains(&nid);
+        let viewport_fixed = prepared.viewport_fixed_nodes().contains(&nid);
         return format!(
             "{{\"x\":{},\"y\":{},\"width\":{},\"height\":{},\"viewportFixed\":{}}}",
-            x, y, rect.width, rect.height, viewport_fixed
+            rect.x, rect.y, rect.width, rect.height, viewport_fixed
         );
     }
     String::new()
@@ -2149,8 +2139,8 @@ fn op_layout_metrics(state: &OpState) -> String {
     let shared = state.borrow::<SharedState>().clone();
     let mut gs = shared.borrow_mut();
     let viewport = gs.viewport;
-    let content = ensure_layout_cache(&mut gs)
-        .map(|cache| cache.content_size)
+    let content = ensure_prepared_render(&mut gs)
+        .map(|prepared| prepared.content_size())
         .unwrap_or(viewport);
     format!(
         "{{\"scrollWidth\":{},\"scrollHeight\":{},\"clientWidth\":{},\"clientHeight\":{}}}",

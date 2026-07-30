@@ -11,7 +11,7 @@ pub use deno_core::v8::IsolateHandle;
 
 use crate::module_loader::ObscuraModuleLoader;
 #[cfg(feature = "render")]
-use crate::ops::clamp_scroll_offset;
+use crate::ops::{clamp_scroll_offset, document_base_url, ensure_prepared_render};
 use crate::ops::{build_extension, ObscuraState, StoredNetworkResponseBody};
 
 static SNAPSHOT: &[u8] = include_bytes!(env!("OBSCURA_SNAPSHOT_PATH"));
@@ -192,17 +192,27 @@ impl ObscuraJsRuntime {
     pub fn set_dom(&self, dom: DomTree) {
         let mut gs = self.state.borrow_mut();
         gs.dom = Some(dom);
-        // A new document invalidates the layout cache; it is recomputed lazily
-        // on the next geometry read.
+        // A new document owns a fresh retained scene and resource cache.
         #[cfg(feature = "render")]
         {
-            gs.layout_cache = None;
+            gs.prepared_render = None;
+            gs.render_resources = obscura_render::RenderResourceCache::default();
             gs.scroll_offset = (0.0, 0.0);
         }
     }
 
     pub fn set_url(&self, url: &str) {
-        self.state.borrow_mut().url = url.to_string();
+        let mut state = self.state.borrow_mut();
+        if state.url != url {
+            state.url = url.to_string();
+            #[cfg(feature = "render")]
+            {
+                // Relative resources use the document URL when no <base> is
+                // present. Keep already-fetched absolute bytes, but rebuild
+                // candidate selection/layout against the new base.
+                state.prepared_render = None;
+            }
+        }
     }
 
     /// Set the document's character encoding (WHATWG canonical name). Backs
@@ -292,7 +302,7 @@ impl ObscuraJsRuntime {
         {
             let mut state = self.state.borrow_mut();
             state.viewport = (width as f32, height as f32);
-            state.layout_cache = None;
+            state.prepared_render = None;
         }
         let _ = self.runtime.execute_script(
             "<set-viewport>",
@@ -317,6 +327,41 @@ impl ObscuraJsRuntime {
         let mut state = self.state.borrow_mut();
         let requested = state.scroll_offset;
         clamp_scroll_offset(&mut state, requested)
+    }
+
+    /// Capture the live render viewport from the same prepared layout used by
+    /// CSSOM geometry. A mismatched ad-hoc viewport/base returns `None` so the
+    /// browser layer can retain its compatibility one-shot path.
+    #[cfg(feature = "render")]
+    pub fn screenshot_prepared(
+        &self,
+        viewport: (f32, f32),
+        base_url: Option<&str>,
+    ) -> Option<Vec<u8>> {
+        let mut state = self.state.borrow_mut();
+        let effective_base = document_base_url(&state);
+        if viewport != state.viewport || base_url != effective_base.as_deref() {
+            return None;
+        }
+        ensure_prepared_render(&mut state)?;
+        let requested = state.scroll_offset;
+        let scroll = state
+            .prepared_render
+            .as_ref()
+            .map(|prepared| prepared.clamp_scroll(requested))?;
+        state.scroll_offset = scroll;
+        let ObscuraState {
+            dom,
+            prepared_render,
+            render_resources,
+            ..
+        } = &mut *state;
+        obscura_render::screenshot_prepared(
+            dom.as_ref()?,
+            prepared_render.as_mut()?,
+            render_resources,
+            scroll,
+        )
     }
 
     /// Run __obscura_init() after all per-page properties (UA, platform, stealth, etc.)
@@ -1056,7 +1101,13 @@ impl ObscuraJsRuntime {
         }
     }
     pub fn take_dom(&self) -> Option<DomTree> {
-        self.state.borrow_mut().dom.take()
+        let mut state = self.state.borrow_mut();
+        #[cfg(feature = "render")]
+        {
+            state.prepared_render = None;
+            state.render_resources = obscura_render::RenderResourceCache::default();
+        }
+        state.dom.take()
     }
 
     pub fn with_dom<R>(&self, f: impl FnOnce(&DomTree) -> R) -> Option<R> {
@@ -1093,7 +1144,7 @@ impl ObscuraJsRuntime {
         }
         #[cfg(feature = "render")]
         {
-            state.layout_cache = None;
+            state.prepared_render = None;
         }
         true
     }
@@ -2969,6 +3020,124 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn prepared_render_shares_resource_geometry_with_cssom_and_screenshots() {
+        let dom = parse_html(
+            r#"<html style="margin:0"><head>
+                <base href="/assets/">
+            </head><body style="margin:0">
+                <div id="frame" style="width:160px">
+                    <img id="hero" src="hero.svg" style="display:block;width:100%;height:auto">
+                </div>
+                <div style="height:400px;background:#0000ff"></div>
+            </body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_url("http://example.test/docs/page");
+        rt.set_viewport(200.0, 100.0);
+
+        let loads = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let loader_loads = std::sync::Arc::clone(&loads);
+        rt.state.borrow_mut().render_resources =
+            obscura_render::RenderResourceCache::with_loader(move |url: &str| {
+                assert_eq!(url, "http://example.test/assets/hero.svg");
+                *loader_loads.lock().expect("loader count") += 1;
+                Some(
+                    br##"<svg xmlns="http://www.w3.org/2000/svg" width="400" height="100">
+                        <rect width="400" height="100" fill="#ffff00"/>
+                    </svg>"##
+                        .to_vec(),
+                )
+            });
+        rt.run_page_init();
+
+        let before = rt
+            .evaluate(
+                r#"
+                const hero = document.getElementById("hero");
+                const rect = hero.getBoundingClientRect();
+                return [rect.width, rect.height, document.documentElement.scrollHeight];
+                "#,
+            )
+            .expect("initial geometry");
+        let before = before.as_array().expect("initial tuple");
+        assert_eq!(before[0].as_f64(), Some(160.0));
+        assert_eq!(before[1].as_f64(), Some(40.0));
+        let cssom_height = before[2].as_f64().expect("scroll height") as f32;
+        let (prepared_address, prepared_height) = {
+            let state = rt.state.borrow();
+            let prepared = state.prepared_render.as_ref().expect("prepared by CSSOM");
+            (
+                prepared as *const obscura_render::PreparedRender as usize,
+                prepared.content_size().1,
+            )
+        };
+        assert_eq!(cssom_height, prepared_height);
+        assert_eq!(*loads.lock().expect("prepare load count"), 1);
+
+        let base_url = Some("http://example.test/assets/");
+        let top = rt
+            .screenshot_prepared((200.0, 100.0), base_url)
+            .expect("top screenshot");
+        rt.evaluate(
+            "(function(){ window.scrollTo(0, document.documentElement.scrollHeight); return window.scrollY; })()",
+        )
+        .expect("scroll to bottom");
+        let bottom = rt
+            .screenshot_prepared((200.0, 100.0), base_url)
+            .expect("bottom screenshot");
+        let bottom_repeat = rt
+            .screenshot_prepared((200.0, 100.0), base_url)
+            .expect("repeated bottom screenshot");
+        assert_ne!(top, bottom);
+        assert_eq!(bottom, bottom_repeat);
+        {
+            let state = rt.state.borrow();
+            let prepared = state.prepared_render.as_ref().expect("retained prepared render");
+            assert_eq!(
+                prepared as *const obscura_render::PreparedRender as usize,
+                prepared_address,
+                "screenshots must consume the CSSOM-prepared layout"
+            );
+            assert_eq!(prepared.content_size().1, cssom_height);
+        }
+        assert_eq!(*loads.lock().expect("paint load count"), 1);
+
+        let after = rt
+            .evaluate(
+                r#"
+                const hero = document.getElementById("hero");
+                document.getElementById("frame").setAttribute("style", "width:80px");
+                const rect = hero.getBoundingClientRect();
+                return [rect.width, rect.height, document.documentElement.scrollHeight];
+                "#,
+            )
+            .expect("mutated geometry");
+        let after = after.as_array().expect("mutated tuple");
+        assert_eq!(after[0].as_f64(), Some(80.0));
+        assert_eq!(after[1].as_f64(), Some(20.0));
+        let mutated_height = after[2].as_f64().expect("mutated scroll height") as f32;
+        assert_eq!(
+            rt.state
+                .borrow()
+                .prepared_render
+                .as_ref()
+                .expect("rebuilt prepared render")
+                .content_size()
+                .1,
+            mutated_height
+        );
+        rt.screenshot_prepared((200.0, 100.0), base_url)
+            .expect("mutated screenshot");
+        assert_eq!(
+            *loads.lock().expect("mutation load count"),
+            1,
+            "relayout must retain successful resource bytes"
+        );
     }
 
     #[cfg(feature = "render")]
