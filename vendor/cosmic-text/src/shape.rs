@@ -144,10 +144,41 @@ fn shape_fallback(
     // requests non-default variation coordinates, then use the varied face for
     // metrics, plan construction, and shaping so advances and glyph selection
     // are derived from the same instance.
-    let varied_face = if attrs.font_variations.is_empty() {
+    let varied_face = if !font.rustybuzz().is_variable()
+        || (attrs.font_variations.is_empty()
+            && attrs.font_weight_axis_opt.is_none()
+            && attrs.font_optical_size_opt.is_none()
+            && !attrs.font_italic_axis)
+    {
         None
     } else {
         let mut face = font.rustybuzz().clone();
+        if let Some(value) = attrs
+            .font_weight_axis_opt
+            .map(|value| value.0)
+            .filter(|value| value.is_finite())
+        {
+            let _ = face.set_variation(rustybuzz::ttf_parser::Tag::from_bytes(b"wght"), value);
+        }
+        if let Some(value) = attrs
+            .font_optical_size_opt
+            .map(|value| value.0)
+            .filter(|value| value.is_finite())
+        {
+            let _ = face.set_variation(rustybuzz::ttf_parser::Tag::from_bytes(b"opsz"), value);
+        }
+        if attrs.font_italic_axis {
+            let italic = rustybuzz::ttf_parser::Tag::from_bytes(b"ital");
+            if face
+                .variation_axes()
+                .into_iter()
+                .any(|axis| axis.tag == italic)
+            {
+                let _ = face.set_variation(italic, 1.0);
+            } else {
+                let _ = face.set_variation(rustybuzz::ttf_parser::Tag::from_bytes(b"slnt"), -14.0);
+            }
+        }
         for variation in attrs
             .font_variations
             .iter()
@@ -257,6 +288,10 @@ fn shape_fallback(
             font_monospace_em_width: font.monospace_em_width(),
             font_id: font.id(),
             glyph_id: info.glyph_id.try_into().expect("failed to cast glyph ID"),
+            font_is_variable: face.is_variable(),
+            font_weight_axis_opt: attrs.font_weight_axis_opt.map(|value| value.0),
+            font_optical_size_opt: attrs.font_optical_size_opt.map(|value| value.0),
+            font_italic_axis: attrs.font_italic_axis,
             //TODO: color should not be related to shaping
             color_opt: attrs.color_opt,
             metadata: attrs.metadata,
@@ -539,6 +574,7 @@ fn shape_skip(
         .expect("no default font found");
     let font_id = font.id();
     let font_monospace_em_width = font.monospace_em_width();
+    let font_is_variable = font.rustybuzz().is_variable();
     let font = font.as_swash();
 
     let charmap = font.charmap();
@@ -569,6 +605,10 @@ fn shape_skip(
                     font_monospace_em_width,
                     font_id,
                     glyph_id,
+                    font_is_variable,
+                    font_weight_axis_opt: attrs.font_weight_axis_opt.map(|value| value.0),
+                    font_optical_size_opt: attrs.font_optical_size_opt.map(|value| value.0),
+                    font_italic_axis: attrs.font_italic_axis,
                     color_opt: attrs.color_opt,
                     metadata: attrs.metadata,
                     cache_key_flags: attrs.cache_key_flags,
@@ -592,6 +632,10 @@ pub struct ShapeGlyph {
     pub font_monospace_em_width: Option<f32>,
     pub font_id: fontdb::ID,
     pub glyph_id: u16,
+    pub font_is_variable: bool,
+    pub font_weight_axis_opt: Option<f32>,
+    pub font_optical_size_opt: Option<f32>,
+    pub font_italic_axis: bool,
     pub color_opt: Option<Color>,
     pub metadata: usize,
     pub cache_key_flags: CacheKeyFlags,
@@ -615,6 +659,10 @@ impl ShapeGlyph {
             line_height_opt,
             font_id: self.font_id,
             glyph_id: self.glyph_id,
+            font_is_variable: self.font_is_variable,
+            font_weight_axis_opt: self.font_weight_axis_opt,
+            font_optical_size_opt: self.font_optical_size_opt,
+            font_italic_axis: self.font_italic_axis,
             x,
             y,
             w,

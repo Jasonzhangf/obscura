@@ -22,6 +22,14 @@ pub struct LayoutGlyph {
     pub font_id: fontdb::ID,
     /// Font id of the glyph
     pub glyph_id: u16,
+    /// Whether the selected font face has variation axes.
+    pub font_is_variable: bool,
+    /// Automatic `wght` axis value requested by the span.
+    pub font_weight_axis_opt: Option<f32>,
+    /// Automatic `opsz` axis value requested by the span.
+    pub font_optical_size_opt: Option<f32>,
+    /// Whether the span requests an italic variation axis.
+    pub font_italic_axis: bool,
     /// X offset of hitbox
     pub x: f32,
     /// Y offset of hitbox

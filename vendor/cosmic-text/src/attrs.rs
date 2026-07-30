@@ -331,6 +331,14 @@ pub struct Attrs<'a> {
     /// A specific database face selected by the caller. Font fallback remains
     /// available when that face does not contain a requested glyph.
     pub font_id_opt: Option<fontdb::ID>,
+    /// High-level CSS `font-weight` coordinate, applied only when the actual
+    /// shaped face provides a `wght` axis.
+    pub font_weight_axis_opt: Option<VariationValue>,
+    /// Automatic optical-size coordinate derived from the used font size.
+    /// `None` represents `font-optical-sizing: none`.
+    pub font_optical_size_opt: Option<VariationValue>,
+    /// Whether high-level font style requests an italic variable instance.
+    pub font_italic_axis: bool,
     pub stretch: Stretch,
     pub style: Style,
     pub weight: Weight,
@@ -352,6 +360,9 @@ impl<'a> Attrs<'a> {
             color_opt: None,
             family: Family::SansSerif,
             font_id_opt: None,
+            font_weight_axis_opt: None,
+            font_optical_size_opt: None,
+            font_italic_axis: false,
             stretch: Stretch::Normal,
             style: Style::Normal,
             weight: Weight::NORMAL,
@@ -379,6 +390,21 @@ impl<'a> Attrs<'a> {
     /// Prefer one exact database face before ordinary family matching.
     pub fn font_id(mut self, font_id: fontdb::ID) -> Self {
         self.font_id_opt = Some(font_id);
+        self
+    }
+
+    pub fn font_weight_axis(mut self, value: f32) -> Self {
+        self.font_weight_axis_opt = Some(VariationValue(value));
+        self
+    }
+
+    pub fn font_optical_size(mut self, value: f32) -> Self {
+        self.font_optical_size_opt = Some(VariationValue(value));
+        self
+    }
+
+    pub fn font_italic_axis(mut self, italic: bool) -> Self {
+        self.font_italic_axis = italic;
         self
     }
 
@@ -453,6 +479,9 @@ impl<'a> Attrs<'a> {
     pub fn compatible(&self, other: &Self) -> bool {
         self.family == other.family
             && self.font_id_opt == other.font_id_opt
+            && self.font_weight_axis_opt == other.font_weight_axis_opt
+            && self.font_optical_size_opt == other.font_optical_size_opt
+            && self.font_italic_axis == other.font_italic_axis
             && self.stretch == other.stretch
             && self.style == other.style
             && self.weight == other.weight
@@ -487,6 +516,9 @@ pub struct AttrsOwned {
     pub color_opt: Option<Color>,
     pub family_owned: FamilyOwned,
     pub font_id_opt: Option<fontdb::ID>,
+    pub font_weight_axis_opt: Option<VariationValue>,
+    pub font_optical_size_opt: Option<VariationValue>,
+    pub font_italic_axis: bool,
     pub stretch: Stretch,
     pub style: Style,
     pub weight: Weight,
@@ -505,6 +537,9 @@ impl AttrsOwned {
             color_opt: attrs.color_opt,
             family_owned: FamilyOwned::new(attrs.family),
             font_id_opt: attrs.font_id_opt,
+            font_weight_axis_opt: attrs.font_weight_axis_opt,
+            font_optical_size_opt: attrs.font_optical_size_opt,
+            font_italic_axis: attrs.font_italic_axis,
             stretch: attrs.stretch,
             style: attrs.style,
             weight: attrs.weight,
@@ -522,6 +557,9 @@ impl AttrsOwned {
             color_opt: self.color_opt,
             family: self.family_owned.as_family(),
             font_id_opt: self.font_id_opt,
+            font_weight_axis_opt: self.font_weight_axis_opt,
+            font_optical_size_opt: self.font_optical_size_opt,
+            font_italic_axis: self.font_italic_axis,
             stretch: self.stretch,
             style: self.style,
             weight: self.weight,
