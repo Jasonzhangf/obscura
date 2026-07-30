@@ -231,6 +231,11 @@
     {"name": "first block keeps its declared geometry", "color": "#087f5b", "x": 0, "y": 0, "width": 900, "height": 20},
     {"name": "formatting whitespace does not interrupt sibling margin collapse", "color": "#1971c2", "x": 0, "y": 60, "width": 900, "height": 20}
   ],
+  "bootstrap-float-clearfix": [
+    {"name": "percentage float keeps the block containing width", "color": "#1971c2", "x": 0, "y": 0, "width": 900, "height": 900},
+    {"name": "viewport-height float continues below its child", "color": "#087f5b", "x": 0, "y": 900, "width": 900, "height": 100},
+    {"name": "clearfix keeps centered float content in the first band", "color": "#f8f9fa", "x": 250, "y": 200, "width": 400, "height": 500}
+  ],
   "replaced-grid-order": [
     {"name": "order-modified description occupies the first grid cell", "color": "#e8590c", "x": 0, "y": 0, "width": 300, "height": 200},
     {"name": "media wrapper shares the first row", "color": "#1971c2", "x": 300, "y": 0, "width": 300, "height": 300},
