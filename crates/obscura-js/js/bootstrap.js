@@ -18,7 +18,7 @@
     '__obscura_hw', '__obscura_mem',
     '__documentReadyState__', '__currentUrl',
     // internal helpers (var-declared throughout the file)
-    '__processDynScriptQueue', '_markNative', '_fpRand', '_fpNoise',
+    '__processDynScriptQueue', '_decodeDataScriptUrl', '_markNative', '_fpRand', '_fpNoise',
     '_fpCache', '_getFp', '_fp', '_splitAsciiWhitespace',
     '_getElementsByClassName', '_docEncoding', '_docIsUtf8',
     '_isSpecialScheme', '_applyDocQueryEncoding', '_anchorBase',
@@ -163,6 +163,37 @@ let _fpSeed = 0;
 // when SPAs dynamically insert multiple <script module> tags at once.
 let __dynScriptQueue = [];
 let __dynScriptBusy = false;
+function _decodeDataScriptUrl(url) {
+  let parsed;
+  try { parsed = new URL(url); }
+  catch(e) { throw new TypeError('Invalid dynamic script data URL'); }
+
+  const path = parsed.pathname;
+  const comma = path.indexOf(',');
+  if (comma < 0) throw new TypeError('Invalid dynamic script data URL');
+
+  const parts = path.slice(0, comma).split(';');
+  const mime = parts.shift().trim().toLowerCase();
+  const isJavaScript = mime === 'application/ecmascript' ||
+    mime === 'application/javascript' || mime === 'application/x-ecmascript' ||
+    mime === 'application/x-javascript' || mime === 'text/ecmascript' ||
+    mime === 'text/javascript' || /^text\/javascript1\.[0-5]$/.test(mime) ||
+    mime === 'text/jscript' || mime === 'text/livescript' ||
+    mime === 'text/x-ecmascript' || mime === 'text/x-javascript';
+  if (!isJavaScript) throw new TypeError('Unsupported dynamic script data URL MIME type');
+
+  let payload = path.slice(comma + 1);
+  try { payload = decodeURIComponent(payload); }
+  catch(e) { throw new TypeError('Invalid dynamic script data URL encoding'); }
+
+  const isBase64 = parts.some((part) => part.trim().toLowerCase() === 'base64');
+  if (!isBase64) return payload;
+  const clean = payload.replace(/[\r\n\s]/g, '');
+  if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(clean)) {
+    throw new TypeError('Invalid dynamic script data URL base64');
+  }
+  return new TextDecoder().decode(_base64ToUint8Array(clean));
+}
 async function __processDynScriptQueue() {
   if (__dynScriptBusy) return;
   __dynScriptBusy = true;
@@ -176,11 +207,16 @@ async function __processDynScriptQueue() {
         if (task.isModule) {
           await import(task.url);
         } else {
-          const raw = await Deno.core.ops.op_fetch_url(task.url, "GET", "{}", "", task.pageOrigin, "no-cors");
-          const parsed = JSON.parse(raw);
-          if (parsed.body) {
+          let body;
+          if (task.url.startsWith('data:')) {
+            body = _decodeDataScriptUrl(task.url);
+          } else {
+            const raw = await Deno.core.ops.op_fetch_url(task.url, "GET", "{}", "", task.pageOrigin, "no-cors");
+            body = JSON.parse(raw).body;
+          }
+          if (body) {
             globalThis.__currentScriptNid = task.nid;
-            try { (0, eval)(parsed.body); }
+            try { (0, eval)(body); }
             catch(e) { console.error('Dynamic script error (' + task.url + '):', e.message); }
             finally { globalThis.__currentScriptNid = task.prevNid || 0; }
           }
