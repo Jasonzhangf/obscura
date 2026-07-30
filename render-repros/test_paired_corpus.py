@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import importlib.util
+import json
 import unittest
 from pathlib import Path
 
@@ -118,6 +119,128 @@ class ControlledScrollTests(unittest.TestCase):
     def test_scroll_y_parser_accepts_bottom_and_integer(self):
         self.assertEqual(paired_corpus.parse_scroll_y("bottom"), "bottom")
         self.assertEqual(paired_corpus.parse_scroll_y("-20"), -20)
+
+
+class GeometryProbeTests(unittest.TestCase):
+    @staticmethod
+    def chromium_state():
+        return {
+            "document": {
+                "outer_html_sha256": "outer",
+                "visible_text_sha256": "text",
+            },
+            "geometry_probes": [],
+        }
+
+    class FakePage:
+        def __init__(self, state):
+            self.state = state
+            self.calls = []
+
+        def evaluate(self, expression, *args):
+            self.calls.append((expression, args))
+            return self.state
+
+    def test_default_state_expressions_do_not_include_probe_work(self):
+        obscura_expression = paired_corpus.obscura_state_eval_expression(None)
+        self.assertNotIn("sampleGeometrySelector", obscura_expression)
+        self.assertNotIn("geometry_probes", obscura_expression)
+
+        page = self.FakePage(self.chromium_state())
+        paired_corpus.capture_chromium_state(page)
+        self.assertEqual(len(page.calls), 1)
+        expression, args = page.calls[0]
+        self.assertEqual(args, ())
+        self.assertNotIn("sampleGeometrySelector", expression)
+        self.assertNotIn("geometry_probes", expression)
+
+    def test_repeatable_selectors_are_passed_safely_in_one_state_expression(self):
+        selectors = ["header nav a", '[data-label="a\\\"b"]', "["]
+        obscura_expression = paired_corpus.obscura_state_eval_expression(
+            (0, 25), selectors
+        )
+        encoded = json.dumps(selectors, ensure_ascii=True, separators=(",", ":"))
+        self.assertIn(encoded, obscura_expression)
+        self.assertIn("sampleGeometrySelector", obscura_expression)
+        self.assertIn("catch(error)", obscura_expression)
+        self.assertIn("geometry_probes:geometryProbes", obscura_expression)
+
+        page = self.FakePage(self.chromium_state())
+        paired_corpus.capture_chromium_state(page, selectors)
+        self.assertEqual(len(page.calls), 1)
+        expression, args = page.calls[0]
+        self.assertEqual(args, (selectors,))
+        self.assertIn("querySelectorAll(selector)", expression)
+        self.assertIn("catch(error)", expression)
+        self.assertIn("geometry_probes: geometryProbes", expression)
+
+    def test_probe_comparison_reports_raw_deltas_and_invalid_errors(self):
+        obscura = {
+            "geometry_probes": [
+                {
+                    "selector": ".card",
+                    "valid": True,
+                    "count": 2,
+                    "rects": [
+                        {
+                            "x": 11,
+                            "y": 18,
+                            "width": 100,
+                            "height": 40,
+                            "visible": True,
+                        }
+                    ],
+                    "error": None,
+                },
+                {
+                    "selector": "[",
+                    "valid": False,
+                    "count": None,
+                    "rects": [],
+                    "error": {"name": "SyntaxError", "message": "invalid selector"},
+                },
+            ]
+        }
+        chromium = {
+            "geometry_probes": [
+                {
+                    "selector": ".card",
+                    "valid": True,
+                    "count": 1,
+                    "rects": [
+                        {
+                            "x": 10,
+                            "y": 20,
+                            "width": 98,
+                            "height": 40,
+                            "visible": False,
+                        }
+                    ],
+                    "error": None,
+                },
+                {
+                    "selector": "[",
+                    "valid": False,
+                    "count": None,
+                    "rects": [],
+                    "error": {"name": "SyntaxError", "message": "invalid selector"},
+                },
+            ]
+        }
+
+        comparison = paired_corpus.compare_geometry_probes(obscura, chromium)
+        self.assertEqual(comparison[0]["counts"]["delta"], 1)
+        self.assertEqual(
+            comparison[0]["rect_deltas"][0]["delta"],
+            {"x": 1, "y": -2, "width": 2, "height": 0},
+        )
+        self.assertEqual(
+            comparison[0]["rect_deltas"][0]["visibility"],
+            {"obscura": True, "chromium": False},
+        )
+        self.assertEqual(comparison[1]["valid"], {"obscura": False, "chromium": False})
+        self.assertIsNone(comparison[1]["counts"]["delta"])
+        self.assertEqual(comparison[1]["rects_compared"], 0)
 
 
 if __name__ == "__main__":

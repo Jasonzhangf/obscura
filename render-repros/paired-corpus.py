@@ -6,7 +6,8 @@ screenshots, records browser versions and timings, and reports raw full-canvas
 pixel diagnostics plus background-tolerant structural-edge diagnostics from
 check.py. Browser identity is pinned and both engines record DOM/text
 fingerprints, viewport geometry, and JS-visible resource-readiness state at
-capture time.
+capture time. Repeatable `--geometry-selector` probes can additionally retain
+bounded, viewport-relative element rects from that same pre-screenshot sample.
 It deliberately emits no aggregate parity verdict. An optional pre-change
 Obscura binary can be captured concurrently so regressions are compared
 against the same live-page moment.
@@ -61,6 +62,42 @@ BRAND_PERMUTATIONS = [
     [2, 0, 1],
     [2, 1, 0],
 ]
+GEOMETRY_PROBE_RECT_LIMIT = 200
+
+
+def geometry_probe_javascript(selectors_expression):
+    """Return bounded, per-selector geometry sampling JavaScript."""
+    return (
+        "const sampleGeometrySelector=selector=>{try{"
+        "const elements=Array.from(document.querySelectorAll(selector));"
+        "const rects=elements.slice(0,"
+        f"{GEOMETRY_PROBE_RECT_LIMIT}"
+        ").map((element,index)=>{"
+        "const rect=element.getBoundingClientRect();"
+        "const style=getComputedStyle(element);"
+        "const opacity=Number.parseFloat(style.opacity);"
+        "const clientRectCount=element.getClientRects().length;"
+        "return {index:index,x:rect.left,y:rect.top,"
+        "width:rect.width,height:rect.height,"
+        "visible:clientRectCount>0&&rect.width>0&&rect.height>0"
+        "&&style.display!=='none'&&style.visibility!=='hidden'"
+        "&&style.visibility!=='collapse'"
+        "&&(!Number.isFinite(opacity)||opacity>0),"
+        "client_rect_count:clientRectCount};"
+        "});"
+        "return {selector:selector,valid:true,count:elements.length,"
+        "coordinate_space:'viewport-css-px',"
+        f"rect_limit:{GEOMETRY_PROBE_RECT_LIMIT},"
+        f"rects_truncated:elements.length>{GEOMETRY_PROBE_RECT_LIMIT},"
+        "rects:rects,error:null};"
+        "}catch(error){return {selector:selector,valid:false,count:null,"
+        "coordinate_space:'viewport-css-px',"
+        f"rect_limit:{GEOMETRY_PROBE_RECT_LIMIT},"
+        "rects_truncated:false,rects:[],"
+        "error:{name:error&&error.name?String(error.name):'Error',"
+        "message:error&&error.message?String(error.message):String(error)}};}};"
+        f"const geometryProbes={selectors_expression}.map(sampleGeometrySelector);"
+    )
 
 
 def slug(url):
@@ -104,7 +141,7 @@ def scroll_eval_expression(scroll):
     return obscura_state_eval_expression(scroll)
 
 
-def obscura_state_eval_expression(scroll):
+def obscura_state_eval_expression(scroll, geometry_selectors=None):
     """Sample the live page after an optional scroll and immediately before paint."""
     scroll_script = ""
     requested = "null"
@@ -120,6 +157,14 @@ def obscura_state_eval_expression(scroll):
             "window.scrollTo(requestedX,requestedY);"
         )
         requested = "{x:requestedX,y:requestedY}"
+    geometry_setup = ""
+    geometry_result = ""
+    if geometry_selectors:
+        selectors_json = json.dumps(
+            list(geometry_selectors), ensure_ascii=True, separators=(",", ":")
+        )
+        geometry_setup = geometry_probe_javascript(selectors_json)
+        geometry_result = "geometry_probes:geometryProbes,"
     return (
         "(()=>{"
         + scroll_script
@@ -136,9 +181,11 @@ def obscura_state_eval_expression(scroll):
         "for(let i=0;i<value.length;i++){h^=value.charCodeAt(i);"
         "h=Math.imul(h,16777619)}"
         "return ('00000000'+(h>>>0).toString(16)).slice(-8)};"
-        "return JSON.stringify({"
+        + geometry_setup
+        + "return JSON.stringify({"
         "sampled_phase:'immediately-before-screenshot',"
-        f"requested:{requested},"
+        + geometry_result
+        + f"requested:{requested},"
         "url:location.href,"
         "document:{ready_state:document.readyState,"
         "element_count:document.getElementsByTagName('*').length,"
@@ -368,7 +415,15 @@ def probe_obscura_css_media(binary):
 
 
 def capture_obscura(
-    binary, url, screenshot, log, width, height, settle_ms, scroll=None
+    binary,
+    url,
+    screenshot,
+    log,
+    width,
+    height,
+    settle_ms,
+    scroll=None,
+    geometry_selectors=None,
 ):
     env = obscura_environment(width, height)
     command = [
@@ -384,7 +439,7 @@ def capture_obscura(
         "--wait",
         f"{settle_ms / 1000:g}",
     ]
-    state_expression = obscura_state_eval_expression(scroll)
+    state_expression = obscura_state_eval_expression(scroll, geometry_selectors)
     command.extend(["--eval", state_expression])
     started = time.time()
     try:
@@ -476,10 +531,9 @@ def chromium_identity_override(session):
     )
 
 
-def capture_chromium_state(page):
+def capture_chromium_state(page, geometry_selectors=None):
     """Sample page provenance immediately before the screenshot."""
-    state = page.evaluate(
-        """async () => {
+    expression = """async () => {
           async function sha256(value) {
             if (!globalThis.crypto || !crypto.subtle) return null;
             const bytes = new TextEncoder().encode(value);
@@ -602,7 +656,25 @@ def capture_chromium_state(page):
             }
           };
         }"""
-    )
+    if geometry_selectors:
+        expression = expression.replace(
+            "async () => {", "async geometrySelectors => {", 1
+        )
+        expression = expression.replace(
+            "          const root = document.documentElement;",
+            geometry_probe_javascript("geometrySelectors")
+            + "          const root = document.documentElement;",
+            1,
+        )
+        expression = expression.replace(
+            '          return {\n            sampled_phase: "immediately-before-screenshot",',
+            '          return {\n            geometry_probes: geometryProbes,\n'
+            '            sampled_phase: "immediately-before-screenshot",',
+            1,
+        )
+        state = page.evaluate(expression, list(geometry_selectors))
+    else:
+        state = page.evaluate(expression)
     document_state = state["document"]
     if (
         document_state["outer_html_sha256"] is None
@@ -711,6 +783,79 @@ def compare_page_states(obscura, chromium):
     }
 
 
+def compare_geometry_probes(obscura, chromium):
+    """Report raw per-selector deltas without reducing them to a verdict."""
+    obscura_probes = (obscura or {}).get("geometry_probes") or []
+    chromium_probes = (chromium or {}).get("geometry_probes") or []
+    comparisons = []
+    for index in range(max(len(obscura_probes), len(chromium_probes))):
+        obscura_probe = (
+            obscura_probes[index] if index < len(obscura_probes) else None
+        )
+        chromium_probe = (
+            chromium_probes[index] if index < len(chromium_probes) else None
+        )
+        obscura_rects = (obscura_probe or {}).get("rects") or []
+        chromium_rects = (chromium_probe or {}).get("rects") or []
+        rect_deltas = []
+        for rect_index in range(min(len(obscura_rects), len(chromium_rects))):
+            obscura_rect = obscura_rects[rect_index]
+            chromium_rect = chromium_rects[rect_index]
+            deltas = {}
+            for field in ("x", "y", "width", "height"):
+                left = obscura_rect.get(field)
+                right = chromium_rect.get(field)
+                deltas[field] = (
+                    left - right
+                    if isinstance(left, (int, float))
+                    and isinstance(right, (int, float))
+                    else None
+                )
+            rect_deltas.append(
+                {
+                    "index": rect_index,
+                    "delta": deltas,
+                    "visibility": {
+                        "obscura": obscura_rect.get("visible"),
+                        "chromium": chromium_rect.get("visible"),
+                    },
+                }
+            )
+        obscura_count = (obscura_probe or {}).get("count")
+        chromium_count = (chromium_probe or {}).get("count")
+        comparisons.append(
+            {
+                "index": index,
+                "selector": (
+                    (obscura_probe or {}).get("selector")
+                    if obscura_probe is not None
+                    else (chromium_probe or {}).get("selector")
+                ),
+                "valid": {
+                    "obscura": (obscura_probe or {}).get("valid"),
+                    "chromium": (chromium_probe or {}).get("valid"),
+                },
+                "errors": {
+                    "obscura": (obscura_probe or {}).get("error"),
+                    "chromium": (chromium_probe or {}).get("error"),
+                },
+                "counts": {
+                    "obscura": obscura_count,
+                    "chromium": chromium_count,
+                    "delta": (
+                        obscura_count - chromium_count
+                        if isinstance(obscura_count, int)
+                        and isinstance(chromium_count, int)
+                        else None
+                    ),
+                },
+                "rects_compared": len(rect_deltas),
+                "rect_deltas": rect_deltas,
+            }
+        )
+    return comparisons
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("urls", help="one URL per line; # comments allowed")
@@ -724,6 +869,16 @@ def main():
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=1400)
     parser.add_argument("--settle-ms", type=int, default=3000)
+    parser.add_argument(
+        "--geometry-selector",
+        action="append",
+        default=[],
+        metavar="CSS_SELECTOR",
+        help=(
+            "repeatable selector whose match count and viewport-relative "
+            "bounding rects are sampled in both engines immediately before capture"
+        ),
+    )
     parser.add_argument(
         "--scroll-x",
         type=int,
@@ -828,6 +983,20 @@ def main():
         },
         "pages": [],
     }
+    if args.geometry_selector:
+        manifest["geometry_probes"] = {
+            "selectors": args.geometry_selector,
+            "coordinate_space": "viewport-css-px",
+            "rect_limit_per_selector": GEOMETRY_PROBE_RECT_LIMIT,
+            "visibility": (
+                "practical rendered-box heuristic: client rect exists, positive "
+                "bounding size, display/visibility permit paint, and opacity > 0"
+            ),
+            "comparison_semantics": (
+                "raw per-selector counts, rect deltas in document order, and "
+                "visibility observations; no aggregate parity verdict"
+            ),
+        }
     manifest["obscura_identity_probe"] = probe_obscura_identity(args.obscura_bin)
     manifest["obscura_css_media_probe"] = probe_obscura_css_media(args.obscura_bin)
     if args.baseline_bin:
@@ -915,6 +1084,7 @@ def main():
                     args.height,
                     args.settle_ms,
                     controlled_scroll,
+                    args.geometry_selector,
                 )
                 baseline_future = None
                 if args.baseline_bin:
@@ -928,6 +1098,7 @@ def main():
                         args.height,
                         args.settle_ms,
                         controlled_scroll,
+                        args.geometry_selector,
                     )
 
                 chrome_started = time.time()
@@ -948,7 +1119,9 @@ def main():
                         page.wait_for_timeout(args.settle_ms)
                     chromium_state_ok = False
                     try:
-                        chromium_state = capture_chromium_state(page)
+                        chromium_state = capture_chromium_state(
+                            page, args.geometry_selector
+                        )
                         chromium_state["media"]["matches_configured"] = (
                             media_matches_configured(chromium_state["media"])
                         )
@@ -991,6 +1164,13 @@ def main():
                         page_result["obscura"].get("state"),
                         chromium_state,
                     )
+                    if args.geometry_selector:
+                        page_result["geometry_probe_comparison"] = (
+                            compare_geometry_probes(
+                                page_result["obscura"].get("state"),
+                                chromium_state,
+                            )
+                        )
                 if (
                     chrome_ok
                     and baseline_future
@@ -1002,6 +1182,13 @@ def main():
                             chromium_state,
                         )
                     )
+                    if args.geometry_selector:
+                        page_result["baseline_geometry_probe_comparison"] = (
+                            compare_geometry_probes(
+                                page_result["baseline"].get("state"),
+                                chromium_state,
+                            )
+                        )
 
                 if (
                     controlled_scroll is not None
