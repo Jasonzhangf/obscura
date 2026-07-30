@@ -6749,6 +6749,29 @@ mod tests {
     }
 
     #[test]
+    fn declarative_shadow_style_does_not_leak_into_document_cascade() {
+        let tree = parse_html(
+            r#"<style>
+                 html, body { margin:0 }
+                 .button { width:123px; height:20px }
+               </style>
+               <x-button>
+                 <template shadowrootmode="open">
+                   <style>.button { width:100% }</style>
+                   <span class="button">shadow control</span>
+                 </template>
+               </x-button>
+               <div id="light-button" class="button"></div>"#,
+        );
+        let laid = layout_dom(&tree, (1280.0, 720.0));
+        let button = tree.get_element_by_id("light-button").unwrap();
+        let rect = laid.rects[&button];
+
+        assert!((rect.width - 123.0).abs() < 0.1, "{rect:?}");
+        assert!((rect.height - 20.0).abs() < 0.1, "{rect:?}");
+    }
+
+    #[test]
     fn multicol_balances_atomic_blocks_like_chromium() {
         // Chromium 140 geometry for this reduction is a 630x300 container,
         // 190px columns at x=0/220/440, and a 2/3/3 source-order partition.

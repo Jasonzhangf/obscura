@@ -224,6 +224,21 @@ impl TreeSink for DomTree {
         self.set_quirks(mode == QuirksMode::Quirks);
     }
 
+    fn allow_declarative_shadow_roots(&self, _intended_parent: &NodeId) -> bool {
+        // html5ever defaults this hook to `true`, but its default
+        // `attach_declarative_shadow` implementation returns an error. In
+        // that combination the tree builder consumes
+        // `<template shadowrootmode=...>` without inserting a template and
+        // then appends its contents directly to the host. That leaks shadow
+        // styles and markup into the light DOM.
+        //
+        // Keep declarative shadow roots as ordinary inert templates until
+        // DomTree has a real shadow-root node, tree-scoped selectors, and a
+        // scoped stylesheet cascade. Returning false makes html5ever take its
+        // fully implemented ordinary-template path.
+        false
+    }
+
     fn is_mathml_annotation_xml_integration_point(&self, target: &NodeId) -> bool {
         self.with_node(*target, |n| match &n.data {
             NodeData::Element { mathml_annotation_xml_integration_point, .. } => {
@@ -342,5 +357,80 @@ mod tests {
             .expect("valid selector")
             .expect("template context preserves the row");
         assert_eq!(tree.text_content(row), "cell");
+    }
+
+    #[test]
+    fn declarative_shadow_markup_remains_an_inert_template() {
+        let tree = parse_html(
+            r#"<x-card id="host">
+                 <template id="shadow" shadowrootmode="open">
+                   <style id="shadow-style">.button { width:100% }</style>
+                   <span id="shadow-content">shadow</span>
+                 </template>
+                 <span id="light-content">light</span>
+               </x-card>"#,
+        );
+
+        let host = tree.get_element_by_id("host").unwrap();
+        let template = tree.get_element_by_id("shadow").unwrap();
+        let contents = tree
+            .template_contents(template)
+            .expect("parsed template has a contents document");
+        let style = tree.get_element_by_id("shadow-style").unwrap();
+        let shadow_content = tree.get_element_by_id("shadow-content").unwrap();
+        let light_content = tree.get_element_by_id("light-content").unwrap();
+        let element_children = |parent| {
+            tree.children(parent)
+                .into_iter()
+                .filter(|child| tree.get_node(*child).is_some_and(|node| node.is_element()))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            element_children(host),
+            vec![template, light_content],
+            "shadow markup must not be spliced into the host's light children"
+        );
+        assert!(
+            tree.children(template).is_empty(),
+            "template nodes keep their markup in the separate contents document"
+        );
+        assert_eq!(element_children(contents), vec![style, shadow_content]);
+        assert_eq!(tree.get_node(style).unwrap().parent, Some(contents));
+        assert_eq!(
+            tree.get_node(shadow_content).unwrap().parent,
+            Some(contents)
+        );
+        assert!(
+            !tree.descendants(tree.document()).contains(&style),
+            "inert shadow styles must not enter the document tree"
+        );
+    }
+
+    #[test]
+    fn ordinary_template_parsing_is_unchanged() {
+        let tree = parse_html(
+            r#"<div id="host">
+                 <template id="ordinary"><span id="inside">content</span></template>
+                 <span id="outside">light</span>
+               </div>"#,
+        );
+
+        let host = tree.get_element_by_id("host").unwrap();
+        let template = tree.get_element_by_id("ordinary").unwrap();
+        let contents = tree.template_contents(template).unwrap();
+        let inside = tree.get_element_by_id("inside").unwrap();
+        let outside = tree.get_element_by_id("outside").unwrap();
+        let element_children = |parent| {
+            tree.children(parent)
+                .into_iter()
+                .filter(|child| tree.get_node(*child).is_some_and(|node| node.is_element()))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(element_children(host), vec![template, outside]);
+        assert!(tree.children(template).is_empty());
+        assert_eq!(element_children(contents), vec![inside]);
+        assert_eq!(tree.get_node(inside).unwrap().parent, Some(contents));
     }
 }
