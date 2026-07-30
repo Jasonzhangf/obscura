@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use std::net::{IpAddr, SocketAddr};
@@ -13,6 +13,52 @@ use url::Url;
 
 use crate::cookies::CookieJar;
 use crate::interceptor::{InterceptAction, RequestInterceptor};
+
+fn configured_root_paths() -> Vec<std::path::PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(path) = std::env::var_os("SSL_CERT_FILE").filter(|path| !path.is_empty()) {
+        paths.push(path.into());
+    }
+    if let Some(directory) = std::env::var_os("SSL_CERT_DIR").filter(|path| !path.is_empty()) {
+        match std::fs::read_dir(directory) {
+            Ok(entries) => {
+                paths.extend(entries.filter_map(|entry| entry.ok().map(|entry| entry.path())));
+            }
+            Err(error) => {
+                tracing::warn!(%error, "failed to read SSL_CERT_DIR");
+            }
+        }
+    }
+    paths.sort();
+    paths
+}
+
+fn configured_root_certificates() -> &'static [reqwest::Certificate] {
+    static ROOTS: OnceLock<Vec<reqwest::Certificate>> = OnceLock::new();
+
+    ROOTS.get_or_init(|| {
+        let mut certificates = Vec::new();
+        for path in configured_root_paths() {
+            let bytes = match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    tracing::warn!(%error, path = %path.display(), "failed to read CA certificate file");
+                    continue;
+                }
+            };
+            match reqwest::Certificate::from_pem_bundle(&bytes) {
+                Ok(mut bundle) if !bundle.is_empty() => certificates.append(&mut bundle),
+                _ => match reqwest::Certificate::from_der(&bytes) {
+                    Ok(certificate) => certificates.push(certificate),
+                    Err(error) => {
+                        tracing::warn!(%error, path = %path.display(), "failed to parse CA certificate file");
+                    }
+                },
+            }
+        }
+        certificates
+    })
+}
 
 #[derive(Debug, Clone)]
 pub struct Response {
@@ -455,6 +501,14 @@ impl ObscuraHttpClient {
                 // SSRF guard: reject hostnames that resolve to a private/loopback IP.
                 .dns_resolver(Arc::new(SsrfGuardResolver::new(self.allow_private_network)))
 ;
+
+            if std::env::var_os("SSL_CERT_FILE").is_some()
+                || std::env::var_os("SSL_CERT_DIR").is_some()
+            {
+                for certificate in configured_root_certificates() {
+                    builder = builder.add_root_certificate(certificate.clone());
+                }
+            }
 
             if let Some(ref proxy) = self.proxy_url {
                 if let Ok(p) = reqwest::Proxy::all(proxy.as_str()) {
@@ -911,13 +965,13 @@ mod ssrf_tests {
         (port, ca_cert.pem())
     }
 
-    // The two native-roots tests set/rely on SSL_CERT_FILE, which
-    // rustls-native-certs reads once per process at client build. They are
-    // only correct under `cargo nextest` (one process per test) — the same
-    // constraint the whole workspace already has.
+    // The two configured-roots tests set/rely on SSL_CERT_FILE, which is
+    // cached once per process at client build. They are only correct under
+    // `cargo nextest` (one process per test), the same constraint the whole
+    // workspace already has.
 
     #[tokio::test]
-    async fn native_roots_trusts_a_private_ca_via_ssl_cert_file() {
+    async fn configured_roots_trust_a_private_ca_via_ssl_cert_file() {
         let (port, ca_pem) = https_fixture_with_private_ca().await;
         let ca_file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(ca_file.path(), ca_pem).unwrap();
@@ -932,9 +986,26 @@ mod ssrf_tests {
     }
 
     #[tokio::test]
+    async fn configured_roots_trust_a_private_ca_via_ssl_cert_dir() {
+        let (port, ca_pem) = https_fixture_with_private_ca().await;
+        let ca_dir = tempfile::tempdir().unwrap();
+        std::fs::write(ca_dir.path().join("private-ca.pem"), ca_pem).unwrap();
+        std::env::set_var("SSL_CERT_DIR", ca_dir.path());
+
+        let client =
+            ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
+        let url = Url::parse(&format!("https://127.0.0.1:{port}/")).unwrap();
+        let resp = client
+            .fetch(&url)
+            .await
+            .expect("private CA in SSL_CERT_DIR must be trusted");
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.text(), "private ca ok");
+    }
+
+    #[tokio::test]
     async fn private_ca_is_still_rejected_without_ssl_cert_file() {
-        // Guards against the native-roots feature weakening verification: the
-        // same fixture that the SSL_CERT_FILE test trusts must fail here. The
+        // The same fixture that the SSL_CERT_FILE test trusts must fail here. The
         // listener is reachable (same setup), so an Err can only be TLS.
         let (port, _ca_pem) = https_fixture_with_private_ca().await;
         let client =

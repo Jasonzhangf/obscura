@@ -26,7 +26,7 @@ tempfile = "3"
 wreq-util = { version = "=3.0.0-rc.12", optional = true }
 
 [dev-dependencies]
-# TLS fixtures for the native-roots tests: rcgen mints a throwaway CA + leaf,
+# TLS fixtures for the configured-roots tests: rcgen mints a throwaway CA + leaf,
 # tokio-rustls serves one HTTPS response with them. Pinned to the ring
 # provider so the test binary has a single rustls CryptoProvider (reqwest's
 # rustls also uses ring; adding aws-lc-rs would make provider auto-selection
