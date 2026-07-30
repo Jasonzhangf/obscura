@@ -2378,6 +2378,30 @@ pub(crate) fn layout_dom_with_web_fonts(
                         &mut measure,
                     );
                 }
+                if apply_full_span_column_subgrids(
+                    tree,
+                    &mut taffy_tree,
+                    &id_map,
+                    &styles,
+                    |tree, node| {
+                        tree.compute_layout_with_measure(
+                            node,
+                            taffy::Size {
+                                width: taffy::AvailableSpace::MaxContent,
+                                height: taffy::AvailableSpace::MaxContent,
+                            },
+                            &mut measure,
+                        )
+                        .ok()?;
+                        tree.layout(node).ok().map(|layout| layout.size.width)
+                    },
+                ) {
+                    let _ = taffy_tree.compute_layout_with_measure(
+                        taffy_root,
+                        available,
+                        &mut measure,
+                    );
+                }
                 if apply_table_cell_block_alignment(
                     tree,
                     &mut taffy_tree,
@@ -2418,6 +2442,25 @@ pub(crate) fn layout_dom_with_web_fonts(
                     &id_map,
                     &styles,
                     &ifc_items,
+                ) {
+                    let _ = taffy_tree.compute_layout(taffy_root, available);
+                }
+                if apply_full_span_column_subgrids(
+                    tree,
+                    &mut taffy_tree,
+                    &id_map,
+                    &styles,
+                    |tree, node| {
+                        tree.compute_layout(
+                            node,
+                            taffy::Size {
+                                width: taffy::AvailableSpace::MaxContent,
+                                height: taffy::AvailableSpace::MaxContent,
+                            },
+                        )
+                        .ok()?;
+                        tree.layout(node).ok().map(|layout| layout.size.width)
+                    },
                 ) {
                     let _ = taffy_tree.compute_layout(taffy_root, available);
                 }
@@ -2713,6 +2756,359 @@ fn resolve_grid_areas(
             }
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct ColumnSubgridWrapper {
+    node: taffy::NodeId,
+    gap: f32,
+    start_mbp: f32,
+    end_mbp: f32,
+}
+
+#[derive(Clone, Copy)]
+struct ColumnSubgridLeaf {
+    node: taffy::NodeId,
+    dom: NodeId,
+    column: usize,
+    gap: f32,
+    start_mbp: f32,
+    end_mbp: f32,
+}
+
+struct ColumnSubgridPlan {
+    parent: taffy::NodeId,
+    track_count: usize,
+    parent_gap: f32,
+    wrappers: Vec<ColumnSubgridWrapper>,
+    leaves: Vec<ColumnSubgridLeaf>,
+}
+
+fn is_full_span_column_subgrid(style: &crate::LayoutStyle) -> bool {
+    if style.display != crate::Display::Grid
+        || !style.grid_template_columns_subgrid
+        || style.overflow_hidden
+        || style.position == Some(taffy::Position::Absolute)
+        || style.width != crate::Dimension::Auto
+        || style.justify_self.is_some_and(|value| value != taffy::AlignSelf::STRETCH)
+        || style.margin_auto[1]
+        || style.margin_auto[3]
+    {
+        return false;
+    }
+    let Some(line) = &style.grid_column else {
+        return false;
+    };
+    matches!(
+        (&line.start, &line.end),
+        (taffy::GridPlacement::Line(start), taffy::GridPlacement::Line(end))
+            if start.as_i16() == 1 && end.as_i16() == -1
+    )
+}
+
+/// Collect the deliberately bounded Grid Level 2 subset used by broad
+/// "aligned rows" components: a full-span column subgrid, optionally nested
+/// through more full-span column subgrids, whose final children auto-place one
+/// per inherited column. Partial spans, explicit leaf placement, independent
+/// formatting contexts, and authored inline sizing are left on the existing
+/// fallback rather than being represented inaccurately.
+fn collect_column_subgrid_descendants(
+    tree: &DomTree,
+    dom: NodeId,
+    track_count: usize,
+    taffy_by_dom: &HashMap<NodeId, taffy::NodeId>,
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+    start_mbp: f32,
+    end_mbp: f32,
+    depth: usize,
+    wrappers: &mut Vec<ColumnSubgridWrapper>,
+    leaves: &mut Vec<ColumnSubgridLeaf>,
+) -> bool {
+    if depth > 8 {
+        return false;
+    }
+    let Some(style) = styles.get(&dom) else {
+        return false;
+    };
+    let Some(&node) = taffy_by_dom.get(&dom) else {
+        return false;
+    };
+    let start_mbp = start_mbp + style.margin.left + style.border.left + style.padding.left;
+    let end_mbp = end_mbp + style.margin.right + style.border.right + style.padding.right;
+    let gap = style.column_gap.unwrap_or(0.0);
+    wrappers.push(ColumnSubgridWrapper { node, gap, start_mbp, end_mbp });
+
+    let children: Vec<NodeId> = tree
+        .children(dom)
+        .into_iter()
+        .filter(|child| {
+            styles
+                .get(child)
+                .map(|style| style.display != crate::Display::None)
+                .unwrap_or(false)
+        })
+        .collect();
+    if children.is_empty() {
+        return false;
+    }
+    let nested = children
+        .iter()
+        .filter(|child| styles.get(child).is_some_and(is_full_span_column_subgrid))
+        .count();
+    if nested > 0 {
+        if nested != children.len() {
+            return false;
+        }
+        return children.into_iter().all(|child| {
+            collect_column_subgrid_descendants(
+                tree,
+                child,
+                track_count,
+                taffy_by_dom,
+                styles,
+                start_mbp,
+                end_mbp,
+                depth + 1,
+                wrappers,
+                leaves,
+            )
+        });
+    }
+
+    let flow = style.grid_auto_flow.unwrap_or(taffy::GridAutoFlow::Row);
+    if !matches!(flow, taffy::GridAutoFlow::Row | taffy::GridAutoFlow::RowDense) {
+        return false;
+    }
+    for (index, child) in children.into_iter().enumerate() {
+        let Some(child_style) = styles.get(&child) else {
+            return false;
+        };
+        // This first subset intentionally excludes spanning and explicitly
+        // placed items. It is the common data-row/card-row pattern and keeps
+        // each descendant contribution attributable to one ancestor track.
+        if child_style.grid_column.is_some()
+            || child_style.position == Some(taffy::Position::Absolute)
+            || child_style.margin_auto[1]
+            || child_style.margin_auto[3]
+        {
+            return false;
+        }
+        let Some(&node) = taffy_by_dom.get(&child) else {
+            return false;
+        };
+        leaves.push(ColumnSubgridLeaf {
+            node,
+            dom: child,
+            column: index % track_count,
+            gap,
+            start_mbp,
+            end_mbp,
+        });
+    }
+    true
+}
+
+fn fixed_grid_tracks(widths: &[f32]) -> Vec<taffy::GridTemplateComponent<String>> {
+    widths
+        .iter()
+        .map(|width| {
+            taffy::GridTemplateComponent::Single(taffy::MinMax {
+                min: taffy::MinTrackSizingFunction::length((*width).max(0.0)),
+                max: taffy::MaxTrackSizingFunction::length((*width).max(0.0)),
+            })
+        })
+        .collect()
+}
+
+/// Resolve a safe full-span column-subgrid subset in two passes.
+///
+/// Gecko first collects subgrid descendants into the nearest non-subgridded
+/// ancestor's track sizing, then copies that ancestor's *used* track sizes
+/// down the chain. Its descendant contributions add accumulated edge
+/// margin/border/padding and center a custom subgrid gap over the ancestor
+/// gap. Taffy has no subgrid primitive, so we reproduce those same operations
+/// only for definite, all-auto, single-span rows. Once every max-content
+/// growth limit fits, `justify-content:normal` stretches all auto tracks by an
+/// equal share; narrower/cyclic cases decline this fast path.
+///
+/// The current style model does not expose orthogonal writing modes and emits
+/// Taffy's default LTR direction for every grid; this physical-column reduction
+/// therefore cannot accidentally enter an RTL/orthogonal layout path that the
+/// surrounding renderer does not implement yet. Percentage-width parents are
+/// accepted only after the preliminary layout produced finite, explicit used
+/// track sizes; that resolved track sum is the definite basis for pass two.
+fn apply_full_span_column_subgrids<F>(
+    tree: &DomTree,
+    taffy_tree: &mut TaffyTree<usize>,
+    id_map: &HashMap<taffy::NodeId, NodeId>,
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+    mut measure_max_content: F,
+) -> bool
+where
+    F: FnMut(&mut TaffyTree<usize>, taffy::NodeId) -> Option<f32>,
+{
+    let taffy_by_dom: HashMap<NodeId, taffy::NodeId> =
+        id_map.iter().map(|(taffy, dom)| (*dom, *taffy)).collect();
+    let mut plans = Vec::new();
+
+    for (&dom, style) in styles {
+        if style.display != crate::Display::Grid
+            || style.grid_template_columns_subgrid
+            || !matches!(style.width, crate::Dimension::Px(_) | crate::Dimension::Percent(_))
+            || style.justify_content.is_some_and(|value| value != taffy::JustifyContent::STRETCH)
+        {
+            continue;
+        }
+        let all_auto = !style.grid_template_columns.is_empty()
+            && style.grid_template_columns.iter().all(|track| {
+                matches!(
+                    track,
+                    taffy::GridTemplateComponent::Single(size)
+                        if size.min.is_auto() && size.max.is_auto()
+                )
+            });
+        if !all_auto || style.grid_template_columns.len() > 32 {
+            continue;
+        }
+        let track_count = style.grid_template_columns.len();
+        let direct: Vec<NodeId> = tree
+            .children(dom)
+            .into_iter()
+            .filter(|child| styles.get(child).is_some_and(|style| style.display != crate::Display::None))
+            .collect();
+        if direct.is_empty()
+            || !direct
+                .iter()
+                .all(|child| styles.get(child).is_some_and(is_full_span_column_subgrid))
+        {
+            continue;
+        }
+        let Some(&parent) = taffy_by_dom.get(&dom) else {
+            continue;
+        };
+        let mut wrappers = Vec::new();
+        let mut leaves = Vec::new();
+        if !direct.into_iter().all(|child| {
+            collect_column_subgrid_descendants(
+                tree,
+                child,
+                track_count,
+                &taffy_by_dom,
+                styles,
+                0.0,
+                0.0,
+                0,
+                &mut wrappers,
+                &mut leaves,
+            )
+        }) || leaves.is_empty()
+        {
+            continue;
+        }
+        plans.push(ColumnSubgridPlan {
+            parent,
+            track_count,
+            parent_gap: style.column_gap.unwrap_or(0.0),
+            wrappers,
+            leaves,
+        });
+    }
+
+    let mut changed = false;
+    for plan in plans {
+        let target_track_sum = match taffy_tree.detailed_layout_info(plan.parent) {
+            taffy::tree::DetailedLayoutInfo::Grid(info)
+                if info.columns.negative_implicit_tracks == 0
+                    && info.columns.positive_implicit_tracks == 0
+                    && info.columns.explicit_tracks as usize == plan.track_count =>
+            {
+                info.columns.sizes.iter().sum::<f32>()
+            }
+            _ => continue,
+        };
+        if !target_track_sum.is_finite() || target_track_sum <= 0.0 {
+            continue;
+        }
+        let mut max_content = vec![0.0f32; plan.track_count];
+        let mut valid = true;
+        for leaf in &plan.leaves {
+            let Some(mut contribution) = measure_max_content(taffy_tree, leaf.node) else {
+                valid = false;
+                break;
+            };
+            let Some(leaf_style) = styles.get(&leaf.dom) else {
+                valid = false;
+                break;
+            };
+            contribution += leaf_style.margin.left + leaf_style.margin.right;
+            if plan.track_count > 1 {
+                let gap_delta = leaf.gap - plan.parent_gap;
+                contribution += if leaf.column == 0 || leaf.column + 1 == plan.track_count {
+                    gap_delta / 2.0
+                } else {
+                    gap_delta
+                };
+            }
+            if leaf.column == 0 {
+                contribution += leaf.start_mbp;
+            }
+            if leaf.column + 1 == plan.track_count {
+                contribution += leaf.end_mbp;
+            }
+            max_content[leaf.column] = max_content[leaf.column].max(contribution.max(0.0));
+        }
+        let max_sum: f32 = max_content.iter().sum();
+        if !valid || max_sum > target_track_sum + 0.01 {
+            continue;
+        }
+        let stretch = (target_track_sum - max_sum) / plan.track_count as f32;
+        let used: Vec<f32> = max_content.iter().map(|width| width + stretch).collect();
+        if used.iter().any(|width| !width.is_finite() || *width < 0.0) {
+            continue;
+        }
+
+        // Validate the entire copied chain before mutating anything. A large
+        // edge MBP or gap delta can exhaust an outer track; declining the plan
+        // atomically is safer than leaving only the ancestor frozen.
+        let mut copied_wrappers = Vec::with_capacity(plan.wrappers.len());
+        for wrapper in &plan.wrappers {
+            let mut copied = used.clone();
+            if plan.track_count > 1 {
+                let root_half = plan.parent_gap / 2.0;
+                let child_half = wrapper.gap / 2.0;
+                for (index, width) in copied.iter_mut().enumerate() {
+                    *width += if index == 0 || index + 1 == plan.track_count {
+                        root_half - child_half
+                    } else {
+                        plan.parent_gap - wrapper.gap
+                    };
+                }
+            }
+            copied[0] -= wrapper.start_mbp;
+            copied[plan.track_count - 1] -= wrapper.end_mbp;
+            if copied.iter().any(|width| !width.is_finite() || *width < 0.0)
+                || taffy_tree.style(wrapper.node).is_err()
+            {
+                valid = false;
+                break;
+            }
+            copied_wrappers.push((wrapper.node, copied));
+        }
+        if !valid || taffy_tree.style(plan.parent).is_err() {
+            continue;
+        }
+
+        let mut parent_style = taffy_tree.style(plan.parent).unwrap().clone();
+        parent_style.grid_template_columns = fixed_grid_tracks(&used);
+        let _ = taffy_tree.set_style(plan.parent, parent_style);
+        for (node, copied) in copied_wrappers {
+            let mut style = taffy_tree.style(node).unwrap().clone();
+            style.grid_template_columns = fixed_grid_tracks(&copied);
+            let _ = taffy_tree.set_style(node, style);
+        }
+        changed = true;
+    }
+    changed
 }
 
 /// Resolve a raw `grid-column`/`grid-row` value that names grid lines into a

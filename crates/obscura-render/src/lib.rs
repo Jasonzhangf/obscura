@@ -365,6 +365,10 @@ pub struct LayoutStyle {
     // resolved to line placements on children in a later pass.
     pub grid_template_columns: Vec<taffy::GridTemplateComponent<String>>,
     pub grid_template_rows: Vec<taffy::GridTemplateComponent<String>>,
+    /// `grid-template-columns: subgrid`. Taffy has no native subgrid track
+    /// component, so `dom` resolves the safe full-span column subset after
+    /// measuring the non-subgridded ancestor's intrinsic track contributions.
+    pub grid_template_columns_subgrid: bool,
     pub grid_auto_flow: Option<taffy::GridAutoFlow>,
     pub grid_areas: Option<Vec<Vec<String>>>,
     pub grid_area_name: Option<String>,

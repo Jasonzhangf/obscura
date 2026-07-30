@@ -1512,6 +1512,153 @@ fn auto_grid_track_freezes_at_growth_limit_during_distribution() {
     );
 }
 
+/// Chromium 150 oracle for the full-span nested column-subgrid pattern used by
+/// Mozilla's springboard/data rows. The 20px child gap is centered on the
+/// ancestor's zero-width grid lines, so descendant contributions inflate the
+/// ancestor tracks by [10, 20, 10]. The remaining 240px then stretches the
+/// three auto tracks equally: 130px, 180px, 190px.
+#[test]
+fn nested_full_span_column_subgrid_shares_ancestor_tracks() {
+    let tree = parse_html(
+        r#"
+        <style>
+          * { box-sizing:border-box }
+          html, body { margin:0 }
+          #parent {
+            display:grid;
+            width:500px;
+            grid-template-columns:repeat(3, auto);
+          }
+          .subgrid, .inner {
+            display:grid;
+            grid-column:1 / -1;
+            grid-template-columns:subgrid;
+          }
+          .inner { column-gap:20px }
+          .leaf { height:20px }
+          .a { width:40px }
+          .b { width:80px }
+          .c { width:100px }
+        </style>
+        <div id="parent">
+          <div id="row-one" class="subgrid">
+            <div id="inner-one" class="inner">
+              <div id="a" class="leaf a"></div>
+              <div id="b" class="leaf b"></div>
+              <div id="c" class="leaf c"></div>
+            </div>
+          </div>
+          <div class="subgrid">
+            <div class="inner">
+              <div class="leaf a"></div>
+              <div class="leaf b"></div>
+              <div class="leaf c"></div>
+            </div>
+          </div>
+        </div>
+        "#,
+    );
+    let layout = layout_dom(&tree, (800.0, 600.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    let parent = rect("parent");
+    let row = rect("row-one");
+    let inner = rect("inner-one");
+    let a = rect("a");
+    let b = rect("b");
+    let c = rect("c");
+
+    assert!(
+        (parent.width - 500.0).abs() < 0.01
+            && (parent.height - 40.0).abs() < 0.01
+            && (row.width - 500.0).abs() < 0.01
+            && (row.height - 20.0).abs() < 0.01
+            && (inner.width - 500.0).abs() < 0.01
+            && (inner.height - 20.0).abs() < 0.01,
+        "nested subgrids must share one row of ancestor tracks: \
+         parent={parent:?} row={row:?} inner={inner:?}"
+    );
+    assert!(
+        (a.x - 0.0).abs() < 0.01
+            && (a.width - 40.0).abs() < 0.01
+            && (b.x - 140.0).abs() < 0.01
+            && (b.width - 80.0).abs() < 0.01
+            && (c.x - 320.0).abs() < 0.01
+            && (c.width - 100.0).abs() < 0.01,
+        "Chrome column positions: a={a:?} b={b:?} c={c:?}"
+    );
+
+    let repeated = layout_dom(&tree, (800.0, 600.0));
+    for id in ["parent", "row-one", "inner-one", "a", "b", "c"] {
+        let node = tree.get_element_by_id(id).unwrap();
+        assert_eq!(
+            layout.rects[&node], repeated.rects[&node],
+            "the two-pass reduction must be stable across repeated layouts: {id}"
+        );
+    }
+}
+
+/// Cases outside the bounded reduction must retain the existing fallback,
+/// rather than freezing an invented set of ancestor tracks. The narrow parent
+/// cannot fit every max-content growth limit, and the second row only spans a
+/// subset of its parent columns.
+#[test]
+fn unsafe_column_subgrid_cases_decline_the_fast_path() {
+    let tree = parse_html(
+        r#"
+        <style>
+          * { box-sizing:border-box }
+          html, body { margin:0 }
+          .parent {
+            display:grid;
+            grid-template-columns:repeat(3, auto);
+          }
+          #narrow { width:200px }
+          #partial { width:500px }
+          .subgrid, .inner {
+            display:grid;
+            grid-column:1 / -1;
+            grid-template-columns:subgrid;
+          }
+          #partial-row { grid-column:1 / 3 }
+          .inner { column-gap:20px }
+          .leaf { height:20px }
+          .a { width:40px }
+          .b { width:80px }
+          .c { width:100px }
+        </style>
+        <div id="narrow" class="parent">
+          <div class="subgrid"><div class="inner">
+            <div class="leaf a"></div>
+            <div id="narrow-b" class="leaf b"></div>
+            <div class="leaf c"></div>
+          </div></div>
+        </div>
+        <div id="partial" class="parent">
+          <div id="partial-row" class="subgrid"><div class="inner">
+            <div class="leaf a"></div>
+            <div id="partial-b" class="leaf b"></div>
+            <div class="leaf c"></div>
+          </div></div>
+        </div>
+        "#,
+    );
+    let layout = layout_dom(&tree, (800.0, 600.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    let narrow = rect("narrow");
+    let narrow_b = rect("narrow-b");
+    let partial = rect("partial");
+    let partial_b = rect("partial-b");
+
+    assert!(
+        (narrow.height - 60.0).abs() < 0.01 && (narrow_b.x - narrow.x).abs() < 0.01,
+        "max-content overflow must retain the stacked fallback: {narrow:?} {narrow_b:?}"
+    );
+    assert!(
+        (partial.height - 60.0).abs() < 0.01 && (partial_b.x - partial.x).abs() < 0.01,
+        "partial-span subgrid must retain the stacked fallback: {partial:?} {partial_b:?}"
+    );
+}
+
 #[test]
 fn empty_block_before_participates_in_normal_flow_geometry() {
     let tree = parse_html(

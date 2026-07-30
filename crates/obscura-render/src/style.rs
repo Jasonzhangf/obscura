@@ -993,6 +993,7 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         }
         "grid-template-columns" => {
             let (tracks, names) = parse_track_list_named(value);
+            style.grid_template_columns_subgrid = is_subgrid_track_list(value);
             style.grid_template_columns = tracks;
             style.grid_col_line_names = (!names.is_empty()).then(|| build_line_map(names));
         }
@@ -1749,10 +1750,17 @@ pub(crate) fn parse_track_list_named(
     Vec<taffy::GridTemplateComponent<String>>,
     Vec<(String, i16)>,
 ) {
+    let tokens = tokenize_tracks(value);
     let mut tracks = Vec::new();
     let mut names = Vec::new();
     let mut line: i16 = 1;
-    for tok in tokenize_tracks(value) {
+    // A subgridded axis owns line names but no sizing functions. Do not turn
+    // the keyword into the generic unknown-token => auto-track fallback.
+    let is_subgrid = tokens
+        .first()
+        .map(|token| token.eq_ignore_ascii_case("subgrid"))
+        .unwrap_or(false);
+    for tok in tokens.into_iter().skip(usize::from(is_subgrid)) {
         expand_track_token(&tok, &mut tracks, &mut names, &mut line);
     }
     (tracks, names)
@@ -1945,6 +1953,7 @@ fn parse_grid_template(style: &mut LayoutStyle, value: &str) {
     }
     if let Some(cols) = cols_part {
         let (tracks, names) = parse_track_list_named(cols);
+        style.grid_template_columns_subgrid = is_subgrid_track_list(cols);
         style.grid_template_columns = tracks;
         style.grid_col_line_names = (!names.is_empty()).then(|| build_line_map(names));
     }
@@ -1963,6 +1972,7 @@ fn parse_grid_shorthand(style: &mut LayoutStyle, value: &str) {
     if rows.to_ascii_lowercase().contains("auto-flow") {
         style.grid_template_rows.clear();
         let (tracks, names) = parse_track_list_named(columns);
+        style.grid_template_columns_subgrid = is_subgrid_track_list(columns);
         style.grid_template_columns = tracks;
         style.grid_col_line_names = (!names.is_empty()).then(|| build_line_map(names));
         style.grid_auto_flow = Some(if rows.to_ascii_lowercase().contains("dense") {
@@ -1972,6 +1982,7 @@ fn parse_grid_shorthand(style: &mut LayoutStyle, value: &str) {
         });
     } else if columns.to_ascii_lowercase().contains("auto-flow") {
         style.grid_template_columns.clear();
+        style.grid_template_columns_subgrid = false;
         let (tracks, names) = parse_track_list_named(rows);
         style.grid_template_rows = tracks;
         style.grid_row_line_names = (!names.is_empty()).then(|| build_line_map(names));
@@ -1983,6 +1994,13 @@ fn parse_grid_shorthand(style: &mut LayoutStyle, value: &str) {
     } else {
         parse_grid_template(style, value);
     }
+}
+
+fn is_subgrid_track_list(value: &str) -> bool {
+    tokenize_tracks(value)
+        .first()
+        .map(|token| token.eq_ignore_ascii_case("subgrid"))
+        .unwrap_or(false)
 }
 
 fn parse_grid_auto_flow(value: &str) -> Option<taffy::GridAutoFlow> {
