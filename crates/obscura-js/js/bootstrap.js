@@ -2613,6 +2613,13 @@ class Document extends Node {
   // returned a generic Event for every type, which broke libraries that call
   // createEvent('CustomEvent').initCustomEvent(...) — see issue #41.
   createEvent(type) {
+    const normalized = String(type || '').toLowerCase();
+    if (normalized === 'promiserejectionevent') {
+      throw new DOMException(
+        "The provided event type ('PromiseRejectionEvent') is invalid",
+        'NotSupportedError'
+      );
+    }
     const map = {
       'customevent': CustomEvent, 'customevents': CustomEvent,
       'mouseevent': MouseEvent,   'mouseevents': MouseEvent,
@@ -2627,10 +2634,9 @@ class Document extends Node {
       'popstateevent': PopStateEvent,
       'animationevent': AnimationEvent,
       'transitionevent': TransitionEvent,
-      'promiserejectionevent': PromiseRejectionEvent,
       'storageevent': StorageEvent,
     };
-    const Cls = map[String(type || '').toLowerCase()] || Event;
+    const Cls = map[normalized] || Event;
     return new Cls('');
   }
   createRange() { return new Range(); }
@@ -5010,7 +5016,12 @@ globalThis.ToggleEvent = class ToggleEvent extends Event {
 _markNative(globalThis.ToggleEvent);
 
 globalThis.PromiseRejectionEvent = class PromiseRejectionEvent extends Event {
-  constructor(type, init = {}) {
+  constructor(type, init) {
+    if (arguments.length < 2 || init == null || !('promise' in Object(init))) {
+      throw new TypeError(
+        "Failed to construct 'PromiseRejectionEvent': required member promise is undefined."
+      );
+    }
     super(type, init);
     this.promise = init.promise;
     this.reason = init.reason;
