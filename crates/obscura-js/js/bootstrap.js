@@ -253,7 +253,16 @@ async function __processDynScriptQueue() {
             body = _decodeDataScriptUrl(task.url);
           } else {
             const raw = await Deno.core.ops.op_fetch_url(task.url, "GET", "{}", "", task.pageOrigin, "no-cors");
-            body = JSON.parse(raw).body;
+            const parsed = JSON.parse(raw);
+            // The HTML script-fetch algorithm treats an unsuccessful HTTP
+            // response as a network error. Evaluating its response body is both
+            // observably unlike browsers and dangerous: JSON error payloads
+            // become JavaScript source, while servers can return diagnostic
+            // HTML that mutates global state before throwing.
+            if (!(parsed.status >= 200 && parsed.status <= 299)) {
+              throw new Error('HTTP ' + (parsed.status || 0));
+            }
+            body = parsed.body;
           }
           if (body) {
             globalThis.__currentScriptNid = task.nid;

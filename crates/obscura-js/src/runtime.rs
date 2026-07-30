@@ -4894,6 +4894,52 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn unsuccessful_dynamic_script_response_fires_error_without_evaluating_body() {
+        let mut rt = setup_runtime("<html><head></head><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const originalFetchOp = Deno.core.ops.op_fetch_url;
+                    try {
+                        Deno.core.ops.op_fetch_url = (url) => JSON.stringify({
+                            status: 401,
+                            headers: { "content-type": "application/json" },
+                            body: "globalThis.__executedFailedScript = true",
+                            url,
+                        });
+                        const script = document.createElement("script");
+                        script.src = "/unauthorized.js";
+                        const outcome = await new Promise(resolve => {
+                            script.onload = () => resolve("load");
+                            script.onerror = () => resolve("error");
+                            document.head.appendChild(script);
+                        });
+                        return {
+                            outcome,
+                            executed: globalThis.__executedFailedScript === true,
+                        };
+                    } finally {
+                        Deno.core.ops.op_fetch_url = originalFetchOp;
+                    }
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({
+                "outcome": "error",
+                "executed": false,
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn test_response_array_buffer_preserves_typed_array_view() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt.call_function_on_for_cdp(

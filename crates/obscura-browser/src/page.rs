@@ -839,7 +839,7 @@ impl Page {
             if let Some(js) = &mut self.js {
                 let escaped_css = all_css.replace('\\', "\\\\").replace('`', "\\`").replace('$', "\\$");
                 let code = format!(
-                    "var style = document.createElement('style'); style.textContent = `{}`; document.head.appendChild(style);",
+                    "var style = document.createElement('style'); style.setAttribute('data-obscura-external-stylesheets', ''); style.textContent = `{}`; document.head.appendChild(style);",
                     escaped_css
                 );
                 let _ = js.execute_script("<fetch_stylesheets>", &code);
@@ -1084,6 +1084,23 @@ impl Page {
         let mut fetched: std::collections::HashMap<usize, (String, String, obscura_net::Response)> = std::collections::HashMap::new();
         for result in fetch_results {
             if let Some((idx, url, resp)) = result {
+                if !script_response_is_executable(resp.status) {
+                    self.record_network_event_with_body(
+                        &url,
+                        "GET",
+                        "Script",
+                        resp.status,
+                        &resp.headers,
+                        &resp.body,
+                        false,
+                    );
+                    tracing::warn!(
+                        "Refusing to execute script {} after HTTP {}",
+                        url,
+                        resp.status
+                    );
+                    continue;
+                }
                 // Script bodies: only the HTTP Content-Type charset matters
                 // (no in-band meta-charset for JS).
                 let code = obscura_net::decode_non_html(&resp.body, resp.content_type());
@@ -2268,6 +2285,10 @@ impl Page {
     }
 }
 
+fn script_response_is_executable(status: u16) -> bool {
+    (200..=299).contains(&status)
+}
+
 fn url_matches_cdp_pattern(pattern: &str, url: &str) -> bool {
     if pattern == "*" {
         return true;
@@ -2299,9 +2320,22 @@ fn url_matches_cdp_pattern(pattern: &str, url: &str) -> bool {
 mod tests {
     use super::{
         parse_import_url, rebase_css_urls, should_restore_hydration_snapshot, split_css_imports,
-        truncate_on_char_boundary, url_matches_cdp_pattern, HydrationStats,
+        script_response_is_executable, truncate_on_char_boundary, url_matches_cdp_pattern,
+        HydrationStats,
     };
     use obscura_dom::parse_html;
+
+    #[test]
+    fn external_scripts_require_a_successful_http_status() {
+        assert!(script_response_is_executable(200));
+        assert!(script_response_is_executable(204));
+        assert!(script_response_is_executable(299));
+        assert!(!script_response_is_executable(0));
+        assert!(!script_response_is_executable(304));
+        assert!(!script_response_is_executable(401));
+        assert!(!script_response_is_executable(404));
+        assert!(!script_response_is_executable(500));
+    }
 
     #[cfg(feature = "render")]
     #[test]

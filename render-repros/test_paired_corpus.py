@@ -57,6 +57,8 @@ class ControlledScrollTests(unittest.TestCase):
     def test_every_capture_expression_samples_page_state_without_scrolling(self):
         expression = paired_corpus.obscura_state_eval_expression(None)
         self.assertIn("outer_html_fnv1a32", expression)
+        self.assertIn("data-obscura-external-stylesheets", expression)
+        self.assertIn("normalized_outer_html_fnv1a32", expression)
         self.assertIn("visible_text_fnv1a32", expression)
         self.assertNotIn("window.scrollTo", expression)
 
@@ -80,8 +82,10 @@ class ControlledScrollTests(unittest.TestCase):
                 "ready_state": "complete",
                 "element_count": 9,
                 "outer_html_utf16": 100,
+                "normalized_outer_html_utf16": 90,
                 "visible_text_utf16": 30,
                 "outer_html_fnv1a32": "aaaaaaaa",
+                "normalized_outer_html_fnv1a32": "dddddddd",
                 "visible_text_fnv1a32": "bbbbbbbb",
             },
             "geometry": {"document_scroll_height": 1200, "scroll_y": 300},
@@ -91,8 +95,10 @@ class ControlledScrollTests(unittest.TestCase):
                 "ready_state": "complete",
                 "element_count": 7,
                 "outer_html_utf16": 95,
+                "normalized_outer_html_utf16": 90,
                 "visible_text_utf16": 30,
                 "outer_html_fnv1a32": "cccccccc",
+                "normalized_outer_html_fnv1a32": "dddddddd",
                 "visible_text_fnv1a32": "bbbbbbbb",
             },
             "geometry": {"document_scroll_height": 1000, "scroll_y": 250},
@@ -101,6 +107,8 @@ class ControlledScrollTests(unittest.TestCase):
         self.assertTrue(comparison["ready_state_equal"])
         self.assertEqual(comparison["element_count_delta"], 2)
         self.assertFalse(comparison["outer_html_fingerprint_equal"])
+        self.assertTrue(comparison["normalized_outer_html_fingerprint_equal"])
+        self.assertEqual(comparison["normalized_outer_html_utf16_delta"], 0)
         self.assertTrue(comparison["visible_text_fingerprint_equal"])
         self.assertEqual(
             comparison["geometry_delta"]["document_scroll_height"], 200

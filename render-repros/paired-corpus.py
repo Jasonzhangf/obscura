@@ -125,6 +125,11 @@ def obscura_state_eval_expression(scroll):
         + scroll_script
         + "const root=document.documentElement,body=document.body;"
         "const dom=root?root.outerHTML:'';"
+        "const normalizedRoot=root?root.cloneNode(true):null;"
+        "if(normalizedRoot){normalizedRoot.querySelectorAll("
+        "'style[data-obscura-external-stylesheets],style[data-obscura-linked]'"
+        ").forEach(node=>node.remove())}"
+        "const normalizedDom=normalizedRoot?normalizedRoot.outerHTML:'';"
         "const text=body?body.innerText.replace(/\\s+/g,' ').trim():'';"
         "const images=Array.from(document.images||[]),fonts=document.fonts;"
         "const hash=value=>{let h=2166136261;"
@@ -138,6 +143,8 @@ def obscura_state_eval_expression(scroll):
         "document:{ready_state:document.readyState,"
         "element_count:document.getElementsByTagName('*').length,"
         "outer_html_utf16:dom.length,outer_html_fnv1a32:hash(dom),"
+        "normalized_outer_html_utf16:normalizedDom.length,"
+        "normalized_outer_html_fnv1a32:hash(normalizedDom),"
         "visible_text_utf16:text.length,visible_text_fnv1a32:hash(text)},"
         "geometry:{inner_width:innerWidth,inner_height:innerHeight,"
         "scroll_x:scrollX,scroll_y:scrollY,"
@@ -492,6 +499,13 @@ def capture_chromium_state(page):
           const root = document.documentElement;
           const body = document.body;
           const dom = root ? root.outerHTML : "";
+          const normalizedRoot = root ? root.cloneNode(true) : null;
+          if (normalizedRoot) {
+            normalizedRoot.querySelectorAll(
+              "style[data-obscura-external-stylesheets],style[data-obscura-linked]"
+            ).forEach(node => node.remove());
+          }
+          const normalizedDom = normalizedRoot ? normalizedRoot.outerHTML : "";
           const visibleText = body ? body.innerText : "";
           const normalizedText = visibleText.replace(/\\s+/g, " ").trim();
           const images = Array.from(document.images || []);
@@ -528,6 +542,11 @@ def capture_chromium_state(page):
               outer_html_fnv1a32: fnv1a32(dom),
               outer_html_bytes: new TextEncoder().encode(dom).length,
               outer_html_sha256: await sha256(dom),
+              normalized_outer_html_utf16: normalizedDom.length,
+              normalized_outer_html_fnv1a32: fnv1a32(normalizedDom),
+              normalized_outer_html_bytes:
+                new TextEncoder().encode(normalizedDom).length,
+              normalized_outer_html_sha256: await sha256(normalizedDom),
               visible_text_utf16: normalizedText.length,
               visible_text_fnv1a32: fnv1a32(normalizedText),
               visible_text_bytes: new TextEncoder().encode(normalizedText).length,
@@ -668,6 +687,15 @@ def compare_page_states(obscura, chromium):
             and obscura_document.get("outer_html_fnv1a32")
             == chromium_document.get("outer_html_fnv1a32")
         ),
+        "normalized_outer_html_utf16_delta": delta(
+            obscura_document.get("normalized_outer_html_utf16"),
+            chromium_document.get("normalized_outer_html_utf16"),
+        ),
+        "normalized_outer_html_fingerprint_equal": (
+            obscura_document.get("normalized_outer_html_fnv1a32") is not None
+            and obscura_document.get("normalized_outer_html_fnv1a32")
+            == chromium_document.get("normalized_outer_html_fnv1a32")
+        ),
         "visible_text_fingerprint_equal": (
             obscura_document.get("visible_text_fnv1a32") is not None
             and obscura_document.get("visible_text_fnv1a32")
@@ -787,7 +815,10 @@ def main():
                 "DOM/text fingerprints and length deltas expose different live "
                 "page states. They are provenance tripwires, not proof that "
                 "equal states contain equal layout or that unequal serialized "
-                "DOM necessarily represents a rendering failure."
+                "DOM necessarily represents a rendering failure. Normalized DOM "
+                "fingerprints exclude only Obscura's explicitly marked external-"
+                "stylesheet mirror nodes, because Chromium's CSSOM does not "
+                "serialize fetched stylesheet text into outerHTML."
             ),
             "resource_readiness": (
                 "Obscura's DOM image/font readiness is sampled before paint; "
