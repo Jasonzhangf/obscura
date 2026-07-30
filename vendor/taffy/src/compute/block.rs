@@ -534,9 +534,35 @@ fn compute_inner(
         }
     }
 
+    // Margin-collapsing metadata is part of a block's intrinsic contribution,
+    // not only its final child placement. Grid and flex sizing can measure a
+    // block here and use its exposed start/end margin sets to size an ancestor
+    // item. Dropping them from ComputeSize makes the ancestor track shorter
+    // than the block's eventual descendants.
+    let all_in_flow_children_can_be_collapsed_through =
+        items.iter().all(|item| item.position == Position::Absolute || item.can_be_collapsed_through);
+    let can_be_collapsed_through =
+        !has_styles_preventing_being_collapsed_through && all_in_flow_children_can_be_collapsed_through;
+    let top_margin = if own_margins_collapse_with_children.start {
+        first_child_top_margin_set
+    } else {
+        let margin_top = raw_margin.top.resolve_or_zero(parent_size.width, |val, basis| tree.calc(val, basis));
+        CollapsibleMarginSet::from_margin(margin_top)
+    };
+    let bottom_margin = if own_margins_collapse_with_children.end {
+        last_child_bottom_margin_set
+    } else {
+        let margin_bottom = raw_margin.bottom.resolve_or_zero(parent_size.width, |val, basis| tree.calc(val, basis));
+        CollapsibleMarginSet::from_margin(margin_bottom)
+    };
+
     // Short-circuit if computing size
     if run_mode == RunMode::ComputeSize {
-        return LayoutOutput::from_outer_size(final_outer_size);
+        let mut output = LayoutOutput::from_outer_size(final_outer_size);
+        output.top_margin = top_margin;
+        output.bottom_margin = bottom_margin;
+        output.margins_can_collapse_through = can_be_collapsed_through;
+        return output;
     }
 
     // Commit deferred in-flow layouts to the tree. Floated items already wrote their own layouts.
@@ -577,12 +603,6 @@ fn compute_inner(
         }
     }
 
-    // 7. Determine whether this node can be collapsed through
-    let all_in_flow_children_can_be_collapsed_through =
-        items.iter().all(|item| item.position == Position::Absolute || item.can_be_collapsed_through);
-    let can_be_collapsed_through =
-        !has_styles_preventing_being_collapsed_through && all_in_flow_children_can_be_collapsed_through;
-
     #[cfg_attr(not(feature = "content_size"), allow(unused_variables))]
     let content_size = inflow_content_size.f32_max(absolute_content_size);
 
@@ -591,19 +611,8 @@ fn compute_inner(
         #[cfg(feature = "content_size")]
         content_size,
         first_baselines: Point::NONE,
-        top_margin: if own_margins_collapse_with_children.start {
-            first_child_top_margin_set
-        } else {
-            let margin_top = raw_margin.top.resolve_or_zero(parent_size.width, |val, basis| tree.calc(val, basis));
-            CollapsibleMarginSet::from_margin(margin_top)
-        },
-        bottom_margin: if own_margins_collapse_with_children.end {
-            last_child_bottom_margin_set
-        } else {
-            let margin_bottom =
-                raw_margin.bottom.resolve_or_zero(parent_size.width, |val, basis| tree.calc(val, basis));
-            CollapsibleMarginSet::from_margin(margin_bottom)
-        },
+        top_margin,
+        bottom_margin,
         margins_can_collapse_through: can_be_collapsed_through,
     }
 }

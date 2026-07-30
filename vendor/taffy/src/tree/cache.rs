@@ -4,7 +4,7 @@
 
 use crate::geometry::Size;
 use crate::style::AvailableSpace;
-use crate::tree::{LayoutInput, LayoutOutput, RunMode};
+use crate::tree::{CollapsibleMarginSet, LayoutInput, LayoutOutput, RunMode};
 use crate::RequestedAxis;
 
 /// The number of cache entries for each node in the tree
@@ -81,6 +81,12 @@ fn size_mixed_cache_key(kd: Size<Option<f32>>, avs: Size<AvailableSpace>) -> u64
     (mixed_cache_key(kd.width, avs.width) as u64) << 32 | mixed_cache_key(kd.height, avs.height) as u64
 }
 
+#[inline(always)]
+fn vertical_margin_context_key(input: &LayoutInput) -> u8 {
+    u8::from(input.vertical_margins_are_collapsible.start)
+        | (u8::from(input.vertical_margins_are_collapsible.end) << 1)
+}
+
 /// Space-optimised cache key that packs bits into as small a size as possible
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize))]
@@ -132,6 +138,40 @@ pub(crate) struct CacheEntry<T> {
     content: T,
 }
 
+/// The block-layout metadata required by a preliminary size contribution.
+///
+/// A compact entry avoids retaining full baselines/content-size while keeping
+/// the collapsible margins that an ancestor grid or flex item must consume.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
+struct MeasureOutput {
+    size: Size<f32>,
+    top_margin: CollapsibleMarginSet,
+    bottom_margin: CollapsibleMarginSet,
+    margins_can_collapse_through: bool,
+    vertical_margins_are_collapsible: u8,
+}
+
+impl MeasureOutput {
+    fn new(input: &LayoutInput, output: LayoutOutput) -> Self {
+        Self {
+            size: output.size,
+            top_margin: output.top_margin,
+            bottom_margin: output.bottom_margin,
+            margins_can_collapse_through: output.margins_can_collapse_through,
+            vertical_margins_are_collapsible: vertical_margin_context_key(input),
+        }
+    }
+
+    fn into_layout_output(self) -> LayoutOutput {
+        let mut output = LayoutOutput::from_outer_size(self.size);
+        output.top_margin = self.top_margin;
+        output.bottom_margin = self.bottom_margin;
+        output.margins_can_collapse_through = self.margins_can_collapse_through;
+        output
+    }
+}
+
 /// A cache for caching the results of a sizing a Grid Item or Flexbox Item
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize))]
@@ -139,7 +179,7 @@ pub struct Cache {
     /// The cache entry for the node's final layout
     final_layout_entry: Option<CacheEntry<LayoutOutput>>,
     /// The cache entries for the node's preliminary size measurements
-    measure_entries: [Option<CacheEntry<Size<f32>>>; CACHE_SIZE],
+    measure_entries: [Option<CacheEntry<MeasureOutput>>; CACHE_SIZE],
     /// Tracks if all cache entries are empty
     is_empty: bool,
 }
@@ -230,8 +270,10 @@ impl Cache {
                 for entry in self.measure_entries.iter().flatten() {
                     if entry.key.kd_available_space == key.kd_available_space
                         && (entry.key.x_axis_parent_size() == key.x_axis_parent_size())
+                        && entry.content.vertical_margins_are_collapsible
+                            == vertical_margin_context_key(input)
                     {
-                        return Some(LayoutOutput::from_outer_size(entry.content));
+                        return Some(entry.content.into_layout_output());
                     }
                 }
 
@@ -252,7 +294,8 @@ impl Cache {
             RunMode::ComputeSize => {
                 self.is_empty = false;
                 let cache_slot = Self::compute_cache_slot(input.known_dimensions, input.available_space);
-                self.measure_entries[cache_slot] = Some(CacheEntry { key, content: layout_output.size });
+                self.measure_entries[cache_slot] =
+                    Some(CacheEntry { key, content: MeasureOutput::new(input, layout_output) });
             }
             RunMode::PerformHiddenLayout => {}
         }

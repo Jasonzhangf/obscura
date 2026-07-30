@@ -777,6 +777,90 @@ fn ratio_only_inline_svg_sizes_inside_an_auto_grid_row() {
     );
 }
 
+/// Chromium 150 includes collapsed descendant margins in a grid item's
+/// intrinsic block-size. The nested 64px margin reaches through `section`,
+/// making the first item 200px tall; the second row therefore begins after
+/// that item and the 20px row gap, rather than overlapping the descendant.
+#[test]
+fn grid_item_intrinsic_height_includes_collapsed_descendant_margins() {
+    let tree = parse_html(
+        r#"<html><head><style>
+             html,body{margin:0}
+             #outer{display:grid;width:300px;grid-template-rows:auto auto;row-gap:20px}
+             #item{position:relative}
+             #lead{height:20px;margin-top:16px}
+             #deep{height:100px;margin-top:64px}
+             #after{height:10px}
+           </style></head><body>
+             <div id="outer">
+               <div id="item">
+                 <div id="lead"></div>
+                 <section><div id="deep"></div></section>
+               </div>
+               <div id="after"></div>
+             </div>
+           </body></html>"#,
+    );
+    let layout = layout_dom(&tree, (800.0, 600.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    let outer = rect("outer");
+    let item = rect("item");
+    let deep = rect("deep");
+    let after = rect("after");
+
+    assert!(
+        (item.height - 200.0).abs() < 0.01 && (deep.y + deep.height - 200.0).abs() < 0.01,
+        "the grid item must contain the collapsed nested margin: item={item:?} deep={deep:?}"
+    );
+    assert!(
+        (after.y - 220.0).abs() < 0.01 && (outer.height - 230.0).abs() < 0.01,
+        "later grid rows must not overlap overflowing intrinsic content: outer={outer:?} after={after:?}"
+    );
+}
+
+/// Collapsible margin sets retain their largest positive and most-negative
+/// members separately. A negative nested margin therefore shortens the grid
+/// item's intrinsic contribution and overlaps the preceding block in exactly
+/// the same way during measurement and final layout.
+#[test]
+fn grid_item_intrinsic_height_keeps_negative_collapsed_margin() {
+    let tree = parse_html(
+        r#"<html><head><style>
+             html,body{margin:0}
+             #outer{display:grid;width:300px;grid-template-rows:auto auto;row-gap:20px}
+             #item{position:relative}
+             #lead{height:20px;margin-top:16px}
+             #deep{height:100px;margin-top:-24px}
+             #after{height:10px}
+           </style></head><body>
+             <div id="outer">
+               <div id="item">
+                 <div id="lead"></div>
+                 <section><div id="deep"></div></section>
+               </div>
+               <div id="after"></div>
+             </div>
+           </body></html>"#,
+    );
+    let layout = layout_dom(&tree, (800.0, 600.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    let outer = rect("outer");
+    let item = rect("item");
+    let deep = rect("deep");
+    let after = rect("after");
+
+    assert!(
+        (item.height - 112.0).abs() < 0.01
+            && (deep.y - 12.0).abs() < 0.01
+            && (deep.height - 100.0).abs() < 0.01,
+        "negative collapsed margin geometry must survive measurement: item={item:?} deep={deep:?}"
+    );
+    assert!(
+        (after.y - 132.0).abs() < 0.01 && (outer.height - 142.0).abs() < 0.01,
+        "the following grid row must use the shortened contribution: outer={outer:?} after={after:?}"
+    );
+}
+
 #[test]
 fn inline_block_flex_items_keep_block_inner_flow() {
     let tree = parse_html(include_str!("../../../render-repros/inline-block-flex-items.html"));
