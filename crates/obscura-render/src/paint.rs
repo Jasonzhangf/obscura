@@ -8,6 +8,8 @@
 use obscura_dom::tree::DomTree;
 use tiny_skia::{Color, FillRule, GradientStop, LinearGradient, Paint, PathBuilder, Pixmap, Point, RadialGradient, Rect, SpreadMode, Transform};
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
+use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 
 static FONT_BYTES: &[u8] = include_bytes!("../assets/liberation-sans.ttf");
 static SERIF_FONT_BYTES: &[u8] = include_bytes!("../assets/liberation-serif.ttf");
@@ -17,6 +19,269 @@ static FONT_OBLIQUE_BYTES: &[u8] = include_bytes!("../assets/liberation-sans-obl
 static FONT_BOLD_OBLIQUE_BYTES: &[u8] = include_bytes!("../assets/liberation-sans-boldoblique.ttf");
 
 use crate::dom::layout_dom_with_web_fonts;
+
+const DEFAULT_RESOURCE_CACHE_ENTRIES: usize = 512;
+const DEFAULT_RESOURCE_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Synchronous byte loader used by [`RenderResourceCache`]. The default
+/// implementation uses Obscura's pooled image agent; tests and embedding
+/// callers can provide a local loader without changing preparation or paint.
+pub trait RenderResourceLoader {
+    fn load(&mut self, url: &str) -> Option<Vec<u8>>;
+}
+
+impl<F> RenderResourceLoader for F
+where
+    F: FnMut(&str) -> Option<Vec<u8>>,
+{
+    fn load(&mut self, url: &str) -> Option<Vec<u8>> {
+        self(url)
+    }
+}
+
+struct HttpResourceLoader;
+
+impl RenderResourceLoader for HttpResourceLoader {
+    fn load(&mut self, url: &str) -> Option<Vec<u8>> {
+        http_get_bytes(url)
+    }
+}
+
+enum CachedResource {
+    Bytes(Arc<[u8]>),
+    Missing(std::time::Instant),
+}
+
+/// Page-scoped raw resource bytes shared by layout preparation and repeated
+/// paints. Entries are FIFO-bounded by both count and retained byte size.
+/// Successful bytes use `Arc` so consumers never clone an image/font body.
+pub struct RenderResourceCache {
+    entries: HashMap<String, CachedResource>,
+    order: VecDeque<String>,
+    retained_bytes: usize,
+    max_entries: usize,
+    max_bytes: usize,
+    loader: Box<dyn RenderResourceLoader>,
+}
+
+impl Default for RenderResourceCache {
+    fn default() -> Self {
+        Self::with_loader_and_limits(
+            HttpResourceLoader,
+            DEFAULT_RESOURCE_CACHE_ENTRIES,
+            DEFAULT_RESOURCE_CACHE_BYTES,
+        )
+    }
+}
+
+impl RenderResourceCache {
+    pub fn with_loader(loader: impl RenderResourceLoader + 'static) -> Self {
+        Self::with_loader_and_limits(
+            loader,
+            DEFAULT_RESOURCE_CACHE_ENTRIES,
+            DEFAULT_RESOURCE_CACHE_BYTES,
+        )
+    }
+
+    pub fn with_loader_and_limits(
+        loader: impl RenderResourceLoader + 'static,
+        max_entries: usize,
+        max_bytes: usize,
+    ) -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            retained_bytes: 0,
+            max_entries,
+            max_bytes,
+            loader: Box::new(loader),
+        }
+    }
+
+    pub fn retained_entry_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn retained_byte_len(&self) -> usize {
+        self.retained_bytes
+    }
+
+    fn get_or_load(&mut self, url: &str) -> Option<Arc<[u8]>> {
+        const MISSING_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
+        if let Some(entry) = self.entries.get(url) {
+            match entry {
+                CachedResource::Bytes(bytes) => return Some(Arc::clone(bytes)),
+                CachedResource::Missing(at) if at.elapsed() < MISSING_RETRY_AFTER => return None,
+                CachedResource::Missing(_) => {}
+            }
+        }
+        self.remove(url);
+
+        let loaded = self.loader.load(url).map(Arc::<[u8]>::from);
+        match loaded {
+            Some(bytes) => {
+                self.insert_bytes(url.to_string(), Arc::clone(&bytes));
+                Some(bytes)
+            }
+            None => {
+                self.insert_missing(url.to_string());
+                None
+            }
+        }
+    }
+
+    fn insert_bytes(&mut self, url: String, bytes: Arc<[u8]>) {
+        if self.max_entries == 0 || bytes.len() > self.max_bytes {
+            return;
+        }
+        while self.entries.len() >= self.max_entries
+            || self.retained_bytes.saturating_add(bytes.len()) > self.max_bytes
+        {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.remove_entry(&oldest);
+        }
+        self.retained_bytes = self.retained_bytes.saturating_add(bytes.len());
+        self.order.push_back(url.clone());
+        self.entries.insert(url, CachedResource::Bytes(bytes));
+    }
+
+    fn insert_missing(&mut self, url: String) {
+        if self.max_entries == 0 {
+            return;
+        }
+        while self.entries.len() >= self.max_entries {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.remove_entry(&oldest);
+        }
+        self.order.push_back(url.clone());
+        self.entries
+            .insert(url, CachedResource::Missing(std::time::Instant::now()));
+    }
+
+    fn remove(&mut self, url: &str) {
+        if self.entries.contains_key(url) {
+            self.order.retain(|key| key != url);
+            self.remove_entry(url);
+        }
+    }
+
+    fn remove_entry(&mut self, url: &str) {
+        if let Some(CachedResource::Bytes(bytes)) = self.entries.remove(url) {
+            self.retained_bytes = self.retained_bytes.saturating_sub(bytes.len());
+        }
+    }
+}
+
+/// The exact responsive image candidate chosen during preparation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SelectedImage {
+    pub resolved_url: String,
+    pub density: f32,
+}
+
+/// A final image/font-aware document layout retained across viewport paints.
+/// The DOM must not be mutated while this value is reused.
+pub struct PreparedRender {
+    viewport: (f32, f32),
+    base_url: Option<String>,
+    content_size: (f32, f32),
+    viewport_fixed: std::collections::HashSet<obscura_dom::tree::NodeId>,
+    sticky: crate::StickyLayout,
+    selected_images: HashMap<obscura_dom::tree::NodeId, SelectedImage>,
+    svg_fonts: Arc<usvg::fontdb::Database>,
+    layout: crate::DomLayout,
+}
+
+impl PreparedRender {
+    pub fn viewport(&self) -> (f32, f32) {
+        self.viewport
+    }
+
+    pub fn base_url(&self) -> Option<&str> {
+        self.base_url.as_deref()
+    }
+
+    pub fn layout(&self) -> &crate::DomLayout {
+        &self.layout
+    }
+
+    pub fn content_size(&self) -> (f32, f32) {
+        self.content_size
+    }
+
+    pub fn viewport_fixed_nodes(
+        &self,
+    ) -> &std::collections::HashSet<obscura_dom::tree::NodeId> {
+        &self.viewport_fixed
+    }
+
+    pub fn sticky_layout(&self) -> &crate::StickyLayout {
+        &self.sticky
+    }
+
+    pub fn clamp_scroll(&self, requested: (f32, f32)) -> (f32, f32) {
+        let clamp_axis = |requested: f32, content: f32, viewport: f32| {
+            if requested.is_finite() {
+                requested.clamp(0.0, (content - viewport).max(0.0))
+            } else {
+                0.0
+            }
+        };
+        (
+            clamp_axis(requested.0, self.content_size.0, self.viewport.0),
+            clamp_axis(requested.1, self.content_size.1, self.viewport.1),
+        )
+    }
+
+    /// Border box in immutable document space, including authored translate
+    /// transforms but excluding root-scroll and sticky movement.
+    pub fn document_rect(
+        &self,
+        id: obscura_dom::tree::NodeId,
+    ) -> Option<crate::Rect> {
+        let rect = *self.layout.rects.get(&id)?;
+        let offset = self
+            .layout
+            .translates
+            .get(&id)
+            .copied()
+            .unwrap_or((0.0, 0.0));
+        Some(crate::Rect {
+            x: rect.x + offset.0,
+            y: rect.y + offset.1,
+            ..rect
+        })
+    }
+
+    /// Border box in the current root viewport. This is the read-only geometry
+    /// path used by a later CSSOM integration and shares paint's clamped scroll,
+    /// fixed-subtree, and sticky-positioning derivatives.
+    pub fn viewport_rect(
+        &self,
+        id: obscura_dom::tree::NodeId,
+        requested_scroll: (f32, f32),
+    ) -> Option<crate::Rect> {
+        let mut rect = self.document_rect(id)?;
+        let scroll = self.clamp_scroll(requested_scroll);
+        if !self.viewport_fixed.contains(&id) {
+            let sticky = self.sticky.translation_for(id, self.viewport, scroll);
+            rect.x += sticky.0 - scroll.0;
+            rect.y += sticky.1 - scroll.1;
+        }
+        Some(rect)
+    }
+
+    pub fn selected_image(
+        &self,
+        id: obscura_dom::tree::NodeId,
+    ) -> Option<&SelectedImage> {
+        self.selected_images.get(&id)
+    }
+}
 
 /// Render `tree` at `viewport` (width, height) in CSS pixels to a Pixmap, or
 /// None if the viewport is zero-sized. `base_url`, when given, resolves the
@@ -36,21 +301,33 @@ pub fn paint_dom_scrolled(
     base_url: Option<&str>,
     scroll: (f32, f32),
 ) -> Option<Pixmap> {
-    let (w, h) = (viewport.0 as u32, viewport.1 as u32);
-    let mut pixmap = Pixmap::new(w, h)?;
-    pixmap.fill(Color::WHITE);
+    let mut resources = RenderResourceCache::default();
+    let mut prepared = prepare_dom(tree, viewport, base_url, &mut resources)?;
+    paint_prepared(tree, &mut prepared, &mut resources, scroll)
+}
 
-    // The same URL (an icon sprite, a repeated background image) commonly
-    // backs many elements on one page; fetch each distinct URL at most once
-    // per screenshot. `None` caches a failed fetch too, so a broken image
-    // reference does not retry on every element that references it.
-    let mut image_cache: std::collections::HashMap<String, Option<Vec<u8>>> = std::collections::HashMap::new();
+/// Resolve image candidates and web fonts, then create the single final layout
+/// shared by CSS geometry consumers and repeated paint.
+pub fn prepare_dom(
+    tree: &DomTree,
+    viewport: (f32, f32),
+    base_url: Option<&str>,
+    resources: &mut RenderResourceCache,
+) -> Option<PreparedRender> {
+    if !viewport.0.is_finite()
+        || !viewport.1.is_finite()
+        || viewport.0 <= 0.0
+        || viewport.1 <= 0.0
+    {
+        return None;
+    }
     // Fetch <img> bytes up front to learn intrinsic sizes for layout (a
     // CSS-sized image with no width/height attribute would otherwise be 0x0
     // and never paint). This seeds the same cache the paint pass reads, so
     // each URL is still fetched at most once.
-    let mut intrinsic = collect_image_intrinsics(tree, viewport, base_url, &mut image_cache);
-    let fonts = collect_web_fonts(tree, base_url);
+    let (mut intrinsic, mut selected_images) =
+        collect_image_intrinsics(tree, viewport, base_url, resources);
+    let fonts = collect_web_fonts(tree, base_url, resources);
     // Most framework pages use web fonts and many decorative SVG icons, but
     // only SVG text needs the page font faces. Avoid cloning/loading the page
     // font database for ordinary icons and HTML-only text.
@@ -68,20 +345,51 @@ pub fn paint_dom_scrolled(
         tree,
         &laid.styles,
         base_url,
-        &mut image_cache,
+        resources,
         &mut intrinsic,
+        &mut selected_images,
     ) {
         laid = layout_dom_with_web_fonts(tree, viewport, &intrinsic, &fonts);
     }
+    let content_size = laid.scrolling_content_size(tree, viewport);
+    let viewport_fixed = laid.viewport_fixed_nodes(tree);
+    let sticky = laid.root_sticky_layout(tree, viewport);
+    Some(PreparedRender {
+        viewport,
+        base_url: base_url.map(str::to_string),
+        content_size,
+        viewport_fixed,
+        sticky,
+        selected_images,
+        svg_fonts,
+        layout: laid,
+    })
+}
+
+/// Paint one root-scroll position from an already prepared resource-aware
+/// layout. Resource bytes and glyph caches are reused across calls.
+pub fn paint_prepared(
+    tree: &DomTree,
+    prepared: &mut PreparedRender,
+    resources: &mut RenderResourceCache,
+    scroll: (f32, f32),
+) -> Option<Pixmap> {
+    let (w, h) = (prepared.viewport.0 as u32, prepared.viewport.1 as u32);
+    let mut pixmap = Pixmap::new(w, h)?;
+    pixmap.fill(Color::WHITE);
     paint_laid_dom_scrolled(
         tree,
-        viewport,
-        base_url,
+        prepared.viewport,
+        prepared.base_url.as_deref(),
         scroll,
         pixmap,
-        image_cache,
-        svg_fonts,
-        &mut laid,
+        resources,
+        &prepared.selected_images,
+        &prepared.svg_fonts,
+        prepared.content_size,
+        &prepared.viewport_fixed,
+        &prepared.sticky,
+        &mut prepared.layout,
     )
 }
 
@@ -94,11 +402,16 @@ fn paint_laid_dom_scrolled(
     base_url: Option<&str>,
     scroll: (f32, f32),
     mut pixmap: Pixmap,
-    mut image_cache: std::collections::HashMap<String, Option<Vec<u8>>>,
-    svg_fonts: std::sync::Arc<usvg::fontdb::Database>,
+    image_cache: &mut RenderResourceCache,
+    selected_images: &HashMap<obscura_dom::tree::NodeId, SelectedImage>,
+    svg_fonts: &Arc<usvg::fontdb::Database>,
+    content_size: (f32, f32),
+    viewport_fixed: &std::collections::HashSet<obscura_dom::tree::NodeId>,
+    sticky: &crate::StickyLayout,
     laid: &mut crate::DomLayout,
 ) -> Option<Pixmap> {
-    let scroll_state = ScrollPaintState::new(tree, laid, viewport, scroll);
+    let scroll_state =
+        ScrollPaintState::new(viewport, scroll, content_size, viewport_fixed, sticky);
     // Only raster images inside an actually rotated/scaled subtree receive an
     // affine entry. Ordinary pages pay one fast style scan and allocate no
     // matrix map; transformed pages do matrix work only along those subtrees.
@@ -242,7 +555,7 @@ fn paint_laid_dom_scrolled(
                     viewport,
                     root_font_size,
                     base_url,
-                    &mut image_cache,
+                    image_cache,
                 );
             }
             continue;
@@ -365,7 +678,7 @@ fn paint_laid_dom_scrolled(
                 style.mask_size,
                 style.mask_repeat,
                 &mut pixmap,
-                &mut image_cache,
+                image_cache,
             );
         } else if let Some(bg_url) = &style.background_image {
             if let Some(img_rect) = background_image_rect(
@@ -379,7 +692,7 @@ fn paint_laid_dom_scrolled(
                 style.font_size.unwrap_or(16.0),
                 root_font_size,
                 viewport,
-                &mut image_cache,
+                image_cache,
             ) {
                 // A background layer is always clipped to its owner's border
                 // box and then to inherited overflow. Keep its full destination
@@ -397,7 +710,7 @@ fn paint_laid_dom_scrolled(
                         &visible,
                         crate::ObjectFit::Fill,
                         &mut pixmap,
-                        &mut image_cache,
+                        image_cache,
                         None,
                     );
                 }
@@ -416,7 +729,7 @@ fn paint_laid_dom_scrolled(
                 root_font_size,
                 clip,
                 base_url,
-                &mut image_cache,
+                image_cache,
             );
         }
 
@@ -470,25 +783,20 @@ fn paint_laid_dom_scrolled(
         }
 
         if name.local.as_ref() == "img" {
-            let source = style
-                .content_image
-                .as_ref()
-                .map(|url| (url.clone(), 1.0))
-                .or_else(|| resolve_img_url(tree, nid, viewport));
-            if let Some((src, _density)) = source {
+            if let Some(source) = selected_images.get(&nid) {
                 // `visible_rect` is the border box already intersected with the
                 // ancestor overflow clip: the raster must not paint past it (a
                 // half-scrolled carousel slide's image otherwise bleeds over
                 // the viewport edge).
                 let painted =
                     paint_image(
-                        &src,
-                        base_url,
+                        &source.resolved_url,
+                        None,
                         &rect,
                         &visible_rect,
                         style.object_fit,
                         &mut pixmap,
-                        &mut image_cache,
+                        image_cache,
                         projected_image,
                     );
                 // Fall back when the image itself did not paint, following
@@ -540,7 +848,7 @@ fn paint_laid_dom_scrolled(
             // the standalone document. A document-level/external symbol may
             // itself contain `currentColor`, and therefore has to be present
             // when the root color is established.
-            inject_external_sprites(tree, nid, base_url, &mut markup, &mut image_cache, &mut sprite_cache);
+            inject_external_sprites(tree, nid, base_url, &mut markup, image_cache, &mut sprite_cache);
             // resvg parses the serialized subtree as a standalone SVG
             // document, outside the page's author stylesheet. Preserve the
             // host element's computed `color` so paths using `currentColor`
@@ -586,7 +894,7 @@ fn paint_laid_dom_scrolled(
                     viewport,
                     root_font_size,
                     base_url,
-                    &mut image_cache,
+                    image_cache,
                 );
             }
         }
@@ -720,7 +1028,7 @@ fn paint_laid_dom_scrolled(
                 viewport,
                 root_font_size,
                 base_url,
-                &mut image_cache,
+                image_cache,
             );
         }
     }
@@ -765,22 +1073,22 @@ fn paint_laid_dom_scrolled(
 /// accumulating movement when the same prepared document paints more than one
 /// frame.
 #[derive(Debug)]
-struct ScrollPaintState {
+struct ScrollPaintState<'a> {
     scroll: (f32, f32),
-    viewport_fixed: std::collections::HashSet<obscura_dom::tree::NodeId>,
+    viewport_fixed: &'a std::collections::HashSet<obscura_dom::tree::NodeId>,
     sticky: std::collections::HashMap<obscura_dom::tree::NodeId, (f32, f32)>,
     sticky_clips: std::collections::HashMap<obscura_dom::tree::NodeId, (f32, f32)>,
     active: bool,
 }
 
-impl ScrollPaintState {
+impl<'a> ScrollPaintState<'a> {
     fn new(
-        tree: &DomTree,
-        laid: &crate::DomLayout,
         viewport: (f32, f32),
         requested: (f32, f32),
+        content: (f32, f32),
+        viewport_fixed: &'a std::collections::HashSet<obscura_dom::tree::NodeId>,
+        sticky_layout: &crate::StickyLayout,
     ) -> Self {
-        let content = laid.scrolling_content_size(tree, viewport);
         let scroll_x = if requested.0.is_finite() {
             requested
                 .0
@@ -796,12 +1104,11 @@ impl ScrollPaintState {
             0.0
         };
         let scroll = (scroll_x, scroll_y);
-        let sticky_layout = laid.root_sticky_layout(tree, viewport);
         let active = scroll != (0.0, 0.0) || !sticky_layout.is_empty();
         if !active {
             return Self {
                 scroll,
-                viewport_fixed: std::collections::HashSet::new(),
+                viewport_fixed,
                 sticky: std::collections::HashMap::new(),
                 sticky_clips: std::collections::HashMap::new(),
                 active,
@@ -812,7 +1119,7 @@ impl ScrollPaintState {
         let sticky_clips = sticky_layout.clip_translations_from(&sticky);
         Self {
             scroll,
-            viewport_fixed: laid.viewport_fixed_nodes(tree),
+            viewport_fixed,
             sticky,
             sticky_clips,
             active,
@@ -1223,6 +1530,18 @@ pub fn screenshot_png_scrolled(
         .and_then(|pixmap| pixmap.encode_png().ok())
 }
 
+/// PNG convenience wrapper for a retained resource-aware layout.
+pub fn screenshot_prepared(
+    tree: &DomTree,
+    prepared: &mut PreparedRender,
+    resources: &mut RenderResourceCache,
+    scroll: (f32, f32),
+) -> Option<Vec<u8>> {
+    paint_prepared(tree, prepared, resources, scroll)?
+        .encode_png()
+        .ok()
+}
+
 /// A representative visible color for `background-clip: text` text whose own
 /// color is transparent, used on the word-split paint path (the cosmic-text IFC
 /// path samples the gradient per glyph in `inline`). Returns the gradient's mid
@@ -1440,30 +1759,39 @@ fn draw_text(
 
 /// Resolve `src` (a `data:` URI, or an absolute/relative URL against
 /// `base_url`) to raw bytes, fetching over the network at most once per
-/// distinct URL per screenshot via `cache`.
+/// distinct URL through the retained resource cache.
 fn fetch_bytes(
     src: &str,
     base_url: Option<&str>,
-    cache: &mut std::collections::HashMap<String, Option<Vec<u8>>>,
-) -> Option<Vec<u8>> {
+    cache: &mut RenderResourceCache,
+) -> Option<Arc<[u8]>> {
     if let Some(rest) = src.strip_prefix("data:") {
         let comma_idx = rest.find(',')?;
         let (meta, data) = (&rest[..comma_idx], &rest[comma_idx + 1..]);
         // Data-backed SVGs and web fonts may be base64 or percent-escaped.
         // Decode from the encoding label rather than assuming every data URI
         // is base64.
-        return if meta.contains("base64") {
+        let bytes = if meta.contains("base64") {
             use base64::Engine;
             base64::engine::general_purpose::STANDARD.decode(data).ok()
         } else {
             Some(percent_decode(data))
-        };
+        }?;
+        return Some(Arc::from(bytes));
+    }
+    let resolved = resolve_resource_url(src, base_url)?;
+    cache.get_or_load(&resolved)
+}
+
+fn resolve_resource_url(src: &str, base_url: Option<&str>) -> Option<String> {
+    if src.starts_with("data:") {
+        return Some(src.to_string());
     }
     // Resolve relative to the document's base URL: the overwhelming majority
     // of real markup uses relative image paths ("logo.svg", not
     // "https://example.com/logo.svg"), so without this every relative <img>
     // or mask/background reference silently fails to fetch.
-    let resolved = if src.starts_with("http://") || src.starts_with("https://") {
+    if src.starts_with("http://") || src.starts_with("https://") {
         Some(src.to_string())
     } else if let Some(rest) = src.strip_prefix("//") {
         // Protocol-relative URL (`//upload.wikimedia.org/...`, ubiquitous on
@@ -1481,16 +1809,7 @@ fn fetch_bytes(
             .and_then(|b| url::Url::parse(b).ok())
             .and_then(|base| base.join(src).ok())
             .map(|u| u.to_string())
-    };
-    // The same icon/sprite/background is routinely referenced by dozens of
-    // elements on one page (every story's vote arrow, every repeated logo);
-    // fetch each distinct URL over the network once per screenshot rather
-    // than once per element.
-    let url = resolved?;
-    cache
-        .entry(url.clone())
-        .or_insert_with(|| http_get_bytes(&url))
-        .clone()
+    }
 }
 
 /// Fetch the Latin/ASCII face from each authored `@font-face` rule and decode
@@ -1498,8 +1817,11 @@ fn fetch_bytes(
 /// filtering is load-bearing for performance: generated font packages commonly
 /// emit six or seven script subsets per face, while an English page needs only
 /// the subset containing ASCII.
-fn collect_web_fonts(tree: &DomTree, base_url: Option<&str>) -> Vec<crate::inline::WebFont> {
-    let mut cache = std::collections::HashMap::new();
+fn collect_web_fonts(
+    tree: &DomTree,
+    base_url: Option<&str>,
+    cache: &mut RenderResourceCache,
+) -> Vec<crate::inline::WebFont> {
     let mut seen = std::collections::HashSet::new();
     let mut fonts = Vec::new();
     let mut rules = Vec::new();
@@ -1561,7 +1883,7 @@ fn collect_web_fonts(tree: &DomTree, base_url: Option<&str>) -> Vec<crate::inlin
         if !seen.insert(key.clone()) {
             continue;
         }
-        if let Some(decoded) = fetch_and_decode_font(src, base_url, &mut cache) {
+        if let Some(decoded) = fetch_and_decode_font(src, base_url, cache) {
             let metadata = rules.iter().find(|rule| rule.0 == key);
             fonts.push(crate::inline::WebFont {
                 data: decoded,
@@ -1579,7 +1901,7 @@ fn collect_web_fonts(tree: &DomTree, base_url: Option<&str>) -> Vec<crate::inlin
         if !seen.insert(key) {
             continue;
         }
-        if let Some(decoded) = fetch_and_decode_font(&src, base_url, &mut cache) {
+        if let Some(decoded) = fetch_and_decode_font(&src, base_url, cache) {
             fonts.push(crate::inline::WebFont {
                 data: decoded,
                 family,
@@ -1606,7 +1928,7 @@ fn font_resource_key(src: &str, base_url: Option<&str>) -> String {
 fn fetch_and_decode_font(
     src: &str,
     base_url: Option<&str>,
-    cache: &mut std::collections::HashMap<String, Option<Vec<u8>>>,
+    cache: &mut RenderResourceCache,
 ) -> Option<Vec<u8>> {
     let compressed = fetch_bytes(src, base_url, cache)?;
     if compressed.len() > 8 * 1024 * 1024 {
@@ -1617,7 +1939,7 @@ fn fetch_and_decode_font(
         Some(b"wOFF") => wuff::decompress_woff1(&compressed).ok(),
         // TrueType/OpenType collections and raw sfnt fonts already have the
         // representation fontdb expects.
-        Some(b"\0\x01\0\0" | b"OTTO" | b"ttcf") => Some(compressed),
+        Some(b"\0\x01\0\0" | b"OTTO" | b"ttcf") => Some(compressed.as_ref().to_vec()),
         _ => None,
     }?;
     (decoded.len() <= 32 * 1024 * 1024).then_some(decoded)
@@ -2191,7 +2513,7 @@ fn background_image_rect(
     em: f32,
     rem: f32,
     viewport: (f32, f32),
-    cache: &mut std::collections::HashMap<String, Option<Vec<u8>>>,
+    cache: &mut RenderResourceCache,
 ) -> Option<crate::Rect> {
     let bytes = fetch_bytes(src, base_url, cache)?;
     let intrinsic = if is_svg(&bytes) {
@@ -2294,7 +2616,7 @@ fn paint_in_flow_generated_box(
     viewport: (f32, f32),
     root_font_size: f32,
     base_url: Option<&str>,
-    image_cache: &mut std::collections::HashMap<String, Option<Vec<u8>>>,
+    image_cache: &mut RenderResourceCache,
 ) {
     let Some(host_style) = laid.styles.get(&generated.host) else {
         return;
@@ -2497,7 +2819,7 @@ fn paint_positioned_pseudo(
     root_font_size: f32,
     ancestor_clip: Option<crate::Rect>,
     base_url: Option<&str>,
-    image_cache: &mut std::collections::HashMap<String, Option<Vec<u8>>>,
+    image_cache: &mut RenderResourceCache,
 ) {
     if style.position != Some(taffy::Position::Absolute) {
         return;
@@ -2642,16 +2964,28 @@ fn collect_image_intrinsics(
     tree: &DomTree,
     viewport: (f32, f32),
     base_url: Option<&str>,
-    cache: &mut std::collections::HashMap<String, Option<Vec<u8>>>,
-) -> std::collections::HashMap<obscura_dom::tree::NodeId, (f32, f32)> {
+    cache: &mut RenderResourceCache,
+) -> (
+    HashMap<obscura_dom::tree::NodeId, (f32, f32)>,
+    HashMap<obscura_dom::tree::NodeId, SelectedImage>,
+) {
     let mut out = std::collections::HashMap::new();
+    let mut selected = HashMap::new();
     for nid in tree.descendants(tree.document()) {
         let Some(node) = tree.get_node(nid) else { continue };
         if node.as_element().map(|e| e.local.as_ref() != "img").unwrap_or(true) {
             continue;
         }
         let Some((url, density)) = resolve_img_url(tree, nid, viewport) else { continue };
-        let Some(bytes) = fetch_bytes(&url, base_url, cache) else { continue };
+        let resolved_url = resolve_resource_url(&url, base_url).unwrap_or(url);
+        selected.insert(
+            nid,
+            SelectedImage {
+                resolved_url: resolved_url.clone(),
+                density,
+            },
+        );
+        let Some(bytes) = fetch_bytes(&resolved_url, None, cache) else { continue };
         let dimensions = image_dimensions(&bytes).map(|(width, height)| (width as f32, height as f32))
             .or_else(|| svg_intrinsic(&bytes));
         if let Some((w, h)) = dimensions {
@@ -2663,7 +2997,7 @@ fn collect_image_intrinsics(
             }
         }
     }
-    out
+    (out, selected)
 }
 
 /// Add intrinsic metadata for CSS `content:url(...)` images after the first
@@ -2673,8 +3007,9 @@ fn collect_content_image_intrinsics(
     tree: &DomTree,
     styles: &std::collections::HashMap<obscura_dom::tree::NodeId, crate::LayoutStyle>,
     base_url: Option<&str>,
-    cache: &mut std::collections::HashMap<String, Option<Vec<u8>>>,
+    cache: &mut RenderResourceCache,
     out: &mut std::collections::HashMap<obscura_dom::tree::NodeId, (f32, f32)>,
+    selected: &mut HashMap<obscura_dom::tree::NodeId, SelectedImage>,
 ) -> bool {
     let mut changed = false;
     for (&nid, style) in styles {
@@ -2690,7 +3025,16 @@ fn collect_content_image_intrinsics(
         let Some(url) = style.content_image.as_deref() else {
             continue;
         };
-        let Some(bytes) = fetch_bytes(url, base_url, cache) else {
+        let resolved_url =
+            resolve_resource_url(url, base_url).unwrap_or_else(|| url.to_string());
+        selected.insert(
+            nid,
+            SelectedImage {
+                resolved_url: resolved_url.clone(),
+                density: 1.0,
+            },
+        );
+        let Some(bytes) = fetch_bytes(&resolved_url, None, cache) else {
             continue;
         };
         let dimensions = image_dimensions(&bytes)
@@ -2960,7 +3304,7 @@ fn paint_image(
     visible_rect: &crate::Rect,
     object_fit: crate::ObjectFit,
     pixmap: &mut Pixmap,
-    cache: &mut std::collections::HashMap<String, Option<Vec<u8>>>,
+    cache: &mut RenderResourceCache,
     transform: Option<ImageAffine>,
 ) -> bool {
     if rect.width <= 0.0 || rect.height <= 0.0 {
@@ -3507,7 +3851,7 @@ fn inject_external_sprites(
     root: obscura_dom::tree::NodeId,
     base_url: Option<&str>,
     markup: &mut String,
-    cache: &mut std::collections::HashMap<String, Option<Vec<u8>>>,
+    cache: &mut RenderResourceCache,
     sprite_cache: &mut std::collections::HashMap<String, Option<String>>,
 ) {
     // Distinct external references (full href, url, fragment id), in first-seen
@@ -3795,7 +4139,7 @@ fn paint_mask(
     mask_size: Option<(f32, f32)>,
     mask_repeat: Option<(bool, bool)>,
     pixmap: &mut Pixmap,
-    cache: &mut std::collections::HashMap<String, Option<Vec<u8>>>,
+    cache: &mut RenderResourceCache,
 ) -> bool {
     if rect.width <= 0.0 || rect.height <= 0.0 {
         return false;
@@ -3916,48 +4260,112 @@ mod tests {
     #[test]
     fn repeated_scroll_captures_reuse_immutable_layout_geometry() {
         let tree = parse_html(
-            r#"<html style="margin:0"><body style="margin:0">
+            r#"<html style="margin:0"><head><style>
+                @font-face { font-family: Fixture; src: url("https://assets.test/font.ttf"); }
+                body { font-family: Fixture; }
+            </style></head><body style="margin:0">
+                <img id="hero" src="https://assets.test/fallback.svg"
+                     srcset="https://assets.test/hero.svg 2x"
+                     style="display:block;width:100px;height:auto">
+                <div style="position:sticky;top:0;height:10px;background:#00ff00"></div>
                 <div style="height:60px;background:#ff0000"></div>
-                <div style="height:180px;overflow:hidden;background:#0000ff">
+                <div style="height:180px;overflow:hidden;background:#0000ff;
+                            background-image:url('https://assets.test/background.svg')">
                     <div style="position:sticky;top:5px;height:20px;background:#00ff00"></div>
                     <div style="transform:translate(3px,4px);height:80px;color:#ffffff">stable text</div>
                 </div>
+                <div id="fixed" style="position:fixed;top:2px;left:2px;width:8px;height:8px"></div>
             </body></html>"#,
         );
         let viewport = (100.0, 80.0);
-        let mut laid = crate::layout_dom(&tree, viewport);
-        let base_rects = laid.rects.clone();
-        let base_translates = laid.translates.clone();
-        let base_clips = laid.clip_rects.clone();
+        let counts = Arc::new(std::sync::Mutex::new(HashMap::<String, usize>::new()));
+        let loader_counts = Arc::clone(&counts);
+        let mut resources = RenderResourceCache::with_loader(move |url: &str| {
+            *loader_counts
+                .lock()
+                .expect("loader counts")
+                .entry(url.to_string())
+                .or_default() += 1;
+            match url {
+                "https://assets.test/font.ttf" => Some(FONT_BYTES.to_vec()),
+                "https://assets.test/hero.svg" => Some(
+                    br##"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100">
+                        <rect width="200" height="100" fill="#ffff00"/>
+                    </svg>"##
+                        .to_vec(),
+                ),
+                "https://assets.test/background.svg" => Some(
+                    br##"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20">
+                        <rect width="20" height="20" fill="#0000ff"/>
+                    </svg>"##
+                        .to_vec(),
+                ),
+                _ => None,
+            }
+        });
+        let mut prepared =
+            prepare_dom(&tree, viewport, None, &mut resources).expect("prepared render");
+        let hero = tree
+            .query_selector("#hero")
+            .expect("valid selector")
+            .expect("hero");
+        assert_eq!(
+            prepared.selected_image(hero),
+            Some(&SelectedImage {
+                resolved_url: "https://assets.test/hero.svg".to_string(),
+                density: 2.0,
+            })
+        );
+        let hero_rect = prepared.layout().rects.get(&hero).expect("hero rect");
+        assert!((hero_rect.width - 100.0).abs() < 0.1);
+        assert!((hero_rect.height - 50.0).abs() < 0.1);
+        assert!(prepared.content_size().1 > viewport.1);
+        assert!(!prepared.sticky_layout().is_empty());
+        assert_eq!(
+            prepared.viewport_rect(hero, (0.0, 20.0)).unwrap().y,
+            prepared.document_rect(hero).unwrap().y - 20.0
+        );
+        let fixed = tree
+            .query_selector("#fixed")
+            .expect("valid selector")
+            .expect("fixed");
+        assert!(prepared.viewport_fixed_nodes().contains(&fixed));
+        assert_eq!(
+            prepared.viewport_rect(fixed, (0.0, 100.0)),
+            prepared.document_rect(fixed)
+        );
+        let base_rects = prepared.layout().rects.clone();
+        let base_translates = prepared.layout().translates.clone();
+        let base_clips = prepared.layout().clip_rects.clone();
 
-        fn capture(
-            tree: &DomTree,
-            laid: &mut crate::DomLayout,
-            viewport: (f32, f32),
-            scroll: (f32, f32),
-        ) -> Vec<u8> {
-            let mut pixmap =
-                Pixmap::new(viewport.0 as u32, viewport.1 as u32).expect("viewport pixmap");
-            pixmap.fill(Color::WHITE);
-            paint_laid_dom_scrolled(
-                tree,
-                viewport,
-                None,
-                scroll,
-                pixmap,
-                std::collections::HashMap::new(),
-                svg_font_database(),
-                laid,
-            )
-            .expect("painted viewport")
-            .encode_png()
-            .expect("encoded viewport")
-        }
-
-        let near = capture(&tree, &mut laid, viewport, (0.0, 20.0));
-        let far = capture(&tree, &mut laid, viewport, (0.0, 100.0));
-        let far_repeat = capture(&tree, &mut laid, viewport, (0.0, 100.0));
-        let near_after_far = capture(&tree, &mut laid, viewport, (0.0, 20.0));
+        let near = screenshot_prepared(
+            &tree,
+            &mut prepared,
+            &mut resources,
+            (0.0, 20.0),
+        )
+        .expect("near capture");
+        let far = screenshot_prepared(
+            &tree,
+            &mut prepared,
+            &mut resources,
+            (0.0, 100.0),
+        )
+        .expect("far capture");
+        let far_repeat = screenshot_prepared(
+            &tree,
+            &mut prepared,
+            &mut resources,
+            (0.0, 100.0),
+        )
+        .expect("repeated far capture");
+        let near_after_far = screenshot_prepared(
+            &tree,
+            &mut prepared,
+            &mut resources,
+            (0.0, 20.0),
+        )
+        .expect("repeated near capture");
 
         assert_ne!(near, far, "distinct scroll positions must paint distinct frames");
         assert_eq!(far, far_repeat, "the same scroll position must be stable");
@@ -3965,9 +4373,20 @@ mod tests {
             near, near_after_far,
             "an intervening capture must not accumulate scroll movement"
         );
-        assert_eq!(laid.rects, base_rects);
-        assert_eq!(laid.translates, base_translates);
-        assert_eq!(laid.clip_rects, base_clips);
+        assert_eq!(prepared.layout().rects, base_rects);
+        assert_eq!(prepared.layout().translates, base_translates);
+        assert_eq!(prepared.layout().clip_rects, base_clips);
+        let counts = counts.lock().expect("final loader counts");
+        for url in [
+            "https://assets.test/font.ttf",
+            "https://assets.test/hero.svg",
+            "https://assets.test/background.svg",
+        ] {
+            assert_eq!(counts.get(url), Some(&1), "{url} must load exactly once");
+        }
+        assert!(!counts.contains_key("https://assets.test/fallback.svg"));
+        assert_eq!(resources.retained_entry_count(), 3);
+        assert!(resources.retained_byte_len() > FONT_BYTES.len());
     }
 
     /// Portable pixel counterpart to the Chromium root-sticky geometry probe
@@ -4118,7 +4537,7 @@ mod tests {
             width: 132.0,
             height: 60.0,
         };
-        let mut cache = std::collections::HashMap::new();
+        let mut cache = RenderResourceCache::default();
         let image = background_image_rect(
             source,
             None,
@@ -4228,13 +4647,15 @@ mod tests {
             (host_rect.x, host_rect.y, host_rect.width, host_rect.height),
             (0.0, 0.0, 100.0, 40.0)
         );
-        let mut cache = std::collections::HashMap::new();
+        let mut cache = RenderResourceCache::default();
+        let mut selected = HashMap::new();
         assert!(collect_content_image_intrinsics(
             &tree,
             &first.styles,
             None,
             &mut cache,
             &mut intrinsic,
+            &mut selected,
         ));
         let laid = layout_dom_with_web_fonts(&tree, (120.0, 80.0), &intrinsic, &[]);
         let image_id = tree
@@ -4863,7 +5284,7 @@ mod tests {
         let svg = tree.query_selector("svg").unwrap().unwrap();
         let mut markup = serialize_svg(&tree, svg);
         let before = markup.clone();
-        let mut cache = std::collections::HashMap::new();
+        let mut cache = RenderResourceCache::default();
         let mut sprite_cache = std::collections::HashMap::new();
         inject_external_sprites(&tree, svg, None, &mut markup, &mut cache, &mut sprite_cache);
         assert_eq!(markup, before, "same-document use must be untouched");
@@ -4881,7 +5302,7 @@ mod tests {
         );
         let svg = tree.query_selector("#icon").unwrap().unwrap();
         let mut markup = serialize_svg(&tree, svg);
-        let mut cache = std::collections::HashMap::new();
+        let mut cache = RenderResourceCache::default();
         let mut sprite_cache = std::collections::HashMap::new();
         inject_external_sprites(&tree, svg, None, &mut markup, &mut cache, &mut sprite_cache);
         assert!(
@@ -4904,7 +5325,7 @@ mod tests {
         );
         let svg = tree.query_selector("#icon").unwrap().unwrap();
         let mut markup = serialize_svg(&tree, svg);
-        let mut cache = std::collections::HashMap::new();
+        let mut cache = RenderResourceCache::default();
         let mut sprite_cache = std::collections::HashMap::new();
         inject_external_sprites(&tree, svg, None, &mut markup, &mut cache, &mut sprite_cache);
         inject_svg_current_color(&mut markup, [220, 20, 60, 255]);

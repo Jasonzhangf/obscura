@@ -27,7 +27,11 @@ pub use dom::{
 #[cfg(feature = "paint")]
 mod paint;
 #[cfg(feature = "paint")]
-pub use paint::{paint_dom, paint_dom_scrolled, screenshot_png, screenshot_png_scrolled};
+pub use paint::{
+    paint_dom, paint_dom_scrolled, paint_prepared, prepare_dom, screenshot_png,
+    screenshot_png_scrolled, screenshot_prepared, PreparedRender, RenderResourceCache,
+    RenderResourceLoader, SelectedImage,
+};
 
 // Real inline text layout (cosmic-text) lives behind the paint feature; the
 // layout-only build keeps the lighter word-split geometry. The stub lets
