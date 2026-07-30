@@ -15,8 +15,8 @@
 use std::{collections::HashMap, sync::Arc};
 
 use cosmic_text::{
-    Align, Attrs, Buffer, CacheKey, CacheKeyFlags, Color, Family, FontSystem, Metrics, Shaping,
-    Style, SwashCache, SwashImage, Weight, Wrap,
+    Align, Attrs, Buffer, CacheKey, CacheKeyFlags, Color, Family, FeatureTag, FontFeatures,
+    FontSystem, Metrics, Shaping, Style, SwashCache, SwashImage, Weight, Wrap,
 };
 use swash::scale::{image::Content as SwashContent, Render, ScaleContext, Source, StrikeWith};
 use swash::zeno::{Angle, Format, Transform, Vector};
@@ -782,6 +782,8 @@ impl TextEngine {
         let attrs = SpanAttrs {
             font_size: context.font_size,
             line_height: context.line_height,
+            letter_spacing: context.letter_spacing,
+            letter_spacing_non_normal: context.letter_spacing_non_normal,
             weight: context.weight,
             variation_weight: context.variation_weight,
             italic: context.italic,
@@ -971,6 +973,8 @@ impl TextEngine {
 struct SpanAttrs {
     font_size: f32,
     line_height: f32,
+    letter_spacing: f32,
+    letter_spacing_non_normal: bool,
     weight: u16,
     variation_weight: Option<u16>,
     italic: bool,
@@ -993,6 +997,16 @@ impl SpanAttrs {
         ));
         a = a.weight(Weight(self.weight));
         a = a.style(if self.italic { Style::Italic } else { Style::Normal });
+        if self.letter_spacing.is_finite() && self.letter_spacing != 0.0 {
+            a = a.letter_spacing(self.letter_spacing / self.font_size.max(1.0));
+        }
+        if self.letter_spacing_non_normal {
+            let mut features = FontFeatures::new();
+            features
+                .disable(FeatureTag::STANDARD_LIGATURES)
+                .disable(FeatureTag::CONTEXTUAL_LIGATURES);
+            a = a.font_features(features);
+        }
         // Clip-text glyphs must be shaped with an opaque fill so their coverage
         // reaches paint; the real gradient is selected through metadata.
         let color = if self.clip_fill.is_some() { [255, 255, 255, 255] } else { self.color };
@@ -1014,6 +1028,8 @@ impl SpanAttrs {
 struct SpanCtx {
     font_size: f32,
     line_height: f32,
+    letter_spacing: f32,
+    letter_spacing_non_normal: bool,
     color: [u8; 4],
     weight: u16,
     variation_weight: Option<u16>,
@@ -1055,6 +1071,8 @@ fn base_span_ctx(
     SpanCtx {
         font_size: base.font_size.unwrap_or(16.0),
         line_height: used_line_height(base),
+        letter_spacing: base.letter_spacing.unwrap_or(0.0),
+        letter_spacing_non_normal: base.letter_spacing_non_normal.unwrap_or(false),
         color: base.color.unwrap_or([0, 0, 0, 255]),
         weight: font.shape_weight,
         variation_weight: font.variation_weight,
@@ -1107,6 +1125,8 @@ fn collect_node_spans(
             let attrs = SpanAttrs {
                 font_size: ctx.font_size,
                 line_height: ctx.line_height,
+                letter_spacing: ctx.letter_spacing,
+                letter_spacing_non_normal: ctx.letter_spacing_non_normal,
                 weight: ctx.weight,
                 variation_weight: ctx.variation_weight,
                 italic: ctx.italic,
@@ -1127,6 +1147,8 @@ fn collect_node_spans(
                 out.push(("\n".to_string(), SpanAttrs {
                     font_size: ctx.font_size,
                     line_height: ctx.line_height,
+                    letter_spacing: ctx.letter_spacing,
+                    letter_spacing_non_normal: ctx.letter_spacing_non_normal,
                     weight: ctx.weight,
                     variation_weight: ctx.variation_weight,
                     italic: ctx.italic,
@@ -1183,6 +1205,12 @@ fn collect_node_spans(
                 line_height: style
                     .map(used_line_height)
                     .unwrap_or(ctx.line_height),
+                letter_spacing: style
+                    .and_then(|style| style.letter_spacing)
+                    .unwrap_or(ctx.letter_spacing),
+                letter_spacing_non_normal: style
+                    .and_then(|style| style.letter_spacing_non_normal)
+                    .unwrap_or(ctx.letter_spacing_non_normal),
                 color,
                 weight: font.shape_weight,
                 variation_weight: font.variation_weight,
@@ -1859,6 +1887,8 @@ mod tests {
         let attrs = SpanAttrs {
             font_size: 16.0,
             line_height: 18.0,
+            letter_spacing: 0.0,
+            letter_spacing_non_normal: false,
             weight: 400,
             variation_weight: Some(725),
             italic: false,
@@ -1871,6 +1901,31 @@ mod tests {
         assert_ne!(metadata & META_UNDERLINE, 0);
         assert_eq!(metadata_fill(metadata), Some(37));
         assert_eq!(metadata_variation_weight(metadata), Some(725));
+    }
+
+    #[test]
+    fn non_normal_letter_spacing_reaches_shaping_features() {
+        let span = SpanAttrs {
+            font_size: 20.0,
+            line_height: 24.0,
+            letter_spacing: 2.0,
+            letter_spacing_non_normal: true,
+            weight: 400,
+            variation_weight: None,
+            italic: false,
+            underline: false,
+            color: [0, 0, 0, 255],
+            family: Arc::from(FAMILY),
+            clip_fill: None,
+        };
+        let attrs = span.to_attrs();
+        assert_eq!(attrs.letter_spacing_opt.unwrap().0, 0.1);
+        assert!(attrs.font_features.features.iter().any(|feature| {
+            feature.tag == FeatureTag::STANDARD_LIGATURES && feature.value == 0
+        }));
+        assert!(attrs.font_features.features.iter().any(|feature| {
+            feature.tag == FeatureTag::CONTEXTUAL_LIGATURES && feature.value == 0
+        }));
     }
 
     fn variable_font_fixture() -> Vec<u8> {

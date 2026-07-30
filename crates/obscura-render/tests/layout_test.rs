@@ -2147,3 +2147,43 @@ fn percentage_max_replaced_items_keep_natural_max_content_size() {
         "{second:?}"
     );
 }
+
+/// Tailwind's `tracking-tighter` is not a paint-only transform: it changes
+/// shaped advances before line breaking. At this exact Chromium oracle width,
+/// the heading is two 40px lines with -1.8px tracking and three lines at
+/// `normal`. This guards the general shaping path, not a framework selector.
+#[test]
+fn negative_letter_spacing_changes_intrinsic_line_breaks() {
+    let tree = parse_html(
+        r#"
+        <style>
+          html, body { margin:0 }
+          :root { --tracking-tighter:-.05em }
+          .heading {
+            box-sizing:border-box;
+            width:512px;
+            font-size:36px;
+            line-height:40px;
+            font-weight:500;
+            padding-inline:8px;
+          }
+          #tight { letter-spacing:var(--tracking-tighter) }
+          #reset { letter-spacing:normal }
+        </style>
+        <section style="letter-spacing:-2px">
+          <div id="tight" class="heading">Rapidly build modern websites without ever leaving your HTML.</div>
+          <div id="reset" class="heading">Rapidly build modern websites without ever leaving your HTML.</div>
+        </section>
+        "#,
+    );
+    let layout = layout_dom(&tree, (512.0, 400.0));
+    let tight_id = tree.get_element_by_id("tight").unwrap();
+    let reset_id = tree.get_element_by_id("reset").unwrap();
+    let tight = layout.rects[&tight_id];
+    let reset = layout.rects[&reset_id];
+
+    assert_eq!(layout.styles[&tight_id].letter_spacing, Some(-1.8000001));
+    assert_eq!(layout.styles[&reset_id].letter_spacing, Some(0.0));
+    assert_eq!(tight.height, 80.0, "negative tracking must shape to two lines: {tight:?}");
+    assert_eq!(reset.height, 120.0, "`normal` must reset inherited tracking: {reset:?}");
+}

@@ -334,6 +334,19 @@ pub struct LayoutStyle {
     /// eagerly treating `9vw` as the number 9 made responsive headings pin to
     /// the minimum arm of their clamp.
     pub font_size_expression: Option<String>,
+    /// Computed `letter-spacing` in CSS pixels. This inherited property is
+    /// resolved top-down because `em` is relative to the element's own
+    /// computed font size while `rem` and viewport units need live context.
+    pub letter_spacing: Option<f32>,
+    /// Non-pixel `letter-spacing` retained until the inheritance pass.
+    pub letter_spacing_raw: Option<Dimension>,
+    /// Deferred functional `letter-spacing` (`calc()`, `min()`, `clamp()`).
+    pub letter_spacing_expression: Option<String>,
+    /// Whether the computed value came from a non-`normal` declaration.
+    /// CSS suppresses optional ligatures for every non-normal value, including
+    /// an explicit zero; keeping this provenance avoids conflating it with the
+    /// `normal` initial value.
+    pub letter_spacing_non_normal: Option<bool>,
     /// Specified CSS font weight during cascade (`1..1000`, `bolder`, or
     /// `lighter`), normalized to its numeric computed value by the inheritance
     /// pass before layout and shaping.

@@ -21,16 +21,30 @@ use crate::{Rect, to_taffy_style};
 /// (lightest-weight) feature set, matching RENDER.md's documented "layout
 /// (default)" mode.
 #[cfg(feature = "paint")]
-fn text_width(text: &str, size: f32, is_bold: bool, family: Option<&str>) -> f32 {
+fn text_width(
+    text: &str,
+    size: f32,
+    is_bold: bool,
+    family: Option<&str>,
+    letter_spacing: f32,
+) -> f32 {
     crate::paint::measure_text(text, size, is_bold, family)
+        + text.chars().filter(|c| !c.is_control()).count() as f32 * letter_spacing
 }
 
 #[cfg(not(feature = "paint"))]
-fn text_width(text: &str, size: f32, is_bold: bool, _family: Option<&str>) -> f32 {
+fn text_width(
+    text: &str,
+    size: f32,
+    is_bold: bool,
+    _family: Option<&str>,
+    letter_spacing: f32,
+) -> f32 {
     const AVG_CHAR_WIDTH_EM: f32 = 0.55;
     let chars = text.chars().filter(|c| !c.is_control()).count() as f32;
-    let width = chars * size * AVG_CHAR_WIDTH_EM;
-    if is_bold { width * 1.08 } else { width }
+    let glyph_width = chars * size * AVG_CHAR_WIDTH_EM;
+    (if is_bold { glyph_width * 1.08 } else { glyph_width })
+        + chars * letter_spacing
 }
 
 /// Per-element border boxes after layout, in viewport coordinates.
@@ -1062,6 +1076,8 @@ pub(crate) fn layout_dom_with_web_fonts(
             font_size: Option<f32>,
             font_weight: u16,
             font_family: Option<String>,
+            letter_spacing: f32,
+            letter_spacing_non_normal: bool,
             text_align: Option<taffy::AlignItems>,
             legacy_center: bool,
             visibility_hidden: bool,
@@ -1092,6 +1108,8 @@ pub(crate) fn layout_dom_with_web_fonts(
                     font_size: None,
                     font_weight: 400,
                     font_family: None,
+                    letter_spacing: 0.0,
+                    letter_spacing_non_normal: false,
                     text_align: None,
                     legacy_center: false,
                     visibility_hidden: false,
@@ -1183,6 +1201,32 @@ pub(crate) fn layout_dom_with_web_fonts(
                 // em in non-font-size properties is relative to this element's
                 // OWN computed font-size; resolve every relative length now.
                 let em_px = style.font_size.unwrap_or(parent_fs);
+                if let Some(expression) = style.letter_spacing_expression.as_deref() {
+                    style.letter_spacing = crate::style::resolve_contextual_length(
+                        expression,
+                        em_px,
+                        root_fs,
+                        vw,
+                        vh,
+                        em_px,
+                    );
+                } else if let Some(raw) = style.letter_spacing_raw {
+                    style.letter_spacing = match raw.resolve(em_px, root_fs, vw, vh) {
+                        crate::Dimension::Px(pixels) if pixels.is_finite() => Some(pixels),
+                        _ => None,
+                    };
+                }
+                match style.letter_spacing {
+                    Some(spacing) if spacing.is_finite() => inh.letter_spacing = spacing,
+                    _ => style.letter_spacing = Some(inh.letter_spacing),
+                }
+                match style.letter_spacing_non_normal {
+                    Some(non_normal) => inh.letter_spacing_non_normal = non_normal,
+                    None => {
+                        style.letter_spacing_non_normal =
+                            Some(inh.letter_spacing_non_normal)
+                    }
+                }
                 if let Some(expression) = style.row_gap_expression.as_deref() {
                     style.row_gap = crate::style::resolve_contextual_length(
                         expression,
@@ -1505,6 +1549,9 @@ pub(crate) fn layout_dom_with_web_fonts(
                 // now-final computed style.
                 let host_color = style.color;
                 let host_font_size = style.font_size.unwrap_or(parent_fs);
+                let host_letter_spacing = style.letter_spacing.unwrap_or(0.0);
+                let host_letter_spacing_non_normal =
+                    style.letter_spacing_non_normal.unwrap_or(false);
                 let host_weight = crate::style::used_font_weight(style);
                 let host_family = style.font_family.clone();
                 let host_line_height = style.line_height;
@@ -1540,6 +1587,30 @@ pub(crate) fn layout_dom_with_web_fonts(
                         pseudo.font_size = Some(host_font_size);
                     }
                     let pseudo_em = pseudo.font_size.unwrap_or(host_font_size);
+                    if let Some(expression) = pseudo.letter_spacing_expression.as_deref() {
+                        pseudo.letter_spacing = crate::style::resolve_contextual_length(
+                            expression,
+                            pseudo_em,
+                            root_fs,
+                            vw,
+                            vh,
+                            pseudo_em,
+                        );
+                    } else if let Some(raw) = pseudo.letter_spacing_raw {
+                        pseudo.letter_spacing =
+                            match raw.resolve(pseudo_em, root_fs, vw, vh) {
+                                crate::Dimension::Px(pixels) if pixels.is_finite() => {
+                                    Some(pixels)
+                                }
+                                _ => None,
+                            };
+                    } else if pseudo.letter_spacing.is_none() {
+                        pseudo.letter_spacing = Some(host_letter_spacing);
+                    }
+                    if pseudo.letter_spacing_non_normal.is_none() {
+                        pseudo.letter_spacing_non_normal =
+                            Some(host_letter_spacing_non_normal);
+                    }
                     for index in 0..6 {
                         if let Some(expression) = pseudo.size_expressions[index].as_deref() {
                             let percent_base = if matches!(index, 1 | 3 | 5) {
@@ -1749,7 +1820,13 @@ pub(crate) fn layout_dom_with_web_fonts(
                     .collect::<Vec<_>>()
                     .join(" ");
                 let mut content_width =
-                    text_width(&label, font_size, bold, style.font_family.as_deref());
+                    text_width(
+                        &label,
+                        font_size,
+                        bold,
+                        style.font_family.as_deref(),
+                        style.letter_spacing.unwrap_or(0.0),
+                    );
                 let pseudo_width = |pseudo: Option<&crate::LayoutStyle>| {
                     let Some(pseudo) = pseudo else { return 0.0 };
                     match pseudo.width {
@@ -1806,6 +1883,7 @@ pub(crate) fn layout_dom_with_web_fonts(
                             font_size,
                             bold,
                             style.font_family.as_deref(),
+                            style.letter_spacing.unwrap_or(0.0),
                         )
                     })
                     .fold(0.0f32, f32::max);
@@ -4241,6 +4319,7 @@ fn build_text_words(
     let mut family = None;
     let mut line_height = fsize * 1.2;
     let mut transform = crate::TextTransform::None;
+    let mut letter_spacing = 0.0;
     if let Some(parent_id) = node.parent {
         if let Some(p_style) = styles.get(&parent_id) {
             fsize = p_style.font_size.unwrap_or(16.0);
@@ -4250,6 +4329,7 @@ fn build_text_words(
             transform = p_style
                 .text_transform
                 .unwrap_or(crate::TextTransform::None);
+            letter_spacing = p_style.letter_spacing.unwrap_or(0.0);
         }
     }
     display_text = transform_word_leaf_text(&display_text, transform);
@@ -4261,6 +4341,7 @@ fn build_text_words(
         line_height,
         is_bold,
         family,
+        letter_spacing,
         taffy_tree,
         words,
     )
@@ -4301,13 +4382,14 @@ fn build_word_leaves(
     line_height: f32,
     is_bold: bool,
     family: Option<&str>,
+    letter_spacing: f32,
     taffy_tree: &mut TaffyTree<usize>,
     words: &mut HashMap<taffy::NodeId, (NodeId, String)>,
 ) -> Vec<taffy::NodeId> {
     tokenize_with_spaces(text)
         .into_iter()
         .filter_map(|token| {
-            let width = text_width(&token, fsize, is_bold, family);
+            let width = text_width(&token, fsize, is_bold, family, letter_spacing);
             // A pure-whitespace token is HTML source formatting or a bare
             // inter-element space; it keeps its (small) width so adjacent
             // inline content stays visually separated, but contributes no
@@ -4351,6 +4433,7 @@ fn build_pseudo_content(
         crate::inline::used_line_height(style),
         is_bold,
         style.font_family.as_deref(),
+        style.letter_spacing.unwrap_or(0.0),
         taffy_tree,
         words,
     )

@@ -640,6 +640,7 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
             // to the inheritance pass (they need parent/root font-size).
             apply_font_size(style, value);
         }
+        "letter-spacing" => apply_letter_spacing(style, value),
         "font" => apply_font_shorthand(style, value),
         "font-weight" => {
             if let Some(weight) = specified_font_weight(value) {
@@ -1151,6 +1152,7 @@ pub(crate) fn supports_declaration(name: &str, value: &str) -> bool {
             | "border-color"
             | "color-scheme"
             | "font-size"
+            | "letter-spacing"
             | "font"
             | "font-weight"
             | "font-family"
@@ -3159,6 +3161,55 @@ fn apply_font_size(style: &mut LayoutStyle, value: &str) {
     }
 }
 
+fn apply_letter_spacing(style: &mut LayoutStyle, value: &str) {
+    let value = value.trim();
+    let lower = value.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "normal" | "initial" | "revert" | "revert-layer"
+    ) {
+        style.letter_spacing = Some(0.0);
+        style.letter_spacing_raw = None;
+        style.letter_spacing_expression = None;
+        style.letter_spacing_non_normal = Some(false);
+        return;
+    }
+    // `letter-spacing` inherits, so `unset` has the same computed behavior as
+    // `inherit`. Leave this style unspecified for the top-down pass.
+    if matches!(lower.as_str(), "inherit" | "unset") || value.is_empty() {
+        return;
+    }
+    // Percentages are invalid even inside CSS math. Do not clear an earlier
+    // valid cascade winner when a later declaration is invalid.
+    if value.contains('%') {
+        return;
+    }
+    style.letter_spacing_non_normal = Some(true);
+    if value.contains('(') {
+        style.letter_spacing = None;
+        style.letter_spacing_raw = None;
+        style.letter_spacing_expression = Some(value.to_string());
+        return;
+    }
+    style.letter_spacing_expression = None;
+    match dimension_value(value) {
+        crate::Dimension::Px(pixels) if pixels.is_finite() => {
+            style.letter_spacing = Some(pixels);
+            style.letter_spacing_raw = None;
+        }
+        crate::Dimension::Percent(_) | crate::Dimension::Auto => {
+            // Percentages and keywords other than `normal` are invalid.
+            style.letter_spacing = None;
+            style.letter_spacing_raw = None;
+            style.letter_spacing_non_normal = None;
+        }
+        relative => {
+            style.letter_spacing = None;
+            style.letter_spacing_raw = Some(relative);
+        }
+    }
+}
+
 fn apply_gap_value(style: &mut LayoutStyle, row: bool, value: &str) {
     let value = value.trim();
     let lower = value.to_ascii_lowercase();
@@ -4367,6 +4418,34 @@ mod tests {
         assert_eq!(computed_font_weight(Some("lighter"), 550), 400);
         assert_eq!(computed_font_weight(Some("lighter"), 750), 700);
         assert_eq!(computed_font_weight(Some("lighter"), 900), 700);
+    }
+
+    #[test]
+    fn letter_spacing_preserves_units_resets_and_invalid_cascade_values() {
+        let relative = compute_style("span", Some("letter-spacing:-.05em"));
+        assert_eq!(
+            relative.letter_spacing_raw,
+            Some(crate::Dimension::Em(-0.05))
+        );
+        assert_eq!(relative.letter_spacing_non_normal, Some(true));
+
+        let reset = compute_style(
+            "span",
+            Some("letter-spacing:4px;letter-spacing:normal"),
+        );
+        assert_eq!(reset.letter_spacing, Some(0.0));
+        assert_eq!(reset.letter_spacing_non_normal, Some(false));
+
+        let invalid = compute_style(
+            "span",
+            Some("letter-spacing:3px;letter-spacing:calc(10% + 1px)"),
+        );
+        assert_eq!(invalid.letter_spacing, Some(3.0));
+        assert_eq!(invalid.letter_spacing_non_normal, Some(true));
+
+        let inherited = compute_style("span", Some("letter-spacing:unset"));
+        assert_eq!(inherited.letter_spacing, None);
+        assert_eq!(inherited.letter_spacing_non_normal, None);
     }
 
     #[test]

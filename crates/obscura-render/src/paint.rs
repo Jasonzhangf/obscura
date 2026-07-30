@@ -819,6 +819,7 @@ fn paint_laid_dom_scrolled(
                                 12.0,
                                 false,
                                 None,
+                                0.0,
                                 clip,
                             );
                         }
@@ -918,6 +919,7 @@ fn paint_laid_dom_scrolled(
                     fsize,
                     false,
                     style.font_family.as_deref(),
+                    style.letter_spacing.unwrap_or(0.0),
                     clip,
                 );
             }
@@ -941,6 +943,7 @@ fn paint_laid_dom_scrolled(
                     fsize,
                     is_bold,
                     style.font_family.as_deref(),
+                    style.letter_spacing.unwrap_or(0.0),
                     clip,
                 );
             }
@@ -964,6 +967,7 @@ fn paint_laid_dom_scrolled(
                     fsize,
                     crate::style::used_font_weight(style) >= 600,
                     style.font_family.as_deref(),
+                    style.letter_spacing.unwrap_or(0.0),
                     Some(visible_rect),
                 );
             }
@@ -1013,6 +1017,7 @@ fn paint_laid_dom_scrolled(
                             fsize,
                             false,
                             style.font_family.as_deref(),
+                            style.letter_spacing.unwrap_or(0.0),
                             clip,
                         );
                     }
@@ -1602,6 +1607,7 @@ fn paint_text_node(
             fsize,
             is_bold,
             style.font_family.as_deref(),
+            style.letter_spacing.unwrap_or(0.0),
             clip,
         );
     }
@@ -1677,6 +1683,7 @@ fn draw_text(
     size: f32,
     is_bold: bool,
     family: Option<&str>,
+    letter_spacing: f32,
     clip: Option<crate::Rect>,
 ) {
     // A fully clipped-away run (the common "visually hidden" accessibility
@@ -1750,9 +1757,13 @@ fn draw_text(
             // is wider than what draw_text actually advances through, and
             // the difference shows up as a visible gap after every word once
             // each word is its own independently-positioned box.
-            caret.x += scaled_font.h_advance(id) + if is_bold { 1.0 } else { 0.0 };
+            caret.x += scaled_font.h_advance(id)
+                + if is_bold { 1.0 } else { 0.0 }
+                + letter_spacing;
         } else {
-            caret.x += scaled_font.h_advance(id) + if is_bold { 1.0 } else { 0.0 };
+            caret.x += scaled_font.h_advance(id)
+                + if is_bold { 1.0 } else { 0.0 }
+                + letter_spacing;
         }
     }
 }
