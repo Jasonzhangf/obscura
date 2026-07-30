@@ -73,11 +73,36 @@ pub fn paint_dom_scrolled(
     ) {
         laid = layout_dom_with_web_fonts(tree, viewport, &intrinsic, &fonts);
     }
-    apply_document_scroll(tree, &mut laid, viewport, scroll);
+    paint_laid_dom_scrolled(
+        tree,
+        viewport,
+        base_url,
+        scroll,
+        pixmap,
+        image_cache,
+        svg_fonts,
+        &mut laid,
+    )
+}
+
+/// Paint an already prepared layout without changing its document-space
+/// geometry. Root scrolling and sticky positioning are per-shot visual state,
+/// so alternating captures can safely reuse the same layout.
+fn paint_laid_dom_scrolled(
+    tree: &DomTree,
+    viewport: (f32, f32),
+    base_url: Option<&str>,
+    scroll: (f32, f32),
+    mut pixmap: Pixmap,
+    mut image_cache: std::collections::HashMap<String, Option<Vec<u8>>>,
+    svg_fonts: std::sync::Arc<usvg::fontdb::Database>,
+    laid: &mut crate::DomLayout,
+) -> Option<Pixmap> {
+    let scroll_state = ScrollPaintState::new(tree, laid, viewport, scroll);
     // Only raster images inside an actually rotated/scaled subtree receive an
     // affine entry. Ordinary pages pay one fast style scan and allocate no
     // matrix map; transformed pages do matrix work only along those subtrees.
-    let projected_images = collect_projected_image_transforms(tree, &laid);
+    let projected_images = collect_projected_image_transforms(tree, laid, &scroll_state);
     let root_font_size = tree
         .query_selector("html")
         .ok()
@@ -207,12 +232,13 @@ pub fn paint_dom_scrolled(
         };
 
         if node.is_text() {
-            paint_text_node(tree, nid, &laid, &mut pixmap);
+            paint_text_node(tree, nid, laid, &scroll_state, &mut pixmap);
             for generated in &generated_after_at[paint_index] {
                 paint_in_flow_generated_box(
                     &mut pixmap,
                     generated,
-                    &laid,
+                    laid,
+                    &scroll_state,
                     viewport,
                     root_font_size,
                     base_url,
@@ -242,19 +268,18 @@ pub fn paint_dom_scrolled(
 
         // A `transform: translate()` on this element or any ancestor offsets
         // this element's whole painted box (and, applied per node, its whole
-        // subtree). The box shifts into screen space; the inherited clip is
-        // ALREADY in screen space (shifted by its own owner's translate at
-        // `resolve_clip_rects`), so it must not move with this descendant:
-        // that is what lets a clip cull a slide the carousel track has
-        // translated out of its viewport.
-        let (ox, oy) = laid.translates.get(&nid).copied().unwrap_or((0.0, 0.0));
+        // subtree). The box shifts into screen space. The inherited clip is
+        // owner-shifted by layout and root-scroll/sticky-adjusted by the visual
+        // state, but it must not move with this descendant: that is what lets a
+        // clip cull a slide the carousel track translated out of its viewport.
+        let (ox, oy) = scroll_state.translation_for(laid, nid);
         let rect = crate::Rect { x: rect.x + ox, y: rect.y + oy, width: rect.width, height: rect.height };
 
         // Ancestor `overflow: hidden` clip, if any. Skip painting entirely
         // once the box has no visible overlap with it (this is what makes the
         // ubiquitous 1x1 clipped "visually hidden" accessibility pattern
         // actually invisible instead of painting text wherever it lands).
-        let clip = laid.clip_rects.get(&nid).copied().flatten();
+        let clip = scroll_state.clip_for(laid, nid);
         let projected_image = projected_images.get(&nid).copied();
         let cull_rect = projected_image
             .map(|transform| transform.map_rect(rect))
@@ -556,7 +581,8 @@ pub fn paint_dom_scrolled(
                 paint_in_flow_generated_box(
                     &mut pixmap,
                     generated,
-                    &laid,
+                    laid,
+                    &scroll_state,
                     viewport,
                     root_font_size,
                     base_url,
@@ -689,7 +715,8 @@ pub fn paint_dom_scrolled(
             paint_in_flow_generated_box(
                 &mut pixmap,
                 generated,
-                &laid,
+                laid,
+                &scroll_state,
                 viewport,
                 root_font_size,
                 base_url,
@@ -717,7 +744,7 @@ pub fn paint_dom_scrolled(
         // Shift the shaped glyphs by the same accumulated translate as the
         // container's box so text under a transformed ancestor moves with
         // it. Computed before the mutable `paint_item` borrow.
-        let off = laid.translates.get(&nid).copied().unwrap_or((0.0, 0.0));
+        let off = scroll_state.translation_for(laid, nid);
         if let Some(idx) = whole {
             laid.text_engine.paint_item(idx, &mut pixmap, off);
         }
@@ -733,56 +760,98 @@ pub fn paint_dom_scrolled(
     Some(pixmap)
 }
 
-fn apply_document_scroll(
-    tree: &DomTree,
-    laid: &mut crate::DomLayout,
-    viewport: (f32, f32),
-    requested: (f32, f32),
-) {
-    let content = laid.scrolling_content_size(tree, viewport);
-    let scroll_x = if requested.0.is_finite() {
-        requested
-            .0
-            .clamp(0.0, (content.0 - viewport.0).max(0.0))
-    } else {
-        0.0
-    };
-    let scroll_y = if requested.1.is_finite() {
-        requested
-            .1
-            .clamp(0.0, (content.1 - viewport.1).max(0.0))
-    } else {
-        0.0
-    };
-    let sticky_layout = laid.root_sticky_layout(tree, viewport);
-    if scroll_x == 0.0 && scroll_y == 0.0 && sticky_layout.is_empty() {
-        return;
-    }
-    let sticky =
-        sticky_layout.translations(viewport, (scroll_x, scroll_y));
-    let sticky_clips =
-        sticky_layout.clip_translations_from(&sticky);
+/// Per-capture root-scroll and sticky offsets layered over an immutable
+/// document-space [`DomLayout`]. Keeping these deltas out of the layout avoids
+/// accumulating movement when the same prepared document paints more than one
+/// frame.
+#[derive(Debug)]
+struct ScrollPaintState {
+    scroll: (f32, f32),
+    viewport_fixed: std::collections::HashSet<obscura_dom::tree::NodeId>,
+    sticky: std::collections::HashMap<obscura_dom::tree::NodeId, (f32, f32)>,
+    sticky_clips: std::collections::HashMap<obscura_dom::tree::NodeId, (f32, f32)>,
+    active: bool,
+}
 
-    let viewport_fixed = laid.viewport_fixed_nodes(tree);
-    for id in tree.descendants(tree.document()) {
-        if viewport_fixed.contains(&id) {
-            continue;
+impl ScrollPaintState {
+    fn new(
+        tree: &DomTree,
+        laid: &crate::DomLayout,
+        viewport: (f32, f32),
+        requested: (f32, f32),
+    ) -> Self {
+        let content = laid.scrolling_content_size(tree, viewport);
+        let scroll_x = if requested.0.is_finite() {
+            requested
+                .0
+                .clamp(0.0, (content.0 - viewport.0).max(0.0))
+        } else {
+            0.0
+        };
+        let scroll_y = if requested.1.is_finite() {
+            requested
+                .1
+                .clamp(0.0, (content.1 - viewport.1).max(0.0))
+        } else {
+            0.0
+        };
+        let scroll = (scroll_x, scroll_y);
+        let sticky_layout = laid.root_sticky_layout(tree, viewport);
+        let active = scroll != (0.0, 0.0) || !sticky_layout.is_empty();
+        if !active {
+            return Self {
+                scroll,
+                viewport_fixed: std::collections::HashSet::new(),
+                sticky: std::collections::HashMap::new(),
+                sticky_clips: std::collections::HashMap::new(),
+                active,
+            };
         }
-        let offset = laid.translates.entry(id).or_insert((0.0, 0.0));
-        if let Some((x, y)) = sticky.get(&id) {
-            offset.0 += x;
-            offset.1 += y;
+
+        let sticky = sticky_layout.translations(viewport, scroll);
+        let sticky_clips = sticky_layout.clip_translations_from(&sticky);
+        Self {
+            scroll,
+            viewport_fixed: laid.viewport_fixed_nodes(tree),
+            sticky,
+            sticky_clips,
+            active,
         }
-        offset.0 -= scroll_x;
-        offset.1 -= scroll_y;
-        if let Some(Some(clip)) = laid.clip_rects.get_mut(&id) {
-            if let Some((x, y)) = sticky_clips.get(&id) {
-                clip.x += x;
-                clip.y += y;
-            }
-            clip.x -= scroll_x;
-            clip.y -= scroll_y;
+    }
+
+    fn translation_for(
+        &self,
+        laid: &crate::DomLayout,
+        id: obscura_dom::tree::NodeId,
+    ) -> (f32, f32) {
+        let base = laid.translates.get(&id).copied().unwrap_or((0.0, 0.0));
+        if !self.active || self.viewport_fixed.contains(&id) {
+            return base;
         }
+        let sticky = self.sticky.get(&id).copied().unwrap_or((0.0, 0.0));
+        (
+            base.0 + sticky.0 - self.scroll.0,
+            base.1 + sticky.1 - self.scroll.1,
+        )
+    }
+
+    fn clip_for(
+        &self,
+        laid: &crate::DomLayout,
+        id: obscura_dom::tree::NodeId,
+    ) -> Option<crate::Rect> {
+        let mut clip = laid.clip_rects.get(&id).copied().flatten()?;
+        if !self.active || self.viewport_fixed.contains(&id) {
+            return Some(clip);
+        }
+        let sticky = self
+            .sticky_clips
+            .get(&id)
+            .copied()
+            .unwrap_or((0.0, 0.0));
+        clip.x += sticky.0 - self.scroll.0;
+        clip.y += sticky.1 - self.scroll.1;
+        Some(clip)
     }
 }
 
@@ -877,11 +946,12 @@ impl ImageAffine {
 }
 
 /// Accumulate rotation/scale matrices through transformed subtrees, storing
-/// entries only for raster `<img>` descendants. Translation remains on
-/// `DomLayout::translates`, whose offsets already include root scroll.
+/// entries only for raster `<img>` descendants. Translation comes from the
+/// per-shot visual state so the document-space layout remains reusable.
 fn collect_projected_image_transforms(
     tree: &DomTree,
     layout: &crate::DomLayout,
+    scroll_state: &ScrollPaintState,
 ) -> std::collections::HashMap<obscura_dom::tree::NodeId, ImageAffine> {
     if !layout.styles.values().any(|style| {
         style.transform_projection.is_some() || style.transform_scale.is_some()
@@ -892,6 +962,7 @@ fn collect_projected_image_transforms(
     fn walk(
         tree: &DomTree,
         layout: &crate::DomLayout,
+        scroll_state: &ScrollPaintState,
         id: obscura_dom::tree::NodeId,
         parent: ImageAffine,
         active: bool,
@@ -915,7 +986,7 @@ fn collect_projected_image_transforms(
                 scale_y * projection[3],
             ];
             if let Some(rect) = layout.rects.get(&id) {
-                let offset = layout.translates.get(&id).copied().unwrap_or((0.0, 0.0));
+                let offset = scroll_state.translation_for(layout, id);
                 let (origin_x, origin_y) = style.transform_origin.unwrap_or((
                     crate::Dimension::Percent(0.5),
                     crate::Dimension::Percent(0.5),
@@ -939,7 +1010,15 @@ fn collect_projected_image_transforms(
             out.insert(id, combined);
         }
         for child in tree.children(id) {
-            walk(tree, layout, child, combined, transformed, out);
+            walk(
+                tree,
+                layout,
+                scroll_state,
+                child,
+                combined,
+                transformed,
+                out,
+            );
         }
     }
 
@@ -947,6 +1026,7 @@ fn collect_projected_image_transforms(
     walk(
         tree,
         layout,
+        scroll_state,
         tree.document(),
         ImageAffine::IDENTITY,
         false,
@@ -1173,8 +1253,8 @@ fn paint_text_node(
     tree: &DomTree,
     nid: obscura_dom::tree::NodeId,
     laid: &crate::DomLayout,
+    scroll_state: &ScrollPaintState,
     pixmap: &mut Pixmap,
-
 ) -> Option<()> {
     let runs = laid.text_runs.get(&nid)?;
     let node = tree.get_node(nid)?;
@@ -1188,9 +1268,10 @@ fn paint_text_node(
     let is_bold = crate::style::used_font_weight(style) >= 600;
     // A text node has no transform of its own, but any transformed element
     // ancestor offsets it (the accumulation covers text nodes too). The clip
-    // is already in screen space and stays put.
-    let (ox, oy) = laid.translates.get(&nid).copied().unwrap_or((0.0, 0.0));
-    let clip = laid.clip_rects.get(&nid).copied().flatten();
+    // receives root-scroll/sticky movement without following the descendant's
+    // own transform.
+    let (ox, oy) = scroll_state.translation_for(laid, nid);
+    let clip = scroll_state.clip_for(laid, nid);
 
     for (rect, word) in runs {
         draw_text(
@@ -2209,6 +2290,7 @@ fn paint_in_flow_generated_box(
     pixmap: &mut Pixmap,
     generated: &crate::dom::GeneratedBox,
     laid: &crate::dom::DomLayout,
+    scroll_state: &ScrollPaintState,
     viewport: (f32, f32),
     root_font_size: f32,
     base_url: Option<&str>,
@@ -2226,18 +2308,14 @@ fn paint_in_flow_generated_box(
         return;
     }
 
-    let (ox, oy) = laid
-        .translates
-        .get(&generated.host)
-        .copied()
-        .unwrap_or((0.0, 0.0));
+    let (ox, oy) = scroll_state.translation_for(laid, generated.host);
     let rect = crate::Rect {
         x: generated.rect.x + ox,
         y: generated.rect.y + oy,
         width: generated.rect.width,
         height: generated.rect.height,
     };
-    let mut clip = laid.clip_rects.get(&generated.host).copied().flatten();
+    let mut clip = scroll_state.clip_for(laid, generated.host);
     if host_style.overflow_hidden {
         if let Some(host_rect) = laid.rects.get(&generated.host) {
             let own = crate::Rect {
@@ -3833,6 +3911,63 @@ mod tests {
                 "{name} viewport should keep fixed subtree at the viewport origin: {fixed:?}"
             );
         }
+    }
+
+    #[test]
+    fn repeated_scroll_captures_reuse_immutable_layout_geometry() {
+        let tree = parse_html(
+            r#"<html style="margin:0"><body style="margin:0">
+                <div style="height:60px;background:#ff0000"></div>
+                <div style="height:180px;overflow:hidden;background:#0000ff">
+                    <div style="position:sticky;top:5px;height:20px;background:#00ff00"></div>
+                    <div style="transform:translate(3px,4px);height:80px;color:#ffffff">stable text</div>
+                </div>
+            </body></html>"#,
+        );
+        let viewport = (100.0, 80.0);
+        let mut laid = crate::layout_dom(&tree, viewport);
+        let base_rects = laid.rects.clone();
+        let base_translates = laid.translates.clone();
+        let base_clips = laid.clip_rects.clone();
+
+        fn capture(
+            tree: &DomTree,
+            laid: &mut crate::DomLayout,
+            viewport: (f32, f32),
+            scroll: (f32, f32),
+        ) -> Vec<u8> {
+            let mut pixmap =
+                Pixmap::new(viewport.0 as u32, viewport.1 as u32).expect("viewport pixmap");
+            pixmap.fill(Color::WHITE);
+            paint_laid_dom_scrolled(
+                tree,
+                viewport,
+                None,
+                scroll,
+                pixmap,
+                std::collections::HashMap::new(),
+                svg_font_database(),
+                laid,
+            )
+            .expect("painted viewport")
+            .encode_png()
+            .expect("encoded viewport")
+        }
+
+        let near = capture(&tree, &mut laid, viewport, (0.0, 20.0));
+        let far = capture(&tree, &mut laid, viewport, (0.0, 100.0));
+        let far_repeat = capture(&tree, &mut laid, viewport, (0.0, 100.0));
+        let near_after_far = capture(&tree, &mut laid, viewport, (0.0, 20.0));
+
+        assert_ne!(near, far, "distinct scroll positions must paint distinct frames");
+        assert_eq!(far, far_repeat, "the same scroll position must be stable");
+        assert_eq!(
+            near, near_after_far,
+            "an intervening capture must not accumulate scroll movement"
+        );
+        assert_eq!(laid.rects, base_rects);
+        assert_eq!(laid.translates, base_translates);
+        assert_eq!(laid.clip_rects, base_clips);
     }
 
     /// Portable pixel counterpart to the Chromium root-sticky geometry probe
