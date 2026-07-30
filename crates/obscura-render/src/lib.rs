@@ -183,6 +183,27 @@ impl Dimension {
     }
 }
 
+/// Computed CSS `font-optical-sizing`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FontOpticalSizing {
+    /// Let a variable font's `opsz` axis follow the computed font size.
+    #[default]
+    Auto,
+    /// Leave the font's optical-size axis at its normal/default setting.
+    None,
+}
+
+/// One canonical CSS `font-variation-settings` axis assignment.
+///
+/// The CSS parser guarantees a printable four-byte ASCII tag and a finite
+/// value. Settings are stored in tag order with duplicate tags collapsed so
+/// shaping and rasterization can consume one deterministic axis tuple.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FontVariationSetting {
+    pub tag: [u8; 4],
+    pub value: f32,
+}
+
 /// The subset of CSS that influences box layout. Expanded in later phases.
 #[derive(Debug, Clone, Default)]
 pub struct LayoutStyle {
@@ -374,6 +395,12 @@ pub struct LayoutStyle {
     /// resolves it to a bundled face (Liberation Sans/Serif/Mono) the way
     /// Chromium picks a generic family on this host.
     pub font_family: Option<String>,
+    /// Computed inherited `font-optical-sizing`. `None` during cascade means
+    /// inherit; the top-down pass resolves every element to `Some`.
+    pub font_optical_sizing: Option<FontOpticalSizing>,
+    /// Computed inherited `font-variation-settings`. `None` during cascade
+    /// means inherit, while `Some(Vec::new())` is the `normal` initial value.
+    pub font_variation_settings: Option<Vec<FontVariationSetting>>,
     /// Inherited `text-align`, represented with the matching horizontal
     /// alignment keywords. Kept separate from flex/grid `align-items`: using
     /// one field for both made `text-align:left` shrink-wrap flex children.

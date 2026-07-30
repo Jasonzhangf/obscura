@@ -16,7 +16,8 @@ use std::{collections::HashMap, sync::Arc};
 
 use cosmic_text::{
     Align, Attrs, Buffer, CacheKey, CacheKeyFlags, Color, Family, FeatureTag, FontFeatures,
-    FontSystem, Metrics, Shaping, Style, SwashCache, SwashImage, Weight, Wrap,
+    FontSystem, FontVariations, Metrics, Shaping, Style, SwashCache, SwashImage, VariationTag,
+    Weight, Wrap,
 };
 use swash::scale::{image::Content as SwashContent, Render, ScaleContext, Source, StrikeWith};
 use swash::zeno::{Angle, Format, Transform, Vector};
@@ -91,19 +92,23 @@ struct LoadedFamily {
 #[derive(Clone)]
 struct LoadedFace {
     name: Arc<str>,
+    font_id: Option<cosmic_text::fontdb::ID>,
     min_weight: u16,
     max_weight: u16,
     shape_weight: u16,
     italic: bool,
+    has_optical_size: bool,
 }
 
 #[derive(Clone)]
 struct ResolvedFont {
     family: Arc<str>,
+    font_id: Option<cosmic_text::fontdb::ID>,
     shape_weight: u16,
-    /// Authored `wght` coordinate for a ranged @font-face. Cosmic Text 0.12
-    /// cannot carry this into shaping, so it is kept separately for raster.
+    /// Authored `wght` coordinate for a ranged `@font-face`, retained while
+    /// descriptor selection is converted into the canonical axis tuple.
     variation_weight: Option<u16>,
+    has_optical_size: bool,
 }
 
 #[derive(Clone)]
@@ -142,19 +147,18 @@ fn resolve_loaded_font(
                     .copied()
                     .find(|face| (face.min_weight..=face.max_weight).contains(&requested_weight))
                 {
-                    // cosmic-text 0.12 only accepts the named family when the
-                    // shaping weight exactly matches fontdb's weight for that
-                    // file. A variable face commonly advertises `100 900` in
-                    // CSS while fontdb records its default instance as 400.
-                    // Passing the authored weight makes cosmic-text reject the
-                    // right family and fall through to an unrelated exact-
-                    // weight face. Select the file at its database weight;
-                    // variable-axis shaping is not exposed by this version.
+                    // The named-family matcher uses fontdb's default weight for
+                    // this resource, while a variable face commonly advertises
+                    // `100 900` in CSS. Preserve the descriptor-selected file
+                    // and its database weight; the authored coordinate enters
+                    // the canonical axis tuple below.
                     return ResolvedFont {
                         family: Arc::clone(&face.name),
+                        font_id: face.font_id,
                         shape_weight: face.shape_weight,
                         variation_weight: (face.min_weight != face.max_weight)
                             .then_some(requested_weight),
+                        has_optical_size: face.has_optical_size,
                     };
                 }
                 let available: Vec<_> =
@@ -166,8 +170,10 @@ fn resolve_loaded_font(
                 {
                     return ResolvedFont {
                         family: Arc::clone(&face.name),
+                        font_id: face.font_id,
                         shape_weight: face.shape_weight,
                         variation_weight: None,
+                        has_optical_size: face.has_optical_size,
                     };
                 }
             }
@@ -177,8 +183,10 @@ fn resolve_loaded_font(
     let weights: &[u16] = &[400, 700];
     ResolvedFont {
         family: Arc::from(fallback),
+        font_id: None,
         shape_weight: match_font_weight(requested_weight, weights),
         variation_weight: None,
+        has_optical_size: false,
     }
 }
 
@@ -262,12 +270,15 @@ pub(crate) fn used_line_height(style: &LayoutStyle) -> f32 {
     }
 }
 
-/// Per-glyph flags carried through cosmic-text's `metadata` field. Bit zero is
-/// the underline flag; the remaining bits encode an optional one-based index
-/// into an [`InlineItem`]'s clip-text fills.
+type ClipTextFill = (f32, Vec<([u8; 4], Option<f32>)>);
+
+/// Per-glyph flags carried through cosmic-text's metadata. The common
+/// non-variable path stays allocation-free: underline and fill remain packed
+/// directly, while the upper half is a one-based index into an optional
+/// variation-set table.
 const META_UNDERLINE: usize = 1;
 const META_FILL_SHIFT: usize = 1;
-const META_VARIATION_BITS: usize = 10;
+const META_VARIATION_BITS: usize = usize::BITS as usize / 2;
 const META_VARIATION_SHIFT: usize = usize::BITS as usize - META_VARIATION_BITS;
 const META_VARIATION_MASK: usize =
     ((1usize << META_VARIATION_BITS) - 1) << META_VARIATION_SHIFT;
@@ -277,12 +288,9 @@ fn metadata_fill(metadata: usize) -> Option<usize> {
     ((metadata & META_FILL_MASK) >> META_FILL_SHIFT).checked_sub(1)
 }
 
-fn metadata_variation_weight(metadata: usize) -> Option<u16> {
-    let weight = ((metadata & META_VARIATION_MASK) >> META_VARIATION_SHIFT) as u16;
-    (weight != 0).then_some(weight)
+fn metadata_variation(metadata: usize) -> Option<usize> {
+    ((metadata & META_VARIATION_MASK) >> META_VARIATION_SHIFT).checked_sub(1)
 }
-
-type ClipTextFill = (f32, Vec<([u8; 4], Option<f32>)>);
 
 /// One inline formatting context: a shaped cosmic-text buffer plus where to
 /// paint it (filled in after layout).
@@ -300,6 +308,9 @@ pub struct InlineItem {
     /// one entry, allowing an inline accent span to own a gradient without
     /// recoloring the rest of its heading.
     clip_fills: Vec<ClipTextFill>,
+    /// Canonical axis tuples, populated only when this IFC actually contains
+    /// variable text. Glyph metadata stores a one-based index.
+    variation_sets: Vec<Arc<FontVariations>>,
 }
 
 /// Owns the font set and shaping caches for one render pass, plus every
@@ -314,15 +325,15 @@ pub struct TextEngine {
     replaced: Vec<ReplacedItem>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct VariableCacheKey {
     glyph: CacheKey,
-    weight: u16,
+    variations: Arc<FontVariations>,
 }
 
 /// Swash's ordinary cache key intentionally has no variation coordinates.
-/// Keep variable instances in a separate cache so a 400 glyph can never be
-/// reused for 700 and repeated paint remains O(1) after the first raster.
+/// Keep variable instances in a separate cache so different axis tuples can
+/// never share an outline and repeated paint remains O(1) after first raster.
 struct VariableSwashCache {
     context: ScaleContext,
     images: HashMap<VariableCacheKey, Option<SwashImage>>,
@@ -340,22 +351,29 @@ impl VariableSwashCache {
         &mut self,
         font_system: &mut FontSystem,
         cache_key: CacheKey,
-        weight: u16,
+        variations: Arc<FontVariations>,
         base: Color,
         mut f: F,
     ) {
+        let render_variations = Arc::clone(&variations);
         let key = VariableCacheKey {
             glyph: cache_key,
-            weight,
+            variations,
         };
         let image = self.images.entry(key).or_insert_with(|| {
             let font = font_system.get_font(cache_key.font_id)?;
+            let settings = render_variations.iter().map(|variation| {
+                (
+                    swash::tag_from_bytes(variation.tag.as_bytes()),
+                    variation.value.0,
+                )
+            });
             let mut scaler = self
                 .context
                 .builder(font.as_swash())
                 .size(f32::from_bits(cache_key.font_size_bits))
                 .hint(true)
-                .variations([("wght", weight as f32)])
+                .variations(settings)
                 .build();
             let offset = Vector::new(cache_key.x_bin.as_float(), cache_key.y_bin.as_float());
             Render::new(&[
@@ -623,6 +641,14 @@ impl TextEngine {
         let mut loaded_families = HashMap::new();
         for (id, declared_family, declared_weight, declared_italic) in declarations {
             let Some(face) = db.face(id) else { continue };
+            let has_optical_size = db
+                .with_face_data(id, |data, index| {
+                    swash::FontRef::from_index(data, index as usize).map_or(false, |font| {
+                        font.variations()
+                            .any(|axis| axis.tag() == swash::tag_from_bytes(b"opsz"))
+                    })
+                })
+                .unwrap_or(false);
             let names = face.families.clone();
             let internal_name = names
                 .first()
@@ -641,10 +667,12 @@ impl TextEngine {
                     .or_insert_with(|| LoadedFamily { faces: Vec::new() });
                 family.faces.push(LoadedFace {
                     name: Arc::clone(&internal_name),
+                    font_id: Some(id),
                     min_weight: weight.0,
                     max_weight: weight.1,
                     shape_weight,
                     italic,
+                    has_optical_size,
                 });
             }
         }
@@ -785,7 +813,8 @@ impl TextEngine {
             letter_spacing: context.letter_spacing,
             letter_spacing_non_normal: context.letter_spacing_non_normal,
             weight: context.weight,
-            variation_weight: context.variation_weight,
+            font_id: context.font_id,
+            variations: context.variations.clone(),
             italic: context.italic,
             underline: context.underline,
             color: context.color,
@@ -859,10 +888,34 @@ impl TextEngine {
         // column overflows instead, matching normal `overflow-wrap: normal`.
         buffer.set_wrap(&mut self.font_system, Wrap::Word);
         // Always Advanced shaping: Basic mis-maps per-span attribute
-        // boundaries in cosmic-text 0.12 (a multi-color run like body text
+        // boundaries in the shaping backend (a multi-color run like body text
         // with links ends up coloring the wrong glyphs), and shaping is a
         // small fraction of a page's CSS-cascade-dominated render time.
-        let rich = spans.iter().map(|(t, a)| (t.as_str(), a.to_attrs()));
+        let mut variation_sets = Vec::<Arc<FontVariations>>::new();
+        for (_, attrs) in &spans {
+            if let Some(variations) = attrs.variations.as_ref() {
+                if !variation_sets
+                    .iter()
+                    .any(|existing| **existing == **variations)
+                {
+                    variation_sets.push(Arc::clone(variations));
+                }
+            }
+        }
+        let rich = spans.iter().map(|(text, attrs)| {
+            let variation_index = attrs
+                .variations
+                .as_ref()
+                .map(|variations| {
+                    variation_sets
+                        .iter()
+                        .position(|existing| **existing == **variations)
+                        .expect("collected span variation set")
+                        + 1
+                })
+                .unwrap_or(0);
+            (text.as_str(), attrs.to_attrs(variation_index))
+        });
         let defaults = Attrs::new().family(Family::Name(FAMILY));
         buffer.set_rich_text(
             &mut self.font_system,
@@ -890,6 +943,7 @@ impl TextEngine {
             origin: (0.0, 0.0),
             clip: None,
             clip_fills,
+            variation_sets,
         });
         Some(idx)
     }
@@ -976,7 +1030,8 @@ struct SpanAttrs {
     letter_spacing: f32,
     letter_spacing_non_normal: bool,
     weight: u16,
-    variation_weight: Option<u16>,
+    font_id: Option<cosmic_text::fontdb::ID>,
+    variations: Option<Arc<FontVariations>>,
     italic: bool,
     underline: bool,
     color: [u8; 4],
@@ -985,7 +1040,7 @@ struct SpanAttrs {
 }
 
 impl SpanAttrs {
-    fn to_attrs(&self) -> Attrs<'_> {
+    fn to_attrs(&self, variation_index: usize) -> Attrs<'_> {
         let mut a = Attrs::new().family(Family::Name(self.family.as_ref()));
         // Inline descendants keep their own computed font metrics inside the
         // enclosing line box. Without per-span metrics, an `<a>`/`<span>`
@@ -996,6 +1051,9 @@ impl SpanAttrs {
             self.line_height.max(1.0),
         ));
         a = a.weight(Weight(self.weight));
+        if let Some(font_id) = self.font_id {
+            a = a.font_id(font_id);
+        }
         a = a.style(if self.italic { Style::Italic } else { Style::Normal });
         if self.letter_spacing.is_finite() && self.letter_spacing != 0.0 {
             a = a.letter_spacing(self.letter_spacing / self.font_size.max(1.0));
@@ -1014,13 +1072,15 @@ impl SpanAttrs {
         // reaches paint; the real gradient is selected through metadata.
         let color = if self.clip_fill.is_some() { [255, 255, 255, 255] } else { self.color };
         a = a.color(Color::rgba(color[0], color[1], color[2], color[3]));
-        // Underline, the optional fill index, and a variable `wght` coordinate
-        // share the per-glyph metadata.
-        let fill = self.clip_fill.map_or(0, |index| (index + 1) << META_FILL_SHIFT);
+        let fill = self
+            .clip_fill
+            .map_or(0, |index| (index + 1) << META_FILL_SHIFT);
         debug_assert_eq!(fill & !META_FILL_MASK, 0);
-        let variation = self
-            .variation_weight
-            .map_or(0, |weight| usize::from(weight.clamp(1, 1000)) << META_VARIATION_SHIFT);
+        let variation = variation_index << META_VARIATION_SHIFT;
+        assert_eq!(variation & !META_VARIATION_MASK, 0);
+        if let Some(variations) = self.variations.as_ref() {
+            a = a.font_variations((**variations).clone());
+        }
         a = a.metadata(fill | variation | usize::from(self.underline));
         a
     }
@@ -1035,7 +1095,10 @@ struct SpanCtx {
     letter_spacing_non_normal: bool,
     color: [u8; 4],
     weight: u16,
-    variation_weight: Option<u16>,
+    font_id: Option<cosmic_text::fontdb::ID>,
+    variations: Option<Arc<FontVariations>>,
+    variable_weight: bool,
+    has_optical_size: bool,
     italic: bool,
     underline: bool,
     transform: TextTransform,
@@ -1061,6 +1124,32 @@ struct Collector {
 /// shape the glyphs in opaque white so their coverage renders, then recolor
 /// them from the background at paint time; otherwise transparent text stays
 /// transparent (and invisible), unchanged.
+fn resolved_font_variations(
+    style: &LayoutStyle,
+    font: &ResolvedFont,
+) -> Option<Arc<FontVariations>> {
+    let mut variations = FontVariations::new();
+    if let Some(weight) = font.variation_weight {
+        variations.set(VariationTag::new(b"wght"), weight as f32);
+    }
+    if font.has_optical_size
+        && style.font_optical_sizing.unwrap_or(crate::FontOpticalSizing::Auto)
+            == crate::FontOpticalSizing::Auto
+    {
+        let optical_size = style.font_size.unwrap_or(16.0);
+        if optical_size.is_finite() {
+            variations.set(VariationTag::new(b"opsz"), optical_size);
+        }
+    }
+    // Low-level CSS axes override the corresponding high-level coordinates.
+    for setting in style.font_variation_settings.as_deref().unwrap_or(&[]) {
+        if setting.value.is_finite() {
+            variations.set(VariationTag::new(&setting.tag), setting.value);
+        }
+    }
+    (!variations.is_empty()).then(|| Arc::new(variations))
+}
+
 fn base_span_ctx(
     base: &LayoutStyle,
     font: ResolvedFont,
@@ -1071,6 +1160,7 @@ fn base_span_ctx(
         collector.clip_fills.push(fill);
         index
     });
+    let variations = resolved_font_variations(base, &font);
     SpanCtx {
         font_size: base.font_size.unwrap_or(16.0),
         line_height: used_line_height(base),
@@ -1078,7 +1168,10 @@ fn base_span_ctx(
         letter_spacing_non_normal: base.letter_spacing_non_normal.unwrap_or(false),
         color: base.color.unwrap_or([0, 0, 0, 255]),
         weight: font.shape_weight,
-        variation_weight: font.variation_weight,
+        font_id: font.font_id,
+        variations,
+        variable_weight: font.variation_weight.is_some(),
+        has_optical_size: font.has_optical_size,
         italic: base.font_style_italic.unwrap_or(false),
         underline: base.underline.unwrap_or(false),
         transform: base.text_transform.unwrap_or(TextTransform::None),
@@ -1131,7 +1224,8 @@ fn collect_node_spans(
                 letter_spacing: ctx.letter_spacing,
                 letter_spacing_non_normal: ctx.letter_spacing_non_normal,
                 weight: ctx.weight,
-                variation_weight: ctx.variation_weight,
+                font_id: ctx.font_id,
+                variations: ctx.variations.clone(),
                 italic: ctx.italic,
                 underline: ctx.underline,
                 color: ctx.color,
@@ -1153,7 +1247,8 @@ fn collect_node_spans(
                     letter_spacing: ctx.letter_spacing,
                     letter_spacing_non_normal: ctx.letter_spacing_non_normal,
                     weight: ctx.weight,
-                    variation_weight: ctx.variation_weight,
+                    font_id: ctx.font_id,
+                    variations: ctx.variations.clone(),
                     italic: ctx.italic,
                     underline: ctx.underline,
                     color: ctx.color,
@@ -1192,15 +1287,20 @@ fn collect_node_spans(
                 })
                 .unwrap_or_else(|| ResolvedFont {
                     family: Arc::clone(&ctx.family),
-                    shape_weight: if ctx.variation_weight.is_some() {
+                    font_id: ctx.font_id,
+                    shape_weight: if ctx.variable_weight {
                         ctx.weight
                     } else {
                         requested_weight
                     },
                     variation_weight: ctx
-                        .variation_weight
-                        .map(|_| requested_weight.clamp(1, 1000)),
+                        .variable_weight
+                        .then_some(requested_weight.clamp(1, 1000)),
+                    has_optical_size: ctx.has_optical_size,
                 });
+            let variations = style
+                .map(|style| resolved_font_variations(style, &font))
+                .unwrap_or_else(|| ctx.variations.clone());
             let child = SpanCtx {
                 font_size: style
                     .and_then(|style| style.font_size)
@@ -1216,7 +1316,10 @@ fn collect_node_spans(
                     .unwrap_or(ctx.letter_spacing_non_normal),
                 color,
                 weight: font.shape_weight,
-                variation_weight: font.variation_weight,
+                font_id: font.font_id,
+                variations,
+                variable_weight: font.variation_weight.is_some(),
+                has_optical_size: font.has_optical_size,
                 italic: ctx.italic || style.and_then(|s| s.font_style_italic).unwrap_or(false),
                 // Underline propagates in: an ancestor's underline covers
                 // descendant text; an element only sets its own via CSS.
@@ -1606,11 +1709,14 @@ impl TextEngine {
                     pixels[idx] = tiny_skia::PremultipliedColorU8::from_rgba(out_r as u8, out_g as u8, out_b as u8, out_a as u8)
                         .unwrap_or(dst);
                 };
-                if let Some(weight) = metadata_variation_weight(glyph.metadata) {
+                if let Some(variations) = metadata_variation(glyph.metadata)
+                    .and_then(|index| item.variation_sets.get(index))
+                    .map(Arc::clone)
+                {
                     variable_swash.with_pixels(
                         font_system,
                         physical.cache_key,
-                        weight,
+                        variations,
                         glyph_color,
                         &mut draw_pixel,
                     );
@@ -1791,24 +1897,30 @@ mod tests {
             faces: vec![
                 LoadedFace {
                     name: Arc::from("Poppins"),
+                    font_id: None,
                     min_weight: 400,
                     max_weight: 400,
                     shape_weight: 400,
                     italic: false,
+                    has_optical_size: false,
                 },
                 LoadedFace {
                     name: Arc::from("Poppins Medium"),
+                    font_id: None,
                     min_weight: 500,
                     max_weight: 500,
                     shape_weight: 500,
                     italic: false,
+                    has_optical_size: false,
                 },
                 LoadedFace {
                     name: Arc::from("Poppins"),
+                    font_id: None,
                     min_weight: 700,
                     max_weight: 700,
                     shape_weight: 700,
                     italic: false,
+                    has_optical_size: false,
                 },
             ],
         };
@@ -1840,10 +1952,12 @@ mod tests {
             LoadedFamily {
                 faces: vec![LoadedFace {
                     name: Arc::from(FAMILY),
+                    font_id: None,
                     min_weight: 100,
                     max_weight: 900,
                     shape_weight: 400,
                     italic: false,
+                    has_optical_size: false,
                 }],
             },
         );
@@ -1866,16 +1980,91 @@ mod tests {
     }
 
     #[test]
+    fn descriptor_selected_resource_pins_the_exact_font_face() {
+        let data = SANS_R.to_vec();
+        let mut engine = TextEngine::new_with_web_fonts(&[
+            WebFont {
+                data: data.clone(),
+                family: Some("Pinned Variable".to_string()),
+                weight: Some((100, 400)),
+                italic: Some(false),
+            },
+            WebFont {
+                data,
+                family: Some("Pinned Variable".to_string()),
+                weight: Some((500, 900)),
+                italic: Some(false),
+            },
+        ]);
+        let loaded = &engine.loaded_families["pinned variable"];
+        assert_eq!(loaded.faces.len(), 2);
+        let first_id = loaded.faces[0].font_id.unwrap();
+        let selected = resolve_loaded_font(
+            Some("Pinned Variable"),
+            700,
+            false,
+            &engine.loaded_families,
+        );
+        let selected_id = selected.font_id.unwrap();
+        assert_ne!(
+            first_id, selected_id,
+            "the fixture must contain two distinct database resources"
+        );
+        let selected_font = engine
+            .font_system
+            .get_font(selected_id)
+            .expect("the descriptor-selected database face must be loadable");
+        assert_eq!(selected_font.id(), selected_id);
+
+        let tree = obscura_dom::parse_html(
+            "<p id='copy'>Build whatever you want, without touching your CSS file.</p>",
+        );
+        let copy = tree.get_element_by_id("copy").unwrap();
+        let style = LayoutStyle {
+            display: Display::Block,
+            font_family: Some("Pinned Variable".to_string()),
+            font_weight: Some("700".to_string()),
+            font_size: Some(32.0),
+            ..Default::default()
+        };
+        let item = engine
+            .try_build(&tree, copy, &HashMap::from([(copy, style)]))
+            .unwrap();
+        assert_eq!(
+            engine.items[item].buffer.lines[0]
+                .attrs_list()
+                .get_span(0)
+                .font_id_opt,
+            Some(selected_id),
+            "the resolved face must survive rich-text span construction"
+        );
+        engine.measure(item, None);
+        let shaped_id = engine.items[item]
+            .buffer
+            .layout_runs()
+            .next()
+            .and_then(|run| run.glyphs.first())
+            .map(|glyph| glyph.font_id)
+            .unwrap();
+        assert_eq!(
+            shaped_id, selected_id,
+            "family/default-weight rematching must not replace the descriptor-selected resource"
+        );
+    }
+
+    #[test]
     fn ranged_face_preserves_requested_weight_for_variable_raster() {
         let loaded = HashMap::from([(
             "inter".to_string(),
             LoadedFamily {
                 faces: vec![LoadedFace {
                     name: Arc::from("Inter"),
+                    font_id: None,
                     min_weight: 100,
                     max_weight: 900,
                     shape_weight: 400,
                     italic: false,
+                    has_optical_size: true,
                 }],
             },
         )]);
@@ -1886,24 +2075,82 @@ mod tests {
     }
 
     #[test]
-    fn glyph_metadata_keeps_fill_and_variable_weight_independent() {
+    fn glyph_metadata_keeps_fill_and_variations_independent() {
+        let mut variations = FontVariations::new();
+        variations.set(VariationTag::new(b"wght"), 725.0);
         let attrs = SpanAttrs {
             font_size: 16.0,
             line_height: 18.0,
             letter_spacing: 0.0,
             letter_spacing_non_normal: false,
             weight: 400,
-            variation_weight: Some(725),
+            font_id: None,
+            variations: Some(Arc::new(variations)),
             italic: false,
             underline: true,
             color: [1, 2, 3, 255],
             family: Arc::from(FAMILY),
             clip_fill: Some(37),
         };
-        let metadata = attrs.to_attrs().metadata;
-        assert_ne!(metadata & META_UNDERLINE, 0);
-        assert_eq!(metadata_fill(metadata), Some(37));
-        assert_eq!(metadata_variation_weight(metadata), Some(725));
+        let shaped = attrs.to_attrs(42);
+        assert_ne!(shaped.metadata & META_UNDERLINE, 0);
+        assert_eq!(metadata_fill(shaped.metadata), Some(37));
+        assert_eq!(metadata_variation(shaped.metadata), Some(41));
+        assert_eq!(
+            shaped
+                .font_variations
+                .iter()
+                .find(|variation| variation.tag == VariationTag::new(b"wght"))
+                .map(|variation| variation.value.0),
+            Some(725.0)
+        );
+    }
+
+    #[test]
+    fn static_text_keeps_the_zero_allocation_variation_path() {
+        let tree = obscura_dom::parse_html("<p id='copy'>ordinary text</p>");
+        let copy = tree.get_element_by_id("copy").unwrap();
+        let mut style = LayoutStyle::default();
+        style.display = Display::Block;
+        let static_font = ResolvedFont {
+            family: Arc::from(FAMILY),
+            font_id: None,
+            shape_weight: 400,
+            variation_weight: None,
+            has_optical_size: false,
+        };
+        assert!(resolved_font_variations(&style, &static_font).is_none());
+        let styles = HashMap::from([(copy, style)]);
+        let mut engine = TextEngine::new();
+        let item = engine.try_build(&tree, copy, &styles).unwrap();
+
+        assert!(engine.items[item].variation_sets.is_empty());
+        assert_eq!(engine.items[item].variation_sets.capacity(), 0);
+    }
+
+    #[test]
+    fn programmatic_nonfinite_variations_never_reach_shape_or_raster() {
+        let style = LayoutStyle {
+            font_variation_settings: Some(vec![
+                crate::FontVariationSetting {
+                    tag: *b"opsz",
+                    value: f32::NAN,
+                },
+                crate::FontVariationSetting {
+                    tag: *b"wght",
+                    value: f32::INFINITY,
+                },
+            ]),
+            ..Default::default()
+        };
+        let font = ResolvedFont {
+            family: Arc::from(FAMILY),
+            font_id: None,
+            shape_weight: 400,
+            variation_weight: None,
+            has_optical_size: false,
+        };
+        assert!(resolved_font_variations(&style, &font).is_none());
     }
 
     #[test]
@@ -1914,14 +2161,15 @@ mod tests {
             letter_spacing: 2.0,
             letter_spacing_non_normal: true,
             weight: 400,
-            variation_weight: None,
+            font_id: None,
+            variations: None,
             italic: false,
             underline: false,
             color: [0, 0, 0, 255],
             family: Arc::from(FAMILY),
             clip_fill: None,
         };
-        let attrs = span.to_attrs();
+        let attrs = span.to_attrs(1);
         assert_eq!(attrs.letter_spacing_opt.unwrap().0, 0.1);
         assert!(attrs.font_features.features.iter().any(|feature| {
             feature.tag == FeatureTag::STANDARD_LIGATURES && feature.value == 0
@@ -1932,7 +2180,7 @@ mod tests {
 
         let mut zero = span;
         zero.letter_spacing = 0.0;
-        assert!(zero.to_attrs().font_features.features.is_empty());
+        assert!(zero.to_attrs(1).font_features.features.is_empty());
     }
 
     fn variable_font_fixture() -> Vec<u8> {
@@ -1976,7 +2224,12 @@ mod tests {
             .variable_swash
             .images
             .keys()
-            .map(|key| key.weight)
+            .filter_map(|key| {
+                key.variations
+                    .iter()
+                    .find(|variation| variation.tag == VariationTag::new(b"wght"))
+                    .map(|variation| variation.value.0 as u16)
+            })
             .collect();
         cached_weights.sort_unstable();
         cached_weights.dedup();
@@ -1984,10 +2237,10 @@ mod tests {
     }
 
     #[test]
-    fn variable_wght_changes_true_outline_without_changing_layout_geometry() {
+    fn variable_wght_changes_shape_and_true_outline() {
         let (regular_geometry, regular_ink, regular_cache) = render_variable_weight(400);
         let (black_geometry, black_ink, black_cache) = render_variable_weight(900);
-        assert_eq!(regular_geometry, black_geometry);
+        assert!(regular_geometry.0 > 0.0 && black_geometry.0 > 0.0);
         assert!(
             black_ink > regular_ink * 13 / 10,
             "wght=900 should carry substantially more raster ink: {regular_ink} vs {black_ink}"
@@ -2034,9 +2287,103 @@ mod tests {
             .variable_swash
             .images
             .keys()
-            .map(|key| key.weight)
+            .filter_map(|key| {
+                key.variations
+                    .iter()
+                    .find(|variation| variation.tag == VariationTag::new(b"wght"))
+                    .map(|variation| variation.value.0 as u16)
+            })
             .collect();
         assert_eq!(weights, std::collections::HashSet::from([400, 900]));
+    }
+
+    fn render_tailwind_optical_heading(
+        optical_sizing: crate::FontOpticalSizing,
+        explicit_opsz: Option<f32>,
+        width: f32,
+    ) -> ((f32, f32), usize, std::collections::HashSet<u32>) {
+        let mut engine = TextEngine::new_with_web_fonts(&[WebFont {
+            data: variable_font_fixture(),
+            family: Some("Obscura VF Test".to_string()),
+            weight: Some((100, 900)),
+            italic: Some(false),
+        }]);
+        let tree = obscura_dom::parse_html(
+            "<h2 id='copy'>Build whatever you want, without touching your CSS file.</h2>",
+        );
+        let copy = tree.get_element_by_id("copy").unwrap();
+        let mut style = LayoutStyle::default();
+        style.display = Display::Block;
+        style.font_family = Some("Obscura VF Test".to_string());
+        style.font_weight = Some("500".to_string());
+        style.font_size = Some(40.0);
+        style.line_height = Some(crate::LineHeight::Px(40.0));
+        style.letter_spacing = Some(-2.0);
+        style.letter_spacing_non_normal = Some(true);
+        style.font_optical_sizing = Some(optical_sizing);
+        style.font_variation_settings = Some(
+            explicit_opsz
+                .map(|value| {
+                    vec![crate::FontVariationSetting {
+                        tag: *b"opsz",
+                        value,
+                    }]
+                })
+                .unwrap_or_default(),
+        );
+        let styles = HashMap::from([(copy, style)]);
+        let item = engine.try_build(&tree, copy, &styles).unwrap();
+        let geometry = engine.measure(item, Some(width));
+        let lines = engine.items[item].buffer.layout_runs().count();
+        engine.finalize(item, (0.0, 0.0), width, None);
+        let mut pixmap = tiny_skia::Pixmap::new(512, 140).unwrap();
+        engine.paint_item(item, &mut pixmap, (0.0, 0.0));
+        let optical_values = engine
+            .variable_swash
+            .images
+            .keys()
+            .filter_map(|key| {
+                key.variations
+                    .iter()
+                    .find(|variation| variation.tag == VariationTag::new(b"opsz"))
+                    .map(|variation| variation.value.0.to_bits())
+            })
+            .collect();
+        (geometry, lines, optical_values)
+    }
+
+    #[test]
+    fn optical_sizing_changes_tailwind_heading_shape_and_raster_axes() {
+        let (auto_geometry, auto_lines, auto_axes) = render_tailwind_optical_heading(
+            crate::FontOpticalSizing::Auto,
+            None,
+            496.0,
+        );
+        let (none_geometry, none_lines, none_axes) = render_tailwind_optical_heading(
+            crate::FontOpticalSizing::None,
+            None,
+            496.0,
+        );
+        let (explicit_geometry, explicit_lines, explicit_axes) =
+            render_tailwind_optical_heading(
+                crate::FontOpticalSizing::Auto,
+                Some(14.0),
+                496.0,
+            );
+
+        assert_ne!(
+            auto_geometry, none_geometry,
+            "automatic opsz must affect the shaped heading advances"
+        );
+        assert_eq!(auto_lines, none_lines);
+        assert_eq!(explicit_lines, none_lines);
+        assert_eq!(explicit_geometry, none_geometry);
+        assert_eq!(auto_axes, std::collections::HashSet::from([40.0f32.to_bits()]));
+        assert!(none_axes.is_empty());
+        assert_eq!(
+            explicit_axes,
+            std::collections::HashSet::from([14.0f32.to_bits()])
+        );
     }
 
     #[test]

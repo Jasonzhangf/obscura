@@ -59,6 +59,9 @@ base64 = "0.22"
 [patch.crates-io]
 # Keep the grid shrink-to-fit correction local until it lands upstream.
 taffy = { path = "vendor/taffy" }
+# Carry the same canonical variable-font coordinates through shaping and
+# rasterization until the upstream API exposes them.
+cosmic-text = { path = "vendor/cosmic-text" }
 
 # Unwinding (the Rust default) is REQUIRED for the anti-panic protocol: ops wrap
 # their bodies in std::panic::catch_unwind so a panic degrades to an error return

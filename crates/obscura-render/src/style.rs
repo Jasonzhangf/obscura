@@ -9,6 +9,7 @@
 //! the crate dependency-light.
 
 use crate::{Display, Edges, LayoutStyle};
+use std::collections::BTreeMap;
 
 /// Compute the layout-relevant style for an element: UA defaults for its tag,
 /// overridden by its inline `style="..."` declarations.
@@ -431,6 +432,106 @@ fn parse_container_shorthand(value: &str) -> Option<(Vec<String>, crate::Contain
     }
 }
 
+fn parse_font_variation_settings(value: &str) -> Option<Vec<crate::FontVariationSetting>> {
+    let mut input = cssparser::ParserInput::new(value.trim());
+    let mut parser = cssparser::Parser::new(&mut input);
+    if parser.is_exhausted() {
+        return None;
+    }
+
+    // A map both implements CSS's "last duplicate wins" rule and gives the
+    // inline engine a stable tag order independent of author ordering.
+    let mut settings = BTreeMap::new();
+    loop {
+        let tag = parser.expect_string_cloned().ok()?;
+        let bytes = tag.as_bytes();
+        if bytes.len() != 4 || !bytes.iter().all(|byte| (0x20..=0x7e).contains(byte)) {
+            return None;
+        }
+        let value = parse_font_variation_number(&mut parser)?;
+        if !value.is_finite() {
+            return None;
+        }
+        let tag = [bytes[0], bytes[1], bytes[2], bytes[3]];
+        // Keep numerically equivalent signed zeroes canonical for stable cache
+        // keys later in the shaping and rasterization pipeline.
+        settings.insert(tag, if value == 0.0 { 0.0 } else { value });
+        if parser.is_exhausted() {
+            break;
+        }
+        parser.expect_comma().ok()?;
+        if parser.is_exhausted() {
+            return None;
+        }
+    }
+    Some(
+        settings
+            .into_iter()
+            .map(|(tag, value)| crate::FontVariationSetting { tag, value })
+            .collect(),
+    )
+}
+
+fn parse_font_variation_number(parser: &mut cssparser::Parser<'_, '_>) -> Option<f32> {
+    if let Ok(value) = parser.try_parse(|input| input.expect_number()) {
+        return value.is_finite().then_some(value);
+    }
+    let start = parser.position();
+    let token = parser.next().ok()?.clone();
+    let cssparser::Token::Function(name) = token else {
+        return None;
+    };
+    if !matches!(
+        name.to_ascii_lowercase().as_str(),
+        "calc" | "min" | "max" | "clamp" | "round"
+    ) {
+        return None;
+    }
+    parser
+        .parse_nested_block(|input| unitless_math_tokens(input, 0))
+        .ok()?;
+    let expression = parser.slice_from(start);
+    resolve_contextual_length(expression, 0.0, 0.0, 0.0, 0.0, 0.0)
+        .filter(|value| value.is_finite())
+}
+
+fn unitless_math_tokens<'i, 't>(
+    parser: &mut cssparser::Parser<'i, 't>,
+    depth: u8,
+) -> Result<(), cssparser::ParseError<'i, ()>> {
+    if depth >= 64 {
+        return Err(parser.new_custom_error(()));
+    }
+    while !parser.is_exhausted() {
+        let token = parser
+            .next_including_whitespace_and_comments()?
+            .clone();
+        match token {
+            cssparser::Token::Number { .. }
+            | cssparser::Token::WhiteSpace(_)
+            | cssparser::Token::Comment(_)
+            | cssparser::Token::Comma
+            | cssparser::Token::Delim('+')
+            | cssparser::Token::Delim('-')
+            | cssparser::Token::Delim('*')
+            | cssparser::Token::Delim('/') => {}
+            cssparser::Token::Function(name)
+                if matches!(
+                    name.to_ascii_lowercase().as_str(),
+                    "calc" | "min" | "max" | "clamp" | "round"
+                ) =>
+            {
+                parser.parse_nested_block(|input| unitless_math_tokens(input, depth + 1))?;
+            }
+            cssparser::Token::ParenthesisBlock => {
+                parser.parse_nested_block(|input| unitless_math_tokens(input, depth + 1))?;
+            }
+            _ => return Err(parser.new_custom_error(())),
+        }
+    }
+    Ok(())
+}
+
 fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
     match name {
         "display" => {
@@ -733,6 +834,30 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
             let v = value.trim().to_ascii_lowercase();
             if !v.is_empty() && v != "inherit" {
                 style.font_family = Some(v);
+            }
+        }
+        "font-optical-sizing" => {
+            let parsed = match value.trim().to_ascii_lowercase().as_str() {
+                "inherit" | "unset" | "revert" | "revert-layer" => Some(None),
+                "auto" | "initial" => Some(Some(crate::FontOpticalSizing::Auto)),
+                "none" => Some(Some(crate::FontOpticalSizing::None)),
+                _ => None,
+            };
+            if let Some(value) = parsed {
+                style.font_optical_sizing = value;
+            }
+        }
+        "font-variation-settings" => {
+            let lower = value.trim().to_ascii_lowercase();
+            if matches!(
+                lower.as_str(),
+                "inherit" | "unset" | "revert" | "revert-layer"
+            ) {
+                style.font_variation_settings = None;
+            } else if matches!(lower.as_str(), "normal" | "initial") {
+                style.font_variation_settings = Some(Vec::new());
+            } else if let Some(settings) = parse_font_variation_settings(value) {
+                style.font_variation_settings = Some(settings);
             }
         }
         // Text alignment is inherited and applies to inline line boxes. It is
@@ -1242,6 +1367,8 @@ pub(crate) fn supports_declaration(name: &str, value: &str) -> bool {
             | "font-weight"
             | "font-family"
             | "font-style"
+            | "font-optical-sizing"
+            | "font-variation-settings"
             | "text-align"
             | "text-transform"
             | "text-decoration"
@@ -1358,6 +1485,14 @@ pub(crate) fn supports_declaration(name: &str, value: &str) -> bool {
         "container-type" => parse_container_type(value).is_some(),
         "container-name" => parse_container_names(value).is_some(),
         "container" => parse_container_shorthand(value).is_some(),
+        "font-optical-sizing" => matches!(
+            value.to_ascii_lowercase().as_str(),
+            "auto" | "none"
+        ),
+        "font-variation-settings" => {
+            value.eq_ignore_ascii_case("normal")
+                || parse_font_variation_settings(value).is_some()
+        }
         "float" => matches!(
             value.to_ascii_lowercase().as_str(),
             "none" | "left" | "right"
@@ -3386,6 +3521,8 @@ fn apply_font_shorthand(style: &mut LayoutStyle, value: &str) {
     // The shorthand resets every constituent before applying supplied values.
     style.font_style_italic = Some(false);
     style.font_weight = Some("400".to_string());
+    style.font_optical_sizing = Some(crate::FontOpticalSizing::Auto);
+    style.font_variation_settings = Some(Vec::new());
     style.line_height = Some(crate::LineHeight::Normal);
     style.line_height_expression = None;
     for token in &tokens[..size_index] {
@@ -4506,6 +4643,168 @@ mod tests {
         assert_eq!(computed_font_weight(Some("lighter"), 550), 400);
         assert_eq!(computed_font_weight(Some("lighter"), 750), 700);
         assert_eq!(computed_font_weight(Some("lighter"), 900), 700);
+    }
+
+    #[test]
+    fn variable_font_properties_parse_canonically_and_atomically() {
+        let style = compute_style(
+            "span",
+            Some(
+                r#"font-optical-sizing:none;
+                   font-variation-settings:"wght" 500, "\6f psz" 14, "wght" 650"#,
+            ),
+        );
+        assert_eq!(
+            style.font_optical_sizing,
+            Some(crate::FontOpticalSizing::None)
+        );
+        assert_eq!(
+            style.font_variation_settings.as_deref(),
+            Some(
+                [
+                    crate::FontVariationSetting {
+                        tag: *b"opsz",
+                        value: 14.0,
+                    },
+                    crate::FontVariationSetting {
+                        tag: *b"wght",
+                        value: 650.0,
+                    },
+                ]
+                .as_slice()
+            )
+        );
+
+        let case_sensitive = compute_style(
+            "span",
+            Some(r#"font-variation-settings:"wght" 400, "WGHT" 700"#),
+        );
+        assert_eq!(
+            case_sensitive.font_variation_settings.as_deref(),
+            Some(
+                [
+                    crate::FontVariationSetting {
+                        tag: *b"WGHT",
+                        value: 700.0,
+                    },
+                    crate::FontVariationSetting {
+                        tag: *b"wght",
+                        value: 400.0,
+                    },
+                ]
+                .as_slice()
+            )
+        );
+
+        for malformed in [
+            r#""abc" 1"#,
+            r#"wght 1"#,
+            r#""wght" 1,"#,
+            r#""wght" calc(1px)"#,
+            r#""wght" 1e999"#,
+            r#""wégt" 1"#,
+        ] {
+            let css = format!(
+                r#"font-variation-settings:"opsz" 20;font-variation-settings:{malformed}"#
+            );
+            let unchanged = compute_style("span", Some(&css));
+            assert_eq!(
+                unchanged.font_variation_settings.as_deref(),
+                Some(
+                    [crate::FontVariationSetting {
+                        tag: *b"opsz",
+                        value: 20.0,
+                    }]
+                    .as_slice()
+                ),
+                "invalid declaration was not atomic: {malformed}"
+            );
+        }
+    }
+
+    #[test]
+    fn variable_font_css_wide_values_and_font_shorthand_obey_cascade() {
+        let inherited = compute_style(
+            "span",
+            Some(
+                r#"font-optical-sizing:none;font-optical-sizing:unset;
+                   font-variation-settings:"wght" 700;font-variation-settings:inherit"#,
+            ),
+        );
+        assert_eq!(inherited.font_optical_sizing, None);
+        assert_eq!(inherited.font_variation_settings, None);
+
+        let reset = compute_style(
+            "span",
+            Some(
+                r#"font-optical-sizing:none;font-optical-sizing:initial;
+                   font-variation-settings:"wght" 700;font-variation-settings:normal"#,
+            ),
+        );
+        assert_eq!(
+            reset.font_optical_sizing,
+            Some(crate::FontOpticalSizing::Auto)
+        );
+        assert_eq!(reset.font_variation_settings, Some(Vec::new()));
+
+        let reverted = compute_style(
+            "span",
+            Some(
+                r#"font-optical-sizing:none;font-optical-sizing:revert;
+                   font-variation-settings:"wght" 700;font-variation-settings:revert-layer"#,
+            ),
+        );
+        assert_eq!(reverted.font_optical_sizing, None);
+        assert_eq!(reverted.font_variation_settings, None);
+
+        let shorthand = compute_style(
+            "span",
+            Some(
+                r#"font-optical-sizing:none;font-variation-settings:"opsz" 22;
+                   font:italic 500 20px/1.2 Inter"#,
+            ),
+        );
+        assert_eq!(
+            shorthand.font_optical_sizing,
+            Some(crate::FontOpticalSizing::Auto)
+        );
+        assert_eq!(shorthand.font_variation_settings, Some(Vec::new()));
+
+        assert!(supports_declaration("font-optical-sizing", "auto"));
+        assert!(!supports_declaration("font-optical-sizing", "enabled"));
+        assert!(supports_declaration(
+            "font-variation-settings",
+            r#""opsz" 18, "wght" 500"#
+        ));
+        assert!(supports_declaration(
+            "font-variation-settings",
+            r#""opsz" calc(18)"#
+        ));
+
+        let calculated = compute_style(
+            "span",
+            Some(r#"font-variation-settings:"opsz" calc(10 * 2), "wght" max(400, 500)"#),
+        );
+        assert_eq!(
+            calculated.font_variation_settings.as_deref(),
+            Some(
+                [
+                    crate::FontVariationSetting {
+                        tag: *b"opsz",
+                        value: 20.0,
+                    },
+                    crate::FontVariationSetting {
+                        tag: *b"wght",
+                        value: 500.0,
+                    },
+                ]
+                .as_slice()
+            )
+        );
+        assert!(!supports_declaration(
+            "font-variation-settings",
+            r#""opsz" calc(18px)"#
+        ));
     }
 
     #[test]

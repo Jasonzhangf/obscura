@@ -1076,6 +1076,8 @@ pub(crate) fn layout_dom_with_web_fonts(
             font_size: Option<f32>,
             font_weight: u16,
             font_family: Option<String>,
+            font_optical_sizing: crate::FontOpticalSizing,
+            font_variation_settings: Vec<crate::FontVariationSetting>,
             letter_spacing: f32,
             letter_spacing_non_normal: bool,
             container_type: crate::ContainerType,
@@ -1110,6 +1112,8 @@ pub(crate) fn layout_dom_with_web_fonts(
                     font_size: None,
                     font_weight: 400,
                     font_family: None,
+                    font_optical_sizing: crate::FontOpticalSizing::Auto,
+                    font_variation_settings: Vec::new(),
                     letter_spacing: 0.0,
                     letter_spacing_non_normal: false,
                     container_type: crate::ContainerType::Normal,
@@ -1410,6 +1414,17 @@ pub(crate) fn layout_dom_with_web_fonts(
                 style.font_weight = Some(computed_weight.to_string());
                 inh.font_weight = computed_weight;
                 match &style.font_family { Some(f) => inh.font_family = Some(f.clone()), None => style.font_family = inh.font_family.clone() }
+                match style.font_optical_sizing {
+                    Some(value) => inh.font_optical_sizing = value,
+                    None => style.font_optical_sizing = Some(inh.font_optical_sizing),
+                }
+                match &style.font_variation_settings {
+                    Some(settings) => inh.font_variation_settings.clone_from(settings),
+                    None => {
+                        style.font_variation_settings =
+                            Some(inh.font_variation_settings.clone())
+                    }
+                }
                 let is_table = tree
                     .get_node(id)
                     .map_or(false, |node| {
@@ -1566,6 +1581,8 @@ pub(crate) fn layout_dom_with_web_fonts(
                     style.letter_spacing_non_normal.unwrap_or(false);
                 let host_weight = crate::style::used_font_weight(style);
                 let host_family = style.font_family.clone();
+                let host_optical_sizing = style.font_optical_sizing;
+                let host_variation_settings = style.font_variation_settings.clone();
                 let host_line_height = style.line_height;
                 let host_transform = style.text_transform;
                 let host_italic = style.font_style_italic;
@@ -1710,6 +1727,13 @@ pub(crate) fn layout_dom_with_web_fonts(
                     pseudo.font_weight = Some(weight.to_string());
                     if pseudo.font_family.is_none() {
                         pseudo.font_family = host_family.clone();
+                    }
+                    if pseudo.font_optical_sizing.is_none() {
+                        pseudo.font_optical_sizing = host_optical_sizing;
+                    }
+                    if pseudo.font_variation_settings.is_none() {
+                        pseudo.font_variation_settings =
+                            host_variation_settings.clone();
                     }
                     if let Some(expression) = pseudo.line_height_expression.as_deref() {
                         if let Some(resolved) = crate::style::resolve_contextual_length(
@@ -7332,6 +7356,79 @@ mod tests {
         assert_eq!(pseudo.font_family, host.font_family);
         assert_eq!(pseudo.font_weight, host.font_weight);
         assert_eq!(pseudo.line_height, host.line_height);
+    }
+
+    #[test]
+    fn variable_font_properties_inherit_and_reset_through_elements_and_pseudos() {
+        let tree = parse_html(
+            r#"<style>
+                #parent {
+                    font-optical-sizing:none;
+                    font-variation-settings:"opsz" 20, "wght" 650;
+                }
+                #parent::before { content:"before" }
+                #reset {
+                    font-optical-sizing:initial;
+                    font-variation-settings:normal;
+                }
+                #reset::after {
+                    content:"after";
+                    font-optical-sizing:inherit;
+                    font-variation-settings:"wght" 300;
+                }
+            </style>
+            <div id="parent">
+                <span id="inherited"></span>
+                <span id="reset"><b id="reset-child"></b></span>
+            </div>"#,
+        );
+        let laid = layout_dom(&tree, (1280.0, 720.0));
+        let get = |selector: &str| {
+            let id = tree.query_selector(selector).unwrap().unwrap();
+            &laid.styles[&id]
+        };
+        let parent = get("#parent");
+        let inherited = get("#inherited");
+        assert_eq!(
+            parent.font_optical_sizing,
+            Some(crate::FontOpticalSizing::None)
+        );
+        assert_eq!(inherited.font_optical_sizing, parent.font_optical_sizing);
+        assert_eq!(
+            inherited.font_variation_settings,
+            parent.font_variation_settings
+        );
+        let before = parent.before_pseudo.as_ref().unwrap();
+        assert_eq!(before.font_optical_sizing, parent.font_optical_sizing);
+        assert_eq!(
+            before.font_variation_settings,
+            parent.font_variation_settings
+        );
+
+        let reset = get("#reset");
+        let reset_child = get("#reset-child");
+        assert_eq!(
+            reset.font_optical_sizing,
+            Some(crate::FontOpticalSizing::Auto)
+        );
+        assert_eq!(reset.font_variation_settings, Some(Vec::new()));
+        assert_eq!(reset_child.font_optical_sizing, reset.font_optical_sizing);
+        assert_eq!(
+            reset_child.font_variation_settings,
+            reset.font_variation_settings
+        );
+        let after = reset.after_pseudo.as_ref().unwrap();
+        assert_eq!(after.font_optical_sizing, reset.font_optical_sizing);
+        assert_eq!(
+            after.font_variation_settings.as_deref(),
+            Some(
+                [crate::FontVariationSetting {
+                    tag: *b"wght",
+                    value: 300.0,
+                }]
+                .as_slice()
+            )
+        );
     }
 
     #[test]

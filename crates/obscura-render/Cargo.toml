@@ -23,8 +23,8 @@ ab_glyph = { workspace = true, optional = true }
 # fonts (no system-font scan) so layout stays deterministic across hosts.
 cosmic-text = { version = "=0.14.2", default-features = false, features = ["std", "swash"], optional = true }
 # Keep this exactly aligned with cosmic-text 0.14's raster backend. Cosmic
-# does not expose variation coordinates, so variable font instances are
-# rasterized through Swash directly while Cosmic remains the shaper.
+# and the renderer consume the same canonical variation coordinates for
+# shaping and rasterization.
 swash = { version = "=0.2.0", default-features = false, features = ["std", "scale", "render"], optional = true }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"], optional = true }
 ureq = { version = "2.9", default-features = false, features = ["tls"], optional = true }
