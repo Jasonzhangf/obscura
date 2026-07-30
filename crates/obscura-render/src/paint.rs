@@ -74,6 +74,10 @@ pub fn paint_dom_scrolled(
         laid = layout_dom_with_web_fonts(tree, viewport, &intrinsic, &fonts);
     }
     apply_document_scroll(tree, &mut laid, viewport, scroll);
+    // Only raster images inside an actually rotated/scaled subtree receive an
+    // affine entry. Ordinary pages pay one fast style scan and allocate no
+    // matrix map; transformed pages do matrix work only along those subtrees.
+    let projected_images = collect_projected_image_transforms(tree, &laid);
     let root_font_size = tree
         .query_selector("html")
         .ok()
@@ -251,12 +255,16 @@ pub fn paint_dom_scrolled(
         // ubiquitous 1x1 clipped "visually hidden" accessibility pattern
         // actually invisible instead of painting text wherever it lands).
         let clip = laid.clip_rects.get(&nid).copied().flatten();
+        let projected_image = projected_images.get(&nid).copied();
+        let cull_rect = projected_image
+            .map(|transform| transform.map_rect(rect))
+            .unwrap_or(rect);
         let visible_rect = match clip {
-            Some(c) => match rect.intersect(&c) {
+            Some(c) => match cull_rect.intersect(&c) {
                 Some(r) => r,
                 None => continue,
             },
-            None => rect,
+            None => cull_rect,
         };
         let box_rect = match Rect::from_xywh(visible_rect.x, visible_rect.y, visible_rect.width, visible_rect.height) {
             Some(r) => r,
@@ -365,6 +373,7 @@ pub fn paint_dom_scrolled(
                         crate::ObjectFit::Fill,
                         &mut pixmap,
                         &mut image_cache,
+                        None,
                     );
                 }
             }
@@ -447,7 +456,16 @@ pub fn paint_dom_scrolled(
                 // half-scrolled carousel slide's image otherwise bleeds over
                 // the viewport edge).
                 let painted =
-                    paint_image(&src, base_url, &rect, &visible_rect, style.object_fit, &mut pixmap, &mut image_cache);
+                    paint_image(
+                        &src,
+                        base_url,
+                        &rect,
+                        &visible_rect,
+                        style.object_fit,
+                        &mut pixmap,
+                        &mut image_cache,
+                        projected_image,
+                    );
                 // Fall back when the image itself did not paint, following
                 // what browsers show for a broken image: a non-empty alt
                 // renders as text in place of the image (no placeholder box),
@@ -766,6 +784,175 @@ fn apply_document_scroll(
             clip.y -= scroll_y;
         }
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ImageAffine {
+    a: f32,
+    b: f32,
+    c: f32,
+    d: f32,
+    e: f32,
+    f: f32,
+}
+
+impl ImageAffine {
+    const IDENTITY: Self = Self {
+        a: 1.0,
+        b: 0.0,
+        c: 0.0,
+        d: 1.0,
+        e: 0.0,
+        f: 0.0,
+    };
+
+    /// Compose `self(other(point))`.
+    fn then(self, other: Self) -> Self {
+        Self {
+            a: self.a * other.a + self.c * other.b,
+            b: self.b * other.a + self.d * other.b,
+            c: self.a * other.c + self.c * other.d,
+            d: self.b * other.c + self.d * other.d,
+            e: self.a * other.e + self.c * other.f + self.e,
+            f: self.b * other.e + self.d * other.f + self.f,
+        }
+    }
+
+    fn around(origin: (f32, f32), linear: [f32; 4]) -> Self {
+        let [a, b, c, d] = linear;
+        Self {
+            a,
+            b,
+            c,
+            d,
+            e: origin.0 - a * origin.0 - c * origin.1,
+            f: origin.1 - b * origin.0 - d * origin.1,
+        }
+    }
+
+    fn map(self, x: f32, y: f32) -> (f32, f32) {
+        (
+            self.a * x + self.c * y + self.e,
+            self.b * x + self.d * y + self.f,
+        )
+    }
+
+    fn map_rect(self, rect: crate::Rect) -> crate::Rect {
+        let points = [
+            self.map(rect.x, rect.y),
+            self.map(rect.x + rect.width, rect.y),
+            self.map(rect.x, rect.y + rect.height),
+            self.map(rect.x + rect.width, rect.y + rect.height),
+        ];
+        let left = points.iter().map(|point| point.0).fold(f32::INFINITY, f32::min);
+        let top = points.iter().map(|point| point.1).fold(f32::INFINITY, f32::min);
+        let right = points
+            .iter()
+            .map(|point| point.0)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let bottom = points
+            .iter()
+            .map(|point| point.1)
+            .fold(f32::NEG_INFINITY, f32::max);
+        crate::Rect {
+            x: left,
+            y: top,
+            width: (right - left).max(0.0),
+            height: (bottom - top).max(0.0),
+        }
+    }
+
+    fn tiny_skia(self) -> Transform {
+        Transform::from_row(self.a, self.b, self.c, self.d, self.e, self.f)
+    }
+
+    fn is_identity(self) -> bool {
+        (self.a - 1.0).abs() < f32::EPSILON
+            && self.b.abs() < f32::EPSILON
+            && self.c.abs() < f32::EPSILON
+            && (self.d - 1.0).abs() < f32::EPSILON
+            && self.e.abs() < f32::EPSILON
+            && self.f.abs() < f32::EPSILON
+    }
+}
+
+/// Accumulate rotation/scale matrices through transformed subtrees, storing
+/// entries only for raster `<img>` descendants. Translation remains on
+/// `DomLayout::translates`, whose offsets already include root scroll.
+fn collect_projected_image_transforms(
+    tree: &DomTree,
+    layout: &crate::DomLayout,
+) -> std::collections::HashMap<obscura_dom::tree::NodeId, ImageAffine> {
+    if !layout.styles.values().any(|style| {
+        style.transform_projection.is_some() || style.transform_scale.is_some()
+    }) {
+        return std::collections::HashMap::new();
+    }
+
+    fn walk(
+        tree: &DomTree,
+        layout: &crate::DomLayout,
+        id: obscura_dom::tree::NodeId,
+        parent: ImageAffine,
+        active: bool,
+        out: &mut std::collections::HashMap<obscura_dom::tree::NodeId, ImageAffine>,
+    ) {
+        let style = layout.styles.get(&id);
+        let own_active = style.is_some_and(|style| {
+            style.transform_projection.is_some() || style.transform_scale.is_some()
+        });
+        let mut combined = parent;
+        if own_active {
+            let style = style.unwrap();
+            let projection = style
+                .transform_projection
+                .unwrap_or([1.0, 0.0, 0.0, 1.0]);
+            let (scale_x, scale_y) = style.transform_scale.unwrap_or((1.0, 1.0));
+            let linear = [
+                scale_x * projection[0],
+                scale_y * projection[1],
+                scale_x * projection[2],
+                scale_y * projection[3],
+            ];
+            if let Some(rect) = layout.rects.get(&id) {
+                let offset = layout.translates.get(&id).copied().unwrap_or((0.0, 0.0));
+                let (origin_x, origin_y) = style.transform_origin.unwrap_or((
+                    crate::Dimension::Percent(0.5),
+                    crate::Dimension::Percent(0.5),
+                ));
+                let origin = (
+                    rect.x + offset.0 + crate::dom::resolve_translate(origin_x, rect.width),
+                    rect.y + offset.1 + crate::dom::resolve_translate(origin_y, rect.height),
+                );
+                combined = parent.then(ImageAffine::around(origin, linear));
+            }
+        }
+
+        let transformed = active || own_active;
+        if transformed
+            && !combined.is_identity()
+            && tree.get_node(id).is_some_and(|node| {
+                node.as_element()
+                    .is_some_and(|element| element.local.as_ref() == "img")
+            })
+        {
+            out.insert(id, combined);
+        }
+        for child in tree.children(id) {
+            walk(tree, layout, child, combined, transformed, out);
+        }
+    }
+
+    let mut out = std::collections::HashMap::new();
+    walk(
+        tree,
+        layout,
+        tree.document(),
+        ImageAffine::IDENTITY,
+        false,
+        &mut out,
+    );
+    out
 }
 
 /// A closed rounded-rectangle path, corners approximated by quadratic curves
@@ -2155,6 +2342,7 @@ fn paint_in_flow_generated_box(
                 crate::ObjectFit::Fill,
                 pixmap,
                 image_cache,
+                None,
             );
         }
     }
@@ -2343,6 +2531,7 @@ fn paint_positioned_pseudo(
                 crate::ObjectFit::Fill,
                 pixmap,
                 image_cache,
+                None,
             );
         }
     }
@@ -2694,6 +2883,7 @@ fn paint_image(
     object_fit: crate::ObjectFit,
     pixmap: &mut Pixmap,
     cache: &mut std::collections::HashMap<String, Option<Vec<u8>>>,
+    transform: Option<ImageAffine>,
 ) -> bool {
     if rect.width <= 0.0 || rect.height <= 0.0 {
         return false;
@@ -2745,7 +2935,9 @@ fn paint_image(
         dest.y as i32,
         content.as_ref(),
         &tiny_skia::PixmapPaint::default(),
-        Transform::identity(),
+        transform
+            .map(ImageAffine::tiny_skia)
+            .unwrap_or_else(Transform::identity),
         clip.as_ref(),
     );
     true
@@ -4172,6 +4364,39 @@ mod tests {
         assert!(
             content.blue() > 220 && content.red() < 40,
             "translated cover image must remain visible inside padding box: {content:?}"
+        );
+    }
+
+    #[test]
+    fn projected_image_transform_enters_overflow_clip() {
+        // Chromium reduction: without the projected rotate/scale, this image is
+        // wholly left of the clip. Its transformed right edge reaches x=53.14.
+        let tree = parse_html(
+            r#"<html><body style="margin:0">
+               <div style="position:relative;width:120px;height:100px;overflow:hidden">
+                 <div style="position:absolute;left:-60px;top:50px;transform-origin:0 0;
+                             transform:rotateX(60deg) rotateZ(-45deg);scale:200%">
+                   <img alt="" src="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='40'%20height='40'%3E%3Crect%20width='40'%20height='40'%20fill='red'/%3E%3C/svg%3E"
+                        style="display:block;width:40px;height:40px">
+                 </div>
+               </div>
+               </body></html>"#,
+        );
+        let pixmap = paint_dom(&tree, (160.0, 120.0), None).expect("pixmap");
+
+        assert!(
+            (0..100).any(|y| (0..120).any(|x| {
+                let pixel = pixmap.pixel(x, y).expect("inside viewport");
+                pixel.red() > 220 && pixel.green() < 40 && pixel.blue() < 40
+            })),
+            "projected image should enter the overflow clip"
+        );
+        assert!(
+            (0..120).all(|y| (120..160).all(|x| {
+                let pixel = pixmap.pixel(x, y).expect("outside clip");
+                pixel.red() > 240 && pixel.green() > 240 && pixel.blue() > 240
+            })),
+            "projected image must remain clipped to its overflow ancestor"
         );
     }
 

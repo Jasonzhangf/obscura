@@ -563,6 +563,16 @@ impl TextEngine {
         self.items.is_empty()
     }
 
+    #[cfg(test)]
+    pub(crate) fn item_text(&self, idx: usize) -> String {
+        self.items[idx]
+            .buffer
+            .lines
+            .iter()
+            .map(|line| line.text())
+            .collect()
+    }
+
     /// Build an inline formatting context for `id`'s subtree if it is one we
     /// can collapse to shaped text (see [`is_pure_text_ifc`]); returns the
     /// item index to store as the leaf's taffy context. `None` means the

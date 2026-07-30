@@ -1698,6 +1698,40 @@ fn selected_picture_source_dimensions_override_fallback_image_ratio() {
     assert_eq!(narrow.styles[&image].aspect_ratio, Some(1.0));
 }
 
+#[test]
+fn responsive_escaped_utility_classes_apply_logical_padding() {
+    let tree = parse_html(
+        r#"
+        <style>
+          :root { --spacing: .25rem }
+          *, ::before, ::after { box-sizing: border-box }
+          @media (min-width: 40rem) {
+            .sm\:px-2 { padding-inline: calc(var(--spacing) * 2) }
+            .sm\:py-4 { padding-block: calc(var(--spacing) * 4) }
+          }
+        </style>
+        <a id="cell" class="sm:px-2 sm:py-4"
+           style="display:block;width:270px">
+          <span id="child" style="display:block;height:20px"></span>
+        </a>
+        "#,
+    );
+    let cell_id = tree.get_element_by_id("cell").unwrap();
+    assert_eq!(
+        tree.query_selector(r".sm\:px-2").unwrap(),
+        Some(cell_id),
+        "the escaped utility selector must decode to the literal class token"
+    );
+    let layout = layout_dom(&tree, (1280.0, 900.0));
+    let cell = layout.rects[&cell_id];
+    let child = layout.rects[&tree.get_element_by_id("child").unwrap()];
+
+    assert!((cell.width - 270.0).abs() < 0.01, "{cell:?}");
+    assert!((cell.height - 52.0).abs() < 0.01, "{cell:?}");
+    assert!((child.x - cell.x - 8.0).abs() < 0.01, "{child:?}");
+    assert!((child.y - cell.y - 16.0).abs() < 0.01, "{child:?}");
+}
+
 /// HTML width/height attributes are provisional presentational hints. Once
 /// the image is decoded, its natural dimensions replace that mapped ratio.
 #[test]

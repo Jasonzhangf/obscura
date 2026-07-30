@@ -3709,6 +3709,84 @@ fn build_any(
     build(tree, id, taffy_tree, id_map, words, engine, ifc_items, styles).into_iter().collect()
 }
 
+/// Build the direct children of a genuine flex/grid container.
+///
+/// CSS wraps every contiguous run of in-flow text in one anonymous flex/grid
+/// item whose contents form an inline formatting context. Splitting a text
+/// node into one taffy item per word is only valid inside our flex-wrap IFC
+/// stand-in; doing it at this outer level makes `flex-wrap:nowrap` lay an
+/// entire paragraph on one line (MDN's contributor quote). Fold text runs to
+/// one measured/shaped anonymous item and leave authored element children as
+/// their own flex/grid items.
+#[allow(clippy::too_many_arguments)]
+fn build_flex_grid_children(
+    tree: &DomTree,
+    parent: NodeId,
+    dom_children: &[NodeId],
+    taffy_tree: &mut TaffyTree<usize>,
+    id_map: &mut HashMap<taffy::NodeId, NodeId>,
+    words: &mut HashMap<taffy::NodeId, (NodeId, String)>,
+    engine: &mut crate::inline::TextEngine,
+    ifc_items: &mut IfcRegistry,
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+) -> Vec<taffy::NodeId> {
+    let mut children = Vec::new();
+    let mut index = 0;
+    while index < dom_children.len() {
+        let is_text = tree.get_node(dom_children[index]).map_or(false, |node| {
+            matches!(node.data, obscura_dom::tree::NodeData::Text { .. })
+        });
+        if !is_text {
+            children.extend(build_any(
+                tree,
+                dom_children[index],
+                taffy_tree,
+                id_map,
+                words,
+                engine,
+                ifc_items,
+                styles,
+            ));
+            index += 1;
+            continue;
+        }
+
+        let start = index;
+        while index < dom_children.len()
+            && tree.get_node(dom_children[index]).map_or(false, |node| {
+                matches!(node.data, obscura_dom::tree::NodeData::Text { .. })
+            })
+        {
+            index += 1;
+        }
+        let run = &dom_children[start..index];
+        if let Some(item) = engine.try_build_run(tree, parent, run, styles) {
+            let style = taffy::Style {
+                display: taffy::style::Display::Block,
+                ..Default::default()
+            };
+            if let Ok(leaf) = taffy_tree.new_leaf_with_context(style, item) {
+                ifc_items.runs.entry(parent).or_default().push(item);
+                children.push(leaf);
+                continue;
+            }
+        }
+        for &text in run {
+            children.extend(build_any(
+                tree,
+                text,
+                taffy_tree,
+                id_map,
+                words,
+                engine,
+                ifc_items,
+                styles,
+            ));
+        }
+    }
+    children
+}
+
 /// Is `id` a `display: inline` element with no box appearance or sizing of
 /// its own — safe to flatten into its parent's child list instead of giving
 /// it an independent (and, for wrapping auto-width containers, buggy) flex
@@ -4862,6 +4940,20 @@ fn build(
 
     let mut child_ids: Vec<taffy::NodeId> = if has_float_child {
         build_children_with_float_zone(tree, id, &dom_children, taffy_tree, id_map, words, engine, ifc_items, styles)
+    } else if matches!(style.display, crate::Display::Flex | crate::Display::Grid)
+        && !style.internal_flex_container
+    {
+        build_flex_grid_children(
+            tree,
+            id,
+            &dom_children,
+            taffy_tree,
+            id_map,
+            words,
+            engine,
+            ifc_items,
+            styles,
+        )
     } else {
         dom_children.into_iter().flat_map(|cid| build_any(tree, cid, taffy_tree, id_map, words, engine, ifc_items, styles)).collect()
     };
@@ -6237,6 +6329,26 @@ mod tests {
     }
 
     #[test]
+    fn direct_flex_text_is_one_wrapping_anonymous_item() {
+        // Chromium 140: the pseudo is one flex item and the direct text run
+        // is one anonymous flex item with a 276px inline formatting context.
+        // The sentence wraps to three 20px lines; treating every word as an
+        // outer flex item instead produces one overflowing 20px line.
+        let tree = parse_html(
+            "<style>\
+             *{box-sizing:border-box}body{margin:0}\
+             #quote{display:flex;gap:8px;width:300px;font:16px/20px 'Liberation Sans'}\
+             #quote::before{content:'';display:block;width:16px;height:16px;flex-shrink:0}\
+             </style>\
+             <div id=\"quote\">This anonymous text item must wrap inside the remaining flex space instead of overflowing.</div>",
+        );
+        let laid = layout_dom(&tree, (500.0, 200.0));
+        let quote = laid.rects[&tree.get_element_by_id("quote").unwrap()];
+        assert!((quote.width - 300.0).abs() < 0.1, "{quote:?}");
+        assert!((quote.height - 60.0).abs() < 0.1, "{quote:?}");
+    }
+
+    #[test]
     fn empty_document_is_safe() {
         // html5ever always synthesizes html/head/body, so an empty document
         // still has a few element rects. The point is that it does not panic.
@@ -6360,20 +6472,11 @@ mod tests {
         let tree = parse_html(
             r#"<div id="cta" style="display:flex;text-transform:uppercase">get started</div>"#,
         );
-        let text = tree
-            .descendants(tree.document())
-            .into_iter()
-            .find(|id| tree.get_node(*id).is_some_and(|node| node.is_text()))
-            .unwrap();
         let laid = layout_dom(&tree, (1280.0, 720.0));
-        let painted = laid
-            .text_runs
-            .get(&text)
-            .unwrap()
-            .iter()
-            .map(|(_, word)| word.as_str())
-            .collect::<String>();
-        assert_eq!(painted, "GET STARTED");
+        let cta = tree.get_element_by_id("cta").unwrap();
+        let items = &laid.run_ifc_items[&cta];
+        assert_eq!(items.len(), 1);
+        assert_eq!(laid.text_engine.item_text(items[0]), "GET STARTED");
         assert_eq!(
             transform_word_leaf_text("hELLO wORLD", crate::TextTransform::Capitalize),
             "HELLO WORLD"
@@ -6383,17 +6486,14 @@ mod tests {
     #[test]
     fn word_leaves_use_the_computed_line_height() {
         let tree = parse_html(
-            r#"<div style="display:flex;font:16px/32px monospace">code</div>"#,
+            r#"<div id="code" style="display:flex;font:16px/32px monospace">code</div>"#,
         );
-        let text = tree
-            .descendants(tree.document())
-            .into_iter()
-            .find(|id| tree.get_node(*id).is_some_and(|node| node.is_text()))
-            .unwrap();
-        let laid = layout_dom(&tree, (1280.0, 720.0));
-        let runs = laid.text_runs.get(&text).unwrap();
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].0.height, 32.0);
+        let mut laid = layout_dom(&tree, (1280.0, 720.0));
+        let code = tree.get_element_by_id("code").unwrap();
+        let items = &laid.run_ifc_items[&code];
+        assert_eq!(items.len(), 1);
+        let (_, height) = laid.text_engine.measure(items[0], Some(1280.0));
+        assert_eq!(height, 32.0);
     }
 
     #[test]

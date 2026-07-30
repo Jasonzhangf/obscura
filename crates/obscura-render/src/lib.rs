@@ -577,12 +577,19 @@ pub struct LayoutStyle {
     /// absolute and fixed descendants. Kept as a bitset so `filter:none`
     /// cannot clear a transform/containment trigger from another property.
     pub containing_block_triggers: u16,
-    /// `transform: scale(sx[, sy])` / `scaleX` / `scaleY`, captured as (sx, sy).
-    /// Parsed and stored so a value that mixes scale with translate still yields
-    /// its translate part; scale is not yet folded into paint geometry (doing so
-    /// correctly would require scaling every descendant's size and text, outside
-    /// the paint-time translate-offset model used here).
+    /// `transform: scale(sx[, sy])` / `scaleX` / `scaleY`, or the individual
+    /// `scale` property, captured as (sx, sy). Raster-image paint applies it to
+    /// the element's subtree together with [`LayoutStyle::transform_projection`].
     pub transform_scale: Option<(f32, f32)>,
+    /// The affine x/y projection of authored `rotate`, `rotateX`, `rotateY`,
+    /// and `rotateZ` transform functions. CSS transforms without perspective
+    /// remain affine when their input plane has z=0, so this preserves modern
+    /// 3D-tilted image cards without introducing a full scene graph.
+    /// Stored as `[a, b, c, d]` for `x'=a*x+c*y`, `y'=b*x+d*y`.
+    pub transform_projection: Option<[f32; 4]>,
+    /// Authored `transform-origin`, unresolved so percentages use the final
+    /// border-box dimensions. `None` is the CSS initial value, 50% 50%.
+    pub transform_origin: Option<(Dimension, Dimension)>,
     /// `box-shadow` (first layer only). Painted behind the element's own
     /// background/border box: cards, buttons, menus, and modals across the
     /// modern web rely on it for depth, and without it those elements paint

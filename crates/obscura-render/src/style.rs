@@ -1020,6 +1020,8 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         "grid-row-start" => set_grid_placement_side(style, value, false, true),
         "grid-row-end" => set_grid_placement_side(style, value, false, false),
         "transform" => parse_transform(style, value),
+        "transform-origin" => style.transform_origin = parse_transform_origin(value),
+        "scale" => parse_individual_scale(style, value),
         "filter" => set_containing_block_trigger(
             style,
             crate::CB_TRIGGER_FILTER,
@@ -1225,6 +1227,8 @@ pub(crate) fn supports_declaration(name: &str, value: &str) -> bool {
             | "grid-row-start"
             | "grid-row-end"
             | "transform"
+            | "transform-origin"
+            | "scale"
             | "filter"
             | "backdrop-filter"
             | "-webkit-backdrop-filter"
@@ -1449,12 +1453,11 @@ fn content_alignment_pair(
     None
 }
 
-/// Parse the subset of `transform` obscura applies at paint time: `translate`,
-/// `translateX`, `translateY` (px and %, stored unresolved so % can resolve
-/// against the element's own border box later) and `scale`/`scaleX`/`scaleY`.
-/// `rotate`, `skew`, `matrix`, and `perspective` are ignored (left unhandled)
-/// rather than erroring, so a value that mixes them still contributes its
-/// translate and scale parts.
+/// Parse the transform functions used by the scoped paint model. Translation
+/// stays unresolved until the final border box is known. Scale is captured
+/// separately, while rotations are multiplied as 3×3 matrices and projected
+/// onto the input z=0 plane; this exactly represents rotateX/Y/Z chains that
+/// do not introduce perspective.
 fn parse_transform(style: &mut LayoutStyle, value: &str) {
     let v = value.trim();
     if v.is_empty() {
@@ -1466,6 +1469,7 @@ fn parse_transform(style: &mut LayoutStyle, value: &str) {
     if v.eq_ignore_ascii_case("none") {
         style.transform_translate = None;
         style.transform_scale = None;
+        style.transform_projection = None;
         set_containing_block_trigger(style, crate::CB_TRIGGER_TRANSFORM, false);
         return;
     }
@@ -1477,6 +1481,12 @@ fn parse_transform(style: &mut LayoutStyle, value: &str) {
     let zero = crate::Dimension::Px(0.0);
     let (mut tx, mut ty): (Option<crate::Dimension>, Option<crate::Dimension>) = (None, None);
     let (mut sx, mut sy): (Option<f32>, Option<f32>) = (None, None);
+    let mut rotation = [
+        1.0f32, 0.0, 0.0,
+        0.0, 1.0, 0.0,
+        0.0, 0.0, 1.0,
+    ];
+    let mut has_rotation = false;
     for (func, args) in functions {
         let parts: Vec<&str> = args.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
         match func.to_ascii_lowercase().as_str() {
@@ -1517,7 +1527,27 @@ fn parse_transform(style: &mut LayoutStyle, value: &str) {
                     sy = Some(a);
                 }
             }
-            // rotate / skew / matrix / perspective: not modeled, skip.
+            "rotate" | "rotatez" => {
+                if let Some(angle) = parts.first().and_then(|value| angle_degrees(value)) {
+                    rotation = matrix3_mul(rotation, rotate_z_matrix(angle));
+                    has_rotation = true;
+                }
+            }
+            "rotatex" => {
+                if let Some(angle) = parts.first().and_then(|value| angle_degrees(value)) {
+                    rotation = matrix3_mul(rotation, rotate_x_matrix(angle));
+                    has_rotation = true;
+                }
+            }
+            "rotatey" => {
+                if let Some(angle) = parts.first().and_then(|value| angle_degrees(value)) {
+                    rotation = matrix3_mul(rotation, rotate_y_matrix(angle));
+                    has_rotation = true;
+                }
+            }
+            // Skew, matrix, and perspective remain outside the scoped affine
+            // image projection. Other supported functions in the same value
+            // still take effect.
             _ => {}
         }
     }
@@ -1527,6 +1557,118 @@ fn parse_transform(style: &mut LayoutStyle, value: &str) {
     if sx.is_some() || sy.is_some() {
         style.transform_scale = Some((sx.unwrap_or(1.0), sy.unwrap_or(1.0)));
     }
+    style.transform_projection = has_rotation.then_some([
+        rotation[0],
+        rotation[3],
+        rotation[1],
+        rotation[4],
+    ]);
+}
+
+fn matrix3_mul(left: [f32; 9], right: [f32; 9]) -> [f32; 9] {
+    let mut out = [0.0; 9];
+    for row in 0..3 {
+        for column in 0..3 {
+            out[row * 3 + column] = (0..3)
+                .map(|inner| left[row * 3 + inner] * right[inner * 3 + column])
+                .sum();
+        }
+    }
+    out
+}
+
+fn rotate_x_matrix(angle: f32) -> [f32; 9] {
+    let (sin, cos) = angle.to_radians().sin_cos();
+    [1.0, 0.0, 0.0, 0.0, cos, -sin, 0.0, sin, cos]
+}
+
+fn rotate_y_matrix(angle: f32) -> [f32; 9] {
+    let (sin, cos) = angle.to_radians().sin_cos();
+    [cos, 0.0, sin, 0.0, 1.0, 0.0, -sin, 0.0, cos]
+}
+
+fn rotate_z_matrix(angle: f32) -> [f32; 9] {
+    let (sin, cos) = angle.to_radians().sin_cos();
+    [cos, -sin, 0.0, sin, cos, 0.0, 0.0, 0.0, 1.0]
+}
+
+fn angle_degrees(value: &str) -> Option<f32> {
+    fn primitive(value: &str) -> Option<f32> {
+        let value = value.trim().to_ascii_lowercase();
+        if let Some(number) = value.strip_suffix("deg") {
+            number.trim().parse().ok()
+        } else if let Some(number) = value.strip_suffix("grad") {
+            number.trim().parse::<f32>().ok().map(|value| value * 0.9)
+        } else if let Some(number) = value.strip_suffix("rad") {
+            number
+                .trim()
+                .parse::<f32>()
+                .ok()
+                .map(f32::to_degrees)
+        } else if let Some(number) = value.strip_suffix("turn") {
+            number.trim().parse::<f32>().ok().map(|value| value * 360.0)
+        } else if value == "0" {
+            Some(0.0)
+        } else {
+            None
+        }
+    }
+
+    let value = value.trim();
+    let Some(inner) = value
+        .strip_prefix("calc(")
+        .and_then(|value| value.strip_suffix(')'))
+    else {
+        return primitive(value);
+    };
+    if let Some((angle, factor)) = inner.split_once('*') {
+        return Some(primitive(angle)? * factor.trim().parse::<f32>().ok()?);
+    }
+    if let Some((angle, divisor)) = inner.split_once('/') {
+        let divisor = divisor.trim().parse::<f32>().ok()?;
+        return (divisor != 0.0).then(|| primitive(angle).map(|angle| angle / divisor)).flatten();
+    }
+    primitive(inner)
+}
+
+fn parse_transform_origin(value: &str) -> Option<(crate::Dimension, crate::Dimension)> {
+    let mut x = None;
+    let mut y = None;
+    for token in value.split_whitespace().take(2) {
+        match token.to_ascii_lowercase().as_str() {
+            "left" => x = Some(crate::Dimension::Percent(0.0)),
+            "right" => x = Some(crate::Dimension::Percent(1.0)),
+            "top" => y = Some(crate::Dimension::Percent(0.0)),
+            "bottom" => y = Some(crate::Dimension::Percent(1.0)),
+            "center" if x.is_none() => x = Some(crate::Dimension::Percent(0.5)),
+            "center" => y = Some(crate::Dimension::Percent(0.5)),
+            _ if x.is_none() => x = Some(dimension_value(token)),
+            _ => y = Some(dimension_value(token)),
+        }
+    }
+    if x.is_none() && y.is_none() {
+        return None;
+    }
+    Some((
+        x.unwrap_or(crate::Dimension::Percent(0.5)),
+        y.unwrap_or(crate::Dimension::Percent(0.5)),
+    ))
+}
+
+fn parse_individual_scale(style: &mut LayoutStyle, value: &str) {
+    if value.trim().eq_ignore_ascii_case("none") {
+        style.transform_scale = None;
+        return;
+    }
+    let values: Vec<f32> = value
+        .split_whitespace()
+        .take(2)
+        .filter_map(scale_number)
+        .collect();
+    let Some(&x) = values.first() else { return };
+    let y = values.get(1).copied().unwrap_or(x);
+    style.transform_scale = Some((x, y));
+    set_containing_block_trigger(style, crate::CB_TRIGGER_TRANSFORM, true);
 }
 
 fn non_none_value(value: &str) -> bool {
@@ -3233,9 +3375,9 @@ fn edges(value: &str) -> Option<Edges> {
 /// Split a 1-or-2 value shorthand into (start, end); a single value applies to
 /// both. Used by the logical-property axes (`margin-inline`, `padding-block`).
 fn two(value: &str) -> (&str, &str) {
-    let mut it = value.split_whitespace();
-    let a = it.next().unwrap_or("0");
-    let b = it.next().unwrap_or(a);
+    let values = split_ws_paren(value);
+    let a = values.first().copied().unwrap_or("0");
+    let b = values.get(1).copied().unwrap_or(a);
     (a, b)
 }
 
@@ -3349,7 +3491,7 @@ fn set_padding_px(padding: &mut Edges, idx: usize, px: f32) {
 
 /// `padding: <t> <r>? <b>? <l>?`, percentage-aware per side.
 fn apply_padding_shorthand(style: &mut LayoutStyle, value: &str) {
-    let toks: Vec<&str> = value.split_whitespace().collect();
+    let toks = split_ws_paren(value);
     let (t, r, b, l) = match toks.as_slice() {
         [a] => (*a, *a, *a, *a),
         [v, h] => (*v, *h, *v, *h),
@@ -3379,7 +3521,7 @@ fn percent_fraction(tok: &str) -> Option<f32> {
 /// `margin: <t> <r>? <b>? <l>?` with per-side `auto` (so `margin: 0 auto`
 /// centers).
 fn apply_margin_shorthand(style: &mut LayoutStyle, value: &str) {
-    let toks: Vec<&str> = value.split_whitespace().collect();
+    let toks = split_ws_paren(value);
     let (t, r, b, l) = match toks.as_slice() {
         [a] => (*a, *a, *a, *a),
         [v, h] => (*v, *h, *v, *h),
