@@ -615,6 +615,20 @@ def main():
                 "and content size immediately before paint"
             ),
         },
+        "methodology_limits": {
+            "pixel_metrics": (
+                "raw full-canvas diagnostics only; they are a tripwire, not a "
+                "fidelity verdict"
+            ),
+            "controlled_scroll": (
+                "Obscura currently computes CSSOM scroll metrics in an "
+                "asset-light JS layout cache, while screenshot paint performs "
+                "a separate resource-aware layout. Recorded scroll offsets "
+                "therefore prove API state but do not by themselves prove that "
+                "both images show the same semantic bottom. Inspect landmarks "
+                "and content-height deltas until those layouts are shared."
+            ),
+        },
         "pages": [],
     }
     manifest["obscura_identity_probe"] = probe_obscura_identity(args.obscura_bin)

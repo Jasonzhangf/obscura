@@ -3190,6 +3190,51 @@ mod tests {
 
     #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
+    async fn intersection_observer_does_not_refire_while_target_stays_intersecting() {
+        let dom = parse_html(
+            r#"<html><body>
+                <div id="feed"></div>
+                <div id="sentinel"></div>
+            </body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_viewport(1280.0, 720.0);
+        rt.run_page_init();
+
+        let result = rt
+            .evaluate_for_cdp(
+                r#"
+                new Promise(resolve => {
+                    const feed = document.getElementById("feed");
+                    let loaded = 0;
+                    const observer = new IntersectionObserver(entries => {
+                        for (const entry of entries) {
+                            if (!entry.isIntersecting) continue;
+                            for (let i = 0; i < 10; i++) {
+                                const card = document.createElement("div");
+                                card.textContent = "Item " + loaded++;
+                                feed.appendChild(card);
+                            }
+                        }
+                    });
+                    observer.observe(document.getElementById("sentinel"));
+                    setTimeout(() => resolve([
+                        loaded,
+                        feed.querySelectorAll("div").length,
+                    ]), 200);
+                })
+                "#,
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.value.unwrap(), serde_json::json!([10, 10]));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
     async fn intersection_observer_recomputes_after_style_mutation_and_resize() {
         let dom = parse_html(
             r#"<html style="margin:0"><body style="margin:0">
