@@ -625,11 +625,27 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
             style.height_set = true;
         }
         "box-sizing" => {
+            let value = value.trim();
             style.box_sizing = if value.eq_ignore_ascii_case("border-box") {
                 crate::BoxSizing::BorderBox
             } else if value.eq_ignore_ascii_case("content-box") {
                 crate::BoxSizing::ContentBox
+            } else if value.eq_ignore_ascii_case("initial")
+                || value.eq_ignore_ascii_case("unset")
+                || value.eq_ignore_ascii_case("revert")
+                || value.eq_ignore_ascii_case("revert-layer")
+            {
+                // `box-sizing` is not inherited, so both its initial value and
+                // `unset` compute to content-box. The compact cascade cannot
+                // recover a declaration from a lower origin/layer after it has
+                // applied an author winner; consistently with the other
+                // non-inherited properties here, approximate both revert
+                // forms with the initial value rather than retaining an
+                // earlier declaration from the same author origin.
+                crate::BoxSizing::ContentBox
             } else if value.eq_ignore_ascii_case("inherit") {
+                // Preserve the specified inherit marker until the DOM's
+                // top-down computed-style pass can resolve it from the parent.
                 crate::BoxSizing::Inherit
             } else {
                 style.box_sizing
@@ -5252,7 +5268,7 @@ mod tests {
     }
 
     #[test]
-    fn box_sizing_defaults_to_content_box_and_parses_both_keywords() {
+    fn box_sizing_parses_values_and_css_wide_keywords() {
         assert_eq!(
             compute_style("div", None).box_sizing,
             crate::BoxSizing::ContentBox
@@ -5272,6 +5288,45 @@ mod tests {
         assert_eq!(
             compute_style("div", Some("box-sizing:inherit")).box_sizing,
             crate::BoxSizing::Inherit
+        );
+        for keyword in ["initial", "unset", "revert", "revert-layer"] {
+            assert_eq!(
+                compute_style(
+                    "div",
+                    Some(&format!("box-sizing:border-box;box-sizing:{keyword}"))
+                )
+                .box_sizing,
+                crate::BoxSizing::ContentBox,
+                "{keyword} must not retain the preceding border-box value"
+            );
+        }
+    }
+
+    #[test]
+    fn box_sizing_initial_restores_content_box_geometry_after_universal_reset() {
+        use obscura_dom::tree_sink::parse_html;
+
+        let tree = parse_html(
+            r#"<style>
+                * { box-sizing: border-box }
+                body { margin: 0 }
+                .parent { width: 600px }
+                .form {
+                    box-sizing: initial;
+                    width: 100%;
+                    max-width: 435px;
+                    padding: 15px;
+                }
+            </style>
+            <div class="parent"><form id="form" class="form"></form></div>"#,
+        );
+        let laid = crate::dom::layout_dom(&tree, (1280.0, 720.0));
+        let form = tree.query_selector("#form").unwrap().unwrap();
+
+        assert_eq!(laid.styles[&form].box_sizing, crate::BoxSizing::ContentBox);
+        assert_eq!(
+            laid.rects[&form].width, 465.0,
+            "435px content max-width plus 15px padding on both sides"
         );
     }
 
