@@ -363,9 +363,8 @@ pub struct LayoutStyle {
     /// Deferred functional `letter-spacing` (`calc()`, `min()`, `clamp()`).
     pub letter_spacing_expression: Option<String>,
     /// Whether the computed value came from a non-`normal` declaration.
-    /// CSS suppresses optional ligatures for every non-normal value, including
-    /// an explicit zero; keeping this provenance avoids conflating it with the
-    /// `normal` initial value.
+    /// Keeping this provenance distinguishes an explicit zero from the
+    /// `normal` initial value while resolving the inherited property.
     pub letter_spacing_non_normal: Option<bool>,
     /// Specified CSS font weight during cascade (`1..1000`, `bolder`, or
     /// `lighter`), normalized to its numeric computed value by the inheritance

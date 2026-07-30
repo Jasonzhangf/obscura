@@ -1000,7 +1000,10 @@ impl SpanAttrs {
         if self.letter_spacing.is_finite() && self.letter_spacing != 0.0 {
             a = a.letter_spacing(self.letter_spacing / self.font_size.max(1.0));
         }
-        if self.letter_spacing_non_normal {
+        if self.letter_spacing_non_normal
+            && self.letter_spacing.is_finite()
+            && self.letter_spacing != 0.0
+        {
             let mut features = FontFeatures::new();
             features
                 .disable(FeatureTag::STANDARD_LIGATURES)
@@ -1926,6 +1929,10 @@ mod tests {
         assert!(attrs.font_features.features.iter().any(|feature| {
             feature.tag == FeatureTag::CONTEXTUAL_LIGATURES && feature.value == 0
         }));
+
+        let mut zero = span;
+        zero.letter_spacing = 0.0;
+        assert!(zero.to_attrs().font_features.features.is_empty());
     }
 
     fn variable_font_fixture() -> Vec<u8> {
