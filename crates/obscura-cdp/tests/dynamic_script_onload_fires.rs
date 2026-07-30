@@ -154,15 +154,17 @@ async fn dynamic_data_scripts_execute_before_chained_load_handlers() {
                 window.__dataScriptState = state;
 
                 var a = document.createElement('script');
-                a.src = 'data:text/javascript,window.__dataScriptState.aExec=true';
+                a.src = 'data:,window.__dataScriptState.aExec=true';
                 a.onload = function () {
                     state.aLoad = true;
                     var b = document.createElement('script');
-                    b.src = 'data:application/javascript,' + encodeURIComponent('window.__dataScriptState.bExec=true');
+                    b.src = 'data:text/html,' + encodeURIComponent('window.__dataScriptState.bExec=true');
                     b.onload = function () {
                         state.bLoad = true;
                         var c = document.createElement('script');
-                        c.src = 'data:text/javascript;base64,' + btoa('window.__dataScriptState.cExec=true');
+                        c.src = 'data:text/javascript;base64,' +
+                            btoa('window.__dataScriptState.cExec=true').replace(/=+$/, '') +
+                            '#ignored-fragment';
                         c.onload = function () { state.cLoad = true; };
                         document.head.appendChild(c);
                     };
@@ -195,4 +197,54 @@ async fn dynamic_data_scripts_execute_before_chained_load_handlers() {
         r#"{"aExec":true,"aLoad":true,"bExec":true,"bLoad":true,"cExec":true,"cLoad":true}"#,
         "data URL script bodies must execute before each chained load handler"
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn invalid_dynamic_data_script_fires_error_not_load() {
+    let mut ctx = CdpContext::new();
+    let page_id = ctx.create_page();
+    let session_id = "session-1";
+    ctx.sessions.insert(session_id.to_string(), page_id);
+
+    cdp(
+        &mut ctx,
+        1,
+        "Page.navigate",
+        json!({"url": "data:text/html,<html><head></head><body></body></html>", "waitUntil": "load"}),
+        session_id,
+    )
+    .await;
+
+    cdp(
+        &mut ctx,
+        2,
+        "Runtime.callFunctionOn",
+        json!({
+            "functionDeclaration": r#"function () {
+                window.__invalidDataScript = { error: false, load: false };
+                var script = document.createElement('script');
+                script.src = 'data:text/javascript;base64,!';
+                script.onerror = function () { window.__invalidDataScript.error = true; };
+                script.onload = function () { window.__invalidDataScript.load = true; };
+                document.head.appendChild(script);
+            }"#,
+            "awaitPromise": true,
+        }),
+        session_id,
+    )
+    .await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let result = cdp(
+        &mut ctx,
+        3,
+        "Runtime.evaluate",
+        json!({
+            "expression": "JSON.stringify(window.__invalidDataScript)",
+            "returnByValue": true,
+        }),
+        session_id,
+    )
+    .await;
+    assert_eq!(result["result"]["value"], r#"{"error":true,"load":false}"#);
 }
