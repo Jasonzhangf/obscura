@@ -861,7 +861,14 @@ impl TextEngine {
         // with links ends up coloring the wrong glyphs), and shaping is a
         // small fraction of a page's CSS-cascade-dominated render time.
         let rich = spans.iter().map(|(t, a)| (t.as_str(), a.to_attrs()));
-        buffer.set_rich_text(&mut self.font_system, rich, Attrs::new().family(Family::Name(FAMILY)), Shaping::Advanced);
+        let defaults = Attrs::new().family(Family::Name(FAMILY));
+        buffer.set_rich_text(
+            &mut self.font_system,
+            rich,
+            &defaults,
+            Shaping::Advanced,
+            None,
+        );
 
         let align = match base.text_align {
             Some(taffy::AlignItems::CENTER) => Some(Align::Center),
