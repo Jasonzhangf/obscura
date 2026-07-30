@@ -414,11 +414,18 @@ const REPLACED_CONTEXT_BIT: usize = 1usize << (usize::BITS - 1);
 #[derive(Clone, Copy)]
 struct ReplacedItem {
     intrinsic_width: f32,
-    intrinsic_height: f32,
+    preferred_width: Option<f32>,
+    preferred_height: Option<f32>,
+    preferred_ratio: f32,
     min_width: Option<f32>,
     min_height: Option<f32>,
     max_width: Option<f32>,
     max_height: Option<f32>,
+    /// CSS Sizing's cyclic-percentage rule makes a proper replaced element's
+    /// inline min-content contribution zero when its preferred or maximum
+    /// inline size contains a percentage. The natural size still participates
+    /// in max-content sizing and in the final definite layout.
+    zero_inline_min_content: bool,
 }
 
 impl ReplacedItem {
@@ -427,13 +434,36 @@ impl ReplacedItem {
             Dimension::Px(value) => Some(value.max(0.0)),
             _ => None,
         };
+        let expression_has_percentage = |index: usize| {
+            style.size_expressions[index]
+                .as_deref()
+                .map_or(false, |expression| expression.contains('%'))
+        };
+        let intrinsic_ratio = if width.is_finite()
+            && height.is_finite()
+            && width > 0.0
+            && height > 0.0
+        {
+            width / height
+        } else {
+            1.0
+        };
         ReplacedItem {
             intrinsic_width: width,
-            intrinsic_height: height,
+            preferred_width: px(style.width),
+            preferred_height: px(style.height),
+            preferred_ratio: style
+                .aspect_ratio
+                .filter(|ratio| ratio.is_finite() && *ratio > 0.0)
+                .unwrap_or(intrinsic_ratio),
             min_width: px(style.min_width),
             min_height: px(style.min_height),
             max_width: px(style.max_width),
             max_height: px(style.max_height),
+            zero_inline_min_content: matches!(style.width, Dimension::Percent(_))
+                || matches!(style.max_width, Dimension::Percent(_))
+                || expression_has_percentage(0)
+                || expression_has_percentage(4),
         }
     }
 
@@ -443,24 +473,99 @@ impl ReplacedItem {
         min.map_or(value, |min| value.max(min))
     }
 
+    /// Apply the CSS 2.1 10.4/10.7 constraint table for a replaced element
+    /// whose preferred width and height are both auto. Unlike independently
+    /// clamping the two axes, this transfers a one-axis min/max constraint
+    /// through the preferred aspect ratio whenever the constraints allow it.
+    fn constrain_auto_size(self, tentative: taffy::Size<f32>) -> taffy::Size<f32> {
+        let min_width = self.min_width.unwrap_or(0.0);
+        let min_height = self.min_height.unwrap_or(0.0);
+        let max_width = self.max_width.unwrap_or(f32::INFINITY).max(min_width);
+        let max_height = self.max_height.unwrap_or(f32::INFINITY).max(min_height);
+        let width = tentative.width;
+        let height = tentative.height;
+
+        let height_at_max_width = (max_width / self.preferred_ratio).max(min_height);
+        let height_at_min_width = (min_width / self.preferred_ratio).min(max_height);
+        let width_at_max_height = (max_height * self.preferred_ratio).max(min_width);
+        let width_at_min_height = (min_height * self.preferred_ratio).min(max_width);
+
+        let (width, height) = if width > max_width {
+            if height > max_height {
+                if max_width * height <= max_height * width {
+                    (max_width, height_at_max_width)
+                } else {
+                    (width_at_max_height, max_height)
+                }
+            } else {
+                (max_width, height_at_max_width)
+            }
+        } else if width < min_width {
+            if height < min_height {
+                if min_width * height <= min_height * width {
+                    (width_at_min_height, min_height)
+                } else {
+                    (min_width, height_at_min_width)
+                }
+            } else {
+                (min_width, height_at_min_width)
+            }
+        } else if height > max_height {
+            (width_at_max_height, max_height)
+        } else if height < min_height {
+            (width_at_min_height, min_height)
+        } else {
+            (width, height)
+        };
+
+        taffy::Size { width, height }
+    }
+
     fn size(self, known: taffy::Size<Option<f32>>) -> taffy::Size<f32> {
         let (width, height) = match (known.width, known.height) {
             (Some(width), Some(height)) => (width, height),
             (Some(width), None) => (
                 width,
-                width * self.intrinsic_height / self.intrinsic_width,
+                width / self.preferred_ratio,
             ),
             (None, Some(height)) => (
-                height * self.intrinsic_width / self.intrinsic_height,
+                height * self.preferred_ratio,
                 height,
             ),
-            (None, None) => (self.intrinsic_width, self.intrinsic_height),
+            (None, None) => match (self.preferred_width, self.preferred_height) {
+                (Some(width), Some(height)) => (width, height),
+                (Some(width), None) => (width, width / self.preferred_ratio),
+                (None, Some(height)) => (height * self.preferred_ratio, height),
+                (None, None) => (
+                    self.intrinsic_width,
+                    self.intrinsic_width / self.preferred_ratio,
+                ),
+            },
         };
-        taffy::Size {
-            width: Self::clamp(width, self.min_width, self.max_width),
-            height: Self::clamp(height, self.min_height, self.max_height),
+        let tentative = taffy::Size { width, height };
+        if self.preferred_width.is_none()
+            && self.preferred_height.is_none()
+            && (known.width.is_none() || known.height.is_none())
+        {
+            self.constrain_auto_size(tentative)
+        } else {
+            taffy::Size {
+                width: Self::clamp(width, self.min_width, self.max_width),
+                height: Self::clamp(height, self.min_height, self.max_height),
+            }
         }
     }
+}
+
+pub(crate) fn constrained_auto_replaced_size(
+    width: f32,
+    height: f32,
+    style: &LayoutStyle,
+) -> taffy::Size<f32> {
+    ReplacedItem::from_style(width, height, style).size(taffy::Size {
+        width: None,
+        height: None,
+    })
 }
 
 impl Default for TextEngine {
@@ -822,7 +927,15 @@ impl TextEngine {
         available: taffy::Size<taffy::AvailableSpace>,
     ) -> taffy::Size<f32> {
         if idx & REPLACED_CONTEXT_BIT != 0 {
-            return self.replaced[idx & !REPLACED_CONTEXT_BIT].size(known);
+            let replaced = self.replaced[idx & !REPLACED_CONTEXT_BIT];
+            let mut size = replaced.size(known);
+            if replaced.zero_inline_min_content
+                && known.width.is_none()
+                && matches!(available.width, taffy::AvailableSpace::MinContent)
+            {
+                size.width = 0.0;
+            }
+            return size;
         }
         let width = known.width.or(match available.width {
             taffy::AvailableSpace::Definite(width) => Some(width),
@@ -1521,6 +1634,108 @@ mod tests {
         assert_eq!(normal_line_height(12.0, FAMILY), 14.0);
         assert_eq!(normal_line_height(13.0, SERIF_FAMILY), 16.0);
         assert_eq!(normal_line_height(13.0, MONO_FAMILY), 15.0);
+    }
+
+    #[test]
+    fn replaced_percentage_math_only_zeroes_inline_min_content() {
+        for expression_index in [0, 4] {
+            let mut engine = TextEngine::new();
+            let mut style = LayoutStyle::default();
+            style.size_expressions[expression_index] =
+                Some("calc(100% - 1px)".to_string());
+            let item = engine.register_replaced(800.0, 400.0, &style);
+            let unknown = taffy::Size {
+                width: None,
+                height: None,
+            };
+            let min_content = engine.measure_taffy(
+                item,
+                unknown,
+                taffy::Size {
+                    width: taffy::AvailableSpace::MinContent,
+                    height: taffy::AvailableSpace::MaxContent,
+                },
+            );
+            let max_content = engine.measure_taffy(
+                item,
+                unknown,
+                taffy::Size {
+                    width: taffy::AvailableSpace::MaxContent,
+                    height: taffy::AvailableSpace::MaxContent,
+                },
+            );
+            let final_size = engine.measure_taffy(
+                item,
+                taffy::Size {
+                    width: Some(300.0),
+                    height: None,
+                },
+                taffy::Size {
+                    width: taffy::AvailableSpace::Definite(300.0),
+                    height: taffy::AvailableSpace::MaxContent,
+                },
+            );
+
+            assert_eq!(min_content.width, 0.0);
+            assert_eq!(max_content.width, 800.0);
+            assert_eq!(max_content.height, 400.0);
+            assert_eq!(final_size.width, 300.0);
+            assert_eq!(final_size.height, 150.0);
+        }
+    }
+
+    #[test]
+    fn both_auto_replaced_constraints_transfer_through_preferred_ratio() {
+        let unknown = taffy::Size {
+            width: None,
+            height: None,
+        };
+        let measure = |style: &LayoutStyle| {
+            ReplacedItem::from_style(512.0, 323.0, style).size(unknown)
+        };
+
+        let max_height = LayoutStyle {
+            max_height: Dimension::Px(128.0),
+            ..Default::default()
+        };
+        let size = measure(&max_height);
+        assert!((size.width - 202.89783).abs() < 0.001, "{size:?}");
+        assert!((size.height - 128.0).abs() < 0.001, "{size:?}");
+
+        let max_width = LayoutStyle {
+            max_width: Dimension::Px(256.0),
+            ..Default::default()
+        };
+        let size = measure(&max_width);
+        assert!((size.width - 256.0).abs() < 0.001, "{size:?}");
+        assert!((size.height - 161.5).abs() < 0.001, "{size:?}");
+
+        let min_width = LayoutStyle {
+            min_width: Dimension::Px(1024.0),
+            ..Default::default()
+        };
+        let size = measure(&min_width);
+        assert!((size.width - 1024.0).abs() < 0.001, "{size:?}");
+        assert!((size.height - 646.0).abs() < 0.001, "{size:?}");
+
+        let min_height = LayoutStyle {
+            min_height: Dimension::Px(646.0),
+            ..Default::default()
+        };
+        let size = measure(&min_height);
+        assert!((size.width - 1024.0).abs() < 0.001, "{size:?}");
+        assert!((size.height - 646.0).abs() < 0.001, "{size:?}");
+
+        // A non-intrinsic authored ratio is the preferred ratio used for
+        // transfer, rather than the decoded resource's natural ratio.
+        let authored_ratio = LayoutStyle {
+            max_height: Dimension::Px(128.0),
+            aspect_ratio: Some(4.0),
+            ..Default::default()
+        };
+        let size = measure(&authored_ratio);
+        assert!((size.width - 512.0).abs() < 0.001, "{size:?}");
+        assert!((size.height - 128.0).abs() < 0.001, "{size:?}");
     }
 
     #[test]

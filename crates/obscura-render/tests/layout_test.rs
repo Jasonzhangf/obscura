@@ -2013,3 +2013,137 @@ fn authored_aspect_ratio_wins_over_decoded_image_ratio() {
     assert!((rect.height - 125.0).abs() < 0.01, "{rect:?}");
     assert_eq!(layout.styles[&image].aspect_ratio, Some(4.0));
 }
+
+#[test]
+fn both_auto_replaced_max_height_preserves_intrinsic_ratio() {
+    let tree = parse_html(
+        r#"
+        <style>
+          html, body { margin:0 }
+          img { display:block; max-height:128px }
+        </style>
+        <img id="image" src="image.png">
+        "#,
+    );
+    let image = tree.get_element_by_id("image").unwrap();
+    let intrinsic = HashMap::from([(image, (512.0, 323.0))]);
+    let layout = layout_dom_with_images(&tree, (1000.0, 600.0), &intrinsic);
+    let rect = layout.rects[&image];
+
+    // The layout result is pixel-snapped; the exact pre-snap result is
+    // independently covered by the inline constraint-table unit test.
+    assert_eq!((rect.width, rect.height), (203.0, 128.0), "{rect:?}");
+}
+
+/// Chromium 150 applies CSS Sizing's compressible replaced-element rule when
+/// `max-width:100%` is cyclic during intrinsic sizing. Each image contributes
+/// zero to its column's automatic minimum, so the row can flex-shrink the
+/// natural 303/200/500/200/293px bases into exactly 1184px including gaps.
+#[test]
+fn percentage_max_replaced_items_shrink_in_a_flex_row() {
+    let tree = parse_html(
+        r#"
+        <style>
+          html, body { margin:0 }
+          #row { display:flex; gap:8px; width:1184px; overflow:hidden }
+          .col { display:flex; flex-direction:column; gap:8px }
+          img { display:block; max-width:100%; height:auto }
+        </style>
+        <div id="row">
+          <div id="c1" class="col"><img id="i1" width="303" height="255"></div>
+          <div id="c2" class="col"><img id="i2" width="200" height="400"></div>
+          <div id="c3" class="col"><img id="i3" width="500" height="250"></div>
+          <div id="c4" class="col"><img id="i4" width="200" height="400"></div>
+          <div id="c5" class="col"><img id="i5" width="293" height="354"></div>
+        </div>
+        "#,
+    );
+    let ids = ["i1", "i2", "i3", "i4", "i5"]
+        .map(|id| tree.get_element_by_id(id).unwrap());
+    let intrinsic = HashMap::from([
+        (ids[0], (303.0, 255.0)),
+        (ids[1], (200.0, 400.0)),
+        (ids[2], (500.0, 250.0)),
+        (ids[3], (200.0, 400.0)),
+        (ids[4], (293.0, 354.0)),
+    ]);
+    let layout = layout_dom_with_images(&tree, (1280.0, 1000.0), &intrinsic);
+    let row = layout.rects[&tree.get_element_by_id("row").unwrap()];
+    let columns = ["c1", "c2", "c3", "c4", "c5"]
+        .map(|id| layout.rects[&tree.get_element_by_id(id).unwrap()]);
+    let images = ids.map(|id| layout.rects[&id]);
+    let expected_widths: [f32; 5] =
+        [233.328125, 154.0, 385.03125, 154.015625, 225.625];
+
+    assert!((row.width - 1184.0).abs() < 0.01, "{row:?}");
+    assert!(
+        (row.height - 308.03125).abs() < 0.05,
+        "row={row:?}, columns={columns:?}, images={images:?}"
+    );
+    for (index, expected) in expected_widths.into_iter().enumerate() {
+        // Taffy exposes device-pixel-snapped border boxes; retain Chromium's
+        // fractional flex result above as the oracle, then compare its snapped
+        // width at this one-CSS-pixel device scale.
+        let expected = expected.round();
+        assert!(
+            (columns[index].width - expected).abs() < 0.01,
+            "column {index}: {:?}",
+            columns[index]
+        );
+        assert!(
+            (images[index].width - expected).abs() < 0.01,
+            "image {index}: {:?}",
+            images[index]
+        );
+    }
+    assert!(
+        ((images[0].width / images[0].height) - (303.0 / 255.0)).abs() < 0.001,
+        "final layout must preserve the first intrinsic ratio: {:?}",
+        images[0]
+    );
+    assert!(
+        ((images[4].width / images[4].height) - (293.0 / 354.0)).abs() < 0.001,
+        "final layout must preserve the last intrinsic ratio: {:?}",
+        images[4]
+    );
+}
+
+/// The cyclic percentage affects only the min-content contribution. With
+/// positive free space, the same boxes retain their natural max-content bases.
+#[test]
+fn percentage_max_replaced_items_keep_natural_max_content_size() {
+    let tree = parse_html(
+        r#"
+        <style>
+          html, body { margin:0 }
+          #row { display:flex; gap:8px; width:2000px }
+          .col { display:flex; flex-direction:column }
+          img { display:block; max-width:100%; height:auto }
+        </style>
+        <div id="row">
+          <div id="c1" class="col"><img id="i1" width="303" height="255"></div>
+          <div id="c2" class="col"><img id="i2" width="500" height="250"></div>
+        </div>
+        "#,
+    );
+    let first = tree.get_element_by_id("i1").unwrap();
+    let second = tree.get_element_by_id("i2").unwrap();
+    let intrinsic = HashMap::from([
+        (first, (303.0, 255.0)),
+        (second, (500.0, 250.0)),
+    ]);
+    let layout = layout_dom_with_images(&tree, (2200.0, 1000.0), &intrinsic);
+    let first = layout.rects[&first];
+    let second = layout.rects[&second];
+
+    assert!(
+        (first.width - 303.0).abs() < 0.01
+            && (first.height - 255.0).abs() < 0.01,
+        "{first:?}"
+    );
+    assert!(
+        (second.width - 500.0).abs() < 0.01
+            && (second.height - 250.0).abs() < 0.01,
+        "{second:?}"
+    );
+}

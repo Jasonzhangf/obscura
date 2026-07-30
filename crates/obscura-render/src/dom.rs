@@ -2027,12 +2027,6 @@ pub(crate) fn layout_dom_with_web_fonts(
                     s.aspect_ratio = Some(iw / ih);
                     s.aspect_ratio_is_mapped = false;
                 }
-                let w_auto = matches!(s.width, crate::Dimension::Auto);
-                let h_auto = matches!(s.height, crate::Dimension::Auto);
-                if w_auto && h_auto {
-                    s.width = crate::Dimension::Px(iw);
-                    s.height = crate::Dimension::Px(ih);
-                }
             }
         }
 
@@ -5101,6 +5095,83 @@ fn build(
     // measure callback derives the other axis through the intrinsic ratio.
     if _name.local.as_ref() == "img" {
         if let Some((width, height)) = style.intrinsic_size {
+            let intrinsic_ratio =
+                if width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0 {
+                    width / height
+                } else {
+                    1.0
+                };
+            let preferred_ratio = style
+                .aspect_ratio
+                .filter(|ratio| ratio.is_finite() && *ratio > 0.0)
+                .unwrap_or(intrinsic_ratio);
+
+            // Taffy has one preferred-size field but CSS intrinsic sizing has
+            // separate preferred and min-content contributions. For a proper
+            // replaced element with a percentage maximum, encode the
+            // equivalent min(preferred-width, percentage-max) function by
+            // swapping the two operands: the percentage is indefinite during
+            // intrinsic contribution sizing and resolves in final layout,
+            // while the fixed maximum retains the replaced box's preferred
+            // width. This applies to authored sizes and intrinsic auto sizes
+            // alike; it is not tied to HTML width attributes.
+            if let crate::Dimension::Percent(maximum) = style.max_width {
+                let preferred_width = match style.width {
+                    crate::Dimension::Px(width) => Some(width),
+                    crate::Dimension::Auto => match style.height {
+                        crate::Dimension::Px(height) => Some(height * preferred_ratio),
+                        _ => Some(
+                            crate::inline::constrained_auto_replaced_size(
+                                width, height, style,
+                            )
+                            .width,
+                        ),
+                    },
+                    _ => None,
+                };
+                if let Some(preferred_width) = preferred_width {
+                    taffy_style.size.width = taffy::Dimension::percent(maximum);
+                    taffy_style.max_size.width =
+                        taffy::Dimension::length(preferred_width.max(0.0));
+                }
+            }
+
+            // When both preferred axes are auto and all min/max constraints
+            // are definite, resolve CSS2's ratio-preserving constraint table
+            // before handing the leaf to taffy. Otherwise taffy's block
+            // stretch supplies a containing-block width as a known dimension
+            // and independently clamps the height, distorting the ratio.
+            let has_definite_constraint = [
+                style.min_width,
+                style.min_height,
+                style.max_width,
+                style.max_height,
+            ]
+            .into_iter()
+            .any(|dimension| matches!(dimension, crate::Dimension::Px(_)));
+            let has_percentage_constraint = [
+                style.min_width,
+                style.min_height,
+                style.max_width,
+                style.max_height,
+            ]
+            .into_iter()
+            .any(|dimension| matches!(dimension, crate::Dimension::Percent(_)))
+                || style.size_expressions[2..=5]
+                    .iter()
+                    .flatten()
+                    .any(|expression| expression.contains('%'));
+            if matches!(style.width, crate::Dimension::Auto)
+                && matches!(style.height, crate::Dimension::Auto)
+                && has_definite_constraint
+                && !has_percentage_constraint
+            {
+                let constrained =
+                    crate::inline::constrained_auto_replaced_size(width, height, style);
+                taffy_style.size.width = taffy::Dimension::length(constrained.width);
+                taffy_style.size.height = taffy::Dimension::length(constrained.height);
+            }
+
             // When an auto axis has a definite min/max constraint, the
             // measured replaced leaf must own intrinsic-ratio transfer so it
             // can clamp the derived size. Leaving the same ratio on taffy's
