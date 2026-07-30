@@ -932,17 +932,13 @@ fn split_supports_operator<'a>(condition: &'a str, operator: &str) -> Option<Vec
     Some(parts)
 }
 
-/// Coarse `@media` evaluation against an assumed 1280px-wide desktop viewport.
+/// Coarse `@media` evaluation against the live layout viewport.
 ///
 /// Real stylesheets format media features inconsistently
 /// (`max-width:750px`, `max-width: 750px`, even `max-width : 750px`), so this
 /// strips whitespace before scanning: CSS gives no semantic meaning to spaces
 /// inside `(feature: value)`, so it's safe to discard them wholesale rather
 /// than special-case every formatting variant a site might use.
-pub(crate) fn media_query_applies(query: &str) -> bool {
-    media_query_applies_for_viewport(query, (1280.0, 720.0))
-}
-
 pub(crate) fn media_query_applies_for_viewport(
     query: &str,
     viewport: (f32, f32),

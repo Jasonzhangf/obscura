@@ -744,6 +744,39 @@ fn inline_svg_derives_auto_height_from_view_box() {
     );
 }
 
+/// Chromium 150 resolves a ratio-only inline SVG as an atomic replaced item
+/// during both intrinsic grid track sizing and the final percentage-width
+/// pass. The 270px track leaves 254px after the grid item's inline padding;
+/// the 320:96 viewBox then contributes 76.1875px of height.
+#[test]
+fn ratio_only_inline_svg_sizes_inside_an_auto_grid_row() {
+    let tree = parse_html(
+        r#"<html><head><style>
+             html,body{margin:0}
+             #grid{display:grid;grid-template-columns:270px}
+             #cell{display:grid;place-content:center;padding:16px 8px}
+             #logo{display:block;width:100%;max-width:320px}
+           </style></head><body>
+             <div id="grid"><div id="cell">
+               <svg id="logo" viewBox="0 0 320 96"><path d="M0 0h320v96z"/></svg>
+             </div></div>
+           </body></html>"#,
+    );
+    let layout = layout_dom(&tree, (800.0, 600.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    let cell = rect("cell");
+    let logo = rect("logo");
+    assert!((logo.width - 254.0).abs() < 0.01, "SVG width: {logo:?}");
+    assert!(
+        (logo.height - 76.1875).abs() < 0.01,
+        "viewBox ratio must transfer the final grid width: {logo:?}"
+    );
+    assert!(
+        (cell.height - 108.1875).abs() < 0.01,
+        "SVG contribution plus block padding must size the auto row: {cell:?}"
+    );
+}
+
 #[test]
 fn inline_block_flex_items_keep_block_inner_flow() {
     let tree = parse_html(include_str!("../../../render-repros/inline-block-flex-items.html"));
@@ -1626,4 +1659,41 @@ fn light_dark_uses_the_final_inherited_color_scheme_across_the_cascade() {
         "a scheme list admitting light uses the current light preference"
     );
     assert_eq!(mixed_style.background_color, Some([0xab, 0xcd, 0xef, 0xff]));
+}
+
+/// Chromium 150 maps width/height from the selected <picture><source> onto
+/// the associated image as presentation hints. The selected 800/400 source
+/// therefore reserves a 500x250 box before it loads; below the media
+/// breakpoint, the fallback img's 600/600 ratio reserves 500x500.
+#[test]
+fn selected_picture_source_dimensions_override_fallback_image_ratio() {
+    let tree = parse_html(
+        r#"
+        <style>
+          html, body { margin:0 }
+          img { display:block; width:500px; height:auto }
+        </style>
+        <picture>
+          <source
+            media="(min-width:800px)"
+            srcset="chosen.png"
+            width="800"
+            height="400">
+          <img id="image" src="fallback.png" width="600" height="600">
+        </picture>
+        "#,
+    );
+    let image = tree.get_element_by_id("image").unwrap();
+
+    let wide = layout_dom(&tree, (1000.0, 600.0));
+    let wide_rect = wide.rects[&image];
+    assert!((wide_rect.width - 500.0).abs() < 0.01, "{wide_rect:?}");
+    assert!((wide_rect.height - 250.0).abs() < 0.01, "{wide_rect:?}");
+    assert_eq!(wide.styles[&image].aspect_ratio, Some(2.0));
+
+    let narrow = layout_dom(&tree, (700.0, 600.0));
+    let narrow_rect = narrow.rects[&image];
+    assert!((narrow_rect.width - 500.0).abs() < 0.01, "{narrow_rect:?}");
+    assert!((narrow_rect.height - 500.0).abs() < 0.01, "{narrow_rect:?}");
+    assert_eq!(narrow.styles[&image].aspect_ratio, Some(1.0));
 }

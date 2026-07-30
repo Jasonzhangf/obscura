@@ -951,7 +951,27 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
             }
         }
         "row-gap" | "grid-row-gap" => apply_gap_value(style, true, value),
-        "column-gap" | "grid-column-gap" => apply_gap_value(style, false, value),
+        "column-gap" | "grid-column-gap" | "-webkit-column-gap" => {
+            apply_gap_value(style, false, value)
+        }
+        "column-count" | "-webkit-column-count" => {
+            style.column_count = parse_column_count(value);
+        }
+        "columns" | "-webkit-columns" => {
+            // `columns` is `column-width || column-count`; width remains auto
+            // in our box-fragmentation subset, but the shorthand still resets
+            // an earlier count when it contains no positive integer.
+            style.column_count = split_ws_paren(value)
+                .into_iter()
+                .find_map(parse_column_count);
+        }
+        "break-inside" => {
+            style.break_inside_avoid =
+                matches!(value.trim().to_ascii_lowercase().as_str(), "avoid" | "avoid-column");
+        }
+        "-webkit-column-break-inside" => {
+            style.break_inside_avoid = value.trim().eq_ignore_ascii_case("avoid");
+        }
         "border-spacing" => {
             let dims: Vec<f32> = value.split_whitespace().filter_map(px_value).collect();
             if let Some(&h) = dims.first() {
@@ -1179,6 +1199,13 @@ pub(crate) fn supports_declaration(name: &str, value: &str) -> bool {
             | "grid-row-gap"
             | "column-gap"
             | "grid-column-gap"
+            | "-webkit-column-gap"
+            | "column-count"
+            | "-webkit-column-count"
+            | "columns"
+            | "-webkit-columns"
+            | "break-inside"
+            | "-webkit-column-break-inside"
             | "border-spacing"
             | "border-collapse"
             | "grid-template-columns"
@@ -2999,6 +3026,14 @@ fn apply_gap_value(style: &mut LayoutStyle, row: bool, value: &str) {
     }
 }
 
+fn parse_column_count(value: &str) -> Option<u16> {
+    let count = value.trim().parse::<u32>().ok()?;
+    // Keep pathological author input from allocating thousands of anonymous
+    // fragmentainers. Real page layouts use single-digit counts; 64 retains
+    // ample useful range while keeping construction and balancing bounded.
+    (count > 0).then(|| count.min(64) as u16)
+}
+
 pub(crate) fn line_height_expression_is_length(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
     lower.contains('%')
@@ -3972,6 +4007,19 @@ mod tests {
         let flow_root = compute_style("div", Some("display: flow-root"));
         assert_eq!(flow_root.display, Display::Block);
         assert!(flow_root.flow_root);
+    }
+
+    #[test]
+    fn parses_multicol_count_shorthand_and_break_avoidance() {
+        let shorthand = compute_style(
+            "div",
+            Some("columns: 240px 3; break-inside: avoid-column"),
+        );
+        assert_eq!(shorthand.column_count, Some(3));
+        assert!(shorthand.break_inside_avoid);
+
+        let reset = compute_style("div", Some("column-count: 4; columns: auto"));
+        assert_eq!(reset.column_count, None);
     }
 
     #[test]

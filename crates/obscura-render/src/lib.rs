@@ -388,6 +388,19 @@ pub struct LayoutStyle {
     pub column_gap_expression: Option<String>,
     pub row_gap_expression: Option<String>,
 
+    // CSS Multi-column Layout. A count greater than one creates that many
+    // equal-width fragmentainer columns in `dom::build`; the first layout
+    // pass measures the in-flow child boxes at their real column width and a
+    // bounded balancing pass then distributes them in column-major order.
+    // `None` is the initial `auto` column count.
+    pub column_count: Option<u16>,
+    /// `break-inside: avoid` makes this box an atomic balancing unit. The
+    /// current box-level multicol implementation cannot fragment the inside
+    /// of a child yet, but retaining the computed value makes that limitation
+    /// explicit and lets the balancing path distinguish authored break
+    /// avoidance as finer-grained fragmentation is added.
+    pub break_inside_avoid: bool,
+
     /// `border-spacing: <horizontal> <vertical>?` (or the `cellspacing`
     /// attribute). Only meaningful on a `<table>`; taffy has no native table
     /// display mode, so `dom::propagate_border_spacing` distributes this down

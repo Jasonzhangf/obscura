@@ -489,6 +489,17 @@ struct IfcRegistry {
     /// nodes real geometry; `apply_float_continuations` uses it to narrow the
     /// later intersecting bands before the final layout.
     float_continuations: Vec<FloatContinuation>,
+    /// CSS multi-column containers built as a row of anonymous block
+    /// fragmentainers. All in-flow boxes start in the first fragmentainer so
+    /// the preliminary layout measures them at the final column width; the
+    /// post-pass then balances those already-built boxes without rebuilding
+    /// or reshaping their subtrees.
+    multicol: Vec<MulticolBuild>,
+}
+
+struct MulticolBuild {
+    columns: Vec<taffy::NodeId>,
+    children: Vec<taffy::NodeId>,
 }
 
 #[derive(Clone, Copy)]
@@ -650,6 +661,109 @@ fn apply_presentational_hints(node: &obscura_dom::tree::Node, style: &mut crate:
     }
 }
 
+/// The selected `<picture><source>` contributes presentation hints to its
+/// associated `<img>`. In particular, source width/height replace the fallback
+/// image attributes and provide the pre-load aspect ratio. Gecko exposes this
+/// as an extra mapped declaration block on HTMLImageElement; doing the same
+/// before the author cascade preserves the correct origin and precedence.
+fn apply_picture_source_hints(
+    tree: &DomTree,
+    img_id: NodeId,
+    viewport: (f32, f32),
+    style: &mut crate::LayoutStyle,
+) {
+    let Some(img) = tree.get_node(img_id) else { return };
+    if img
+        .as_element()
+        .map_or(true, |element| element.local.as_ref() != "img")
+    {
+        return;
+    }
+    let Some(parent_id) = img.parent else { return };
+    let is_picture = tree
+        .get_node(parent_id)
+        .is_some_and(|parent| {
+            parent
+                .as_element()
+                .is_some_and(|element| element.local.as_ref() == "picture")
+        });
+    if !is_picture {
+        return;
+    }
+
+    let mut selected = None;
+    for child_id in tree.children(parent_id) {
+        if child_id == img_id {
+            break;
+        }
+        let Some(source) = tree.get_node(child_id) else { continue };
+        if source
+            .as_element()
+            .map_or(true, |element| element.local.as_ref() != "source")
+        {
+            continue;
+        }
+        if source
+            .get_attribute("srcset")
+            .is_none_or(|srcset| srcset.trim().is_empty())
+        {
+            continue;
+        }
+        if let Some(media) = source.get_attribute("media") {
+            if !media.trim().is_empty()
+                && !crate::css::media_query_applies_for_viewport(media, viewport)
+            {
+                continue;
+            }
+        }
+        if let Some(kind) = source.get_attribute("type") {
+            let kind = kind.trim().to_ascii_lowercase();
+            if !kind.is_empty()
+                && !matches!(
+                    kind.as_str(),
+                    "image/avif"
+                        | "image/bmp"
+                        | "image/gif"
+                        | "image/jpeg"
+                        | "image/jpg"
+                        | "image/png"
+                        | "image/svg+xml"
+                        | "image/webp"
+                        | "image/x-icon"
+                        | "image/vnd.microsoft.icon"
+                )
+            {
+                continue;
+            }
+        }
+        selected = Some(source);
+        break;
+    }
+    let Some(source) = selected else { return };
+    let parse_dimension = |name| {
+        source
+            .get_attribute(name)
+            .and_then(|value| value.trim().parse::<f32>().ok())
+            .filter(|value| value.is_finite() && *value > 0.0)
+    };
+    let width = parse_dimension("width");
+    let height = parse_dimension("height");
+    if width.is_none() && height.is_none() {
+        return;
+    }
+
+    // A missing source dimension explicitly maps to auto so it replaces the
+    // corresponding fallback <img> presentation hint.
+    style.width = width.map_or(crate::Dimension::Auto, crate::Dimension::Px);
+    style.height = height.map_or(crate::Dimension::Auto, crate::Dimension::Px);
+    style.width_set = true;
+    style.height_set = true;
+    style.aspect_ratio = match (width, height) {
+        (Some(width), Some(height)) => Some(width / height),
+        _ => None,
+    };
+}
+
 /// Compute the UA + author style for every element in preorder, maintaining
 /// `matcher`'s ancestor filter as we descend so descendant-combinator rules
 /// fast-reject correctly. Non-element nodes (text, comments) are skipped but
@@ -662,6 +776,7 @@ fn cascade_walk(
     styles: &mut HashMap<NodeId, crate::LayoutStyle>,
     parent_props: &std::rc::Rc<HashMap<String, String>>,
     quirks_mode: bool,
+    viewport: (f32, f32),
     inherited_cell_padding: Option<f32>,
     inherited_color_scheme_dark: bool,
 ) {
@@ -746,6 +861,7 @@ fn cascade_walk(
             }
         }
         apply_presentational_hints(&node, &mut style);
+        apply_picture_source_hints(tree, id, viewport, &mut style);
         let node_id = node.get_attribute("id");
         let classes: Vec<String> = node
             .get_attribute("class")
@@ -792,6 +908,7 @@ fn cascade_walk(
             styles,
             &this_props,
             quirks_mode,
+            viewport,
             descendant_cell_padding,
             descendant_color_scheme_dark,
         );
@@ -888,6 +1005,7 @@ pub(crate) fn layout_dom_with_web_fonts(
         &mut styles,
         &root_props,
         quirks_mode,
+        viewport,
         None,
         false,
     );
@@ -2225,6 +2343,13 @@ pub(crate) fn layout_dom_with_web_fonts(
                     );
                 }
                 let _ = taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
+                if apply_multicol_balance(&mut taffy_tree, &ifc_items.multicol) {
+                    let _ = taffy_tree.compute_layout_with_measure(
+                        taffy_root,
+                        available,
+                        &mut measure,
+                    );
+                }
                 if apply_float_continuations(
                     tree,
                     &mut taffy_tree,
@@ -2273,6 +2398,9 @@ pub(crate) fn layout_dom_with_web_fonts(
                     );
                 }
                 let _ = taffy_tree.compute_layout(taffy_root, available);
+                if apply_multicol_balance(&mut taffy_tree, &ifc_items.multicol) {
+                    let _ = taffy_tree.compute_layout(taffy_root, available);
+                }
                 if apply_float_continuations(
                     tree,
                     &mut taffy_tree,
@@ -3262,6 +3390,96 @@ fn apply_table_row_geometry(
                 let mut stretched = current.clone();
                 stretched.size.height = taffy::Dimension::auto();
                 let _ = taffy_tree.set_style(cell, stretched);
+            }
+        }
+    }
+    changed
+}
+
+/// Balance the atomic child boxes of each CSS multi-column container.
+///
+/// Gecko's multicol reflow brackets a known-infeasible and known-feasible
+/// column block-size, then repeatedly reflows at a tighter candidate until it
+/// finds the smallest feasible height. We use the same invariant over the
+/// already measured direct child boxes: a candidate is feasible when a
+/// source-ordered greedy fill needs no more than the requested column count.
+/// This is O(24 * children) per multicol container and does not reshape or
+/// rebuild descendants during the search.
+fn apply_multicol_balance(
+    taffy_tree: &mut TaffyTree<usize>,
+    multicol: &[MulticolBuild],
+) -> bool {
+    let mut changed = false;
+    for set in multicol {
+        let column_count = set.columns.len();
+        if column_count < 2 || set.children.is_empty() {
+            continue;
+        }
+        let weights: Vec<f32> = set
+            .children
+            .iter()
+            .map(|child| {
+                taffy_tree.layout(*child).map_or(0.0, |layout| {
+                    (layout.size.height + layout.margin.top + layout.margin.bottom)
+                        .max(0.0)
+                })
+            })
+            .collect();
+        let groups = column_count.min(weights.len());
+        let max_weight = weights.iter().copied().fold(0.0f32, f32::max);
+        let total: f32 = weights.iter().sum();
+        let mut low = max_weight;
+        let mut high = total.max(low);
+        if high > 0.0 {
+            for _ in 0..24 {
+                let candidate = (low + high) * 0.5;
+                let mut used = 1usize;
+                let mut current = 0.0f32;
+                for weight in &weights {
+                    if current > 0.0 && current + *weight > candidate {
+                        used += 1;
+                        current = *weight;
+                    } else {
+                        current += *weight;
+                    }
+                }
+                if used <= groups {
+                    high = candidate;
+                } else {
+                    low = candidate;
+                }
+            }
+        }
+
+        // Pack from the end at the smallest feasible height. This leaves the
+        // first columns filled first (column-major source order) while still
+        // guaranteeing one item for every non-empty column.
+        let mut ranges = Vec::with_capacity(groups);
+        let mut end = weights.len();
+        for remaining_groups in (1..=groups).rev() {
+            let earliest = remaining_groups - 1;
+            let mut start = end;
+            let mut used = 0.0f32;
+            while start > earliest {
+                let next = weights[start - 1];
+                if start < end && used + next > high + 0.001 {
+                    break;
+                }
+                start -= 1;
+                used += next;
+            }
+            ranges.push(start..end);
+            end = start;
+        }
+        ranges.reverse();
+
+        for (index, column) in set.columns.iter().enumerate() {
+            let children = ranges
+                .get(index)
+                .map(|range| &set.children[range.clone()])
+                .unwrap_or(&[]);
+            if taffy_tree.set_children(*column, children).is_ok() {
+                changed = true;
             }
         }
     }
@@ -4345,6 +4563,31 @@ fn build(
         }
     }
 
+    // An inline SVG is an atomic replaced box in the surrounding formatting
+    // context. Its descendants paint inside its SVG viewport; they must not
+    // become CSS layout children. In particular, a viewBox supplies an
+    // intrinsic ratio whose auto axis is transferred from a percentage-sized
+    // definite axis during the grid's final pass. Treating the SVG as a normal
+    // empty container makes its intrinsic contribution zero during grid track
+    // sizing, collapsing responsive logo walls to zero-height rows.
+    if _name.local.as_ref() == "svg" {
+        if let Some(ratio) = style.aspect_ratio.filter(|ratio| ratio.is_finite() && *ratio > 0.0)
+        {
+            // A viewBox supplies a ratio but no intrinsic dimensions. The
+            // 300px default inline size is CSS Images' default object size;
+            // the ratio supplies the corresponding block size. Definite CSS
+            // axes still arrive through `known` and override this fallback.
+            let width = 300.0;
+            let height = width / ratio;
+            let context = engine.register_replaced(width, height, style);
+            let leaf = taffy_tree
+                .new_leaf_with_context(taffy_style, context)
+                .ok()?;
+            id_map.insert(leaf, id);
+            return Some(leaf);
+        }
+    }
+
     // A replaced image is a measured leaf, even when CSS gives it a percentage
     // width. Its intrinsic dimensions participate in an auto-sized ancestor's
     // max-content measurement; once the percentage axis becomes definite, the
@@ -4662,7 +4905,76 @@ fn build(
         }
     }
 
-    let taffy_id = if child_ids.is_empty() {
+    let multicol_count = style
+        .column_count
+        .filter(|count| *count > 1)
+        .map(usize::from);
+    // Box-level balancing is sound only when every generated direct box is an
+    // authored atomic fragment. Ordinary prose needs line-level fragmentation;
+    // pretending its paragraph boxes are columns would be worse than the
+    // current single-column fallback. This gate intentionally makes
+    // `break-inside:avoid` the capability boundary until inline fragment
+    // continuations exist.
+    let atomic_multicol_children = !child_ids.is_empty()
+        && child_ids.iter().all(|child| {
+            id_map
+                .get(child)
+                .and_then(|dom_id| styles.get(dom_id))
+                .map_or(false, |child_style| {
+                    child_style.break_inside_avoid
+                        && child_style.float.is_none()
+                        && !matches!(
+                            child_style.position,
+                            Some(taffy::Position::Absolute)
+                        )
+                })
+        });
+    let taffy_id = if let Some(column_count) =
+        multicol_count.filter(|_| atomic_multicol_children)
+    {
+        // A multicol container keeps its ordinary outer/block box, but its
+        // inner formatting context is a horizontal sequence of equal-width
+        // fragmentainers. Taffy does not expose CSS fragmentation, so build
+        // those fragmentainers explicitly. The first preliminary layout puts
+        // every child in column one, which measures each subtree at the exact
+        // final column width. `apply_multicol_balance` then performs the
+        // bounded Gecko-style feasible-height search and reparents the
+        // already measured boxes before the final layout.
+        taffy_style.display = taffy::style::Display::Flex;
+        taffy_style.flex_direction = taffy::FlexDirection::Row;
+        taffy_style.flex_wrap = taffy::FlexWrap::NoWrap;
+        if style.column_gap.is_none() {
+            taffy_style.gap.width =
+                taffy::style::LengthPercentage::length(style.font_size.unwrap_or(16.0));
+        }
+        let column_style = taffy::Style {
+            display: taffy::style::Display::Block,
+            flex_grow: 1.0,
+            flex_shrink: 1.0,
+            flex_basis: taffy::style::Dimension::length(0.0),
+            min_size: taffy::Size {
+                width: taffy::style::Dimension::length(0.0),
+                height: taffy::style::Dimension::auto(),
+            },
+            ..Default::default()
+        };
+        let mut columns = Vec::with_capacity(column_count);
+        columns.push(
+            taffy_tree
+                .new_with_children(column_style.clone(), &child_ids)
+                .ok()?,
+        );
+        for _ in 1..column_count {
+            columns.push(taffy_tree.new_leaf(column_style.clone()).ok()?);
+        }
+        let multicol =
+            taffy_tree.new_with_children(taffy_style, &columns).ok()?;
+        ifc_items.multicol.push(MulticolBuild {
+            columns,
+            children: child_ids,
+        });
+        multicol
+    } else if child_ids.is_empty() {
         taffy_tree.new_leaf(taffy_style).ok()?
     } else {
         taffy_tree.new_with_children(taffy_style, &child_ids).ok()?
@@ -5829,6 +6141,83 @@ mod tests {
             "children heights should be 40 and 60, got {:?}",
             sorted
         );
+    }
+
+    #[test]
+    fn multicol_balances_atomic_blocks_like_chromium() {
+        // Chromium 140 geometry for this reduction is a 630x300 container,
+        // 190px columns at x=0/220/440, and a 2/3/3 source-order partition.
+        // Explicit heights keep this a layout-algorithm regression rather
+        // than a font/raster comparison.
+        let tree = parse_html(
+            "<html><head><style>#columns{columns:1}@media (width >= 700px){#columns{columns:3}}</style></head>\
+             <body style=\"margin:0\"><div id=\"columns\" style=\"column-gap:30px;width:630px\">\
+             <div id=\"a\" style=\"height:180px;break-inside:avoid\"></div>\
+             <div id=\"b\" style=\"height:120px;break-inside:avoid\"></div>\
+             <div id=\"c\" style=\"height:60px;break-inside:avoid\"></div>\
+             <div id=\"d\" style=\"height:150px;break-inside:avoid\"></div>\
+             <div id=\"e\" style=\"height:90px;break-inside:avoid\"></div>\
+             <div id=\"f\" style=\"height:120px;break-inside:avoid\"></div>\
+             <div id=\"g\" style=\"height:80px;break-inside:avoid\"></div>\
+             <div id=\"h\" style=\"height:100px;break-inside:avoid\"></div>\
+             </div></body></html>",
+        );
+        let laid = layout_dom(&tree, (800.0, 600.0));
+        let rect = |id: &str| laid.rects[&tree.get_element_by_id(id).unwrap()];
+        let columns = rect("columns");
+        assert!((columns.width - 630.0).abs() < 0.1, "{columns:?}");
+        assert!((columns.height - 300.0).abs() < 0.1, "{columns:?}");
+
+        let expected = [
+            ("a", 0.0, 0.0, 190.0, 180.0),
+            ("b", 0.0, 180.0, 190.0, 120.0),
+            ("c", 220.0, 0.0, 190.0, 60.0),
+            ("d", 220.0, 60.0, 190.0, 150.0),
+            ("e", 220.0, 210.0, 190.0, 90.0),
+            ("f", 440.0, 0.0, 190.0, 120.0),
+            ("g", 440.0, 120.0, 190.0, 80.0),
+            ("h", 440.0, 200.0, 190.0, 100.0),
+        ];
+        for (id, x, y, width, height) in expected {
+            let child = rect(id);
+            assert!((child.x - columns.x - x).abs() < 0.1, "{id}: {child:?}");
+            assert!((child.y - columns.y - y).abs() < 0.1, "{id}: {child:?}");
+            assert!((child.width - width).abs() < 0.1, "{id}: {child:?}");
+            assert!((child.height - height).abs() < 0.1, "{id}: {child:?}");
+        }
+
+        let narrow = layout_dom(&tree, (600.0, 1000.0));
+        let columns_id = tree.get_element_by_id("columns").unwrap();
+        let c_id = tree.get_element_by_id("c").unwrap();
+        assert_eq!(narrow.styles[&columns_id].column_count, Some(1));
+        assert!(
+            (narrow.rects[&columns_id].height - 900.0).abs() < 0.1,
+            "{:?}",
+            narrow.rects[&columns_id]
+        );
+        assert!(
+            (narrow.rects[&c_id].y - narrow.rects[&columns_id].y - 300.0).abs() < 0.1,
+            "{:?}",
+            narrow.rects[&c_id]
+        );
+    }
+
+    #[test]
+    fn multicol_does_not_atomize_breakable_prose_boxes() {
+        let tree = parse_html(
+            "<html><body style=\"margin:0\"><main id=\"columns\" style=\"columns:2;width:200px\">\
+             <p id=\"first\" style=\"height:100px;margin:0\"></p>\
+             <p id=\"second\" style=\"height:100px;margin:0\"></p>\
+             </main></body></html>",
+        );
+        let laid = layout_dom(&tree, (400.0, 400.0));
+        let columns = laid.rects[&tree.get_element_by_id("columns").unwrap()];
+        let first = laid.rects[&tree.get_element_by_id("first").unwrap()];
+        let second = laid.rects[&tree.get_element_by_id("second").unwrap()];
+        assert!((columns.height - 200.0).abs() < 0.1, "{columns:?}");
+        assert!((first.width - 200.0).abs() < 0.1, "{first:?}");
+        assert!((second.x - first.x).abs() < 0.1, "{second:?}");
+        assert!((second.y - first.y - 100.0).abs() < 0.1, "{second:?}");
     }
 
     #[test]

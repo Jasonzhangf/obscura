@@ -49,7 +49,7 @@ pub fn paint_dom_scrolled(
     // CSS-sized image with no width/height attribute would otherwise be 0x0
     // and never paint). This seeds the same cache the paint pass reads, so
     // each URL is still fetched at most once.
-    let mut intrinsic = collect_image_intrinsics(tree, base_url, &mut image_cache);
+    let mut intrinsic = collect_image_intrinsics(tree, viewport, base_url, &mut image_cache);
     let fonts = collect_web_fonts(tree, base_url);
     // Most framework pages use web fonts and many decorative SVG icons, but
     // only SVG text needs the page font faces. Avoid cloning/loading the page
@@ -440,7 +440,7 @@ pub fn paint_dom_scrolled(
                 .content_image
                 .as_ref()
                 .map(|url| (url.clone(), 1.0))
-                .or_else(|| resolve_img_url(tree, nid));
+                .or_else(|| resolve_img_url(tree, nid, viewport));
             if let Some((src, _density)) = source {
                 // `visible_rect` is the border box already intersected with the
                 // ancestor overflow clip: the raster must not paint past it (a
@@ -2373,6 +2373,7 @@ fn paint_positioned_pseudo(
 /// explicit dimensions. Keyed by the `<img>`'s NodeId.
 fn collect_image_intrinsics(
     tree: &DomTree,
+    viewport: (f32, f32),
     base_url: Option<&str>,
     cache: &mut std::collections::HashMap<String, Option<Vec<u8>>>,
 ) -> std::collections::HashMap<obscura_dom::tree::NodeId, (f32, f32)> {
@@ -2382,7 +2383,7 @@ fn collect_image_intrinsics(
         if node.as_element().map(|e| e.local.as_ref() != "img").unwrap_or(true) {
             continue;
         }
-        let Some((url, density)) = resolve_img_url(tree, nid) else { continue };
+        let Some((url, density)) = resolve_img_url(tree, nid, viewport) else { continue };
         let Some(bytes) = fetch_bytes(&url, base_url, cache) else { continue };
         let dimensions = image_dimensions(&bytes).map(|(width, height)| (width as f32, height as f32))
             .or_else(|| svg_intrinsic(&bytes));
@@ -2447,17 +2448,21 @@ fn collect_content_image_intrinsics(
 /// resolve the same URL the browser would end up with: a matching `<picture>`
 /// source first, then a real candidate from `srcset`/`data-srcset`, then a
 /// non-inline `src`/`data-*` URL, then any `src` (an inlined data: image).
-fn resolve_img_url(tree: &DomTree, nid: obscura_dom::tree::NodeId) -> Option<(String, f32)> {
+fn resolve_img_url(
+    tree: &DomTree,
+    nid: obscura_dom::tree::NodeId,
+    viewport: (f32, f32),
+) -> Option<(String, f32)> {
     let node = tree.get_node(nid)?;
     // A <picture>'s preceding, type/media-matching <source> wins over the
     // <img>'s own attributes (HTML "update the source set").
-    if let Some(pick) = picture_source_url(tree, nid) {
+    if let Some(pick) = picture_source_url(tree, nid, viewport) {
         return Some(pick);
     }
     let sizes = node.get_attribute("sizes");
     for a in ["srcset", "data-srcset"] {
         if let Some(v) = node.get_attribute(a) {
-            if let Some(pick) = best_srcset_candidate(v, sizes) {
+            if let Some(pick) = best_srcset_candidate(v, sizes, viewport) {
                 return Some(pick);
             }
         }
@@ -2489,7 +2494,11 @@ fn resolve_img_url(tree: &DomTree, nid: obscura_dom::tree::NodeId) -> Option<(St
 /// first supported one (matching `type` and `media`), per WebKit's
 /// `HTMLImageElement::bestFitSourceFromPictureElement`. `None` means no source
 /// applied and the caller should fall back to the `<img>`'s own attributes.
-fn picture_source_url(tree: &DomTree, img_nid: obscura_dom::tree::NodeId) -> Option<(String, f32)> {
+fn picture_source_url(
+    tree: &DomTree,
+    img_nid: obscura_dom::tree::NodeId,
+    viewport: (f32, f32),
+) -> Option<(String, f32)> {
     let img = tree.get_node(img_nid)?;
     let parent = img.parent?;
     let is_picture = tree
@@ -2518,12 +2527,14 @@ fn picture_source_url(tree: &DomTree, img_nid: obscura_dom::tree::NodeId) -> Opt
             }
         }
         if let Some(m) = child.get_attribute("media") {
-            if !m.trim().is_empty() && !crate::css::media_query_applies(m) {
+            if !m.trim().is_empty()
+                && !crate::css::media_query_applies_for_viewport(m, viewport)
+            {
                 continue;
             }
         }
         let sizes = child.get_attribute("sizes");
-        if let Some(u) = best_srcset_candidate(srcset, sizes) {
+        if let Some(u) = best_srcset_candidate(srcset, sizes, viewport) {
             return Some(u);
         }
     }
@@ -2541,11 +2552,6 @@ fn source_type_supported(t: &str) -> bool {
     )
 }
 
-/// Assumed layout viewport width (matches the desktop width the `@media`
-/// cascade evaluates against in `css.rs`). Used to turn `w` descriptors and
-/// `vw`/`%` source sizes into effective pixel densities.
-const SRCSET_VIEWPORT_W: f32 = 1280.0;
-
 /// Pick one URL from a `srcset` list, matching the WebKit/Blink selection:
 /// normalize each `w` descriptor to an effective density (`w / source-size`,
 /// with the source-size taken from `sizes` or falling back to the viewport
@@ -2556,9 +2562,13 @@ const SRCSET_VIEWPORT_W: f32 = 1280.0;
 /// x-descriptor (or, for w-descriptors, width / source-size): the factor the
 /// file's raw pixels must be divided by to get CSS px. Laying out with raw
 /// pixels made every 2x responsive image occupy twice its design size.
-fn best_srcset_candidate(srcset: &str, sizes: Option<&str>) -> Option<(String, f32)> {
+fn best_srcset_candidate(
+    srcset: &str,
+    sizes: Option<&str>,
+    viewport: (f32, f32),
+) -> Option<(String, f32)> {
     const DPR: f32 = 1.0;
-    let source_size = source_size_px(sizes);
+    let source_size = source_size_px(sizes, viewport);
     let mut cands: Vec<(f32, String)> = Vec::new();
     // Parse candidates WHATWG-style: a URL is a run of non-whitespace (so a
     // data: URI's internal commas stay part of it, unlike a naive split on
@@ -2616,8 +2626,8 @@ fn best_srcset_candidate(srcset: &str, sizes: Option<&str>) -> Option<(String, f
 /// attribute: the first entry whose media condition holds at our assumed
 /// desktop viewport (a bare entry always holds), else the viewport width. Used
 /// only to convert `w` descriptors to densities, so a coarse value is fine.
-fn source_size_px(sizes: Option<&str>) -> f32 {
-    let Some(sizes) = sizes else { return SRCSET_VIEWPORT_W };
+fn source_size_px(sizes: Option<&str>, viewport: (f32, f32)) -> f32 {
+    let Some(sizes) = sizes else { return viewport.0 };
     for entry in sizes.split(',') {
         let entry = entry.trim();
         if entry.is_empty() {
@@ -2625,15 +2635,15 @@ fn source_size_px(sizes: Option<&str>) -> f32 {
         }
         let (cond, len) = split_size_entry(entry);
         if let Some(cond) = cond {
-            if !crate::css::media_query_applies(&cond) {
+            if !crate::css::media_query_applies_for_viewport(&cond, viewport) {
                 continue;
             }
         }
-        if let Some(px) = length_to_px(&len) {
+        if let Some(px) = length_to_px(&len, viewport.0) {
             return px;
         }
     }
-    SRCSET_VIEWPORT_W
+    viewport.0
 }
 
 /// Split one `sizes` entry into its optional leading media condition and its
@@ -2665,11 +2675,11 @@ fn split_size_entry(entry: &str) -> (Option<String>, String) {
 /// Resolve a `sizes` length to px against the assumed viewport. `vw`/`%` scale
 /// by the viewport width; `px` is literal; `em`/`rem` use the 16px root.
 /// `calc()` and other forms return `None` (the caller tries the next entry).
-fn length_to_px(len: &str) -> Option<f32> {
+fn length_to_px(len: &str, viewport_width: f32) -> Option<f32> {
     let t = len.trim().to_ascii_lowercase();
     let num = |s: &str| s.trim().parse::<f32>().ok();
-    if let Some(v) = t.strip_suffix("vw").and_then(num) { return Some(v / 100.0 * SRCSET_VIEWPORT_W); }
-    if let Some(v) = t.strip_suffix('%').and_then(num) { return Some(v / 100.0 * SRCSET_VIEWPORT_W); }
+    if let Some(v) = t.strip_suffix("vw").and_then(num) { return Some(v / 100.0 * viewport_width); }
+    if let Some(v) = t.strip_suffix('%').and_then(num) { return Some(v / 100.0 * viewport_width); }
     if let Some(v) = t.strip_suffix("px").and_then(num) { return Some(v); }
     if let Some(v) = t.strip_suffix("rem").and_then(num) { return Some(v * 16.0); }
     if let Some(v) = t.strip_suffix("em").and_then(num) { return Some(v * 16.0); }
