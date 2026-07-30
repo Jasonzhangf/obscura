@@ -380,6 +380,57 @@ pub(crate) fn split_declarations(css: &str) -> Vec<&str> {
     parts
 }
 
+fn parse_container_type(value: &str) -> Option<crate::ContainerType> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "normal" => Some(crate::ContainerType::Normal),
+        "inline-size" => Some(crate::ContainerType::InlineSize),
+        "size" => Some(crate::ContainerType::Size),
+        "initial" | "unset" | "revert" | "revert-layer" => {
+            Some(crate::ContainerType::Normal)
+        }
+        _ => None,
+    }
+}
+
+fn parse_container_names(value: &str) -> Option<Vec<String>> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if matches!(
+        value.to_ascii_lowercase().as_str(),
+        "none" | "initial" | "unset" | "revert" | "revert-layer"
+    ) {
+        return Some(Vec::new());
+    }
+    let mut names = Vec::new();
+    let mut input = cssparser::ParserInput::new(value);
+    let mut parser = cssparser::Parser::new(&mut input);
+    while !parser.is_exhausted() {
+        let ident = parser.expect_ident_cloned().ok()?;
+        let lower = ident.to_ascii_lowercase();
+        if matches!(lower.as_str(), "none" | "not" | "and" | "or") {
+            return None;
+        }
+        names.push(ident.to_string());
+    }
+    (!names.is_empty()).then_some(names)
+}
+
+fn parse_container_shorthand(value: &str) -> Option<(Vec<String>, crate::ContainerType)> {
+    let value = value.trim();
+    if matches!(value.to_ascii_lowercase().as_str(), "initial" | "unset" | "revert" | "revert-layer")
+    {
+        return Some((Vec::new(), crate::ContainerType::Normal));
+    }
+    let parts = split_top_level(value, '/');
+    match parts.as_slice() {
+        [names] => Some((parse_container_names(names)?, crate::ContainerType::Normal)),
+        [names, kind] => Some((parse_container_names(names)?, parse_container_type(kind)?)),
+        _ => None,
+    }
+}
+
 fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
     match name {
         "display" => {
@@ -429,6 +480,37 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                     style.display_contents = true;
                 }
                 _ => {}
+            }
+        }
+        "container-type" => {
+            if value.eq_ignore_ascii_case("inherit") {
+                style.container_type = crate::ContainerType::Normal;
+                style.container_type_inherit = true;
+            } else if let Some(kind) = parse_container_type(value) {
+                style.container_type = kind;
+                style.container_type_inherit = false;
+            }
+        }
+        "container-name" => {
+            if value.eq_ignore_ascii_case("inherit") {
+                style.container_names.clear();
+                style.container_names_inherit = true;
+            } else if let Some(names) = parse_container_names(value) {
+                style.container_names = names;
+                style.container_names_inherit = false;
+            }
+        }
+        "container" => {
+            if value.eq_ignore_ascii_case("inherit") {
+                style.container_names.clear();
+                style.container_type = crate::ContainerType::Normal;
+                style.container_names_inherit = true;
+                style.container_type_inherit = true;
+            } else if let Some((names, kind)) = parse_container_shorthand(value) {
+                style.container_names = names;
+                style.container_type = kind;
+                style.container_names_inherit = false;
+                style.container_type_inherit = false;
             }
         }
         "width" => {
@@ -1097,6 +1179,9 @@ pub(crate) fn supports_declaration(name: &str, value: &str) -> bool {
             | "max-width"
             | "max-height"
             | "box-sizing"
+            | "container"
+            | "container-type"
+            | "container-name"
             | "aspect-ratio"
             | "margin"
             | "margin-top"
@@ -1270,6 +1355,9 @@ pub(crate) fn supports_declaration(name: &str, value: &str) -> bool {
             value.to_ascii_lowercase().as_str(),
             "content-box" | "border-box"
         ),
+        "container-type" => parse_container_type(value).is_some(),
+        "container-name" => parse_container_names(value).is_some(),
+        "container" => parse_container_shorthand(value).is_some(),
         "float" => matches!(
             value.to_ascii_lowercase().as_str(),
             "none" | "left" | "right"
@@ -4476,6 +4564,59 @@ mod tests {
             Some("contain:none;content-visibility:visible;filter:none;perspective:none"),
         );
         assert!(!s.establishes_positioning_containing_block());
+    }
+
+    #[test]
+    fn container_properties_and_shorthand_preserve_values() {
+        let defaults = compute_style("div", None);
+        assert_eq!(defaults.container_type, crate::ContainerType::Normal);
+        assert!(defaults.container_names.is_empty());
+
+        let longhands = compute_style(
+            "div",
+            Some("container-name:main sidebar;container-type:inline-size"),
+        );
+        assert_eq!(longhands.container_type, crate::ContainerType::InlineSize);
+        assert_eq!(longhands.container_names, ["main", "sidebar"]);
+
+        let shorthand = compute_style(
+            "div",
+            Some("container-name:old;container-type:size;container:main/inline-size"),
+        );
+        assert_eq!(shorthand.container_type, crate::ContainerType::InlineSize);
+        assert_eq!(shorthand.container_names, ["main"]);
+        let name_only = compute_style("div", Some("container-type:size;container:card"));
+        assert_eq!(name_only.container_type, crate::ContainerType::Normal);
+
+        let inherited = compute_style(
+            "div",
+            Some("container:outer/size;container:inherit"),
+        );
+        assert!(inherited.container_type_inherit);
+        assert!(inherited.container_names_inherit);
+        let reset = compute_style(
+            "div",
+            Some("container:outer/size;container:inherit;container:none"),
+        );
+        assert!(!reset.container_type_inherit);
+        assert!(!reset.container_names_inherit);
+    }
+
+    #[test]
+    fn container_supports_validation_is_typed_and_shorthand_atomic() {
+        let style = compute_style(
+            "div",
+            Some("container:main/inline-size;container:broken/unknown;container-name:also not"),
+        );
+        assert_eq!(style.container_type, crate::ContainerType::InlineSize);
+        assert_eq!(style.container_names, ["main"]);
+        assert!(!style.establishes_positioning_containing_block());
+        assert!(supports_declaration("container-type", "inline-size"));
+        assert!(!supports_declaration("container-type", "inline"));
+        assert!(supports_declaration("container-name", "main sidebar"));
+        assert!(!supports_declaration("container-name", "main not"));
+        assert!(supports_declaration("container", "main/inline-size"));
+        assert!(!supports_declaration("container", "main/unknown"));
     }
 
     #[test]

@@ -1078,6 +1078,8 @@ pub(crate) fn layout_dom_with_web_fonts(
             font_family: Option<String>,
             letter_spacing: f32,
             letter_spacing_non_normal: bool,
+            container_type: crate::ContainerType,
+            container_names: Vec<String>,
             text_align: Option<taffy::AlignItems>,
             legacy_center: bool,
             visibility_hidden: bool,
@@ -1110,6 +1112,8 @@ pub(crate) fn layout_dom_with_web_fonts(
                     font_family: None,
                     letter_spacing: 0.0,
                     letter_spacing_non_normal: false,
+                    container_type: crate::ContainerType::Normal,
+                    container_names: Vec::new(),
                     text_align: None,
                     legacy_center: false,
                     visibility_hidden: false,
@@ -1227,6 +1231,14 @@ pub(crate) fn layout_dom_with_web_fonts(
                             Some(inh.letter_spacing_non_normal)
                     }
                 }
+                if style.container_type_inherit {
+                    style.container_type = inh.container_type;
+                }
+                if style.container_names_inherit {
+                    style.container_names.clone_from(&inh.container_names);
+                }
+                inh.container_type = style.container_type;
+                inh.container_names.clone_from(&style.container_names);
                 if let Some(expression) = style.row_gap_expression.as_deref() {
                     style.row_gap = crate::style::resolve_contextual_length(
                         expression,

@@ -13,12 +13,64 @@ use std::collections::HashMap;
 
 use crate::LayoutStyle;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ContainerConditionId(u32);
+
+impl ContainerConditionId {
+    const NONE: Self = Self(0);
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ContainerConditionNode {
+    parent: ContainerConditionId,
+    /// Comma-separated queries in one prelude are alternatives; parent-linked
+    /// nodes represent nested `@container` rules that must all match.
+    alternatives: Vec<ContainerQuery>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ContainerQuery {
+    name: Option<String>,
+    condition: Option<ContainerQueryExpr>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum ContainerQueryExpr {
+    Feature(ContainerSizeFeature),
+    Not(Box<ContainerQueryExpr>),
+    And(Vec<ContainerQueryExpr>),
+    Or(Vec<ContainerQueryExpr>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ContainerQueryAxis { Width, InlineSize }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ContainerQueryComparison { Min, Max }
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ContainerSizeFeature {
+    axis: ContainerQueryAxis,
+    comparison: ContainerQueryComparison,
+    length: ContainerQueryLength,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ContainerQueryLength { Px(f32), Em(f32), Rem(f32) }
+
+struct ParsedRule {
+    selector: String,
+    declarations: String,
+    container_condition_id: ContainerConditionId,
+}
+
 struct Rule {
     sel: CompiledSelector,
     normal_decls: String,
     important_decls: String,
     /// Source order, for breaking specificity ties (later wins).
     order: usize,
+    container_condition_id: ContainerConditionId,
 }
 
 struct PseudoRule {
@@ -26,11 +78,14 @@ struct PseudoRule {
     normal_decls: String,
     important_decls: String,
     order: usize,
+    container_condition_id: ContainerConditionId,
 }
 
 /// An indexed set of author rules ready for fast per-element matching.
 pub struct Stylesheet {
     rules: Vec<Rule>,
+    /// Index zero is the unconditional sentinel.
+    container_conditions: Vec<ContainerConditionNode>,
     /// Final declarations from `@keyframes name { ... 100%/to { ... } }`.
     /// Static screenshots are taken after the requested settle interval, so a
     /// finite forwards-filled animation contributes this declaration block.
@@ -47,6 +102,13 @@ pub struct Stylesheet {
 }
 
 impl Stylesheet {
+    /// Until Stage B supplies completed container geometry, preserved
+    /// conditional rules remain inactive rather than using viewport geometry.
+    fn container_condition_is_active(&self, id: ContainerConditionId) -> bool {
+        debug_assert!((id.0 as usize) < self.container_conditions.len());
+        id == ContainerConditionId::NONE
+    }
+
     /// Parse and index a set of raw CSS sources (the text of each `<style>`
     /// block, in document order). Selectors that fail to parse are dropped.
     pub fn parse(tree: &DomTree, sources: &[String]) -> Self {
@@ -64,6 +126,10 @@ impl Stylesheet {
     ) -> Self {
         let mut sheet = Stylesheet {
             rules: Vec::new(),
+            container_conditions: vec![ContainerConditionNode {
+                parent: ContainerConditionId::NONE,
+                alternatives: Vec::new(),
+            }],
             keyframe_ends: HashMap::new(),
             by_id: HashMap::new(),
             by_class: HashMap::new(),
@@ -77,7 +143,13 @@ impl Stylesheet {
             for (name, decls) in extract_keyframe_end_states(src) {
                 sheet.keyframe_ends.insert(name, decls);
             }
-            for (selector, decls) in parse_stylesheet_for_viewport(src, viewport) {
+            let parsed = parse_stylesheet_for_viewport_preserving_containers(
+                src,
+                viewport,
+                &mut sheet.container_conditions,
+                ContainerConditionId::NONE,
+            );
+            for ParsedRule { selector, declarations: decls, container_condition_id } in parsed {
                 let sel_trim = selector.trim();
                 if let Some(base) = strip_pseudo_element(sel_trim, "before") {
                     if let Some(sel) = tree.compile_rule_selector(base) {
@@ -88,6 +160,7 @@ impl Stylesheet {
                             normal_decls,
                             important_decls,
                             order,
+                            container_condition_id,
                         });
                     }
                     order += 1;
@@ -102,6 +175,7 @@ impl Stylesheet {
                             normal_decls,
                             important_decls,
                             order,
+                            container_condition_id,
                         });
                     }
                     order += 1;
@@ -116,7 +190,9 @@ impl Stylesheet {
                     SelectorKey::Local(v) => sheet.by_local.entry(v.clone()).or_default().push(idx),
                     SelectorKey::Universal => sheet.universal.push(idx),
                 }
-                sheet.rules.push(Rule { sel, normal_decls, important_decls, order });
+                sheet.rules.push(Rule {
+                    sel, normal_decls, important_decls, order, container_condition_id,
+                });
                 order += 1;
             }
         }
@@ -134,7 +210,10 @@ impl Stylesheet {
         let build = |rules: &[PseudoRule], matcher: &mut Matcher| {
             let mut matched: Vec<(u32, usize, &PseudoRule)> = rules
                 .iter()
-                .filter(|rule| matcher.matches(tree, nid, &rule.sel))
+                .filter(|rule| {
+                    self.container_condition_is_active(rule.container_condition_id)
+                        && matcher.matches(tree, nid, &rule.sel)
+                })
                 .map(|rule| (rule.sel.specificity(), rule.order, rule))
                 .collect();
             if matched.is_empty() {
@@ -235,7 +314,9 @@ impl Stylesheet {
             if let Some(idxs) = bucket {
                 for &i in idxs {
                     let rule = &self.rules[i];
-                    if matcher.matches(tree, nid, &rule.sel) {
+                    if self.container_condition_is_active(rule.container_condition_id)
+                        && matcher.matches(tree, nid, &rule.sel)
+                    {
                         matched.push((rule.sel.specificity(), rule.order, i));
                     }
                 }
@@ -671,6 +752,27 @@ fn parse_stylesheet_for_viewport(
     css: &str,
     viewport: (f32, f32),
 ) -> Vec<(String, String)> {
+    let mut conditions = vec![ContainerConditionNode {
+        parent: ContainerConditionId::NONE,
+        alternatives: Vec::new(),
+    }];
+    parse_stylesheet_for_viewport_preserving_containers(
+        css, viewport, &mut conditions, ContainerConditionId::NONE,
+    )
+    .into_iter()
+    // This legacy tuple API cannot express conditional context. Keep its
+    // established behavior by omitting unresolved container rules.
+    .filter(|rule| rule.container_condition_id == ContainerConditionId::NONE)
+    .map(|rule| (rule.selector, rule.declarations))
+    .collect()
+}
+
+fn parse_stylesheet_for_viewport_preserving_containers(
+    css: &str,
+    viewport: (f32, f32),
+    container_conditions: &mut Vec<ContainerConditionNode>,
+    container_condition_id: ContainerConditionId,
+) -> Vec<ParsedRule> {
     let mut rules = Vec::new();
     let mut current_selector = String::new();
     let mut current_decls = String::new();
@@ -709,13 +811,19 @@ fn parse_stylesheet_for_viewport(
                 let sel = current_selector.trim();
                 let decls = current_decls.trim();
                 if let Some(at) = sel.strip_prefix('@') {
-                    flush_at_rule(at, sel, decls, &mut rules, viewport);
+                    flush_at_rule(
+                        at, sel, decls, &mut rules, viewport,
+                        container_conditions, container_condition_id,
+                    );
                 } else {
                     // The body may contain nested rules (CSS Nesting, ubiquitous
                     // in Tailwind v4 / modern frameworks: `.a{ &:hover{} .b{} }`).
                     // Flatten them against this selector; denest also handles the
                     // no-nesting case (just emits the rule's own declarations).
-                    denest(sel, decls, &mut rules, viewport);
+                    denest(
+                        sel, decls, &mut rules, viewport,
+                        container_conditions, container_condition_id,
+                    );
                 }
                 current_selector.clear();
                 current_decls.clear();
@@ -743,16 +851,35 @@ fn flush_at_rule(
     at: &str,
     sel: &str,
     inner: &str,
-    rules: &mut Vec<(String, String)>,
+    rules: &mut Vec<ParsedRule>,
     viewport: (f32, f32),
+    container_conditions: &mut Vec<ContainerConditionNode>,
+    container_condition_id: ContainerConditionId,
 ) {
     if at.starts_with("media") {
         if media_query_applies_for_viewport(sel, viewport) {
-            rules.extend(parse_stylesheet_for_viewport(inner, viewport));
+            rules.extend(parse_stylesheet_for_viewport_preserving_containers(
+                inner, viewport, container_conditions, container_condition_id,
+            ));
         }
     } else if at.starts_with("supports") {
         if supports_condition_applies(sel) {
-            rules.extend(parse_stylesheet_for_viewport(inner, viewport));
+            rules.extend(parse_stylesheet_for_viewport_preserving_containers(
+                inner, viewport, container_conditions, container_condition_id,
+            ));
+        }
+    } else if at.starts_with("container") {
+        let prelude = at["container".len()..].trim();
+        if let Some(alternatives) = parse_container_query_list(prelude) {
+            let Ok(raw_id) = u32::try_from(container_conditions.len()) else { return };
+            let id = ContainerConditionId(raw_id);
+            container_conditions.push(ContainerConditionNode {
+                parent: container_condition_id,
+                alternatives,
+            });
+            rules.extend(parse_stylesheet_for_viewport_preserving_containers(
+                inner, viewport, container_conditions, id,
+            ));
         }
     } else if at.starts_with("property") {
         // `@property --x { syntax:..; initial-value: V }` declares a custom
@@ -765,7 +892,11 @@ fn flush_at_rule(
             for decl in inner.split(';') {
                 if let Some((k, v)) = decl.split_once(':') {
                     if k.trim().eq_ignore_ascii_case("initial-value") && !v.trim().is_empty() {
-                        rules.push((":root".to_string(), format!("{}: {}", name, v.trim())));
+                        rules.push(ParsedRule {
+                            selector: ":root".to_string(),
+                            declarations: format!("{}: {}", name, v.trim()),
+                            container_condition_id,
+                        });
                     }
                 }
             }
@@ -780,10 +911,121 @@ fn flush_at_rule(
         // left whole pages unstyled (white backgrounds, collapsed layout). The
         // `@layer a, b;` ordering-statement form has no block and is discarded
         // by parse_stylesheet's top-level `;` handling.
-        rules.extend(parse_stylesheet_for_viewport(inner, viewport));
+        rules.extend(parse_stylesheet_for_viewport_preserving_containers(
+            inner, viewport, container_conditions, container_condition_id,
+        ));
     }
     // Other at-rules (@font-face, @keyframes, @import, ...) carry no
     // layout-relevant rules for us, so drop them.
+}
+
+fn parse_container_query_list(prelude: &str) -> Option<Vec<ContainerQuery>> {
+    let queries = split_media_query_list(prelude)
+        .into_iter()
+        .map(parse_container_query)
+        .collect::<Option<Vec<_>>>()?;
+    (!queries.is_empty()).then_some(queries)
+}
+
+fn parse_container_query(input: &str) -> Option<ContainerQuery> {
+    let input = input.trim();
+    if input.is_empty() {
+        return None;
+    }
+    let starts_with_condition =
+        input.starts_with('(') || strip_ascii_keyword(input, "not").is_some();
+    let (name, condition) = if starts_with_condition {
+        (None, Some(input))
+    } else if let Some(split) = input.find(char::is_whitespace) {
+        let name = parse_container_query_name(&input[..split])?;
+        let condition = input[split..].trim();
+        (Some(name), (!condition.is_empty()).then_some(condition))
+    } else {
+        (Some(parse_container_query_name(input)?), None)
+    };
+    let condition = match condition {
+        Some(condition) => Some(parse_container_query_expr(condition)?),
+        None => None,
+    };
+    Some(ContainerQuery { name, condition })
+}
+
+fn parse_container_query_name(input: &str) -> Option<String> {
+    let mut input = cssparser::ParserInput::new(input.trim());
+    let mut parser = cssparser::Parser::new(&mut input);
+    let ident = parser.expect_ident_cloned().ok()?;
+    if !parser.is_exhausted() {
+        return None;
+    }
+    let lower = ident.to_ascii_lowercase();
+    if matches!(lower.as_str(), "none" | "not" | "and" | "or") {
+        return None;
+    }
+    Some(ident.to_string())
+}
+
+fn parse_container_query_expr(input: &str) -> Option<ContainerQueryExpr> {
+    let input = input.trim();
+    if let Some(parts) = split_supports_operator(input, "or") {
+        return Some(ContainerQueryExpr::Or(
+            parts.into_iter().map(parse_container_query_expr).collect::<Option<_>>()?,
+        ));
+    }
+    if let Some(parts) = split_supports_operator(input, "and") {
+        return Some(ContainerQueryExpr::And(
+            parts.into_iter().map(parse_container_query_expr).collect::<Option<_>>()?,
+        ));
+    }
+    if let Some(rest) = strip_ascii_keyword(input, "not") {
+        return Some(ContainerQueryExpr::Not(Box::new(parse_container_query_expr(rest)?)));
+    }
+    let inner = enclosing_parenthesized(input)?;
+    parse_container_size_feature(inner)
+        .map(ContainerQueryExpr::Feature)
+        .or_else(|| parse_container_query_expr(inner))
+}
+
+fn strip_ascii_keyword<'a>(input: &'a str, keyword: &str) -> Option<&'a str> {
+    if !input.get(..keyword.len())?.eq_ignore_ascii_case(keyword) {
+        return None;
+    }
+    let rest = &input[keyword.len()..];
+    rest.chars().next()
+        .filter(|character| character.is_whitespace())
+        .map(|_| rest.trim_start())
+}
+
+fn parse_container_size_feature(input: &str) -> Option<ContainerSizeFeature> {
+    let (name, value) = input.split_once(':')?;
+    let (comparison, axis) = match name.trim().to_ascii_lowercase().as_str() {
+        "min-width" => (ContainerQueryComparison::Min, ContainerQueryAxis::Width),
+        "max-width" => (ContainerQueryComparison::Max, ContainerQueryAxis::Width),
+        "min-inline-size" => (ContainerQueryComparison::Min, ContainerQueryAxis::InlineSize),
+        "max-inline-size" => (ContainerQueryComparison::Max, ContainerQueryAxis::InlineSize),
+        _ => return None,
+    };
+    Some(ContainerSizeFeature {
+        axis,
+        comparison,
+        length: parse_container_query_length(value)?,
+    })
+}
+
+fn parse_container_query_length(input: &str) -> Option<ContainerQueryLength> {
+    let input = input.trim().to_ascii_lowercase();
+    let number = |value: &str| {
+        value.parse::<f32>().ok().filter(|value| value.is_finite())
+    };
+    if let Some(value) = input.strip_suffix("rem").and_then(number) {
+        return Some(ContainerQueryLength::Rem(value));
+    }
+    if let Some(value) = input.strip_suffix("em").and_then(number) {
+        return Some(ContainerQueryLength::Em(value));
+    }
+    if let Some(value) = input.strip_suffix("px").and_then(number) {
+        return Some(ContainerQueryLength::Px(value));
+    }
+    number(&input).filter(|value| *value == 0.0).map(ContainerQueryLength::Px)
 }
 
 /// Evaluate the boolean subset of CSS Conditional Rules used by modern
@@ -1146,8 +1388,10 @@ fn combine_selectors(parent: &str, child: &str) -> String {
 fn denest(
     sel: &str,
     body: &str,
-    rules: &mut Vec<(String, String)>,
+    rules: &mut Vec<ParsedRule>,
     viewport: (f32, f32),
+    container_conditions: &mut Vec<ContainerConditionNode>,
+    container_condition_id: ContainerConditionId,
 ) {
     let chars: Vec<char> = body.chars().collect();
     let n = chars.len();
@@ -1221,18 +1465,30 @@ fn denest(
                     // A nested at-rule keeps the enclosing selector for its body.
                     if at.starts_with("media") {
                         if media_query_applies_for_viewport(pre, viewport) {
-                            denest(sel, &inner, rules, viewport);
+                            denest(sel, &inner, rules, viewport, container_conditions, container_condition_id);
                         }
                     } else if at.starts_with("supports") {
                         if supports_condition_applies(pre) {
-                            denest(sel, &inner, rules, viewport);
+                            denest(sel, &inner, rules, viewport, container_conditions, container_condition_id);
+                        }
+                    } else if at.starts_with("container") {
+                        let prelude = at["container".len()..].trim();
+                        if let Some(alternatives) = parse_container_query_list(prelude) {
+                            if let Ok(raw_id) = u32::try_from(container_conditions.len()) {
+                                let id = ContainerConditionId(raw_id);
+                                container_conditions.push(ContainerConditionNode {
+                                    parent: container_condition_id,
+                                    alternatives,
+                                });
+                                denest(sel, &inner, rules, viewport, container_conditions, id);
+                            }
                         }
                     } else if at.starts_with("layer") {
-                        denest(sel, &inner, rules, viewport);
+                        denest(sel, &inner, rules, viewport, container_conditions, container_condition_id);
                     }
                 } else if !pre.is_empty() {
                     let full = combine_selectors(sel, pre);
-                    denest(&full, &inner, rules, viewport);
+                    denest(&full, &inner, rules, viewport, container_conditions, container_condition_id);
                 }
                 i = j;
                 seg = i;
@@ -1263,7 +1519,11 @@ fn denest(
         for s in split_selector_list(sel) {
             let s = s.trim();
             if !s.is_empty() {
-                rules.push((s.to_string(), own.clone()));
+                rules.push(ParsedRule {
+                    selector: s.to_string(),
+                    declarations: own.clone(),
+                    container_condition_id,
+                });
             }
         }
     }
@@ -1465,6 +1725,13 @@ fn split_media_query_list(query: &str) -> Vec<&str> {
 mod tests {
     use super::*;
 
+    fn condition_arena_root() -> Vec<ContainerConditionNode> {
+        vec![ContainerConditionNode {
+            parent: ContainerConditionId::NONE,
+            alternatives: Vec::new(),
+        }]
+    }
+
     #[test]
     fn generated_content_resolves_host_attributes_and_resets() {
         let tree = obscura_dom::parse_html(
@@ -1545,6 +1812,105 @@ mod tests {
                 .iter()
                 .any(|(_, declarations)| declarations.contains("width:100%"))
         );
+    }
+
+    #[test]
+    fn tailwind_container_query_is_retained_but_simple_parser_omits_it() {
+        let css = r#"
+            .base { width: 10px }
+            @container (min-width: 28rem) {
+                .\@md\:flex-row { flex-direction: row }
+            }
+            @container main not (max-inline-size: 60em) {
+                .named { width: 20px }
+            }
+        "#;
+        let mut conditions = condition_arena_root();
+        let parsed = parse_stylesheet_for_viewport_preserving_containers(
+            css, (1280.0, 720.0), &mut conditions, ContainerConditionId::NONE,
+        );
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[1].container_condition_id, ContainerConditionId(1));
+        assert_eq!(parsed[2].container_condition_id, ContainerConditionId(2));
+        assert_eq!(conditions.len(), 3);
+        assert_eq!(
+            conditions[1].alternatives[0].condition,
+            Some(ContainerQueryExpr::Feature(ContainerSizeFeature {
+                axis: ContainerQueryAxis::Width,
+                comparison: ContainerQueryComparison::Min,
+                length: ContainerQueryLength::Rem(28.0),
+            }))
+        );
+        assert_eq!(conditions[2].alternatives[0].name.as_deref(), Some("main"));
+        assert!(matches!(
+            conditions[2].alternatives[0].condition,
+            Some(ContainerQueryExpr::Not(_))
+        ));
+        assert_eq!(parse_stylesheet(css).len(), 1);
+    }
+
+    #[test]
+    fn nested_container_rules_form_a_parent_condition_chain() {
+        let css = "@container shell (min-width:40rem){\
+            @container (max-inline-size:50rem){.card{display:grid}}}";
+        let mut conditions = condition_arena_root();
+        let parsed = parse_stylesheet_for_viewport_preserving_containers(
+            css, (1280.0, 720.0), &mut conditions, ContainerConditionId::NONE,
+        );
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].container_condition_id, ContainerConditionId(2));
+        assert_eq!(conditions[2].parent, ContainerConditionId(1));
+        assert_eq!(conditions[1].parent, ContainerConditionId::NONE);
+    }
+
+    #[test]
+    fn unresolved_container_rules_do_not_enter_cascade_or_pseudos() {
+        let tree = obscura_dom::parse_html(r#"<div id="target"></div>"#);
+        let target = tree.query_selector("#target").unwrap().unwrap();
+        let sheet = Stylesheet::parse(&tree, &[r#"
+            #target{width:10px}
+            @container (min-width:28rem){
+                #target{width:999px}
+                #target::before{content:"inactive"}
+            }
+            #target{height:20px}
+        "#.to_string()]);
+        assert_eq!(sheet.rules.len(), 3, "conditional rule remains indexed");
+        assert_eq!(sheet.container_conditions.len(), 2);
+        let mut matcher = tree.matcher();
+        let mut style = LayoutStyle::default();
+        sheet.apply(
+            &tree, &mut matcher, target, Some("target"), &[], "div", &mut style,
+            &HashMap::new(), None,
+        );
+        assert_eq!(style.width, crate::Dimension::Px(10.0));
+        assert_eq!(style.height, crate::Dimension::Px(20.0));
+        let (before, after) =
+            sheet.pseudo_styles(&tree, &mut matcher, target, &HashMap::new(), &style);
+        assert!(before.is_none() && after.is_none());
+    }
+
+    #[test]
+    fn no_container_parser_output_and_order_are_unchanged() {
+        let css = ".card{width:10px}\
+            @supports (display:grid){.card{display:grid}}\
+            @media (min-width:64rem){.card{width:20px}}\
+            .card{height:30px}";
+        assert_eq!(
+            parse_stylesheet_for_viewport(css, (1280.0, 720.0)),
+            vec![
+                (".card".into(), "width:10px;".into()),
+                (".card".into(), "display:grid;".into()),
+                (".card".into(), "width:20px;".into()),
+                (".card".into(), "height:30px;".into()),
+            ]
+        );
+        let mut conditions = condition_arena_root();
+        let rich = parse_stylesheet_for_viewport_preserving_containers(
+            css, (1280.0, 720.0), &mut conditions, ContainerConditionId::NONE,
+        );
+        assert_eq!(conditions.len(), 1);
+        assert!(rich.iter().all(|rule| rule.container_condition_id == ContainerConditionId::NONE));
     }
 
     #[test]

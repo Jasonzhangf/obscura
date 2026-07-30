@@ -129,6 +129,16 @@ pub enum Display {
     None,
 }
 
+/// Computed `container-type` value. Stage A carries it through the cascade;
+/// the layout convergence stage will use it for query eligibility.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ContainerType {
+    #[default]
+    Normal,
+    InlineSize,
+    Size,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub enum Dimension {
     #[default]
@@ -177,6 +187,16 @@ impl Dimension {
 #[derive(Debug, Clone, Default)]
 pub struct LayoutStyle {
     pub display: Display,
+    /// Computed CSS `container-type` (not inherited).
+    pub container_type: ContainerType,
+    /// The specified value was the CSS-wide `inherit` keyword. Resolved
+    /// top-down before layout because `container-type` is otherwise
+    /// non-inherited.
+    pub(crate) container_type_inherit: bool,
+    /// Computed CSS `container-name`; empty represents `none` (not inherited).
+    pub container_names: Vec<String>,
+    /// The specified `container-name` value was CSS-wide `inherit`.
+    pub(crate) container_names_inherit: bool,
     /// True when `display:flex` is only an internal stand-in for native HTML
     /// layout such as table cells, rather than the computed CSS display.
     /// Descendants are not CSS flex items in these containers.
