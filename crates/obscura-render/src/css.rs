@@ -129,6 +129,7 @@ impl Stylesheet {
         matcher: &mut Matcher,
         nid: NodeId,
         props: &HashMap<String, String>,
+        host_style: &LayoutStyle,
     ) -> (Option<LayoutStyle>, Option<LayoutStyle>) {
         let build = |rules: &[PseudoRule], matcher: &mut Matcher| {
             let mut matched: Vec<(u32, usize, &PseudoRule)> = rules
@@ -140,24 +141,55 @@ impl Stylesheet {
                 return None;
             }
             matched.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-            let mut style = LayoutStyle::default();
+            // Generated ::before/::after boxes have an inline outer display
+            // by default. LayoutStyle's general default is block because it
+            // primarily represents ordinary DOM boxes, so set the pseudo
+            // initial value explicitly before applying author declarations.
+            let mut style = LayoutStyle {
+                display: crate::Display::Inline,
+                ..Default::default()
+            };
+            style.color_scheme_dark = host_style.color_scheme_dark;
+            let inherited_color_scheme_dark = host_style.color_scheme_dark;
             let mut content = None;
             for &(_, _, rule) in &matched {
-                let expanded = substitute_vars(&rule.normal_decls, props, 0);
-                crate::style::apply_declarations(&mut style, &expanded);
+                let expanded = substitute_declarations(&rule.normal_decls, props);
+                crate::style::apply_color_scheme_declarations_from(
+                    &mut style,
+                    &expanded,
+                    inherited_color_scheme_dark,
+                );
+            }
+            for &(_, _, rule) in &matched {
+                let expanded = substitute_declarations(&rule.important_decls, props);
+                crate::style::apply_color_scheme_declarations_from(
+                    &mut style,
+                    &expanded,
+                    inherited_color_scheme_dark,
+                );
+            }
+            for &(_, _, rule) in &matched {
+                let expanded = substitute_declarations(&rule.normal_decls, props);
+                crate::style::apply_declarations_with_locked_color_scheme(
+                    &mut style,
+                    &expanded,
+                );
                 if let Some(value) = extract_content(&expanded, tree, nid) {
                     content = value;
                 }
             }
             for &(_, _, rule) in &matched {
-                let expanded = substitute_vars(&rule.important_decls, props, 0);
-                crate::style::apply_declarations(&mut style, &expanded);
+                let expanded = substitute_declarations(&rule.important_decls, props);
+                crate::style::apply_declarations_with_locked_color_scheme(
+                    &mut style,
+                    &expanded,
+                );
                 if let Some(value) = extract_content(&expanded, tree, nid) {
                     content = value;
                 }
             }
             style.before_content = content;
-            if style.before_content.is_some() {
+            if style.before_content.is_some() || style.content_image.is_some() {
                 Some(style)
             } else {
                 None
@@ -254,20 +286,80 @@ impl Stylesheet {
         } else {
             let mut m = parent_props.clone();
             for (k, v) in own {
-                m.insert(k, v);
+                match v.trim().to_ascii_lowercase().as_str() {
+                    // CSS-wide keywords on a custom property are cascade
+                    // instructions, not literal token streams. `initial`
+                    // produces the guaranteed-invalid value so var() must use
+                    // its fallback even when an ancestor defined the token.
+                    "initial" => {
+                        m.remove(&k);
+                    }
+                    // Custom properties inherit by default. `unset` therefore
+                    // has the same effect as `inherit`; approximate both
+                    // revert forms with the inherited author value as well.
+                    "inherit" | "unset" | "revert" | "revert-layer" => {
+                        if let Some(inherited) = parent_props.get(&k) {
+                            m.insert(k, inherited.clone());
+                        } else {
+                            m.remove(&k);
+                        }
+                    }
+                    _ => {
+                        m.insert(k, v);
+                    }
+                }
             }
             Some(m)
         };
         let props = effective.as_ref().unwrap_or(parent_props);
 
+        let inherited_color_scheme_dark = style.color_scheme_dark;
+        // `light-dark()` resolves against the element's final used color
+        // scheme, not the declaration order. Determine the scheme winner
+        // across the complete author cascade before applying any color-valued
+        // property. The style starts with its inherited scheme.
+        for &(_, _, i) in &matched {
+            let expanded =
+                substitute_declarations(&self.rules[i].normal_decls, props);
+            crate::style::apply_color_scheme_declarations_from(
+                style,
+                &expanded,
+                inherited_color_scheme_dark,
+            );
+        }
+        let expanded = substitute_declarations(&inline_normal, props);
+        crate::style::apply_color_scheme_declarations_from(
+            style,
+            &expanded,
+            inherited_color_scheme_dark,
+        );
+        for &(_, _, i) in &matched {
+            let expanded =
+                substitute_declarations(&self.rules[i].important_decls, props);
+            crate::style::apply_color_scheme_declarations_from(
+                style,
+                &expanded,
+                inherited_color_scheme_dark,
+            );
+        }
+        let expanded = substitute_declarations(&inline_important, props);
+        crate::style::apply_color_scheme_declarations_from(
+            style,
+            &expanded,
+            inherited_color_scheme_dark,
+        );
+
         // Pass 2: apply normal declarations with `var()` substituted against
         // the resolved custom-property map.
         for &(_, _, i) in &matched {
-            let expanded = substitute_vars(&self.rules[i].normal_decls, props, 0);
-            crate::style::apply_declarations(style, &expanded);
+            let expanded = substitute_declarations(&self.rules[i].normal_decls, props);
+            crate::style::apply_declarations_with_locked_color_scheme(
+                style,
+                &expanded,
+            );
         }
-        let expanded = substitute_vars(&inline_normal, props, 0);
-        crate::style::apply_declarations(style, &expanded);
+        let expanded = substitute_declarations(&inline_normal, props);
+        crate::style::apply_declarations_with_locked_color_scheme(style, &expanded);
 
         // CSS animations form a cascade origin above normal author rules and
         // below author !important. A static renderer has no compositor clock;
@@ -277,18 +369,24 @@ impl Stylesheet {
         if style.animation_fill_forwards && !style.animation_iteration_infinite {
             if let Some(name) = style.animation_name.as_deref() {
                 if let Some(decls) = self.keyframe_ends.get(name) {
-                    let expanded = substitute_vars(decls, props, 0);
-                    crate::style::apply_declarations(style, &expanded);
+                    let expanded = substitute_declarations(decls, props);
+                    crate::style::apply_declarations_with_locked_color_scheme(
+                        style,
+                        &expanded,
+                    );
                 }
             }
         }
 
         for &(_, _, i) in &matched {
-            let expanded = substitute_vars(&self.rules[i].important_decls, props, 0);
-            crate::style::apply_declarations(style, &expanded);
+            let expanded = substitute_declarations(&self.rules[i].important_decls, props);
+            crate::style::apply_declarations_with_locked_color_scheme(
+                style,
+                &expanded,
+            );
         }
-        let expanded = substitute_vars(&inline_important, props, 0);
-        crate::style::apply_declarations(style, &expanded);
+        let expanded = substitute_declarations(&inline_important, props);
+        crate::style::apply_declarations_with_locked_color_scheme(style, &expanded);
         effective
     }
 }
@@ -372,14 +470,36 @@ fn extract_keyframe_end_states(css: &str) -> Vec<(String, String)> {
     found
 }
 
-/// Substitute every `var(--name, fallback?)` in `input` with its resolved
-/// value from `props` (recursively, so a token that itself references another
-/// token resolves; a depth cap guards against reference cycles). A missing
-/// variable with no fallback expands to empty, which makes the declaration
-/// invalid and dropped, exactly as CSS specifies.
-pub(crate) fn substitute_vars(input: &str, props: &HashMap<String, String>, depth: u8) -> String {
-    if depth > 16 || !input.contains("var(") {
-        return input.to_string();
+/// Resolve variables one declaration at a time. An invalid variable poisons
+/// its entire declaration at computed-value time, but must not erase unrelated
+/// declarations in the same rule.
+fn substitute_declarations(css: &str, props: &HashMap<String, String>) -> String {
+    let mut expanded = String::new();
+    for declaration in crate::style::split_declarations(css) {
+        let Some((name, value)) = declaration.split_once(':') else {
+            continue;
+        };
+        let Some(value) = substitute_var_value(value.trim(), props, 0) else {
+            continue;
+        };
+        expanded.push_str(name.trim());
+        expanded.push(':');
+        expanded.push_str(&value);
+        expanded.push(';');
+    }
+    expanded
+}
+
+/// Substitute every `var(--name, fallback?)` in one property value. `None`
+/// represents CSS's guaranteed-invalid value. Crucially, invalidity propagates
+/// through an intermediate custom property so an outer var() can use its own
+/// fallback (`--toggle:var(--missing) dark; color:var(--toggle,light)`).
+fn substitute_var_value(input: &str, props: &HashMap<String, String>, depth: u8) -> Option<String> {
+    if depth > 16 {
+        return None;
+    }
+    if !input.contains("var(") {
+        return Some(input.to_string());
     }
     let mut out = String::new();
     let mut rest = input;
@@ -403,23 +523,28 @@ pub(crate) fn substitute_vars(input: &str, props: &HashMap<String, String>, dept
             }
         }
         let Some(end) = end else {
-            out.push_str(&rest[pos..]);
-            return out;
+            return None;
         };
         let inner = &after[..end];
         let (name, fallback) = match inner.split_once(',') {
             Some((n, f)) => (n.trim(), Some(f.trim())),
             None => (inner.trim(), None),
         };
-        let replacement = match props.get(name) {
-            Some(v) => substitute_vars(v, props, depth + 1),
-            None => fallback.map(|f| substitute_vars(f, props, depth + 1)).unwrap_or_default(),
+        let resolved = props
+            .get(name)
+            .and_then(|value| substitute_var_value(value, props, depth + 1));
+        let replacement = match resolved {
+            Some(value) => value,
+            None => {
+                let fallback = fallback?;
+                substitute_var_value(fallback, props, depth + 1)?
+            }
         };
         out.push_str(&replacement);
         rest = &after[end + 1..];
     }
     out.push_str(rest);
-    out
+    Some(out)
 }
 
 /// If `selector`'s rightmost compound is the pseudo-element `which`
@@ -477,6 +602,17 @@ fn extract_content(decls: &str, tree: &DomTree, nid: NodeId) -> Option<Option<St
         };
         if let Some(parsed) = parsed {
             result = Some(Some(parsed));
+        } else if value
+            .trim_start()
+            .get(..4)
+            .map_or(false, |prefix| prefix.eq_ignore_ascii_case("url("))
+        {
+            // An image-valued content declaration supersedes any earlier
+            // string declaration. The image itself is retained on
+            // LayoutStyle::content_image by apply_declarations; clearing the
+            // text here keeps the two views of the winning declaration in
+            // sync and, importantly, keeps the pseudo alive.
+            result = Some(None);
         }
     }
     result
@@ -615,7 +751,9 @@ fn flush_at_rule(
             rules.extend(parse_stylesheet_for_viewport(inner, viewport));
         }
     } else if at.starts_with("supports") {
-        rules.extend(parse_stylesheet_for_viewport(inner, viewport));
+        if supports_condition_applies(sel) {
+            rules.extend(parse_stylesheet_for_viewport(inner, viewport));
+        }
     } else if at.starts_with("property") {
         // `@property --x { syntax:..; initial-value: V }` declares a custom
         // property and its default. Register the initial-value as a `:root`
@@ -648,6 +786,152 @@ fn flush_at_rule(
     // layout-relevant rules for us, so drop them.
 }
 
+/// Evaluate the boolean subset of CSS Conditional Rules used by modern
+/// framework stylesheets. This follows the same shape as Gecko's
+/// SupportsCondition tree: declaration/selector leaves, arbitrary grouping,
+/// unary `not`, and top-level `and`/`or` chains. Unknown or malformed future
+/// syntax is false instead of optimistically enabling a fallback branch.
+pub(crate) fn supports_condition_applies(condition: &str) -> bool {
+    let condition = condition.trim();
+    let condition = condition
+        .strip_prefix("@supports")
+        .or_else(|| condition.strip_prefix("supports"))
+        .unwrap_or(condition)
+        .trim();
+    eval_supports_condition(condition)
+}
+
+fn eval_supports_condition(condition: &str) -> bool {
+    let condition = condition.trim();
+    if condition.is_empty() {
+        return false;
+    }
+    if let Some(inner) = enclosing_parenthesized(condition) {
+        return eval_supports_condition(inner);
+    }
+    if condition
+        .get(..3)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("not"))
+        && condition
+            .as_bytes()
+            .get(3)
+            .is_some_and(u8::is_ascii_whitespace)
+    {
+        return !eval_supports_condition(condition[3..].trim());
+    }
+    if let Some(parts) = split_supports_operator(condition, "or") {
+        return parts.into_iter().any(eval_supports_condition);
+    }
+    if let Some(parts) = split_supports_operator(condition, "and") {
+        return parts.into_iter().all(eval_supports_condition);
+    }
+    let lower = condition.to_ascii_lowercase();
+    if lower.starts_with("selector(") && condition.ends_with(')') {
+        let inner = &condition["selector(".len()..condition.len() - 1];
+        return obscura_dom::selector::parse_selector(inner.trim()).is_ok();
+    }
+    let Some((name, value)) = condition.split_once(':') else {
+        return false;
+    };
+    crate::style::supports_declaration(name, value)
+}
+
+/// Return the contents when one outer parenthesis pair encloses the complete
+/// expression. A declaration leaf such as `(display:grid)` intentionally
+/// becomes `display:grid` and is handled after boolean operators.
+fn enclosing_parenthesized(condition: &str) -> Option<&str> {
+    if !condition.starts_with('(') {
+        return None;
+    }
+    let mut depth = 0i32;
+    let mut quote = None;
+    for (index, character) in condition.char_indices() {
+        if let Some(active) = quote {
+            if character == active {
+                quote = None;
+            }
+            continue;
+        }
+        match character {
+            '\'' | '"' => quote = Some(character),
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth < 0 {
+                    return None;
+                }
+                if depth == 0 {
+                    return (index + character.len_utf8() == condition.len())
+                        .then_some(&condition[1..index]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn split_supports_operator<'a>(condition: &'a str, operator: &str) -> Option<Vec<&'a str>> {
+    let bytes = condition.as_bytes();
+    let operator = operator.as_bytes();
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut index = 0usize;
+    let mut depth = 0i32;
+    let mut quote = None;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if let Some(active) = quote {
+            if byte == active {
+                quote = None;
+            } else if byte == b'\\' {
+                index += 1;
+            }
+            index += 1;
+            continue;
+        }
+        match byte {
+            b'\'' | b'"' => quote = Some(byte),
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth < 0 {
+                    return None;
+                }
+            }
+            _ if depth == 0
+                && index + operator.len() <= bytes.len()
+                && bytes[index..index + operator.len()].eq_ignore_ascii_case(operator)
+                && index > 0
+                && bytes[index - 1].is_ascii_whitespace()
+                && bytes
+                    .get(index + operator.len())
+                    .is_some_and(u8::is_ascii_whitespace) =>
+            {
+                let part = condition[start..index].trim();
+                if part.is_empty() {
+                    return None;
+                }
+                parts.push(part);
+                index += operator.len();
+                start = index;
+                continue;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    if depth != 0 || quote.is_some() || parts.is_empty() {
+        return None;
+    }
+    let tail = condition[start..].trim();
+    if tail.is_empty() {
+        return None;
+    }
+    parts.push(tail);
+    Some(parts)
+}
+
 /// Coarse `@media` evaluation against an assumed 1280px-wide desktop viewport.
 ///
 /// Real stylesheets format media features inconsistently
@@ -678,16 +962,26 @@ fn single_media_query_applies_for_viewport(
 ) -> bool {
     let viewport_w = viewport.0;
     let viewport_h = viewport.1;
-    if query.contains("print") {
+    let query = query.trim().strip_prefix("@media").unwrap_or(query).trim();
+    let compact: String = query
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .flat_map(|c| c.to_lowercase())
+        .collect();
+
+    // Tailwind expresses every `max-*` breakpoint as the negation of a
+    // min-width query (`not all and (min-width:40rem)`). Evaluate the inner
+    // condition and invert it; treating all `not all` queries as permanently
+    // false makes mutually exclusive responsive utilities apply together at
+    // desktop widths. Unknown browser-targeting features still conservatively
+    // evaluate true inside and therefore false after negation.
+    if let Some(inner) = compact.strip_prefix("notalland") {
+        return !single_media_query_applies_for_viewport(inner, viewport);
+    }
+    if compact == "notall" {
         return false;
     }
-    let compact: String = query.chars().filter(|c| !c.is_whitespace()).flat_map(|c| c.to_lowercase()).collect();
-
-    // A `not all` / `not all and (...)` query is a browser-targeting hack (most
-    // commonly the Safari-only flex-gap fallback `@media not all and
-    // (min-resolution:.001dpcm)`, which flips containers from flex to grid); it
-    // does not apply in a Chromium-like context.
-    if compact.starts_with("notall") {
+    if compact.contains("print") {
         return false;
     }
 
@@ -933,7 +1227,11 @@ fn denest(
                         if media_query_applies_for_viewport(pre, viewport) {
                             denest(sel, &inner, rules, viewport);
                         }
-                    } else if at.starts_with("supports") || at.starts_with("layer") {
+                    } else if at.starts_with("supports") {
+                        if supports_condition_applies(pre) {
+                            denest(sel, &inner, rules, viewport);
+                        }
+                    } else if at.starts_with("layer") {
                         denest(sel, &inner, rules, viewport);
                     }
                 } else if !pre.is_empty() {
@@ -1254,6 +1552,40 @@ mod tests {
     }
 
     #[test]
+    fn supports_conditions_gate_legacy_framework_fallbacks() {
+        let legacy_probe = "(((-webkit-hyphens:none)) and \
+            (not (margin-trim:inline))) or \
+            ((-moz-orient:inline) and \
+            (not (color:rgb(from red r g b))))";
+        assert!(!supports_condition_applies(legacy_probe));
+        assert!(supports_condition_applies(
+            "(display:grid) and (selector(.card > *))"
+        ));
+        assert!(supports_condition_applies(
+            "not (unknown-engine-prop:value)"
+        ));
+
+        let css = format!(
+            "@supports {legacy_probe} {{ .legacy {{ line-height:1.5 }} }}\
+             @supports (display:grid) {{ .modern {{ display:grid }} }}\
+             .host {{ @supports {legacy_probe} {{ width:999px }} }}"
+        );
+        let rules = parse_stylesheet_for_viewport(&css, (1280.0, 720.0));
+        assert!(
+            !rules.iter().any(|(selector, declarations)| {
+                selector == ".legacy" || declarations.contains("999px")
+            }),
+            "false supports branches must be skipped: {rules:?}"
+        );
+        assert!(
+            rules.iter().any(|(selector, declarations)| {
+                selector == ".modern" && declarations.contains("display:grid")
+            }),
+            "true supports branch should remain: {rules:?}"
+        );
+    }
+
+    #[test]
     fn media_breakpoints_support_font_relative_lengths_and_ranges() {
         assert!(!media_query_applies_for_viewport(
             "@media (min-width: 64rem)",
@@ -1271,6 +1603,35 @@ mod tests {
             "@media (width > calc(60em - 1px))",
             (900.0, 1000.0)
         ));
+    }
+
+    #[test]
+    fn negated_min_width_queries_form_max_breakpoints() {
+        assert!(media_query_applies_for_viewport(
+            "@media not all and (min-width: 40rem)",
+            (639.0, 900.0)
+        ));
+        assert!(!media_query_applies_for_viewport(
+            "@media not all and (min-width: 40rem)",
+            (1280.0, 900.0)
+        ));
+
+        let css = r#"
+            .hidden { display: none }
+            @media not all and (min-width: 40rem) {
+                .max-sm\:inline { display: inline }
+            }
+            @media (min-width: 80rem) {
+                .xl\:inline { display: inline }
+            }
+        "#;
+        let desktop = parse_stylesheet_for_viewport(css, (1280.0, 900.0));
+        assert!(!desktop
+            .iter()
+            .any(|(selector, _)| selector == r".max-sm\:inline"));
+        assert!(desktop
+            .iter()
+            .any(|(selector, _)| selector == r".xl\:inline"));
     }
 
     #[test]

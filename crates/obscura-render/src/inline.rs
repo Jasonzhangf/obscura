@@ -14,7 +14,12 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use cosmic_text::{Align, Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, Style, SwashCache, Weight, Wrap};
+use cosmic_text::{
+    Align, Attrs, Buffer, CacheKey, CacheKeyFlags, Color, Family, FontSystem, Metrics, Shaping,
+    Style, SwashCache, SwashImage, Weight, Wrap,
+};
+use swash::scale::{image::Content as SwashContent, Render, ScaleContext, Source, StrikeWith};
+use swash::zeno::{Angle, Format, Transform, Vector};
 
 use obscura_dom::tree::{DomTree, NodeId};
 
@@ -90,7 +95,15 @@ struct LoadedFace {
     max_weight: u16,
     shape_weight: u16,
     italic: bool,
-    variable: bool,
+}
+
+#[derive(Clone)]
+struct ResolvedFont {
+    family: Arc<str>,
+    shape_weight: u16,
+    /// Authored `wght` coordinate for a ranged @font-face. Cosmic Text 0.12
+    /// cannot carry this into shaping, so it is kept separately for raster.
+    variation_weight: Option<u16>,
 }
 
 #[derive(Clone)]
@@ -106,7 +119,7 @@ fn resolve_loaded_font(
     requested_weight: u16,
     requested_italic: bool,
     loaded: &HashMap<String, LoadedFamily>,
-) -> (Arc<str>, u16) {
+) -> ResolvedFont {
     if let Some(stack) = fam {
         for token in stack.split(',') {
             let name = token
@@ -124,15 +137,25 @@ fn resolve_loaded_font(
                 } else {
                     exact_style
                 };
-                if let Some(face) = candidates.iter().copied().find(|face| {
-                    (face.min_weight..=face.max_weight).contains(&requested_weight)
-                }) {
-                    let weight = if face.variable {
-                        requested_weight
-                    } else {
-                        face.shape_weight
+                if let Some(face) = candidates
+                    .iter()
+                    .copied()
+                    .find(|face| (face.min_weight..=face.max_weight).contains(&requested_weight))
+                {
+                    // cosmic-text 0.12 only accepts the named family when the
+                    // shaping weight exactly matches fontdb's weight for that
+                    // file. A variable face commonly advertises `100 900` in
+                    // CSS while fontdb records its default instance as 400.
+                    // Passing the authored weight makes cosmic-text reject the
+                    // right family and fall through to an unrelated exact-
+                    // weight face. Select the file at its database weight;
+                    // variable-axis shaping is not exposed by this version.
+                    return ResolvedFont {
+                        family: Arc::clone(&face.name),
+                        shape_weight: face.shape_weight,
+                        variation_weight: (face.min_weight != face.max_weight)
+                            .then_some(requested_weight),
                     };
-                    return (Arc::clone(&face.name), weight);
                 }
                 let available: Vec<_> =
                     candidates.iter().map(|face| face.min_weight).collect();
@@ -141,14 +164,22 @@ fn resolve_loaded_font(
                     .into_iter()
                     .find(|face| face.min_weight == matched)
                 {
-                    return (Arc::clone(&face.name), face.shape_weight);
+                    return ResolvedFont {
+                        family: Arc::clone(&face.name),
+                        shape_weight: face.shape_weight,
+                        variation_weight: None,
+                    };
                 }
             }
         }
     }
     let fallback = resolve_font_family(fam);
     let weights: &[u16] = &[400, 700];
-    (Arc::from(fallback), match_font_weight(requested_weight, weights))
+    ResolvedFont {
+        family: Arc::from(fallback),
+        shape_weight: match_font_weight(requested_weight, weights),
+        variation_weight: None,
+    }
 }
 
 /// CSS Fonts' asymmetric missing-weight search. In particular, 600 selects
@@ -191,28 +222,6 @@ fn match_font_weight(requested: u16, available: &[u16]) -> u16 {
     }
 }
 
-fn face_is_variable(data: &[u8], face_index: u32) -> bool {
-    let base = if data.get(..4) == Some(b"ttcf") {
-        let offset = 12usize.saturating_add(face_index as usize * 4);
-        data.get(offset..offset + 4)
-            .and_then(|bytes| bytes.try_into().ok())
-            .map(u32::from_be_bytes)
-            .unwrap_or(0) as usize
-    } else {
-        0
-    };
-    let Some(count) = data
-        .get(base + 4..base + 6)
-        .and_then(|bytes| bytes.try_into().ok())
-        .map(u16::from_be_bytes)
-    else {
-        return false;
-    };
-    (0..count as usize).any(|index| {
-        let start = base + 12 + index * 16;
-        data.get(start..start + 4) == Some(b"fvar")
-    })
-}
 /// Resolve `line-height: normal` from the selected face's horizontal header.
 ///
 /// Chromium's FreeType-backed Linux path grid-fits the ascent, descent, and
@@ -258,6 +267,20 @@ pub(crate) fn used_line_height(style: &LayoutStyle) -> f32 {
 /// into an [`InlineItem`]'s clip-text fills.
 const META_UNDERLINE: usize = 1;
 const META_FILL_SHIFT: usize = 1;
+const META_VARIATION_BITS: usize = 10;
+const META_VARIATION_SHIFT: usize = usize::BITS as usize - META_VARIATION_BITS;
+const META_VARIATION_MASK: usize =
+    ((1usize << META_VARIATION_BITS) - 1) << META_VARIATION_SHIFT;
+const META_FILL_MASK: usize = ((1usize << META_VARIATION_SHIFT) - 1) & !META_UNDERLINE;
+
+fn metadata_fill(metadata: usize) -> Option<usize> {
+    ((metadata & META_FILL_MASK) >> META_FILL_SHIFT).checked_sub(1)
+}
+
+fn metadata_variation_weight(metadata: usize) -> Option<u16> {
+    let weight = ((metadata & META_VARIATION_MASK) >> META_VARIATION_SHIFT) as u16;
+    (weight != 0).then_some(weight)
+}
 
 type ClipTextFill = (f32, Vec<([u8; 4], Option<f32>)>);
 
@@ -286,8 +309,104 @@ pub struct TextEngine {
     font_system: FontSystem,
     loaded_families: HashMap<String, LoadedFamily>,
     swash: SwashCache,
+    variable_swash: VariableSwashCache,
     items: Vec<InlineItem>,
     replaced: Vec<ReplacedItem>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct VariableCacheKey {
+    glyph: CacheKey,
+    weight: u16,
+}
+
+/// Swash's ordinary cache key intentionally has no variation coordinates.
+/// Keep variable instances in a separate cache so a 400 glyph can never be
+/// reused for 700 and repeated paint remains O(1) after the first raster.
+struct VariableSwashCache {
+    context: ScaleContext,
+    images: HashMap<VariableCacheKey, Option<SwashImage>>,
+}
+
+impl VariableSwashCache {
+    fn new() -> Self {
+        Self {
+            context: ScaleContext::new(),
+            images: HashMap::new(),
+        }
+    }
+
+    fn with_pixels<F: FnMut(i32, i32, Color)>(
+        &mut self,
+        font_system: &mut FontSystem,
+        cache_key: CacheKey,
+        weight: u16,
+        base: Color,
+        mut f: F,
+    ) {
+        let key = VariableCacheKey {
+            glyph: cache_key,
+            weight,
+        };
+        let image = self.images.entry(key).or_insert_with(|| {
+            let font = font_system.get_font(cache_key.font_id)?;
+            let mut scaler = self
+                .context
+                .builder(font.as_swash())
+                .size(f32::from_bits(cache_key.font_size_bits))
+                .hint(true)
+                .variations([("wght", weight as f32)])
+                .build();
+            let offset = Vector::new(cache_key.x_bin.as_float(), cache_key.y_bin.as_float());
+            Render::new(&[
+                Source::ColorOutline(0),
+                Source::ColorBitmap(StrikeWith::BestFit),
+                Source::Outline,
+            ])
+            .format(Format::Alpha)
+            .offset(offset)
+            .transform(
+                cache_key
+                    .flags
+                    .contains(CacheKeyFlags::FAKE_ITALIC)
+                    .then(|| {
+                        Transform::skew(
+                            Angle::from_degrees(14.0),
+                            Angle::from_degrees(0.0),
+                        )
+                    }),
+            )
+            .render(&mut scaler, cache_key.glyph_id)
+        });
+        let Some(image) = image else { return };
+        let left = image.placement.left;
+        let top = -image.placement.top;
+        match image.content {
+            SwashContent::Mask => {
+                for (index, alpha) in image.data.iter().copied().enumerate() {
+                    let x = index as i32 % image.placement.width as i32;
+                    let y = index as i32 / image.placement.width as i32;
+                    f(
+                        left + x,
+                        top + y,
+                        Color(((alpha as u32) << 24) | base.0 & 0x00FF_FFFF),
+                    );
+                }
+            }
+            SwashContent::Color => {
+                for (index, rgba) in image.data.chunks_exact(4).enumerate() {
+                    let x = index as i32 % image.placement.width as i32;
+                    let y = index as i32 / image.placement.width as i32;
+                    f(
+                        left + x,
+                        top + y,
+                        Color::rgba(rgba[0], rgba[1], rgba[2], rgba[3]),
+                    );
+                }
+            }
+            SwashContent::SubpixelMask => {}
+        }
+    }
 }
 
 const REPLACED_CONTEXT_BIT: usize = 1usize << (usize::BITS - 1);
@@ -407,9 +526,6 @@ impl TextEngine {
             let shape_weight = face.weight.0;
             let italic = declared_italic
                 .unwrap_or(!matches!(face.style, cosmic_text::fontdb::Style::Normal));
-            let variable = db
-                .with_face_data(id, face_is_variable)
-                .unwrap_or(false);
             let weight = declared_weight.unwrap_or((shape_weight, shape_weight));
             let declared_names: Vec<String> = declared_family
                 .map(|name| vec![name])
@@ -424,7 +540,6 @@ impl TextEngine {
                     max_weight: weight.1,
                     shape_weight,
                     italic,
-                    variable,
                 });
             }
         }
@@ -434,6 +549,7 @@ impl TextEngine {
             font_system,
             loaded_families,
             swash: SwashCache::new(),
+            variable_swash: VariableSwashCache::new(),
             items: Vec::new(),
             replaced: Vec::new(),
         }
@@ -458,18 +574,13 @@ impl TextEngine {
         }
         let base = styles.get(&id)?;
         let mut collector = Collector { last_was_space: true, clip_fills: Vec::new() };
-        let (family, weight) = resolve_loaded_font(
+        let font = resolve_loaded_font(
             base.font_family.as_deref(),
             crate::style::used_font_weight(base),
             base.font_style_italic.unwrap_or(false),
             &self.loaded_families,
         );
-        let ctx = base_span_ctx(
-            base,
-            family,
-            weight,
-            &mut collector,
-        );
+        let ctx = base_span_ctx(base, font, &mut collector);
         let mut spans: Vec<(String, SpanAttrs)> = Vec::new();
         collect_spans(
             tree,
@@ -508,18 +619,13 @@ impl TextEngine {
         }
         let base = styles.get(&parent)?;
         let mut collector = Collector { last_was_space: true, clip_fills: Vec::new() };
-        let (family, weight) = resolve_loaded_font(
+        let font = resolve_loaded_font(
             base.font_family.as_deref(),
             crate::style::used_font_weight(base),
             base.font_style_italic.unwrap_or(false),
             &self.loaded_families,
         );
-        let ctx = base_span_ctx(
-            base,
-            family,
-            weight,
-            &mut collector,
-        );
+        let ctx = base_span_ctx(base, font, &mut collector);
         let mut spans: Vec<(String, SpanAttrs)> = Vec::new();
         for &cid in run {
             collect_node_spans(
@@ -551,17 +657,18 @@ impl TextEngine {
             last_was_space: true,
             clip_fills: Vec::new(),
         };
-        let (family, weight) = resolve_loaded_font(
+        let font = resolve_loaded_font(
             style.font_family.as_deref(),
             crate::style::used_font_weight(style),
             style.font_style_italic.unwrap_or(false),
             &self.loaded_families,
         );
-        let context = base_span_ctx(style, family, weight, &mut collector);
+        let context = base_span_ctx(style, font, &mut collector);
         let attrs = SpanAttrs {
             font_size: context.font_size,
             line_height: context.line_height,
             weight: context.weight,
+            variation_weight: context.variation_weight,
             italic: context.italic,
             underline: context.underline,
             color: context.color,
@@ -735,6 +842,7 @@ struct SpanAttrs {
     font_size: f32,
     line_height: f32,
     weight: u16,
+    variation_weight: Option<u16>,
     italic: bool,
     underline: bool,
     color: [u8; 4],
@@ -759,9 +867,14 @@ impl SpanAttrs {
         // reaches paint; the real gradient is selected through metadata.
         let color = if self.clip_fill.is_some() { [255, 255, 255, 255] } else { self.color };
         a = a.color(Color::rgba(color[0], color[1], color[2], color[3]));
-        // Underline and the optional fill index share the per-glyph metadata.
+        // Underline, the optional fill index, and a variable `wght` coordinate
+        // share the per-glyph metadata.
         let fill = self.clip_fill.map_or(0, |index| (index + 1) << META_FILL_SHIFT);
-        a = a.metadata(fill | usize::from(self.underline));
+        debug_assert_eq!(fill & !META_FILL_MASK, 0);
+        let variation = self
+            .variation_weight
+            .map_or(0, |weight| usize::from(weight.clamp(1, 1000)) << META_VARIATION_SHIFT);
+        a = a.metadata(fill | variation | usize::from(self.underline));
         a
     }
 }
@@ -773,6 +886,7 @@ struct SpanCtx {
     line_height: f32,
     color: [u8; 4],
     weight: u16,
+    variation_weight: Option<u16>,
     italic: bool,
     underline: bool,
     transform: TextTransform,
@@ -800,8 +914,7 @@ struct Collector {
 /// transparent (and invisible), unchanged.
 fn base_span_ctx(
     base: &LayoutStyle,
-    family: Arc<str>,
-    weight: u16,
+    font: ResolvedFont,
     collector: &mut Collector,
 ) -> SpanCtx {
     let clip_fill = clip_text_fill(base).map(|fill| {
@@ -813,11 +926,12 @@ fn base_span_ctx(
         font_size: base.font_size.unwrap_or(16.0),
         line_height: used_line_height(base),
         color: base.color.unwrap_or([0, 0, 0, 255]),
-        weight,
+        weight: font.shape_weight,
+        variation_weight: font.variation_weight,
         italic: base.font_style_italic.unwrap_or(false),
         underline: base.underline.unwrap_or(false),
         transform: base.text_transform.unwrap_or(TextTransform::None),
-        family,
+        family: font.family,
         clip_fill,
     }
 }
@@ -864,6 +978,7 @@ fn collect_node_spans(
                 font_size: ctx.font_size,
                 line_height: ctx.line_height,
                 weight: ctx.weight,
+                variation_weight: ctx.variation_weight,
                 italic: ctx.italic,
                 underline: ctx.underline,
                 color: ctx.color,
@@ -883,6 +998,7 @@ fn collect_node_spans(
                     font_size: ctx.font_size,
                     line_height: ctx.line_height,
                     weight: ctx.weight,
+                    variation_weight: ctx.variation_weight,
                     italic: ctx.italic,
                     underline: ctx.underline,
                     color: ctx.color,
@@ -907,7 +1023,7 @@ fn collect_node_spans(
             let requested_weight = style
                 .map(crate::style::used_font_weight)
                 .unwrap_or(ctx.weight);
-            let (family, weight) = style
+            let font = style
                 .and_then(|style| style.font_family.as_deref())
                 .map(|family| {
                     resolve_loaded_font(
@@ -919,7 +1035,17 @@ fn collect_node_spans(
                         loaded_families,
                     )
                 })
-                .unwrap_or_else(|| (Arc::clone(&ctx.family), requested_weight));
+                .unwrap_or_else(|| ResolvedFont {
+                    family: Arc::clone(&ctx.family),
+                    shape_weight: if ctx.variation_weight.is_some() {
+                        ctx.weight
+                    } else {
+                        requested_weight
+                    },
+                    variation_weight: ctx
+                        .variation_weight
+                        .map(|_| requested_weight.clamp(1, 1000)),
+                });
             let child = SpanCtx {
                 font_size: style
                     .and_then(|style| style.font_size)
@@ -928,13 +1054,14 @@ fn collect_node_spans(
                     .map(used_line_height)
                     .unwrap_or(ctx.line_height),
                 color,
-                weight,
+                weight: font.shape_weight,
+                variation_weight: font.variation_weight,
                 italic: ctx.italic || style.and_then(|s| s.font_style_italic).unwrap_or(false),
                 // Underline propagates in: an ancestor's underline covers
                 // descendant text; an element only sets its own via CSS.
                 underline: ctx.underline || style.and_then(|s| s.underline).unwrap_or(false),
                 transform: style.and_then(|s| s.text_transform).unwrap_or(ctx.transform),
-                family,
+                family: font.family,
                 clip_fill,
             };
             collect_spans(
@@ -998,8 +1125,17 @@ fn buffer_size(buffer: &Buffer) -> (f32, f32) {
 /// plain inline formatting (no atomic inline boxes, no block children, no
 /// inline element carrying its own box)? Such a container collapses cleanly
 /// to one shaped buffer; anything else keeps the general build path.
-fn is_pure_text_ifc(tree: &DomTree, id: NodeId, styles: &std::collections::HashMap<NodeId, LayoutStyle>) -> bool {
-    let Some(style) = styles.get(&id) else { return false };
+fn is_pure_text_ifc(
+    tree: &DomTree,
+    id: NodeId,
+    styles: &std::collections::HashMap<NodeId, LayoutStyle>,
+) -> bool {
+    let Some(style) = styles.get(&id) else {
+        return false;
+    };
+    if style.before_pseudo.is_some() || style.after_pseudo.is_some() {
+        return false;
+    }
     // Only containers that lay their children out in normal flow (block, or
     // the flex-column stand-ins our UA sheet uses for td/th/center). A real
     // flex/grid row with inline children is rare and better left to taffy.
@@ -1080,8 +1216,8 @@ fn inline_child_ok(tree: &DomTree, cid: NodeId, styles: &std::collections::HashM
                 && style.position.is_none()
                 && style.float.is_none()
                 && !style.overflow_hidden
-                && style.before_content.is_none()
-                && style.after_content.is_none();
+                && style.before_pseudo.is_none()
+                && style.after_pseudo.is_none();
             if !foldable_inline {
                 return false;
             }
@@ -1177,6 +1313,7 @@ impl TextEngine {
         let TextEngine {
             font_system,
             swash,
+            variable_swash,
             items,
             ..
         } = self;
@@ -1203,7 +1340,7 @@ impl TextEngine {
             let mut seg: Option<(f32, f32, f32, [u8; 4])> = None; // x0, x1, font_size, color
             for g in run.glyphs {
                 let underlined = g.metadata & META_UNDERLINE != 0;
-                if let Some(fill_index) = (g.metadata >> META_FILL_SHIFT).checked_sub(1) {
+                if let Some(fill_index) = metadata_fill(g.metadata) {
                     if let Some(bounds) = fill_bounds.get_mut(fill_index) {
                         let glyph_bounds = (
                             g.x,
@@ -1259,12 +1396,8 @@ impl TextEngine {
             for glyph in run.glyphs {
                 let physical = glyph.physical((0.0, 0.0), 1.0);
                 let glyph_color = glyph.color_opt.unwrap_or(default);
-                let fill_index = (glyph.metadata >> META_FILL_SHIFT).checked_sub(1);
-                swash.with_pixels(
-                    font_system,
-                    physical.cache_key,
-                    glyph_color,
-                    |x, y, color| {
+                let fill_index = metadata_fill(glyph.metadata);
+                let mut draw_pixel = |x, y, color: Color| {
                     let a = color.a() as u32;
                     if a == 0 {
                         return;
@@ -1311,8 +1444,23 @@ impl TextEngine {
                     let out_b = sb + (dst.blue() as u32 * inv / 255);
                     pixels[idx] = tiny_skia::PremultipliedColorU8::from_rgba(out_r as u8, out_g as u8, out_b as u8, out_a as u8)
                         .unwrap_or(dst);
-                    },
-                );
+                };
+                if let Some(weight) = metadata_variation_weight(glyph.metadata) {
+                    variable_swash.with_pixels(
+                        font_system,
+                        physical.cache_key,
+                        weight,
+                        glyph_color,
+                        &mut draw_pixel,
+                    );
+                } else {
+                    swash.with_pixels(
+                        font_system,
+                        physical.cache_key,
+                        glyph_color,
+                        &mut draw_pixel,
+                    );
+                }
             }
         }
 
@@ -1349,6 +1497,7 @@ impl TextEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
 
     const RED: [u8; 4] = [255, 0, 0, 255];
     const BLUE: [u8; 4] = [0, 0, 255, 255];
@@ -1383,7 +1532,6 @@ mod tests {
                     max_weight: 400,
                     shape_weight: 400,
                     italic: false,
-                    variable: false,
                 },
                 LoadedFace {
                     name: Arc::from("Poppins Medium"),
@@ -1391,7 +1539,6 @@ mod tests {
                     max_weight: 500,
                     shape_weight: 500,
                     italic: false,
-                    variable: false,
                 },
                 LoadedFace {
                     name: Arc::from("Poppins"),
@@ -1399,17 +1546,203 @@ mod tests {
                     max_weight: 700,
                     shape_weight: 700,
                     italic: false,
-                    variable: false,
                 },
             ],
         };
         let loaded = HashMap::from([("poppins".to_string(), family)]);
         let medium = resolve_loaded_font(Some("Poppins, sans-serif"), 500, false, &loaded);
-        assert_eq!(medium.0.as_ref(), "Poppins Medium");
-        assert_eq!(medium.1, 500);
+        assert_eq!(medium.family.as_ref(), "Poppins Medium");
+        assert_eq!(medium.shape_weight, 500);
+        assert_eq!(medium.variation_weight, None);
         let semibold = resolve_loaded_font(Some("Poppins"), 600, false, &loaded);
-        assert_eq!(semibold.0.as_ref(), "Poppins");
-        assert_eq!(semibold.1, 700);
+        assert_eq!(semibold.family.as_ref(), "Poppins");
+        assert_eq!(semibold.shape_weight, 700);
+        assert_eq!(semibold.variation_weight, None);
+    }
+
+    #[test]
+    fn ranged_face_shapes_at_its_font_database_weight() {
+        let tree = obscura_dom::parse_html("<p id='copy'>Variable family</p>");
+        let copy = tree.get_element_by_id("copy").unwrap();
+        let mut style = LayoutStyle::default();
+        style.display = Display::Block;
+        style.font_family = Some("test variable".to_string());
+        style.font_weight = Some("700".to_string());
+        style.font_size = Some(32.0);
+        let styles = HashMap::from([(copy, style)]);
+
+        let mut engine = TextEngine::new();
+        engine.loaded_families.insert(
+            "test variable".to_string(),
+            LoadedFamily {
+                faces: vec![LoadedFace {
+                    name: Arc::from(FAMILY),
+                    min_weight: 100,
+                    max_weight: 900,
+                    shape_weight: 400,
+                    italic: false,
+                }],
+            },
+        );
+
+        let item = engine.try_build(&tree, copy, &styles).unwrap();
+        engine.measure(item, None);
+        let font_id = engine.items[item]
+            .buffer
+            .layout_runs()
+            .next()
+            .and_then(|run| run.glyphs.first())
+            .map(|glyph| glyph.font_id)
+            .unwrap();
+        let face = engine.font_system.db().face(font_id).unwrap();
+        assert!(
+            face.families.iter().any(|(name, _)| name == FAMILY),
+            "authored family must not fall through to an unrelated exact-weight face"
+        );
+        assert_eq!(face.weight.0, 400);
+    }
+
+    #[test]
+    fn ranged_face_preserves_requested_weight_for_variable_raster() {
+        let loaded = HashMap::from([(
+            "inter".to_string(),
+            LoadedFamily {
+                faces: vec![LoadedFace {
+                    name: Arc::from("Inter"),
+                    min_weight: 100,
+                    max_weight: 900,
+                    shape_weight: 400,
+                    italic: false,
+                }],
+            },
+        )]);
+        let resolved = resolve_loaded_font(Some("Inter, sans-serif"), 725, false, &loaded);
+        assert_eq!(resolved.family.as_ref(), "Inter");
+        assert_eq!(resolved.shape_weight, 400);
+        assert_eq!(resolved.variation_weight, Some(725));
+    }
+
+    #[test]
+    fn glyph_metadata_keeps_fill_and_variable_weight_independent() {
+        let attrs = SpanAttrs {
+            font_size: 16.0,
+            line_height: 18.0,
+            weight: 400,
+            variation_weight: Some(725),
+            italic: false,
+            underline: true,
+            color: [1, 2, 3, 255],
+            family: Arc::from(FAMILY),
+            clip_fill: Some(37),
+        };
+        let metadata = attrs.to_attrs().metadata;
+        assert_ne!(metadata & META_UNDERLINE, 0);
+        assert_eq!(metadata_fill(metadata), Some(37));
+        assert_eq!(metadata_variation_weight(metadata), Some(725));
+    }
+
+    fn variable_font_fixture() -> Vec<u8> {
+        let encoded: String = include_str!("../tests/fonts/obscura-vf-test.woff2.b64")
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        let compressed = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("decode variable-font fixture");
+        wuff::decompress_woff2(&compressed).expect("decompress variable-font fixture")
+    }
+
+    fn render_variable_weight(weight: u16) -> ((f32, f32), u64, Vec<u16>) {
+        let mut engine = TextEngine::new_with_web_fonts(&[WebFont {
+            data: variable_font_fixture(),
+            family: Some("Obscura VF Test".to_string()),
+            weight: Some((100, 900)),
+            italic: Some(false),
+        }]);
+        let tree = obscura_dom::parse_html("<p id='copy'>MMMMMMMM</p>");
+        let copy = tree.get_element_by_id("copy").unwrap();
+        let mut style = LayoutStyle::default();
+        style.display = Display::Block;
+        style.font_family = Some("Obscura VF Test".to_string());
+        style.font_weight = Some(weight.to_string());
+        style.font_size = Some(64.0);
+        style.line_height = Some(crate::LineHeight::Px(80.0));
+        let styles = HashMap::from([(copy, style)]);
+        let item = engine.try_build(&tree, copy, &styles).unwrap();
+        let geometry = engine.measure(item, Some(600.0));
+        engine.finalize(item, (0.0, 0.0), 600.0, None);
+        let mut pixmap = tiny_skia::Pixmap::new(600, 100).unwrap();
+        engine.paint_item(item, &mut pixmap, (0.0, 0.0));
+        let ink = pixmap
+            .pixels()
+            .iter()
+            .map(|pixel| u64::from(pixel.alpha()))
+            .sum();
+        let mut cached_weights: Vec<_> = engine
+            .variable_swash
+            .images
+            .keys()
+            .map(|key| key.weight)
+            .collect();
+        cached_weights.sort_unstable();
+        cached_weights.dedup();
+        (geometry, ink, cached_weights)
+    }
+
+    #[test]
+    fn variable_wght_changes_true_outline_without_changing_layout_geometry() {
+        let (regular_geometry, regular_ink, regular_cache) = render_variable_weight(400);
+        let (black_geometry, black_ink, black_cache) = render_variable_weight(900);
+        assert_eq!(regular_geometry, black_geometry);
+        assert!(
+            black_ink > regular_ink * 13 / 10,
+            "wght=900 should carry substantially more raster ink: {regular_ink} vs {black_ink}"
+        );
+        assert_eq!(regular_cache, vec![400]);
+        assert_eq!(black_cache, vec![900]);
+    }
+
+    #[test]
+    fn variable_glyph_cache_keys_include_weight_axis() {
+        let mut engine = TextEngine::new_with_web_fonts(&[WebFont {
+            data: variable_font_fixture(),
+            family: Some("Obscura VF Test".to_string()),
+            weight: Some((100, 900)),
+            italic: Some(false),
+        }]);
+        let tree = obscura_dom::parse_html(
+            "<p id='copy'><span id='regular'>M</span><span id='black'>M</span></p>",
+        );
+        let copy = tree.get_element_by_id("copy").unwrap();
+        let regular = tree.get_element_by_id("regular").unwrap();
+        let black = tree.get_element_by_id("black").unwrap();
+        let mut base = LayoutStyle::default();
+        base.display = Display::Block;
+        base.font_family = Some("Obscura VF Test".to_string());
+        base.font_size = Some(64.0);
+        base.line_height = Some(crate::LineHeight::Px(80.0));
+        let mut regular_style = base.clone();
+        regular_style.display = Display::Inline;
+        regular_style.font_weight = Some("400".to_string());
+        let mut black_style = regular_style.clone();
+        black_style.font_weight = Some("900".to_string());
+        let styles = HashMap::from([
+            (copy, base),
+            (regular, regular_style),
+            (black, black_style),
+        ]);
+        let item = engine.try_build(&tree, copy, &styles).unwrap();
+        engine.measure(item, Some(200.0));
+        engine.finalize(item, (0.0, 0.0), 200.0, None);
+        let mut pixmap = tiny_skia::Pixmap::new(200, 100).unwrap();
+        engine.paint_item(item, &mut pixmap, (0.0, 0.0));
+        let weights: std::collections::HashSet<_> = engine
+            .variable_swash
+            .images
+            .keys()
+            .map(|key| key.weight)
+            .collect();
+        assert_eq!(weights, std::collections::HashSet::from([400, 900]));
     }
 
     #[test]

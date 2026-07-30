@@ -641,10 +641,21 @@ async fn run_fetch(
     // nor by the V8 watchdog (terminate_execution only unwinds JS bytecode, not
     // native Rust running beneath a V8->op call). As an absolute backstop so one
     // fetch can never wedge the worker, a daemon thread force-exits if the whole
-    // operation overruns timeout + wait + grace. A normal fetch returns first and
-    // the process exits before this fires.
+    // operation overruns navigation + every configured settle pass + grace. A
+    // normal fetch returns first and the process exits before this fires.
     {
-        let hard = Duration::from_secs(timeout_secs.saturating_add(wait_secs).saturating_add(10));
+        let settle_passes = if eval.is_some()
+            && (screenshot.is_some() || selector.is_some() || dump_specified)
+        {
+            2
+        } else {
+            1
+        };
+        let hard = Duration::from_secs(
+            timeout_secs
+                .saturating_add(wait_secs.saturating_mul(settle_passes))
+                .saturating_add(10),
+        );
         std::thread::spawn(move || {
             std::thread::sleep(hard);
             eprintln!("obscura: hard timeout exceeded ({}s); forcing exit", hard.as_secs());
@@ -671,11 +682,62 @@ async fn run_fetch(
     // pages stay fast.
     page.settle(wait_secs.saturating_mul(1000)).await;
 
-    // --screenshot renders the settled page to a PNG. Requires the render
-    // feature; without it, page.screenshot is absent and we report clearly.
+    let mut deferred_eval_output = None;
+    if let Some(ref expr) = eval {
+        // Bound the eval by the same budget as navigation so a runaway
+        // expression (infinite loop, never-settling sync work) cannot hang.
+        let result = page.evaluate_with_timeout(expr, Duration::from_secs(timeout_secs));
+
+        // A bare --eval (no --selector, --dump, or --screenshot) returns the
+        // eval value directly, so synchronous expressions
+        // (JSON.stringify, ...) are unchanged. Screenshot captures continue
+        // below so an evaluation such as scrollTo() affects the painted
+        // viewport instead of being silently ignored.
+        if !dump_specified && selector.is_none() && screenshot.is_none() {
+            let rendered = match result {
+                serde_json::Value::String(s) => s,
+                serde_json::Value::Null => "null".to_string(),
+                other => other.to_string(),
+            };
+            write_or_print(rendered, output.as_ref()).await?;
+            context.save_cookies();
+            return Ok(());
+        }
+        if screenshot.is_some() {
+            deferred_eval_output = Some(result);
+        }
+
+        // --eval combined with --selector, --dump, and/or --screenshot
+        // typically kicks off async work (a fetch promise, a timer, a scroll
+        // listener) that writes the DOM. Drive the event loop again so that
+        // work completes, then fall through to selector/capture/dump instead
+        // of returning the still-pending eval value (issue #248).
+        page.settle(wait_secs.saturating_mul(1000)).await;
+    }
+
+    if let Some(ref sel) = selector {
+        let found = wait_for_selector(&mut page, sel, wait_secs).await;
+        if !found {
+            eprintln!("Warning: selector '{}' not found after {}s", sel, wait_secs);
+        }
+    }
+
+    // --screenshot renders the settled, optionally evaluated page to a PNG.
+    // Requires the render feature; without it, page.screenshot is absent and
+    // we report clearly.
     if let Some(ref path) = screenshot {
         #[cfg(feature = "render")]
         {
+            let capture_state = deferred_eval_output.as_ref().map(|_| {
+                page.evaluate(
+                    "(()=>({\
+                     scrollX:window.scrollX,scrollY:window.scrollY,\
+                     innerWidth:window.innerWidth,innerHeight:window.innerHeight,\
+                     scrollWidth:document.documentElement?document.documentElement.scrollWidth:0,\
+                     scrollHeight:document.documentElement?document.documentElement.scrollHeight:0\
+                     }))()",
+                )
+            });
             // Default CSS-pixel viewport, matching the engine's innerWidth/Height.
             // OBSCURA_SHOT_W / OBSCURA_SHOT_H override it (e.g. a tall viewport to
             // capture below-the-fold content in one shot).
@@ -683,6 +745,19 @@ async fn run_fetch(
             match page.screenshot(viewport) {
                 Some(bytes) => std::fs::write(path, &bytes)?,
                 None => anyhow::bail!("screenshot failed: page has no DOM to render"),
+            }
+            // A screenshot+eval command used to ignore the expression
+            // completely. Emit both its value and a standard state sampled
+            // after the post-eval settle so automation can record the exact
+            // live viewport that was painted.
+            if let Some(result) = deferred_eval_output {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "evaluation": result,
+                        "captureState": capture_state.unwrap_or(serde_json::Value::Null),
+                    })
+                );
             }
             if !quiet {
                 eprintln!("Screenshot written: {} ({} bytes)", path.display(), std::fs::metadata(path).map(|m| m.len()).unwrap_or(0));
@@ -696,40 +771,6 @@ async fn run_fetch(
                 "--screenshot {} requires a build with the render feature (cargo build --features render)",
                 path.display()
             );
-        }
-    }
-
-    if let Some(ref expr) = eval {
-        // Bound the eval by the same budget as navigation so a runaway
-        // expression (infinite loop, never-settling sync work) cannot hang.
-        let result = page.evaluate_with_timeout(expr, Duration::from_secs(timeout_secs));
-
-        // A bare --eval (no --selector, no --dump) returns the eval value
-        // directly, so synchronous expressions (JSON.stringify, ...) are
-        // unchanged.
-        if !dump_specified && selector.is_none() {
-            let rendered = match result {
-                serde_json::Value::String(s) => s,
-                serde_json::Value::Null => "null".to_string(),
-                other => other.to_string(),
-            };
-            write_or_print(rendered, output.as_ref()).await?;
-            context.save_cookies();
-            return Ok(());
-        }
-
-        // --eval combined with --selector and/or --dump: the eval typically
-        // kicks off async work (a fetch promise, a timer) that writes the DOM.
-        // Drive the event loop again so that work completes, then fall through
-        // to the selector wait and the dump path instead of returning the
-        // still-pending eval value (issue #248).
-        page.settle(wait_secs.saturating_mul(1000)).await;
-    }
-
-    if let Some(ref sel) = selector {
-        let found = wait_for_selector(&mut page, sel, wait_secs).await;
-        if !found {
-            eprintln!("Warning: selector '{}' not found after {}s", sel, wait_secs);
         }
     }
 

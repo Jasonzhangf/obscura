@@ -406,25 +406,47 @@ pub async fn handle(
                 .get_session_page(session_id)
                 .map(|page| (page.viewport.0 as f64, page.viewport.1 as f64))
                 .unwrap_or((1280.0, 720.0));
-            let content_height = ctx
+            let mut page_x = 0.0;
+            let mut page_y = 0.0;
+            let mut content_width = width;
+            let mut content_height = height;
+            if let Some(values) = ctx
                 .get_session_page_mut(session_id)
-                .map(|p| p.evaluate("document.documentElement && document.documentElement.scrollHeight"))
-                .and_then(|v| v.as_f64())
-                .filter(|n| *n > 0.0)
-                .unwrap_or(height);
+                .map(|page| {
+                    page.evaluate(
+                        "[window.scrollX, window.scrollY, \
+                         document.documentElement && document.documentElement.scrollWidth, \
+                         document.documentElement && document.documentElement.scrollHeight]",
+                    )
+                })
+                .and_then(|value| value.as_array().cloned())
+            {
+                page_x = values.first().and_then(Value::as_f64).unwrap_or(0.0);
+                page_y = values.get(1).and_then(Value::as_f64).unwrap_or(0.0);
+                content_width = values
+                    .get(2)
+                    .and_then(Value::as_f64)
+                    .filter(|value| *value > 0.0)
+                    .unwrap_or(width);
+                content_height = values
+                    .get(3)
+                    .and_then(Value::as_f64)
+                    .filter(|value| *value > 0.0)
+                    .unwrap_or(height);
+            }
             let layout_viewport = json!({
-                "pageX": 0, "pageY": 0,
+                "pageX": page_x, "pageY": page_y,
                 "clientWidth": width, "clientHeight": height,
             });
             let visual_viewport = json!({
                 "offsetX": 0.0, "offsetY": 0.0,
-                "pageX": 0.0, "pageY": 0.0,
+                "pageX": page_x, "pageY": page_y,
                 "clientWidth": width, "clientHeight": height,
                 "scale": 1.0, "zoom": 1.0,
             });
             let content_size = json!({
                 "x": 0.0, "y": 0.0,
-                "width": width, "height": content_height,
+                "width": content_width, "height": content_height,
             });
             Ok(json!({
                 "layoutViewport": layout_viewport,
@@ -604,6 +626,59 @@ mod tests {
         assert_eq!(content["width"].as_f64(), Some(1280.0));
         // Without a live page the content height falls back to the viewport.
         assert_eq!(content["height"].as_f64(), Some(720.0));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test]
+    async fn cdp_metrics_and_capture_follow_the_scrolled_viewport() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = format!("{page_id}-session");
+        ctx.sessions.insert(session_id.clone(), page_id);
+        let session = Some(session_id);
+        ctx.get_session_page_mut(&session)
+            .expect("page")
+            .set_viewport((100.0, 80.0));
+
+        handle(
+            "navigate",
+            &json!({
+                "url": "data:text/html,<html style='margin:0'><body style='margin:0'><div style='height:80px;background:red'></div><div style='height:80px;background:blue'></div><div style='position:fixed;left:0;top:0;width:20px;height:20px;background:green'></div></body></html>",
+                "waitUntil": "load",
+            }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("navigate");
+
+        let top = handle("captureScreenshot", &json!({}), &mut ctx, &session)
+            .await
+            .expect("top capture");
+        ctx.get_session_page_mut(&session)
+            .expect("page")
+            .evaluate("return (window.scrollTo(0, 80), window.scrollY)");
+
+        let metrics = handle("getLayoutMetrics", &json!({}), &mut ctx, &session)
+            .await
+            .expect("metrics");
+        assert_eq!(metrics["layoutViewport"]["pageY"].as_f64(), Some(80.0));
+        assert_eq!(metrics["visualViewport"]["pageY"].as_f64(), Some(80.0));
+        assert_eq!(metrics["contentSize"]["width"].as_f64(), Some(100.0));
+        assert!(
+            metrics["contentSize"]["height"].as_f64().unwrap_or_default() >= 160.0,
+            "contentSize must expose the scrollable document: {metrics}"
+        );
+
+        let scrolled = handle("captureScreenshot", &json!({}), &mut ctx, &session)
+            .await
+            .expect("scrolled capture");
+        let top_data = top["data"].as_str().expect("top png");
+        let scrolled_data = scrolled["data"].as_str().expect("scrolled png");
+        assert_ne!(
+            top_data, scrolled_data,
+            "CDP captureScreenshot must paint the current scroll offset"
+        );
     }
 
     #[tokio::test]

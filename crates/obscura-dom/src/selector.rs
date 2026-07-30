@@ -1032,6 +1032,22 @@ mod tests {
     }
 
     #[test]
+    fn compiled_nested_is_descendant_matches_with_ancestor_filter() {
+        let tree = parse_html(
+            r#"<div class="**:[.line]:block"><code><span id="target" class="line">x</span></code></div>"#,
+        );
+        let target = tree.get_element_by_id("target").unwrap();
+        let compiled = tree
+            .compile_rule_selector(r#":is(.\*\*\:\[\.line\]\:block *).line"#)
+            .unwrap();
+        let mut matcher = tree.matcher();
+        for ancestor in tree.ancestors(target).into_iter().rev() {
+            matcher.push_ancestor(&tree, ancestor);
+        }
+        assert!(matcher.matches(&tree, target, &compiled));
+    }
+
+    #[test]
     fn test_query_selector_attribute() {
         let tree = parse_html(
             r#"<input type="text" name="user"><input type="password" name="pass">"#,

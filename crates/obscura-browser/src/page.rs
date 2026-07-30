@@ -1790,7 +1790,15 @@ impl Page {
         // the overwhelming majority of real markup.
         let base_url = self.resolve_base_url();
         let base_url = base_url.as_ref().map(|u| u.as_str());
-        self.with_dom(|dom| obscura_js::screenshot_png(dom, viewport, base_url)).flatten()
+        let scroll = self
+            .js
+            .as_ref()
+            .map(|js| js.scroll_offset())
+            .unwrap_or((0.0, 0.0));
+        self.with_dom(|dom| {
+            obscura_js::screenshot_png_scrolled(dom, viewport, base_url, scroll)
+        })
+        .flatten()
     }
 
     /// Absolute URLs the page pulled in via fetch()/XHR (issue #301). Empty
@@ -2287,6 +2295,45 @@ mod tests {
         truncate_on_char_boundary, url_matches_cdp_pattern, HydrationStats,
     };
     use obscura_dom::parse_html;
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn page_screenshot_uses_the_live_window_scroll_offset() {
+        let context = std::sync::Arc::new(crate::BrowserContext::new("scroll-test".to_string()));
+        let mut page = super::Page::new("scroll-page".to_string(), context);
+        page.set_viewport((100.0, 80.0));
+
+        let dom = parse_html(
+            r#"<html style="margin:0"><body style="margin:0">
+                <div style="height:80px;background:#ff0000"></div>
+                <div id="second" style="height:80px;background:#0000ff"></div>
+                <div style="position:fixed;left:0;top:0;width:20px;height:20px;background:#00ff00"></div>
+            </body></html>"#,
+        );
+        let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new();
+        runtime.set_dom(dom);
+        runtime.set_url("https://example.test/scroll");
+        runtime.set_viewport(100.0, 80.0);
+        runtime.run_page_init();
+        page.js = Some(runtime);
+        page.url = Some(url::Url::parse("https://example.test/scroll").unwrap());
+
+        let before = page.screenshot(page.viewport).expect("top screenshot");
+        assert_eq!(
+            page.evaluate(
+                "return (document.getElementById('second').scrollIntoView(), window.scrollY)"
+            )
+                .as_f64(),
+            Some(80.0)
+        );
+        let after = page.screenshot(page.viewport).expect("scrolled screenshot");
+
+        assert_ne!(before, after, "Page screenshot must paint the scrolled viewport");
+        assert_eq!(
+            page.js.as_ref().expect("runtime").scroll_offset(),
+            (0.0, 80.0)
+        );
+    }
 
     #[test]
     fn truncate_never_splits_a_multibyte_char() {

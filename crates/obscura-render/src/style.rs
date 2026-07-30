@@ -237,13 +237,16 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
 
 pub fn apply_inline(style: &mut LayoutStyle, css: &str) {
     let (normal, important) = partition_declarations(css);
-    apply_declarations(style, &normal);
-    apply_declarations(style, &important);
+    let inherited_scheme = style.color_scheme_dark;
+    apply_color_scheme_declarations_from(style, &normal, inherited_scheme);
+    apply_color_scheme_declarations_from(style, &important, inherited_scheme);
+    apply_declarations_with_locked_color_scheme(style, &normal);
+    apply_declarations_with_locked_color_scheme(style, &important);
 }
 
 /// Split a declaration block into normal and `!important` declarations while
 /// preserving source order inside each priority. The returned declarations
-/// have the priority marker removed, ready for [`apply_declarations`].
+/// have the priority marker removed, ready for the computed-style pass.
 pub(crate) fn partition_declarations(css: &str) -> (String, String) {
     let mut normal = String::new();
     let mut important = String::new();
@@ -270,16 +273,72 @@ pub(crate) fn partition_declarations(css: &str) -> (String, String) {
     (normal, important)
 }
 
-/// Apply declarations in the order provided. Priority ordering must already
-/// have been resolved by the caller.
-pub(crate) fn apply_declarations(style: &mut LayoutStyle, css: &str) {
+/// Apply only `color-scheme` from a declaration list. The stylesheet cascade
+/// runs this over every matching block before resolving color-valued
+/// declarations, because `light-dark()` selects from the element's final used
+/// scheme regardless of whether `color-scheme` appears before or after the
+/// color in source order.
+pub(crate) fn apply_color_scheme_declarations_from(
+    style: &mut LayoutStyle,
+    css: &str,
+    inherited_scheme: bool,
+) {
+    for raw in split_declarations(css) {
+        let Some((name, value)) = raw.trim().split_once(':') else { continue };
+        if name.trim().eq_ignore_ascii_case("color-scheme") {
+            apply_color_scheme(style, value.trim(), inherited_scheme);
+        }
+    }
+}
+
+pub(crate) fn apply_declarations_with_locked_color_scheme(
+    style: &mut LayoutStyle,
+    css: &str,
+) {
     for raw in split_declarations(css) {
         let decl = raw.trim();
         if decl.is_empty() {
             continue;
         }
-        let Some((name, value)) = decl.split_once(':') else { continue };
-        apply_value(style, &name.trim().to_ascii_lowercase(), value.trim());
+        let Some((name, value)) = decl.split_once(':') else {
+            continue;
+        };
+        let name = name.trim().to_ascii_lowercase();
+        if name != "color-scheme" {
+            apply_value(style, &name, value.trim());
+        }
+    }
+}
+
+fn apply_color_scheme(
+    style: &mut LayoutStyle,
+    value: &str,
+    inherited_scheme: bool,
+) {
+    let tokens: Vec<String> = value
+        .split_whitespace()
+        .map(|token| token.to_ascii_lowercase())
+        .collect();
+    if tokens.iter().any(|token| token == "inherit" || token == "unset") {
+        style.color_scheme_dark = inherited_scheme;
+        return;
+    }
+    if tokens.iter().any(|token| {
+        matches!(token.as_str(), "initial" | "revert" | "revert-layer")
+    }) {
+        style.color_scheme_dark = false;
+        return;
+    }
+    // The current browser/user preference is light. A scheme list that admits
+    // light therefore uses light; a dark-only list uses dark. `normal`,
+    // initial/revert, and malformed values retain the default/inherited light
+    // behavior used by this compact computed-style model.
+    if tokens.iter().any(|token| token == "light")
+        || tokens.iter().any(|token| token == "normal")
+    {
+        style.color_scheme_dark = false;
+    } else if tokens.iter().any(|token| token == "dark") {
+        style.color_scheme_dark = true;
     }
 }
 
@@ -448,8 +507,10 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                 style.border_color = None;
                 return;
             }
-            for p in value.split_whitespace() {
-                if let Some(c) = parse_color(p) {
+            for p in split_ws_paren(value) {
+                if let Some(c) =
+                    parse_color_for_scheme(p, style.color_scheme_dark)
+                {
                     style.border_color = Some(c);
                 } else if p.ends_with("px") || p.chars().all(|c| c.is_ascii_digit()) {
                     if let Some(e) = edges(p) { style.border = e; }
@@ -469,7 +530,10 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         "border-left-width" | "border-left" => {
             set_edge(&mut style.border, Side::Left, border_side_width(value))
         }
-        "background-color" => style.background_color = parse_color(value),
+        "background-color" => {
+            style.background_color =
+                parse_color_for_scheme(value, style.color_scheme_dark)
+        }
         "background" => {
             // A shorthand resets every omitted background longhand to its
             // initial value before applying the layers it does name.
@@ -480,14 +544,18 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
             // so leave the prior cascade winner untouched in that case.
             if !value.trim().is_empty() {
                 style.background_color = None;
-                style.background_gradient = parse_linear_gradient(value);
-                style.background_radial_gradient = parse_radial_gradient(value);
-                style.background_conic_gradient = parse_conic_gradient(value);
+                style.background_gradient =
+                    parse_linear_gradient(value, style.color_scheme_dark);
+                style.background_radial_gradient =
+                    parse_radial_gradient(value, style.color_scheme_dark);
+                style.background_conic_gradient =
+                    parse_conic_gradient(value, style.color_scheme_dark);
                 if style.background_gradient.is_none()
                     && style.background_radial_gradient.is_none()
                     && style.background_conic_gradient.is_none()
                 {
-                    style.background_color = parse_color(value);
+                    style.background_color =
+                        parse_color_for_scheme(value, style.color_scheme_dark);
                 }
                 style.background_image = parse_url(value);
                 style.background_size = None;
@@ -498,9 +566,12 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
             }
         }
         "background-image" => {
-            style.background_gradient = parse_linear_gradient(value);
-            style.background_radial_gradient = parse_radial_gradient(value);
-            style.background_conic_gradient = parse_conic_gradient(value);
+            style.background_gradient =
+                parse_linear_gradient(value, style.color_scheme_dark);
+            style.background_radial_gradient =
+                parse_radial_gradient(value, style.color_scheme_dark);
+            style.background_conic_gradient =
+                parse_conic_gradient(value, style.color_scheme_dark);
             style.background_image = parse_url(value);
         }
         "background-size" => {
@@ -510,6 +581,10 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
             style.background_size_fit = parse_background_size_fit(value);
         }
         "background-position" => style.background_position = parse_background_position(value),
+        // On replaced elements, an image-valued `content` replaces the
+        // ordinary source and participates in intrinsic sizing. String-valued
+        // generated content is handled separately for pseudo-elements.
+        "content" => style.content_image = parse_url(value),
         "mask-image" | "-webkit-mask-image" => style.mask_image = parse_url(value),
         "mask-size" | "-webkit-mask-size" => {
             style.mask_size = parse_background_size(value)
@@ -533,8 +608,30 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         // transparent through this inherited property while clipping a
         // background gradient to the text. We model one effective text color,
         // so the vendor fill color is the paint-time color winner.
-        "color" | "-webkit-text-fill-color" => style.color = parse_color(value),
-        "border-color" => style.border_color = parse_color(value),
+        "color" | "-webkit-text-fill-color" => {
+            style.color = parse_color_for_scheme(value, style.color_scheme_dark)
+        }
+        // Inline SVG is rasterized as a standalone SVG document. Preserve
+        // author-CSS presentation values verbatim so paint can carry the
+        // computed cascade into that document (including currentColor,
+        // `none`, and paint-server URLs).
+        "fill" => {
+            style.svg_fill = Some(resolve_svg_presentation_color(
+                value,
+                style.color_scheme_dark,
+            ))
+        }
+        "stroke" => {
+            style.svg_stroke = Some(resolve_svg_presentation_color(
+                value,
+                style.color_scheme_dark,
+            ))
+        }
+        "stroke-width" => style.svg_stroke_width = Some(value.trim().to_string()),
+        "border-color" => {
+            style.border_color =
+                parse_color_for_scheme(value, style.color_scheme_dark)
+        }
         "font-size" => {
             // Absolute lengths resolve now; font/viewport-relative ones defer
             // to the inheritance pass (they need parent/root font-size).
@@ -654,18 +751,27 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                 "absolute" => {
                     style.position = Some(taffy::Position::Absolute);
                     style.position_fixed = false;
+                    style.position_sticky = false;
                 }
                 "fixed" => {
                     style.position = Some(taffy::Position::Absolute);
                     style.position_fixed = true;
+                    style.position_sticky = false;
                 }
-                "relative" | "sticky" => {
+                "relative" => {
                     style.position = Some(taffy::Position::Relative);
                     style.position_fixed = false;
+                    style.position_sticky = false;
+                }
+                "sticky" => {
+                    style.position = Some(taffy::Position::Relative);
+                    style.position_fixed = false;
+                    style.position_sticky = true;
                 }
                 "static" => {
                     style.position = None;
                     style.position_fixed = false;
+                    style.position_sticky = false;
                 }
                 _ => {}
             }
@@ -709,6 +815,26 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         }
         "overflow" | "overflow-x" | "overflow-y" => {
             style.overflow_hidden = value != "visible";
+            style.overflow_scroll_container =
+                !matches!(value, "visible" | "clip");
+        }
+        "scrollbar-gutter" => {
+            let lower = value.to_ascii_lowercase();
+            style.scrollbar_gutters = if lower
+                .split_ascii_whitespace()
+                .any(|token| token == "stable")
+            {
+                if lower
+                    .split_ascii_whitespace()
+                    .any(|token| token == "both-edges")
+                {
+                    2
+                } else {
+                    1
+                }
+            } else {
+                0
+            };
         }
         "visibility" => style.visibility_hidden = Some(value.eq_ignore_ascii_case("hidden")),
         "opacity" => style.opacity = value.trim().parse::<f32>().ok(),
@@ -905,9 +1031,244 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
             value.trim().eq_ignore_ascii_case("auto"),
         ),
         "box-shadow" | "-webkit-box-shadow" => {
-            style.box_shadow = parse_box_shadow(value, style.color);
+            style.box_shadow = parse_box_shadow(
+                value,
+                style.color,
+                style.color_scheme_dark,
+            );
         }
         _ => {}
+    }
+}
+
+/// Whether a declaration is syntactically supported by the renderer's CSS
+/// property/value implementation. `@supports` and the JavaScript-facing
+/// capability model must not treat every non-empty declaration as valid:
+/// modern framework sheets use negative feature probes to isolate legacy
+/// browser fallbacks, and activating those fallbacks corrupts the modern
+/// cascade.
+pub(crate) fn supports_declaration(name: &str, value: &str) -> bool {
+    let name = name.trim().to_ascii_lowercase();
+    let value = value.trim();
+    if value.is_empty() {
+        return false;
+    }
+    if name.starts_with("--") {
+        return name.len() > 2;
+    }
+    let css_wide = matches!(
+        value.to_ascii_lowercase().as_str(),
+        "initial" | "inherit" | "unset" | "revert" | "revert-layer"
+    );
+    let known = matches!(
+        name.as_str(),
+        "display"
+            | "width"
+            | "height"
+            | "min-width"
+            | "min-height"
+            | "max-width"
+            | "max-height"
+            | "box-sizing"
+            | "aspect-ratio"
+            | "margin"
+            | "margin-top"
+            | "margin-right"
+            | "margin-bottom"
+            | "margin-left"
+            | "margin-inline"
+            | "margin-inline-start"
+            | "margin-inline-end"
+            | "margin-block"
+            | "margin-block-start"
+            | "margin-block-end"
+            | "padding"
+            | "padding-top"
+            | "padding-right"
+            | "padding-bottom"
+            | "padding-left"
+            | "padding-inline"
+            | "padding-inline-start"
+            | "padding-inline-end"
+            | "padding-block"
+            | "padding-block-start"
+            | "padding-block-end"
+            | "border-radius"
+            | "border"
+            | "border-width"
+            | "border-top-width"
+            | "border-right-width"
+            | "border-bottom-width"
+            | "border-left-width"
+            | "border-top"
+            | "border-right"
+            | "border-bottom"
+            | "border-left"
+            | "background"
+            | "background-color"
+            | "background-image"
+            | "background-size"
+            | "background-position"
+            | "background-clip"
+            | "-webkit-background-clip"
+            | "mask-image"
+            | "-webkit-mask-image"
+            | "mask-size"
+            | "-webkit-mask-size"
+            | "mask-repeat"
+            | "-webkit-mask-repeat"
+            | "color"
+            | "-webkit-text-fill-color"
+            | "fill"
+            | "stroke"
+            | "stroke-width"
+            | "border-color"
+            | "color-scheme"
+            | "font-size"
+            | "font"
+            | "font-weight"
+            | "font-family"
+            | "font-style"
+            | "text-align"
+            | "text-transform"
+            | "text-decoration"
+            | "text-decoration-line"
+            | "line-height"
+            | "align-items"
+            | "justify-items"
+            | "place-items"
+            | "align-self"
+            | "justify-self"
+            | "place-self"
+            | "align-content"
+            | "justify-content"
+            | "place-content"
+            | "flex-direction"
+            | "flex-wrap"
+            | "flex-grow"
+            | "flex-shrink"
+            | "flex-basis"
+            | "flex"
+            | "order"
+            | "position"
+            | "float"
+            | "object-fit"
+            | "top"
+            | "right"
+            | "bottom"
+            | "left"
+            | "inset"
+            | "overflow"
+            | "overflow-x"
+            | "overflow-y"
+            | "scrollbar-gutter"
+            | "visibility"
+            | "opacity"
+            | "animation"
+            | "animation-name"
+            | "animation-fill-mode"
+            | "animation-iteration-count"
+            | "z-index"
+            | "clear"
+            | "vertical-align"
+            | "list-style"
+            | "list-style-type"
+            | "gap"
+            | "grid-gap"
+            | "row-gap"
+            | "grid-row-gap"
+            | "column-gap"
+            | "grid-column-gap"
+            | "border-spacing"
+            | "border-collapse"
+            | "grid-template-columns"
+            | "grid-template-rows"
+            | "grid-template-areas"
+            | "grid-template"
+            | "grid"
+            | "grid-auto-flow"
+            | "grid-area"
+            | "grid-column"
+            | "grid-row"
+            | "grid-column-start"
+            | "grid-column-end"
+            | "grid-row-start"
+            | "grid-row-end"
+            | "transform"
+            | "filter"
+            | "backdrop-filter"
+            | "-webkit-backdrop-filter"
+            | "perspective"
+            | "contain"
+            | "will-change"
+            | "content-visibility"
+            | "box-shadow"
+            | "-webkit-box-shadow"
+    );
+    if !known {
+        return false;
+    }
+    if css_wide {
+        return true;
+    }
+    match name.as_str() {
+        "display" => matches!(
+            value.to_ascii_lowercase().as_str(),
+            "none"
+                | "flex"
+                | "inline-flex"
+                | "inline"
+                | "inline-block"
+                | "grid"
+                | "inline-grid"
+                | "block"
+                | "flow-root"
+                | "contents"
+        ),
+        "position" => matches!(
+            value.to_ascii_lowercase().as_str(),
+            "static" | "relative" | "absolute" | "fixed" | "sticky"
+        ),
+        "box-sizing" => matches!(
+            value.to_ascii_lowercase().as_str(),
+            "content-box" | "border-box"
+        ),
+        "float" => matches!(
+            value.to_ascii_lowercase().as_str(),
+            "none" | "left" | "right"
+        ),
+        "object-fit" => matches!(
+            value.to_ascii_lowercase().as_str(),
+            "fill" | "contain" | "cover" | "none" | "scale-down"
+        ),
+        "visibility" => matches!(
+            value.to_ascii_lowercase().as_str(),
+            "visible" | "hidden" | "collapse"
+        ),
+        "scrollbar-gutter" => matches!(
+            value.to_ascii_lowercase().as_str(),
+            "auto" | "stable" | "stable both-edges"
+        ),
+        "color" | "-webkit-text-fill-color" | "background-color" | "border-color" => {
+            parse_color(value).is_some()
+        }
+        "color-scheme" => {
+            let tokens: Vec<&str> = value.split_whitespace().collect();
+            !tokens.is_empty()
+                && tokens.iter().all(|token| {
+                    matches!(
+                        token.to_ascii_lowercase().as_str(),
+                        "normal" | "light" | "dark" | "only"
+                    )
+                })
+                && tokens.iter().any(|token| {
+                    matches!(
+                        token.to_ascii_lowercase().as_str(),
+                        "normal" | "light" | "dark"
+                    )
+                })
+        }
+        _ => true,
     }
 }
 
@@ -1509,13 +1870,20 @@ fn set_grid_placement_side(
         } else {
             &mut style.grid_row_raw
         };
-        let (mut start, mut end) = raw_slot
-            .as_deref()
-            .and_then(|raw| raw.split_once('/'))
-            .map(|(start, end)| {
+        let (mut start, mut end) = match raw_slot.as_deref() {
+            Some(raw) if raw.contains('/') => {
+                let (start, end) = raw.split_once('/').unwrap();
                 (start.trim().to_string(), end.trim().to_string())
-            })
-            .unwrap_or_else(|| ("auto".to_string(), "auto".to_string()));
+            }
+            // A single named grid-area shorthand contributes its `-start`
+            // and `-end` lines. Preserve both logical sides when a later
+            // longhand overrides only one of them (`grid-column:content`
+            // followed by `grid-column-end:extended-full-end`, as on MDN).
+            // Resolution can still fall back to an exact named line when no
+            // area-generated name exists.
+            Some(raw) => (raw.trim().to_string(), raw.trim().to_string()),
+            None => ("auto".to_string(), "auto".to_string()),
+        };
         if is_start {
             start = value.trim().to_string();
         } else {
@@ -1591,19 +1959,51 @@ fn parse_grid_placement(value: &str) -> taffy::GridPlacement {
 /// rgb()/rgba(), `var(--x, fallback)` (uses the fallback), and a set of named
 /// colors. Returns None for anything else (transparent).
 pub(crate) fn parse_color(value: &str) -> Option<[u8; 4]> {
+    parse_color_for_scheme(value, false)
+}
+
+fn parse_color_for_scheme(value: &str, dark_scheme: bool) -> Option<[u8; 4]> {
     let raw = value.trim();
+    // CSS Color 5 `light-dark(light, dark)` selects by the used color scheme.
+    // Obscura currently exposes the default/light scheme, so return the first
+    // branch. Both branches still have to be complete valid colors: accepting
+    // a valid light arm beside malformed dark syntax would keep a declaration
+    // that Chromium rejects at parse time.
+    let lower_full = raw.to_ascii_lowercase();
+    if lower_full.starts_with("light-dark(") {
+        let inner_and_close = &raw["light-dark(".len()..];
+        let close = find_matching_paren(inner_and_close)?;
+        if !inner_and_close[close + 1..].trim().is_empty() {
+            return None;
+        }
+        let arguments = split_top_level(&inner_and_close[..close], ',');
+        if arguments.len() != 2
+            || arguments
+                .iter()
+                .any(|argument| argument.trim().is_empty() || !is_complete_color_token(argument))
+        {
+            return None;
+        }
+        let light =
+            parse_color_for_scheme(arguments[0].trim(), dark_scheme)?;
+        let dark =
+            parse_color_for_scheme(arguments[1].trim(), dark_scheme)?;
+        return Some(if dark_scheme { dark } else { light });
+    }
     // CSS custom property with a fallback: var(--name, <fallback>). We cannot
     // resolve the variable, but the fallback after the comma is a real color.
     if let Some(rest) = raw.strip_prefix("var(") {
         let inner = rest.strip_suffix(')').unwrap_or(rest);
         if let Some((_, fallback)) = inner.split_once(',') {
-            return parse_color(fallback.trim());
+            return parse_color_for_scheme(fallback.trim(), dark_scheme);
         }
         return None;
     }
     // rgb()/rgba() functional notation.
-    let lower_full = raw.to_ascii_lowercase();
-    if let Some(rest) = lower_full.strip_prefix("rgb(").or_else(|| lower_full.strip_prefix("rgba(")) {
+    if let Some(rest) = lower_full
+        .strip_prefix("rgb(")
+        .or_else(|| lower_full.strip_prefix("rgba("))
+    {
         let inner = rest.strip_suffix(')').unwrap_or(rest);
         let parts: Vec<&str> = inner.split([',', '/', ' ']).filter(|p| !p.trim().is_empty()).collect();
         if parts.len() >= 3 {
@@ -1690,10 +2090,14 @@ pub(crate) fn parse_color(value: &str) -> Option<[u8; 4]> {
                 if let Some(idx) = s.rfind(char::is_whitespace) {
                     let tail = s[idx + 1..].trim();
                     if let Some(p) = tail.strip_suffix('%').and_then(|x| x.parse::<f32>().ok()) {
-                        return parse_color(s[..idx].trim()).map(|c| (c, Some(p / 100.0)));
+                        return parse_color_for_scheme(
+                            s[..idx].trim(),
+                            dark_scheme,
+                        )
+                        .map(|c| (c, Some(p / 100.0)));
                     }
                 }
-                parse_color(s).map(|c| (c, None))
+                parse_color_for_scheme(s, dark_scheme).map(|c| (c, None))
             };
             if let (Some((c1, p1)), Some((c2, p2))) = (parse_arg(args[1]), parse_arg(args[2])) {
                 let (w1, w2) = match (p1, p2) {
@@ -1775,6 +2179,18 @@ pub(crate) fn parse_color(value: &str) -> Option<[u8; 4]> {
         "transparent" => Some([0, 0, 0, 0]),
         _ => named_color(&v),
     }
+}
+
+fn resolve_svg_presentation_color(value: &str, dark_scheme: bool) -> String {
+    let raw = value.trim();
+    if raw.to_ascii_lowercase().contains("light-dark(") {
+        if let Some([red, green, blue, alpha]) =
+            parse_color_for_scheme(raw, dark_scheme)
+        {
+            return format!("#{red:02x}{green:02x}{blue:02x}{alpha:02x}");
+        }
+    }
+    raw.to_string()
 }
 
 /// The remaining common CSS named colors (the hot ones from real sites) beyond
@@ -1888,6 +2304,52 @@ fn named_color(v: &str) -> Option<[u8; 4]> {
         _ => return None,
     };
     Some([rgb[0], rgb[1], rgb[2], 255])
+}
+
+/// Reject trailing tokens and unbalanced functions before a `light-dark()`
+/// branch reaches the intentionally permissive legacy color parser. Nested
+/// color functions and their internal whitespace remain valid.
+fn is_complete_color_token(value: &str) -> bool {
+    let value = value.trim();
+    if value.is_empty() {
+        return false;
+    }
+    let mut depth = 0i32;
+    let mut first_open = None;
+    let mut outer_close = None;
+    for (index, character) in value.char_indices() {
+        match character {
+            '(' => {
+                if depth == 0 && first_open.is_none() {
+                    first_open = Some(index);
+                }
+                depth += 1;
+            }
+            ')' => {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+                if depth == 0 {
+                    outer_close = Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 {
+        return false;
+    }
+    match first_open {
+        Some(open) => {
+            open > 0
+                && value[..open]
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '-')
+                && outer_close == Some(value.len() - 1)
+        }
+        None => !value.chars().any(char::is_whitespace),
+    }
 }
 
 /// Convert `hsl()`/`hsla()` to RGBA. `h` in degrees, `s`/`l` as 0-1.
@@ -2166,10 +2628,19 @@ fn eval_contextual_calc(expr: &str, context: &LengthContext) -> Option<f32> {
                 current.push(character);
             }
             '+' | '-' if depth == 0 => {
-                if !current.trim().is_empty() {
-                    terms.push((sign, std::mem::take(&mut current)));
+                let follows_product_operator = current
+                    .chars()
+                    .rev()
+                    .find(|character| !character.is_whitespace())
+                    .is_some_and(|character| matches!(character, '*' | '/'));
+                if follows_product_operator {
+                    current.push(character);
+                } else {
+                    if !current.trim().is_empty() {
+                        terms.push((sign, std::mem::take(&mut current)));
+                    }
+                    sign = if character == '-' { -1.0 } else { 1.0 };
                 }
-                sign = if character == '-' { -1.0 } else { 1.0 };
             }
             _ => current.push(character),
         }
@@ -2352,10 +2823,19 @@ fn eval_calc(expr: &str) -> Option<f32> {
             '(' => { depth += 1; cur.push(c); }
             ')' => { depth -= 1; cur.push(c); }
             '+' | '-' if depth == 0 => {
-                if !cur.trim().is_empty() {
-                    terms.push((sign, std::mem::take(&mut cur)));
+                let follows_product_operator = cur
+                    .chars()
+                    .rev()
+                    .find(|character| !character.is_whitespace())
+                    .is_some_and(|character| matches!(character, '*' | '/'));
+                if follows_product_operator {
+                    cur.push(c);
+                } else {
+                    if !cur.trim().is_empty() {
+                        terms.push((sign, std::mem::take(&mut cur)));
+                    }
+                    sign = if c == '-' { -1.0 } else { 1.0 };
                 }
-                sign = if c == '-' { -1.0 } else { 1.0 };
             }
             _ => cur.push(c),
         }
@@ -2912,7 +3392,10 @@ fn token(value: &str) -> Option<&str> {
 /// clockwise); `to <side>` keywords map to their angle. Color stops keep their
 /// optional 0..1 position. Returns None if it is not a linear-gradient or has
 /// no parseable colors. Radial/conic gradients are not handled (None).
-fn parse_linear_gradient(value: &str) -> Option<(f32, Vec<([u8; 4], Option<f32>)>)> {
+fn parse_linear_gradient(
+    value: &str,
+    dark_scheme: bool,
+) -> Option<(f32, Vec<([u8; 4], Option<f32>)>)> {
     let v = value.trim();
     let lower = v.to_ascii_lowercase();
     let start = lower.find("linear-gradient(")?;
@@ -2997,7 +3480,7 @@ fn parse_linear_gradient(value: &str) -> Option<(f32, Vec<([u8; 4], Option<f32>)
         } else {
             (t, None)
         };
-        if let Some(c) = parse_color(color_str) {
+        if let Some(c) = parse_color_for_scheme(color_str, dark_scheme) {
             stops.push((c, pos));
         }
     }
@@ -3011,6 +3494,7 @@ fn parse_linear_gradient(value: &str) -> Option<(f32, Vec<([u8; 4], Option<f32>)
 
 fn parse_radial_gradient(
     value: &str,
+    dark_scheme: bool,
 ) -> Option<((f32, f32), Vec<([u8; 4], Option<f32>)>)> {
     let lower = value.to_ascii_lowercase();
     let start = lower.find("radial-gradient(")?;
@@ -3037,13 +3521,13 @@ fn parse_radial_gradient(
             center.1 = y;
         }
         stop_start = 1;
-    } else if parse_color(parts[0].trim()).is_none() {
+    } else if parse_color_for_scheme(parts[0].trim(), dark_scheme).is_none() {
         stop_start = 1;
     }
     let mut stops = Vec::new();
     for part in &parts[stop_start..] {
         let (color, position) = split_color_stop(part.trim());
-        if let Some(color) = parse_color(color) {
+        if let Some(color) = parse_color_for_scheme(color, dark_scheme) {
             stops.push((color, position));
         }
     }
@@ -3055,6 +3539,7 @@ fn parse_radial_gradient(
 /// is retained as box-relative fractions for paint-time resolution.
 fn parse_conic_gradient(
     value: &str,
+    dark_scheme: bool,
 ) -> Option<(f32, (f32, f32), Vec<([u8; 4], Option<f32>)>)> {
     let v = value.trim();
     let lower = v.to_ascii_lowercase();
@@ -3106,7 +3591,7 @@ fn parse_conic_gradient(
             continue;
         }
         let (color, position) = split_color_stop(part);
-        if let Some(color) = parse_color(color) {
+        if let Some(color) = parse_color_for_scheme(color, dark_scheme) {
             stops.push((color, position));
         }
     }
@@ -3382,7 +3867,11 @@ fn parse_background_position(value: &str) -> (f32, f32) {
 /// keyword and the color may each lead or trail the lengths; comma-separated
 /// multiples are accepted but only the first layer is stored. `current_color`
 /// supplies the default when the color is omitted (CSS `currentColor`).
-fn parse_box_shadow(value: &str, current_color: Option<[u8; 4]>) -> Option<crate::BoxShadow> {
+fn parse_box_shadow(
+    value: &str,
+    current_color: Option<[u8; 4]>,
+    dark_scheme: bool,
+) -> Option<crate::BoxShadow> {
     let v = value.trim();
     if v.is_empty() || v.eq_ignore_ascii_case("none") {
         return None;
@@ -3411,7 +3900,7 @@ fn parse_box_shadow(value: &str, current_color: Option<[u8; 4]>) -> Option<crate
                 continue;
             }
         }
-        if let Some(c) = parse_color(t) {
+        if let Some(c) = parse_color_for_scheme(t, dark_scheme) {
             color = Some(c);
         }
     }
@@ -3837,6 +4326,17 @@ mod tests {
         );
         assert_eq!(
             resolve_contextual_length(
+                "calc(35rem*-1/4)",
+                context.0,
+                context.1,
+                context.2,
+                context.3,
+                context.4,
+            ),
+            Some(-140.0)
+        );
+        assert_eq!(
+            resolve_contextual_length(
                 "calc(round(247px * 1, 10px))",
                 context.0,
                 context.1,
@@ -3894,6 +4394,58 @@ mod tests {
         assert!(!n.background_clip_text);
         let l = compute_style("h1", Some("background-clip: text"));
         assert!(l.background_clip_text);
+    }
+
+    #[test]
+    fn light_dark_uses_light_scheme_and_validates_both_nested_branches() {
+        assert_eq!(
+            parse_color("light-dark(rgb(16, 32, 48), hsl(0 100% 50%))"),
+            Some([16, 32, 48, 255])
+        );
+        assert_eq!(
+            parse_color(
+                "LIGHT-DARK(color-mix(in srgb, #204060 75%, transparent), \
+                 light-dark(white, black))"
+            ),
+            Some([32, 64, 96, 191]),
+            "nested commas must stay inside their color function"
+        );
+        let style = compute_style(
+            "div",
+            Some(
+                "color:light-dark(#123456,#ffffff);\
+                 background-color:light-dark(rgb(1, 2, 3),rgb(4, 5, 6));\
+                 border-color:light-dark(red,blue)",
+            ),
+        );
+        assert_eq!(style.color, Some([0x12, 0x34, 0x56, 255]));
+        assert_eq!(style.background_color, Some([1, 2, 3, 255]));
+        assert_eq!(style.border_color, Some([255, 0, 0, 255]));
+        assert!(supports_declaration(
+            "color",
+            "light-dark(rgb(1, 2, 3), color-mix(in srgb, white 50%, black))"
+        ));
+
+        for malformed in [
+            "light-dark(red)",
+            "light-dark(red, blue, green)",
+            "light-dark(red,)",
+            "light-dark(,blue)",
+            "light-dark(red, rgb(1, 2, 3)",
+            "light-dark(red garbage, blue)",
+            "light-dark(red, definitely-not-a-color)",
+            "light-dark(red, blue) trailing",
+        ] {
+            assert_eq!(
+                parse_color(malformed),
+                None,
+                "malformed light-dark() must invalidate the declaration: {malformed}"
+            );
+            assert!(
+                !supports_declaration("color", malformed),
+                "@supports must reject malformed light-dark(): {malformed}"
+            );
+        }
     }
 
     #[test]
@@ -3998,6 +4550,9 @@ mod tests {
         // The exact shape MediaWiki uses to offset a TOC toggle button into
         // the left margin: a negative product divided by a constant.
         assert_eq!(resolve_length("calc(-1 * 22px / 2)"), Some(-11.0));
+        // Minifiers commonly remove every optional space. A sign immediately
+        // following `*` or `/` is unary and belongs to that factor.
+        assert_eq!(resolve_length("calc(35px*-1/4)"), Some(-8.75));
     }
 
     #[test]

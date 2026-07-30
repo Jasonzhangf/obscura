@@ -10,6 +10,8 @@ use obscura_dom::DomTree;
 pub use deno_core::v8::IsolateHandle;
 
 use crate::module_loader::ObscuraModuleLoader;
+#[cfg(feature = "render")]
+use crate::ops::clamp_scroll_offset;
 use crate::ops::{build_extension, ObscuraState, StoredNetworkResponseBody};
 
 static SNAPSHOT: &[u8] = include_bytes!(env!("OBSCURA_SNAPSHOT_PATH"));
@@ -195,6 +197,7 @@ impl ObscuraJsRuntime {
         #[cfg(feature = "render")]
         {
             gs.layout_cache = None;
+            gs.scroll_offset = (0.0, 0.0);
         }
     }
 
@@ -285,6 +288,12 @@ impl ObscuraJsRuntime {
         if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
             return;
         }
+        #[cfg(feature = "render")]
+        {
+            let mut state = self.state.borrow_mut();
+            state.viewport = (width as f32, height as f32);
+            state.layout_cache = None;
+        }
         let _ = self.runtime.execute_script(
             "<set-viewport>",
             format!(
@@ -294,9 +303,20 @@ impl ObscuraJsRuntime {
                  if(globalThis.visualViewport){{\
                    globalThis.visualViewport.width={width};\
                    globalThis.visualViewport.height={height};\
+                 }}\
+                 if(typeof globalThis.__obscura_recompute_intersections==='function'){{\
+                   globalThis.__obscura_recompute_intersections();\
                  }}",
             ),
         );
+    }
+
+    /// Current clamped root scroll offset shared by CSSOM geometry and paint.
+    #[cfg(feature = "render")]
+    pub fn scroll_offset(&self) -> (f32, f32) {
+        let mut state = self.state.borrow_mut();
+        let requested = state.scroll_offset;
+        clamp_scroll_offset(&mut state, requested)
     }
 
     /// Run __obscura_init() after all per-page properties (UA, platform, stealth, etc.)
@@ -1872,6 +1892,146 @@ mod tests {
     }
 
     #[test]
+    fn animation_frame_requires_a_callable_callback() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    try {
+                        requestAnimationFrame(null);
+                        return [false, ""];
+                    } catch (error) {
+                        return [error instanceof TypeError, error.name];
+                    }
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([true, "TypeError"]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn animation_frames_are_ordered_batches_with_rendering_timestamps() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "animation-frame-order",
+            r#"
+                globalThis.__rafEvents = [];
+                globalThis.__rafStamps = [];
+                Promise.resolve().then(() => __rafEvents.push("microtask-before"));
+                setTimeout(() => __rafEvents.push("timer"), 1);
+                requestAnimationFrame((timestamp) => {
+                    __rafEvents.push("raf-a");
+                    __rafStamps.push(timestamp);
+                    Promise.resolve().then(() => __rafEvents.push("microtask-in-raf"));
+                    requestAnimationFrame((nextTimestamp) => {
+                        __rafEvents.push("raf-next");
+                        __rafStamps.push(nextTimestamp);
+                    });
+                });
+                requestAnimationFrame((timestamp) => {
+                    __rafEvents.push("raf-b");
+                    __rafStamps.push(timestamp);
+                });
+            "#,
+        )
+        .unwrap();
+
+        rt.run_event_loop_bounded(150).await.unwrap();
+        let result = rt
+            .evaluate(
+                r#"[
+                    __rafEvents,
+                    __rafStamps.length,
+                    __rafStamps[0] === __rafStamps[1],
+                    __rafStamps[2] > __rafStamps[1]
+                ]"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                [
+                    "microtask-before",
+                    "timer",
+                    "raf-a",
+                    "raf-b",
+                    "microtask-in-raf",
+                    "raf-next"
+                ],
+                3,
+                true,
+                true
+            ])
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancel_animation_frame_removes_pending_and_current_batch_callbacks() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "animation-frame-cancel",
+            r#"
+                globalThis.__rafEvents = [];
+                const pending = requestAnimationFrame(() => __rafEvents.push("pending"));
+                cancelAnimationFrame(pending);
+                let sameBatch;
+                requestAnimationFrame(() => {
+                    __rafEvents.push("first");
+                    cancelAnimationFrame(sameBatch);
+                });
+                sameBatch = requestAnimationFrame(() => __rafEvents.push("same-batch"));
+            "#,
+        )
+        .unwrap();
+
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__rafEvents").unwrap(),
+            serde_json::json!(["first"])
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn self_requeueing_animation_frame_yields_to_timer_tasks() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "animation-frame-yield",
+            r#"
+                globalThis.__rafCount = 0;
+                globalThis.__rafStopped = false;
+                globalThis.__timerAfterAnimation = false;
+                let frameId = 0;
+                function frame() {
+                    __rafCount++;
+                    frameId = requestAnimationFrame(frame);
+                }
+                frameId = requestAnimationFrame(frame);
+                setTimeout(() => {
+                    cancelAnimationFrame(frameId);
+                    __rafStopped = true;
+                }, 55);
+                setTimeout(() => {
+                    __timerAfterAnimation = true;
+                }, 65);
+            "#,
+        )
+        .unwrap();
+
+        rt.run_event_loop_bounded(200).await.unwrap();
+        let result = rt
+            .evaluate("[__rafCount, __rafStopped, __timerAfterAnimation]")
+            .unwrap();
+        let values = result.as_array().unwrap();
+        let frame_count = values[0].as_u64().unwrap();
+        assert!(
+            (2..=5).contains(&frame_count),
+            "expected a few paced animation frames before cancellation, got {frame_count}"
+        );
+        assert_eq!(values[1], serde_json::json!(true));
+        assert_eq!(values[2], serde_json::json!(true));
+    }
+
+    #[test]
     fn test_document_url() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let url = rt.evaluate("document.URL").unwrap();
@@ -1890,6 +2050,38 @@ mod tests {
         let mut rt = setup_runtime("<ul><li>A</li><li>B</li><li>C</li></ul>");
         let count = rt.evaluate("document.querySelectorAll('li').length").unwrap();
         assert_eq!(count.as_f64().unwrap() as i64, 3);
+    }
+
+    #[test]
+    fn css_supports_matches_capabilities_and_boolean_conditions() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"JSON.stringify([
+                    CSS.supports("-webkit-hyphens", "none"),
+                    CSS.supports("margin-trim", "inline"),
+                    CSS.supports("-moz-orient", "inline"),
+                    CSS.supports("color", "rgb(from red r g b)"),
+                    CSS.supports("(((-webkit-hyphens:none)) and (not (margin-trim:inline))) or ((-moz-orient:inline) and (not (color:rgb(from red r g b))))"),
+                    CSS.supports("display", "grid"),
+                    CSS.supports("(display:grid) and (selector(.card > *))"),
+                    CSS.supports("not (unknown-engine-prop:value)"),
+                    CSS.supports("selector(.card >)"),
+                    CSS.supports("selector(:obscura-unknown)"),
+                    CSS.supports("selector(.card,)"),
+                    CSS.supports("scrollbar-gutter", "stable"),
+                    CSS.supports("scrollbar-gutter", "floating"),
+                    CSS.supports("color", "light-dark(rgb(1, 2, 3), color-mix(in srgb, white 50%, black))"),
+                    CSS.supports("(color:light-dark(red, light-dark(white, black)))"),
+                    CSS.supports("color", "light-dark(red)"),
+                    CSS.supports("color", "light-dark(red, rgb(1, 2, 3)")
+                ])"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!("[false,false,false,true,false,true,true,true,false,false,false,true,false,true,true,false,false]")
+        );
     }
 
     #[test]
@@ -2500,6 +2692,7 @@ mod tests {
 
     /// Issue #468: window.scrollTo/scrollBy/scroll were no-op stubs, so the
     /// dominant infinite-scroll idiom never advanced the page offset.
+    #[cfg(not(feature = "render"))]
     #[test]
     fn window_scroll_methods_move_the_page_offset() {
         let mut rt = setup_runtime(r#"<html><body><div id="d"></div></body></html>"#);
@@ -2528,6 +2721,7 @@ mod tests {
 
     /// Issue #468: the page offset is one value, readable and writable through
     /// either `window.scrollY` or `document.scrollingElement.scrollTop`.
+    #[cfg(not(feature = "render"))]
     #[test]
     fn window_scroll_offset_is_shared_with_the_scrolling_element() {
         let mut rt = setup_runtime(r#"<html><body><div id="d"></div></body></html>"#);
@@ -2549,6 +2743,7 @@ mod tests {
 
     /// Issue #468: a scroll event must reach listeners on both the window and
     /// the document — that is the signal lazy loaders wait for.
+    #[cfg(not(feature = "render"))]
     #[tokio::test(flavor = "current_thread")]
     async fn window_scroll_fires_a_scroll_event() {
         let mut rt = setup_runtime(r#"<html><body><div id="d"></div></body></html>"#);
@@ -2569,6 +2764,587 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.value.unwrap(), serde_json::json!([1, 1, 400]));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn rendered_window_scroll_clamps_and_geometry_is_viewport_relative() {
+        let dom = parse_html(
+            r#"<html style="margin:0"><body style="margin:0">
+                <div id="wide" style="width:600px;height:700px"></div>
+                <div id="target" style="width:20px;height:300px"></div>
+                <div id="fixed" style="position:fixed;left:12px;top:14px;width:30px;height:25px">
+                    <span id="fixed-child">fixed</span>
+                </div>
+            </body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_viewport(320.0, 200.0);
+        rt.run_page_init();
+
+        let result = rt
+            .evaluate(
+                r#"
+                const target = document.getElementById("target");
+                const fixed = document.getElementById("fixed");
+                const fixedChild = document.getElementById("fixed-child");
+                const before = {
+                    target: target.getBoundingClientRect(),
+                    fixed: fixed.getBoundingClientRect(),
+                    fixedChild: fixedChild.getBoundingClientRect(),
+                };
+                window.scrollTo(99999, 99999);
+                const maxX = document.documentElement.scrollWidth - innerWidth;
+                const maxY = document.documentElement.scrollHeight - innerHeight;
+                const after = {
+                    target: target.getBoundingClientRect(),
+                    fixed: fixed.getBoundingClientRect(),
+                    fixedChild: fixedChild.getBoundingClientRect(),
+                };
+                return [
+                    innerWidth, innerHeight,
+                    document.documentElement.clientWidth,
+                    document.documentElement.clientHeight,
+                    document.documentElement.scrollWidth,
+                    document.documentElement.scrollHeight,
+                    window.scrollX, window.scrollY,
+                    document.scrollingElement.scrollLeft,
+                    document.scrollingElement.scrollTop,
+                    maxX, maxY,
+                    Math.abs(after.target.left - (before.target.left - maxX)) < 0.01,
+                    Math.abs(after.target.top - (before.target.top - maxY)) < 0.01,
+                    Math.abs(after.fixed.left - before.fixed.left) < 0.01,
+                    Math.abs(after.fixed.top - before.fixed.top) < 0.01,
+                    Math.abs(after.fixedChild.left - before.fixedChild.left) < 0.01,
+                    Math.abs(after.fixedChild.top - before.fixedChild.top) < 0.01,
+                ];
+                "#,
+            )
+            .unwrap();
+        let values = result.as_array().expect("array");
+        assert_eq!(&values[0..4], &serde_json::json!([320, 200, 320, 200]).as_array().unwrap()[..]);
+        let scroll_width = values[4].as_f64().expect("scrollWidth");
+        let scroll_height = values[5].as_f64().expect("scrollHeight");
+        assert!(scroll_width >= 600.0, "scrollWidth was {scroll_width}");
+        assert!(scroll_height >= 1000.0, "scrollHeight was {scroll_height}");
+        assert_eq!(values[6], values[10]);
+        assert_eq!(values[7], values[11]);
+        assert_eq!(values[8], values[10]);
+        assert_eq!(values[9], values[11]);
+        assert!(values[12..].iter().all(|value| value == &serde_json::json!(true)));
+    }
+
+    /// Chromium 150 reference (800x513 CSS-pixel viewport):
+    /// top=[60,20,20,-267], bottom=[448,448,231,31,-496] at the sampled
+    /// root scroll offsets. This keeps sticky distinct from fixed positioning,
+    /// verifies subtree movement, bottom-only sticking, and the containing
+    /// block's lower boundary without depending on a live site.
+    #[cfg(feature = "render")]
+    #[test]
+    fn root_scroll_sticky_geometry_matches_chromium_constraints() {
+        let dom = parse_html(
+            r#"<html style="margin:0"><body style="margin:0">
+                <div style="height:40px"></div>
+                <div id="cb" style="box-sizing:border-box;height:900px;padding:10px 12px;border:4px solid #333">
+                    <div id="top" style="box-sizing:border-box;position:sticky;top:20px;height:60px;margin:6px">
+                        <div id="top-child" style="height:12px"></div>
+                    </div>
+                    <div style="height:500px"></div>
+                    <div id="bottom" style="box-sizing:border-box;position:sticky;bottom:15px;height:50px;margin:5px"></div>
+                </div>
+                <div style="height:700px"></div>
+                <div id="fixed" style="position:fixed;left:600px;top:20px;width:60px;height:60px"></div>
+            </body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_viewport(800.0, 513.0);
+        rt.run_page_init();
+
+        let result = rt
+            .evaluate(
+                r#"
+                const top = document.getElementById("top");
+                const child = document.getElementById("top-child");
+                const bottom = document.getElementById("bottom");
+                const fixed = document.getElementById("fixed");
+                const sample = y => {
+                    window.scrollTo(0, y);
+                    return [
+                        window.scrollY,
+                        top.getBoundingClientRect().top,
+                        child.getBoundingClientRect().top,
+                        bottom.getBoundingClientRect().top,
+                        fixed.getBoundingClientRect().top,
+                    ];
+                };
+                return [sample(0), sample(100), sample(400), sample(600), sample(9999)];
+                "#,
+            )
+            .unwrap();
+        let rows = result.as_array().expect("rows");
+        let number = |row: usize, column: usize| {
+            rows[row].as_array().unwrap()[column].as_f64().unwrap()
+        };
+        let close = |actual: f64, expected: f64| {
+            assert!(
+                (actual - expected).abs() < 0.05,
+                "expected {expected}, got {actual}"
+            );
+        };
+
+        close(number(0, 1), 60.0);
+        close(number(0, 3), 448.0);
+        close(number(1, 1), 20.0);
+        close(number(1, 2), 20.0);
+        close(number(1, 3), 448.0);
+        close(number(2, 1), 20.0);
+        close(number(2, 3), 231.0);
+        close(number(3, 1), 20.0);
+        close(number(3, 3), 31.0);
+        close(number(4, 0), 1127.0);
+        close(number(4, 1), -267.0);
+        close(number(4, 2), -267.0);
+        close(number(4, 3), -496.0);
+        for row in 0..rows.len() {
+            close(number(row, 4), 20.0);
+        }
+    }
+
+    /// Chromium 150 horizontal reference for the same constraint algorithm:
+    /// the sticky subtree pins at x=20, remains distinct from fixed, then
+    /// leaves with its 500px containing block at the right boundary.
+    #[cfg(feature = "render")]
+    #[test]
+    fn root_scroll_sticky_supports_the_inline_axis() {
+        let dom = parse_html(
+            r#"<html style="margin:0"><body style="margin:0">
+                <div style="box-sizing:border-box;margin-left:40px;width:500px;height:100px;padding:10px;border:4px solid">
+                    <div id="sticky" style="box-sizing:border-box;position:sticky;left:20px;width:60px;height:30px;margin:6px">
+                        <div id="child" style="width:10px;height:10px"></div>
+                    </div>
+                </div>
+                <div style="width:1600px;height:600px"></div>
+                <div id="fixed" style="position:fixed;left:20px;top:100px;width:60px;height:30px"></div>
+            </body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_viewport(800.0, 513.0);
+        rt.run_page_init();
+
+        let result = rt
+            .evaluate(
+                r#"
+                const sticky = document.getElementById("sticky");
+                const child = document.getElementById("child");
+                const fixed = document.getElementById("fixed");
+                const sample = x => {
+                    window.scrollTo(x, 0);
+                    return [
+                        window.scrollX,
+                        sticky.getBoundingClientRect().left,
+                        child.getBoundingClientRect().left,
+                        fixed.getBoundingClientRect().left,
+                    ];
+                };
+                return [sample(0), sample(100), sample(400), sample(800)];
+                "#,
+            )
+            .unwrap();
+        let rows = result.as_array().unwrap();
+        let expected = [
+            [0.0, 60.0, 60.0, 20.0],
+            [100.0, 20.0, 20.0, 20.0],
+            [400.0, 20.0, 20.0, 20.0],
+            [800.0, -340.0, -340.0, 20.0],
+        ];
+        for (row, expected) in rows.iter().zip(expected) {
+            for (actual, expected) in row.as_array().unwrap().iter().zip(expected) {
+                let actual = actual.as_f64().unwrap();
+                assert!(
+                    (actual - expected).abs() < 0.05,
+                    "expected {expected}, got {actual}"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn rendered_layout_cache_is_invalidated_by_style_mutations() {
+        let dom = parse_html(
+            r#"<html style="margin:0"><body style="margin:0">
+                <div id="box" style="height:300px;width:40px"></div>
+            </body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_viewport(200.0, 100.0);
+        rt.run_page_init();
+
+        let result = rt
+            .evaluate(
+                r#"
+                const box = document.getElementById("box");
+                const before = [
+                    document.documentElement.scrollHeight,
+                    box.getBoundingClientRect().height,
+                ];
+                box.setAttribute("style", "height:900px;width:80px");
+                const after = [
+                    document.documentElement.scrollHeight,
+                    box.getBoundingClientRect().height,
+                    box.getBoundingClientRect().width,
+                ];
+                return [before, after];
+                "#,
+            )
+            .unwrap();
+        let values = result.as_array().expect("result");
+        let before = values[0].as_array().expect("before");
+        let after = values[1].as_array().expect("after");
+        assert!(after[0].as_f64().unwrap() > before[0].as_f64().unwrap());
+        assert_eq!(before[1].as_f64(), Some(300.0));
+        assert_eq!(after[1].as_f64(), Some(900.0));
+        assert_eq!(after[2].as_f64(), Some(80.0));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn rendered_window_scroll_events_require_actual_movement() {
+        let dom = parse_html(
+            r#"<html style="margin:0"><body style="margin:0">
+                <div style="height:1000px"></div>
+            </body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_viewport(320.0, 200.0);
+        rt.run_page_init();
+
+        let moved = rt
+            .evaluate_for_cdp(
+                r#"
+                new Promise(resolve => {
+                    let win = 0, doc = 0;
+                    window.addEventListener("scroll", () => win++);
+                    document.addEventListener("scroll", () => doc++);
+                    window.scrollTo(0, 100);
+                    setTimeout(() => resolve([win, doc, window.scrollY]), 5);
+                })
+                "#,
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(moved.value.unwrap(), serde_json::json!([1, 1, 100]));
+
+        rt.evaluate("window.scrollTo(0, 99999)").unwrap();
+        rt.run_event_loop_bounded(20).await.unwrap();
+        let no_op = rt
+            .evaluate_for_cdp(
+                r#"
+                new Promise(resolve => {
+                    let win = 0, doc = 0;
+                    window.addEventListener("scroll", () => win++);
+                    document.addEventListener("scroll", () => doc++);
+                    const before = window.scrollY;
+                    window.scrollTo(0, 99999);
+                    setTimeout(() => resolve([win, doc, before, window.scrollY]), 5);
+                })
+                "#,
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        let values = no_op.value.unwrap();
+        let values = values.as_array().expect("array");
+        assert_eq!(&values[0..2], &serde_json::json!([0, 0]).as_array().unwrap()[..]);
+        assert_eq!(values[2], values[3]);
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn intersection_observer_tracks_viewport_threshold_crossings() {
+        let dom = parse_html(
+            r#"<html style="margin:0"><body style="margin:0">
+                <div style="height:150px"></div>
+                <div id="target" style="height:100px"></div>
+                <div style="height:300px"></div>
+            </body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_viewport(200.0, 100.0);
+        rt.run_page_init();
+
+        let result = rt
+            .evaluate_for_cdp(
+                r#"
+                new Promise(resolve => {
+                    const records = [];
+                    const target = document.getElementById("target");
+                    const observer = new IntersectionObserver(entries => {
+                        for (const entry of entries) {
+                            records.push([
+                                entry.isIntersecting,
+                                Math.round(entry.intersectionRatio * 100) / 100,
+                                Math.round(entry.boundingClientRect.top),
+                                Math.round(entry.intersectionRect.height),
+                            ]);
+                        }
+                    }, { threshold: [0, 0.5, 1] });
+                    observer.observe(target);
+                    setTimeout(() => window.scrollTo(0, 100), 5);
+                    setTimeout(() => window.scrollTo(0, 260), 15);
+                    setTimeout(() => resolve(records), 30);
+                })
+                "#,
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!([
+                [false, 0, 150, 0],
+                [true, 0.5, 50, 50],
+                [false, 0, -110, 0],
+            ])
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn intersection_observer_honors_root_margin_zero_area_and_no_fake_refires() {
+        let dom = parse_html(
+            r#"<html style="margin:0"><body style="margin:0;position:relative">
+                <div style="height:110px"></div>
+                <div id="margin-target" style="height:10px"></div>
+                <div id="zero" style="position:absolute;left:20px;top:50px;width:0;height:0"></div>
+                <div id="root" style="height:20px;overflow:auto"></div>
+                <div style="height:300px"></div>
+            </body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_viewport(200.0, 100.0);
+        rt.run_page_init();
+
+        let result = rt
+            .evaluate_for_cdp(
+                r#"
+                new Promise(resolve => {
+                    const marginRecords = [], zeroRecords = [];
+                    const marginObserver = new IntersectionObserver(
+                        entries => marginRecords.push(...entries.map(entry => [
+                            entry.isIntersecting,
+                            entry.intersectionRatio,
+                            entry.rootBounds.bottom,
+                        ])),
+                        { rootMargin: "0px 0px 20px", threshold: [0, 1] }
+                    );
+                    const zeroObserver = new IntersectionObserver(
+                        entries => zeroRecords.push(...entries.map(entry => [
+                            entry.isIntersecting,
+                            entry.intersectionRatio,
+                        ]))
+                    );
+                    marginObserver.observe(document.getElementById("margin-target"));
+                    zeroObserver.observe(document.getElementById("zero"));
+                    let unsupported = "";
+                    try {
+                        new IntersectionObserver(() => {}, {
+                            root: document.getElementById("root")
+                        });
+                    } catch (error) {
+                        unsupported = error.name;
+                    }
+                    setTimeout(() => resolve([
+                        marginRecords, zeroRecords, unsupported,
+                        marginObserver.rootMargin, marginObserver.thresholds,
+                    ]), 200);
+                })
+                "#,
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!([
+                [[true, 1, 120]],
+                [[true, 1]],
+                "NotSupportedError",
+                "0px 0px 20px 0px",
+                [0, 1],
+            ])
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn intersection_observer_recomputes_after_style_mutation_and_resize() {
+        let dom = parse_html(
+            r#"<html style="margin:0"><body style="margin:0">
+                <div id="spacer" style="height:150px"></div>
+                <div id="target" style="height:20px"></div>
+                <div style="height:300px"></div>
+            </body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_viewport(200.0, 100.0);
+        rt.run_page_init();
+        rt.execute_script(
+            "intersection-mutation",
+            r#"
+                globalThis.__ioRecords = [];
+                globalThis.__io = new IntersectionObserver(entries => {
+                    __ioRecords.push(...entries.map(entry => [
+                        entry.isIntersecting,
+                        Math.round(entry.boundingClientRect.top),
+                    ]));
+                });
+                __io.observe(document.getElementById("target"));
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(10).await.unwrap();
+
+        rt.evaluate(
+            r#"document.getElementById("spacer").setAttribute("style", "height:120px")"#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(10).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__ioRecords").unwrap(),
+            serde_json::json!([[false, 150]])
+        );
+
+        rt.set_viewport(200.0, 160.0);
+        rt.run_event_loop_bounded(20).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__ioRecords").unwrap(),
+            serde_json::json!([[false, 150], [true, 120]])
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn scroll_into_view_aligns_the_root_viewport_and_clamps() {
+        let dom = parse_html(
+            r#"<html style="margin:0"><body style="margin:0">
+                <div style="height:300px"></div>
+                <div id="target" style="height:40px"></div>
+                <div style="height:340px"></div>
+                <div id="bottom" style="height:20px"></div>
+                <div id="fixed" style="position:fixed;top:10px;height:20px"></div>
+            </body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_viewport(200.0, 100.0);
+        rt.run_page_init();
+
+        let result = rt
+            .evaluate(
+                r#"
+                const target = document.getElementById("target");
+                const bottom = document.getElementById("bottom");
+                const fixed = document.getElementById("fixed");
+                target.scrollIntoView();
+                const start = scrollY;
+                scrollTo(0, 0);
+                target.scrollIntoView({ block: "center" });
+                const center = scrollY;
+                scrollTo(0, 0);
+                target.scrollIntoView({ block: "end" });
+                const end = scrollY;
+                scrollTo(0, 0);
+                target.scrollIntoView({ block: "nearest" });
+                const nearestOutside = scrollY;
+                scrollTo(0, 250);
+                target.scrollIntoView({ block: "nearest" });
+                const nearestVisible = scrollY;
+                fixed.scrollIntoView();
+                const afterFixed = scrollY;
+                bottom.scrollIntoView({ block: "start" });
+                const clamped = scrollY;
+                const max = document.documentElement.scrollHeight - innerHeight;
+                return [
+                    start, center, end, nearestOutside, nearestVisible,
+                    afterFixed, clamped, max,
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([300, 270, 240, 240, 250, 250, 600, 600])
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn scroll_into_view_emits_events_only_when_the_root_moves() {
+        let dom = parse_html(
+            r#"<html style="margin:0"><body style="margin:0">
+                <div style="height:300px"></div>
+                <div id="target" style="height:40px"></div>
+                <div style="height:300px"></div>
+            </body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_viewport(200.0, 100.0);
+        rt.run_page_init();
+
+        rt.evaluate("window.scrollTo(0, 250)").unwrap();
+        rt.run_event_loop_bounded(20).await.unwrap();
+        let no_op = rt
+            .evaluate_for_cdp(
+                r#"
+                new Promise(resolve => {
+                    let win = 0, doc = 0;
+                    window.addEventListener("scroll", () => win++);
+                    document.addEventListener("scroll", () => doc++);
+                    document.getElementById("target").scrollIntoView({ block: "nearest" });
+                    setTimeout(() => resolve([win, doc, scrollY]), 5);
+                })
+                "#,
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(no_op.value.unwrap(), serde_json::json!([0, 0, 250]));
+
+        rt.evaluate("window.scrollTo(0, 0)").unwrap();
+        rt.run_event_loop_bounded(20).await.unwrap();
+        let moved = rt
+            .evaluate_for_cdp(
+                r#"
+                new Promise(resolve => {
+                    let win = 0, doc = 0;
+                    window.addEventListener("scroll", () => win++);
+                    document.addEventListener("scroll", () => doc++);
+                    document.getElementById("target").scrollIntoView({ block: "center" });
+                    setTimeout(() => resolve([win, doc, scrollY]), 5);
+                })
+                "#,
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(moved.value.unwrap(), serde_json::json!([1, 1, 270]));
     }
 
     /// Issue #469: FILTER_SKIP leaves a skipped node's children eligible, so

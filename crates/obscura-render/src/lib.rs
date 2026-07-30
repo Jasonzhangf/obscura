@@ -20,12 +20,14 @@ pub mod style;
 pub use style::compute_style;
 
 pub mod dom;
-pub use dom::{layout_dom, layout_dom_with_images, layout_dom_with_resources, DomLayout};
+pub use dom::{
+    layout_dom, layout_dom_with_images, layout_dom_with_resources, DomLayout, StickyLayout,
+};
 
 #[cfg(feature = "paint")]
 mod paint;
 #[cfg(feature = "paint")]
-pub use paint::{paint_dom, screenshot_png};
+pub use paint::{paint_dom, paint_dom_scrolled, screenshot_png, screenshot_png_scrolled};
 
 // Real inline text layout (cosmic-text) lives behind the paint feature; the
 // layout-only build keeps the lighter word-split geometry. The stub lets
@@ -301,7 +303,19 @@ pub struct LayoutStyle {
     pub mask_repeat: Option<(bool, bool)>,
     /// Foreground (text) color for the paint step.
     pub color: Option<[u8; 4]>,
+    /// Computed SVG presentation properties supplied by author CSS. Inline
+    /// SVG is serialized into a standalone document for resvg; without
+    /// carrying these values across that boundary, stylesheet-driven icons
+    /// and text lose their fill/stroke and can become completely invisible.
+    pub svg_fill: Option<String>,
+    pub svg_stroke: Option<String>,
+    pub svg_stroke_width: Option<String>,
     pub border_color: Option<[u8; 4]>,
+    /// Used color scheme for CSS Color 5 `light-dark()`. The renderer's
+    /// current user preference is light; an inherited `color-scheme: dark`
+    /// subtree switches this to true, while `normal`, `light`, or a list that
+    /// permits light keeps the light scheme.
+    pub color_scheme_dark: bool,
     pub font_size: Option<f32>,
     /// `font-size` given in a font/viewport-relative unit, resolved to
     /// `font_size` (px) during the inheritance pass against the parent and
@@ -391,6 +405,10 @@ pub struct LayoutStyle {
     /// Distinguishes `fixed` from `absolute`; both map to taffy's absolute
     /// layout mode, but fixed boxes use the initial containing block.
     pub position_fixed: bool,
+    /// Distinguishes `sticky` from ordinary relative positioning. Sticky boxes
+    /// remain in normal flow; their insets constrain a scroll-time translation
+    /// and therefore must not be applied as taffy relative offsets.
+    pub position_sticky: bool,
     pub inset: [Option<Dimension>; 4], // top, right, bottom, left
     /// Deferred functional inset expressions in top/right/bottom/left order.
     pub inset_expressions: [Option<String>; 4],
@@ -401,6 +419,15 @@ pub struct LayoutStyle {
     /// clipped box used for skip-links and screen-reader-only labels) actually
     /// invisible instead of painting its text wherever it lands.
     pub overflow_hidden: bool,
+    /// Whether computed overflow establishes a scroll container. `clip`
+    /// clips paint but deliberately does not establish one, which matters for
+    /// selecting the scrollport that controls a sticky descendant.
+    pub overflow_scroll_container: bool,
+    /// Number of classic scrollbar gutters reserved by
+    /// `scrollbar-gutter:stable` (one) or `stable both-edges` (two). Root
+    /// gutters reduce the initial containing block even when the scrollbar
+    /// itself is visually hidden in a headless screenshot.
+    pub scrollbar_gutters: u8,
 
     /// `float: left|right`. True CSS float needs per-line reflow around the
     /// float's shape, which taffy's block/flex/grid modes do not do; see
@@ -445,6 +472,11 @@ pub struct LayoutStyle {
     /// compositing.
     pub effectively_invisible: bool,
 
+    /// A CSS image supplied by `content: url(...)` on a replaced element.
+    /// This is distinct from generated pseudo text: on an `<img>` it becomes
+    /// the element's image source and contributes intrinsic dimensions just
+    /// like an HTML `src`.
+    pub content_image: Option<String>,
     /// Literal text injected by a `::before`/`::after` rule with a plain
     /// string-literal `content` (see `css::Stylesheet::pseudo_content`).
     /// Rendered as an extra word-run at the start/end of this element's
@@ -863,12 +895,14 @@ pub(crate) fn to_taffy_style(style: &LayoutStyle) -> Style {
     // Positioning. Absolute/fixed take the box out of flow.
     if let Some(pos) = style.position {
         s.position = pos;
-        s.inset = taffy::Rect {
-            top: inset_lpa(style.inset[0]),
-            right: inset_lpa(style.inset[1]),
-            bottom: inset_lpa(style.inset[2]),
-            left: inset_lpa(style.inset[3]),
-        };
+        if !style.position_sticky {
+            s.inset = taffy::Rect {
+                top: inset_lpa(style.inset[0]),
+                right: inset_lpa(style.inset[1]),
+                bottom: inset_lpa(style.inset[2]),
+                left: inset_lpa(style.inset[3]),
+            };
+        }
     }
 
     s.margin = rect_auto(style.margin, style.margin_auto);

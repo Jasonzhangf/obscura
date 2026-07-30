@@ -657,8 +657,66 @@ globalThis.setInterval = (fn, delay = 0, ...args) => {
 };
 
 globalThis.clearInterval = (id) => { _intervals.delete(id); _clearedTimers.add(id); };
-globalThis.requestAnimationFrame = (fn) => setTimeout(fn, 0);
-globalThis.cancelAnimationFrame = globalThis.clearTimeout;
+
+// Animation callbacks are a rendering-phase batch, not zero-delay
+// microtasks.  In particular, a callback which queues itself must yield to
+// timers, networking, and the embedder between frames.  The old setTimeout(0)
+// alias eventually used Promise.resolve(), so a normal animation loop formed
+// an unbounded microtask chain and pinned V8 until the watchdog terminated it.
+const _RAF_FRAME_DELAY_MS = 16;
+let _rafPending = new Map();
+let _rafCurrentBatch = null;
+let _rafFrameScheduled = false;
+let _rafRunningFrame = false;
+
+function _scheduleAnimationFrame() {
+  if (_rafFrameScheduled || _rafRunningFrame || _rafPending.size === 0) return;
+  _rafFrameScheduled = true;
+  _scheduleAfter(_RAF_FRAME_DELAY_MS, () => {
+    _rafFrameScheduled = false;
+    if (_rafPending.size === 0) return;
+
+    // Swap before invoking anything. A callback requested while this batch is
+    // running therefore belongs to the next frame. Every callback in this
+    // batch receives the same rendering timestamp.
+    const batch = _rafPending;
+    _rafPending = new Map();
+    _rafCurrentBatch = batch;
+    _rafRunningFrame = true;
+    const timestamp = performance.now();
+    try {
+      for (const [id, callback] of batch) {
+        // cancelAnimationFrame() may remove a later callback while an earlier
+        // callback in the same frame is running.
+        if (!batch.has(id)) continue;
+        batch.delete(id);
+        try { callback(timestamp); }
+        catch (e) { console.error("Animation frame error:", e); }
+      }
+    } finally {
+      _rafRunningFrame = false;
+      _rafCurrentBatch = null;
+      _scheduleAnimationFrame();
+    }
+  });
+}
+
+globalThis.requestAnimationFrame = (fn) => {
+  if (typeof fn !== "function") {
+    throw new TypeError(
+      "Failed to execute 'requestAnimationFrame' on 'Window': parameter 1 is not of type 'Function'."
+    );
+  }
+  const id = ++_tid;
+  _rafPending.set(id, fn);
+  _scheduleAnimationFrame();
+  return id;
+};
+
+globalThis.cancelAnimationFrame = (id) => {
+  _rafPending.delete(id);
+  if (_rafCurrentBatch) _rafCurrentBatch.delete(id);
+};
 globalThis.queueMicrotask = globalThis.queueMicrotask || ((fn) => Promise.resolve().then(fn));
 
 class MessageChannel {
@@ -2687,49 +2745,103 @@ class Element extends Node {
   // returning 100x20 there made every element appear off-screen and broke .click().
   get clientWidth() { return this._isViewportRoot() ? (globalThis.innerWidth || 1280) : 100; }
   get clientHeight() { return this._isViewportRoot() ? (globalThis.innerHeight || 720) : 20; }
-  get scrollWidth() { return this._isViewportRoot() ? (globalThis.innerWidth || 1280) : 100; }
-  get scrollHeight() { return this._isViewportRoot() ? (globalThis.innerHeight || 720) : 20; }
+  get scrollWidth() {
+    if (!this._isViewportRoot()) return 100;
+    const metrics = this._renderScrollMetrics();
+    return metrics ? metrics.scrollWidth : (globalThis.innerWidth || 1280);
+  }
+  get scrollHeight() {
+    if (!this._isViewportRoot()) return 20;
+    const metrics = this._renderScrollMetrics();
+    return metrics ? metrics.scrollHeight : (globalThis.innerHeight || 720);
+  }
   _isViewportRoot() {
     const t = this.tagName;
     return t === 'HTML' || t === 'BODY';
   }
-  // No layout engine, so there is no real overflow to scroll and the offset is
-  // deliberately NOT clamped: without real geometry any synthetic max is a
-  // guess, and a max derived from a stub scroll box pins scrollTop at 0, which
-  // deadlocks scroll-driven lazy loaders (no scroll -> no content -> no scroll).
-  // We track the offset so scrollTop/scrollLeft round-trip, and fire a scroll
-  // event on direct assignment -- lazy loaders that set `el.scrollTop = N` rely
-  // on that event, and scrollTo/scrollBy below would otherwise be its only source.
-  get scrollTop() { return this._scrollTop || 0; }
+  _renderScrollMetrics() {
+    if (typeof Deno.core.ops.op_layout_metrics !== 'function') return null;
+    try {
+      const raw = Deno.core.ops.op_layout_metrics();
+      return raw ? JSON.parse(raw) : null;
+    } catch (_e) {
+      return null;
+    }
+  }
+  _renderScrollOffset() {
+    if (typeof Deno.core.ops.op_scroll_offset !== 'function') return null;
+    try {
+      const raw = Deno.core.ops.op_scroll_offset();
+      return raw ? JSON.parse(raw) : null;
+    } catch (_e) {
+      return null;
+    }
+  }
+  _setRenderScroll(x, y) {
+    if (typeof Deno.core.ops.op_scroll_to !== 'function') return null;
+    try {
+      const raw = Deno.core.ops.op_scroll_to(+x || 0, +y || 0);
+      return raw ? JSON.parse(raw) : null;
+    } catch (_e) {
+      return null;
+    }
+  }
+  // Render builds clamp the viewport root against measured document overflow.
+  // Nested element scrollers still use synthetic, deliberately unclamped state:
+  // their contents do not yet participate in scroll-container layout, and a
+  // guessed maximum would pin lazy-loading scrollers at zero.
+  get scrollTop() {
+    if (this._isViewportRoot()) {
+      const offset = this._renderScrollOffset();
+      if (offset) return offset.y || 0;
+    }
+    return this._scrollTop || 0;
+  }
   set scrollTop(v) {
     v = +v;
     const nv = Number.isFinite(v) && v > 0 ? v : 0;
-    const changed = nv !== (this._scrollTop || 0);
-    this._scrollTop = nv;
+    const old = this.scrollTop;
+    let actual = nv;
+    if (this._isViewportRoot()) {
+      const offset = this._renderScrollOffset();
+      const updated = offset && this._setRenderScroll(offset.x, nv);
+      if (updated) actual = updated.y || 0;
+    }
+    const changed = actual !== old;
+    this._scrollTop = actual;
     if (changed && !this._scrollSuppress) this._fireScroll();
+    if (changed && this._isViewportRoot() &&
+        typeof globalThis.__obscura_recompute_intersections === "function") {
+      globalThis.__obscura_recompute_intersections();
+    }
   }
-  get scrollLeft() { return this._scrollLeft || 0; }
+  get scrollLeft() {
+    if (this._isViewportRoot()) {
+      const offset = this._renderScrollOffset();
+      if (offset) return offset.x || 0;
+    }
+    return this._scrollLeft || 0;
+  }
   set scrollLeft(v) {
     v = +v;
     const nv = Number.isFinite(v) && v > 0 ? v : 0;
-    const changed = nv !== (this._scrollLeft || 0);
-    this._scrollLeft = nv;
+    const old = this.scrollLeft;
+    let actual = nv;
+    if (this._isViewportRoot()) {
+      const offset = this._renderScrollOffset();
+      const updated = offset && this._setRenderScroll(nv, offset.y);
+      if (updated) actual = updated.x || 0;
+    }
+    const changed = actual !== old;
+    this._scrollLeft = actual;
     if (changed && !this._scrollSuppress) this._fireScroll();
+    if (changed && this._isViewportRoot() &&
+        typeof globalThis.__obscura_recompute_intersections === "function") {
+      globalThis.__obscura_recompute_intersections();
+    }
   }
   getBoundingClientRect() {
     globalThis.__obscura_click_target = this;
-    // documentElement and body span the full viewport. Without this every
-    // hit test against them clips down to a 100x20 synthetic cell and
-    // Document.elementFromPoint can never recurse into their children.
-    if (this._isViewportRoot()) {
-      const vw = globalThis.innerWidth || 1280;
-      const vh = globalThis.innerHeight || 720;
-      return {
-        x: 0, y: 0, width: vw, height: vh,
-        top: 0, right: vw, bottom: vh, left: 0,
-        toJSON() { return this; },
-      };
-    }
     // Real layout when the render feature is compiled in: ask the Rust layout
     // cache for this element's border box. The op is absent in the default
     // build, so probe with typeof and fall through to the synthetic rect below.
@@ -2740,14 +2852,31 @@ class Element extends Node {
           var _r = JSON.parse(_geom);
           if (_r && typeof _r.width === 'number') {
             var _x = _r.x, _y = _r.y, _w = _r.width, _h = _r.height;
-            return {
+            var _rect = {
               x: _x, y: _y, width: _w, height: _h,
               top: _y, right: _x + _w, bottom: _y + _h, left: _x,
               toJSON() { return this; },
             };
+            Object.defineProperty(_rect, "__obscuraViewportFixed", {
+              value: !!_r.viewportFixed,
+              enumerable: false,
+            });
+            return _rect;
           }
         }
       } catch (_e) {}
+    }
+    // Default (non-render) builds keep viewport-sized roots. Without this
+    // synthetic fallback every hit test against them clips down to a 100x20
+    // cell and Document.elementFromPoint cannot recurse into their children.
+    if (this._isViewportRoot()) {
+      const vw = globalThis.innerWidth || 1280;
+      const vh = globalThis.innerHeight || 720;
+      return {
+        x: 0, y: 0, width: vw, height: vh,
+        top: 0, right: vw, bottom: vh, left: 0,
+        toJSON() { return this; },
+      };
     }
     // No layout engine (default build) or this node has no box: synthesize a
     // deterministic position from the node id so Playwright's actionability
@@ -2790,7 +2919,40 @@ class Element extends Node {
   set ariaHidden(v) { if (v == null) this.removeAttribute('aria-hidden'); else this.setAttribute('aria-hidden', String(v)); }
   get ariaSelected() { return this.getAttribute('aria-selected'); }
   set ariaSelected(v) { if (v == null) this.removeAttribute('aria-selected'); else this.setAttribute('aria-selected', String(v)); }
-  scrollIntoView() { globalThis.__obscura_click_target = this; }
+  scrollIntoView(arg) {
+    globalThis.__obscura_click_target = this;
+    const rect = this.getBoundingClientRect();
+    // A viewport-fixed subtree is already expressed in the viewport's
+    // coordinate space and cannot be brought closer by moving the document.
+    if (rect.__obscuraViewportFixed) return;
+
+    let block = "start", inline = "nearest";
+    if (arg === false) block = "end";
+    else if (arg && typeof arg === "object") {
+      if (["start", "center", "end", "nearest"].includes(arg.block)) block = arg.block;
+      if (["start", "center", "end", "nearest"].includes(arg.inline)) inline = arg.inline;
+    }
+    const currentX = globalThis.scrollX || 0;
+    const currentY = globalThis.scrollY || 0;
+    const vw = globalThis.innerWidth || 1280;
+    const vh = globalThis.innerHeight || 720;
+    const align = (mode, start, end, size, viewportSize, current) => {
+      if (mode === "start") return current + start;
+      if (mode === "center") return current + start - (viewportSize - size) / 2;
+      if (mode === "end") return current + end - viewportSize;
+      // CSSOM View's nearest alignment: do nothing when fully visible or when
+      // the box spans both viewport edges; otherwise move the closer edge in.
+      if ((start >= 0 && end <= viewportSize) || (start < 0 && end > viewportSize)) {
+        return current;
+      }
+      if (start < 0) return current + start;
+      if (end > viewportSize) return current + end - viewportSize;
+      return current;
+    };
+    const left = align(inline, rect.left, rect.right, rect.width, vw, currentX);
+    const top = align(block, rect.top, rect.bottom, rect.height, vh, currentY);
+    globalThis.scrollTo({ left, top, behavior: arg && arg.behavior });
+  }
   // scrollTo/scrollBy/scroll accept either (x, y) or a ScrollToOptions object.
   // The setters fire a scroll event of their own, so suppress the per-axis ones
   // here and emit a single event for the whole movement, the way a real browser
@@ -5498,104 +5660,182 @@ globalThis.NodeFilter = {
 // ResizeObserver is defined earlier with real per-target firing; the stub
 // that previously lived here was a no-op that clobbered the real class.
 //
-// IntersectionObserver: without a layout engine we can't compute real
-// intersection geometry, so every observed target is treated as fully
-// in-viewport (`isIntersecting: true`, `intersectionRatio: 1`). Real
-// libraries lean on this in three patterns we must support:
-//
-//   1. Lazy load: observe(img) -> first intersection -> load src -> unobserve.
-//      One fire is enough — covered by the initial microtask fire.
-//   2. Infinite scroll: observe(sentinel) -> on intersection load more ->
-//      new sentinel mounts -> fire again. Needs re-fires as DOM grows.
-//   3. Reveal-on-scroll animations: observe(card) -> isIntersecting flips
-//      true once and an animation runs. One fire is enough.
-//
-// To cover (2) without spinning forever, we burst-fire at an exponential
-// backoff schedule and ALSO re-fire whenever the DOM mutates (a strong
-// signal that the page just rendered something new). Per-observer total
-// fire cap stops us from looping on a never-disconnected observer.
+// Viewport IntersectionObserver. Render builds provide real, scroll-relative
+// target boxes through getBoundingClientRect. Element scroll-container roots
+// remain intentionally unsupported until their offsets participate in layout.
 globalThis.__intersectionObservers = [];
+function _ioRect(x, y, width, height) {
+  return {
+    x, y, width, height,
+    top: y, left: x, right: x + width, bottom: y + height,
+    toJSON() { return this; },
+  };
+}
+function _ioMargins(value) {
+  const parts = String(value || "0px").trim().split(/\s+/);
+  if (parts.length < 1 || parts.length > 4) return null;
+  const parsed = parts.map((part) => {
+    const match = /^([-+]?(?:\d+(?:\.\d*)?|\.\d+))(px|%)$/.exec(part);
+    return match ? { value: Number(match[1]), unit: match[2] } : null;
+  });
+  if (parsed.some((part) => !part)) return null;
+  if (parsed.length === 1) return [parsed[0], parsed[0], parsed[0], parsed[0]];
+  if (parsed.length === 2) return [parsed[0], parsed[1], parsed[0], parsed[1]];
+  if (parsed.length === 3) return [parsed[0], parsed[1], parsed[2], parsed[1]];
+  return parsed;
+}
+function _ioUnsupportedRoot() {
+  const error = new Error(
+    "Obscura IntersectionObserver element roots require element scroll-container layout"
+  );
+  error.name = "NotSupportedError";
+  return error;
+}
 globalThis.IntersectionObserver = class IntersectionObserver {
   constructor(callback, options) {
+    if (typeof callback !== "function") {
+      throw new TypeError("IntersectionObserver callback must be a function");
+    }
     this._callback = callback;
     this._options = options || {};
+    if (this._options.root != null) throw _ioUnsupportedRoot();
+    this._margins = _ioMargins(this._options.rootMargin || "0px");
+    if (!this._margins) throw new SyntaxError("Invalid IntersectionObserver rootMargin");
+    const raw = this._options.threshold == null
+      ? [0]
+      : (Array.isArray(this._options.threshold) ? this._options.threshold : [this._options.threshold]);
+    this._thresholds = [...new Set(raw.map(Number))].sort((a, b) => a - b);
+    if (!this._thresholds.length) this._thresholds = [0];
+    if (this._thresholds.some((value) => !Number.isFinite(value) || value < 0 || value > 1)) {
+      throw new RangeError("IntersectionObserver threshold must be between 0 and 1");
+    }
     this._targets = new Set();
+    this._previous = new Map();
+    this._records = [];
     this._connected = true;
-    this._fireCount = 0;
+    this._deliveryPending = false;
     globalThis.__intersectionObservers.push(this);
   }
-  _fireFor(targets) {
-    if (!this._connected || !targets.length || this._fireCount >= 256) return;
-    this._fireCount++;
-    const records = targets.map(target => ({
-      target,
-      isIntersecting: true,
-      intersectionRatio: 1,
-      boundingClientRect: target.getBoundingClientRect
-        ? target.getBoundingClientRect()
-        : { x: 0, y: 0, width: 100, height: 20, top: 0, left: 0, right: 100, bottom: 20 },
-      intersectionRect: target.getBoundingClientRect
-        ? target.getBoundingClientRect()
-        : { x: 0, y: 0, width: 100, height: 20, top: 0, left: 0, right: 100, bottom: 20 },
-      rootBounds: { x: 0, y: 0, width: 1280, height: 720, top: 0, left: 0, right: 1280, bottom: 720 },
-      time: Date.now(),
-    }));
-    try { this._callback(records, this); } catch (e) { /* IO callbacks must not propagate */ }
+  _rootBounds() {
+    const width = globalThis.innerWidth || 1280;
+    const height = globalThis.innerHeight || 720;
+    const resolve = (margin, basis) =>
+      margin.unit === "%" ? margin.value * basis / 100 : margin.value;
+    // IntersectionObserver resolves every rootMargin percentage against the
+    // root rectangle's width, including the block-axis sides.
+    const top = resolve(this._margins[0], width);
+    const right = resolve(this._margins[1], width);
+    const bottom = resolve(this._margins[2], width);
+    const left = resolve(this._margins[3], width);
+    return _ioRect(-left, -top, width + left + right, height + top + bottom);
   }
-  observe(el) {
-    if (!el || !this._connected) return;
-    if (this._targets.has(el)) return;
-    this._targets.add(el);
-    Promise.resolve().then(() => this._fireFor([el]));
-    // Exponential burst to cover infinite-scroll sentinels that "re-arm"
-    // after content lands. Without a real scroll/layout signal, we fake the
-    // re-fire schedule. Beyond ~10s the page has usually settled.
-    [120, 500, 1500, 3500, 7000].forEach(delay => {
-      setTimeout(() => {
-        if (this._connected && this._targets.has(el)) this._fireFor([el]);
-      }, delay);
+  _entry(target) {
+    const rect = target.getBoundingClientRect();
+    const root = this._rootBounds();
+    const left = Math.max(rect.left, root.left);
+    const top = Math.max(rect.top, root.top);
+    const right = Math.min(rect.right, root.right);
+    const bottom = Math.min(rect.bottom, root.bottom);
+    const edgesTouch = right >= left && bottom >= top;
+    const width = Math.max(0, right - left);
+    const height = Math.max(0, bottom - top);
+    const targetArea = Math.max(0, rect.width) * Math.max(0, rect.height);
+    const area = width * height;
+    const isIntersecting = edgesTouch;
+    return {
+      target,
+      isIntersecting,
+      intersectionRatio: targetArea > 0 ? area / targetArea : (isIntersecting ? 1 : 0),
+      boundingClientRect: _ioRect(rect.x, rect.y, rect.width, rect.height),
+      intersectionRect: _ioRect(left, top, width, height),
+      rootBounds: root,
+      time: performance.now(),
+    };
+  }
+  _thresholdIndex(ratio) {
+    let index = 0;
+    while (index < this._thresholds.length && this._thresholds[index] <= ratio) index++;
+    return index;
+  }
+  _queueChanged(target, forceInitial) {
+    const entry = this._entry(target);
+    const previous = this._previous.get(target);
+    const changed = forceInitial || !previous ||
+      previous.isIntersecting !== entry.isIntersecting ||
+      this._thresholdIndex(previous.intersectionRatio) !==
+        this._thresholdIndex(entry.intersectionRatio);
+    this._previous.set(target, {
+      isIntersecting: entry.isIntersecting,
+      intersectionRatio: entry.intersectionRatio,
+    });
+    if (changed) this._records.push(entry);
+  }
+  _check(targets, forceInitial) {
+    if (!this._connected) return;
+    for (const target of targets) {
+      if (this._targets.has(target)) this._queueChanged(target, !!forceInitial);
+    }
+    if (!this._records.length || this._deliveryPending) return;
+    this._deliveryPending = true;
+    Promise.resolve().then(() => {
+      this._deliveryPending = false;
+      if (!this._connected || !this._records.length) return;
+      const records = this.takeRecords();
+      try { this._callback(records, this); } catch (e) {}
     });
   }
-  unobserve(el) { this._targets.delete(el); }
+  observe(el) {
+    if (!el || !this._connected || this._targets.has(el)) return;
+    this._targets.add(el);
+    this._previous.delete(el);
+    this._check([el], true);
+  }
+  unobserve(el) {
+    this._targets.delete(el);
+    this._previous.delete(el);
+  }
   disconnect() {
     this._connected = false;
     this._targets.clear();
-    const idx = globalThis.__intersectionObservers.indexOf(this);
-    if (idx >= 0) globalThis.__intersectionObservers.splice(idx, 1);
+    this._previous.clear();
+    this._records.length = 0;
+    const index = globalThis.__intersectionObservers.indexOf(this);
+    if (index >= 0) globalThis.__intersectionObservers.splice(index, 1);
   }
-  takeRecords() { return []; }
-  get root() { return this._options.root || null; }
-  get rootMargin() { return this._options.rootMargin || "0px 0px 0px 0px"; }
-  get thresholds() {
-    const t = this._options.threshold;
-    if (t == null) return [0];
-    return Array.isArray(t) ? t.slice() : [t];
+  takeRecords() { return this._records.splice(0); }
+  get root() { return null; }
+  get rootMargin() {
+    return this._margins.map((margin) => `${margin.value}${margin.unit}`).join(" ");
   }
+  get thresholds() { return this._thresholds.slice(); }
 };
-// When the DOM mutates (e.g. infinite scroll loads a batch of items), re-fire
-// every active IntersectionObserver so libraries observing dynamic content
-// see a fresh isIntersecting=true event. Uses the same per-observer fire cap
-// to prevent runaway loops if the page is mutating in a tight cycle.
 (function() {
-  const reFire = () => {
-    for (const obs of globalThis.__intersectionObservers) {
-      if (!obs._connected) continue;
-      const ts = [...obs._targets];
-      if (ts.length) obs._fireFor(ts);
-    }
-  };
-  // Lazy-attach a single MutationObserver on document.body once the page is
-  // ready, debounced via a microtask so a flurry of mutations only triggers
-  // one IO sweep.
   let pending = false;
+  const recompute = () => {
+    if (pending) return;
+    pending = true;
+    Promise.resolve().then(() => {
+      pending = false;
+      for (const observer of globalThis.__intersectionObservers) {
+        if (observer._connected && observer._targets.size) {
+          observer._check([...observer._targets], false);
+        }
+      }
+    });
+  };
+  globalThis.__obscura_recompute_intersections = recompute;
+  globalThis.addEventListener("resize", recompute);
   const wireUp = () => {
     if (!globalThis.document?.body) return;
-    const mo = new MutationObserver(() => {
-      if (pending) return;
-      pending = true;
-      Promise.resolve().then(() => { pending = false; reFire(); });
-    });
-    try { mo.observe(globalThis.document.body, {childList: true, subtree: true}); } catch {}
+    const observer = new MutationObserver(recompute);
+    try {
+      observer.observe(globalThis.document.body, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        characterData: true,
+      });
+    } catch {}
   };
   if (globalThis.document?.body) wireUp();
   else Promise.resolve().then(wireUp);
@@ -6718,21 +6958,312 @@ globalThis.screenLeft = 0; globalThis.screenTop = 0;
 globalThis.pageXOffset = 0; globalThis.pageYOffset = 0;
 globalThis.scrollX = 0; globalThis.scrollY = 0;
 
+// Keep the JavaScript capability surface aligned with the declarations the
+// renderer actually implements. Reporting an unknown declaration as supported
+// is not harmless: Tailwind and other framework sheets use negative probes to
+// select legacy-browser fallbacks, which can replace their modern cascade.
+const _CSS_SUPPORTED_DECLARATIONS = new Set((
+  "display width height min-width min-height max-width max-height box-sizing aspect-ratio " +
+  "margin margin-top margin-right margin-bottom margin-left margin-inline margin-inline-start " +
+  "margin-inline-end margin-block margin-block-start margin-block-end padding padding-top " +
+  "padding-right padding-bottom padding-left padding-inline padding-inline-start padding-inline-end " +
+  "padding-block padding-block-start padding-block-end border-radius border border-width " +
+  "border-top-width border-right-width border-bottom-width border-left-width border-top border-right " +
+  "border-bottom border-left background background-color background-image background-size " +
+  "background-position background-clip -webkit-background-clip mask-image -webkit-mask-image " +
+  "mask-size -webkit-mask-size mask-repeat -webkit-mask-repeat color -webkit-text-fill-color fill " +
+  "stroke stroke-width border-color font-size font font-weight font-family font-style text-align " +
+  "text-transform text-decoration text-decoration-line line-height align-items justify-items " +
+  "place-items align-self justify-self place-self align-content justify-content place-content " +
+  "flex-direction flex-wrap flex-grow flex-shrink flex-basis flex order position float object-fit " +
+  "top right bottom left inset overflow overflow-x overflow-y scrollbar-gutter visibility opacity animation " +
+  "animation-name animation-fill-mode animation-iteration-count z-index clear vertical-align " +
+  "list-style list-style-type gap grid-gap row-gap grid-row-gap column-gap grid-column-gap " +
+  "border-spacing border-collapse grid-template-columns grid-template-rows grid-template-areas " +
+  "grid-template grid grid-auto-flow grid-area grid-column grid-row grid-column-start " +
+  "grid-column-end grid-row-start grid-row-end transform filter backdrop-filter " +
+  "-webkit-backdrop-filter perspective contain will-change content-visibility box-shadow " +
+  "-webkit-box-shadow"
+).split(/\s+/));
+
+const _CSS_SUPPORTED_COLOR_NAMES = new Set((
+  "transparent white black gray grey silver lightgray lightgrey darkgray darkgrey whitesmoke " +
+  "gainsboro red green lime blue navy yellow orange purple maroon teal aqua cyan fuchsia magenta " +
+  "olive darkblue mediumblue royalblue dodgerblue cornflowerblue steelblue deepskyblue skyblue " +
+  "lightskyblue lightblue powderblue cadetblue slateblue darkslateblue midnightblue indigo " +
+  "darkgreen forestgreen seagreen mediumseagreen limegreen yellowgreen olivedrab darkolivegreen " +
+  "greenyellow lightgreen palegreen springgreen mediumaquamarine aquamarine turquoise " +
+  "mediumturquoise darkcyan crimson firebrick darkred indianred tomato orangered coral salmon " +
+  "lightsalmon darksalmon hotpink deeppink pink lightpink palevioletred mediumvioletred violet " +
+  "orchid plum mediumpurple blueviolet darkviolet darkorchid darkmagenta lavender thistle gold " +
+  "goldenrod darkgoldenrod khaki darkkhaki peachpuff moccasin papayawhip wheat tan burlywood " +
+  "sandybrown peru chocolate sienna saddlebrown brown rosybrown darkorange lightyellow " +
+  "lightgoldenrodyellow lemonchiffon beige ivory azure mintcream honeydew snow seashell linen " +
+  "oldlace floralwhite ghostwhite aliceblue lavenderblush mistyrose cornsilk antiquewhite bisque " +
+  "blanchedalmond navajowhite dimgray dimgrey slategray slategrey lightslategray lightslategrey " +
+  "darkslategray darkslategrey"
+).split(/\s+/));
+
+function _cssSupportsColor(value) {
+  const raw = value.trim();
+  const lower = raw.toLowerCase();
+  if (_CSS_SUPPORTED_COLOR_NAMES.has(lower)) return true;
+  if (/^#[0-9a-f]{3,4}(?:[0-9a-f]{2}){0,2}$/i.test(lower)) {
+    return [4, 5, 7, 9].includes(lower.length);
+  }
+  if (lower.startsWith("var(") && lower.endsWith(")")) {
+    const comma = _cssTopLevelComma(raw.slice(4, -1));
+    return comma >= 0 && _cssSupportsColor(raw.slice(4 + comma + 1, -1));
+  }
+  if (/^rgba?\(/.test(lower) && lower.endsWith(")")) {
+    // Chromium accepts relative colors and Tailwind uses this exact syntax as
+    // a browser-family probe. Painting every relative-color expression is a
+    // separate concern from recognizing its valid conditional syntax.
+    if (/\bfrom\b/.test(lower)) {
+      return /^rgba?\(\s*from\s+\S[\s\S]*\)$/i.test(raw);
+    }
+    const parts = lower.slice(lower.indexOf("(") + 1, -1)
+      .split(/[,\s/]+/).filter(Boolean);
+    return parts.length >= 3 && parts.slice(0, 3)
+      .every((part) => /^[-+]?(?:\d+(?:\.\d*)?|\.\d+)%?$/.test(part));
+  }
+  if (/^hsla?\(/.test(lower) && lower.endsWith(")")) {
+    const parts = lower.slice(lower.indexOf("(") + 1, -1)
+      .split(/[,\s/]+/).filter(Boolean);
+    return parts.length >= 3 && parts.slice(0, 3).every((part) =>
+      /^[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:deg|%)?$/.test(part));
+  }
+  if (/^okl(?:ab|ch)\(/.test(lower) && lower.endsWith(")")) {
+    const parts = lower.slice(lower.indexOf("(") + 1, -1)
+      .split(/[,\s/]+/).filter(Boolean);
+    return parts.length >= 3 && parts.slice(0, 3).every((part) =>
+      /^[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:deg|%)?$/.test(part));
+  }
+  if (lower.startsWith("light-dark(") && lower.endsWith(")")) {
+    const parts = _cssSplitTopLevel(
+      raw.slice("light-dark(".length, -1),
+      ","
+    );
+    return !!parts && parts.length === 2 &&
+      parts.every((part) => part.trim() && _cssSupportsColor(part));
+  }
+  if (lower.startsWith("color-mix(") && lower.endsWith(")")) {
+    const parts = _cssSplitTopLevel(lower.slice("color-mix(".length, -1), ",");
+    if (!parts || parts.length < 3 || !/^in\s+\S+$/i.test(parts[0].trim())) return false;
+    const color = (part) => _cssSupportsColor(part.trim().replace(/\s+[-+]?(?:\d+(?:\.\d*)?|\.\d+)%\s*$/, ""));
+    return color(parts[1]) && color(parts[2]);
+  }
+  return false;
+}
+
+function _cssTopLevelComma(text) {
+  let depth = 0, quote = "";
+  for (let i = 0; i < text.length; i++) {
+    const character = text[i];
+    if (quote) {
+      if (character === "\\") i++;
+      else if (character === quote) quote = "";
+      continue;
+    }
+    if (character === "'" || character === '"') quote = character;
+    else if (character === "(") depth++;
+    else if (character === ")") depth--;
+    else if (character === "," && depth === 0) return i;
+    if (depth < 0) return -1;
+  }
+  return -1;
+}
+
+function _cssSupportsDeclaration(name, value) {
+  name = name.trim().toLowerCase();
+  value = value.trim();
+  if (!value) return false;
+  if (name.startsWith("--")) return name.length > 2;
+  if (!_CSS_SUPPORTED_DECLARATIONS.has(name)) return false;
+  const lower = value.toLowerCase();
+  if (["initial", "inherit", "unset", "revert", "revert-layer"].includes(lower)) return true;
+  if (name === "display") {
+    return ["none", "flex", "inline-flex", "inline", "inline-block", "grid",
+      "inline-grid", "block", "flow-root", "contents"].includes(lower);
+  }
+  if (name === "position") {
+    return ["static", "relative", "absolute", "fixed", "sticky"].includes(lower);
+  }
+  if (name === "box-sizing") return ["content-box", "border-box"].includes(lower);
+  if (name === "float") return ["none", "left", "right"].includes(lower);
+  if (name === "object-fit") {
+    return ["fill", "contain", "cover", "none", "scale-down"].includes(lower);
+  }
+  if (name === "visibility") return ["visible", "hidden", "collapse"].includes(lower);
+  if (name === "scrollbar-gutter") {
+    return lower === "auto" || lower === "stable" || lower === "stable both-edges";
+  }
+  if (["color", "-webkit-text-fill-color", "background-color", "border-color"].includes(name)) {
+    return _cssSupportsColor(value);
+  }
+  return true;
+}
+
+// Return the contents only when one pair of parentheses encloses the complete
+// expression. Declaration leaves such as `(display:grid)` are then evaluated
+// by the same path as the two-argument overload.
+function _cssEnclosingGroup(text) {
+  if (!text.startsWith("(")) return null;
+  let depth = 0, quote = "";
+  for (let i = 0; i < text.length; i++) {
+    const character = text[i];
+    if (quote) {
+      if (character === "\\") i++;
+      else if (character === quote) quote = "";
+      continue;
+    }
+    if (character === "'" || character === '"') quote = character;
+    else if (character === "(") depth++;
+    else if (character === ")") {
+      depth--;
+      if (depth < 0) return null;
+      if (depth === 0) return i === text.length - 1 ? text.slice(1, i) : null;
+    }
+  }
+  return null;
+}
+
+function _cssSplitTopLevel(text, operator) {
+  const parts = [];
+  const isWord = /^[a-z]+$/i.test(operator);
+  let start = 0, depth = 0, quote = "";
+  for (let i = 0; i < text.length; i++) {
+    const character = text[i];
+    if (quote) {
+      if (character === "\\") i++;
+      else if (character === quote) quote = "";
+      continue;
+    }
+    if (character === "'" || character === '"') {
+      quote = character;
+      continue;
+    }
+    if (character === "(" || character === "[") depth++;
+    else if (character === ")" || character === "]") {
+      depth--;
+      if (depth < 0) return null;
+    } else if (depth === 0 &&
+        text.slice(i, i + operator.length).toLowerCase() === operator.toLowerCase() &&
+        (!isWord || (i > 0 && /\s/.test(text[i - 1]) &&
+          i + operator.length < text.length && /\s/.test(text[i + operator.length])))) {
+      const part = text.slice(start, i).trim();
+      if (!part) return null;
+      parts.push(part);
+      i += operator.length - 1;
+      start = i + 1;
+    }
+  }
+  if (depth !== 0 || quote || !parts.length) return null;
+  const tail = text.slice(start).trim();
+  if (!tail) return null;
+  parts.push(tail);
+  return parts;
+}
+
+function _cssHasTopLevelComma(text) {
+  let depth = 0, quote = "";
+  for (let i = 0; i < text.length; i++) {
+    const character = text[i];
+    if (quote) {
+      if (character === "\\") i++;
+      else if (character === quote) quote = "";
+      continue;
+    }
+    if (character === "\\") { i++; continue; }
+    if (character === "'" || character === '"') quote = character;
+    else if (character === "(" || character === "[") depth++;
+    else if (character === ")" || character === "]") depth--;
+    else if (character === "," && depth === 0) return true;
+    if (depth < 0) return false;
+  }
+  return false;
+}
+
+const _CSS_SUPPORTED_SIMPLE_PSEUDOS = new Set((
+  "hover active focus focus-visible focus-within enabled disabled checked link any-link visited " +
+  "first-child last-child only-child root empty scope first-of-type last-of-type only-of-type " +
+  "before after"
+).split(/\s+/));
+const _CSS_SUPPORTED_FUNCTIONAL_PSEUDOS = new Set((
+  "nth-child nth-of-type nth-last-child nth-last-of-type is where has host not"
+).split(/\s+/));
+
+function _cssSupportsSelector(selector) {
+  selector = selector.trim();
+  if (!selector || /[{};]/.test(selector)) return false;
+  const split = _cssSplitTopLevel(selector, ",");
+  if (!split && _cssHasTopLevelComma(selector)) return false;
+  const selectors = split || [selector];
+  return selectors.every((part) => {
+    part = part.trim();
+    if (!part || /^[>+~]/.test(part) || /[>+~]\s*$/.test(part)) return false;
+    let parens = 0, brackets = 0, quote = "";
+    for (let i = 0; i < part.length; i++) {
+      const character = part[i];
+      if (quote) {
+        if (character === "\\") i++;
+        else if (character === quote) quote = "";
+        continue;
+      }
+      if (character === "\\") { i++; continue; }
+      if (character === "'" || character === '"') quote = character;
+      else if (character === "(") parens++;
+      else if (character === ")") parens--;
+      else if (character === "[") brackets++;
+      else if (character === "]") brackets--;
+      else if (character === ":" && brackets === 0) {
+        const doubleColon = part[i + 1] === ":";
+        let end = i + (doubleColon ? 2 : 1);
+        const start = end;
+        while (end < part.length && /[a-z0-9_-]/i.test(part[end])) end++;
+        if (end === start) return false;
+        const name = part.slice(start, end).toLowerCase();
+        const functional = part[end] === "(";
+        if (doubleColon) {
+          if (functional || !["before", "after"].includes(name)) return false;
+        } else if (functional) {
+          if (!_CSS_SUPPORTED_FUNCTIONAL_PSEUDOS.has(name)) return false;
+        } else if (!_CSS_SUPPORTED_SIMPLE_PSEUDOS.has(name)) {
+          return false;
+        }
+        i = end - 1;
+      }
+      if (parens < 0 || brackets < 0) return false;
+    }
+    return !quote && parens === 0 && brackets === 0;
+  });
+}
+
+function _cssSupportsCondition(condition) {
+  condition = condition.trim();
+  if (!condition) return false;
+  const grouped = _cssEnclosingGroup(condition);
+  if (grouped !== null) return _cssSupportsCondition(grouped);
+  if (/^not\s/i.test(condition)) return !_cssSupportsCondition(condition.slice(3).trim());
+  const orParts = _cssSplitTopLevel(condition, "or");
+  if (orParts) return orParts.some(_cssSupportsCondition);
+  const andParts = _cssSplitTopLevel(condition, "and");
+  if (andParts) return andParts.every(_cssSupportsCondition);
+  if (/^selector\(/i.test(condition) && condition.endsWith(")")) {
+    return _cssSupportsSelector(condition.slice(condition.indexOf("(") + 1, -1));
+  }
+  const colon = condition.indexOf(":");
+  if (colon < 0) return false;
+  return _cssSupportsDeclaration(condition.slice(0, colon), condition.slice(colon + 1));
+}
+
 globalThis.CSS = {
   supports(prop, value){
     try {
-      var p, v;
-      if (arguments.length >= 2) { p = String(prop).trim(); v = String(value).trim(); }
-      else {
-        var cond = String(prop).trim().replace(/^\(+|\)+$/g, "").trim();
-        var idx = cond.indexOf(":");
-        if (idx === -1) return false;
-        p = cond.slice(0, idx).trim(); v = cond.slice(idx + 1).trim();
+      if (arguments.length >= 2) {
+        return _cssSupportsDeclaration(String(prop), String(value));
       }
-      if (!p || !v) return false;
-      // The engine renders standard CSS; report it as supported so feature-gated
-      // SPAs don't bail to /unsupported. (Previous stub always returned false.)
-      return true;
+      return _cssSupportsCondition(String(prop));
     } catch (e) { return false; }
   },
   escape(s){ return s; }
@@ -8290,8 +8821,9 @@ URL.revokeObjectURL = function(url) {
 //
 // The page offset is stored on the scrolling element rather than in separate
 // window state, so window.scrollY and document.scrollingElement.scrollTop are
-// two views of one value, which is what pages assume. As with #431 there is no
-// layout, so the offset still cannot be clamped to a real maximum.
+// two views of one value, which is what pages assume. Render builds clamp that
+// shared root offset against measured document overflow; non-render builds keep
+// the legacy synthetic offset used by automation-only consumers.
 function _scrollRoot() {
   const doc = globalThis.document;
   return (doc && doc.scrollingElement) || null;
@@ -8299,6 +8831,8 @@ function _scrollRoot() {
 function _windowScroll(x, y, relative) {
   const root = _scrollRoot();
   if (!root) return;
+  const beforeLeft = root.scrollLeft || 0;
+  const beforeTop = root.scrollTop || 0;
   let left, top;
   if (x !== null && typeof x === 'object') { left = x.left; top = x.top; }
   else { left = x; top = y; }
@@ -8307,6 +8841,9 @@ function _windowScroll(x, y, relative) {
   }
   if (top !== undefined) {
     root.scrollTop = (relative ? (root.scrollTop || 0) : 0) + (+top || 0);
+  }
+  if ((root.scrollLeft || 0) === beforeLeft && (root.scrollTop || 0) === beforeTop) {
+    return;
   }
   // Async, matching the element path #431 added. Dispatched at the document
   // AND the window: a page scroll event reaches both in Chrome, but

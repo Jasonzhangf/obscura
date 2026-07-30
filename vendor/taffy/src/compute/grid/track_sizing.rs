@@ -1399,15 +1399,25 @@ fn distribute_space_up_to_limits(
             .iter()
             .filter(|track| track_affected_property(track) + track.item_incurred_increase < track_limit(track))
             .filter(|track| track_is_affected(track))
-            .map(|track| (track_limit(track) - track_affected_property(track)) / track_distribution_proportion(track))
+            .map(|track| {
+                (track_limit(track)
+                    - track_affected_property(track)
+                    - track.item_incurred_increase)
+                    / track_distribution_proportion(track)
+            })
             .min_by(|a, b| a.total_cmp(b))
             .unwrap(); // We will never pass an empty track list to this function
         let iteration_item_incurred_increase =
             f32_min(min_increase_limit, space_to_distribute / track_distribution_proportion_sum);
 
         for track in tracks.iter_mut().filter(|track| track_is_affected(track)) {
+            let current_size = track_affected_property(track) + track.item_incurred_increase;
+            let limit = track_limit(track);
+            if current_size >= limit {
+                continue;
+            }
             let increase = iteration_item_incurred_increase * track_distribution_proportion(track);
-            if increase > 0.0 && track_affected_property(track) + increase <= track_limit(track) + THRESHOLD {
+            if increase > 0.0 && current_size + increase <= limit + THRESHOLD {
                 track.item_incurred_increase += increase;
                 space_to_distribute -= increase;
             }

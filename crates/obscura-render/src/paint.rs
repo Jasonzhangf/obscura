@@ -12,6 +12,9 @@ use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
 static FONT_BYTES: &[u8] = include_bytes!("../assets/liberation-sans.ttf");
 static SERIF_FONT_BYTES: &[u8] = include_bytes!("../assets/liberation-serif.ttf");
 static MONO_FONT_BYTES: &[u8] = include_bytes!("../assets/liberation-mono.ttf");
+static FONT_BOLD_BYTES: &[u8] = include_bytes!("../assets/liberation-sans-bold.ttf");
+static FONT_OBLIQUE_BYTES: &[u8] = include_bytes!("../assets/liberation-sans-oblique.ttf");
+static FONT_BOLD_OBLIQUE_BYTES: &[u8] = include_bytes!("../assets/liberation-sans-boldoblique.ttf");
 
 use crate::dom::layout_dom_with_web_fonts;
 
@@ -21,6 +24,18 @@ use crate::dom::layout_dom_with_web_fonts;
 /// majority of real-world markup; without it only absolute and `data:` URLs
 /// can be fetched.
 pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -> Option<Pixmap> {
+    paint_dom_scrolled(tree, viewport, base_url, (0.0, 0.0))
+}
+
+/// Render the visible viewport after root scrolling. Normal document content
+/// is translated by the clamped scroll offset while viewport-fixed subtrees
+/// remain anchored to the initial containing block.
+pub fn paint_dom_scrolled(
+    tree: &DomTree,
+    viewport: (f32, f32),
+    base_url: Option<&str>,
+    scroll: (f32, f32),
+) -> Option<Pixmap> {
     let (w, h) = (viewport.0 as u32, viewport.1 as u32);
     let mut pixmap = Pixmap::new(w, h)?;
     pixmap.fill(Color::WHITE);
@@ -34,9 +49,31 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
     // CSS-sized image with no width/height attribute would otherwise be 0x0
     // and never paint). This seeds the same cache the paint pass reads, so
     // each URL is still fetched at most once.
-    let intrinsic = collect_image_intrinsics(tree, base_url, &mut image_cache);
+    let mut intrinsic = collect_image_intrinsics(tree, base_url, &mut image_cache);
     let fonts = collect_web_fonts(tree, base_url);
+    // Most framework pages use web fonts and many decorative SVG icons, but
+    // only SVG text needs the page font faces. Avoid cloning/loading the page
+    // font database for ordinary icons and HTML-only text.
+    let svg_fonts = if has_inline_svg_text(tree) {
+        svg_font_database_with_web_fonts(&fonts)
+    } else {
+        svg_font_database()
+    };
     let mut laid = layout_dom_with_web_fonts(tree, viewport, &intrinsic, &fonts);
+    // `content:url(...)` is computed by the author cascade, whereas ordinary
+    // HTML image sources are available before layout. Pay for a second layout
+    // only on the uncommon pages that actually use a CSS image as replaced
+    // content: its metadata then enters the same intrinsic-size map as `src`.
+    if collect_content_image_intrinsics(
+        tree,
+        &laid.styles,
+        base_url,
+        &mut image_cache,
+        &mut intrinsic,
+    ) {
+        laid = layout_dom_with_web_fonts(tree, viewport, &intrinsic, &fonts);
+    }
+    apply_document_scroll(tree, &mut laid, viewport, scroll);
     let root_font_size = tree
         .query_selector("html")
         .ok()
@@ -106,7 +143,57 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
         .chain(pos_layers.into_iter().flat_map(|(_, sub)| sub))
         .collect();
 
-    for nid in paint_order {
+    // Generated boxes are anonymous layout children. ::before paints directly
+    // after its host's own box; ::after paints after the host's last DOM
+    // descendant in this paint order. Build the latter schedule only on pages
+    // that actually materialized a generated box. A reverse DOM-preorder pass
+    // propagates each node's paint index to its parent once, deriving subtree
+    // endpoints in O(nodes + generated boxes), including reordered z layers.
+    let mut generated_before: std::collections::HashMap<
+        obscura_dom::tree::NodeId,
+        Vec<crate::dom::GeneratedBox>,
+    > = std::collections::HashMap::new();
+    let mut generated_after_at: Vec<Vec<crate::dom::GeneratedBox>> =
+        vec![Vec::new(); paint_order.len()];
+    if !laid.generated_boxes.is_empty() {
+        let paint_indices: std::collections::HashMap<obscura_dom::tree::NodeId, usize> =
+            paint_order
+                .iter()
+                .enumerate()
+                .map(|(index, &nid)| (nid, index))
+                .collect();
+        let mut last_index: std::collections::HashMap<obscura_dom::tree::NodeId, usize> =
+            paint_indices.clone();
+        let dom_preorder = tree.descendants(tree.document());
+        for nid in dom_preorder.into_iter().rev() {
+            let Some(index) = last_index.get(&nid).copied() else {
+                continue;
+            };
+            if let Some(parent) = tree.get_node(nid).and_then(|node| node.parent) {
+                last_index
+                    .entry(parent)
+                    .and_modify(|last| *last = (*last).max(index))
+                    .or_insert(index);
+            }
+        }
+        for generated in laid.generated_boxes.iter().copied() {
+            match generated.kind {
+                crate::dom::GeneratedBoxKind::Before => {
+                    generated_before
+                        .entry(generated.host)
+                        .or_default()
+                        .push(generated);
+                }
+                crate::dom::GeneratedBoxKind::After => {
+                    if let Some(index) = last_index.get(&generated.host) {
+                        generated_after_at[*index].push(generated);
+                    }
+                }
+            }
+        }
+    }
+
+    for (paint_index, nid) in paint_order.into_iter().enumerate() {
         if svg_subtree_skip.contains(&nid) {
             continue;
         }
@@ -117,6 +204,17 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
 
         if node.is_text() {
             paint_text_node(tree, nid, &laid, &mut pixmap);
+            for generated in &generated_after_at[paint_index] {
+                paint_in_flow_generated_box(
+                    &mut pixmap,
+                    generated,
+                    &laid,
+                    viewport,
+                    root_font_size,
+                    base_url,
+                    &mut image_cache,
+                );
+            }
             continue;
         }
 
@@ -283,6 +381,8 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
                 viewport,
                 root_font_size,
                 clip,
+                base_url,
+                &mut image_cache,
             );
         }
 
@@ -336,7 +436,12 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
         }
 
         if name.local.as_ref() == "img" {
-            if let Some((src, _density)) = resolve_img_url(tree, nid) {
+            let source = style
+                .content_image
+                .as_ref()
+                .map(|url| (url.clone(), 1.0))
+                .or_else(|| resolve_img_url(tree, nid));
+            if let Some((src, _density)) = source {
                 // `visible_rect` is the border box already intersected with the
                 // ancestor overflow clip: the raster must not paint past it (a
                 // half-scrolled carousel slide's image otherwise bleeds over
@@ -387,7 +492,7 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
         // is drawn at its full border-box size (undistorted) and clipped to the
         // overflow-visible region.
         if name.local.as_ref() == "svg" {
-            let mut markup = serialize_svg(tree, nid);
+            let mut markup = serialize_svg_styled(tree, nid, &laid.styles);
             // Resolve referenced symbols before carrying the host color into
             // the standalone document. A document-level/external symbol may
             // itself contain `currentColor`, and therefore has to be present
@@ -406,8 +511,14 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
             // the sprite, splice the referenced `<symbol>` into a local `<defs>`,
             // and rewrite the href to a same-document `#id`. Same-document
             // `<use href="#id">` (empty url) is untouched.
-            if let Some(content) = render_svg(markup.as_bytes(), rect.width as u32, rect.height as u32) {
-                let mask = clip.and_then(|_| rect_clip_mask(pixmap.width(), pixmap.height(), &visible_rect));
+            if let Some(content) = render_svg_with_font_database(
+                markup.as_bytes(),
+                rect.width as u32,
+                rect.height as u32,
+                &svg_fonts,
+            ) {
+                let mask = clip
+                    .and_then(|_| rect_clip_mask(pixmap.width(), pixmap.height(), &visible_rect));
                 pixmap.draw_pixmap(
                     rect.x as i32,
                     rect.y as i32,
@@ -419,6 +530,20 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
             }
             for child in tree.descendants(nid) {
                 svg_subtree_skip.insert(child);
+            }
+        }
+
+        if let Some(generated) = generated_before.get(&nid) {
+            for generated in generated {
+                paint_in_flow_generated_box(
+                    &mut pixmap,
+                    generated,
+                    &laid,
+                    viewport,
+                    root_font_size,
+                    base_url,
+                    &mut image_cache,
+                );
             }
         }
 
@@ -542,6 +667,17 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
                 }
             }
         }
+        for generated in &generated_after_at[paint_index] {
+            paint_in_flow_generated_box(
+                &mut pixmap,
+                generated,
+                &laid,
+                viewport,
+                root_font_size,
+                base_url,
+                &mut image_cache,
+            );
+        }
     }
 
     // Inline formatting contexts shaped by cosmic-text (paragraphs, headings,
@@ -577,6 +713,59 @@ pub fn paint_dom(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -
     }
 
     Some(pixmap)
+}
+
+fn apply_document_scroll(
+    tree: &DomTree,
+    laid: &mut crate::DomLayout,
+    viewport: (f32, f32),
+    requested: (f32, f32),
+) {
+    let content = laid.scrolling_content_size(tree, viewport);
+    let scroll_x = if requested.0.is_finite() {
+        requested
+            .0
+            .clamp(0.0, (content.0 - viewport.0).max(0.0))
+    } else {
+        0.0
+    };
+    let scroll_y = if requested.1.is_finite() {
+        requested
+            .1
+            .clamp(0.0, (content.1 - viewport.1).max(0.0))
+    } else {
+        0.0
+    };
+    let sticky_layout = laid.root_sticky_layout(tree, viewport);
+    if scroll_x == 0.0 && scroll_y == 0.0 && sticky_layout.is_empty() {
+        return;
+    }
+    let sticky =
+        sticky_layout.translations(viewport, (scroll_x, scroll_y));
+    let sticky_clips =
+        sticky_layout.clip_translations_from(&sticky);
+
+    let viewport_fixed = laid.viewport_fixed_nodes(tree);
+    for id in tree.descendants(tree.document()) {
+        if viewport_fixed.contains(&id) {
+            continue;
+        }
+        let offset = laid.translates.entry(id).or_insert((0.0, 0.0));
+        if let Some((x, y)) = sticky.get(&id) {
+            offset.0 += x;
+            offset.1 += y;
+        }
+        offset.0 -= scroll_x;
+        offset.1 -= scroll_y;
+        if let Some(Some(clip)) = laid.clip_rects.get_mut(&id) {
+            if let Some((x, y)) = sticky_clips.get(&id) {
+                clip.x += x;
+                clip.y += y;
+            }
+            clip.x -= scroll_x;
+            clip.y -= scroll_y;
+        }
+    }
 }
 
 /// A closed rounded-rectangle path, corners approximated by quadratic curves
@@ -754,6 +943,17 @@ fn selected_option_label(
 /// viewport is zero-sized. Convenience over `paint_dom` + `encode_png`.
 pub fn screenshot_png(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -> Option<Vec<u8>> {
     paint_dom(tree, viewport, base_url)?.encode_png().ok()
+}
+
+/// PNG convenience wrapper for a scrolled root viewport.
+pub fn screenshot_png_scrolled(
+    tree: &DomTree,
+    viewport: (f32, f32),
+    base_url: Option<&str>,
+    scroll: (f32, f32),
+) -> Option<Vec<u8>> {
+    paint_dom_scrolled(tree, viewport, base_url, scroll)
+        .and_then(|pixmap| pixmap.encode_png().ok())
 }
 
 /// A representative visible color for `background-clip: text` text whose own
@@ -1818,6 +2018,210 @@ fn split_background_size_components(value: &str) -> Vec<&str> {
     components
 }
 
+fn paint_in_flow_generated_box(
+    pixmap: &mut Pixmap,
+    generated: &crate::dom::GeneratedBox,
+    laid: &crate::dom::DomLayout,
+    viewport: (f32, f32),
+    root_font_size: f32,
+    base_url: Option<&str>,
+    image_cache: &mut std::collections::HashMap<String, Option<Vec<u8>>>,
+) {
+    let Some(host_style) = laid.styles.get(&generated.host) else {
+        return;
+    };
+    let style = match generated.kind {
+        crate::dom::GeneratedBoxKind::Before => host_style.before_pseudo.as_deref(),
+        crate::dom::GeneratedBoxKind::After => host_style.after_pseudo.as_deref(),
+    };
+    let Some(style) = style else { return };
+    if style.effectively_invisible {
+        return;
+    }
+
+    let (ox, oy) = laid
+        .translates
+        .get(&generated.host)
+        .copied()
+        .unwrap_or((0.0, 0.0));
+    let rect = crate::Rect {
+        x: generated.rect.x + ox,
+        y: generated.rect.y + oy,
+        width: generated.rect.width,
+        height: generated.rect.height,
+    };
+    let mut clip = laid.clip_rects.get(&generated.host).copied().flatten();
+    if host_style.overflow_hidden {
+        if let Some(host_rect) = laid.rects.get(&generated.host) {
+            let own = crate::Rect {
+                x: host_rect.x + ox,
+                y: host_rect.y + oy,
+                width: host_rect.width,
+                height: host_rect.height,
+            };
+            clip = Some(match clip {
+                Some(inherited) => inherited.intersect(&own).unwrap_or(crate::Rect::default()),
+                None => own,
+            });
+        }
+    }
+    let visible = match clip {
+        Some(clip) => rect.intersect(&clip),
+        None => Some(rect),
+    };
+    let Some(visible) = visible else { return };
+    if visible.width <= 0.0 || visible.height <= 0.0 {
+        return;
+    }
+
+    if let Some(shadow) = style.box_shadow {
+        paint_box_shadow(pixmap, &shadow, &rect, style.border_radius, clip);
+    }
+    let path = if style.border_radius > 0.5 {
+        rounded_rect_path(
+            visible.x,
+            visible.y,
+            visible.width,
+            visible.height,
+            style.border_radius,
+        )
+    } else {
+        Rect::from_xywh(visible.x, visible.y, visible.width, visible.height).and_then(|rect| {
+            let mut builder = PathBuilder::new();
+            builder.push_rect(rect);
+            builder.finish()
+        })
+    };
+    let Some(path) = path else { return };
+    if style.mask_image.is_none() && !style.background_clip_text {
+        if let Some(color) = style.background_color {
+            let mut paint = Paint::default();
+            paint.set_color(Color::from_rgba8(color[0], color[1], color[2], color[3]));
+            paint.anti_alias = style.border_radius > 0.5;
+            pixmap.fill_path(
+                &path,
+                &paint,
+                FillRule::Winding,
+                Transform::identity(),
+                None,
+            );
+        }
+        if let Some((center, stops)) = &style.background_radial_gradient {
+            paint_radial_gradient(pixmap, &path, &rect, *center, stops);
+        }
+        if let Some((angle, center, stops)) = &style.background_conic_gradient {
+            paint_conic_gradient(pixmap, &rect, *angle, *center, stops);
+        }
+        if let Some((angle, stops)) = &style.background_gradient {
+            paint_linear_gradient(pixmap, &path, &rect, *angle, stops);
+        }
+    }
+    if let Some(mask_url) = &style.mask_image {
+        let fill = style
+            .background_color
+            .or(style.color)
+            .unwrap_or([0, 0, 0, 255]);
+        paint_mask(
+            mask_url,
+            base_url,
+            &visible,
+            fill,
+            style.background_gradient.as_ref(),
+            style.background_conic_gradient.as_ref(),
+            style.mask_size,
+            style.mask_repeat,
+            pixmap,
+            image_cache,
+        );
+    } else if let Some(background_url) = &style.background_image {
+        if let Some(image_rect) = background_image_rect(
+            background_url,
+            base_url,
+            &rect,
+            style.background_size,
+            style.background_size_expression.as_deref(),
+            style.background_size_fit,
+            style.background_position,
+            style.font_size.unwrap_or(16.0),
+            root_font_size,
+            viewport,
+            image_cache,
+        ) {
+            paint_image(
+                background_url,
+                base_url,
+                &image_rect,
+                &visible,
+                crate::ObjectFit::Fill,
+                pixmap,
+                image_cache,
+            );
+        }
+    }
+
+    let border_color = style.border_color.or(style.color).unwrap_or([0, 0, 0, 255]);
+    let mut border_paint = Paint::default();
+    border_paint.set_color(Color::from_rgba8(
+        border_color[0],
+        border_color[1],
+        border_color[2],
+        border_color[3],
+    ));
+    let mut borders = PathBuilder::new();
+    let mut push_edge = |edge: crate::Rect| {
+        let edge = match clip {
+            Some(clip) => edge.intersect(&clip),
+            None => Some(edge),
+        };
+        if let Some(edge) = edge {
+            if let Some(rect) = Rect::from_xywh(edge.x, edge.y, edge.width, edge.height) {
+                borders.push_rect(rect);
+            }
+        }
+    };
+    if style.border.top > 0.0 {
+        push_edge(crate::Rect {
+            x: rect.x,
+            y: rect.y,
+            width: rect.width,
+            height: style.border.top,
+        });
+    }
+    if style.border.right > 0.0 {
+        push_edge(crate::Rect {
+            x: rect.x + rect.width - style.border.right,
+            y: rect.y,
+            width: style.border.right,
+            height: rect.height,
+        });
+    }
+    if style.border.bottom > 0.0 {
+        push_edge(crate::Rect {
+            x: rect.x,
+            y: rect.y + rect.height - style.border.bottom,
+            width: rect.width,
+            height: style.border.bottom,
+        });
+    }
+    if style.border.left > 0.0 {
+        push_edge(crate::Rect {
+            x: rect.x,
+            y: rect.y,
+            width: style.border.left,
+            height: rect.height,
+        });
+    }
+    if let Some(path) = borders.finish() {
+        pixmap.fill_path(
+            &path,
+            &border_paint,
+            FillRule::Winding,
+            Transform::identity(),
+            None,
+        );
+    }
+}
+
 fn paint_positioned_pseudo(
     text_engine: &mut crate::inline::TextEngine,
     pixmap: &mut Pixmap,
@@ -1826,6 +2230,8 @@ fn paint_positioned_pseudo(
     viewport: (f32, f32),
     root_font_size: f32,
     ancestor_clip: Option<crate::Rect>,
+    base_url: Option<&str>,
+    image_cache: &mut std::collections::HashMap<String, Option<Vec<u8>>>,
 ) {
     if style.position != Some(taffy::Position::Absolute) {
         return;
@@ -1876,19 +2282,69 @@ fn paint_positioned_pseudo(
         })
     };
     let Some(path) = path else { return };
-    if let Some(color) = style.background_color {
-        let mut paint = Paint::default();
-        paint.set_color(Color::from_rgba8(color[0], color[1], color[2], color[3]));
-        pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+    if style.mask_image.is_none() {
+        if let Some(color) = style.background_color {
+            let mut paint = Paint::default();
+            paint.set_color(Color::from_rgba8(color[0], color[1], color[2], color[3]));
+            pixmap.fill_path(
+                &path,
+                &paint,
+                FillRule::Winding,
+                Transform::identity(),
+                None,
+            );
+        }
+        if let Some((center, stops)) = &style.background_radial_gradient {
+            paint_radial_gradient(pixmap, &path, &rect, *center, stops);
+        }
+        if let Some((angle, center, stops)) = &style.background_conic_gradient {
+            paint_conic_gradient(pixmap, &rect, *angle, *center, stops);
+        }
+        if let Some((angle, stops)) = &style.background_gradient {
+            paint_linear_gradient(pixmap, &path, &rect, *angle, stops);
+        }
     }
-    if let Some((center, stops)) = &style.background_radial_gradient {
-        paint_radial_gradient(pixmap, &path, &rect, *center, stops);
-    }
-    if let Some((angle, center, stops)) = &style.background_conic_gradient {
-        paint_conic_gradient(pixmap, &rect, *angle, *center, stops);
-    }
-    if let Some((angle, stops)) = &style.background_gradient {
-        paint_linear_gradient(pixmap, &path, &rect, *angle, stops);
+    if let Some(mask_url) = &style.mask_image {
+        let fill = style
+            .background_color
+            .or(style.color)
+            .unwrap_or([0, 0, 0, 255]);
+        paint_mask(
+            mask_url,
+            base_url,
+            &visible,
+            fill,
+            style.background_gradient.as_ref(),
+            style.background_conic_gradient.as_ref(),
+            style.mask_size,
+            style.mask_repeat,
+            pixmap,
+            image_cache,
+        );
+    } else if let Some(bg_url) = &style.background_image {
+        if let Some(image_rect) = background_image_rect(
+            bg_url,
+            base_url,
+            &rect,
+            style.background_size,
+            style.background_size_expression.as_deref(),
+            style.background_size_fit,
+            style.background_position,
+            em,
+            root_font_size,
+            viewport,
+            image_cache,
+        ) {
+            paint_image(
+                bg_url,
+                base_url,
+                &image_rect,
+                &visible,
+                crate::ObjectFit::Fill,
+                pixmap,
+                image_cache,
+            );
+        }
     }
     if let Some(content) = style.before_content.as_deref().filter(|content| !content.is_empty()) {
         let Some(item) = text_engine.push_generated_text(content, style) else { return };
@@ -1940,6 +2396,47 @@ fn collect_image_intrinsics(
         }
     }
     out
+}
+
+/// Add intrinsic metadata for CSS `content:url(...)` images after the first
+/// cascade has exposed their computed URL. Returns true when a new intrinsic
+/// entry was added and layout therefore needs one resource-aware retry.
+fn collect_content_image_intrinsics(
+    tree: &DomTree,
+    styles: &std::collections::HashMap<obscura_dom::tree::NodeId, crate::LayoutStyle>,
+    base_url: Option<&str>,
+    cache: &mut std::collections::HashMap<String, Option<Vec<u8>>>,
+    out: &mut std::collections::HashMap<obscura_dom::tree::NodeId, (f32, f32)>,
+) -> bool {
+    let mut changed = false;
+    for (&nid, style) in styles {
+        let Some(node) = tree.get_node(nid) else {
+            continue;
+        };
+        if node
+            .as_element()
+            .map_or(true, |name| name.local.as_ref() != "img")
+        {
+            continue;
+        }
+        let Some(url) = style.content_image.as_deref() else {
+            continue;
+        };
+        let Some(bytes) = fetch_bytes(url, base_url, cache) else {
+            continue;
+        };
+        let dimensions = image_dimensions(&bytes)
+            .map(|(width, height)| (width as f32, height as f32))
+            .or_else(|| svg_intrinsic(&bytes));
+        let Some((width, height)) = dimensions else {
+            continue;
+        };
+        if width <= 0.0 || height <= 0.0 {
+            continue;
+        }
+        changed |= out.insert(nid, (width, height)) != Some((width, height));
+    }
+    changed
 }
 
 /// Choose the URL to paint for an `<img>`. Browsers do not use `src` alone:
@@ -2317,6 +2814,16 @@ fn is_svg(bytes: &[u8]) -> bool {
 /// Rasterize SVG bytes to a `width` x `height` pixmap, scaled to fit (matching
 /// how a replaced element like `<img>` sizes its intrinsic content).
 fn render_svg(bytes: &[u8], width: u32, height: u32) -> Option<Pixmap> {
+    let fonts = svg_font_database();
+    render_svg_with_font_database(bytes, width, height, &fonts)
+}
+
+fn render_svg_with_font_database(
+    bytes: &[u8],
+    width: u32,
+    height: u32,
+    fonts: &std::sync::Arc<usvg::fontdb::Database>,
+) -> Option<Pixmap> {
     if width == 0 || height == 0 {
         return None;
     }
@@ -2332,6 +2839,8 @@ fn render_svg(bytes: &[u8], width: u32, height: u32) -> Option<Pixmap> {
     // override them, so provide the used viewport as actual root attributes.
     let viewport_svg = svg_with_root_viewport(bytes, width, height)?;
     opts.default_size = usvg::Size::from_wh(width as f32, height as f32)?;
+    opts.font_family = "Liberation Serif".to_string();
+    opts.fontdb = std::sync::Arc::clone(fonts);
     let tree = usvg::Tree::from_data(&viewport_svg, &opts).ok()?;
     let size = tree.size();
     if size.width() <= 0.0 || size.height() <= 0.0 {
@@ -2341,6 +2850,60 @@ fn render_svg(bytes: &[u8], width: u32, height: u32) -> Option<Pixmap> {
     let transform = Transform::from_scale(width as f32 / size.width(), height as f32 / size.height());
     resvg::render(&tree, transform, &mut svg_pixmap.as_mut());
     Some(svg_pixmap)
+}
+
+/// A deterministic font database shared by every SVG raster in the process.
+/// Constructing/scanning a database per icon is far too expensive for pages
+/// with SVG-heavy navigation and would be prohibitive for future repeated
+/// frame capture. The embedded faces are the same stable browser-generic
+/// families used by the HTML text engine.
+fn svg_font_database() -> std::sync::Arc<usvg::fontdb::Database> {
+    static DATABASE: std::sync::OnceLock<std::sync::Arc<usvg::fontdb::Database>> =
+        std::sync::OnceLock::new();
+    std::sync::Arc::clone(DATABASE.get_or_init(|| {
+        let mut database = usvg::fontdb::Database::new();
+        for bytes in [
+            FONT_BYTES,
+            FONT_BOLD_BYTES,
+            FONT_OBLIQUE_BYTES,
+            FONT_BOLD_OBLIQUE_BYTES,
+            SERIF_FONT_BYTES,
+            MONO_FONT_BYTES,
+        ] {
+            database.load_font_data(bytes.to_vec());
+        }
+        database.set_sans_serif_family("Liberation Sans");
+        database.set_serif_family("Liberation Serif");
+        database.set_monospace_family("Liberation Mono");
+        std::sync::Arc::new(database)
+    }))
+}
+
+fn svg_font_database_with_web_fonts(
+    web_fonts: &[crate::inline::WebFont],
+) -> std::sync::Arc<usvg::fontdb::Database> {
+    let base = svg_font_database();
+    if web_fonts.is_empty() {
+        return base;
+    }
+    // `fontdb::Database::clone` shares each binary source; only the page's
+    // already-decoded user fonts allocate here, once per page rather than once
+    // per SVG. HTML shaping needs the same bytes, so retaining both databases
+    // is the cost of keeping the rasterizer and layout engine deterministic.
+    let mut database = (*base).clone();
+    for font in web_fonts {
+        database.load_font_data(font.data.clone());
+    }
+    std::sync::Arc::new(database)
+}
+
+fn has_inline_svg_text(tree: &DomTree) -> bool {
+    tree.descendants(tree.document()).into_iter().any(|nid| {
+        tree.get_node(nid).is_some_and(|node| {
+            node.as_element()
+                .is_some_and(|name| matches!(name.local.as_ref(), "text" | "tspan" | "textPath"))
+        })
+    })
 }
 
 /// Return SVG XML whose root `width`/`height` are the resolved CSS viewport.
@@ -2454,9 +3017,24 @@ fn svg_root_attr_value_range(tag: &str, wanted: &str) -> Option<(usize, usize)> 
 /// explicit closing tag. The root gains an `xmlns` declaration when it lacks
 /// one (common for inline svg, whose namespace is implied by the HTML parser
 /// but required for usvg to parse the string on its own).
+#[cfg(test)]
 fn serialize_svg(tree: &DomTree, root: obscura_dom::tree::NodeId) -> String {
     let mut buf = String::new();
-    serialize_svg_node(tree, root, true, &mut buf);
+    serialize_svg_node(tree, root, true, None, &mut buf);
+    buf
+}
+
+/// Serialize an inline SVG while carrying the page's computed author styling
+/// into the standalone document consumed by resvg. External page stylesheets
+/// are otherwise outside that document, so class-driven SVG text and icons
+/// silently fall back to presentation attributes or SVG defaults.
+fn serialize_svg_styled(
+    tree: &DomTree,
+    root: obscura_dom::tree::NodeId,
+    styles: &std::collections::HashMap<obscura_dom::tree::NodeId, crate::LayoutStyle>,
+) -> String {
+    let mut buf = String::new();
+    serialize_svg_node(tree, root, true, Some(styles), &mut buf);
     buf
 }
 
@@ -2476,7 +3054,13 @@ fn inject_svg_current_color(markup: &mut String, color: [u8; 4]) {
     markup.insert_str(start + "<svg".len(), &attribute);
 }
 
-fn serialize_svg_node(tree: &DomTree, nid: obscura_dom::tree::NodeId, is_root: bool, buf: &mut String) {
+fn serialize_svg_node(
+    tree: &DomTree,
+    nid: obscura_dom::tree::NodeId,
+    is_root: bool,
+    styles: Option<&std::collections::HashMap<obscura_dom::tree::NodeId, crate::LayoutStyle>>,
+    buf: &mut String,
+) {
     let node = match tree.get_node(nid) {
         Some(n) => n,
         None => return,
@@ -2490,7 +3074,7 @@ fn serialize_svg_node(tree: &DomTree, nid: obscura_dom::tree::NodeId, is_root: b
         // Document/comment/PI: no tag of its own, emit only element children.
         None => {
             for child in tree.children(nid) {
-                serialize_svg_node(tree, child, false, buf);
+                serialize_svg_node(tree, child, false, styles, buf);
             }
             return;
         }
@@ -2499,6 +3083,7 @@ fn serialize_svg_node(tree: &DomTree, nid: obscura_dom::tree::NodeId, is_root: b
     buf.push('<');
     buf.push_str(tag);
     let mut has_xmlns = false;
+    let mut source_style: Option<String> = None;
     if let Some(attrs) = node.attrs() {
         for attr in attrs {
             // Emit the local name only, dropping any prefix (`xlink:href` ->
@@ -2517,10 +3102,85 @@ fn serialize_svg_node(tree: &DomTree, nid: obscura_dom::tree::NodeId, is_root: b
             if aname == "xmlns" {
                 has_xmlns = true;
             }
+            if styles.is_some() && aname == "style" {
+                source_style = Some(attr.value.to_string());
+                continue;
+            }
             buf.push(' ');
             buf.push_str(aname);
             buf.push_str("=\"");
             svg_escape_attr(&attr.value, buf);
+            buf.push('"');
+        }
+    }
+    if styles.is_some() {
+        let mut declarations = String::new();
+        if let Some(source) = source_style.as_deref() {
+            declarations.push_str(source.trim());
+            if !declarations.is_empty() && !declarations.ends_with(';') {
+                declarations.push(';');
+            }
+        }
+        let mut append = |name: &str, value: &str| {
+            if value.trim().is_empty() {
+                return;
+            }
+            declarations.push_str(name);
+            declarations.push(':');
+            declarations.push_str(value);
+            declarations.push_str("!important;");
+        };
+        if let Some(computed) = styles.and_then(|all| all.get(&nid)) {
+            if let Some(value) = computed.svg_fill.as_deref() {
+                append(
+                    "fill",
+                    if value.eq_ignore_ascii_case("currentcolor") {
+                        "currentColor"
+                    } else {
+                        value
+                    },
+                );
+            }
+            if let Some(value) = computed.svg_stroke.as_deref() {
+                append(
+                    "stroke",
+                    if value.eq_ignore_ascii_case("currentcolor") {
+                        "currentColor"
+                    } else {
+                        value
+                    },
+                );
+            }
+            if let Some(value) = computed.svg_stroke_width.as_deref() {
+                append("stroke-width", value);
+            }
+            if matches!(tag, "svg" | "text" | "textPath" | "textpath" | "tspan") {
+                if let Some(value) = computed.font_size {
+                    append("font-size", &format!("{value}px"));
+                }
+                if let Some(value) = computed.font_weight.as_deref() {
+                    append("font-weight", value);
+                }
+                if let Some(value) = computed.font_family.as_deref() {
+                    append("font-family", value);
+                }
+                if computed.font_style_italic == Some(true) {
+                    append("font-style", "italic");
+                }
+            }
+            if let Some(color) = computed.color {
+                append(
+                    "color",
+                    &format!("#{:02x}{:02x}{:02x}", color[0], color[1], color[2]),
+                );
+            }
+            if let Some(opacity) = computed.opacity {
+                append("opacity", &opacity.to_string());
+            }
+        }
+        if !declarations.is_empty() {
+            buf.push_str(" style=\"");
+            svg_escape_attr(&declarations, buf);
             buf.push('"');
         }
     }
@@ -2529,7 +3189,7 @@ fn serialize_svg_node(tree: &DomTree, nid: obscura_dom::tree::NodeId, is_root: b
     }
     buf.push('>');
     for child in tree.children(nid) {
-        serialize_svg_node(tree, child, false, buf);
+        serialize_svg_node(tree, child, false, styles, buf);
     }
     buf.push_str("</");
     buf.push_str(tag);
@@ -2626,7 +3286,7 @@ fn inject_external_sprites(
         if symbol_id == root || root_descendants.contains(&symbol_id) {
             continue;
         }
-        serialize_svg_node(tree, symbol_id, false, &mut defs);
+        serialize_svg_node(tree, symbol_id, false, None, &mut defs);
     }
     for (href, url, frag) in &refs {
         let key = format!("{url}#{frag}");
@@ -2939,6 +3599,90 @@ mod tests {
     use obscura_dom::tree_sink::parse_html;
 
     #[test]
+    fn scrolled_viewport_moves_document_content_but_not_fixed_subtrees() {
+        let tree = parse_html(
+            r#"<html style="margin:0"><body style="margin:0">
+                <div style="height:80px;background:#ff0000"></div>
+                <div style="height:80px;background:#0000ff"></div>
+                <div style="position:fixed;z-index:10;left:0;top:0;width:20px;height:20px;background:#00ff00">
+                    <span style="color:#00ff00">x</span>
+                </div>
+            </body></html>"#,
+        );
+        let top = paint_dom_scrolled(&tree, (100.0, 80.0), None, (0.0, 0.0))
+            .expect("top viewport");
+        let scrolled = paint_dom_scrolled(&tree, (100.0, 80.0), None, (0.0, 80.0))
+            .expect("scrolled viewport");
+
+        let top_content = top.pixel(50, 10).expect("top content");
+        assert!(
+            top_content.red() > 240 && top_content.blue() < 15,
+            "top viewport should show first red block: {top_content:?}"
+        );
+        let scrolled_content = scrolled.pixel(50, 10).expect("scrolled content");
+        assert!(
+            scrolled_content.blue() > 240 && scrolled_content.red() < 15,
+            "scrolled viewport should show second blue block: {scrolled_content:?}"
+        );
+        for (name, pixmap) in [("top", &top), ("scrolled", &scrolled)] {
+            let fixed = pixmap.pixel(5, 5).expect("fixed content");
+            assert!(
+                fixed.green() > 240 && fixed.red() < 15 && fixed.blue() < 15,
+                "{name} viewport should keep fixed subtree at the viewport origin: {fixed:?}"
+            );
+        }
+    }
+
+    /// Portable pixel counterpart to the Chromium root-sticky geometry probe
+    /// in obscura-js. It checks that sticky backgrounds and descendants move
+    /// as one painted subtree, bottom sticking is visible, fixed remains
+    /// viewport-anchored, and the top sticky eventually exits at its
+    /// containing-block boundary.
+    #[test]
+    fn root_scroll_sticky_paints_subtrees_and_respects_bottom_boundary() {
+        let tree = parse_html(
+            r#"<html style="margin:0"><body style="margin:0;background:#220022">
+                <div style="height:40px;background:#ffffff"></div>
+                <div style="box-sizing:border-box;height:900px;padding:10px 12px;border:4px solid #333;background:#dddddd">
+                    <div style="box-sizing:border-box;position:sticky;top:20px;height:60px;margin:6px;background:#ff0000">
+                        <div style="height:12px;background:#0000ff"></div>
+                    </div>
+                    <div style="height:500px"></div>
+                    <div style="box-sizing:border-box;position:sticky;bottom:15px;height:50px;margin:5px;background:#ff8800"></div>
+                </div>
+                <div style="height:700px;background:#220022"></div>
+                <div style="position:fixed;z-index:10;left:600px;top:20px;width:60px;height:60px;background:#00ff00"></div>
+            </body></html>"#,
+        );
+        let viewport = (800.0, 513.0);
+        let top = paint_dom_scrolled(&tree, viewport, None, (0.0, 0.0)).unwrap();
+        let stuck = paint_dom_scrolled(&tree, viewport, None, (0.0, 100.0)).unwrap();
+        let bottom_normal =
+            paint_dom_scrolled(&tree, viewport, None, (0.0, 400.0)).unwrap();
+        let boundary =
+            paint_dom_scrolled(&tree, viewport, None, (0.0, 9999.0)).unwrap();
+
+        let is_color = |pixel: tiny_skia::PremultipliedColorU8, rgb: [u8; 3]| {
+            (pixel.red() as i16 - rgb[0] as i16).abs() < 8
+                && (pixel.green() as i16 - rgb[1] as i16).abs() < 8
+                && (pixel.blue() as i16 - rgb[2] as i16).abs() < 8
+        };
+        assert!(is_color(top.pixel(100, 80).unwrap(), [255, 0, 0]));
+        assert!(is_color(top.pixel(100, 460).unwrap(), [255, 136, 0]));
+        assert!(is_color(stuck.pixel(100, 25).unwrap(), [0, 0, 255]));
+        assert!(is_color(stuck.pixel(100, 50).unwrap(), [255, 0, 0]));
+        assert!(is_color(stuck.pixel(100, 460).unwrap(), [255, 136, 0]));
+        assert!(is_color(
+            bottom_normal.pixel(100, 240).unwrap(),
+            [255, 136, 0]
+        ));
+        assert!(is_color(boundary.pixel(100, 20).unwrap(), [34, 0, 34]));
+        for pixmap in [&top, &stuck, &bottom_normal, &boundary] {
+            assert!(is_color(pixmap.pixel(620, 30).unwrap(), [0, 255, 0]));
+        }
+    }
+
+    #[test]
     fn object_fit_contain_and_cover_center_and_preserve_aspect() {
         // A 200x100 box (2:1) with a square 100x100 image, offset so centering
         // is checked against the box origin, not (0,0).
@@ -3086,6 +3830,146 @@ mod tests {
         assert_eq!(
             (outside.red(), outside.green(), outside.blue()),
             (255, 255, 255)
+        );
+    }
+
+    #[test]
+    fn paints_generated_style_images_and_sizes_content_url_as_replaced_content() {
+        let tree = parse_html(
+            r#"<html><head><style>
+               body { margin:0 }
+               #host { position:relative; width:100px; height:40px }
+               #host::before {
+                 content:""; position:absolute; left:0; top:0;
+                 width:40px; height:40px;
+                 background-image:url("data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='40'%20height='40'%3E%3Crect%20width='40'%20height='40'%20fill='blue'/%3E%3C/svg%3E");
+                 background-size:100% 100%;
+               }
+               #host::after {
+                 content:""; position:absolute; left:50px; top:0;
+                 width:40px; height:40px; background-color:red;
+                 mask-image:url("data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='40'%20height='40'%3E%3Ccircle%20cx='20'%20cy='20'%20r='16'%20fill='white'/%3E%3C/svg%3E");
+                 mask-size:40px 40px; mask-repeat:no-repeat;
+               }
+               #content-image {
+                 display:block;
+                 content:url("data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='30'%20height='20'%3E%3Crect%20width='30'%20height='20'%20fill='lime'/%3E%3C/svg%3E");
+               }
+               </style></head><body>
+                 <div id="host"></div><img id="content-image" alt="">
+               </body></html>"#,
+        );
+
+        // The first cascade exposes the style image. Feeding its decoded
+        // dimensions back through the ordinary intrinsic map must give the
+        // source-less replaced element its 30x20 CSS box.
+        let mut intrinsic = std::collections::HashMap::new();
+        let first = layout_dom_with_web_fonts(&tree, (120.0, 80.0), &intrinsic, &[]);
+        let host_id = tree
+            .query_selector("#host")
+            .expect("selector")
+            .expect("host");
+        let host_style = &first.styles[&host_id];
+        assert!(
+            host_style
+                .before_pseudo
+                .as_deref()
+                .and_then(|style| style.background_image.as_deref())
+                .is_some(),
+            "the positioned pseudo must retain its parsed URL background"
+        );
+        assert!(
+            host_style
+                .after_pseudo
+                .as_deref()
+                .and_then(|style| style.mask_image.as_deref())
+                .is_some(),
+            "the positioned pseudo must retain its parsed URL mask"
+        );
+        let host_rect = first.rects[&host_id];
+        assert_eq!(
+            (host_rect.x, host_rect.y, host_rect.width, host_rect.height),
+            (0.0, 0.0, 100.0, 40.0)
+        );
+        let mut cache = std::collections::HashMap::new();
+        assert!(collect_content_image_intrinsics(
+            &tree,
+            &first.styles,
+            None,
+            &mut cache,
+            &mut intrinsic,
+        ));
+        let laid = layout_dom_with_web_fonts(&tree, (120.0, 80.0), &intrinsic, &[]);
+        let image_id = tree
+            .query_selector("#content-image")
+            .expect("selector")
+            .expect("content image");
+        let image_rect = laid.rects[&image_id];
+        assert_eq!(
+            (
+                image_rect.x,
+                image_rect.y,
+                image_rect.width,
+                image_rect.height
+            ),
+            (0.0, 40.0, 30.0, 20.0),
+            "content:url must use ordinary replaced-element geometry"
+        );
+
+        let pixmap = paint_dom(&tree, (120.0, 80.0), None).expect("pixmap");
+        let blue = pixmap.pixel(20, 20).expect("blue pseudo");
+        assert!(
+            blue.blue() > 220 && blue.red() < 40 && blue.green() < 80,
+            "positioned pseudo background-image must paint: {blue:?}"
+        );
+        let red = pixmap.pixel(70, 20).expect("masked pseudo center");
+        assert!(
+            red.red() > 220 && red.green() < 40 && red.blue() < 40,
+            "positioned pseudo mask center must use the authored fill: {red:?}"
+        );
+        let transparent_corner = pixmap.pixel(51, 1).expect("mask corner");
+        assert_eq!(
+            (
+                transparent_corner.red(),
+                transparent_corner.green(),
+                transparent_corner.blue(),
+            ),
+            (255, 255, 255),
+            "transparent mask corners must not paint the pseudo's solid box"
+        );
+        let green = pixmap.pixel(15, 50).expect("content image");
+        assert!(
+            green.green() > 220 && green.red() < 40 && green.blue() < 40,
+            "content:url image must paint through the replaced-image path: {green:?}"
+        );
+    }
+
+    #[test]
+    fn paints_empty_in_flow_generated_block_at_its_layout_rect() {
+        let tree = parse_html(
+            r#"<html><head><style>
+               html, body { margin:0 }
+               body { font-size:20px; line-height:20px }
+               #host { width:200px }
+               #host::before {
+                 content:""; display:block; width:80px; height:40px;
+                 margin-bottom:10px; background:#0066cc;
+               }
+               #next { width:20px; height:10px; background:#00aa00 }
+               </style></head><body>
+                 <div id="host">TEXT</div><div id="next"></div>
+               </body></html>"#,
+        );
+        let pixmap = paint_dom(&tree, (240.0, 100.0), None).expect("pixmap");
+        let generated = pixmap.pixel(40, 20).expect("generated block pixel");
+        assert!(
+            generated.blue() > 180 && generated.green() > 70 && generated.red() < 30,
+            "the anonymous generated box must paint its own background: {generated:?}"
+        );
+        let following = pixmap.pixel(10, 75).expect("following block pixel");
+        assert!(
+            following.green() > 120 && following.red() < 30 && following.blue() < 30,
+            "the following block must paint below the generated geometry: {following:?}"
         );
     }
 
@@ -3248,6 +4132,40 @@ mod tests {
     }
 
     #[test]
+    fn transformed_image_is_clipped_inside_overflow_border() {
+        // CSS overflow clipping belongs to the owner's padding box. The
+        // translated images paint after the viewport's border in tree order,
+        // so a border-box clip would let them overwrite the border.
+        let tree = parse_html(
+            r#"<html><body style="margin:0">
+               <div style="width:100px;height:60px;overflow:hidden;
+                           border:4px solid red">
+                 <div style="display:flex;transform:translate(-50px,0)">
+                   <img alt="" src="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='100'%20height='60'%3E%3Crect%20width='100'%20height='60'%20fill='blue'/%3E%3C/svg%3E"
+                        style="width:100px;height:60px;object-fit:cover;flex-shrink:0">
+                   <img alt="" src="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='100'%20height='60'%3E%3Crect%20width='100'%20height='60'%20fill='blue'/%3E%3C/svg%3E"
+                        style="width:100px;height:60px;object-fit:cover;flex-shrink:0">
+                 </div>
+               </div>
+               </body></html>"#,
+        );
+        let pixmap = paint_dom(&tree, (140.0, 90.0), None).expect("pixmap");
+
+        for &(x, y) in &[(0, 30), (3, 30), (104, 30), (107, 30), (50, 0), (50, 67)] {
+            let pixel = pixmap.pixel(x, y).expect("border pixel");
+            assert!(
+                pixel.red() > 220 && pixel.green() < 40 && pixel.blue() < 40,
+                "translated image must not overwrite border pixel ({x},{y}): {pixel:?}"
+            );
+        }
+        let content = pixmap.pixel(50, 30).expect("content pixel");
+        assert!(
+            content.blue() > 220 && content.red() < 40,
+            "translated cover image must remain visible inside padding box: {content:?}"
+        );
+    }
+
+    #[test]
     fn translate_offscreen_box_is_not_painted() {
         // translate(-10000px,0) shoves the box far off the left edge (the old
         // hidden skip-link idiom); it must not paint anywhere on the canvas.
@@ -3377,6 +4295,50 @@ mod tests {
         assert!(
             usvg::Tree::from_data(out.as_bytes(), &opts).is_ok(),
             "usvg should parse serialized svg: {out}",
+        );
+    }
+
+    #[test]
+    fn inline_svg_keeps_author_css_and_embedded_text_fonts() {
+        // Inline SVG is parsed in the HTML document and styled by the page's
+        // author sheet, then serialized into a standalone document for resvg.
+        // The standalone boundary must not erase a CSS fill/font and inherit
+        // the root's `fill:none`, which made text-only illustrations blank.
+        let tree = parse_html(
+            r##"<html><head><style>
+                .art > text {
+                    fill:#00cc55;
+                    font-family:sans-serif;
+                    font-size:24px;
+                    font-weight:400
+                }
+                </style></head><body style="margin:0">
+                <svg class="art" width="120" height="50"
+                     viewBox="0 0 120 50" fill="none">
+                    <text x="4" y="32">SVG text</text>
+                </svg>
+                </body></html>"##,
+        );
+        let svg = tree.query_selector("svg").unwrap().unwrap();
+        let layout = crate::dom::layout_dom(&tree, (160.0, 80.0));
+        let markup = serialize_svg_styled(&tree, svg, &layout.styles);
+        assert!(
+            markup.contains("fill:#00cc55!important"),
+            "computed author fill must cross the standalone boundary: {markup}"
+        );
+        assert!(
+            markup.contains("font-size:24px!important"),
+            "computed SVG font size must cross the standalone boundary: {markup}"
+        );
+
+        let pixmap = paint_dom(&tree, (160.0, 80.0), None).expect("pixmap");
+        let painted_green = pixmap
+            .pixels()
+            .iter()
+            .any(|pixel| pixel.green() > 150 && pixel.red() < 80 && pixel.blue() < 120);
+        assert!(
+            painted_green,
+            "author-styled SVG text should rasterize with embedded fonts"
         );
     }
 
@@ -3583,6 +4545,48 @@ mod tests {
                 .iter()
                 .any(|pixel| pixel.red() > 180 && pixel.green() < 60 && pixel.blue() < 100),
             "injected currentColor symbol should inherit target SVG color: {markup}",
+        );
+    }
+
+    #[test]
+    fn svg_light_dark_presentation_is_resolved_before_usvg() {
+        let tree = parse_html(
+            r#"<style>
+               #dark { color-scheme:dark }
+               #dark rect {
+                 fill:light-dark(#c3c7cb,#51565d);
+                 stroke:light-dark(#ffffff,#000000);
+               }
+               </style>
+               <div id="dark">
+                 <svg id="icon" width="10" height="10" viewBox="0 0 10 10">
+                   <rect width="10" height="10"/>
+                 </svg>
+               </div>"#,
+        );
+        let laid = crate::dom::layout_dom(&tree, (100.0, 100.0));
+        let svg = tree.query_selector("#icon").unwrap().unwrap();
+        let markup = serialize_svg_styled(&tree, svg, &laid.styles);
+        assert!(
+            !markup.to_ascii_lowercase().contains("light-dark("),
+            "unsupported CSS Color 5 syntax must not reach usvg: {markup}"
+        );
+        assert!(
+            markup.contains("fill:#51565dff!important")
+                && markup.contains("stroke:#000000ff!important"),
+            "serialized presentation colors must use the dark subtree scheme: {markup}"
+        );
+        let pixmap =
+            render_svg(markup.as_bytes(), 10, 10).expect("resolved SVG renders");
+        let center = pixmap.pixel(5, 5).expect("center pixel");
+        assert!(
+            center.red() > 60
+                && center.red() < 110
+                && center.green() > 60
+                && center.green() < 120
+                && center.blue() > 70
+                && center.blue() < 130,
+            "resolved dark fill must survive usvg rasterization: {center:?}"
         );
     }
 

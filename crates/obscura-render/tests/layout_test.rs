@@ -931,6 +931,164 @@ fn non_stretched_auto_grid_item_shrink_wraps_inside_grid_area() {
 }
 
 #[test]
+fn percentage_max_width_clamps_grid_item_intrinsic_size() {
+    let tree = parse_html(
+        r#"
+        <style>
+          body { margin: 0 }
+          #grid { display: grid; width: 1200px }
+          #item { max-width: 100% }
+          #gallery { display: flex; gap: 8px }
+          .column { flex: none; height: 20px }
+        </style>
+        <div id="grid">
+          <div id="item">
+            <div id="gallery">
+              <div class="column" style="width:303px"></div>
+              <div class="column" style="width:200px"></div>
+              <div class="column" style="width:500px"></div>
+              <div class="column" style="width:200px"></div>
+              <div class="column" style="width:293px"></div>
+            </div>
+          </div>
+        </div>
+        "#,
+    );
+    let layout = layout_dom(&tree, (1280.0, 200.0));
+    let grid = layout.rects[&tree.get_element_by_id("grid").unwrap()];
+    let item = layout.rects[&tree.get_element_by_id("item").unwrap()];
+    let gallery = layout.rects[&tree.get_element_by_id("gallery").unwrap()];
+    assert!(
+        (grid.width - 1200.0).abs() < 0.01
+            && (item.width - 1200.0).abs() < 0.01
+            && (gallery.width - 1200.0).abs() < 0.01,
+        "max-width:100% must clamp the grid item while its flex contents overflow: \
+         grid={grid:?} item={item:?} gallery={gallery:?}"
+    );
+}
+
+#[test]
+fn named_area_shorthand_survives_end_longhand_override() {
+    let tree = parse_html(
+        r#"
+        <style>
+          body { margin: 0 }
+          #grid {
+            display: grid;
+            width: 1200px;
+            grid-template-columns:
+              [extended-full-start] 16px
+              [full-start] 200px
+              [content-start] 768px
+              [content-end] 200px
+              [full-end] 16px
+              [extended-full-end];
+          }
+          #grid > * { grid-column: content }
+          #hero { grid-column-end: extended-full-end }
+        </style>
+        <div id="grid"><div id="hero"></div></div>
+        "#,
+    );
+    let layout = layout_dom(&tree, (1280.0, 200.0));
+    let hero = layout.rects[&tree.get_element_by_id("hero").unwrap()];
+    assert!(
+        (hero.x - 216.0).abs() < 0.01 && (hero.width - 984.0).abs() < 0.01,
+        "the end longhand must retain the shorthand's named content start: {hero:?}"
+    );
+}
+
+#[test]
+fn auto_width_flex_button_keeps_native_intrinsic_sizing() {
+    let tree = parse_html(
+        r#"
+        <style>
+          body { margin: 0 }
+          #box { width: 600px }
+          button {
+            display: flex;
+            margin: 0 auto;
+            padding: 19px 24px;
+            border: 2px solid;
+            gap: 6px;
+            font-size: 24px;
+          }
+          button::before { content: ""; width: 1em; height: 1em }
+        </style>
+        <div id="box"><button id="search">Search</button></div>
+        "#,
+    );
+    let layout = layout_dom(&tree, (800.0, 200.0));
+    let button = layout.rects[&tree.get_element_by_id("search").unwrap()];
+    assert!(
+        button.width > 120.0
+            && button.width < 220.0
+            && (button.x - (600.0 - button.width) / 2.0).abs() < 0.01,
+        "the auto-width flex button should shrink-wrap and center: {button:?}"
+    );
+}
+
+#[test]
+fn flex_auto_margin_absorbs_space_before_justify_content() {
+    let tree = parse_html(
+        r#"
+        <style>
+          body { margin: 0 }
+          #bar {
+            display: flex;
+            width: 1280px;
+            gap: 16px;
+            justify-content: flex-end;
+          }
+          #crumb { width: 42px; height: 20px; margin: 0 auto 0 0 }
+          #theme { width: 91px; height: 20px }
+          #language { width: 131px; height: 20px }
+        </style>
+        <div id="bar">
+          <div id="crumb"></div>
+          <div id="theme"></div>
+          <div id="language"></div>
+        </div>
+        "#,
+    );
+    let layout = layout_dom(&tree, (1280.0, 200.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    let crumb = rect("crumb");
+    let theme = rect("theme");
+    let language = rect("language");
+    assert!(
+        (crumb.x - 0.0).abs() < 0.01
+            && (theme.x - 1042.0).abs() < 0.01
+            && (language.x - 1149.0).abs() < 0.01,
+        "main-axis auto margin must consume free space before justify-content: \
+         crumb={crumb:?} theme={theme:?} language={language:?}"
+    );
+}
+
+#[test]
+fn nested_is_descendant_utility_blockifies_matching_lines() {
+    let tree = parse_html(
+        r#"
+        <style>
+          pre { display: flex }
+          code code { position: relative }
+          :is(.\*\*\:\[\.line\]\:block *).line { display: block }
+        </style>
+        <div class="**:[.line]:block">
+          <pre><code><code><span id="one" class="line">one</span><span id="two" class="line">two</span></code></code></pre>
+        </div>
+        "#,
+    );
+    let layout = layout_dom(&tree, (500.0, 200.0));
+    let one = tree.get_element_by_id("one").unwrap();
+    let two = tree.get_element_by_id("two").unwrap();
+    assert_eq!(layout.styles[&one].display, obscura_render::Display::Block);
+    assert_eq!(layout.styles[&two].display, obscura_render::Display::Block);
+    assert!(layout.rects[&two].y > layout.rects[&one].y);
+    assert_eq!(layout.rects[&one].width, layout.rects[&two].width);
+}
+
+#[test]
 fn opposing_floats_share_header_band_through_inline_wrapper() {
     let tree = parse_html(include_str!("../../../render-repros/opposing-header-floats.html"));
     let layout = layout_dom(&tree, (900.0, 1000.0));
@@ -1167,4 +1325,305 @@ fn contextual_right_inset_uses_root_font_tokens() {
         (rect.x - 744.0).abs() < 0.01,
         "right inset should place 100px box at 900 - 56 - 100: {rect:?}"
     );
+}
+
+#[test]
+fn false_legacy_supports_probe_does_not_override_modern_line_height() {
+    // Tailwind v4 uses this old-browser probe around a leading-variable reset.
+    // Chromium rejects the condition. Flattening every @supports body made
+    // the reset win, invalidated the var(), and inflated three 96px lines from
+    // 288px to an inherited 432px.
+    let tree = parse_html(
+        r#"
+        <style>
+          @supports (((-webkit-hyphens:none)) and
+                    (not (margin-trim:inline))) or
+                    ((-moz-orient:inline) and
+                    (not (color:rgb(from red r g b)))) {
+            * { --leading:initial }
+          }
+          :root { --hero-line-height:1 }
+          body { margin:0; line-height:1.5 }
+          #hero {
+            margin:0;
+            width:600px;
+            font-size:96px;
+            line-height:var(--leading,var(--hero-line-height))
+          }
+        </style>
+        <h1 id="hero">one<br>two<br>three</h1>
+        "#,
+    );
+    let layout = layout_dom(&tree, (1280.0, 720.0));
+    let hero = layout.rects[&tree.get_element_by_id("hero").unwrap()];
+    assert!(
+        (hero.height - 288.0).abs() < 0.01,
+        "three 96px modern lines should be 288px tall: {hero:?}"
+    );
+}
+
+#[test]
+fn custom_property_css_wide_keywords_preserve_var_fallback_semantics() {
+    let tree = parse_html(
+        r#"
+        <style>
+          :root {
+            --tone:#112233;
+            --light:initial;
+            --toggle:var(--light) #18191b;
+            --page:var(--toggle,#ffffff)
+          }
+          #invalid { --tone:initial; color:var(--tone,#445566) }
+          #inherited { --tone:unset; color:var(--tone,#445566) }
+          #nested { background-color:var(--page) }
+        </style>
+        <div id="invalid">fallback</div>
+        <div id="inherited">inherit</div>
+        <div id="nested">nested fallback</div>
+        "#,
+    );
+    let layout = layout_dom(&tree, (800.0, 600.0));
+    let invalid = tree.get_element_by_id("invalid").unwrap();
+    let inherited = tree.get_element_by_id("inherited").unwrap();
+    let nested = tree.get_element_by_id("nested").unwrap();
+    assert_eq!(
+        layout.styles[&invalid].color,
+        Some([0x44, 0x55, 0x66, 0xff]),
+        "`initial` is guaranteed-invalid and var() must use its fallback"
+    );
+    assert_eq!(
+        layout.styles[&inherited].color,
+        Some([0x11, 0x22, 0x33, 0xff]),
+        "`unset` inherits a custom property's parent value"
+    );
+    assert_eq!(
+        layout.styles[&nested].background_color,
+        Some([0xff, 0xff, 0xff, 0xff]),
+        "an invalid nested custom property must activate the outer fallback"
+    );
+}
+
+#[test]
+fn stable_root_scrollbar_gutter_reduces_the_initial_containing_block() {
+    let tree = parse_html(
+        r#"
+        <style>
+          html { overflow-y:auto; scrollbar-gutter:stable }
+          body { margin:0 }
+          #fill { width:100%; height:40px }
+          #center { width:401px; height:40px; margin-inline:auto }
+        </style>
+        <div id="fill"></div>
+        <div id="center"></div>
+        "#,
+    );
+    let layout = layout_dom(&tree, (900.0, 600.0));
+    let fill = layout.rects[&tree.get_element_by_id("fill").unwrap()];
+    let center = layout.rects[&tree.get_element_by_id("center").unwrap()];
+    assert!(
+        (fill.width - 885.0).abs() < 0.01,
+        "stable classic gutter should reserve 15px: {fill:?}"
+    );
+    assert!(
+        (center.x - 242.0).abs() < 0.01,
+        "401px box should center in the 885px ICB: {center:?}"
+    );
+}
+
+#[test]
+fn auto_grid_track_freezes_at_growth_limit_during_distribution() {
+    // The first auto track reaches its max-content growth limit before the
+    // second. The remaining free space belongs only to the second track.
+    // Giving the frozen track that remainder again makes the grid overflow
+    // even though the two automatic minimums fit the definite container.
+    let tree = parse_html(
+        r#"
+        <style>
+          * { box-sizing:border-box }
+          html, body { margin:0 }
+          #grid {
+            display:grid;
+            width:1016px;
+            grid-template-columns:auto auto;
+            grid-template-rows:320px;
+            column-gap:16px;
+          }
+          #copy {
+            grid-column:1;
+            font:400 48px/57.6px sans-serif;
+          }
+          #art {
+            grid-column:2;
+            overflow:hidden;
+          }
+          #art > div { width:560px; height:560px }
+        </style>
+        <div id="grid">
+          <h1 id="copy">Resources for Developers,<br> by Developers</h1>
+          <div id="art"><div></div></div>
+        </div>
+        "#,
+    );
+    let layout = layout_dom(&tree, (1280.0, 720.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    let grid = rect("grid");
+    let copy = rect("copy");
+    let art = rect("art");
+    assert!(
+        ((copy.x + copy.width + 16.0) - art.x).abs() < 0.01,
+        "the authored column gap must separate the final tracks: {copy:?} {art:?}"
+    );
+    assert!(
+        ((art.x + art.width) - (grid.x + grid.width)).abs() < 0.01,
+        "free-space redistribution must not grow a track after it freezes: {grid:?} {copy:?} {art:?}"
+    );
+}
+
+#[test]
+fn empty_block_before_participates_in_normal_flow_geometry() {
+    let tree = parse_html(
+        r#"
+        <style>
+          html, body { margin:0 }
+          body { font-size:20px; line-height:20px }
+          #host { width:200px; background:#eee }
+          #host::before {
+            content:"";
+            display:block;
+            width:80px;
+            height:40px;
+            margin-bottom:10px;
+            background:#06c;
+          }
+          #next { width:20px; height:10px; background:#0a0 }
+        </style>
+        <div id="host">TEXT</div><div id="next"></div>
+        "#,
+    );
+    let layout = layout_dom(&tree, (800.0, 600.0));
+    let host = layout.rects[&tree.get_element_by_id("host").unwrap()];
+    let next = layout.rects[&tree.get_element_by_id("next").unwrap()];
+    assert!(
+        (host.height - 70.0).abs() < 0.01,
+        "40px generated block + 10px margin + 20px line must size host: {host:?}"
+    );
+    assert!(
+        (next.y - 70.0).abs() < 0.01,
+        "following flow content must start after generated geometry: {next:?}"
+    );
+}
+
+#[test]
+fn empty_inline_block_pseudo_is_an_atomic_flex_item() {
+    let tree = parse_html(
+        r#"
+        <style>
+          html, body { margin:0 }
+          #host { display:flex; width:100px; height:20px }
+          #host::before {
+            content:"";
+            display:inline-block;
+            width:.5em;
+            height:.5em;
+            margin-right:5px;
+            border:2px solid #06c;
+          }
+          #label { width:20px; height:10px }
+        </style>
+        <div id="host"><span id="label"></span></div>
+        "#,
+    );
+    let layout = layout_dom(&tree, (800.0, 600.0));
+    let label = layout.rects[&tree.get_element_by_id("label").unwrap()];
+    assert!(
+        (label.x - 17.0).abs() < 0.01,
+        "8px pseudo content width + 2px borders + 5px margin must precede label: {label:?}"
+    );
+}
+
+#[test]
+fn light_dark_uses_the_final_inherited_color_scheme_across_the_cascade() {
+    let tree = parse_html(
+        r#"
+        <style>
+          :root {
+            --surface:light-dark(#f5f5f5,#18191b);
+          }
+          #dark {
+            background-color:var(--surface);
+            color:light-dark(#111111,#eeeeee);
+            border:1px solid light-dark(#dddddd,#333333);
+          }
+          #dark {
+            color-scheme:dark;
+          }
+          #dark::before {
+            content:"";
+            display:block;
+            width:10px;
+            height:10px;
+            background:light-dark(#ff0000,#0000ff);
+          }
+          #child {
+            background-image:linear-gradient(
+              light-dark(#ffffff,#101010),
+              light-dark(#eeeeee,#202020)
+            );
+          }
+          #icon rect {
+            fill:light-dark(#c3c7cb,#51565d);
+            stroke:light-dark(#ffffff,#000000);
+          }
+          #mixed {
+            background:light-dark(#abcdef,#123456);
+            color-scheme:light dark;
+          }
+        </style>
+        <section id="dark">
+          <div id="child"></div>
+          <svg id="icon"><rect width="10" height="10"/></svg>
+        </section>
+        <div id="mixed"></div>
+        "#,
+    );
+    let layout = layout_dom(&tree, (800.0, 600.0));
+    let dark = tree.get_element_by_id("dark").unwrap();
+    let child = tree.get_element_by_id("child").unwrap();
+    let mixed = tree.get_element_by_id("mixed").unwrap();
+    let rect = tree.query_selector("#icon rect").unwrap().unwrap();
+
+    let dark_style = &layout.styles[&dark];
+    assert!(dark_style.color_scheme_dark);
+    assert_eq!(dark_style.background_color, Some([0x18, 0x19, 0x1b, 0xff]));
+    assert_eq!(dark_style.color, Some([0xee, 0xee, 0xee, 0xff]));
+    assert_eq!(dark_style.border_color, Some([0x33, 0x33, 0x33, 0xff]));
+    assert_eq!(
+        dark_style
+            .before_pseudo
+            .as_deref()
+            .and_then(|pseudo| pseudo.background_color),
+        Some([0x00, 0x00, 0xff, 0xff]),
+        "pseudo must use its host's inherited dark scheme"
+    );
+
+    let child_style = &layout.styles[&child];
+    assert!(child_style.color_scheme_dark);
+    let (_, stops) = child_style
+        .background_gradient
+        .as_ref()
+        .expect("dark gradient");
+    assert_eq!(stops[0].0, [0x10, 0x10, 0x10, 0xff]);
+    assert_eq!(stops[1].0, [0x20, 0x20, 0x20, 0xff]);
+
+    let rect_style = &layout.styles[&rect];
+    assert!(rect_style.color_scheme_dark);
+    assert_eq!(rect_style.svg_fill.as_deref(), Some("#51565dff"));
+    assert_eq!(rect_style.svg_stroke.as_deref(), Some("#000000ff"));
+
+    let mixed_style = &layout.styles[&mixed];
+    assert!(
+        !mixed_style.color_scheme_dark,
+        "a scheme list admitting light uses the current light preference"
+    );
+    assert_eq!(mixed_style.background_color, Some([0xab, 0xcd, 0xef, 0xff]));
 }
