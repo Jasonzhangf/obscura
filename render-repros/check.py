@@ -5,6 +5,8 @@ Behavior assertions are based on solid-color component geometry, so font
 anti-aliasing does not decide pass/fail. Pair metrics are diagnostics only:
 they use the full equal-sized canvas with no registration, cropping, blank-page
 exclusion, or opaque aggregate "parity" verdict.
+Structural diagnostics include both lossy row/column projections and a
+bidirectional nearest-edge distance that preserves two-dimensional placement.
 """
 
 import json
@@ -13,7 +15,14 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
-from scipy.ndimage import find_objects, gaussian_filter, gaussian_filter1d, label, sobel
+from scipy.ndimage import (
+    distance_transform_edt,
+    find_objects,
+    gaussian_filter,
+    gaussian_filter1d,
+    label,
+    sobel,
+)
 
 
 def rgb(value):
@@ -60,6 +69,41 @@ def structural_edges(array):
     return magnitude > 48.0
 
 
+def bidirectional_edge_distance(ours_edges, chromium_edges):
+    """Return symmetric nearest-edge distances in native CSS-pixel space.
+
+    Row and column projections intentionally discard the other coordinate, so
+    two layouts can have identical projections while their boxes occupy
+    different quadrants. A distance transform retains both coordinates. Each
+    engine contributes equally instead of allowing the denser edge map to
+    dominate the score.
+    """
+    ours_count = int(ours_edges.sum())
+    chromium_count = int(chromium_edges.sum())
+    if ours_count == 0 and chromium_count == 0:
+        return {
+            "edge_bidirectional_mean_distance_px": 0.0,
+            "edge_bidirectional_p95_distance_px": 0.0,
+        }
+    if ours_count == 0 or chromium_count == 0:
+        return {
+            "edge_bidirectional_mean_distance_px": None,
+            "edge_bidirectional_p95_distance_px": None,
+        }
+
+    distance_to_chromium = distance_transform_edt(~chromium_edges)[ours_edges]
+    distance_to_ours = distance_transform_edt(~ours_edges)[chromium_edges]
+    mean_distance = (distance_to_chromium.mean() + distance_to_ours.mean()) / 2.0
+    p95_distance = (
+        np.percentile(distance_to_chromium, 95)
+        + np.percentile(distance_to_ours, 95)
+    ) / 2.0
+    return {
+        "edge_bidirectional_mean_distance_px": round(float(mean_distance), 6),
+        "edge_bidirectional_p95_distance_px": round(float(p95_distance), 6),
+    }
+
+
 def pair_metrics(ours, chromium):
     if ours.shape != chromium.shape:
         return {"size_mismatch": [list(ours.shape), list(chromium.shape)]}
@@ -103,7 +147,8 @@ def pair_metrics(ours, chromium):
     )
     edge_row_projection = float(np.abs(ours_edge_rows - chromium_edge_rows).mean() / width)
     edge_col_projection = float(np.abs(ours_edge_cols - chromium_edge_cols).mean() / height)
-    return {
+    edge_distance = bidirectional_edge_distance(ours_edges, chromium_edges)
+    metrics = {
         "rgb_mae": round(float(delta.mean() / 255.0), 6),
         "pixels_gt_10": round(float((max_channel > 10).mean()), 6),
         "pixels_gt_50": round(float((max_channel > 50).mean()), 6),
@@ -118,6 +163,8 @@ def pair_metrics(ours, chromium):
         "edge_row_projection_delta": round(edge_row_projection, 6),
         "edge_column_projection_delta": round(edge_col_projection, 6),
     }
+    metrics.update(edge_distance)
+    return metrics
 
 
 def main():
@@ -171,7 +218,8 @@ def main():
             f"p>50={metrics.get('pixels_gt_50', '-'):>8} "
             f"edge_bbox={metrics.get('edge_bbox_max_delta', '-'):>3} "
             f"edge_row={metrics.get('edge_row_projection_delta', '-'):>8} "
-            f"edge_col={metrics.get('edge_column_projection_delta', '-'):>8}"
+            f"edge_col={metrics.get('edge_column_projection_delta', '-'):>8} "
+            f"edge_2d={metrics.get('edge_bidirectional_mean_distance_px', '-'):>8}"
         )
 
     report["failures"] = failures

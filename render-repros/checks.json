@@ -126,6 +126,12 @@
     {"name": "grid shorthand creates explicit columns", "color": "#087f5b", "width": 287, "height": 60, "count": 3},
     {"name": "custom property grid shorthand creates explicit columns", "color": "#1971c2", "width": 287, "height": 60, "count": 3}
   ],
+  "img-density-and-alt": [
+    {"name": "raw intrinsic image keeps its 648 CSS pixel width", "color": "#ff0000", "width": 652},
+    {"name": "2x density descriptor halves the intrinsic CSS width", "color": "#ff0000", "width": 328},
+    {"name": "width descriptor and sizes establish a 300 pixel source size", "color": "#ff0000", "width": 304},
+    {"name": "overflow viewport retains its fixed border geometry", "color": "#ff0000", "width": 304, "height": 104}
+  ],
   "inline-block-flex-items": [
     {"name": "inline block title keeps its max content width", "color": "#087f5b", "x": 32, "y": 0, "width": 350, "height": 20},
     {"name": "inline block list shrink wraps and stacks children", "color": "#1971c2", "x": 525, "y": 0, "width": 90, "height": 60},
@@ -202,6 +208,10 @@
     {"name": "inline wrapper exposes left float to header BFC", "color": "#1971c2", "x": 0, "y": 0, "width": 200, "height": 100},
     {"name": "opposing float shares the same band", "color": "#e8590c", "x": 600, "y": 60, "width": 300, "height": 40},
     {"name": "cleared navigation follows the float band", "color": "#087f5b", "x": 0, "y": 100, "width": 900, "height": 50}
+  ],
+  "percentage-height-indefinite-parent": [
+    {"name": "content sizes the indefinite percentage-height chain", "color": "#087f5b", "x": 0, "y": 0, "height": 24},
+    {"name": "following flow starts after the content-sized chain", "color": "#e8590c", "x": 0, "y": 24, "width": 400, "height": 20}
   ],
   "relative-box-edges": [
     {"name": "vh margin resolves against viewport height", "color": "#087f5b", "x": 0, "y": 150, "width": 100, "height": 40},
