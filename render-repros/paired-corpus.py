@@ -4,8 +4,9 @@
 Every run uses a new output directory, checks process status and non-empty
 screenshots, records browser versions and timings, and reports raw full-canvas
 pixel diagnostics plus background-tolerant structural-edge diagnostics from
-check.py. Browser identity is pinned and Chromium's DOM/text fingerprints,
-viewport geometry, and resource-readiness state are recorded at capture time.
+check.py. Browser identity is pinned and both engines record DOM/text
+fingerprints, viewport geometry, and JS-visible resource-readiness state at
+capture time.
 It deliberately emits no aggregate parity verdict. An optional pre-change
 Obscura binary can be captured concurrently so regressions are compared
 against the same live-page moment.
@@ -99,30 +100,76 @@ def parse_scroll_y(value):
 
 
 def scroll_eval_expression(scroll):
-    if scroll is None:
-        return None
-    scroll_x, scroll_y = scroll
-    requested_y = (
-        "document.documentElement.scrollHeight"
-        if scroll_y == "bottom"
-        else str(scroll_y)
-    )
+    """Compatibility wrapper used by older callers and focused tests."""
+    return obscura_state_eval_expression(scroll)
+
+
+def obscura_state_eval_expression(scroll):
+    """Sample the live page after an optional scroll and immediately before paint."""
+    scroll_script = ""
+    requested = "null"
+    if scroll is not None:
+        scroll_x, scroll_y = scroll
+        requested_y = (
+            "document.documentElement.scrollHeight"
+            if scroll_y == "bottom"
+            else str(scroll_y)
+        )
+        scroll_script = (
+            f"const requestedX={scroll_x},requestedY={requested_y};"
+            "window.scrollTo(requestedX,requestedY);"
+        )
+        requested = "{x:requestedX,y:requestedY}"
     return (
         "(()=>{"
-        f"const requestedX={scroll_x},requestedY={requested_y};"
-        "window.scrollTo(requestedX,requestedY);"
+        + scroll_script
+        + "const root=document.documentElement,body=document.body;"
+        "const dom=root?root.outerHTML:'';"
+        "const text=body?body.innerText.replace(/\\s+/g,' ').trim():'';"
+        "const images=Array.from(document.images||[]),fonts=document.fonts;"
+        "const hash=value=>{let h=2166136261;"
+        "for(let i=0;i<value.length;i++){h^=value.charCodeAt(i);"
+        "h=Math.imul(h,16777619)}"
+        "return ('00000000'+(h>>>0).toString(16)).slice(-8)};"
         "return JSON.stringify({"
-        "requested:{x:requestedX,y:requestedY},"
-        "actual:{x:window.scrollX,y:window.scrollY},"
-        "viewport:{width:innerWidth,height:innerHeight},"
-        "content:{width:document.documentElement.scrollWidth,"
-        "height:document.documentElement.scrollHeight}"
+        "sampled_phase:'immediately-before-screenshot',"
+        f"requested:{requested},"
+        "url:location.href,"
+        "document:{ready_state:document.readyState,"
+        "element_count:document.getElementsByTagName('*').length,"
+        "outer_html_utf16:dom.length,outer_html_fnv1a32:hash(dom),"
+        "visible_text_utf16:text.length,visible_text_fnv1a32:hash(text)},"
+        "geometry:{inner_width:innerWidth,inner_height:innerHeight,"
+        "scroll_x:scrollX,scroll_y:scrollY,"
+        "document_client_width:root?root.clientWidth:null,"
+        "document_client_height:root?root.clientHeight:null,"
+        "document_scroll_width:root?root.scrollWidth:null,"
+        "document_scroll_height:root?root.scrollHeight:null,"
+        "body_client_width:body?body.clientWidth:null,"
+        "body_client_height:body?body.clientHeight:null,"
+        "body_scroll_width:body?body.scrollWidth:null,"
+        "body_scroll_height:body?body.scrollHeight:null},"
+        "fonts:{supported:!!fonts,status:fonts?fonts.status:null,"
+        "face_count:fonts?Array.from(fonts).length:null,"
+        "ready_at_sample:fonts?fonts.status==='loaded':null},"
+        "images:{total:images.length,"
+        "complete:images.filter(image=>image.complete).length,"
+        "complete_with_pixels:images.filter(image=>image.complete&&image.naturalWidth>0).length,"
+        "complete_without_pixels:images.filter(image=>image.complete&&image.naturalWidth===0).length,"
+        "pending:images.filter(image=>!image.complete).length,"
+        "lazy:images.filter(image=>image.loading==='lazy').length},"
+        "media:{"
+        "prefers_color_scheme_light:matchMedia('(prefers-color-scheme: light)').matches,"
+        "prefers_color_scheme_dark:matchMedia('(prefers-color-scheme: dark)').matches,"
+        "prefers_reduced_motion_no_preference:matchMedia('(prefers-reduced-motion: no-preference)').matches,"
+        "prefers_reduced_motion_reduce:matchMedia('(prefers-reduced-motion: reduce)').matches}"
         "})"
         "})()"
     )
 
 
-def parse_obscura_scroll_report(stdout):
+def parse_obscura_capture_report(stdout):
+    """Parse the CLI's evaluation plus authoritative screenshot capture state."""
     for line in reversed(stdout.splitlines()):
         try:
             report = json.loads(line)
@@ -138,25 +185,47 @@ def parse_obscura_scroll_report(stdout):
                 evaluated = json.loads(evaluated)
             except json.JSONDecodeError:
                 evaluated = None
+        if not isinstance(evaluated, dict):
+            continue
+        state = dict(evaluated)
+        geometry = dict(state.get("geometry") or {})
         capture = report["captureState"]
-        requested = evaluated.get("requested") if isinstance(evaluated, dict) else None
-        return {
-            "requested": requested,
-            "actual": {
-                "x": capture.get("scrollX"),
-                "y": capture.get("scrollY"),
-            },
-            "viewport": {
-                "width": capture.get("innerWidth"),
-                "height": capture.get("innerHeight"),
-            },
-            "content": {
-                "width": capture.get("scrollWidth"),
-                "height": capture.get("scrollHeight"),
-            },
-            "sampled_phase": "immediately-before-screenshot",
-        }
+        # These values come from the exact prepared render used by screenshot,
+        # so they take precedence over the JS sample if the two ever diverge.
+        geometry.update(
+            {
+                "inner_width": capture.get("innerWidth"),
+                "inner_height": capture.get("innerHeight"),
+                "scroll_x": capture.get("scrollX"),
+                "scroll_y": capture.get("scrollY"),
+                "document_scroll_width": capture.get("scrollWidth"),
+                "document_scroll_height": capture.get("scrollHeight"),
+            }
+        )
+        state["geometry"] = geometry
+        state["sampled_phase"] = "immediately-before-screenshot"
+        return state
     return None
+
+
+def parse_obscura_scroll_report(stdout):
+    state = parse_obscura_capture_report(stdout)
+    if state is None:
+        return None
+    geometry = state.get("geometry") or {}
+    return {
+        "requested": state.get("requested"),
+        "actual": {"x": geometry.get("scroll_x"), "y": geometry.get("scroll_y")},
+        "viewport": {
+            "width": geometry.get("inner_width"),
+            "height": geometry.get("inner_height"),
+        },
+        "content": {
+            "width": geometry.get("document_scroll_width"),
+            "height": geometry.get("document_scroll_height"),
+        },
+        "sampled_phase": state["sampled_phase"],
+    }
 
 
 def obscura_environment(width, height):
@@ -308,28 +377,41 @@ def capture_obscura(
         "--wait",
         f"{settle_ms / 1000:g}",
     ]
-    scroll_expression = scroll_eval_expression(scroll)
-    if scroll_expression is not None:
-        command.extend(["--eval", scroll_expression])
+    state_expression = obscura_state_eval_expression(scroll)
+    command.extend(["--eval", state_expression])
     started = time.time()
     try:
         result = subprocess.run(
             command, capture_output=True, text=True, timeout=75, env=env
         )
         log.write_text(result.stdout + result.stderr)
-        scroll_state = None
-        if scroll_expression is not None and result.returncode == 0:
-            scroll_state = parse_obscura_scroll_report(result.stdout)
+        state = (
+            parse_obscura_capture_report(result.stdout)
+            if result.returncode == 0
+            else None
+        )
+        if state is not None:
+            media = state.get("media") or {}
+            media["matches_configured"] = media_matches_configured(media)
+            state["media"] = media
+        scroll_state = (
+            parse_obscura_scroll_report(result.stdout)
+            if scroll is not None and state is not None
+            else None
+        )
         ok = (
             result.returncode == 0
             and screenshot.is_file()
             and screenshot.stat().st_size > 0
-            and (scroll_expression is None or scroll_state is not None)
+            and state is not None
+            and state["media"]["matches_configured"]
+            and (scroll is None or scroll_state is not None)
         )
         return {
             "ok": ok,
             "status": result.returncode,
             "elapsed_s": round(time.time() - started, 3),
+            "state": state,
             "scroll_state": scroll_state,
         }
     except subprocess.TimeoutExpired as error:
@@ -398,6 +480,14 @@ def capture_chromium_state(page):
             return Array.from(new Uint8Array(digest), byte =>
               byte.toString(16).padStart(2, "0")).join("");
           }
+          function fnv1a32(value) {
+            let hash = 2166136261;
+            for (let index = 0; index < value.length; index++) {
+              hash ^= value.charCodeAt(index);
+              hash = Math.imul(hash, 16777619);
+            }
+            return (hash >>> 0).toString(16).padStart(8, "0");
+          }
 
           const root = document.documentElement;
           const body = document.body;
@@ -434,8 +524,12 @@ def capture_chromium_state(page):
             document: {
               ready_state: document.readyState,
               element_count: document.getElementsByTagName("*").length,
+              outer_html_utf16: dom.length,
+              outer_html_fnv1a32: fnv1a32(dom),
               outer_html_bytes: new TextEncoder().encode(dom).length,
               outer_html_sha256: await sha256(dom),
+              visible_text_utf16: normalizedText.length,
+              visible_text_fnv1a32: fnv1a32(normalizedText),
               visible_text_bytes: new TextEncoder().encode(normalizedText).length,
               visible_text_sha256: await sha256(normalizedText),
             },
@@ -525,6 +619,70 @@ def write_results(path, manifest):
     path.write_text(json.dumps(manifest, indent=2) + "\n")
 
 
+def compare_page_states(obscura, chromium):
+    """Return explicit same-page and geometry deltas; never infer a parity verdict."""
+    obscura_document = (obscura or {}).get("document") or {}
+    chromium_document = (chromium or {}).get("document") or {}
+    obscura_geometry = (obscura or {}).get("geometry") or {}
+    chromium_geometry = (chromium or {}).get("geometry") or {}
+
+    def delta(left, right):
+        if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+            return left - right
+        return None
+
+    geometry_fields = (
+        "inner_width",
+        "inner_height",
+        "scroll_x",
+        "scroll_y",
+        "document_client_width",
+        "document_client_height",
+        "document_scroll_width",
+        "document_scroll_height",
+        "body_client_width",
+        "body_client_height",
+        "body_scroll_width",
+        "body_scroll_height",
+    )
+    return {
+        "url_equal": (obscura or {}).get("url") == (chromium or {}).get("url"),
+        "ready_state_equal": (
+            obscura_document.get("ready_state")
+            == chromium_document.get("ready_state")
+        ),
+        "element_count_delta": delta(
+            obscura_document.get("element_count"),
+            chromium_document.get("element_count"),
+        ),
+        "outer_html_utf16_delta": delta(
+            obscura_document.get("outer_html_utf16"),
+            chromium_document.get("outer_html_utf16"),
+        ),
+        "visible_text_utf16_delta": delta(
+            obscura_document.get("visible_text_utf16"),
+            chromium_document.get("visible_text_utf16"),
+        ),
+        "outer_html_fingerprint_equal": (
+            obscura_document.get("outer_html_fnv1a32") is not None
+            and obscura_document.get("outer_html_fnv1a32")
+            == chromium_document.get("outer_html_fnv1a32")
+        ),
+        "visible_text_fingerprint_equal": (
+            obscura_document.get("visible_text_fnv1a32") is not None
+            and obscura_document.get("visible_text_fnv1a32")
+            == chromium_document.get("visible_text_fnv1a32")
+        ),
+        "geometry_delta": {
+            field: delta(
+                obscura_geometry.get(field),
+                chromium_geometry.get(field),
+            )
+            for field in geometry_fields
+        },
+    }
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("urls", help="one URL per line; # comments allowed")
@@ -609,10 +767,9 @@ def main():
         "state_observability": {
             "chromium": "same page, sampled immediately before screenshot",
             "obscura": (
-                "identity and JS media probed on a data URL; CSS media behavior "
-                "verified by a separate pixel probe; controlled-scroll captures "
-                "record the same live page's requested/clamped offset, viewport, "
-                "and content size immediately before paint"
+                "same live page sampled immediately before screenshot; the CLI "
+                "captureState records the exact shared PreparedRender viewport, "
+                "scroll offset, and content size used by paint"
             ),
         },
         "methodology_limits": {
@@ -621,12 +778,21 @@ def main():
                 "fidelity verdict"
             ),
             "controlled_scroll": (
-                "Obscura currently computes CSSOM scroll metrics in an "
-                "asset-light JS layout cache, while screenshot paint performs "
-                "a separate resource-aware layout. Recorded scroll offsets "
-                "therefore prove API state but do not by themselves prove that "
-                "both images show the same semantic bottom. Inspect landmarks "
-                "and content-height deltas until those layouts are shared."
+                "CSSOM and screenshot paint share one resource-aware "
+                "PreparedRender. Content-size and scroll deltas are exact for "
+                "each captured engine, but different DOM/resource states can "
+                "still make semantic bottom landmarks differ."
+            ),
+            "page_state": (
+                "DOM/text fingerprints and length deltas expose different live "
+                "page states. They are provenance tripwires, not proof that "
+                "equal states contain equal layout or that unequal serialized "
+                "DOM necessarily represents a rendering failure."
+            ),
+            "resource_readiness": (
+                "Obscura's DOM image/font readiness is sampled before paint; "
+                "paint may then fetch retained renderer resources that are not "
+                "reflected back into HTMLImageElement or FontFaceSet state."
             ),
         },
         "pages": [],
@@ -788,6 +954,23 @@ def main():
                 page_result["obscura"] = ours_future.result()
                 if baseline_future:
                     page_result["baseline"] = baseline_future.result()
+
+                if chrome_ok and page_result["obscura"]["ok"]:
+                    page_result["page_state_comparison"] = compare_page_states(
+                        page_result["obscura"].get("state"),
+                        chromium_state,
+                    )
+                if (
+                    chrome_ok
+                    and baseline_future
+                    and page_result["baseline"]["ok"]
+                ):
+                    page_result["baseline_page_state_comparison"] = (
+                        compare_page_states(
+                            page_result["baseline"].get("state"),
+                            chromium_state,
+                        )
+                    )
 
                 if (
                     controlled_scroll is not None

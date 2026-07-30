@@ -54,6 +54,59 @@ class ControlledScrollTests(unittest.TestCase):
         self.assertEqual(state["content"]["height"], 2702)
         self.assertEqual(state["sampled_phase"], "immediately-before-screenshot")
 
+    def test_every_capture_expression_samples_page_state_without_scrolling(self):
+        expression = paired_corpus.obscura_state_eval_expression(None)
+        self.assertIn("outer_html_fnv1a32", expression)
+        self.assertIn("visible_text_fnv1a32", expression)
+        self.assertNotIn("window.scrollTo", expression)
+
+    def test_capture_report_keeps_dom_state_and_authoritative_geometry(self):
+        stdout = (
+            '{"evaluation":"{\\"document\\":{\\"ready_state\\":\\"complete\\",'
+            '\\"element_count\\":7,\\"outer_html_fnv1a32\\":\\"12345678\\"},'
+            '\\"geometry\\":{\\"document_scroll_height\\":999}}",'
+            '"captureState":{"scrollX":3,"scrollY":40,'
+            '"innerWidth":640,"innerHeight":480,'
+            '"scrollWidth":650,"scrollHeight":1200}}\n'
+        )
+        state = paired_corpus.parse_obscura_capture_report(stdout)
+        self.assertEqual(state["document"]["element_count"], 7)
+        self.assertEqual(state["geometry"]["scroll_y"], 40)
+        self.assertEqual(state["geometry"]["document_scroll_height"], 1200)
+
+    def test_page_state_comparison_reports_provenance_and_geometry_deltas(self):
+        obscura = {
+            "document": {
+                "ready_state": "complete",
+                "element_count": 9,
+                "outer_html_utf16": 100,
+                "visible_text_utf16": 30,
+                "outer_html_fnv1a32": "aaaaaaaa",
+                "visible_text_fnv1a32": "bbbbbbbb",
+            },
+            "geometry": {"document_scroll_height": 1200, "scroll_y": 300},
+        }
+        chromium = {
+            "document": {
+                "ready_state": "complete",
+                "element_count": 7,
+                "outer_html_utf16": 95,
+                "visible_text_utf16": 30,
+                "outer_html_fnv1a32": "cccccccc",
+                "visible_text_fnv1a32": "bbbbbbbb",
+            },
+            "geometry": {"document_scroll_height": 1000, "scroll_y": 250},
+        }
+        comparison = paired_corpus.compare_page_states(obscura, chromium)
+        self.assertTrue(comparison["ready_state_equal"])
+        self.assertEqual(comparison["element_count_delta"], 2)
+        self.assertFalse(comparison["outer_html_fingerprint_equal"])
+        self.assertTrue(comparison["visible_text_fingerprint_equal"])
+        self.assertEqual(
+            comparison["geometry_delta"]["document_scroll_height"], 200
+        )
+        self.assertEqual(comparison["geometry_delta"]["scroll_y"], 50)
+
     def test_scroll_y_parser_accepts_bottom_and_integer(self):
         self.assertEqual(paired_corpus.parse_scroll_y("bottom"), "bottom")
         self.assertEqual(paired_corpus.parse_scroll_y("-20"), -20)
