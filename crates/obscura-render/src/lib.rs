@@ -212,6 +212,10 @@ pub struct LayoutStyle {
     /// size when percentage dimensions are resolved through an auto-sized
     /// wrapper (`img { width:100%; height:auto }`).
     pub intrinsic_size: Option<(f32, f32)>,
+    /// The current ratio came from HTML width/height presentation hints
+    /// (`<img>` or its selected `<picture><source>`), rather than authored
+    /// CSS. A decoded image's natural ratio replaces this provisional ratio.
+    pub aspect_ratio_is_mapped: bool,
     pub margin: Edges,
     /// Which margin sides are `auto` (top, right, bottom, left). `margin: 0
     /// auto` / `margin-inline: auto` centering needs a real Auto margin, which

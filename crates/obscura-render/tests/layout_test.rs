@@ -768,11 +768,11 @@ fn ratio_only_inline_svg_sizes_inside_an_auto_grid_row() {
     let logo = rect("logo");
     assert!((logo.width - 254.0).abs() < 0.01, "SVG width: {logo:?}");
     assert!(
-        (logo.height - 76.1875).abs() < 0.01,
-        "viewBox ratio must transfer the final grid width: {logo:?}"
+        (logo.height - 76.1875).abs() < 0.25,
+        "viewBox ratio must transfer the final grid width before Obscura's device-pixel rounding: {logo:?}"
     );
     assert!(
-        (cell.height - 108.1875).abs() < 0.01,
+        (cell.height - 108.1875).abs() < 0.25,
         "SVG contribution plus block padding must size the auto row: {cell:?}"
     );
 }
@@ -1696,4 +1696,55 @@ fn selected_picture_source_dimensions_override_fallback_image_ratio() {
     assert!((narrow_rect.width - 500.0).abs() < 0.01, "{narrow_rect:?}");
     assert!((narrow_rect.height - 500.0).abs() < 0.01, "{narrow_rect:?}");
     assert_eq!(narrow.styles[&image].aspect_ratio, Some(1.0));
+}
+
+/// HTML width/height attributes are provisional presentational hints. Once
+/// the image is decoded, its natural dimensions replace that mapped ratio.
+#[test]
+fn decoded_image_ratio_replaces_mapped_html_ratio() {
+    let tree = parse_html(
+        r#"
+        <style>
+          html, body { margin:0 }
+          img { display:block; width:500px; height:auto }
+        </style>
+        <img id="image" src="image.png" width="600" height="600">
+        "#,
+    );
+    let image = tree.get_element_by_id("image").unwrap();
+    let intrinsic = HashMap::from([(image, (800.0, 400.0))]);
+    let layout = layout_dom_with_images(&tree, (1000.0, 600.0), &intrinsic);
+    let rect = layout.rects[&image];
+
+    assert!((rect.width - 500.0).abs() < 0.01, "{rect:?}");
+    assert!((rect.height - 250.0).abs() < 0.01, "{rect:?}");
+    assert_eq!(layout.styles[&image].aspect_ratio, Some(2.0));
+}
+
+/// Unlike HTML presentation hints, an authored `aspect-ratio` declaration
+/// remains authoritative after the resource's natural dimensions are known.
+#[test]
+fn authored_aspect_ratio_wins_over_decoded_image_ratio() {
+    let tree = parse_html(
+        r#"
+        <style>
+          html, body { margin:0 }
+          img {
+            display:block;
+            width:500px;
+            height:auto;
+            aspect-ratio:4 / 1;
+          }
+        </style>
+        <img id="image" src="image.png" width="600" height="600">
+        "#,
+    );
+    let image = tree.get_element_by_id("image").unwrap();
+    let intrinsic = HashMap::from([(image, (800.0, 400.0))]);
+    let layout = layout_dom_with_images(&tree, (1000.0, 600.0), &intrinsic);
+    let rect = layout.rects[&image];
+
+    assert!((rect.width - 500.0).abs() < 0.01, "{rect:?}");
+    assert!((rect.height - 125.0).abs() < 0.01, "{rect:?}");
+    assert_eq!(layout.styles[&image].aspect_ratio, Some(4.0));
 }

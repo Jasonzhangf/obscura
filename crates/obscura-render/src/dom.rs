@@ -633,6 +633,7 @@ fn apply_presentational_hints(node: &obscura_dom::tree::Node, style: &mut crate:
         if let (Some(w), Some(h)) = (aw, ah) {
             if w > 0.0 && h > 0.0 {
                 style.aspect_ratio = Some(w / h);
+                style.aspect_ratio_is_mapped = true;
             }
         }
     }
@@ -762,6 +763,7 @@ fn apply_picture_source_hints(
         (Some(width), Some(height)) => Some(width / height),
         _ => None,
     };
+    style.aspect_ratio_is_mapped = style.aspect_ratio.is_some();
 }
 
 /// Compute the UA + author style for every element in preorder, maintaining
@@ -2021,8 +2023,9 @@ pub(crate) fn layout_dom_with_web_fonts(
             }
             if let Some(s) = styles.get_mut(&nid) {
                 s.intrinsic_size = Some((iw, ih));
-                if s.aspect_ratio.is_none() {
+                if s.aspect_ratio.is_none() || s.aspect_ratio_is_mapped {
                     s.aspect_ratio = Some(iw / ih);
+                    s.aspect_ratio_is_mapped = false;
                 }
                 let w_auto = matches!(s.width, crate::Dimension::Auto);
                 let h_auto = matches!(s.height, crate::Dimension::Auto);
@@ -4573,6 +4576,19 @@ fn build(
     if _name.local.as_ref() == "svg" {
         if let Some(ratio) = style.aspect_ratio.filter(|ratio| ratio.is_finite() && *ratio > 0.0)
         {
+            // A percentage inline size inside an auto grid track is cyclic
+            // during intrinsic sizing: it behaves as auto for the contribution
+            // pass, then fills the final track. Taffy 0.12 keeps the intrinsic
+            // fallback width instead of revisiting that percentage. Express
+            // the final fill as grid self-stretch so the known content width
+            // reaches the replaced-item measure callback.
+            if matches!(style.width, crate::Dimension::Percent(_))
+                && matches!(style.height, crate::Dimension::Auto)
+            {
+                taffy_style.size.width = taffy::Dimension::auto();
+                taffy_style.min_size.width = taffy::Dimension::length(0.0);
+                taffy_style.justify_self = Some(taffy::AlignSelf::STRETCH);
+            }
             // A viewBox supplies a ratio but no intrinsic dimensions. The
             // 300px default inline size is CSS Images' default object size;
             // the ratio supplies the corresponding block size. Definite CSS

@@ -468,7 +468,10 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
             style.max_height = dimension_value(value);
             style.size_expressions[5] = deferred_length_expression(value);
         }
-        "aspect-ratio" => style.aspect_ratio = parse_aspect_ratio(value),
+        "aspect-ratio" => {
+            style.aspect_ratio = parse_aspect_ratio(value);
+            style.aspect_ratio_is_mapped = false;
+        }
         "margin" => apply_margin_shorthand(style, value),
         "margin-top" => set_margin_side(style, 0, value),
         "margin-right" => set_margin_side(style, 1, value),
