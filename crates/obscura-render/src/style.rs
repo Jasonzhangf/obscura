@@ -549,6 +549,8 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                     | "inline-grid"
                     | "block"
                     | "flow-root"
+                    | "table"
+                    | "inline-table"
                     | "contents"
             ) {
                 style.internal_flex_container = false;
@@ -569,6 +571,19 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                 "block" => style.display = crate::Display::Block,
                 "flow-root" => {
                     style.display = crate::Display::Block;
+                    style.flow_root = true;
+                }
+                // Taffy has no table formatting mode. Preserve the important
+                // outer-display and BFC semantics instead of ignoring these
+                // values and retaining a stale earlier `display` winner.
+                // Native HTML tables still take the dedicated table builder.
+                "table" => {
+                    style.display = crate::Display::Block;
+                    style.flow_root = true;
+                }
+                "inline-table" => {
+                    style.display = crate::Display::Inline;
+                    style.is_inline_block = true;
                     style.flow_root = true;
                 }
                 "contents" => {
@@ -4462,6 +4477,15 @@ mod tests {
         let flow_root = compute_style("div", Some("display: flow-root"));
         assert_eq!(flow_root.display, Display::Block);
         assert!(flow_root.flow_root);
+
+        let table = compute_style("div", Some("display:none; display:table"));
+        assert_eq!(table.display, Display::Block);
+        assert!(table.flow_root);
+
+        let inline_table = compute_style("div", Some("display:block; display:inline-table"));
+        assert_eq!(inline_table.display, Display::Inline);
+        assert!(inline_table.is_inline_block);
+        assert!(inline_table.flow_root);
     }
 
     #[test]
