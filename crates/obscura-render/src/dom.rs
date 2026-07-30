@@ -4950,6 +4950,23 @@ fn build(
 
     let mut taffy_style = to_taffy_style(style);
 
+    // A non-stretched flex item in a column flex container uses fit-content
+    // for its auto inline size. In a nested flex layout taffy can retain the
+    // item's earlier max-content measurement after the outer row shrinks its
+    // column, so direct prose stays one enormous line instead of being
+    // remeasured at the final column width (MDN's contributor quote).
+    //
+    // Taffy has no fit-content box-size value. For the narrow text-container
+    // case, a synthetic percentage max has the same final effect: it is
+    // indefinite during intrinsic measurement, then caps the item to its
+    // containing block once that width is known. The automatic min-content
+    // size still wins for an unbreakable word, preserving intentional
+    // overflow. Keep the workaround away from replaced/atomic boxes and
+    // authored sizing constraints.
+    if needs_column_flex_text_fit_content_cap(tree, id, style, styles) {
+        taffy_style.max_size.width = taffy::Dimension::percent(1.0);
+    }
+
     // A grid item's automatic minimum size is clamped by a definite
     // max-width. Taffy's intrinsic track pass cannot resolve a percentage max
     // until the track exists, so `max-width:100%` otherwise participates with
@@ -5753,6 +5770,90 @@ fn build_mixed_block(
     };
     id_map.insert(taffy_id, id);
     Some(taffy_id)
+}
+
+fn needs_column_flex_text_fit_content_cap(
+    tree: &DomTree,
+    id: NodeId,
+    style: &crate::LayoutStyle,
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+) -> bool {
+    if style.display != crate::Display::Flex
+        || style.internal_flex_container
+        || style.is_inline_block
+        || style.float.is_some()
+        || matches!(style.position, Some(taffy::Position::Absolute))
+        || style.aspect_ratio.is_some()
+        || !matches!(
+            (style.width, style.min_width, style.max_width),
+            (
+                crate::Dimension::Auto,
+                crate::Dimension::Auto,
+                crate::Dimension::Auto
+            )
+        )
+        || style.size_expressions[0].is_some()
+        || style.size_expressions[2].is_some()
+        || style.size_expressions[4].is_some()
+        || style.padding.left != 0.0
+        || style.padding.right != 0.0
+        || style.border.left != 0.0
+        || style.border.right != 0.0
+        || style.margin.left != 0.0
+        || style.margin.right != 0.0
+        || style.margin_auto[1]
+        || style.margin_auto[3]
+        || style.margin_percent[1].is_some()
+        || style.margin_percent[3].is_some()
+        || style.margin_relative[1].is_some()
+        || style.margin_relative[3].is_some()
+        || style.margin_expressions[1].is_some()
+        || style.margin_expressions[3].is_some()
+    {
+        return false;
+    }
+
+    let has_direct_text = tree.children(id).into_iter().any(|child| {
+        tree.get_node(child).map_or(false, |node| {
+            matches!(
+                &node.data,
+                obscura_dom::tree::NodeData::Text { contents }
+                    if !contents.trim().is_empty()
+            )
+        })
+    });
+    if !has_direct_text {
+        return false;
+    }
+
+    let mut parent = tree.get_node(id).and_then(|node| node.parent);
+    let parent_style = loop {
+        let Some(parent_id) = parent else {
+            return false;
+        };
+        let Some(parent_style) = styles.get(&parent_id) else {
+            return false;
+        };
+        if parent_style.display_contents {
+            parent = tree.get_node(parent_id).and_then(|node| node.parent);
+            continue;
+        }
+        break parent_style;
+    };
+    if parent_style.display != crate::Display::Flex
+        || parent_style.internal_flex_container
+        || !matches!(
+            parent_style.flex_direction,
+            Some(taffy::FlexDirection::Column | taffy::FlexDirection::ColumnReverse)
+        )
+    {
+        return false;
+    }
+
+    style
+        .align_self
+        .unwrap_or(parent_style.align_items.unwrap_or(taffy::AlignItems::STRETCH))
+        != taffy::AlignSelf::STRETCH
 }
 
 /// Expand `display: contents` wrappers so their children partition into the
@@ -6742,6 +6843,87 @@ mod tests {
         let quote = laid.rects[&tree.get_element_by_id("quote").unwrap()];
         assert!((quote.width - 300.0).abs() < 0.1, "{quote:?}");
         assert!((quote.height - 60.0).abs() < 0.1, "{quote:?}");
+    }
+
+    #[test]
+    fn auto_width_column_flex_text_uses_fit_content_width() {
+        // Chromium 145: the outer row leaves 533px beside the fixed 203px
+        // sibling and 32px gap. The auto-width quote is fit-content, so its
+        // direct anonymous text item reflows to five 24px lines. Measuring it
+        // only at max-content instead produces a 2097px-wide, 24px-tall line.
+        let tree = parse_html(
+            r#"<style>
+               * { box-sizing: border-box }
+               body { margin: 0; font: 16px/24px "Liberation Sans" }
+               #row { display: flex; gap: 32px; width: 768px }
+               #column {
+                 display: flex;
+                 flex-direction: column;
+                 align-items: flex-start;
+               }
+               #quote { display: flex; gap: 8px; margin: 0 }
+               #quote::before {
+                 content: "";
+                 display: block;
+                 flex-shrink: 0;
+                 width: 16px;
+                 height: 16px;
+               }
+               #logo { width: 203px; height: 128px; flex-shrink: 0 }
+               </style>
+               <section id="row">
+                 <div id="column"><blockquote id="quote">MDN closely follows W3C standards which helps me keep up with important topics. It's a complete package as it caters to everything; complex APIs, new browser functionalities, and best practices. MDN serves as a truly valuable resource and continues to assist me in my everyday development.</blockquote></div>
+                 <div id="logo"></div>
+               </section>"#,
+        );
+        let laid = layout_dom(&tree, (1280.0, 720.0));
+        let rect = |id| laid.rects[&tree.get_element_by_id(id).unwrap()];
+        let row = rect("row");
+        let column = rect("column");
+        let quote = rect("quote");
+        let logo = rect("logo");
+        assert!((row.width - 768.0).abs() < 0.1, "{row:?}");
+        assert!((row.height - 128.0).abs() < 0.1, "{row:?}");
+        assert!((column.width - 533.0).abs() < 0.1, "{column:?}");
+        assert!((quote.width - 533.0).abs() < 0.1, "{quote:?}");
+        assert!((quote.height - 120.0).abs() < 0.1, "{quote:?}");
+        assert!((logo.x - 565.0).abs() < 0.1, "{logo:?}");
+        assert!((logo.width - 203.0).abs() < 0.1, "{logo:?}");
+    }
+
+    #[test]
+    fn column_flex_fit_content_preserves_unbreakable_min_content() {
+        // Chromium 145 keeps the unbreakable quote at 2561.25px and lets the
+        // constrained row overflow. The synthetic fit-content cap must not
+        // turn an intrinsic min-content floor into overflow-wrap:anywhere.
+        let word = "X".repeat(240);
+        let tree = parse_html(&format!(
+            r#"<style>
+               * {{ box-sizing: border-box }}
+               body {{ margin: 0; font: 16px/24px "Liberation Sans" }}
+               #row {{ display: flex; gap: 32px; width: 768px }}
+               #column {{
+                 display: flex;
+                 flex-direction: column;
+                 align-items: flex-start;
+               }}
+               #quote {{ display: flex; margin: 0 }}
+               #logo {{ width: 203px; height: 128px; flex-shrink: 0 }}
+               </style>
+               <section id="row">
+                 <div id="column"><blockquote id="quote">{word}</blockquote></div>
+                 <div id="logo"></div>
+               </section>"#
+        ));
+        let laid = layout_dom(&tree, (1280.0, 720.0));
+        let rect = |id| laid.rects[&tree.get_element_by_id(id).unwrap()];
+        let column = rect("column");
+        let quote = rect("quote");
+        let logo = rect("logo");
+        assert!(quote.width > 2500.0, "{quote:?}");
+        assert!((column.width - quote.width).abs() < 0.1, "{column:?} {quote:?}");
+        assert!((quote.height - 24.0).abs() < 0.1, "{quote:?}");
+        assert!((logo.x - quote.width - 32.0).abs() < 0.1, "{logo:?}");
     }
 
     #[test]
