@@ -1121,7 +1121,9 @@ class Node {
     const t = this.nodeType;
     if (t === 3 || t === 8) _dom("set_text_content", this._nid, String(v ?? ""));
   }
-  get parentNode() { return _wrap(+_dom("parent_node", this._nid)); }
+  get parentNode() {
+    return this._shadowParent || _wrap(+_dom("parent_node", this._nid));
+  }
   get parentElement() { const p = this.parentNode; return p && p.nodeType === 1 ? p : null; }
   get childNodes() {
     const ids = _domParse("child_nodes", this._nid) || [];
@@ -1129,8 +1131,22 @@ class Node {
   }
   get firstChild() { return _wrap(+_dom("first_child", this._nid)); }
   get lastChild() { return _wrap(+_dom("last_child", this._nid)); }
-  get nextSibling() { return _wrap(+_dom("next_sibling", this._nid)); }
-  get previousSibling() { return _wrap(+_dom("prev_sibling", this._nid)); }
+  get nextSibling() {
+    if (this._shadowParent) {
+      const children = this._shadowParent.childNodes;
+      const index = children.indexOf(this);
+      return index >= 0 ? (children[index + 1] || null) : null;
+    }
+    return _wrap(+_dom("next_sibling", this._nid));
+  }
+  get previousSibling() {
+    if (this._shadowParent) {
+      const children = this._shadowParent.childNodes;
+      const index = children.indexOf(this);
+      return index > 0 ? children[index - 1] : null;
+    }
+    return _wrap(+_dom("prev_sibling", this._nid));
+  }
   appendChild(c) {
     if (!c) return c;
     if (c instanceof DocumentFragment) {
@@ -1138,6 +1154,7 @@ class Node {
       for (const child of children) this.appendChild(child);
       return c;
     }
+    if (c._shadowParent) c._shadowParent.removeChild(c);
     _dom("append_child", this._nid, c._nid);
     if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('childList', this._nid, [c._nid], []);
     if (c instanceof Element && c.tagName === 'SCRIPT') {
@@ -1234,6 +1251,7 @@ class Node {
       this.removeChild(oldChild);
       return oldChild;
     }
+    if (newChild._shadowParent) newChild._shadowParent.removeChild(newChild);
     _dom("insert_before", newChild._nid, oldChild._nid);
     _dom("remove_child", oldChild._nid);
     return oldChild;
@@ -1246,6 +1264,7 @@ class Node {
       for (const child of children) this.insertBefore(child, ref);
       return n;
     }
+    if (n._shadowParent) n._shadowParent.removeChild(n);
     _dom("insert_before", n._nid, ref._nid);
     return n;
   }
@@ -1303,7 +1322,14 @@ class Node {
     // -1 => this precedes other => other FOLLOWS this(4); +1 => this PRECEDING(2)).
     return (+_dom("compare_order", this._nid, other._nid) < 0) ? 4 : 2;
   }
-  getRootNode() { return globalThis.document; }
+  getRootNode(options) {
+    let root = this;
+    while (root.parentNode) root = root.parentNode;
+    if (options?.composed && root instanceof ShadowRoot) {
+      return root.host.getRootNode(options);
+    }
+    return root;
+  }
   normalize() {
     // Merge adjacent exclusive Text nodes, drop empty ones, recurse. Detached
     // removed nodes keep their own data (read from the backing node by nid).
@@ -3154,12 +3180,8 @@ class Element extends Node {
   }
   getAnimations() { return []; }
   get isConnected() {
-    var node = this;
-    while (node) {
-      if (node.nodeType === 9) return true;
-      node = node.parentNode;
-    }
-    return false;
+    const root = this.getRootNode({ composed: true });
+    return !!root && root.nodeType === 9;
   }
   remove() { if (this.parentNode) this.parentNode.removeChild(this); }
   append(...nodes) { for (const n of _convertNodes(nodes)) this.appendChild(n); }
@@ -5577,12 +5599,8 @@ if (!CharacterData.prototype.remove) CharacterData.prototype.remove = Element.pr
 if (!('isConnected' in Node.prototype)) {
   Object.defineProperty(Node.prototype, 'isConnected', {
     get() {
-      let node = this;
-      while (node) {
-        if (node.nodeType === 9) return true; // Document node
-        node = node.parentNode;
-      }
-      return false;
+      const root = this.getRootNode({ composed: true });
+      return !!root && root.nodeType === 9;
     }
   });
 }
@@ -8991,11 +9009,11 @@ Element.prototype.attachShadow = function attachShadow(opts) {
     host: host,
     get innerHTML() { return children.map(c => c.outerHTML || c.textContent || '').join(''); },
     set innerHTML(v) {
-      children.length = 0;
+      while (children.length) shadow.removeChild(children[children.length - 1]);
       if (v) {
         const tmp = document.createElement('div');
         tmp.innerHTML = v;
-        for (let i = 0; i < tmp.childNodes.length; i++) children.push(tmp.childNodes[i]);
+        for (const child of Array.from(tmp.childNodes)) shadow.appendChild(child);
       }
     },
     get childNodes() { return children; },
@@ -9005,8 +9023,10 @@ Element.prototype.attachShadow = function attachShadow(opts) {
     get children() { return children.filter(c => c.nodeType === 1); },
     appendChild(c) {
       if (c) {
+        if (c._shadowParent) c._shadowParent.removeChild(c);
+        else if (c.parentNode) c.parentNode.removeChild(c);
         children.push(c);
-        try { c.parentNode = shadow; } catch (_) { /* parentNode is getter-only on Node, ignore */ }
+        c._shadowParent = shadow;
       }
       return c;
     },
@@ -9015,18 +9035,30 @@ Element.prototype.attachShadow = function attachShadow(opts) {
       if (!ref) { shadow.appendChild(n); return n; }
       const idx = children.indexOf(ref);
       if (idx >= 0) {
+        if (n._shadowParent) n._shadowParent.removeChild(n);
+        else if (n.parentNode) n.parentNode.removeChild(n);
         children.splice(idx, 0, n);
-        try { n.parentNode = shadow; } catch (_) {}
+        n._shadowParent = shadow;
       }
       else shadow.appendChild(n);
       return n;
     },
-    removeChild(c) { const idx = children.indexOf(c); if (idx >= 0) children.splice(idx, 1); return c; },
+    removeChild(c) {
+      const idx = children.indexOf(c);
+      if (idx >= 0) {
+        children.splice(idx, 1);
+        if (c._shadowParent === shadow) c._shadowParent = null;
+      }
+      return c;
+    },
     replaceChild(n, o) {
       const idx = children.indexOf(o);
       if (idx >= 0) {
+        if (n._shadowParent) n._shadowParent.removeChild(n);
+        else if (n.parentNode) n.parentNode.removeChild(n);
         children[idx] = n;
-        try { n.parentNode = shadow; } catch (_) {}
+        n._shadowParent = shadow;
+        if (o._shadowParent === shadow) o._shadowParent = null;
       }
       return o;
     },
@@ -9046,8 +9078,14 @@ Element.prototype.attachShadow = function attachShadow(opts) {
       return results;
     },
     getElementById(id) { return shadow.querySelector('#' + id); },
-    contains(n) { return children.includes(n); },
-    getRootNode() { return shadow; },
+    contains(n) {
+      return n === shadow || children.some(
+        child => child === n || (child.contains && child.contains(n))
+      );
+    },
+    getRootNode(options) {
+      return options?.composed ? host.getRootNode(options) : shadow;
+    },
     get ownerDocument() { return document; },
     get nodeType() { return 11; }, // DOCUMENT_FRAGMENT_NODE
     get nodeName() { return '#document-fragment'; },
@@ -9058,10 +9096,12 @@ Element.prototype.attachShadow = function attachShadow(opts) {
     // these the inherited Node accessors run against this._nid. The setter in
     // particular would target the host document and wipe it. Operate on the
     // shadow's own `children` store instead.
-    get textContent() { return children.map(c => c.textContent || "").join(""); },
+    get textContent() {
+      return children.map(c => c.nodeType === 8 ? "" : (c.textContent || "")).join("");
+    },
     set textContent(v) {
-      children.length = 0;
-      if (v != null && v !== "") children.push(document.createTextNode(String(v)));
+      while (children.length) shadow.removeChild(children[children.length - 1]);
+      if (v != null && v !== "") shadow.appendChild(document.createTextNode(String(v)));
     },
     hasChildNodes() { return children.length > 0; },
     // A detached fragment id backs any inherited nid-based method we do not
@@ -10831,7 +10871,12 @@ globalThis.__obscura_init = function() {
   globalThis.__virtualUrl = null;
   _installWasmStreamingFallback();
 
-  globalThis.document = new Document(+_dom("document_node_id"));
+  const documentNid = +_dom("document_node_id");
+  globalThis.document = new Document(documentNid);
+  // parentNode on <html> reaches the backing document node. Keep that wrapper
+  // canonical so getRootNode(), isConnected, and identity comparisons return
+  // the same Document object exposed as globalThis.document.
+  _cache.set(documentNid, globalThis.document);
 
   const scr = _fp('screen');
   const sw = scr[0], sh = scr[1];

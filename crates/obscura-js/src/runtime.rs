@@ -1942,6 +1942,86 @@ mod tests {
     }
 
     #[test]
+    fn shadow_root_children_expose_parent_siblings_and_composed_root() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                const host = document.createElement("lit-host");
+                document.body.appendChild(host);
+                const root = host.attachShadow({ mode: "open" });
+                const start = document.createComment("start");
+                const end = document.createComment("end");
+                root.appendChild(start);
+                root.appendChild(end);
+
+                const text = document.createTextNode("rendered");
+                start.parentNode.insertBefore(text, end);
+                const inserted = [
+                    start.parentNode === root,
+                    start.nextSibling === text,
+                    text.previousSibling === start,
+                    text.nextSibling === end,
+                    end.previousSibling === text,
+                    root.contains(text),
+                    text.getRootNode() === root,
+                    text.getRootNode({ composed: true }) === document,
+                    root.getRootNode({ composed: true }) === document,
+                    root.isConnected,
+                    text.isConnected,
+                    root.textContent
+                ];
+
+                root.removeChild(text);
+                const removed = [
+                    text.parentNode === null,
+                    start.nextSibling === end,
+                    end.previousSibling === start
+                ];
+
+                document.body.appendChild(start);
+                const moved = [
+                    start.parentNode === document.body,
+                    start.getRootNode() === document,
+                    root.firstChild === end
+                ];
+
+                root.innerHTML = "<span id='inside'>inside</span>";
+                const inside = root.firstChild;
+                const parsed = [
+                    inside.parentNode === root,
+                    inside.getRootNode() === root,
+                    root.textContent
+                ];
+                return [inserted, removed, moved, parsed];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                [
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                    "rendered"
+                ],
+                [true, true, true],
+                [true, true, true],
+                [true, true, "inside"]
+            ])
+        );
+    }
+
+    #[test]
     fn create_element_synchronously_constructs_an_existing_definition() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt
