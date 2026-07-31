@@ -6033,7 +6033,12 @@ fn build_flex_grid_children(
 /// wrapping plain text with no inline styling.
 fn is_flattenable_inline(tree: &DomTree, id: NodeId, styles: &HashMap<NodeId, crate::LayoutStyle>) -> bool {
     let Some(node) = tree.get_node(id) else { return false };
-    if node.as_element().is_none() {
+    let Some(element) = node.as_element() else {
+        return false;
+    };
+    // BR is boxless-looking but semantically contributes a mandatory break.
+    // Flattening it as an empty wrapper deletes the break entirely.
+    if element.local.as_ref() == "br" {
         return false;
     }
     let Some(style) = styles.get(&id) else { return false };
@@ -7498,15 +7503,16 @@ fn build(
         }
     }
 
-    // A forced break that reaches the general box builder sits between block
-    // or atomic siblings, so it cannot be folded into a shaped inline run.
-    // Give that sentinel the inherited used line-height instead of the UA
-    // style's zero placeholder. This is the block/flex analogue of BRFrame's
-    // empty-line contribution; break tags inside text and mixed block runs
-    // are handled by the inline collector below.
+    // Outside a foldable inline run, BR is a zero-inline-size line
+    // participant. The mixed-inline fallback adds a separate anonymous
+    // full-width breaker after this mapped marker; keeping that control box
+    // anonymous prevents its layout surrogate from leaking into CSSOM/paint.
     if _name.local.as_ref() == "br" {
         let height = crate::inline::used_line_height(style).max(0.0);
+        taffy_style.size.width = taffy::style::Dimension::length(0.0);
         taffy_style.size.height = taffy::style::Dimension::length(height);
+        taffy_style.flex_grow = 0.0;
+        taffy_style.flex_shrink = 0.0;
         let leaf = taffy_tree.new_leaf(taffy_style).ok()?;
         id_map.insert(leaf, id);
         return Some(leaf);
@@ -8322,7 +8328,53 @@ fn build_mixed_block(
                     before_pending = false;
                 }
                 for &rc in run {
-                    atoms.extend(build_any(tree, rc, taffy_tree, id_map, words, engine, ifc_items, styles));
+                    let is_forced_break = tree
+                        .get_node(rc)
+                        .is_some_and(|node| {
+                            node.as_element()
+                                .is_some_and(|element| element.local.as_ref() == "br")
+                        });
+                    if is_forced_break {
+                        // A BR participates in the current line with zero
+                        // inline size, then forces the following content onto
+                        // a new line. A single 100%-wide, line-height-tall flex
+                        // item creates a phantom third line for A<br>B. Split
+                        // those responsibilities: the mapped marker supplies
+                        // the current line strut, while an anonymous 100%
+                        // breaker may occupy its own zero-height flex line.
+                        atoms.extend(build_any(
+                            tree,
+                            rc,
+                            taffy_tree,
+                            id_map,
+                            words,
+                            engine,
+                            ifc_items,
+                            styles,
+                        ));
+                        let breaker_style = taffy::Style {
+                            flex_grow: 0.0,
+                            flex_shrink: 0.0,
+                            flex_basis: taffy::style::Dimension::percent(1.0),
+                            size: taffy::Size {
+                                width: taffy::style::Dimension::percent(1.0),
+                                height: taffy::style::Dimension::length(0.0),
+                            },
+                            ..Default::default()
+                        };
+                        atoms.push(taffy_tree.new_leaf(breaker_style).ok()?);
+                    } else {
+                        atoms.extend(build_any(
+                            tree,
+                            rc,
+                            taffy_tree,
+                            id_map,
+                            words,
+                            engine,
+                            ifc_items,
+                            styles,
+                        ));
+                    }
                 }
                 if join_after {
                     atoms.extend(after_leaves.iter().copied());
@@ -11083,6 +11135,53 @@ mod tests {
         assert!(
             laid.rects[&normal].height > 20.0,
             "the explicit normal line should still wrap at the containing width"
+        );
+    }
+
+    #[test]
+    fn forced_break_in_pseudo_joined_inline_run_has_no_phantom_line() {
+        let tree = parse_html(
+            r#"<style>
+                html,body,h1,p { margin:0 }
+                h1 { width:600px; font:40px/60px sans-serif }
+                #heading::after, #consecutive::after {
+                    content:"_"; display:inline; position:relative
+                }
+                p { width:300px; font:16px/20px sans-serif }
+            </style>
+            <h1 id="heading">first<br id="heading-break">second</h1>
+            <p id="consecutive">A<br><br>B</p>"#,
+        );
+        let laid = layout_dom(&tree, (800.0, 400.0));
+        let heading = tree.get_element_by_id("heading").unwrap();
+        let heading_break = tree.get_element_by_id("heading-break").unwrap();
+        let consecutive = tree.get_element_by_id("consecutive").unwrap();
+        let break_style = &laid.styles[&heading_break];
+
+        assert_eq!(break_style.display, crate::Display::Inline);
+        assert_eq!(break_style.width, crate::Dimension::Auto);
+        assert_eq!(break_style.height, crate::Dimension::Auto);
+        assert!(
+            (laid.rects[&heading].height - 120.0).abs() < 0.01,
+            "A<br>B plus an inline pseudo must form two 60px lines: host={:?}, br={:?}, pseudo={}, run_ifc={}",
+            laid.rects[&heading],
+            laid.rects.get(&heading_break),
+            laid.styles[&heading].after_pseudo.is_some(),
+            laid.run_ifc_items
+                .get(&heading)
+                .map_or(0, |items| items.len())
+        );
+        assert_eq!(
+            laid.rects
+                .get(&heading_break)
+                .map_or(0.0, |rect| rect.width),
+            0.0,
+            "the mapped BR marker must not expose the anonymous breaker width"
+        );
+        assert!(
+            (laid.rects[&consecutive].height - 60.0).abs() < 0.01,
+            "A<br><br>B must form three 20px lines: {:?}",
+            laid.rects[&consecutive]
         );
     }
 

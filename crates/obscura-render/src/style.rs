@@ -39,7 +39,7 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
         "span" | "a" | "b" | "i" | "strong" | "em" | "font" | "code" | "small"
         | "sub" | "sup" | "mark" | "abbr" | "cite" | "var" | "dfn" | "kbd"
         | "samp" | "q" | "time" | "s" | "u" | "del" | "ins" | "tt" | "big"
-        | "bdi" | "bdo" | "wbr" | "data" | "output" | "label" | "ruby" | "rt"
+        | "bdi" | "bdo" | "br" | "wbr" | "data" | "output" | "label" | "ruby" | "rt"
         | "rp" => Display::Inline,
         "tr" => Display::Flex,
         _ => Display::Block,
@@ -67,13 +67,6 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
         // not lay out as a real box (news CDNs put dimensions on `<source>`,
         // which otherwise paints an empty box the size of the image).
         style.display = crate::Display::None;
-    } else if tag == "br" {
-        // Keep forced breaks as full-width sentinels in the general
-        // flex/block fallback. The builder replaces the zero height with the
-        // inherited used line-height; pure and mixed inline runs fold the tag
-        // into the shaped line stream instead.
-        style.width = crate::Dimension::Percent(1.0);
-        style.height = crate::Dimension::Px(0.0);
     } else if tag == "pre" {
         // HTML's UA sheet preserves source whitespace in preformatted blocks.
         style.white_space = Some(crate::WhiteSpace::Pre);
