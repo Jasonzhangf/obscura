@@ -5668,6 +5668,70 @@ mod tests {
     }
 
     #[test]
+    fn angular_absolute_primary_button_paints_one_generated_label() {
+        let tree = parse_html(
+            r#"<html><head><style>
+               :root {
+                 --orange-red:#f00; --vivid-pink:#f0f; --electric-violet:#70f;
+                 --page-bg-radial-gradient:radial-gradient(circle,#fff 0%,#fff 100%);
+                 --page-background:#fff; --primary-contrast:#111;
+               }
+               html, body { margin:0 }
+               .section { position:relative; width:500px; height:300px }
+               .content button { position:absolute; bottom:48px }
+               .docs-primary-btn {
+                 cursor:pointer; border:none; outline:none; position:relative;
+                 border-radius:4px; padding:12px 24px; width:max-content;
+                 color:transparent; font-size:14px; font-weight:600;
+                 background:linear-gradient(90deg,var(--orange-red) 0%,
+                   var(--vivid-pink) 50%,var(--electric-violet) 100%);
+               }
+               .docs-primary-btn::before {
+                 content:attr(text); position:absolute; inset:1px;
+                 background:var(--page-bg-radial-gradient); border-radius:3px;
+                 display:flex; align-items:center; justify-content:center;
+                 color:var(--primary-contrast);
+               }
+               .docs-primary-btn::after {
+                 content:attr(text); position:absolute; inset:1px;
+                 background:var(--page-background); border-radius:3px;
+                 display:flex; align-items:center; justify-content:center;
+                 color:var(--primary-contrast);
+               }
+               </style></head><body>
+                 <section class="section"><div class="content">
+                   <button id="cta" class="docs-primary-btn" text="Learn more">Learn more</button>
+                 </div></section>
+               </body></html>"#,
+        );
+        let laid = crate::layout_dom(&tree, (500.0, 300.0));
+        let cta = tree.get_element_by_id("cta").unwrap();
+        let rect = laid.rects[&cta];
+        let style = &laid.styles[&cta];
+        assert_eq!(style.color, Some([0, 0, 0, 0]));
+        let pixmap = paint_dom(&tree, (500.0, 300.0), None).expect("pixmap");
+        let rows = (rect.y.floor() as u32..(rect.y + rect.height).ceil() as u32)
+            .map(|y| {
+                (rect.x.floor() as u32..(rect.x + rect.width).ceil() as u32)
+                    .filter(|&x| {
+                        let pixel = pixmap.pixel(x, y).unwrap();
+                        pixel.red() < 100 && pixel.green() < 100 && pixel.blue() < 100
+                    })
+                    .count()
+            })
+            .collect::<Vec<_>>();
+        let ink_rows = rows
+            .iter()
+            .enumerate()
+            .filter_map(|(row, &ink)| (ink > 0).then_some(row))
+            .collect::<Vec<_>>();
+        assert!(
+            ink_rows.last().unwrap() - ink_rows.first().unwrap() <= 14,
+            "only the generated label may paint; transparent host text leaked across rows {rows:?}"
+        );
+    }
+
+    #[test]
     fn native_select_paints_only_the_selected_label_and_arrow() {
         let tree = parse_html(
             r#"<html><body style="margin:0">

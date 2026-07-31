@@ -1845,7 +1845,11 @@ impl TextEngine {
                 let glyph_color = glyph.color_opt.unwrap_or(default);
                 let fill_index = metadata_fill(glyph.metadata);
                 let mut draw_pixel = |x, y, color: Color| {
-                    let a = color.a() as u32;
+                    // cosmic-text's mask rasterizer replaces the authored
+                    // alpha with glyph coverage (see its `blend base alpha?`
+                    // TODO). Reapply the span alpha here so transparent and
+                    // translucent CSS text do not become opaque at paint.
+                    let a = color.a() as u32 * glyph_color.a() as u32 / 255;
                     if a == 0 {
                         return;
                     }
@@ -1924,8 +1928,12 @@ impl TextEngine {
             }
         }
 
-        // Stroke the underline segments (opaque; text is already drawn above).
+        // Stroke underline segments with the same authored alpha as their
+        // glyphs. Transparent text decorations are transparent too.
         for (x0, x1, y, thick, col) in underlines {
+            if col[3] == 0 {
+                continue;
+            }
             let t = thick.max(1.0).round() as i32;
             for dt in 0..t {
                 let py = oy as i32 + y as i32 + dt;
@@ -1947,7 +1955,23 @@ impl TextEngine {
                         }
                     }
                     let i = (py * pw + px) as usize;
-                    pixels[i] = tiny_skia::PremultipliedColorU8::from_rgba(col[0], col[1], col[2], 255).unwrap_or(pixels[i]);
+                    let dst = pixels[i];
+                    let sa = col[3] as u32;
+                    let inv = 255 - sa;
+                    let out_a = sa + dst.alpha() as u32 * inv / 255;
+                    let out_r = col[0] as u32 * sa / 255
+                        + dst.red() as u32 * inv / 255;
+                    let out_g = col[1] as u32 * sa / 255
+                        + dst.green() as u32 * inv / 255;
+                    let out_b = col[2] as u32 * sa / 255
+                        + dst.blue() as u32 * inv / 255;
+                    pixels[i] = tiny_skia::PremultipliedColorU8::from_rgba(
+                        out_r as u8,
+                        out_g as u8,
+                        out_b as u8,
+                        out_a as u8,
+                    )
+                    .unwrap_or(dst);
                 }
             }
         }
@@ -2588,6 +2612,44 @@ mod tests {
         cached_weights.sort_unstable();
         cached_weights.dedup();
         (geometry, ink, cached_weights)
+    }
+
+    #[test]
+    fn shaped_text_preserves_authored_alpha_through_mask_rasterization() {
+        let render_alpha = |alpha: u8, underline: bool| {
+            let tree = obscura_dom::parse_html("<p id='copy'>Alpha</p>");
+            let copy = tree.get_element_by_id("copy").unwrap();
+            let mut style = LayoutStyle::default();
+            style.display = Display::Block;
+            style.font_size = Some(32.0);
+            style.line_height = Some(crate::LineHeight::Px(40.0));
+            style.color = Some([0, 0, 0, alpha]);
+            style.underline = Some(underline);
+            let styles = HashMap::from([(copy, style)]);
+            let mut engine = TextEngine::new();
+            let item = engine.try_build(&tree, copy, &styles).unwrap();
+            engine.finalize(item, (0.0, 0.0), 160.0, None);
+            let mut pixmap = tiny_skia::Pixmap::new(160, 48).unwrap();
+            engine.paint_item(item, &mut pixmap, (0.0, 0.0));
+            pixmap
+                .pixels()
+                .iter()
+                .map(|pixel| u64::from(pixel.alpha()))
+                .sum::<u64>()
+        };
+
+        assert_eq!(
+            render_alpha(0, true),
+            0,
+            "transparent glyphs and decorations must not paint"
+        );
+        let half = render_alpha(128, false);
+        let opaque = render_alpha(255, false);
+        let ratio = half * 100 / opaque;
+        assert!(
+            (48..=52).contains(&ratio),
+            "50% CSS alpha must retain half the opaque coverage: half={half}, opaque={opaque}"
+        );
     }
 
     #[test]
