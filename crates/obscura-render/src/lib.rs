@@ -615,6 +615,10 @@ pub struct LayoutStyle {
     /// shaped text (a fixed ratio made real-site prose noticeably tighter than
     /// Chromium).
     pub line_height: Option<LineHeight>,
+    /// `white-space`. Inherited; `None` means inherit the nearest ancestor's
+    /// value (or the initial `normal`). The inline shaper uses this to retain
+    /// author/source newlines in code blocks and to select wrapping behavior.
+    pub white_space: Option<WhiteSpace>,
     /// Deferred functional line-height (`calc()`, `min()`, `clamp()`) resolved
     /// after the element font and live viewport are known.
     pub line_height_expression: Option<String>,
@@ -784,6 +788,20 @@ pub enum LineHeight {
     /// A specified length or percentage awaiting computed-value resolution.
     /// It becomes `Px` on the declaring element before inheritance.
     Relative(Dimension),
+}
+
+/// The legacy `white-space` shorthand values needed by inline collection and
+/// line breaking. `BreakSpaces` currently shares pre-wrap's wrapping model;
+/// its finer trailing-space opportunity rules can be added independently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WhiteSpace {
+    #[default]
+    Normal,
+    NoWrap,
+    Pre,
+    PreWrap,
+    PreLine,
+    BreakSpaces,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

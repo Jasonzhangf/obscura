@@ -74,6 +74,9 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
         // into the shaped line stream instead.
         style.width = crate::Dimension::Percent(1.0);
         style.height = crate::Dimension::Px(0.0);
+    } else if tag == "pre" {
+        // HTML's UA sheet preserves source whitespace in preformatted blocks.
+        style.white_space = Some(crate::WhiteSpace::Pre);
     } else if tag == "body" {
         style.margin = Edges { top: 8.0, right: 8.0, bottom: 8.0, left: 8.0 };
     } else if tag == "h1" {
@@ -1174,6 +1177,21 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                 v.parse::<f32>().ok().map(crate::LineHeight::Ratio)
             };
         }
+        "white-space" => {
+            style.white_space = match value.trim().to_ascii_lowercase().as_str() {
+                "normal" | "initial" | "revert" | "revert-layer" => {
+                    Some(crate::WhiteSpace::Normal)
+                }
+                "nowrap" => Some(crate::WhiteSpace::NoWrap),
+                "pre" => Some(crate::WhiteSpace::Pre),
+                "pre-wrap" => Some(crate::WhiteSpace::PreWrap),
+                "pre-line" => Some(crate::WhiteSpace::PreLine),
+                "break-spaces" => Some(crate::WhiteSpace::BreakSpaces),
+                // `white-space` inherits, so unset behaves as inherit.
+                "inherit" | "unset" => None,
+                _ => style.white_space,
+            };
+        }
         "font-style" => {
             let v = value.trim().to_ascii_lowercase();
             style.font_style_italic = Some(v.starts_with("italic") || v.starts_with("oblique"));
@@ -1414,6 +1432,7 @@ pub(crate) fn supports_declaration(name: &str, value: &str) -> bool {
             | "text-decoration"
             | "text-decoration-line"
             | "line-height"
+            | "white-space"
             | "align-items"
             | "justify-items"
             | "place-items"
@@ -1533,6 +1552,10 @@ pub(crate) fn supports_declaration(name: &str, value: &str) -> bool {
             value.eq_ignore_ascii_case("normal")
                 || parse_font_variation_settings(value).is_some()
         }
+        "white-space" => matches!(
+            value.to_ascii_lowercase().as_str(),
+            "normal" | "nowrap" | "pre" | "pre-wrap" | "pre-line" | "break-spaces"
+        ),
         "float" => matches!(
             value.to_ascii_lowercase().as_str(),
             "none" | "left" | "right"

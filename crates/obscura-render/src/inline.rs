@@ -878,6 +878,7 @@ impl TextEngine {
         push_text(
             text,
             context.transform,
+            context.white_space,
             &attrs,
             &mut spans,
             &mut collector,
@@ -894,15 +895,32 @@ impl TextEngine {
         mut spans: Vec<(String, SpanAttrs)>,
         clip_fills: Vec<ClipTextFill>,
     ) -> Option<usize> {
-        // Trim a single trailing space so it does not widen the last line.
-        if let Some((text, _)) = spans.last_mut() {
-            if text.ends_with(' ') {
-                text.pop();
+        let white_space = base.white_space.unwrap_or_default();
+        // Collapsible trailing whitespace does not widen the last line.
+        if matches!(
+            white_space,
+            crate::WhiteSpace::Normal
+                | crate::WhiteSpace::NoWrap
+                | crate::WhiteSpace::PreLine
+        ) {
+            if let Some((text, _)) = spans.last_mut() {
+                if text.ends_with(' ') {
+                    text.pop();
+                }
             }
         }
         if spans
             .iter()
-            .all(|(text, _)| text.trim().is_empty() && !text.contains('\n'))
+            .all(|(text, _)| {
+                text.is_empty()
+                    || (matches!(
+                        white_space,
+                        crate::WhiteSpace::Normal
+                            | crate::WhiteSpace::NoWrap
+                            | crate::WhiteSpace::PreLine
+                    ) && text.trim().is_empty()
+                        && !text.contains('\n'))
+            })
         {
             return None;
         }
@@ -939,7 +957,17 @@ impl TextEngine {
         // so a table/flex column never squeezes narrower than a whole word
         // and forces an ugly mid-word break; a single word wider than its
         // column overflows instead, matching normal `overflow-wrap: normal`.
-        buffer.set_wrap(&mut self.font_system, Wrap::Word);
+        buffer.set_wrap(
+            &mut self.font_system,
+            if matches!(
+                white_space,
+                crate::WhiteSpace::NoWrap | crate::WhiteSpace::Pre
+            ) {
+                Wrap::None
+            } else {
+                Wrap::Word
+            },
+        );
         // Always Advanced shaping: Basic mis-maps per-span attribute
         // boundaries in the shaping backend (a multi-color run like body text
         // with links ends up coloring the wrong glyphs), and shaping is a
@@ -1160,6 +1188,7 @@ struct SpanCtx {
     italic: bool,
     underline: bool,
     transform: TextTransform,
+    white_space: crate::WhiteSpace,
     family: Arc<str>,
     clip_fill: Option<usize>,
 }
@@ -1222,6 +1251,7 @@ fn base_span_ctx(
         italic: base.font_style_italic.unwrap_or(false),
         underline: base.underline.unwrap_or(false),
         transform: base.text_transform.unwrap_or(TextTransform::None),
+        white_space: base.white_space.unwrap_or_default(),
         family: font.family,
         clip_fill,
     }
@@ -1280,7 +1310,14 @@ fn collect_node_spans(
                 family: Arc::clone(&ctx.family),
                 clip_fill: ctx.clip_fill,
             };
-            push_text(contents, ctx.transform, &attrs, out, c);
+            push_text(
+                contents,
+                ctx.transform,
+                ctx.white_space,
+                &attrs,
+                out,
+                c,
+            );
         }
         _ => {
             let Some(elem) = node.as_element() else { return };
@@ -1366,6 +1403,9 @@ fn collect_node_spans(
                 // descendant text; an element only sets its own via CSS.
                 underline: ctx.underline || style.and_then(|s| s.underline).unwrap_or(false),
                 transform: style.and_then(|s| s.text_transform).unwrap_or(ctx.transform),
+                white_space: style
+                    .and_then(|s| s.white_space)
+                    .unwrap_or(ctx.white_space),
                 family: font.family,
                 clip_fill,
             };
@@ -1382,15 +1422,32 @@ fn collect_node_spans(
     }
 }
 
-fn push_text(raw: &str, transform: TextTransform, attrs: &SpanAttrs, out: &mut Vec<(String, SpanAttrs)>, c: &mut Collector) {
+fn push_text(
+    raw: &str,
+    transform: TextTransform,
+    white_space: crate::WhiteSpace,
+    attrs: &SpanAttrs,
+    out: &mut Vec<(String, SpanAttrs)>,
+    c: &mut Collector,
+) {
     let mut buf = String::new();
     let mut at_word_start = c.last_was_space;
     for ch in raw.chars() {
         if ch.is_whitespace() {
-            if !c.last_was_space {
-                buf.push(' ');
-                c.last_was_space = true;
+            match white_space {
+                crate::WhiteSpace::Pre
+                | crate::WhiteSpace::PreWrap
+                | crate::WhiteSpace::BreakSpaces => buf.push(ch),
+                crate::WhiteSpace::PreLine if ch == '\n' => {
+                    if buf.ends_with(' ') {
+                        buf.pop();
+                    }
+                    buf.push('\n');
+                }
+                _ if !c.last_was_space => buf.push(' '),
+                _ => {}
             }
+            c.last_was_space = true;
             at_word_start = true;
         } else {
             match transform {
@@ -2645,6 +2702,43 @@ mod tests {
         assert!(
             glyph_sizes.iter().any(|size| (*size - 32.0).abs() < 0.01),
             "inline descendant should shape at 32px: {glyph_sizes:?}"
+        );
+    }
+
+    #[test]
+    fn preformatted_newlines_preserve_authored_line_count() {
+        let tree = obscura_dom::parse_html(
+            r#"<style>
+                html,body { margin:0 }
+                .box { margin:0; width:200px; font:16px/24px monospace }
+                #explicit { white-space:pre-wrap }
+                #normal { white-space:normal }
+            </style>
+            <pre id="ua" class="box"><code>alpha
+beta
+gamma</code></pre>
+            <div id="explicit" class="box">alpha
+beta
+gamma</div>
+            <div id="normal" class="box">alpha
+beta
+gamma</div>"#,
+        );
+        let laid = crate::dom::layout_dom(&tree, (400.0, 300.0));
+        let rect = |id| laid.rects[&tree.get_element_by_id(id).unwrap()];
+
+        assert_eq!(laid.styles[&tree.get_element_by_id("ua").unwrap()].white_space, Some(crate::WhiteSpace::Pre));
+        assert_eq!(laid.styles[&tree.get_element_by_id("explicit").unwrap()].white_space, Some(crate::WhiteSpace::PreWrap));
+        assert!((rect("ua").height - 72.0).abs() < 0.01, "{:?}", rect("ua"));
+        assert!(
+            (rect("explicit").height - 72.0).abs() < 0.01,
+            "{:?}",
+            rect("explicit")
+        );
+        assert!(
+            (rect("normal").height - 24.0).abs() < 0.01,
+            "{:?}",
+            rect("normal")
         );
     }
 
