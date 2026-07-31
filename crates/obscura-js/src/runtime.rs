@@ -756,16 +756,21 @@ impl ObscuraJsRuntime {
             (st.http_client.clone(), st.callbacks.clone())
         };
         let source_code = match client {
-            Some(c) => match c.fetch_with_callbacks(&specifier, callbacks.as_deref()).await {
-                Ok(resp) => obscura_net::decode_non_html(&resp.body, resp.content_type()),
-                Err(e) => {
-                    tracing::warn!("Module fetch failed ({}): {}", url, e);
-                    String::new()
+            Some(c) => {
+                let resp = c
+                    .fetch_with_callbacks(&specifier, callbacks.as_deref())
+                    .await
+                    .map_err(|e| format!("Module fetch failed ({}): {}", url, e))?;
+                if !(200..=299).contains(&resp.status) {
+                    return Err(format!("Module {} returned HTTP {}", url, resp.status));
                 }
-            },
+                obscura_net::decode_non_html(&resp.body, resp.content_type())
+            }
             None => {
-                tracing::warn!("No http_client wired to runtime; module {} will be empty", url);
-                String::new()
+                return Err(format!(
+                    "No http_client wired to runtime; cannot fetch module {}",
+                    url
+                ));
             }
         };
 
@@ -781,8 +786,10 @@ impl ObscuraJsRuntime {
             Ok(Ok(id)) => id,
             Ok(Err(e)) => return Err(format!("Module load error: {}", e)),
             Err(_) => {
-                tracing::warn!("Module graph load timed out after {}ms: {}", budget_ms, url);
-                return Ok(());
+                return Err(format!(
+                    "Module graph load timed out after {}ms: {}",
+                    budget_ms, url
+                ));
             }
         };
 
@@ -790,8 +797,7 @@ impl ObscuraJsRuntime {
         // for the loop to go fully idle: a page timer (setInterval) keeps the
         // loop busy forever and would otherwise burn the whole budget (#374).
         self.drive_module_eval(module_id, budget_ms, &format!("Module {}", url))
-            .await;
-        Ok(())
+            .await
     }
 
     /// Drive a just-started module evaluation to completion, or up to
@@ -800,12 +806,16 @@ impl ObscuraJsRuntime {
     /// busy forever and would otherwise burn the whole budget, abandoning a
     /// module that had already evaluated (issue #374).
     ///
-    /// A module eval error or a timeout is logged under `what` and swallowed:
-    /// neither is fatal to rendering the rest of the page. An event-loop error
-    /// is propagated out of the select and handled the same way -- it must not
-    /// be discarded, or a module stalled on a top-level await spins here for the
-    /// whole budget with nothing logged.
-    async fn drive_module_eval(&mut self, module_id: deno_core::ModuleId, budget_ms: u64, what: &str) {
+    /// A module eval error or timeout is returned to the page lifecycle. The
+    /// caller may continue rendering, but must not report a failed module as
+    /// successfully loaded. An event-loop error is propagated out of the
+    /// select and handled the same way.
+    async fn drive_module_eval(
+        &mut self,
+        module_id: deno_core::ModuleId,
+        budget_ms: u64,
+        what: &str,
+    ) -> Result<(), String> {
         let budget = tokio::time::Duration::from_millis(budget_ms);
         let result = self.runtime.mod_evaluate(module_id);
         tokio::pin!(result);
@@ -817,16 +827,19 @@ impl ObscuraJsRuntime {
             tokio::pin!(event_loop);
             tokio::select! {
                 biased;
-                r = &mut result => r,
                 e = &mut event_loop => { e?; (&mut result).await }
+                r = &mut result => r,
             }
         })
         .await;
 
         match outcome {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => tracing::warn!("{} eval error: {}", what, e),
-            Err(_) => tracing::warn!("{} evaluation timed out after {}ms", what, budget_ms),
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(format!("{} eval error: {}", what, e)),
+            Err(_) => Err(format!(
+                "{} evaluation timed out after {}ms",
+                what, budget_ms
+            )),
         }
     }
 
@@ -849,8 +862,10 @@ impl ObscuraJsRuntime {
             Ok(Ok(id)) => id,
             Ok(Err(e)) => return Err(format!("Inline module load error: {}", e)),
             Err(_) => {
-                tracing::warn!("Inline module graph load timed out after {}ms", budget_ms);
-                return Ok(());
+                return Err(format!(
+                    "Inline module graph load timed out after {}ms",
+                    budget_ms
+                ));
             }
         };
 
@@ -859,8 +874,7 @@ impl ObscuraJsRuntime {
         // keeps the loop busy forever, and waiting for idle burned the whole
         // budget on this preamble module and starved the module that mounts the
         // app, leaving #root empty (issue #374).
-        self.drive_module_eval(module_id, budget_ms, "Inline module").await;
-        Ok(())
+        self.drive_module_eval(module_id, budget_ms, "Inline module").await
     }
 
     pub fn execute_script(&mut self, _name: &str, source: &str) -> Result<(), String> {
@@ -5345,6 +5359,118 @@ mod tests {
         assert_eq!(nan, serde_json::Value::Null);
         let inf = rt.evaluate("document.elementFromPoint(Infinity, 10)").unwrap();
         assert_eq!(inf, serde_json::Value::Null);
+    }
+
+    fn spawn_one_response_server(status: &str, body: &str) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let status = status.to_string();
+        let body = body.to_string();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request);
+            let response = format!(
+                "HTTP/1.1 {}\r\nContent-Type: application/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                status,
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        format!("http://{}", address)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn entry_module_http_failure_is_not_evaluated_as_empty_source() {
+        let base = spawn_one_response_server("404 Not Found", "not found");
+        let jar = std::sync::Arc::new(obscura_net::CookieJar::new());
+        let client = std::sync::Arc::new(obscura_net::ObscuraHttpClient::with_full_options(
+            jar,
+            None,
+            true,
+        ));
+        let mut rt = ObscuraJsRuntime::with_base_url(&format!("{}/", base));
+        rt.set_http_client(client);
+
+        let error = rt
+            .load_module(&format!("{}/entry.js", base), 1_000)
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("HTTP 404"),
+            "expected entry fetch status in error, got: {}",
+            error
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn inline_module_graph_error_propagates() {
+        let mut rt = ObscuraJsRuntime::with_base_url("https://example.com/");
+        let error = rt
+            .load_inline_module("import 'bare-specifier';", "https://example.com/", 1_000)
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("Inline module load error"),
+            "expected graph load error, got: {}",
+            error
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn inline_module_evaluation_error_propagates() {
+        let mut rt = ObscuraJsRuntime::with_base_url("https://example.com/");
+        let error = rt
+            .load_inline_module(
+                "throw new Error('module-evaluation-boom');",
+                "https://example.com/",
+                1_000,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("Inline module eval error")
+                && error.contains("module-evaluation-boom"),
+            "expected evaluation error, got: {}",
+            error
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn inline_module_evaluation_timeout_propagates() {
+        let mut rt = ObscuraJsRuntime::with_base_url("https://example.com/");
+        let error = rt
+            .load_inline_module(
+                "await new Promise(resolve => setTimeout(resolve, 10000));",
+                "https://example.com/",
+                20,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("Inline module evaluation timed out after 20ms"),
+            "expected evaluation timeout, got: {}",
+            error
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn successful_inline_module_does_not_wait_for_interval_idle() {
+        let mut rt = ObscuraJsRuntime::with_base_url("https://example.com/");
+        rt.load_inline_module(
+            "globalThis.__module_loaded = true; setInterval(() => {}, 10000);",
+            "https://example.com/",
+            500,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            rt.evaluate("globalThis.__module_loaded").unwrap(),
+            serde_json::json!(true)
+        );
     }
 
     // Issue #139 — proxy_url must thread through to both the ES-module
