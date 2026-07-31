@@ -775,6 +775,7 @@ fn paint_laid_dom_scrolled(
                 base_url,
                 &visible_rect,
                 fill,
+                style.background_radial_gradient.as_ref(),
                 style.background_gradient.as_ref(),
                 style.background_conic_gradient.as_ref(),
                 style.mask_size,
@@ -2593,6 +2594,31 @@ fn linear_color_at(
     sample_normalized_stops(stops, position)
 }
 
+fn radial_color_at(
+    rect: &crate::Rect,
+    center: (f32, f32),
+    stops: &[(f32, [u8; 4])],
+    x: f32,
+    y: f32,
+) -> [u8; 4] {
+    let center_x = rect.x + rect.width * center.0;
+    let center_y = rect.y + rect.height * center.1;
+    let radius = [
+        (rect.x - center_x).hypot(rect.y - center_y),
+        (rect.x + rect.width - center_x).hypot(rect.y - center_y),
+        (rect.x - center_x).hypot(rect.y + rect.height - center_y),
+        (rect.x + rect.width - center_x).hypot(rect.y + rect.height - center_y),
+    ]
+    .into_iter()
+    .fold(0.0, f32::max);
+    let position = if radius <= f32::EPSILON {
+        0.0
+    } else {
+        (x - center_x).hypot(y - center_y) / radius
+    };
+    sample_normalized_stops(stops, position)
+}
+
 fn premultiplied(color: [u8; 4]) -> tiny_skia::PremultipliedColorU8 {
     let alpha = color[3] as u32;
     tiny_skia::PremultipliedColorU8::from_rgba(
@@ -2836,6 +2862,7 @@ fn paint_in_flow_generated_box(
             base_url,
             &visible,
             fill,
+            style.background_radial_gradient.as_ref(),
             style.background_gradient.as_ref(),
             style.background_conic_gradient.as_ref(),
             style.mask_size,
@@ -3025,6 +3052,7 @@ fn paint_positioned_pseudo(
             base_url,
             &visible,
             fill,
+            style.background_radial_gradient.as_ref(),
             style.background_gradient.as_ref(),
             style.background_conic_gradient.as_ref(),
             style.mask_size,
@@ -4257,6 +4285,7 @@ fn paint_mask(
     base_url: Option<&str>,
     rect: &crate::Rect,
     fill: [u8; 4],
+    radial_gradient: Option<&((f32, f32), Vec<([u8; 4], Option<f32>)>)>,
     linear_gradient: Option<&(f32, Vec<([u8; 4], Option<f32>)>)>,
     conic_gradient: Option<&(f32, (f32, f32), Vec<([u8; 4], Option<f32>)>)>,
     mask_size: Option<(f32, f32)>,
@@ -4293,6 +4322,8 @@ fn paint_mask(
         linear_gradient.map(|(_, stops)| normalized_stops(stops));
     let normalized_conic =
         conic_gradient.map(|(_, _, stops)| normalized_stops(stops));
+    let normalized_radial =
+        radial_gradient.map(|(_, stops)| normalized_stops(stops));
     let Some(mut recolored) = Pixmap::new(box_width, box_height) else {
         return false;
     };
@@ -4321,6 +4352,10 @@ fn paint_mask(
                 (linear_gradient, normalized_linear.as_deref())
             {
                 linear_color_at(rect, *angle, stops, sample_x, sample_y)
+            } else if let (Some((center, _)), Some(stops)) =
+                (radial_gradient, normalized_radial.as_deref())
+            {
+                radial_color_at(rect, *center, stops, sample_x, sample_y)
             } else {
                 fill
             };
@@ -4822,6 +4857,84 @@ mod tests {
         assert!(
             green.green() > 220 && green.red() < 40 && green.blue() < 40,
             "content:url image must paint through the replaced-image path: {green:?}"
+        );
+    }
+
+    #[test]
+    fn repeated_data_svg_masks_sample_radial_sources_on_every_box_path() {
+        let tree = parse_html(
+            r##"<html><head><style>
+               html, body { margin:0 }
+               .mask {
+                 width:88px; height:66px;
+               }
+               .mask-source, #in-flow::before, #positioned::after {
+                 mask-image:url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='72' height='72' viewBox='0 0 72 72'><defs><pattern id='p' patternUnits='userSpaceOnUse' width='72' height='72'><g transform='translate(36 36) rotate(-60)'><line x1='-10' y1='0' x2='10' y2='0' stroke='white' stroke-width='3' stroke-linecap='round'/></g></pattern></defs><rect width='100%' height='100%' fill='url(%23p)'/></svg>");
+                 mask-size:22px 22px; mask-repeat:repeat;
+               }
+               #ordinary { position:absolute; left:0; top:0 }
+               #in-flow { position:absolute; left:100px; top:0 }
+               #in-flow::before {
+                 content:""; display:block;
+                 width:88px; height:66px;
+                 background:radial-gradient(circle at 50% 125%,transparent 20%,#f627e3 35%,#6911d2 55%,transparent 75%);
+               }
+               #positioned { position:absolute; left:200px; top:0 }
+               #positioned::after {
+                 content:""; position:absolute; inset:0;
+                 background:radial-gradient(circle at 50% 125%,transparent 20%,#f627e3 35%,#6911d2 55%,transparent 75%);
+               }
+               #ordinary {
+                 background:radial-gradient(circle at 50% 125%,transparent 20%,#f627e3 35%,#6911d2 55%,transparent 75%);
+               }
+               #solid-source { position:absolute; left:0; top:80px; background-color:#00aa00 }
+               #linear-source { position:absolute; left:100px; top:80px; background:linear-gradient(90deg,#ff0000,#0000ff) }
+               #conic-source { position:absolute; left:200px; top:80px; background:conic-gradient(from 0deg at 50% 50%,#ff0000,#0000ff,#ff0000) }
+               </style></head><body>
+                 <div id="ordinary" class="mask mask-source"></div>
+                 <div id="in-flow" class="mask"></div>
+                 <div id="positioned" class="mask"></div>
+                 <div id="solid-source" class="mask mask-source"></div>
+                 <div id="linear-source" class="mask mask-source"></div>
+                 <div id="conic-source" class="mask mask-source"></div>
+               </body></html>"##,
+        );
+        let pixmap = paint_dom(&tree, (300.0, 160.0), None).expect("pixmap");
+        let count_pixels = |left: u32, top: u32, predicate: fn(u8, u8, u8) -> bool| {
+            (top..top + 66)
+                .flat_map(|y| (left..left + 88).map(move |x| (x, y)))
+                .filter(|&(x, y)| {
+                    let pixel = pixmap.pixel(x, y).expect("pixel");
+                    predicate(pixel.red(), pixel.green(), pixel.blue())
+                })
+                .count()
+        };
+        let is_radial_color = |red, green, blue| {
+            red > 70 && blue > 100 && blue as u16 > green as u16 * 2
+        };
+        for (name, left) in [("ordinary element", 0), ("in-flow pseudo", 100), ("positioned pseudo", 200)] {
+            let colored = count_pixels(left, 0, is_radial_color);
+            assert!(
+                colored > 20,
+                "{name} must sample the radial source through the repeated SVG mask, found {colored} colored pixels"
+            );
+            let black = count_pixels(left, 0, |red, green, blue| red < 20 && green < 20 && blue < 20);
+            assert_eq!(
+                black, 0,
+                "{name} must not fall back to the default black mask fill"
+            );
+        }
+        assert!(
+            count_pixels(0, 80, |red, green, blue| green > 100 && red < 40 && blue < 40) > 20,
+            "solid mask sources must keep painting"
+        );
+        assert!(
+            count_pixels(100, 80, |red, green, blue| (red > 100 || blue > 100) && green < 80) > 20,
+            "linear-gradient mask sources must keep painting"
+        );
+        assert!(
+            count_pixels(200, 80, |red, green, blue| (red > 100 || blue > 100) && green < 80) > 20,
+            "conic-gradient mask sources must keep painting"
         );
     }
 
