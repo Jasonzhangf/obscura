@@ -126,3 +126,68 @@ fn paired_capture_reasserts_scroll_after_the_post_eval_settle() {
 
     std::fs::remove_dir_all(directory).expect("remove temporary output directory");
 }
+
+#[test]
+fn paired_capture_evaluates_state_after_final_scroll_reassert() {
+    let directory = output_directory();
+    std::fs::create_dir_all(&directory).expect("temporary output directory");
+    let screenshot = directory.join("capture-boundary.png");
+    let url = concat!(
+        "data:text/html,<html style=\"margin:0;scroll-behavior:smooth\">",
+        "<body style=\"margin:0\"><div style=\"height:400px\"></div>",
+        "</body></html>"
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_obscura"))
+        .args(["fetch", url, "--screenshot"])
+        .arg(&screenshot)
+        .args([
+            "--eval",
+            "JSON.stringify({phase:'capture-boundary-before-screenshot',y:scrollY})",
+            "--wait",
+            "0",
+            "--timeout",
+            "5",
+            "--quiet",
+        ])
+        .env("OBSCURA_SHOT_W", "100")
+        .env("OBSCURA_SHOT_H", "80")
+        .env("OBSCURA_SHOT_SCROLL_X", "0")
+        .env("OBSCURA_SHOT_SCROLL_Y", "80")
+        .env("OBSCURA_SHOT_EVAL_AT_CAPTURE", "1")
+        .output()
+        .expect("run obscura fetch");
+    assert!(
+        output.status.success(),
+        "capture failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("capture report JSON");
+    let evaluation: serde_json::Value = serde_json::from_str(
+        report["evaluation"]
+            .as_str()
+            .expect("stringified boundary state"),
+    )
+    .expect("boundary state JSON");
+    assert_eq!(
+        evaluation["phase"].as_str(),
+        Some("capture-boundary-before-screenshot")
+    );
+    assert_eq!(
+        evaluation["y"].as_f64(),
+        report["captureState"]["scrollY"].as_f64(),
+        "state and screenshot captureState must observe the same final reassert"
+    );
+    assert_eq!(
+        report["controlledScroll"]["initialPhase"].as_str(),
+        Some("before-controlled-scroll-settle")
+    );
+    assert_eq!(
+        report["controlledScroll"]["phase"].as_str(),
+        Some("immediately-before-capture-state-and-screenshot")
+    );
+
+    std::fs::remove_dir_all(directory).expect("remove temporary output directory");
+}

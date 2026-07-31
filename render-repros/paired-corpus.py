@@ -63,6 +63,7 @@ BRAND_PERMUTATIONS = [
     [2, 1, 0],
 ]
 GEOMETRY_PROBE_RECT_LIMIT = 200
+CAPTURE_BOUNDARY_PHASE = "capture-boundary-before-screenshot"
 
 
 def geometry_probe_javascript(selectors_expression):
@@ -216,8 +217,18 @@ def reassert_chromium_controlled_scroll(page, scroll):
     )
 
 
-def obscura_state_eval_expression(scroll, geometry_selectors=None):
-    """Sample the live page after an optional scroll and immediately before paint."""
+def obscura_state_eval_expression(
+    scroll,
+    geometry_selectors=None,
+    sampled_phase="before-cli-post-eval-settle",
+):
+    """Build a page-state sample with an explicit phase label.
+
+    `scroll` remains for compatibility with focused tests and ordinary callers.
+    Paired captures perform their authored scroll before the second settle in
+    the CLI, then invoke this expression without scrolling at the final capture
+    boundary.
+    """
     scroll_script = ""
     requested = "null"
     controlled_scroll_result = "null"
@@ -269,7 +280,7 @@ def obscura_state_eval_expression(scroll, geometry_selectors=None):
         "return ('00000000'+(h>>>0).toString(16)).slice(-8)};"
         + geometry_setup
         + "return JSON.stringify({"
-        "sampled_phase:'before-cli-post-eval-settle',"
+        f"sampled_phase:{json.dumps(sampled_phase)},"
         + geometry_result
         + f"requested:{requested},"
         + f"controlled_scroll:{controlled_scroll_result},"
@@ -347,7 +358,10 @@ def parse_obscura_capture_report(stdout):
         if isinstance(report.get("controlledScroll"), dict):
             state["controlled_scroll_capture"] = report["controlledScroll"]
         state["evaluation_sampled_phase"] = state.get("sampled_phase")
-        state["sampled_phase"] = "immediately-before-screenshot"
+        state["screenshot_sampled_phase"] = CAPTURE_BOUNDARY_PHASE
+        state["state_and_screenshot_share_capture_boundary"] = (
+            state.get("sampled_phase") == CAPTURE_BOUNDARY_PHASE
+        )
         return state
     return None
 
@@ -366,8 +380,14 @@ def parse_obscura_scroll_report(stdout):
             or state.get("requested")
         ),
         "pre_reassert_actual": capture_controlled.get("preReassertActual"),
-        "pre_initial_actual": controlled.get("pre_initial_actual"),
-        "post_initial_actual": controlled.get("post_initial_actual"),
+        "pre_initial_actual": (
+            capture_controlled.get("preInitialActual")
+            or controlled.get("pre_initial_actual")
+        ),
+        "post_initial_actual": (
+            capture_controlled.get("postInitialActual")
+            or controlled.get("post_initial_actual")
+        ),
         "final_reassert_actual": capture_controlled.get(
             "finalReassertActual"
         ),
@@ -407,6 +427,10 @@ def obscura_environment(width, height):
         # randomized platform changes responsive content and font selection,
         # making a renderer comparison answer the wrong question.
         OBSCURA_PROFILE=str(CANONICAL_OBSCURA_PROFILE),
+        # Run the paired corpus's read-only state/selector evaluation only after
+        # all settle phases and the final scroll reassertion. No event-loop
+        # pumping occurs between that evaluation and screenshot paint.
+        OBSCURA_SHOT_EVAL_AT_CAPTURE="1",
     )
     return env
 
@@ -557,7 +581,11 @@ def capture_obscura(
         "--wait",
         f"{settle_ms / 1000:g}",
     ]
-    state_expression = obscura_state_eval_expression(scroll, geometry_selectors)
+    state_expression = obscura_state_eval_expression(
+        None,
+        geometry_selectors,
+        sampled_phase=CAPTURE_BOUNDARY_PHASE,
+    )
     command.extend(["--eval", state_expression])
     started = time.time()
     try:
@@ -650,15 +678,15 @@ def chromium_identity_override(session):
 
 
 def capture_chromium_state(page, geometry_selectors=None):
-    """Sample page provenance immediately before the screenshot."""
-    expression = """async () => {
-          async function sha256(value) {
-            if (!globalThis.crypto || !crypto.subtle) return null;
-            const bytes = new TextEncoder().encode(value);
-            const digest = await crypto.subtle.digest("SHA-256", bytes);
-            return Array.from(new Uint8Array(digest), byte =>
-              byte.toString(16).padStart(2, "0")).join("");
-          }
+    """Synchronously sample page provenance immediately before screenshot.
+
+    Keep the in-page evaluation free of promises and event-loop yields. Hashing
+    is intentionally performed on the host after the synchronous snapshot
+    returns; awaiting WebCrypto here would let page tasks mutate layout between
+    the geometry sample and screenshot paint while falsely labeling both as one
+    capture boundary.
+    """
+    expression = """() => {
           function fnv1a32(value) {
             let hash = 2166136261;
             for (let index = 0; index < value.length; index++) {
@@ -695,7 +723,12 @@ def capture_chromium_state(page, geometry_selectors=None):
               matchMedia("(prefers-reduced-motion: reduce)").matches
           };
           return {
-            sampled_phase: "immediately-before-screenshot",
+            _hash_sources: {
+              dom,
+              normalized_dom: normalizedDom,
+              visible_text: normalizedText
+            },
+            sampled_phase: __CAPTURE_BOUNDARY_PHASE__,
             url: location.href,
             identity: {
               user_agent: navigator.userAgent,
@@ -715,16 +748,13 @@ def capture_chromium_state(page, geometry_selectors=None):
               outer_html_utf16: dom.length,
               outer_html_fnv1a32: fnv1a32(dom),
               outer_html_bytes: new TextEncoder().encode(dom).length,
-              outer_html_sha256: await sha256(dom),
               normalized_outer_html_utf16: normalizedDom.length,
               normalized_outer_html_fnv1a32: fnv1a32(normalizedDom),
               normalized_outer_html_bytes:
                 new TextEncoder().encode(normalizedDom).length,
-              normalized_outer_html_sha256: await sha256(normalizedDom),
               visible_text_utf16: normalizedText.length,
               visible_text_fnv1a32: fnv1a32(normalizedText),
               visible_text_bytes: new TextEncoder().encode(normalizedText).length,
-              visible_text_sha256: await sha256(normalizedText),
             },
             geometry: {
               inner_width: innerWidth,
@@ -776,9 +806,12 @@ def capture_chromium_state(page, geometry_selectors=None):
             }
           };
         }"""
+    expression = expression.replace(
+        "__CAPTURE_BOUNDARY_PHASE__", json.dumps(CAPTURE_BOUNDARY_PHASE), 1
+    )
     if geometry_selectors:
         expression = expression.replace(
-            "async () => {", "async geometrySelectors => {", 1
+            "() => {", "geometrySelectors => {", 1
         )
         expression = expression.replace(
             "          const root = document.documentElement;",
@@ -787,39 +820,133 @@ def capture_chromium_state(page, geometry_selectors=None):
             1,
         )
         expression = expression.replace(
-            '          return {\n            sampled_phase: "immediately-before-screenshot",',
+            "          return {\n            _hash_sources:",
             '          return {\n            geometry_probes: geometryProbes,\n'
-            '            sampled_phase: "immediately-before-screenshot",',
+            "            _hash_sources:",
             1,
         )
         state = page.evaluate(expression, list(geometry_selectors))
     else:
         state = page.evaluate(expression)
+    return state
+
+
+def finalize_chromium_state_hashes(state):
+    """Finalize hashes after paint without touching the live Chromium page."""
     document_state = state["document"]
-    if (
-        document_state["outer_html_sha256"] is None
-        or document_state["visible_text_sha256"] is None
-    ):
-        # crypto.subtle is unavailable on some non-secure/file origins. Only
-        # transfer the potentially large strings on that fallback path.
-        fallback = page.evaluate(
-            """() => {
-              const dom = document.documentElement
-                ? document.documentElement.outerHTML
-                : "";
-              const text = document.body
-                ? document.body.innerText.replace(/\\s+/g, " ").trim()
-                : "";
-              return {dom, text};
-            }"""
-        )
+    hash_sources = state.pop("_hash_sources", None)
+    if hash_sources is not None:
         document_state["outer_html_sha256"] = hashlib.sha256(
-            fallback["dom"].encode()
+            hash_sources["dom"].encode()
+        ).hexdigest()
+        document_state["normalized_outer_html_sha256"] = hashlib.sha256(
+            hash_sources["normalized_dom"].encode()
         ).hexdigest()
         document_state["visible_text_sha256"] = hashlib.sha256(
-            fallback["text"].encode()
+            hash_sources["visible_text"].encode()
         ).hexdigest()
     return state
+
+
+def chromium_capture_signature(state):
+    """Return the capture-critical state used to bracket a Chromium PNG.
+
+    Full DOM hashes remain useful provenance but are intentionally excluded:
+    analytics nodes can churn without affecting paint. The signature focuses
+    on viewport/content geometry, resource readiness, and every requested
+    geometry probe.
+    """
+    document = state.get("document") or {}
+    geometry = state.get("geometry") or {}
+    fonts = state.get("fonts") or {}
+    images = state.get("images") or {}
+    probes = []
+    for probe in state.get("geometry_probes") or []:
+        probes.append(
+            {
+                "selector": probe.get("selector"),
+                "valid": probe.get("valid"),
+                "count": probe.get("count"),
+                "rects_truncated": probe.get("rects_truncated"),
+                "rects": [
+                    {
+                        key: rect.get(key)
+                        for key in (
+                            "x",
+                            "y",
+                            "width",
+                            "height",
+                            "visible",
+                            "client_rect_count",
+                        )
+                    }
+                    for rect in probe.get("rects") or []
+                ],
+            }
+        )
+    return {
+        "document": {
+            key: document.get(key)
+            for key in ("ready_state", "element_count")
+        },
+        "geometry": {
+            key: geometry.get(key)
+            for key in (
+                "inner_width",
+                "inner_height",
+                "scroll_x",
+                "scroll_y",
+                "device_pixel_ratio",
+                "document_client_width",
+                "document_client_height",
+                "document_scroll_width",
+                "document_scroll_height",
+                "body_client_width",
+                "body_client_height",
+                "body_scroll_width",
+                "body_scroll_height",
+                "visual_viewport",
+            )
+        },
+        "fonts": {
+            key: fonts.get(key)
+            for key in ("supported", "status", "face_count", "ready_at_sample")
+        },
+        "images": {
+            key: images.get(key)
+            for key in (
+                "total",
+                "complete",
+                "complete_with_pixels",
+                "complete_without_pixels",
+                "pending",
+                "lazy",
+            )
+        },
+        "geometry_probes": probes,
+    }
+
+
+def capture_chromium_image(page, screenshot, geometry_selectors=None):
+    """Bracket one Chromium PNG with synchronous capture-critical samples."""
+    state = capture_chromium_state(page, geometry_selectors)
+    page.screenshot(
+        path=str(screenshot),
+        full_page=False,
+        timeout=50000,
+    )
+    post_capture_state = capture_chromium_state(page, geometry_selectors)
+    before_signature = chromium_capture_signature(state)
+    after_signature = chromium_capture_signature(post_capture_state)
+    post_capture_state.pop("_hash_sources", None)
+    boundary = {
+        "bracketed": True,
+        "stable": before_signature == after_signature,
+        "before": before_signature,
+        "after": after_signature,
+    }
+    finalize_chromium_state_hashes(state)
+    return state, boundary
 
 
 def freeze_chromium_animations(page, sample_ms):
@@ -1104,7 +1231,8 @@ def main():
             "after load and once after the initial scroll. Both engines record "
             "the resulting anchored offset and then reassert the requested "
             "offset with instant behavior immediately before capture state "
-            "and paint"
+            "and paint. Neither engine performs another settle between state/"
+            "selector sampling and screenshot paint"
         ),
         "animation_sampling": (
             {
@@ -1146,11 +1274,19 @@ def main():
             ),
         },
         "state_observability": {
-            "chromium": "same page, sampled immediately before screenshot",
+            "capture_boundary_phase": CAPTURE_BOUNDARY_PHASE,
+            "chromium": (
+                "same page, synchronously sampled after all settle phases and "
+                "immediately before screenshot. A second synchronous sample "
+                "after paint brackets the PNG and reports whether capture-"
+                "critical geometry/readiness remained stable. DOM SHA-256 "
+                "finalization runs on the host only after paint"
+            ),
             "obscura": (
-                "DOM/resource probes are sampled by the eval that begins the "
-                "post-eval settle; the CLI captureState is sampled afterward, "
-                "following the final instant scroll reassert, and records the "
+                "the paired-capture CLI defers DOM/resource/selector evaluation "
+                "until after all settle phases and the final instant scroll "
+                "reassert. Evaluation, captureState, and screenshot then run "
+                "consecutively without another settle; captureState records the "
                 "exact shared PreparedRender viewport, scroll offset, and "
                 "content size used by paint"
             ),
@@ -1312,6 +1448,7 @@ def main():
 
                 chrome_started = time.time()
                 chromium_scroll_state = None
+                chromium_capture_boundary = None
                 try:
                     page.goto(url, wait_until="load", timeout=50000)
                     page.wait_for_timeout(args.settle_ms)
@@ -1340,9 +1477,19 @@ def main():
                         )
                     chromium_state_ok = False
                     try:
-                        chromium_state = capture_chromium_state(
-                            page, args.geometry_selector
+                        (
+                            chromium_state,
+                            chromium_capture_boundary,
+                        ) = capture_chromium_image(
+                            page,
+                            chrome_path,
+                            args.geometry_selector,
                         )
+                        if not chromium_capture_boundary["stable"]:
+                            chrome_messages.append(
+                                "capture boundary warning: capture-critical "
+                                "state changed while taking the Chromium PNG"
+                            )
                         if chromium_scroll_state is not None:
                             chromium_state["controlled_scroll"] = (
                                 chromium_scroll_state
@@ -1362,9 +1509,12 @@ def main():
                     except Exception as error:
                         chromium_state = None
                         chrome_messages.append(f"state capture error: {error}")
-                    page.screenshot(
-                        path=str(chrome_path), full_page=False, timeout=50000
-                    )
+                    if not chrome_path.is_file():
+                        page.screenshot(
+                            path=str(chrome_path),
+                            full_page=False,
+                            timeout=50000,
+                        )
                     chrome_ok = (
                         chromium_state_ok
                         and chrome_path.is_file()
@@ -1382,6 +1532,9 @@ def main():
                     "elapsed_s": round(time.time() - chrome_started, 3),
                     "title": page.title() if chrome_ok else None,
                     "state": chromium_state if chrome_ok else None,
+                    "capture_boundary_validation": (
+                        chromium_capture_boundary if chrome_ok else None
+                    ),
                     "scroll_state": (
                         chromium_scroll_state if chrome_ok else None
                     ),

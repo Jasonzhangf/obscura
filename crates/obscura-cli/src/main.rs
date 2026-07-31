@@ -636,6 +636,33 @@ async fn run_fetch(
         eprintln!("Fetching {}...", url_str);
     }
 
+    // The paired corpus opts into a truthful capture boundary: its read-only
+    // evaluation runs after all settle passes and the final scroll reassert,
+    // immediately before screenshot paint. Ordinary CLI evaluation retains
+    // its existing evaluate-then-settle behavior when this private variable is
+    // absent.
+    let eval_at_capture_boundary = screenshot.is_some()
+        && eval.is_some()
+        && std::env::var("OBSCURA_SHOT_EVAL_AT_CAPTURE")
+            .is_ok_and(|value| value == "1");
+    let controlled_scroll_request = screenshot.as_ref().and_then(|_| {
+        let raw_y = std::env::var("OBSCURA_SHOT_SCROLL_Y").ok()?;
+        let x = match std::env::var("OBSCURA_SHOT_SCROLL_X") {
+            Ok(raw) => raw.parse::<f64>().ok().filter(|value| value.is_finite())?,
+            Err(_) => 0.0,
+        };
+        let requested_y = if raw_y.eq_ignore_ascii_case("bottom") {
+            "document.documentElement.scrollHeight".to_string()
+        } else {
+            raw_y
+                .parse::<f64>()
+                .ok()
+                .filter(|value| value.is_finite())
+                .map(|value| value.to_string())?
+        };
+        Some((x, requested_y))
+    });
+
     // Process-level hard deadline. A synchronous hang inside a Rust op invoked
     // from page JS cannot be cancelled by tokio (there is no await to interrupt)
     // nor by the V8 watchdog (terminate_execution only unwinds JS bytecode, not
@@ -644,7 +671,9 @@ async fn run_fetch(
     // operation overruns navigation + every configured settle pass + grace. A
     // normal fetch returns first and the process exits before this fires.
     {
-        let settle_passes = if eval.is_some()
+        let settle_passes = if eval_at_capture_boundary {
+            1 + u64::from(controlled_scroll_request.is_some())
+        } else if eval.is_some()
             && (screenshot.is_some() || selector.is_some() || dump_specified)
         {
             2
@@ -683,36 +712,60 @@ async fn run_fetch(
     page.settle(wait_secs.saturating_mul(1000)).await;
 
     let mut deferred_eval_output = None;
-    if let Some(ref expr) = eval {
-        // Bound the eval by the same budget as navigation so a runaway
-        // expression (infinite loop, never-settling sync work) cannot hang.
-        let result = page.evaluate_with_timeout(expr, Duration::from_secs(timeout_secs));
-
-        // A bare --eval (no --selector, --dump, or --screenshot) returns the
-        // eval value directly, so synchronous expressions
-        // (JSON.stringify, ...) are unchanged. Screenshot captures continue
-        // below so an evaluation such as scrollTo() affects the painted
-        // viewport instead of being silently ignored.
-        if !dump_specified && selector.is_none() && screenshot.is_none() {
-            let rendered = match result {
-                serde_json::Value::String(s) => s,
-                serde_json::Value::Null => "null".to_string(),
-                other => other.to_string(),
-            };
-            write_or_print(rendered, output.as_ref()).await?;
-            context.save_cookies();
-            return Ok(());
-        }
-        if screenshot.is_some() {
-            deferred_eval_output = Some(result);
-        }
-
-        // --eval combined with --selector, --dump, and/or --screenshot
-        // typically kicks off async work (a fetch promise, a timer, a scroll
-        // listener) that writes the DOM. Drive the event loop again so that
-        // work completes, then fall through to selector/capture/dump instead
-        // of returning the still-pending eval value (issue #248).
+    let initial_controlled_scroll = if eval_at_capture_boundary {
+        controlled_scroll_request.as_ref().map(|(x, requested_y)| {
+            page.evaluate(&format!(
+                "(()=>{{\
+                 const requestedX={x},requestedY={requested_y};\
+                 const preInitial={{x:window.scrollX,y:window.scrollY}};\
+                 window.scrollTo(requestedX,requestedY);\
+                 return {{requested:{{x:requestedX,y:requestedY}},\
+                 preInitialActual:preInitial,\
+                 postInitialActual:{{x:window.scrollX,y:window.scrollY}},\
+                 initialBehavior:'authored',\
+                 initialPhase:'before-controlled-scroll-settle'}}\
+                 }})()"
+            ))
+        })
+    } else {
+        None
+    };
+    if initial_controlled_scroll.is_some() {
         page.settle(wait_secs.saturating_mul(1000)).await;
+    }
+
+    if !eval_at_capture_boundary {
+        if let Some(ref expr) = eval {
+            // Bound the eval by the same budget as navigation so a runaway
+            // expression (infinite loop, never-settling sync work) cannot hang.
+            let result = page.evaluate_with_timeout(expr, Duration::from_secs(timeout_secs));
+
+            // A bare --eval (no --selector, --dump, or --screenshot) returns the
+            // eval value directly, so synchronous expressions
+            // (JSON.stringify, ...) are unchanged. Screenshot captures continue
+            // below so an evaluation such as scrollTo() affects the painted
+            // viewport instead of being silently ignored.
+            if !dump_specified && selector.is_none() && screenshot.is_none() {
+                let rendered = match result {
+                    serde_json::Value::String(s) => s,
+                    serde_json::Value::Null => "null".to_string(),
+                    other => other.to_string(),
+                };
+                write_or_print(rendered, output.as_ref()).await?;
+                context.save_cookies();
+                return Ok(());
+            }
+            if screenshot.is_some() {
+                deferred_eval_output = Some(result);
+            }
+
+            // --eval combined with --selector, --dump, and/or --screenshot
+            // typically kicks off async work (a fetch promise, a timer, a scroll
+            // listener) that writes the DOM. Drive the event loop again so that
+            // work completes, then fall through to selector/capture/dump instead
+            // of returning the still-pending eval value (issue #248).
+            page.settle(wait_secs.saturating_mul(1000)).await;
+        }
     }
 
     if let Some(ref sel) = selector {
@@ -735,26 +788,10 @@ async fn run_fetch(
             // into one instant reassertion at the actual capture boundary.
             // Ordinary CLI screenshots are unchanged when these private
             // capture-environment variables are absent.
-            let controlled_scroll = std::env::var("OBSCURA_SHOT_SCROLL_Y")
-                .ok()
-                .and_then(|raw_y| {
-                    let x = match std::env::var("OBSCURA_SHOT_SCROLL_X") {
-                        Ok(raw) => raw
-                            .parse::<f64>()
-                            .ok()
-                            .filter(|value| value.is_finite())?,
-                        Err(_) => 0.0,
-                    };
-                    let requested_y = if raw_y.eq_ignore_ascii_case("bottom") {
-                        "document.documentElement.scrollHeight".to_string()
-                    } else {
-                        raw_y
-                            .parse::<f64>()
-                            .ok()
-                            .filter(|value| value.is_finite())
-                            .map(|value| value.to_string())?
-                    };
-                    Some(page.evaluate(&format!(
+            let controlled_scroll = controlled_scroll_request
+                .as_ref()
+                .map(|(x, requested_y)| {
+                    page.evaluate(&format!(
                         "(()=>{{\
                          const requestedX={x},requestedY={requested_y};\
                          const preReassert={{x:window.scrollX,y:window.scrollY}};\
@@ -771,8 +808,15 @@ async fn run_fetch(
                          behavior:'instant',\
                          phase:'immediately-before-capture-state-and-screenshot'}}\
                          }})()"
-                    )))
+                    ))
                 });
+            if eval_at_capture_boundary {
+                if let Some(ref expr) = eval {
+                    deferred_eval_output = Some(
+                        page.evaluate_with_timeout(expr, Duration::from_secs(timeout_secs))
+                    );
+                }
+            }
             let capture_state = deferred_eval_output.as_ref().map(|_| {
                 page.evaluate(
                     "(()=>({\
@@ -796,11 +840,31 @@ async fn run_fetch(
             // after the post-eval settle so automation can record the exact
             // live viewport that was painted.
             if let Some(result) = deferred_eval_output {
+                let mut controlled_scroll_report = controlled_scroll;
+                if let (Some(report), Some(initial)) = (
+                    controlled_scroll_report.as_mut(),
+                    initial_controlled_scroll.as_ref(),
+                ) {
+                    if let (Some(report), Some(initial)) =
+                        (report.as_object_mut(), initial.as_object())
+                    {
+                        for key in [
+                            "preInitialActual",
+                            "postInitialActual",
+                            "initialBehavior",
+                            "initialPhase",
+                        ] {
+                            if let Some(value) = initial.get(key) {
+                                report.insert(key.to_string(), value.clone());
+                            }
+                        }
+                    }
+                }
                 println!(
                     "{}",
                     serde_json::json!({
                         "evaluation": result,
-                        "controlledScroll": controlled_scroll,
+                        "controlledScroll": controlled_scroll_report,
                         "captureState": capture_state.unwrap_or(serde_json::Value::Null),
                     })
                 );

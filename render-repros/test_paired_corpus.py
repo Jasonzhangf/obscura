@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 
+import hashlib
 import importlib.util
 import json
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPT = Path(__file__).with_name("paired-corpus.py")
@@ -75,12 +77,14 @@ class ControlledScrollTests(unittest.TestCase):
     def test_capture_report_uses_post_settle_state(self):
         stdout = (
             "diagnostic\n"
-            '{"evaluation":"{\\"requested\\":{\\"x\\":0,\\"y\\":2702},'
-            '\\"controlled_scroll\\":{\\"requested\\":{\\"x\\":0,\\"y\\":2702},'
-            '\\"pre_initial_actual\\":{\\"x\\":0,\\"y\\":0},'
-            '\\"post_initial_actual\\":{\\"x\\":0,\\"y\\":12},'
-            '\\"initial_behavior\\":\\"authored\\"}}",'
+            '{"evaluation":"{\\"sampled_phase\\":'
+            '\\"capture-boundary-before-screenshot\\",'
+            '\\"requested\\":null,\\"controlled_scroll\\":null}",'
             '"controlledScroll":{"requested":{"x":0,"y":2702},'
+            '"preInitialActual":{"x":0,"y":0},'
+            '"postInitialActual":{"x":0,"y":12},'
+            '"initialBehavior":"authored",'
+            '"initialPhase":"before-controlled-scroll-settle",'
             '"preReassertActual":{"x":0,"y":1791},'
             '"finalReassertActual":{"x":0,"y":1802},'
             '"behavior":"instant",'
@@ -102,7 +106,9 @@ class ControlledScrollTests(unittest.TestCase):
         self.assertEqual(state["actual"], {"x": 0, "y": 1802})
         self.assertEqual(state["reassert_behavior"], "instant")
         self.assertEqual(state["content"]["height"], 2702)
-        self.assertEqual(state["sampled_phase"], "immediately-before-screenshot")
+        self.assertEqual(
+            state["sampled_phase"], paired_corpus.CAPTURE_BOUNDARY_PHASE
+        )
 
     def test_obscura_capture_exports_final_scroll_request_to_cli(self):
         environment = paired_corpus.obscura_environment(1280, 720)
@@ -111,6 +117,20 @@ class ControlledScrollTests(unittest.TestCase):
         )
         self.assertEqual(environment["OBSCURA_SHOT_SCROLL_X"], "12")
         self.assertEqual(environment["OBSCURA_SHOT_SCROLL_Y"], "bottom")
+        self.assertEqual(environment["OBSCURA_SHOT_EVAL_AT_CAPTURE"], "1")
+
+    def test_paired_state_expression_is_read_only_at_capture_boundary(self):
+        expression = paired_corpus.obscura_state_eval_expression(
+            None,
+            [".card"],
+            sampled_phase=paired_corpus.CAPTURE_BOUNDARY_PHASE,
+        )
+        self.assertIn(
+            f'sampled_phase:"{paired_corpus.CAPTURE_BOUNDARY_PHASE}"',
+            expression,
+        )
+        self.assertIn("geometry_probes:geometryProbes", expression)
+        self.assertNotIn("window.scrollTo", expression)
 
     def test_every_capture_expression_samples_page_state_without_scrolling(self):
         expression = paired_corpus.obscura_state_eval_expression(None)
@@ -124,7 +144,9 @@ class ControlledScrollTests(unittest.TestCase):
 
     def test_capture_report_keeps_dom_state_and_authoritative_geometry(self):
         stdout = (
-            '{"evaluation":"{\\"document\\":{\\"ready_state\\":\\"complete\\",'
+            '{"evaluation":"{\\"sampled_phase\\":'
+            '\\"capture-boundary-before-screenshot\\",'
+            '\\"document\\":{\\"ready_state\\":\\"complete\\",'
             '\\"element_count\\":7,\\"outer_html_fnv1a32\\":\\"12345678\\"},'
             '\\"geometry\\":{\\"document_scroll_height\\":999}}",'
             '"captureState":{"scrollX":3,"scrollY":40,'
@@ -135,6 +157,26 @@ class ControlledScrollTests(unittest.TestCase):
         self.assertEqual(state["document"]["element_count"], 7)
         self.assertEqual(state["geometry"]["scroll_y"], 40)
         self.assertEqual(state["geometry"]["document_scroll_height"], 1200)
+        self.assertTrue(state["state_and_screenshot_share_capture_boundary"])
+
+    def test_legacy_pre_settle_report_is_not_relabelled_as_capture_state(self):
+        stdout = (
+            '{"evaluation":"{\\"sampled_phase\\":'
+            '\\"before-cli-post-eval-settle\\",'
+            '\\"document\\":{},\\"geometry\\":{}}",'
+            '"captureState":{"scrollX":0,"scrollY":0,'
+            '"innerWidth":640,"innerHeight":480,'
+            '"scrollWidth":640,"scrollHeight":480}}\n'
+        )
+        state = paired_corpus.parse_obscura_capture_report(stdout)
+        self.assertEqual(
+            state["sampled_phase"], "before-cli-post-eval-settle"
+        )
+        self.assertEqual(
+            state["screenshot_sampled_phase"],
+            paired_corpus.CAPTURE_BOUNDARY_PHASE,
+        )
+        self.assertFalse(state["state_and_screenshot_share_capture_boundary"])
 
     def test_page_state_comparison_reports_provenance_and_geometry_deltas(self):
         obscura = {
@@ -212,6 +254,77 @@ class GeometryProbeTests(unittest.TestCase):
         self.assertEqual(args, ())
         self.assertNotIn("sampleGeometrySelector", expression)
         self.assertNotIn("geometry_probes", expression)
+        self.assertNotIn("async ", expression)
+        self.assertNotIn("await ", expression)
+        self.assertNotIn("crypto.subtle", expression)
+        self.assertIn(
+            f'sampled_phase: "{paired_corpus.CAPTURE_BOUNDARY_PHASE}"',
+            expression,
+        )
+
+    def test_chromium_snapshot_paints_before_host_hashing(self):
+        events = []
+        first_state = {
+            "_hash_sources": {
+                "dom": "<html></html>",
+                "normalized_dom": "<html></html>",
+                "visible_text": "hello",
+            },
+            "document": {},
+        }
+        second_state = {
+            "_hash_sources": {
+                "dom": "<html></html>",
+                "normalized_dom": "<html></html>",
+                "visible_text": "hello",
+            },
+            "document": {},
+        }
+
+        class OrderedPage:
+            def __init__(self):
+                self.states = [first_state, second_state]
+
+            def evaluate(self, expression, *args):
+                events.append("evaluate")
+                return self.states.pop(0)
+
+            def screenshot(self, **kwargs):
+                events.append("screenshot")
+
+        real_sha256 = hashlib.sha256
+
+        def ordered_sha256(value):
+            events.append("sha256")
+            return real_sha256(value)
+
+        with mock.patch.object(
+            paired_corpus.hashlib,
+            "sha256",
+            side_effect=ordered_sha256,
+        ):
+            captured, boundary = paired_corpus.capture_chromium_image(
+                OrderedPage(), Path("/tmp/not-written.png")
+            )
+
+        self.assertEqual(
+            events,
+            ["evaluate", "screenshot", "evaluate", "sha256", "sha256", "sha256"],
+        )
+        self.assertTrue(boundary["stable"])
+        self.assertNotIn("_hash_sources", captured)
+        self.assertEqual(
+            captured["document"]["outer_html_sha256"],
+            hashlib.sha256(b"<html></html>").hexdigest(),
+        )
+        self.assertEqual(
+            captured["document"]["normalized_outer_html_sha256"],
+            hashlib.sha256(b"<html></html>").hexdigest(),
+        )
+        self.assertEqual(
+            captured["document"]["visible_text_sha256"],
+            hashlib.sha256(b"hello").hexdigest(),
+        )
 
     def test_repeatable_selectors_are_passed_safely_in_one_state_expression(self):
         selectors = ["header nav a", '[data-label="a\\\"b"]', "["]
@@ -232,6 +345,10 @@ class GeometryProbeTests(unittest.TestCase):
         self.assertIn("querySelectorAll(selector)", expression)
         self.assertIn("catch(error)", expression)
         self.assertIn("geometry_probes: geometryProbes", expression)
+        self.assertIn(
+            f'sampled_phase: "{paired_corpus.CAPTURE_BOUNDARY_PHASE}"',
+            expression,
+        )
 
     def test_probe_comparison_reports_raw_deltas_and_invalid_errors(self):
         obscura = {
