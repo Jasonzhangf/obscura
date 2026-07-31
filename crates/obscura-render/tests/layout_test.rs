@@ -1273,6 +1273,49 @@ fn text_alignment_does_not_shrink_block_children_or_wrap_inline_block_rows() {
 }
 
 #[test]
+fn non_replaced_inline_ignores_used_width_height_and_min_max_sizes() {
+    let tree = parse_html(
+        r#"<style>
+          html,body,p{margin:0}
+          #host{width:300px;font-size:16px;line-height:20px}
+          #token{
+            position:relative;
+            width:100%;height:100px;
+            min-width:100%;min-height:100px;
+            max-width:100%;max-height:100px;
+            padding:0 5px;
+            background:red
+          }
+          #after{position:relative;background:blue}
+        </style>
+        <p id="host">A <code id="token">token</code> <span id="after">after</span></p>"#,
+    );
+    let laid = layout_dom(&tree, (400.0, 200.0));
+    let token_id = tree.get_element_by_id("token").unwrap();
+    let after_id = tree.get_element_by_id("after").unwrap();
+    let token = laid.rects[&token_id];
+    let after = laid.rects[&after_id];
+
+    assert_eq!(
+        laid.styles[&token_id].width,
+        obscura_render::Dimension::Percent(1.0),
+        "computed style must retain the authored percentage"
+    );
+    assert!(
+        token.width > 20.0 && token.width < 100.0,
+        "a non-replaced inline's used width must hug its text and padding: {token:?}"
+    );
+    assert!(
+        token.height < 40.0,
+        "height/min-height/max-height do not apply to a non-replaced inline: {token:?}"
+    );
+    assert!(
+        after.x >= token.x + token.width - 0.01 && (after.y - token.y).abs() < 0.01,
+        "the following inline must remain on the same line: {token:?} {after:?}"
+    );
+}
+
+#[test]
 fn inline_svg_derives_auto_height_from_view_box() {
     let tree = parse_html(
         r#"<html><head><style>html,body{margin:0}#logo{width:112px}</style></head>

@@ -512,6 +512,14 @@ pub struct LayoutStyle {
     /// (`<img>` or its selected `<picture><source>`), rather than authored
     /// CSS. A decoded image's natural ratio replaces this provisional ratio.
     pub aspect_ratio_is_mapped: bool,
+    /// Whether this element generates a replaced box.
+    ///
+    /// Replaced elements with `display:inline` are atomic and therefore keep
+    /// authored width/height/min/max sizing. Ordinary inline boxes compute
+    /// those properties but ignore them for used layout. This provenance
+    /// cannot be inferred from intrinsic dimensions because an unloaded or
+    /// broken image remains replaced.
+    pub(crate) is_replaced_box: bool,
     pub margin: Edges,
     /// Which margin sides are `auto` (top, right, bottom, left). `margin: 0
     /// auto` / `margin-inline: auto` centering needs a real Auto margin, which
@@ -994,6 +1002,13 @@ pub(crate) const CB_TRIGGER_CONTENT_VISIBILITY: u16 = 1 << 6;
 pub(crate) const CB_TRIGGER_TRANSLATE: u16 = 1 << 7;
 
 impl LayoutStyle {
+    /// Whether CSS box sizes compute normally but do not apply to this box's
+    /// used geometry. The display value here is post-blockification, so roots,
+    /// flex/grid items, floats, and out-of-flow boxes retain applicable sizes.
+    pub(crate) fn ignores_used_box_sizes(&self) -> bool {
+        self.display == Display::Inline && !self.is_inline_block && !self.is_replaced_box
+    }
+
     pub(crate) fn establishes_positioning_containing_block(&self) -> bool {
         self.containing_block_triggers != 0
     }
@@ -1346,6 +1361,21 @@ pub(crate) fn to_taffy_style(style: &LayoutStyle) -> Style {
         if ar.is_finite() && ar > 0.0 {
             s.aspect_ratio = Some(ar);
         }
+    }
+    if style.ignores_used_box_sizes() {
+        s.size = taffy::Size {
+            width: taffy::Dimension::auto(),
+            height: taffy::Dimension::auto(),
+        };
+        s.min_size = taffy::Size {
+            width: taffy::Dimension::auto(),
+            height: taffy::Dimension::auto(),
+        };
+        s.max_size = taffy::Size {
+            width: taffy::Dimension::auto(),
+            height: taffy::Dimension::auto(),
+        };
+        s.aspect_ratio = None;
     }
     if style.display != Display::Block {
         if let Some(ai) = style.align_items {

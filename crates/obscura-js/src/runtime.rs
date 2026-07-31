@@ -2216,6 +2216,98 @@ mod tests {
 
     #[cfg(feature = "render")]
     #[test]
+    fn ordinary_inline_keeps_computed_sizes_but_uses_content_geometry() {
+        let dom = parse_html(
+            r#"<html><head><style>
+                html,body,p { margin:0 }
+                #host { width:300px; font-size:16px; line-height:20px }
+                #token {
+                    position:relative;
+                    width:100%; height:100px;
+                    min-width:100%; min-height:100px;
+                    max-width:100%; max-height:100px;
+                    padding:0 5px; background:red
+                }
+                #after { position:relative }
+                #atomic {
+                    display:inline-block; box-sizing:border-box;
+                    width:80px; height:30px; padding:0; border:0
+                }
+                #replaced {
+                    display:inline; box-sizing:border-box;
+                    width:80px; height:30px; min-width:0; min-height:0;
+                    max-width:none; max-height:none; padding:0; border:0
+                }
+                #items { display:flex }
+                #item {
+                    display:inline; box-sizing:border-box; flex:none;
+                    width:90px; height:25px; padding:0; border:0
+                }
+            </style></head><body>
+                <p id="host">A <code id="token">token</code> <span id="after">after</span></p>
+                <span id="atomic"></span>
+                <input id="replaced">
+                <div id="items"><span id="item"></span></div>
+            </body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_viewport(400.0, 240.0);
+        rt.run_page_init();
+
+        let result = rt
+            .evaluate(
+                r#"
+                const token = document.getElementById("token");
+                const after = document.getElementById("after");
+                const computed = getComputedStyle(token);
+                const rect = token.getBoundingClientRect();
+                const afterRect = after.getBoundingClientRect();
+                const atomic = document.getElementById("atomic").getBoundingClientRect();
+                const replaced = document.getElementById("replaced").getBoundingClientRect();
+                const item = document.getElementById("item").getBoundingClientRect();
+                return {
+                    computed: [
+                        computed.width, computed.height,
+                        computed.minWidth, computed.minHeight,
+                        computed.maxWidth, computed.maxHeight
+                    ],
+                    rect: [rect.x, rect.y, rect.width, rect.height],
+                    after: [afterRect.x, afterRect.y],
+                    client: [token.clientWidth, token.clientHeight],
+                    atomic: [atomic.width, atomic.height],
+                    replaced: [replaced.width, replaced.height],
+                    item: [item.width, item.height, getComputedStyle(item).display]
+                };
+                "#,
+            )
+            .unwrap();
+
+        assert_eq!(
+            result["computed"],
+            serde_json::json!(["100%", "100px", "100%", "100px", "100%", "100px"])
+        );
+        let rect = result["rect"].as_array().unwrap();
+        let token_x = rect[0].as_f64().unwrap();
+        let token_y = rect[1].as_f64().unwrap();
+        let token_width = rect[2].as_f64().unwrap();
+        let token_height = rect[3].as_f64().unwrap();
+        assert!(
+            token_width > 20.0 && token_width < 100.0,
+            "ordinary inline should hug text and padding: {rect:?}"
+        );
+        assert!(token_height < 40.0, "ignored block size leaked into geometry");
+        assert_eq!(result["client"], serde_json::json!([0, 0]));
+        let after = result["after"].as_array().unwrap();
+        assert!(after[0].as_f64().unwrap() >= token_x + token_width - 0.01);
+        assert!((after[1].as_f64().unwrap() - token_y).abs() < 0.01);
+        assert_eq!(result["atomic"], serde_json::json!([80, 30]));
+        assert_eq!(result["replaced"], serde_json::json!([80, 30]));
+        assert_eq!(result["item"], serde_json::json!([90, 25, "block"]));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
     fn computed_style_uses_renderer_stylesheet_cascade_and_invalidates() {
         let dom = parse_html(
             r#"<html><head><style>

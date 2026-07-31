@@ -894,6 +894,7 @@ fn resolve_atomic_percentage_heights(
                 .is_some_and(|node| node.parent == Some(parent_id));
             let child_percent = styles.get(&dom_id).and_then(|style| {
                 (style.size_expressions[1].is_none()
+                    && !style.ignores_used_box_sizes()
                     && !matches!(style.position, Some(taffy::Position::Absolute)))
                 .then_some(style.height)
                 .and_then(|height| match height {
@@ -1381,6 +1382,7 @@ fn cascade_walk(
                 .filter(|value| value.is_finite() && *value >= 0.0);
         }
         let mut style = crate::style::ua_style(elem.local.as_ref());
+        style.is_replaced_box = crate::inline::is_replaced(elem.local.as_ref());
         style.color_scheme_dark = inherited_color_scheme_dark;
         if matches!(elem.local.as_ref(), "td" | "th") {
             if let Some(padding) = inherited_cell_padding {
@@ -1480,7 +1482,8 @@ fn cascade_walk(
             this_props = std::rc::Rc::new(m);
         }
         custom_properties.insert(id, this_props.clone());
-        let (before_pseudo, after_pseudo) =
+        style.is_replaced_box |= style.content_image.is_some();
+        let (mut before_pseudo, mut after_pseudo) =
             if let Some(evaluator) = container_evaluator.as_deref_mut() {
                 sheet.pseudo_styles_with_container_queries(
                     tree,
@@ -1493,6 +1496,12 @@ fn cascade_walk(
             } else {
                 sheet.pseudo_styles(tree, matcher, id, &this_props, &style)
             };
+        for pseudo in [&mut before_pseudo, &mut after_pseudo]
+            .into_iter()
+            .flatten()
+        {
+            pseudo.is_replaced_box = pseudo.content_image.is_some();
+        }
         style.before_content = before_pseudo
             .as_ref()
             .filter(|pseudo| pseudo.position != Some(taffy::Position::Absolute))
@@ -2073,6 +2082,7 @@ fn layout_dom_once(
             opacity_product: f32,
             list_style: crate::ListStyle,
             line_height: crate::LineHeight,
+            white_space: crate::WhiteSpace,
             text_wrap_style: crate::TextWrapStyle,
             text_transform: crate::TextTransform,
             italic: bool,
@@ -2121,6 +2131,7 @@ fn layout_dom_once(
                     // CSS initial value of list-style-type.
                     list_style: crate::ListStyle::Disc,
                     line_height: crate::LineHeight::Normal,
+                    white_space: crate::WhiteSpace::Normal,
                     text_wrap_style: crate::TextWrapStyle::Auto,
                     text_transform: crate::TextTransform::None,
                     italic: false,
@@ -2501,6 +2512,7 @@ fn layout_dom_once(
                     inh.visibility_hidden || inh.opacity_product <= 0.0;
                 match style.list_style { Some(v) => inh.list_style = v, None => style.list_style = Some(inh.list_style) }
                 match style.line_height { Some(v) => inh.line_height = v, None => style.line_height = Some(inh.line_height) }
+                match style.white_space { Some(v) => inh.white_space = v, None => style.white_space = Some(inh.white_space) }
                 match style.text_wrap_style { Some(v) => inh.text_wrap_style = v, None => style.text_wrap_style = Some(inh.text_wrap_style) }
                 match style.text_transform { Some(v) => inh.text_transform = v, None => style.text_transform = Some(inh.text_transform) }
                 match style.font_style_italic { Some(v) => inh.italic = v, None => style.font_style_italic = Some(inh.italic) }
@@ -2621,6 +2633,7 @@ fn layout_dom_once(
                 let host_optical_sizing = style.font_optical_sizing;
                 let host_variation_settings = style.font_variation_settings.clone();
                 let host_line_height = style.line_height;
+                let host_white_space = style.white_space;
                 let host_text_wrap_style = style.text_wrap_style;
                 let host_transform = style.text_transform;
                 let host_italic = style.font_style_italic;
@@ -2834,6 +2847,9 @@ fn layout_dom_once(
                         pseudo.line_height = Some(crate::LineHeight::Px(pixels));
                     } else if pseudo.line_height.is_none() {
                         pseudo.line_height = host_line_height;
+                    }
+                    if pseudo.white_space.is_none() {
+                        pseudo.white_space = host_white_space;
                     }
                     if pseudo.text_wrap_style.is_none() {
                         pseudo.text_wrap_style = host_text_wrap_style;
@@ -3210,6 +3226,7 @@ fn layout_dom_once(
                 crate::blockify_outer_display(style);
             }
         }
+        blockify_generated_pseudos(&mut styles);
 
         // The initial containing block is modelled by the root taffy node's
         // definite viewport height (set at build), which is what `html,body{
@@ -5671,6 +5688,30 @@ fn blockify_layout_children(
     }
 }
 
+/// Generated `::before`/`::after` boxes participate in the same display
+/// fixups as real elements. They are stored inside their host style rather
+/// than in the DOM map, so the normal root/item/float/positioned loops above
+/// cannot reach them.
+fn blockify_generated_pseudos(styles: &mut HashMap<NodeId, crate::LayoutStyle>) {
+    for host in styles.values_mut() {
+        let host_is_item_container = matches!(
+            host.display,
+            crate::Display::Flex | crate::Display::Grid
+        ) && !host.internal_flex_container;
+        for pseudo in [host.before_pseudo.as_mut(), host.after_pseudo.as_mut()]
+            .into_iter()
+            .flatten()
+        {
+            if host_is_item_container
+                || matches!(pseudo.position, Some(taffy::Position::Absolute))
+                || pseudo.float.is_some()
+            {
+                crate::blockify_outer_display(pseudo);
+            }
+        }
+    }
+}
+
 /// Build whichever of an element or a text node `id` is, returning every
 /// taffy node it produced (usually one, but a text node fans out to one leaf
 /// per word; see `build_text_words`). Callers collecting a container's
@@ -5914,8 +5955,6 @@ fn is_flattenable_inline(tree: &DomTree, id: NodeId, styles: &HashMap<NodeId, cr
         && style.background_image.is_none()
         && style.mask_image.is_none()
         && style.border == crate::Edges::default()
-        && style.width == crate::Dimension::Auto
-        && style.height == crate::Dimension::Auto
         && style.position.is_none()
         && !style.overflow_hidden
         && style.float.is_none()
@@ -6085,12 +6124,6 @@ fn pseudo_requires_generated_box(style: &crate::LayoutStyle, content: Option<&st
         || style.display != crate::Display::Inline
         || style.is_inline_block
         || style.position.is_some()
-        || style.width != crate::Dimension::Auto
-        || style.height != crate::Dimension::Auto
-        || style.min_width != crate::Dimension::Auto
-        || style.min_height != crate::Dimension::Auto
-        || style.max_width != crate::Dimension::Auto
-        || style.max_height != crate::Dimension::Auto
         || style.margin != crate::Edges::default()
         || style.margin_auto.iter().any(|value| *value)
         || style.padding != crate::Edges::default()
@@ -6374,7 +6407,7 @@ where
         .iter()
         .filter_map(|(&node, &dom)| {
             let style = styles.get(&dom)?;
-            if !style.width_fit_content {
+            if !style.width_fit_content || style.ignores_used_box_sizes() {
                 return None;
             }
             let layout = taffy_tree.layout(node).ok()?;
@@ -7017,6 +7050,7 @@ fn defer_cyclic_flex_inline_sizes(
 ) -> Vec<DeferredCyclicInlineSize> {
     let candidates: Vec<(NodeId, usize, String)> = styles
         .iter()
+        .filter(|(_, style)| !style.ignores_used_box_sizes())
         .flat_map(|(&id, style)| {
             [0usize, 2, 4].into_iter().filter_map(move |slot| {
                 style.size_expressions[slot]
@@ -10831,6 +10865,124 @@ mod tests {
         };
         assert_eq!(width("content-cell"), 124.0);
         assert_eq!(width("border-cell"), 100.0);
+    }
+
+    #[test]
+    fn white_space_inherits_into_a_block_descendant_inline_context() {
+        let tree = parse_html(
+            r#"<style>
+                html, body, pre { margin:0 }
+                pre { width:120px; white-space:pre; font-size:16px; line-height:20px }
+                code { display:flex; flex-direction:column }
+                .line { display:block }
+                #normal { white-space:normal }
+                #inherited::before { content:""; display:none }
+            </style>
+            <pre><code>
+                <span id="inherited" class="line">alpha beta gamma delta</span>
+                <span id="normal" class="line">alpha beta gamma delta</span>
+            </code></pre>"#,
+        );
+        let laid = layout_dom(&tree, (400.0, 200.0));
+        let inherited = tree.get_element_by_id("inherited").unwrap();
+        let normal = tree.get_element_by_id("normal").unwrap();
+
+        assert_eq!(
+            laid.styles[&inherited].white_space,
+            Some(crate::WhiteSpace::Pre),
+            "a block descendant must inherit the preformatted wrapping mode"
+        );
+        assert_eq!(
+            laid.styles[&normal].white_space,
+            Some(crate::WhiteSpace::Normal),
+            "an explicit descendant value must override inherited pre"
+        );
+        assert_eq!(
+            laid.styles[&inherited]
+                .before_pseudo
+                .as_ref()
+                .unwrap()
+                .white_space,
+            Some(crate::WhiteSpace::Pre),
+            "a pseudo-element must inherit the originating element's computed wrapping mode"
+        );
+        assert_eq!(
+            laid.rects[&inherited].height, 20.0,
+            "the inherited pre line must overflow horizontally without wrapping"
+        );
+        assert!(
+            laid.rects[&normal].height > 20.0,
+            "the explicit normal line should still wrap at the containing width"
+        );
+    }
+
+    #[test]
+    fn generated_inline_boxes_apply_sizes_only_after_display_blockification() {
+        let tree = parse_html(
+            r#"<style>
+                html,body { margin:0 }
+                #flex { display:flex }
+                #flex::before {
+                    content:""; display:inline;
+                    width:100px; height:70px;
+                    min-width:250px; min-height:120px;
+                    max-width:50px; max-height:40px;
+                    background:red
+                }
+                #float::before {
+                    content:""; display:inline; float:left;
+                    width:80px; height:40px; background:blue
+                }
+                #relative::before {
+                    content:""; display:inline; position:relative;
+                    width:80px; height:40px; background:green
+                }
+            </style>
+            <div id="flex"></div>
+            <div id="float"></div>
+            <div id="relative"></div>"#,
+        );
+        let laid = layout_dom(&tree, (500.0, 300.0));
+        let flex = tree.get_element_by_id("flex").unwrap();
+        let float = tree.get_element_by_id("float").unwrap();
+        let relative = tree.get_element_by_id("relative").unwrap();
+
+        let pseudo = |host| {
+            laid.generated_boxes
+                .iter()
+                .find(|generated| {
+                    generated.host == host && generated.kind == GeneratedBoxKind::Before
+                })
+                .unwrap()
+                .rect
+        };
+        assert_eq!(
+            laid.styles[&flex].before_pseudo.as_ref().unwrap().display,
+            crate::Display::Block,
+            "a generated flex item must be blockified"
+        );
+        assert_eq!(
+            laid.styles[&float].before_pseudo.as_ref().unwrap().display,
+            crate::Display::Block,
+            "a floated generated box must be blockified"
+        );
+        assert_eq!(
+            laid.styles[&relative]
+                .before_pseudo
+                .as_ref()
+                .unwrap()
+                .display,
+            crate::Display::Inline,
+            "relative positioning does not make an ordinary inline atomic"
+        );
+        assert_eq!(pseudo(flex).width, 250.0);
+        assert_eq!(pseudo(flex).height, 120.0);
+        assert_eq!(pseudo(float).width, 80.0);
+        assert_eq!(pseudo(float).height, 40.0);
+        assert!(
+            pseudo(relative).width < 80.0 && pseudo(relative).height < 40.0,
+            "an ordinary inline pseudo must ignore authored box sizes"
+        );
     }
 
     #[test]

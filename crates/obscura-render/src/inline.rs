@@ -1812,7 +1812,7 @@ fn is_pure_text_ifc(
 /// contains one is never a pure-text IFC (it keeps the general build path,
 /// where the element gets a real taffy box). This is by tag, not display, so a
 /// stylesheet setting `img{display:inline}` cannot trick us into folding it.
-fn is_replaced(local: &str) -> bool {
+pub(crate) fn is_replaced(local: &str) -> bool {
     matches!(
         local,
         "img" | "svg" | "canvas" | "video" | "audio" | "iframe" | "embed"

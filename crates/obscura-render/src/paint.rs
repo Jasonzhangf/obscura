@@ -391,6 +391,9 @@ impl PreparedRender {
     ) -> Option<(f32, f32)> {
         let rect = self.layout.rects.get(&id)?;
         let style = self.layout.styles.get(&id)?;
+        if style.ignores_used_box_sizes() {
+            return Some((0.0, 0.0));
+        }
         Some((
             (rect.width - style.border.left - style.border.right).max(0.0),
             (rect.height - style.border.top - style.border.bottom).max(0.0),
@@ -482,7 +485,10 @@ impl PreparedRender {
             },
         );
 
-        if let Some(rect) = rect {
+        if style.ignores_used_box_sizes() {
+            out.insert("width", dimension_css(style.width, "auto"));
+            out.insert("height", dimension_css(style.height, "auto"));
+        } else if let Some(rect) = rect {
             let horizontal_non_content =
                 style.border.left + style.border.right + style.padding.left + style.padding.right;
             let vertical_non_content =
