@@ -2613,6 +2613,13 @@ class Document extends Node {
   // returned a generic Event for every type, which broke libraries that call
   // createEvent('CustomEvent').initCustomEvent(...) — see issue #41.
   createEvent(type) {
+    const normalized = String(type || '').toLowerCase();
+    if (normalized === 'promiserejectionevent') {
+      throw new DOMException(
+        "The provided event type ('PromiseRejectionEvent') is invalid",
+        'NotSupportedError'
+      );
+    }
     const map = {
       'customevent': CustomEvent, 'customevents': CustomEvent,
       'mouseevent': MouseEvent,   'mouseevents': MouseEvent,
@@ -2627,8 +2634,9 @@ class Document extends Node {
       'popstateevent': PopStateEvent,
       'animationevent': AnimationEvent,
       'transitionevent': TransitionEvent,
+      'storageevent': StorageEvent,
     };
-    const Cls = map[String(type || '').toLowerCase()] || Event;
+    const Cls = map[normalized] || Event;
     return new Cls('');
   }
   createRange() { return new Range(); }
@@ -5006,6 +5014,40 @@ globalThis.ToggleEvent = class ToggleEvent extends Event {
   }
 };
 _markNative(globalThis.ToggleEvent);
+
+globalThis.PromiseRejectionEvent = class PromiseRejectionEvent extends Event {
+  constructor(type, init) {
+    if (arguments.length < 2 || init == null || !('promise' in Object(init))) {
+      throw new TypeError(
+        "Failed to construct 'PromiseRejectionEvent': required member promise is undefined."
+      );
+    }
+    super(type, init);
+    this.promise = init.promise;
+    this.reason = init.reason;
+  }
+};
+_markNative(globalThis.PromiseRejectionEvent);
+
+globalThis.StorageEvent = class StorageEvent extends Event {
+  constructor(type, init = {}) {
+    super(type, init);
+    this.key = init.key !== undefined ? init.key : null;
+    this.oldValue = init.oldValue !== undefined ? init.oldValue : null;
+    this.newValue = init.newValue !== undefined ? init.newValue : null;
+    this.url = init.url || "";
+    this.storageArea = init.storageArea || null;
+  }
+  initStorageEvent(type, bubbles, cancelable, key, oldValue, newValue, url, storageArea) {
+    this.initEvent(type, bubbles, cancelable);
+    this.key = key !== undefined ? key : null;
+    this.oldValue = oldValue !== undefined ? oldValue : null;
+    this.newValue = newValue !== undefined ? newValue : null;
+    this.url = url || "";
+    this.storageArea = storageArea || null;
+  }
+};
+_markNative(globalThis.StorageEvent);
 
 // AbortController / AbortSignal. AbortSignal is a real constructor with a
 // prototype, so feature-detection and `AbortSignal.prototype` access work. It
