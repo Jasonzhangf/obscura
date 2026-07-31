@@ -781,6 +781,25 @@ async fn run_fetch(
     if let Some(ref path) = screenshot {
         #[cfg(feature = "render")]
         {
+            // Default CSS-pixel viewport, matching the engine's innerWidth/Height.
+            // OBSCURA_SHOT_W / OBSCURA_SHOT_H override it (e.g. a tall viewport to
+            // capture below-the-fold content in one shot).
+            let viewport = screenshot_viewport.unwrap_or((1280.0, 720.0));
+            // The parity harness performs one throwaway paint in both engines
+            // before observing image/font readiness. Obscura resolves retained
+            // render resources during prepare/paint, so sampling first would
+            // compare pre-paint Obscura state with post-load Chromium state.
+            // Keep this private opt-in out of ordinary CLI screenshots.
+            let warmup_capture = std::env::var("OBSCURA_SHOT_RESOURCE_WARMUP")
+                .is_ok_and(|value| value == "1");
+            if warmup_capture {
+                if page.screenshot(viewport).is_none() {
+                    anyhow::bail!("resource warm-up screenshot failed: page has no DOM to render");
+                }
+                // Give completion callbacks one bounded task turn before the
+                // capture-boundary evaluation reads resource state.
+                page.settle(1).await;
+            }
             // Paired renderer captures need a stable final coordinate after
             // the post-eval settle. Authored smooth scrolling and scroll
             // anchoring may legitimately move an earlier scrollTo while the
@@ -827,10 +846,6 @@ async fn run_fetch(
                      }))()",
                 )
             });
-            // Default CSS-pixel viewport, matching the engine's innerWidth/Height.
-            // OBSCURA_SHOT_W / OBSCURA_SHOT_H override it (e.g. a tall viewport to
-            // capture below-the-fold content in one shot).
-            let viewport = screenshot_viewport.unwrap_or((1280.0, 720.0));
             match page.screenshot(viewport) {
                 Some(bytes) => std::fs::write(path, &bytes)?,
                 None => anyhow::bail!("screenshot failed: page has no DOM to render"),
@@ -865,6 +880,12 @@ async fn run_fetch(
                     serde_json::json!({
                         "evaluation": result,
                         "controlledScroll": controlled_scroll_report,
+                        "resourceWarmup": {
+                            "performed": warmup_capture,
+                            "discardedShots": if warmup_capture { 1 } else { 0 },
+                            "taskTurnMs": if warmup_capture { 1 } else { 0 },
+                            "phase": "before-final-scroll-reassert-and-state-sample",
+                        },
                         "captureState": capture_state.unwrap_or(serde_json::Value::Null),
                     })
                 );

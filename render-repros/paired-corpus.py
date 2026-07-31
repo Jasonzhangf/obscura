@@ -64,6 +64,7 @@ BRAND_PERMUTATIONS = [
 ]
 GEOMETRY_PROBE_RECT_LIMIT = 200
 CAPTURE_BOUNDARY_PHASE = "capture-boundary-before-screenshot"
+RESOURCE_WARMUP_PHASE = "before-final-scroll-reassert-and-state-sample"
 
 
 def geometry_probe_javascript(selectors_expression):
@@ -360,6 +361,8 @@ def parse_obscura_capture_report(stdout):
         state["geometry"] = geometry
         if isinstance(report.get("controlledScroll"), dict):
             state["controlled_scroll_capture"] = report["controlledScroll"]
+        if isinstance(report.get("resourceWarmup"), dict):
+            state["resource_warmup"] = report["resourceWarmup"]
         state["evaluation_sampled_phase"] = state.get("sampled_phase")
         state["screenshot_sampled_phase"] = CAPTURE_BOUNDARY_PHASE
         state["state_and_screenshot_share_capture_boundary"] = (
@@ -434,6 +437,10 @@ def obscura_environment(width, height):
         # all settle phases and the final scroll reassertion. No event-loop
         # pumping occurs between that evaluation and screenshot paint.
         OBSCURA_SHOT_EVAL_AT_CAPTURE="1",
+        # Resolve the exact retained image/font graph with one throwaway paint
+        # before resource-readiness state is sampled. Chromium performs the
+        # same warm-up shot in the paired process.
+        OBSCURA_SHOT_RESOURCE_WARMUP="1",
     )
     return env
 
@@ -952,6 +959,19 @@ def capture_chromium_image(page, screenshot, geometry_selectors=None):
     return state, boundary
 
 
+def warm_chromium_capture(page):
+    """Resolve paint-time resources before capture-boundary state sampling."""
+    page.screenshot(full_page=False, timeout=50000)
+    # Yield one bounded browser task turn, matching the Obscura CLI warm-up.
+    page.wait_for_timeout(1)
+    return {
+        "performed": True,
+        "discardedShots": 1,
+        "taskTurnMs": 1,
+        "phase": RESOURCE_WARMUP_PHASE,
+    }
+
+
 def freeze_chromium_animations(page, sample_ms):
     """Pause currently exposed Web Animations at one explicit local time.
 
@@ -1278,17 +1298,21 @@ def main():
         },
         "state_observability": {
             "capture_boundary_phase": CAPTURE_BOUNDARY_PHASE,
+            "resource_warmup_phase": RESOURCE_WARMUP_PHASE,
             "chromium": (
-                "same page, synchronously sampled after all settle phases and "
+                "same page, one discard paint resolves the retained resource "
+                "graph, then one bounded task turn and the final scroll "
+                "reassert run before synchronous state sampling. State is "
                 "immediately before screenshot. A second synchronous sample "
                 "after paint brackets the PNG and reports whether capture-"
                 "critical geometry/readiness remained stable. DOM SHA-256 "
                 "finalization runs on the host only after paint"
             ),
             "obscura": (
-                "the paired-capture CLI defers DOM/resource/selector evaluation "
-                "until after all settle phases and the final instant scroll "
-                "reassert. Evaluation, captureState, and screenshot then run "
+                "the paired-capture CLI takes one discard paint over the same "
+                "live page, pumps one bounded task turn, then performs the "
+                "final instant scroll reassert before deferred DOM/resource/"
+                "selector evaluation. Evaluation, captureState, and screenshot run "
                 "consecutively without another settle; captureState records the "
                 "exact shared PreparedRender viewport, scroll offset, and "
                 "content size used by paint"
@@ -1318,9 +1342,12 @@ def main():
                 "serialize fetched stylesheet text into outerHTML."
             ),
             "resource_readiness": (
-                "Obscura's DOM image/font readiness is sampled before paint; "
-                "paint may then fetch retained renderer resources that are not "
-                "reflected back into HTMLImageElement or FontFaceSet state."
+                "Both engines take and discard one screenshot before sampling "
+                "resource readiness, then yield one bounded task turn. This "
+                "warms the exact retained render graph instead of comparing "
+                "Obscura's pre-paint state with Chromium's post-load state. "
+                "A successful fetch is still not proof of equal decode, selected "
+                "source, or paint output."
             ),
             "animation_sampling": (
                 "The deterministic option controls only animations still "
@@ -1452,6 +1479,7 @@ def main():
                 chrome_started = time.time()
                 chromium_scroll_state = None
                 chromium_capture_boundary = None
+                chromium_resource_warmup = None
                 try:
                     page.goto(url, wait_until="load", timeout=50000)
                     page.wait_for_timeout(args.settle_ms)
@@ -1472,6 +1500,7 @@ def main():
                         animation_sampling = freeze_chromium_animations(
                             page, args.animation_time_ms
                         )
+                    chromium_resource_warmup = warm_chromium_capture(page)
                     if controlled_scroll is not None:
                         chromium_scroll_state = (
                             reassert_chromium_controlled_scroll(
@@ -1537,6 +1566,9 @@ def main():
                     "state": chromium_state if chrome_ok else None,
                     "capture_boundary_validation": (
                         chromium_capture_boundary if chrome_ok else None
+                    ),
+                    "resource_warmup": (
+                        chromium_resource_warmup if chrome_ok else None
                     ),
                     "scroll_state": (
                         chromium_scroll_state if chrome_ok else None

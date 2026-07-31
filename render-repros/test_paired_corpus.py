@@ -118,6 +118,7 @@ class ControlledScrollTests(unittest.TestCase):
         self.assertEqual(environment["OBSCURA_SHOT_SCROLL_X"], "12")
         self.assertEqual(environment["OBSCURA_SHOT_SCROLL_Y"], "bottom")
         self.assertEqual(environment["OBSCURA_SHOT_EVAL_AT_CAPTURE"], "1")
+        self.assertEqual(environment["OBSCURA_SHOT_RESOURCE_WARMUP"], "1")
 
     def test_paired_state_expression_is_read_only_at_capture_boundary(self):
         expression = paired_corpus.obscura_state_eval_expression(
@@ -324,6 +325,26 @@ class GeometryProbeTests(unittest.TestCase):
         self.assertEqual(
             captured["document"]["visible_text_sha256"],
             hashlib.sha256(b"hello").hexdigest(),
+        )
+
+    def test_chromium_resource_warmup_discards_one_shot_then_yields(self):
+        events = []
+
+        class WarmupPage:
+            def screenshot(self, **kwargs):
+                events.append(("screenshot", kwargs))
+                return b"discarded"
+
+            def wait_for_timeout(self, timeout):
+                events.append(("wait", timeout))
+
+        report = paired_corpus.warm_chromium_capture(WarmupPage())
+        self.assertEqual([event[0] for event in events], ["screenshot", "wait"])
+        self.assertEqual(events[1], ("wait", 1))
+        self.assertNotIn("path", events[0][1])
+        self.assertEqual(report["discardedShots"], 1)
+        self.assertEqual(
+            report["phase"], paired_corpus.RESOURCE_WARMUP_PHASE
         )
 
     def test_repeatable_selectors_are_passed_safely_in_one_state_expression(self):

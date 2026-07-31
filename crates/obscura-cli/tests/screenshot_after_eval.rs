@@ -155,6 +155,7 @@ fn paired_capture_evaluates_state_after_final_scroll_reassert() {
         .env("OBSCURA_SHOT_SCROLL_X", "0")
         .env("OBSCURA_SHOT_SCROLL_Y", "80")
         .env("OBSCURA_SHOT_EVAL_AT_CAPTURE", "1")
+        .env("OBSCURA_SHOT_RESOURCE_WARMUP", "1")
         .output()
         .expect("run obscura fetch");
     assert!(
@@ -187,6 +188,15 @@ fn paired_capture_evaluates_state_after_final_scroll_reassert() {
     assert_eq!(
         report["controlledScroll"]["phase"].as_str(),
         Some("immediately-before-capture-state-and-screenshot")
+    );
+    assert_eq!(report["resourceWarmup"]["performed"].as_bool(), Some(true));
+    assert_eq!(
+        report["resourceWarmup"]["discardedShots"].as_u64(),
+        Some(1)
+    );
+    assert_eq!(
+        report["resourceWarmup"]["phase"].as_str(),
+        Some("before-final-scroll-reassert-and-state-sample")
     );
 
     std::fs::remove_dir_all(directory).expect("remove temporary output directory");
