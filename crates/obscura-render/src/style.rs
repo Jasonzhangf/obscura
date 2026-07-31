@@ -119,6 +119,18 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
         style.display = Display::Inline;
         style.is_inline_block = true;
         style.text_align = Some(taffy::AlignItems::CENTER);
+        style.box_sizing = crate::BoxSizing::BorderBox;
+        // Chromium's native button content box keeps one pixel of block-axis
+        // and six pixels of inline-axis padding. Framework resets commonly
+        // remove the native border/background but intentionally retain this
+        // padding; percentage-height icon children therefore resolve against
+        // the padded content box (44px border box -> 42px content box).
+        style.padding = Edges {
+            top: 1.0,
+            right: 6.0,
+            bottom: 1.0,
+            left: 6.0,
+        };
     } else if tag == "select" {
         // A closed native select is an atomic inline control. Its option
         // children belong to the popup (and remain display:none in our frame
@@ -445,6 +457,89 @@ fn parse_container_shorthand(value: &str) -> Option<(Vec<String>, crate::Contain
     }
 }
 
+#[derive(Clone, Copy)]
+struct ParsedOverflowAxis {
+    specified: u8,
+    inherit: bool,
+}
+
+fn parse_overflow_axis(value: &str) -> Option<ParsedOverflowAxis> {
+    let lower = value.trim().to_ascii_lowercase();
+    let (specified, inherit) = match lower.as_str() {
+        "visible" => (0, false),
+        "clip" => (1, false),
+        "hidden" | "scroll" | "auto" | "overlay" => (2, false),
+        "inherit" => (0, true),
+        "initial" | "unset" | "revert" | "revert-layer" => (0, false),
+        _ => return None,
+    };
+    Some(ParsedOverflowAxis { specified, inherit })
+}
+
+fn parse_overflow_declaration(
+    name: &str,
+    value: &str,
+) -> Option<(Option<ParsedOverflowAxis>, Option<ParsedOverflowAxis>)> {
+    match name {
+        "overflow-x" => Some((Some(parse_overflow_axis(value)?), None)),
+        "overflow-y" => Some((None, Some(parse_overflow_axis(value)?))),
+        "overflow" => {
+            let values = split_ws_paren(value);
+            if values.is_empty() || values.len() > 2 {
+                return None;
+            }
+            // CSS-wide keywords apply to the whole shorthand and cannot be
+            // mixed with another component.
+            let first = parse_overflow_axis(values[0])?;
+            if first.inherit
+                || matches!(
+                    values[0].to_ascii_lowercase().as_str(),
+                    "initial" | "unset" | "revert" | "revert-layer"
+                )
+            {
+                return (values.len() == 1).then_some((Some(first), Some(first)));
+            }
+            let second = if let Some(value) = values.get(1) {
+                let parsed = parse_overflow_axis(value)?;
+                if parsed.inherit
+                    || matches!(
+                        value.to_ascii_lowercase().as_str(),
+                        "initial" | "unset" | "revert" | "revert-layer"
+                    )
+                {
+                    return None;
+                }
+                parsed
+            } else {
+                first
+            };
+            Some((Some(first), Some(second)))
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn recompute_overflow(style: &mut LayoutStyle) {
+    // CSS Overflow computed-value coupling: if exactly one axis is scrollable,
+    // `visible` on the other computes to `auto` and `clip` computes to
+    // `hidden`. A clip/visible pair remains genuinely axis-specific.
+    let mut computed_x = style.overflow_specified_x;
+    let mut computed_y = style.overflow_specified_y;
+    if (computed_x == 2) != (computed_y == 2) {
+        if computed_x == 2 {
+            computed_y = 2;
+        } else {
+            computed_x = 2;
+        }
+    }
+    style.overflow_clip_x = computed_x != 0;
+    style.overflow_clip_y = computed_y != 0;
+    style.overflow_scroll_x = computed_x == 2;
+    style.overflow_scroll_y = computed_y == 2;
+    style.overflow_hidden = style.overflow_clip_x || style.overflow_clip_y;
+    style.overflow_scroll_container = style.overflow_scroll_x || style.overflow_scroll_y;
+}
+
 fn parse_font_variation_settings(value: &str) -> Option<Vec<crate::FontVariationSetting>> {
     let mut input = cssparser::ParserInput::new(value.trim());
     let mut parser = cssparser::Parser::new(&mut input);
@@ -653,6 +748,7 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         }
         "width" => {
             style.width = dimension_value(value);
+            style.width_fit_content = value.trim().eq_ignore_ascii_case("fit-content");
             style.size_expressions[0] = deferred_length_expression(value);
             style.width_set = true;
         }
@@ -811,12 +907,7 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
             // so leave the prior cascade winner untouched in that case.
             if !value.trim().is_empty() {
                 style.background_color = None;
-                style.background_gradient =
-                    parse_linear_gradient(value, style.color_scheme_dark);
-                style.background_radial_gradient =
-                    parse_radial_gradient(value, style.color_scheme_dark);
-                style.background_conic_gradient =
-                    parse_conic_gradient(value, style.color_scheme_dark);
+                set_background_gradients(style, value);
                 if style.background_gradient.is_none()
                     && style.background_radial_gradient.is_none()
                     && style.background_conic_gradient.is_none()
@@ -828,17 +919,13 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                 style.background_size = None;
                 style.background_size_expression = background_size_expression(value);
                 style.background_size_fit = parse_background_size_fit(value);
-                style.background_position = (0.0, 0.0);
+                style.background_position = crate::BackgroundPosition::default();
+                style.background_repeat = parse_image_repeat(value);
                 style.background_clip_text = false;
             }
         }
         "background-image" => {
-            style.background_gradient =
-                parse_linear_gradient(value, style.color_scheme_dark);
-            style.background_radial_gradient =
-                parse_radial_gradient(value, style.color_scheme_dark);
-            style.background_conic_gradient =
-                parse_conic_gradient(value, style.color_scheme_dark);
+            set_background_gradients(style, value);
             style.background_image = parse_url(value);
         }
         "background-size" => {
@@ -848,6 +935,9 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
             style.background_size_fit = parse_background_size_fit(value);
         }
         "background-position" => style.background_position = parse_background_position(value),
+        "background-repeat" => {
+            style.background_repeat = parse_image_repeat(value);
+        }
         // On replaced elements, an image-valued `content` replaces the
         // ordinary source and participates in intrinsic sizing. String-valued
         // generated content is handled separately for pseudo-elements.
@@ -857,13 +947,7 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
             style.mask_size = parse_background_size(value)
         }
         "mask-repeat" | "-webkit-mask-repeat" => {
-            style.mask_repeat = match value.trim() {
-                "repeat" | "space" | "round" => Some((true, true)),
-                "repeat-x" => Some((true, false)),
-                "repeat-y" => Some((false, true)),
-                "no-repeat" => Some((false, false)),
-                _ => None,
-            }
+            style.mask_repeat = parse_image_repeat(value);
         }
         "background-clip" | "-webkit-background-clip" => {
             // `text` clips the background to the element's glyphs (the gradient/
@@ -1033,15 +1117,13 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                 style.align_content = Some(align);
                 style.justify_content = Some(justify);
             }
-        },
-        "flex-direction" => {
-            match value {
+        }
+        "flex-direction" => match value {
                 "row" => style.flex_direction = Some(taffy::FlexDirection::Row),
                 "row-reverse" => style.flex_direction = Some(taffy::FlexDirection::RowReverse),
                 "column" => style.flex_direction = Some(taffy::FlexDirection::Column),
                 "column-reverse" => style.flex_direction = Some(taffy::FlexDirection::ColumnReverse),
                 _ => {}
-            }
         },
         "flex-wrap" => {
             match value {
@@ -1060,8 +1142,7 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         }
         "flex-basis" => { style.flex_basis = dimension_value(value.trim()); }
         "flex" => parse_flex_shorthand(style, value),
-        "position" => {
-            match value {
+        "position" => match value {
                 "absolute" => {
                     style.position = Some(taffy::Position::Absolute);
                     style.position_fixed = false;
@@ -1088,30 +1169,58 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                     style.position_sticky = false;
                 }
                 _ => {}
-            }
         },
-        "float" => {
-            match value {
+        "float" => match value {
                 "left" => style.float = Some(crate::Float::Left),
                 "right" => style.float = Some(crate::Float::Right),
                 "none" => style.float = None,
                 _ => {}
-            }
         },
-        "object-fit" => {
-            match value.trim().to_ascii_lowercase().as_str() {
+        "counter-reset" => {
+            if let Some(counters) = parse_counter_directives(value, 0) {
+                style.counter_reset = counters;
+            }
+        }
+        "counter-increment" => {
+            if let Some(counters) = parse_counter_directives(value, 1) {
+                style.counter_increment = counters;
+            }
+        }
+        "counter-set" => {
+            if let Some(counters) = parse_counter_directives(value, 0) {
+                style.counter_set = counters;
+            }
+        }
+        "object-fit" => match value.trim().to_ascii_lowercase().as_str() {
                 "fill" => style.object_fit = crate::ObjectFit::Fill,
                 "contain" => style.object_fit = crate::ObjectFit::Contain,
                 "cover" => style.object_fit = crate::ObjectFit::Cover,
                 "scale-down" => style.object_fit = crate::ObjectFit::ScaleDown,
                 "none" => style.object_fit = crate::ObjectFit::None,
                 _ => {}
-            }
         },
         "top" => set_inset_side(style, 0, value),
         "right" => set_inset_side(style, 1, value),
         "bottom" => set_inset_side(style, 2, value),
         "left" => set_inset_side(style, 3, value),
+        // Logical insets in the engine's current horizontal LTR writing mode.
+        // Utility frameworks prefer these over left/right (for example,
+        // Tailwind's `inset-x-0` emits `inset-inline:0`), so dropping them
+        // turns stretched fixed overlays into shrink-to-fit boxes.
+        "inset-inline" => {
+            let (start, end) = two(value);
+            set_inset_side(style, 3, start);
+            set_inset_side(style, 1, end);
+        }
+        "inset-inline-start" => set_inset_side(style, 3, value),
+        "inset-inline-end" => set_inset_side(style, 1, value),
+        "inset-block" => {
+            let (start, end) = two(value);
+            set_inset_side(style, 0, start);
+            set_inset_side(style, 2, end);
+        }
+        "inset-block-start" => set_inset_side(style, 0, value),
+        "inset-block-end" => set_inset_side(style, 2, value),
         "inset" => {
             // 1-4 values, CSS shorthand order: all / v h / t h b / t r b l.
             let parts = split_ws_paren(value);
@@ -1128,9 +1237,19 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
             set_inset_side(style, 3, l);
         }
         "overflow" | "overflow-x" | "overflow-y" => {
-            style.overflow_hidden = value != "visible";
-            style.overflow_scroll_container =
-                !matches!(value, "visible" | "clip");
+            let Some((x, y)) = parse_overflow_declaration(name, value) else {
+                return;
+            };
+            if let Some(x) = x {
+                style.overflow_specified_x = x.specified;
+                style.overflow_inherit_x = x.inherit;
+            }
+            if let Some(y) = y {
+                style.overflow_specified_y = y.specified;
+                style.overflow_inherit_y = y.inherit;
+            }
+            style.overflow_axes_set = true;
+            recompute_overflow(style);
         }
         "scrollbar-gutter" => {
             let lower = value.to_ascii_lowercase();
@@ -1279,13 +1398,8 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
             style.line_height = if v.eq_ignore_ascii_case("normal") {
                 Some(crate::LineHeight::Normal)
             } else if let Some(pct) = v.strip_suffix('%') {
-                pct.trim()
-                    .parse::<f32>()
-                    .ok()
-                    .map(|number| {
-                        crate::LineHeight::Relative(crate::Dimension::Percent(
-                            number / 100.0,
-                        ))
+                pct.trim().parse::<f32>().ok().map(|number| {
+                    crate::LineHeight::Relative(crate::Dimension::Percent(number / 100.0))
                     })
             } else if v.ends_with("px") || v.ends_with("pt") {
                 px_value(v).map(crate::LineHeight::Px)
@@ -1432,6 +1546,7 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         "grid-row-end" => set_grid_placement_side(style, value, false, false),
         "transform" => parse_transform(style, value),
         "transform-origin" => style.transform_origin = parse_transform_origin(value),
+        "translate" => parse_individual_translate(style, value),
         "scale" => parse_individual_scale(style, value),
         "filter" => set_containing_block_trigger(
             style,
@@ -1550,6 +1665,7 @@ pub(crate) fn supports_declaration(name: &str, value: &str) -> bool {
             | "background-image"
             | "background-size"
             | "background-position"
+            | "background-repeat"
             | "background-clip"
             | "-webkit-background-clip"
             | "mask-image"
@@ -1600,12 +1716,21 @@ pub(crate) fn supports_declaration(name: &str, value: &str) -> bool {
             | "order"
             | "position"
             | "float"
+            | "counter-reset"
+            | "counter-increment"
+            | "counter-set"
             | "object-fit"
             | "top"
             | "right"
             | "bottom"
             | "left"
             | "inset"
+            | "inset-inline"
+            | "inset-inline-start"
+            | "inset-inline-end"
+            | "inset-block"
+            | "inset-block-start"
+            | "inset-block-end"
             | "overflow"
             | "overflow-x"
             | "overflow-y"
@@ -1655,6 +1780,7 @@ pub(crate) fn supports_declaration(name: &str, value: &str) -> bool {
             | "grid-row-end"
             | "transform"
             | "transform-origin"
+            | "translate"
             | "scale"
             | "filter"
             | "backdrop-filter"
@@ -1742,6 +1868,9 @@ pub(crate) fn supports_declaration(name: &str, value: &str) -> bool {
             value.to_ascii_lowercase().as_str(),
             "auto" | "stable" | "stable both-edges"
         ),
+        "overflow" | "overflow-x" | "overflow-y" => {
+            parse_overflow_declaration(&name, value).is_some()
+        }
         "color" | "-webkit-text-fill-color" | "background-color" | "border-color" => {
             parse_color(value).is_some()
         }
@@ -2358,6 +2487,54 @@ fn parse_individual_scale(style: &mut LayoutStyle, value: &str) {
     let y = values.get(1).copied().unwrap_or(x);
     style.transform_scale = Some((x, y));
     set_containing_block_trigger(style, crate::CB_TRIGGER_TRANSFORM, true);
+}
+
+fn parse_individual_translate(style: &mut LayoutStyle, value: &str) {
+    let value = value.trim();
+    if matches!(
+        value.to_ascii_lowercase().as_str(),
+        "none" | "initial" | "unset" | "revert" | "revert-layer"
+    ) {
+        style.individual_translate = None;
+        style.individual_translate_expressions = [None, None];
+        set_containing_block_trigger(style, crate::CB_TRIGGER_TRANSLATE, false);
+        return;
+    }
+
+    let values = split_ws_paren(value);
+    if values.is_empty() || values.len() > 3 {
+        return;
+    }
+    let component = |token: &str| {
+        if token.contains('(') {
+            Some((crate::Dimension::Px(0.0), Some(token.trim().to_string())))
+        } else {
+            let dimension = dimension_value(token);
+            (!matches!(dimension, crate::Dimension::Auto)).then_some((dimension, None))
+        }
+    };
+    let Some((x, x_expression)) = component(values[0]) else {
+        return;
+    };
+    let Some((y, y_expression)) = values
+        .get(1)
+        .map(|value| component(value))
+        .unwrap_or_else(|| Some((crate::Dimension::Px(0.0), None)))
+    else {
+        return;
+    };
+    // The optional third component is a z translation. The scoped renderer is
+    // two-dimensional, but accepting a valid value still preserves x/y like
+    // transform:translate3d() does.
+    if values
+        .get(2)
+        .is_some_and(|value| component(value).is_none())
+    {
+        return;
+    }
+    style.individual_translate = Some((x, y));
+    style.individual_translate_expressions = [x_expression, y_expression];
+    set_containing_block_trigger(style, crate::CB_TRIGGER_TRANSLATE, true);
 }
 
 fn non_none_value(value: &str) -> bool {
@@ -2985,10 +3162,7 @@ fn parse_color_for_scheme(value: &str, dark_scheme: bool) -> Option<[u8; 4]> {
                 if let Some(idx) = s.rfind(char::is_whitespace) {
                     let tail = s[idx + 1..].trim();
                     if let Some(p) = tail.strip_suffix('%').and_then(|x| x.parse::<f32>().ok()) {
-                        return parse_color_for_scheme(
-                            s[..idx].trim(),
-                            dark_scheme,
-                        )
+                        return parse_color_for_scheme(s[..idx].trim(), dark_scheme)
                         .map(|c| (c, Some(p / 100.0)));
                     }
                 }
@@ -3821,6 +3995,62 @@ fn set_inset_side(style: &mut LayoutStyle, index: usize, value: &str) {
     }
 }
 
+/// Parse `counter-reset`, `counter-increment`, and `counter-set` name/value
+/// pairs. Gecko likewise assigns the property-specific default integer when a
+/// name is not followed by an integer (reset/set 0, increment 1).
+fn parse_counter_directives(
+    value: &str,
+    default_value: i32,
+) -> Option<Vec<crate::CounterDirective>> {
+    let trimmed = value.trim();
+    if trimmed.eq_ignore_ascii_case("none")
+        || matches!(
+            trimmed.to_ascii_lowercase().as_str(),
+            "initial" | "inherit" | "unset" | "revert" | "revert-layer"
+        )
+    {
+        return Some(Vec::new());
+    }
+
+    let tokens = split_ws_paren(trimmed);
+    if tokens.is_empty() {
+        return None;
+    }
+    let mut result = Vec::new();
+    let mut index = 0;
+    while index < tokens.len() {
+        let name = tokens[index].trim();
+        if !valid_counter_name(name) {
+            return None;
+        }
+        index += 1;
+        let value = tokens
+            .get(index)
+            .and_then(|token| token.parse::<i32>().ok())
+            .map(|value| {
+                index += 1;
+                value
+            })
+            .unwrap_or(default_value);
+        result.push(crate::CounterDirective {
+            name: name.to_string(),
+            value,
+        });
+    }
+    Some(result)
+}
+
+fn valid_counter_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    !name.is_empty()
+        && !matches!(
+            lower.as_str(),
+            "none" | "initial" | "inherit" | "unset" | "revert" | "revert-layer"
+        )
+        && !name
+            .contains(|ch: char| ch.is_whitespace() || matches!(ch, '(' | ')' | ',' | '"' | '\''))
+}
+
 /// Absolute keyword font-sizes (the `medium`-anchored scale), for the handful
 /// of pages that still use them.
 fn font_size_keyword(v: &str) -> Option<f32> {
@@ -3977,7 +4207,9 @@ fn parse_column_count(value: &str) -> Option<u16> {
 pub(crate) fn line_height_expression_is_length(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
     lower.contains('%')
-        || ["px", "pt", "pc", "in", "cm", "mm", "rem", "em", "ex", "vw", "vh", "vmin", "vmax"]
+        || [
+            "px", "pt", "pc", "in", "cm", "mm", "rem", "em", "ex", "vw", "vh", "vmin", "vmax",
+        ]
             .iter()
             .any(|unit| lower.contains(unit))
 }
@@ -4231,7 +4463,16 @@ fn parse_clip_path_polygon(value: &str) -> Option<crate::ClipPathPolygon> {
 
 /// Parse every length token in a value as px (for box shorthands).
 fn edges(value: &str) -> Option<Edges> {
-    let dims: Vec<f32> = value.split_whitespace().filter_map(px_value).collect();
+    // Keep functional lengths intact while tokenizing. Design systems commonly
+    // expose border widths through custom properties such as
+    // `--stroke:calc(1*1px)`; after var() substitution that calc is still one
+    // valid border-width token. Splitting on every internal space and calling
+    // px_value() dropped it, leaving an otherwise fully-authored control with
+    // no painted border.
+    let dims: Vec<f32> = split_ws_paren(value)
+        .into_iter()
+        .map(px)
+        .collect::<Option<Vec<_>>>()?;
     edges_from(dims)
 }
 
@@ -4420,7 +4661,9 @@ fn px_value(tok: &str) -> Option<f32> {
         n = n.trim_end_matches(|c: char| c.is_ascii_alphabetic());
     }
     
-    if n.chars().any(|c| !(c.is_ascii_digit() || c == '.' || c == '-')) {
+    if n.chars()
+        .any(|c| !(c.is_ascii_digit() || c == '.' || c == '-'))
+    {
         return None;
     }
     n.parse::<f32>().ok().map(|v| v * scale)
@@ -4430,18 +4673,74 @@ fn token(value: &str) -> Option<&str> {
     value.split_whitespace().next()
 }
 
+fn set_background_gradients(style: &mut LayoutStyle, value: &str) {
+    let layers = parse_background_gradient_layers(value, style.color_scheme_dark);
+    style.background_gradient = layers.iter().find_map(|layer| match layer {
+        crate::BackgroundGradientLayer::Linear { angle, stops, .. } => {
+            Some((*angle, stops.clone()))
+        }
+        _ => None,
+    });
+    style.background_radial_gradient = layers.iter().find_map(|layer| match layer {
+        crate::BackgroundGradientLayer::Radial { center, stops } => Some((*center, stops.clone())),
+        _ => None,
+    });
+    style.background_conic_gradient = layers.iter().find_map(|layer| match layer {
+        crate::BackgroundGradientLayer::Conic {
+            angle,
+            center,
+            stops,
+        } => Some((*angle, *center, stops.clone())),
+        _ => None,
+    });
+    style.background_gradient_layers = layers;
+}
+
+fn parse_background_gradient_layers(
+    value: &str,
+    dark_scheme: bool,
+) -> Vec<crate::BackgroundGradientLayer> {
+    let mut layers = Vec::new();
+    for authored_layer in split_top_level(value, ',') {
+        if let Some(linear) = parse_linear_gradient(authored_layer, dark_scheme) {
+            layers.push(crate::BackgroundGradientLayer::Linear {
+                angle: linear.angle,
+                stops: linear.stops,
+                stop_positions: linear.stop_positions,
+                repeating: linear.repeating,
+            });
+        } else if let Some((center, stops)) = parse_radial_gradient(authored_layer, dark_scheme) {
+            layers.push(crate::BackgroundGradientLayer::Radial { center, stops });
+        } else if let Some((angle, center, stops)) =
+            parse_conic_gradient(authored_layer, dark_scheme)
+        {
+            layers.push(crate::BackgroundGradientLayer::Conic {
+                angle,
+                center,
+                stops,
+            });
+        }
+    }
+    layers
+}
+
+struct ParsedLinearGradient {
+    angle: f32,
+    stops: Vec<([u8; 4], Option<f32>)>,
+    stop_positions: Vec<Option<String>>,
+    repeating: bool,
+}
+
 /// Parse a `linear-gradient(...)` (also `repeating-`/`-webkit-`/`-moz-`) into
 /// (angle-degrees, color stops). Angle is CSS convention (0deg = to top, grows
 /// clockwise); `to <side>` keywords map to their angle. Color stops keep their
 /// optional 0..1 position. Returns None if it is not a linear-gradient or has
 /// no parseable colors. Radial/conic gradients are not handled (None).
-fn parse_linear_gradient(
-    value: &str,
-    dark_scheme: bool,
-) -> Option<(f32, Vec<([u8; 4], Option<f32>)>)> {
+fn parse_linear_gradient(value: &str, dark_scheme: bool) -> Option<ParsedLinearGradient> {
     let v = value.trim();
     let lower = v.to_ascii_lowercase();
     let start = lower.find("linear-gradient(")?;
+    let repeating = lower[..start].ends_with("repeating-");
     // The original prefixed WebKit gradient syntax predates the standardized
     // angle system: 0deg points right and positive angles turn
     // counter-clockwise. Blink still accepts that syntax for compatibility.
@@ -4506,25 +4805,39 @@ fn parse_linear_gradient(
         stop_start = 1;
     }
     let mut stops: Vec<([u8; 4], Option<f32>)> = Vec::new();
+    let mut stop_positions = Vec::new();
     for p in &parts[stop_start..] {
         let t = p.trim();
         if t.is_empty() {
             continue;
         }
-        // "color [pos%]" - the color may itself contain spaces (rgb( ... )) so
-        // split off a trailing percentage token if present.
-        let (color_str, pos) = if let Some(idx) = t.rfind(char::is_whitespace) {
-            let tail = t[idx + 1..].trim();
-            if let Some(pct) = tail.strip_suffix('%').and_then(|s| s.parse::<f32>().ok()) {
-                (t[..idx].trim(), Some((pct / 100.0).clamp(0.0, 1.0)))
-            } else {
-                (t, None)
+        let tokens = split_ws_paren(t);
+        let parsed = (1..=tokens.len()).find_map(|color_tokens| {
+            let position_tokens = &tokens[color_tokens..];
+            if position_tokens.len() > 2
+                || !position_tokens
+                    .iter()
+                    .all(|position| gradient_position_is_valid(position))
+            {
+                return None;
             }
+            let color = tokens[..color_tokens].join(" ");
+            parse_color_for_scheme(&color, dark_scheme).map(|color| (color, position_tokens))
+        });
+        if let Some((color, positions)) = parsed {
+            if positions.is_empty() {
+                stops.push((color, None));
+                stop_positions.push(None);
         } else {
-            (t, None)
-        };
-        if let Some(c) = parse_color_for_scheme(color_str, dark_scheme) {
-            stops.push((c, pos));
+                for position in positions {
+                    let percentage = position
+                        .strip_suffix('%')
+                        .and_then(|number| number.parse::<f32>().ok())
+                        .map(|percentage| percentage / 100.0);
+                    stops.push((color, percentage));
+                    stop_positions.push(Some(position.trim().to_string()));
+                }
+            }
         }
     }
     if stops.len() < 2 {
@@ -4532,7 +4845,30 @@ fn parse_linear_gradient(
         // to background_color instead (return None so parse_color runs).
         return None;
     }
-    Some((angle, stops))
+    Some(ParsedLinearGradient {
+        angle,
+        stops,
+        stop_positions,
+        repeating,
+    })
+}
+
+fn gradient_position_is_valid(value: &str) -> bool {
+    let value = value.trim();
+    if value == "0" || value == "-0" || value.contains('(') {
+        return true;
+    }
+    [
+        "%", "px", "em", "rem", "ex", "vw", "vh", "vmin", "vmax", "dvw", "dvh", "svw", "svh",
+        "lvw", "lvh",
+    ]
+    .iter()
+    .any(|suffix| {
+        value
+            .strip_suffix(suffix)
+            .and_then(|number| number.trim().parse::<f32>().ok())
+            .is_some_and(f32::is_finite)
+    })
 }
 
 fn parse_radial_gradient(
@@ -4556,13 +4892,7 @@ fn parse_radial_gradient(
             .map(|(_, coords)| coords)
             .or_else(|| prelude.strip_prefix("at "))
             .unwrap_or_default();
-        let mut coords = coords.split_whitespace();
-        if let Some(x) = coords.next().and_then(percent_fraction) {
-            center.0 = x;
-        }
-        if let Some(y) = coords.next().and_then(percent_fraction) {
-            center.1 = y;
-        }
+        center = parse_gradient_center(coords);
         stop_start = 1;
     } else if parse_color_for_scheme(parts[0].trim(), dark_scheme).is_none() {
         stop_start = 1;
@@ -4575,6 +4905,28 @@ fn parse_radial_gradient(
         }
     }
     (stops.len() >= 2).then_some((center, stops))
+}
+
+fn parse_gradient_center(value: &str) -> (f32, f32) {
+    let mut center = (0.5, 0.5);
+    let mut percentages = value.split_whitespace().filter_map(percent_fraction);
+    if let Some(x) = percentages.next() {
+        center.0 = x;
+    }
+    if let Some(y) = percentages.next() {
+        center.1 = y;
+    }
+    for token in value.split_whitespace() {
+        match token {
+            "left" => center.0 = 0.0,
+            "right" => center.0 = 1.0,
+            "top" => center.1 = 0.0,
+            "bottom" => center.1 = 1.0,
+            // `center` leaves the corresponding unspecified axis at 50%.
+            _ => {}
+        }
+    }
+    center
 }
 
 /// Parse the common `conic-gradient(from A at X Y, color P%, ...)` form.
@@ -4854,6 +5206,31 @@ fn parse_background_size_fit(value: &str) -> Option<crate::ObjectFit> {
     }
 }
 
+fn parse_image_repeat(value: &str) -> Option<(bool, bool)> {
+    let tokens: Vec<&str> = split_ws_paren(value)
+        .into_iter()
+        .filter(|token| {
+            matches!(
+                token.to_ascii_lowercase().as_str(),
+                "repeat" | "no-repeat" | "repeat-x" | "repeat-y" | "space" | "round"
+            )
+        })
+        .collect();
+    match tokens.as_slice() {
+        [token, ..] if token.eq_ignore_ascii_case("repeat-x") => Some((true, false)),
+        [token, ..] if token.eq_ignore_ascii_case("repeat-y") => Some((false, true)),
+        [x, y, ..] => Some((
+            !x.eq_ignore_ascii_case("no-repeat"),
+            !y.eq_ignore_ascii_case("no-repeat"),
+        )),
+        [both] => {
+            let repeat = !both.eq_ignore_ascii_case("no-repeat");
+            Some((repeat, repeat))
+        }
+        _ => None,
+    }
+}
+
 fn background_size_expression(value: &str) -> Option<String> {
     let (_, size) = value.rsplit_once('/')?;
     let mut depth = 0i32;
@@ -4873,36 +5250,143 @@ fn background_size_expression(value: &str) -> Option<String> {
     (!size.is_empty()).then(|| size.to_string())
 }
 
-/// `background-position` keywords/lengths -> a 0.0-1.0 fraction per axis (the
-/// fraction of the box's leftover space, after the image's own size, to
-/// offset by: 0 = start edge, 1 = end edge, 0.5 = centered).
+/// Parse the first layer of `background-position`.
 ///
-/// `left`/`right` always set the x axis and `top`/`bottom` always set y,
-/// regardless of order (CSS allows `center right` and `right center`
-/// interchangeably for keyword-only values). Any axis left unset by an
-/// explicit keyword defaults to centered, which correctly handles a bare
-/// `center` (both axes), a single directional keyword (`right` -> the other
-/// axis centers), and explicit percentages (first fills x, second fills y,
-/// per CSS shorthand order).
-fn parse_background_position(value: &str) -> (f32, f32) {
+/// Percentages are retained as fractions of the space left after sizing the
+/// image, while lengths remain start-edge offsets. This distinction is
+/// essential for CSS sprites: centering a 48px image in a 24px owner moves it
+/// by -12px, whereas `background-position:0` must leave it at the start edge
+/// and `background-position:-24px` must select its second 24px frame.
+fn parse_background_position(value: &str) -> crate::BackgroundPosition {
+    use crate::{BackgroundPosition, BackgroundPositionAxis};
+
+    let first_layer = split_top_level(value, ',')
+        .into_iter()
+        .next()
+        .unwrap_or(value)
+        .trim();
+    let tokens = split_ws_paren(first_layer);
+    let center = BackgroundPositionAxis::percentage(0.5);
+    let start = BackgroundPositionAxis::percentage(0.0);
+    let end = BackgroundPositionAxis::percentage(1.0);
+
+    let numeric = |token: &str| {
+        let token = token.trim();
+        if let Some(number) = token.strip_suffix('%') {
+            let percentage = number.parse::<f32>().ok()? / 100.0;
+            return percentage
+                .is_finite()
+                .then(|| BackgroundPositionAxis::percentage(percentage));
+        }
+        px_value(token)
+            .filter(|length| length.is_finite())
+            .map(BackgroundPositionAxis::pixels)
+    };
+    let horizontal_keyword = |token: &str| match token {
+        "left" => Some(start),
+        "right" => Some(end),
+        _ => None,
+    };
+    let vertical_keyword = |token: &str| match token {
+        "top" => Some(start),
+        "bottom" => Some(end),
+        _ => None,
+    };
+
+    match tokens.as_slice() {
+        [] => BackgroundPosition::default(),
+        [one] => {
+            if let Some(y) = vertical_keyword(one) {
+                BackgroundPosition::new(center, y)
+            } else {
+                let x = horizontal_keyword(one)
+                    .or_else(|| (*one == "center").then_some(center))
+                    .or_else(|| numeric(one))
+                    .unwrap_or(center);
+                BackgroundPosition::new(x, center)
+            }
+        }
+        [first, second] => {
+            if let Some(y) = vertical_keyword(first) {
+                let x = horizontal_keyword(second)
+                    .or_else(|| (*second == "center").then_some(center))
+                    .unwrap_or(center);
+                return BackgroundPosition::new(x, y);
+            }
+            if let Some(x) = horizontal_keyword(first) {
+                let y = vertical_keyword(second)
+                    .or_else(|| (*second == "center").then_some(center))
+                    .or_else(|| numeric(second))
+                    .unwrap_or(center);
+                return BackgroundPosition::new(x, y);
+            }
+            if let Some(x) = horizontal_keyword(second) {
+                let y = vertical_keyword(first)
+                    .or_else(|| (*first == "center").then_some(center))
+                    .unwrap_or(center);
+                return BackgroundPosition::new(x, y);
+            }
+            let x = (*first == "center")
+                .then_some(center)
+                .or_else(|| numeric(first))
+                .unwrap_or(center);
+            let y = vertical_keyword(second)
+                .or_else(|| (*second == "center").then_some(center))
+                .or_else(|| numeric(second))
+                .unwrap_or(center);
+            BackgroundPosition::new(x, y)
+        }
+        _ => {
+            // Three/four-value syntax anchors an offset to a named edge:
+            // `right 10px bottom 20px` => `calc(100% - 10px)
+            // calc(100% - 20px)`.
     let mut x = None;
     let mut y = None;
-    for tok in value.split_whitespace() {
-        match tok {
-            "left" => x = Some(0.0),
-            "right" => x = Some(1.0),
-            "top" => y = Some(0.0),
-            "bottom" => y = Some(1.0),
-            t if t.ends_with('%') => {
-                if let Ok(pct) = t.trim_end_matches('%').parse::<f32>() {
-                    let v = pct / 100.0;
-                    if x.is_none() { x = Some(v); } else { y = Some(v); }
+            let mut index = 0;
+            while index < tokens.len() {
+                let token = tokens[index];
+                let (axis, from_end) = match token {
+                    "left" => (Some(false), false),
+                    "right" => (Some(false), true),
+                    "top" => (Some(true), false),
+                    "bottom" => (Some(true), true),
+                    "center" => {
+                        if x.is_none() {
+                            x = Some(center);
+                        } else if y.is_none() {
+                            y = Some(center);
                 }
+                        index += 1;
+                        continue;
+                    }
+                    _ => (None, false),
+                };
+                if let Some(vertical) = axis {
+                    let offset = tokens.get(index + 1).and_then(|next| numeric(next));
+                    let position = match offset {
+                        Some(offset) if from_end => BackgroundPositionAxis::from_end_offset(offset),
+                        Some(offset) => offset,
+                        None if from_end => end,
+                        None => start,
+                    };
+                    if vertical {
+                        y = Some(position);
+                    } else {
+                        x = Some(position);
             }
-            _ => {} // "center" (or an unhandled bare length): leaves this axis to default below
+                    index += usize::from(offset.is_some());
+                } else if let Some(position) = numeric(token) {
+                    if x.is_none() {
+                        x = Some(position);
+                    } else if y.is_none() {
+                        y = Some(position);
+                    }
+                }
+                index += 1;
+            }
+            BackgroundPosition::new(x.unwrap_or(center), y.unwrap_or(center))
         }
     }
-    (x.unwrap_or(0.5), y.unwrap_or(0.5))
 }
 
 /// Parse a `box-shadow` value into its first layer:
@@ -5195,6 +5679,16 @@ mod tests {
         assert_eq!(button.display, crate::Display::Inline);
         assert!(button.is_inline_block);
         assert_eq!(button.text_align, Some(taffy::AlignItems::CENTER));
+        assert_eq!(button.box_sizing, crate::BoxSizing::BorderBox);
+        assert_eq!(
+            button.padding,
+            Edges {
+                top: 1.0,
+                right: 6.0,
+                bottom: 1.0,
+                left: 6.0,
+            }
+        );
     }
 
     #[test]
@@ -5631,6 +6125,42 @@ mod tests {
     }
 
     #[test]
+    fn border_width_accepts_css_math_tokens() {
+        let style = compute_style(
+            "button",
+            Some(
+                "border-style:solid;\
+                 border-width:calc(1 * 1px);\
+                 border-color:rgba(208,217,251,.4)",
+            ),
+        );
+        assert_eq!(
+            style.border,
+            Edges {
+                top: 1.0,
+                right: 1.0,
+                bottom: 1.0,
+                left: 1.0,
+            }
+        );
+        assert_eq!(style.border_color, Some([208, 217, 251, 102]));
+
+        let asymmetric = compute_style(
+            "div",
+            Some("border-width:calc(1px * 2) 3px calc(2px + 2px) 5px"),
+        );
+        assert_eq!(
+            asymmetric.border,
+            Edges {
+                top: 2.0,
+                right: 3.0,
+                bottom: 4.0,
+                left: 5.0,
+            }
+        );
+    }
+
+    #[test]
     fn longhand_overrides_shorthand() {
         let s = compute_style("div", Some("padding: 5px; padding-left: 30px"));
         assert_eq!(s.padding.top, 5.0);
@@ -5673,6 +6203,62 @@ mod tests {
         assert_eq!(s.margin_relative[3], Some(crate::Dimension::Vw(10.0)));
         assert_eq!(s.padding_relative[0], Some(crate::Dimension::Rem(1.0)));
         assert_eq!(s.padding_relative[1], Some(crate::Dimension::Vmin(2.0)));
+    }
+
+    #[test]
+    fn logical_insets_map_to_ltr_physical_edges() {
+        let style = compute_style(
+            "div",
+            Some(
+                "inset-inline:10px 20%;\
+                 inset-block:1rem calc(100vh - 2px);\
+                 inset-inline-start:3px",
+            ),
+        );
+
+        assert_eq!(style.inset[3], Some(crate::Dimension::Px(3.0)));
+        assert_eq!(style.inset[1], Some(crate::Dimension::Percent(0.2)));
+        assert_eq!(style.inset[0], Some(crate::Dimension::Rem(1.0)));
+        assert!(style.inset[2].is_none());
+        assert_eq!(
+            style.inset_expressions[2].as_deref(),
+            Some("calc(100vh - 2px)")
+        );
+        assert!(supports_declaration("inset-inline", "0"));
+        assert!(supports_declaration("inset-block-end", "2rem"));
+    }
+
+    #[test]
+    fn counter_properties_parse_ordered_name_integer_pairs() {
+        let style = compute_style(
+            "div",
+            Some(
+                "counter-reset:chapter 2 line;\
+                 counter-increment:chapter line 3;\
+                 counter-set:folio 9",
+            ),
+        );
+        let pairs = |pairs: &[crate::CounterDirective]| {
+            pairs
+                .iter()
+                .map(|pair| (pair.name.clone(), pair.value))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            pairs(&style.counter_reset),
+            [("chapter".to_string(), 2), ("line".to_string(), 0)]
+        );
+        assert_eq!(
+            pairs(&style.counter_increment),
+            [("chapter".to_string(), 1), ("line".to_string(), 3)]
+        );
+        assert_eq!(pairs(&style.counter_set), [("folio".to_string(), 9)]);
+        assert!(supports_declaration("counter-reset", "line"));
+        assert!(supports_declaration("counter-increment", "line 2"));
+
+        let cleared = compute_style("div", Some("counter-reset:line 4;counter-reset:none"));
+        assert!(cleared.counter_reset.is_empty());
     }
 
     #[test]
@@ -5929,11 +6515,12 @@ mod tests {
         assert_eq!(s.background_color, None);
         assert_eq!(s.background_gradient, None);
         assert_eq!(s.background_conic_gradient, None);
+        assert!(s.background_gradient_layers.is_empty());
         assert_eq!(s.background_image, None);
         assert_eq!(s.background_size, None);
         assert_eq!(s.background_size_expression, None);
         assert_eq!(s.background_size_fit, None);
-        assert_eq!(s.background_position, (0.0, 0.0));
+        assert_eq!(s.background_position, crate::BackgroundPosition::default());
         assert!(!s.background_clip_text);
 
         let cover = compute_style(
@@ -5955,6 +6542,103 @@ mod tests {
         assert_eq!(
             contextual.background_size_expression.as_deref(),
             Some("calc(100% - 2rem) auto")
+        );
+    }
+
+    #[test]
+    fn background_gradients_keep_authored_layer_order_and_keyword_centers() {
+        let style = compute_style(
+            "div",
+            Some(
+                "background-image:\
+                 linear-gradient(180deg,transparent,white 85%),\
+                 radial-gradient(ellipse at top left,red,transparent 50%),\
+                 radial-gradient(ellipse at top right,blue,transparent 50%),\
+                 radial-gradient(ellipse at center right,lime,transparent 50%),\
+                 radial-gradient(ellipse at center left,fuchsia,transparent 50%)",
+            ),
+        );
+        assert_eq!(style.background_gradient_layers.len(), 5);
+        assert!(matches!(
+            style.background_gradient_layers[0],
+            crate::BackgroundGradientLayer::Linear { angle, .. }
+                if (angle - 180.0).abs() < 0.001
+        ));
+        let centers: Vec<(f32, f32)> = style
+            .background_gradient_layers
+            .iter()
+            .filter_map(|layer| match layer {
+                crate::BackgroundGradientLayer::Radial { center, .. } => Some(*center),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            centers,
+            vec![(0.0, 0.0), (1.0, 0.0), (1.0, 0.5), (0.0, 0.5)]
+        );
+    }
+
+    #[test]
+    fn repeating_linear_gradient_retains_length_stops_and_repeat_axes() {
+        let style = compute_style(
+            "div",
+            Some(
+                "background-image:repeating-linear-gradient(315deg,\
+                 rgba(0,0,0,.05) 0,rgba(0,0,0,.05) 1px,\
+                 transparent 0,transparent 50%);\
+                 background-size:10px 10px;background-repeat:repeat-x no-repeat",
+            ),
+        );
+        assert_eq!(style.background_repeat, Some((true, false)));
+        let crate::BackgroundGradientLayer::Linear {
+            stop_positions,
+            repeating,
+            ..
+        } = &style.background_gradient_layers[0]
+        else {
+            panic!("expected a linear gradient layer");
+        };
+        assert!(*repeating);
+        assert_eq!(
+            stop_positions,
+            &[
+                Some("0".to_string()),
+                Some("1px".to_string()),
+                Some("0".to_string()),
+                Some("50%".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn background_position_preserves_sprite_offsets() {
+        use crate::{BackgroundPosition, BackgroundPositionAxis};
+
+        let first = compute_style("div", Some("background-position:0"));
+        assert_eq!(
+            first.background_position,
+            BackgroundPosition::new(
+                BackgroundPositionAxis::pixels(0.0),
+                BackgroundPositionAxis::percentage(0.5),
+            )
+        );
+
+        let selected = compute_style("div", Some("background-position:-24px"));
+        assert_eq!(
+            selected.background_position,
+            BackgroundPosition::new(
+                BackgroundPositionAxis::pixels(-24.0),
+                BackgroundPositionAxis::percentage(0.5),
+            )
+        );
+
+        let edge_offsets = compute_style("div", Some("background-position:right 10px bottom 20px"));
+        assert_eq!(
+            edge_offsets.background_position,
+            BackgroundPosition::new(
+                BackgroundPositionAxis::length_percentage(-10.0, 1.0),
+                BackgroundPositionAxis::length_percentage(-20.0, 1.0),
+            )
         );
     }
 
@@ -5988,6 +6672,67 @@ mod tests {
         let s = compute_style("div", Some("width: 100px !important; height: auto"));
         assert_eq!(s.width, crate::Dimension::Px(100.0));
         assert_eq!(s.height, crate::Dimension::Auto);
+    }
+
+    #[test]
+    fn overflow_axis_coupling_recomputes_from_winning_specified_values() {
+        let style = compute_style(
+            "div",
+            Some(
+                "overflow-x:hidden;overflow-y:auto;\
+                 overflow-y:visible;overflow-x:visible",
+            ),
+        );
+        assert!(!style.overflow_clip_x);
+        assert!(!style.overflow_clip_y);
+        assert!(!style.overflow_hidden);
+        assert!(!style.overflow_scroll_container);
+
+        let style = compute_style("div", Some("overflow-x:clip;overflow-y:visible"));
+        assert!(style.overflow_clip_x);
+        assert!(!style.overflow_clip_y);
+        assert!(!style.overflow_scroll_container);
+    }
+
+    #[test]
+    fn overflow_rejects_invalid_values_and_handles_css_wide_keywords_atomically() {
+        let style = compute_style(
+            "div",
+            Some(
+                "overflow-x:clip;overflow-x:nonsense;\
+                 overflow:hidden;overflow:hidden visible auto",
+            ),
+        );
+        assert!(style.overflow_scroll_x && style.overflow_scroll_y);
+
+        let reset = compute_style("div", Some("overflow:hidden;overflow:initial"));
+        assert!(!reset.overflow_hidden);
+        assert!(!reset.overflow_scroll_container);
+
+        let longhand_reset =
+            compute_style("div", Some("overflow:hidden;overflow-x:initial"));
+        assert!(
+            longhand_reset.overflow_scroll_x && longhand_reset.overflow_scroll_y,
+            "visible/hidden must recompute to auto/hidden"
+        );
+
+        for valid in [
+            ("overflow", "hidden"),
+            ("overflow", "clip visible"),
+            ("overflow", "initial"),
+            ("overflow-x", "inherit"),
+        ] {
+            assert!(supports_declaration(valid.0, valid.1), "{valid:?}");
+        }
+        for invalid in [
+            ("overflow", ""),
+            ("overflow", "nonsense"),
+            ("overflow", "hidden visible auto"),
+            ("overflow", "inherit visible"),
+            ("overflow-y", "hidden auto"),
+        ] {
+            assert!(!supports_declaration(invalid.0, invalid.1), "{invalid:?}");
+        }
     }
 
     #[test]

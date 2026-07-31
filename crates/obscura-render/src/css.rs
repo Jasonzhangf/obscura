@@ -359,16 +359,17 @@ impl<'a> ContainerQueryEvaluator<'a> {
                     if !axis_available {
                         return (ContainerQueryTruth::Unknown, Some(id));
                     }
-                    let truth = query.condition.as_ref().map_or(
-                        ContainerQueryTruth::True,
-                        |condition| {
+                    let truth =
+                        query
+                            .condition
+                            .as_ref()
+                            .map_or(ContainerQueryTruth::True, |condition| {
                             evaluate_container_query_expr(
                                 condition,
                                 container,
                                 self.snapshot.root_font_size,
                             )
-                        },
-                    );
+                            });
                     return (truth, Some(id));
                 }
             }
@@ -745,7 +746,7 @@ impl Stylesheet {
             };
             style.color_scheme_dark = host_style.color_scheme_dark;
             let inherited_color_scheme_dark = host_style.color_scheme_dark;
-            let mut content = None;
+            let mut generated_content = None;
             for &(_, _, rule) in &matched {
                 let expanded = substitute_declarations(&rule.normal_decls, props);
                 crate::style::apply_color_scheme_declarations_from(
@@ -769,7 +770,7 @@ impl Stylesheet {
                     &expanded,
                 );
                 if let Some(value) = extract_content(&expanded, tree, nid) {
-                    content = value;
+                    generated_content = value;
                 }
             }
             for &(_, _, rule) in &matched {
@@ -779,11 +780,14 @@ impl Stylesheet {
                     &expanded,
                 );
                 if let Some(value) = extract_content(&expanded, tree, nid) {
-                    content = value;
+                    generated_content = value;
                 }
             }
-            style.before_content = content;
-            if style.before_content.is_some() || style.content_image.is_some() {
+            style.before_content = generated_content
+                .as_ref()
+                .map(|items| generated_content_with_zero_counters(items));
+            style.generated_content = generated_content;
+            if style.generated_content.is_some() || style.content_image.is_some() {
                 Some(style)
             } else {
                 None
@@ -1461,11 +1465,51 @@ fn substitute_var_value(input: &str, props: &HashMap<String, String>, depth: u8)
                 substitute_var_value(fallback, props, depth + 1)?
             }
         };
+        // `var()` substitutes a token sequence, not source text. Insert a
+        // separator only where reparsing would merge boundary tokens:
+        // `2px` + `solid` must not become the dimension `2pxsolid`, and `10`
+        // + `%` must not become a percentage. Do not add unconditional
+        // whitespace: it is significant around calc()'s `+` and `-`.
+        if out
+            .chars()
+            .next_back()
+            .zip(replacement.chars().next())
+            .is_some_and(|(left, right)| css_substitution_boundary_merges(left, right))
+        {
+            out.push(' ');
+        }
         out.push_str(&replacement);
+        if replacement
+            .chars()
+            .next_back()
+            .zip(after[end + 1..].chars().next())
+            .is_some_and(|(left, right)| css_substitution_boundary_merges(left, right))
+        {
+            out.push(' ');
+        }
         rest = &after[end + 1..];
     }
     out.push_str(rest);
     Some(out)
+}
+
+fn css_substitution_boundary_merges(left: char, right: char) -> bool {
+    let name = |ch: char| {
+        ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' || ch == '\\' || !ch.is_ascii()
+    };
+    if left.is_ascii_digit() && right == '-' {
+        // A number followed by `-` remains two tokens. Separating these would
+        // incorrectly make `calc(var(--n)- 1px)` satisfy calc's whitespace
+        // requirement.
+        return false;
+    }
+    (name(left) && name(right))
+        || ((left.is_ascii_digit() || left == '.')
+            && (right == '.' || right == '%' || name(right)))
+        || (matches!(left, '#' | '@') && name(right))
+        || (!left.is_ascii_digit() && name(left) && right == '(')
+        || (left == '+' && (right.is_ascii_digit() || right == '.'))
+        || (left == '/' && right == '*')
 }
 
 /// If `selector`'s rightmost compound is the pseudo-element `which`
@@ -1493,7 +1537,11 @@ fn strip_pseudo_element<'a>(selector: &'a str, which: &str) -> Option<&'a str> {
 /// strings, support the common `attr(name)` form used by component-library
 /// buttons and badges. The attribute is resolved against the originating
 /// element, as CSS generated content requires.
-fn extract_content(decls: &str, tree: &DomTree, nid: NodeId) -> Option<Option<String>> {
+fn extract_content(
+    decls: &str,
+    tree: &DomTree,
+    nid: NodeId,
+) -> Option<Option<Vec<crate::GeneratedContentItem>>> {
     let mut result = None;
     for raw in crate::style::split_declarations(decls) {
         let Some((name, value)) = raw.split_once(':') else { continue };
@@ -1505,22 +1553,7 @@ fn extract_content(decls: &str, tree: &DomTree, nid: NodeId) -> Option<Option<St
             result = Some(None);
             continue;
         }
-        let parsed = if let Some(quote) =
-            value.chars().next().filter(|ch| matches!(ch, '"' | '\''))
-        {
-            let rest = &value[quote.len_utf8()..];
-            rest.find(quote).map(|end| unescape_css_string(&rest[..end]))
-        } else if let Some(rest) = value.strip_prefix("attr(") {
-            rest.find(')').map(|end| {
-                tree.get_node(nid)
-                    .and_then(|node| {
-                        node.get_attribute(rest[..end].trim()).map(str::to_owned)
-                    })
-                    .unwrap_or_default()
-            })
-        } else {
-            None
-        };
+        let parsed = parse_generated_content_items(value, tree, nid);
         if let Some(parsed) = parsed {
             result = Some(Some(parsed));
         } else if value
@@ -1537,6 +1570,289 @@ fn extract_content(decls: &str, tree: &DomTree, nid: NodeId) -> Option<Option<St
         }
     }
     result
+}
+
+fn generated_content_with_zero_counters(items: &[crate::GeneratedContentItem]) -> String {
+    let mut text = String::new();
+    for item in items {
+        match item {
+            crate::GeneratedContentItem::Text(value) => text.push_str(value),
+            crate::GeneratedContentItem::Counter { style, .. } => {
+                text.push_str(&format_counter_value(0, *style));
+            }
+            crate::GeneratedContentItem::Counters {
+                style,
+                separator: _,
+                ..
+            } => text.push_str(&format_counter_value(0, *style)),
+        }
+    }
+    text
+}
+
+fn parse_generated_content_items(
+    value: &str,
+    tree: &DomTree,
+    nid: NodeId,
+) -> Option<Vec<crate::GeneratedContentItem>> {
+    let mut items = Vec::new();
+    let mut rest = value.trim();
+    while !rest.is_empty() {
+        rest = rest.trim_start();
+        let first = rest.chars().next()?;
+        if matches!(first, '"' | '\'') {
+            let (raw, tail) = take_css_quoted(rest)?;
+            items.push(crate::GeneratedContentItem::Text(unescape_css_string(raw)));
+            rest = tail;
+            continue;
+        }
+
+        let name_end = rest
+            .char_indices()
+            .find_map(|(index, ch)| (!is_css_ident_char(ch)).then_some(index))
+            .unwrap_or(rest.len());
+        let name = &rest[..name_end];
+        let after_name = rest[name_end..].trim_start();
+        if !after_name.starts_with('(') {
+            // Quote-control keywords are valid generated-content items, but
+            // they do not contribute text in the current renderer.
+            if matches!(
+                name.to_ascii_lowercase().as_str(),
+                "open-quote" | "close-quote" | "no-open-quote" | "no-close-quote"
+            ) {
+                rest = after_name;
+                continue;
+            }
+            return None;
+        }
+        let (arguments, tail) = take_css_function_arguments(after_name)?;
+        match name.to_ascii_lowercase().as_str() {
+            "attr" => {
+                let attribute = arguments
+                    .split_whitespace()
+                    .next()
+                    .filter(|name| !name.is_empty())?;
+                let value = tree
+                    .get_node(nid)
+                    .and_then(|node| node.get_attribute(attribute).map(str::to_owned))
+                    .unwrap_or_default();
+                items.push(crate::GeneratedContentItem::Text(value));
+            }
+            "counter" => {
+                let arguments = split_function_arguments(arguments);
+                let name = arguments.first()?.trim();
+                if !valid_generated_counter_name(name) || arguments.len() > 2 {
+                    return None;
+                }
+                let style = match arguments.get(1) {
+                    Some(style) => parse_generated_counter_style(style.trim())?,
+                    None => crate::GeneratedCounterStyle::default(),
+                };
+                items.push(crate::GeneratedContentItem::Counter {
+                    name: name.to_string(),
+                    style,
+                });
+            }
+            "counters" => {
+                let arguments = split_function_arguments(arguments);
+                if !(2..=3).contains(&arguments.len()) {
+                    return None;
+                }
+                let name = arguments[0].trim();
+                if !valid_generated_counter_name(name) {
+                    return None;
+                }
+                let (separator, separator_tail) = take_css_quoted(arguments[1].trim())?;
+                if !separator_tail.trim().is_empty() {
+                    return None;
+                }
+                let style = match arguments.get(2) {
+                    Some(style) => parse_generated_counter_style(style.trim())?,
+                    None => crate::GeneratedCounterStyle::default(),
+                };
+                items.push(crate::GeneratedContentItem::Counters {
+                    name: name.to_string(),
+                    separator: unescape_css_string(separator),
+                    style,
+                });
+            }
+            _ => return None,
+        }
+        rest = tail;
+    }
+    (!items.is_empty()).then_some(items)
+}
+
+fn is_css_ident_char(ch: char) -> bool {
+    ch.is_alphanumeric() || matches!(ch, '-' | '_' | '\\')
+}
+
+fn take_css_quoted(value: &str) -> Option<(&str, &str)> {
+    let quote = value.chars().next().filter(|ch| matches!(ch, '"' | '\''))?;
+    let mut escaped = false;
+    for (offset, ch) in value[quote.len_utf8()..].char_indices() {
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == quote {
+            let end = quote.len_utf8() + offset;
+            return Some((
+                &value[quote.len_utf8()..end],
+                &value[end + quote.len_utf8()..],
+            ));
+        }
+    }
+    None
+}
+
+fn take_css_function_arguments(value: &str) -> Option<(&str, &str)> {
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    for (offset, ch) in value.char_indices() {
+        if let Some(open) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == open {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '"' | '\'' => quote = Some(ch),
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some((&value[1..offset], &value[offset + 1..]));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn split_function_arguments(value: &str) -> Vec<&str> {
+    let mut result = Vec::new();
+    let mut start = 0;
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    for (offset, ch) in value.char_indices() {
+        if let Some(open) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == open {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '"' | '\'' => quote = Some(ch),
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                result.push(value[start..offset].trim());
+                start = offset + 1;
+            }
+            _ => {}
+        }
+    }
+    result.push(value[start..].trim());
+    result
+}
+
+fn valid_generated_counter_name(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(is_css_ident_char)
+}
+
+fn parse_generated_counter_style(value: &str) -> Option<crate::GeneratedCounterStyle> {
+    Some(match value.to_ascii_lowercase().as_str() {
+        "decimal" => crate::GeneratedCounterStyle::Decimal,
+        "decimal-leading-zero" => crate::GeneratedCounterStyle::DecimalLeadingZero,
+        "lower-alpha" | "lower-latin" => crate::GeneratedCounterStyle::LowerAlpha,
+        "upper-alpha" | "upper-latin" => crate::GeneratedCounterStyle::UpperAlpha,
+        "lower-roman" => crate::GeneratedCounterStyle::LowerRoman,
+        "upper-roman" => crate::GeneratedCounterStyle::UpperRoman,
+        _ => return None,
+    })
+}
+
+pub(crate) fn format_counter_value(value: i32, style: crate::GeneratedCounterStyle) -> String {
+    match style {
+        crate::GeneratedCounterStyle::Decimal => value.to_string(),
+        crate::GeneratedCounterStyle::DecimalLeadingZero if (-9..=9).contains(&value) => {
+            if value < 0 {
+                format!("-{:02}", value.unsigned_abs())
+            } else {
+                format!("{value:02}")
+            }
+        }
+        crate::GeneratedCounterStyle::DecimalLeadingZero => value.to_string(),
+        crate::GeneratedCounterStyle::LowerAlpha => alpha_counter(value, false),
+        crate::GeneratedCounterStyle::UpperAlpha => alpha_counter(value, true),
+        crate::GeneratedCounterStyle::LowerRoman => roman_counter(value, false),
+        crate::GeneratedCounterStyle::UpperRoman => roman_counter(value, true),
+    }
+}
+
+fn alpha_counter(value: i32, uppercase: bool) -> String {
+    if value <= 0 {
+        return value.to_string();
+    }
+    let mut value = value as u32;
+    let mut result = Vec::new();
+    while value > 0 {
+        value -= 1;
+        result.push((b'a' + (value % 26) as u8) as char);
+        value /= 26;
+    }
+    result.reverse();
+    let result: String = result.into_iter().collect();
+    if uppercase {
+        result.to_ascii_uppercase()
+    } else {
+        result
+    }
+}
+
+fn roman_counter(value: i32, uppercase: bool) -> String {
+    if !(1..=3999).contains(&value) {
+        return value.to_string();
+    }
+    let mut value = value;
+    let mut result = String::new();
+    for &(amount, numeral) in &[
+        (1000, "M"),
+        (900, "CM"),
+        (500, "D"),
+        (400, "CD"),
+        (100, "C"),
+        (90, "XC"),
+        (50, "L"),
+        (40, "XL"),
+        (10, "X"),
+        (9, "IX"),
+        (5, "V"),
+        (4, "IV"),
+        (1, "I"),
+    ] {
+        while value >= amount {
+            value -= amount;
+            result.push_str(numeral);
+        }
+    }
+    if uppercase {
+        result
+    } else {
+        result.to_ascii_lowercase()
+    }
 }
 
 /// Decode CSS string escapes: `\` followed by 1-6 hex digits is a Unicode
@@ -2892,11 +3208,51 @@ mod tests {
         let cta = tree.query_selector("#cta").unwrap().unwrap();
         assert_eq!(
             extract_content("content:attr(data-label)", &tree, cta),
-            Some(Some("Get Started".to_string()))
+            Some(Some(vec![crate::GeneratedContentItem::Text(
+                "Get Started".to_string()
+            )]))
         );
         assert_eq!(
             extract_content(r#"content:"fallback";content:none"#, &tree, cta),
             Some(None)
+        );
+    }
+
+    #[test]
+    fn generated_content_parses_counter_items_and_styles() {
+        let tree = obscura_dom::parse_html(r#"<span id="line"></span>"#);
+        let line = tree.query_selector("#line").unwrap().unwrap();
+        assert_eq!(
+            extract_content(
+                r#"content:"[" counters(section, ".", upper-roman) "] " counter(line)"#,
+                &tree,
+                line,
+            ),
+            Some(Some(vec![
+                crate::GeneratedContentItem::Text("[".to_string()),
+                crate::GeneratedContentItem::Counters {
+                    name: "section".to_string(),
+                    separator: ".".to_string(),
+                    style: crate::GeneratedCounterStyle::UpperRoman,
+                },
+                crate::GeneratedContentItem::Text("] ".to_string()),
+                crate::GeneratedContentItem::Counter {
+                    name: "line".to_string(),
+                    style: crate::GeneratedCounterStyle::Decimal,
+                },
+            ]))
+        );
+        assert_eq!(
+            format_counter_value(27, crate::GeneratedCounterStyle::LowerAlpha),
+            "aa"
+        );
+        assert_eq!(
+            format_counter_value(14, crate::GeneratedCounterStyle::UpperRoman),
+            "XIV"
+        );
+        assert_eq!(
+            format_counter_value(-4, crate::GeneratedCounterStyle::DecimalLeadingZero),
+            "-04"
         );
     }
 
@@ -3231,17 +3587,13 @@ mod tests {
         let css = ".card { display:block; @media (max-width: 950px) { width:100%; } }";
         let narrow = parse_stylesheet_for_viewport(css, (900.0, 1000.0));
         let wide = parse_stylesheet_for_viewport(css, (1280.0, 720.0));
-        assert!(
-            narrow
+        assert!(narrow
                 .iter()
                 .any(|(selector, declarations)| selector == ".card"
-                    && declarations.contains("width:100%"))
-        );
-        assert!(
-            !wide
+                && declarations.contains("width:100%")));
+        assert!(!wide
                 .iter()
-                .any(|(_, declarations)| declarations.contains("width:100%"))
-        );
+            .any(|(_, declarations)| declarations.contains("width:100%")));
     }
 
     #[test]
@@ -3485,6 +3837,63 @@ mod tests {
             Some("75%"),
             "an invalid typed value computes to the registered initial value"
         );
+    }
+
+    #[test]
+    fn var_substitution_preserves_neighboring_token_boundaries() {
+        let props = HashMap::from([
+            ("--stroke".to_string(), "2px".to_string()),
+            ("--amount".to_string(), "10".to_string()),
+        ]);
+        assert_eq!(
+            substitute_var_value("var(--stroke)solid", &props, 0).as_deref(),
+            Some("2px solid")
+        );
+        assert_eq!(
+            substitute_var_value("calc(var(--stroke)*3)", &props, 0).as_deref(),
+            Some("calc(2px*3)"),
+            "punctuation adjacency must not gain calc-significant whitespace"
+        );
+        assert_eq!(
+            substitute_var_value("calc(var(--amount)- 2px)", &props, 0).as_deref(),
+            Some("calc(10- 2px)"),
+            "substitution must not make an invalid unspaced calc minus valid"
+        );
+        assert_eq!(
+            substitute_var_value("+var(--amount)", &props, 0).as_deref(),
+            Some("+ 10"),
+            "a delim plus followed by a number must not become a signed number token"
+        );
+        assert_eq!(
+            substitute_var_value("var(--amount)%", &props, 0).as_deref(),
+            Some("10 %"),
+            "a number token followed by a percent delimiter is not a percentage token"
+        );
+
+        let tree = obscura_dom::parse_html(r#"<div id="target"></div>"#);
+        let css = r#"
+            #target {
+                --stroke:2px;
+                --ink:#123456;
+                border:var(--stroke)solid var(--ink);
+                height:calc(var(--stroke)*3);
+            }
+        "#;
+        let sheet = Stylesheet::parse(&tree, &[css.to_string()]);
+        let target = tree.get_element_by_id("target").unwrap();
+        let (style, _) =
+            apply_registered_property_test_style(&sheet, &tree, target, &HashMap::new());
+        assert_eq!(
+            style.border,
+            crate::Edges {
+                top: 2.0,
+                right: 2.0,
+                bottom: 2.0,
+                left: 2.0,
+            }
+        );
+        assert_eq!(style.border_color, Some([0x12, 0x34, 0x56, 0xff]));
+        assert_eq!(style.height, crate::Dimension::Px(6.0));
     }
 
     #[test]

@@ -6,12 +6,16 @@
 //! dependencies, so a screenshot is reproducible across hosts.
 
 use obscura_dom::tree::DomTree;
-use tiny_skia::{Color, FillRule, GradientStop, LinearGradient, Paint, PathBuilder, Pixmap, Point, RadialGradient, Rect, SpreadMode, Transform};
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use tiny_skia::{
+    Color, FillRule, FilterQuality, GradientStop, LinearGradient, Paint, PathBuilder, Pattern,
+    Pixmap, Point, RadialGradient, Rect, SpreadMode, Transform,
+};
 
 static FONT_BYTES: &[u8] = include_bytes!("../assets/liberation-sans.ttf");
+static SYSTEM_FONT_BYTES: &[u8] = include_bytes!("../assets/dejavu-sans.ttf");
 static SERIF_FONT_BYTES: &[u8] = include_bytes!("../assets/liberation-serif.ttf");
 static MONO_FONT_BYTES: &[u8] = include_bytes!("../assets/liberation-mono.ttf");
 static FONT_BOLD_BYTES: &[u8] = include_bytes!("../assets/liberation-sans-bold.ttf");
@@ -519,6 +523,8 @@ pub fn paint_prepared(
         &prepared.viewport_fixed,
         &prepared.sticky,
         &mut prepared.layout,
+        None,
+        None,
     )
 }
 
@@ -538,6 +544,8 @@ fn paint_laid_dom_scrolled(
     viewport_fixed: &std::collections::HashSet<obscura_dom::tree::NodeId>,
     sticky: &crate::StickyLayout,
     laid: &mut crate::DomLayout,
+    paint_root: Option<obscura_dom::tree::NodeId>,
+    suppress_opacity_for: Option<obscura_dom::tree::NodeId>,
 ) -> Option<Pixmap> {
     let scroll_state =
         ScrollPaintState::new(viewport, scroll, content_size, viewport_fixed, sticky);
@@ -557,6 +565,12 @@ fn paint_laid_dom_scrolled(
     // box/text loop below and the inline-formatting loop after it (an svg
     // `<text>` element must not also paint its glyphs on top of the raster).
     let mut svg_subtree_skip: std::collections::HashSet<obscura_dom::tree::NodeId> = std::collections::HashSet::new();
+    // Text is painted in a second pass, after the box-order loop. Remember
+    // every subtree already painted into an opacity layer so its shaped text
+    // is not drawn a second time at full opacity in the outer pass.
+    let mut opacity_subtree_skip: std::collections::HashSet<
+        obscura_dom::tree::NodeId,
+    > = std::collections::HashSet::new();
     // External sprite symbols, keyed by "url#id", extracted from a fetched
     // sprite file so a `<use href="url#id">` resolves. One sprite backs many
     // icons (a whole logo/icon band), so cache the parsed symbol across every
@@ -580,17 +594,38 @@ fn paint_laid_dom_scrolled(
     let mut pos_layers: Vec<(i32, Vec<obscura_dom::tree::NodeId>)> = Vec::new();
     let mut normal: Vec<obscura_dom::tree::NodeId> = Vec::new();
     let mut consumed: std::collections::HashSet<obscura_dom::tree::NodeId> = std::collections::HashSet::new();
-    for nid in tree.descendants(tree.document()) {
+    let mut paint_nodes = paint_root.into_iter().collect::<Vec<_>>();
+    paint_nodes.extend(tree.descendants(paint_root.unwrap_or_else(|| tree.document())));
+    for nid in paint_nodes.iter().copied() {
         if consumed.contains(&nid) {
             continue;
         }
+        let is_opacity_root = suppress_opacity_for != Some(nid)
+            && laid
+                .styles
+                .get(&nid)
+                .and_then(|style| style.opacity)
+                .is_some_and(|opacity| opacity.clamp(0.0, 1.0) < 1.0);
         let z = laid
             .styles
             .get(&nid)
             .filter(|s| s.position.is_some())
             .and_then(|s| s.z_index)
             .filter(|&z| z != 0);
-        if let Some(z) = z {
+        if is_opacity_root {
+            let mut sub = vec![nid];
+            sub.extend(tree.descendants(nid));
+            for &member in &sub {
+                consumed.insert(member);
+            }
+            // An opacity effect is one atomic paint-order unit. Its internal
+            // z-order is resolved while painting its isolated surface.
+            match z {
+                Some(z) if z < 0 => neg_layers.push((z, vec![nid])),
+                Some(z) => pos_layers.push((z, vec![nid])),
+                None => normal.push(nid),
+            }
+        } else if let Some(z) = z {
             let mut sub = vec![nid];
             sub.extend(tree.descendants(nid));
             for &m in &sub {
@@ -635,25 +670,29 @@ fn paint_laid_dom_scrolled(
                 .collect();
         let mut last_index: std::collections::HashMap<obscura_dom::tree::NodeId, usize> =
             paint_indices.clone();
-        let dom_preorder = tree.descendants(tree.document());
+        let dom_preorder = paint_nodes.clone();
         for nid in dom_preorder.into_iter().rev() {
             let Some(index) = last_index.get(&nid).copied() else {
                 continue;
             };
-            if let Some(parent) = tree.get_node(nid).and_then(|node| node.parent) {
-                last_index
-                    .entry(parent)
-                    .and_modify(|last| *last = (*last).max(index))
-                    .or_insert(index);
+            if paint_root != Some(nid) {
+                if let Some(parent) = tree.get_node(nid).and_then(|node| node.parent) {
+                    last_index
+                        .entry(parent)
+                        .and_modify(|last| *last = (*last).max(index))
+                        .or_insert(index);
+                }
             }
         }
         for generated in laid.generated_boxes.iter().copied() {
             match generated.kind {
                 crate::dom::GeneratedBoxKind::Before => {
-                    generated_before
-                        .entry(generated.host)
-                        .or_default()
-                        .push(generated);
+                    if paint_indices.contains_key(&generated.host) {
+                        generated_before
+                            .entry(generated.host)
+                            .or_default()
+                            .push(generated);
+                    }
                 }
                 crate::dom::GeneratedBoxKind::After => {
                     if let Some(index) = last_index.get(&generated.host) {
@@ -698,6 +737,53 @@ fn paint_laid_dom_scrolled(
             Some(r) => *r,
             None => continue,
         };
+
+        let own_opacity = laid
+            .styles
+            .get(&nid)
+            .and_then(|style| style.opacity)
+        .unwrap_or(1.0)
+        .clamp(0.0, 1.0);
+        if suppress_opacity_for != Some(nid) && own_opacity < 1.0 {
+            opacity_subtree_skip.insert(nid);
+            opacity_subtree_skip.extend(tree.descendants(nid));
+            if own_opacity <= 0.0 {
+                continue;
+            }
+            // Opacity is applied to the finished stacking context, never to
+            // each primitive. Otherwise two opaque overlapping children at
+            // opacity:.5 incorrectly become .75 alpha in their overlap.
+            let layer = Pixmap::new(pixmap.width(), pixmap.height())?;
+            let layer = paint_laid_dom_scrolled(
+                tree,
+                viewport,
+                base_url,
+                scroll,
+                layer,
+                image_cache,
+                selected_images,
+                svg_fonts,
+                content_size,
+                viewport_fixed,
+                sticky,
+                laid,
+                Some(nid),
+                Some(nid),
+            )?;
+            let group_paint = tiny_skia::PixmapPaint {
+                opacity: own_opacity,
+                ..tiny_skia::PixmapPaint::default()
+            };
+            pixmap.draw_pixmap(
+                0,
+                0,
+                layer.as_ref(),
+                &group_paint,
+                Transform::identity(),
+                None,
+            );
+            continue;
+        }
 
         let style = match laid.styles.get(&nid) {
             Some(s) => s,
@@ -760,7 +846,8 @@ fn paint_laid_dom_scrolled(
         // Box path (rounded if border-radius), reused for gradient/color fill.
         let radius = style.border_radius.resolve(rect.width, rect.height);
         let has_radius = radius.0 > 0.5 && radius.1 > 0.5;
-        let bg_path = || if has_radius {
+        let bg_path = || {
+            if has_radius {
             rounded_rect_path(
                 visible_rect.x,
                 visible_rect.y,
@@ -773,6 +860,7 @@ fn paint_laid_dom_scrolled(
             let mut pb = PathBuilder::new();
             pb.push_rect(box_rect);
             pb.finish()
+            }
         };
         // A linear-gradient background (heavily used by modern hero sections);
         // without this it paints white. Takes precedence over a solid color.
@@ -793,6 +881,20 @@ fn paint_laid_dom_scrolled(
                     );
                 }
             }
+            if !style.background_gradient_layers.is_empty() {
+                if let Some(path) = bg_path() {
+                    paint_background_gradient_layers(
+                        &mut pixmap,
+                        &path,
+                        &visible_rect,
+                        radius,
+                        style,
+                        root_font_size,
+                        viewport,
+                        clip_path_mask.as_ref(),
+                    );
+                }
+            } else {
             if let Some((center, stops)) = &style.background_radial_gradient {
                 if let Some(path) = bg_path() {
                     paint_radial_gradient(
@@ -828,6 +930,7 @@ fn paint_laid_dom_scrolled(
                     );
                 }
             }
+        }
         }
 
         if let Some(mask_url) = &style.mask_image {
@@ -885,7 +988,45 @@ fn paint_laid_dom_scrolled(
                 }
             }
         }
-        for pseudo in [style.before_pseudo.as_deref(), style.after_pseudo.as_deref()]
+        let positioned_pseudo_containing_block = {
+            let mut ancestor = Some(nid);
+            let mut found = None;
+            while let Some(candidate) = ancestor {
+                let candidate_style = laid.styles.get(&candidate);
+                let establishes = candidate_style.is_some_and(|candidate_style| {
+                    candidate_style.position.is_some()
+                        || candidate_style.establishes_positioning_containing_block()
+                });
+                if establishes {
+                    if let Some(candidate_rect) = laid.rects.get(&candidate).copied() {
+                        let (candidate_x, candidate_y) =
+                            scroll_state.translation_for(laid, candidate);
+                        found = Some(crate::Rect {
+                            x: candidate_rect.x + candidate_x,
+                            y: candidate_rect.y + candidate_y,
+                            width: candidate_rect.width,
+                            height: candidate_rect.height,
+                        });
+                        break;
+                    }
+                    // A positioned inline can be flattened out of the taffy
+                    // tree when its block children form the real layout
+                    // boxes. It is still the CSS containing block, but has no
+                    // usable rectangle in this representation. Keep walking
+                    // to the nearest positioned ancestor that does have one
+                    // instead of falling back to the host line itself. The
+                    // latter places `left:0` generated gutters directly over
+                    // their margin-shifted text.
+                }
+                ancestor = tree.get_node(candidate).and_then(|node| node.parent);
+            }
+            found.unwrap_or(rect)
+        };
+        let positioned_pseudo_clip = scroll_state.descendant_clip_for(laid, nid);
+        for pseudo in [
+            style.before_pseudo.as_deref(),
+            style.after_pseudo.as_deref(),
+        ]
             .into_iter()
             .flatten()
         {
@@ -893,10 +1034,11 @@ fn paint_laid_dom_scrolled(
                 &mut laid.text_engine,
                 &mut pixmap,
                 pseudo,
+                &positioned_pseudo_containing_block,
                 &rect,
                 viewport,
                 root_font_size,
-                clip,
+                positioned_pseudo_clip,
                 base_url,
                 image_cache,
             );
@@ -976,8 +1118,7 @@ fn paint_laid_dom_scrolled(
                 // ancestor overflow clip: the raster must not paint past it (a
                 // half-scrolled carousel slide's image otherwise bleeds over
                 // the viewport edge).
-                let painted =
-                    paint_image(
+                let painted = paint_image(
                         &source.resolved_url,
                         None,
                         &rect,
@@ -1034,7 +1175,12 @@ fn paint_laid_dom_scrolled(
         // is drawn at its full border-box size (undistorted) and clipped to the
         // overflow-visible region.
         if name.local.as_ref() == "svg" {
-            let mut markup = serialize_svg_styled(tree, nid, &laid.styles);
+            let mut markup = serialize_svg_styled(
+                tree,
+                nid,
+                &laid.styles,
+                (suppress_opacity_for == Some(nid)).then_some(nid),
+            );
             // Resolve referenced symbols before carrying the host color into
             // the standalone document. A document-level/external symbol may
             // itself contain `currentColor`, and therefore has to be present
@@ -1240,8 +1386,8 @@ fn paint_laid_dom_scrolled(
     // cells, labels) draw last, in tree order, so their glyphs sit above the
     // box backgrounds/borders painted in the loop above. Each item already
     // carries its final origin and clip from `TextEngine::finalize`.
-    for nid in tree.descendants(tree.document()) {
-        if svg_subtree_skip.contains(&nid) {
+    for nid in paint_nodes {
+        if svg_subtree_skip.contains(&nid) || opacity_subtree_skip.contains(&nid) {
             continue;
         }
         let whole = laid.ifc_items.get(&nid).copied();
@@ -1280,6 +1426,7 @@ fn paint_laid_dom_scrolled(
 /// frame.
 #[derive(Debug)]
 struct ScrollPaintState<'a> {
+    viewport: (f32, f32),
     scroll: (f32, f32),
     viewport_fixed: &'a std::collections::HashSet<obscura_dom::tree::NodeId>,
     sticky: std::collections::HashMap<obscura_dom::tree::NodeId, (f32, f32)>,
@@ -1313,6 +1460,7 @@ impl<'a> ScrollPaintState<'a> {
         let active = scroll != (0.0, 0.0) || !sticky_layout.is_empty();
         if !active {
             return Self {
+                viewport,
                 scroll,
                 viewport_fixed,
                 sticky: std::collections::HashMap::new(),
@@ -1324,6 +1472,7 @@ impl<'a> ScrollPaintState<'a> {
         let sticky = sticky_layout.translations(viewport, scroll);
         let sticky_clips = sticky_layout.clip_translations_from(&sticky);
         Self {
+            viewport,
             scroll,
             viewport_fixed,
             sticky,
@@ -1353,6 +1502,15 @@ impl<'a> ScrollPaintState<'a> {
         laid: &crate::DomLayout,
         id: obscura_dom::tree::NodeId,
     ) -> Option<crate::Rect> {
+        self.overflow_clip_for(laid, id)
+            .map(|clip| clip.viewport_rect(self.viewport))
+    }
+
+    fn overflow_clip_for(
+        &self,
+        laid: &crate::DomLayout,
+        id: obscura_dom::tree::NodeId,
+    ) -> Option<crate::dom::OverflowClip> {
         let mut clip = laid.clip_rects.get(&id).copied().flatten()?;
         if !self.active || self.viewport_fixed.contains(&id) {
             return Some(clip);
@@ -1362,9 +1520,33 @@ impl<'a> ScrollPaintState<'a> {
             .get(&id)
             .copied()
             .unwrap_or((0.0, 0.0));
-        clip.x += sticky.0 - self.scroll.0;
-        clip.y += sticky.1 - self.scroll.1;
+        clip.translate(
+            sticky.0 - self.scroll.0,
+            sticky.1 - self.scroll.1,
+        );
         Some(clip)
+    }
+
+    fn descendant_clip_for(
+        &self,
+        laid: &crate::DomLayout,
+        id: obscura_dom::tree::NodeId,
+    ) -> Option<crate::Rect> {
+        let inherited = self.overflow_clip_for(laid, id);
+        let style = laid.styles.get(&id)?;
+        if !style.overflow_hidden || style.overflow_propagated_to_viewport {
+            return inherited.map(|clip| clip.viewport_rect(self.viewport));
+        }
+        let rect = laid.rects.get(&id)?;
+        let (ox, oy) = self.translation_for(laid, id);
+        let own = crate::dom::OverflowClip::for_box(rect, style, ox, oy);
+        Some(
+            match inherited {
+                Some(clip) => clip.intersect(own),
+                None => own,
+            }
+            .viewport_rect(self.viewport),
+        )
     }
 
     /// Capture-space clip for a shaped inline context. `clip_for` supplies the
@@ -1376,23 +1558,7 @@ impl<'a> ScrollPaintState<'a> {
         laid: &crate::DomLayout,
         id: obscura_dom::tree::NodeId,
     ) -> Option<crate::Rect> {
-        let inherited = self.clip_for(laid, id);
-        let style = laid.styles.get(&id)?;
-        if !style.overflow_hidden {
-            return inherited;
-        }
-        let rect = laid.rects.get(&id)?;
-        let (ox, oy) = self.translation_for(laid, id);
-        let own = crate::Rect {
-            x: rect.x + ox + style.border.left,
-            y: rect.y + oy + style.border.top,
-            width: (rect.width - style.border.left - style.border.right).max(0.0),
-            height: (rect.height - style.border.top - style.border.bottom).max(0.0),
-        };
-        Some(match inherited {
-            Some(clip) => clip.intersect(&own).unwrap_or(crate::Rect::default()),
-            None => own,
-        })
+        self.descendant_clip_for(laid, id)
     }
 }
 
@@ -1880,6 +2046,9 @@ fn fallback_font_bytes(family: Option<&str>) -> &'static [u8] {
             .trim()
             .trim_matches(|c| c == '"' || c == '\'')
             .to_ascii_lowercase();
+        if token == "system-ui" || token == "ui-sans-serif" {
+            return SYSTEM_FONT_BYTES;
+        }
         if token == "monospace"
             || token.contains("mono")
             || token.contains("courier")
@@ -1905,14 +2074,12 @@ fn fallback_font_bytes(family: Option<&str>) -> &'static [u8] {
             || token == "arial"
             || token == "helvetica"
             || token == "helvetica neue"
-            || token == "system-ui"
             || token == "-apple-system"
             || token == "roboto"
             || token == "segoe ui"
             || token == "inter"
             || token == "verdana"
             || token == "tahoma"
-            || token == "ui-sans-serif"
         {
             return FONT_BYTES;
         }
@@ -2288,9 +2455,14 @@ fn font_face_blocks(css: &str) -> Vec<&str> {
 }
 
 fn font_face_declaration<'a>(face: &'a str, name: &str) -> Option<&'a str> {
-    split_css_top_level(face, ';').into_iter().find_map(|declaration| {
+    split_css_top_level(face, ';')
+        .into_iter()
+        .find_map(|declaration| {
         let (property, value) = declaration.split_once(':')?;
-        property.trim().eq_ignore_ascii_case(name).then_some(value.trim())
+            property
+                .trim()
+                .eq_ignore_ascii_case(name)
+                .then_some(value.trim())
     })
 }
 
@@ -2575,6 +2747,129 @@ fn paint_linear_gradient(
     }
 }
 
+fn paint_linear_gradient_layer(
+    pixmap: &mut Pixmap,
+    path: &tiny_skia::Path,
+    rect: &crate::Rect,
+    angle: f32,
+    stops: &[([u8; 4], Option<f32>)],
+    stop_positions: &[Option<String>],
+    repeating: bool,
+    em: f32,
+    rem: f32,
+    viewport: (f32, f32),
+    clip: Option<&tiny_skia::Mask>,
+) {
+    if stops.len() < 2 {
+        return;
+    }
+    let rad = angle.to_radians();
+    let dx = rad.sin();
+    let dy = -rad.cos();
+    let (cx, cy) = (rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
+    let half = (dx.abs() * rect.width + dy.abs() * rect.height) / 2.0;
+    let line_length = half * 2.0;
+    if line_length <= f32::EPSILON {
+        return;
+    }
+    let base_start = Point::from_xy(cx - dx * half, cy - dy * half);
+    let base_end = Point::from_xy(cx + dx * half, cy + dy * half);
+    let mut positions: Vec<Option<f32>> = stops
+        .iter()
+        .enumerate()
+        .map(|(index, (_, legacy))| {
+            stop_positions
+                .get(index)
+                .and_then(Option::as_deref)
+                .and_then(|value| {
+                    crate::style::resolve_contextual_length(
+                        value,
+                        em,
+                        rem,
+                        viewport.0 / 100.0,
+                        viewport.1 / 100.0,
+                        line_length,
+                    )
+                    .map(|pixels| pixels / line_length)
+                })
+                .or(*legacy)
+        })
+        .collect();
+    if positions.first().is_some_and(Option::is_none) {
+        positions[0] = Some(0.0);
+    }
+    let last_index = positions.len() - 1;
+    if positions[last_index].is_none() {
+        positions[last_index] = Some(1.0);
+    }
+    let mut previous = 0usize;
+    for index in 1..positions.len() {
+        let Some(mut position) = positions[index] else {
+            continue;
+        };
+        let previous_position = positions[previous].unwrap_or(0.0);
+        position = position.max(previous_position);
+        positions[index] = Some(position);
+        let gap = index - previous;
+        for offset in 1..gap {
+            positions[previous + offset] = Some(
+                previous_position + (position - previous_position) * offset as f32 / gap as f32,
+            );
+        }
+        previous = index;
+    }
+    let first = positions[0].unwrap_or(0.0);
+    let last = positions[last_index].unwrap_or(first);
+    if repeating && last - first <= 1e-6 {
+        let color = gradient_stop_color(stops, last_index);
+        let mut paint = Paint::default();
+        paint.set_color(Color::from_rgba8(color[0], color[1], color[2], color[3]));
+        pixmap.fill_path(path, &paint, FillRule::Winding, Transform::identity(), clip);
+        return;
+    }
+    let (start, end, spread, normalize) = if repeating {
+        (
+            Point::from_xy(
+                base_start.x + (base_end.x - base_start.x) * first,
+                base_start.y + (base_end.y - base_start.y) * first,
+            ),
+            Point::from_xy(
+                base_start.x + (base_end.x - base_start.x) * last,
+                base_start.y + (base_end.y - base_start.y) * last,
+            ),
+            SpreadMode::Repeat,
+            Some((first, last - first)),
+        )
+    } else {
+        (base_start, base_end, SpreadMode::Pad, None)
+    };
+    let mut gradient_stops = Vec::with_capacity(stops.len());
+    let mut monotonic = 0.0f32;
+    for (index, _) in stops.iter().enumerate() {
+        let color = gradient_stop_color(stops, index);
+        let position = match normalize {
+            Some((origin, span)) => {
+                ((positions[index].unwrap_or(origin) - origin) / span).clamp(0.0, 1.0)
+            }
+            None => positions[index].unwrap_or(0.0).clamp(0.0, 1.0),
+    }
+        .max(monotonic);
+        monotonic = position;
+        gradient_stops.push(GradientStop::new(
+            position,
+            Color::from_rgba8(color[0], color[1], color[2], color[3]),
+        ));
+    }
+    if let Some(shader) =
+        LinearGradient::new(start, end, gradient_stops, spread, Transform::identity())
+    {
+        let mut paint = Paint::default();
+        paint.shader = shader;
+        paint.anti_alias = true;
+        pixmap.fill_path(path, &paint, FillRule::Winding, Transform::identity(), clip);
+    }
+}
+
 fn paint_radial_gradient(
     pixmap: &mut Pixmap,
     path: &tiny_skia::Path,
@@ -2622,6 +2917,234 @@ fn paint_radial_gradient(
         paint.anti_alias = true;
         pixmap.fill_path(path, &paint, FillRule::Winding, Transform::identity(), clip);
     }
+}
+
+fn paint_background_gradient_layers(
+    pixmap: &mut Pixmap,
+    path: &tiny_skia::Path,
+    rect: &crate::Rect,
+    border_radius: (f32, f32),
+    style: &crate::LayoutStyle,
+    root_font_size: f32,
+    viewport: (f32, f32),
+    clip: Option<&tiny_skia::Mask>,
+) {
+    let layers = &style.background_gradient_layers;
+    let em = style.font_size.unwrap_or(16.0);
+    let tile_size = background_gradient_tile_size(style, rect, em, root_font_size, viewport);
+    let needs_tile =
+        (tile_size.0 - rect.width).abs() > 0.01 || (tile_size.1 - rect.height).abs() > 0.01;
+    if needs_tile && tile_size.0 > 0.0 && tile_size.1 > 0.0 {
+        let width = tile_size.0.ceil().clamp(1.0, 4096.0) as u32;
+        let height = tile_size.1.ceil().clamp(1.0, 4096.0) as u32;
+        if let Some(mut tile) = Pixmap::new(width, height) {
+            let tile_rect = crate::Rect {
+                x: 0.0,
+                y: 0.0,
+                width: width as f32,
+                height: height as f32,
+            };
+            if let Some(tile_path) = Rect::from_xywh(0.0, 0.0, tile_rect.width, tile_rect.height)
+                .and_then(|rect| {
+                    let mut builder = PathBuilder::new();
+                    builder.push_rect(rect);
+                    builder.finish()
+                })
+            {
+                paint_gradient_layer_stack(
+                    &mut tile,
+                    &tile_path,
+                    &tile_rect,
+                    (0.0, 0.0),
+                    layers,
+                    em,
+                    root_font_size,
+                    viewport,
+                    None,
+                );
+                let tile_x = rect.x
+                    + style
+                        .background_position
+                        .x
+                        .resolve(rect.width - tile_size.0);
+                let tile_y = rect.y
+                    + style
+                        .background_position
+                        .y
+                        .resolve(rect.height - tile_size.1);
+                let repeats = style.background_repeat.unwrap_or((true, true));
+                if repeats == (true, true) {
+                    let mut paint = Paint::default();
+                    paint.shader = Pattern::new(
+                        tile.as_ref(),
+                        SpreadMode::Repeat,
+                        FilterQuality::Nearest,
+                        1.0,
+                        Transform::from_translate(tile_x, tile_y),
+                    );
+                    pixmap.fill_path(path, &paint, FillRule::Winding, Transform::identity(), clip);
+                    return;
+                }
+
+                let mut owner_clip = clip.cloned().or_else(|| {
+                    let mut mask = tiny_skia::Mask::new(pixmap.width(), pixmap.height())?;
+                    mask.fill_path(path, FillRule::Winding, true, Transform::identity());
+                    Some(mask)
+                });
+                if clip.is_some() {
+                    if let Some(mask) = owner_clip.as_mut() {
+                        mask.intersect_path(path, FillRule::Winding, true, Transform::identity());
+                    }
+                }
+                let start_x = if repeats.0 {
+                    tile_x - ((tile_x - rect.x) / width as f32).ceil() * width as f32
+                } else {
+                    tile_x
+                };
+                let start_y = if repeats.1 {
+                    tile_y - ((tile_y - rect.y) / height as f32).ceil() * height as f32
+                } else {
+                    tile_y
+                };
+                let end_x = if repeats.0 {
+                    rect.x + rect.width
+                } else {
+                    tile_x + 0.5
+                };
+                let end_y = if repeats.1 {
+                    rect.y + rect.height
+                } else {
+                    tile_y + 0.5
+                };
+                let mut y = start_y;
+                while y < end_y {
+                    let mut x = start_x;
+                    while x < end_x {
+                        pixmap.draw_pixmap(
+                            x.floor() as i32,
+                            y.floor() as i32,
+                            tile.as_ref(),
+                            &tiny_skia::PixmapPaint::default(),
+                            Transform::identity(),
+                            owner_clip.as_ref(),
+                        );
+                        if !repeats.0 {
+                            break;
+                        }
+                        x += width as f32;
+                    }
+                    if !repeats.1 {
+                        break;
+                    }
+                    y += height as f32;
+                }
+                return;
+            }
+        }
+    }
+
+    paint_gradient_layer_stack(
+        pixmap,
+        path,
+        rect,
+        border_radius,
+        layers,
+        em,
+        root_font_size,
+        viewport,
+        clip,
+    );
+}
+
+fn paint_gradient_layer_stack(
+    pixmap: &mut Pixmap,
+    path: &tiny_skia::Path,
+    rect: &crate::Rect,
+    border_radius: (f32, f32),
+    layers: &[crate::BackgroundGradientLayer],
+    em: f32,
+    root_font_size: f32,
+    viewport: (f32, f32),
+    clip: Option<&tiny_skia::Mask>,
+) {
+    // CSS lists the topmost background first. Paint back-to-front so every
+    // translucent layer composites over the layers authored after it.
+    for layer in layers.iter().rev() {
+        match layer {
+            crate::BackgroundGradientLayer::Linear {
+                angle,
+                stops,
+                stop_positions,
+                repeating,
+            } => {
+                paint_linear_gradient_layer(
+                    pixmap,
+                    path,
+                    rect,
+                    *angle,
+                    stops,
+                    stop_positions,
+                    *repeating,
+                    em,
+                    root_font_size,
+                    viewport,
+                    clip,
+                );
+            }
+            crate::BackgroundGradientLayer::Radial { center, stops } => {
+                paint_radial_gradient(pixmap, path, rect, *center, stops, clip);
+            }
+            crate::BackgroundGradientLayer::Conic {
+                angle,
+                center,
+                stops,
+            } => {
+                paint_conic_gradient(pixmap, rect, border_radius, *angle, *center, stops, clip);
+            }
+        }
+    }
+}
+
+fn background_gradient_tile_size(
+    style: &crate::LayoutStyle,
+    rect: &crate::Rect,
+    em: f32,
+    rem: f32,
+    viewport: (f32, f32),
+) -> (f32, f32) {
+    if matches!(
+        style.background_size_fit,
+        Some(crate::ObjectFit::Cover | crate::ObjectFit::Contain)
+    ) {
+        return (rect.width, rect.height);
+    }
+    if let Some(expression) = style.background_size_expression.as_deref() {
+        let components = split_background_size_components(expression);
+        let resolve = |value: &&str, basis: f32| {
+            (!value.eq_ignore_ascii_case("auto"))
+                .then(|| {
+                    crate::style::resolve_contextual_length(
+                        value,
+                        em,
+                        rem,
+                        viewport.0 / 100.0,
+                        viewport.1 / 100.0,
+                        basis,
+                    )
+                })
+                .flatten()
+        };
+        let width = components
+            .first()
+            .and_then(|value| resolve(value, rect.width))
+            .unwrap_or(rect.width);
+        let height = components
+            .get(1)
+            .and_then(|value| resolve(value, rect.height))
+            .unwrap_or(rect.height);
+        return (width, height);
+    }
+    style.background_size.unwrap_or((rect.width, rect.height))
 }
 
 fn paint_conic_gradient(
@@ -2874,7 +3397,7 @@ fn background_image_rect(
     explicit_size: Option<(f32, f32)>,
     size_expression: Option<&str>,
     fit: Option<crate::ObjectFit>,
-    position: (f32, f32),
+    position: crate::BackgroundPosition,
     em: f32,
     rem: f32,
     viewport: (f32, f32),
@@ -2939,8 +3462,8 @@ fn background_image_rect(
         return None;
     }
     Some(crate::Rect {
-        x: box_rect.x + (box_rect.width - width) * position.0,
-        y: box_rect.y + (box_rect.height - height) * position.1,
+        x: box_rect.x + position.x.resolve(box_rect.width - width),
+        y: box_rect.y + position.y.resolve(box_rect.height - height),
         width,
         height,
     })
@@ -3002,21 +3525,7 @@ fn paint_in_flow_generated_box(
         width: generated.rect.width,
         height: generated.rect.height,
     };
-    let mut clip = scroll_state.clip_for(laid, generated.host);
-    if host_style.overflow_hidden {
-        if let Some(host_rect) = laid.rects.get(&generated.host) {
-            let own = crate::Rect {
-                x: host_rect.x + ox,
-                y: host_rect.y + oy,
-                width: host_rect.width,
-                height: host_rect.height,
-            };
-            clip = Some(match clip {
-                Some(inherited) => inherited.intersect(&own).unwrap_or(crate::Rect::default()),
-                None => own,
-            });
-        }
-    }
+    let clip = scroll_state.descendant_clip_for(laid, generated.host);
     let visible = match clip {
         Some(clip) => rect.intersect(&clip),
         None => Some(rect),
@@ -3072,6 +3581,18 @@ fn paint_in_flow_generated_box(
                 clip_path_mask.as_ref(),
             );
         }
+        if !style.background_gradient_layers.is_empty() {
+            paint_background_gradient_layers(
+                pixmap,
+                &path,
+                &rect,
+                radius,
+                style,
+                root_font_size,
+                viewport,
+                clip_path_mask.as_ref(),
+            );
+        } else {
         if let Some((center, stops)) = &style.background_radial_gradient {
             paint_radial_gradient(
                 pixmap,
@@ -3094,14 +3615,8 @@ fn paint_in_flow_generated_box(
             );
         }
         if let Some((angle, stops)) = &style.background_gradient {
-            paint_linear_gradient(
-                pixmap,
-                &path,
-                &rect,
-                *angle,
-                stops,
-                clip_path_mask.as_ref(),
-            );
+                paint_linear_gradient(pixmap, &path, &rect, *angle, stops, clip_path_mask.as_ref());
+            }
         }
     }
     if let Some(mask_url) = &style.mask_image {
@@ -3221,6 +3736,7 @@ fn paint_positioned_pseudo(
     pixmap: &mut Pixmap,
     style: &crate::LayoutStyle,
     containing_block: &crate::Rect,
+    static_position_rect: &crate::Rect,
     viewport: (f32, f32),
     root_font_size: f32,
     ancestor_clip: Option<crate::Rect>,
@@ -3231,36 +3747,58 @@ fn paint_positioned_pseudo(
         return;
     }
     let em = style.font_size.unwrap_or(16.0);
-    let resolve = |dimension: crate::Dimension, basis: f32| {
-        match dimension.resolve(em, root_font_size, viewport.0 / 100.0, viewport.1 / 100.0) {
+    let resolve = |dimension: crate::Dimension, basis: f32| match dimension.resolve(
+        em,
+        root_font_size,
+        viewport.0 / 100.0,
+        viewport.1 / 100.0,
+    ) {
             crate::Dimension::Px(value) => Some(value),
             crate::Dimension::Percent(value) => Some(value * basis),
             _ => None,
-        }
     };
     let top = style.inset[0].and_then(|value| resolve(value, containing_block.height));
     let right = style.inset[1].and_then(|value| resolve(value, containing_block.width));
     let bottom = style.inset[2].and_then(|value| resolve(value, containing_block.height));
     let left = style.inset[3].and_then(|value| resolve(value, containing_block.width));
-    let width = resolve(style.width, containing_block.width).or_else(|| {
-        Some(containing_block.width - left? - right?)
-    });
-    let height = resolve(style.height, containing_block.height).or_else(|| {
-        Some(containing_block.height - top? - bottom?)
-    });
-    let (Some(width), Some(height)) = (width, height) else { return };
+    // Generated text supplies the shrink-to-fit dimensions of an absolutely
+    // positioned pseudo whose width and/or height is auto. Tailwind's code
+    // gutters use exactly this shape (`width` plus auto height); requiring two
+    // opposing insets previously discarded the pseudo before text painting.
+    let generated_item = style
+        .before_content
+        .as_deref()
+        .filter(|content| !content.is_empty())
+        .and_then(|content| text_engine.push_generated_text(content, style));
+    let generated_intrinsic = generated_item.map(|item| text_engine.measure(item, None));
+    let width = resolve(style.width, containing_block.width)
+        .or_else(|| Some(containing_block.width - left? - right?))
+        .or_else(|| generated_intrinsic.map(|size| size.0));
+    let height = resolve(style.height, containing_block.height)
+        .or_else(|| Some(containing_block.height - top? - bottom?))
+        .or_else(|| generated_intrinsic.map(|size| size.1));
+    let (Some(width), Some(height)) = (width, height) else {
+        return;
+    };
     if width <= 0.0 || height <= 0.0 {
         return;
     }
     let x = left
         .map(|value| containing_block.x + value)
         .or_else(|| right.map(|value| containing_block.x + containing_block.width - value - width))
-        .unwrap_or(containing_block.x);
+        .unwrap_or(static_position_rect.x);
     let y = top
         .map(|value| containing_block.y + value)
-        .or_else(|| bottom.map(|value| containing_block.y + containing_block.height - value - height))
-        .unwrap_or(containing_block.y);
-    let rect = crate::Rect { x, y, width, height };
+        .or_else(|| {
+            bottom.map(|value| containing_block.y + containing_block.height - value - height)
+        })
+        .unwrap_or(static_position_rect.y);
+    let rect = crate::Rect {
+        x,
+        y,
+        width,
+        height,
+    };
     let visible = match ancestor_clip {
         Some(clip) => rect.intersect(&clip),
         None => Some(rect),
@@ -3308,6 +3846,18 @@ fn paint_positioned_pseudo(
                 clip_path_mask.as_ref(),
             );
         }
+        if !style.background_gradient_layers.is_empty() {
+            paint_background_gradient_layers(
+                pixmap,
+                &path,
+                &rect,
+                radius,
+                style,
+                root_font_size,
+                viewport,
+                clip_path_mask.as_ref(),
+            );
+        } else {
         if let Some((center, stops)) = &style.background_radial_gradient {
             paint_radial_gradient(
                 pixmap,
@@ -3330,14 +3880,8 @@ fn paint_positioned_pseudo(
             );
         }
         if let Some((angle, stops)) = &style.background_gradient {
-            paint_linear_gradient(
-                pixmap,
-                &path,
-                &rect,
-                *angle,
-                stops,
-                clip_path_mask.as_ref(),
-            );
+                paint_linear_gradient(pixmap, &path, &rect, *angle, stops, clip_path_mask.as_ref());
+            }
         }
     }
     if let Some(mask_url) = &style.mask_image {
@@ -3388,15 +3932,32 @@ fn paint_positioned_pseudo(
             );
         }
     }
-    if let Some(content) = style.before_content.as_deref().filter(|content| !content.is_empty()) {
-        let Some(item) = text_engine.push_generated_text(content, style) else { return };
-        let (text_width, text_height) = text_engine.measure(item, None);
-        let x = match style.justify_content {
-            Some(taffy::JustifyContent::CENTER) => rect.x + (rect.width - text_width) / 2.0,
-            Some(taffy::JustifyContent::FLEX_END | taffy::JustifyContent::END) => {
-                rect.x + rect.width - style.padding.right - text_width
+    if let Some(item) = generated_item {
+        let (text_width, text_height) = generated_intrinsic.unwrap_or_default();
+        // `text-align` positions inline content within the pseudo's content
+        // box. It is independent of flex/grid `justify-content`: Tailwind's
+        // absolutely positioned line-number gutters are inline-block pseudos,
+        // so consulting only `justify-content` left every counter at the
+        // gutter's start edge even though its inherited computed alignment
+        // was `right`.
+        let x = if style.display == crate::Display::Flex {
+            match style.justify_content {
+                Some(taffy::JustifyContent::CENTER) => {
+                    rect.x + (rect.width - text_width) / 2.0
+                }
+                Some(taffy::JustifyContent::FLEX_END | taffy::JustifyContent::END) => {
+                    rect.x + rect.width - style.padding.right - text_width
+                }
+                _ => rect.x + style.padding.left,
             }
-            _ => rect.x + style.padding.left,
+        } else {
+            match style.text_align {
+                Some(taffy::AlignItems::CENTER) => rect.x + (rect.width - text_width) / 2.0,
+                Some(taffy::AlignItems::FLEX_END | taffy::AlignItems::END) => {
+                    rect.x + rect.width - style.padding.right - text_width
+                }
+                _ => rect.x + style.padding.left,
+            }
         };
         let y = match style.align_items {
             Some(taffy::AlignItems::CENTER) => rect.y + (rect.height - text_height) / 2.0,
@@ -3958,8 +4519,7 @@ fn polygon_clip_mask(
     rem: f32,
     viewport: (f32, f32),
 ) -> Option<tiny_skia::Mask> {
-    let resolve = |coordinate: crate::Dimension, basis: f32| {
-        match coordinate.resolve(
+    let resolve = |coordinate: crate::Dimension, basis: f32| match coordinate.resolve(
             em,
             rem,
             viewport.0 / 100.0,
@@ -3968,7 +4528,6 @@ fn polygon_clip_mask(
             crate::Dimension::Px(value) => Some(value),
             crate::Dimension::Percent(value) => Some(value * basis),
             _ => None,
-        }
     };
     let mut builder = PathBuilder::new();
     for (index, &(x, y)) in polygon.points.iter().enumerate() {
@@ -4172,9 +4731,8 @@ fn svg_root_attr_value_range(tag: &str, wanted: &str) -> Option<(usize, usize)> 
         while index < bytes.len() && bytes[index].is_ascii_whitespace() {
             index += 1;
         }
-        let (value_start, value_end) = if index < bytes.len()
-            && matches!(bytes[index], b'"' | b'\'')
-        {
+        let (value_start, value_end) =
+            if index < bytes.len() && matches!(bytes[index], b'"' | b'\'') {
             let delimiter = bytes[index];
             index += 1;
             let start = index;
@@ -4214,7 +4772,7 @@ fn svg_root_attr_value_range(tag: &str, wanted: &str) -> Option<(usize, usize)> 
 #[cfg(test)]
 fn serialize_svg(tree: &DomTree, root: obscura_dom::tree::NodeId) -> String {
     let mut buf = String::new();
-    serialize_svg_node(tree, root, true, None, &mut buf);
+    serialize_svg_node(tree, root, true, None, None, &mut buf);
     buf
 }
 
@@ -4226,9 +4784,17 @@ fn serialize_svg_styled(
     tree: &DomTree,
     root: obscura_dom::tree::NodeId,
     styles: &std::collections::HashMap<obscura_dom::tree::NodeId, crate::LayoutStyle>,
+    suppress_opacity_for: Option<obscura_dom::tree::NodeId>,
 ) -> String {
     let mut buf = String::new();
-    serialize_svg_node(tree, root, true, Some(styles), &mut buf);
+    serialize_svg_node(
+        tree,
+        root,
+        true,
+        Some(styles),
+        suppress_opacity_for,
+        &mut buf,
+    );
     buf
 }
 
@@ -4253,6 +4819,7 @@ fn serialize_svg_node(
     nid: obscura_dom::tree::NodeId,
     is_root: bool,
     styles: Option<&std::collections::HashMap<obscura_dom::tree::NodeId, crate::LayoutStyle>>,
+    suppress_opacity_for: Option<obscura_dom::tree::NodeId>,
     buf: &mut String,
 ) {
     let node = match tree.get_node(nid) {
@@ -4268,7 +4835,14 @@ fn serialize_svg_node(
         // Document/comment/PI: no tag of its own, emit only element children.
         None => {
             for child in tree.children(nid) {
-                serialize_svg_node(tree, child, false, styles, buf);
+                serialize_svg_node(
+                    tree,
+                    child,
+                    false,
+                    styles,
+                    suppress_opacity_for,
+                    buf,
+                );
             }
             return;
         }
@@ -4368,8 +4942,15 @@ fn serialize_svg_node(
                     &format!("#{:02x}{:02x}{:02x}", color[0], color[1], color[2]),
                 );
             }
-            if let Some(opacity) = computed.opacity {
-                append("opacity", &opacity.to_string());
+            if suppress_opacity_for == Some(nid) {
+                // The HTML paint layer applies this SVG root's opacity after
+                // resvg returns. Override both a source style declaration and
+                // the computed value here so the group is not faded twice.
+                append("opacity", "1");
+            } else {
+                if let Some(opacity) = computed.opacity {
+                    append("opacity", &opacity.to_string());
+                }
             }
         }
         if !declarations.is_empty() {
@@ -4383,7 +4964,14 @@ fn serialize_svg_node(
     }
     buf.push('>');
     for child in tree.children(nid) {
-        serialize_svg_node(tree, child, false, styles, buf);
+        serialize_svg_node(
+            tree,
+            child,
+            false,
+            styles,
+            suppress_opacity_for,
+            buf,
+        );
     }
     buf.push_str("</");
     buf.push_str(tag);
@@ -4480,7 +5068,7 @@ fn inject_external_sprites(
         if symbol_id == root || root_descendants.contains(&symbol_id) {
             continue;
         }
-        serialize_svg_node(tree, symbol_id, false, None, &mut defs);
+        serialize_svg_node(tree, symbol_id, false, None, None, &mut defs);
     }
     for (href, url, frag) in &refs {
         let key = format!("{url}#{frag}");
@@ -4872,33 +5460,13 @@ mod tests {
         let mut resources = RenderResourceCache::default();
         let mut prepared =
             prepare_dom(&tree, viewport, None, &mut resources).expect("prepared render");
-        let top = paint_prepared(
-            &tree,
-            &mut prepared,
-            &mut resources,
-            (0.0, 0.0),
-        )
-        .expect("top capture");
-        let scrolled = paint_prepared(
-            &tree,
-            &mut prepared,
-            &mut resources,
-            (0.0, 1000.0),
-        )
+        let top =
+            paint_prepared(&tree, &mut prepared, &mut resources, (0.0, 0.0)).expect("top capture");
+        let scrolled = paint_prepared(&tree, &mut prepared, &mut resources, (0.0, 1000.0))
         .expect("scrolled capture");
-        let top_repeat = paint_prepared(
-            &tree,
-            &mut prepared,
-            &mut resources,
-            (0.0, 0.0),
-        )
+        let top_repeat = paint_prepared(&tree, &mut prepared, &mut resources, (0.0, 0.0))
         .expect("repeated top capture");
-        let scrolled_repeat = paint_prepared(
-            &tree,
-            &mut prepared,
-            &mut resources,
-            (0.0, 1000.0),
-        )
+        let scrolled_repeat = paint_prepared(&tree, &mut prepared, &mut resources, (0.0, 1000.0))
         .expect("repeated scrolled capture");
 
         assert_eq!(top, top_repeat, "returning to the top must not accumulate scroll");
@@ -5036,36 +5604,19 @@ mod tests {
         let base_translates = prepared.layout().translates.clone();
         let base_clips = prepared.layout().clip_rects.clone();
 
-        let near = screenshot_prepared(
-            &tree,
-            &mut prepared,
-            &mut resources,
-            (0.0, 20.0),
-        )
+        let near = screenshot_prepared(&tree, &mut prepared, &mut resources, (0.0, 20.0))
         .expect("near capture");
-        let far = screenshot_prepared(
-            &tree,
-            &mut prepared,
-            &mut resources,
-            (0.0, 100.0),
-        )
+        let far = screenshot_prepared(&tree, &mut prepared, &mut resources, (0.0, 100.0))
         .expect("far capture");
-        let far_repeat = screenshot_prepared(
-            &tree,
-            &mut prepared,
-            &mut resources,
-            (0.0, 100.0),
-        )
+        let far_repeat = screenshot_prepared(&tree, &mut prepared, &mut resources, (0.0, 100.0))
         .expect("repeated far capture");
-        let near_after_far = screenshot_prepared(
-            &tree,
-            &mut prepared,
-            &mut resources,
-            (0.0, 20.0),
-        )
+        let near_after_far = screenshot_prepared(&tree, &mut prepared, &mut resources, (0.0, 20.0))
         .expect("repeated near capture");
 
-        assert_ne!(near, far, "distinct scroll positions must paint distinct frames");
+        assert_ne!(
+            near, far,
+            "distinct scroll positions must paint distinct frames"
+        );
         assert_eq!(far, far_repeat, "the same scroll position must be stable");
         assert_eq!(
             near, near_after_far,
@@ -5205,6 +5756,34 @@ mod tests {
     }
 
     #[test]
+    fn paints_border_when_var_is_adjacent_to_border_style_token() {
+        let tree = parse_html(
+            r##"<html><head><style>
+                body { margin:0 }
+                #target {
+                    --stroke:2px;
+                    --ink:#e11d48;
+                    width:30px;
+                    height:30px;
+                    border:var(--stroke)solid var(--ink);
+                    background:#fff;
+                }
+            </style></head><body><div id="target"></div></body></html>"##,
+        );
+        let pixmap = paint_dom(&tree, (60.0, 60.0), None).expect("pixmap");
+        let border = pixmap.pixel(1, 1).expect("border pixel");
+        assert!(
+            border.red() > 200 && border.green() < 70 && border.blue() < 100,
+            "adjacent var() substitution must retain a painted red border: {border:?}"
+        );
+        let interior = pixmap.pixel(5, 5).expect("interior pixel");
+        assert!(
+            interior.red() > 245 && interior.green() > 245 && interior.blue() > 245,
+            "the border must not consume the content box: {interior:?}"
+        );
+    }
+
+    #[test]
     fn percentage_border_radius_paints_circles_ellipses_and_replaced_clips() {
         let tree = parse_html(
             r##"<html><body style="margin:0">
@@ -5268,6 +5847,102 @@ mod tests {
     }
 
     #[test]
+    fn ordered_background_gradients_paint_every_translucent_layer() {
+        let tree = parse_html(
+            r#"<html><body style="margin:0">
+               <div style="width:100px;height:100px;background-color:white;
+                 background-image:
+                   linear-gradient(180deg,transparent,white 85%),
+                   radial-gradient(circle at top left,rgba(255,0,0,.9),transparent 50%),
+                   radial-gradient(circle at top right,rgba(0,0,255,.9),transparent 50%)">
+               </div>
+               </body></html>"#,
+        );
+        let pixmap = paint_dom(&tree, (100.0, 100.0), None).expect("pixmap");
+        let left = pixmap.pixel(4, 4).expect("top-left gradient");
+        let right = pixmap.pixel(95, 4).expect("top-right gradient");
+        assert!(
+            left.red() > left.blue() + 80,
+            "the top-left radial layer must tint its own corner: {left:?}"
+        );
+        assert!(
+            right.blue() > right.red() + 80,
+            "the later top-right radial layer must remain beneath the authored top layer: {right:?}"
+        );
+    }
+
+    #[test]
+    fn repeating_linear_gradient_tiles_at_background_size_over_ordered_layer() {
+        let tree = parse_html(
+            r#"<html><body style="margin:0">
+               <div style="width:40px;height:40px;background-color:white;
+                 background-image:
+                   repeating-linear-gradient(315deg,
+                     rgba(0,0,0,.65) 0,rgba(0,0,0,.65) 1px,
+                     transparent 0,transparent 50%),
+                   linear-gradient(red,red);
+                 background-size:10px 10px">
+               </div>
+               </body></html>"#,
+        );
+        let pixmap = paint_dom(&tree, (40.0, 40.0), None).expect("pixmap");
+        let mut dark = 0usize;
+        let mut red = 0usize;
+        for y in 0..10 {
+            for x in 0..10 {
+                let first = pixmap.pixel(x, y).expect("first tile");
+                let repeated = pixmap.pixel(x + 20, y + 20).expect("repeated tile");
+                assert_eq!(
+                    first, repeated,
+                    "background-size must establish a stable 10px tile at ({x},{y})"
+                );
+                if first.red() < 150 {
+                    dark += 1;
+                } else if first.red() > 220 && first.green() < 40 && first.blue() < 40 {
+                    red += 1;
+                }
+            }
+        }
+        assert!(dark > 4, "the repeating hatch must paint dark stripes");
+        assert!(
+            red > 20,
+            "transparent hatch gaps must reveal the ordered red layer"
+        );
+    }
+
+    #[test]
+    fn length_background_positions_select_sprite_frames() {
+        let sprite = "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='48'%20height='24'%3E%3Crect%20width='24'%20height='24'%20fill='%23ff0000'/%3E%3Crect%20x='24'%20width='24'%20height='24'%20fill='%230000ff'/%3E%3C/svg%3E";
+        let tree = parse_html(&format!(
+            r#"<html><body style="margin:0;background:white">
+               <div style="position:absolute;left:0;top:0;width:24px;height:42px;
+                 background-color:black;background-image:url(&quot;{sprite}&quot;);
+                 background-size:48px 24px;background-position:0;background-repeat:no-repeat"></div>
+               <div style="position:absolute;left:30px;top:0;width:24px;height:42px;
+                 background-color:black;background-image:url(&quot;{sprite}&quot;);
+                 background-size:48px 24px;background-position:-24px;background-repeat:no-repeat"></div>
+               </body></html>"#
+        ));
+        let pixmap = paint_dom(&tree, (60.0, 45.0), None).expect("pixmap");
+
+        let first = pixmap.pixel(12, 21).expect("first sprite frame");
+        assert!(
+            first.red() > 200 && first.green() < 40 && first.blue() < 40,
+            "`background-position:0` must anchor the first frame at the start edge: {first:?}"
+        );
+        let second = pixmap.pixel(42, 21).expect("second sprite frame");
+        assert!(
+            second.blue() > 200 && second.red() < 40 && second.green() < 40,
+            "a negative pixel position must select the next sprite frame: {second:?}"
+        );
+        let above = pixmap.pixel(12, 2).expect("vertical centering");
+        assert!(
+            above.red() < 30 && above.green() < 30 && above.blue() < 30,
+            "a one-value horizontal position must default the vertical axis to center: {above:?}"
+        );
+    }
+
+    #[test]
     fn negative_text_indent_clips_label_without_hiding_background_icon() {
         let tree = parse_html(
             r#"<html><body style="margin:0">
@@ -5316,7 +5991,10 @@ mod tests {
             None,
             Some("calc(100% - 2rem) auto"),
             None,
-            (0.0, 0.5),
+            crate::BackgroundPosition::new(
+                crate::BackgroundPositionAxis::percentage(0.0),
+                crate::BackgroundPositionAxis::percentage(0.5),
+            ),
             10.0,
             10.0,
             (1280.0, 720.0),
@@ -5837,6 +6515,250 @@ mod tests {
     }
 
     #[test]
+    fn authored_combobox_button_paints_css_math_border() {
+        let tree = parse_html(
+            r#"<html style="margin:0"><head><style>
+                :root {
+                    --stroke-standard: calc(1 * 1px);
+                    --control-height: calc(4px * 10);
+                    --control-radius: calc(4px * 2);
+                }
+                #host { width:260px }
+                #language {
+                    display:flex;
+                    align-items:center;
+                    justify-content:space-between;
+                    width:100%;
+                    height:var(--control-height);
+                    box-sizing:border-box;
+                    border-style:solid;
+                    border-width:var(--stroke-standard);
+                    border-color:rgba(208,217,251,.4);
+                    border-radius:var(--control-radius);
+                    padding:1px 12px;
+                }
+            </style></head><body style="margin:0">
+                <div id="host">
+                    <button id="language" role="combobox">
+                        <span>English (United States)</span><span>▼</span>
+                    </button>
+                </div>
+            </body></html>"#,
+        );
+        let laid = crate::layout_dom(&tree, (320.0, 80.0));
+        let language = tree.get_element_by_id("language").unwrap();
+        let rect = laid.rects[&language];
+        let style = &laid.styles[&language];
+        assert_eq!((rect.width, rect.height), (260.0, 40.0));
+        assert_eq!(
+            style.border,
+            crate::Edges {
+                top: 1.0,
+                right: 1.0,
+                bottom: 1.0,
+                left: 1.0,
+            }
+        );
+
+        let pixmap = paint_dom(&tree, (320.0, 80.0), None).expect("pixmap");
+        let painted_top_edge = (20..240)
+            .filter(|&x| pixmap.pixel(x, 0).is_some_and(|pixel| pixel.alpha() > 0))
+            .count();
+        assert!(
+            painted_top_edge > 200,
+            "the rounded authored border should paint across the control: {painted_top_edge}"
+        );
+    }
+
+    #[test]
+    fn fractional_opacity_composites_boxes_and_inline_svg_once() {
+        let tree = parse_html(
+            r#"<html><body style="margin:0">
+                <div style="width:20px;height:20px;background:black;opacity:.05"></div>
+                <svg style="position:absolute;left:30px;top:0;opacity:.05"
+                     width="20" height="20" viewBox="0 0 20 20">
+                    <rect width="20" height="20" fill="black"/>
+                </svg>
+            </body></html>"#,
+        );
+        let pixmap = paint_dom(&tree, (60.0, 30.0), None).expect("pixmap");
+        for (label, x) in [("box", 10), ("svg", 40)] {
+            let pixel = pixmap.pixel(x, 10).expect("pixel");
+            assert!(
+                (240..=244).contains(&pixel.red())
+                    && pixel.red() == pixel.green()
+                    && pixel.green() == pixel.blue(),
+                "{label} opacity:.05 should composite black once over white: {pixel:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn opacity_is_applied_to_overlapping_children_as_one_group() {
+        let tree = parse_html(
+            r#"<html><body style="margin:0">
+                <div style="position:relative;width:30px;height:20px;opacity:.5">
+                    <div style="position:absolute;left:0;width:20px;height:20px;background:black"></div>
+                    <div style="position:absolute;left:10px;width:20px;height:20px;background:black"></div>
+                </div>
+            </body></html>"#,
+        );
+        let pixmap = paint_dom(&tree, (40.0, 30.0), None).expect("pixmap");
+        let samples = [5, 15, 25].map(|x| pixmap.pixel(x, 10).unwrap().red());
+        assert!(
+            samples.iter().all(|channel| (126..=129).contains(channel)),
+            "single-child and overlap regions must receive the same group alpha: {samples:?}"
+        );
+    }
+
+    #[test]
+    fn nested_opacity_groups_multiply_at_composite_boundaries() {
+        let tree = parse_html(
+            r#"<html><body style="margin:0">
+                <div style="width:20px;height:20px;opacity:.5">
+                    <div style="width:20px;height:20px;background:black;opacity:.5"></div>
+                </div>
+            </body></html>"#,
+        );
+        let pixmap = paint_dom(&tree, (30.0, 30.0), None).expect("pixmap");
+        let pixel = pixmap.pixel(10, 10).expect("pixel");
+        assert!(
+            (190..=193).contains(&pixel.red())
+                && pixel.red() == pixel.green()
+                && pixel.green() == pixel.blue(),
+            "nested .5 groups should produce .25 black over white: {pixel:?}"
+        );
+    }
+
+    #[test]
+    fn opacity_group_contains_z_order_and_preserves_clip_transforms() {
+        let tree = parse_html(
+            r#"<html><body style="margin:0">
+                <div style="position:relative;width:20px;height:20px;
+                            overflow:hidden;opacity:.5">
+                    <div style="position:absolute;z-index:999;left:0;top:0;
+                                transform:translate(10px,0);width:20px;height:20px;
+                                background:red"></div>
+                </div>
+                <div style="position:absolute;left:30px;top:0;width:20px;height:20px;
+                            opacity:.5">
+                    <div style="position:absolute;z-index:999;width:20px;height:20px;
+                                background:red"></div>
+                </div>
+                <div style="position:absolute;left:30px;top:0;width:20px;height:20px;
+                            background:blue"></div>
+            </body></html>"#,
+        );
+        let pixmap = paint_dom(&tree, (60.0, 30.0), None).expect("pixmap");
+        let clipped_out = pixmap.pixel(5, 10).unwrap();
+        let clipped_in = pixmap.pixel(15, 10).unwrap();
+        let outside = pixmap.pixel(25, 10).unwrap();
+        assert_eq!(
+            (clipped_out.red(), clipped_out.green(), clipped_out.blue()),
+            (255, 255, 255)
+        );
+        assert!(
+            clipped_in.red() > 240 && (126..=129).contains(&clipped_in.green()),
+            "translated child should be clipped then group-composited: {clipped_in:?}"
+        );
+        assert_eq!(
+            (outside.red(), outside.green(), outside.blue()),
+            (255, 255, 255)
+        );
+        let covered = pixmap.pixel(40, 10).unwrap();
+        assert!(
+            covered.blue() > 240 && covered.red() < 20,
+            "high-z descendant must stay inside the earlier opacity group: {covered:?}"
+        );
+    }
+
+    #[test]
+    fn overflow_clipping_keeps_physical_axes_independent() {
+        let tree = parse_html(
+            r#"<html><body style="margin:0">
+                <div style="position:relative;width:20px;height:20px;
+                            overflow-x:clip">
+                    <div style="position:absolute;left:10px;top:30px;
+                                width:20px;height:10px;background:red"></div>
+                </div>
+                <div style="position:absolute;left:40px;top:0;width:20px;height:20px;
+                            overflow-y:clip">
+                    <div style="position:absolute;left:30px;top:10px;
+                                width:10px;height:20px;background:blue"></div>
+                </div>
+            </body></html>"#,
+        );
+        let pixmap = paint_dom(&tree, (90.0, 50.0), None).expect("pixmap");
+
+        let x_inside_y_outside = pixmap.pixel(15, 35).unwrap();
+        assert!(
+            x_inside_y_outside.red() > 240 && x_inside_y_outside.blue() < 20,
+            "overflow-x:clip must not clip a Brave-shaped absolute child on Y: \
+             {x_inside_y_outside:?}"
+        );
+        assert_eq!(
+            pixmap.pixel(25, 35).map(|p| (p.red(), p.green(), p.blue())),
+            Some((255, 255, 255)),
+            "overflow-x:clip must still clip X"
+        );
+
+        let y_inside_x_outside = pixmap.pixel(75, 15).unwrap();
+        assert!(
+            y_inside_x_outside.blue() > 240 && y_inside_x_outside.red() < 20,
+            "overflow-y:clip must not clip the reciprocal X overflow: \
+             {y_inside_x_outside:?}"
+        );
+        assert_eq!(
+            pixmap.pixel(75, 25).map(|p| (p.red(), p.green(), p.blue())),
+            Some((255, 255, 255)),
+            "overflow-y:clip must still clip Y"
+        );
+    }
+
+    #[test]
+    fn generated_boxes_use_the_hosts_overflow_on_only_the_authored_axis() {
+        let tree = parse_html(
+            r#"<html><body style="margin:0">
+                <div id="x"></div><div id="y"></div>
+                <style>
+                  #x { position:relative;width:20px;height:20px;overflow-x:clip }
+                  #x::before { content:"";position:absolute;left:10px;top:30px;
+                               width:20px;height:10px;background:red }
+                  #y { position:absolute;left:40px;top:0;width:20px;height:20px;
+                       overflow-y:clip }
+                  #y::after { content:"";display:block;width:10px;height:30px;
+                              margin-left:30px;background:blue }
+                </style>
+            </body></html>"#,
+        );
+        let pixmap = paint_dom(&tree, (90.0, 50.0), None).expect("pixmap");
+
+        let positioned_y_overflow = pixmap.pixel(15, 35).unwrap();
+        assert!(
+            positioned_y_overflow.red() > 240 && positioned_y_overflow.blue() < 20,
+            "positioned pseudo must remain visible outside Y for overflow-x:clip: \
+             {positioned_y_overflow:?}"
+        );
+        assert_eq!(
+            pixmap.pixel(25, 35).map(|p| (p.red(), p.green(), p.blue())),
+            Some((255, 255, 255)),
+            "positioned pseudo must be clipped on X"
+        );
+
+        let in_flow_x_overflow = pixmap.pixel(75, 10).unwrap();
+        assert!(
+            in_flow_x_overflow.blue() > 240 && in_flow_x_overflow.red() < 20,
+            "in-flow pseudo must remain visible outside X for overflow-y:clip: \
+             {in_flow_x_overflow:?}"
+        );
+        assert_eq!(
+            pixmap.pixel(75, 25).map(|p| (p.red(), p.green(), p.blue())),
+            Some((255, 255, 255)),
+            "in-flow pseudo must be clipped on Y"
+        );
+    }
+
+    #[test]
     fn later_element_paints_over_earlier() {
         // A blue div nested inside a red one: both cover the origin, and blue
         // (a descendant, later in tree order) paints over red.
@@ -6034,6 +6956,15 @@ mod tests {
             mono > sans * 1.5,
             "monospace advances must be used for code text: sans={sans}, mono={mono}"
         );
+
+        let sample = "Build fast, responsive sites with Bootstrap";
+        let system = measure_text(sample, 64.0, false, Some("system-ui, sans-serif"));
+        let arial = measure_text(sample, 64.0, false, Some("Arial, sans-serif"));
+        assert!(
+            system > arial * 1.08,
+            "Chromium's Linux system-ui face is DejaVu Sans, not the narrower \
+             Liberation Sans used for Arial: system={system}, arial={arial}"
+        );
     }
 
     #[test]
@@ -6115,7 +7046,7 @@ mod tests {
         );
         let svg = tree.query_selector("svg").unwrap().unwrap();
         let layout = crate::dom::layout_dom(&tree, (160.0, 80.0));
-        let markup = serialize_svg_styled(&tree, svg, &layout.styles);
+        let markup = serialize_svg_styled(&tree, svg, &layout.styles, None);
         assert!(
             markup.contains("fill:#00cc55!important"),
             "computed author fill must cross the standalone boundary: {markup}"
@@ -6360,7 +7291,7 @@ mod tests {
         );
         let laid = crate::dom::layout_dom(&tree, (100.0, 100.0));
         let svg = tree.query_selector("#icon").unwrap().unwrap();
-        let markup = serialize_svg_styled(&tree, svg, &laid.styles);
+        let markup = serialize_svg_styled(&tree, svg, &laid.styles, None);
         assert!(
             !markup.to_ascii_lowercase().contains("light-dark("),
             "unsupported CSS Color 5 syntax must not reach usvg: {markup}"

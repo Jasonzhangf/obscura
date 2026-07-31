@@ -47,16 +47,190 @@ fn text_width(
         + chars * letter_spacing
 }
 
+#[derive(Default)]
+struct NativeButtonIntrinsicContent {
+    text: String,
+    atomic_width: f32,
+}
+
+/// Collect the normal-flow content that contributes to an auto-sized
+/// `<button>`'s intrinsic inline size.
+///
+/// DOM `textContent` is deliberately the wrong abstraction here: it includes
+/// text below `display:none` boxes and absolutely positioned accessibility
+/// labels. Gecko gives `<button>` an ordinary block/flex/grid frame, so those
+/// descendants either have no frame or are out of flow and cannot enlarge its
+/// intrinsic inline size. Atomic replaced descendants (most commonly an SVG
+/// icon) do contribute their definite outer inline size.
+fn native_button_intrinsic_content(
+    tree: &DomTree,
+    root: NodeId,
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+    font_size: f32,
+) -> NativeButtonIntrinsicContent {
+    fn definite_inline_size(dimension: crate::Dimension, font_size: f32) -> Option<f32> {
+        match dimension {
+            crate::Dimension::Px(px) => Some(px),
+            crate::Dimension::Em(value) | crate::Dimension::Rem(value) => Some(value * font_size),
+            crate::Dimension::Ex(value) => Some(value * font_size * 0.528_320_3),
+            _ => None,
+        }
+        .map(|value| value.max(0.0))
+    }
+
+    fn walk(
+        tree: &DomTree,
+        id: NodeId,
+        styles: &HashMap<NodeId, crate::LayoutStyle>,
+        font_size: f32,
+        content: &mut NativeButtonIntrinsicContent,
+    ) {
+        let Some(node) = tree.get_node(id) else {
+            return;
+        };
+        if let Some(text) = node.text_content_of_text_node() {
+            content.text.push_str(text);
+            return;
+        }
+        let Some(element) = node.as_element() else {
+            return;
+        };
+        let style = styles.get(&id);
+        if style.is_some_and(|style| {
+            style.display == crate::Display::None
+                || matches!(style.position, Some(taffy::Position::Absolute))
+        }) {
+            return;
+        }
+
+        let is_atomic = matches!(
+            element.local.as_ref(),
+            "svg" | "img" | "video" | "canvas" | "iframe" | "embed" | "object"
+        );
+        if is_atomic {
+            if let Some(style) = style {
+                if let Some(width) = definite_inline_size(style.width, font_size) {
+                    let horizontal_edges = style.padding.left
+                        + style.padding.right
+                        + style.border.left
+                        + style.border.right;
+                    let border_box = if style.box_sizing == crate::BoxSizing::ContentBox {
+                        width + horizontal_edges
+                    } else {
+                        width.max(horizontal_edges)
+                    };
+                    content.atomic_width +=
+                        border_box + style.margin.left.max(0.0) + style.margin.right.max(0.0);
+                }
+            }
+            return;
+        }
+
+        for child in tree.children(id) {
+            walk(tree, child, styles, font_size, content);
+        }
+    }
+
+    let mut content = NativeButtonIntrinsicContent::default();
+    for child in tree.children(root) {
+        walk(tree, child, styles, font_size, &mut content);
+    }
+    content
+}
+
+/// One accumulated overflow clip with independent physical axes.
+///
+/// `None` on an axis means unbounded on that axis. This avoids representing
+/// `overflow-x:clip` with an artificial enormous Y rectangle, which can
+/// corrupt scrolling overflow and transformed clip intersections.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct OverflowClip {
+    x: Option<(f32, f32)>,
+    y: Option<(f32, f32)>,
+}
+
+impl OverflowClip {
+    pub(crate) fn for_box(
+        rect: &Rect,
+        style: &crate::LayoutStyle,
+        tx: f32,
+        ty: f32,
+    ) -> Self {
+        let left = rect.x + tx + style.border.left;
+        let top = rect.y + ty + style.border.top;
+        let right = (rect.x + tx + rect.width - style.border.right).max(left);
+        let bottom = (rect.y + ty + rect.height - style.border.bottom).max(top);
+        Self {
+            x: style.clips_overflow_x().then_some((left, right)),
+            y: style.clips_overflow_y().then_some((top, bottom)),
+        }
+    }
+
+    pub(crate) fn intersect(self, other: Self) -> Self {
+        let axis = |a: Option<(f32, f32)>, b: Option<(f32, f32)>| match (a, b) {
+            (Some((a0, a1)), Some((b0, b1))) => {
+                let start = a0.max(b0);
+                Some((start, a1.min(b1).max(start)))
+            }
+            (Some(bounds), None) | (None, Some(bounds)) => Some(bounds),
+            (None, None) => None,
+        };
+        Self {
+            x: axis(self.x, other.x),
+            y: axis(self.y, other.y),
+        }
+    }
+
+    pub(crate) fn intersect_rect(self, rect: &Rect) -> Option<Rect> {
+        let left = self.x.map_or(rect.x, |(start, _)| rect.x.max(start));
+        let right = self
+            .x
+            .map_or(rect.x + rect.width, |(_, end)| (rect.x + rect.width).min(end));
+        let top = self.y.map_or(rect.y, |(start, _)| rect.y.max(start));
+        let bottom = self
+            .y
+            .map_or(rect.y + rect.height, |(_, end)| (rect.y + rect.height).min(end));
+        (right > left && bottom > top).then_some(Rect {
+            x: left,
+            y: top,
+            width: right - left,
+            height: bottom - top,
+        })
+    }
+
+    pub(crate) fn translate(&mut self, dx: f32, dy: f32) {
+        if let Some((start, end)) = &mut self.x {
+            *start += dx;
+            *end += dx;
+        }
+        if let Some((start, end)) = &mut self.y {
+            *start += dy;
+            *end += dy;
+        }
+    }
+
+    pub(crate) fn viewport_rect(self, viewport: (f32, f32)) -> Rect {
+        let (left, right) = self.x.unwrap_or((0.0, viewport.0));
+        let (top, bottom) = self.y.unwrap_or((0.0, viewport.1));
+        Rect {
+            x: left,
+            y: top,
+            width: (right - left).max(0.0),
+            height: (bottom - top).max(0.0),
+        }
+    }
+}
+
 /// Per-element border boxes after layout, in viewport coordinates.
 pub struct DomLayout {
     pub rects: HashMap<NodeId, Rect>,
     pub styles: HashMap<NodeId, crate::LayoutStyle>,
-    /// The clip rect inherited from ancestor `overflow: hidden` boxes, keyed
+    /// The per-axis clip inherited from ancestor non-visible overflow, keyed
     /// per node, in SCREEN space (the clip owner's box shifted by the owner's
     /// accumulated translate; see `resolve_clip_rects`). `None` means
     /// unclipped. Does not include the node's own overflow (that only clips
     /// its children, not itself).
-    pub clip_rects: HashMap<NodeId, Option<Rect>>,
+    pub clip_rects: HashMap<NodeId, Option<OverflowClip>>,
     /// Accumulated `transform: translate()` per node (own + ancestors), in CSS
     /// px. Only nodes with a non-zero accumulation are present; paint shifts
     /// each box by this to reach screen space.
@@ -326,27 +500,20 @@ impl DomLayout {
         for id in tree.descendants(tree.document()) {
             let parent = tree.get_node(id).and_then(|node| node.parent);
             let has_nested_scroll_container = parent.is_some_and(|parent| {
-                inside_nested_scroller.get(&parent).copied().unwrap_or(false)
-                    || self
-                        .styles
+                inside_nested_scroller
                         .get(&parent)
-                        .is_some_and(|style| {
-                            let is_root_propagated_overflow = tree
-                                .get_node(parent)
-                                .is_some_and(|node| {
-                                    node.as_element().is_some_and(|element| {
-                                        matches!(element.local.as_ref(), "html" | "body")
-                                    })
-                                });
-                            style.overflow_scroll_container && !is_root_propagated_overflow
-                        })
+                    .copied()
+                    .unwrap_or(false)
+                    || self.styles.get(&parent).is_some_and(|style| {
+                        style.overflow_scroll_container
+                            && !is_viewport_overflow_source(parent, &self.styles)
+                    })
             });
             inside_nested_scroller.insert(id, has_nested_scroll_container);
             let parent_sticky = parent
                 .and_then(|parent| nearest_sticky.get(&parent).copied())
                 .flatten();
-            let inherited_clip = parent
-                .and_then(|parent| {
+            let inherited_clip = parent.and_then(|parent| {
                     let parent_style = self.styles.get(&parent);
                     if parent_style.is_some_and(|style| style.overflow_hidden) {
                         nearest_sticky.get(&parent).copied().flatten()
@@ -386,15 +553,7 @@ impl DomLayout {
             // position, before its own transform is painted. `translates`
             // carries the accumulated transform chain, so remove exactly this
             // frame's resolved translate while retaining every ancestor's.
-            let (own_tx, own_ty) = style
-                .transform_translate
-                .map(|(x, y)| {
-                    (
-                        resolve_translate(x, rect.width),
-                        resolve_translate(y, rect.height),
-                    )
-                })
-                .unwrap_or((0.0, 0.0));
+            let (own_tx, own_ty) = resolved_own_translate(style, &rect, 16.0, viewport);
             let normal = Rect {
                 x: rect.x + tx - own_tx,
                 y: rect.y + ty - own_ty,
@@ -472,7 +631,7 @@ impl DomLayout {
 fn accumulate_scrolling_overflow(
     tree: &DomTree,
     id: NodeId,
-    inherited_clip: Option<Rect>,
+    inherited_clip: Option<OverflowClip>,
     fixed: &HashSet<NodeId>,
     rects: &HashMap<NodeId, Rect>,
     styles: &HashMap<NodeId, crate::LayoutStyle>,
@@ -495,7 +654,7 @@ fn accumulate_scrolling_overflow(
     });
     if let Some(overflow) = translated {
         let visible = if let Some(clip) = inherited_clip {
-            overflow.intersect(&clip)
+            clip.intersect_rect(&overflow)
         } else {
             Some(overflow)
         };
@@ -509,16 +668,14 @@ fn accumulate_scrolling_overflow(
     // painting, but it does not truncate the root scrolling area's CSSOM
     // overflow dimensions. Ordinary descendant overflow clips still bound
     // their subtree's contribution.
-    let is_viewport_overflow_source = tree.get_node(id).is_some_and(|node| {
-        node.as_element()
-            .is_some_and(|element| matches!(element.local.as_ref(), "html" | "body"))
-    });
     let child_clip = match (styles.get(&id), rects.get(&id)) {
-        (Some(style), Some(rect)) if style.overflow_hidden && !is_viewport_overflow_source => {
+        (Some(style), Some(rect))
+            if style.overflow_hidden && !is_viewport_overflow_source(id, styles) =>
+        {
             let (tx, ty) = translates.get(&id).copied().unwrap_or((0.0, 0.0));
-            let own = overflow_clip_rect(rect, style, tx, ty);
+            let own = OverflowClip::for_box(rect, style, tx, ty);
             Some(match inherited_clip {
-                Some(clip) => clip.intersect(&own).unwrap_or(Rect::default()),
+                Some(clip) => clip.intersect(own),
                 None => own,
             })
         }
@@ -528,6 +685,48 @@ fn accumulate_scrolling_overflow(
         accumulate_scrolling_overflow(
             tree, child, child_clip, fixed, rects, styles, translates, right, bottom,
         );
+    }
+}
+
+fn is_viewport_overflow_source(
+    id: NodeId,
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+) -> bool {
+    styles
+        .get(&id)
+        .is_some_and(|style| style.overflow_propagated_to_viewport)
+}
+
+fn mark_viewport_overflow_source(
+    tree: &DomTree,
+    root: NodeId,
+    styles: &mut HashMap<NodeId, crate::LayoutStyle>,
+) {
+    let root_is_html = tree.get_node(root).is_some_and(|node| {
+        node.as_element()
+            .is_some_and(|element| element.local.as_ref() == "html")
+    });
+    if !root_is_html {
+        return;
+    }
+    let root_owns_overflow = styles
+        .get(&root)
+        .is_some_and(|style| style.overflow_hidden);
+    if let Some(style) = styles.get_mut(&root) {
+        style.overflow_propagated_to_viewport = true;
+    }
+    if root_owns_overflow {
+        return;
+    }
+    if let Some(body) = tree.children(root).into_iter().find(|child| {
+        tree.get_node(*child).is_some_and(|node| {
+            node.as_element()
+                .is_some_and(|element| element.local.as_ref() == "body")
+        })
+    }) {
+        if let Some(style) = styles.get_mut(&body) {
+            style.overflow_propagated_to_viewport = true;
+        }
     }
 }
 
@@ -645,12 +844,124 @@ fn sync_resolved_percentage_padding(
     );
 }
 
+/// Taffy's flex stand-in for an inline formatting context can lose the
+/// block-axis percentage basis of an atomic containing block. This is most
+/// visible when the atomic box is floated: the float's synthetic placement
+/// wrapper has an indefinite block size, so a `height:100%` descendant
+/// collapses even though the float itself has a definite used height.
+///
+/// Blink's `CalculateChildAvailableSize` and Gecko's `ReflowInput` both pass
+/// the containing block's used content-box block size to such descendants.
+/// Reify that basis after the preliminary layout, when min/max constraints and
+/// border-box edges are known exactly. Keep the repair to ordinary direct
+/// descendants of definite floated/inline-block containing blocks; grid-area,
+/// flex-item, positioned, and anonymous containing-block rules remain native.
+fn resolve_atomic_percentage_heights(
+    tree: &DomTree,
+    taffy_tree: &mut TaffyTree<usize>,
+    taffy_root: taffy::NodeId,
+    id_map: &HashMap<taffy::NodeId, NodeId>,
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+    definite_height_nodes: &HashSet<NodeId>,
+) -> bool {
+    fn visit(
+        tree: &DomTree,
+        taffy_tree: &mut TaffyTree<usize>,
+        node: taffy::NodeId,
+        nearest_dom_parent: Option<NodeId>,
+        containing_block_height: f32,
+        id_map: &HashMap<taffy::NodeId, NodeId>,
+        styles: &HashMap<NodeId, crate::LayoutStyle>,
+        definite_height_nodes: &HashSet<NodeId>,
+        changed: &mut bool,
+    ) {
+        let Ok(layout) = taffy_tree.layout(node) else {
+            return;
+        };
+        let own_content_height = layout.content_box_height().max(0.0);
+        let dom_id = id_map.get(&node).copied();
+
+        if let (Some(dom_id), Some(parent_id)) = (dom_id, nearest_dom_parent) {
+            let is_direct_dom_child = tree
+                .get_node(dom_id)
+                .is_some_and(|node| node.parent == Some(parent_id));
+            let child_percent = styles.get(&dom_id).and_then(|style| {
+                (style.size_expressions[1].is_none()
+                    && !matches!(style.position, Some(taffy::Position::Absolute)))
+                .then_some(style.height)
+                .and_then(|height| match height {
+                    crate::Dimension::Percent(percent) => Some(percent),
+                    _ => None,
+                })
+            });
+            let parent_is_definite_atomic = styles.get(&parent_id).is_some_and(|style| {
+                (style.float.is_some() || style.is_inline_block)
+                    && definite_height_nodes.contains(&parent_id)
+                    && style.size_expressions[1].is_none()
+            });
+            if is_direct_dom_child
+                && parent_is_definite_atomic
+                && containing_block_height.is_finite()
+            {
+                if let Some(percent) = child_percent {
+                    if let Ok(current) = taffy_tree.style(node) {
+                        let mut resolved = current.clone();
+                        resolved.size.height =
+                            taffy::Dimension::length((percent * containing_block_height).max(0.0));
+                        if taffy_tree.set_style(node, resolved).is_ok() {
+                            *changed = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        let next_dom_parent = dom_id.or(nearest_dom_parent);
+        let next_containing_block_height = if dom_id.is_some() {
+            own_content_height
+        } else {
+            containing_block_height
+        };
+        let children = taffy_tree.children(node).unwrap_or_default();
+        for child in children {
+            visit(
+                tree,
+                taffy_tree,
+                child,
+                next_dom_parent,
+                next_containing_block_height,
+                id_map,
+                styles,
+                definite_height_nodes,
+                changed,
+            );
+        }
+    }
+
+    let mut changed = false;
+    visit(
+        tree,
+        taffy_tree,
+        taffy_root,
+        None,
+        0.0,
+        id_map,
+        styles,
+        definite_height_nodes,
+        &mut changed,
+    );
+    changed
+}
+
 fn sync_positioned_pseudo_percentage_padding(
     rects: &HashMap<NodeId, Rect>,
     styles: &mut HashMap<NodeId, crate::LayoutStyle>,
 ) {
     let has_positioned_percentage_padding = styles.values().any(|style| {
-        [style.before_pseudo.as_deref(), style.after_pseudo.as_deref()]
+        [
+            style.before_pseudo.as_deref(),
+            style.after_pseudo.as_deref(),
+        ]
             .into_iter()
             .flatten()
             .any(|pseudo| {
@@ -755,22 +1066,24 @@ struct FloatContinuation {
 fn resolve_clip_rects(
     tree: &DomTree,
     id: NodeId,
-    inherited: Option<Rect>,
+    inherited: Option<OverflowClip>,
     tx: f32,
     ty: f32,
     rects: &HashMap<NodeId, Rect>,
     styles: &HashMap<NodeId, crate::LayoutStyle>,
-    clip_rects: &mut HashMap<NodeId, Option<Rect>>,
+    clip_rects: &mut HashMap<NodeId, Option<OverflowClip>>,
     translates: &mut HashMap<NodeId, (f32, f32)>,
+    root_font_size: f32,
+    viewport: (f32, f32),
 ) {
     clip_rects.insert(id, inherited);
     // This node's own translate joins the accumulation for its box and its
     // whole subtree (percentages resolve against its own border box).
-    let (tx, ty) = match (styles.get(&id).and_then(|s| s.transform_translate), rects.get(&id)) {
-        (Some((dx, dy)), Some(rect)) => (tx + resolve_translate(dx, rect.width), ty + resolve_translate(dy, rect.height)),
-        (Some((dx, dy)), None) => (tx + resolve_translate(dx, 0.0), ty + resolve_translate(dy, 0.0)),
-        _ => (tx, ty),
-    };
+    let (own_tx, own_ty) = styles.get(&id).map_or((0.0, 0.0), |style| {
+        let rect = rects.get(&id).copied().unwrap_or_default();
+        resolved_own_translate(style, &rect, root_font_size, viewport)
+    });
+    let (tx, ty) = (tx + own_tx, ty + own_ty);
     if tx != 0.0 || ty != 0.0 {
         translates.insert(id, (tx, ty));
     }
@@ -779,57 +1092,78 @@ fn resolve_clip_rects(
     // coordinates, and the pixmap already supplies that viewport clip.
     // Materializing it here as an ordinary descendant clip would make root
     // scrolling translate the viewport itself offscreen.
-    let is_viewport_overflow_source = tree.get_node(id).is_some_and(|node| {
-        node.as_element().is_some_and(|element| {
-            if element.local.as_ref() == "html" {
-                return true;
-            }
-            if element.local.as_ref() != "body" {
-                return false;
-            }
-            // Body overflow propagates to the viewport only while the root's
-            // own overflow is visible. Once html establishes overflow, body
-            // remains an ordinary clipping box.
-            node.parent
-                .and_then(|parent| tree.get_node(parent).map(|parent_node| (parent, parent_node)))
-                .is_some_and(|(parent, parent_node)| {
-                    parent_node
-                        .as_element()
-                        .is_some_and(|name| name.local.as_ref() == "html")
-                        && !styles
-                            .get(&parent)
-                            .is_some_and(|style| style.overflow_hidden)
-                })
-        })
-    });
     let next = match (styles.get(&id), rects.get(&id)) {
-        (Some(style), Some(rect)) if style.overflow_hidden && !is_viewport_overflow_source => {
-            let own = overflow_clip_rect(rect, style, tx, ty);
+        (Some(style), Some(rect))
+            if style.overflow_hidden && !is_viewport_overflow_source(id, styles) =>
+        {
+            let own = OverflowClip::for_box(rect, style, tx, ty);
             Some(match inherited {
-                Some(clip) => clip.intersect(&own).unwrap_or(Rect::default()),
+                Some(clip) => clip.intersect(own),
                 None => own,
             })
         }
         _ => inherited,
     };
     for cid in tree.children(id) {
-        resolve_clip_rects(tree, cid, next, tx, ty, rects, styles, clip_rects, translates);
+        resolve_clip_rects(
+            tree,
+            cid,
+            next,
+            tx,
+            ty,
+            rects,
+            styles,
+            clip_rects,
+            translates,
+            root_font_size,
+            viewport,
+        );
     }
+}
+
+fn resolved_own_translate(
+    style: &crate::LayoutStyle,
+    rect: &Rect,
+    root_font_size: f32,
+    viewport: (f32, f32),
+) -> (f32, f32) {
+    let mut offset = style
+        .transform_translate
+        .map(|(x, y)| {
+            (
+                resolve_translate(x, rect.width),
+                resolve_translate(y, rect.height),
+            )
+        })
+        .unwrap_or((0.0, 0.0));
+    let Some((x, y)) = style.individual_translate else {
+        return offset;
+    };
+    let em = style.font_size.unwrap_or(16.0);
+    let resolve_axis = |axis: usize, value: crate::Dimension, basis: f32| {
+        style.individual_translate_expressions[axis]
+            .as_deref()
+            .and_then(|expression| {
+                crate::style::resolve_contextual_length(
+                    expression,
+                    em,
+                    root_font_size,
+                    viewport.0 / 100.0,
+                    viewport.1 / 100.0,
+                    basis,
+                )
+            })
+            .unwrap_or_else(|| resolve_translate(value, basis))
+    };
+    offset.0 += resolve_axis(0, x, rect.width);
+    offset.1 += resolve_axis(1, y, rect.height);
+    offset
 }
 
 /// The CSS overflow clip is the padding box, not the outer border box. This is
 /// also the coordinate-space boundary Gecko captures for descendant display
 /// items: transformed content may cover the padding area but must not repaint
 /// its clip owner's border.
-fn overflow_clip_rect(rect: &Rect, style: &crate::LayoutStyle, tx: f32, ty: f32) -> Rect {
-    Rect {
-        x: rect.x + tx + style.border.left,
-        y: rect.y + ty + style.border.top,
-        width: (rect.width - style.border.left - style.border.right).max(0.0),
-        height: (rect.height - style.border.top - style.border.bottom).max(0.0),
-    }
-}
-
 /// Resolve one `transform: translate()` component to px: a length passes
 /// through, a percentage is taken against `basis` (the element's own
 /// border-box extent on that axis). Font/viewport-relative leftovers fall
@@ -936,9 +1270,7 @@ fn apply_picture_source_hints(
         return;
     }
     let Some(parent_id) = img.parent else { return };
-    let is_picture = tree
-        .get_node(parent_id)
-        .is_some_and(|parent| {
+    let is_picture = tree.get_node(parent_id).is_some_and(|parent| {
             parent
                 .as_element()
                 .is_some_and(|element| element.local.as_ref() == "picture")
@@ -1202,6 +1534,169 @@ fn cascade_walk(
     if is_element {
         matcher.pop_ancestor();
     }
+}
+
+#[derive(Default)]
+struct CssCounterState {
+    values: HashMap<String, Vec<i32>>,
+}
+
+impl CssCounterState {
+    fn apply(
+        &mut self,
+        reset: &[crate::CounterDirective],
+        increment: &[crate::CounterDirective],
+        set: &[crate::CounterDirective],
+    ) -> Vec<String> {
+        let mut created = Vec::new();
+        for directive in reset {
+            self.values
+                .entry(directive.name.clone())
+                .or_default()
+                .push(directive.value);
+            created.push(directive.name.clone());
+        }
+        for directive in increment {
+            let stack = self.values.entry(directive.name.clone()).or_default();
+            if stack.is_empty() {
+                stack.push(0);
+                created.push(directive.name.clone());
+            }
+            if let Some(value) = stack.last_mut() {
+                *value = value.saturating_add(directive.value);
+            }
+        }
+        for directive in set {
+            let stack = self.values.entry(directive.name.clone()).or_default();
+            if stack.is_empty() {
+                stack.push(0);
+                created.push(directive.name.clone());
+            }
+            if let Some(value) = stack.last_mut() {
+                *value = directive.value;
+            }
+        }
+        created
+    }
+
+    fn pop_created(&mut self, created: &[String]) {
+        for name in created.iter().rev() {
+            if let Some(stack) = self.values.get_mut(name) {
+                stack.pop();
+                if stack.is_empty() {
+                    self.values.remove(name);
+                }
+            }
+        }
+    }
+
+    fn render(&self, items: &[crate::GeneratedContentItem]) -> String {
+        let mut result = String::new();
+        for item in items {
+            match item {
+                crate::GeneratedContentItem::Text(text) => result.push_str(text),
+                crate::GeneratedContentItem::Counter { name, style } => {
+                    let value = self
+                        .values
+                        .get(name)
+                        .and_then(|stack| stack.last())
+                        .copied()
+                        .unwrap_or(0);
+                    result.push_str(&crate::css::format_counter_value(value, *style));
+                }
+                crate::GeneratedContentItem::Counters {
+                    name,
+                    separator,
+                    style,
+                } => {
+                    if let Some(stack) = self.values.get(name).filter(|stack| !stack.is_empty()) {
+                        for (index, value) in stack.iter().enumerate() {
+                            if index != 0 {
+                                result.push_str(separator);
+                            }
+                            result.push_str(&crate::css::format_counter_value(*value, *style));
+                        }
+                    } else {
+                        result.push_str(&crate::css::format_counter_value(0, *style));
+                    }
+                }
+            }
+        }
+        result
+    }
+}
+
+/// Resolve generated CSS counter text in tree order after the complete author
+/// cascade is known. Counter scopes created by an element remain visible to
+/// its descendants and following siblings, and expire with their shared
+/// parent. That is the scope shape used by browser counter managers and covers
+/// nested chapter numbering as well as line counters reset on a `<code>`.
+fn resolve_css_counters(tree: &DomTree, styles: &mut HashMap<NodeId, crate::LayoutStyle>) {
+    fn walk(
+        tree: &DomTree,
+        id: NodeId,
+        styles: &mut HashMap<NodeId, crate::LayoutStyle>,
+        counters: &mut CssCounterState,
+    ) -> Vec<String> {
+        let Some(node) = tree.get_node(id) else {
+            return Vec::new();
+        };
+        if styles
+            .get(&id)
+            .is_some_and(|style| style.display == crate::Display::None)
+        {
+            return Vec::new();
+        }
+
+        let created = styles.get(&id).map_or_else(Vec::new, |style| {
+            counters.apply(
+                &style.counter_reset,
+                &style.counter_increment,
+                &style.counter_set,
+            )
+        });
+
+        if let Some(style) = styles.get_mut(&id) {
+            if let Some(pseudo) = style.before_pseudo.as_mut() {
+                if let Some(items) = pseudo.generated_content.as_deref() {
+                    pseudo.before_content = Some(counters.render(items));
+                }
+            }
+            style.before_content = style
+                .before_pseudo
+                .as_ref()
+                .filter(|pseudo| pseudo.position != Some(taffy::Position::Absolute))
+                .and_then(|pseudo| pseudo.before_content.clone());
+        }
+
+        let mut child_scopes = Vec::new();
+        for child in tree.children(id) {
+            child_scopes.extend(walk(tree, child, styles, counters));
+        }
+        counters.pop_created(&child_scopes);
+
+        if let Some(style) = styles.get_mut(&id) {
+            if let Some(pseudo) = style.after_pseudo.as_mut() {
+                if let Some(items) = pseudo.generated_content.as_deref() {
+                    pseudo.before_content = Some(counters.render(items));
+                }
+            }
+            style.after_content = style
+                .after_pseudo
+                .as_ref()
+                .filter(|pseudo| pseudo.position != Some(taffy::Position::Absolute))
+                .and_then(|pseudo| pseudo.before_content.clone());
+        }
+
+        // Non-element nodes cannot create counter scopes, but walking through
+        // them keeps this robust to document fragments and template wrappers.
+        let _ = node;
+        created
+    }
+
+    let mut counters = CssCounterState::default();
+    let root_scopes = walk(tree, tree.document(), styles, &mut counters);
+    counters.pop_created(&root_scopes);
 }
 
 /// Lay out a DOM tree within `viewport` (width, height) in CSS pixels.
@@ -1489,10 +1984,7 @@ fn layout_dom_once(
     // into children, pop on the way back out. This is what lets descendant
     // combinators (".mw-body .firstHeading") fast-reject via the filter
     // instead of falling back to the always-true "can't reject" case.
-    let quirks_mode = !tree
-        .descendants(tree.document())
-        .into_iter()
-        .any(|id| {
+    let quirks_mode = !tree.descendants(tree.document()).into_iter().any(|id| {
             tree.get_node(id).map_or(false, |node| {
                 matches!(node.data, obscura_dom::tree::NodeData::Doctype { .. })
             })
@@ -1510,6 +2002,7 @@ fn layout_dom_once(
         None,
         false,
     );
+    resolve_css_counters(tree, &mut styles);
     let cascade_time = t1.elapsed();
     let (signature, query_stats) = evaluator.map_or_else(
         || (None, crate::css::ContainerQueryStats::default()),
@@ -1584,6 +2077,8 @@ fn layout_dom_once(
             box_sizing: crate::BoxSizing,
             border_collapse: bool,
             table_vertical_align: Option<crate::VerticalAlign>,
+            overflow_x: u8,
+            overflow_y: u8,
             /// Containing-block width in px for the current element, carried
             /// down so percentage padding/margin (which resolve against the
             /// containing block WIDTH, all sides) can be turned into px before
@@ -1623,6 +2118,8 @@ fn layout_dom_once(
                     box_sizing: crate::BoxSizing::ContentBox,
                     border_collapse: false,
                     table_vertical_align: None,
+                    overflow_x: 0,
+                    overflow_y: 0,
                     cb_width: 0.0,
                     cb_height_definite: false,
                 }
@@ -1643,14 +2140,7 @@ fn layout_dom_once(
             ) {
                 (Some(px), _, _) => px,
                 (None, _, Some(expression)) => {
-                    crate::style::resolve_contextual_length(
-                        expression,
-                        16.0,
-                        16.0,
-                        vw,
-                        vh,
-                        16.0,
-                    )
+                    crate::style::resolve_contextual_length(expression, 16.0, 16.0, vw, vh, 16.0)
                     .unwrap_or(16.0)
                 }
                 (None, Some(d), _) => match d.resolve(16.0, 16.0, vw, vh) {
@@ -1667,6 +2157,11 @@ fn layout_dom_once(
         let mut root_inh = Inherited::default();
         root_inh.cb_width = initial_cb_width;
         root_inh.cb_height_definite = true;
+        // This set records computed definiteness after walking the real
+        // containing-block chain. Merely retaining `height:Percent` is not
+        // sufficient: under an auto-height containing block it computes to
+        // auto and must never become a post-layout percentage basis.
+        let mut definite_height_nodes = HashSet::new();
         let mut queue = vec![(root_id, root_inh)];
         while let Some((id, mut inh)) = queue.pop() {
             // Default the child containing-block width to this element's own
@@ -1736,6 +2231,29 @@ fn layout_dom_once(
                 }
                 inh.container_type = style.container_type;
                 inh.container_names.clone_from(&style.container_names);
+                if style.overflow_inherit_x {
+                    style.overflow_specified_x = inh.overflow_x;
+                    style.overflow_inherit_x = false;
+                }
+                if style.overflow_inherit_y {
+                    style.overflow_specified_y = inh.overflow_y;
+                    style.overflow_inherit_y = false;
+                }
+                crate::style::recompute_overflow(style);
+                inh.overflow_x = if style.overflow_scroll_x {
+                    2
+                } else if style.overflow_clip_x {
+                    1
+                } else {
+                    0
+                };
+                inh.overflow_y = if style.overflow_scroll_y {
+                    2
+                } else if style.overflow_clip_y {
+                    1
+                } else {
+                    0
+                };
                 if let Some(expression) = style.row_gap_expression.as_deref() {
                     style.row_gap = crate::style::resolve_contextual_length(
                         expression,
@@ -1839,6 +2357,9 @@ fn layout_dom_once(
                     style.height,
                     crate::Dimension::Px(_) | crate::Dimension::Percent(_)
                 );
+                if child_cb_height_definite {
+                    definite_height_nodes.insert(id);
+                }
                 for index in 0..4 {
                     let Some(expression) =
                         style.inset_expressions[index].as_deref()
@@ -1850,8 +2371,7 @@ fn layout_dom_once(
                     } else {
                         viewport.1
                     };
-                    style.inset[index] =
-                        crate::style::resolve_contextual_length(
+                    style.inset[index] = crate::style::resolve_contextual_length(
                             expression,
                             em_px,
                             root_fs,
@@ -1918,9 +2438,7 @@ fn layout_dom_once(
                             Some(inh.font_variation_settings.clone())
                     }
                 }
-                let is_table = tree
-                    .get_node(id)
-                    .map_or(false, |node| {
+                let is_table = tree.get_node(id).map_or(false, |node| {
                         node.as_element()
                             .map_or(false, |name| name.local.as_ref() == "table")
                     });
@@ -1954,7 +2472,8 @@ fn layout_dom_once(
                 }
                 inh.visibility_hidden = style.visibility_hidden.unwrap_or(inh.visibility_hidden);
                 inh.opacity_product *= style.opacity.unwrap_or(1.0);
-                style.effectively_invisible = inh.visibility_hidden || inh.opacity_product < 0.02;
+                style.effectively_invisible =
+                    inh.visibility_hidden || inh.opacity_product <= 0.0;
                 match style.list_style { Some(v) => inh.list_style = v, None => style.list_style = Some(inh.list_style) }
                 match style.line_height { Some(v) => inh.line_height = v, None => style.line_height = Some(inh.line_height) }
                 match style.text_wrap_style { Some(v) => inh.text_wrap_style = v, None => style.text_wrap_style = Some(inh.text_wrap_style) }
@@ -2083,7 +2602,30 @@ fn layout_dom_once(
                 let host_text_align = style.text_align;
                 let host_text_indent = style.text_indent;
                 let host_invisible = style.effectively_invisible;
+                let host_overflow_x = if style.overflow_scroll_x {
+                    2
+                } else if style.overflow_clip_x {
+                    1
+                } else {
+                    0
+                };
+                let host_overflow_y = if style.overflow_scroll_y {
+                    2
+                } else if style.overflow_clip_y {
+                    1
+                } else {
+                    0
+                };
                 let settle_pseudo = |pseudo: &mut crate::LayoutStyle| {
+                    if pseudo.overflow_inherit_x {
+                        pseudo.overflow_specified_x = host_overflow_x;
+                        pseudo.overflow_inherit_x = false;
+                    }
+                    if pseudo.overflow_inherit_y {
+                        pseudo.overflow_specified_y = host_overflow_y;
+                        pseudo.overflow_inherit_y = false;
+                    }
+                    crate::style::recompute_overflow(pseudo);
                     if let Some(expression) = pseudo.font_size_expression.as_deref() {
                         pseudo.font_size = crate::style::resolve_contextual_length(
                             expression,
@@ -2121,11 +2663,8 @@ fn layout_dom_once(
                             pseudo_em,
                         );
                     } else if let Some(raw) = pseudo.letter_spacing_raw {
-                        pseudo.letter_spacing =
-                            match raw.resolve(pseudo_em, root_fs, vw, vh) {
-                                crate::Dimension::Px(pixels) if pixels.is_finite() => {
-                                    Some(pixels)
-                                }
+                        pseudo.letter_spacing = match raw.resolve(pseudo_em, root_fs, vw, vh) {
+                            crate::Dimension::Px(pixels) if pixels.is_finite() => Some(pixels),
                                 _ => None,
                             };
                     } else if pseudo.letter_spacing.is_none() {
@@ -2318,6 +2857,10 @@ fn layout_dom_once(
             }
         }
 
+        // Root/body overflow propagated to the viewport leaves the source
+        // element itself overflow-visible for Taffy and BFC decisions.
+        mark_viewport_overflow_source(tree, root_id, &mut styles);
+
         // Border-collapse is inherited, so only distribute a table's
         // effective spacing to the legacy flex fallback after the computed
         // top-down values are known.
@@ -2329,6 +2872,22 @@ fn layout_dom_once(
         // font; author CSS widths/heights remain authoritative. Without this
         // replaced-control sizing, inputs/selects are empty auto-sized leaves
         // (0px tall and often stretched to their container).
+        let native_button_contents: HashMap<NodeId, NativeButtonIntrinsicContent> = styles
+            .iter()
+            .filter_map(|(&id, style)| {
+                let node = tree.get_node(id)?;
+                let element = node.as_element()?;
+                (element.local.as_ref() == "button" && style.width == crate::Dimension::Auto).then(
+                    || {
+                        let font_size = style.font_size.unwrap_or(13.333_333).max(1.0);
+                        (
+                            id,
+                            native_button_intrinsic_content(tree, id, &styles, font_size),
+                        )
+                    },
+                )
+            })
+            .collect();
         for (&id, style) in styles.iter_mut() {
             let Some(node) = tree.get_node(id) else {
                 continue;
@@ -2345,22 +2904,26 @@ fn layout_dom_once(
                 // border box from its label, generated icon, gap, and edges.
                 let font_size = style.font_size.unwrap_or(13.333_333).max(1.0);
                 let bold = crate::style::used_font_weight(style) >= 600;
-                let label = tree
-                    .text_content(id)
+                let intrinsic_content = native_button_contents.get(&id);
+                let label = intrinsic_content
+                    .map(|content| content.text.as_str())
+                    .unwrap_or_default()
                     .split_whitespace()
                     .collect::<Vec<_>>()
                     .join(" ");
-                let mut content_width =
-                    text_width(
+                let mut content_width = text_width(
                         &label,
                         font_size,
                         bold,
                         style.font_family.as_deref(),
                         style.letter_spacing.unwrap_or(0.0),
                     );
+                content_width += intrinsic_content
+                    .map(|content| content.atomic_width)
+                    .unwrap_or(0.0);
                 let pseudo_width = |pseudo: Option<&crate::LayoutStyle>| {
                     let Some(pseudo) = pseudo else { return 0.0 };
-                    match pseudo.width {
+                    let content = match pseudo.width {
                         crate::Dimension::Px(px) => px.max(0.0),
                         crate::Dimension::Em(value) | crate::Dimension::Rem(value) => {
                             (value * font_size).max(0.0)
@@ -2370,7 +2933,17 @@ fn layout_dom_once(
                             font_size
                         }
                         _ => 0.0,
-                    }
+                    };
+                    let horizontal_edges = pseudo.padding.left
+                        + pseudo.padding.right
+                        + pseudo.border.left
+                        + pseudo.border.right;
+                    let border_box = if pseudo.box_sizing == crate::BoxSizing::ContentBox {
+                        content + horizontal_edges
+                    } else {
+                        content.max(horizontal_edges)
+                    };
+                    border_box + pseudo.margin.left.max(0.0) + pseudo.margin.right.max(0.0)
                 };
                 let before = pseudo_width(style.before_pseudo.as_deref());
                 let after = pseudo_width(style.after_pseudo.as_deref());
@@ -2395,8 +2968,7 @@ fn layout_dom_once(
                     .descendants(id)
                     .into_iter()
                     .filter(|option_id| {
-                        tree.get_node(*option_id)
-                            .map_or(false, |option| {
+                        tree.get_node(*option_id).map_or(false, |option| {
                                 option
                                     .as_element()
                                     .map_or(false, |name| name.local.as_ref() == "option")
@@ -2642,9 +3214,8 @@ fn layout_dom_once(
                 {
                     if let Ok(current) = taffy_tree.style(taffy_root) {
                         let mut adjusted = current.clone();
-                        let outer = (initial_cb_width
-                            - root_style.margin.left
-                            - root_style.margin.right)
+                        let outer =
+                            (initial_cb_width - root_style.margin.left - root_style.margin.right)
                             .max(0.0);
                         let declared = if root_style.box_sizing == crate::BoxSizing::ContentBox {
                             (outer
@@ -2670,12 +3241,13 @@ fn layout_dom_once(
             #[cfg(feature = "paint")]
             {
                 let engine = &mut engine;
-                let mut measure =
-                    |known: taffy::Size<Option<f32>>, avail: taffy::Size<taffy::AvailableSpace>, _node, ctx: Option<&mut usize>, _style: &taffy::Style| {
+                let mut measure = |known: taffy::Size<Option<f32>>,
+                                   avail: taffy::Size<taffy::AvailableSpace>,
+                                   _node,
+                                   ctx: Option<&mut usize>,
+                                   _style: &taffy::Style| {
                         match ctx {
-                            Some(&mut idx) => {
-                                engine.measure_taffy(idx, known, avail)
-                            }
+                        Some(&mut idx) => engine.measure_taffy(idx, known, avail),
                             None => taffy::Size::ZERO,
                         }
                     };
@@ -2963,16 +3535,42 @@ fn layout_dom_once(
                 }
 
                 let _ = taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
-                if repair_intrinsic_column_flex_negative_margins(
+                if apply_fit_content_widths(
                     &mut taffy_tree,
                     &id_map,
                     &styles,
+                    initial_cb_width,
+                    |tree, node, width| {
+                        tree.compute_layout_with_measure(
+                            node,
+                            taffy::Size {
+                                width,
+                                height: taffy::AvailableSpace::MaxContent,
+                            },
+                            &mut measure,
+                        )
+                        .ok()?;
+                        tree.layout(node).ok().map(|layout| layout.size.width)
+                    },
                 ) {
-                    let _ = taffy_tree.compute_layout_with_measure(
-                        taffy_root,
-                        available,
-                        &mut measure,
-                    );
+                    let _ =
+                        taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
+                }
+                if resolve_atomic_percentage_heights(
+                    tree,
+                    &mut taffy_tree,
+                    taffy_root,
+                    &id_map,
+                    &styles,
+                    &definite_height_nodes,
+                ) {
+                    let _ =
+                        taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
+                }
+                if repair_intrinsic_column_flex_negative_margins(&mut taffy_tree, &id_map, &styles)
+                {
+                    let _ =
+                        taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
                 }
                 if resolve_deferred_flex_inline_sizes(
                     tree,
@@ -3034,7 +3632,7 @@ fn layout_dom_once(
                                 width: taffy::AvailableSpace::MaxContent,
                                 height: taffy::AvailableSpace::MaxContent,
                             },
-                            &mut measure,
+                        &mut measure,
                         )
                         .ok()?;
                         tree.layout(node).ok().map(|layout| layout.size.width)
@@ -3081,11 +3679,37 @@ fn layout_dom_once(
             #[cfg(not(feature = "paint"))]
             {
                 let _ = taffy_tree.compute_layout(taffy_root, available);
-                if repair_intrinsic_column_flex_negative_margins(
+                if apply_fit_content_widths(
                     &mut taffy_tree,
                     &id_map,
                     &styles,
+                    initial_cb_width,
+                    |tree, node, width| {
+                        tree.compute_layout(
+                            node,
+                            taffy::Size {
+                                width,
+                                height: taffy::AvailableSpace::MaxContent,
+                            },
+                        )
+                        .ok()?;
+                        tree.layout(node).ok().map(|layout| layout.size.width)
+                    },
                 ) {
+                    let _ = taffy_tree.compute_layout(taffy_root, available);
+                }
+                if resolve_atomic_percentage_heights(
+                    tree,
+                    &mut taffy_tree,
+                    taffy_root,
+                    &id_map,
+                    &styles,
+                    &definite_height_nodes,
+                ) {
+                    let _ = taffy_tree.compute_layout(taffy_root, available);
+                }
+                if repair_intrinsic_column_flex_negative_margins(&mut taffy_tree, &id_map, &styles)
+                {
                     let _ = taffy_tree.compute_layout(taffy_root, available);
                 }
                 if resolve_deferred_flex_inline_sizes(
@@ -3194,7 +3818,23 @@ fn layout_dom_once(
     let mut clip_rects = HashMap::new();
     let mut translates = HashMap::new();
     if let Some(root_id) = root {
-        resolve_clip_rects(tree, root_id, None, 0.0, 0.0, &rects, &styles, &mut clip_rects, &mut translates);
+        let root_font_size = styles
+            .get(&root_id)
+            .and_then(|style| style.font_size)
+            .unwrap_or(16.0);
+        resolve_clip_rects(
+            tree,
+            root_id,
+            None,
+            0.0,
+            0.0,
+            &rects,
+            &styles,
+            &mut clip_rects,
+            &mut translates,
+            root_font_size,
+            viewport,
+        );
     }
 
     // Pin each shaped inline context to its final content-box origin/width now
@@ -3227,14 +3867,15 @@ fn layout_dom_once(
             let inherited = clip_rects.get(nid).copied().flatten();
             let clip = if style.overflow_hidden {
                 let (tx, ty) = translates.get(nid).copied().unwrap_or((0.0, 0.0));
-                let own = overflow_clip_rect(rect, style, tx, ty);
+                let own = OverflowClip::for_box(rect, style, tx, ty);
                 Some(match inherited {
-                    Some(c) => c.intersect(&own).unwrap_or(crate::Rect::default()),
+                    Some(c) => c.intersect(own),
                     None => own,
                 })
             } else {
                 inherited
-            };
+            }
+            .map(|clip| clip.viewport_rect(viewport));
             engine.finalize(idx, origin, cw, clip);
         }
     }
@@ -3247,14 +3888,15 @@ fn layout_dom_once(
         let clip = match (styles.get(parent), rects.get(parent)) {
             (Some(style), Some(prect)) if style.overflow_hidden => {
                 let (tx, ty) = translates.get(parent).copied().unwrap_or((0.0, 0.0));
-                let own = overflow_clip_rect(prect, style, tx, ty);
+                let own = OverflowClip::for_box(prect, style, tx, ty);
                 Some(match inherited {
-                    Some(c) => c.intersect(&own).unwrap_or(crate::Rect::default()),
+                    Some(c) => c.intersect(own),
                     None => own,
                 })
             }
             _ => inherited,
-        };
+        }
+        .map(|clip| clip.viewport_rect(viewport));
         for &idx in items {
             if let Some(rect) = anon_rects.get(&idx) {
                 engine.finalize(idx, (rect.x, rect.y), rect.width, clip);
@@ -4364,8 +5006,7 @@ fn apply_float_continuations(
                     .unwrap_or(false)
                 {
                     if let Some(&bfc_node) = reverse.get(&parent) {
-                        changed |=
-                            grow_bfc_to_float_bottom(
+                        changed |= grow_bfc_to_float_bottom(
                                 taffy_tree,
                                 bfc_node,
                                 &preliminary_rects,
@@ -5370,6 +6011,7 @@ fn pseudo_requires_generated_box(style: &crate::LayoutStyle, content: Option<&st
         || !style.border_radius.is_zero()
         || style.overflow_hidden
         || style.transform_translate.is_some()
+        || style.individual_translate.is_some()
         || style.transform_scale.is_some()
 }
 
@@ -5556,9 +6198,7 @@ fn synthesize_row_rects(tree: &DomTree, rects: &mut HashMap<NodeId, Rect>) {
         }
         let mut section: Option<Rect> = None;
         for row in tree.children(id) {
-            let is_row = tree
-                .get_node(row)
-                .map_or(false, |node| {
+            let is_row = tree.get_node(row).map_or(false, |node| {
                     node.as_element()
                         .map_or(false, |element| element.local.as_ref() == "tr")
                 });
@@ -5594,6 +6234,153 @@ fn dom_depth(tree: &DomTree, id: NodeId) -> usize {
         }
     }
     d
+}
+
+/// Resolve the `width: fit-content` keyword after the containing inline space
+/// is known.
+///
+/// Blink's shrink-to-fit helper and Gecko's `ShrinkISizeToFit` use the CSS
+/// intrinsic-size formula:
+///
+/// `max(min-content, min(max-content, available - inline margins))`.
+///
+/// Taffy's box-size `Dimension` has no intrinsic keyword, so these nodes are
+/// initially built as `width:auto`. That preliminary layout is useful: for a
+/// stretched grid item it exposes the item's actual grid-area width (which can
+/// be much narrower than the grid container), and for a normal block it
+/// exposes its fill-available width. We snapshot that available space, measure
+/// the subtree at min/max-content, then install the resulting definite
+/// preferred width before the final root layout.
+fn apply_fit_content_widths<F>(
+    taffy_tree: &mut TaffyTree<usize>,
+    id_map: &HashMap<taffy::NodeId, NodeId>,
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+    initial_cb_width: f32,
+    mut intrinsic_width: F,
+) -> bool
+where
+    F: FnMut(
+        &mut TaffyTree<usize>,
+        taffy::NodeId,
+        taffy::AvailableSpace,
+    ) -> Option<f32>,
+{
+    struct Candidate {
+        node: taffy::NodeId,
+        available: f32,
+        margin: f32,
+        inline_edges: f32,
+        content_box: bool,
+    }
+
+    // Snapshot every containing-space input before intrinsic subtree
+    // measurements overwrite cached node layouts.
+    let candidates: Vec<Candidate> = id_map
+        .iter()
+        .filter_map(|(&node, &dom)| {
+            let style = styles.get(&dom)?;
+            if !style.width_fit_content {
+                return None;
+            }
+            let layout = taffy_tree.layout(node).ok()?;
+            let margin = layout.margin.left + layout.margin.right;
+            let inline_edges =
+                layout.padding.left + layout.padding.right + layout.border.left + layout.border.right;
+
+            let parent = taffy_tree.parent(node);
+            let parent_content = parent
+                .and_then(|parent| taffy_tree.layout(parent).ok())
+                .map(|layout| layout.content_box_width())
+                .unwrap_or(initial_cb_width)
+                .max(0.0);
+
+            // `auto` stretches in these exact inline-axis situations, so its
+            // preliminary margin-box width is the local available space. In
+            // particular this preserves a grid area's track width instead of
+            // incorrectly using the entire grid container.
+            let uses_preliminary_stretch = parent
+                .and_then(|parent| taffy_tree.style(parent).ok())
+                .map(|parent_style| match parent_style.display {
+                    taffy::Display::Block => {
+                        style.float.is_none()
+                            && !matches!(style.position, Some(taffy::Position::Absolute))
+                    }
+                    taffy::Display::Grid => {
+                        let child_align = taffy_tree
+                            .style(node)
+                            .ok()
+                            .and_then(|child| child.justify_self)
+                            .or(parent_style.justify_items)
+                            .unwrap_or(taffy::AlignItems::STRETCH);
+                        child_align == taffy::AlignItems::STRETCH
+                    }
+                    taffy::Display::Flex
+                        if matches!(
+                            parent_style.flex_direction,
+                            taffy::FlexDirection::Column
+                                | taffy::FlexDirection::ColumnReverse
+                        ) =>
+                    {
+                        let child_align = taffy_tree
+                            .style(node)
+                            .ok()
+                            .and_then(|child| child.align_self)
+                            .or(parent_style.align_items)
+                            .unwrap_or(taffy::AlignItems::STRETCH);
+                        child_align == taffy::AlignItems::STRETCH
+                    }
+                    _ => false,
+                })
+                .unwrap_or(false);
+            let available = if uses_preliminary_stretch {
+                (layout.size.width + margin).max(0.0)
+            } else {
+                parent_content
+            };
+
+            Some(Candidate {
+                node,
+                available,
+                margin,
+                inline_edges,
+                content_box: style.box_sizing == crate::BoxSizing::ContentBox,
+            })
+        })
+        .collect();
+
+    let mut changed = false;
+    for candidate in candidates {
+        let Some(min_content) = intrinsic_width(
+            taffy_tree,
+            candidate.node,
+            taffy::AvailableSpace::MinContent,
+        ) else {
+            continue;
+        };
+        let Some(max_content) = intrinsic_width(
+            taffy_tree,
+            candidate.node,
+            taffy::AvailableSpace::MaxContent,
+        ) else {
+            continue;
+        };
+        let fill = (candidate.available - candidate.margin).max(0.0);
+        let used_outer = min_content.max(max_content.min(fill));
+        let declaration = if candidate.content_box {
+            (used_outer - candidate.inline_edges).max(0.0)
+        } else {
+            used_outer.max(0.0)
+        };
+        let Ok(current) = taffy_tree.style(candidate.node) else {
+            continue;
+        };
+        let mut resolved = current.clone();
+        resolved.size.width = taffy::Dimension::length(declaration);
+        if taffy_tree.set_style(candidate.node, resolved).is_ok() {
+            changed = true;
+        }
+    }
+    changed
 }
 
 fn collect_table_rows(tree: &DomTree, id: NodeId, rows: &mut Vec<NodeId>) {
@@ -5979,14 +6766,11 @@ fn container_auto_inline_size(
             );
             if row {
                 ContainerAutoInlineSize::Intrinsic
-            } else if style
-                .align_self
-                .unwrap_or(
+            } else if style.align_self.unwrap_or(
                     parent_style
                         .align_items
                         .unwrap_or(taffy::AlignItems::STRETCH),
-                )
-                == taffy::AlignSelf::STRETCH
+            ) == taffy::AlignSelf::STRETCH
             {
                 ContainerAutoInlineSize::FillAvailable
             } else {
@@ -5994,14 +6778,11 @@ fn container_auto_inline_size(
             }
         }
         crate::Display::Grid => {
-            if style
-                .justify_self
-                .unwrap_or(
+            if style.justify_self.unwrap_or(
                     parent_style
                         .justify_items
                         .unwrap_or(taffy::JustifyItems::STRETCH),
-                )
-                == taffy::AlignSelf::STRETCH
+            ) == taffy::AlignSelf::STRETCH
             {
                 ContainerAutoInlineSize::StretchedGridItem
             } else {
@@ -6045,14 +6826,11 @@ fn container_auto_block_size(
     };
 
     if parent_style.display == crate::Display::Grid
-        && style
-            .align_self
-            .unwrap_or(
+        && style.align_self.unwrap_or(
                 parent_style
                     .align_items
                     .unwrap_or(taffy::AlignItems::STRETCH),
-            )
-            == taffy::AlignSelf::STRETCH
+        ) == taffy::AlignSelf::STRETCH
         && !style.margin_auto[0]
         && !style.margin_auto[2]
     {
@@ -6548,9 +7326,7 @@ fn build(
                     crate::Dimension::Auto => match style.height {
                         crate::Dimension::Px(height) => Some(height * preferred_ratio),
                         _ => Some(
-                            crate::inline::constrained_auto_replaced_size(
-                                width, height, style,
-                            )
+                            crate::inline::constrained_auto_replaced_size(width, height, style)
                             .width,
                         ),
                     },
@@ -6610,8 +7386,7 @@ fn build(
             // images in auto wrappers can be measured at intrinsic size before
             // their percentage width becomes definite, and taffy then needs
             // the ratio to transfer that final width to height.
-            let measured_axis_constraint =
-                (!matches!(style.height, crate::Dimension::Auto)
+            let measured_axis_constraint = (!matches!(style.height, crate::Dimension::Auto)
                     && matches!(style.width, crate::Dimension::Auto)
                     && matches!(
                         (style.min_width, style.max_width),
@@ -7650,10 +8425,12 @@ fn estimate_flow_sibling_height(
                 .and_then(|node| node.as_element().map(|element| element.local.as_ref() == "img"))
                 .unwrap_or(false)
         })
-        .filter_map(|descendant| match styles.get(&descendant).map(|style| style.height) {
+        .filter_map(
+            |descendant| match styles.get(&descendant).map(|style| style.height) {
             Some(crate::Dimension::Px(height)) => Some(height.max(0.0)),
             _ => None,
-        })
+            },
+        )
         .sum();
     let own_image_height = if tree
         .get_node(id)
@@ -7694,7 +8471,7 @@ fn establishes_block_formatting_context(style: &crate::LayoutStyle) -> bool {
     matches!(style.display, crate::Display::Flex | crate::Display::Grid)
         || effective_container_type(style) != crate::ContainerType::Normal
         || style.flow_root
-        || style.overflow_hidden
+        || (style.overflow_scroll_container && !style.overflow_propagated_to_viewport)
         || style.is_inline_block
         || style.float.is_some()
         || matches!(style.position, Some(taffy::Position::Absolute))
@@ -7837,10 +8614,12 @@ fn can_use_native_float_band(
         }
     }
 
-    // Taffy represents overflow clipping as a real BFC root. Other Obscura
-    // BFC markers do not yet have a distinct taffy-side representation, so
-    // they are intentionally not used as an escape-safety signal here.
-    let parent_is_native_bfc = parent_style.overflow_hidden;
+    // Taffy represents scroll-container overflow as a real BFC root. Plain
+    // `clip` does not establish a BFC, and viewport-propagated overflow leaves
+    // its source box visible. Other Obscura BFC markers do not yet have a
+    // distinct taffy-side representation, so they are not an escape signal.
+    let parent_is_native_bfc = parent_style.overflow_scroll_container
+        && !parent_style.overflow_propagated_to_viewport;
     saw_float && (saw_clear_after_floats || parent_is_native_bfc)
 }
 
@@ -7958,7 +8737,9 @@ fn build_children_with_float_zone(
                 && has_in_flow_generated_pseudo(Some(after))
         })
     });
-    let parent_min_height = styles.get(&parent_id).and_then(|parent| match parent.min_height {
+    let parent_min_height = styles
+        .get(&parent_id)
+        .and_then(|parent| match parent.min_height {
         crate::Dimension::Px(value) => Some(value),
         _ => None,
     });
@@ -8650,6 +9431,42 @@ mod tests {
     }
 
     #[test]
+    fn native_button_intrinsic_width_uses_only_rendered_in_flow_content() {
+        let tree = parse_html(
+            r#"<style>
+                html,body{margin:0}
+                button{font-size:16px;padding:0 8px;border:0}
+                .gone{display:none}
+                .a11y{position:absolute;width:1px;height:1px}
+              </style>
+              <button id="plain">v5.3</button>
+              <button id="labels"><span class="gone">Bootstrap</span><span class="a11y">Bootstrap </span>v5.3<span class="a11y">(switch to other versions)</span></button>
+              <button id="icon"><svg style="width:16px;height:16px"></svg></button>
+              <button id="icon-label"><svg style="width:16px;height:16px"></svg><span class="gone">Toggle theme</span></button>"#,
+        );
+        let laid = layout_dom(&tree, (800.0, 600.0));
+        let rect = |id: &str| laid.rects[&tree.get_element_by_id(id).unwrap()];
+
+        assert!(
+            (rect("plain").width - rect("labels").width).abs() < 0.1,
+            "hidden/out-of-flow labels enlarged the button: plain={:?}, labels={:?}",
+            rect("plain"),
+            rect("labels")
+        );
+        assert!(
+            (rect("icon").width - rect("icon-label").width).abs() < 0.1,
+            "display:none icon label enlarged the button: icon={:?}, labelled={:?}",
+            rect("icon"),
+            rect("icon-label")
+        );
+        assert!(
+            (rect("icon").width - 32.0).abs() < 0.1,
+            "the in-flow 16px SVG and horizontal padding must contribute: {:?}",
+            rect("icon")
+        );
+    }
+
+    #[test]
     fn text_alignment_does_not_shrink_wrap_block_grid_and_flex_children() {
         let tree = parse_html(
             r#"<style>
@@ -8720,6 +9537,44 @@ mod tests {
                  rect={rect:?} frame={frame:?}"
             );
         }
+    }
+
+    #[test]
+    fn individual_translate_percentage_uses_own_border_box() {
+        let tree = parse_html(
+            r#"<style>
+                html,body{margin:0}
+                #containing-block{position:relative;width:453px;height:412px}
+                #card{
+                    position:absolute;
+                    top:50%;
+                    right:64px;
+                    width:310px;
+                    height:280px;
+                    --tw-translate-x:0;
+                    --tw-translate-y:calc(calc(1 / 2 * 100%) * -1);
+                    translate:var(--tw-translate-x) var(--tw-translate-y);
+                }
+            </style>
+            <div id="containing-block"><div id="card"></div></div>"#,
+        );
+        let laid = layout_dom(&tree, (800.0, 600.0));
+        let card = tree.get_element_by_id("card").unwrap();
+        let rect = laid.rects[&card];
+        let translated = laid.translates[&card];
+
+        assert!(
+            (rect.y - 206.0).abs() < 0.01,
+            "absolute top:50% must use the containing block: {rect:?}"
+        );
+        assert!(
+            translated.0.abs() < 0.01 && (translated.1 + 140.0).abs() < 0.01,
+            "translate percentage must use the card's own 280px border box: {translated:?}"
+        );
+        assert!(
+            laid.styles[&card].establishes_positioning_containing_block(),
+            "an individual translate creates a containing block like transform"
+        );
     }
 
     #[test]
@@ -9057,8 +9912,7 @@ mod tests {
                 .descendants(tree.document())
                 .into_iter()
                 .find(|id| {
-                    tree.get_node(*id)
-                        .is_some_and(|node| {
+                    tree.get_node(*id).is_some_and(|node| {
                             node.as_element()
                                 .is_some_and(|element| element.local.as_ref() == "body")
                         })
@@ -9081,8 +9935,7 @@ mod tests {
                 .descendants(tree.document())
                 .into_iter()
                 .find(|id| {
-                    tree.get_node(*id)
-                        .is_some_and(|node| {
+                    tree.get_node(*id).is_some_and(|node| {
                             node.as_element()
                                 .is_some_and(|element| element.local.as_ref() == "html")
                         })
@@ -9100,7 +9953,8 @@ mod tests {
     fn viewport_overflow_clip_does_not_truncate_root_scrolling_overflow() {
         let tree = parse_html(
             r#"<style>
-                html,body{margin:0;height:100%;overflow:hidden}
+                html,body{margin:0;height:100%}
+                html{overflow:hidden}
                 main{padding-top:48px}
                 #long{height:5000px}
             </style><main id="main"><div id="long"></div></main>"#,
@@ -9110,6 +9964,45 @@ mod tests {
         let content = laid.scrolling_content_size(&tree, (900.0, 1000.0));
         assert!((main.height - 5048.0).abs() < 0.01, "{main:?}");
         assert_eq!(content, (900.0, 5048.0));
+    }
+
+    #[test]
+    fn propagated_body_overflow_is_visible_to_layout_and_does_not_create_a_bfc() {
+        let tree = parse_html(
+            r#"<html style="margin:0;overflow:visible">
+               <body style="margin:0;overflow:hidden"><div style="height:20px"></div></body>
+               </html>"#,
+        );
+        let laid = layout_dom(&tree, (100.0, 60.0));
+        let body = tree
+            .descendants(tree.document())
+            .into_iter()
+            .find(|id| {
+                tree.get_node(*id).is_some_and(|node| {
+                    node.as_element()
+                        .is_some_and(|element| element.local.as_ref() == "body")
+                })
+            })
+            .unwrap();
+        let style = &laid.styles[&body];
+        assert!(style.overflow_propagated_to_viewport);
+        assert!(!establishes_block_formatting_context(style));
+        let taffy = crate::to_taffy_style(style);
+        assert_eq!(taffy.overflow.x, taffy::style::Overflow::Visible);
+        assert_eq!(taffy.overflow.y, taffy::style::Overflow::Visible);
+    }
+
+    #[test]
+    fn html_owned_overflow_keeps_body_clip_in_root_scrolling_overflow() {
+        let tree = parse_html(
+            r#"<html style="margin:0;overflow:auto">
+               <body style="margin:0;width:100px;height:50px;overflow:hidden">
+                 <div style="position:absolute;left:150px;top:60px;width:20px;height:20px"></div>
+               </body>
+               </html>"#,
+        );
+        let laid = layout_dom(&tree, (80.0, 40.0));
+        assert_eq!(laid.scrolling_content_size(&tree, (80.0, 40.0)), (100.0, 50.0));
     }
 
     #[test]

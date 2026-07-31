@@ -3017,3 +3017,455 @@ fn text_indent_is_inherited_and_initial_resets_to_zero() {
         Some(obscura_render::Dimension::Px(40.0))
     );
 }
+
+/// Modern utility frameworks emit logical insets for full-width fixed bars
+/// (`inset-x-0` in Tailwind is `inset-inline:0`). Both inline edges constrain
+/// an auto-width positioned box, so it must stretch across the viewport.
+#[test]
+fn logical_inline_insets_stretch_a_fixed_auto_width_box() {
+    let tree = parse_html(
+        r#"
+        <style>
+          html, body { margin:0 }
+          #bar {
+            position:fixed;
+            inset-inline:0;
+            inset-block-start:0;
+            height:56px;
+          }
+        </style>
+        <div id="bar"><span>Brand</span><nav>Links</nav></div>
+        "#,
+    );
+    let layout = layout_dom(&tree, (1440.0, 1000.0));
+    let bar = layout.rects[&tree.get_element_by_id("bar").unwrap()];
+
+    assert_eq!(bar.x, 0.0, "{bar:?}");
+    assert_eq!(bar.y, 0.0, "{bar:?}");
+    assert_eq!(bar.width, 1440.0, "{bar:?}");
+    assert_eq!(bar.height, 56.0, "{bar:?}");
+}
+
+#[test]
+fn flex_automatic_minimum_uses_overflow_on_the_matching_axis() {
+    let tree = parse_html(
+        r#"
+        <style>
+          html, body { margin:0 }
+          .row { display:flex; width:40px }
+          .item { flex-shrink:1 }
+          .wide { width:100px; height:10px }
+          #block-clipped { overflow-y:clip }
+          #inline-clipped { overflow-x:hidden }
+        </style>
+        <div class="row"><div id="block-clipped" class="item"><div class="wide"></div></div></div>
+        <div class="row"><div id="inline-clipped" class="item"><div class="wide"></div></div></div>
+        "#,
+    );
+    let layout = layout_dom(&tree, (200.0, 100.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+
+    assert_eq!(
+        rect("block-clipped").width,
+        100.0,
+        "block-axis overflow must not remove the inline automatic minimum"
+    );
+    assert_eq!(
+        rect("inline-clipped").width,
+        40.0,
+        "inline-axis non-visible overflow allows the flex item to shrink"
+    );
+}
+
+fn tailwind_line_counter_fixture() -> obscura_dom::tree::DomTree {
+    parse_html(
+        r#"
+        <style>
+          html, body { margin:0; background:white }
+          code { display:block; position:relative; width:120px; counter-reset:line }
+          .line {
+            display:block;
+            height:20px;
+            margin-left:24px;
+            counter-increment:line;
+          }
+          .line::before {
+            content:counter(line);
+            display:inline-block;
+            position:absolute;
+            left:0;
+            width:16px;
+            color:black;
+            text-align:right;
+          }
+        </style>
+        <code>
+          <span id="line-one" class="line">alpha</span>
+          <span id="line-two" class="line">beta</span>
+          <span id="line-three" class="line">gamma</span>
+        </code>
+        "#,
+    )
+}
+
+#[test]
+fn css_counters_resolve_generated_line_numbers_in_tree_order() {
+    let tree = tailwind_line_counter_fixture();
+    let layout = layout_dom(&tree, (120.0, 80.0));
+    for (id, expected) in [("line-one", "1"), ("line-two", "2"), ("line-three", "3")] {
+        let style = &layout.styles[&tree.get_element_by_id(id).unwrap()];
+        assert_eq!(
+            style
+                .before_pseudo
+                .as_ref()
+                .and_then(|pseudo| pseudo.before_content.as_deref()),
+            Some(expected),
+            "{id}"
+        );
+    }
+}
+
+#[test]
+fn nested_counter_scopes_feed_counters_function_and_expire_at_parent() {
+    let tree = parse_html(
+        r#"
+        <style>
+          ol { counter-reset:item; list-style:none }
+          li { counter-increment:item }
+          li::before { content:counters(item, ".") " " }
+        </style>
+        <ol>
+          <li id="outer-one">one
+            <ol><li id="inner-one">nested</li></ol>
+          </li>
+          <li id="outer-two">two</li>
+        </ol>
+        "#,
+    );
+    let layout = layout_dom(&tree, (400.0, 200.0));
+    let generated = |id| {
+        layout.styles[&tree.get_element_by_id(id).unwrap()]
+            .before_content
+            .clone()
+    };
+
+    assert_eq!(generated("outer-one").as_deref(), Some("1 "));
+    assert_eq!(generated("inner-one").as_deref(), Some("1.1 "));
+    assert_eq!(generated("outer-two").as_deref(), Some("2 "));
+}
+
+#[cfg(feature = "paint")]
+#[test]
+fn generated_counter_text_reaches_the_positioned_pseudo_paint_path() {
+    let tree = tailwind_line_counter_fixture();
+    let pixmap =
+        obscura_render::paint_dom(&tree, (120.0, 80.0), None).expect("counter fixture paints");
+    for (line, y_range) in [(1, 0..20), (2, 20..40), (3, 40..60)] {
+        let dark_gutter_pixels = y_range
+            .flat_map(|y| (0..20).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                let pixel = pixmap.pixel(x, y).expect("inside pixmap");
+                pixel.red() < 100 && pixel.green() < 100 && pixel.blue() < 100
+            })
+            .count();
+        assert!(
+            dark_gutter_pixels > 2,
+            "generated line {line} should paint at its own static block-axis position"
+        );
+    }
+}
+
+#[cfg(feature = "paint")]
+#[test]
+fn positioned_counter_inside_nested_inline_code_uses_the_code_gutter() {
+    let tree = parse_html(
+        r#"
+        <style>
+          html, body { margin:0; background:white }
+          pre {
+            display:flex;
+            margin:0;
+            padding:12px;
+            width:220px;
+            background:black;
+            white-space:pre;
+          }
+          code.outer { display:block; width:100% }
+          code.inner { display:inline }
+          .with-line-numbers code { counter-reset:line; position:relative }
+          .line {
+            display:block;
+            isolation:isolate;
+            height:24px;
+            margin-left:36px;
+            counter-increment:line;
+            color:white;
+            font:13px/24px monospace;
+          }
+          .line::before {
+            content:counter(line);
+            width:24px;
+            text-align:right;
+            color:red;
+            display:inline-block;
+            position:absolute;
+            left:0;
+            font-family:monospace;
+          }
+        </style>
+        <div class="with-line-numbers">
+          <pre><code class="outer"><code class="inner"><span class="line"><span style="color:pink">&lt;div</span><span>&gt;</span></span>
+            <span class="line"><span style="color:pink">&lt;span</span><span>&gt;text&lt;/span&gt;</span></span>
+            <span class="line"><span style="color:pink">&lt;/div</span><span>&gt;</span></span></code></code></pre>
+        </div>
+        "#,
+    );
+    let pixmap = obscura_render::paint_dom(&tree, (260.0, 100.0), None)
+        .expect("nested Tailwind-shaped code fixture paints");
+    let red_ink = |x_range: std::ops::Range<u32>| {
+        (0..72)
+            .flat_map(|y| x_range.clone().map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                let pixel = pixmap.pixel(x, y).expect("inside pixmap");
+                pixel.red() > 160 && pixel.green() < 100 && pixel.blue() < 100
+            })
+            .count()
+    };
+    assert!(
+        red_ink(12..36) > 4,
+        "line counters must paint in the positioned code gutter"
+    );
+    assert_eq!(
+        red_ink(45..72),
+        0,
+        "line counters must not overpaint the margin-shifted source text"
+    );
+}
+
+#[cfg(feature = "paint")]
+#[test]
+fn positioned_generated_text_honors_text_alignment_inside_its_box() {
+    let tree = parse_html(
+        r#"
+        <style>
+          html, body { margin:0; background:white }
+          .row {
+            position:relative;
+            width:40px;
+            height:24px;
+          }
+          .row::before {
+            content:counter(line);
+            position:absolute;
+            inset:0 auto auto 0;
+            width:24px;
+            height:20px;
+            color:black;
+            font:16px/20px monospace;
+          }
+          .one { counter-reset:line 1 }
+          .ten { counter-reset:line 10 }
+          .right::before { text-align:right }
+          .center::before { text-align:center }
+          .left::before { text-align:left }
+        </style>
+        <div class="row right one"></div>
+        <div class="row right ten"></div>
+        <div class="row center one"></div>
+        <div class="row center ten"></div>
+        <div class="row left one"></div>
+        <div class="row left ten"></div>
+        "#,
+    );
+    let pixmap =
+        obscura_render::paint_dom(&tree, (80.0, 144.0), None).expect("aligned counters paint");
+    let ink_bounds = |row: u32| {
+        let mut min_x = u32::MAX;
+        let mut max_x = 0;
+        for y in row * 24..row * 24 + 20 {
+            for x in 0..24 {
+                let pixel = pixmap.pixel(x, y).expect("inside pixmap");
+                if pixel.red() < 100 && pixel.green() < 100 && pixel.blue() < 100 {
+                    min_x = min_x.min(x);
+                    max_x = max_x.max(x);
+                }
+            }
+        }
+        assert_ne!(min_x, u32::MAX, "row {row} should contain generated text");
+        (min_x, max_x)
+    };
+
+    let right_one = ink_bounds(0);
+    let right_ten = ink_bounds(1);
+    let center_one = ink_bounds(2);
+    let center_ten = ink_bounds(3);
+    let left_one = ink_bounds(4);
+    let left_ten = ink_bounds(5);
+
+    assert!(
+        right_one.1.abs_diff(right_ten.1) <= 1,
+        "right-aligned 1 and 10 should share an end edge: {right_one:?} {right_ten:?}"
+    );
+    assert!(
+        left_one.0.abs_diff(left_ten.0) <= 1,
+        "left-aligned 1 and 10 should share a start edge: {left_one:?} {left_ten:?}"
+    );
+    assert!(
+        (center_one.0 + center_one.1).abs_diff(center_ten.0 + center_ten.1) <= 2,
+        "center-aligned 1 and 10 should share a center: {center_one:?} {center_ten:?}"
+    );
+    assert!(
+        left_one.0 < center_one.0 && center_one.0 < right_one.0,
+        "single-digit ink should move across the pseudo box: \
+         left={left_one:?} center={center_one:?} right={right_one:?}"
+    );
+}
+
+/// A percentage block size on an in-flow child resolves against the
+/// containing block's definite content box. Floating the containing block
+/// changes its outer inline participation, not that block-axis percentage
+/// basis.
+#[test]
+fn percentage_height_inside_floated_and_inline_block_controls_uses_content_box() {
+    let tree = parse_html(
+        r#"
+        <style>
+          html, body { margin:0 }
+          #row { width:400px; height:44px }
+          .control {
+            box-sizing:border-box;
+            width:50%;
+            height:100%;
+            padding-block:1px;
+          }
+          #floated { float:left }
+          #inline { display:inline-block }
+          .icon {
+            display:inline-block;
+            width:24px;
+            height:100%;
+          }
+        </style>
+        <div id="row">
+          <button id="floated" class="control"><span id="float-icon" class="icon"></span></button><button id="inline" class="control"><span id="inline-icon" class="icon"></span></button>
+        </div>
+        "#,
+    );
+    let layout = layout_dom(&tree, (400.0, 200.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+
+    assert_eq!(rect("floated").height, 44.0);
+    assert_eq!(rect("inline").height, 44.0);
+    assert_eq!(
+        rect("float-icon").height,
+        42.0,
+        "a floated containing block retains its definite content-box basis"
+    );
+    assert_eq!(
+        rect("inline-icon").height,
+        42.0,
+        "border-box padding must not leak into the child percentage basis"
+    );
+}
+
+/// A percentage height computes to auto when its containing block's height is
+/// content-dependent. The resulting post-layout height must not be recycled as
+/// a new percentage basis on a repair pass.
+#[test]
+fn percentage_height_chain_under_auto_height_atomic_parent_stays_indefinite() {
+    let tree = parse_html(
+        r#"
+        <style>
+          html, body { margin:0 }
+          .control { height:100%; padding-block:2px }
+          #floated { float:left }
+          #inline { display:inline-block }
+          .icon { display:inline-block; height:100% }
+          .content { height:13px }
+        </style>
+        <section><div id="floated" class="control"><div id="float-icon" class="icon"><div class="content"></div></div></div></section>
+        <section><div id="inline" class="control"><div id="inline-icon" class="icon"><div class="content"></div></div></div></section>
+        "#,
+    );
+    let layout = layout_dom(&tree, (400.0, 200.0));
+    let id = |name| tree.get_element_by_id(name).unwrap();
+
+    for name in ["floated", "inline", "float-icon", "inline-icon"] {
+        assert_eq!(
+            layout.styles[&id(name)].height,
+            obscura_render::Dimension::Auto,
+            "{name} must retain an indefinite block-axis percentage basis"
+        );
+    }
+    assert_eq!(layout.rects[&id("float-icon")].height, 13.0);
+    assert_eq!(layout.rects[&id("inline-icon")].height, 13.0);
+}
+
+#[test]
+fn fit_content_width_shrink_wraps_a_grid_item_instead_of_stretching() {
+    let tree = parse_html(
+        r#"
+        <body style="margin:0">
+          <div style="display:grid;width:500px">
+            <a id="cta" style="display:block;width:fit-content;padding:8px 12px">Launch Brave</a>
+          </div>
+        </body>
+        "#,
+    );
+    let layout = layout_dom(&tree, (800.0, 200.0));
+    let id = tree.get_element_by_id("cta").unwrap();
+    let rect = layout.rects[&id];
+
+    assert!(
+        layout.styles[&id].width_fit_content,
+        "the intrinsic keyword must survive the computed-style translation"
+    );
+    assert!(
+        rect.width > 80.0 && rect.width < 200.0,
+        "a short CTA should shrink-wrap within its grid area, not stretch to 500px: {rect:?}"
+    );
+}
+
+#[test]
+fn fit_content_width_uses_available_space_and_wraps_breakable_text() {
+    let tree = parse_html(
+        r#"
+        <body style="margin:0">
+          <div style="width:140px">
+            <div id="fit" style="width:fit-content;font-size:16px;line-height:20px">several breakable words need wrapping here</div>
+          </div>
+        </body>
+        "#,
+    );
+    let layout = layout_dom(&tree, (500.0, 200.0));
+    let rect = layout.rects[&tree.get_element_by_id("fit").unwrap()];
+
+    assert!(
+        (rect.width - 140.0).abs() < 0.1,
+        "fit-content should clamp max-content to the containing block: {rect:?}"
+    );
+    assert!(
+        rect.height >= 40.0,
+        "the clamped fit-content box must reflow its breakable text: {rect:?}"
+    );
+}
+
+#[test]
+fn fit_content_width_keeps_an_unbreakable_min_content_floor() {
+    let tree = parse_html(
+        r#"
+        <body style="margin:0">
+          <div style="width:60px">
+            <div id="fit" style="width:fit-content;font-size:16px">supercalifragilisticexpialidocious</div>
+          </div>
+        </body>
+        "#,
+    );
+    let layout = layout_dom(&tree, (500.0, 200.0));
+    let rect = layout.rects[&tree.get_element_by_id("fit").unwrap()];
+
+    assert!(
+        rect.width > 60.0,
+        "min-content must win when an unbreakable token is wider than the available space: {rect:?}"
+    );
+}

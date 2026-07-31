@@ -235,6 +235,65 @@ impl BorderRadius {
     }
 }
 
+/// One axis of a CSS `background-position`.
+///
+/// CSS positions combine an absolute offset with a percentage of the space
+/// left after sizing the background image. Keeping both terms is necessary
+/// for sprite sheets: `-24px` is an offset from the start edge, while
+/// `right 10px` is equivalent to `100% - 10px`.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct BackgroundPositionAxis {
+    length: f32,
+    percentage: f32,
+}
+
+impl BackgroundPositionAxis {
+    pub const fn pixels(length: f32) -> Self {
+        Self {
+            length,
+            percentage: 0.0,
+        }
+    }
+
+    pub const fn percentage(percentage: f32) -> Self {
+        Self {
+            length: 0.0,
+            percentage,
+        }
+    }
+
+    pub const fn length_percentage(length: f32, percentage: f32) -> Self {
+        Self { length, percentage }
+    }
+
+    pub const fn from_end_offset(offset: Self) -> Self {
+        Self {
+            length: -offset.length,
+            percentage: 1.0 - offset.percentage,
+        }
+    }
+
+    pub fn resolve(self, leftover_space: f32) -> f32 {
+        self.length + self.percentage * leftover_space
+    }
+}
+
+/// The two axes of CSS `background-position`.
+///
+/// The derived default is the CSS initial value `0% 0%`. A one-value
+/// longhand such as `background-position: 0` is parsed as `0 center`.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct BackgroundPosition {
+    pub x: BackgroundPositionAxis,
+    pub y: BackgroundPositionAxis,
+}
+
+impl BackgroundPosition {
+    pub const fn new(x: BackgroundPositionAxis, y: BackgroundPositionAxis) -> Self {
+        Self { x, y }
+    }
+}
+
 /// Fill rule for a CSS `clip-path: polygon(...)`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ClipPathFillRule {
@@ -253,6 +312,69 @@ pub enum ClipPathFillRule {
 pub struct ClipPathPolygon {
     pub fill_rule: ClipPathFillRule,
     pub points: Vec<(Dimension, Dimension)>,
+}
+
+/// One CSS gradient from the ordered `background-image` layer list.
+///
+/// CSS paints the first authored layer closest to the user, so paint walks
+/// this vector in reverse over the background color. Keeping the authored
+/// order is essential when a hero combines a linear fade with several
+/// partially transparent radial highlights.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BackgroundGradientLayer {
+    Linear {
+        angle: f32,
+        stops: Vec<([u8; 4], Option<f32>)>,
+        /// Authored stop positions, retained until paint so absolute lengths
+        /// can resolve against the final gradient-line length.
+        stop_positions: Vec<Option<String>>,
+        /// `repeating-linear-gradient()` repeats the interval from its first
+        /// resolved stop through its last, independently of background tiling.
+        repeating: bool,
+    },
+    Radial {
+        center: (f32, f32),
+        stops: Vec<([u8; 4], Option<f32>)>,
+    },
+    Conic {
+        angle: f32,
+        center: (f32, f32),
+        stops: Vec<([u8; 4], Option<f32>)>,
+    },
+}
+
+/// One computed CSS counter operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CounterDirective {
+    pub name: String,
+    pub value: i32,
+}
+
+/// Counter styles supported in generated text.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GeneratedCounterStyle {
+    #[default]
+    Decimal,
+    DecimalLeadingZero,
+    LowerAlpha,
+    UpperAlpha,
+    LowerRoman,
+    UpperRoman,
+}
+
+/// One item in a computed `content` value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GeneratedContentItem {
+    Text(String),
+    Counter {
+        name: String,
+        style: GeneratedCounterStyle,
+    },
+    Counters {
+        name: String,
+        separator: String,
+        style: GeneratedCounterStyle,
+    },
 }
 
 /// The subset of CSS that influences box layout. Expanded in later phases.
@@ -285,6 +407,12 @@ pub struct LayoutStyle {
     /// descendants while leaving auto-width blocks fill-available.
     pub legacy_center: bool,
     pub width: Dimension,
+    /// The preferred inline size is the intrinsic `fit-content` keyword.
+    ///
+    /// Taffy's box-size dimension cannot represent intrinsic sizing keywords,
+    /// so `width` remains `Auto` while the DOM layout convergence pass applies
+    /// the CSS shrink-to-fit formula from min/max-content measurements.
+    pub width_fit_content: bool,
     pub height: Dimension,
     /// Which box edge `width`/`height` and min/max sizes describe. CSS starts
     /// at `content-box`; many modern reset sheets opt into `border-box`.
@@ -373,8 +501,10 @@ pub struct LayoutStyle {
     /// the center is a fraction of the border box, and stops are normalized
     /// during paint. Conic gradients commonly provide the color source for a
     /// repeated SVG mask in modern hero artwork.
-    pub background_conic_gradient:
-        Option<(f32, (f32, f32), Vec<([u8; 4], Option<f32>)>)>,
+    pub background_conic_gradient: Option<(f32, (f32, f32), Vec<([u8; 4], Option<f32>)>)>,
+    /// Every parsed gradient in authored background-layer order. The legacy
+    /// single-kind fields above remain populated for mask/text fast paths.
+    pub background_gradient_layers: Vec<BackgroundGradientLayer>,
     /// The first `url(...)` reference from `background`/`background-image`
     /// (gradients and repeat keywords in the same shorthand are ignored: we
     /// paint the referenced image, not the gradient layer).
@@ -389,10 +519,13 @@ pub struct LayoutStyle {
     /// Keyword `background-size` behavior. `None` is CSS `auto`, which uses
     /// the image's intrinsic dimensions rather than stretching it to the box.
     pub background_size_fit: Option<ObjectFit>,
-    /// `background-position` as a 0.0-1.0 fraction per axis (0,0 = default
-    /// top-left; 1,0.5 = "right center"). The fraction applies to the leftover
-    /// space after resolving explicit, intrinsic, cover, or contain size.
-    pub background_position: (f32, f32),
+    /// `background-position`, retained as a length-plus-percentage per axis.
+    /// Percentages apply to the leftover space after resolving explicit,
+    /// intrinsic, cover, or contain size.
+    pub background_position: BackgroundPosition,
+    /// Explicit `(repeat-x, repeat-y)` choice. `None` is the CSS initial
+    /// `repeat` in both axes.
+    pub background_repeat: Option<(bool, bool)>,
     /// `background-clip: text` / `-webkit-background-clip: text`: the background
     /// paints only through the element's glyphs, not as a filled box. Combined
     /// with a transparent text color this is the common gradient-text technique
@@ -571,6 +704,22 @@ pub struct LayoutStyle {
     /// clipped box used for skip-links and screen-reader-only labels) actually
     /// invisible instead of painting its text wherever it lands.
     pub overflow_hidden: bool,
+    /// Independent computed overflow clips. `overflow_hidden` remains the
+    /// aggregate compatibility/BFC flag; paint and automatic minimum sizing
+    /// must consult the relevant axis.
+    pub overflow_clip_x: bool,
+    pub overflow_clip_y: bool,
+    pub(crate) overflow_axes_set: bool,
+    pub(crate) overflow_specified_x: u8,
+    pub(crate) overflow_specified_y: u8,
+    pub(crate) overflow_inherit_x: bool,
+    pub(crate) overflow_inherit_y: bool,
+    pub(crate) overflow_scroll_x: bool,
+    pub(crate) overflow_scroll_y: bool,
+    /// This element's authored overflow is propagated to the viewport. Its
+    /// own box therefore behaves as `overflow: visible` for layout/BFC
+    /// purposes while the capture viewport supplies the paint clip.
+    pub(crate) overflow_propagated_to_viewport: bool,
     /// Whether computed overflow establishes a scroll container. `clip`
     /// clips paint but deliberately does not establish one, which matters for
     /// selecting the scrollport that controls a sticky descendant.
@@ -611,15 +760,16 @@ pub struct LayoutStyle {
     /// `clear`, when set: this element moves below preceding floats on the
     /// given side(s), ending their float zone.
     pub clear: Option<Clear>,
+    /// Non-inherited CSS counter operations in computed declaration order.
+    /// Reset operations run before increments on the same element.
+    pub counter_reset: Vec<CounterDirective>,
+    pub counter_increment: Vec<CounterDirective>,
+    pub counter_set: Vec<CounterDirective>,
     /// Resolved during the inheritance pass: true when this element should
     /// not be painted at all, either from its own or an inherited
     /// `visibility: hidden`, or because the product of its own and every
-    /// ancestor's `opacity` has collapsed to (near) zero. Real `opacity`
-    /// composites as translucent groups, which our paint step does not do;
-    /// collapsing it to a binary paint/don't-paint decision is enough to
-    /// make the extremely common "opacity:0 + visibility:hidden" collapsed
-    /// dropdown/panel pattern actually invisible, without needing full alpha
-    /// compositing.
+    /// ancestor's `opacity` is zero. Fractional values remain paintable and
+    /// are isolated into composited groups by the paint pass.
     pub effectively_invisible: bool,
 
     /// A CSS image supplied by `content: url(...)` on a replaced element.
@@ -633,6 +783,9 @@ pub struct LayoutStyle {
     /// children, same as if it were real text content.
     pub before_content: Option<String>,
     pub after_content: Option<String>,
+    /// Typed computed `content` items retained until the document-order
+    /// counter pass can resolve `counter()` and `counters()`.
+    pub generated_content: Option<Vec<GeneratedContentItem>>,
     /// Computed boxes generated by `::before`/`::after`. Text-only pseudos
     /// continue through `before_content`/`after_content`; these styles retain
     /// positioned decorative boxes for layout-independent painting.
@@ -696,9 +849,10 @@ pub struct LayoutStyle {
     /// (this is what underlines links, which are underlined by UA default).
     pub underline: Option<bool>,
 
-    /// `font-style: italic|oblique`. Inherited. Selects the oblique face when
-    /// shaping (we embed the DejaVu Sans oblique/bold-oblique faces). `None`
-    /// means inherit.
+    /// `font-style: italic|oblique`. Inherited. Selects an available oblique
+    /// face when shaping; the bundled Linux `system-ui` face synthesizes its
+    /// slant from DejaVu Sans regular/bold to match Chromium. `None` means
+    /// inherit.
     pub font_style_italic: Option<bool>,
 
     /// `object-fit` for a replaced element (`<img>`). Controls how the decoded
@@ -715,6 +869,12 @@ pub struct LayoutStyle {
     /// off-screen skip-link out of view instead of painting it on-screen. Not
     /// inherited (transform is a non-inherited property).
     pub transform_translate: Option<(Dimension, Dimension)>,
+    /// Individual CSS `translate` property. This composes independently with
+    /// the legacy `transform` property, so `transform:none` must not clear it.
+    /// Functional values are retained separately until the final border box
+    /// is known because percentages resolve against that box's own axes.
+    pub individual_translate: Option<(Dimension, Dimension)>,
+    pub individual_translate_expressions: [Option<String>; 2],
     /// Independent CSS-property triggers that establish containing blocks for
     /// absolute and fixed descendants. Kept as a bitset so `filter:none`
     /// cannot clear a transform/containment trigger from another property.
@@ -766,10 +926,27 @@ pub(crate) const CB_TRIGGER_PERSPECTIVE: u16 = 1 << 3;
 pub(crate) const CB_TRIGGER_CONTAIN: u16 = 1 << 4;
 pub(crate) const CB_TRIGGER_WILL_CHANGE: u16 = 1 << 5;
 pub(crate) const CB_TRIGGER_CONTENT_VISIBILITY: u16 = 1 << 6;
+pub(crate) const CB_TRIGGER_TRANSLATE: u16 = 1 << 7;
 
 impl LayoutStyle {
     pub(crate) fn establishes_positioning_containing_block(&self) -> bool {
         self.containing_block_triggers != 0
+    }
+
+    pub(crate) fn clips_overflow_x(&self) -> bool {
+        if self.overflow_axes_set {
+            self.overflow_clip_x
+        } else {
+            self.overflow_hidden
+        }
+    }
+
+    pub(crate) fn clips_overflow_y(&self) -> bool {
+        if self.overflow_axes_set {
+            self.overflow_clip_y
+        } else {
+            self.overflow_hidden
+        }
     }
 }
 
@@ -1070,15 +1247,27 @@ pub(crate) fn to_taffy_style(style: &LayoutStyle) -> Style {
         width: dimension(style.width),
         height: dimension(style.height),
     };
-    // Tell taffy's own layout algorithm about `overflow: hidden`, not just our
-    // paint-time clip rects: per spec, a flex/grid item's automatic minimum
-    // size is content-based only when its overflow is `visible`, and `0`
-    // otherwise. Without this, an explicit `height: 0; overflow: hidden`
-    // element (the common collapsed-dropdown-panel pattern: hidden until a
-    // sibling checkbox is checked) still grows to fit its content, since
-    // taffy has no way to know it should not.
-    if style.overflow_hidden {
-        s.overflow = taffy::Point { x: taffy::style::Overflow::Hidden, y: taffy::style::Overflow::Hidden };
+    // Tell taffy's layout algorithm about computed overflow, not just our
+    // paint-time clips: a flex/grid automatic minimum depends on the relevant
+    // axis. Overflow propagated from html/body belongs to the viewport and
+    // must leave the source element's own layout overflow visible.
+    if style.overflow_hidden && !style.overflow_propagated_to_viewport {
+        s.overflow = taffy::Point {
+            x: if style.overflow_scroll_x {
+                taffy::style::Overflow::Hidden
+            } else if style.clips_overflow_x() {
+                taffy::style::Overflow::Clip
+            } else {
+                taffy::style::Overflow::Visible
+            },
+            y: if style.overflow_scroll_y {
+                taffy::style::Overflow::Hidden
+            } else if style.clips_overflow_y() {
+                taffy::style::Overflow::Clip
+            } else {
+                taffy::style::Overflow::Visible
+            },
+        };
     }
     s.min_size = taffy::Size {
         width: dimension(style.min_width),

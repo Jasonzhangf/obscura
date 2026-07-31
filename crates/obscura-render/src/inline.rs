@@ -27,11 +27,10 @@ use obscura_dom::tree::{DomTree, NodeId};
 use crate::{Dimension, Display, LayoutStyle, Rect, TextTransform};
 
 // Bundled faces. Chrome on this class of host renders `sans-serif` and the
-// ubiquitous Arial/Helvetica/system-ui stacks as Liberation Sans, `serif` as
-// Liberation Serif, and `monospace` as Liberation Mono. Matching those keeps
-// text metrics (advance widths, wrapping, line positions) aligned with Chromium
-// instead of drifting ~12% wider on DejaVu's wider glyphs. DejaVu Sans is kept
-// only as a last-resort fallback for glyphs the Liberation faces lack.
+// ubiquitous Arial/Helvetica stacks as Liberation Sans, `system-ui` as DejaVu
+// Sans, `serif` as Liberation Serif, and `monospace` as Liberation Mono.
+// Matching those keeps text metrics (advance widths, wrapping, line positions)
+// aligned with Chromium instead of drifting between unrelated host faces.
 static SANS_R: &[u8] = include_bytes!("../assets/liberation-sans.ttf");
 static SANS_B: &[u8] = include_bytes!("../assets/liberation-sans-bold.ttf");
 static SANS_O: &[u8] = include_bytes!("../assets/liberation-sans-oblique.ttf");
@@ -44,44 +43,78 @@ static MONO_R: &[u8] = include_bytes!("../assets/liberation-mono.ttf");
 static MONO_B: &[u8] = include_bytes!("../assets/liberation-mono-bold.ttf");
 static MONO_O: &[u8] = include_bytes!("../assets/liberation-mono-oblique.ttf");
 static MONO_BO: &[u8] = include_bytes!("../assets/liberation-mono-boldoblique.ttf");
-static FALLBACK: &[u8] = include_bytes!("../assets/dejavu-sans.ttf");
+static SYSTEM_R: &[u8] = include_bytes!("../assets/dejavu-sans.ttf");
+static SYSTEM_B: &[u8] = include_bytes!("../assets/dejavu-sans-bold.ttf");
+#[cfg(test)]
+static FALLBACK: &[u8] = SYSTEM_R;
 
 const FAMILY: &str = "Liberation Sans";
 const SERIF_FAMILY: &str = "Liberation Serif";
 const MONO_FAMILY: &str = "Liberation Mono";
+const SYSTEM_FAMILY: &str = "DejaVu Sans";
 
 /// Map a CSS `font-family` list to a bundled face the way Chromium resolves the
-/// generic families on this host: a monospace/code stack -> Liberation Mono, a
-/// serif stack -> Liberation Serif, everything else (sans-serif, Arial,
-/// Helvetica, system-ui, named sans webfonts, ...) -> Liberation Sans. The first
-/// family whose category is recognizable wins, matching CSS fallback order.
+/// generic families on this host. Chromium's Linux `system-ui` resolves to
+/// DejaVu Sans, while `sans-serif`/Arial/Helvetica resolve to Liberation Sans.
+/// The first recognizable family wins, matching CSS fallback order.
 fn resolve_font_family(fam: Option<&str>) -> &'static str {
     let Some(f) = fam else { return FAMILY };
     for tok in f.split(',') {
-        let t = tok.trim().trim_matches(|c| c == '"' || c == '\'').trim();
-        if t.is_empty() {
-            continue;
-        }
-        if t == "monospace" || t.contains("mono") || t.contains("courier")
-            || t.contains("consol") || t == "menlo" || t == "monaco" || t == "code"
-        {
-            return MONO_FAMILY;
-        }
-        if t == "serif" || t == "georgia" || t.contains("times") || t == "cambria"
-            || t.contains("garamond") || t.contains("liberation serif") || t == "roman"
-        {
-            return SERIF_FAMILY;
-        }
-        if t == "sans-serif" || t.contains("sans") || t == "arial" || t == "helvetica"
-            || t == "helvetica neue" || t == "system-ui" || t == "-apple-system"
-            || t == "roboto" || t == "segoe ui" || t == "inter" || t == "verdana"
-            || t == "tahoma" || t == "ui-sans-serif"
-        {
-            return FAMILY;
+        if let Some(family) = bundled_family_for_css_token(tok) {
+            return family;
         }
         // Unrecognized named webfont: keep scanning for a generic fallback.
     }
     FAMILY
+}
+
+fn bundled_family_for_css_token(token: &str) -> Option<&'static str> {
+    let token = token
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'')
+        .trim()
+        .to_ascii_lowercase();
+    if token.is_empty() {
+        return None;
+    }
+    if token == "system-ui" || token == "ui-sans-serif" {
+        return Some(SYSTEM_FAMILY);
+    }
+    if token == "monospace"
+        || token.contains("mono")
+        || token.contains("courier")
+        || token.contains("consol")
+        || token == "menlo"
+        || token == "monaco"
+        || token == "code"
+    {
+        return Some(MONO_FAMILY);
+    }
+    if token == "serif"
+        || token == "georgia"
+        || token.contains("times")
+        || token == "cambria"
+        || token.contains("garamond")
+        || token.contains("liberation serif")
+        || token == "roman"
+    {
+        return Some(SERIF_FAMILY);
+    }
+    if token == "sans-serif"
+        || token.contains("sans")
+        || token == "arial"
+        || token == "helvetica"
+        || token == "helvetica neue"
+        || token == "-apple-system"
+        || token == "roboto"
+        || token == "segoe ui"
+        || token == "inter"
+        || token == "verdana"
+        || token == "tahoma"
+    {
+        return Some(FAMILY);
+    }
+    None
 }
 
 #[derive(Clone)]
@@ -112,6 +145,7 @@ struct ResolvedFont {
     family: Arc<str>,
     font_id: Option<cosmic_text::fontdb::ID>,
     metrics: FaceMetrics,
+    synthetic_italic: bool,
 }
 
 #[derive(Clone)]
@@ -130,11 +164,32 @@ fn resolve_loaded_font(
 ) -> ResolvedFont {
     if let Some(stack) = fam {
         for token in stack.split(',') {
-            let name = token
-                .trim()
-                .trim_matches(|c| c == '"' || c == '\'')
-                .trim();
-            if let Some(family) = loaded.get(&name.to_ascii_lowercase()) {
+            let name = token.trim().trim_matches(|c| c == '"' || c == '\'').trim();
+            let family = loaded.get(&name.to_ascii_lowercase()).or_else(|| {
+                bundled_family_for_css_token(name)
+                    .and_then(|family| loaded.get(&family.to_ascii_lowercase()))
+            });
+            if let Some(resolved) = family
+                .and_then(|family| select_loaded_face(family, requested_weight, requested_italic))
+            {
+                return resolved;
+            }
+        }
+    }
+    let fallback = resolve_font_family(fam);
+    ResolvedFont {
+        family: Arc::from(fallback),
+        font_id: None,
+        metrics: bundled_face_metrics(fallback),
+        synthetic_italic: false,
+    }
+}
+
+fn select_loaded_face(
+    family: &LoadedFamily,
+    requested_weight: u16,
+    requested_italic: bool,
+) -> Option<ResolvedFont> {
                 let exact_style: Vec<_> = family
                     .faces
                     .iter()
@@ -150,39 +205,28 @@ fn resolve_loaded_font(
                     .copied()
                     .find(|face| (face.min_weight..=face.max_weight).contains(&requested_weight))
                 {
-                    // The named-family matcher uses fontdb's default weight for
-                    // this resource, while a variable face commonly advertises
-                    // `100 900` in CSS. Preserve the descriptor-selected file
-                    // and its database weight; the authored coordinate enters
-                    // the canonical axis tuple below.
-                    return ResolvedFont {
+        // The named-family matcher uses fontdb's default weight for this
+        // resource, while a variable face commonly advertises `100 900` in
+        // CSS. Preserve the descriptor-selected file and its database weight;
+        // the authored coordinate enters the canonical axis tuple below.
+        return Some(ResolvedFont {
                         family: Arc::clone(&face.name),
                         font_id: face.font_id,
                         metrics: face.metrics,
-                    };
+            synthetic_italic: requested_italic && !face.italic,
+        });
                 }
-                let available: Vec<_> =
-                    candidates.iter().map(|face| face.min_weight).collect();
+    let available: Vec<_> = candidates.iter().map(|face| face.min_weight).collect();
                 let matched = match_font_weight(requested_weight, &available);
-                if let Some(face) = candidates
+    candidates
                     .into_iter()
                     .find(|face| face.min_weight == matched)
-                {
-                    return ResolvedFont {
+        .map(|face| ResolvedFont {
                         family: Arc::clone(&face.name),
                         font_id: face.font_id,
                         metrics: face.metrics,
-                    };
-                }
-            }
-        }
-    }
-    let fallback = resolve_font_family(fam);
-    ResolvedFont {
-        family: Arc::from(fallback),
-        font_id: None,
-        metrics: bundled_face_metrics(fallback),
-    }
+            synthetic_italic: requested_italic && !face.italic,
+        })
 }
 
 /// CSS Fonts' asymmetric missing-weight search. In particular, 600 selects
@@ -238,6 +282,7 @@ fn bundled_face_metrics(family: &str) -> FaceMetrics {
     let (ascent, descent, line_gap) = match family {
         SERIF_FAMILY => (1825.0, 443.0, 87.0),
         MONO_FAMILY => (1705.0, 615.0, 0.0),
+        SYSTEM_FAMILY => (1901.0, 483.0, 0.0),
         _ => (1854.0, 434.0, 67.0),
     };
     FaceMetrics {
@@ -580,11 +625,8 @@ impl ReplacedItem {
                 .as_deref()
                 .map_or(false, |expression| expression.contains('%'))
         };
-        let intrinsic_ratio = if width.is_finite()
-            && height.is_finite()
-            && width > 0.0
-            && height > 0.0
-        {
+        let intrinsic_ratio =
+            if width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0 {
             width / height
         } else {
             1.0
@@ -740,10 +782,8 @@ impl TextEngine {
         let mut db = cosmic_text::fontdb::Database::new();
         let mut declarations = Vec::new();
         for bytes in [
-            SANS_R, SANS_B, SANS_O, SANS_BO,
-            SERIF_R, SERIF_B, SERIF_O, SERIF_BO,
-            MONO_R, MONO_B, MONO_O, MONO_BO,
-            FALLBACK,
+            SANS_R, SANS_B, SANS_O, SANS_BO, SERIF_R, SERIF_B, SERIF_O, SERIF_BO, MONO_R, MONO_B,
+            MONO_O, MONO_BO, SYSTEM_R, SYSTEM_B,
         ] {
             for id in db.load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(bytes))) {
                 declarations.push((id, None, None, None));
@@ -936,6 +976,7 @@ impl TextEngine {
             font_id: context.font_id,
             variations: context.variations.clone(),
             italic: context.italic,
+            synthetic_italic: context.synthetic_italic,
             underline: context.underline,
             color: context.color,
             family: context.family,
@@ -977,9 +1018,7 @@ impl TextEngine {
                 }
             }
         }
-        if spans
-            .iter()
-            .all(|(text, _)| {
+        if spans.iter().all(|(text, _)| {
                 text.is_empty()
                     || (matches!(
                         white_space,
@@ -988,8 +1027,7 @@ impl TextEngine {
                             | crate::WhiteSpace::PreLine
                     ) && text.trim().is_empty()
                         && !text.contains('\n'))
-            })
-        {
+        }) {
             return None;
         }
 
@@ -1208,6 +1246,7 @@ struct SpanAttrs {
     font_id: Option<cosmic_text::fontdb::ID>,
     variations: Option<Arc<FontVariations>>,
     italic: bool,
+    synthetic_italic: bool,
     underline: bool,
     color: [u8; 4],
     family: Arc<str>,
@@ -1234,7 +1273,14 @@ impl SpanAttrs {
         if let Some(font_id) = self.font_id {
             a = a.font_id(font_id);
         }
-        a = a.style(if self.italic { Style::Italic } else { Style::Normal });
+        a = a.style(if self.italic {
+            Style::Italic
+        } else {
+            Style::Normal
+        });
+        if self.synthetic_italic {
+            a = a.cache_key_flags(CacheKeyFlags::FAKE_ITALIC);
+        }
         if self.letter_spacing.is_finite() && self.letter_spacing != 0.0 {
             a = a.letter_spacing(self.letter_spacing / self.font_size.max(1.0));
         }
@@ -1280,6 +1326,7 @@ struct SpanCtx {
     font_metrics: FaceMetrics,
     variations: Option<Arc<FontVariations>>,
     italic: bool,
+    synthetic_italic: bool,
     underline: bool,
     transform: TextTransform,
     white_space: crate::WhiteSpace,
@@ -1345,6 +1392,7 @@ fn base_span_ctx(
         font_metrics: font.metrics,
         variations,
         italic: base.font_style_italic.unwrap_or(false),
+        synthetic_italic: font.synthetic_italic,
         underline: base.underline.unwrap_or(false),
         transform: base.text_transform.unwrap_or(TextTransform::None),
         white_space: base.white_space.unwrap_or_default(),
@@ -1401,6 +1449,7 @@ fn collect_node_spans(
                 font_id: ctx.font_id,
                 variations: ctx.variations.clone(),
                 italic: ctx.italic,
+                synthetic_italic: ctx.synthetic_italic,
                 underline: ctx.underline,
                 color: ctx.color,
                 family: Arc::clone(&ctx.family),
@@ -1422,7 +1471,9 @@ fn collect_node_spans(
                 return;
             }
             if elem.local.as_ref() == "br" {
-                out.push(("\n".to_string(), SpanAttrs {
+                out.push((
+                    "\n".to_string(),
+                    SpanAttrs {
                     font_size: ctx.font_size,
                     line_height: ctx.line_height,
                     letter_spacing: ctx.letter_spacing,
@@ -1432,11 +1483,13 @@ fn collect_node_spans(
                     font_id: ctx.font_id,
                     variations: ctx.variations.clone(),
                     italic: ctx.italic,
+                        synthetic_italic: ctx.synthetic_italic,
                     underline: ctx.underline,
                     color: ctx.color,
                     family: Arc::clone(&ctx.family),
                     clip_fill: ctx.clip_fill,
-                }));
+                    },
+                ));
                 c.last_was_space = true;
                 return;
             }
@@ -1471,6 +1524,7 @@ fn collect_node_spans(
                     family: Arc::clone(&ctx.family),
                     font_id: ctx.font_id,
                     metrics: ctx.font_metrics,
+                    synthetic_italic: ctx.synthetic_italic,
                 });
             let variations = style
                 .map(|style| resolved_font_variations(style, &font))
@@ -1497,6 +1551,7 @@ fn collect_node_spans(
                 font_metrics: font.metrics,
                 variations,
                 italic: ctx.italic || style.and_then(|s| s.font_style_italic).unwrap_or(false),
+                synthetic_italic: font.synthetic_italic,
                 // Underline propagates in: an ancestor's underline covers
                 // descendant text; an element only sets its own via CSS.
                 underline: ctx.underline || style.and_then(|s| s.underline).unwrap_or(false),
@@ -2066,13 +2121,20 @@ impl TextEngine {
                     let out_r = sr + (dst.red() as u32 * inv / 255);
                     let out_g = sg + (dst.green() as u32 * inv / 255);
                     let out_b = sb + (dst.blue() as u32 * inv / 255);
-                    pixels[idx] = tiny_skia::PremultipliedColorU8::from_rgba(out_r as u8, out_g as u8, out_b as u8, out_a as u8)
+                    pixels[idx] = tiny_skia::PremultipliedColorU8::from_rgba(
+                        out_r as u8,
+                        out_g as u8,
+                        out_b as u8,
+                        out_a as u8,
+                    )
                         .unwrap_or(dst);
                 };
                 let explicit_variations = metadata_variation(glyph.metadata)
                     .and_then(|index| item.variation_sets.get(index))
                     .map(Arc::clone);
-                let effective_variations = glyph.font_is_variable.then(|| {
+                let effective_variations = glyph
+                    .font_is_variable
+                    .then(|| {
                     variable_swash.effective_variations(
                         font_system,
                         physical.cache_key.font_id,
@@ -2081,7 +2143,8 @@ impl TextEngine {
                         glyph.font_italic_axis,
                         explicit_variations,
                     )
-                }).flatten();
+                    })
+                    .flatten();
                 if let Some(variations) = effective_variations {
                     variable_swash.with_pixels(
                         font_system,
@@ -2158,6 +2221,92 @@ mod tests {
 
     const RED: [u8; 4] = [255, 0, 0, 255];
     const BLUE: [u8; 4] = [0, 0, 255, 255];
+
+    #[test]
+    fn system_ui_resolves_in_stack_order_to_chromium_linux_face() {
+        let stack = "system-ui, -apple-system, \"Segoe UI\", Roboto, \
+                     \"Helvetica Neue\", \"Noto Sans\", \"Liberation Sans\", \
+                     Arial, sans-serif";
+        assert_eq!(resolve_font_family(Some(stack)), SYSTEM_FAMILY);
+
+        let mut engine = TextEngine::new();
+        let system = resolve_loaded_font(Some(stack), 600, false, &engine.loaded_families);
+        assert_eq!(system.family.as_ref(), SYSTEM_FAMILY);
+        let face = engine
+            .font_system
+            .db()
+            .face(system.font_id.expect("bundled system-ui face"))
+            .expect("system-ui database face");
+        assert_eq!(
+            face.weight.0, 700,
+            "CSS weight 600 selects DejaVu Sans Bold just as Chromium does"
+        );
+
+        let italic = resolve_loaded_font(Some("system-ui"), 400, true, &engine.loaded_families);
+        let italic_face = engine
+            .font_system
+            .db()
+            .face(italic.font_id.expect("bundled system-ui italic fallback"))
+            .expect("system-ui italic fallback database face");
+        assert_eq!(italic_face.weight.0, 400);
+        assert_eq!(
+            italic_face.style,
+            cosmic_text::fontdb::Style::Normal,
+            "Chromium synthesizes system-ui italic from DejaVu Sans regular on this host"
+        );
+
+        let bold_italic =
+            resolve_loaded_font(Some("system-ui"), 700, true, &engine.loaded_families);
+        let bold_italic_face = engine
+            .font_system
+            .db()
+            .face(
+                bold_italic
+                    .font_id
+                    .expect("bundled system-ui bold italic fallback"),
+            )
+            .expect("system-ui bold italic fallback database face");
+        assert_eq!(bold_italic_face.weight.0, 700);
+        assert_eq!(
+            bold_italic_face.style,
+            cosmic_text::fontdb::Style::Normal,
+            "Chromium synthesizes system-ui bold italic from DejaVu Sans Bold on this host"
+        );
+
+        let tree = obscura_dom::parse_html("<p id='copy'>Italic system UI</p>");
+        let copy = tree.get_element_by_id("copy").unwrap();
+        let mut style = LayoutStyle::default();
+        style.display = Display::Block;
+        style.font_family = Some("system-ui".to_string());
+        style.font_style_italic = Some(true);
+        style.font_size = Some(32.0);
+        let item = engine
+            .try_build(&tree, copy, &HashMap::from([(copy, style)]))
+            .expect("system-ui italic shapes");
+        engine.measure(item, Some(400.0));
+        let glyph = engine.items[item]
+            .buffer
+            .layout_runs()
+            .next()
+            .and_then(|run| run.glyphs.first())
+            .expect("system-ui italic glyph");
+        assert!(
+            glyph
+                .physical((0.0, 0.0), 1.0)
+                .cache_key
+                .flags
+                .contains(CacheKeyFlags::FAKE_ITALIC),
+            "the normal DejaVu resource must retain the requested synthetic slant"
+        );
+
+        let arial = resolve_loaded_font(
+            Some("Arial, sans-serif"),
+            600,
+            false,
+            &engine.loaded_families,
+        );
+        assert_eq!(arial.family.as_ref(), FAMILY);
+    }
 
     #[test]
     fn normal_line_height_grid_fits_each_face_metric() {
@@ -2540,6 +2689,7 @@ mod tests {
             font_id: None,
             variations: Some(Arc::new(variations)),
             italic: false,
+            synthetic_italic: false,
             underline: true,
             color: [1, 2, 3, 255],
             family: Arc::from(FAMILY),
@@ -2569,6 +2719,7 @@ mod tests {
             family: Arc::from(FAMILY),
             font_id: None,
             metrics: bundled_face_metrics(FAMILY),
+            synthetic_italic: false,
         };
         assert!(resolved_font_variations(&style, &static_font).is_none());
         let styles = HashMap::from([(copy, style)]);
@@ -2598,6 +2749,7 @@ mod tests {
             family: Arc::from(FAMILY),
             font_id: None,
             metrics: bundled_face_metrics(FAMILY),
+            synthetic_italic: false,
         };
         assert!(resolved_font_variations(&style, &font).is_none());
     }
@@ -2614,6 +2766,7 @@ mod tests {
             font_id: None,
             variations: None,
             italic: false,
+            synthetic_italic: false,
             underline: false,
             color: [0, 0, 0, 255],
             family: Arc::from(FAMILY),
