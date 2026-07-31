@@ -1194,14 +1194,17 @@ fn paint_laid_dom_scrolled(
         // container's box so text under a transformed ancestor moves with
         // it. Computed before the mutable `paint_item` borrow.
         let off = scroll_state.translation_for(laid, nid);
+        let clip = scroll_state.shaped_text_clip_for(laid, nid);
         if let Some(idx) = whole {
-            laid.text_engine.paint_item(idx, &mut pixmap, off);
+            laid.text_engine
+                .paint_item_with_clip(idx, &mut pixmap, off, clip);
         }
         // Anonymous inline-run leaves of a mixed block (see
         // `build_mixed_block`), pinned to their own boxes at finalize.
         if let Some(items) = run_items {
             for idx in items {
-                laid.text_engine.paint_item(idx, &mut pixmap, off);
+                laid.text_engine
+                    .paint_item_with_clip(idx, &mut pixmap, off, clip);
             }
         }
     }
@@ -1300,6 +1303,34 @@ impl<'a> ScrollPaintState<'a> {
         clip.x += sticky.0 - self.scroll.0;
         clip.y += sticky.1 - self.scroll.1;
         Some(clip)
+    }
+
+    /// Capture-space clip for a shaped inline context. `clip_for` supplies the
+    /// adjusted ancestor chain; text owned by an `overflow:hidden` element
+    /// also needs that element's own padding-box clip in the same viewport
+    /// coordinates.
+    fn shaped_text_clip_for(
+        &self,
+        laid: &crate::DomLayout,
+        id: obscura_dom::tree::NodeId,
+    ) -> Option<crate::Rect> {
+        let inherited = self.clip_for(laid, id);
+        let style = laid.styles.get(&id)?;
+        if !style.overflow_hidden {
+            return inherited;
+        }
+        let rect = laid.rects.get(&id)?;
+        let (ox, oy) = self.translation_for(laid, id);
+        let own = crate::Rect {
+            x: rect.x + ox + style.border.left,
+            y: rect.y + oy + style.border.top,
+            width: (rect.width - style.border.left - style.border.right).max(0.0),
+            height: (rect.height - style.border.top - style.border.bottom).max(0.0),
+        };
+        Some(match inherited {
+            Some(clip) => clip.intersect(&own).unwrap_or(crate::Rect::default()),
+            None => own,
+        })
     }
 }
 
@@ -4535,6 +4566,109 @@ mod tests {
                 "{name} viewport should keep fixed subtree at the viewport origin: {fixed:?}"
             );
         }
+    }
+
+    #[test]
+    fn repeated_scroll_capture_moves_shaped_text_and_its_overflow_clip_together() {
+        let tree = parse_html(
+            r#"<html style="margin:0;overflow:auto"><body style="margin:0">
+               <div style="height:1000px;background:#ff0000"></div>
+               <section style="height:160px;overflow:hidden;background:#000000;color:#ffffff">
+                 <h2 style="margin:0;font-size:32px;line-height:40px">VISIBLE SCROLLED TEXT</h2>
+                 <p style="margin:0;font-size:20px;line-height:28px">SECOND SHAPED LINE</p>
+                 <div style="position:absolute;left:260px;top:1100px;width:20px;height:20px;background:#00ff00"></div>
+                 <svg style="position:absolute;left:260px;top:1040px;width:20px;height:20px"
+                      viewBox="0 0 20 20"><rect width="20" height="20" fill="cyan"/></svg>
+                 <div style="position:absolute;left:20px;top:1150px;width:20px;height:30px;background:#ff00ff"></div>
+               </section>
+               <div style="height:200px"></div>
+               </body></html>"#,
+        );
+        let viewport = (300.0, 180.0);
+        let mut resources = RenderResourceCache::default();
+        let mut prepared =
+            prepare_dom(&tree, viewport, None, &mut resources).expect("prepared render");
+        let top = paint_prepared(
+            &tree,
+            &mut prepared,
+            &mut resources,
+            (0.0, 0.0),
+        )
+        .expect("top capture");
+        let scrolled = paint_prepared(
+            &tree,
+            &mut prepared,
+            &mut resources,
+            (0.0, 1000.0),
+        )
+        .expect("scrolled capture");
+        let top_repeat = paint_prepared(
+            &tree,
+            &mut prepared,
+            &mut resources,
+            (0.0, 0.0),
+        )
+        .expect("repeated top capture");
+        let scrolled_repeat = paint_prepared(
+            &tree,
+            &mut prepared,
+            &mut resources,
+            (0.0, 1000.0),
+        )
+        .expect("repeated scrolled capture");
+
+        assert_eq!(top, top_repeat, "returning to the top must not accumulate scroll");
+        assert_eq!(
+            scrolled, scrolled_repeat,
+            "repeated bottom paint must reuse immutable document geometry"
+        );
+        let white_ink = (0..90)
+            .flat_map(|y| (0..250).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                let pixel = scrolled.pixel(x, y).expect("text pixel");
+                pixel.red() > 220 && pixel.green() > 220 && pixel.blue() > 220
+            })
+            .count();
+        assert!(
+            white_ink > 100,
+            "visible shaped text must share the viewport-space overflow clip, found {white_ink} white pixels"
+        );
+        let marker = scrolled.pixel(270, 110).expect("marker pixel");
+        assert!(
+            marker.green() > 220 && marker.red() < 40 && marker.blue() < 40,
+            "a non-text box in the same clipped section must remain visible: {marker:?}"
+        );
+        let svg_marker = scrolled.pixel(270, 50).expect("svg marker pixel");
+        assert!(
+            svg_marker.green() > 220 && svg_marker.blue() > 220 && svg_marker.red() < 40,
+            "an inline svg in the same clipped section must remain visible: {svg_marker:?}"
+        );
+        let clipped_marker = scrolled.pixel(30, 165).expect("clipped marker pixel");
+        assert!(
+            clipped_marker.red() > 240
+                && clipped_marker.green() > 240
+                && clipped_marker.blue() > 240,
+            "nested overflow must still clip content below its document-space padding box: {clipped_marker:?}"
+        );
+    }
+
+    #[test]
+    fn body_overflow_stays_a_content_clip_when_html_owns_root_overflow() {
+        let tree = parse_html(
+            r#"<html style="margin:0;overflow:auto">
+               <body style="margin:0;width:100px;height:50px;overflow:hidden">
+                 <div style="position:absolute;left:10px;top:60px;width:20px;height:20px;background:red"></div>
+               </body>
+               </html>"#,
+        );
+        let output = paint_dom(&tree, (100.0, 100.0), None).expect("paint");
+        let below_body = output.pixel(15, 65).expect("pixel");
+        assert!(
+            below_body.red() > 240
+                && below_body.green() > 240
+                && below_body.blue() > 240,
+            "body overflow must not be mistaken for a viewport clip when html already owns overflow: {below_body:?}"
+        );
     }
 
     #[test]

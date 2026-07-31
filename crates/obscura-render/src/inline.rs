@@ -1739,12 +1739,24 @@ fn sample_gradient(fill: &(f32, Vec<([u8; 4], Option<f32>)>), x: f32, y: f32, w:
 }
 
 impl TextEngine {
-    /// Rasterize inline context `idx` into `pixmap`, honoring its clip. Uses
-    /// cosmic-text's swash-backed rasterizer (anti-aliased, per-glyph color
-    /// from the span attributes). `offset` is the accumulated `transform:
-    /// translate()` of the container's ancestors, shifting both the glyph
-    /// origin and the clip so shaped text moves with a transformed box.
+    /// Rasterize inline context `idx` into `pixmap`, honoring its finalized
+    /// clip. Tests and generated items whose coordinates do not change between
+    /// layout and paint use this path.
     pub fn paint_item(&mut self, idx: usize, pixmap: &mut tiny_skia::Pixmap, offset: (f32, f32)) {
+        self.paint_item_with_clip(idx, pixmap, offset, None);
+    }
+
+    /// Rasterize an inline context with a capture-space clip override. Root
+    /// scrolling is layered over immutable document layout, so the glyph
+    /// origin and any overflow clip must both be sampled in the current
+    /// viewport rather than mixing viewport and document coordinates.
+    pub fn paint_item_with_clip(
+        &mut self,
+        idx: usize,
+        pixmap: &mut tiny_skia::Pixmap,
+        offset: (f32, f32),
+        clip_override: Option<Rect>,
+    ) {
         let TextEngine {
             font_system,
             swash,
@@ -1758,7 +1770,7 @@ impl TextEngine {
         // but the clip is already in screen space (owner-shifted at
         // `resolve_clip_rects`) and must not move with the container, or a
         // translated slide would drag its viewport's clip along with it.
-        let clip = item.clip;
+        let clip = clip_override.or(item.clip);
         let pw = pixmap.width() as i32;
         let ph = pixmap.height() as i32;
         let clip_bounds = clip.map(|c| (c.x, c.y, c.x + c.width, c.y + c.height));

@@ -621,8 +621,36 @@ fn resolve_clip_rects(
     if tx != 0.0 || ty != 0.0 {
         translates.insert(id, (tx, ty));
     }
+    // Overflow propagated from html/body establishes the root scrolling
+    // viewport. It is anchored to the capture surface, not to document
+    // coordinates, and the pixmap already supplies that viewport clip.
+    // Materializing it here as an ordinary descendant clip would make root
+    // scrolling translate the viewport itself offscreen.
+    let is_viewport_overflow_source = tree.get_node(id).is_some_and(|node| {
+        node.as_element().is_some_and(|element| {
+            if element.local.as_ref() == "html" {
+                return true;
+            }
+            if element.local.as_ref() != "body" {
+                return false;
+            }
+            // Body overflow propagates to the viewport only while the root's
+            // own overflow is visible. Once html establishes overflow, body
+            // remains an ordinary clipping box.
+            node.parent
+                .and_then(|parent| tree.get_node(parent).map(|parent_node| (parent, parent_node)))
+                .is_some_and(|(parent, parent_node)| {
+                    parent_node
+                        .as_element()
+                        .is_some_and(|name| name.local.as_ref() == "html")
+                        && !styles
+                            .get(&parent)
+                            .is_some_and(|style| style.overflow_hidden)
+                })
+        })
+    });
     let next = match (styles.get(&id), rects.get(&id)) {
-        (Some(style), Some(rect)) if style.overflow_hidden => {
+        (Some(style), Some(rect)) if style.overflow_hidden && !is_viewport_overflow_source => {
             let own = overflow_clip_rect(rect, style, tx, ty);
             Some(match inherited {
                 Some(clip) => clip.intersect(&own).unwrap_or(Rect::default()),
