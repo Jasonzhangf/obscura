@@ -772,6 +772,52 @@ fn fetch_timeout() -> std::time::Duration {
 /// Matches reqwest's default policy of 10.
 const FETCH_REDIRECT_LIMIT: usize = 10;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FetchCredentials {
+    Omit,
+    SameOrigin,
+    Include,
+}
+
+impl FetchCredentials {
+    fn parse(value: &str) -> Self {
+        match value {
+            "omit" => Self::Omit,
+            "include" => Self::Include,
+            _ => Self::SameOrigin,
+        }
+    }
+
+    fn allows(self, page_origin: &str, request_url: &str) -> bool {
+        match self {
+            Self::Omit => false,
+            Self::Include => true,
+            Self::SameOrigin => request_origin(request_url)
+                .map(|origin| origin == page_origin)
+                .unwrap_or(false),
+        }
+    }
+}
+
+fn request_origin(request_url: &str) -> Option<String> {
+    url::Url::parse(request_url)
+        .ok()
+        .map(|url| url.origin().ascii_serialization())
+}
+
+fn cors_response_allows(
+    credentials: FetchCredentials,
+    page_origin: &str,
+    allowed_origin: &str,
+    allow_credentials: &str,
+) -> bool {
+    if credentials == FetchCredentials::Include {
+        allowed_origin == page_origin && allow_credentials == "true"
+    } else {
+        allowed_origin == "*" || allowed_origin == page_origin
+    }
+}
+
 #[op2(async)]
 #[string]
 async fn op_fetch_url(
@@ -782,6 +828,7 @@ async fn op_fetch_url(
     #[string] body: String,
     #[string] origin: String,
     #[string] mode: String,
+    #[string] credentials: String,
 ) -> Result<String, deno_error::JsErrorBox> {
     tracing::debug!("op_fetch_url called: {} {} (intercept check pending)", method, url);
 
@@ -926,18 +973,15 @@ async fn op_fetch_url(
             .map_err(deno_error::JsErrorBox::generic)?,
     };
 
-    let request_origin = url::Url::parse(&url)
-        .ok()
-        .map(|u| {
-            let host = u.host_str().unwrap_or("");
-            match u.port() {
-                Some(p) => format!("{}://{}:{}", u.scheme(), host, p),
-                None => format!("{}://{}", u.scheme(), host),
-            }
-        })
-        .unwrap_or_default();
-    let page_origin = if origin.is_empty() { request_origin.clone() } else { origin.clone() };
-    let is_cross_origin = !page_origin.is_empty() && request_origin != page_origin;
+    let initial_request_origin = request_origin(&url).unwrap_or_default();
+    let page_origin = if origin.is_empty() {
+        initial_request_origin.clone()
+    } else {
+        origin.clone()
+    };
+    let is_cross_origin =
+        !page_origin.is_empty() && initial_request_origin != page_origin;
+    let credentials = FetchCredentials::parse(&credentials);
 
     let req_method: reqwest::Method = method.parse().unwrap_or(reqwest::Method::GET);
 
@@ -959,35 +1003,6 @@ async fn op_fetch_url(
                 };
                 cbs.fire_request(&info).await;
             }
-        }
-    }
-
-    // Stealth mode: route the scripted request through the wreq client so its
-    // TLS fingerprint and Chrome client hints match the main navigation. The
-    // rustls ClientHello plus missing client hints that op_fetch_url's reqwest
-    // path sends otherwise read as a non-browser script to bot managers (the
-    // AWS WAF challenge verify call, Akamai sensors, etc.).
-    #[cfg(feature = "stealth")]
-    {
-        let stealth = {
-            let st = state.borrow();
-            let gs = st.borrow::<SharedState>().clone();
-            let client = gs.borrow().stealth_client.clone();
-            client
-        };
-        if let Some(stealth) = stealth {
-            return stealth_fetch_all(
-                stealth,
-                url.clone(),
-                req_method.as_str().to_string(),
-                custom_headers.clone(),
-                body.clone(),
-                page_origin.clone(),
-                is_cross_origin,
-                mode.clone(),
-                callbacks.clone(),
-            )
-            .await;
         }
     }
 
@@ -1022,11 +1037,48 @@ async fn op_fetch_url(
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
 
-        if allowed_origin != "*" && allowed_origin != page_origin {
+        let allow_credentials = preflight
+            .headers()
+            .get("access-control-allow-credentials")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if !cors_response_allows(
+            credentials,
+            &page_origin,
+            allowed_origin,
+            allow_credentials,
+        ) {
             return Err(deno_error::JsErrorBox::generic(format!(
                 "CORS preflight: Origin '{}' not allowed by Access-Control-Allow-Origin '{}'",
                 page_origin, allowed_origin
             )));
+        }
+    }
+
+    // Stealth mode: route scripted requests through wreq after the CORS
+    // preflight. stealth_fetch_all applies the credentials decision to each
+    // redirect hop without losing the Chrome TLS/client-hint transport.
+    #[cfg(feature = "stealth")]
+    {
+        let stealth = {
+            let st = state.borrow();
+            let gs = st.borrow::<SharedState>().clone();
+            let client = gs.borrow().stealth_client.clone();
+            client
+        };
+        if let Some(stealth) = stealth {
+            return stealth_fetch_all(
+                stealth,
+                url.clone(),
+                req_method.as_str().to_string(),
+                custom_headers.clone(),
+                body.clone(),
+                page_origin.clone(),
+                mode.clone(),
+                credentials,
+                callbacks.clone(),
+            )
+            .await;
         }
     }
 
@@ -1043,11 +1095,15 @@ async fn op_fetch_url(
             .request(current_method.clone(), &current_url)
             .timeout(fetch_timeout());
 
-        if is_cross_origin {
+        let current_is_cross_origin = request_origin(&current_url)
+            .map(|request_origin| request_origin != page_origin)
+            .unwrap_or(false);
+        if current_is_cross_origin {
             req = req.header("Origin", &page_origin);
         }
 
-        if !is_cross_origin {
+        let credentials_allowed = credentials.allows(&page_origin, &current_url);
+        if credentials_allowed {
             if let Some(ref jar) = cookie_jar {
                 if let Ok(parsed_url) = url::Url::parse(&current_url) {
                     let cookie_header = jar.get_cookie_header(&parsed_url);
@@ -1091,11 +1147,13 @@ async fn op_fetch_url(
             counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         }
 
-        if let Some(ref jar) = cookie_jar {
-            if let Ok(parsed_url) = url::Url::parse(&current_url) {
-                for val in resp.headers().get_all(reqwest::header::SET_COOKIE) {
-                    if let Ok(s) = val.to_str() {
-                        jar.set_cookie(s, &parsed_url);
+        if credentials_allowed {
+            if let Some(ref jar) = cookie_jar {
+                if let Ok(parsed_url) = url::Url::parse(&current_url) {
+                    for val in resp.headers().get_all(reqwest::header::SET_COOKIE) {
+                        if let Ok(s) = val.to_str() {
+                            jar.set_cookie(s, &parsed_url);
+                        }
                     }
                 }
             }
@@ -1169,20 +1227,34 @@ async fn op_fetch_url(
         .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
         .collect();
 
-    if is_cross_origin && mode == "cors" {
+    let final_is_cross_origin = request_origin(&current_url)
+        .map(|request_origin| request_origin != page_origin)
+        .unwrap_or(false);
+    if final_is_cross_origin && mode == "cors" {
         let allowed = resp_headers
             .get("access-control-allow-origin")
             .map(|s| s.as_str())
             .unwrap_or("");
 
-        if allowed != "*" && allowed != page_origin {
+        let allow_credentials = resp_headers
+            .get("access-control-allow-credentials")
+            .map(|s| s.as_str())
+            .unwrap_or("");
+        if !cors_response_allows(credentials, &page_origin, allowed, allow_credentials) {
             return Ok(serde_json::json!({
                 "status": 0,
                 "body": "",
                 "url": url,
                 "headers": {},
                 "corsBlocked": true,
-                "corsError": format!("CORS error: Origin '{}' not in Access-Control-Allow-Origin '{}'", page_origin, allowed),
+                "corsError": if credentials == FetchCredentials::Include {
+                    format!(
+                        "CORS error: credentialed request requires Access-Control-Allow-Origin '{}' and Access-Control-Allow-Credentials 'true'",
+                        page_origin
+                    )
+                } else {
+                    format!("CORS error: Origin '{}' not in Access-Control-Allow-Origin '{}'", page_origin, allowed)
+                },
             })
             .to_string());
         }
@@ -1294,8 +1366,8 @@ async fn stealth_fetch_all(
     custom_headers: HashMap<String, String>,
     body: String,
     page_origin: String,
-    is_cross_origin: bool,
     mode: String,
+    credentials: FetchCredentials,
     callbacks: Option<Arc<CallbackRegistry>>,
 ) -> Result<String, deno_error::JsErrorBox> {
     let mut current_url = url.clone();
@@ -1315,15 +1387,25 @@ async fn stealth_fetch_all(
         };
 
         let mut req_headers: HashMap<String, String> = HashMap::new();
-        if is_cross_origin {
+        let current_is_cross_origin =
+            parsed_current.origin().ascii_serialization() != page_origin;
+        if current_is_cross_origin {
             req_headers.insert("origin".to_string(), page_origin.clone());
         }
         for (k, v) in &custom_headers {
             req_headers.insert(k.to_lowercase(), v.clone());
         }
 
+        let credentials_allowed = credentials.allows(&page_origin, &current_url);
         let r = stealth
-            .send_single(&current_method, &parsed_current, &req_headers, &current_body)
+            .send_single(
+                &current_method,
+                &parsed_current,
+                &req_headers,
+                &current_body,
+                credentials_allowed,
+                credentials_allowed,
+            )
             .await
             .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
 
@@ -1364,19 +1446,33 @@ async fn stealth_fetch_all(
         current_url = next_url.to_string();
     };
 
-    if is_cross_origin && mode == "cors" {
+    let final_is_cross_origin = request_origin(&current_url)
+        .map(|request_origin| request_origin != page_origin)
+        .unwrap_or(false);
+    if final_is_cross_origin && mode == "cors" {
         let allowed = resp_headers
             .get("access-control-allow-origin")
             .map(|s| s.as_str())
             .unwrap_or("");
-        if allowed != "*" && allowed != page_origin {
+        let allow_credentials = resp_headers
+            .get("access-control-allow-credentials")
+            .map(|s| s.as_str())
+            .unwrap_or("");
+        if !cors_response_allows(credentials, &page_origin, allowed, allow_credentials) {
             return Ok(serde_json::json!({
                 "status": 0, "body": "", "url": url, "headers": {},
                 "corsBlocked": true,
-                "corsError": format!(
-                    "CORS error: Origin '{}' not in Access-Control-Allow-Origin '{}'",
-                    page_origin, allowed
-                ),
+                "corsError": if credentials == FetchCredentials::Include {
+                    format!(
+                        "CORS error: credentialed request requires Access-Control-Allow-Origin '{}' and Access-Control-Allow-Credentials 'true'",
+                        page_origin
+                    )
+                } else {
+                    format!(
+                        "CORS error: Origin '{}' not in Access-Control-Allow-Origin '{}'",
+                        page_origin, allowed
+                    )
+                },
             })
             .to_string());
         }
@@ -1436,7 +1532,7 @@ fn glob_match(pattern: &str, url: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::glob_match;
+    use super::{cors_response_allows, glob_match, FetchCredentials};
 
     #[test]
     fn glob_match_handles_cdp_blocked_url_patterns() {
@@ -1459,6 +1555,54 @@ mod tests {
         assert!(!glob_match(
             "*://*.gstatic.com/*.woff2",
             "https://fonts.gstatic.com/s/inter/v18/font.woff",
+        ));
+    }
+
+    #[test]
+    fn fetch_credentials_gate_cookie_send_and_storage_per_request_origin() {
+        let page_origin = "https://www.example.com";
+        let same_origin_url = "https://www.example.com/api";
+        let explicit_default_port = "https://www.example.com:443/api";
+        let cross_origin_url = "https://api.example.com/data";
+
+        assert!(!FetchCredentials::Omit.allows(page_origin, same_origin_url));
+        assert!(!FetchCredentials::Omit.allows(page_origin, cross_origin_url));
+
+        assert!(FetchCredentials::SameOrigin.allows(page_origin, same_origin_url));
+        assert!(FetchCredentials::SameOrigin.allows(page_origin, explicit_default_port));
+        assert!(!FetchCredentials::SameOrigin.allows(page_origin, cross_origin_url));
+
+        assert!(FetchCredentials::Include.allows(page_origin, same_origin_url));
+        assert!(FetchCredentials::Include.allows(page_origin, cross_origin_url));
+    }
+
+    #[test]
+    fn credentialed_cors_requires_exact_origin_and_allow_credentials() {
+        let page_origin = "https://www.example.com";
+
+        assert!(cors_response_allows(
+            FetchCredentials::SameOrigin,
+            page_origin,
+            "*",
+            "",
+        ));
+        assert!(!cors_response_allows(
+            FetchCredentials::Include,
+            page_origin,
+            "*",
+            "true",
+        ));
+        assert!(!cors_response_allows(
+            FetchCredentials::Include,
+            page_origin,
+            page_origin,
+            "",
+        ));
+        assert!(cors_response_allows(
+            FetchCredentials::Include,
+            page_origin,
+            page_origin,
+            "true",
         ));
     }
 }

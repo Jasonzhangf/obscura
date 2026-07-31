@@ -252,7 +252,7 @@ async function __processDynScriptQueue() {
           if (task.url.startsWith('data:')) {
             body = _decodeDataScriptUrl(task.url);
           } else {
-            const raw = await Deno.core.ops.op_fetch_url(task.url, "GET", "{}", "", task.pageOrigin, "no-cors");
+            const raw = await Deno.core.ops.op_fetch_url(task.url, "GET", "{}", "", task.pageOrigin, "no-cors", "same-origin");
             const parsed = JSON.parse(raw);
             // The HTML script-fetch algorithm treats an unsuccessful HTTP
             // response as a network error. Evaluating its response body is both
@@ -392,7 +392,7 @@ async function _fetchLinkedCss(url, pageOrigin, depth = 0, seen = new Set()) {
   if (depth > 4 || seen.has(url)) return "";
   seen.add(url);
   const raw = await Deno.core.ops.op_fetch_url(
-    url, "GET", "{}", "", pageOrigin, "no-cors"
+    url, "GET", "{}", "", pageOrigin, "no-cors", "same-origin"
   );
   const parsed = JSON.parse(raw);
   if (parsed.blocked || parsed.status >= 400 || parsed.status === 0) {
@@ -4911,6 +4911,7 @@ function _serializeBody(initBody, headers) {
 }
 
 globalThis.fetch = async (input, init = {}) => {
+  init = init || {};
   let url = typeof input === "string"
     ? input
     : (input instanceof Request
@@ -4927,8 +4928,14 @@ globalThis.fetch = async (input, init = {}) => {
   const body = _serializeBody(init.body, _h);
   const hdrs = JSON.stringify(_h);
   const fetchMode = init.mode || (input instanceof Request ? input.mode : "cors");
+  const fetchCredentials = init.credentials !== undefined
+    ? String(init.credentials)
+    : (input instanceof Request ? input.credentials : "same-origin");
+  if (fetchCredentials !== "omit" && fetchCredentials !== "same-origin" && fetchCredentials !== "include") {
+    throw new TypeError("Failed to execute 'fetch': '" + fetchCredentials + "' is not a valid RequestCredentials value");
+  }
   const pageOrigin = (function() { try { const u = new URL(_domParse("document_url") || "about:blank"); return u.origin; } catch(e) { return ""; } })();
-  const raw = await Deno.core.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode);
+  const raw = await Deno.core.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode, fetchCredentials);
   const parsed = JSON.parse(raw);
   if (parsed.blocked) {
     const err = new TypeError('net::ERR_FAILED');
@@ -5097,6 +5104,7 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
       headers: this._headers,
       body: body || undefined,
       mode: 'cors',
+      credentials: this.withCredentials ? 'include' : 'same-origin',
     }).then(async (resp) => {
       if (xhr._aborted) return;
 
@@ -5318,21 +5326,39 @@ _markNative(globalThis.cancelIdleCallback);
 if (typeof Request === 'undefined') {
   globalThis.Request = class Request {
     constructor(input, init = {}) {
+      const inputRequest = input instanceof Request ? input : null;
       if (typeof input === 'string') { this.url = input; }
-      else if (input instanceof Request) { this.url = input.url; init = { ...input, ...init }; }
+      else if (inputRequest) { this.url = inputRequest.url; init = { ...inputRequest, ...init }; }
       else if (typeof URL === 'function' && input instanceof URL) { this.url = input.href; }
       else { this.url = input?.url || input?.href || String(input); }
       this.method = (init.method || 'GET').toUpperCase();
       this.headers = new Headers(init.headers);
       this.body = init.body || null;
       this.mode = init.mode || 'cors';
-      this.credentials = init.credentials || 'same-origin';
+      this.credentials = init.credentials !== undefined
+        ? String(init.credentials)
+        : (inputRequest ? inputRequest.credentials : 'same-origin');
+      if (this.credentials !== 'omit' && this.credentials !== 'same-origin' && this.credentials !== 'include') {
+        throw new TypeError("Failed to construct 'Request': '" + this.credentials + "' is not a valid RequestCredentials value");
+      }
       this.redirect = init.redirect || 'follow';
       this.referrer = init.referrer || '';
       this.signal = init.signal || { aborted: false, addEventListener(){}, removeEventListener(){} };
       this.cache = init.cache || 'default';
     }
-    clone() { return new Request(this.url, { method: this.method, headers: this.headers, body: this.body }); }
+    clone() {
+      return new Request(this.url, {
+        method: this.method,
+        headers: this.headers,
+        body: this.body,
+        mode: this.mode,
+        credentials: this.credentials,
+        redirect: this.redirect,
+        referrer: this.referrer,
+        signal: this.signal,
+        cache: this.cache,
+      });
+    }
     async text() { return this.body ? String(this.body) : ''; }
     async json() { return JSON.parse(await this.text()); }
     async arrayBuffer() { return new TextEncoder().encode(await this.text()).buffer; }

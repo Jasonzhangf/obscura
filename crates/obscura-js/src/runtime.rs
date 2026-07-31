@@ -5604,6 +5604,81 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn fetch_and_xhr_forward_browser_credentials_modes() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const originalFetchOp = Deno.core.ops.op_fetch_url;
+                    const calls = [];
+                    try {
+                        Deno.core.ops.op_fetch_url =
+                            (url, method, headers, body, origin, mode, credentials) => {
+                                calls.push({ url, credentials });
+                                return JSON.stringify({
+                                    status: 200,
+                                    headers: {},
+                                    body: "ok",
+                                    url,
+                                });
+                            };
+
+                        await fetch("/default");
+                        await fetch("/omit", { credentials: "omit" });
+                        const request = new Request("/included", { credentials: "include" });
+                        await fetch(request);
+                        await fetch(request.clone());
+                        await fetch(request, { credentials: "same-origin" });
+
+                        const sendXhr = (path, withCredentials) => new Promise((resolve, reject) => {
+                            const xhr = new XMLHttpRequest();
+                            xhr.open("GET", path);
+                            xhr.withCredentials = withCredentials;
+                            xhr.onload = resolve;
+                            xhr.onerror = reject;
+                            xhr.send();
+                        });
+                        await sendXhr("/xhr-default", false);
+                        await sendXhr("/xhr-credentialed", true);
+
+                        let invalidFetchRejected = false;
+                        try {
+                            await fetch("/bad", { credentials: "invalid" });
+                        } catch (error) {
+                            invalidFetchRejected = error instanceof TypeError;
+                        }
+
+                        return { calls, invalidFetchRejected };
+                    } finally {
+                        Deno.core.ops.op_fetch_url = originalFetchOp;
+                    }
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({
+                "calls": [
+                    { "url": "http://example.com/default", "credentials": "same-origin" },
+                    { "url": "http://example.com/omit", "credentials": "omit" },
+                    { "url": "http://example.com/included", "credentials": "include" },
+                    { "url": "http://example.com/included", "credentials": "include" },
+                    { "url": "http://example.com/included", "credentials": "same-origin" },
+                    { "url": "http://example.com/xhr-default", "credentials": "same-origin" },
+                    { "url": "http://example.com/xhr-credentialed", "credentials": "include" },
+                ],
+                "invalidFetchRejected": true,
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn dynamic_linked_stylesheet_enters_the_live_dom_with_imports_rebased() {
         let mut rt = setup_runtime(
             "<html><head></head><body><div class=\"card\"></div></body></html>",

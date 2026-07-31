@@ -188,19 +188,17 @@ impl StealthHttpClient {
         Err(ObscuraNetError::TooManyRedirects(url.to_string()))
     }
 
-    /// One request with no redirect following, for scripted fetch()/XHR. Reads
-    /// the cookie jar for the Cookie header and stores Set-Cookie back into it,
-    /// so the caller only owns redirect hops and SSRF re-validation. Used in
-    /// stealth mode so JS-level requests carry the same Chrome TLS fingerprint
-    /// and client hints as the main navigation instead of the rustls ClientHello
-    /// that op_fetch_url would otherwise send (which bot managers read as a
-    /// non-browser script and reject, e.g. the AWS WAF challenge verify call).
+    /// One request with no redirect following, for scripted fetch()/XHR. The
+    /// caller supplies the Fetch credentials decision for this redirect hop,
+    /// while this method preserves the Chrome transport fingerprint.
     pub async fn send_single(
         &self,
         method: &str,
         url: &Url,
         headers: &HashMap<String, String>,
         body: &str,
+        send_cookies: bool,
+        store_cookies: bool,
     ) -> Result<Response, ObscuraNetError> {
         if let Some(host) = url.host_str() {
             if crate::blocklist::is_blocked(host) {
@@ -220,9 +218,11 @@ impl StealthHttpClient {
             .map_err(|e| ObscuraNetError::Network(format!("invalid method '{}': {}", method, e)))?;
         let mut req = self.client.request(req_method, url.as_str());
 
-        let cookie_header = self.cookie_jar.get_cookie_header(url);
-        if !cookie_header.is_empty() {
-            req = req.header("cookie", &cookie_header);
+        if send_cookies {
+            let cookie_header = self.cookie_jar.get_cookie_header(url);
+            if !cookie_header.is_empty() {
+                req = req.header("cookie", &cookie_header);
+            }
         }
         for (k, v) in self.extra_headers.read().await.iter() {
             req = req.header(k.as_str(), v.as_str());
@@ -242,9 +242,11 @@ impl StealthHttpClient {
         self.in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
 
         let status = resp.status();
-        for val in resp.headers().get_all("set-cookie") {
-            if let Ok(s) = val.to_str() {
-                self.cookie_jar.set_cookie(s, url);
+        if store_cookies {
+            for val in resp.headers().get_all("set-cookie") {
+                if let Ok(s) = val.to_str() {
+                    self.cookie_jar.set_cookie(s, url);
+                }
             }
         }
         let response_headers: HashMap<String, String> = resp
