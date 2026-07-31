@@ -7914,6 +7914,145 @@ fn build_children_with_float_zone(
 ) -> Vec<taffy::NodeId> {
     let is_float = |cid: NodeId| styles.get(&cid).map(|s| s.float.is_some()).unwrap_or(false);
 
+    // A definite-height block whose only substantive contents are either one
+    // full-width float or one percentage float followed by one percentage
+    // inline atom has a bounded, single float band.  The general legacy path
+    // below cannot represent that shape: it puts the float in an auto-width,
+    // zero-height escape wrapper, so both percentage axes resolve against an
+    // indefinite synthetic box.  A Bootstrap `width:100%;height:100%` column
+    // then collapses or moves away from block-start, and the equally common
+    // `[float:left;width:50%][inline-block;width:50%]` control row gives the
+    // float zero size.
+    //
+    // Keep this deliberately narrower than a float manager.  In this exact
+    // one-band case a full-size flex row is only a placement representation:
+    // its percentage basis is the real containing block's content box, its
+    // block-start is the normal flow position, and it cannot incorrectly
+    // contain an escaping float because the parent already owns a definite
+    // block size.  Text, multiple flow siblings, auto sizes, and floats that
+    // can extend beyond an auto-height parent retain the general path.
+    let parent_has_definite_height = styles.get(&parent_id).is_some_and(|parent| {
+        matches!(
+            parent.height,
+            crate::Dimension::Px(_) | crate::Dimension::Percent(_)
+        ) && parent.size_expressions[1].is_none()
+            && !has_in_flow_generated_pseudo(parent.before_pseudo.as_deref())
+            && !has_in_flow_generated_pseudo(parent.after_pseudo.as_deref())
+    });
+    if parent_has_definite_height {
+        let fills_axis = |value: f32| (value - 1.0).abs() < 0.001;
+        let substantive: Vec<NodeId> = dom_children
+            .iter()
+            .copied()
+            .filter(|cid| {
+                tree.get_node(*cid).is_some_and(|node| {
+                    node.is_element() || !tree.text_content(*cid).trim().is_empty()
+                })
+            })
+            .collect();
+        let floated: Vec<NodeId> = substantive
+            .iter()
+            .copied()
+            .filter(|cid| is_float(*cid))
+            .collect();
+        if floated.len() == 1 {
+            let float_dom = floated[0];
+            let float_style = styles.get(&float_dom);
+            let float_percent_width = float_style.and_then(|style| match style.width {
+                crate::Dimension::Percent(value) => Some(value),
+                _ => None,
+            });
+            let float_fills_height = float_style.is_some_and(|style| {
+                matches!(style.height, crate::Dimension::Percent(value) if fills_axis(value))
+                    && style.size_expressions[1].is_none()
+            });
+            let sole_full_width_float = substantive.len() == 1
+                && float_percent_width.is_some_and(fills_axis)
+                && float_fills_height;
+            let split_band_flow = if substantive.len() == 2
+                && substantive[0] == float_dom
+                && float_style.and_then(|style| style.float) == Some(crate::Float::Left)
+                && float_fills_height
+            {
+                let flow_dom = substantive[1];
+                styles.get(&flow_dom).and_then(|flow_style| {
+                    let flow_percent_width = match flow_style.width {
+                        crate::Dimension::Percent(value) => value,
+                        _ => return None,
+                    };
+                    let flow_fills_height = matches!(
+                        flow_style.height,
+                        crate::Dimension::Percent(value) if fills_axis(value)
+                    ) && flow_style.size_expressions[1].is_none();
+                    let widths_fill_one_band = float_percent_width.is_some_and(|float_width| {
+                        float_width > 0.0
+                            && flow_percent_width > 0.0
+                            && (float_width + flow_percent_width - 1.0).abs() < 0.001
+                    });
+                    (flow_style.display != crate::Display::None
+                        && !flow_style.display_contents
+                        && flow_style.is_inline_block
+                        && flow_fills_height
+                        && widths_fill_one_band)
+                        .then_some(flow_dom)
+                })
+            } else {
+                None
+            };
+
+            if sole_full_width_float || split_band_flow.is_some() {
+                let float_node = build(
+                    tree,
+                    float_dom,
+                    taffy_tree,
+                    id_map,
+                    words,
+                    engine,
+                    ifc_items,
+                    styles,
+                );
+                // The split-band guard admits only a boxed inline-block
+                // element, so it must be built as one atomic box. Calling
+                // `build_any` here would be needlessly fragile: its text and
+                // transparent-inline branches may fan out into several nodes,
+                // and discovering that only after construction would leave
+                // detached nodes behind when falling back to the general path.
+                let flow_node = split_band_flow.and_then(|flow_dom| {
+                    build(
+                        tree,
+                        flow_dom,
+                        taffy_tree,
+                        id_map,
+                        words,
+                        engine,
+                        ifc_items,
+                        styles,
+                    )
+                });
+                if let Some(float_node) = float_node {
+                    if sole_full_width_float || flow_node.is_some() {
+                        let children: Vec<taffy::NodeId> =
+                            [Some(float_node), flow_node].into_iter().flatten().collect();
+                        let band_style = taffy::Style {
+                            display: taffy::style::Display::Flex,
+                            flex_direction: taffy::FlexDirection::Row,
+                            flex_wrap: taffy::FlexWrap::NoWrap,
+                            align_items: Some(taffy::AlignItems::FLEX_START),
+                            size: taffy::Size {
+                                width: taffy::Dimension::percent(1.0),
+                                height: taffy::Dimension::percent(1.0),
+                            },
+                            ..Default::default()
+                        };
+                        if let Ok(band) = taffy_tree.new_with_children(band_style, &children) {
+                            return vec![band];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // A block made entirely from inline-ish flow content and two or more
     // right floats is the classic utility/navigation bar. Right floats are
     // placed from the inline end inward, so their visual order is the reverse

@@ -886,6 +886,106 @@ fn float_exclusion_continues_through_non_bfc_block_wrappers() {
 }
 
 #[test]
+fn full_width_percentage_float_uses_definite_containing_block() {
+    let tree = parse_html(
+        r#"
+        <style>
+          html, body { margin: 0; width: 100%; height: 100% }
+          #host { width: 100%; height: 100% }
+          #float {
+            float: left;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            width: 100%;
+            height: 100%;
+          }
+          #badges { display: flex; gap: 20px }
+          .badge { width: 100px; height: 48px }
+        </style>
+        <div id="host">
+          <div id="float">
+            <div id="badges">
+              <div class="badge"></div>
+              <div class="badge"></div>
+              <div class="badge"></div>
+            </div>
+          </div>
+        </div>
+        "#,
+    );
+    let layout = layout_dom(&tree, (800.0, 600.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    let host = rect("host");
+    let float = rect("float");
+    let badges = rect("badges");
+    assert!(
+        (host.x - 0.0).abs() < 0.01
+            && (host.y - 0.0).abs() < 0.01
+            && (host.width - 800.0).abs() < 0.01
+            && (host.height - 600.0).abs() < 0.01,
+        "host: {host:?}"
+    );
+    assert!(
+        (float.x - 0.0).abs() < 0.01
+            && (float.y - 0.0).abs() < 0.01
+            && (float.width - 800.0).abs() < 0.01
+            && (float.height - 600.0).abs() < 0.01,
+        "float: {float:?}"
+    );
+    assert!(
+        (badges.x - 230.0).abs() < 0.01
+            && (badges.y - 0.0).abs() < 0.01
+            && (badges.width - 340.0).abs() < 0.01
+            && (badges.height - 48.0).abs() < 0.01,
+        "nested centered badges: {badges:?}"
+    );
+}
+
+#[test]
+fn percentage_float_and_inline_sibling_share_definite_height_band() {
+    let tree = parse_html(
+        r#"
+        <style>
+          html, body { margin: 0 }
+          #host {
+            box-sizing: border-box;
+            width: 400px;
+            height: 46px;
+            border: 1px solid;
+          }
+          #float, #flow {
+            box-sizing: border-box;
+            display: inline-block;
+            width: 50%;
+            height: 100%;
+          }
+          #float { float: left }
+        </style>
+        <div id="host"><button id="float"></button><button id="flow"></button></div>
+        "#,
+    );
+    let layout = layout_dom(&tree, (800.0, 200.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    let float = rect("float");
+    let flow = rect("flow");
+    assert!(
+        (float.x - 1.0).abs() < 0.01
+            && (float.y - 1.0).abs() < 0.01
+            && (float.width - 199.0).abs() < 0.01
+            && (float.height - 44.0).abs() < 0.01,
+        "float: {float:?}"
+    );
+    assert!(
+        (flow.x - 200.0).abs() < 0.01
+            && (flow.y - 1.0).abs() < 0.01
+            && (flow.width - 199.0).abs() < 0.01
+            && (flow.height - 44.0).abs() < 0.01,
+        "flow: {flow:?}"
+    );
+}
+
+#[test]
 fn replaced_image_contributes_intrinsic_size_in_ordered_grid() {
     let tree = parse_html(include_str!("../../../render-repros/replaced-grid-order.html"));
     let image_id = tree.get_element_by_id("image").unwrap();
