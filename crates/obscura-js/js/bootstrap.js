@@ -1925,6 +1925,16 @@ class Element extends Node {
     if (n === "style") this._style._replaceFromAttribute(value);
     if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev);
     if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('attributes', this._nid, [], [], n);
+    if (this.localName === "source"
+        && (n === "srcset" || n === "sizes" || n === "media" || n === "type")) {
+      const picture = this.parentElement;
+      const image = picture && picture.localName === "picture"
+        ? picture.querySelector("img")
+        : null;
+      if (image && typeof image._imageSourceChanged === "function") {
+        image._imageSourceChanged();
+      }
+    }
   }
   setAttributeNS(ns, n, v) {
     ns = ns == null || ns === '' ? '' : String(ns);
@@ -1934,7 +1944,23 @@ class Element extends Node {
     _dom("set_attribute_ns", this._nid, ns + "\0" + n + "\0" + value);
     if (ns === "" && n === "style") this._style._replaceFromAttribute(value);
   }
-  removeAttribute(n) { n = _htmlAttrName(this, n); const popoverPrev = (n === "popover") ? this.popover : undefined; _dom("remove_attribute", this._nid, n); if (n === "style") this._style._replaceFromAttribute(""); if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev); }
+  removeAttribute(n) {
+    n = _htmlAttrName(this, n);
+    const popoverPrev = (n === "popover") ? this.popover : undefined;
+    _dom("remove_attribute", this._nid, n);
+    if (n === "style") this._style._replaceFromAttribute("");
+    if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev);
+    if (this.localName === "source"
+        && (n === "srcset" || n === "sizes" || n === "media" || n === "type")) {
+      const picture = this.parentElement;
+      const image = picture && picture.localName === "picture"
+        ? picture.querySelector("img")
+        : null;
+      if (image && typeof image._imageSourceChanged === "function") {
+        image._imageSourceChanged();
+      }
+    }
+  }
   removeAttributeNS(ns, n) {
     ns = String(ns == null ? "" : ns);
     n = String(n);
@@ -3885,20 +3911,26 @@ function _imageEncodingError() {
 }
 
 // HTMLImageElement is backed by the same retained resource cache used by
-// layout/paint. The render-only native op fetches and sniffs the ordinary
-// `src`; bootstrap owns only the observable request state and event timing.
-// Responsive candidate selection remains explicitly deferred to the renderer.
+// layout/paint. The render-only native op owns responsive candidate selection,
+// fetching, and metadata sniffing; bootstrap owns only the observable request
+// state and event timing.
 class HTMLImageElement extends Element {
   constructor(nid) {
     super(nid);
     this._imageRequest = 0;
     this._imageQueued = false;
-    this._imageComplete = !this.getAttribute("src");
+    this._imageInitialized = false;
+    this._imageCompletionDeferred = false;
+    this._imageComplete = typeof Deno.core.ops.op_image_metadata === "function"
+      ? true
+      : !this.getAttribute("src");
     this._imageDecoded = false;
     this._imageNaturalWidth = 0;
     this._imageNaturalHeight = 0;
     this._imageCurrentSrc = "";
     this._imageDecodeWaiters = [];
+    this._refreshImageFromCache();
+    this._imageInitialized = true;
     // Parser images stay lazy until script observes their lifecycle or paint
     // asks for the same cache entry. Inline handlers are observers too.
     if (!this._imageComplete
@@ -3982,7 +4014,10 @@ class HTMLImageElement extends Element {
   setAttribute(name, value) {
     const normalized = String(name).toLowerCase();
     super.setAttribute(name, value);
-    if (normalized === "src") this._imageSourceChanged();
+    if (normalized === "src" || normalized === "srcset" || normalized === "sizes"
+        || normalized === "data-src" || normalized === "data-srcset") {
+      this._imageSourceChanged();
+    }
     else if ((normalized === "onload" || normalized === "onerror")
         && !this._imageComplete) this._queueImageRequest();
   }
@@ -3990,7 +4025,10 @@ class HTMLImageElement extends Element {
   removeAttribute(name) {
     const normalized = String(name).toLowerCase();
     super.removeAttribute(name);
-    if (normalized === "src") this._imageSourceChanged();
+    if (normalized === "src" || normalized === "srcset" || normalized === "sizes"
+        || normalized === "data-src" || normalized === "data-srcset") {
+      this._imageSourceChanged();
+    }
   }
 
   decode() {
@@ -4007,27 +4045,33 @@ class HTMLImageElement extends Element {
   }
 
   _imageSourceChanged() {
+    this._adoptImageCandidate("");
+    this._imageCompletionDeferred = true;
+    this._refreshImageFromCache(true);
+    if (!this._imageComplete) this._queueImageRequest();
+  }
+
+  _adoptImageCandidate(currentSrc) {
     this._rejectImageDecodes();
     this._imageRequest++;
     this._imageQueued = false;
     this._imageNaturalWidth = 0;
     this._imageNaturalHeight = 0;
     this._imageDecoded = false;
-    this._imageCurrentSrc = "";
-    this._imageComplete = !this.getAttribute("src");
-    if (!this._imageComplete) this._queueImageRequest();
+    this._imageCurrentSrc = currentSrc ? String(currentSrc) : "";
+    this._imageComplete = !this._imageCurrentSrc;
   }
 
   _queueImageRequest() {
     if (this._imageQueued || this._imageComplete) return;
     this._imageQueued = true;
     const request = this._imageRequest;
-    Promise.resolve().then(() => {
+    setTimeout(() => {
       this._imageQueued = false;
       if (request === this._imageRequest && !this._imageComplete) {
         this._runImageRequest(request);
       }
-    });
+    }, 1);
   }
 
   _runImageRequest(request) {
@@ -4049,23 +4093,51 @@ class HTMLImageElement extends Element {
     this._applyImageMetadata(metadata, request, true);
   }
 
-  _refreshImageFromCache() {
-    if (this._imageComplete || !this.getAttribute("src")) return;
+  _refreshImageFromCache(deferCompletion) {
     try {
       const op = Deno.core.ops.op_image_metadata;
       if (typeof op !== "function") return;
       const metadata = JSON.parse(op(this._nid >>> 0, true));
-      if (!metadata || metadata.state === "pending") return;
+      if (!metadata) return;
+      const selected = metadata.currentSrc ? String(metadata.currentSrc) : "";
+      if (selected !== this._imageCurrentSrc) {
+        this._adoptImageCandidate(selected);
+        // A live candidate switch is a new request even when paint retained
+        // the candidate bytes. A cache-only getter must not synchronously
+        // complete it and swallow the later load/error event.
+        if (this._imageInitialized && selected) {
+          this._imageCompletionDeferred = true;
+        }
+      }
+      if (metadata.state === "pending") {
+        if (selected && this._imageComplete) {
+          this._adoptImageCandidate(selected);
+        }
+        return;
+      }
+      if ((deferCompletion || this._imageCompletionDeferred) && selected) {
+        this._imageComplete = false;
+        this._imageDecoded = false;
+        this._imageNaturalWidth = 0;
+        this._imageNaturalHeight = 0;
+        return;
+      }
       this._applyImageMetadata(metadata, this._imageRequest, false);
     } catch (_error) {}
   }
 
   _applyImageMetadata(metadata, request, dispatchEvent) {
     if (request !== this._imageRequest) return;
-    this._imageComplete = true;
-    this._imageCurrentSrc = metadata && metadata.currentSrc
+    const selected = metadata && metadata.currentSrc
       ? String(metadata.currentSrc)
-      : this.src;
+      : "";
+    if (selected !== this._imageCurrentSrc) {
+      this._adoptImageCandidate(selected);
+      request = this._imageRequest;
+    }
+    this._imageCompletionDeferred = false;
+    this._imageComplete = true;
+    this._imageCurrentSrc = selected || this.src;
     const width = Number(metadata && metadata.width);
     const height = Number(metadata && metadata.height);
     const loaded = !!(metadata && metadata.ok)

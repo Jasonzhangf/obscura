@@ -2115,52 +2115,87 @@ fn op_image_metadata(state: &OpState, nid: u32, cached_only: bool) -> String {
     let shared = state.borrow::<SharedState>().clone();
     let mut gs = shared.borrow_mut();
     let node_id = NodeId::new(nid);
-    let src = gs.dom.as_ref().and_then(|dom| {
-        let node = dom.get_node(node_id)?;
-        let element = node.as_element()?;
-        if element.local.as_ref() != "img" {
-            return None;
-        }
-        node.get_attribute("src").map(str::to_string)
+    let is_image = gs.dom.as_ref().is_some_and(|dom| {
+        dom.get_node(node_id)
+            .is_some_and(|node| {
+                node.as_element()
+                    .is_some_and(|element| element.local.as_ref() == "img")
+            })
     });
-    let Some(src) = src.filter(|src| !src.trim().is_empty()) else {
+    if !is_image {
+        return serde_json::json!({ "ok": false, "currentSrc": "" }).to_string();
+    }
+    let base_url = document_base_url(&gs);
+    let viewport = gs.viewport;
+    let ObscuraState {
+        dom,
+        render_resources,
+        ..
+    } = &mut *gs;
+    let Some(dom) = dom.as_ref() else {
         return serde_json::json!({ "ok": false, "currentSrc": "" }).to_string();
     };
-    let base_url = document_base_url(&gs);
-    let metadata = if cached_only {
-        match gs
-            .render_resources
-            .cached_image_metadata(&src, base_url.as_deref())
-        {
-            None => {
-                return serde_json::json!({ "state": "pending" }).to_string();
-            }
+    let (current_src, density, known, dimensions) = if cached_only {
+        match render_resources.cached_image_element_metadata(
+            dom,
+            node_id,
+            viewport,
+            base_url.as_deref(),
+        ) {
             Some(metadata) => metadata,
+            None => {
+                return serde_json::json!({
+                    "state": "error",
+                    "ok": false,
+                    "currentSrc": "",
+                })
+                .to_string();
+            }
         }
     } else {
-        gs.render_resources
-            .image_metadata(&src, base_url.as_deref())
+        match render_resources.image_element_metadata(
+            dom,
+            node_id,
+            viewport,
+            base_url.as_deref(),
+        ) {
+            Some((current_src, density, dimensions)) => {
+                (current_src, density, true, dimensions)
+            }
+            None => {
+                return serde_json::json!({
+                    "state": "error",
+                    "ok": false,
+                    "currentSrc": "",
+                })
+                .to_string();
+            }
+        }
     };
-    match metadata {
-        Some((current_src, width, height)) => serde_json::json!({
+    if !known {
+        return serde_json::json!({
+            "state": "pending",
+            "currentSrc": current_src,
+            "density": density,
+        })
+        .to_string();
+    }
+    match dimensions {
+        Some((width, height)) => serde_json::json!({
             "state": "loaded",
             "ok": true,
             "currentSrc": current_src,
+            "density": density,
             "width": width,
             "height": height,
         })
         .to_string(),
         None => {
-            let current_src = base_url
-                .as_deref()
-                .and_then(|base| url::Url::parse(base).ok())
-                .and_then(|base| base.join(&src).ok())
-                .map(|url| url.to_string())
-                .unwrap_or(src);
             serde_json::json!({
                 "state": "error",
                 "ok": false,
                 "currentSrc": current_src,
+                "density": density,
             })
             .to_string()
         }

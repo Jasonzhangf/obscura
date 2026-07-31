@@ -162,6 +162,49 @@ impl RenderResourceCache {
         }
     }
 
+    /// Select and inspect the resource for one live `<img>` using the same
+    /// `picture`/`srcset`/`sizes` algorithm as `collect_image_intrinsics`.
+    /// Dimensions are returned in CSS pixels after candidate-density scaling.
+    /// A selected URL with `None` dimensions is an authoritative load/decode
+    /// failure.
+    pub fn image_element_metadata(
+        &mut self,
+        tree: &DomTree,
+        id: obscura_dom::tree::NodeId,
+        viewport: (f32, f32),
+        base_url: Option<&str>,
+    ) -> Option<(String, f32, Option<(f32, f32)>)> {
+        let (src, density) = resolve_img_url(tree, id, viewport)?;
+        let resolved_url = resolve_resource_url(&src, base_url).unwrap_or(src);
+        let dimensions = fetch_bytes(&resolved_url, None, self)
+            .and_then(|bytes| image_metadata_from_bytes(&bytes))
+            .map(|(width, height)| (width / density, height / density));
+        Some((resolved_url, density, dimensions))
+    }
+
+    /// Cache-only counterpart to [`Self::image_element_metadata`]. The boolean
+    /// is false only when the selected candidate has no live cache outcome;
+    /// callers may queue the loading form without ever blocking a getter.
+    pub fn cached_image_element_metadata(
+        &self,
+        tree: &DomTree,
+        id: obscura_dom::tree::NodeId,
+        viewport: (f32, f32),
+        base_url: Option<&str>,
+    ) -> Option<(String, f32, bool, Option<(f32, f32)>)> {
+        let (src, density) = resolve_img_url(tree, id, viewport)?;
+        let resolved_url = resolve_resource_url(&src, base_url).unwrap_or(src);
+        match self.cached_image_metadata(&resolved_url, None) {
+            None => Some((resolved_url, density, false, None)),
+            Some(dimensions) => Some((
+                resolved_url,
+                density,
+                true,
+                dimensions.map(|(_, width, height)| (width / density, height / density)),
+            )),
+        }
+    }
+
     fn get_or_load(&mut self, url: &str) -> Option<Arc<[u8]>> {
         if let Some(entry) = self.entries.get(url) {
             match entry {

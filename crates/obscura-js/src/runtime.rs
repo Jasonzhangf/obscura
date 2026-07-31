@@ -4455,6 +4455,176 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn responsive_picture_lifecycle_tracks_viewport_density_and_source_media() {
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = requests.clone();
+        let png = two_by_three_png();
+        let mut rt = parser_image_runtime(
+            r#"
+                <picture>
+                    <source type="image/avif" srcset="unsupported.avif">
+                    <source id="wide-source" media="(min-width: 800px)"
+                            srcset="wide.png 2x">
+                    <source media="(max-width: 799px)" srcset="narrow.png">
+                    <img id="responsive-picture" src="fallback.png">
+                </picture>
+            "#,
+            move |url: &str| {
+                seen.lock().unwrap().push(url.to_string());
+                Some(png.clone())
+            },
+        );
+        rt.set_viewport(1000.0, 600.0);
+        rt.execute_script(
+            "observe-responsive-picture",
+            r#"
+                globalThis.__pictureLoads = [];
+                const pictureImage = document.getElementById("responsive-picture");
+                pictureImage.addEventListener("load", () => {
+                    __pictureLoads.push(pictureImage.currentSrc);
+                });
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate(
+                "[pictureImage.currentSrc, pictureImage.naturalWidth, \
+                  pictureImage.naturalHeight, __pictureLoads]"
+            )
+            .unwrap(),
+            serde_json::json!([
+                "http://example.com/page/wide.png",
+                1,
+                2,
+                ["http://example.com/page/wide.png"]
+            ])
+        );
+
+        // A live viewport change re-runs the renderer's media/source
+        // selection. The cache-only complete getter must report pending but
+        // must not perform the load itself.
+        rt.set_viewport(600.0, 600.0);
+        assert_eq!(rt.evaluate("pictureImage.complete").unwrap(), serde_json::json!(false));
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate(
+                "[pictureImage.currentSrc, pictureImage.naturalWidth, \
+                  pictureImage.naturalHeight, __pictureLoads]"
+            )
+            .unwrap(),
+            serde_json::json!([
+                "http://example.com/page/narrow.png",
+                2,
+                3,
+                [
+                    "http://example.com/page/wide.png",
+                    "http://example.com/page/narrow.png"
+                ]
+            ])
+        );
+
+        // Mutating a <source> selection input invalidates its associated img.
+        // The wide bytes are already shared in the render cache, but lifecycle
+        // completion remains task-queued and emits one new load event.
+        rt.execute_script(
+            "mutate-picture-source",
+            r#"
+                document.getElementById("wide-source").setAttribute("media", "all");
+                globalThis.__pictureCompleteAfterSourceMutation = pictureImage.complete;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            rt.evaluate("__pictureCompleteAfterSourceMutation").unwrap(),
+            serde_json::json!(false)
+        );
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("[pictureImage.currentSrc, __pictureLoads]").unwrap(),
+            serde_json::json!([
+                "http://example.com/page/wide.png",
+                [
+                    "http://example.com/page/wide.png",
+                    "http://example.com/page/narrow.png",
+                    "http://example.com/page/wide.png"
+                ]
+            ])
+        );
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec![
+                "http://example.com/page/wide.png".to_string(),
+                "http://example.com/page/narrow.png".to_string(),
+            ]
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn responsive_srcset_sizes_uses_renderer_selected_current_src() {
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = requests.clone();
+        let png = two_by_three_png();
+        let mut rt = parser_image_runtime(
+            r#"<img id="responsive-srcset" src="fallback.png"
+                     srcset="small.png 400w, large.png 800w" sizes="400px">"#,
+            move |url: &str| {
+                seen.lock().unwrap().push(url.to_string());
+                Some(png.clone())
+            },
+        );
+        rt.execute_script(
+            "observe-responsive-srcset",
+            r#"
+                globalThis.__srcsetLoads = [];
+                const srcsetImage = document.getElementById("responsive-srcset");
+                srcsetImage.addEventListener("load", () => {
+                    __srcsetLoads.push(srcsetImage.currentSrc);
+                });
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("[srcsetImage.currentSrc, __srcsetLoads]").unwrap(),
+            serde_json::json!([
+                "http://example.com/page/small.png",
+                ["http://example.com/page/small.png"]
+            ])
+        );
+
+        change_srcset_image_sizes(&mut rt);
+        assert_eq!(rt.evaluate("srcsetImage.complete").unwrap(), serde_json::json!(false));
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("[srcsetImage.currentSrc, __srcsetLoads]").unwrap(),
+            serde_json::json!([
+                "http://example.com/page/large.png",
+                [
+                    "http://example.com/page/small.png",
+                    "http://example.com/page/large.png"
+                ]
+            ])
+        );
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec![
+                "http://example.com/page/small.png".to_string(),
+                "http://example.com/page/large.png".to_string(),
+            ]
+        );
+    }
+
+    #[cfg(feature = "render")]
+    fn change_srcset_image_sizes(rt: &mut ObscuraJsRuntime) {
+        rt.execute_script("change-responsive-sizes", r#"srcsetImage.sizes = "800px";"#)
+            .unwrap();
+    }
+
     /// Regression for #105: `HTMLFormElement` must expose `.elements` so
     /// frameworks that probe form field collections work.
     #[test]
