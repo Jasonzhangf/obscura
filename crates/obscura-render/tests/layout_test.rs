@@ -945,6 +945,40 @@ fn full_width_percentage_float_uses_definite_containing_block() {
 }
 
 #[test]
+fn clearfix_contains_a_full_width_definite_height_float() {
+    let tree = parse_html(
+        r#"
+        <style>
+          html, body { margin: 0 }
+          #host { width: 100% }
+          #host::before, #host::after { content: " "; display: table }
+          #host::after { clear: both }
+          #float { float: left; width: 100%; height: 600px }
+        </style>
+        <div id="host"><div id="float"></div></div>
+        "#,
+    );
+    let layout = layout_dom(&tree, (800.0, 700.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    let host = rect("host");
+    let float = rect("float");
+    assert!(
+        (host.x - 0.0).abs() < 0.01
+            && (host.y - 0.0).abs() < 0.01
+            && (host.width - 800.0).abs() < 0.01
+            && (host.height - 600.0).abs() < 0.01,
+        "host: {host:?}"
+    );
+    assert!(
+        (float.x - 0.0).abs() < 0.01
+            && (float.y - 0.0).abs() < 0.01
+            && (float.width - 800.0).abs() < 0.01
+            && (float.height - 600.0).abs() < 0.01,
+        "float: {float:?}"
+    );
+}
+
+#[test]
 fn percentage_float_and_inline_sibling_share_definite_height_band() {
     let tree = parse_html(
         r#"

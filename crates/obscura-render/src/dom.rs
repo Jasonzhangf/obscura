@@ -7952,7 +7952,13 @@ fn build_children_with_float_zone(
             crate::Dimension::Px(_) | crate::Dimension::Percent(_)
         ) && parent.size_expressions[1].is_none()
     });
-    if parent_has_definite_height {
+    let parent_has_clearfix = styles.get(&parent_id).is_some_and(|parent| {
+        parent.after_pseudo.as_deref().is_some_and(|after| {
+            matches!(after.clear, Some(crate::Clear::Left | crate::Clear::Both))
+                && has_in_flow_generated_pseudo(Some(after))
+        })
+    });
+    if parent_has_definite_height || parent_has_clearfix {
         let fills_axis = |value: f32| (value - 1.0).abs() < 0.001;
         let substantive: Vec<NodeId> = dom_children
             .iter()
@@ -7979,10 +7985,14 @@ fn build_children_with_float_zone(
                 matches!(style.height, crate::Dimension::Percent(value) if fills_axis(value))
                     && style.size_expressions[1].is_none()
             });
+            let float_has_definite_height = float_style.is_some_and(|style| {
+                matches!(style.height, crate::Dimension::Px(_)) && style.size_expressions[1].is_none()
+            }) || float_fills_height;
             let sole_full_width_float = substantive.len() == 1
                 && float_percent_width.is_some_and(fills_axis)
-                && float_fills_height;
-            let split_band_flow = if substantive.len() == 2
+                && float_has_definite_height;
+            let split_band_flow = if parent_has_definite_height
+                && substantive.len() == 2
                 && substantive[0] == float_dom
                 && float_style.and_then(|style| style.float) == Some(crate::Float::Left)
                 && float_fills_height
@@ -8053,7 +8063,11 @@ fn build_children_with_float_zone(
                             align_items: Some(taffy::AlignItems::FLEX_START),
                             size: taffy::Size {
                                 width: taffy::Dimension::percent(1.0),
-                                height: taffy::Dimension::percent(1.0),
+                                height: if parent_has_definite_height {
+                                    taffy::Dimension::percent(1.0)
+                                } else {
+                                    taffy::Dimension::auto()
+                                },
                             },
                             ..Default::default()
                         };
