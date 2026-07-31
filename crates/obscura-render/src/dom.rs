@@ -4568,6 +4568,17 @@ fn build_any(
     let Some(inner) = build(tree, id, taffy_tree, id_map, words, engine, ifc_items, styles) else {
         return Vec::new();
     };
+    let inline_align = styles.get(&id).and_then(|style| {
+        if !crate::is_inline_level_box(style) {
+            return None;
+        }
+        match style.vertical_align {
+            Some(crate::VerticalAlign::Middle) => Some(taffy::AlignSelf::CENTER),
+            Some(crate::VerticalAlign::Bottom) => Some(taffy::AlignSelf::FLEX_END),
+            Some(crate::VerticalAlign::Top) => Some(taffy::AlignSelf::FLEX_START),
+            None => None,
+        }
+    });
     let needs_outer = styles.get(&id).is_some_and(|style| {
         style.is_inline_block
             && matches!(style.display, crate::Display::Flex | crate::Display::Grid)
@@ -4575,6 +4586,13 @@ fn build_any(
             && style.size_expressions[0].is_none()
     });
     if !needs_outer {
+        if let Some(align_self) = inline_align {
+            if let Ok(current) = taffy_tree.style(inner) {
+                let mut adjusted = current.clone();
+                adjusted.align_self = Some(align_self);
+                let _ = taffy_tree.set_style(inner, adjusted);
+            }
+        }
         return vec![inner];
     }
 
@@ -4583,11 +4601,43 @@ fn build_any(
     // the available width. A transparent atomic outer node supplies the
     // shrink-wrapping inline participation while the authored node retains its
     // real Flex/Grid layout and remains the DOM geometry/paint owner.
+    let transfers_inline_constraint = styles.get(&id).is_some_and(|style| {
+        style.min_width != crate::Dimension::Auto
+            || style.max_width != crate::Dimension::Auto
+            || style.size_expressions[2].is_some()
+            || style.size_expressions[4].is_some()
+    });
+    let (outer_min_width, outer_max_width) = if transfers_inline_constraint {
+        taffy_tree
+            .style(inner)
+            .map(|inner_style| (inner_style.min_size.width, inner_style.max_size.width))
+            .unwrap_or((taffy::Dimension::auto(), taffy::Dimension::auto()))
+    } else {
+        (taffy::Dimension::auto(), taffy::Dimension::auto())
+    };
+    if transfers_inline_constraint {
+        if let Ok(current) = taffy_tree.style(inner) {
+            let mut adjusted = current.clone();
+            adjusted.size.width = taffy::Dimension::percent(1.0);
+            adjusted.min_size.width = taffy::Dimension::auto();
+            adjusted.max_size.width = taffy::Dimension::auto();
+            let _ = taffy_tree.set_style(inner, adjusted);
+        }
+    }
     let outer_style = taffy::Style {
         display: taffy::style::Display::Flex,
         flex_direction: taffy::FlexDirection::Row,
         flex_wrap: taffy::FlexWrap::Wrap,
         align_items: Some(taffy::AlignItems::FLEX_START),
+        align_self: inline_align,
+        min_size: taffy::Size {
+            width: outer_min_width,
+            height: taffy::Dimension::auto(),
+        },
+        max_size: taffy::Size {
+            width: outer_max_width,
+            height: taffy::Dimension::auto(),
+        },
         ..Default::default()
     };
     match taffy_tree.new_with_children(outer_style, &[inner]) {
@@ -7967,6 +8017,70 @@ mod tests {
                 "{name}: {item:?}"
             );
         }
+    }
+
+    #[test]
+    fn inline_flex_and_grid_resolve_percentage_min_max_against_containing_block() {
+        let tree = parse_html(
+            r#"<style>
+                html,body{margin:0}
+                .host{width:700px}
+                .flex{display:inline-flex}
+                .grid{display:inline-grid}
+                .max{max-width:50%}
+                .min{min-width:50%}
+                .wide{width:500px;height:20px}
+                .narrow{width:100px;height:20px}
+            </style>
+            <div class="host"><div id="flex-max" class="flex max"><div class="wide"></div></div></div>
+            <div class="host"><div id="grid-max" class="grid max"><div class="wide"></div></div></div>
+            <div class="host"><div id="flex-min" class="flex min"><div class="narrow"></div></div></div>
+            <div class="host"><div id="grid-min" class="grid min"><div class="narrow"></div></div></div>"#,
+        );
+        let laid = layout_dom(&tree, (800.0, 300.0));
+        for name in ["flex-max", "grid-max", "flex-min", "grid-min"] {
+            let item = laid.rects[&tree.get_element_by_id(name).unwrap()];
+            assert!(
+                (item.width - 350.0).abs() < 0.01,
+                "{name} resolved its percentage constraint against the wrong box: {item:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn inline_atomic_vertical_align_controls_cross_axis_placement() {
+        let tree = parse_html(
+            r#"<style>
+                html,body{margin:0}
+                .line{font:20px/40px sans-serif}
+                .atom{display:inline-flex;width:30px}
+                .bottom{vertical-align:bottom}
+                .middle{vertical-align:middle}
+                #bottom-short,#middle-short{height:10px}
+                #bottom-tall,#middle-tall{height:30px}
+            </style>
+            <div class="line">x<span id="bottom-short" class="atom bottom"></span><span id="bottom-tall" class="atom bottom"></span></div>
+            <div class="line">x<span id="middle-short" class="atom middle"></span><span id="middle-tall" class="atom middle"></span></div>"#,
+        );
+        let laid = layout_dom(&tree, (800.0, 200.0));
+        let rect = |name| laid.rects[&tree.get_element_by_id(name).unwrap()];
+        let bottom_short = rect("bottom-short");
+        let bottom_tall = rect("bottom-tall");
+        assert!(
+            (bottom_short.y + bottom_short.height - bottom_tall.y - bottom_tall.height).abs()
+                < 0.01,
+            "bottom-aligned atoms did not share a line bottom: {bottom_short:?} {bottom_tall:?}"
+        );
+        let middle_short = rect("middle-short");
+        let middle_tall = rect("middle-tall");
+        assert!(
+            (middle_short.y + middle_short.height / 2.0
+                - middle_tall.y
+                - middle_tall.height / 2.0)
+                .abs()
+                < 0.01,
+            "middle-aligned atoms did not share a line center: {middle_short:?} {middle_tall:?}"
+        );
     }
 
     #[test]
