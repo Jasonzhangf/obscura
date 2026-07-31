@@ -73,23 +73,44 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
     } else if tag == "body" {
         style.margin = Edges { top: 8.0, right: 8.0, bottom: 8.0, left: 8.0 };
     } else if tag == "h1" {
-        style.font_size = Some(32.0);
+        style.font_size = None;
+        style.font_size_raw = Some(crate::Dimension::Em(2.0));
         style.font_weight = Some("bold".to_string());
-        style.margin = Edges { top: 21.0, bottom: 21.0, left: 0.0, right: 0.0 };
+        style.margin_relative[0] = Some(crate::Dimension::Em(0.67));
+        style.margin_relative[2] = Some(crate::Dimension::Em(0.67));
     } else if tag == "h2" {
-        style.font_size = Some(24.0);
+        style.font_size = None;
+        style.font_size_raw = Some(crate::Dimension::Em(1.5));
         style.font_weight = Some("bold".to_string());
-        style.margin = Edges { top: 19.0, bottom: 19.0, left: 0.0, right: 0.0 };
+        style.margin_relative[0] = Some(crate::Dimension::Em(0.83));
+        style.margin_relative[2] = Some(crate::Dimension::Em(0.83));
     } else if tag == "h3" {
-        style.font_size = Some(18.7);
+        style.font_size = None;
+        style.font_size_raw = Some(crate::Dimension::Em(1.17));
         style.font_weight = Some("bold".to_string());
-        style.margin = Edges { top: 18.0, bottom: 18.0, left: 0.0, right: 0.0 };
-    } else if tag == "h4" || tag == "h5" || tag == "h6" {
-        style.font_size = Some(16.0);
+        style.margin_relative[0] = Some(crate::Dimension::Em(1.0));
+        style.margin_relative[2] = Some(crate::Dimension::Em(1.0));
+    } else if tag == "h4" {
+        style.font_size = None;
+        style.font_size_raw = Some(crate::Dimension::Em(1.0));
         style.font_weight = Some("bold".to_string());
-        style.margin = Edges { top: 21.0, bottom: 21.0, left: 0.0, right: 0.0 };
-    } else if matches!(tag, "p" | "ul" | "ol" | "menu" | "dir") {
-        style.margin = Edges { top: 16.0, bottom: 16.0, left: 0.0, right: 0.0 };
+        style.margin_relative[0] = Some(crate::Dimension::Em(1.33));
+        style.margin_relative[2] = Some(crate::Dimension::Em(1.33));
+    } else if tag == "h5" {
+        style.font_size = None;
+        style.font_size_raw = Some(crate::Dimension::Em(0.83));
+        style.font_weight = Some("bold".to_string());
+        style.margin_relative[0] = Some(crate::Dimension::Em(1.67));
+        style.margin_relative[2] = Some(crate::Dimension::Em(1.67));
+    } else if tag == "h6" {
+        style.font_size = None;
+        style.font_size_raw = Some(crate::Dimension::Em(0.67));
+        style.font_weight = Some("bold".to_string());
+        style.margin_relative[0] = Some(crate::Dimension::Em(2.33));
+        style.margin_relative[2] = Some(crate::Dimension::Em(2.33));
+    } else if matches!(tag, "p" | "dl" | "ul" | "ol" | "menu" | "dir") {
+        style.margin_relative[0] = Some(crate::Dimension::Em(1.0));
+        style.margin_relative[2] = Some(crate::Dimension::Em(1.0));
         if matches!(tag, "ul" | "menu" | "dir") {
             style.list_style = Some(crate::ListStyle::Disc);
             style.padding.left = 40.0;
@@ -4307,10 +4328,31 @@ fn font_size_keyword(v: &str) -> Option<f32> {
 }
 
 fn apply_font_size(style: &mut LayoutStyle, value: &str) {
-    if value.trim().contains('(') {
+    let value = value.trim();
+    match value.to_ascii_lowercase().as_str() {
+        // font-size is inherited; unset therefore has inherit semantics.
+        "inherit" | "unset" => {
+            style.font_size = None;
+            style.font_size_raw = None;
+            style.font_size_expression = None;
+            return;
+        }
+        "initial" => {
+            style.font_size = Some(16.0);
+            style.font_size_raw = None;
+            style.font_size_expression = None;
+            return;
+        }
+        // The compact cascade does not retain origin/layer history. Preserve
+        // the already-applied lower-origin value instead of treating revert
+        // as inherit or initial.
+        "revert" | "revert-layer" => return,
+        _ => {}
+    }
+    if value.contains('(') {
         style.font_size = None;
         style.font_size_raw = None;
-        style.font_size_expression = Some(value.trim().to_string());
+        style.font_size_expression = Some(value.to_string());
         return;
     }
     style.font_size_expression = None;

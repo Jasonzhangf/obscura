@@ -1395,6 +1395,39 @@ fn cascade_walk(
         let mut style = crate::style::ua_style(elem.local.as_ref());
         style.is_replaced_box = crate::inline::is_replaced(elem.local.as_ref());
         style.color_scheme_dark = inherited_color_scheme_dark;
+        if matches!(elem.local.as_ref(), "dir" | "dl" | "menu" | "ol" | "ul") {
+            let mut list_ancestor_count = 0usize;
+            let mut has_list_or_definition_ancestor = false;
+            let mut ancestor = node.parent;
+            while let Some(ancestor_id) = ancestor {
+                let Some(ancestor_node) = tree.get_node(ancestor_id) else {
+                    break;
+                };
+                if let Some(ancestor_element) = ancestor_node.as_element() {
+                    let local = ancestor_element.local.as_ref();
+                    if matches!(local, "dir" | "dl" | "menu" | "ol" | "ul") {
+                        has_list_or_definition_ancestor = true;
+                    }
+                    if matches!(local, "dir" | "menu" | "ol" | "ul") {
+                        list_ancestor_count += 1;
+                    }
+                }
+                ancestor = ancestor_node.parent;
+            }
+            if has_list_or_definition_ancestor {
+                style.margin.top = 0.0;
+                style.margin.bottom = 0.0;
+                style.margin_relative[0] = None;
+                style.margin_relative[2] = None;
+            }
+            if matches!(elem.local.as_ref(), "dir" | "menu" | "ul") {
+                style.list_style = match list_ancestor_count {
+                    0 => Some(crate::ListStyle::Disc),
+                    1 => Some(crate::ListStyle::Circle),
+                    _ => Some(crate::ListStyle::Square),
+                };
+            }
+        }
         if matches!(elem.local.as_ref(), "td" | "th") {
             if let Some(padding) = inherited_cell_padding {
                 style.padding = crate::Edges {
@@ -11183,6 +11216,91 @@ mod tests {
             "A<br><br>B must form three 20px lines: {:?}",
             laid.rects[&consecutive]
         );
+    }
+
+    #[test]
+    fn ua_block_margins_resolve_against_the_computed_element_font() {
+        let tree = parse_html(
+            r#"<style>
+                body { margin:0 }
+                h1 { font-size:40px }
+                p { font-size:24px }
+            </style>
+            <h1 id="heading">Heading</h1>
+            <p id="paragraph">Paragraph</p>
+            <section style="font-size:20px">
+              <h1 id="h1">H1</h1><h2 id="h2">H2</h2><h3 id="h3">H3</h3>
+              <h4 id="h4">H4</h4><h5 id="h5">H5</h5><h6 id="h6">H6</h6>
+              <h1 id="inherit-size" style="font-size:inherit">Inherited</h1>
+              <h1 id="initial-size" style="font-size:initial">Initial</h1>
+            </section>
+            <ul id="outer-list"><li>
+              <ul id="second-list"><li>
+                <ol><li><ul id="third-list"></ul></li></ol>
+              </li></ul>
+            </li></ul>
+            <dl><dd><ul id="definition-list-child"></ul></dd></dl>"#,
+        );
+        let laid = layout_dom(&tree, (800.0, 400.0));
+        let heading = tree.get_element_by_id("heading").unwrap();
+        let paragraph = tree.get_element_by_id("paragraph").unwrap();
+
+        assert!(
+            (laid.styles[&heading].margin.top - 26.8).abs() < 0.01
+                && (laid.styles[&heading].margin.bottom - 26.8).abs() < 0.01,
+            "h1's 0.67em UA margins must follow its authored 40px font: {:?}",
+            laid.styles[&heading].margin
+        );
+        assert!(
+            (laid.styles[&paragraph].margin.top - 24.0).abs() < 0.01
+                && (laid.styles[&paragraph].margin.bottom - 24.0).abs() < 0.01,
+            "p's 1em UA margins must follow its authored 24px font: {:?}",
+            laid.styles[&paragraph].margin
+        );
+        for (id, size, margin) in [
+            ("h1", 40.0, 26.8),
+            ("h2", 30.0, 24.9),
+            ("h3", 23.4, 23.4),
+            ("h4", 20.0, 26.6),
+            ("h5", 16.6, 27.722),
+            ("h6", 13.4, 31.222),
+        ] {
+            let style = &laid.styles[&tree.get_element_by_id(id).unwrap()];
+            assert!(
+                (style.font_size.unwrap() - size).abs() < 0.01
+                    && (style.margin.top - margin).abs() < 0.01
+                    && (style.margin.bottom - margin).abs() < 0.01,
+                "{id} UA font and margins must resolve from the inherited 20px font: size={:?}, margin={:?}",
+                style.font_size,
+                style.margin
+            );
+        }
+        for (id, size, margin) in [
+            ("inherit-size", 20.0, 13.4),
+            ("initial-size", 16.0, 10.72),
+        ] {
+            let style = &laid.styles[&tree.get_element_by_id(id).unwrap()];
+            assert!(
+                (style.font_size.unwrap() - size).abs() < 0.01
+                    && (style.margin.top - margin).abs() < 0.01,
+                "{id} CSS-wide font-size semantics must override the UA heading size: size={:?}, margin={:?}",
+                style.font_size,
+                style.margin
+            );
+        }
+        for (id, marker) in [
+            ("second-list", crate::ListStyle::Circle),
+            ("third-list", crate::ListStyle::Square),
+            ("definition-list-child", crate::ListStyle::Disc),
+        ] {
+            let style = &laid.styles[&tree.get_element_by_id(id).unwrap()];
+            assert_eq!(style.margin.top, 0.0, "{id} must lose nested UA margins");
+            assert_eq!(
+                style.margin.bottom, 0.0,
+                "{id} must lose nested UA margins"
+            );
+            assert_eq!(style.list_style, Some(marker), "{id} marker depth");
+        }
     }
 
     #[test]
