@@ -559,6 +559,21 @@ fn sync_resolved_percentage_padding(
     generated: &[GeneratedBoxBuild],
     styles: &mut HashMap<NodeId, crate::LayoutStyle>,
 ) {
+    let has_percentage_padding = styles.values().any(|style| {
+        style.padding_percent.iter().any(Option::is_some)
+            || style
+                .before_pseudo
+                .as_deref()
+                .is_some_and(|pseudo| pseudo.padding_percent.iter().any(Option::is_some))
+            || style
+                .after_pseudo
+                .as_deref()
+                .is_some_and(|pseudo| pseudo.padding_percent.iter().any(Option::is_some))
+    });
+    if !has_percentage_padding {
+        return;
+    }
+
     fn sync(style: &mut crate::LayoutStyle, containing_block_width: f32) {
         if let Some(percent) = style.padding_percent[0] {
             style.padding.top = percent * containing_block_width;
@@ -634,6 +649,19 @@ fn sync_positioned_pseudo_percentage_padding(
     rects: &HashMap<NodeId, Rect>,
     styles: &mut HashMap<NodeId, crate::LayoutStyle>,
 ) {
+    let has_positioned_percentage_padding = styles.values().any(|style| {
+        [style.before_pseudo.as_deref(), style.after_pseudo.as_deref()]
+            .into_iter()
+            .flatten()
+            .any(|pseudo| {
+                pseudo.position == Some(taffy::Position::Absolute)
+                    && pseudo.padding_percent.iter().any(Option::is_some)
+            })
+    });
+    if !has_positioned_percentage_padding {
+        return;
+    }
+
     fn sync(pseudo: &mut crate::LayoutStyle, containing_block_width: f32) {
         if pseudo.position != Some(taffy::Position::Absolute) {
             return;
