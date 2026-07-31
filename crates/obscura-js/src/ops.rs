@@ -525,6 +525,15 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
         "create_document_fragment" => {
             dom.new_node(NodeData::Document).index().to_string()
         }
+        "clone_node" => {
+            let nid = match arg1.parse::<u32>() {
+                Ok(n) => n,
+                Err(_) => return "-1".into(),
+            };
+            dom.clone_node(NodeId::new(nid), arg2 == "true")
+                .map(|id| id.index().to_string())
+                .unwrap_or("-1".into())
+        }
         "create_element" => {
             dom.new_node(NodeData::Element {
                 name: html5ever::QualName::new(None, html5ever::ns!(html), html5ever::LocalName::from(arg1.as_str())),

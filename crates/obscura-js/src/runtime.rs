@@ -4623,15 +4623,92 @@ mod tests {
     }
 
     #[test]
-    fn test_clone_node_deep() {
-        let mut rt = setup_runtime(r#"<div id="src"><p>A</p><p>B</p></div>"#);
-        rt.execute_script("test", r#"
-            var src = document.getElementById('src');
-            var clone = src.cloneNode(true);
-            document.body.appendChild(clone);
-        "#).unwrap();
-        let count = rt.evaluate("document.querySelectorAll('p').length").unwrap();
-        assert!(count.as_f64().unwrap() as i64 >= 4, "Deep clone should duplicate <p> children, got: {}", count);
+    fn shallow_element_clone_preserves_interface_attributes_and_isolation() {
+        let mut rt = setup_runtime(
+            r#"<section id="src" class="source" data-token="original"><span>child</span></section>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+                const source = document.getElementById('src');
+                const clone = source.cloneNode(false);
+                clone.className = 'clone';
+                source.setAttribute('data-token', 'changed');
+                return [
+                    clone instanceof Node,
+                    clone instanceof Element,
+                    clone instanceof HTMLElement,
+                    typeof clone.outerHTML,
+                    typeof clone.querySelectorAll,
+                    clone.tagName,
+                    clone.id,
+                    clone.className,
+                    clone.getAttribute('data-token'),
+                    clone.childNodes.length,
+                    clone.ownerDocument === document,
+                    clone.parentNode === null,
+                    clone !== source,
+                    source.className,
+                    source.getAttribute('data-token'),
+                    source.childNodes.length,
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                true, true, true, "string", "function", "SECTION", "src", "clone",
+                "original", 0, true, true, true, "source", "changed", 1
+            ])
+        );
+    }
+
+    #[test]
+    fn deep_document_element_clone_stays_an_independent_html_element() {
+        let mut rt = setup_runtime(
+            r#"<html lang="en" data-root="original"><head><title>Clone</title></head><body><main id="app" data-state="source"><p class="item">original text</p></main></body></html>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+                const source = document.documentElement;
+                const clone = source.cloneNode(true);
+                const cloneItem = clone.querySelector('.item');
+                const sourceItem = source.querySelector('.item');
+                cloneItem.textContent = 'clone text';
+                source.querySelector('#app').setAttribute('data-state', 'changed');
+                clone.setAttribute('lang', 'fr');
+                return [
+                    clone instanceof Element,
+                    clone instanceof HTMLElement,
+                    clone.tagName,
+                    typeof clone.outerHTML,
+                    typeof clone.querySelectorAll,
+                    clone.querySelectorAll('head, body, main, p').length,
+                    clone.ownerDocument === document,
+                    clone.parentNode === null,
+                    clone !== source,
+                    clone.querySelector('body') !== document.body,
+                    clone.getAttribute('data-root'),
+                    clone.getAttribute('lang'),
+                    source.getAttribute('lang'),
+                    cloneItem.textContent,
+                    sourceItem.textContent,
+                    clone.querySelector('#app').getAttribute('data-state'),
+                    source.querySelector('#app').getAttribute('data-state'),
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                true, true, "HTML", "string", "function", 4, true, true, true,
+                true, "original", "fr", "en", "clone text", "original text",
+                "source", "changed"
+            ])
+        );
     }
 
     #[test]

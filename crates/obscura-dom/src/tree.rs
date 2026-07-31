@@ -873,6 +873,67 @@ impl DomTree {
         }
     }
 
+    /// Clone one node within this tree without attaching the clone.
+    ///
+    /// This operates on node data directly instead of serializing and parsing
+    /// HTML. Besides avoiding context-sensitive fragment parsing (`<html>`,
+    /// table children, and foreign content), it preserves the cloned root's
+    /// element type and namespace. Template contents are stored in a separate
+    /// document node and therefore need their own remapped clone.
+    pub fn clone_node(&self, source_node_id: NodeId, deep: bool) -> Option<NodeId> {
+        let source_data = self.get_node(source_node_id)?.data;
+        let cloned_root = self.new_node(source_data);
+        let mut stack = Vec::new();
+        self.prepare_cloned_children(source_node_id, cloned_root, deep, &mut stack);
+
+        while let Some((dest_parent, source_node)) = stack.pop() {
+            let source_data = match self.get_node(source_node) {
+                Some(node) => node.data,
+                None => continue,
+            };
+            let cloned_node = self.new_node(source_data);
+            self.append_child(dest_parent, cloned_node);
+            self.prepare_cloned_children(source_node, cloned_node, true, &mut stack);
+        }
+
+        Some(cloned_root)
+    }
+
+    fn prepare_cloned_children(
+        &self,
+        source_node: NodeId,
+        cloned_node: NodeId,
+        deep: bool,
+        stack: &mut Vec<(NodeId, NodeId)>,
+    ) {
+        let source_contents = self
+            .with_node(source_node, |node| match &node.data {
+                NodeData::Element { template_contents, .. } => *template_contents,
+                _ => None,
+            })
+            .flatten();
+
+        if let Some(source_contents) = source_contents {
+            let cloned_contents = self.new_node(NodeData::Document);
+            self.with_node_mut(cloned_node, |node| {
+                if let NodeData::Element { template_contents, .. } = &mut node.data {
+                    *template_contents = Some(cloned_contents);
+                }
+            });
+            if deep {
+                for child in self.children(source_contents).into_iter().rev() {
+                    stack.push((cloned_contents, child));
+                }
+            }
+        }
+
+        if deep {
+            for child in self.children(source_node).into_iter().rev() {
+                stack.push((cloned_node, child));
+            }
+        }
+    }
+
     fn import_node_from(&self, parent_id: NodeId, source: &DomTree, source_node_id: NodeId) {
         // Iterative DFS with an explicit (dest_parent, source_node) stack so a
         // deeply nested source tree cannot overflow the thread stack and abort

@@ -1233,6 +1233,10 @@ class Node {
   contains(o) { return o ? _dom("contains", this._nid, o._nid) === "true" : false; }
   hasChildNodes() { return _dom("has_child_nodes", this._nid) === "true"; }
   cloneNode(deep) {
+    const t = this.nodeType;
+    if (t === 1) {
+      return _wrap(+_dom("clone_node", this._nid, deep ? "true" : "false"));
+    }
     // Clone structurally via real DOM nodes rather than round-tripping through a
     // throwaway <div>.innerHTML: the fragment parser discards elements that are
     // not valid children of <div> (<tr>, <td>, <option>, …), so the old path
