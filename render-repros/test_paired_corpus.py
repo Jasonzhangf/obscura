@@ -40,20 +40,77 @@ class ControlledScrollTests(unittest.TestCase):
             "requestedY=document.documentElement.scrollHeight", expression
         )
         self.assertIn("window.scrollTo(requestedX,requestedY)", expression)
+        self.assertIn("preInitialActual", expression)
+        self.assertIn("postInitialActual", expression)
+        self.assertNotIn("behavior:'instant'", expression)
+
+    def test_chromium_reassert_records_settled_and_final_offsets(self):
+        class FakePage:
+            def __init__(self):
+                self.calls = []
+
+            def evaluate(self, expression, argument):
+                self.calls.append((expression, argument))
+                return {
+                    "requested": {"x": 4, "y": 300},
+                    "pre_reassert_actual": {"x": 4, "y": 287},
+                    "final_actual": {"x": 4, "y": 300},
+                    "reassert_behavior": "instant",
+                }
+
+        page = FakePage()
+        result = paired_corpus.reassert_chromium_controlled_scroll(
+            page, (4, 300)
+        )
+        self.assertEqual(result["pre_reassert_actual"]["y"], 287)
+        self.assertEqual(result["final_actual"]["y"], 300)
+        expression, argument = page.calls[0]
+        self.assertEqual(argument, [4, 300])
+        self.assertIn('behavior: "instant"', expression)
+        self.assertLess(
+            expression.index("beforeReassert"),
+            expression.index("window.scrollTo({"),
+        )
 
     def test_capture_report_uses_post_settle_state(self):
         stdout = (
             "diagnostic\n"
-            '{"evaluation":"{\\"requested\\":{\\"x\\":0,\\"y\\":2702}}",'
+            '{"evaluation":"{\\"requested\\":{\\"x\\":0,\\"y\\":2702},'
+            '\\"controlled_scroll\\":{\\"requested\\":{\\"x\\":0,\\"y\\":2702},'
+            '\\"pre_initial_actual\\":{\\"x\\":0,\\"y\\":0},'
+            '\\"post_initial_actual\\":{\\"x\\":0,\\"y\\":12},'
+            '\\"initial_behavior\\":\\"authored\\"}}",'
+            '"controlledScroll":{"requested":{"x":0,"y":2702},'
+            '"preReassertActual":{"x":0,"y":1791},'
+            '"finalReassertActual":{"x":0,"y":1802},'
+            '"behavior":"instant",'
+            '"phase":"immediately-before-capture-state-and-screenshot"},'
             '"captureState":{"scrollX":0,"scrollY":1802,'
             '"innerWidth":1280,"innerHeight":900,'
             '"scrollWidth":1291,"scrollHeight":2702}}\n'
         )
         state = paired_corpus.parse_obscura_scroll_report(stdout)
         self.assertEqual(state["requested"], {"x": 0, "y": 2702})
+        self.assertEqual(
+            state["pre_reassert_actual"], {"x": 0, "y": 1791}
+        )
+        self.assertEqual(state["pre_initial_actual"], {"x": 0, "y": 0})
+        self.assertEqual(state["post_initial_actual"], {"x": 0, "y": 12})
+        self.assertEqual(
+            state["final_reassert_actual"], {"x": 0, "y": 1802}
+        )
         self.assertEqual(state["actual"], {"x": 0, "y": 1802})
+        self.assertEqual(state["reassert_behavior"], "instant")
         self.assertEqual(state["content"]["height"], 2702)
         self.assertEqual(state["sampled_phase"], "immediately-before-screenshot")
+
+    def test_obscura_capture_exports_final_scroll_request_to_cli(self):
+        environment = paired_corpus.obscura_environment(1280, 720)
+        paired_corpus.with_controlled_scroll_environment(
+            environment, (12, "bottom")
+        )
+        self.assertEqual(environment["OBSCURA_SHOT_SCROLL_X"], "12")
+        self.assertEqual(environment["OBSCURA_SHOT_SCROLL_Y"], "bottom")
 
     def test_every_capture_expression_samples_page_state_without_scrolling(self):
         expression = paired_corpus.obscura_state_eval_expression(None)

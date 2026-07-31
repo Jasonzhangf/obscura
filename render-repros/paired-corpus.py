@@ -161,10 +161,66 @@ def scroll_eval_expression(scroll):
     return obscura_state_eval_expression(scroll)
 
 
+def reassert_chromium_controlled_scroll(page, scroll):
+    """Reassert an exact capture offset after the page's settle interval.
+
+    The first controlled scroll intentionally obeys the page's authored
+    `scroll-behavior` and participates in ordinary scroll anchoring while the
+    page settles. That is useful runtime evidence, but it is not a stable
+    screenshot coordinate: a shrinking region above the viewport can move the
+    final offset even when both engines laid it out correctly. Preserve that
+    settled offset, then issue one explicit instant scroll immediately before
+    state sampling and paint.
+    """
+    scroll_x, scroll_y = scroll
+    return page.evaluate(
+        """([x, y]) => {
+          const requestedY = y === "bottom"
+            ? document.documentElement.scrollHeight
+            : y;
+          const beforeReassert = {x: window.scrollX, y: window.scrollY};
+          try {
+            window.scrollTo({
+              left: x,
+              top: requestedY,
+              behavior: "instant"
+            });
+          } catch (_) {
+            const root = document.documentElement;
+            const previous = root ? root.style.getPropertyValue(
+              "scroll-behavior") : "";
+            const priority = root ? root.style.getPropertyPriority(
+              "scroll-behavior") : "";
+            if (root) {
+              root.style.setProperty("scroll-behavior", "auto", "important");
+            }
+            window.scrollTo(x, requestedY);
+            if (root) {
+              if (previous) {
+                root.style.setProperty("scroll-behavior", previous, priority);
+              } else {
+                root.style.removeProperty("scroll-behavior");
+              }
+            }
+          }
+          return {
+            requested: {x, y: requestedY},
+            pre_reassert_actual: beforeReassert,
+            final_actual: {x: window.scrollX, y: window.scrollY},
+            reassert_behavior: "instant",
+            pre_reassert_phase: "after-controlled-scroll-settle",
+            final_phase: "immediately-before-state-and-screenshot"
+          };
+        }""",
+        [scroll_x, scroll_y],
+    )
+
+
 def obscura_state_eval_expression(scroll, geometry_selectors=None):
     """Sample the live page after an optional scroll and immediately before paint."""
     scroll_script = ""
     requested = "null"
+    controlled_scroll_result = "null"
     if scroll is not None:
         scroll_x, scroll_y = scroll
         requested_y = (
@@ -174,9 +230,19 @@ def obscura_state_eval_expression(scroll, geometry_selectors=None):
         )
         scroll_script = (
             f"const requestedX={scroll_x},requestedY={requested_y};"
+            "const preInitialActual={x:window.scrollX,y:window.scrollY};"
             "window.scrollTo(requestedX,requestedY);"
+            "const postInitialActual={x:window.scrollX,y:window.scrollY};"
         )
         requested = "{x:requestedX,y:requestedY}"
+        controlled_scroll_result = (
+            "{requested:{x:requestedX,y:requestedY},"
+            "pre_initial_actual:preInitialActual,"
+            "post_initial_actual:postInitialActual,"
+            "initial_behavior:'authored',"
+            "initial_phase:'before-cli-post-eval-settle',"
+            "final_phase:'cli-capture-state-after-post-eval-settle'}"
+        )
     geometry_setup = ""
     geometry_result = ""
     if geometry_selectors:
@@ -203,9 +269,10 @@ def obscura_state_eval_expression(scroll, geometry_selectors=None):
         "return ('00000000'+(h>>>0).toString(16)).slice(-8)};"
         + geometry_setup
         + "return JSON.stringify({"
-        "sampled_phase:'immediately-before-screenshot',"
+        "sampled_phase:'before-cli-post-eval-settle',"
         + geometry_result
         + f"requested:{requested},"
+        + f"controlled_scroll:{controlled_scroll_result},"
         "url:location.href,"
         "document:{ready_state:document.readyState,"
         "element_count:document.getElementsByTagName('*').length,"
@@ -277,6 +344,9 @@ def parse_obscura_capture_report(stdout):
             }
         )
         state["geometry"] = geometry
+        if isinstance(report.get("controlledScroll"), dict):
+            state["controlled_scroll_capture"] = report["controlledScroll"]
+        state["evaluation_sampled_phase"] = state.get("sampled_phase")
         state["sampled_phase"] = "immediately-before-screenshot"
         return state
     return None
@@ -287,8 +357,20 @@ def parse_obscura_scroll_report(stdout):
     if state is None:
         return None
     geometry = state.get("geometry") or {}
+    controlled = state.get("controlled_scroll") or {}
+    capture_controlled = state.get("controlled_scroll_capture") or {}
     return {
-        "requested": state.get("requested"),
+        "requested": (
+            capture_controlled.get("requested")
+            or controlled.get("requested")
+            or state.get("requested")
+        ),
+        "pre_reassert_actual": capture_controlled.get("preReassertActual"),
+        "pre_initial_actual": controlled.get("pre_initial_actual"),
+        "post_initial_actual": controlled.get("post_initial_actual"),
+        "final_reassert_actual": capture_controlled.get(
+            "finalReassertActual"
+        ),
         "actual": {"x": geometry.get("scroll_x"), "y": geometry.get("scroll_y")},
         "viewport": {
             "width": geometry.get("inner_width"),
@@ -298,6 +380,12 @@ def parse_obscura_scroll_report(stdout):
             "width": geometry.get("document_scroll_width"),
             "height": geometry.get("document_scroll_height"),
         },
+        "reassert_behavior": capture_controlled.get("behavior"),
+        "pre_reassert_phase": capture_controlled.get("phase"),
+        "final_phase": (
+            capture_controlled.get("phase")
+            or controlled.get("final_phase")
+        ),
         "sampled_phase": state["sampled_phase"],
     }
 
@@ -320,6 +408,14 @@ def obscura_environment(width, height):
         # making a renderer comparison answer the wrong question.
         OBSCURA_PROFILE=str(CANONICAL_OBSCURA_PROFILE),
     )
+    return env
+
+
+def with_controlled_scroll_environment(env, scroll):
+    """Copy capture-only final scroll coordinates into the CLI environment."""
+    if scroll is not None:
+        env["OBSCURA_SHOT_SCROLL_X"] = str(scroll[0])
+        env["OBSCURA_SHOT_SCROLL_Y"] = str(scroll[1])
     return env
 
 
@@ -445,7 +541,9 @@ def capture_obscura(
     scroll=None,
     geometry_selectors=None,
 ):
-    env = obscura_environment(width, height)
+    env = with_controlled_scroll_environment(
+        obscura_environment(width, height), scroll
+    )
     command = [
         binary,
         "fetch",
@@ -1003,7 +1101,10 @@ def main():
         "settle_semantics": (
             "full wall-clock interval while pumping each engine; when a "
             "controlled scroll is requested, the same interval runs once "
-            "after load and once after scrolling"
+            "after load and once after the initial scroll. Both engines record "
+            "the resulting anchored offset and then reassert the requested "
+            "offset with instant behavior immediately before capture state "
+            "and paint"
         ),
         "animation_sampling": (
             {
@@ -1047,9 +1148,11 @@ def main():
         "state_observability": {
             "chromium": "same page, sampled immediately before screenshot",
             "obscura": (
-                "same live page sampled immediately before screenshot; the CLI "
-                "captureState records the exact shared PreparedRender viewport, "
-                "scroll offset, and content size used by paint"
+                "DOM/resource probes are sampled by the eval that begins the "
+                "post-eval settle; the CLI captureState is sampled afterward, "
+                "following the final instant scroll reassert, and records the "
+                "exact shared PreparedRender viewport, scroll offset, and "
+                "content size used by paint"
             ),
         },
         "methodology_limits": {
@@ -1058,10 +1161,13 @@ def main():
                 "fidelity verdict"
             ),
             "controlled_scroll": (
-                "CSSOM and screenshot paint share one resource-aware "
-                "PreparedRender. Content-size and scroll deltas are exact for "
-                "each captured engine, but different DOM/resource states can "
-                "still make semantic bottom landmarks differ."
+                "The settled pre-reassert offset is diagnostic evidence, not "
+                "the comparison coordinate: authored smooth scrolling and "
+                "scroll anchoring can legitimately move it while layout above "
+                "the viewport changes. The requested offset is reasserted "
+                "instantly for final state and paint. CSSOM and screenshot "
+                "paint share one resource-aware PreparedRender, but different "
+                "content sizes can still clamp the same request differently."
             ),
             "page_state": (
                 "DOM/text fingerprints and length deltas expose different live "
@@ -1205,6 +1311,7 @@ def main():
                     )
 
                 chrome_started = time.time()
+                chromium_scroll_state = None
                 try:
                     page.goto(url, wait_until="load", timeout=50000)
                     page.wait_for_timeout(args.settle_ms)
@@ -1225,11 +1332,21 @@ def main():
                         animation_sampling = freeze_chromium_animations(
                             page, args.animation_time_ms
                         )
+                    if controlled_scroll is not None:
+                        chromium_scroll_state = (
+                            reassert_chromium_controlled_scroll(
+                                page, controlled_scroll
+                            )
+                        )
                     chromium_state_ok = False
                     try:
                         chromium_state = capture_chromium_state(
                             page, args.geometry_selector
                         )
+                        if chromium_scroll_state is not None:
+                            chromium_state["controlled_scroll"] = (
+                                chromium_scroll_state
+                            )
                         if animation_sampling is not None:
                             chromium_state["animation_sampling"] = (
                                 animation_sampling
@@ -1265,6 +1382,9 @@ def main():
                     "elapsed_s": round(time.time() - chrome_started, 3),
                     "title": page.title() if chrome_ok else None,
                     "state": chromium_state if chrome_ok else None,
+                    "scroll_state": (
+                        chromium_scroll_state if chrome_ok else None
+                    ),
                 }
                 context.close()
                 page_result["obscura"] = ours_future.result()
@@ -1322,6 +1442,12 @@ def main():
                     )
                     page_result["controlled_scroll_comparison"] = {
                         "comparable": comparable,
+                        "obscura_pre_reassert_actual": ours_scroll.get(
+                            "pre_reassert_actual"
+                        ),
+                        "chromium_pre_reassert_actual": (
+                            chromium_scroll_state or {}
+                        ).get("pre_reassert_actual"),
                         "obscura_actual": ours_actual,
                         "chromium_actual": {
                             "x": chrome_geometry.get("scroll_x"),

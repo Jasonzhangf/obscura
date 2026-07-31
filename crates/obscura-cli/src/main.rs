@@ -728,6 +728,51 @@ async fn run_fetch(
     if let Some(ref path) = screenshot {
         #[cfg(feature = "render")]
         {
+            // Paired renderer captures need a stable final coordinate after
+            // the post-eval settle. Authored smooth scrolling and scroll
+            // anchoring may legitimately move an earlier scrollTo while the
+            // page changes above the viewport, so the comparison harness opts
+            // into one instant reassertion at the actual capture boundary.
+            // Ordinary CLI screenshots are unchanged when these private
+            // capture-environment variables are absent.
+            let controlled_scroll = std::env::var("OBSCURA_SHOT_SCROLL_Y")
+                .ok()
+                .and_then(|raw_y| {
+                    let x = match std::env::var("OBSCURA_SHOT_SCROLL_X") {
+                        Ok(raw) => raw
+                            .parse::<f64>()
+                            .ok()
+                            .filter(|value| value.is_finite())?,
+                        Err(_) => 0.0,
+                    };
+                    let requested_y = if raw_y.eq_ignore_ascii_case("bottom") {
+                        "document.documentElement.scrollHeight".to_string()
+                    } else {
+                        raw_y
+                            .parse::<f64>()
+                            .ok()
+                            .filter(|value| value.is_finite())
+                            .map(|value| value.to_string())?
+                    };
+                    Some(page.evaluate(&format!(
+                        "(()=>{{\
+                         const requestedX={x},requestedY={requested_y};\
+                         const preReassert={{x:window.scrollX,y:window.scrollY}};\
+                         const root=document.documentElement;\
+                         const previous=root?root.style.getPropertyValue('scroll-behavior'):'';\
+                         const priority=root?root.style.getPropertyPriority('scroll-behavior'):'';\
+                         if(root)root.style.setProperty('scroll-behavior','auto','important');\
+                         window.scrollTo(requestedX,requestedY);\
+                         if(root){{if(previous)root.style.setProperty('scroll-behavior',previous,priority);\
+                         else root.style.removeProperty('scroll-behavior')}}\
+                         return {{requested:{{x:requestedX,y:requestedY}},\
+                         preReassertActual:preReassert,\
+                         finalReassertActual:{{x:window.scrollX,y:window.scrollY}},\
+                         behavior:'instant',\
+                         phase:'immediately-before-capture-state-and-screenshot'}}\
+                         }})()"
+                    )))
+                });
             let capture_state = deferred_eval_output.as_ref().map(|_| {
                 page.evaluate(
                     "(()=>({\
@@ -755,6 +800,7 @@ async fn run_fetch(
                     "{}",
                     serde_json::json!({
                         "evaluation": result,
+                        "controlledScroll": controlled_scroll,
                         "captureState": capture_state.unwrap_or(serde_json::Value::Null),
                     })
                 );
