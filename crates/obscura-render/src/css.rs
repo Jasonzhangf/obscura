@@ -96,6 +96,21 @@ struct PseudoRule {
     container_condition_id: ContainerConditionId,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct KeyframeStop {
+    /// CSS keyframes always provide an offset. Keeping this optional makes the
+    /// normalization rule explicit and reusable by future script-created
+    /// keyframes without changing the sampler.
+    offset: Option<f32>,
+    declarations: String,
+    source_order: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Keyframes {
+    stops: Vec<KeyframeStop>,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ContainerBox {
     pub(crate) container_type: crate::ContainerType,
@@ -468,10 +483,10 @@ pub struct Stylesheet {
     rules: Vec<Rule>,
     /// Index zero is the unconditional sentinel.
     container_conditions: Vec<ContainerConditionNode>,
-    /// Final declarations from `@keyframes name { ... 100%/to { ... } }`.
-    /// Static screenshots are taken after the requested settle interval, so a
-    /// finite forwards-filled animation contributes this declaration block.
-    keyframe_ends: HashMap<String, String>,
+    /// Every offset from each `@keyframes` rule. The opacity sampler resolves
+    /// property-specific segments at the stylesheet's explicit sample time.
+    keyframes: HashMap<String, Keyframes>,
+    animation_sample_time: crate::AnimationSampleTime,
     by_id: HashMap<String, Vec<usize>>,
     by_class: HashMap<String, Vec<usize>>,
     by_local: HashMap<String, Vec<usize>>,
@@ -545,13 +560,28 @@ impl Stylesheet {
         sources: &[String],
         viewport: (f32, f32),
     ) -> Self {
+        Self::parse_for_viewport_at_animation_time(
+            tree,
+            sources,
+            viewport,
+            crate::AnimationSampleTime::default(),
+        )
+    }
+
+    pub fn parse_for_viewport_at_animation_time(
+        tree: &DomTree,
+        sources: &[String],
+        viewport: (f32, f32),
+        animation_sample_time: crate::AnimationSampleTime,
+    ) -> Self {
         let mut sheet = Stylesheet {
             rules: Vec::new(),
             container_conditions: vec![ContainerConditionNode {
                 parent: ContainerConditionId::NONE,
                 alternatives: Vec::new(),
             }],
-            keyframe_ends: HashMap::new(),
+            keyframes: HashMap::new(),
+            animation_sample_time,
             by_id: HashMap::new(),
             by_class: HashMap::new(),
             by_local: HashMap::new(),
@@ -561,8 +591,8 @@ impl Stylesheet {
         };
         let mut order = 0usize;
         for src in sources {
-            for (name, decls) in extract_keyframe_end_states(src) {
-                sheet.keyframe_ends.insert(name, decls);
+            for (name, keyframes) in extract_keyframes(src) {
+                sheet.keyframes.insert(name, keyframes);
             }
             let parsed = parse_stylesheet_for_viewport_preserving_containers(
                 src,
@@ -969,19 +999,28 @@ impl Stylesheet {
         let expanded = substitute_declarations(&inline_normal, props);
         crate::style::apply_declarations_with_locked_color_scheme(style, &expanded);
 
-        // CSS animations form a cascade origin above normal author rules and
-        // below author !important. A static renderer has no compositor clock;
-        // after page settling, the useful deterministic state for a finite
-        // forwards/both animation is its final keyframe. Infinite animations
-        // intentionally keep their ordinary computed values.
-        if style.animation_fill_forwards && !style.animation_iteration_infinite {
-            if let Some(name) = style.animation_name.as_deref() {
-                if let Some(decls) = self.keyframe_ends.get(name) {
-                    let expanded = substitute_declarations(decls, props);
-                    crate::style::apply_declarations_with_locked_color_scheme(
-                        style,
-                        &expanded,
-                    );
+        // Animation control properties from author !important participate in
+        // computed timing, while the animated value itself remains below the
+        // important author origin. Resolve those controls on a temporary style
+        // before sampling, then let the ordinary important pass override the
+        // sampled opacity where appropriate.
+        let mut animation_style = style.clone();
+        for &(_, _, i) in &matched {
+            let expanded = substitute_declarations(&self.rules[i].important_decls, props);
+            crate::style::apply_animation_declarations(&mut animation_style, &expanded);
+        }
+        let expanded = substitute_declarations(&inline_important, props);
+        crate::style::apply_animation_declarations(&mut animation_style, &expanded);
+        if let Some(name) = animation_style.animation_name.as_deref() {
+            if let Some(keyframes) = self.keyframes.get(name) {
+                if let Some(opacity) = sample_animation_opacity(
+                    keyframes,
+                    style.opacity.unwrap_or(1.0),
+                    &animation_style.animation_timing,
+                    self.animation_sample_time,
+                    props,
+                ) {
+                    style.opacity = Some(opacity);
                 }
             }
         }
@@ -999,10 +1038,10 @@ impl Stylesheet {
     }
 }
 
-/// Collect the declaration block for each keyframes rule's `to`/`100%` stop.
-/// This is deliberately independent of selector parsing: keyframe selectors
-/// are percentages, not DOM selectors, and must never enter the rule index.
-fn extract_keyframe_end_states(css: &str) -> Vec<(String, String)> {
+/// Collect every offset and declaration block from standard and prefixed
+/// keyframes rules. Keyframe selectors are percentages rather than DOM
+/// selectors and must never enter the ordinary rule index.
+fn extract_keyframes(css: &str) -> Vec<(String, Keyframes)> {
     let lower = css.to_ascii_lowercase();
     let mut found = Vec::new();
     let mut cursor = 0usize;
@@ -1061,21 +1100,246 @@ fn extract_keyframe_end_states(css: &str) -> Vec<(String, String)> {
         }
         let Some(close) = close else { break };
         let inner = &css[open + 1..close];
-        let mut final_decls = None;
-        for (selector, decls) in parse_stylesheet_for_viewport(inner, (1280.0, 720.0)) {
-            if selector
-                .split(',')
-                .any(|part| matches!(part.trim().to_ascii_lowercase().as_str(), "to" | "100%"))
-            {
-                final_decls = Some(decls);
+        let mut stops = Vec::new();
+        for (source_order, (selector, declarations)) in
+            parse_stylesheet_for_viewport(inner, (1280.0, 720.0))
+                .into_iter()
+                .enumerate()
+        {
+            for part in selector.split(',') {
+                if let Some(offset) = parse_keyframe_offset(part) {
+                    stops.push(KeyframeStop {
+                        offset: Some(offset),
+                        declarations: declarations.clone(),
+                        source_order,
+                    });
+                }
             }
         }
-        if let Some(decls) = final_decls {
-            found.push((name.to_string(), decls));
+        if !stops.is_empty() {
+            found.push((name.to_string(), Keyframes { stops }));
         }
         cursor = close + 1;
     }
     found
+}
+
+fn parse_keyframe_offset(value: &str) -> Option<f32> {
+    let value = value.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "from" => Some(0.0),
+        "to" => Some(1.0),
+        _ => value
+            .strip_suffix('%')?
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .filter(|offset| offset.is_finite() && (0.0..=100.0).contains(offset))
+            .map(|offset| offset / 100.0),
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AnimationPhase {
+    Before,
+    Active,
+    After,
+}
+
+fn sample_animation_opacity(
+    keyframes: &Keyframes,
+    underlying: f32,
+    timing: &crate::AnimationTiming,
+    sample_time: crate::AnimationSampleTime,
+    props: &HashMap<String, String>,
+) -> Option<f32> {
+    let progress = animation_directed_progress(timing, sample_time)?;
+    let normalized = normalized_keyframe_offsets(&keyframes.stops);
+    let mut opacity_stops = Vec::<(f32, usize, f32)>::new();
+    for (offset, stop) in normalized {
+        let expanded = substitute_declarations(&stop.declarations, props);
+        if let Some(opacity) = opacity_from_declarations(&expanded) {
+            opacity_stops.push((offset, stop.source_order, opacity));
+        }
+    }
+    if opacity_stops.is_empty() {
+        return None;
+    }
+    opacity_stops.sort_by(|left, right| {
+        left.0
+            .total_cmp(&right.0)
+            .then(left.1.cmp(&right.1))
+    });
+    let mut merged = Vec::<(f32, f32)>::new();
+    for (offset, _, opacity) in opacity_stops {
+        if merged.last().is_some_and(|last| last.0 == offset) {
+            merged.last_mut().unwrap().1 = opacity;
+        } else {
+            merged.push((offset, opacity));
+        }
+    }
+    if merged.first().is_none_or(|stop| stop.0 > 0.0) {
+        merged.insert(0, (0.0, underlying));
+    }
+    if merged.last().is_none_or(|stop| stop.0 < 1.0) {
+        merged.push((1.0, underlying));
+    }
+    if progress <= merged[0].0 {
+        return Some(merged[0].1.clamp(0.0, 1.0));
+    }
+    for pair in merged.windows(2) {
+        let (from_offset, from_value) = pair[0];
+        let (to_offset, to_value) = pair[1];
+        if progress <= to_offset {
+            if progress == to_offset || to_offset == from_offset {
+                return Some(to_value.clamp(0.0, 1.0));
+            }
+            let position = (progress - from_offset) / (to_offset - from_offset);
+            return Some((from_value + (to_value - from_value) * position).clamp(0.0, 1.0));
+        }
+    }
+    Some(merged.last().unwrap().1.clamp(0.0, 1.0))
+}
+
+fn opacity_from_declarations(declarations: &str) -> Option<f32> {
+    let mut opacity = None;
+    for declaration in crate::style::split_declarations(declarations) {
+        let Some((name, value)) = declaration.split_once(':') else { continue };
+        if name.trim().eq_ignore_ascii_case("opacity") {
+            if let Ok(parsed) = value.trim().parse::<f32>() {
+                if parsed.is_finite() {
+                    opacity = Some(parsed);
+                }
+            }
+        }
+    }
+    opacity
+}
+
+fn animation_directed_progress(
+    timing: &crate::AnimationTiming,
+    sample_time: crate::AnimationSampleTime,
+) -> Option<f32> {
+    let duration = timing.duration_ms.max(0.0);
+    let iterations = timing.iteration_count.max(0.0);
+    let active_duration = if duration == 0.0 || iterations == 0.0 {
+        0.0
+    } else {
+        duration * iterations
+    };
+    let local_time = if timing.play_state == crate::AnimationPlayState::Paused {
+        0.0
+    } else {
+        sample_time.milliseconds
+    };
+    if !local_time.is_finite() {
+        return None;
+    }
+    let end_time = (timing.delay_ms + active_duration).max(0.0);
+    let before_boundary = timing.delay_ms.clamp(0.0, end_time);
+    let after_boundary = (timing.delay_ms + active_duration).min(end_time).max(0.0);
+    let phase = if local_time < before_boundary {
+        AnimationPhase::Before
+    } else if local_time >= after_boundary {
+        AnimationPhase::After
+    } else {
+        AnimationPhase::Active
+    };
+    let active_time = match phase {
+        AnimationPhase::Before => {
+            if !matches!(
+                timing.fill_mode,
+                crate::AnimationFillMode::Backwards | crate::AnimationFillMode::Both
+            ) {
+                return None;
+            }
+            (local_time - timing.delay_ms).max(0.0)
+        }
+        AnimationPhase::Active => local_time - timing.delay_ms,
+        AnimationPhase::After => {
+            if !matches!(
+                timing.fill_mode,
+                crate::AnimationFillMode::Forwards | crate::AnimationFillMode::Both
+            ) {
+                return None;
+            }
+            (local_time - timing.delay_ms).clamp(0.0, active_duration)
+        }
+    };
+
+    let overall_progress = if duration == 0.0 {
+        if phase == AnimationPhase::Before { 0.0 } else { iterations }
+    } else {
+        active_time / duration
+    };
+    if !overall_progress.is_finite() {
+        return Some(match timing.direction {
+            crate::AnimationDirection::Reverse | crate::AnimationDirection::AlternateReverse => 1.0,
+            _ => 0.0,
+        });
+    }
+    let mut current_iteration = overall_progress.floor().max(0.0);
+    let mut simple_progress = overall_progress.rem_euclid(1.0);
+    if phase == AnimationPhase::After
+        && iterations > 0.0
+        && simple_progress == 0.0
+    {
+        simple_progress = 1.0;
+        current_iteration = (current_iteration - 1.0).max(0.0);
+    }
+    let reverse = match timing.direction {
+        crate::AnimationDirection::Normal => false,
+        crate::AnimationDirection::Reverse => true,
+        crate::AnimationDirection::Alternate => current_iteration.rem_euclid(2.0) >= 1.0,
+        crate::AnimationDirection::AlternateReverse => current_iteration.rem_euclid(2.0) < 1.0,
+    };
+    Some(if reverse {
+        1.0 - simple_progress
+    } else {
+        simple_progress
+    })
+}
+
+fn normalized_keyframe_offsets(stops: &[KeyframeStop]) -> Vec<(f32, &KeyframeStop)> {
+    if stops.is_empty() {
+        return Vec::new();
+    }
+    let mut offsets = stops.iter().map(|stop| stop.offset).collect::<Vec<_>>();
+    if offsets.len() == 1 {
+        offsets[0] = Some(offsets[0].unwrap_or(1.0));
+    } else {
+        if offsets[0].is_none() {
+            offsets[0] = Some(0.0);
+        }
+        let last = offsets.len() - 1;
+        if offsets[last].is_none() {
+            offsets[last] = Some(1.0);
+        }
+    }
+    let mut index = 0usize;
+    while index < offsets.len() {
+        if offsets[index].is_some() {
+            index += 1;
+            continue;
+        }
+        let start = index - 1;
+        let mut end = index + 1;
+        while offsets[end].is_none() {
+            end += 1;
+        }
+        let from = offsets[start].unwrap();
+        let to = offsets[end].unwrap();
+        let span = (end - start) as f32;
+        for missing in index..end {
+            offsets[missing] = Some(from + (to - from) * (missing - start) as f32 / span);
+        }
+        index = end + 1;
+    }
+    stops
+        .iter()
+        .zip(offsets)
+        .map(|(stop, offset)| (offset.unwrap(), stop))
+        .collect()
 }
 
 /// Resolve variables one declaration at a time. An invalid variable poisons
@@ -2506,7 +2770,7 @@ mod tests {
     }
 
     #[test]
-    fn keyframes_extract_only_the_final_animation_state() {
+    fn keyframes_retain_every_animation_offset() {
         let css = r#"
             @keyframes dismiss {
                 from { opacity: 1; visibility: visible; }
@@ -2518,11 +2782,289 @@ mod tests {
                 100% { transform: translateX(20px); }
             }
         "#;
-        let ends: HashMap<_, _> = extract_keyframe_end_states(css).into_iter().collect();
-        assert!(ends["dismiss"].contains("opacity: 0"));
-        assert!(ends["dismiss"].contains("visibility: hidden"));
-        assert!(!ends["dismiss"].contains("opacity: 1"));
-        assert!(ends["slide"].contains("translateX(20px)"));
+        let keyframes: HashMap<_, _> = extract_keyframes(css).into_iter().collect();
+        let dismiss = normalized_keyframe_offsets(&keyframes["dismiss"].stops);
+        assert_eq!(
+            dismiss.iter().map(|(offset, _)| *offset).collect::<Vec<_>>(),
+            [0.0, 0.5, 1.0]
+        );
+        assert!(dismiss[0].1.declarations.contains("opacity: 1"));
+        assert!(dismiss[2].1.declarations.contains("visibility: hidden"));
+        let slide = normalized_keyframe_offsets(&keyframes["slide"].stops);
+        assert_eq!(
+            slide.iter().map(|(offset, _)| *offset).collect::<Vec<_>>(),
+            [0.0, 1.0]
+        );
+        assert!(slide[1].1.declarations.contains("translateX(20px)"));
+    }
+
+    fn sampled_animation_style(css: &str, sample_ms: f32, target_id: &str) -> LayoutStyle {
+        let tree = obscura_dom::parse_html(&format!(r#"<div id="{target_id}"></div>"#));
+        let target = tree.get_element_by_id(target_id).unwrap();
+        let sheet = Stylesheet::parse_for_viewport_at_animation_time(
+            &tree,
+            &[css.to_string()],
+            (1280.0, 720.0),
+            crate::AnimationSampleTime {
+                milliseconds: sample_ms,
+            },
+        );
+        let node = tree.get_node(target).unwrap();
+        let element = node.as_element().unwrap();
+        let mut matcher = tree.matcher();
+        let mut style = LayoutStyle::default();
+        sheet.apply(
+            &tree,
+            &mut matcher,
+            target,
+            node.get_attribute("id"),
+            &[],
+            element.local.as_ref(),
+            &mut style,
+            &HashMap::new(),
+            None,
+        );
+        style
+    }
+
+    fn sampled_fade(extra: &str, sample_ms: f32) -> f32 {
+        let css = format!(
+            r#"
+                @keyframes fade {{ from {{ opacity:0 }} to {{ opacity:1 }} }}
+                #target {{
+                    opacity:.4;
+                    animation:fade 1s linear infinite;
+                    {extra}
+                }}
+            "#
+        );
+        sampled_animation_style(&css, sample_ms, "target")
+            .opacity
+            .unwrap_or(1.0)
+    }
+
+    fn assert_opacity(actual: f32, expected: f32) {
+        assert!(
+            (actual - expected).abs() < 0.0001,
+            "expected opacity {expected}, got {actual}"
+        );
+    }
+
+    #[test]
+    fn animation_timeline_handles_delay_fill_iterations_and_direction_at_t0() {
+        assert_opacity(sampled_fade("", 0.0), 0.0);
+        assert_opacity(sampled_fade("animation-delay:250ms", 0.0), 0.4);
+        assert_opacity(
+            sampled_fade("animation-delay:250ms;animation-fill-mode:backwards", 0.0),
+            0.0,
+        );
+        assert_opacity(
+            sampled_fade(
+                "animation-delay:250ms;animation-fill-mode:backwards;animation-direction:reverse",
+                0.0,
+            ),
+            1.0,
+        );
+        assert_opacity(sampled_fade("animation-delay:-250ms", 0.0), 0.25);
+        assert_opacity(sampled_fade("animation-delay:-1s", 0.0), 0.0);
+        assert_opacity(
+            sampled_fade("animation-delay:-1s;animation-direction:alternate", 0.0),
+            1.0,
+        );
+        assert_opacity(
+            sampled_fade(
+                "animation-delay:-1s;animation-iteration-count:1;animation-fill-mode:none",
+                0.0,
+            ),
+            0.4,
+        );
+        assert_opacity(
+            sampled_fade(
+                "animation-delay:-1s;animation-iteration-count:1;animation-fill-mode:forwards",
+                0.0,
+            ),
+            1.0,
+        );
+        assert_opacity(
+            sampled_fade(
+                "animation-delay:-1s;animation-iteration-count:1;animation-fill-mode:forwards;animation-direction:reverse",
+                0.0,
+            ),
+            0.0,
+        );
+        assert_opacity(
+            sampled_fade(
+                "animation-delay:-2s;animation-iteration-count:2;animation-fill-mode:forwards;animation-direction:alternate",
+                0.0,
+            ),
+            0.0,
+        );
+        assert_opacity(
+            sampled_fade(
+                "animation-iteration-count:0;animation-fill-mode:forwards",
+                0.0,
+            ),
+            0.0,
+        );
+        assert_opacity(
+            sampled_fade(
+                "animation-duration:0s;animation-iteration-count:1;animation-fill-mode:none",
+                0.0,
+            ),
+            0.4,
+        );
+        assert_opacity(
+            sampled_fade(
+                "animation-duration:0s;animation-iteration-count:1;animation-fill-mode:forwards",
+                0.0,
+            ),
+            1.0,
+        );
+        assert_opacity(
+            sampled_fade(
+                "animation-delay:-2.5s;animation-iteration-count:2.5;animation-fill-mode:forwards",
+                0.0,
+            ),
+            0.5,
+        );
+    }
+
+    #[test]
+    fn animation_calc_delay_pause_and_important_origin_are_deterministic() {
+        assert_opacity(
+            sampled_fade("--step:.1s;animation-delay:calc(var(--step) * -2.5)", 0.0),
+            0.25,
+        );
+        assert_opacity(sampled_fade("animation-play-state:paused", 500.0), 0.0);
+        assert_opacity(sampled_fade("", 500.0), 0.5);
+        assert_opacity(
+            sampled_fade(
+                "animation-delay:-250ms !important;opacity:.8 !important",
+                0.0,
+            ),
+            0.8,
+        );
+    }
+
+    #[test]
+    fn opacity_segments_use_underlying_endpoints_and_exact_later_boundaries() {
+        let missing_endpoints = r#"
+            @keyframes middle { 50% { opacity:1 } }
+            #target { opacity:.4; animation:middle 1s linear 1 both }
+        "#;
+        assert_opacity(
+            sampled_animation_style(missing_endpoints, 250.0, "target")
+                .opacity
+                .unwrap(),
+            0.7,
+        );
+        assert_opacity(
+            sampled_animation_style(missing_endpoints, 750.0, "target")
+                .opacity
+                .unwrap(),
+            0.7,
+        );
+        let exact_boundary = r#"
+            @keyframes peak {
+                0% { opacity:0 }
+                50% { opacity:1 }
+                100% { opacity:0 }
+            }
+            #target { opacity:.4; animation:peak 1s linear 1 both }
+        "#;
+        assert_opacity(
+            sampled_animation_style(exact_boundary, 500.0, "target")
+                .opacity
+                .unwrap(),
+            1.0,
+        );
+    }
+
+    #[test]
+    fn missing_keyframe_offsets_follow_web_animation_distribution() {
+        let stop = |offset| KeyframeStop {
+            offset,
+            declarations: "opacity:1".to_string(),
+            source_order: 0,
+        };
+        let single = [stop(None)];
+        assert_eq!(normalized_keyframe_offsets(&single)[0].0, 1.0);
+        let pair = [stop(None), stop(None)];
+        assert_eq!(
+            normalized_keyframe_offsets(&pair)
+                .iter()
+                .map(|(offset, _)| *offset)
+                .collect::<Vec<_>>(),
+            [0.0, 1.0]
+        );
+        let distributed = [
+            stop(Some(0.0)),
+            stop(None),
+            stop(None),
+            stop(Some(0.75)),
+            stop(None),
+        ];
+        assert_eq!(
+            normalized_keyframe_offsets(&distributed)
+                .iter()
+                .map(|(offset, _)| *offset)
+                .collect::<Vec<_>>(),
+            [0.0, 0.25, 0.5, 0.75, 1.0]
+        );
+    }
+
+    #[test]
+    fn mozilla_stagger_samples_only_the_delay_zero_frame() {
+        let mut html = String::new();
+        let mut selectors = String::new();
+        for frame in 0..12 {
+            html.push_str(&format!(r#"<svg id="frame{frame}" class="frame"></svg>"#));
+            selectors.push_str(&format!(
+                "#frame{frame}{{animation-delay:calc(var(--base-delay) * {frame})}}"
+            ));
+        }
+        let tree = obscura_dom::parse_html(&html);
+        let css = format!(
+            r#"
+                @keyframes wave {{
+                    0%, 8.333% {{ opacity:1 }}
+                    8.4%, to {{ opacity:0 }}
+                }}
+                .frame {{
+                    --base-delay:.1s;
+                    opacity:0;
+                    animation:wave 1.2s linear infinite;
+                }}
+                {selectors}
+            "#
+        );
+        let sheet = Stylesheet::parse_for_viewport_at_animation_time(
+            &tree,
+            &[css],
+            (1280.0, 720.0),
+            crate::AnimationSampleTime::default(),
+        );
+        for frame in 0..12 {
+            let id = format!("frame{frame}");
+            let target = tree.get_element_by_id(&id).unwrap();
+            let node = tree.get_node(target).unwrap();
+            let element = node.as_element().unwrap();
+            let classes = vec!["frame".to_string()];
+            let mut matcher = tree.matcher();
+            let mut style = LayoutStyle::default();
+            sheet.apply(
+                &tree,
+                &mut matcher,
+                target,
+                node.get_attribute("id"),
+                &classes,
+                element.local.as_ref(),
+                &mut style,
+                &HashMap::new(),
+                None,
+            );
+            assert_opacity(style.opacity.unwrap(), if frame == 0 { 1.0 } else { 0.0 });
+        }
     }
 
     #[test]

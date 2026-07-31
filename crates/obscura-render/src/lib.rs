@@ -533,13 +533,11 @@ pub struct LayoutStyle {
     /// `opacity`, own (non-inherited) value in 0.0-1.0. `None` means the
     /// default of 1.0.
     pub opacity: Option<f32>,
-    /// First CSS animation name and the parts of its timing contract needed by
-    /// a settled, static screenshot. A finite animation with a forwards/both
-    /// fill mode contributes its 100% keyframe after normal declarations and
+    /// First CSS animation name and its timing contract. The stylesheet
+    /// sampler contributes animated opacity after normal declarations and
     /// before author `!important`, matching the animation cascade origin.
     pub animation_name: Option<String>,
-    pub animation_fill_forwards: bool,
-    pub animation_iteration_infinite: bool,
+    pub animation_timing: AnimationTiming,
     /// `vertical-align` for a table cell's content. Cells effectively default
     /// to `middle` in browsers (the HTML UA sheet sets it on row groups and
     /// cells inherit it); obscura applies it as main-axis alignment of the
@@ -807,6 +805,67 @@ pub enum WhiteSpace {
     PreWrap,
     PreLine,
     BreakSpaces,
+}
+
+/// Deterministic CSS animation sample time relative to the animation's
+/// timeline origin. Screenshot rendering currently uses the initial value
+/// (0ms); keeping it explicit lets capture plumbing freeze other engines at
+/// the same instant instead of depending on wall-clock settling.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct AnimationSampleTime {
+    pub milliseconds: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AnimationDirection {
+    #[default]
+    Normal,
+    Reverse,
+    Alternate,
+    AlternateReverse,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AnimationFillMode {
+    #[default]
+    None,
+    Forwards,
+    Backwards,
+    Both,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AnimationPlayState {
+    #[default]
+    Running,
+    Paused,
+}
+
+/// Timing fields for the first CSS animation. Milliseconds are used
+/// internally so `s`, `ms`, negative delays, and calculated stagger values
+/// share one unit.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AnimationTiming {
+    pub duration_ms: f32,
+    pub delay_ms: f32,
+    /// A finite non-negative count, or positive infinity for `infinite`.
+    pub iteration_count: f32,
+    pub direction: AnimationDirection,
+    pub fill_mode: AnimationFillMode,
+    pub play_state: AnimationPlayState,
+}
+
+impl Default for AnimationTiming {
+    fn default() -> Self {
+        Self {
+            duration_ms: 0.0,
+            delay_ms: 0.0,
+            iteration_count: 1.0,
+            direction: AnimationDirection::Normal,
+            fill_mode: AnimationFillMode::None,
+            play_state: AnimationPlayState::Running,
+        }
+    }
 }
 
 /// The implemented `text-wrap-style` values. Other line-breaking strategies

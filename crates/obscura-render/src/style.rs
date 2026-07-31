@@ -314,6 +314,16 @@ pub(crate) fn apply_declarations_with_locked_color_scheme(
     }
 }
 
+pub(crate) fn apply_animation_declarations(style: &mut LayoutStyle, css: &str) {
+    for raw in split_declarations(css) {
+        let Some((name, value)) = raw.trim().split_once(':') else { continue };
+        let name = name.trim().to_ascii_lowercase();
+        if name == "animation" || name.starts_with("animation-") {
+            apply_value(style, &name, value.trim());
+        }
+    }
+}
+
 fn apply_color_scheme(
     style: &mut LayoutStyle,
     value: &str,
@@ -1116,20 +1126,82 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         "animation" => apply_animation_shorthand(style, value),
         "animation-name" => {
             let first = split_top_level(value, ',').into_iter().next().unwrap_or("").trim();
-            style.animation_name = if first.is_empty() || first.eq_ignore_ascii_case("none") {
+            style.animation_name = if first.is_empty()
+                || matches!(
+                    first.to_ascii_lowercase().as_str(),
+                    "none" | "initial" | "inherit" | "unset" | "revert" | "revert-layer"
+                )
+            {
                 None
             } else {
                 Some(first.to_string())
             };
         }
+        "animation-duration" => {
+            let first = split_top_level(value, ',').into_iter().next().unwrap_or("").trim();
+            if matches!(
+                first.to_ascii_lowercase().as_str(),
+                "initial" | "inherit" | "unset" | "revert" | "revert-layer"
+            ) {
+                style.animation_timing.duration_ms = 0.0;
+            } else if let Some(milliseconds) = parse_animation_time_ms(first).filter(|time| *time >= 0.0) {
+                style.animation_timing.duration_ms = milliseconds;
+            }
+        }
+        "animation-delay" => {
+            let first = split_top_level(value, ',').into_iter().next().unwrap_or("").trim();
+            if matches!(
+                first.to_ascii_lowercase().as_str(),
+                "initial" | "inherit" | "unset" | "revert" | "revert-layer"
+            ) {
+                style.animation_timing.delay_ms = 0.0;
+            } else if let Some(milliseconds) = parse_animation_time_ms(first) {
+                style.animation_timing.delay_ms = milliseconds;
+            }
+        }
         "animation-fill-mode" => {
             let first = split_top_level(value, ',').into_iter().next().unwrap_or("").trim();
-            style.animation_fill_forwards =
-                first.eq_ignore_ascii_case("forwards") || first.eq_ignore_ascii_case("both");
+            if matches!(
+                first.to_ascii_lowercase().as_str(),
+                "initial" | "inherit" | "unset" | "revert" | "revert-layer"
+            ) {
+                style.animation_timing.fill_mode = crate::AnimationFillMode::None;
+            } else if let Some(fill) = parse_animation_fill_mode(first) {
+                style.animation_timing.fill_mode = fill;
+            }
         }
         "animation-iteration-count" => {
             let first = split_top_level(value, ',').into_iter().next().unwrap_or("").trim();
-            style.animation_iteration_infinite = first.eq_ignore_ascii_case("infinite");
+            if matches!(
+                first.to_ascii_lowercase().as_str(),
+                "initial" | "inherit" | "unset" | "revert" | "revert-layer"
+            ) {
+                style.animation_timing.iteration_count = 1.0;
+            } else if let Some(iterations) = parse_animation_iteration_count(first) {
+                style.animation_timing.iteration_count = iterations;
+            }
+        }
+        "animation-direction" => {
+            let first = split_top_level(value, ',').into_iter().next().unwrap_or("").trim();
+            if matches!(
+                first.to_ascii_lowercase().as_str(),
+                "initial" | "inherit" | "unset" | "revert" | "revert-layer"
+            ) {
+                style.animation_timing.direction = crate::AnimationDirection::Normal;
+            } else if let Some(direction) = parse_animation_direction(first) {
+                style.animation_timing.direction = direction;
+            }
+        }
+        "animation-play-state" => {
+            let first = split_top_level(value, ',').into_iter().next().unwrap_or("").trim();
+            if matches!(
+                first.to_ascii_lowercase().as_str(),
+                "initial" | "inherit" | "unset" | "revert" | "revert-layer"
+            ) {
+                style.animation_timing.play_state = crate::AnimationPlayState::Running;
+            } else if let Some(play_state) = parse_animation_play_state(first) {
+                style.animation_timing.play_state = play_state;
+            }
         }
         "z-index" => {
             style.z_index = match value.trim() {
@@ -1510,8 +1582,12 @@ pub(crate) fn supports_declaration(name: &str, value: &str) -> bool {
             | "opacity"
             | "animation"
             | "animation-name"
+            | "animation-duration"
+            | "animation-delay"
             | "animation-fill-mode"
             | "animation-iteration-count"
+            | "animation-direction"
+            | "animation-play-state"
             | "z-index"
             | "clear"
             | "vertical-align"
@@ -1606,6 +1682,12 @@ pub(crate) fn supports_declaration(name: &str, value: &str) -> bool {
             "auto" | "wrap" | "balance" | "wrap balance" | "balance wrap"
         ),
         "text-wrap-style" => matches!(value.to_ascii_lowercase().as_str(), "auto" | "balance"),
+        "animation-duration" => parse_animation_time_ms(value).is_some_and(|time| time >= 0.0),
+        "animation-delay" => parse_animation_time_ms(value).is_some(),
+        "animation-iteration-count" => parse_animation_iteration_count(value).is_some(),
+        "animation-direction" => parse_animation_direction(value).is_some(),
+        "animation-fill-mode" => parse_animation_fill_mode(value).is_some(),
+        "animation-play-state" => parse_animation_play_state(value).is_some(),
         "float" => matches!(
             value.to_ascii_lowercase().as_str(),
             "none" | "left" | "right"
@@ -1646,15 +1728,22 @@ pub(crate) fn supports_declaration(name: &str, value: &str) -> bool {
 }
 
 fn apply_animation_shorthand(style: &mut LayoutStyle, value: &str) {
-    style.animation_name = None;
-    style.animation_fill_forwards = false;
-    style.animation_iteration_infinite = false;
-
     let first = split_top_level(value, ',').into_iter().next().unwrap_or("").trim();
-    if first.is_empty() || first.eq_ignore_ascii_case("none") {
+    if first.is_empty() {
+        return;
+    }
+    if matches!(
+        first.to_ascii_lowercase().as_str(),
+        "initial" | "inherit" | "unset" | "revert" | "revert-layer"
+    ) {
+        style.animation_name = None;
+        style.animation_timing = crate::AnimationTiming::default();
         return;
     }
 
+    let mut name = None;
+    let mut timing = crate::AnimationTiming::default();
+    let mut time_count = 0usize;
     for token in split_ws_paren(first) {
         let lower = token.to_ascii_lowercase();
         let timing_keyword = matches!(
@@ -1663,35 +1752,258 @@ fn apply_animation_shorthand(style: &mut LayoutStyle, value: &str) {
         ) || lower.starts_with("cubic-bezier(")
             || lower.starts_with("steps(")
             || lower.starts_with("linear(");
-        let time = lower
-            .strip_suffix("ms")
-            .or_else(|| lower.strip_suffix('s'))
-            .and_then(|number| number.parse::<f32>().ok())
-            .is_some();
-        let control_keyword = matches!(
-            lower.as_str(),
-            "normal"
-                | "reverse"
-                | "alternate"
-                | "alternate-reverse"
-                | "backwards"
-                | "running"
-                | "paused"
-        );
-        if lower == "forwards" || lower == "both" {
-            style.animation_fill_forwards = true;
-        } else if lower == "infinite" {
-            style.animation_iteration_infinite = true;
-        } else if time
-            || timing_keyword
-            || control_keyword
-            || lower.parse::<f32>().is_ok()
-            || lower == "none"
-        {
+        if let Some(time) = parse_animation_time_ms(&lower) {
+            if time_count == 0 {
+                if time < 0.0 {
+                    return;
+                }
+                timing.duration_ms = time;
+            } else if time_count == 1 {
+                timing.delay_ms = time;
+            } else {
+                return;
+            }
+            time_count += 1;
+        } else if let Some(direction) = parse_animation_direction(&lower) {
+            timing.direction = direction;
+        } else if let Some(fill) = parse_animation_fill_mode(&lower) {
+            timing.fill_mode = fill;
+        } else if let Some(play_state) = parse_animation_play_state(&lower) {
+            timing.play_state = play_state;
+        } else if let Some(iterations) = parse_animation_iteration_count(&lower) {
+            timing.iteration_count = iterations;
+        } else if timing_keyword {
             continue;
-        } else if style.animation_name.is_none() {
-            style.animation_name = Some(token.to_string());
+        } else if lower == "none" {
+            if name.is_some() {
+                return;
+            }
+        } else if name.is_none() {
+            name = Some(token.to_string());
+        } else {
+            return;
         }
+    }
+    style.animation_name = name;
+    style.animation_timing = timing;
+}
+
+fn parse_animation_direction(value: &str) -> Option<crate::AnimationDirection> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "normal" => Some(crate::AnimationDirection::Normal),
+        "reverse" => Some(crate::AnimationDirection::Reverse),
+        "alternate" => Some(crate::AnimationDirection::Alternate),
+        "alternate-reverse" => Some(crate::AnimationDirection::AlternateReverse),
+        _ => None,
+    }
+}
+
+fn parse_animation_fill_mode(value: &str) -> Option<crate::AnimationFillMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "none" => Some(crate::AnimationFillMode::None),
+        "forwards" => Some(crate::AnimationFillMode::Forwards),
+        "backwards" => Some(crate::AnimationFillMode::Backwards),
+        "both" => Some(crate::AnimationFillMode::Both),
+        _ => None,
+    }
+}
+
+fn parse_animation_play_state(value: &str) -> Option<crate::AnimationPlayState> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "running" => Some(crate::AnimationPlayState::Running),
+        "paused" => Some(crate::AnimationPlayState::Paused),
+        _ => None,
+    }
+}
+
+fn parse_animation_iteration_count(value: &str) -> Option<f32> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("infinite") {
+        return Some(f32::INFINITY);
+    }
+    value.parse::<f32>().ok().filter(|count| count.is_finite() && *count >= 0.0)
+}
+
+#[derive(Clone, Copy)]
+enum AnimationCalcValue {
+    Number(f32),
+    Milliseconds(f32),
+}
+
+impl AnimationCalcValue {
+    fn negated(self) -> Self {
+        match self {
+            Self::Number(value) => Self::Number(-value),
+            Self::Milliseconds(value) => Self::Milliseconds(-value),
+        }
+    }
+
+    fn add(self, other: Self, subtract: bool) -> Option<Self> {
+        let sign = if subtract { -1.0 } else { 1.0 };
+        match (self, other) {
+            (Self::Number(left), Self::Number(right)) => Some(Self::Number(left + sign * right)),
+            (Self::Milliseconds(left), Self::Milliseconds(right)) => {
+                Some(Self::Milliseconds(left + sign * right))
+            }
+            _ => None,
+        }
+    }
+
+    fn multiply(self, other: Self) -> Option<Self> {
+        match (self, other) {
+            (Self::Number(left), Self::Number(right)) => Some(Self::Number(left * right)),
+            (Self::Milliseconds(time), Self::Number(number))
+            | (Self::Number(number), Self::Milliseconds(time)) => {
+                Some(Self::Milliseconds(time * number))
+            }
+            _ => None,
+        }
+    }
+
+    fn divide(self, other: Self) -> Option<Self> {
+        match (self, other) {
+            (_, Self::Number(0.0)) => None,
+            (Self::Number(left), Self::Number(right)) => Some(Self::Number(left / right)),
+            (Self::Milliseconds(time), Self::Number(number)) => {
+                Some(Self::Milliseconds(time / number))
+            }
+            (Self::Milliseconds(left), Self::Milliseconds(right)) if right != 0.0 => {
+                Some(Self::Number(left / right))
+            }
+            _ => None,
+        }
+    }
+}
+
+struct AnimationCalcParser<'a> {
+    input: &'a [u8],
+    position: usize,
+}
+
+impl AnimationCalcParser<'_> {
+    fn skip_whitespace(&mut self) {
+        while self.input.get(self.position).is_some_and(u8::is_ascii_whitespace) {
+            self.position += 1;
+        }
+    }
+
+    fn consume(&mut self, byte: u8) -> bool {
+        self.skip_whitespace();
+        if self.input.get(self.position) == Some(&byte) {
+            self.position += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn sum(&mut self) -> Option<AnimationCalcValue> {
+        let mut value = self.product()?;
+        loop {
+            if self.consume(b'+') {
+                value = value.add(self.product()?, false)?;
+            } else if self.consume(b'-') {
+                value = value.add(self.product()?, true)?;
+            } else {
+                return Some(value);
+            }
+        }
+    }
+
+    fn product(&mut self) -> Option<AnimationCalcValue> {
+        let mut value = self.unary()?;
+        loop {
+            if self.consume(b'*') {
+                value = value.multiply(self.unary()?)?;
+            } else if self.consume(b'/') {
+                value = value.divide(self.unary()?)?;
+            } else {
+                return Some(value);
+            }
+        }
+    }
+
+    fn unary(&mut self) -> Option<AnimationCalcValue> {
+        if self.consume(b'+') {
+            self.unary()
+        } else if self.consume(b'-') {
+            Some(self.unary()?.negated())
+        } else {
+            self.primary()
+        }
+    }
+
+    fn primary(&mut self) -> Option<AnimationCalcValue> {
+        if self.consume(b'(') {
+            let value = self.sum()?;
+            self.consume(b')').then_some(value)
+        } else {
+            self.number()
+        }
+    }
+
+    fn number(&mut self) -> Option<AnimationCalcValue> {
+        self.skip_whitespace();
+        let start = self.position;
+        let mut saw_digit = false;
+        while let Some(byte) = self.input.get(self.position) {
+            if byte.is_ascii_digit() {
+                saw_digit = true;
+                self.position += 1;
+            } else if *byte == b'.' {
+                self.position += 1;
+            } else {
+                break;
+            }
+        }
+        if !saw_digit {
+            return None;
+        }
+        let number = std::str::from_utf8(&self.input[start..self.position])
+            .ok()?
+            .parse::<f32>()
+            .ok()?;
+        if self.input.get(self.position..self.position + 2) == Some(b"ms") {
+            self.position += 2;
+            Some(AnimationCalcValue::Milliseconds(number))
+        } else if self.input.get(self.position) == Some(&b's') {
+            self.position += 1;
+            Some(AnimationCalcValue::Milliseconds(number * 1000.0))
+        } else {
+            Some(AnimationCalcValue::Number(number))
+        }
+    }
+}
+
+pub(crate) fn parse_animation_time_ms(value: &str) -> Option<f32> {
+    let normalized = value.trim().to_ascii_lowercase();
+    let is_calc = normalized.starts_with("calc(") && normalized.ends_with(')');
+    if !is_calc
+        && normalized
+            .bytes()
+            .any(|byte| matches!(byte, b'+' | b'*' | b'/' | b'(' | b')'))
+    {
+        return None;
+    }
+    let expression = if is_calc {
+        &normalized[5..normalized.len() - 1]
+    } else {
+        normalized.as_str()
+    };
+    let mut parser = AnimationCalcParser {
+        input: expression.as_bytes(),
+        position: 0,
+    };
+    let result = parser.sum()?;
+    parser.skip_whitespace();
+    if parser.position != parser.input.len() {
+        return None;
+    }
+    match result {
+        AnimationCalcValue::Milliseconds(milliseconds) if milliseconds.is_finite() => {
+            Some(milliseconds)
+        }
+        _ => None,
     }
 }
 
@@ -4591,22 +4903,51 @@ mod tests {
     }
 
     #[test]
-    fn animation_shorthand_preserves_settled_forward_fill_contract() {
+    fn animation_shorthand_parses_the_first_timing_contract() {
         let finite = compute_style(
             "div",
             Some("animation: dismiss-overlay .6s ease-out forwards"),
         );
         assert_eq!(finite.animation_name.as_deref(), Some("dismiss-overlay"));
-        assert!(finite.animation_fill_forwards);
-        assert!(!finite.animation_iteration_infinite);
+        assert_eq!(finite.animation_timing.duration_ms, 600.0);
+        assert_eq!(finite.animation_timing.fill_mode, crate::AnimationFillMode::Forwards);
+        assert_eq!(finite.animation_timing.iteration_count, 1.0);
 
         let infinite = compute_style(
             "div",
             Some("animation: pulse 1s linear infinite"),
         );
         assert_eq!(infinite.animation_name.as_deref(), Some("pulse"));
-        assert!(!infinite.animation_fill_forwards);
-        assert!(infinite.animation_iteration_infinite);
+        assert_eq!(infinite.animation_timing.duration_ms, 1000.0);
+        assert_eq!(infinite.animation_timing.fill_mode, crate::AnimationFillMode::None);
+        assert!(infinite.animation_timing.iteration_count.is_infinite());
+
+        let calculated = compute_style(
+            "div",
+            Some(
+                "animation:wave 1.2s linear infinite;\
+                 animation-delay:calc(.1s * -2.5);\
+                 animation-direction:alternate-reverse;\
+                 animation-fill-mode:both;\
+                 animation-play-state:paused",
+            ),
+        );
+        assert_eq!(calculated.animation_timing.delay_ms, -250.0);
+        assert_eq!(
+            calculated.animation_timing.direction,
+            crate::AnimationDirection::AlternateReverse
+        );
+        assert_eq!(calculated.animation_timing.fill_mode, crate::AnimationFillMode::Both);
+        assert_eq!(calculated.animation_timing.play_state, crate::AnimationPlayState::Paused);
+        assert_eq!(parse_animation_time_ms("calc(1s / 2 + 25ms)"), Some(525.0));
+        assert_eq!(parse_animation_time_ms("1s * 2"), None);
+
+        let reset = compute_style(
+            "div",
+            Some("animation:fade 2s -1s 3 reverse both paused;animation:initial"),
+        );
+        assert_eq!(reset.animation_name, None);
+        assert_eq!(reset.animation_timing, crate::AnimationTiming::default());
     }
 
     #[test]
