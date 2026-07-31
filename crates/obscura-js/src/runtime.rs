@@ -2275,6 +2275,9 @@ mod tests {
                     rect: [rect.x, rect.y, rect.width, rect.height],
                     after: [afterRect.x, afterRect.y],
                     client: [token.clientWidth, token.clientHeight],
+                    clientRects: Array.from(token.getClientRects(), r => [
+                        r.x, r.y, r.width, r.height
+                    ]),
                     atomic: [atomic.width, atomic.height],
                     replaced: [replaced.width, replaced.height],
                     item: [item.width, item.height, getComputedStyle(item).display]
@@ -2298,6 +2301,19 @@ mod tests {
         );
         assert!(token_height < 40.0, "ignored block size leaked into geometry");
         assert_eq!(result["client"], serde_json::json!([0, 0]));
+        let client_rects = result["clientRects"].as_array().unwrap();
+        assert_eq!(client_rects.len(), 1);
+        let client_rect = client_rects[0].as_array().unwrap();
+        for (actual, expected) in client_rect
+            .iter()
+            .map(|value| value.as_f64().unwrap())
+            .zip([token_x, token_y, token_width, token_height])
+        {
+            assert!(
+                (actual - expected).abs() < 0.001,
+                "getClientRects must expose the renderer's inline fragments"
+            );
+        }
         let after = result["after"].as_array().unwrap();
         assert!(after[0].as_f64().unwrap() >= token_x + token_width - 0.01);
         assert!((after[1].as_f64().unwrap() - token_y).abs() < 0.01);
@@ -2374,6 +2390,49 @@ mod tests {
             )
             .unwrap(),
             serde_json::json!(["grid", "150px", "0.8"])
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn computed_typography_uses_resolved_renderer_values() {
+        let dom = parse_html(
+            r#"<html><head><style>
+                #parent {
+                    font-size:20px; line-height:1.5;
+                    letter-spacing:-.05em; white-space:pre-wrap;
+                    text-align:end
+                }
+                #child { font-size:10px }
+                #zero { letter-spacing:0px; white-space:break-spaces }
+            </style></head><body>
+                <div id="parent"><span id="child">child</span></div>
+                <div id="zero">zero</div>
+            </body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_viewport(400.0, 200.0);
+        rt.run_page_init();
+
+        let result = rt
+            .evaluate(
+                r#"
+                const sample = id => {
+                    const s = getComputedStyle(document.getElementById(id));
+                    return [s.lineHeight, s.letterSpacing, s.whiteSpace, s.textAlign];
+                };
+                return [sample("parent"), sample("child"), sample("zero")];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                ["30px", "-1px", "pre-wrap", "end"],
+                ["15px", "-1px", "pre-wrap", "end"],
+                ["normal", "normal", "break-spaces", "start"],
+            ])
         );
     }
 

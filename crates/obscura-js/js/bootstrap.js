@@ -3044,6 +3044,14 @@ class Element extends Node {
     const geometry = this._renderBoxGeometry();
     if (geometry === null) return new DOMRectList([]);
     if (geometry !== undefined) {
+      if (Array.isArray(geometry.clientRects)) {
+        return new DOMRectList(geometry.clientRects.map(
+          rect => this._rectFromRenderGeometry({
+            ...rect,
+            viewportFixed: geometry.viewportFixed,
+          })
+        ));
+      }
       return new DOMRectList([this._rectFromRenderGeometry(geometry)]);
     }
     return new DOMRectList([this.getBoundingClientRect()]);
@@ -5945,6 +5953,7 @@ globalThis.getComputedStyle = (el) => {
     'margin-top': '0px', 'margin-right': '0px', 'margin-bottom': '0px', 'margin-left': '0px',
     'padding-top': '0px', 'padding-right': '0px', 'padding-bottom': '0px', 'padding-left': '0px',
     'font-size': '16px', 'line-height': 'normal', 'font-weight': '400',
+    'letter-spacing': 'normal',
     'font-family': 'Times',
     color: 'rgb(0, 0, 0)', 'background-color': 'rgba(0, 0, 0, 0)',
     'border-width': '0px', 'border-style': 'none', 'border-color': 'rgb(0, 0, 0)',

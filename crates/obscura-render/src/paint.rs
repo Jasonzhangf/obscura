@@ -479,10 +479,36 @@ impl PreparedRender {
             "line-height",
             match style.line_height.unwrap_or(crate::LineHeight::Normal) {
                 crate::LineHeight::Normal => "normal".to_string(),
-                crate::LineHeight::Ratio(value) => css_number(value),
-                crate::LineHeight::Px(value) => css_px(value),
-                crate::LineHeight::Relative(value) => dimension_css(value, "normal"),
+                _ => css_px(self.layout.text_engine.selected_line_height(style)),
             },
+        );
+        out.insert(
+            "letter-spacing",
+            match style.letter_spacing.unwrap_or(0.0) {
+                value if value == 0.0 => "normal".to_string(),
+                value => css_px(value),
+            },
+        );
+        out.insert(
+            "white-space",
+            match style.white_space.unwrap_or_default() {
+                crate::WhiteSpace::Normal => "normal",
+                crate::WhiteSpace::NoWrap => "nowrap",
+                crate::WhiteSpace::Pre => "pre",
+                crate::WhiteSpace::PreWrap => "pre-wrap",
+                crate::WhiteSpace::PreLine => "pre-line",
+                crate::WhiteSpace::BreakSpaces => "break-spaces",
+            }
+            .to_string(),
+        );
+        out.insert(
+            "text-align",
+            match style.text_align {
+                Some(taffy::AlignItems::CENTER) => "center",
+                Some(taffy::AlignItems::FLEX_END | taffy::AlignItems::END) => "end",
+                _ => "start",
+            }
+            .to_string(),
         );
 
         if style.ignores_used_box_sizes() {
@@ -675,6 +701,49 @@ impl PreparedRender {
             rect.y += sticky.1 - scroll.1;
         }
         Some(rect)
+    }
+
+    /// Every CSS border-box fragment in the current root viewport. Ordinary
+    /// inlines can have one fragment per line; all other boxes expose their
+    /// single border box. Keeping this separate from the bounding union is
+    /// required by CSSOM View's `getClientRects()`.
+    pub fn viewport_client_rects(
+        &self,
+        id: obscura_dom::tree::NodeId,
+        requested_scroll: (f32, f32),
+    ) -> Option<Vec<crate::Rect>> {
+        let source = self
+            .layout
+            .inline_fragments
+            .get(&id)
+            .cloned()
+            .or_else(|| self.layout.rects.get(&id).copied().map(|rect| vec![rect]))?;
+        let transform = self
+            .layout
+            .translates
+            .get(&id)
+            .copied()
+            .unwrap_or((0.0, 0.0));
+        let scroll = self.clamp_scroll(requested_scroll);
+        let movement = if self.viewport_fixed.contains(&id) {
+            transform
+        } else {
+            let sticky = self.sticky.translation_for(id, self.viewport, scroll);
+            (
+                transform.0 + sticky.0 - scroll.0,
+                transform.1 + sticky.1 - scroll.1,
+            )
+        };
+        Some(
+            source
+                .into_iter()
+                .map(|rect| crate::Rect {
+                    x: rect.x + movement.0,
+                    y: rect.y + movement.1,
+                    ..rect
+                })
+                .collect(),
+        )
     }
 
     pub fn selected_image(
@@ -1183,7 +1252,16 @@ fn paint_laid_dom_scrolled(
         };
 
         if node.is_text() {
-            paint_text_node(tree, nid, laid, &scroll_state, &mut pixmap);
+            if let Some(items) = laid.word_ifc_items.get(&nid) {
+                let offset = scroll_state.translation_for(laid, nid);
+                let clip = scroll_state.shaped_text_clip_for(laid, nid);
+                for &item in items {
+                    laid.text_engine
+                        .paint_item_with_clip(item, &mut pixmap, offset, clip);
+                }
+            } else {
+                paint_text_node(tree, nid, laid, &scroll_state, &mut pixmap);
+            }
             for generated in &generated_after_at[paint_index] {
                 paint_in_flow_generated_box(
                     &mut pixmap,

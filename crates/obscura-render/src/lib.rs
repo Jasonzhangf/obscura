@@ -127,6 +127,37 @@ pub mod inline {
         ) -> Option<usize> {
             None
         }
+
+        /// Layout-only builds do not load page fonts. Preserve the same
+        /// line-vs-fragment contract with deterministic bundled metrics.
+        pub(crate) fn inline_font_box_height(&self, style: &crate::LayoutStyle) -> f32 {
+            style.font_size.unwrap_or(16.0)
+        }
+
+        pub(crate) fn selected_line_height(&self, style: &crate::LayoutStyle) -> f32 {
+            match style.line_height.unwrap_or(crate::LineHeight::Normal) {
+                crate::LineHeight::Normal => style.font_size.unwrap_or(16.0) * 1.2,
+                crate::LineHeight::Ratio(value) => style.font_size.unwrap_or(16.0) * value,
+                crate::LineHeight::Px(value) => value,
+                crate::LineHeight::Relative(crate::Dimension::Percent(value)) => {
+                    style.font_size.unwrap_or(16.0) * value
+                }
+                crate::LineHeight::Relative(crate::Dimension::Px(value)) => value,
+                crate::LineHeight::Relative(_) => style.font_size.unwrap_or(16.0),
+            }
+        }
+
+        pub(crate) fn push_generated_text(
+            &mut self,
+            _text: &str,
+            _style: &crate::LayoutStyle,
+        ) -> Option<usize> {
+            None
+        }
+
+        pub(crate) fn measure_word(&mut self, _idx: usize) -> (f32, f32) {
+            (0.0, 0.0)
+        }
     }
 }
 
@@ -1463,6 +1494,19 @@ pub(crate) fn to_taffy_style(style: &LayoutStyle) -> Style {
     s.margin = rect_auto(style.margin, style.margin_auto);
     s.padding = rect_lp_percent(style.padding, style.padding_percent);
     s.border = rect_lp(style.border);
+    if style.ignores_used_box_sizes() {
+        // Block-axis margins on an ordinary non-replaced inline neither move
+        // nor size its fragment. Padding and border do paint around the raw
+        // font box, but they protrude outside the CSS line-height rather than
+        // increasing line advance. Keep them in LayoutStyle for fragment
+        // synthesis/paint and remove them only from this Taffy line surrogate.
+        s.margin.top = taffy::LengthPercentageAuto::length(0.0);
+        s.margin.bottom = taffy::LengthPercentageAuto::length(0.0);
+        s.padding.top = taffy::LengthPercentage::length(0.0);
+        s.padding.bottom = taffy::LengthPercentage::length(0.0);
+        s.border.top = taffy::LengthPercentage::length(0.0);
+        s.border.bottom = taffy::LengthPercentage::length(0.0);
+    }
     s
 }
 

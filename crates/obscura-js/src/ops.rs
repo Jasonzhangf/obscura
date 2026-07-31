@@ -2427,10 +2427,11 @@ pub(crate) fn clamp_scroll_offset(state: &mut ObscuraState, requested: (f32, f32
 /// cache. The cache is computed lazily on first read and cleared on navigation
 /// (see `set_dom`). Coordinates are viewport-relative after the shared root
 /// scroll offset, except for viewport-fixed subtrees. Returns JSON
-/// `{"x","y","width","height","clientWidth","clientHeight"}` in CSS pixels,
-/// or an empty string when the node has no box. The client dimensions are the
-/// unscaled padding box used by CSSOM View, whereas the rect is the visual
-/// viewport-relative border box. Feature-gated.
+/// `{"x","y","width","height","clientWidth","clientHeight","clientRects"}`
+/// in CSS pixels, or an empty string when the node has no box. The client
+/// dimensions are the unscaled padding box used by CSSOM View, `clientRects`
+/// retains every inline continuation, and the top-level rect is their visual
+/// viewport-relative bounding union. Feature-gated.
 #[cfg(feature = "render")]
 #[op2]
 #[string]
@@ -2447,17 +2448,32 @@ fn op_layout_geometry(state: &OpState, #[string] nid_str: String) -> String {
         let Some((client_width, client_height)) = prepared.client_size(nid) else {
             return String::new();
         };
+        let Some(client_rects) = prepared.viewport_client_rects(nid, scroll) else {
+            return String::new();
+        };
+        let client_rects = client_rects
+            .into_iter()
+            .map(|rect| {
+                serde_json::json!({
+                    "x": rect.x,
+                    "y": rect.y,
+                    "width": rect.width,
+                    "height": rect.height,
+                })
+            })
+            .collect::<Vec<_>>();
         let viewport_fixed = prepared.viewport_fixed_nodes().contains(&nid);
-        return format!(
-            "{{\"x\":{},\"y\":{},\"width\":{},\"height\":{},\"clientWidth\":{},\"clientHeight\":{},\"viewportFixed\":{}}}",
-            rect.x,
-            rect.y,
-            rect.width,
-            rect.height,
-            client_width,
-            client_height,
-            viewport_fixed
-        );
+        return serde_json::json!({
+            "x": rect.x,
+            "y": rect.y,
+            "width": rect.width,
+            "height": rect.height,
+            "clientWidth": client_width,
+            "clientHeight": client_height,
+            "clientRects": client_rects,
+            "viewportFixed": viewport_fixed,
+        })
+        .to_string();
     }
     String::new()
 }

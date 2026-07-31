@@ -344,6 +344,9 @@ class GeometryProbeTests(unittest.TestCase):
         self.assertEqual(args, (selectors,))
         self.assertIn("querySelectorAll(selector)", expression)
         self.assertIn("catch(error)", expression)
+        self.assertIn("font_family:style.fontFamily", expression)
+        self.assertIn("line_height:style.lineHeight", expression)
+        self.assertIn("white_space:style.whiteSpace", expression)
         self.assertIn("geometry_probes: geometryProbes", expression)
         self.assertIn(
             f'sampled_phase: "{paired_corpus.CAPTURE_BOUNDARY_PHASE}"',

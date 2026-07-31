@@ -300,6 +300,18 @@ fn normal_line_height(font_size: f32, metrics: FaceMetrics) -> f32 {
         + (metrics.line_gap * scale).round()
 }
 
+/// Grid-fitted font ascent plus descent, excluding both the face line gap and
+/// authored CSS `line-height`.
+///
+/// A non-replaced inline has two different vertical boxes. Its line
+/// participation uses [`used_line_height_with_metrics`], while its painted
+/// fragment/client rect uses this raw font box plus block-axis padding and
+/// border. Chromium and Gecko both fit ascent and descent independently.
+fn font_box_height(font_size: f32, metrics: FaceMetrics) -> f32 {
+    let scale = font_size / metrics.units_per_em.max(1.0);
+    (metrics.ascent * scale).round() + (metrics.descent * scale).round()
+}
+
 fn font_metrics(
     db: &cosmic_text::fontdb::Database,
     id: cosmic_text::fontdb::ID,
@@ -848,6 +860,32 @@ impl TextEngine {
     pub fn len(&self) -> usize {
         self.items.len()
     }
+
+    /// Raw selected-font box used by ordinary inline fragments. This is
+    /// deliberately not CSS `line-height`: leading belongs to the containing
+    /// line and must not enlarge backgrounds, borders, or DOM client rects.
+    pub(crate) fn inline_font_box_height(&self, style: &LayoutStyle) -> f32 {
+        let font = resolve_loaded_font(
+            style.font_family.as_deref(),
+            crate::style::used_font_weight(style),
+            style.font_style_italic.unwrap_or(false),
+            &self.loaded_families,
+        );
+        font_box_height(style.font_size.unwrap_or(16.0), font.metrics)
+    }
+
+    /// Used line-height for the same selected face. Kept beside
+    /// [`inline_font_box_height`](Self::inline_font_box_height) so layout can
+    /// distribute leading around the raw fragment using one font decision.
+    pub(crate) fn selected_line_height(&self, style: &LayoutStyle) -> f32 {
+        let font = resolve_loaded_font(
+            style.font_family.as_deref(),
+            crate::style::used_font_weight(style),
+            style.font_style_italic.unwrap_or(false),
+            &self.loaded_families,
+        );
+        used_line_height_for_font(style, &font)
+    }
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
@@ -1155,6 +1193,32 @@ impl TextEngine {
         let item = &mut items[idx];
         shape_with_text_indent(font_system, item, width);
         let (width, height) = buffer_size(&item.buffer, item.first_line_offset);
+        (width, height.max(item.forced_min_height))
+    }
+
+    /// Exact max-content size for one fallback word item. Paragraph IFCs keep
+    /// their historical integer-ceiled intrinsic width, but word boxes need
+    /// the selected webfont's fractional advance or every token accumulates a
+    /// pixel of horizontal drift against browser geometry.
+    pub(crate) fn measure_word(&mut self, idx: usize) -> (f32, f32) {
+        let TextEngine {
+            font_system, items, ..
+        } = self;
+        let Some(item) = items.get_mut(idx) else {
+            return (0.0, 0.0);
+        };
+        shape_with_text_indent(font_system, item, None);
+        let mut width = 0.0f32;
+        let mut height = 0.0f32;
+        for (line_index, run) in item.buffer.layout_runs().enumerate() {
+            let offset = if line_index == 0 {
+                item.first_line_offset
+            } else {
+                0.0
+            };
+            width = width.max((run.line_w + offset).max(0.0));
+            height = height.max(run.line_top + run.line_height);
+        }
         (width, height.max(item.forced_min_height))
     }
 
