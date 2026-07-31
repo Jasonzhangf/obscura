@@ -275,7 +275,11 @@ pub fn parse_fragment_with_context(html: &str, context_name: QualName) -> DomTre
     use html5ever::tendril::TendrilSink;
     use html5ever::{parse_fragment, ParseOpts};
     let tree = DomTree::new();
-    parse_fragment(tree, ParseOpts::default(), context_name, vec![])
+    // Obscura's fragment parser backs innerHTML in a scripting-enabled
+    // document. html5ever 0.39 makes that context flag explicit; keeping it
+    // true preserves browser parsing for context-sensitive content such as
+    // <noscript>.
+    parse_fragment(tree, ParseOpts::default(), context_name, vec![], true)
         .from_utf8()
         .one(html.as_bytes())
 }

@@ -27,8 +27,8 @@ obscura-js = { path = "crates/obscura-js" }
 obscura-mcp = { path = "crates/obscura-mcp" }
 obscura-render = { path = "crates/obscura-render" }
 
-html5ever = "0.29"
-markup5ever = "0.14"
+html5ever = "0.39"
+markup5ever = "0.39"
 selectors = "0.26"
 servo_arc = "0.4"
 cssparser = "0.34"
