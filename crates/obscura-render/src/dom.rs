@@ -2476,6 +2476,9 @@ fn layout_dom_once(
             }
         }
 
+        let deferred_cyclic_inline_sizes =
+            defer_cyclic_flex_inline_sizes(tree, &mut styles, root_fs, vw, vh);
+
         if let Some(taffy_root) = build(tree, root_id, &mut taffy_tree, &mut id_map, &mut words, &mut engine, &mut ifc_items, &styles) {
             // Taffy has no outer display type and only gives an auto-width
             // Block root the initial-containing-block width. CSS blockifies
@@ -2815,6 +2818,22 @@ fn layout_dom_once(
                     );
                 }
                 let _ = taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
+                if resolve_deferred_flex_inline_sizes(
+                    tree,
+                    &mut taffy_tree,
+                    &id_map,
+                    &mut styles,
+                    &deferred_cyclic_inline_sizes,
+                    root_fs,
+                    vw,
+                    vh,
+                ) {
+                    let _ = taffy_tree.compute_layout_with_measure(
+                        taffy_root,
+                        available,
+                        &mut measure,
+                    );
+                }
                 if apply_multicol_balance(&mut taffy_tree, &ifc_items.multicol) {
                     let _ = taffy_tree.compute_layout_with_measure(
                         taffy_root,
@@ -2894,6 +2913,18 @@ fn layout_dom_once(
                     );
                 }
                 let _ = taffy_tree.compute_layout(taffy_root, available);
+                if resolve_deferred_flex_inline_sizes(
+                    tree,
+                    &mut taffy_tree,
+                    &id_map,
+                    &mut styles,
+                    &deferred_cyclic_inline_sizes,
+                    root_fs,
+                    vw,
+                    vh,
+                ) {
+                    let _ = taffy_tree.compute_layout(taffy_root, available);
+                }
                 if apply_multicol_balance(&mut taffy_tree, &ifc_items.multicol) {
                     let _ = taffy_tree.compute_layout(taffy_root, available);
                 }
@@ -5775,6 +5806,233 @@ fn apply_container_size_containment(
             }
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct DeferredCyclicInlineSize {
+    node: NodeId,
+    flex_item: NodeId,
+    slot: usize,
+}
+
+/// During a flex item's intrinsic-size calculation, percentages in descendant
+/// inline sizes are cyclic: their containing block does not have its used
+/// width yet. Resolving those percentages against the width inherited from a
+/// more distant ancestor turns the temporary value into a permanent
+/// min-content floor. Gecko instead measures the flex item first, then reflows
+/// its descendants under the item's final main size.
+///
+/// Keep the non-percentage part for the intrinsic pass (percentage basis zero),
+/// and remember enough information to resolve the complete expression after
+/// flex sizing has selected the item's used width.
+fn defer_cyclic_flex_inline_sizes(
+    tree: &DomTree,
+    styles: &mut HashMap<NodeId, crate::LayoutStyle>,
+    root_fs: f32,
+    vw: f32,
+    vh: f32,
+) -> Vec<DeferredCyclicInlineSize> {
+    let candidates: Vec<(NodeId, usize, String)> = styles
+        .iter()
+        .flat_map(|(&id, style)| {
+            [0usize, 2, 4].into_iter().filter_map(move |slot| {
+                style.size_expressions[slot]
+                    .as_ref()
+                    .filter(|expression| expression.contains('%'))
+                    .cloned()
+                    .map(|expression| (id, slot, expression))
+            })
+        })
+        .collect();
+    let mut deferred = Vec::new();
+
+    for (id, slot, expression) in candidates {
+        // Start at the expression's containing-box chain, not the sized
+        // node itself. A percentage-sized direct child of a nested flex
+        // container makes that container's contribution cyclic when the
+        // container is itself an item in an outer flex row.
+        let mut candidate = tree.get_node(id).and_then(|node| node.parent);
+        let mut flex_item = None;
+        while let Some(item) = candidate {
+            let mut parent = tree.get_node(item).and_then(|node| node.parent);
+            while let Some(parent_id) = parent {
+                let Some(parent_style) = styles.get(&parent_id) else {
+                    break;
+                };
+                if parent_style.display_contents {
+                    parent = tree.get_node(parent_id).and_then(|node| node.parent);
+                    continue;
+                }
+                let row_flex = parent_style.display == crate::Display::Flex
+                    && !parent_style.internal_flex_container
+                    && !matches!(
+                        parent_style.flex_direction,
+                        Some(
+                            taffy::FlexDirection::Column
+                                | taffy::FlexDirection::ColumnReverse
+                        )
+                    );
+                let item_is_indefinite = styles.get(&item).map_or(false, |style| {
+                    (!matches!(style.width, crate::Dimension::Px(_))
+                        || style.size_expressions[0]
+                            .as_deref()
+                            .is_some_and(|expression| expression.contains('%')))
+                        && style.float.is_none()
+                        && !matches!(
+                            style.position,
+                            Some(taffy::Position::Absolute)
+                        )
+                });
+                if row_flex && item_is_indefinite {
+                    flex_item = Some(item);
+                }
+                break;
+            }
+            if flex_item.is_some() {
+                break;
+            }
+            candidate = tree.get_node(item).and_then(|node| node.parent);
+        }
+        let Some(flex_item) = flex_item else {
+            continue;
+        };
+
+        let em = styles
+            .get(&id)
+            .and_then(|style| style.font_size)
+            .unwrap_or(root_fs);
+        let Some(intrinsic) =
+            crate::style::resolve_contextual_length(&expression, em, root_fs, vw, vh, 0.0)
+        else {
+            continue;
+        };
+        if let Some(style) = styles.get_mut(&id) {
+            let intrinsic = crate::Dimension::Px(intrinsic.max(0.0));
+            match slot {
+                0 => style.width = intrinsic,
+                2 => style.min_width = intrinsic,
+                // A cyclic percentage max-size behaves as its initial value
+                // during intrinsic contribution sizing; treating 50% as a
+                // zero maximum would erase real text/content minimums.
+                4 => style.max_width = crate::Dimension::Auto,
+                _ => unreachable!(),
+            }
+        }
+        deferred.push(DeferredCyclicInlineSize { node: id, flex_item, slot });
+    }
+
+    deferred
+}
+
+fn resolve_deferred_flex_inline_sizes(
+    tree: &DomTree,
+    taffy_tree: &mut TaffyTree<usize>,
+    id_map: &HashMap<taffy::NodeId, NodeId>,
+    styles: &mut HashMap<NodeId, crate::LayoutStyle>,
+    deferred: &[DeferredCyclicInlineSize],
+    root_fs: f32,
+    vw: f32,
+    vh: f32,
+) -> bool {
+    if deferred.is_empty() {
+        return false;
+    }
+    let taffy_by_dom: HashMap<NodeId, taffy::NodeId> =
+        id_map.iter().map(|(&taffy, &dom)| (dom, taffy)).collect();
+
+    // This is the final-reflow boundary: preserve the main size selected by
+    // the outer flex algorithm while descendants are resolved against it.
+    let flex_items: HashSet<NodeId> = deferred.iter().map(|entry| entry.flex_item).collect();
+    for flex_item in flex_items {
+        let Some(&taffy_id) = taffy_by_dom.get(&flex_item) else {
+            continue;
+        };
+        let Ok(layout) = taffy_tree.layout(taffy_id) else {
+            continue;
+        };
+        let Some(style) = styles.get(&flex_item) else {
+            continue;
+        };
+        let horizontal_edges =
+            style.padding.left + style.padding.right + style.border.left + style.border.right;
+        let used_declaration = if style.box_sizing == crate::BoxSizing::ContentBox {
+            (layout.size.width - horizontal_edges).max(0.0)
+        } else {
+            layout.size.width
+        };
+        if let Ok(current) = taffy_tree.style(taffy_id) {
+            let mut fixed = current.clone();
+            fixed.size.width = taffy::Dimension::length(used_declaration);
+            let _ = taffy_tree.set_style(taffy_id, fixed);
+        }
+    }
+
+    for entry in deferred {
+        let Some(expression) = styles
+            .get(&entry.node)
+            .and_then(|style| style.size_expressions[entry.slot].clone())
+        else {
+            continue;
+        };
+        let mut containing = tree.get_node(entry.node).and_then(|node| node.parent);
+        let basis = loop {
+            let Some(parent) = containing else {
+                break None;
+            };
+            let parent_style = styles.get(&parent);
+            if parent_style.is_some_and(|style| style.display_contents) {
+                containing = tree.get_node(parent).and_then(|node| node.parent);
+                continue;
+            }
+            let Some(&taffy_id) = taffy_by_dom.get(&parent) else {
+                containing = tree.get_node(parent).and_then(|node| node.parent);
+                continue;
+            };
+            let Ok(layout) = taffy_tree.layout(taffy_id) else {
+                break None;
+            };
+            let edges = parent_style.map_or(0.0, |style| {
+                style.padding.left + style.padding.right + style.border.left + style.border.right
+            });
+            break Some((layout.size.width - edges).max(0.0));
+        };
+        let Some(basis) = basis else {
+            continue;
+        };
+        let em = styles
+            .get(&entry.node)
+            .and_then(|style| style.font_size)
+            .unwrap_or(root_fs);
+        let Some(value) =
+            crate::style::resolve_contextual_length(&expression, em, root_fs, vw, vh, basis)
+        else {
+            continue;
+        };
+        let value = value.max(0.0);
+        if let Some(style) = styles.get_mut(&entry.node) {
+            let value = crate::Dimension::Px(value);
+            match entry.slot {
+                0 => style.width = value,
+                2 => style.min_width = value,
+                4 => style.max_width = value,
+                _ => unreachable!(),
+            }
+        }
+        let Some(&taffy_id) = taffy_by_dom.get(&entry.node) else {
+            continue;
+        };
+        if let Ok(current) = taffy_tree.style(taffy_id) {
+            let mut resolved = current.clone();
+            match entry.slot {
+                0 => resolved.size.width = taffy::Dimension::length(value),
+                2 => resolved.min_size.width = taffy::Dimension::length(value),
+                4 => resolved.max_size.width = taffy::Dimension::length(value),
+                _ => unreachable!(),
+            }
+            let _ = taffy_tree.set_style(taffy_id, resolved);
+        }
+    }
+    true
 }
 
 fn build(

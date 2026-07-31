@@ -2371,6 +2371,50 @@ fn percentage_max_replaced_items_shrink_in_a_flex_row() {
     );
 }
 
+#[test]
+fn cyclic_descendant_percentages_do_not_inflate_a_flex_items_intrinsic_minimum() {
+    let tree = parse_html(
+        r#"
+        <style>
+          html, body { margin:0 }
+          #row { display:flex; width:1376px; gap:100px }
+          #left { width:100%; max-width:343px }
+          #left-floor { width:343px; height:20px }
+          #middle { display:flex; width:100%; gap:16px }
+          #middle > div { width:calc(33.333% - 16px); height:20px }
+          #right { flex:0 0 136px; height:20px }
+        </style>
+        <div id="row">
+          <div id="left"><div id="left-floor"></div></div>
+          <div id="middle"><div id="m1"></div><div id="m2"></div><div id="m3"></div></div>
+          <div id="right"></div>
+        </div>
+        "#,
+    );
+    let layout = layout_dom(&tree, (1600.0, 600.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    let row = rect("row");
+    let left = rect("left");
+    let middle = rect("middle");
+    let right = rect("right");
+    let middle_children = [rect("m1"), rect("m2"), rect("m3")];
+
+    assert!((row.width - 1376.0).abs() < 0.01, "{row:?}");
+    assert!((left.width - 343.0).abs() < 0.01, "{left:?}");
+    assert!(
+        (middle.width - 697.0).abs() < 0.01,
+        "cyclic descendant percentages must not become a 1376px intrinsic floor: \
+         row={row:?} left={left:?} middle={middle:?} right={right:?}"
+    );
+    assert!((right.width - 136.0).abs() < 0.01, "{right:?}");
+    for child in middle_children {
+        assert!(
+            (216.0..=217.0).contains(&child.width),
+            "the final reflow must resolve calc() against the 697px flex item: {child:?}"
+        );
+    }
+}
+
 /// The cyclic percentage affects only the min-content contribution. With
 /// positive free space, the same boxes retain their natural max-content bases.
 #[test]
