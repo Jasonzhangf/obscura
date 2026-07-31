@@ -9436,6 +9436,38 @@ mod tests {
     }
 
     #[test]
+    fn positioned_pseudo_does_not_wrap_shrink_to_fit_host_text() {
+        let tree = parse_html(
+            r#"<style>
+                html, body { margin:0 }
+                #host {
+                    position:absolute; width:max-content;
+                    padding:12px 24px; border:0;
+                    font-size:14px; font-weight:600; color:transparent;
+                }
+                #host::after {
+                    content:attr(text); position:absolute; inset:1px;
+                    display:flex; align-items:center; justify-content:center;
+                    color:black; background:white;
+                }
+            </style>
+            <button id="host" text="Learn more">Learn more</button>"#,
+        );
+        let laid = layout_dom(&tree, (500.0, 300.0));
+        let host = tree.get_element_by_id("host").unwrap();
+        let rect = laid.rects[&host];
+
+        assert!(
+            (120.0..=130.0).contains(&rect.width),
+            "max-content width must include the shaped inter-word advance: {rect:?}"
+        );
+        assert_eq!(
+            rect.height, 40.0,
+            "positioned generated content must not make the host label wrap"
+        );
+    }
+
+    #[test]
     fn variable_font_properties_inherit_and_reset_through_elements_and_pseudos() {
         let tree = parse_html(
             r#"<style>

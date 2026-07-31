@@ -1568,7 +1568,20 @@ fn is_pure_text_ifc(
     let Some(style) = styles.get(&id) else {
         return false;
     };
-    if style.before_pseudo.is_some() || style.after_pseudo.is_some() {
+    // Out-of-flow generated boxes neither contribute to nor interrupt the
+    // host's inline formatting context. Keeping a positioned decorative
+    // pseudo must not demote an otherwise text-only shrink-to-fit control to
+    // approximate per-word flex leaves: that path can disagree with shaped
+    // space advances and wrap text at its own max-content width.
+    let has_in_flow_pseudo = |pseudo: Option<&LayoutStyle>| {
+        pseudo.is_some_and(|pseudo| {
+            pseudo.display != Display::None
+                && !matches!(pseudo.position, Some(taffy::Position::Absolute))
+        })
+    };
+    if has_in_flow_pseudo(style.before_pseudo.as_deref())
+        || has_in_flow_pseudo(style.after_pseudo.as_deref())
+    {
         return false;
     }
     // Only containers that lay their children out in normal flow (block, or
