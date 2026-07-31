@@ -452,14 +452,17 @@ impl FloatContext {
 
     /// Get the end segment of the last float on side(s) specified by the clear parameter (if any)
     fn cleared_segment(&self, clear: Clear) -> Option<usize> {
+        let placed_end = |slot: usize| {
+            let placed = &self.last_placed_floats[slot];
+            (placed.start < placed.end).then_some(placed.end)
+        };
         match clear {
-            Clear::Left => Some(self.last_placed_floats[0].end),
-            Clear::Right => Some(self.last_placed_floats[1].end),
-            Clear::Both => {
-                let left_end = self.last_placed_floats[0].end;
-                let right_end = self.last_placed_floats[1].end;
-                Some(left_end.max(right_end))
-            }
+            Clear::Left => placed_end(0),
+            Clear::Right => placed_end(1),
+            Clear::Both => match (placed_end(0), placed_end(1)) {
+                (Some(left), Some(right)) => Some(left.max(right)),
+                (left, right) => left.or(right),
+            },
             Clear::None => None,
         }
     }

@@ -534,6 +534,123 @@ fn percentage_flex_overlay_uses_auto_width_parent_content_box() {
 }
 
 #[test]
+fn native_float_band_matches_bootstrap_clearfix_geometry() {
+    let tree = parse_html(include_str!(
+        "../../../render-repros/bootstrap-float-clearfix.html"
+    ));
+    let layout = layout_dom(&tree, (900.0, 1000.0));
+    let rect = |selector| {
+        let id = tree.query_selector(selector).unwrap().unwrap();
+        layout.rects[&id]
+    };
+    let row = rect(".row");
+    let column = rect(".column");
+    let centered = rect(".centered");
+    let card = rect(".card");
+    assert!(
+        (row.x - 0.0).abs() < 0.01
+            && (row.y - 0.0).abs() < 0.01
+            && (row.width - 900.0).abs() < 0.01
+            && (row.height - 1000.0).abs() < 0.01,
+        "row: {row:?}"
+    );
+    assert!(
+        (column.x - 0.0).abs() < 0.01
+            && (column.y - 0.0).abs() < 0.01
+            && (column.width - 900.0).abs() < 0.01
+            && (column.height - 1000.0).abs() < 0.01,
+        "column: {column:?}"
+    );
+    assert!(
+        (centered.x - 0.0).abs() < 0.01
+            && (centered.y - 0.0).abs() < 0.01
+            && (centered.width - 900.0).abs() < 0.01
+            && (centered.height - 900.0).abs() < 0.01,
+        "centered: {centered:?}"
+    );
+    assert!(
+        (card.x - 250.0).abs() < 0.01
+            && (card.y - 200.0).abs() < 0.01
+            && (card.width - 400.0).abs() < 0.01
+            && (card.height - 500.0).abs() < 0.01,
+        "card: {card:?}"
+    );
+}
+
+#[test]
+fn native_percentage_float_uses_padded_containing_block_content_width() {
+    let tree = parse_html(
+        r#"<style>
+            html,body{margin:0}
+            #band{box-sizing:border-box;width:300px;padding:20px}
+            #float{float:left;width:50%;height:40px}
+            #clear{clear:left}
+        </style>
+        <div id="band"><div id="float"></div><div id="clear"></div></div>"#,
+    );
+    let layout = layout_dom(&tree, (600.0, 300.0));
+    let band = layout.rects[&tree.get_element_by_id("band").unwrap()];
+    let float = layout.rects[&tree.get_element_by_id("float").unwrap()];
+    let clear = layout.rects[&tree.get_element_by_id("clear").unwrap()];
+    assert!(
+        (band.width - 300.0).abs() < 0.01 && (band.height - 80.0).abs() < 0.01,
+        "band: {band:?}"
+    );
+    assert!(
+        (float.x - 20.0).abs() < 0.01
+            && (float.y - 20.0).abs() < 0.01
+            && (float.width - 130.0).abs() < 0.01
+            && (float.height - 40.0).abs() < 0.01,
+        "float: {float:?}"
+    );
+    assert!(
+        (clear.x - 20.0).abs() < 0.01 && (clear.y - 60.0).abs() < 0.01,
+        "clear: {clear:?}"
+    );
+}
+
+#[test]
+fn native_float_clearance_is_side_sensitive() {
+    let tree = parse_html(
+        r#"<style>
+            html,body{margin:0}
+            .band{width:200px;overflow:hidden}
+            .float{float:right;width:60px;height:50px}
+            .clear{height:10px}
+            #matching .clear{clear:right}
+            #other-side .clear{clear:left}
+        </style>
+        <div id="matching" class="band"><div class="float"></div><div class="clear"></div></div>
+        <div id="other-side" class="band"><div class="float"></div><div class="clear"></div></div>"#,
+    );
+    let layout = layout_dom(&tree, (600.0, 300.0));
+    let matching = tree.get_element_by_id("matching").unwrap();
+    let other = tree.get_element_by_id("other-side").unwrap();
+    let matching_clear = tree
+        .query_selector("#matching .clear")
+        .unwrap()
+        .unwrap();
+    let other_clear = tree
+        .query_selector("#other-side .clear")
+        .unwrap()
+        .unwrap();
+    let matching_rect = layout.rects[&matching];
+    let other_rect = layout.rects[&other];
+    let matching_clear_rect = layout.rects[&matching_clear];
+    let other_clear_rect = layout.rects[&other_clear];
+    assert!(
+        (matching_clear_rect.y - 50.0).abs() < 0.01
+            && (matching_rect.height - 60.0).abs() < 0.01,
+        "matching: {matching_rect:?} clear: {matching_clear_rect:?}"
+    );
+    assert!(
+        (other_clear_rect.y - 60.0).abs() < 0.01
+            && (other_rect.height - 50.0).abs() < 0.01,
+        "other: {other_rect:?} clear: {other_clear_rect:?}"
+    );
+}
+
+#[test]
 fn float_flow_zone_preserves_blocks_inline_runs_and_clearance() {
     let tree = parse_html(include_str!("../../../render-repros/float-flow-bands.html"));
     let layout = layout_dom(&tree, (900.0, 1000.0));

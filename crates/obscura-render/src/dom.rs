@@ -5912,6 +5912,8 @@ fn build(
     // approximation corrupts flex sizing and percentage-margin placement.
     let has_float_child = style.display == crate::Display::Block
         && dom_children.iter().any(|&cid| styles.get(&cid).map(|s| s.float.is_some()).unwrap_or(false));
+    let native_float_band =
+        has_float_child && can_use_native_float_band(tree, style, &dom_children, styles);
     let has_in_flow_block_child = dom_children.iter().any(|cid| {
             styles.get(cid).map_or(false, |child| {
                 child.display == crate::Display::Block
@@ -5961,6 +5963,7 @@ fn build(
 
     if stacks_children_vertically
         && has_inline_ish_content
+        && !native_float_band
         && !(has_float_child && has_in_flow_block_child)
     {
         taffy_style.display = taffy::style::Display::Flex;
@@ -5980,7 +5983,26 @@ fn build(
         taffy_style.align_items = Some(taffy::AlignItems::FLEX_START);
     }
 
-    let mut child_ids: Vec<taffy::NodeId> = if has_float_child {
+    if native_float_band {
+        // Native float placement is only selected for the guarded flat-band
+        // shape. It requires a real block formatting context on the parent.
+        taffy_style.display = taffy::style::Display::Block;
+    }
+
+    let mut child_ids: Vec<taffy::NodeId> = if native_float_band {
+        build_children_with_native_float_band(
+            tree,
+            id,
+            style,
+            &dom_children,
+            taffy_tree,
+            id_map,
+            words,
+            engine,
+            ifc_items,
+            styles,
+        )
+    } else if has_float_child {
         build_children_with_float_zone(tree, id, &dom_children, taffy_tree, id_map, words, engine, ifc_items, styles)
     } else if matches!(style.display, crate::Display::Flex | crate::Display::Grid)
         && !style.internal_flex_container
@@ -5999,26 +6021,28 @@ fn build(
     } else {
         dom_children.into_iter().flat_map(|cid| build_any(tree, cid, taffy_tree, id_map, words, engine, ifc_items, styles)).collect()
     };
-    if let Some((mut before, _)) = build_in_flow_pseudo(
-        id,
-        GeneratedBoxKind::Before,
-        style.before_pseudo.as_deref(),
-        taffy_tree,
-        words,
-        ifc_items,
-    ) {
-        before.append(&mut child_ids);
-        child_ids = before;
-    }
-    if let Some((mut after, _)) = build_in_flow_pseudo(
-        id,
-        GeneratedBoxKind::After,
-        style.after_pseudo.as_deref(),
-        taffy_tree,
-        words,
-        ifc_items,
-    ) {
-        child_ids.append(&mut after);
+    if !native_float_band {
+        if let Some((mut before, _)) = build_in_flow_pseudo(
+            id,
+            GeneratedBoxKind::Before,
+            style.before_pseudo.as_deref(),
+            taffy_tree,
+            words,
+            ifc_items,
+        ) {
+            before.append(&mut child_ids);
+            child_ids = before;
+        }
+        if let Some((mut after, _)) = build_in_flow_pseudo(
+            id,
+            GeneratedBoxKind::After,
+            style.after_pseudo.as_deref(),
+            taffy_tree,
+            words,
+            ifc_items,
+        ) {
+            child_ids.append(&mut after);
+        }
     }
 
     if style.internal_flex_container
@@ -6810,6 +6834,222 @@ fn establishes_block_formatting_context(style: &crate::LayoutStyle) -> bool {
         || style.is_inline_block
         || style.float.is_some()
         || matches!(style.position, Some(taffy::Position::Absolute))
+}
+
+fn clear_matches_float_sides(clear: crate::Clear, has_left: bool, has_right: bool) -> bool {
+    (!has_left || matches!(clear, crate::Clear::Left | crate::Clear::Both))
+        && (!has_right || matches!(clear, crate::Clear::Right | crate::Clear::Both))
+}
+
+fn has_deferred_or_auto_margin(style: &crate::LayoutStyle) -> bool {
+    style.margin_auto.iter().any(|value| *value)
+        || style.margin_percent.iter().any(Option::is_some)
+        || style.margin_relative.iter().any(Option::is_some)
+        || style.margin_expressions.iter().any(Option::is_some)
+}
+
+fn is_structural_native_clear_box(
+    tree: &DomTree,
+    id: NodeId,
+    style: &crate::LayoutStyle,
+) -> bool {
+    style.display == crate::Display::Block
+        && !style.display_contents
+        && !style.is_table_box
+        && !style.is_inline_block
+        && !style.flow_root
+        && !style.overflow_hidden
+        && effective_container_type(style) == crate::ContainerType::Normal
+        && style.float.is_none()
+        && style.clear.is_some()
+        && !matches!(style.position, Some(taffy::Position::Absolute))
+        && tree.text_content(id).trim().is_empty()
+        && style.before_pseudo.is_none()
+        && style.after_pseudo.is_none()
+}
+
+fn is_structural_native_float_pseudo(style: &crate::LayoutStyle) -> bool {
+    style.display != crate::Display::None
+        && style.display != crate::Display::Inline
+        && !style.display_contents
+        && !style.is_inline_block
+        && (!style.flow_root || style.is_table_box)
+        && !style.overflow_hidden
+        && effective_container_type(style) == crate::ContainerType::Normal
+        && style.float.is_none()
+        && !matches!(style.position, Some(taffy::Position::Absolute))
+        && style
+            .before_content
+            .as_deref()
+            .map_or(true, |content| content.trim().is_empty())
+}
+
+/// Native taffy floats are currently sound for a deliberately small structural
+/// subset: a flat block band made only of definite-width direct floats plus
+/// empty generated/direct clearance boxes. Text flow, transparent wrappers,
+/// shrink-to-fit floats, independent formatting contexts, and tables retain
+/// the synthetic float-zone path.
+fn can_use_native_float_band(
+    tree: &DomTree,
+    parent_style: &crate::LayoutStyle,
+    dom_children: &[NodeId],
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+) -> bool {
+    if parent_style.display != crate::Display::Block
+        || parent_style.internal_flex_container
+        || parent_style.is_inline_block
+        || parent_style.is_table_box
+        || parent_style.float.is_some()
+        || matches!(parent_style.position, Some(taffy::Position::Absolute))
+        || !matches!(
+            parent_style.width,
+            crate::Dimension::Px(_) | crate::Dimension::Percent(_)
+        )
+        || parent_style.size_expressions[0].is_some()
+    {
+        return false;
+    }
+
+    let mut has_left = false;
+    let mut has_right = false;
+    let mut saw_float = false;
+    let mut saw_clear_after_floats = false;
+
+    if let Some(before) = parent_style.before_pseudo.as_deref() {
+        if !is_structural_native_float_pseudo(before) {
+            return false;
+        }
+    }
+
+    for &id in dom_children {
+        let Some(node) = tree.get_node(id) else { continue };
+        if !node.is_element() {
+            if !tree.text_content(id).trim().is_empty() {
+                return false;
+            }
+            continue;
+        }
+        let Some(style) = styles.get(&id) else {
+            return false;
+        };
+        if style.display == crate::Display::None {
+            continue;
+        }
+
+        if let Some(side) = style.float {
+            if saw_clear_after_floats
+                || style.display_contents
+                || style.is_table_box
+                || matches!(style.position, Some(taffy::Position::Absolute))
+                || !matches!(style.width, crate::Dimension::Px(_) | crate::Dimension::Percent(_))
+                || style.size_expressions[0].is_some()
+                || has_deferred_or_auto_margin(style)
+            {
+                return false;
+            }
+            saw_float = true;
+            has_left |= side == crate::Float::Left;
+            has_right |= side == crate::Float::Right;
+        } else if is_structural_native_clear_box(tree, id, style) {
+            if !saw_float {
+                return false;
+            }
+            saw_clear_after_floats |= clear_matches_float_sides(
+                style.clear.expect("structural clear has a side"),
+                has_left,
+                has_right,
+            );
+        } else {
+            return false;
+        }
+    }
+
+    if let Some(after) = parent_style.after_pseudo.as_deref() {
+        if !is_structural_native_float_pseudo(after) {
+            return false;
+        }
+        if let Some(clear) = after.clear {
+            saw_clear_after_floats |= clear_matches_float_sides(clear, has_left, has_right);
+        }
+    }
+
+    // Taffy represents overflow clipping as a real BFC root. Other Obscura
+    // BFC markers do not yet have a distinct taffy-side representation, so
+    // they are intentionally not used as an escape-safety signal here.
+    let parent_is_native_bfc = parent_style.overflow_hidden;
+    saw_float && (saw_clear_after_floats || parent_is_native_bfc)
+}
+
+fn set_native_float_clear(
+    taffy_tree: &mut TaffyTree<usize>,
+    node: taffy::NodeId,
+    style: &crate::LayoutStyle,
+    generated_pseudo: bool,
+) {
+    let Ok(current) = taffy_tree.style(node) else { return };
+    let mut native = current.clone();
+    native.float = match style.float {
+        Some(crate::Float::Left) => taffy::style::Float::Left,
+        Some(crate::Float::Right) => taffy::style::Float::Right,
+        None => taffy::style::Float::None,
+    };
+    native.clear = match style.clear {
+        Some(crate::Clear::Left) => taffy::style::Clear::Left,
+        Some(crate::Clear::Right) => taffy::style::Clear::Right,
+        Some(crate::Clear::Both) => taffy::style::Clear::Both,
+        None => taffy::style::Clear::None,
+    };
+    if generated_pseudo && style.is_table_box {
+        // Bootstrap-style clearfix pseudos use display:table only to generate
+        // an empty block formatting box. Taffy's independent table-item clear
+        // path is incomplete, while its same-BFC block clear path is correct.
+        native.display = taffy::style::Display::Block;
+        native.item_is_table = false;
+    }
+    let _ = taffy_tree.set_style(node, native);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_children_with_native_float_band(
+    tree: &DomTree,
+    parent_id: NodeId,
+    parent_style: &crate::LayoutStyle,
+    dom_children: &[NodeId],
+    taffy_tree: &mut TaffyTree<usize>,
+    id_map: &mut HashMap<taffy::NodeId, NodeId>,
+    words: &mut HashMap<taffy::NodeId, (NodeId, String)>,
+    engine: &mut crate::inline::TextEngine,
+    ifc_items: &mut IfcRegistry,
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+) -> Vec<taffy::NodeId> {
+    let mut result = Vec::new();
+    for (kind, pseudo) in [
+        (GeneratedBoxKind::Before, parent_style.before_pseudo.as_deref()),
+        (GeneratedBoxKind::After, parent_style.after_pseudo.as_deref()),
+    ] {
+        if kind == GeneratedBoxKind::After {
+            for &id in dom_children {
+                let Some(style) = styles.get(&id) else { continue };
+                for node in build_any(
+                    tree, id, taffy_tree, id_map, words, engine, ifc_items, styles,
+                ) {
+                    set_native_float_clear(taffy_tree, node, style, false);
+                    result.push(node);
+                }
+            }
+        }
+        if let Some((nodes, _)) =
+            build_in_flow_pseudo(parent_id, kind, pseudo, taffy_tree, words, ifc_items)
+        {
+            if let Some(style) = pseudo {
+                for node in nodes {
+                    set_native_float_clear(taffy_tree, node, style, true);
+                    result.push(node);
+                }
+            }
+        }
+    }
+    result
 }
 
 fn build_children_with_float_zone(
