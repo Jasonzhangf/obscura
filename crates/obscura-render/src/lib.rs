@@ -341,9 +341,10 @@ pub struct LayoutStyle {
     /// fraction, `None` when the side is a fixed length. All four sides resolve
     /// against the containing block's WIDTH (per CSS, including top/bottom): this
     /// is the responsive aspect-ratio-box trick (`padding-top:56.25%` reserves a
-    /// 16:9 area). The f32 `padding` cannot carry a percentage, so it is
-    /// resolved to px in `dom::layout_dom`'s top-down pass and written back into
-    /// `padding`, which then feeds taffy as a fixed length.
+    /// 16:9 area). The percentage remains typed through Taffy layout so flex/grid
+    /// min/max sizing can establish the final containing-block width first.
+    /// `dom::layout_dom` writes Taffy's resolved used pixels back into `padding`
+    /// before paint and geometry consumers inspect the computed layout.
     pub padding_percent: [Option<f32>; 4],
     /// Font- and viewport-relative padding lengths (top, right, bottom, left),
     /// resolved alongside `margin_relative` during the top-down pass.
@@ -1170,7 +1171,7 @@ pub(crate) fn to_taffy_style(style: &LayoutStyle) -> Style {
     }
 
     s.margin = rect_auto(style.margin, style.margin_auto);
-    s.padding = rect_lp(style.padding);
+    s.padding = rect_lp_percent(style.padding, style.padding_percent);
     s.border = rect_lp(style.border);
     s
 }
@@ -1205,6 +1206,22 @@ fn rect_lp(e: Edges) -> taffy::Rect<taffy::style::LengthPercentage> {
         right: taffy::style::LengthPercentage::length(e.right),
         bottom: taffy::style::LengthPercentage::length(e.bottom),
         left: taffy::style::LengthPercentage::length(e.left),
+    }
+}
+
+fn rect_lp_percent(
+    e: Edges,
+    percent: [Option<f32>; 4],
+) -> taffy::Rect<taffy::style::LengthPercentage> {
+    let side = |value, percent| match percent {
+        Some(percent) => taffy::style::LengthPercentage::percent(percent),
+        None => taffy::style::LengthPercentage::length(value),
+    };
+    taffy::Rect {
+        top: side(e.top, percent[0]),
+        right: side(e.right, percent[1]),
+        bottom: side(e.bottom, percent[2]),
+        left: side(e.left, percent[3]),
     }
 }
 

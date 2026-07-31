@@ -551,6 +551,118 @@ struct GeneratedBoxBuild {
     node: taffy::NodeId,
 }
 
+fn sync_resolved_percentage_padding(
+    taffy_tree: &TaffyTree<usize>,
+    taffy_root: taffy::NodeId,
+    initial_containing_block_width: f32,
+    id_map: &HashMap<taffy::NodeId, NodeId>,
+    generated: &[GeneratedBoxBuild],
+    styles: &mut HashMap<NodeId, crate::LayoutStyle>,
+) {
+    fn sync(style: &mut crate::LayoutStyle, containing_block_width: f32) {
+        if let Some(percent) = style.padding_percent[0] {
+            style.padding.top = percent * containing_block_width;
+        }
+        if let Some(percent) = style.padding_percent[1] {
+            style.padding.right = percent * containing_block_width;
+        }
+        if let Some(percent) = style.padding_percent[2] {
+            style.padding.bottom = percent * containing_block_width;
+        }
+        if let Some(percent) = style.padding_percent[3] {
+            style.padding.left = percent * containing_block_width;
+        }
+    }
+
+    fn visit(
+        taffy_tree: &TaffyTree<usize>,
+        node: taffy::NodeId,
+        containing_block_width: f32,
+        id_map: &HashMap<taffy::NodeId, NodeId>,
+        generated: &HashMap<taffy::NodeId, (NodeId, GeneratedBoxKind)>,
+        styles: &mut HashMap<NodeId, crate::LayoutStyle>,
+    ) {
+        let Ok(layout) = taffy_tree.layout(node) else {
+            return;
+        };
+        if let Some(dom_id) = id_map.get(&node) {
+            if let Some(style) = styles.get_mut(dom_id) {
+                sync(style, containing_block_width);
+            }
+        } else if let Some((host, kind)) = generated.get(&node) {
+            if let Some(host_style) = styles.get_mut(host) {
+                let pseudo = match kind {
+                    GeneratedBoxKind::Before => host_style.before_pseudo.as_deref_mut(),
+                    GeneratedBoxKind::After => host_style.after_pseudo.as_deref_mut(),
+                };
+                if let Some(pseudo) = pseudo {
+                    sync(pseudo, containing_block_width);
+                }
+            }
+        }
+
+        let child_containing_block_width = layout.content_box_width().max(0.0);
+        if let Ok(children) = taffy_tree.children(node) {
+            for child in children {
+                visit(
+                    taffy_tree,
+                    child,
+                    child_containing_block_width,
+                    id_map,
+                    generated,
+                    styles,
+                );
+            }
+        }
+    }
+
+    let generated = generated
+        .iter()
+        .map(|generated| (generated.node, (generated.host, generated.kind)))
+        .collect();
+    visit(
+        taffy_tree,
+        taffy_root,
+        initial_containing_block_width,
+        id_map,
+        &generated,
+        styles,
+    );
+}
+
+fn sync_positioned_pseudo_percentage_padding(
+    rects: &HashMap<NodeId, Rect>,
+    styles: &mut HashMap<NodeId, crate::LayoutStyle>,
+) {
+    fn sync(pseudo: &mut crate::LayoutStyle, containing_block_width: f32) {
+        if pseudo.position != Some(taffy::Position::Absolute) {
+            return;
+        }
+        for (index, percent) in pseudo.padding_percent.into_iter().enumerate() {
+            let Some(percent) = percent else { continue };
+            let value = percent * containing_block_width;
+            match index {
+                0 => pseudo.padding.top = value,
+                1 => pseudo.padding.right = value,
+                2 => pseudo.padding.bottom = value,
+                _ => pseudo.padding.left = value,
+            }
+        }
+    }
+
+    for (host, style) in styles {
+        let Some(rect) = rects.get(host) else { continue };
+        let containing_block_width =
+            (rect.width - style.border.left - style.border.right).max(0.0);
+        if let Some(pseudo) = style.before_pseudo.as_deref_mut() {
+            sync(pseudo, containing_block_width);
+        }
+        if let Some(pseudo) = style.after_pseudo.as_deref_mut() {
+            sync(pseudo, containing_block_width);
+        }
+    }
+}
+
 /// Registry of cosmic-text inline formatting contexts created during the
 /// taffy-tree build: `whole` holds single-leaf containers keyed by the
 /// container's own DOM id, `runs` holds anonymous inline-run leaves keyed by
@@ -1834,11 +1946,11 @@ fn layout_dom_once(
                 }
 
                 // Resolve font/viewport-relative box edges now that their
-                // reference sizes are known. Percentage padding/margin then
-                // resolve against the containing block WIDTH on every side
-                // (per CSS: `padding-top:56.25%` in a 1000px block is 562.5px,
-                // not a fraction of the height). Bake the resolved px back into
-                // `padding`/`margin`, which then feed taffy.
+                // reference sizes are known. Percentage margins still use the
+                // estimated containing-block width here. Pure percentage
+                // padding stays typed until Taffy knows the final flex/grid
+                // containing-block inline size; its used pixels are synced
+                // back into `LayoutStyle` after the final layout.
                 for i in 0..4 {
                     if let Some(expression) = style.padding_expressions[i].as_deref() {
                         if let Some(px) = crate::style::resolve_contextual_length(
@@ -1896,15 +2008,6 @@ fn layout_dom_once(
                                 2 => style.margin.bottom = px,
                                 _ => style.margin.left = px,
                             }
-                        }
-                    }
-                    if let Some(frac) = style.padding_percent[i] {
-                        let px = (frac * cb_w).max(0.0);
-                        match i {
-                            0 => style.padding.top = px,
-                            1 => style.padding.right = px,
-                            2 => style.padding.bottom = px,
-                            _ => style.padding.left = px,
                         }
                     }
                     if let Some(frac) = style.margin_percent[i] {
@@ -2049,15 +2152,6 @@ fn layout_dom_once(
                                     2 => pseudo.margin.bottom = px,
                                     _ => pseudo.margin.left = px,
                                 }
-                            }
-                        }
-                        if let Some(percent) = pseudo.padding_percent[index] {
-                            let px = (percent * cb_w).max(0.0);
-                            match index {
-                                0 => pseudo.padding.top = px,
-                                1 => pseudo.padding.right = px,
-                                2 => pseudo.padding.bottom = px,
-                                _ => pseudo.padding.left = px,
                             }
                         }
                         if let Some(percent) = pseudo.margin_percent[index] {
@@ -3004,6 +3098,14 @@ fn layout_dom_once(
                     let _ = taffy_tree.compute_layout(taffy_root, available);
                 }
             }
+            sync_resolved_percentage_padding(
+                &taffy_tree,
+                taffy_root,
+                initial_cb_width,
+                &id_map,
+                &ifc_items.generated,
+                &mut styles,
+            );
             let generated_nodes: HashMap<taffy::NodeId, usize> = ifc_items
                 .generated
                 .iter()
@@ -3027,6 +3129,7 @@ fn layout_dom_once(
             synthesize_row_rects(tree, &mut rects);
         }
     }
+    sync_positioned_pseudo_percentage_padding(&rects, &mut styles);
 
     let mut clip_rects = HashMap::new();
     let mut translates = HashMap::new();
@@ -5179,6 +5282,7 @@ fn pseudo_requires_generated_box(style: &crate::LayoutStyle, content: Option<&st
         || style.margin != crate::Edges::default()
         || style.margin_auto.iter().any(|value| *value)
         || style.padding != crate::Edges::default()
+        || style.padding_percent.iter().any(|value| value.is_some())
         || style.border != crate::Edges::default()
         || style.background_color.is_some()
         || style.background_gradient.is_some()
@@ -6859,6 +6963,10 @@ fn inline_wrapper_float(
     if wrapper_style.display != crate::Display::Inline
         || wrapper_style.margin != crate::Edges::default()
         || wrapper_style.padding != crate::Edges::default()
+        || wrapper_style
+            .padding_percent
+            .iter()
+            .any(|value| value.is_some())
         || wrapper_style.border != crate::Edges::default()
         || wrapper_style.before_pseudo.is_some()
         || wrapper_style.after_pseudo.is_some()
@@ -7143,6 +7251,8 @@ fn needs_column_flex_text_fit_content_cap(
         || style.size_expressions[4].is_some()
         || style.padding.left != 0.0
         || style.padding.right != 0.0
+        || style.padding_percent[1].is_some()
+        || style.padding_percent[3].is_some()
         || style.border.left != 0.0
         || style.border.right != 0.0
         || style.margin.left != 0.0
@@ -7927,6 +8037,10 @@ fn build_children_with_float_zone(
                     && matches!(style.max_height, crate::Dimension::Auto)
                     && style.margin == crate::Edges::default()
                     && style.padding == crate::Edges::default()
+                    && style
+                        .padding_percent
+                        .iter()
+                        .all(|value| value.is_none())
                     && style.border == crate::Edges::default()
                     && style.before_pseudo.is_none()
                     && style.after_pseudo.is_none()

@@ -163,6 +163,117 @@ fn percentage_padding_top_reserves_aspect_ratio_box() {
 }
 
 #[test]
+fn percentage_padding_uses_final_flex_containing_block_width() {
+    let tree = parse_html(
+        r#"
+        <body style="margin:0">
+          <div style="display:flex;width:690px">
+            <div id="first" style="display:flex;flex-direction:column;width:100%;max-width:500px">
+              <div id="first-sizer" style="width:100%;padding-top:55%"></div>
+            </div>
+          </div>
+          <div style="display:flex;width:690px">
+            <div id="second" style="display:flex;flex-direction:column;width:100%;max-width:450px">
+              <div id="second-sizer" style="width:100%;padding-top:106.7%"></div>
+            </div>
+          </div>
+        </body>
+        "#,
+    );
+    let layout = layout_dom(&tree, (1000.0, 1000.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    let first = rect("first");
+    let first_sizer = rect("first-sizer");
+    let second = rect("second");
+    let second_sizer = rect("second-sizer");
+
+    assert!((first.width - 500.0).abs() < 0.01, "first flex item: {first:?}");
+    assert!(
+        (first_sizer.height - 275.0).abs() < 0.01,
+        "55% padding must use the final 500px containing block: {first_sizer:?}"
+    );
+    assert!((second.width - 450.0).abs() < 0.01, "second flex item: {second:?}");
+    assert!(
+        (second_sizer.height - 480.15).abs() < 0.51,
+        "106.7% padding must use the final 450px containing block: {second_sizer:?}"
+    );
+
+    for (id, expected) in [("first-sizer", 275.0), ("second-sizer", 480.15)] {
+        let node = tree.get_element_by_id(id).unwrap();
+        assert!(
+            (layout.styles[&node].padding.top - expected).abs() < 0.05,
+            "paint/content consumers must see final used padding for {id}: {:?}",
+            layout.styles[&node].padding
+        );
+    }
+}
+
+#[test]
+fn mixed_percentage_padding_shorthand_preserves_fixed_sides_and_content_origin() {
+    let tree = parse_html(
+        r#"
+        <body style="margin:0">
+          <div style="width:500px">
+            <div id="mixed" style="box-sizing:border-box;width:100%;padding:10% 20px 5% 7px">
+              <div id="ink" style="height:10px"></div>
+            </div>
+          </div>
+        </body>
+        "#,
+    );
+    let layout = layout_dom(&tree, (1000.0, 1000.0));
+    let mixed_id = tree.get_element_by_id("mixed").unwrap();
+    let mixed = layout.rects[&mixed_id];
+    let ink = layout.rects[&tree.get_element_by_id("ink").unwrap()];
+    let padding = layout.styles[&mixed_id].padding;
+
+    assert!((mixed.width - 500.0).abs() < 0.01, "border-box width: {mixed:?}");
+    assert!((mixed.height - 85.0).abs() < 0.01, "mixed padding height: {mixed:?}");
+    assert!(
+        (padding.top - 50.0).abs() < 0.01
+            && (padding.right - 20.0).abs() < 0.01
+            && (padding.bottom - 25.0).abs() < 0.01
+            && (padding.left - 7.0).abs() < 0.01,
+        "resolved mixed shorthand: {padding:?}"
+    );
+    assert!(
+        (ink.x - mixed.x - 7.0).abs() < 0.01 && (ink.y - mixed.y - 50.0).abs() < 0.01,
+        "content origin must use the resolved padding: mixed={mixed:?} ink={ink:?}"
+    );
+}
+
+#[test]
+fn positioned_pseudo_percentage_padding_uses_final_host_width() {
+    let tree = parse_html(
+        r#"
+        <style>
+          #host { position:relative; width:400px; height:100px; border:10px solid }
+          #host::before {
+            content:"x";
+            position:absolute;
+            width:100px;
+            height:50px;
+            padding:10% 5%;
+          }
+        </style>
+        <div id="host"></div>
+        "#,
+    );
+    let layout = layout_dom(&tree, (1000.0, 1000.0));
+    let host = tree.get_element_by_id("host").unwrap();
+    let pseudo = layout.styles[&host].before_pseudo.as_ref().unwrap();
+
+    assert!(
+        (pseudo.padding.top - 40.0).abs() < 0.01
+            && (pseudo.padding.right - 20.0).abs() < 0.01
+            && (pseudo.padding.bottom - 40.0).abs() < 0.01
+            && (pseudo.padding.left - 20.0).abs() < 0.01,
+        "positioned pseudo padding must use its final containing block: {:?}",
+        pseudo.padding
+    );
+}
+
+#[test]
 fn inset_absolute_uses_nearest_positioned_ancestor() {
     let html = r##"
         <body style="margin:0">
