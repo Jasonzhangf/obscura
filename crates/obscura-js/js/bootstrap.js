@@ -9004,6 +9004,17 @@ Element.prototype.attachShadow = function attachShadow(opts) {
   }
   const host = this;
   const children = [];
+  const assertInsertable = (node, operation) => {
+    const createsComposedCycle = node instanceof ShadowRoot
+      || node === host
+      || !!(node?.contains && node.contains(host));
+    if (createsComposedCycle) {
+      throw new DOMException(
+        `Failed to execute '${operation}' on 'Node': The new child would contain the parent.`,
+        "HierarchyRequestError"
+      );
+    }
+  };
   const shadow = {
     mode: opts.mode,
     host: host,
@@ -9022,44 +9033,72 @@ Element.prototype.attachShadow = function attachShadow(opts) {
     get firstElementChild() { return children.find(c => c.nodeType === 1) || null; },
     get children() { return children.filter(c => c.nodeType === 1); },
     appendChild(c) {
-      if (c) {
-        if (c._shadowParent) c._shadowParent.removeChild(c);
-        else if (c.parentNode) c.parentNode.removeChild(c);
-        children.push(c);
-        c._shadowParent = shadow;
+      if (!c) return c;
+      assertInsertable(c, "appendChild");
+      if (c instanceof DocumentFragment) {
+        for (const child of Array.from(c.childNodes)) shadow.appendChild(child);
+        return c;
       }
+      if (c._shadowParent) c._shadowParent.removeChild(c);
+      else if (c.parentNode) c.parentNode.removeChild(c);
+      children.push(c);
+      c._shadowParent = shadow;
       return c;
     },
     insertBefore(n, ref) {
       if (!n) return n;
       if (!ref) { shadow.appendChild(n); return n; }
-      const idx = children.indexOf(ref);
-      if (idx >= 0) {
-        if (n._shadowParent) n._shadowParent.removeChild(n);
-        else if (n.parentNode) n.parentNode.removeChild(n);
-        children.splice(idx, 0, n);
-        n._shadowParent = shadow;
+      if (!children.includes(ref)) {
+        throw new DOMException(
+          "Failed to execute 'insertBefore' on 'Node': The reference node is not a child of this node.",
+          "NotFoundError"
+        );
       }
-      else shadow.appendChild(n);
+      if (n === ref) return n;
+      assertInsertable(n, "insertBefore");
+      if (n instanceof DocumentFragment) {
+        for (const child of Array.from(n.childNodes)) shadow.insertBefore(child, ref);
+        return n;
+      }
+      if (n._shadowParent) n._shadowParent.removeChild(n);
+      else if (n.parentNode) n.parentNode.removeChild(n);
+      const idx = children.indexOf(ref);
+      children.splice(idx, 0, n);
+      n._shadowParent = shadow;
       return n;
     },
     removeChild(c) {
       const idx = children.indexOf(c);
-      if (idx >= 0) {
-        children.splice(idx, 1);
-        if (c._shadowParent === shadow) c._shadowParent = null;
+      if (idx < 0) {
+        throw new DOMException(
+          "Failed to execute 'removeChild' on 'Node': The node to be removed is not a child of this node.",
+          "NotFoundError"
+        );
       }
+      children.splice(idx, 1);
+      if (c._shadowParent === shadow) c._shadowParent = null;
       return c;
     },
     replaceChild(n, o) {
-      const idx = children.indexOf(o);
-      if (idx >= 0) {
-        if (n._shadowParent) n._shadowParent.removeChild(n);
-        else if (n.parentNode) n.parentNode.removeChild(n);
-        children[idx] = n;
-        n._shadowParent = shadow;
-        if (o._shadowParent === shadow) o._shadowParent = null;
+      if (!children.includes(o)) {
+        throw new DOMException(
+          "Failed to execute 'replaceChild' on 'Node': The node to be replaced is not a child of this node.",
+          "NotFoundError"
+        );
       }
+      if (n === o) return o;
+      assertInsertable(n, "replaceChild");
+      if (n instanceof DocumentFragment) {
+        for (const child of Array.from(n.childNodes)) shadow.insertBefore(child, o);
+        shadow.removeChild(o);
+        return o;
+      }
+      if (n._shadowParent) n._shadowParent.removeChild(n);
+      else if (n.parentNode) n.parentNode.removeChild(n);
+      const idx = children.indexOf(o);
+      children[idx] = n;
+      n._shadowParent = shadow;
+      if (o._shadowParent === shadow) o._shadowParent = null;
       return o;
     },
     querySelector(s) {

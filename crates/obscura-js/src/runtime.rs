@@ -1993,7 +1993,50 @@ mod tests {
                     inside.getRootNode() === root,
                     root.textContent
                 ];
-                return [inserted, removed, moved, parsed];
+
+                const a = document.createElement("a");
+                const b = document.createElement("b");
+                const c = document.createElement("i");
+                root.replaceChildren(a, b, c);
+                root.insertBefore(a, c);
+                const movedWithin = Array.from(root.children, el => el.localName);
+
+                const fragment = document.createDocumentFragment();
+                const x = document.createElement("x-one");
+                const y = document.createElement("x-two");
+                fragment.append(x, y);
+                root.insertBefore(fragment, c);
+                const flattened = [
+                    Array.from(root.children, el => el.localName),
+                    fragment.childNodes.length,
+                    x.parentNode === root,
+                    y.parentNode === root
+                ];
+
+                root.replaceChild(b, c);
+                const replaced = [
+                    Array.from(root.children, el => el.localName),
+                    c.parentNode === null,
+                    b.parentNode === root
+                ];
+
+                const detached = document.createElement("detached-node");
+                const errors = [];
+                for (const operation of [
+                    () => root.insertBefore(detached, c),
+                    () => root.removeChild(c),
+                    () => root.replaceChild(detached, c),
+                    () => root.appendChild(root),
+                    () => root.appendChild(host)
+                ]) {
+                    try {
+                        operation();
+                        errors.push("none");
+                    } catch (error) {
+                        errors.push(error.name);
+                    }
+                }
+                return [inserted, removed, moved, parsed, movedWithin, flattened, replaced, errors];
                 "#,
             )
             .unwrap();
@@ -2016,7 +2059,17 @@ mod tests {
                 ],
                 [true, true, true],
                 [true, true, true],
-                [true, true, "inside"]
+                [true, true, "inside"],
+                ["b", "a", "i"],
+                [["b", "a", "x-one", "x-two", "i"], 0, true, true],
+                [["a", "x-one", "x-two", "b"], true, true],
+                [
+                    "NotFoundError",
+                    "NotFoundError",
+                    "NotFoundError",
+                    "HierarchyRequestError",
+                    "HierarchyRequestError"
+                ]
             ])
         );
     }
