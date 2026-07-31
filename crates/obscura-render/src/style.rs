@@ -733,9 +733,26 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         "padding-block-end" => set_padding_side(style, 2, value),
         "border-radius" => {
             // Uniform radius from the first value (ignore per-corner / the
-            // `/` vertical-radius form; the common case is one length).
-            if let Some(r) = value.split(['/', ' ']).next().and_then(|t| px(t)) {
-                style.border_radius = r;
+            // `/` vertical-radius form; the common case is one
+            // <length-percentage>). A percentage must remain unresolved until
+            // paint knows both axes of the final border box.
+            let token = value.split('/').next().and_then(|part| part.split_whitespace().next());
+            if matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "initial" | "unset" | "revert" | "revert-layer"
+            ) {
+                style.border_radius = crate::BorderRadius::default();
+            } else if let Some(percentage) = token
+                .and_then(|token| token.strip_suffix('%'))
+                .and_then(|number| number.parse::<f32>().ok())
+                .filter(|number| number.is_finite() && *number >= 0.0)
+            {
+                style.border_radius = crate::BorderRadius::percentage(percentage / 100.0);
+            } else if let Some(length) = token
+                .and_then(px)
+                .filter(|length| length.is_finite() && *length >= 0.0)
+            {
+                style.border_radius = crate::BorderRadius::pixels(length);
             }
         }
         "border" => {
@@ -5027,6 +5044,18 @@ mod tests {
         assert_eq!(side.border.right, 3.0);
         assert_eq!(side.border.bottom, 3.0);
         assert_eq!(side.border.left, 0.0);
+    }
+
+    #[test]
+    fn uniform_border_radius_retains_percentage_until_box_resolution() {
+        let percentage = compute_style("div", Some("border-radius:50%"));
+        assert_eq!(percentage.border_radius.resolve(80.0, 40.0), (40.0, 20.0));
+
+        let pixels = compute_style("div", Some("border-radius:20px"));
+        assert_eq!(pixels.border_radius.resolve(80.0, 40.0), (20.0, 20.0));
+
+        let reset = compute_style("div", Some("border-radius:50%;border-radius:initial"));
+        assert!(reset.border_radius.is_zero());
     }
 
     #[test]

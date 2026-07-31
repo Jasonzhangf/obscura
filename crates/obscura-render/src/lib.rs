@@ -204,6 +204,37 @@ pub struct FontVariationSetting {
     pub value: f32,
 }
 
+/// The supported uniform `border-radius` value as a CSS
+/// `<length-percentage>`. Percentages resolve independently against the
+/// border box's width and height, so `50%` produces an ellipse on a rectangle
+/// and a circle on a square.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct BorderRadius {
+    length: f32,
+    percentage: f32,
+}
+
+impl BorderRadius {
+    pub const fn pixels(length: f32) -> Self {
+        Self { length, percentage: 0.0 }
+    }
+
+    pub const fn percentage(percentage: f32) -> Self {
+        Self { length: 0.0, percentage }
+    }
+
+    pub fn resolve(self, width: f32, height: f32) -> (f32, f32) {
+        (
+            (self.length + self.percentage * width).max(0.0),
+            (self.length + self.percentage * height).max(0.0),
+        )
+    }
+
+    pub fn is_zero(self) -> bool {
+        self.length == 0.0 && self.percentage == 0.0
+    }
+}
+
 /// The subset of CSS that influences box layout. Expanded in later phases.
 #[derive(Debug, Clone, Default)]
 pub struct LayoutStyle {
@@ -301,8 +332,8 @@ pub struct LayoutStyle {
     pub padding_expressions: [Option<String>; 4],
     pub border: Edges,
     /// `border-radius` (uniform; the first value of the shorthand). Rounds the
-    /// background fill and border. In px after resolution.
-    pub border_radius: f32,
+    /// background fill, replaced content, border, and shadow.
+    pub border_radius: BorderRadius,
     /// RGBA for the paint step. Parsed always (cheap), used only with `paint`.
     pub background_color: Option<[u8; 4]>,
     /// `linear-gradient(...)` background: (angle in degrees clockwise from 12

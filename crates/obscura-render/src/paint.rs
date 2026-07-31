@@ -720,9 +720,17 @@ fn paint_laid_dom_scrolled(
         }
 
         // Box path (rounded if border-radius), reused for gradient/color fill.
-        let r = style.border_radius;
-        let bg_path = || if r > 0.5 {
-            rounded_rect_path(visible_rect.x, visible_rect.y, visible_rect.width, visible_rect.height, r)
+        let radius = style.border_radius.resolve(rect.width, rect.height);
+        let has_radius = radius.0 > 0.5 && radius.1 > 0.5;
+        let bg_path = || if has_radius {
+            rounded_rect_path(
+                visible_rect.x,
+                visible_rect.y,
+                visible_rect.width,
+                visible_rect.height,
+                radius.0,
+                radius.1,
+            )
         } else {
             let mut pb = PathBuilder::new();
             pb.push_rect(box_rect);
@@ -737,7 +745,7 @@ fn paint_laid_dom_scrolled(
                 if let Some(path) = bg_path() {
                     let mut paint = Paint::default();
                     paint.set_color(Color::from_rgba8(bg[0], bg[1], bg[2], bg[3]));
-                    paint.anti_alias = r > 0.5;
+                    paint.anti_alias = has_radius;
                     pixmap.fill_path(
                         &path,
                         &paint,
@@ -759,7 +767,14 @@ fn paint_laid_dom_scrolled(
                 }
             }
             if let Some((angle, center, stops)) = &style.background_conic_gradient {
-                paint_conic_gradient(&mut pixmap, &visible_rect, *angle, *center, stops);
+                paint_conic_gradient(
+                    &mut pixmap,
+                    &visible_rect,
+                    radius,
+                    *angle,
+                    *center,
+                    stops,
+                );
             }
             if let Some((angle, stops)) = &style.background_gradient {
                 if let Some(path) = bg_path() {
@@ -774,6 +789,7 @@ fn paint_laid_dom_scrolled(
                 mask_url,
                 base_url,
                 &visible_rect,
+                radius,
                 fill,
                 style.background_radial_gradient.as_ref(),
                 style.background_gradient.as_ref(),
@@ -815,6 +831,7 @@ fn paint_laid_dom_scrolled(
                         &mut pixmap,
                         image_cache,
                         None,
+                        radius,
                     );
                 }
             }
@@ -842,10 +859,17 @@ fn paint_laid_dom_scrolled(
             && style.border.right == style.border.bottom
             && style.border.bottom == style.border.left
             && style.border.top > 0.0;
-        if style.border_radius > 0.5 && uniform_border {
+        if has_radius && uniform_border {
             let bc = style.border_color.or(style.color).unwrap_or([0, 0, 0, 255]);
             let w = style.border.top;
-            if let Some(path) = rounded_rect_path(rect.x + w / 2.0, rect.y + w / 2.0, rect.width - w, rect.height - w, (style.border_radius - w / 2.0).max(0.0)) {
+            if let Some(path) = rounded_rect_path(
+                rect.x + w / 2.0,
+                rect.y + w / 2.0,
+                rect.width - w,
+                rect.height - w,
+                (radius.0 - w / 2.0).max(0.0),
+                (radius.1 - w / 2.0).max(0.0),
+            ) {
                 let mut paint = Paint::default();
                 paint.set_color(Color::from_rgba8(bc[0], bc[1], bc[2], bc[3]));
                 paint.anti_alias = true;
@@ -901,6 +925,7 @@ fn paint_laid_dom_scrolled(
                         &mut pixmap,
                         image_cache,
                         projected_image,
+                        radius,
                     );
                 // Fall back when the image itself did not paint, following
                 // what browsers show for a broken image: a non-empty alt
@@ -972,8 +997,16 @@ fn paint_laid_dom_scrolled(
                 rect.height as u32,
                 &svg_fonts,
             ) {
-                let mask = clip
-                    .and_then(|_| rect_clip_mask(pixmap.width(), pixmap.height(), &visible_rect));
+                let mask = if clip.is_some() || has_radius {
+                    rounded_box_clip_mask(
+                        pixmap.width(),
+                        pixmap.height(),
+                        &visible_rect,
+                        radius,
+                    )
+                } else {
+                    None
+                };
                 pixmap.draw_pixmap(
                     rect.x as i32,
                     rect.y as i32,
@@ -1451,23 +1484,40 @@ fn collect_projected_image_transforms(
 }
 
 /// A closed rounded-rectangle path, corners approximated by quadratic curves
-/// (visually indistinguishable from true arcs at typical UI radii). `r` is
-/// clamped so it never exceeds half the shorter side.
-fn rounded_rect_path(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<tiny_skia::Path> {
+/// (visually indistinguishable from true arcs at typical UI radii). The
+/// horizontal and vertical radii are scaled together when necessary, matching
+/// CSS's overlap rule while preserving percentage ellipses.
+fn rounded_rect_path(
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    rx: f32,
+    ry: f32,
+) -> Option<tiny_skia::Path> {
     if w <= 0.0 || h <= 0.0 {
         return None;
     }
-    let r = r.min(w / 2.0).min(h / 2.0).max(0.0);
+    let mut rx = rx.max(0.0);
+    let mut ry = ry.max(0.0);
+    if rx <= f32::EPSILON || ry <= f32::EPSILON {
+        let mut pb = PathBuilder::new();
+        pb.push_rect(Rect::from_xywh(x, y, w, h)?);
+        return pb.finish();
+    }
+    let scale = 1.0f32.min(w / (2.0 * rx)).min(h / (2.0 * ry));
+    rx *= scale;
+    ry *= scale;
     let mut pb = PathBuilder::new();
-    pb.move_to(x + r, y);
-    pb.line_to(x + w - r, y);
-    pb.quad_to(x + w, y, x + w, y + r);
-    pb.line_to(x + w, y + h - r);
-    pb.quad_to(x + w, y + h, x + w - r, y + h);
-    pb.line_to(x + r, y + h);
-    pb.quad_to(x, y + h, x, y + h - r);
-    pb.line_to(x, y + r);
-    pb.quad_to(x, y, x + r, y);
+    pb.move_to(x + rx, y);
+    pb.line_to(x + w - rx, y);
+    pb.quad_to(x + w, y, x + w, y + ry);
+    pb.line_to(x + w, y + h - ry);
+    pb.quad_to(x + w, y + h, x + w - rx, y + h);
+    pb.line_to(x + rx, y + h);
+    pb.quad_to(x, y + h, x, y + h - ry);
+    pb.line_to(x, y + ry);
+    pb.quad_to(x, y, x + rx, y);
     pb.close();
     pb.finish()
 }
@@ -1486,7 +1536,7 @@ fn paint_box_shadow(
     pixmap: &mut Pixmap,
     shadow: &crate::BoxShadow,
     rect: &crate::Rect,
-    border_radius: f32,
+    border_radius: crate::BorderRadius,
     clip: Option<crate::Rect>,
 ) {
     if shadow.inset || shadow.color[3] == 0 {
@@ -1500,7 +1550,9 @@ fn paint_box_shadow(
     if w0 <= 0.0 || h0 <= 0.0 {
         return;
     }
-    let r0 = (border_radius + spread).max(0.0);
+    let radius = border_radius.resolve(rect.width, rect.height);
+    let rx0 = (radius.0 + spread).max(0.0);
+    let ry0 = (radius.1 + spread).max(0.0);
     let blur = shadow.blur.max(0.0);
     // Ancestor overflow clip: build a mask once and reuse it for every layer.
     let mask = match clip {
@@ -1515,7 +1567,7 @@ fn paint_box_shadow(
     let color = shadow.color;
     if blur < 0.5 {
         // No blur: a single crisp, offset (and spread) rounded rect.
-        fill_shadow_rect(pixmap, x0, y0, w0, h0, r0, color, mask.as_ref());
+        fill_shadow_rect(pixmap, x0, y0, w0, h0, rx0, ry0, color, mask.as_ref());
         return;
     }
     let steps: u32 = (blur.ceil() as u32).clamp(2, 24);
@@ -1529,7 +1581,17 @@ fn paint_box_shadow(
         // j = 0 is the solid core (expansion 0); j = steps-1 reaches the blur
         // radius. Larger rects paint first, smaller (more-covered) ones on top.
         let e = blur * (j as f32) / ((steps - 1) as f32);
-        fill_shadow_rect(pixmap, x0 - e, y0 - e, w0 + 2.0 * e, h0 + 2.0 * e, r0 + e, layer_color, mask.as_ref());
+        fill_shadow_rect(
+            pixmap,
+            x0 - e,
+            y0 - e,
+            w0 + 2.0 * e,
+            h0 + 2.0 * e,
+            rx0 + e,
+            ry0 + e,
+            layer_color,
+            mask.as_ref(),
+        );
     }
 }
 
@@ -1541,15 +1603,16 @@ fn fill_shadow_rect(
     y: f32,
     w: f32,
     h: f32,
-    radius: f32,
+    radius_x: f32,
+    radius_y: f32,
     color: [u8; 4],
     mask: Option<&tiny_skia::Mask>,
 ) {
     if w <= 0.0 || h <= 0.0 || color[3] == 0 {
         return;
     }
-    let path = if radius > 0.5 {
-        match rounded_rect_path(x, y, w, h, radius) {
+    let path = if radius_x > 0.5 && radius_y > 0.5 {
+        match rounded_rect_path(x, y, w, h, radius_x, radius_y) {
             Some(p) => p,
             None => return,
         }
@@ -2443,6 +2506,7 @@ fn paint_radial_gradient(
 fn paint_conic_gradient(
     pixmap: &mut Pixmap,
     rect: &crate::Rect,
+    border_radius: (f32, f32),
     angle: f32,
     center: (f32, f32),
     stops: &[([u8; 4], Option<f32>)],
@@ -2469,13 +2533,23 @@ fn paint_conic_gradient(
             layer.pixels_mut()[(y * width + x) as usize] = premultiplied(color);
         }
     }
+    let clip = if border_radius.0 > 0.5 && border_radius.1 > 0.5 {
+        rounded_box_clip_mask(
+            pixmap.width(),
+            pixmap.height(),
+            rect,
+            border_radius,
+        )
+    } else {
+        None
+    };
     pixmap.draw_pixmap(
         rect.x.floor() as i32,
         rect.y.floor() as i32,
         layer.as_ref(),
         &tiny_skia::PixmapPaint::default(),
         Transform::identity(),
-        None,
+        clip.as_ref(),
     );
 }
 
@@ -2813,13 +2887,16 @@ fn paint_in_flow_generated_box(
     if let Some(shadow) = style.box_shadow {
         paint_box_shadow(pixmap, &shadow, &rect, style.border_radius, clip);
     }
-    let path = if style.border_radius > 0.5 {
+    let radius = style.border_radius.resolve(rect.width, rect.height);
+    let has_radius = radius.0 > 0.5 && radius.1 > 0.5;
+    let path = if has_radius {
         rounded_rect_path(
             visible.x,
             visible.y,
             visible.width,
             visible.height,
-            style.border_radius,
+            radius.0,
+            radius.1,
         )
     } else {
         Rect::from_xywh(visible.x, visible.y, visible.width, visible.height).and_then(|rect| {
@@ -2833,7 +2910,7 @@ fn paint_in_flow_generated_box(
         if let Some(color) = style.background_color {
             let mut paint = Paint::default();
             paint.set_color(Color::from_rgba8(color[0], color[1], color[2], color[3]));
-            paint.anti_alias = style.border_radius > 0.5;
+            paint.anti_alias = has_radius;
             pixmap.fill_path(
                 &path,
                 &paint,
@@ -2846,7 +2923,7 @@ fn paint_in_flow_generated_box(
             paint_radial_gradient(pixmap, &path, &rect, *center, stops);
         }
         if let Some((angle, center, stops)) = &style.background_conic_gradient {
-            paint_conic_gradient(pixmap, &rect, *angle, *center, stops);
+            paint_conic_gradient(pixmap, &rect, radius, *angle, *center, stops);
         }
         if let Some((angle, stops)) = &style.background_gradient {
             paint_linear_gradient(pixmap, &path, &rect, *angle, stops);
@@ -2861,6 +2938,7 @@ fn paint_in_flow_generated_box(
             mask_url,
             base_url,
             &visible,
+            radius,
             fill,
             style.background_radial_gradient.as_ref(),
             style.background_gradient.as_ref(),
@@ -2893,6 +2971,7 @@ fn paint_in_flow_generated_box(
                 pixmap,
                 image_cache,
                 None,
+                radius,
             );
         }
     }
@@ -3010,8 +3089,17 @@ fn paint_positioned_pseudo(
         None => Some(rect),
     };
     let Some(visible) = visible else { return };
-    let path = if style.border_radius > 0.5 {
-        rounded_rect_path(visible.x, visible.y, visible.width, visible.height, style.border_radius)
+    let radius = style.border_radius.resolve(rect.width, rect.height);
+    let has_radius = radius.0 > 0.5 && radius.1 > 0.5;
+    let path = if has_radius {
+        rounded_rect_path(
+            visible.x,
+            visible.y,
+            visible.width,
+            visible.height,
+            radius.0,
+            radius.1,
+        )
     } else {
         Rect::from_xywh(visible.x, visible.y, visible.width, visible.height).and_then(|rect| {
             let mut builder = PathBuilder::new();
@@ -3036,7 +3124,7 @@ fn paint_positioned_pseudo(
             paint_radial_gradient(pixmap, &path, &rect, *center, stops);
         }
         if let Some((angle, center, stops)) = &style.background_conic_gradient {
-            paint_conic_gradient(pixmap, &rect, *angle, *center, stops);
+            paint_conic_gradient(pixmap, &rect, radius, *angle, *center, stops);
         }
         if let Some((angle, stops)) = &style.background_gradient {
             paint_linear_gradient(pixmap, &path, &rect, *angle, stops);
@@ -3051,6 +3139,7 @@ fn paint_positioned_pseudo(
             mask_url,
             base_url,
             &visible,
+            radius,
             fill,
             style.background_radial_gradient.as_ref(),
             style.background_gradient.as_ref(),
@@ -3083,6 +3172,7 @@ fn paint_positioned_pseudo(
                 pixmap,
                 image_cache,
                 None,
+                radius,
             );
         }
     }
@@ -3457,6 +3547,7 @@ fn paint_image(
     pixmap: &mut Pixmap,
     cache: &mut RenderResourceCache,
     transform: Option<ImageAffine>,
+    clip_radius: (f32, f32),
 ) -> bool {
     if rect.width <= 0.0 || rect.height <= 0.0 {
         return false;
@@ -3494,12 +3585,19 @@ fn paint_image(
     // intersected with the ancestor overflow clip): `Cover`/`None` can size
     // the image past the box, and an ancestor clip can cut into the box
     // itself. Only the fully-inside case takes the unmasked fast path.
-    let clip = if dest.width > visible_rect.width + 0.5
+    let has_radius = clip_radius.0 > 0.5 && clip_radius.1 > 0.5;
+    let clip = if has_radius
+        || dest.width > visible_rect.width + 0.5
         || dest.height > visible_rect.height + 0.5
         || dest.x < visible_rect.x - 0.5
         || dest.y < visible_rect.y - 0.5
     {
-        box_clip_mask(pixmap.width(), pixmap.height(), visible_rect)
+        rounded_box_clip_mask(
+            pixmap.width(),
+            pixmap.height(),
+            visible_rect,
+            clip_radius,
+        )
     } else {
         None
     };
@@ -3573,6 +3671,31 @@ fn box_clip_mask(pw: u32, ph: u32, rect: &crate::Rect) -> Option<tiny_skia::Mask
     let mut pb = PathBuilder::new();
     pb.push_rect(r);
     let path = pb.finish()?;
+    mask.fill_path(&path, FillRule::Winding, true, Transform::identity());
+    Some(mask)
+}
+
+/// A full-pixmap clip mask for a border box with a uniform elliptical radius.
+/// Used by replaced and background images, whose raster content otherwise
+/// ignores the owner's rounded corners.
+fn rounded_box_clip_mask(
+    pw: u32,
+    ph: u32,
+    rect: &crate::Rect,
+    radius: (f32, f32),
+) -> Option<tiny_skia::Mask> {
+    if radius.0 <= 0.5 || radius.1 <= 0.5 {
+        return box_clip_mask(pw, ph, rect);
+    }
+    let mut mask = tiny_skia::Mask::new(pw, ph)?;
+    let path = rounded_rect_path(
+        rect.x,
+        rect.y,
+        rect.width,
+        rect.height,
+        radius.0,
+        radius.1,
+    )?;
     mask.fill_path(&path, FillRule::Winding, true, Transform::identity());
     Some(mask)
 }
@@ -4262,18 +4385,6 @@ fn element_end(sprite: &str, start: usize, name: &str) -> Option<usize> {
     None
 }
 
-/// A full-pixmap alpha mask that is opaque only inside `rect`, used to clip a
-/// blit (e.g. an inline svg raster) to an ancestor's overflow-hidden region.
-fn rect_clip_mask(width: u32, height: u32, rect: &crate::Rect) -> Option<tiny_skia::Mask> {
-    let mut mask = tiny_skia::Mask::new(width, height)?;
-    let r = Rect::from_xywh(rect.x, rect.y, rect.width, rect.height)?;
-    let mut pb = PathBuilder::new();
-    pb.push_rect(r);
-    let path = pb.finish()?;
-    mask.fill_path(&path, FillRule::Winding, true, Transform::identity());
-    Some(mask)
-}
-
 /// Paint a `mask-image`: the ubiquitous "colored, scalable icon" pattern,
 /// where an SVG shape is used purely as a stencil and tinted by
 /// `background-color`/`color` rather than carrying its own colors. Fetches
@@ -4284,6 +4395,7 @@ fn paint_mask(
     src: &str,
     base_url: Option<&str>,
     rect: &crate::Rect,
+    border_radius: (f32, f32),
     fill: [u8; 4],
     radial_gradient: Option<&((f32, f32), Vec<([u8; 4], Option<f32>)>)>,
     linear_gradient: Option<&(f32, Vec<([u8; 4], Option<f32>)>)>,
@@ -4364,13 +4476,23 @@ fn paint_mask(
                 premultiplied(color);
         }
     }
+    let clip = if border_radius.0 > 0.5 && border_radius.1 > 0.5 {
+        rounded_box_clip_mask(
+            pixmap.width(),
+            pixmap.height(),
+            rect,
+            border_radius,
+        )
+    } else {
+        None
+    };
     pixmap.draw_pixmap(
         rect.x.floor() as i32,
         rect.y.floor() as i32,
         recolored.as_ref(),
         &tiny_skia::PixmapPaint::default(),
         Transform::identity(),
-        None,
+        clip.as_ref(),
     );
     true
 }
@@ -4662,6 +4784,47 @@ mod tests {
         assert_eq!(outside.red(), 255);
         assert_eq!(outside.green(), 255);
         assert_eq!(outside.blue(), 255);
+    }
+
+    #[test]
+    fn percentage_border_radius_paints_circles_ellipses_and_replaced_clips() {
+        let tree = parse_html(
+            r##"<html><body style="margin:0">
+               <div id="circle" style="position:absolute;left:0;top:0;width:40px;height:40px;
+                    border-radius:50%;background:#ff0000"></div>
+               <div id="ellipse" style="position:absolute;left:50px;top:0;width:80px;height:40px;
+                    border-radius:50%;background:#0000ff"></div>
+               <div id="pill" style="position:absolute;left:140px;top:0;width:80px;height:40px;
+                    border-radius:20px;background:#00aa00"></div>
+               <img alt="" src="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='40'%20height='40'%3E%3Crect%20width='40'%20height='40'%20fill='%23800080'/%3E%3C/svg%3E"
+                    style="position:absolute;left:230px;top:0;width:40px;height:40px;border-radius:50%">
+               </body></html>"##,
+        );
+        let pixmap = paint_dom(&tree, (280.0, 50.0), None).expect("pixmap");
+        let is_white = |x, y| {
+            let pixel = pixmap.pixel(x, y).expect("pixel");
+            pixel.red() > 245 && pixel.green() > 245 && pixel.blue() > 245
+        };
+        assert!(is_white(1, 1), "a square 50% radius must clear its corner");
+        let circle_top = pixmap.pixel(20, 1).expect("circle top");
+        assert!(circle_top.red() > 200 && circle_top.green() < 40 && circle_top.blue() < 40);
+
+        assert!(is_white(60, 3), "a rectangular 50% radius must use a 40x20 elliptical corner");
+        let ellipse_top = pixmap.pixel(90, 1).expect("ellipse top");
+        let ellipse_left = pixmap.pixel(51, 20).expect("ellipse left");
+        for pixel in [ellipse_top, ellipse_left] {
+            assert!(pixel.blue() > 200 && pixel.red() < 40 && pixel.green() < 40);
+        }
+
+        let pill_corner = pixmap.pixel(150, 3).expect("pixel radius pill corner");
+        assert!(
+            pill_corner.green() > 100 && pill_corner.red() < 40 && pill_corner.blue() < 40,
+            "a 20px radius must remain circular rather than resolving like 50%: {pill_corner:?}"
+        );
+
+        assert!(is_white(231, 1), "a circular replaced image must clip its raster corner");
+        let image_center = pixmap.pixel(250, 20).expect("image center");
+        assert!(image_center.red() > 80 && image_center.blue() > 80 && image_center.green() < 40);
     }
 
     #[test]
