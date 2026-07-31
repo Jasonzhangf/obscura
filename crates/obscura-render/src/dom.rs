@@ -4882,6 +4882,22 @@ fn has_inline_content(tree: &DomTree, id: NodeId, styles: &HashMap<NodeId, crate
     })
 }
 
+/// Whether a computed box participates as an in-flow block-level child.
+///
+/// `LayoutStyle::display` stores the inner display mode for flex/grid boxes,
+/// while `is_inline_block` preserves their authored inline outer display.
+/// Consequently a non-inline flex/grid container is block-level just like a
+/// `display:block` box, but inline-block/inline-flex/inline-grid are not.
+fn is_in_flow_block_level(style: &crate::LayoutStyle) -> bool {
+    matches!(
+        style.display,
+        crate::Display::Block | crate::Display::Flex | crate::Display::Grid
+    ) && !style.is_inline_block
+        && !style.display_contents
+        && style.float.is_none()
+        && !matches!(style.position, Some(taffy::Position::Absolute))
+}
+
 /// Blockify the generated layout children of a flex/grid container. A
 /// display:contents element is transparent, so its first boxed descendants
 /// are the items whose outer display changes.
@@ -6437,13 +6453,9 @@ fn build(
             // with real in-flow block children; those need their inner block
             // formatting rather than a single max-content line.
             let has_in_flow_block_child = tree.children(id).iter().any(|child| {
-                styles.get(child).map_or(false, |child_style| {
-                    child_style.display == crate::Display::Block
-                        && !matches!(
-                            child_style.position,
-                            Some(taffy::Position::Absolute)
-                        )
-                })
+                styles
+                    .get(child)
+                    .map_or(false, is_in_flow_block_level)
             });
             if !has_in_flow_block_child {
                 taffy_style.flex_wrap = taffy::FlexWrap::NoWrap;
@@ -6666,14 +6678,7 @@ fn build(
     }
     let internal_mixed_block_flow = style.internal_flex_container
         && dom_children.iter().any(|cid| {
-            styles.get(cid).map_or(false, |child| {
-                child.display == crate::Display::Block
-                    && child.float.is_none()
-                    && !matches!(
-                        child.position,
-                        Some(taffy::Position::Absolute)
-                    )
-            })
+            styles.get(cid).map_or(false, is_in_flow_block_level)
         });
     // In flex and grid formatting contexts, collapsible whitespace-only text
     // between items does not generate an anonymous item. Taffy places each
@@ -6757,11 +6762,7 @@ fn build(
     let native_float_band =
         has_float_child && can_use_native_float_band(tree, style, &dom_children, styles);
     let has_in_flow_block_child = dom_children.iter().any(|cid| {
-            styles.get(cid).map_or(false, |child| {
-                child.display == crate::Display::Block
-                    && child.float.is_none()
-                    && !matches!(child.position, Some(taffy::Position::Absolute))
-            })
+            styles.get(cid).map_or(false, is_in_flow_block_level)
         });
     let is_native_table_cell = node.as_element().map_or(false, |element| {
         matches!(element.local.as_ref(), "td" | "th")
@@ -7434,7 +7435,7 @@ fn inline_wraps_only_in_flow_blocks(
                 return false;
             }
             saw_block = true;
-        } else if child.display == crate::Display::Block {
+        } else if is_in_flow_block_level(child) {
             saw_block = true;
         } else {
             return false;
@@ -8468,6 +8469,45 @@ mod tests {
             "children heights should be 40 and 60, got {:?}",
             sorted
         );
+    }
+
+    #[test]
+    fn text_alignment_does_not_shrink_wrap_block_grid_and_flex_children() {
+        let tree = parse_html(
+            r#"<style>
+                html,body{margin:0}
+                #host{width:900px;text-align:center}
+                #grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:20px}
+                .card{overflow:hidden;height:30px}
+                .wide{width:1200px;height:10px}
+                #flex{display:flex}
+                #flex > div{flex:1;height:20px}
+            </style>
+            <div id="host">
+              <div id="grid">
+                <div id="card-a" class="card"><div class="wide"></div></div>
+                <div id="card-b" class="card"><div class="wide"></div></div>
+              </div>
+              <div id="flex"><div></div><div></div></div>
+            </div>"#,
+        );
+        let laid = layout_dom(&tree, (1000.0, 300.0));
+        let rect = |name| laid.rects[&tree.get_element_by_id(name).unwrap()];
+        let host = rect("host");
+        let grid = rect("grid");
+        let card_a = rect("card-a");
+        let card_b = rect("card-b");
+        let flex = rect("flex");
+
+        assert!((host.width - 900.0).abs() < 0.01, "{host:?}");
+        assert!((grid.width - 900.0).abs() < 0.01, "{grid:?}");
+        assert!(
+            (card_a.width - 440.0).abs() < 0.01
+                && (card_b.width - 440.0).abs() < 0.01
+                && (card_b.x - card_a.x - 460.0).abs() < 0.01,
+            "grid tracks escaped their containing block: {card_a:?} {card_b:?}"
+        );
+        assert!((flex.width - 900.0).abs() < 0.01, "{flex:?}");
     }
 
     #[test]
