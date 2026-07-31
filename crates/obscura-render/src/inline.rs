@@ -1410,7 +1410,7 @@ fn collect_spans(
     c: &mut Collector,
     loaded_families: &HashMap<String, LoadedFamily>,
 ) {
-    for cid in tree.children(id) {
+    for cid in crate::dom::rendered_children(tree, id) {
         collect_node_spans(
             tree,
             cid,
@@ -1795,7 +1795,7 @@ fn is_pure_text_ifc(
         return false;
     }
     let mut has_text = false;
-    let children = tree.children(id);
+    let children = crate::dom::rendered_children(tree, id);
     if children.is_empty() {
         return false;
     }
@@ -1869,7 +1869,7 @@ fn inline_child_ok(tree: &DomTree, cid: NodeId, styles: &std::collections::HashM
             if !foldable_inline {
                 return false;
             }
-            for gc in tree.children(cid) {
+            for gc in crate::dom::rendered_children(tree, cid) {
                 if !inline_child_ok(tree, gc, styles, has_text) {
                     return false;
                 }

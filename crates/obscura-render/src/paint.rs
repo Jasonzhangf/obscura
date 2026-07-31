@@ -27,6 +27,10 @@ use crate::dom::layout_dom_with_web_fonts;
 const DEFAULT_RESOURCE_CACHE_ENTRIES: usize = 512;
 const DEFAULT_RESOURCE_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const MISSING_RESOURCE_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
+/// Exact formats the renderer can decode. Do not use `image/*` or `*/*` here:
+/// either wildcard permits a content-negotiating server to choose AVIF,
+/// JPEG-XL, or another format that this build cannot rasterize.
+const IMAGE_ACCEPT: &str = "image/webp,image/apng,image/svg+xml,image/png,image/jpeg,image/gif,image/bmp,image/x-icon,image/vnd.microsoft.icon";
 
 /// Synchronous byte loader used by [`RenderResourceCache`]. The default
 /// implementation uses Obscura's pooled image agent; tests and embedding
@@ -376,6 +380,247 @@ impl PreparedRender {
         })
     }
 
+    /// Unscaled padding-box size used by CSSOM View's `clientWidth` and
+    /// `clientHeight`. Layout rects are border boxes, so remove the resolved
+    /// borders but retain padding. This deliberately ignores visual
+    /// transforms: client metrics describe layout geometry, unlike
+    /// `getBoundingClientRect()`.
+    pub fn client_size(
+        &self,
+        id: obscura_dom::tree::NodeId,
+    ) -> Option<(f32, f32)> {
+        let rect = self.layout.rects.get(&id)?;
+        let style = self.layout.styles.get(&id)?;
+        Some((
+            (rect.width - style.border.left - style.border.right).max(0.0),
+            (rect.height - style.border.top - style.border.bottom).max(0.0),
+        ))
+    }
+
+    /// A compact CSSOM snapshot derived from the same final cascade and
+    /// layout used by paint and geometry. Keeping this on `PreparedRender`
+    /// lets script fetch all high-traffic computed properties in one op,
+    /// without rebuilding layout once per property access.
+    pub fn computed_style(
+        &self,
+        id: obscura_dom::tree::NodeId,
+    ) -> Option<HashMap<&'static str, String>> {
+        let style = self.layout.styles.get(&id)?;
+        let rect = self.layout.rects.get(&id);
+        let mut out = HashMap::new();
+
+        let display = if style.display_contents {
+            "contents"
+        } else if style.display == crate::Display::None {
+            "none"
+        } else if style.internal_flex_container {
+            "block"
+        } else {
+            match (style.display, style.is_inline_block) {
+                (crate::Display::Flex, true) => "inline-flex",
+                (crate::Display::Grid, true) => "inline-grid",
+                (crate::Display::Block, true) => "inline-block",
+                (crate::Display::Flex, false) => "flex",
+                (crate::Display::Grid, false) => "grid",
+                (crate::Display::Inline, false) => "inline",
+                _ => "block",
+            }
+        };
+        out.insert("display", display.to_string());
+        out.insert(
+            "position",
+            if style.position_fixed {
+                "fixed"
+            } else if style.position_sticky {
+                "sticky"
+            } else {
+                match style.position {
+                    Some(taffy::Position::Absolute) => "absolute",
+                    Some(taffy::Position::Relative) => "relative",
+                    _ => "static",
+                }
+            }
+            .to_string(),
+        );
+        out.insert(
+            "z-index",
+            style.z_index.map_or_else(|| "auto".to_string(), |v| v.to_string()),
+        );
+        out.insert(
+            "visibility",
+            if style.visibility_hidden.unwrap_or(false) {
+                "hidden"
+            } else {
+                "visible"
+            }
+            .to_string(),
+        );
+        out.insert("opacity", css_number(style.opacity.unwrap_or(1.0)));
+        out.insert(
+            "background-color",
+            css_color(style.background_color.unwrap_or([0, 0, 0, 0])),
+        );
+        out.insert("color", css_color(style.color.unwrap_or([0, 0, 0, 255])));
+
+        if let Some(rect) = rect {
+            let horizontal_non_content =
+                style.border.left + style.border.right + style.padding.left + style.padding.right;
+            let vertical_non_content =
+                style.border.top + style.border.bottom + style.padding.top + style.padding.bottom;
+            let (width, height) = match style.box_sizing {
+                crate::BoxSizing::BorderBox => (rect.width, rect.height),
+                _ => (
+                    (rect.width - horizontal_non_content).max(0.0),
+                    (rect.height - vertical_non_content).max(0.0),
+                ),
+            };
+            out.insert("width", css_px(width));
+            out.insert("height", css_px(height));
+        } else {
+            out.insert("width", dimension_css(style.width, "auto"));
+            out.insert("height", dimension_css(style.height, "auto"));
+        }
+        out.insert("min-width", dimension_css(style.min_width, "auto"));
+        out.insert("min-height", dimension_css(style.min_height, "auto"));
+        out.insert("max-width", dimension_css(style.max_width, "none"));
+        out.insert("max-height", dimension_css(style.max_height, "none"));
+        out.insert(
+            "box-sizing",
+            if style.box_sizing == crate::BoxSizing::BorderBox {
+                "border-box"
+            } else {
+                "content-box"
+            }
+            .to_string(),
+        );
+
+        let overflow_axis = |specified: u8, clipped: bool, scroll: bool| {
+            if scroll {
+                // The compact layout model intentionally merges
+                // hidden/auto/scroll for clipping. `auto` is the least
+                // surprising computed scroll-container value.
+                "auto"
+            } else if specified == 1 || clipped {
+                "clip"
+            } else {
+                "visible"
+            }
+        };
+        out.insert(
+            "overflow-x",
+            overflow_axis(
+                style.overflow_specified_x,
+                style.overflow_clip_x,
+                style.overflow_scroll_x,
+            )
+            .to_string(),
+        );
+        out.insert(
+            "overflow-y",
+            overflow_axis(
+                style.overflow_specified_y,
+                style.overflow_clip_y,
+                style.overflow_scroll_y,
+            )
+            .to_string(),
+        );
+
+        for (name, value, auto) in [
+            ("margin-top", style.margin.top, style.margin_auto[0]),
+            ("margin-right", style.margin.right, style.margin_auto[1]),
+            ("margin-bottom", style.margin.bottom, style.margin_auto[2]),
+            ("margin-left", style.margin.left, style.margin_auto[3]),
+        ] {
+            out.insert(name, if auto { "auto".to_string() } else { css_px(value) });
+        }
+        for (name, value) in [
+            ("padding-top", style.padding.top),
+            ("padding-right", style.padding.right),
+            ("padding-bottom", style.padding.bottom),
+            ("padding-left", style.padding.left),
+            ("border-top-width", style.border.top),
+            ("border-right-width", style.border.right),
+            ("border-bottom-width", style.border.bottom),
+            ("border-left-width", style.border.left),
+        ] {
+            out.insert(name, css_px(value));
+        }
+        let border_color = css_color(style.border_color.or(style.color).unwrap_or([0, 0, 0, 255]));
+        out.insert("border-top-color", border_color.clone());
+        out.insert("border-right-color", border_color.clone());
+        out.insert("border-bottom-color", border_color.clone());
+        out.insert("border-left-color", border_color);
+        for (name, width) in [
+            ("border-top-style", style.border.top),
+            ("border-right-style", style.border.right),
+            ("border-bottom-style", style.border.bottom),
+            ("border-left-style", style.border.left),
+        ] {
+            out.insert(name, if width > 0.0 { "solid" } else { "none" }.to_string());
+        }
+
+        out.insert(
+            "flex-direction",
+            match style.flex_direction.unwrap_or(taffy::FlexDirection::Row) {
+                taffy::FlexDirection::Row => "row",
+                taffy::FlexDirection::RowReverse => "row-reverse",
+                taffy::FlexDirection::Column => "column",
+                taffy::FlexDirection::ColumnReverse => "column-reverse",
+            }
+            .to_string(),
+        );
+        out.insert(
+            "flex-wrap",
+            match style.flex_wrap.unwrap_or(taffy::FlexWrap::NoWrap) {
+                taffy::FlexWrap::NoWrap => "nowrap",
+                taffy::FlexWrap::Wrap => "wrap",
+                taffy::FlexWrap::WrapReverse => "wrap-reverse",
+            }
+            .to_string(),
+        );
+        out.insert(
+            "align-items",
+            style
+                .align_items
+                .map_or_else(|| "normal".to_string(), align_items_css),
+        );
+        out.insert(
+            "justify-items",
+            style
+                .justify_items
+                .map_or_else(|| "normal".to_string(), align_items_css),
+        );
+        out.insert(
+            "justify-content",
+            style
+                .justify_content
+                .map_or_else(|| "normal".to_string(), align_content_css),
+        );
+        out.insert(
+            "align-content",
+            style
+                .align_content
+                .map_or_else(|| "normal".to_string(), align_content_css),
+        );
+        out.insert("column-gap", style.column_gap.map_or_else(|| "normal".to_string(), css_px));
+        out.insert("row-gap", style.row_gap.map_or_else(|| "normal".to_string(), css_px));
+        out.insert(
+            "grid-auto-flow",
+            match style.grid_auto_flow.unwrap_or(taffy::GridAutoFlow::Row) {
+                taffy::GridAutoFlow::Row => "row",
+                taffy::GridAutoFlow::Column => "column",
+                taffy::GridAutoFlow::RowDense => "row dense",
+                taffy::GridAutoFlow::ColumnDense => "column dense",
+            }
+            .to_string(),
+        );
+
+        out.insert("transform", transform_css(style));
+        out
+            .insert("transform-origin", transform_origin_css(style, rect));
+        Some(out)
+    }
+
     /// Border box in the current root viewport. This is the read-only geometry
     /// path used by a later CSSOM integration and shares paint's clamped scroll,
     /// fixed-subtree, and sticky-positioning derivatives.
@@ -400,6 +645,127 @@ impl PreparedRender {
     ) -> Option<&SelectedImage> {
         self.selected_images.get(&id)
     }
+}
+
+fn css_number(value: f32) -> String {
+    if value == 0.0 {
+        "0".to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+fn css_px(value: f32) -> String {
+    format!("{}px", css_number(if value == 0.0 { 0.0 } else { value }))
+}
+
+fn dimension_css(value: crate::Dimension, auto: &str) -> String {
+    match value {
+        crate::Dimension::Auto => auto.to_string(),
+        crate::Dimension::Px(v) => css_px(v),
+        crate::Dimension::Percent(v) => format!("{}%", css_number(v * 100.0)),
+        crate::Dimension::Em(v) => format!("{}em", css_number(v)),
+        crate::Dimension::Ex(v) => format!("{}ex", css_number(v)),
+        crate::Dimension::Rem(v) => format!("{}rem", css_number(v)),
+        crate::Dimension::Vw(v) => format!("{}vw", css_number(v)),
+        crate::Dimension::Vh(v) => format!("{}vh", css_number(v)),
+        crate::Dimension::Vmin(v) => format!("{}vmin", css_number(v)),
+        crate::Dimension::Vmax(v) => format!("{}vmax", css_number(v)),
+    }
+}
+
+fn css_color([r, g, b, a]: [u8; 4]) -> String {
+    if a == 255 {
+        format!("rgb({r}, {g}, {b})")
+    } else {
+        format!(
+            "rgba({r}, {g}, {b}, {})",
+            css_number(a as f32 / 255.0)
+        )
+    }
+}
+
+fn align_items_css(value: taffy::AlignItems) -> String {
+    let keyword = match value.keyword {
+        taffy::AlignItemsKeyword::Start => "start",
+        taffy::AlignItemsKeyword::End => "end",
+        taffy::AlignItemsKeyword::FlexStart => "flex-start",
+        taffy::AlignItemsKeyword::FlexEnd => "flex-end",
+        taffy::AlignItemsKeyword::Center => "center",
+        taffy::AlignItemsKeyword::Baseline => "baseline",
+        taffy::AlignItemsKeyword::Stretch => "stretch",
+    };
+    if value.safety == taffy::AlignmentSafety::Safe {
+        format!("safe {keyword}")
+    } else {
+        keyword.to_string()
+    }
+}
+
+fn align_content_css(value: taffy::AlignContent) -> String {
+    let keyword = match value.keyword {
+        taffy::AlignContentKeyword::Start => "start",
+        taffy::AlignContentKeyword::End => "end",
+        taffy::AlignContentKeyword::FlexStart => "flex-start",
+        taffy::AlignContentKeyword::FlexEnd => "flex-end",
+        taffy::AlignContentKeyword::Center => "center",
+        taffy::AlignContentKeyword::Stretch => "stretch",
+        taffy::AlignContentKeyword::SpaceBetween => "space-between",
+        taffy::AlignContentKeyword::SpaceEvenly => "space-evenly",
+        taffy::AlignContentKeyword::SpaceAround => "space-around",
+    };
+    if value.safety == taffy::AlignmentSafety::Safe {
+        format!("safe {keyword}")
+    } else {
+        keyword.to_string()
+    }
+}
+
+fn transform_css(style: &crate::LayoutStyle) -> String {
+    let mut parts = Vec::new();
+    if let Some((x, y)) = style.transform_translate {
+        parts.push(format!(
+            "translate({}, {})",
+            dimension_css(x, "0px"),
+            dimension_css(y, "0px")
+        ));
+    }
+    if let Some((x, y)) = style.individual_translate {
+        parts.push(format!(
+            "translate({}, {})",
+            dimension_css(x, "0px"),
+            dimension_css(y, "0px")
+        ));
+    }
+    if let Some((x, y)) = style.transform_scale {
+        parts.push(format!("scale({}, {})", css_number(x), css_number(y)));
+    }
+    if let Some([a, b, c, d]) = style.transform_projection {
+        parts.push(format!(
+            "matrix({}, {}, {}, {}, 0, 0)",
+            css_number(a),
+            css_number(b),
+            css_number(c),
+            css_number(d)
+        ));
+    }
+    if parts.is_empty() {
+        "none".to_string()
+    } else {
+        parts.join(" ")
+    }
+}
+
+fn transform_origin_css(style: &crate::LayoutStyle, rect: Option<&crate::Rect>) -> String {
+    let (x, y) = style
+        .transform_origin
+        .unwrap_or((crate::Dimension::Percent(0.5), crate::Dimension::Percent(0.5)));
+    let resolve = |value: crate::Dimension, axis: f32| match value {
+        crate::Dimension::Percent(fraction) => css_px(fraction * axis),
+        other => dimension_css(other, "0px"),
+    };
+    let (width, height) = rect.map_or((0.0, 0.0), |rect| (rect.width, rect.height));
+    format!("{} {}", resolve(x, width), resolve(y, height))
 }
 
 /// Render `tree` at `viewport` (width, height) in CSS pixels to a Pixmap, or
@@ -525,7 +891,46 @@ pub fn paint_prepared(
         &mut prepared.layout,
         None,
         None,
+        None,
     )
+}
+
+/// The used `z-index` for an element which participates in stacking order.
+///
+/// A non-auto z-index applies not only to positioned boxes, but also to
+/// otherwise-static flex and grid items. `display:contents` boxes are skipped
+/// while finding the item's formatting-context parent because they generate no
+/// box of their own.
+fn stacking_z_index(
+    tree: &DomTree,
+    laid: &crate::DomLayout,
+    id: obscura_dom::tree::NodeId,
+) -> Option<i32> {
+    let style = laid.styles.get(&id)?;
+    if style.display == crate::Display::None || style.display_contents {
+        return None;
+    }
+    let z = style.z_index?;
+    if style.position.is_some() {
+        return Some(z);
+    }
+
+    let mut parent = tree.get_node(id).and_then(|node| node.parent);
+    while let Some(parent_id) = parent {
+        let Some(parent_style) = laid.styles.get(&parent_id) else {
+            parent = tree.get_node(parent_id).and_then(|node| node.parent);
+            continue;
+        };
+        if parent_style.display_contents {
+            parent = tree.get_node(parent_id).and_then(|node| node.parent);
+            continue;
+        }
+        let is_flex_or_grid = parent_style.display == crate::Display::Grid
+            || (parent_style.display == crate::Display::Flex
+                && !parent_style.internal_flex_container);
+        return is_flex_or_grid.then_some(z);
+    }
+    None
 }
 
 /// Paint an already prepared layout without changing its document-space
@@ -546,6 +951,7 @@ fn paint_laid_dom_scrolled(
     laid: &mut crate::DomLayout,
     paint_root: Option<obscura_dom::tree::NodeId>,
     suppress_opacity_for: Option<obscura_dom::tree::NodeId>,
+    suppress_stacking_for: Option<obscura_dom::tree::NodeId>,
 ) -> Option<Pixmap> {
     let scroll_state =
         ScrollPaintState::new(viewport, scroll, content_size, viewport_fixed, sticky);
@@ -582,14 +988,13 @@ fn paint_laid_dom_scrolled(
     // path free of any added cost.
 
     // Paint order: tree order for the normal flow (later elements paint over
-    // earlier ones), except that a positioned element with a non-zero
-    // z-index lifts its whole subtree into a separate layer: negative layers
-    // paint under the normal flow, positive ones above it, each sorted by
-    // z-index ascending (stable, so equal z keeps tree order). This is the
-    // pragmatic core of CSS stacking contexts: dropdowns/overlays/badges
-    // (z>0) stop losing to later siblings, and z:-1 decorative backdrops
-    // stop covering their content. Nested z roots paint inside their
-    // ancestor root's subtree in tree order.
+    // earlier ones), except that a positioned element or a flex/grid item
+    // with a non-auto z-index lifts its whole subtree into an atomic stacking
+    // unit: negative layers paint under the normal flow, non-negative ones
+    // above it, each sorted by z-index ascending (stable, so equal z keeps
+    // tree order). The unit is recursively painted at its sorted position,
+    // preventing its backgrounds, replaced content, and shaped text from
+    // leaking into different global paint phases.
     let mut neg_layers: Vec<(i32, Vec<obscura_dom::tree::NodeId>)> = Vec::new();
     let mut pos_layers: Vec<(i32, Vec<obscura_dom::tree::NodeId>)> = Vec::new();
     let mut normal: Vec<obscura_dom::tree::NodeId> = Vec::new();
@@ -606,12 +1011,9 @@ fn paint_laid_dom_scrolled(
                 .get(&nid)
                 .and_then(|style| style.opacity)
                 .is_some_and(|opacity| opacity.clamp(0.0, 1.0) < 1.0);
-        let z = laid
-            .styles
-            .get(&nid)
-            .filter(|s| s.position.is_some())
-            .and_then(|s| s.z_index)
-            .filter(|&z| z != 0);
+        let z = (suppress_stacking_for != Some(nid))
+            .then(|| stacking_z_index(tree, laid, nid))
+            .flatten();
         if is_opacity_root {
             let mut sub = vec![nid];
             sub.extend(tree.descendants(nid));
@@ -632,9 +1034,9 @@ fn paint_laid_dom_scrolled(
                 consumed.insert(m);
             }
             if z < 0 {
-                neg_layers.push((z, sub));
+                neg_layers.push((z, vec![nid]));
             } else {
-                pos_layers.push((z, sub));
+                pos_layers.push((z, vec![nid]));
             }
         } else {
             normal.push(nid);
@@ -707,6 +1109,36 @@ fn paint_laid_dom_scrolled(
         if svg_subtree_skip.contains(&nid) {
             continue;
         }
+        if suppress_stacking_for != Some(nid)
+            && stacking_z_index(tree, laid, nid).is_some()
+        {
+            opacity_subtree_skip.insert(nid);
+            opacity_subtree_skip.extend(tree.descendants(nid));
+            // A stacking context is one structural paint item in its parent.
+            // Re-enter the same display-list builder with this root suppressed
+            // so all of its decorations, descendants, and shaped inline text
+            // finish before the next sibling stacking unit starts. Passing the
+            // existing pixmap avoids a viewport-sized intermediate surface;
+            // opacity still takes the isolated-surface path below when needed.
+            pixmap = paint_laid_dom_scrolled(
+                tree,
+                viewport,
+                base_url,
+                scroll,
+                pixmap,
+                image_cache,
+                selected_images,
+                svg_fonts,
+                content_size,
+                viewport_fixed,
+                sticky,
+                laid,
+                Some(nid),
+                suppress_opacity_for,
+                Some(nid),
+            )?;
+            continue;
+        }
         let node = match tree.get_node(nid) {
             Some(n) => n,
             None => continue,
@@ -769,6 +1201,7 @@ fn paint_laid_dom_scrolled(
                 laid,
                 Some(nid),
                 Some(nid),
+                suppress_stacking_for,
             )?;
             let group_paint = tiny_skia::PixmapPaint {
                 opacity: own_opacity,
@@ -2606,12 +3039,11 @@ fn split_css_top_level(value: &str, separator: char) -> Vec<&str> {
 fn http_get_bytes(url: &str) -> Option<Vec<u8>> {
     let mut backoff = std::time::Duration::from_millis(200);
     for attempt in 0..3 {
-        // A browser-like Accept advertises the modern image formats and is what
-        // content-negotiating CDNs expect; some UA-gated hosts also reject a
-        // request with no Accept header outright.
+        // Advertise only formats that this build can decode. Content-negotiating
+        // CDNs otherwise commonly choose AVIF and leave the image blank.
         let res = image_agent()
             .get(url)
-            .set("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
+            .set("Accept", IMAGE_ACCEPT)
             .call();
         match res {
             Ok(resp) => {
@@ -2689,7 +3121,7 @@ fn percent_decode(s: &str) -> Vec<u8> {
     out
 }
 
-/// Decode raster image bytes (jpeg/png/webp) to a premultiplied-alpha pixmap
+/// Decode raster image bytes (GIF/JPEG/PNG/WebP) to a premultiplied-alpha pixmap
 /// resized to `w`x`h`.
 fn raster_to_pixmap(bytes: &[u8], w: u32, h: u32) -> Option<Pixmap> {
     let img = image::load_from_memory(bytes).ok()?.to_rgba8();
@@ -4147,7 +4579,7 @@ fn picture_source_url(
             continue;
         }
         if let Some(t) = child.get_attribute("type") {
-            if !source_type_supported(t) {
+            if !crate::source_type_supported(t) {
                 continue;
             }
         }
@@ -4164,17 +4596,6 @@ fn picture_source_url(
         }
     }
     None
-}
-
-/// Whether a `<source type=...>` names an image format this build can decode.
-/// AVIF/JPEG-XL are intentionally excluded: the `image` crate cannot decode
-/// them here, so a decodable `<img>` fallback must win over such a source.
-fn source_type_supported(t: &str) -> bool {
-    matches!(
-        t.trim().to_ascii_lowercase().as_str(),
-        "image/jpeg" | "image/jpg" | "image/png" | "image/gif" | "image/webp"
-            | "image/bmp" | "image/svg+xml" | "image/x-icon" | "image/vnd.microsoft.icon"
-    )
 }
 
 /// Pick one URL from a `srcset` list, matching the WebKit/Blink selection:
@@ -5404,6 +5825,101 @@ fn paint_mask(
 mod tests {
     use super::*;
     use obscura_dom::tree_sink::parse_html;
+
+    #[test]
+    fn image_accept_advertises_exactly_decodable_mime_types() {
+        assert!(!IMAGE_ACCEPT.contains('*'));
+        assert!(!IMAGE_ACCEPT.to_ascii_lowercase().contains("avif"));
+        for mime in IMAGE_ACCEPT.split(',') {
+            assert!(
+                crate::source_type_supported(mime),
+                "advertised MIME type must be decodable: {mime}"
+            );
+        }
+        for required in [
+            "image/webp",
+            "image/apng",
+            "image/svg+xml",
+            "image/png",
+            "image/jpeg",
+            "image/gif",
+            "image/bmp",
+            "image/x-icon",
+            "image/vnd.microsoft.icon",
+        ] {
+            assert!(
+                IMAGE_ACCEPT.split(',').any(|mime| mime == required),
+                "missing supported MIME type {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn picture_type_filter_skips_avif_and_accepts_parameterized_mime_essence() {
+        let tree = parse_html(
+            r#"<picture>
+                 <source type="IMAGE/AVIF; codecs=av01" srcset="unsupported.avif">
+                 <source type=" Image/WebP ; codecs=lossless " srcset="supported.webp">
+                 <img id="hero" src="fallback.png">
+               </picture>"#,
+        );
+        let hero = tree.get_element_by_id("hero").expect("hero");
+        assert_eq!(
+            picture_source_url(&tree, hero, (800.0, 600.0)),
+            Some(("supported.webp".to_string(), 1.0))
+        );
+    }
+
+    #[test]
+    fn enabled_bmp_and_ico_formats_have_metadata_and_full_raster_decode() {
+        use std::io::Cursor;
+
+        let source = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            2,
+            3,
+            image::Rgba([20, 40, 60, 255]),
+        ));
+        for format in [image::ImageFormat::Bmp, image::ImageFormat::Ico] {
+            let mut encoded = Cursor::new(Vec::new());
+            source
+                .write_to(&mut encoded, format)
+                .expect("encode fixture");
+            let encoded = encoded.into_inner();
+            assert_eq!(image_dimensions(&encoded), Some((2, 3)), "{format:?}");
+            let raster = raster_to_pixmap(&encoded, 2, 3).expect("decode raster");
+            assert_eq!((raster.width(), raster.height()), (2, 3));
+        }
+    }
+
+    #[test]
+    fn gif_placeholders_have_intrinsic_pixels_and_valid_gifs_decode() {
+        // Apple's lazy-picture system (and many generic lazy loaders) uses a
+        // transparent 1x1 GIF as the selected source until the real candidate
+        // enters its preload range. It is still a successfully decoded image:
+        // Chromium reports complete=true and naturalWidth=1.
+        const TRANSPARENT_GIF: &[u8] = &[
+            0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x70,
+            0x00, 0x00, 0x21, 0xf9, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00, 0x2c,
+            0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x02,
+            0x44, 0x01, 0x00, 0x3b,
+        ];
+
+        // Apple's deliberately palette-less placeholder is accepted by
+        // browsers for source selection. Header metadata is sufficient for
+        // complete/naturalWidth; visually it contributes no pixels.
+        assert_eq!(image_dimensions(TRANSPARENT_GIF), Some((1, 1)));
+
+        const VISIBLE_GIF: &[u8] = &[
+            0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x80,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0x2c, 0x00, 0x00,
+            0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x01, 0x4c, 0x00,
+            0x3b,
+        ];
+        let decoded = raster_to_pixmap(VISIBLE_GIF, 1, 1).expect("decode GIF");
+        assert_eq!(decoded.width(), 1);
+        assert_eq!(decoded.height(), 1);
+        assert_eq!(decoded.pixel(0, 0).expect("pixel").alpha(), 255);
+    }
 
     #[test]
     fn scrolled_viewport_moves_document_content_but_not_fixed_subtrees() {
@@ -6669,6 +7185,89 @@ mod tests {
         assert!(
             covered.blue() > 240 && covered.red() < 20,
             "high-z descendant must stay inside the earlier opacity group: {covered:?}"
+        );
+    }
+
+    #[test]
+    fn static_flex_and_grid_item_z_index_paints_each_subtree_atomically() {
+        let blue_image = "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='100'%20height='60'%3E%3Crect%20width='100'%20height='60'%20fill='blue'/%3E%3C/svg%3E";
+        let tree = parse_html(&format!(
+            r#"<html><head><style>
+                 body {{ margin:0 }}
+                 .row {{
+                   position:relative; width:120px; height:70px;
+                   display:flex; align-items:flex-start;
+                 }}
+                 .grid {{
+                   width:120px; height:70px; display:grid;
+                   grid-template-columns:100px;
+                   grid-template-rows:60px;
+                 }}
+                 .front {{
+                   box-sizing:border-box; width:100px; height:60px;
+                   z-index:2; background:#ff0000; border:5px solid #00ff00;
+                   color:#000000; font-size:24px; line-height:30px;
+                 }}
+                 .cover {{
+                   position:absolute; z-index:auto; left:0; top:0;
+                   width:100px; height:60px; background:#0000ff;
+                 }}
+                 .cell {{ grid-area:1 / 1; }}
+                 img.cell {{ width:100px; height:60px; }}
+               </style></head><body>
+                 <div class="row">
+                   <div class="front">FLEX</div>
+                   <div class="cover"></div>
+                 </div>
+                 <div class="grid">
+                   <div class="front cell">GRID</div>
+                   <img class="cell" alt="" src="{blue_image}">
+                 </div>
+                 <div class="row" style="height:60px">
+                   <div class="front" style="z-index:1">LOW</div>
+                   <div class="cover" style="z-index:3"></div>
+                 </div>
+               </body></html>"#
+        ));
+        let pixmap = paint_dom(&tree, (140.0, 210.0), None).expect("pixmap");
+
+        let is_green = |x, y| {
+            let pixel = pixmap.pixel(x, y).expect("border pixel");
+            pixel.green() > 230 && pixel.red() < 30 && pixel.blue() < 30
+        };
+        let is_red = |x, y| {
+            let pixel = pixmap.pixel(x, y).expect("background pixel");
+            pixel.red() > 230 && pixel.green() < 30 && pixel.blue() < 30
+        };
+        assert!(
+            is_green(2, 30) && is_red(80, 50),
+            "the static flex item's border/background must paint above its later absolute sibling"
+        );
+        assert!(
+            is_green(2, 100) && is_red(80, 120),
+            "the static grid item's border/background must paint above its later image sibling"
+        );
+
+        for (label, y0) in [("flex", 0), ("grid", 70)] {
+            let dark_ink = (8..92)
+                .flat_map(|x| (y0 + 8..y0 + 42).map(move |y| (x, y)))
+                .filter(|&(x, y)| {
+                    let pixel = pixmap.pixel(x, y).expect("text pixel");
+                    pixel.red() < 40 && pixel.green() < 40 && pixel.blue() < 40
+                })
+                .count();
+            assert!(
+                dark_ink > 20,
+                "{label} item text must remain inside the raised atomic subtree, found {dark_ink} dark pixels"
+            );
+        }
+
+        assert!(
+            (0..60).all(|dy| (0..100).all(|x| {
+                let pixel = pixmap.pixel(x, 140 + dy).expect("covered pixel");
+                pixel.blue() > 230 && pixel.red() < 30 && pixel.green() < 30
+            })),
+            "a higher-z sibling must cover the lower item's background, border, and shaped text as one unit"
         );
     }
 

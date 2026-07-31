@@ -126,13 +126,13 @@ fn native_button_intrinsic_content(
             return;
         }
 
-        for child in tree.children(id) {
+        for child in rendered_children(tree, id) {
             walk(tree, child, styles, font_size, content);
         }
     }
 
     let mut content = NativeButtonIntrinsicContent::default();
-    for child in tree.children(root) {
+    for child in rendered_children(tree, root) {
         walk(tree, child, styles, font_size, &mut content);
     }
     content
@@ -1104,7 +1104,7 @@ fn resolve_clip_rects(
         }
         _ => inherited,
     };
-    for cid in tree.children(id) {
+    for cid in rendered_children(tree, id) {
         resolve_clip_rects(
             tree,
             cid,
@@ -1305,22 +1305,7 @@ fn apply_picture_source_hints(
             }
         }
         if let Some(kind) = source.get_attribute("type") {
-            let kind = kind.trim().to_ascii_lowercase();
-            if !kind.is_empty()
-                && !matches!(
-                    kind.as_str(),
-                    "image/avif"
-                        | "image/bmp"
-                        | "image/gif"
-                        | "image/jpeg"
-                        | "image/jpg"
-                        | "image/png"
-                        | "image/svg+xml"
-                        | "image/webp"
-                        | "image/x-icon"
-                        | "image/vnd.microsoft.icon"
-                )
-            {
+            if !crate::source_type_supported(kind) {
                 continue;
             }
         }
@@ -1670,7 +1655,7 @@ fn resolve_css_counters(tree: &DomTree, styles: &mut HashMap<NodeId, crate::Layo
         }
 
         let mut child_scopes = Vec::new();
-        for child in tree.children(id) {
+        for child in rendered_children(tree, id) {
             child_scopes.extend(walk(tree, child, styles, counters));
         }
         counters.pop_created(&child_scopes);
@@ -2054,6 +2039,11 @@ fn layout_dom_once(
         // Top-down inheritance of the properties CSS inherits by default.
         #[derive(Clone)]
         struct Inherited {
+            display: crate::Display,
+            display_contents: bool,
+            is_inline_block: bool,
+            flow_root: bool,
+            is_table_box: bool,
             color: Option<[u8; 4]>,
             font_size: Option<f32>,
             font_weight: u16,
@@ -2094,6 +2084,13 @@ fn layout_dom_once(
         impl Default for Inherited {
             fn default() -> Self {
                 Inherited {
+                    // CSS Display's initial outer/inner value is inline flow.
+                    // The root is blockified after computed values settle.
+                    display: crate::Display::Inline,
+                    display_contents: false,
+                    is_inline_block: false,
+                    flow_root: false,
+                    is_table_box: false,
                     color: None,
                     font_size: None,
                     font_weight: 400,
@@ -2169,6 +2166,22 @@ fn layout_dom_once(
             let mut child_cb_width = inh.cb_width;
             let mut child_cb_height_definite = false;
             if let Some(style) = styles.get_mut(&id) {
+                if style.display_inherit {
+                    style.display = inh.display;
+                    style.display_contents = inh.display_contents;
+                    style.is_inline_block = inh.is_inline_block;
+                    style.flow_root = inh.flow_root;
+                    style.is_table_box = inh.is_table_box;
+                    // `internal_flex_container` describes an engine-only UA
+                    // approximation, not the computed CSS display value.
+                    style.internal_flex_container = false;
+                    style.display_inherit = false;
+                }
+                inh.display = style.display;
+                inh.display_contents = style.display_contents;
+                inh.is_inline_block = style.is_inline_block;
+                inh.flow_root = style.flow_root;
+                inh.is_table_box = style.is_table_box;
                 match style.color { Some(c) => inh.color = Some(c), None => style.color = inh.color }
                 // Resolve a relative font-size against the PARENT (em/%) or
                 // ROOT (rem) font-size before inheriting it downward.
@@ -2602,6 +2615,11 @@ fn layout_dom_once(
                 let host_text_align = style.text_align;
                 let host_text_indent = style.text_indent;
                 let host_invisible = style.effectively_invisible;
+                let host_display = style.display;
+                let host_display_contents = style.display_contents;
+                let host_is_inline_block = style.is_inline_block;
+                let host_flow_root = style.flow_root;
+                let host_is_table_box = style.is_table_box;
                 let host_overflow_x = if style.overflow_scroll_x {
                     2
                 } else if style.overflow_clip_x {
@@ -2617,6 +2635,15 @@ fn layout_dom_once(
                     0
                 };
                 let settle_pseudo = |pseudo: &mut crate::LayoutStyle| {
+                    if pseudo.display_inherit {
+                        pseudo.display = host_display;
+                        pseudo.display_contents = host_display_contents;
+                        pseudo.is_inline_block = host_is_inline_block;
+                        pseudo.flow_root = host_flow_root;
+                        pseudo.is_table_box = host_is_table_box;
+                        pseudo.internal_flex_container = false;
+                        pseudo.display_inherit = false;
+                    }
                     if pseudo.overflow_inherit_x {
                         pseudo.overflow_specified_x = host_overflow_x;
                         pseudo.overflow_inherit_x = false;
@@ -3185,8 +3212,8 @@ fn layout_dom_once(
         // Apply fetched intrinsic image sizes. A replaced element with no
         // explicit dimensions must size from its intrinsic pixels (else it is
         // 0x0 and never paints); with one dimension given, the aspect ratio
-        // fills the other. `max-width:100%` (a UA default for img) still caps
-        // it to the container, and the aspect ratio keeps it proportional.
+        // fills the other. An authored `max-width:100%` still caps it to the
+        // container, and the aspect ratio keeps it proportional.
         for (&nid, &(iw, ih)) in intrinsic {
             if iw <= 0.0 || ih <= 0.0 {
                 continue;
@@ -4126,7 +4153,7 @@ fn resolve_grid_areas(
                 }
             }
 
-            for cid in tree.children(id) {
+            for cid in rendered_children(tree, id) {
                 let Some(cstyle) = styles.get_mut(&cid) else { continue };
                 let Some(name) = cstyle.grid_area_name.clone() else { continue };
                 if let Some(&(r0, r1, c0, c1)) = spans.get(&name) {
@@ -4146,7 +4173,7 @@ fn resolve_grid_areas(
         // Named grid lines: resolve children placed with `grid-column`/`grid-row`
         // values that reference a line name against this container's maps.
         if col_lines.is_some() || row_lines.is_some() {
-            for cid in tree.children(id) {
+            for cid in rendered_children(tree, id) {
                 let Some(cstyle) = styles.get_mut(&cid) else { continue };
                 if let (Some(raw), Some(map)) = (cstyle.grid_column_raw.clone(), &col_lines) {
                     if let Some(l) = resolve_named_placement(&raw, map) {
@@ -4978,7 +5005,7 @@ fn apply_float_continuations(
         let mut current = continuation.owner;
         while let Some(parent) = tree.get_node(current).and_then(|node| node.parent)
         {
-            let siblings = tree.children(parent);
+            let siblings = rendered_children(tree, parent);
             let Some(index) = siblings.iter().position(|candidate| *candidate == current)
             else {
                 break;
@@ -5507,12 +5534,47 @@ fn resolve_static_positions_and_reparent(
     }
 }
 
-/// Does `id` have any direct child that is inline-level (a non-whitespace
-/// text node, or an element whose resolved display is `Inline`)? Used to
-/// decide whether a block container needs the flex-row-wrap approximation of
-/// an inline formatting context.
+/// Return the DOM children that generate boxes for `id`.
+pub(crate) fn rendered_children(tree: &DomTree, id: NodeId) -> Vec<NodeId> {
+    let Some(node) = tree.get_node(id) else {
+        return Vec::new();
+    };
+    let is_closed_html_details = node.as_element().is_some_and(|name| {
+        name.ns.as_ref() == "http://www.w3.org/1999/xhtml"
+            && name.local.as_ref() == "details"
+            && node.get_attribute("open").is_none()
+    });
+    if !is_closed_html_details {
+        return tree.children(id);
+    }
+
+    // HTML gives a closed <details> a rendered child list containing only its
+    // first direct <summary> element child. Source text before that summary,
+    // non-summary elements, later summaries, and all of their descendants
+    // remain in the DOM but generate no boxes until the `open` attribute is
+    // present. Filtering at the box-tree boundary keeps both layout
+    // classification and paint/text-run construction from observing the
+    // hidden subtree.
+    tree.children(id)
+        .into_iter()
+        .find(|child| {
+            tree.get_node(*child).is_some_and(|child| {
+                child.as_element().is_some_and(|name| {
+                    name.ns.as_ref() == "http://www.w3.org/1999/xhtml"
+                        && name.local.as_ref() == "summary"
+                })
+            })
+        })
+        .into_iter()
+        .collect()
+}
+
+/// Does `id` have any direct rendered child that is inline-level (a
+/// non-whitespace text node, or an element whose resolved display is
+/// `Inline`)? Used to decide whether a block container needs the flex-row-wrap
+/// approximation of an inline formatting context.
 fn has_inline_content(tree: &DomTree, id: NodeId, styles: &HashMap<NodeId, crate::LayoutStyle>) -> bool {
-    tree.children(id).into_iter().any(|cid| {
+    rendered_children(tree, id).into_iter().any(|cid| {
         let Some(node) = tree.get_node(cid) else { return false };
         match &node.data {
             obscura_dom::tree::NodeData::Text { contents } => !contents.trim().is_empty(),
@@ -5562,7 +5624,7 @@ fn blockify_layout_children(
     parent: NodeId,
     styles: &mut HashMap<NodeId, crate::LayoutStyle>,
 ) {
-    for child in tree.children(parent) {
+    for child in rendered_children(tree, parent) {
         let transparent = styles
             .get(&child)
             .is_some_and(|style| style.display_contents && style.display != crate::Display::None);
@@ -5612,8 +5674,7 @@ fn build_any(
         .map(|s| s.display_contents && s.display != crate::Display::None)
         .unwrap_or(false);
     if splices_children {
-        return tree
-            .children(id)
+        return rendered_children(tree, id)
             .into_iter()
             .flat_map(|cid| build_any(tree, cid, taffy_tree, id_map, words, engine, ifc_items, styles))
             .collect();
@@ -5635,8 +5696,7 @@ fn build_any(
         // wrapper's children into the caller's list (same trick already used
         // for text nodes in `build_text_words`) fixes this at the root: the
         // words become flat siblings that wrap only at the real block level.
-        return tree
-            .children(id)
+        return rendered_children(tree, id)
             .into_iter()
             .flat_map(|cid| build_any(tree, cid, taffy_tree, id_map, words, engine, ifc_items, styles))
             .collect();
@@ -7245,7 +7305,7 @@ fn build(
             // wrapping for explicitly constrained inline-blocks and for ones
             // with real in-flow block children; those need their inner block
             // formatting rather than a single max-content line.
-            let has_in_flow_block_child = tree.children(id).iter().any(|child| {
+            let has_in_flow_block_child = rendered_children(tree, id).iter().any(|child| {
                 styles
                     .get(child)
                     .map_or(false, is_in_flow_block_level)
@@ -7339,11 +7399,15 @@ fn build(
                 }
             }
 
-            // When both preferred axes are auto and all min/max constraints
-            // are definite, resolve CSS2's ratio-preserving constraint table
-            // before handing the leaf to taffy. Otherwise taffy's block
-            // stretch supplies a containing-block width as a known dimension
-            // and independently clamps the height, distorting the ratio.
+            // An auto/auto replaced box starts from its intrinsic width rather
+            // than the fill-available width of an ordinary auto-width block.
+            // Seed that preferred width before handing the leaf to taffy, or
+            // block layout passes the containing-block width as a known
+            // dimension and stretches a source-less/content:url image to the
+            // viewport. Definite constraints additionally resolve CSS2's
+            // ratio-preserving constraint table up front; without constraints,
+            // leave height auto so flex shrink can still transfer through the
+            // preferred aspect ratio.
             let has_definite_constraint = [
                 style.min_width,
                 style.min_height,
@@ -7366,13 +7430,14 @@ fn build(
                     .any(|expression| expression.contains('%'));
             if matches!(style.width, crate::Dimension::Auto)
                 && matches!(style.height, crate::Dimension::Auto)
-                && has_definite_constraint
                 && !has_percentage_constraint
             {
                 let constrained =
                     crate::inline::constrained_auto_replaced_size(width, height, style);
                 taffy_style.size.width = taffy::Dimension::length(constrained.width);
-                taffy_style.size.height = taffy::Dimension::length(constrained.height);
+                if has_definite_constraint {
+                    taffy_style.size.height = taffy::Dimension::length(constrained.height);
+                }
             }
 
             // When an auto axis has a definite min/max constraint, the
@@ -7414,18 +7479,23 @@ fn build(
     // correct path for paragraphs/headings/labels/cells of text; the flex-wrap
     // approximation below only handles the leftovers (mixed inline + atomic
     // boxes, and layout-only builds where `try_build` always declines).
-    if let Some(item) = engine.try_build(tree, id, styles) {
-        if style.display == crate::Display::Block && style.width == crate::Dimension::Auto {
-            // A pure-text block is still a fill-available block. Its shaped
-            // inline context performs text alignment internally; retaining
-            // the flex alignment stand-in here shrink-wraps the leaf to its
-            // text, leaving no free width in which center/end can move it.
-            taffy_style.display = taffy::style::Display::Block;
+    let is_closed_html_details = _name.ns.as_ref() == "http://www.w3.org/1999/xhtml"
+        && _name.local.as_ref() == "details"
+        && node.get_attribute("open").is_none();
+    if !is_closed_html_details {
+        if let Some(item) = engine.try_build(tree, id, styles) {
+            if style.display == crate::Display::Block && style.width == crate::Dimension::Auto {
+                // A pure-text block is still a fill-available block. Its shaped
+                // inline context performs text alignment internally; retaining
+                // the flex alignment stand-in here shrink-wraps the leaf to its
+                // text, leaving no free width in which center/end can move it.
+                taffy_style.display = taffy::style::Display::Block;
+            }
+            let leaf = taffy_tree.new_leaf_with_context(taffy_style, item).ok()?;
+            id_map.insert(leaf, id);
+            ifc_items.whole.insert(id, item);
+            return Some(leaf);
         }
-        let leaf = taffy_tree.new_leaf_with_context(taffy_style, item).ok()?;
-        id_map.insert(leaf, id);
-        ifc_items.whole.insert(id, item);
-        return Some(leaf);
     }
 
     // Taffy has no real inline formatting context: its native Block layout
@@ -7452,7 +7522,7 @@ fn build(
         || has_in_flow_generated_pseudo(style.before_pseudo.as_deref())
         || has_in_flow_generated_pseudo(style.after_pseudo.as_deref());
 
-    let mut dom_children = tree.children(id);
+    let mut dom_children = rendered_children(tree, id);
     // A boxless inline wrapper is transparent to our approximated box tree.
     // Flatten it before deciding whether this block has mixed inline/block
     // content, not only later while building children. Otherwise
@@ -8105,7 +8175,7 @@ fn needs_column_flex_text_fit_content_cap(
         return false;
     }
 
-    let has_direct_text = tree.children(id).into_iter().any(|child| {
+    let has_direct_text = rendered_children(tree, id).into_iter().any(|child| {
         tree.get_node(child).map_or(false, |node| {
             matches!(
                 &node.data,
@@ -8159,7 +8229,7 @@ fn flatten_contents_children(
     for &cid in children {
         let splices = styles.get(&cid).map(|s| s.display_contents && s.display != crate::Display::None).unwrap_or(false);
         if splices {
-            let kids = tree.children(cid);
+            let kids = rendered_children(tree, cid);
             flatten_contents_children(tree, &kids, styles, out);
         } else {
             out.push(cid);
@@ -8198,7 +8268,7 @@ fn inline_wraps_only_in_flow_blocks(
     }
 
     let mut saw_block = false;
-    for cid in tree.children(id) {
+    for cid in rendered_children(tree, id) {
         let Some(node) = tree.get_node(cid) else {
             continue;
         };
@@ -8255,7 +8325,7 @@ fn flatten_boxless_inline_children(
             || is_flattenable_inline(tree, cid, styles)
             || inline_wraps_only_in_flow_blocks(tree, cid, styles)
         {
-            let kids = tree.children(cid);
+            let kids = rendered_children(tree, cid);
             flatten_boxless_inline_children(tree, &kids, styles, out);
         } else {
             out.push(cid);

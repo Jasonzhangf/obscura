@@ -24,6 +24,65 @@ pub use dom::{
     layout_dom, layout_dom_with_images, layout_dom_with_resources, DomLayout, StickyLayout,
 };
 
+/// Whether an image MIME type names a format supported by the renderer build.
+///
+/// Compare the MIME essence case-insensitively and ignore parameters. HTML
+/// allows a `<source type>` value to include parameters, and HTTP MIME types
+/// are ASCII case-insensitive. Keep this list aligned with the `image` crate
+/// features in `Cargo.toml` plus the SVG path in `paint.rs`.
+pub(crate) fn source_type_supported(value: &str) -> bool {
+    let essence = value.split_once(';').map_or(value, |(essence, _)| essence).trim();
+    [
+        "image/apng",
+        "image/bmp",
+        "image/gif",
+        "image/jpeg",
+        "image/jpg",
+        "image/png",
+        "image/svg+xml",
+        "image/vnd.microsoft.icon",
+        "image/webp",
+        "image/x-icon",
+    ]
+    .iter()
+    .any(|supported| essence.eq_ignore_ascii_case(supported))
+}
+
+#[cfg(test)]
+mod image_capability_tests {
+    use super::source_type_supported;
+
+    #[test]
+    fn image_mime_filter_uses_case_insensitive_essence_and_parameters() {
+        for supported in [
+            "image/apng",
+            "image/bmp",
+            "image/gif",
+            "image/jpeg",
+            "image/jpg",
+            "image/png",
+            "image/svg+xml",
+            "image/vnd.microsoft.icon",
+            "image/webp",
+            "image/x-icon",
+            " IMAGE/WEBP ; codecs=lossless ",
+            "Image/Svg+Xml;charset=utf-8",
+        ] {
+            assert!(source_type_supported(supported), "{supported}");
+        }
+        for unsupported in [
+            "",
+            "image/avif",
+            "image/jxl",
+            "image/png,image/webp",
+            "text/html",
+            ";image/png",
+        ] {
+            assert!(!source_type_supported(unsupported), "{unsupported}");
+        }
+    }
+}
+
 #[cfg(feature = "paint")]
 mod paint;
 #[cfg(feature = "paint")]
@@ -381,6 +440,12 @@ pub enum GeneratedContentItem {
 #[derive(Debug, Clone, Default)]
 pub struct LayoutStyle {
     pub display: Display,
+    /// The specified `display` value was the CSS-wide `inherit` keyword.
+    ///
+    /// `display` is normally non-inherited, so the cascade cannot resolve this
+    /// until the parent's computed outer/inner display is known. The DOM
+    /// top-down pass copies that provenance and then clears this marker.
+    pub(crate) display_inherit: bool,
     /// Computed CSS `container-type` (not inherited).
     pub container_type: ContainerType,
     /// The specified value was the CSS-wide `inherit` keyword. Resolved

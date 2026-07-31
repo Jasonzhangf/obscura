@@ -2345,6 +2345,49 @@ fn auto_grid_track_freezes_at_growth_limit_during_distribution() {
     );
 }
 
+#[test]
+fn grid_area_line_shorthand_overlays_children_in_the_same_cell() {
+    let tree = parse_html(
+        r#"
+        <style>
+          * { box-sizing:border-box }
+          html, body { margin:0 }
+          #grid {
+            display:grid;
+            width:320px;
+            grid-template-columns:320px;
+            grid-template-rows:180px;
+          }
+          #grid > * {
+            grid-area:1 / 1 / 1 / 1;
+            width:320px;
+            height:180px;
+          }
+        </style>
+        <div id="grid">
+          <div id="left"></div>
+          <div id="right"></div>
+          <div id="slider"></div>
+        </div>
+        "#,
+    );
+    let layout = layout_dom(&tree, (640.0, 480.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    let grid = rect("grid");
+    for id in ["left", "right", "slider"] {
+        let child = rect(id);
+        assert!(
+            (child.x - grid.x).abs() < 0.01 && (child.y - grid.y).abs() < 0.01,
+            "{id} should overlay the first grid cell instead of auto-placing: \
+             grid={grid:?} child={child:?}"
+        );
+    }
+    assert!(
+        (grid.height - 180.0).abs() < 0.01,
+        "overlaid children must not create implicit rows: {grid:?}"
+    );
+}
+
 /// Chromium 150 oracle for the full-span nested column-subgrid pattern used by
 /// Mozilla's springboard/data rows. The 20px child gap is centered on the
 /// ancestor's zero-width grid lines, so descendant contributions inflate the
@@ -2655,6 +2698,13 @@ fn selected_picture_source_dimensions_override_fallback_image_ratio() {
         </style>
         <picture>
           <source
+            type="image/AVIF; codecs=av01"
+            media="(min-width:800px)"
+            srcset="unsupported.avif"
+            width="2000"
+            height="100">
+          <source
+            type=" IMAGE/PNG ; profile=srgb "
             media="(min-width:800px)"
             srcset="chosen.png"
             width="800"
@@ -2782,6 +2832,66 @@ fn both_auto_replaced_max_height_preserves_intrinsic_ratio() {
     // The layout result is pixel-snapped; the exact pre-snap result is
     // independently covered by the inline constraint-table unit test.
     assert_eq!((rect.width, rect.height), (203.0, 128.0), "{rect:?}");
+}
+
+#[test]
+fn height_sized_oversized_image_keeps_intrinsic_ratio_without_an_author_cap() {
+    let tree = parse_html(
+        r#"
+        <style>
+          html, body { margin:0 }
+          #wrapper {
+            position:relative;
+            width:1280px;
+            height:692px;
+            overflow:hidden;
+          }
+          #image {
+            position:absolute;
+            left:50%;
+            bottom:0;
+            width:auto;
+            height:100%;
+            transform:translateX(-50%);
+          }
+        </style>
+        <div id="wrapper"><img id="image" src="image.jpg"></div>
+        "#,
+    );
+    let image = tree.get_element_by_id("image").unwrap();
+    let intrinsic = HashMap::from([(image, (3008.0, 692.0))]);
+    let layout = layout_dom_with_images(&tree, (1280.0, 1400.0), &intrinsic);
+    let rect = layout.rects[&image];
+
+    // Layout stores the pre-transform border box at the authored 50% inset;
+    // paint/CSSOM applies translateX(-50%) and exposes the final x=-864.
+    assert!((rect.x - 640.0).abs() < 0.01, "{rect:?}");
+    assert!((rect.width - 3008.0).abs() < 0.01, "{rect:?}");
+    assert!((rect.height - 692.0).abs() < 0.01, "{rect:?}");
+}
+
+#[test]
+fn authored_percentage_max_width_still_clamps_an_oversized_image() {
+    let tree = parse_html(
+        r#"
+        <style>
+          html, body { margin:0 }
+          #wrapper { width:1280px }
+          #image { display:block; width:auto; height:auto; max-width:100% }
+        </style>
+        <div id="wrapper"><img id="image" src="image.jpg"></div>
+        "#,
+    );
+    let image = tree.get_element_by_id("image").unwrap();
+    let intrinsic = HashMap::from([(image, (3008.0, 692.0))]);
+    let layout = layout_dom_with_images(&tree, (1280.0, 1400.0), &intrinsic);
+    let rect = layout.rects[&image];
+
+    assert!((rect.width - 1280.0).abs() < 0.01, "{rect:?}");
+    assert!(
+        (rect.height - (1280.0 * 692.0 / 3008.0)).abs() < 1.0,
+        "{rect:?}"
+    );
 }
 
 /// Chromium 150 applies CSS Sizing's compressible replaced-element rule when
@@ -3467,5 +3577,166 @@ fn fit_content_width_keeps_an_unbreakable_min_content_floor() {
     assert!(
         rect.width > 60.0,
         "min-content must win when an unbreakable token is wider than the available space: {rect:?}"
+    );
+}
+
+#[test]
+fn closed_details_lays_out_only_its_first_direct_summary() {
+    let tree = parse_html(
+        r#"
+        <body style="margin:0">
+          <details id="closed" style="width:200px">
+            source text before the summary
+            <div id="before" style="height:30px">
+              <summary id="nested">nested summary is not the details summary</summary>
+            </div>
+            <summary id="first" style="height:20px">visible summary</summary>
+            <div id="content" style="height:50px">
+              <span id="descendant">hidden descendant</span>
+            </div>
+            <summary id="second" style="height:40px">later summary is content</summary>
+          </details>
+        </body>
+        "#,
+    );
+    let layout = layout_dom(&tree, (400.0, 200.0));
+    let id = |name| tree.get_element_by_id(name).unwrap();
+
+    assert!(layout.rects.contains_key(&id("closed")));
+    assert!(layout.rects.contains_key(&id("first")));
+    for hidden in ["before", "nested", "content", "descendant", "second"] {
+        assert!(
+            !layout.rects.contains_key(&id(hidden)),
+            "closed details content must not generate a box: {hidden}"
+        );
+    }
+    assert!(
+        (layout.rects[&id("closed")].height - 20.0).abs() < 0.1,
+        "only the first direct summary contributes to closed details geometry"
+    );
+}
+
+#[test]
+fn open_details_lays_out_all_of_its_content() {
+    let tree = parse_html(
+        r#"
+        <body style="margin:0">
+          <details id="open-details" open style="width:200px">
+            <summary id="summary" style="height:20px">visible summary</summary>
+            <div id="content" style="height:50px">
+              <span id="descendant" style="display:block;height:10px">visible descendant</span>
+            </div>
+            <summary id="second" style="height:40px">later summary is ordinary content</summary>
+          </details>
+        </body>
+        "#,
+    );
+    let layout = layout_dom(&tree, (400.0, 200.0));
+    let id = |name| tree.get_element_by_id(name).unwrap();
+
+    for visible in [
+        "open-details",
+        "summary",
+        "content",
+        "descendant",
+        "second",
+    ] {
+        assert!(
+            layout.rects.contains_key(&id(visible)),
+            "open details must retain its rendered content: {visible}"
+        );
+    }
+    assert!(
+        (layout.rects[&id("open-details")].height - 110.0).abs() < 0.1,
+        "all direct children contribute to open details geometry"
+    );
+}
+
+#[test]
+fn display_inherit_transitively_preserves_contents_and_block_display() {
+    let tree = parse_html(
+        r#"
+        <style>
+          html, body { margin:0 }
+          #row { display:flex; width:200px }
+          #contents { display:contents }
+          .through { display:inherit }
+          .item { display:block; width:40px; height:20px }
+          #block-parent { display:block }
+          #block-child { display:inherit; height:10px }
+        </style>
+        <div id="row">
+          <div id="contents">
+            <div id="inherit-one" class="through">
+              <div id="inherit-two" class="through">
+                <span id="first" class="item"></span>
+                <span id="second" class="item"></span>
+              </div>
+            </div>
+          </div>
+        </div>
+        <section id="block-parent"><span id="block-child"></span></section>
+        <table><tr><td id="native-cell">
+          <div id="native-inherit" style="display:inherit"></div>
+        </td></tr></table>
+        "#,
+    );
+    let layout = layout_dom(&tree, (400.0, 200.0));
+    let id = |name| tree.get_element_by_id(name).unwrap();
+
+    for wrapper in ["contents", "inherit-one", "inherit-two"] {
+        let wrapper = id(wrapper);
+        assert!(layout.styles[&wrapper].display_contents);
+        assert!(
+            !layout.rects.contains_key(&wrapper),
+            "inherited display:contents wrapper must not generate a box"
+        );
+    }
+    let first = layout.rects[&id("first")];
+    let second = layout.rects[&id("second")];
+    assert!((first.y - second.y).abs() < 0.1);
+    assert!((second.x - first.x - first.width).abs() < 0.1);
+
+    let block_child = &layout.styles[&id("block-child")];
+    assert_eq!(block_child.display, obscura_render::Display::Block);
+    assert!(!block_child.display_contents);
+
+    let native_cell = &layout.styles[&id("native-cell")];
+    let native_inherit = &layout.styles[&id("native-inherit")];
+    assert!(native_cell.internal_flex_container);
+    assert_eq!(native_inherit.display, obscura_render::Display::Flex);
+    assert!(
+        !native_inherit.internal_flex_container,
+        "display inheritance must not copy the engine's UA-only table approximation"
+    );
+}
+
+#[cfg(feature = "paint")]
+#[test]
+fn closed_details_content_does_not_paint() {
+    let tree = parse_html(
+        r#"
+        <style>
+          html, body { margin:0; background:white }
+          summary { display:block; width:40px; height:20px; background:#00ff00 }
+          .content { width:40px; height:20px; background:#ff0000 }
+        </style>
+        <details>
+          <summary></summary>
+          <div class="content"></div>
+        </details>
+        "#,
+    );
+    let pixmap =
+        obscura_render::paint_dom(&tree, (40.0, 40.0), None).expect("details fixture paints");
+    let summary = pixmap.pixel(5, 5).expect("summary pixel");
+    assert!(
+        summary.green() > 240 && summary.red() < 20,
+        "the first summary must paint"
+    );
+    let hidden = pixmap.pixel(5, 25).expect("closed content pixel");
+    assert!(
+        hidden.red() > 240 && hidden.green() > 240 && hidden.blue() > 240,
+        "closed details content must leave the page background untouched"
     );
 }

@@ -229,24 +229,16 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
         if tag == "th" {
             style.font_weight = Some("bold".to_string());
         }
-    } else if tag == "img" || tag == "figure" {
-        if tag == "img" {
-            // Images are inline-level replaced elements by default. Model the
-            // atomic inner box with the same inline-block marker used by
-            // native controls, so an icon between text fragments participates
-            // in their line instead of splitting the parent into block runs.
-            // An authored display declaration clears this marker in the
-            // cascade before applying its requested display.
-            style.display = Display::Inline;
-            style.is_inline_block = true;
-        }
-        // Near-universal reset: images fit their container instead of
-        // overflowing. Wikipedia (and most sites) set `img{max-width:100%}`;
-        // making it a UA default prevents a fixed-width thumbnail (e.g. a
-        // 250px infobox image) from spilling out of a narrower box (a 200px
-        // taxobox) when we have not applied the site's own rule.
-        style.max_width = crate::Dimension::Percent(1.0);
-        style.flex_shrink = Some(1.0);
+    } else if tag == "img" {
+        // Images are inline-level replaced elements by default. Model the
+        // atomic inner box with the same inline-block marker used by native
+        // controls, so an icon between text fragments participates in their
+        // line instead of splitting the parent into block runs. Chromium's UA
+        // sheet does not impose a responsive max-width: author/reset CSS must
+        // opt into that. A synthetic `max-width:100%` here distorts deliberately
+        // oversized art whose height and intrinsic ratio establish its width.
+        style.display = Display::Inline;
+        style.is_inline_block = true;
     }
     style
 }
@@ -643,11 +635,9 @@ fn unitless_math_tokens<'i, 't>(
 fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
     match name {
         "display" => {
-            if value != "contents" {
-                style.display_contents = false;
-            }
+            let value = value.trim().to_ascii_lowercase();
             if matches!(
-                value,
+                value.as_str(),
                 "none"
                     | "flex"
                     | "inline-flex"
@@ -660,13 +650,22 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                     | "table"
                     | "inline-table"
                     | "contents"
+                    | "inherit"
+                    | "initial"
+                    | "unset"
             ) {
+                // Every valid authored display value replaces the complete
+                // outer/inner display pair. In particular, it must not retain
+                // the UA table/control approximation merely because its
+                // internal enum happens to equal the newly specified value.
                 style.internal_flex_container = false;
                 style.is_table_box = false;
                 style.is_inline_block = false;
                 style.flow_root = false;
+                style.display_contents = false;
+                style.display_inherit = false;
             }
-            match value {
+            match value.as_str() {
                 "none" => style.display = crate::Display::None,
                 "flex" => style.display = crate::Display::Flex,
                 "inline-flex" => {
@@ -711,6 +710,19 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                     // parent formatting context.
                     style.display = crate::Display::Block;
                     style.display_contents = true;
+                }
+                "inherit" => {
+                    // Keep a valid initial-display placeholder until the
+                    // parent computed style is available. The top-down pass
+                    // copies the parent's outer and inner display provenance,
+                    // but never its engine-only native-layout flags.
+                    style.display = crate::Display::Inline;
+                    style.display_inherit = true;
+                }
+                "initial" | "unset" => {
+                    // `display` is not inherited and its CSS initial value is
+                    // `inline`, independent of the element's HTML UA display.
+                    style.display = crate::Display::Inline;
                 }
                 _ => {}
             }
@@ -1530,14 +1542,7 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         "grid-template" => parse_grid_template(style, value),
         "grid" => parse_grid_shorthand(style, value),
         "grid-auto-flow" => style.grid_auto_flow = parse_grid_auto_flow(value),
-        "grid-area" => {
-            // Named area (single ident) or line form `r/c/r/c`. We only resolve
-            // the named-area case here; line forms are handled by grid-row/column.
-            let v = value.trim();
-            if !v.contains('/') && !v.is_empty() {
-                style.grid_area_name = Some(v.to_string());
-            }
-        }
+        "grid-area" => set_grid_area(style, value),
         "grid-column" => set_grid_placement(style, value, true),
         "grid-row" => set_grid_placement(style, value, false),
         "grid-column-start" => set_grid_placement_side(style, value, true, true),
@@ -1870,6 +1875,17 @@ pub(crate) fn supports_declaration(name: &str, value: &str) -> bool {
         ),
         "overflow" | "overflow-x" | "overflow-y" => {
             parse_overflow_declaration(&name, value).is_some()
+        }
+        "grid-area" => {
+            let parts = split_top_level(value, '/')
+                .into_iter()
+                .map(str::trim)
+                .collect::<Vec<_>>();
+            !parts.is_empty()
+                && parts.len() <= 4
+                && parts.iter().all(|part| {
+                    !part.is_empty() && parse_grid_line_kind(part).is_some()
+                })
         }
         "color" | "-webkit-text-fill-color" | "background-color" | "border-color" => {
             parse_color(value).is_some()
@@ -2880,6 +2896,226 @@ fn parse_grid_auto_flow(value: &str) -> Option<taffy::GridAutoFlow> {
     })
 }
 
+/// Expand the `grid-area` shorthand into its row/column placements.
+///
+/// The four slash-separated components are, in order, row-start,
+/// column-start, row-end, and column-end. Missing end values repeat a
+/// custom-ident start (the named-area form) and otherwise become `auto`, per
+/// CSS Grid. Keeping the expansion in the computed style is important for the
+/// common overlay idiom `grid-area: 1 / 1 / 1 / 1`; treating every slash form
+/// as unsupported makes each child auto-place into a new implicit row.
+fn set_grid_area(style: &mut LayoutStyle, value: &str) {
+    if matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "initial" | "inherit" | "unset" | "revert" | "revert-layer"
+    ) {
+        style.grid_area_name = None;
+        set_grid_placement(style, "auto / auto", true);
+        set_grid_placement(style, "auto / auto", false);
+        return;
+    }
+
+    let parts = split_top_level(value, '/')
+        .into_iter()
+        .map(str::trim)
+        .collect::<Vec<_>>();
+    if parts.is_empty()
+        || parts.len() > 4
+        || parts.iter().any(|part| part.is_empty())
+        || parts
+            .iter()
+            .any(|part| parse_grid_line_kind(part).is_none())
+    {
+        return;
+    }
+
+    let row_start = parts[0];
+    let column_start = parts
+        .get(1)
+        .copied()
+        .unwrap_or_else(|| grid_area_omitted_side(row_start));
+    let row_end = parts
+        .get(2)
+        .copied()
+        .unwrap_or_else(|| grid_area_omitted_side(row_start));
+    let column_end = parts
+        .get(3)
+        .copied()
+        .unwrap_or_else(|| grid_area_omitted_side(column_start));
+
+    // Preserve the compact named-area representation used by
+    // `resolve_grid_areas`, while also retaining the generated `name-start` /
+    // `name-end` line form for grids that expose those named lines directly.
+    if parts.len() == 1 && is_grid_custom_ident(row_start) {
+        style.grid_area_name = Some(row_start.to_string());
+    } else {
+        style.grid_area_name = None;
+    }
+
+    set_grid_placement(
+        style,
+        &format!("{column_start} / {column_end}"),
+        true,
+    );
+    set_grid_placement(style, &format!("{row_start} / {row_end}"), false);
+}
+
+fn grid_area_omitted_side(start: &str) -> &str {
+    if is_grid_custom_ident(start) {
+        start
+    } else {
+        "auto"
+    }
+}
+
+fn is_grid_custom_ident(value: &str) -> bool {
+    matches!(
+        parse_grid_line_kind(value),
+        Some(GridLineKind::IdentOnly)
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GridLineKind {
+    IdentOnly,
+    Other,
+}
+
+/// Validate one `<grid-line>` without mutating the computed style. Shorthand
+/// declarations are atomic: if any of their one-to-four components is invalid,
+/// the entire declaration must be ignored rather than partially resetting
+/// earlier winning longhands.
+fn parse_grid_line_kind(value: &str) -> Option<GridLineKind> {
+    let mut input = cssparser::ParserInput::new(value.trim());
+    let mut parser = cssparser::Parser::new(&mut input);
+
+    // auto
+    {
+        let state = parser.state();
+        if parser
+            .expect_ident_cloned()
+            .is_ok_and(|ident| ident.eq_ignore_ascii_case("auto"))
+            && parser.is_exhausted()
+        {
+            return Some(GridLineKind::Other);
+        }
+        parser.reset(&state);
+    }
+
+    // span && [ <positive-integer> || <custom-ident> ]
+    {
+        let state = parser.state();
+        if parser
+            .expect_ident_cloned()
+            .is_ok_and(|ident| ident.eq_ignore_ascii_case("span"))
+        {
+            let mut saw_integer = consume_grid_integer(&mut parser, true);
+            let mut saw_ident = consume_grid_custom_ident(&mut parser);
+            if !saw_integer {
+                saw_integer = consume_grid_integer(&mut parser, true);
+            }
+            if !saw_ident {
+                saw_ident = consume_grid_custom_ident(&mut parser);
+            }
+            if (saw_integer || saw_ident) && parser.is_exhausted() {
+                return Some(GridLineKind::Other);
+            }
+        }
+        parser.reset(&state);
+    }
+
+    // [ <non-zero-integer> && <custom-ident>? ], in either order.
+    {
+        let state = parser.state();
+        if consume_grid_integer(&mut parser, false) {
+            let _ = consume_grid_custom_ident(&mut parser);
+            if parser.is_exhausted() {
+                return Some(GridLineKind::Other);
+            }
+        }
+        parser.reset(&state);
+    }
+    {
+        let state = parser.state();
+        if consume_grid_custom_ident(&mut parser) {
+            if parser.is_exhausted() {
+                return Some(GridLineKind::IdentOnly);
+            }
+            if consume_grid_integer(&mut parser, false) && parser.is_exhausted() {
+                return Some(GridLineKind::Other);
+            }
+        }
+        parser.reset(&state);
+    }
+
+    // Modern engines accept an integer-valued math function as the numeric
+    // half of a grid line. Keep it non-ident-only so omitted shorthand sides
+    // become auto. Resolution remains deferred in the raw placement path.
+    if consume_grid_integer_math(&mut parser) {
+        let _ = consume_grid_custom_ident(&mut parser);
+        if parser.is_exhausted() {
+            return Some(GridLineKind::Other);
+        }
+    }
+    None
+}
+
+fn consume_grid_integer(parser: &mut cssparser::Parser<'_, '_>, positive_only: bool) -> bool {
+    let state = parser.state();
+    let valid = parser.expect_integer().is_ok_and(|integer| {
+        if positive_only {
+            integer > 0
+        } else {
+            integer != 0
+        }
+    });
+    if !valid {
+        parser.reset(&state);
+    }
+    valid
+}
+
+fn consume_grid_custom_ident(parser: &mut cssparser::Parser<'_, '_>) -> bool {
+    let state = parser.state();
+    let valid = parser.expect_ident_cloned().is_ok_and(|ident| {
+        !matches!(
+            ident.to_ascii_lowercase().as_str(),
+            "auto" | "span" | "initial" | "inherit" | "unset" | "revert" | "revert-layer"
+        )
+    });
+    if !valid {
+        parser.reset(&state);
+    }
+    valid
+}
+
+fn consume_grid_integer_math(parser: &mut cssparser::Parser<'_, '_>) -> bool {
+    let state = parser.state();
+    let is_math = parser.expect_function().is_ok_and(|name| {
+        matches!(
+            name.to_ascii_lowercase().as_str(),
+            "calc" | "min" | "max" | "clamp"
+        )
+    });
+    if !is_math {
+        parser.reset(&state);
+        return false;
+    }
+    let valid = parser
+        .parse_nested_block::<_, _, ()>(|nested| {
+            if nested.is_exhausted() {
+                return Err(nested.new_custom_error(()));
+            }
+            while nested.next_including_whitespace().is_ok() {}
+            Ok(())
+        })
+        .is_ok();
+    if !valid {
+        parser.reset(&state);
+    }
+    valid
+}
+
 /// Store a `grid-column`/`grid-row` value. Numeric/`span` forms resolve to a
 /// `taffy::Line` now; a value that names a grid line (`content-start /
 /// content-end`, or the `grid-column: content` area shorthand) is kept raw and
@@ -2996,7 +3232,8 @@ fn grid_line_has_name(value: &str) -> bool {
         if p.eq_ignore_ascii_case("auto") {
             return false;
         }
-        let rest = p.strip_prefix("span").map(str::trim).unwrap_or(p);
+        let lower = p.to_ascii_lowercase();
+        let rest = lower.strip_prefix("span").map(str::trim).unwrap_or(&lower);
         rest.chars().any(|c| c.is_ascii_alphabetic())
     })
 }
@@ -3016,7 +3253,8 @@ fn parse_grid_line(value: &str) -> Option<taffy::Line<taffy::GridPlacement>> {
 
 fn parse_grid_placement(value: &str) -> taffy::GridPlacement {
     let value = value.trim();
-    if let Some(span) = value.strip_prefix("span").map(str::trim) {
+    let lower = value.to_ascii_lowercase();
+    if let Some(span) = lower.strip_prefix("span").map(str::trim) {
         if let Ok(span) = span.parse::<u16>() {
             return taffy::style_helpers::span(span);
         }
@@ -3864,7 +4102,16 @@ fn split_top_level(s: &str, sep: char) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut depth = 0i32;
     let mut start = 0;
+    let mut escaped = false;
     for (i, c) in s.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if c == '\\' {
+            escaped = true;
+            continue;
+        }
         match c {
             '(' => depth += 1,
             ')' => depth -= 1,
@@ -5625,6 +5872,32 @@ mod tests {
     }
 
     #[test]
+    fn display_css_wide_values_replace_ua_and_prior_provenance() {
+        let initial = compute_style("td", Some("display:initial"));
+        assert_eq!(initial.display, Display::Inline);
+        assert!(!initial.internal_flex_container);
+        assert!(!initial.is_inline_block);
+        assert!(!initial.display_contents);
+
+        let unset = compute_style("div", Some("display:flex;display:unset"));
+        assert_eq!(unset.display, Display::Inline);
+        assert!(!unset.is_inline_block);
+
+        let inherited = compute_style("td", Some("display:contents;display:inherit"));
+        assert_eq!(inherited.display, Display::Inline);
+        assert!(inherited.display_inherit);
+        assert!(!inherited.internal_flex_container);
+        assert!(!inherited.display_contents);
+
+        let important = compute_style(
+            "div",
+            Some("display:block!important;display:contents"),
+        );
+        assert_eq!(important.display, Display::Block);
+        assert!(!important.display_contents);
+    }
+
+    #[test]
     fn authored_display_replaces_internal_flex_provenance() {
         let native_cell = compute_style("td", None);
         assert_eq!(native_cell.display, Display::Flex);
@@ -5689,6 +5962,17 @@ mod tests {
                 left: 6.0,
             }
         );
+    }
+
+    #[test]
+    fn image_ua_style_does_not_invent_a_responsive_size_cap() {
+        let image = ua_style("img");
+        assert_eq!(image.display, crate::Display::Inline);
+        assert!(image.is_inline_block);
+        assert_eq!(image.max_width, crate::Dimension::Auto);
+
+        let authored = compute_style("img", Some("max-width:100%"));
+        assert_eq!(authored.max_width, crate::Dimension::Percent(1.0));
     }
 
     #[test]
@@ -6341,6 +6625,146 @@ mod tests {
             })
         );
         assert_eq!(reset.grid_column_raw, None);
+    }
+
+    #[test]
+    fn grid_area_expands_slash_placements_and_named_area_defaults() {
+        let overlay = compute_style("div", Some("grid-area:1 / 2 / 3 / 4"));
+        assert_eq!(
+            overlay.grid_row,
+            Some(taffy::Line {
+                start: taffy::style_helpers::line(1),
+                end: taffy::style_helpers::line(3),
+            })
+        );
+        assert_eq!(
+            overlay.grid_column,
+            Some(taffy::Line {
+                start: taffy::style_helpers::line(2),
+                end: taffy::style_helpers::line(4),
+            })
+        );
+        assert_eq!(overlay.grid_area_name, None);
+
+        let named = compute_style("div", Some("grid-area:hero"));
+        assert_eq!(named.grid_area_name.as_deref(), Some("hero"));
+        assert_eq!(named.grid_row_raw.as_deref(), Some("hero / hero"));
+        assert_eq!(named.grid_column_raw.as_deref(), Some("hero / hero"));
+
+        let reset = compute_style("div", Some("grid-area:hero;grid-area:initial"));
+        assert_eq!(reset.grid_area_name, None);
+        assert_eq!(
+            reset.grid_row,
+            Some(taffy::Line {
+                start: taffy::GridPlacement::Auto,
+                end: taffy::GridPlacement::Auto,
+            })
+        );
+        assert_eq!(
+            reset.grid_column,
+            Some(taffy::Line {
+                start: taffy::GridPlacement::Auto,
+                end: taffy::GridPlacement::Auto,
+            })
+        );
+
+        for value in ["2 foo", "foo 2", "calc(1)"] {
+            let line = compute_style("div", Some(&format!("grid-area:{value}")));
+            let expected_row = format!("{value} / auto");
+            assert_eq!(
+                line.grid_area_name, None,
+                "{value} is a grid line, not an ident-only named area"
+            );
+            assert_eq!(
+                line.grid_row_raw.as_deref(),
+                Some(expected_row.as_str())
+            );
+            assert_eq!(
+                line.grid_column,
+                Some(taffy::Line {
+                    start: taffy::GridPlacement::Auto,
+                    end: taffy::GridPlacement::Auto,
+                })
+            );
+        }
+
+        let one = compute_style("div", Some("grid-area:1"));
+        assert_eq!(
+            one.grid_row,
+            Some(taffy::Line {
+                start: taffy::style_helpers::line(1),
+                end: taffy::GridPlacement::Auto,
+            })
+        );
+        assert_eq!(
+            one.grid_column,
+            Some(taffy::Line {
+                start: taffy::GridPlacement::Auto,
+                end: taffy::GridPlacement::Auto,
+            })
+        );
+
+        let mixed = compute_style("div", Some("grid-area:hero / 2"));
+        assert_eq!(mixed.grid_row_raw.as_deref(), Some("hero / hero"));
+        assert_eq!(
+            mixed.grid_column,
+            Some(taffy::Line {
+                start: taffy::style_helpers::line(2),
+                end: taffy::GridPlacement::Auto,
+            })
+        );
+
+        let copied_column_ident = compute_style("div", Some("grid-area:1 / col / 3"));
+        assert_eq!(
+            copied_column_ident.grid_row,
+            Some(taffy::Line {
+                start: taffy::style_helpers::line(1),
+                end: taffy::style_helpers::line(3),
+            })
+        );
+        assert_eq!(
+            copied_column_ident.grid_column_raw.as_deref(),
+            Some("col / col")
+        );
+
+        let uppercase_span = compute_style("div", Some("grid-area:SPAN 2"));
+        assert_eq!(
+            uppercase_span.grid_row,
+            Some(taffy::Line {
+                start: taffy::style_helpers::span(2),
+                end: taffy::GridPlacement::Auto,
+            })
+        );
+
+        for invalid in ["0", "span", "span 0", "span -1", "foo bar", "1 / inherit", "1.5"] {
+            let style = compute_style(
+                "div",
+                Some(&format!("grid-area:7 / 8 / 9 / 10;grid-area:{invalid}")),
+            );
+            assert_eq!(
+                style.grid_row,
+                Some(taffy::Line {
+                    start: taffy::style_helpers::line(7),
+                    end: taffy::style_helpers::line(9),
+                }),
+                "invalid `{invalid}` must not partially mutate the earlier shorthand"
+            );
+            assert_eq!(
+                style.grid_column,
+                Some(taffy::Line {
+                    start: taffy::style_helpers::line(8),
+                    end: taffy::style_helpers::line(10),
+                }),
+                "invalid `{invalid}` must not partially mutate the earlier shorthand"
+            );
+            assert!(!supports_declaration("grid-area", invalid));
+        }
+        for valid in ["hero", "1", "hero / 2", "1 / col / 3", "SPAN 2", "span foo"] {
+            assert!(
+                supports_declaration("grid-area", valid),
+                "valid grid-area `{valid}` should pass @supports parsing"
+            );
+        }
     }
 
     #[test]
