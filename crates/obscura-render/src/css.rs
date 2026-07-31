@@ -955,7 +955,9 @@ impl Stylesheet {
         }
         let registration_changed_props = resolved_props != *parent_props;
         let has_own = !own.is_empty();
+        let mut own_names = std::collections::HashSet::new();
         for (k, v) in own {
+            own_names.insert(k.clone());
             let registration = self.registered_custom_properties.get(&k);
             let set_initial = |props: &mut HashMap<String, String>| {
                 if let Some(initial) = registration.and_then(|entry| entry.initial_value.as_ref()) {
@@ -995,6 +997,29 @@ impl Stylesheet {
                         set_initial(&mut resolved_props);
                     }
                 }
+            }
+        }
+        // Custom properties inherit their computed value, not their original
+        // token stream. Resolve only declarations won on this element against
+        // the complete same-element environment (so forward references work),
+        // then pass those substituted values to descendants. Re-resolving an
+        // inherited `--b:var(--a)` after a child overrides `--a` is observably
+        // wrong: browsers keep the parent's already-computed `--b`.
+        let resolution_environment = resolved_props.clone();
+        for name in own_names {
+            let Some(value) = resolution_environment.get(&name) else {
+                continue;
+            };
+            if let Some(computed) = substitute_var_value(value, &resolution_environment, 0) {
+                resolved_props.insert(name, computed);
+            } else if let Some(initial) = self
+                .registered_custom_properties
+                .get(&name)
+                .and_then(|entry| entry.initial_value.clone())
+            {
+                resolved_props.insert(name, initial);
+            } else {
+                resolved_props.remove(&name);
             }
         }
         let effective = if has_own || registration_changed_props {
@@ -1419,7 +1444,11 @@ fn substitute_declarations(css: &str, props: &HashMap<String, String>) -> String
 /// represents CSS's guaranteed-invalid value. Crucially, invalidity propagates
 /// through an intermediate custom property so an outer var() can use its own
 /// fallback (`--toggle:var(--missing) dark; color:var(--toggle,light)`).
-fn substitute_var_value(input: &str, props: &HashMap<String, String>, depth: u8) -> Option<String> {
+pub(crate) fn substitute_var_value(
+    input: &str,
+    props: &HashMap<String, String>,
+    depth: u8,
+) -> Option<String> {
     if depth > 16 {
         return None;
     }

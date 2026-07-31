@@ -2168,6 +2168,52 @@ mod tests {
         );
     }
 
+    #[test]
+    fn hyperlink_content_attributes_reflect_through_the_idl_surface() {
+        let mut rt = setup_runtime(
+            r#"<html><body>
+                <a id="locale" hreflang="en-US" rel="alternate"
+                   target="_blank" download="guide.pdf"
+                   ping="/audit" referrerpolicy="no-referrer">English</a>
+            </body></html>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+                const link = document.getElementById("locale");
+                const initial = [
+                    link.hreflang, link.rel, link.target, link.download,
+                    link.ping, link.referrerPolicy,
+                    link.hreflang.split("-")[1]
+                ];
+                link.hreflang = "de-DE";
+                link.referrerPolicy = "origin";
+                return [
+                    initial,
+                    link.getAttribute("hreflang"),
+                    link.getAttribute("referrerpolicy")
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                [
+                    "en-US",
+                    "alternate",
+                    "_blank",
+                    "guide.pdf",
+                    "/audit",
+                    "no-referrer",
+                    "US"
+                ],
+                "de-DE",
+                "origin"
+            ])
+        );
+    }
+
     #[cfg(feature = "render")]
     #[test]
     fn computed_style_uses_renderer_stylesheet_cascade_and_invalidates() {
@@ -2236,6 +2282,78 @@ mod tests {
             )
             .unwrap(),
             serde_json::json!(["grid", "150px", "0.8"])
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn computed_style_exposes_cascaded_custom_properties_and_invalidates() {
+        let dom = parse_html(
+            r#"<html><head><style>
+                :root { --inherited-space: 17px; --derived-space: var(--inherited-space); }
+                #nav {
+                    --r-globalnav-font-size:17px;
+                    --local-scale:1.25;
+                    font-size:var(--r-globalnav-font-size);
+                }
+            </style></head><body>
+                <nav id="nav"><span id="child"></span></nav>
+            </body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_viewport(400.0, 200.0);
+        rt.run_page_init();
+
+        assert_eq!(
+            rt.evaluate(
+                r#"
+                const nav = document.getElementById("nav");
+                const child = document.getElementById("child");
+                const navStyle = getComputedStyle(nav);
+                const childStyle = getComputedStyle(child);
+                let enumeratesBase = false;
+                for (let i = 0; i < navStyle.length; i++) {
+                    if (navStyle.item(i) === "--r-globalnav-font-size")
+                        enumeratesBase = true;
+                }
+                return [
+                    navStyle.fontSize,
+                    navStyle.getPropertyValue("--r-globalnav-font-size"),
+                    parseInt(navStyle.fontSize) /
+                        parseInt(navStyle.getPropertyValue("--r-globalnav-font-size")),
+                    navStyle.getPropertyValue("--inherited-space"),
+                    navStyle.getPropertyValue("--derived-space"),
+                    navStyle.getPropertyValue("--local-scale"),
+                    childStyle.getPropertyValue("--inherited-space"),
+                    childStyle.getPropertyValue("--local-scale"),
+                    enumeratesBase
+                ];
+                "#,
+            )
+            .unwrap(),
+            serde_json::json!([
+                "17px", "17px", 1,
+                "17px", "17px", "1.25", "17px", "1.25", true
+            ])
+        );
+
+        assert_eq!(
+            rt.evaluate(
+                r#"
+                const nav = document.getElementById("nav");
+                const computed = getComputedStyle(nav);
+                nav.style.setProperty("--inherited-space", "23px");
+                nav.style.fontSize = "19px";
+                return [
+                    computed.fontSize,
+                    computed.getPropertyValue("--inherited-space"),
+                    computed.getPropertyValue("--derived-space")
+                ];
+                "#,
+            )
+            .unwrap(),
+            serde_json::json!(["19px", "23px", "17px"])
         );
     }
 

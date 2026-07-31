@@ -81,7 +81,19 @@ globalThis.dispatchEvent = function(event) {
   return !event.defaultPrevented;
 };
 
-const _dom = (cmd, a1, a2) => Deno.core.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""));
+let _domMutationEpoch = 0;
+const _DOM_MUTATION_COMMANDS = new Set([
+  "append_child", "insert_before", "remove_child",
+  "set_attribute", "remove_attribute",
+  "set_text_content", "set_inner_html", "set_inner_html_context",
+  "create_element", "create_text_node", "create_comment_node",
+  "create_document_fragment", "clone_node",
+]);
+const _dom = (cmd, a1, a2) => {
+  const result = Deno.core.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""));
+  if (_DOM_MUTATION_COMMANDS.has(cmd)) _domMutationEpoch++;
+  return result;
+};
 
 const _nativeFns = new Set();
 // Exact toString override for members whose native form is not just
@@ -2556,6 +2568,23 @@ class Element extends Node {
     return this.getAttribute("href") || "";
   }
   set href(v) { this.setAttribute("href", v); }
+  // HTMLHyperlinkElementUtils / HTMLAnchorElement reflected content
+  // attributes. Real-world locale, routing, and analytics code commonly
+  // enumerates `[hreflang]` links and reads the IDL property rather than
+  // getAttribute(); leaving it undefined aborts the entire component even
+  // though the attribute is present in the DOM.
+  get hreflang() { return this.getAttribute("hreflang") || ""; }
+  set hreflang(v) { this.setAttribute("hreflang", v); }
+  get rel() { return this.getAttribute("rel") || ""; }
+  set rel(v) { this.setAttribute("rel", v); }
+  get target() { return this.getAttribute("target") || ""; }
+  set target(v) { this.setAttribute("target", v); }
+  get download() { return this.getAttribute("download") || ""; }
+  set download(v) { this.setAttribute("download", v); }
+  get ping() { return this.getAttribute("ping") || ""; }
+  set ping(v) { this.setAttribute("ping", v); }
+  get referrerPolicy() { return this.getAttribute("referrerpolicy") || ""; }
+  set referrerPolicy(v) { this.setAttribute("referrerpolicy", v); }
   // HTMLHyperlinkElementUtils URL-decomposition members, live on <a>/<area>.
   get protocol() { const u = (this.localName === 'a' || this.localName === 'area') ? _elemHrefURL(this) : null; return u ? u.protocol : ''; }
   set protocol(v) { if (this.localName === 'a' || this.localName === 'area') _setElemHrefPart(this, 'protocol', v); }
@@ -5863,12 +5892,21 @@ globalThis.getComputedStyle = (el) => {
   // cascade/layout. Fetch it once per CSSStyleDeclaration proxy: reading a
   // dozen properties must not trigger a dozen layout/native crossings.
   let rendered = null;
-  if (typeof Deno.core.ops.op_computed_style === 'function' && el?._nid != null) {
-    try {
-      const raw = Deno.core.ops.op_computed_style(String(el._nid | 0));
-      rendered = raw ? JSON.parse(raw) : null;
-    } catch (e) {}
-  }
+  let renderedEpoch = -1;
+  let computedNames = [];
+  const refreshRendered = () => {
+    if (renderedEpoch === _domMutationEpoch) return;
+    renderedEpoch = _domMutationEpoch;
+    rendered = null;
+    if (typeof Deno.core.ops.op_computed_style === 'function' && el?._nid != null) {
+      try {
+        const raw = Deno.core.ops.op_computed_style(String(el._nid | 0));
+        rendered = raw ? JSON.parse(raw) : null;
+      } catch (e) {}
+    }
+    computedNames = rendered ? Object.keys(rendered) : [];
+  };
+  refreshRendered();
   // React virtualization libraries (react-window, tanstack-virtual,
   // react-virtuoso) all compute container dimensions via getComputedStyle.
   // The defaults table previously returned `auto` for width/height and
@@ -5924,6 +5962,7 @@ globalThis.getComputedStyle = (el) => {
 
   const lookup = (rawProp) => {
     if (typeof rawProp !== 'string') return '';
+    refreshRendered();
     const kebab = rawProp.replace(/([A-Z])/g, '-$1').toLowerCase();
     if (rendered && Object.prototype.hasOwnProperty.call(rendered, kebab))
       return rendered[kebab];
@@ -5944,8 +5983,14 @@ globalThis.getComputedStyle = (el) => {
       if (prop === Symbol.toPrimitive || prop === Symbol.toStringTag) return undefined;
       if (prop === 'getPropertyValue') return (name) => lookup(name);
       if (prop === 'getPropertyPriority') return () => '';
-      if (prop === 'item') return (i) => '';
-      if (prop === 'length') return 0;
+      if (prop === 'item') return (i) => {
+        refreshRendered();
+        return computedNames[i | 0] || '';
+      };
+      if (prop === 'length') {
+        refreshRendered();
+        return computedNames.length;
+      }
       if (prop === 'cssText') return '';
       if (prop === 'parentRule') return null;
       // CSSStyleDeclaration's `has` trap intentionally reports every known

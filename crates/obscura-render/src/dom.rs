@@ -225,6 +225,13 @@ impl OverflowClip {
 pub struct DomLayout {
     pub rects: HashMap<NodeId, Rect>,
     pub styles: HashMap<NodeId, crate::LayoutStyle>,
+    /// Computed custom properties in force for each element. Values are
+    /// reference-counted because the overwhelmingly common case is inheritance
+    /// without an override: an entire subtree can share one cascade map while
+    /// CSSOM still exposes every inherited `--token` through
+    /// `getComputedStyle()`.
+    pub custom_properties:
+        HashMap<NodeId, std::rc::Rc<HashMap<String, String>>>,
     /// The per-axis clip inherited from ancestor non-visible overflow, keyed
     /// per node, in SCREEN space (the clip owner's box shifted by the owner's
     /// accumulated translate; see `resolve_clip_rects`). `None` means
@@ -1348,6 +1355,7 @@ fn cascade_walk(
     sheet: &crate::css::Stylesheet,
     matcher: &mut obscura_dom::selector::Matcher,
     styles: &mut HashMap<NodeId, crate::LayoutStyle>,
+    custom_properties: &mut HashMap<NodeId, std::rc::Rc<HashMap<String, String>>>,
     parent_props: &std::rc::Rc<HashMap<String, String>>,
     container_evaluator: &mut Option<&mut crate::css::ContainerQueryEvaluator<'_>>,
     quirks_mode: bool,
@@ -1471,6 +1479,7 @@ fn cascade_walk(
         if let Some(m) = effective_props {
             this_props = std::rc::Rc::new(m);
         }
+        custom_properties.insert(id, this_props.clone());
         let (before_pseudo, after_pseudo) =
             if let Some(evaluator) = container_evaluator.as_deref_mut() {
                 sheet.pseudo_styles_with_container_queries(
@@ -1508,6 +1517,7 @@ fn cascade_walk(
             sheet,
             matcher,
             styles,
+            custom_properties,
             &this_props,
             container_evaluator,
             quirks_mode,
@@ -1960,6 +1970,7 @@ fn layout_dom_once(
     let t1 = std::time::Instant::now();
     let mut matcher = tree.matcher();
     let mut styles: HashMap<NodeId, crate::LayoutStyle> = HashMap::new();
+    let mut custom_properties = HashMap::new();
     let root_props = std::rc::Rc::new(HashMap::new());
     let mut evaluator =
         snapshot.map(|snapshot| crate::css::ContainerQueryEvaluator::new(tree, snapshot));
@@ -1980,6 +1991,7 @@ fn layout_dom_once(
         &sheet,
         &mut matcher,
         &mut styles,
+        &mut custom_properties,
         &root_props,
         &mut evaluator_ref,
         quirks_mode,
@@ -3948,6 +3960,7 @@ fn layout_dom_once(
         DomLayout {
             rects,
             styles,
+            custom_properties,
             clip_rects,
             translates,
             text_runs,

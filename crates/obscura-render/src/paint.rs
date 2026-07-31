@@ -461,6 +461,26 @@ impl PreparedRender {
             css_color(style.background_color.unwrap_or([0, 0, 0, 0])),
         );
         out.insert("color", css_color(style.color.unwrap_or([0, 0, 0, 255])));
+        out.insert("font-size", css_px(style.font_size.unwrap_or(16.0)));
+        out.insert(
+            "font-weight",
+            style
+                .font_weight
+                .clone()
+                .unwrap_or_else(|| "400".to_string()),
+        );
+        if let Some(family) = &style.font_family {
+            out.insert("font-family", family.clone());
+        }
+        out.insert(
+            "line-height",
+            match style.line_height.unwrap_or(crate::LineHeight::Normal) {
+                crate::LineHeight::Normal => "normal".to_string(),
+                crate::LineHeight::Ratio(value) => css_number(value),
+                crate::LineHeight::Px(value) => css_px(value),
+                crate::LineHeight::Relative(value) => dimension_css(value, "normal"),
+            },
+        );
 
         if let Some(rect) = rect {
             let horizontal_non_content =
@@ -619,6 +639,18 @@ impl PreparedRender {
         out
             .insert("transform-origin", transform_origin_css(style, rect));
         Some(out)
+    }
+
+    /// Cascaded custom properties exposed by CSSOM alongside the compact
+    /// fixed-property snapshot above. These maps are shared across unchanged
+    /// inherited subtrees by `DomLayout`, so reading one does not require a
+    /// second cascade or duplicate every design token for every descendant.
+    pub fn computed_custom_properties(
+        &self,
+        id: obscura_dom::tree::NodeId,
+    ) -> Option<HashMap<String, String>> {
+        let properties = self.layout.custom_properties.get(&id)?;
+        Some(properties.as_ref().clone())
     }
 
     /// Border box in the current root viewport. This is the read-only geometry

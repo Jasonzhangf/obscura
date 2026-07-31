@@ -2473,10 +2473,23 @@ fn op_computed_style(state: &OpState, #[string] nid_str: String) -> String {
     let nid: u32 = nid_str.parse().unwrap_or(0);
     let nid = obscura_dom::tree::NodeId::new(nid);
     let mut gs = shared.borrow_mut();
-    ensure_prepared_render(&mut gs)
-        .and_then(|prepared| prepared.computed_style(nid))
-        .and_then(|snapshot| serde_json::to_string(&snapshot).ok())
-        .unwrap_or_default()
+    let Some(prepared) = ensure_prepared_render(&mut gs) else {
+        return String::new();
+    };
+    let Some(snapshot) = prepared.computed_style(nid) else {
+        return String::new();
+    };
+    let custom = prepared
+        .computed_custom_properties(nid)
+        .unwrap_or_default();
+    let mut object = serde_json::Map::with_capacity(snapshot.len() + custom.len());
+    for (name, value) in snapshot {
+        object.insert(name.to_string(), serde_json::Value::String(value));
+    }
+    for (name, value) in custom {
+        object.insert(name, serde_json::Value::String(value));
+    }
+    serde_json::Value::Object(object).to_string()
 }
 
 /// Root scrolling overflow in CSS pixels. The JS CSSOM probes this op only in
