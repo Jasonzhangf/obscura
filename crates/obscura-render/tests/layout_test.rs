@@ -1637,6 +1637,66 @@ fn responsive_grid_child_spans_all_tracks_via_end_longhand() {
 }
 
 #[test]
+fn grid_column_auto_span_shorthand_places_six_cards_in_two_rows() {
+    let tree = parse_html(
+        r#"
+        <style>
+          .gallery {
+            display: grid;
+            width: 1376px;
+            grid-template-columns: repeat(12, minmax(0, 1fr));
+            column-gap: 16px;
+            row-gap: 64px;
+          }
+          .card {
+            grid-column: auto / span 4;
+            height: 100px;
+          }
+        </style>
+        <div class="gallery">
+          <div class="card" id="card-1"></div>
+          <div class="card" id="card-2"></div>
+          <div class="card" id="card-3"></div>
+          <div class="card" id="card-4"></div>
+          <div class="card" id="card-5"></div>
+          <div class="card" id="card-6"></div>
+        </div>
+        "#,
+    );
+    let layout = layout_dom(&tree, (1440.0, 900.0));
+    let cards: Vec<_> = (1..=6)
+        .map(|index| {
+            let id = tree
+                .get_element_by_id(&format!("card-{index}"))
+                .expect("card exists");
+            layout.rects[&id]
+        })
+        .collect();
+
+    for card in &cards {
+        assert!(
+            (card.width - 448.0).abs() < 0.01,
+            "four of twelve tracks plus internal gaps should be 448px: {card:?}"
+        );
+    }
+    assert_eq!(cards[0].y, cards[1].y);
+    assert_eq!(cards[1].y, cards[2].y);
+    assert_eq!(cards[3].y, cards[4].y);
+    assert_eq!(cards[4].y, cards[5].y);
+    assert!(
+        (cards[3].y - cards[0].y - 164.0).abs() < 0.01,
+        "fourth card should start a second row after the 64px row gap: {:?}",
+        cards
+    );
+    assert!(
+        (cards[1].x - cards[0].x - 464.0).abs() < 0.01
+            && (cards[2].x - cards[1].x - 464.0).abs() < 0.01,
+        "cards should advance by four tracks plus the outer column gap: {:?}",
+        cards
+    );
+}
+
+#[test]
 fn length_line_height_computes_before_inheritance() {
     let tree = parse_html(
         r#"

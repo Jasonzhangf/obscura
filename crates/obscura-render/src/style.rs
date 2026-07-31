@@ -2795,8 +2795,25 @@ fn set_grid_placement_side(
 /// alphabetic token that is not a bare `span <n>` count), so it must defer to
 /// the parent's line-name map.
 fn grid_line_has_name(value: &str) -> bool {
+    let value = value.trim();
+    // `auto` is a grid-placement keyword, not a custom-ident. Sending
+    // `auto / span 4` down the named-line path loses the span whenever the
+    // parent has no named-line map. CSS-wide keywords likewise cannot name a
+    // line and must retain their reset-to-auto behavior in this compact
+    // computed-style model.
+    if value.eq_ignore_ascii_case("auto")
+        || matches!(
+            value.to_ascii_lowercase().as_str(),
+            "initial" | "inherit" | "unset" | "revert" | "revert-layer"
+        )
+    {
+        return false;
+    }
     value.split('/').any(|part| {
         let p = part.trim();
+        if p.eq_ignore_ascii_case("auto") {
+            return false;
+        }
         let rest = p.strip_prefix("span").map(str::trim).unwrap_or(p);
         rest.chars().any(|c| c.is_ascii_alphabetic())
     })
@@ -5651,6 +5668,39 @@ mod tests {
                 end: taffy::style_helpers::line(5),
             })
         );
+    }
+
+    #[test]
+    fn grid_placement_shorthand_keeps_auto_span_out_of_named_line_resolution() {
+        let style = compute_style("div", Some("grid-column:auto / span 4"));
+        assert_eq!(
+            style.grid_column,
+            Some(taffy::Line {
+                start: taffy::GridPlacement::Auto,
+                end: taffy::style_helpers::span(4),
+            })
+        );
+        assert_eq!(style.grid_column_raw, None);
+
+        let named = compute_style("div", Some("grid-column:content-start / content-end"));
+        assert_eq!(
+            named.grid_column_raw.as_deref(),
+            Some("content-start / content-end")
+        );
+        assert_eq!(named.grid_column, None);
+
+        let reset = compute_style(
+            "div",
+            Some("grid-column:2 / span 4;grid-column:initial"),
+        );
+        assert_eq!(
+            reset.grid_column,
+            Some(taffy::Line {
+                start: taffy::GridPlacement::Auto,
+                end: taffy::GridPlacement::Auto,
+            })
+        );
+        assert_eq!(reset.grid_column_raw, None);
     }
 
     #[test]
