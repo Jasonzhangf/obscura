@@ -1,4 +1,7 @@
+use std::cell::RefCell;
 use std::pin::Pin;
+use std::rc::{Rc, Weak};
+use std::sync::Arc;
 
 use deno_core::error::ModuleLoaderError;
 use deno_core::ModuleLoadResponse;
@@ -8,12 +11,22 @@ use deno_core::ModuleSourceCode;
 use deno_core::ModuleSpecifier;
 use deno_core::RequestedModuleType;
 
+use crate::ops::ObscuraState;
+
 pub struct ObscuraModuleLoader {
     pub base_url: String,
     /// Proxy URL threaded through to every dynamic ES-module fetch (#139).
     /// `None` keeps the pre-#139 direct-connection behaviour for callers
     /// that haven't been updated.
     pub proxy_url: Option<String>,
+    /// The owning page's network context. Production runtimes always install
+    /// this so every module in a graph uses the same cookie jar, configured
+    /// identity, redirect/security policy, interception, and callbacks as the
+    /// entry module. Directly-constructed standalone loaders remain supported.
+    page_state: Option<Weak<RefCell<ObscuraState>>>,
+    /// Directly-constructed loaders still use Obscura's network policy and
+    /// connection pool; they simply have an isolated cookie jar.
+    standalone_client: Option<Arc<obscura_net::ObscuraHttpClient>>,
 }
 
 impl ObscuraModuleLoader {
@@ -22,9 +35,28 @@ impl ObscuraModuleLoader {
     }
 
     pub fn with_proxy(base_url: &str, proxy_url: Option<String>) -> Self {
+        let standalone_client = Arc::new(obscura_net::ObscuraHttpClient::with_options(
+            Arc::new(obscura_net::CookieJar::new()),
+            proxy_url.as_deref(),
+        ));
         ObscuraModuleLoader {
             base_url: base_url.to_string(),
             proxy_url,
+            page_state: None,
+            standalone_client: Some(standalone_client),
+        }
+    }
+
+    pub(crate) fn with_page_state(
+        base_url: &str,
+        proxy_url: Option<String>,
+        page_state: &Rc<RefCell<ObscuraState>>,
+    ) -> Self {
+        ObscuraModuleLoader {
+            base_url: base_url.to_string(),
+            proxy_url,
+            page_state: Some(Rc::downgrade(page_state)),
+            standalone_client: None,
         }
     }
 }
@@ -64,52 +96,62 @@ impl ModuleLoader for ObscuraModuleLoader {
         // Capture the loader's proxy here so the async closure below owns a
         // plain Option<String> rather than borrowing &self across an `await`.
         let proxy_url = self.proxy_url.clone();
+        let page_network = match self.page_state.as_ref() {
+            Some(weak) => (|| {
+                let state = weak
+                    .upgrade()
+                    .ok_or_else(|| "Module loader page state was dropped".to_string())?;
+                let state = state
+                    .try_borrow()
+                    .map_err(|_| "Module loader page state is already borrowed".to_string())?;
+                let client = state
+                    .http_client
+                    .clone()
+                    .ok_or_else(|| "No http_client wired to module loader".to_string())?;
+                Ok((client, state.callbacks.clone()))
+            })(),
+            None => self
+                .standalone_client
+                .clone()
+                .map(|client| (client, None))
+                .ok_or_else(|| "No network context wired to module loader".to_string()),
+        };
 
         ModuleLoadResponse::Async(Pin::from(Box::new(async move {
-            // Reuse the process-wide cached client (same one op_fetch_url
-            // uses). Modern SPAs dynamic-import 20-50 chunks per page; the
-            // old code built a fresh reqwest::Client per import, each with
-            // its own empty connection pool, no reuse, fresh TLS init for
-            // every chunk. The cache means the first import on a given
-            // proxy pays the build cost once and every chunk after reuses
-            // the same warm pool.
-            let client = crate::ops::cached_request_client(proxy_url.as_deref())
-                .map_err(io_err)?;
-
             tracing::debug!(
                 "Loading ES module: {} (proxy: {})",
                 url,
                 proxy_url.as_deref().unwrap_or("direct")
             );
 
-            let resp = client
-                .get(&url)
-                .header("Accept", "application/javascript, text/javascript, */*")
-                .send()
-                .await
-                .map_err(|e| io_err(format!("Failed to fetch module {}: {}", url, e)))?;
-
-            if !resp.status().is_success() {
-                return Err(io_err(format!(
-                    "Module {} returned HTTP {}",
-                    url,
-                    resp.status()
-                )));
+            match page_network {
+                Ok((client, callbacks)) => {
+                    let requested = ModuleSpecifier::parse(&url)
+                        .map_err(|e| io_err(format!("Invalid module URL {}: {}", url, e)))?;
+                    let resp = client
+                        .fetch_with_callbacks(&requested, callbacks.as_deref())
+                        .await
+                        .map_err(|e| io_err(format!("Failed to fetch module {}: {}", url, e)))?;
+                    if !(200..=299).contains(&resp.status) {
+                        return Err(io_err(format!(
+                            "Module {} returned HTTP {}",
+                            url, resp.status
+                        )));
+                    }
+                    let found = ModuleSpecifier::parse(resp.url.as_str()).map_err(|e| {
+                        io_err(format!("Invalid final module URL {}: {}", resp.url, e))
+                    })?;
+                    let code = obscura_net::decode_non_html(&resp.body, resp.content_type());
+                    Ok(ModuleSource::new_with_redirect(
+                        deno_core::ModuleType::JavaScript,
+                        ModuleSourceCode::String(code.into()),
+                        &requested,
+                        &found,
+                        None,
+                    ))
+                }
+                Err(error) => Err(io_err(error)),
             }
-
-            let code = resp.text().await.map_err(|e| {
-                io_err(format!("Failed to read module body {}: {}", url, e))
-            })?;
-
-            let specifier = ModuleSpecifier::parse(&url)
-                .map_err(|e| io_err(format!("Invalid module URL {}: {}", url, e)))?;
-
-            Ok(ModuleSource::new(
-                deno_core::ModuleType::JavaScript,
-                ModuleSourceCode::String(code.into()),
-                &specifier,
-                None,
-            ))
         })))
     }
 }

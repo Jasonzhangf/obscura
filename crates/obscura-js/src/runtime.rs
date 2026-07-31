@@ -130,7 +130,9 @@ impl ObscuraJsRuntime {
         let state = Rc::new(RefCell::new(ObscuraState::new()));
         let state_clone = state.clone();
 
-        let module_loader = Rc::new(ObscuraModuleLoader::with_proxy(base_url, proxy_url));
+        let module_loader = Rc::new(ObscuraModuleLoader::with_page_state(
+            base_url, proxy_url, &state,
+        ));
 
         // Build the isolate under the process-wide creation lock so two
         // connection threads never construct isolates concurrently (#430).
@@ -749,40 +751,16 @@ impl ObscuraJsRuntime {
         let specifier = deno_core::ModuleSpecifier::parse(url)
             .map_err(|e| format!("Invalid module URL {}: {}", url, e))?;
 
-        // Fetch the module source. The old impl registered an empty string
-        // and called it loaded, so every Vite / Next module bundle "loaded"
-        // in 1ms with zero code and the SPA never mounted (issue #205).
-        let (client, callbacks) = {
-            let st = self.state.borrow();
-            (st.http_client.clone(), st.callbacks.clone())
-        };
-        let source_code = match client {
-            Some(c) => {
-                let resp = c
-                    .fetch_with_callbacks(&specifier, callbacks.as_deref())
-                    .await
-                    .map_err(|e| format!("Module fetch failed ({}): {}", url, e))?;
-                if !(200..=299).contains(&resp.status) {
-                    return Err(format!("Module {} returned HTTP {}", url, resp.status));
-                }
-                obscura_net::decode_non_html(&resp.body, resp.content_type())
-            }
-            None => {
-                return Err(format!(
-                    "No http_client wired to runtime; cannot fetch module {}",
-                    url
-                ));
-            }
-        };
-
         // Bound the recursive import-graph fetch. deno_core fetches the graph
-        // concurrently, but a module whose top-level eval idle-waits forever (no
-        // CPU, no network) otherwise blocks here until the phase watchdog fires.
+        // concurrently through the one page-scoped module loader. Loading the
+        // entry from that loader too is important: cookies, configured request
+        // headers, redirects, interception, and callbacks must not change at
+        // the first import edge.
         // The caller sizes the budget: short for enhancement modules on an
         // already-rendered page, full for an unmounted SPA shell (#205).
         let module_id = match tokio::time::timeout(
             budget,
-            self.runtime.load_side_es_module_from_code(&specifier, deno_core::ModuleCodeString::from(source_code)),
+            self.runtime.load_side_es_module(&specifier),
         ).await {
             Ok(Ok(id)) => id,
             Ok(Err(e)) => return Err(format!("Module load error: {}", e)),
@@ -7108,6 +7086,86 @@ mod tests {
         format!("http://{}", address)
     }
 
+    #[derive(Clone, Copy)]
+    enum ModuleGraphFixture {
+        CookieProtected,
+        RedirectedChild,
+    }
+
+    fn spawn_module_graph_server(
+        fixture: ModuleGraphFixture,
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (requests_tx, requests_rx) = std::sync::mpsc::channel();
+        let request_count = match fixture {
+            ModuleGraphFixture::CookieProtected => 2,
+            ModuleGraphFixture::RedirectedChild => 3,
+        };
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            for _ in 0..request_count {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = vec![0u8; 8192];
+                let length = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..length]).to_string();
+                let lower_request = request.to_ascii_lowercase();
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_ascii_whitespace().nth(1))
+                    .unwrap_or("/")
+                    .to_string();
+                requests_tx.send(request.clone()).unwrap();
+
+                let (status, extra_headers, body) = match (fixture, path.as_str()) {
+                    (ModuleGraphFixture::CookieProtected, "/entry.js") => (
+                        "200 OK",
+                        "",
+                        "import { value } from './child.js'; \
+                         globalThis.__module_graph_value = value;",
+                    ),
+                    (ModuleGraphFixture::CookieProtected, "/child.js")
+                        if lower_request.contains("\r\ncookie: session=ok\r\n")
+                            && lower_request
+                                .contains("\r\nuser-agent: modulegraphtest/1.0\r\n")
+                            && lower_request.contains("\r\nx-module-test: shared\r\n") =>
+                    {
+                        ("200 OK", "", "export const value = 'cookie-child';")
+                    }
+                    (ModuleGraphFixture::CookieProtected, "/child.js") => (
+                        "401 Unauthorized",
+                        "",
+                        "throw new Error('page request context missing');",
+                    ),
+                    (ModuleGraphFixture::RedirectedChild, "/entry.js") => (
+                        "200 OK",
+                        "",
+                        "import { value } from './redirect.js'; \
+                         globalThis.__module_graph_value = value;",
+                    ),
+                    (ModuleGraphFixture::RedirectedChild, "/redirect.js") => {
+                        ("302 Found", "Location: /child.js\r\n", "")
+                    }
+                    (ModuleGraphFixture::RedirectedChild, "/child.js") => {
+                        ("200 OK", "", "export const value = 'redirect-child';")
+                    }
+                    _ => ("404 Not Found", "", "not found"),
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\n\
+                     Content-Type: application/javascript\r\n\
+                     {extra_headers}Content-Length: {}\r\n\
+                     Connection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        (format!("http://{}", address), requests_rx)
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn entry_module_http_failure_is_not_evaluated_as_empty_source() {
         let base = spawn_one_response_server("404 Not Found", "not found");
@@ -7128,6 +7186,119 @@ mod tests {
             error.contains("HTTP 404"),
             "expected entry fetch status in error, got: {}",
             error
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn descendant_module_uses_page_cookie_identity_and_headers() {
+        let (base, requests) = spawn_module_graph_server(ModuleGraphFixture::CookieProtected);
+        let page_url = url::Url::parse(&format!("{}/", base)).unwrap();
+        let jar = std::sync::Arc::new(obscura_net::CookieJar::new());
+        jar.set_cookie("session=ok; Path=/", &page_url);
+        let client = std::sync::Arc::new(obscura_net::ObscuraHttpClient::with_full_options(
+            jar.clone(),
+            None,
+            true,
+        ));
+        client.set_user_agent("ModuleGraphTest/1.0").await;
+        client
+            .set_extra_headers(std::collections::HashMap::from([(
+                "x-module-test".to_string(),
+                "shared".to_string(),
+            )]))
+            .await;
+        let callback_urls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let callbacks = std::sync::Arc::new(obscura_net::CallbackRegistry::new());
+        let callback_urls_capture = callback_urls.clone();
+        callbacks.add_request(std::sync::Arc::new(move |request| {
+            callback_urls_capture
+                .lock()
+                .unwrap()
+                .push(request.url.path().to_string());
+        }));
+
+        let mut rt = ObscuraJsRuntime::with_base_url(&format!("{}/", base));
+        rt.set_cookie_jar(jar);
+        rt.set_http_client(client);
+        rt.set_callbacks(callbacks);
+        rt.load_module(&format!("{}/entry.js", base), 1_000)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            rt.evaluate("globalThis.__module_graph_value").unwrap(),
+            serde_json::json!("cookie-child"),
+        );
+        let requests = (0..2)
+            .map(|_| {
+                requests
+                    .recv_timeout(std::time::Duration::from_secs(1))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(requests
+            .iter()
+            .any(|request| request.starts_with("GET /entry.js ")));
+        let child = requests
+            .iter()
+            .find(|request| request.starts_with("GET /child.js "))
+            .expect("descendant request");
+        let child_lower = child.to_ascii_lowercase();
+        assert!(
+            child_lower.contains("\r\ncookie: session=ok\r\n"),
+            "{child}"
+        );
+        assert!(
+            child_lower.contains("\r\nuser-agent: modulegraphtest/1.0\r\n"),
+            "{child}"
+        );
+        assert!(
+            child_lower.contains("\r\nx-module-test: shared\r\n"),
+            "{child}"
+        );
+        assert_eq!(
+            *callback_urls.lock().unwrap(),
+            vec!["/entry.js", "/child.js"],
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn descendant_module_follows_page_client_redirects() {
+        let (base, requests) = spawn_module_graph_server(ModuleGraphFixture::RedirectedChild);
+        let jar = std::sync::Arc::new(obscura_net::CookieJar::new());
+        let client = std::sync::Arc::new(obscura_net::ObscuraHttpClient::with_full_options(
+            jar,
+            None,
+            true,
+        ));
+        let mut rt = ObscuraJsRuntime::with_base_url(&format!("{}/", base));
+        rt.set_http_client(client);
+        rt.load_module(&format!("{}/entry.js", base), 1_000)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            rt.evaluate("globalThis.__module_graph_value").unwrap(),
+            serde_json::json!("redirect-child"),
+        );
+        let paths = (0..3)
+            .map(|_| {
+                requests
+                    .recv_timeout(std::time::Duration::from_secs(1))
+                    .unwrap()
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            vec![
+                "GET /entry.js HTTP/1.1",
+                "GET /redirect.js HTTP/1.1",
+                "GET /child.js HTTP/1.1",
+            ],
         );
     }
 
