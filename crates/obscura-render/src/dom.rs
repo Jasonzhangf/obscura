@@ -1572,6 +1572,7 @@ fn layout_dom_once(
             container_type: crate::ContainerType,
             container_names: Vec<String>,
             text_align: Option<taffy::AlignItems>,
+            text_indent: crate::Dimension,
             legacy_center: bool,
             visibility_hidden: bool,
             opacity_product: f32,
@@ -1609,6 +1610,7 @@ fn layout_dom_once(
                     container_type: crate::ContainerType::Normal,
                     container_names: Vec::new(),
                     text_align: None,
+                    text_indent: crate::Dimension::Px(0.0),
                     legacy_center: false,
                     visibility_hidden: false,
                     opacity_product: 1.0,
@@ -1942,6 +1944,14 @@ fn layout_dom_once(
                         }
                     }
                 }
+                match style.text_indent {
+                    Some(indent) => {
+                        let indent = indent.resolve(em_px, root_fs, vw, vh);
+                        style.text_indent = Some(indent);
+                        inh.text_indent = indent;
+                    }
+                    None => style.text_indent = Some(inh.text_indent),
+                }
                 inh.visibility_hidden = style.visibility_hidden.unwrap_or(inh.visibility_hidden);
                 inh.opacity_product *= style.opacity.unwrap_or(1.0);
                 style.effectively_invisible = inh.visibility_hidden || inh.opacity_product < 0.02;
@@ -2071,6 +2081,7 @@ fn layout_dom_once(
                 let host_transform = style.text_transform;
                 let host_italic = style.font_style_italic;
                 let host_text_align = style.text_align;
+                let host_text_indent = style.text_indent;
                 let host_invisible = style.effectively_invisible;
                 let settle_pseudo = |pseudo: &mut crate::LayoutStyle| {
                     if let Some(expression) = pseudo.font_size_expression.as_deref() {
@@ -2260,6 +2271,12 @@ fn layout_dom_once(
                     }
                     if pseudo.text_align.is_none() {
                         pseudo.text_align = host_text_align;
+                    }
+                    if pseudo.text_indent.is_none() {
+                        pseudo.text_indent = host_text_indent;
+                    } else if let Some(indent) = pseudo.text_indent {
+                        pseudo.text_indent =
+                            Some(indent.resolve(pseudo_em, root_fs, vw, vh));
                     }
                     pseudo.effectively_invisible = host_invisible;
                 };

@@ -980,6 +980,7 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
             }
             _ => {}
         },
+        "text-indent" => apply_text_indent(style, value),
         "align-items" => {
             if let Some(Some(value)) = self_alignment_value(value) {
                 style.align_items = Some(value);
@@ -1573,6 +1574,7 @@ pub(crate) fn supports_declaration(name: &str, value: &str) -> bool {
             | "font-optical-sizing"
             | "font-variation-settings"
             | "text-align"
+            | "text-indent"
             | "text-transform"
             | "text-decoration"
             | "text-decoration-line"
@@ -1712,6 +1714,9 @@ pub(crate) fn supports_declaration(name: &str, value: &str) -> bool {
             "auto" | "wrap" | "balance" | "wrap balance" | "balance wrap"
         ),
         "text-wrap-style" => matches!(value.to_ascii_lowercase().as_str(), "auto" | "balance"),
+        "text-indent" => {
+            parse_text_indent(value).is_some()
+        }
         "animation-duration" => parse_animation_time_ms(value).is_some_and(|time| time >= 0.0),
         "animation-delay" => parse_animation_time_ms(value).is_some(),
         "animation-iteration-count" => parse_animation_iteration_count(value).is_some(),
@@ -3908,6 +3913,29 @@ fn apply_letter_spacing(style: &mut LayoutStyle, value: &str) {
     }
 }
 
+fn parse_text_indent(value: &str) -> Option<crate::Dimension> {
+    // The Level 3 `hanging` and `each-line` keywords change which lines are
+    // indented. Keep them invalid until those semantics are represented.
+    if split_ws_paren(value).len() != 1 {
+        return None;
+    }
+    let dimension = dimension_value(value);
+    (!matches!(dimension, crate::Dimension::Auto)).then_some(dimension)
+}
+
+fn apply_text_indent(style: &mut LayoutStyle, value: &str) {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "initial" => style.text_indent = Some(crate::Dimension::Px(0.0)),
+        // This is an inherited property, so `unset` computes like `inherit`.
+        "inherit" | "unset" | "revert" | "revert-layer" => style.text_indent = None,
+        _ => {
+            if let Some(indent) = parse_text_indent(value) {
+                style.text_indent = Some(indent);
+            }
+        }
+    }
+}
+
 fn apply_gap_value(style: &mut LayoutStyle, row: bool, value: &str) {
     let value = value.trim();
     let lower = value.to_ascii_lowercase();
@@ -5485,6 +5513,32 @@ mod tests {
         let inherited = compute_style("span", Some("letter-spacing:unset"));
         assert_eq!(inherited.letter_spacing, None);
         assert_eq!(inherited.letter_spacing_non_normal, None);
+    }
+
+    #[test]
+    fn text_indent_preserves_lengths_percentages_and_inherited_resets() {
+        let relative = compute_style("p", Some("text-indent:2em"));
+        assert_eq!(relative.text_indent, Some(crate::Dimension::Em(2.0)));
+
+        let percentage = compute_style("p", Some("text-indent:25%"));
+        assert_eq!(
+            percentage.text_indent,
+            Some(crate::Dimension::Percent(0.25))
+        );
+
+        let inherited = compute_style("p", Some("text-indent:18px;text-indent:unset"));
+        assert_eq!(inherited.text_indent, None);
+        let initial = compute_style("p", Some("text-indent:18px;text-indent:initial"));
+        assert_eq!(initial.text_indent, Some(crate::Dimension::Px(0.0)));
+
+        let invalid = compute_style(
+            "p",
+            Some("text-indent:18px;text-indent:10px hanging"),
+        );
+        assert_eq!(invalid.text_indent, Some(crate::Dimension::Px(18.0)));
+        assert!(supports_declaration("text-indent", "-9999px"));
+        assert!(supports_declaration("text-indent", "25%"));
+        assert!(!supports_declaration("text-indent", "10px hanging"));
     }
 
     #[test]

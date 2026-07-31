@@ -93,15 +93,25 @@ struct LoadedFamily {
 struct LoadedFace {
     name: Arc<str>,
     font_id: Option<cosmic_text::fontdb::ID>,
+    metrics: FaceMetrics,
     min_weight: u16,
     max_weight: u16,
     italic: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FaceMetrics {
+    ascent: f32,
+    descent: f32,
+    line_gap: f32,
+    units_per_em: f32,
 }
 
 #[derive(Clone)]
 struct ResolvedFont {
     family: Arc<str>,
     font_id: Option<cosmic_text::fontdb::ID>,
+    metrics: FaceMetrics,
 }
 
 #[derive(Clone)]
@@ -148,6 +158,7 @@ fn resolve_loaded_font(
                     return ResolvedFont {
                         family: Arc::clone(&face.name),
                         font_id: face.font_id,
+                        metrics: face.metrics,
                     };
                 }
                 let available: Vec<_> =
@@ -160,6 +171,7 @@ fn resolve_loaded_font(
                     return ResolvedFont {
                         family: Arc::clone(&face.name),
                         font_id: face.font_id,
+                        metrics: face.metrics,
                     };
                 }
             }
@@ -169,6 +181,7 @@ fn resolve_loaded_font(
     ResolvedFont {
         family: Arc::from(fallback),
         font_id: None,
+        metrics: bundled_face_metrics(fallback),
     }
 }
 
@@ -221,19 +234,48 @@ fn match_font_weight(requested: u16, available: &[u16]) -> u16 {
 /// Chromium, not 11px. Keep these metrics beside the embedded faces so normal
 /// line boxes follow the same device-pixel rhythm without consulting host
 /// fonts.
-fn normal_line_height(font_size: f32, family: &str) -> f32 {
+fn bundled_face_metrics(family: &str) -> FaceMetrics {
     let (ascent, descent, line_gap) = match family {
         SERIF_FAMILY => (1825.0, 443.0, 87.0),
         MONO_FAMILY => (1705.0, 615.0, 0.0),
         _ => (1854.0, 434.0, 67.0),
     };
-    let scale = font_size / 2048.0;
-    (ascent * scale).round() + (descent * scale).round() + (line_gap * scale).round()
+    FaceMetrics {
+        ascent,
+        descent,
+        line_gap,
+        units_per_em: 2048.0,
+    }
 }
 
-/// Computed used line-height shared by shaped inline runs and forced-break
-/// sentinels that cannot join a run.
-pub(crate) fn used_line_height(style: &LayoutStyle) -> f32 {
+fn normal_line_height(font_size: f32, metrics: FaceMetrics) -> f32 {
+    let scale = font_size / metrics.units_per_em.max(1.0);
+    (metrics.ascent * scale).round()
+        + (metrics.descent * scale).round()
+        + (metrics.line_gap * scale).round()
+}
+
+fn font_metrics(
+    db: &cosmic_text::fontdb::Database,
+    id: cosmic_text::fontdb::ID,
+) -> Option<FaceMetrics> {
+    db.with_face_data(id, |data, face_index| {
+        let face = cosmic_text::ttf_parser::Face::parse(data, face_index).ok()?;
+        Some(FaceMetrics {
+            ascent: face.ascender().max(0) as f32,
+            descent: -(face.descender().min(0) as f32),
+            line_gap: face.line_gap().max(0) as f32,
+            units_per_em: face.units_per_em() as f32,
+        })
+    })
+    .flatten()
+}
+
+fn used_line_height_for_font(style: &LayoutStyle, font: &ResolvedFont) -> f32 {
+    used_line_height_with_metrics(style, font.metrics)
+}
+
+fn used_line_height_with_metrics(style: &LayoutStyle, metrics: FaceMetrics) -> f32 {
     let font_size = style.font_size.unwrap_or(16.0);
     match style.line_height {
         Some(crate::LineHeight::Px(px)) => px,
@@ -245,11 +287,15 @@ pub(crate) fn used_line_height(style: &LayoutStyle) -> f32 {
                 _ => font_size,
             },
         },
-        None | Some(crate::LineHeight::Normal) => normal_line_height(
-            font_size,
-            resolve_font_family(style.font_family.as_deref()),
-        ),
+        None | Some(crate::LineHeight::Normal) => normal_line_height(font_size, metrics),
     }
+}
+
+/// Computed used line-height shared by shaped inline runs and forced-break
+/// sentinels that cannot join a run.
+pub(crate) fn used_line_height(style: &LayoutStyle) -> f32 {
+    let family = resolve_font_family(style.font_family.as_deref());
+    used_line_height_with_metrics(style, bundled_face_metrics(family))
 }
 
 type ClipTextFill = (f32, Vec<([u8; 4], Option<f32>)>);
@@ -278,6 +324,14 @@ fn metadata_variation(metadata: usize) -> Option<usize> {
 /// paint it (filled in after layout).
 pub struct InlineItem {
     buffer: Buffer,
+    /// Unmodified shaped content retained only when `text-indent` is nonzero.
+    /// Each Taffy measurement can then derive a first-line-only wrap boundary
+    /// without accumulating synthetic hard breaks across repeated probes.
+    source_buffer: Option<Buffer>,
+    text_indent: Dimension,
+    /// Used LTR paint offset for the first formatted line at the most recently
+    /// shaped width. Later lines retain the ordinary content-box origin.
+    first_line_offset: f32,
     /// Whether final shaping should tighten the wrap width while preserving
     /// the natural line count (`text-wrap-style: balance`).
     balance_wrap: bool,
@@ -716,6 +770,8 @@ impl TextEngine {
                 .map(|(name, _)| Arc::<str>::from(name.as_str()))
                 .unwrap_or_else(|| Arc::from(FAMILY));
             let shape_weight = face.weight.0;
+            let metrics = font_metrics(&db, id)
+                .unwrap_or_else(|| bundled_face_metrics(internal_name.as_ref()));
             let italic = declared_italic
                 .unwrap_or(!matches!(face.style, cosmic_text::fontdb::Style::Normal));
             let weight = declared_weight.unwrap_or((shape_weight, shape_weight));
@@ -729,6 +785,7 @@ impl TextEngine {
                 family.faces.push(LoadedFace {
                     name: Arc::clone(&internal_name),
                     font_id: Some(id),
+                    metrics,
                     min_weight: weight.0,
                     max_weight: weight.1,
                     italic,
@@ -783,6 +840,7 @@ impl TextEngine {
             &self.loaded_families,
         );
         let ctx = base_span_ctx(base, font, &mut collector);
+        let line_height = ctx.line_height;
         let mut spans: Vec<(String, SpanAttrs)> = Vec::new();
         collect_spans(
             tree,
@@ -793,7 +851,7 @@ impl TextEngine {
             &mut collector,
             &self.loaded_families,
         );
-        self.push_shaped_item(base, spans, collector.clip_fills)
+        self.push_shaped_item(base, line_height, spans, collector.clip_fills)
     }
 
     /// Build an inline formatting context from a *run* of consecutive
@@ -828,6 +886,7 @@ impl TextEngine {
             &self.loaded_families,
         );
         let ctx = base_span_ctx(base, font, &mut collector);
+        let line_height = ctx.line_height;
         let mut spans: Vec<(String, SpanAttrs)> = Vec::new();
         for &cid in run {
             collect_node_spans(
@@ -840,7 +899,7 @@ impl TextEngine {
                 &self.loaded_families,
             );
         }
-        self.push_shaped_item(base, spans, collector.clip_fills)
+        self.push_shaped_item(base, line_height, spans, collector.clip_fills)
     }
 
     /// Shape generated text that owns a positioned pseudo box.
@@ -866,6 +925,7 @@ impl TextEngine {
             &self.loaded_families,
         );
         let context = base_span_ctx(style, font, &mut collector);
+        let line_height = context.line_height;
         let attrs = SpanAttrs {
             font_size: context.font_size,
             line_height: context.line_height,
@@ -890,7 +950,7 @@ impl TextEngine {
             &mut spans,
             &mut collector,
         );
-        self.push_shaped_item(style, spans, collector.clip_fills)
+        self.push_shaped_item(style, line_height, spans, collector.clip_fills)
     }
 
     /// Shared tail of [`try_build`] / [`try_build_run`]: shape the collected
@@ -899,6 +959,7 @@ impl TextEngine {
     fn push_shaped_item(
         &mut self,
         base: &LayoutStyle,
+        line_h: f32,
         mut spans: Vec<(String, SpanAttrs)>,
         clip_fills: Vec<ClipTextFill>,
     ) -> Option<usize> {
@@ -936,7 +997,6 @@ impl TextEngine {
         // Explicit line-height stays fractional. `normal` is derived from the
         // embedded face metrics with the same per-component pixel fitting as
         // Chromium's Linux font path.
-        let line_h = used_line_height(base);
         let mut forced_breaks = 0usize;
         let mut visible_after_last_break = false;
         for (text, _) in &spans {
@@ -1025,8 +1085,14 @@ impl TextEngine {
         }
 
         let idx = self.items.len();
+        let text_indent = base.text_indent.unwrap_or(Dimension::Px(0.0));
+        let source_buffer = (!matches!(text_indent, Dimension::Px(value) if value == 0.0))
+            .then(|| buffer.clone());
         self.items.push(InlineItem {
             buffer,
+            source_buffer,
+            text_indent,
+            first_line_offset: 0.0,
             balance_wrap: base.text_wrap_style == Some(crate::TextWrapStyle::Balance),
             align,
             forced_min_height,
@@ -1049,9 +1115,8 @@ impl TextEngine {
         }
         let TextEngine { font_system, items, .. } = self;
         let item = &mut items[idx];
-        item.buffer.set_size(font_system, width.map(|w| w.max(0.0)), None);
-        item.buffer.shape_until_scroll(font_system, false);
-        let (width, height) = buffer_size(&item.buffer);
+        shape_with_text_indent(font_system, item, width);
+        let (width, height) = buffer_size(&item.buffer, item.first_line_offset);
         (width, height.max(item.forced_min_height))
     }
 
@@ -1114,8 +1179,7 @@ impl TextEngine {
         } = self;
         let item = &mut items[idx];
         let content_width = content_width.max(0.0);
-        item.buffer.set_size(font_system, Some(content_width), None);
-        item.buffer.shape_until_scroll(font_system, false);
+        shape_with_text_indent(font_system, item, Some(content_width));
         let balanced_width = item
             .balance_wrap
             .then(|| balance_wrap_width(font_system, &mut item.buffer, content_width))
@@ -1213,6 +1277,7 @@ struct SpanCtx {
     weight: u16,
     optical_sizing: crate::FontOpticalSizing,
     font_id: Option<cosmic_text::fontdb::ID>,
+    font_metrics: FaceMetrics,
     variations: Option<Arc<FontVariations>>,
     italic: bool,
     underline: bool,
@@ -1267,15 +1332,17 @@ fn base_span_ctx(
         index
     });
     let variations = resolved_font_variations(base, &font);
+    let line_height = used_line_height_for_font(base, &font);
     SpanCtx {
         font_size: base.font_size.unwrap_or(16.0),
-        line_height: used_line_height(base),
+        line_height,
         letter_spacing: base.letter_spacing.unwrap_or(0.0),
         letter_spacing_non_normal: base.letter_spacing_non_normal.unwrap_or(false),
         color: base.color.unwrap_or([0, 0, 0, 255]),
         weight: crate::style::used_font_weight(base),
         optical_sizing: base.font_optical_sizing.unwrap_or_default(),
         font_id: font.font_id,
+        font_metrics: font.metrics,
         variations,
         italic: base.font_style_italic.unwrap_or(false),
         underline: base.underline.unwrap_or(false),
@@ -1403,6 +1470,7 @@ fn collect_node_spans(
                 .unwrap_or_else(|| ResolvedFont {
                     family: Arc::clone(&ctx.family),
                     font_id: ctx.font_id,
+                    metrics: ctx.font_metrics,
                 });
             let variations = style
                 .map(|style| resolved_font_variations(style, &font))
@@ -1412,7 +1480,7 @@ fn collect_node_spans(
                     .and_then(|style| style.font_size)
                     .unwrap_or(ctx.font_size),
                 line_height: style
-                    .map(used_line_height)
+                    .map(|style| used_line_height_for_font(style, &font))
                     .unwrap_or(ctx.line_height),
                 letter_spacing: style
                     .and_then(|style| style.letter_spacing)
@@ -1426,6 +1494,7 @@ fn collect_node_spans(
                     .and_then(|style| style.font_optical_sizing)
                     .unwrap_or(ctx.optical_sizing),
                 font_id: font.font_id,
+                font_metrics: font.metrics,
                 variations,
                 italic: ctx.italic || style.and_then(|s| s.font_style_italic).unwrap_or(false),
                 // Underline propagates in: an ancestor's underline covers
@@ -1502,14 +1571,90 @@ fn push_text(
 }
 
 /// Total shaped size of a buffer: widest line, and the bottom of the last line.
-fn buffer_size(buffer: &Buffer) -> (f32, f32) {
+fn buffer_size(buffer: &Buffer, first_line_offset: f32) -> (f32, f32) {
     let mut w = 0.0f32;
     let mut h = 0.0f32;
-    for run in buffer.layout_runs() {
-        w = w.max(run.line_w);
+    for (line_index, run) in buffer.layout_runs().enumerate() {
+        let offset = if line_index == 0 {
+            first_line_offset
+        } else {
+            0.0
+        };
+        w = w.max((run.line_w + offset).max(0.0));
         h = h.max(run.line_top + run.line_height);
     }
     (w.ceil(), h)
+}
+
+fn used_text_indent(value: Dimension, width: Option<f32>) -> f32 {
+    let indent = match value {
+        Dimension::Px(pixels) => pixels,
+        Dimension::Percent(fraction) => width.unwrap_or(0.0) * fraction,
+        _ => 0.0,
+    };
+    if indent.is_finite() { indent } else { 0.0 }
+}
+
+/// Shape one IFC with a first-line-only indent.
+///
+/// cosmic-text accepts one wrap width for every visual line. To retain the
+/// browser model, first probe the pristine paragraph at `width - indent`, take
+/// its first wrap boundary, split there, and reshape the tail at the full
+/// content width. The synthetic split lives only in the working clone, so
+/// repeated intrinsic/final Taffy measurements never accumulate hard breaks.
+fn shape_with_text_indent(
+    font_system: &mut FontSystem,
+    item: &mut InlineItem,
+    width: Option<f32>,
+) {
+    let indent = used_text_indent(item.text_indent, width);
+    item.first_line_offset = indent
+        * match item.align {
+            Some(Align::Center) => 0.5,
+            Some(Align::End | Align::Right) => 0.0,
+            _ => 1.0,
+        };
+
+    let Some(source) = item.source_buffer.as_ref() else {
+        item.buffer
+            .set_size(font_system, width.map(|value| value.max(0.0)), None);
+        item.buffer.shape_until_scroll(font_system, false);
+        return;
+    };
+    item.buffer = source.clone();
+
+    let mut first_break = None;
+    if let Some(full_width) = width {
+        item.buffer
+            .set_size(font_system, Some((full_width - indent).max(0.0)), None);
+        item.buffer.shape_until_scroll(font_system, false);
+        first_break = item
+            .buffer
+            .layout_runs()
+            .next()
+            .and_then(|run| run.glyphs.iter().map(|glyph| glyph.end).max());
+    }
+
+    item.buffer = source.clone();
+    if let (Some(mut split), Some(first_line)) =
+        (first_break, item.buffer.lines.first())
+    {
+        let text = first_line.text();
+        while split < text.len() {
+            let Some(ch) = text[split..].chars().next() else { break };
+            if !ch.is_whitespace() {
+                break;
+            }
+            split += ch.len_utf8();
+        }
+        if split > 0 && split < text.len() {
+            let tail = item.buffer.lines[0].split_off(split);
+            item.buffer.lines.insert(1, tail);
+        }
+    }
+    item.buffer
+        .set_size(font_system, width.map(|value| value.max(0.0)), None);
+    item.buffer.shape_until_scroll(font_system, false);
 }
 
 /// Chromium's bisection implementation only balances paragraphs of at most
@@ -1795,7 +1940,12 @@ impl TextEngine {
         let mut underlines: Vec<(f32, f32, f32, f32, [u8; 4])> = Vec::new(); // x0, x1, y, thickness, color
         let mut fill_bounds: Vec<Option<(f32, f32, f32, f32)>> =
             vec![None; item.clip_fills.len()];
-        for run in item.buffer.layout_runs() {
+        for (line_index, run) in item.buffer.layout_runs().enumerate() {
+            let line_offset = if line_index == 0 {
+                item.first_line_offset
+            } else {
+                0.0
+            };
             let base_y = run.line_y;
             let mut seg: Option<(f32, f32, f32, [u8; 4])> = None; // x0, x1, font_size, color
             for g in run.glyphs {
@@ -1803,9 +1953,9 @@ impl TextEngine {
                 if let Some(fill_index) = metadata_fill(g.metadata) {
                     if let Some(bounds) = fill_bounds.get_mut(fill_index) {
                         let glyph_bounds = (
-                            g.x,
+                            g.x + line_offset,
                             run.line_top,
-                            g.x + g.w,
+                            g.x + line_offset + g.w,
                             run.line_top + run.line_height,
                         );
                         *bounds = Some(match *bounds {
@@ -1823,14 +1973,19 @@ impl TextEngine {
                 if underlined {
                     match &mut seg {
                         Some((_, x1, fs, c)) if *c == col => {
-                            *x1 = g.x + g.w;
+                            *x1 = g.x + line_offset + g.w;
                             *fs = fs.max(g.font_size);
                         }
                         _ => {
                             if let Some((x0, x1, fs, c)) = seg.take() {
                                 underlines.push((x0, x1, base_y + (fs * 0.12).max(1.0), (fs / 14.0).max(1.0), c));
                             }
-                            seg = Some((g.x, g.x + g.w, g.font_size, col));
+                            seg = Some((
+                                g.x + line_offset,
+                                g.x + line_offset + g.w,
+                                g.font_size,
+                                col,
+                            ));
                         }
                     }
                 } else if let Some((x0, x1, fs, c)) = seg.take() {
@@ -1852,9 +2007,14 @@ impl TextEngine {
         // over the entire heading and lose inline accent gradients.
         let clip_fills = item.clip_fills.clone();
         let pixels = pixmap.pixels_mut();
-        for run in item.buffer.layout_runs() {
+        for (line_index, run) in item.buffer.layout_runs().enumerate() {
+            let line_offset = if line_index == 0 {
+                item.first_line_offset
+            } else {
+                0.0
+            };
             for glyph in run.glyphs {
-                let physical = glyph.physical((0.0, 0.0), 1.0);
+                let physical = glyph.physical((line_offset, 0.0), 1.0);
                 let glyph_color = glyph.color_opt.unwrap_or(default);
                 let fill_index = metadata_fill(glyph.metadata);
                 let mut draw_pixel = |x, y, color: Color| {
@@ -2004,10 +2164,62 @@ mod tests {
         // Values measured from Chromium 145 using the same bundled Linux
         // platform faces. Small fractional sizes expose the difference from
         // rounding a single 1.15 multiplier.
-        assert_eq!(normal_line_height(9.3333, FAMILY), 10.0);
-        assert_eq!(normal_line_height(12.0, FAMILY), 14.0);
-        assert_eq!(normal_line_height(13.0, SERIF_FAMILY), 16.0);
-        assert_eq!(normal_line_height(13.0, MONO_FAMILY), 15.0);
+        assert_eq!(
+            normal_line_height(9.3333, bundled_face_metrics(FAMILY)),
+            10.0
+        );
+        assert_eq!(
+            normal_line_height(12.0, bundled_face_metrics(FAMILY)),
+            14.0
+        );
+        assert_eq!(
+            normal_line_height(13.0, bundled_face_metrics(SERIF_FAMILY)),
+            16.0
+        );
+        assert_eq!(
+            normal_line_height(13.0, bundled_face_metrics(MONO_FAMILY)),
+            15.0
+        );
+        // Poppins's 1000-unit hhea metrics are 1050/-350 with a 100-unit
+        // gap. A 64px normal line is therefore 67 + 22 + 6 = 95px, rather
+        // than the 74px produced by the old generic-sans constants.
+        assert_eq!(
+            normal_line_height(
+                64.0,
+                FaceMetrics {
+                    ascent: 1050.0,
+                    descent: 350.0,
+                    line_gap: 100.0,
+                    units_per_em: 1000.0,
+                },
+            ),
+            95.0
+        );
+    }
+
+    #[test]
+    fn declared_web_family_keeps_the_loaded_faces_line_metrics() {
+        let engine = TextEngine::new_with_web_fonts(&[WebFont {
+            data: FALLBACK.to_vec(),
+            family: Some("Page Face".to_string()),
+            weight: Some((400, 400)),
+            italic: Some(false),
+        }]);
+        let resolved =
+            resolve_loaded_font(Some("Page Face"), 400, false, &engine.loaded_families);
+        let expected = font_metrics(&engine.font_system.db(), resolved.font_id.unwrap()).unwrap();
+        assert_eq!(resolved.metrics, expected);
+
+        let style = LayoutStyle {
+            font_family: Some("Page Face".to_string()),
+            font_size: Some(64.0),
+            line_height: Some(crate::LineHeight::Normal),
+            ..Default::default()
+        };
+        assert_eq!(
+            used_line_height_for_font(&style, &resolved),
+            normal_line_height(64.0, expected)
+        );
     }
 
     #[test]
@@ -2128,6 +2340,7 @@ mod tests {
                 LoadedFace {
                     name: Arc::from("Poppins"),
                     font_id: None,
+                    metrics: bundled_face_metrics(FAMILY),
                     min_weight: 400,
                     max_weight: 400,
                     italic: false,
@@ -2135,6 +2348,7 @@ mod tests {
                 LoadedFace {
                     name: Arc::from("Poppins Medium"),
                     font_id: None,
+                    metrics: bundled_face_metrics(FAMILY),
                     min_weight: 500,
                     max_weight: 500,
                     italic: false,
@@ -2142,6 +2356,7 @@ mod tests {
                 LoadedFace {
                     name: Arc::from("Poppins"),
                     font_id: None,
+                    metrics: bundled_face_metrics(FAMILY),
                     min_weight: 700,
                     max_weight: 700,
                     italic: false,
@@ -2184,6 +2399,7 @@ mod tests {
                 faces: vec![LoadedFace {
                     name: Arc::from(FAMILY),
                     font_id: Some(regular_id),
+                    metrics: bundled_face_metrics(FAMILY),
                     min_weight: 100,
                     max_weight: 900,
                     italic: false,
@@ -2289,6 +2505,7 @@ mod tests {
                 faces: vec![LoadedFace {
                     name: Arc::from("Inter"),
                     font_id: None,
+                    metrics: bundled_face_metrics(FAMILY),
                     min_weight: 100,
                     max_weight: 900,
                     italic: false,
@@ -2351,6 +2568,7 @@ mod tests {
         let static_font = ResolvedFont {
             family: Arc::from(FAMILY),
             font_id: None,
+            metrics: bundled_face_metrics(FAMILY),
         };
         assert!(resolved_font_variations(&style, &static_font).is_none());
         let styles = HashMap::from([(copy, style)]);
@@ -2379,6 +2597,7 @@ mod tests {
         let font = ResolvedFont {
             family: Arc::from(FAMILY),
             font_id: None,
+            metrics: bundled_face_metrics(FAMILY),
         };
         assert!(resolved_font_variations(&style, &font).is_none());
     }
@@ -2921,6 +3140,53 @@ gamma</div>"#,
                 run.text[start..end].trim().to_string()
             })
             .collect()
+    }
+
+    #[test]
+    fn text_indent_changes_only_the_first_formatted_line() {
+        let tree = obscura_dom::parse_html(
+            "<p id='copy'>alpha beta gamma delta epsilon zeta eta theta</p>",
+        );
+        let copy = tree.get_element_by_id("copy").unwrap();
+        let style = LayoutStyle {
+            display: Display::Block,
+            font_size: Some(16.0),
+            line_height: Some(crate::LineHeight::Px(20.0)),
+            text_indent: Some(Dimension::Px(40.0)),
+            ..Default::default()
+        };
+        let mut engine = TextEngine::new();
+        let item = engine
+            .try_build(&tree, copy, &HashMap::from([(copy, style)]))
+            .unwrap();
+        engine.finalize(item, (0.0, 0.0), 150.0, None);
+
+        let lines = shaped_line_texts(&engine.items[item].buffer);
+        assert!(lines.len() >= 2, "fixture must wrap: {lines:?}");
+        assert_eq!(engine.items[item].first_line_offset, 40.0);
+        let runs: Vec<_> = engine.items[item].buffer.layout_runs().collect();
+        let first_x = runs[0].glyphs.first().unwrap().x
+            + engine.items[item].first_line_offset;
+        let second_x = runs[1].glyphs.first().unwrap().x;
+        assert!(
+            (first_x - 40.0).abs() < 0.01,
+            "first line must start at the authored indent: {first_x}"
+        );
+        assert!(
+            second_x.abs() < 0.01,
+            "continuation lines must return to the content edge: {second_x}"
+        );
+
+        let percentage = LayoutStyle {
+            display: Display::Block,
+            text_indent: Some(Dimension::Percent(0.25)),
+            ..Default::default()
+        };
+        let percent_item = engine
+            .try_build(&tree, copy, &HashMap::from([(copy, percentage)]))
+            .unwrap();
+        engine.finalize(percent_item, (0.0, 0.0), 200.0, None);
+        assert_eq!(engine.items[percent_item].first_line_offset, 50.0);
     }
 
     #[test]

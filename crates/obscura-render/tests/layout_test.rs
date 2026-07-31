@@ -2713,3 +2713,40 @@ fn negative_letter_spacing_changes_intrinsic_line_breaks() {
     assert_eq!(tight.height, 80.0, "negative tracking must shape to two lines: {tight:?}");
     assert_eq!(reset.height, 120.0, "`normal` must reset inherited tracking: {reset:?}");
 }
+
+#[test]
+fn text_indent_is_inherited_and_initial_resets_to_zero() {
+    let tree = parse_html(
+        r#"
+        <style>
+          #parent { font-size:20px; text-indent:2em }
+          #initial { text-indent:initial }
+          #unset { text-indent:unset }
+        </style>
+        <section id="parent">
+          <p id="inherited">Inherited first line</p>
+          <p id="initial">Reset first line</p>
+          <p id="unset">Unset inherits</p>
+        </section>
+        "#,
+    );
+    let layout = layout_dom(&tree, (500.0, 300.0));
+    let style = |id| &layout.styles[&tree.get_element_by_id(id).unwrap()];
+
+    assert_eq!(
+        style("parent").text_indent,
+        Some(obscura_render::Dimension::Px(40.0))
+    );
+    assert_eq!(
+        style("inherited").text_indent,
+        Some(obscura_render::Dimension::Px(40.0))
+    );
+    assert_eq!(
+        style("initial").text_indent,
+        Some(obscura_render::Dimension::Px(0.0))
+    );
+    assert_eq!(
+        style("unset").text_indent,
+        Some(obscura_render::Dimension::Px(40.0))
+    );
+}
