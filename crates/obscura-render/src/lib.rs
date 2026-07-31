@@ -671,6 +671,26 @@ pub struct LayoutStyle {
     pub box_shadow: Option<BoxShadow>,
 }
 
+/// Whether this box has an inline outer display and participates in an inline
+/// formatting context. `display` retains the inner layout mode for
+/// inline-flex/grid, so this cannot be inferred from `Display::Inline` alone.
+pub(crate) fn is_inline_level_box(style: &LayoutStyle) -> bool {
+    style.display == Display::Inline || style.is_inline_block
+}
+
+/// Apply CSS Display blockification while preserving the inner display mode.
+/// Thus inline-flex becomes flex and inline-grid becomes grid, while
+/// inline-block/plain inline become block.
+pub(crate) fn blockify_outer_display(style: &mut LayoutStyle) {
+    if !is_inline_level_box(style) {
+        return;
+    }
+    if style.display == Display::Inline {
+        style.display = Display::Block;
+    }
+    style.is_inline_block = false;
+}
+
 pub(crate) const CB_TRIGGER_TRANSFORM: u16 = 1 << 0;
 pub(crate) const CB_TRIGGER_FILTER: u16 = 1 << 1;
 pub(crate) const CB_TRIGGER_BACKDROP_FILTER: u16 = 1 << 2;

@@ -2288,16 +2288,15 @@ fn layout_dom_once(
 
         resolve_grid_areas(tree, root_id, &mut styles);
 
-        // Blockify flex/grid items (CSS Display 3): a direct inline child of a
-        // genuine flex or grid container gets a blockified outer display while
-        // retaining its own inner formatting context. Without the flex half,
-        // `<pre class=flex><code>...</code></pre>` collapses the code item and
-        // navigation bars treat direct `<a>` children as wrapping inline
-        // containers instead of flex items.
-        //
-        // `internal_flex_container` is deliberately excluded: table cells use
-        // a flex column only as our block-layout stand-in, and their ordinary
-        // inline text must continue to form an inline formatting context.
+        // The root's outer display is always blockified. Keep a declared
+        // inline-flex/grid root's inner mode, but remove its inline
+        // participation marker before box construction.
+        if let Some(root_style) = styles.get_mut(&root_id) {
+            crate::blockify_outer_display(root_style);
+        }
+
+        // CSS Display blockification changes only the outer display. Preserve
+        // the inner Flex/Grid mode of inline-flex/grid items.
         let item_parents: Vec<NodeId> = styles
             .iter()
             .filter(|(_, s)| {
@@ -2308,13 +2307,7 @@ fn layout_dom_once(
             .map(|(&id, _)| id)
             .collect();
         for pid in item_parents {
-            for cid in tree.children(pid) {
-                if let Some(cs) = styles.get_mut(&cid) {
-                    if cs.display == crate::Display::Inline {
-                        cs.display = crate::Display::Block;
-                    }
-                }
-            }
+            blockify_layout_children(tree, pid, &mut styles);
         }
 
         // In an auto-height column flex container, a zero flex basis still
@@ -2352,15 +2345,11 @@ fn layout_dom_once(
             }
         }
 
-        // CSS Display blockification: absolute/fixed boxes and floats compute
-        // an inline outside display to block. This affects how their own mixed
-        // children form lines and blocks; they remain shrink-to-fit where the
-        // positioning/float algorithm requires it.
+        // Absolute/fixed boxes and floats are blockified externally but retain
+        // their inner formatting mode and their context-specific shrink-fit.
         for style in styles.values_mut() {
-            if (matches!(style.position, Some(taffy::Position::Absolute)) || style.float.is_some())
-                && style.display == crate::Display::Inline
-            {
-                style.display = crate::Display::Block;
+            if matches!(style.position, Some(taffy::Position::Absolute)) || style.float.is_some() {
+                crate::blockify_outer_display(style);
             }
         }
 
@@ -2393,6 +2382,35 @@ fn layout_dom_once(
         }
 
         if let Some(taffy_root) = build(tree, root_id, &mut taffy_tree, &mut id_map, &mut words, &mut engine, &mut ifc_items, &styles) {
+            // Taffy has no outer display type and only gives an auto-width
+            // Block root the initial-containing-block width. CSS blockifies
+            // Flex/Grid roots too, so supply the equivalent used width while
+            // leaving an authored root width untouched.
+            if let Some(root_style) = styles.get(&root_id) {
+                if root_style.width == crate::Dimension::Auto
+                    && matches!(root_style.display, crate::Display::Flex | crate::Display::Grid)
+                {
+                    if let Ok(current) = taffy_tree.style(taffy_root) {
+                        let mut adjusted = current.clone();
+                        let outer = (initial_cb_width
+                            - root_style.margin.left
+                            - root_style.margin.right)
+                            .max(0.0);
+                        let declared = if root_style.box_sizing == crate::BoxSizing::ContentBox {
+                            (outer
+                                - root_style.padding.left
+                                - root_style.padding.right
+                                - root_style.border.left
+                                - root_style.border.right)
+                                .max(0.0)
+                        } else {
+                            outer
+                        };
+                        adjusted.size.width = taffy::Dimension::length(declared);
+                        let _ = taffy_tree.set_style(taffy_root, adjusted);
+                    }
+                }
+            }
             let static_position_candidates =
                 reparent_inset_positioned_nodes(tree, &mut taffy_tree, taffy_root, &id_map, &styles);
             let available = taffy::Size {
@@ -4450,7 +4468,7 @@ fn has_inline_content(tree: &DomTree, id: NodeId, styles: &HashMap<NodeId, crate
                         // are not inline content: an inline that is the sole
                         // child of a hero wrapper must not drag the wrapper
                         // into the inline-formatting path.
-                        s.display == crate::Display::Inline
+                        crate::is_inline_level_box(s)
                             && !matches!(s.position, Some(taffy::Position::Absolute))
                             && s.float.is_none()
                     }
@@ -4458,6 +4476,26 @@ fn has_inline_content(tree: &DomTree, id: NodeId, styles: &HashMap<NodeId, crate
                 .unwrap_or(false),
         }
     })
+}
+
+/// Blockify the generated layout children of a flex/grid container. A
+/// display:contents element is transparent, so its first boxed descendants
+/// are the items whose outer display changes.
+fn blockify_layout_children(
+    tree: &DomTree,
+    parent: NodeId,
+    styles: &mut HashMap<NodeId, crate::LayoutStyle>,
+) {
+    for child in tree.children(parent) {
+        let transparent = styles
+            .get(&child)
+            .is_some_and(|style| style.display_contents && style.display != crate::Display::None);
+        if transparent {
+            blockify_layout_children(tree, child, styles);
+        } else if let Some(style) = styles.get_mut(&child) {
+            crate::blockify_outer_display(style);
+        }
+    }
 }
 
 /// Build whichever of an element or a text node `id` is, returning every
@@ -4527,7 +4565,35 @@ fn build_any(
             .flat_map(|cid| build_any(tree, cid, taffy_tree, id_map, words, engine, ifc_items, styles))
             .collect();
     }
-    build(tree, id, taffy_tree, id_map, words, engine, ifc_items, styles).into_iter().collect()
+    let Some(inner) = build(tree, id, taffy_tree, id_map, words, engine, ifc_items, styles) else {
+        return Vec::new();
+    };
+    let needs_outer = styles.get(&id).is_some_and(|style| {
+        style.is_inline_block
+            && matches!(style.display, crate::Display::Flex | crate::Display::Grid)
+            && matches!(style.width, crate::Dimension::Auto)
+            && style.size_expressions[0].is_none()
+    });
+    if !needs_outer {
+        return vec![inner];
+    }
+
+    // Taffy stores only the inner display mode. If an inline-flex/grid node is
+    // handed directly to block or flex layout, its auto width is stretched to
+    // the available width. A transparent atomic outer node supplies the
+    // shrink-wrapping inline participation while the authored node retains its
+    // real Flex/Grid layout and remains the DOM geometry/paint owner.
+    let outer_style = taffy::Style {
+        display: taffy::style::Display::Flex,
+        flex_direction: taffy::FlexDirection::Row,
+        flex_wrap: taffy::FlexWrap::Wrap,
+        align_items: Some(taffy::AlignItems::FLEX_START),
+        ..Default::default()
+    };
+    match taffy_tree.new_with_children(outer_style, &[inner]) {
+        Ok(outer) => vec![outer],
+        Err(_) => vec![inner],
+    }
 }
 
 /// Build the direct children of a genuine flex/grid container.
@@ -6356,7 +6422,7 @@ fn build_mixed_block(
             let is_forced_break = node
                 .as_element()
                 .map_or(false, |element| element.local.as_ref() == "br");
-            is_forced_break || s.display == crate::Display::Inline
+            is_forced_break || crate::is_inline_level_box(s)
         } else {
             false
         };
@@ -7833,6 +7899,153 @@ mod tests {
             assert!(
                 rect.height >= 29.9,
                 "inline-size containment must retain content-driven block size: {rect:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn inline_outer_boxes_shrink_wrap_in_only_child_and_text_flows() {
+        let tree = parse_html(
+            r#"<style>
+                html,body{margin:0}
+                .host{width:700px}
+                .wide{width:400px;height:20px}
+                #ib,#ibt{display:inline-block}
+                #if,#ift{display:inline-flex}
+                #ig,#igt{display:inline-grid}
+            </style>
+            <div class="host"><div id="ib"><div class="wide"></div></div></div>
+            <div class="host"><div id="if"><div class="wide"></div></div></div>
+            <div class="host"><div id="ig"><div class="wide"></div></div></div>
+            <div class="host">A<div id="ibt"><div class="wide"></div></div>B</div>
+            <div class="host">A<div id="ift"><div class="wide"></div></div>B</div>
+            <div class="host">A<div id="igt"><div class="wide"></div></div>B</div>"#,
+        );
+        let laid = layout_dom(&tree, (700.0, 300.0));
+        for name in ["ib", "if", "ig", "ibt", "ift", "igt"] {
+            let rect = laid.rects[&tree.get_element_by_id(name).unwrap()];
+            assert!(
+                (rect.width - 400.0).abs() < 0.01,
+                "{name} did not shrink-wrap its 400px child: {rect:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn inline_flex_and_grid_preserve_percentage_and_box_edge_geometry() {
+        let tree = parse_html(
+            r#"<style>
+                html,body{margin:0}
+                .host{width:700px}
+                .percent{width:50%}
+                .flex{display:inline-flex}
+                .grid{display:inline-grid}
+                .edges{padding:10px 20px;border:5px solid;margin:7px}
+                .child{width:100px;height:20px}
+            </style>
+            <div class="host"><div id="flex-percent" class="flex percent"><div class="child"></div></div></div>
+            <div class="host"><div id="grid-percent" class="grid percent"><div class="child"></div></div></div>
+            <div class="host"><div id="flex-edges" class="flex edges"><div class="child"></div></div></div>
+            <div class="host"><div id="grid-edges" class="grid edges"><div class="child"></div></div></div>"#,
+        );
+        let laid = layout_dom(&tree, (800.0, 300.0));
+        let rect = |name| laid.rects[&tree.get_element_by_id(name).unwrap()];
+        for name in ["flex-percent", "grid-percent"] {
+            let item = rect(name);
+            assert!(
+                (item.width - 350.0).abs() < 0.01
+                    && (item.height - 20.0).abs() < 0.01,
+                "{name}: {item:?}"
+            );
+        }
+        for name in ["flex-edges", "grid-edges"] {
+            let item = rect(name);
+            assert!(
+                (item.x - 7.0).abs() < 0.01
+                    && (item.width - 150.0).abs() < 0.01
+                    && (item.height - 50.0).abs() < 0.01,
+                "{name}: {item:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn blockified_inline_flex_and_grid_items_retain_inner_layout() {
+        let tree = parse_html(
+            r#"<style>
+                html,body{margin:0}
+                .host{display:flex;width:700px}
+                #if{display:inline-flex}
+                #ig{display:inline-grid;grid-template-columns:100px 100px}
+                .item{width:100px;height:20px}
+            </style>
+            <div class="host"><div id="if"><div id="ifa" class="item"></div><div id="ifb" class="item"></div></div></div>
+            <div class="host"><div id="ig"><div id="iga" class="item"></div><div id="igb" class="item"></div></div></div>"#,
+        );
+        let laid = layout_dom(&tree, (700.0, 300.0));
+        let rect = |name| laid.rects[&tree.get_element_by_id(name).unwrap()];
+        for (container, first, second) in [("if", "ifa", "ifb"), ("ig", "iga", "igb")] {
+            let container = rect(container);
+            let first = rect(first);
+            let second = rect(second);
+            assert!((container.width - 200.0).abs() < 0.01, "{container:?}");
+            assert!(
+                (first.y - second.y).abs() < 0.01
+                    && (second.x - first.x - 100.0).abs() < 0.01,
+                "inner layout was destroyed: first={first:?} second={second:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn root_and_body_inline_outer_geometry_matches_blockification_rules() {
+        for display in ["inline-block", "inline-flex", "inline-grid"] {
+            let tree = parse_html(&format!(
+                r#"<style>
+                    html{{margin:0}}body{{margin:0;display:{display}}}
+                    .wide{{width:400px;height:20px}}
+                </style><div class="wide"></div>"#
+            ));
+            let laid = layout_dom(&tree, (800.0, 300.0));
+            let body = tree
+                .descendants(tree.document())
+                .into_iter()
+                .find(|id| {
+                    tree.get_node(*id)
+                        .is_some_and(|node| {
+                            node.as_element()
+                                .is_some_and(|element| element.local.as_ref() == "body")
+                        })
+                })
+                .unwrap();
+            assert!(
+                (laid.rects[&body].width - 400.0).abs() < 0.01,
+                "body {display}: {:?}",
+                laid.rects[&body]
+            );
+
+            let tree = parse_html(&format!(
+                r#"<style>
+                    html{{margin:0;display:{display}}}body{{margin:0}}
+                    .wide{{width:400px;height:20px}}
+                </style><div class="wide"></div>"#
+            ));
+            let laid = layout_dom(&tree, (800.0, 300.0));
+            let root = tree
+                .descendants(tree.document())
+                .into_iter()
+                .find(|id| {
+                    tree.get_node(*id)
+                        .is_some_and(|node| {
+                            node.as_element()
+                                .is_some_and(|element| element.local.as_ref() == "html")
+                        })
+                })
+                .unwrap();
+            assert!(
+                (laid.rects[&root].width - 800.0).abs() < 0.01,
+                "root {display}: {:?}",
+                laid.rects[&root]
             );
         }
     }
