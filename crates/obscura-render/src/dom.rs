@@ -2233,7 +2233,36 @@ fn layout_dom_once(
             // (updated to its content width inside the block below).
             let mut child_cb_width = inh.cb_width;
             let mut child_cb_height_definite = false;
+            let inherited_grid_auto_tracks = styles.get(&id).and_then(|style| {
+                (style.grid_auto_columns_inherit || style.grid_auto_rows_inherit)
+                    .then(|| {
+                        tree.get_node(id)
+                            .and_then(|node| node.parent)
+                            .and_then(|parent| styles.get(&parent))
+                            .map(|parent| {
+                                (
+                                    parent.grid_auto_columns.clone(),
+                                    parent.grid_auto_rows.clone(),
+                                )
+                            })
+                            .unwrap_or_default()
+                    })
+            });
             if let Some(style) = styles.get_mut(&id) {
+                if style.grid_auto_columns_inherit {
+                    style.grid_auto_columns = inherited_grid_auto_tracks
+                        .as_ref()
+                        .map(|tracks| tracks.0.clone())
+                        .unwrap_or_default();
+                    style.grid_auto_columns_inherit = false;
+                }
+                if style.grid_auto_rows_inherit {
+                    style.grid_auto_rows = inherited_grid_auto_tracks
+                        .as_ref()
+                        .map(|tracks| tracks.1.clone())
+                        .unwrap_or_default();
+                    style.grid_auto_rows_inherit = false;
+                }
                 if style.display_inherit {
                     style.display = inh.display;
                     style.display_contents = inh.display_contents;
@@ -2690,6 +2719,8 @@ fn layout_dom_once(
                 let host_is_inline_block = style.is_inline_block;
                 let host_flow_root = style.flow_root;
                 let host_is_table_box = style.is_table_box;
+                let host_grid_auto_columns = style.grid_auto_columns.clone();
+                let host_grid_auto_rows = style.grid_auto_rows.clone();
                 let host_overflow_x = if style.overflow_scroll_x {
                     2
                 } else if style.overflow_clip_x {
@@ -2705,6 +2736,14 @@ fn layout_dom_once(
                     0
                 };
                 let settle_pseudo = |pseudo: &mut crate::LayoutStyle| {
+                    if pseudo.grid_auto_columns_inherit {
+                        pseudo.grid_auto_columns = host_grid_auto_columns.clone();
+                        pseudo.grid_auto_columns_inherit = false;
+                    }
+                    if pseudo.grid_auto_rows_inherit {
+                        pseudo.grid_auto_rows = host_grid_auto_rows.clone();
+                        pseudo.grid_auto_rows_inherit = false;
+                    }
                     if pseudo.display_inherit {
                         pseudo.display = host_display;
                         pseudo.display_contents = host_display_contents;
@@ -11613,6 +11652,112 @@ mod tests {
             (18.0..=22.0).contains(&rect.height),
             "closed native select should have one-line control height: {rect:?}"
         );
+    }
+
+    #[test]
+    fn grid_auto_columns_size_successive_implicit_column_tracks() {
+        let tree = parse_html(
+            r#"<style>
+                html,body { margin:0 }
+                #grid {
+                    display:grid;
+                    width:300px;
+                    grid-template-columns:100px;
+                    grid-auto-columns:50px;
+                    grid-auto-flow:column;
+                }
+                .item { height:20px }
+            </style>
+            <div id="grid">
+                <div id="first" class="item"></div>
+                <div id="second" class="item"></div>
+                <div id="third" class="item"></div>
+            </div>"#,
+        );
+        let laid = layout_dom(&tree, (500.0, 200.0));
+        let rect = |id| laid.rects[&tree.get_element_by_id(id).unwrap()];
+
+        assert_eq!(
+            rect("first"),
+            Rect { x: 0.0, y: 0.0, width: 100.0, height: 20.0 }
+        );
+        assert_eq!(
+            rect("second"),
+            Rect { x: 100.0, y: 0.0, width: 50.0, height: 20.0 }
+        );
+        assert_eq!(
+            rect("third"),
+            Rect { x: 150.0, y: 0.0, width: 50.0, height: 20.0 }
+        );
+    }
+
+    #[test]
+    fn grid_auto_rows_size_successive_implicit_row_tracks() {
+        let tree = parse_html(
+            r#"<style>
+                html,body { margin:0 }
+                #grid {
+                    display:grid;
+                    width:100px;
+                    height:300px;
+                    grid-template-columns:100px;
+                    grid-template-rows:100px;
+                    grid-auto-rows:50px;
+                    grid-auto-flow:row;
+                }
+            </style>
+            <div id="grid">
+                <div id="first"></div>
+                <div id="second"></div>
+                <div id="third"></div>
+            </div>"#,
+        );
+        let laid = layout_dom(&tree, (500.0, 400.0));
+        let rect = |id| laid.rects[&tree.get_element_by_id(id).unwrap()];
+
+        assert_eq!(
+            rect("first"),
+            Rect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 }
+        );
+        assert_eq!(
+            rect("second"),
+            Rect { x: 0.0, y: 100.0, width: 100.0, height: 50.0 }
+        );
+        assert_eq!(
+            rect("third"),
+            Rect { x: 0.0, y: 150.0, width: 100.0, height: 50.0 }
+        );
+    }
+
+    #[test]
+    fn grid_auto_track_inherit_uses_the_parent_computed_lists() {
+        let tree = parse_html(
+            r#"<style>
+                html,body { margin:0 }
+                #parent { grid-auto-columns:60px;grid-auto-rows:70px }
+                #grid {
+                    display:grid;
+                    grid-template-columns:100px;
+                    grid-auto-columns:inherit;
+                    grid-auto-rows:inherit;
+                    grid-auto-flow:column;
+                }
+                #grid > div { height:20px }
+            </style>
+            <div id="parent">
+                <div id="grid"><div></div><div id="implicit"></div></div>
+            </div>"#,
+        );
+        let laid = layout_dom(&tree, (500.0, 300.0));
+        let grid = tree.get_element_by_id("grid").unwrap();
+        let implicit = tree.get_element_by_id("implicit").unwrap();
+
+        assert_eq!(laid.rects[&implicit].x, 100.0);
+        assert_eq!(laid.rects[&implicit].width, 60.0);
+        assert_eq!(laid.styles[&grid].grid_auto_columns.len(), 1);
+        assert_eq!(laid.styles[&grid].grid_auto_rows.len(), 1);
+        assert!(!laid.styles[&grid].grid_auto_columns_inherit);
+        assert!(!laid.styles[&grid].grid_auto_rows_inherit);
     }
 
 }

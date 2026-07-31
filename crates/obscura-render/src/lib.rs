@@ -733,6 +733,16 @@ pub struct LayoutStyle {
     // resolved to line placements on children in a later pass.
     pub grid_template_columns: Vec<taffy::GridTemplateComponent<String>>,
     pub grid_template_rows: Vec<taffy::GridTemplateComponent<String>>,
+    /// Track sizing functions for columns created outside the explicit grid.
+    /// An empty list is the CSS initial `auto` value: taffy supplies one
+    /// automatic implicit track and cycles a non-empty authored list.
+    pub grid_auto_columns: Vec<taffy::TrackSizingFunction>,
+    /// Track sizing functions for rows created outside the explicit grid.
+    pub grid_auto_rows: Vec<taffy::TrackSizingFunction>,
+    /// Explicit CSS-wide `inherit` markers. The properties are normally
+    /// non-inherited, so only the keyword copies the parent's computed list.
+    pub(crate) grid_auto_columns_inherit: bool,
+    pub(crate) grid_auto_rows_inherit: bool,
     /// `grid-template-columns: subgrid`. Taffy has no native subgrid track
     /// component, so `dom` resolves the safe full-span column subset after
     /// measuring the non-subgridded ancestor's intrinsic track contributions.
@@ -1456,6 +1466,12 @@ pub(crate) fn to_taffy_style(style: &LayoutStyle) -> Style {
         }
         if !style.grid_template_rows.is_empty() {
             s.grid_template_rows = style.grid_template_rows.clone();
+        }
+        if !style.grid_auto_columns.is_empty() {
+            s.grid_auto_columns = style.grid_auto_columns.clone();
+        }
+        if !style.grid_auto_rows.is_empty() {
+            s.grid_auto_rows = style.grid_auto_rows.clone();
         }
         if let Some(flow) = style.grid_auto_flow {
             s.grid_auto_flow = flow;

@@ -1552,6 +1552,8 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
             style.grid_template_rows = tracks;
             style.grid_row_line_names = (!names.is_empty()).then(|| build_line_map(names));
         }
+        "grid-auto-columns" => apply_grid_auto_tracks(style, value, true),
+        "grid-auto-rows" => apply_grid_auto_tracks(style, value, false),
         "grid-template-areas" => style.grid_areas = Some(parse_grid_areas(value)),
         "grid-template" => parse_grid_template(style, value),
         "grid" => parse_grid_shorthand(style, value),
@@ -1786,6 +1788,8 @@ pub(crate) fn supports_declaration(name: &str, value: &str) -> bool {
             | "border-collapse"
             | "grid-template-columns"
             | "grid-template-rows"
+            | "grid-auto-columns"
+            | "grid-auto-rows"
             | "grid-template-areas"
             | "grid-template"
             | "grid"
@@ -1900,6 +1904,9 @@ pub(crate) fn supports_declaration(name: &str, value: &str) -> bool {
                 && parts.iter().all(|part| {
                     !part.is_empty() && parse_grid_line_kind(part).is_some()
                 })
+        }
+        "grid-auto-columns" | "grid-auto-rows" => {
+            parse_grid_auto_track_list(value).is_some()
         }
         "color" | "-webkit-text-fill-color" | "background-color" | "border-color" => {
             parse_color(value).is_some()
@@ -2762,6 +2769,105 @@ fn track(tok: &str) -> taffy::TrackSizingFunction {
         };
     }
     MinMax { min: min_track(t), max: max_track(t) }
+}
+
+/// Parse the `<track-size>+` grammar shared by `grid-auto-columns` and
+/// `grid-auto-rows`. Unlike template track lists, implicit track lists do not
+/// accept line names or `repeat()`: the authored list itself is repeated as
+/// needed for successive implicit tracks.
+fn parse_grid_auto_track_list(value: &str) -> Option<Vec<taffy::TrackSizingFunction>> {
+    let tokens = tokenize_tracks(value);
+    if tokens.is_empty()
+        || tokens.iter().any(|token| {
+            let lower = token.trim().to_ascii_lowercase();
+            lower.starts_with('[')
+                || lower.starts_with("repeat(")
+                || lower == "subgrid"
+                || matches!(
+                    lower.as_str(),
+                    "initial" | "inherit" | "unset" | "revert" | "revert-layer"
+                )
+                || !valid_grid_auto_track(&lower)
+        })
+    {
+        return None;
+    }
+    Some(tokens.iter().map(|token| track(token)).collect())
+}
+
+fn valid_grid_auto_track(value: &str) -> bool {
+    if matches!(value, "auto" | "min-content" | "max-content") {
+        return true;
+    }
+    if let Some(inner) = value
+        .strip_prefix("minmax(")
+        .and_then(|inner| inner.strip_suffix(')'))
+    {
+        let Some((min, max)) = inner.split_once(',') else {
+            return false;
+        };
+        return valid_grid_track_breadth(min.trim(), false)
+            && valid_grid_track_breadth(max.trim(), true);
+    }
+    if let Some(inner) = value
+        .strip_prefix("fit-content(")
+        .and_then(|inner| inner.strip_suffix(')'))
+    {
+        return valid_grid_track_length_percentage(inner.trim());
+    }
+    valid_grid_track_breadth(value, true)
+}
+
+fn valid_grid_track_breadth(value: &str, flex_allowed: bool) -> bool {
+    matches!(value, "auto" | "min-content" | "max-content")
+        || (flex_allowed
+            && value
+                .strip_suffix("fr")
+                .and_then(|number| number.trim().parse::<f32>().ok())
+                .is_some_and(|number| number.is_finite() && number >= 0.0))
+        || valid_grid_track_length_percentage(value)
+}
+
+fn valid_grid_track_length_percentage(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    if lower == "0" {
+        return true;
+    }
+    for suffix in ["rem", "vmin", "vmax", "px", "pt", "em", "ex", "vw", "vh", "%"] {
+        if let Some(number) = lower.strip_suffix(suffix) {
+            return number
+                .trim()
+                .parse::<f32>()
+                .ok()
+                .is_some_and(|number| number.is_finite() && number >= 0.0);
+        }
+    }
+    false
+}
+
+fn apply_grid_auto_tracks(style: &mut LayoutStyle, value: &str, columns: bool) {
+    let lower = value.trim().to_ascii_lowercase();
+    let (tracks, inherit) = match lower.as_str() {
+        "inherit" => (Vec::new(), true),
+        // These properties are non-inherited. The compact cascade has no
+        // retained lower-origin/layer declaration for revert, so it follows
+        // the existing non-inherited-property policy and uses the initial
+        // automatic implicit track.
+        "initial" | "unset" | "revert" | "revert-layer" => (Vec::new(), false),
+        _ => {
+            let Some(tracks) = parse_grid_auto_track_list(value) else {
+                return;
+            };
+            (tracks, false)
+        }
+    };
+    if columns {
+        style.grid_auto_columns = tracks;
+        style.grid_auto_columns_inherit = inherit;
+    } else {
+        style.grid_auto_rows = tracks;
+        style.grid_auto_rows_inherit = inherit;
+    }
 }
 
 fn min_track(tok: &str) -> taffy::MinTrackSizingFunction {
@@ -6602,6 +6708,45 @@ mod tests {
         );
         assert_eq!(shorthand.grid_auto_flow, Some(taffy::GridAutoFlow::Row));
         assert_eq!(shorthand.grid_template_columns.len(), 3);
+    }
+
+    #[test]
+    fn implicit_grid_track_lists_parse_and_css_wide_values_reset_them() {
+        let tracks = compute_style(
+            "div",
+            Some(
+                "grid-auto-columns:50px minmax(20px,1fr);\
+                 grid-auto-rows:min-content 25%;",
+            ),
+        );
+        assert_eq!(tracks.grid_auto_columns.len(), 2);
+        assert_eq!(tracks.grid_auto_rows.len(), 2);
+        assert!(supports_declaration("grid-auto-columns", "50px minmax(20px,1fr)"));
+        assert!(supports_declaration("grid-auto-rows", "min-content 25%"));
+        assert!(!supports_declaration("grid-auto-columns", "repeat(2,50px)"));
+
+        for keyword in ["initial", "unset", "revert", "revert-layer"] {
+            let reset = compute_style(
+                "div",
+                Some(&format!(
+                    "grid-auto-columns:50px;grid-auto-columns:{keyword};\
+                     grid-auto-rows:60px;grid-auto-rows:{keyword}"
+                )),
+            );
+            assert!(
+                reset.grid_auto_columns.is_empty() && reset.grid_auto_rows.is_empty(),
+                "{keyword} must restore the initial automatic implicit track"
+            );
+            assert!(!reset.grid_auto_columns_inherit);
+            assert!(!reset.grid_auto_rows_inherit);
+        }
+
+        let inherited = compute_style(
+            "div",
+            Some("grid-auto-columns:inherit;grid-auto-rows:inherit"),
+        );
+        assert!(inherited.grid_auto_columns_inherit);
+        assert!(inherited.grid_auto_rows_inherit);
     }
 
     #[test]
