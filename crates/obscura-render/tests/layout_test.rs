@@ -1645,6 +1645,38 @@ fn font_weight_computes_numerically_through_inheritance() {
 }
 
 #[test]
+fn heading_font_weight_css_wide_keywords_override_the_ua_bold_rule() {
+    let tree = parse_html(
+        r#"
+        <style>
+          @layer base {
+            #parent { font-weight: 500 }
+            #inherited { font-weight: inherit }
+            #unset { font-weight: unset }
+            #initial { font-weight: initial }
+          }
+        </style>
+        <div id="parent">
+          <h1 id="ua">UA bold</h1>
+          <h1 id="inherited">Inherited medium</h1>
+          <h1 id="unset">Unset medium</h1>
+          <h1 id="initial">Initial normal</h1>
+        </div>
+        "#,
+    );
+    let layout = layout_dom(&tree, (900.0, 1000.0));
+    let weight = |id| {
+        layout.styles[&tree.get_element_by_id(id).unwrap()]
+            .font_weight
+            .as_deref()
+    };
+    assert_eq!(weight("ua"), Some("700"));
+    assert_eq!(weight("inherited"), Some("500"));
+    assert_eq!(weight("unset"), Some("500"));
+    assert_eq!(weight("initial"), Some("400"));
+}
+
+#[test]
 fn contextual_right_inset_uses_root_font_tokens() {
     let tree = parse_html(
         r#"

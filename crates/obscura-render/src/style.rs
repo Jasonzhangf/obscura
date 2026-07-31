@@ -869,8 +869,29 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         "letter-spacing" => apply_letter_spacing(style, value),
         "font" => apply_font_shorthand(style, value),
         "font-weight" => {
-            if let Some(weight) = specified_font_weight(value) {
-                style.font_weight = Some(weight);
+            let lower = value.trim().to_ascii_lowercase();
+            match lower.as_str() {
+                // font-weight is inherited. Preserve the inherited marker
+                // until the DOM's top-down computed-style pass can see the
+                // parent's numeric weight. `unset` has the same behavior for
+                // an inherited property.
+                "inherit" | "unset" => {
+                    style.font_weight = Some("inherit".to_string());
+                }
+                // The initial font weight is normal, independent of both the
+                // parent and a heading's bold UA rule.
+                "initial" => {
+                    style.font_weight = Some("400".to_string());
+                }
+                // The compact cascade does not retain origin/layer history,
+                // so leave its current state unchanged instead of pretending
+                // the revert forms mean inherit or initial.
+                "revert" | "revert-layer" => {}
+                _ => {
+                    if let Some(weight) = specified_font_weight(&lower) {
+                        style.font_weight = Some(weight);
+                    }
+                }
             }
         }
         "font-family" => {
@@ -3625,7 +3646,8 @@ fn specified_font_weight(value: &str) -> Option<String> {
 pub(crate) fn computed_font_weight(specified: Option<&str>, inherited: u16) -> u16 {
     match specified {
         None => inherited,
-        Some("normal") => 400,
+        Some("inherit" | "unset") => inherited,
+        Some("normal" | "initial") => 400,
         Some("bold") => 700,
         Some("bolder") if inherited < 100 => 400,
         Some("bolder") if inherited < 350 => 400,
@@ -4721,6 +4743,21 @@ mod tests {
         assert_eq!(computed_font_weight(Some("lighter"), 550), 400);
         assert_eq!(computed_font_weight(Some("lighter"), 750), 700);
         assert_eq!(computed_font_weight(Some("lighter"), 900), 700);
+    }
+
+    #[test]
+    fn font_weight_css_wide_keywords_override_heading_ua_weight() {
+        let inherited = compute_style("h1", Some("font-weight:inherit"));
+        assert_eq!(inherited.font_weight.as_deref(), Some("inherit"));
+        assert_eq!(computed_font_weight(inherited.font_weight.as_deref(), 500), 500);
+
+        let unset = compute_style("h1", Some("font-weight:unset"));
+        assert_eq!(unset.font_weight.as_deref(), Some("inherit"));
+        assert_eq!(computed_font_weight(unset.font_weight.as_deref(), 500), 500);
+
+        let initial = compute_style("h1", Some("font-weight:initial"));
+        assert_eq!(initial.font_weight.as_deref(), Some("400"));
+        assert_eq!(computed_font_weight(initial.font_weight.as_deref(), 500), 400);
     }
 
     #[test]
