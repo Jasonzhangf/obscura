@@ -1114,21 +1114,24 @@ fn layout_dom_with_web_fonts_pass_limit(
     // ancestry and nested conditional depth, retaining a high safety limit
     // against adversarial non-convergence. Hitting it is visible telemetry and
     // uses the conservative fallback below, never a silently stale layout.
-    let max_dom_depth = tree
-        .descendants(tree.document())
-        .into_iter()
-        .filter(|id| tree.get_node(*id).is_some_and(|node| node.is_element()))
-        .map(|id| {
-            let mut depth = 0usize;
-            let mut cursor = Some(id);
-            while let Some(node) = cursor.and_then(|cursor| tree.get_node(cursor)) {
-                depth += usize::from(node.is_element());
-                cursor = node.parent;
-            }
-            depth
-        })
-        .max()
-        .unwrap_or(1);
+    // `descendants` is preorder, so every parent depth is available before
+    // its children. Keep this O(nodes): walking every ancestor separately
+    // makes a deeply nested document quadratic before layout even starts.
+    let mut element_depths = HashMap::new();
+    element_depths.insert(tree.document(), 0usize);
+    let mut max_dom_depth = 1usize;
+    for id in tree.descendants(tree.document()) {
+        let Some(node) = tree.get_node(id) else {
+            continue;
+        };
+        let parent_depth = node
+            .parent
+            .and_then(|parent| element_depths.get(&parent).copied())
+            .unwrap_or(0);
+        let depth = parent_depth + usize::from(node.is_element());
+        element_depths.insert(id, depth);
+        max_dom_depth = max_dom_depth.max(depth);
+    }
     let max_passes = pass_limit.unwrap_or_else(|| {
         (max_dom_depth + sheet.container_condition_depth() + 2)
             .clamp(4, CONTAINER_LAYOUT_SAFETY_LIMIT)
@@ -2972,7 +2975,7 @@ fn container_snapshot(
         ..Default::default()
     };
     for (&id, style) in &layout.styles {
-        let available_type = if style.internal_flex_container || style.is_table_box {
+        let available_type = if style.display_contents {
             crate::ContainerType::Normal
         } else {
             effective_container_type(style)
@@ -2980,7 +2983,6 @@ fn container_snapshot(
         if (style.container_type == crate::ContainerType::Normal
             && style.container_names.is_empty())
             || style.display == crate::Display::None
-            || style.display_contents
         {
             continue;
         }
@@ -5351,11 +5353,14 @@ fn build_table(
 
 /// Effective size-query containment for this generated box.
 ///
-/// CSS size containment has no effect on a non-atomic inline box. Keeping the
-/// check centralized also prevents such an inline from being exposed as a
-/// size-query container by `container_snapshot`.
+/// CSS size containment has no effect on a non-atomic inline box or an
+/// internal table box. Keeping the check centralized also prevents those
+/// boxes from exposing queryable size axes through `container_snapshot`.
 fn effective_container_type(style: &crate::LayoutStyle) -> crate::ContainerType {
-    if style.display == crate::Display::Inline && !style.is_inline_block {
+    if style.internal_flex_container
+        || style.is_table_box
+        || (style.display == crate::Display::Inline && !style.is_inline_block)
+    {
         crate::ContainerType::Normal
     } else {
         style.container_type
@@ -7805,15 +7810,38 @@ mod tests {
     }
 
     #[test]
+    fn ineligible_nearest_display_contents_container_does_not_fall_through() {
+        let tree = parse_html(
+            r#"<style>
+                #outer{container:query/inline-size;width:500px}
+                #inner{display:contents;container:query/inline-size}
+                #target{width:1px}
+                @container query (min-width:400px){#target{width:99px}}
+            </style>
+            <div id="outer"><div id="inner"><div id="target"></div></div></div>"#,
+        );
+        let laid = layout_dom(&tree, (600.0, 200.0));
+        let target = tree.get_element_by_id("target").unwrap();
+        assert_eq!(
+            laid.styles[&target].width,
+            crate::Dimension::Px(1.0),
+            "a named display:contents container must remain the nearest match with unavailable axes"
+        );
+    }
+
+    #[test]
     fn ineligible_nearest_table_container_does_not_fall_through() {
         let tree = parse_html(
             r#"<style>
                 #outer{container-type:inline-size;width:500px}
-                #inner{display:table;container-type:inline-size;width:300px}
+                #inner{display:table;container-type:size;width:300px}
+                #content{height:80px}
                 #target{width:1px}
                 @container (min-width:400px){#target{width:99px}}
             </style>
-            <div id="outer"><div id="inner"><div id="target"></div></div></div>"#,
+            <div id="outer">
+              <div id="inner"><div id="content"><div id="target"></div></div></div>
+            </div>"#,
         );
         let laid = layout_dom(&tree, (600.0, 200.0));
         let inner = tree.get_element_by_id("inner").unwrap();
@@ -7826,6 +7854,35 @@ mod tests {
             laid.styles[&target].width,
             crate::Dimension::Px(1.0),
             "an unavailable nearest table query axis must not fall through to the outer container"
+        );
+        assert!(
+            (laid.rects[&inner].height - 80.0).abs() < 0.01,
+            "container-type must not apply size containment to an authored table box: {:?}",
+            laid.rects[&inner]
+        );
+    }
+
+    #[test]
+    fn container_type_does_not_size_contain_internal_table_cell() {
+        let tree = parse_html(
+            r#"<style>
+                html,body{margin:0}
+                table{border-spacing:0}
+                #cell{container-type:size;padding:0}
+                #content{height:80px;width:120px}
+            </style>
+            <table><tr><td id="cell"><div id="content"></div></td></tr></table>"#,
+        );
+        let laid = layout_dom(&tree, (600.0, 200.0));
+        let cell = tree.get_element_by_id("cell").unwrap();
+        assert!(
+            laid.styles[&cell].internal_flex_container,
+            "the test must exercise the internal table-cell representation"
+        );
+        assert!(
+            laid.rects[&cell].height >= 79.9,
+            "container-type must not zero an internal table cell: {:?}",
+            laid.rects[&cell]
         );
     }
 
