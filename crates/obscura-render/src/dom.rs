@@ -2831,6 +2831,17 @@ fn layout_dom_once(
                     );
                 }
                 let _ = taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
+                if repair_intrinsic_column_flex_negative_margins(
+                    &mut taffy_tree,
+                    &id_map,
+                    &styles,
+                ) {
+                    let _ = taffy_tree.compute_layout_with_measure(
+                        taffy_root,
+                        available,
+                        &mut measure,
+                    );
+                }
                 if resolve_deferred_flex_inline_sizes(
                     tree,
                     &mut taffy_tree,
@@ -2926,6 +2937,13 @@ fn layout_dom_once(
                     );
                 }
                 let _ = taffy_tree.compute_layout(taffy_root, available);
+                if repair_intrinsic_column_flex_negative_margins(
+                    &mut taffy_tree,
+                    &id_map,
+                    &styles,
+                ) {
+                    let _ = taffy_tree.compute_layout(taffy_root, available);
+                }
                 if resolve_deferred_flex_inline_sizes(
                     tree,
                     &mut taffy_tree,
@@ -4536,6 +4554,105 @@ fn apply_table_cell_block_alignment(
         if taffy_tree.set_style(node, aligned).is_ok() {
             changed = true;
         }
+    }
+    changed
+}
+
+/// Repair Taffy 0.12's intrinsic main-size calculation for column flexboxes
+/// containing a negative main-axis margin.
+///
+/// In the max-content path Taffy feeds the margin-adjusted contribution into
+/// its flex-fraction calculation. A negative margin on a shrink-disabled item
+/// can therefore subtract the item's entire flex basis (or many multiples of
+/// it) from the container: a `margin-top:-15px` child with a 100px basis can
+/// collapse an otherwise auto-height flex column to zero. Final item sizes and
+/// placement are still correct; only the container's automatic block size is
+/// corrupted.
+///
+/// CSS defines that automatic size from the flex items' outer main sizes. Use
+/// the already-resolved final item margins and border-box sizes to freeze that
+/// intrinsic content height, then let the caller run Taffy again so ordinary
+/// min/max sizing and ancestor layout consume the corrected contribution.
+fn repair_intrinsic_column_flex_negative_margins(
+    taffy_tree: &mut TaffyTree<usize>,
+    id_map: &HashMap<taffy::NodeId, NodeId>,
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+) -> bool {
+    let mut repairs = Vec::new();
+
+    for (&node, &dom_id) in id_map {
+        let Some(style) = styles.get(&dom_id) else {
+            continue;
+        };
+        if style.display != crate::Display::Flex
+            || style.internal_flex_container
+            || style.height != crate::Dimension::Auto
+            || effective_container_type(style) == crate::ContainerType::Size
+            || !matches!(
+                style.flex_direction,
+                Some(taffy::FlexDirection::Column | taffy::FlexDirection::ColumnReverse)
+            )
+        {
+            continue;
+        }
+
+        let Ok(children) = taffy_tree.children(node) else {
+            continue;
+        };
+        let mut item_count = 0usize;
+        let mut content_height = 0.0f32;
+        let mut has_negative_main_margin = false;
+        for child in children {
+            let (Ok(child_style), Ok(child_layout)) =
+                (taffy_tree.style(child), taffy_tree.layout(child))
+            else {
+                continue;
+            };
+            if child_style.display == taffy::style::Display::None
+                || child_style.position == taffy::style::Position::Absolute
+            {
+                continue;
+            }
+            let margin = child_layout.margin.top + child_layout.margin.bottom;
+            has_negative_main_margin |=
+                child_layout.margin.top < 0.0 || child_layout.margin.bottom < 0.0;
+            content_height += child_layout.size.height + margin;
+            item_count += 1;
+        }
+        if !has_negative_main_margin || item_count == 0 {
+            continue;
+        }
+        content_height +=
+            style.row_gap.unwrap_or(0.0) * item_count.saturating_sub(1) as f32;
+        content_height = content_height.max(0.0);
+
+        let Ok(layout) = taffy_tree.layout(node) else {
+            continue;
+        };
+        let outer_height = content_height
+            + layout.padding.top
+            + layout.padding.bottom
+            + layout.border.top
+            + layout.border.bottom;
+        if (layout.size.height - outer_height).abs() < 0.01 {
+            continue;
+        }
+        let declared_height = if style.box_sizing == crate::BoxSizing::ContentBox {
+            content_height
+        } else {
+            outer_height
+        };
+        repairs.push((node, declared_height));
+    }
+
+    let mut changed = false;
+    for (node, height) in repairs {
+        let Ok(current) = taffy_tree.style(node) else {
+            continue;
+        };
+        let mut repaired = current.clone();
+        repaired.size.height = taffy::Dimension::length(height);
+        changed |= taffy_tree.set_style(node, repaired).is_ok();
     }
     changed
 }

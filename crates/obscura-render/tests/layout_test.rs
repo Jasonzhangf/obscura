@@ -495,6 +495,54 @@ fn negative_flex_margin_overlays_at_container_start() {
 }
 
 #[test]
+fn auto_height_column_flex_counts_negative_main_axis_margins_once() {
+    let html = r##"
+        <html><head><style>
+          html,body{margin:0}
+          #column{display:flex;flex-direction:column}
+          #first,#second,#third{position:relative;flex-shrink:0}
+          #first{height:100px}
+          #second{height:100px;margin-top:-15px}
+          #third{height:666px;margin-top:20px}
+          #contained{container-type:size;display:flex;flex-direction:column}
+          #contained-child{height:100px;margin-top:-15px}
+        </style></head><body>
+          <div id="column">
+            <div id="first"></div>
+            <div id="second"></div>
+            <div id="third"></div>
+          </div>
+          <div id="contained"><div id="contained-child"></div></div>
+        </body></html>
+    "##;
+    let tree = parse_html(html);
+    let layout = layout_dom(&tree, (900.0, 1200.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    let column = rect("column");
+    let first = rect("first");
+    let second = rect("second");
+    let third = rect("third");
+
+    assert!(
+        (column.height - 871.0).abs() < 0.01,
+        "100 + (100 - 15) + (666 + 20) must size the auto-height column: {column:?}"
+    );
+    assert!((first.y - column.y).abs() < 0.01, "first: {first:?}");
+    assert!(
+        (second.y - (first.y + first.height - 15.0)).abs() < 0.01,
+        "negative margin must overlap the preceding item: first={first:?} second={second:?}"
+    );
+    assert!(
+        (third.y - (second.y + second.height + 20.0)).abs() < 0.01,
+        "the following item must retain normal sequential placement: second={second:?} third={third:?}"
+    );
+    assert!(
+        rect("contained").height.abs() < 0.01,
+        "size containment must keep its intentional zero intrinsic block size"
+    );
+}
+
+#[test]
 fn percentage_flex_overlay_uses_auto_width_parent_content_box() {
     let html = r##"
         <html><head><style>
