@@ -170,11 +170,11 @@ def obscura_state_eval_expression(scroll, geometry_selectors=None):
         + scroll_script
         + "const root=document.documentElement,body=document.body;"
         "const dom=root?root.outerHTML:'';"
-        "const normalizedRoot=root?root.cloneNode(true):null;"
-        "if(normalizedRoot){normalizedRoot.querySelectorAll("
+        "const injectedStyles=root?Array.from(root.querySelectorAll("
         "'style[data-obscura-external-stylesheets],style[data-obscura-linked]'"
-        ").forEach(node=>node.remove())}"
-        "const normalizedDom=normalizedRoot?normalizedRoot.outerHTML:'';"
+        ")):[];"
+        "const normalizedDom=injectedStyles.reduce((html,node)=>"
+        "typeof node.outerHTML==='string'?html.replace(node.outerHTML,''):html,dom);"
         "const text=body?body.innerText.replace(/\\s+/g,' ').trim():'';"
         "const images=Array.from(document.images||[]),fonts=document.fonts;"
         "const hash=value=>{let h=2166136261;"
@@ -553,13 +553,15 @@ def capture_chromium_state(page, geometry_selectors=None):
           const root = document.documentElement;
           const body = document.body;
           const dom = root ? root.outerHTML : "";
-          const normalizedRoot = root ? root.cloneNode(true) : null;
-          if (normalizedRoot) {
-            normalizedRoot.querySelectorAll(
-              "style[data-obscura-external-stylesheets],style[data-obscura-linked]"
-            ).forEach(node => node.remove());
-          }
-          const normalizedDom = normalizedRoot ? normalizedRoot.outerHTML : "";
+          const injectedStyles = root ? Array.from(root.querySelectorAll(
+            "style[data-obscura-external-stylesheets],style[data-obscura-linked]"
+          )) : [];
+          const normalizedDom = injectedStyles.reduce(
+            (html, node) => typeof node.outerHTML === "string"
+              ? html.replace(node.outerHTML, "")
+              : html,
+            dom
+          );
           const visibleText = body ? body.innerText : "";
           const normalizedText = visibleText.replace(/\\s+/g, " ").trim();
           const images = Array.from(document.images || []);

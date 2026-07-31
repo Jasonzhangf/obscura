@@ -61,6 +61,8 @@ class ControlledScrollTests(unittest.TestCase):
         self.assertIn("data-obscura-external-stylesheets", expression)
         self.assertIn("normalized_outer_html_fnv1a32", expression)
         self.assertIn("visible_text_fnv1a32", expression)
+        self.assertIn("injectedStyles.reduce", expression)
+        self.assertNotIn("cloneNode", expression)
         self.assertNotIn("window.scrollTo", expression)
 
     def test_capture_report_keeps_dom_state_and_authoritative_geometry(self):
