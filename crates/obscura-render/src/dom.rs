@@ -1396,6 +1396,7 @@ fn layout_dom_once(
             opacity_product: f32,
             list_style: crate::ListStyle,
             line_height: crate::LineHeight,
+            text_wrap_style: crate::TextWrapStyle,
             text_transform: crate::TextTransform,
             italic: bool,
             box_sizing: crate::BoxSizing,
@@ -1433,6 +1434,7 @@ fn layout_dom_once(
                     // CSS initial value of list-style-type.
                     list_style: crate::ListStyle::Disc,
                     line_height: crate::LineHeight::Normal,
+                    text_wrap_style: crate::TextWrapStyle::Auto,
                     text_transform: crate::TextTransform::None,
                     italic: false,
                     box_sizing: crate::BoxSizing::ContentBox,
@@ -1764,6 +1766,7 @@ fn layout_dom_once(
                 style.effectively_invisible = inh.visibility_hidden || inh.opacity_product < 0.02;
                 match style.list_style { Some(v) => inh.list_style = v, None => style.list_style = Some(inh.list_style) }
                 match style.line_height { Some(v) => inh.line_height = v, None => style.line_height = Some(inh.line_height) }
+                match style.text_wrap_style { Some(v) => inh.text_wrap_style = v, None => style.text_wrap_style = Some(inh.text_wrap_style) }
                 match style.text_transform { Some(v) => inh.text_transform = v, None => style.text_transform = Some(inh.text_transform) }
                 match style.font_style_italic { Some(v) => inh.italic = v, None => style.font_style_italic = Some(inh.italic) }
                 if style.box_sizing == crate::BoxSizing::Inherit {
@@ -1892,6 +1895,7 @@ fn layout_dom_once(
                 let host_optical_sizing = style.font_optical_sizing;
                 let host_variation_settings = style.font_variation_settings.clone();
                 let host_line_height = style.line_height;
+                let host_text_wrap_style = style.text_wrap_style;
                 let host_transform = style.text_transform;
                 let host_italic = style.font_style_italic;
                 let host_text_align = style.text_align;
@@ -2078,6 +2082,9 @@ fn layout_dom_once(
                         pseudo.line_height = Some(crate::LineHeight::Px(pixels));
                     } else if pseudo.line_height.is_none() {
                         pseudo.line_height = host_line_height;
+                    }
+                    if pseudo.text_wrap_style.is_none() {
+                        pseudo.text_wrap_style = host_text_wrap_style;
                     }
                     if pseudo.color.is_none() {
                         pseudo.color = host_color;

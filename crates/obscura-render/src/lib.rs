@@ -619,6 +619,11 @@ pub struct LayoutStyle {
     /// value (or the initial `normal`). The inline shaper uses this to retain
     /// author/source newlines in code blocks and to select wrapping behavior.
     pub white_space: Option<WhiteSpace>,
+    /// `text-wrap-style`. Inherited; `None` means inherit the nearest
+    /// ancestor's value (or the initial `auto`). `Balance` keeps the natural
+    /// line count but tightens the effective line-breaking width during the
+    /// inline formatter's final shaping pass.
+    pub text_wrap_style: Option<TextWrapStyle>,
     /// Deferred functional line-height (`calc()`, `min()`, `clamp()`) resolved
     /// after the element font and live viewport are known.
     pub line_height_expression: Option<String>,
@@ -802,6 +807,16 @@ pub enum WhiteSpace {
     PreWrap,
     PreLine,
     BreakSpaces,
+}
+
+/// The implemented `text-wrap-style` values. Other line-breaking strategies
+/// such as `pretty` remain unsupported until their distinct scoring model is
+/// available; treating them as `auto` would make `@supports` lie.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TextWrapStyle {
+    #[default]
+    Auto,
+    Balance,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

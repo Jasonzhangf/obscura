@@ -1213,6 +1213,28 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                 _ => style.white_space,
             };
         }
+        "text-wrap" => {
+            style.text_wrap_style = match value.trim().to_ascii_lowercase().as_str() {
+                "auto" | "wrap" | "initial" | "revert" | "revert-layer" => {
+                    Some(crate::TextWrapStyle::Auto)
+                }
+                "balance" | "wrap balance" | "balance wrap" => Some(crate::TextWrapStyle::Balance),
+                // `text-wrap` inherits, so unset behaves as inherit.
+                "inherit" | "unset" => None,
+                _ => style.text_wrap_style,
+            };
+        }
+        "text-wrap-style" => {
+            style.text_wrap_style = match value.trim().to_ascii_lowercase().as_str() {
+                "auto" | "initial" | "revert" | "revert-layer" => {
+                    Some(crate::TextWrapStyle::Auto)
+                }
+                "balance" => Some(crate::TextWrapStyle::Balance),
+                // `text-wrap-style` inherits, so unset behaves as inherit.
+                "inherit" | "unset" => None,
+                _ => style.text_wrap_style,
+            };
+        }
         "font-style" => {
             let v = value.trim().to_ascii_lowercase();
             style.font_style_italic = Some(v.starts_with("italic") || v.starts_with("oblique"));
@@ -1454,6 +1476,8 @@ pub(crate) fn supports_declaration(name: &str, value: &str) -> bool {
             | "text-decoration-line"
             | "line-height"
             | "white-space"
+            | "text-wrap"
+            | "text-wrap-style"
             | "align-items"
             | "justify-items"
             | "place-items"
@@ -1577,6 +1601,11 @@ pub(crate) fn supports_declaration(name: &str, value: &str) -> bool {
             value.to_ascii_lowercase().as_str(),
             "normal" | "nowrap" | "pre" | "pre-wrap" | "pre-line" | "break-spaces"
         ),
+        "text-wrap" => matches!(
+            value.to_ascii_lowercase().as_str(),
+            "auto" | "wrap" | "balance" | "wrap balance" | "balance wrap"
+        ),
+        "text-wrap-style" => matches!(value.to_ascii_lowercase().as_str(), "auto" | "balance"),
         "float" => matches!(
             value.to_ascii_lowercase().as_str(),
             "none" | "left" | "right"

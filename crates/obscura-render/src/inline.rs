@@ -278,6 +278,13 @@ fn metadata_variation(metadata: usize) -> Option<usize> {
 /// paint it (filled in after layout).
 pub struct InlineItem {
     buffer: Buffer,
+    /// Whether final shaping should tighten the wrap width while preserving
+    /// the natural line count (`text-wrap-style: balance`).
+    balance_wrap: bool,
+    /// Alignment is applied against the original content width. Cosmic-text
+    /// uses its buffer width for both wrapping and alignment, so a balanced
+    /// (narrower) buffer needs a corresponding origin inset.
+    align: Option<Align>,
     /// Minimum block-size contributed by explicit `<br>` breaks. cosmic-text
     /// omits the final empty run for a trailing newline, while CSS still gives
     /// a break-only or consecutive-break line the parent's used line-height.
@@ -1020,6 +1027,8 @@ impl TextEngine {
         let idx = self.items.len();
         self.items.push(InlineItem {
             buffer,
+            balance_wrap: base.text_wrap_style == Some(crate::TextWrapStyle::Balance),
+            align,
             forced_min_height,
             origin: (0.0, 0.0),
             clip: None,
@@ -1093,12 +1102,32 @@ impl TextEngine {
     /// After layout, pin each context to its final content-box origin and
     /// clip, reshaping once at the resolved width so paint draws the same
     /// line breaks the box was sized for.
-    pub fn finalize(&mut self, idx: usize, content_origin: (f32, f32), content_width: f32, clip: Option<Rect>) {
-        let TextEngine { font_system, items, .. } = self;
+    pub fn finalize(
+        &mut self,
+        idx: usize,
+        content_origin: (f32, f32),
+        content_width: f32,
+        clip: Option<Rect>,
+    ) {
+        let TextEngine {
+            font_system, items, ..
+        } = self;
         let item = &mut items[idx];
-        item.buffer.set_size(font_system, Some(content_width.max(0.0)), None);
+        let content_width = content_width.max(0.0);
+        item.buffer.set_size(font_system, Some(content_width), None);
         item.buffer.shape_until_scroll(font_system, false);
-        item.origin = content_origin;
+        let balanced_width = item
+            .balance_wrap
+            .then(|| balance_wrap_width(font_system, &mut item.buffer, content_width))
+            .flatten()
+            .unwrap_or(content_width);
+        let alignment_inset = (content_width - balanced_width).max(0.0)
+            * match item.align {
+                Some(Align::Center) => 0.5,
+                Some(Align::End | Align::Right) => 1.0,
+                _ => 0.0,
+            };
+        item.origin = (content_origin.0 + alignment_inset, content_origin.1);
         item.clip = clip;
     }
 }
@@ -1481,6 +1510,50 @@ fn buffer_size(buffer: &Buffer) -> (f32, f32) {
         h = h.max(run.line_top + run.line_height);
     }
     (w.ceil(), h)
+}
+
+/// Chromium's bisection implementation only balances paragraphs of at most
+/// six lines. Keeping the same cap bounds repeated shaping on long body copy
+/// and confines this work to the heading-sized content the property targets.
+const MAX_BALANCED_LINES: usize = 6;
+
+/// Tighten `buffer` to the narrowest (within one CSS pixel) wrapping width
+/// that retains its natural line count. This is deliberately a final-shaping
+/// operation: intrinsic measurement and the block's used geometry remain
+/// unchanged, while the line grouping changes.
+fn balance_wrap_width(
+    font_system: &mut FontSystem,
+    buffer: &mut Buffer,
+    available_width: f32,
+) -> Option<f32> {
+    let natural = buffer.layout_runs().collect::<Vec<_>>();
+    let line_count = natural.len();
+    if !(2..=MAX_BALANCED_LINES).contains(&line_count) {
+        return None;
+    }
+    // Blink's bisection path is inapplicable to forced breaks; balancing each
+    // hard-break-delimited paragraph needs separate segment constraints.
+    if buffer.lines.len() > 1 {
+        return None;
+    }
+
+    let average_line_width = natural.iter().map(|run| run.line_w).sum::<f32>() / line_count as f32;
+    drop(natural);
+    let mut lower = (average_line_width * 0.8).clamp(0.0, available_width);
+    let mut upper = available_width;
+    while lower + 1.0 < upper {
+        let middle = (lower + upper) * 0.5;
+        buffer.set_size(font_system, Some(middle), None);
+        buffer.shape_until_scroll(font_system, false);
+        if buffer.layout_runs().count() == line_count {
+            upper = middle;
+        } else {
+            lower = middle;
+        }
+    }
+    buffer.set_size(font_system, Some(upper), None);
+    buffer.shape_until_scroll(font_system, false);
+    Some(upper)
 }
 
 /// Does `id` establish an inline formatting context made purely of text and
@@ -2739,6 +2812,84 @@ gamma</div>"#,
             (rect("normal").height - 24.0).abs() < 0.01,
             "{:?}",
             rect("normal")
+        );
+    }
+
+    fn shaped_line_texts(buffer: &Buffer) -> Vec<String> {
+        buffer
+            .layout_runs()
+            .map(|run| {
+                let start = run
+                    .glyphs
+                    .iter()
+                    .map(|glyph| glyph.start)
+                    .min()
+                    .unwrap_or(0);
+                let end = run
+                    .glyphs
+                    .iter()
+                    .map(|glyph| glyph.end)
+                    .max()
+                    .unwrap_or(start);
+                run.text[start..end].trim().to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn text_wrap_balance_changes_line_grouping_without_changing_line_count() {
+        let tree = obscura_dom::parse_html("<h1 id='hero'>Welcome to Mozilla</h1>");
+        let hero = tree.get_element_by_id("hero").unwrap();
+        let style = LayoutStyle {
+            display: Display::Block,
+            font_size: Some(128.0),
+            line_height: Some(crate::LineHeight::Px(128.0)),
+            text_wrap_style: Some(crate::TextWrapStyle::Balance),
+            ..Default::default()
+        };
+        let mut engine = TextEngine::new();
+        let item = engine
+            .try_build(&tree, hero, &HashMap::from([(hero, style)]))
+            .unwrap();
+        let width = 912.0;
+        engine.measure(item, Some(width));
+        let natural_lines = shaped_line_texts(&engine.items[item].buffer);
+
+        engine.finalize(item, (0.0, 0.0), width, None);
+        let balanced_lines = shaped_line_texts(&engine.items[item].buffer);
+        let balanced_width = engine.items[item].buffer.size().0.unwrap();
+
+        assert_eq!(natural_lines, ["Welcome to", "Mozilla"]);
+        assert_eq!(balanced_lines, ["Welcome", "to Mozilla"]);
+        assert!(
+            balanced_width < width - 1.0,
+            "balance should tighten the effective wrap width: {balanced_width}"
+        );
+    }
+
+    #[test]
+    fn text_wrap_style_is_inherited_and_can_be_reset() {
+        let tree = obscura_dom::parse_html(
+            r#"<style>
+                #outer { text-wrap:balance }
+                #reset { text-wrap-style:auto }
+            </style>
+            <div id="outer">
+                <h1 id="inherited">balanced heading words</h1>
+                <h1 id="reset">ordinary heading words</h1>
+            </div>"#,
+        );
+        let inherited = tree.get_element_by_id("inherited").unwrap();
+        let reset = tree.get_element_by_id("reset").unwrap();
+        let laid = crate::dom::layout_dom(&tree, (500.0, 300.0));
+
+        assert_eq!(
+            laid.styles[&inherited].text_wrap_style,
+            Some(crate::TextWrapStyle::Balance)
+        );
+        assert_eq!(
+            laid.styles[&reset].text_wrap_style,
+            Some(crate::TextWrapStyle::Auto)
         );
     }
 
