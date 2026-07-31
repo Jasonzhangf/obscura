@@ -3907,11 +3907,12 @@ fn background_image_rect(
             _ => None,
         }
     });
-    let (width, height) = if let Some(size) = expression_size {
-        size
-    } else if let Some(size) = explicit_size {
-        size
-    } else if let Some(fit) = fit {
+    // `cover` and `contain` are complete sizing algorithms, not contextual
+    // lengths. The style layer deliberately retains the authored token string
+    // for CSS math, so a keyword can also appear in `size_expression`; run the
+    // typed fit first or the unresolved token path falls back to the intrinsic
+    // size and silently bypasses fitting.
+    let (width, height) = if let Some(fit) = fit {
         let (iw, ih) = intrinsic?;
         let scale = match fit {
             crate::ObjectFit::Cover => (box_rect.width / iw).max(box_rect.height / ih),
@@ -3919,6 +3920,10 @@ fn background_image_rect(
             _ => 1.0,
         };
         (iw * scale, ih * scale)
+    } else if let Some(size) = expression_size {
+        size
+    } else if let Some(size) = explicit_size {
+        size
     } else {
         intrinsic.unwrap_or((box_rect.width, box_rect.height))
     };
@@ -6391,6 +6396,38 @@ mod tests {
         assert!(
             image.blue() > 200 && image.red() < 60,
             "the 20x10 intrinsic image must anchor at bottom right"
+        );
+    }
+
+    #[test]
+    fn cover_and_contain_background_sizes_fit_the_positioning_area() {
+        let image = "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='200'%20height='100'%3E%3Crect%20width='200'%20height='100'%20fill='blue'/%3E%3C/svg%3E";
+        let tree = parse_html(&format!(
+            r#"<html><body style="margin:0;background:white">
+               <div style="position:absolute;left:0;top:0;width:100px;height:200px;
+                 background:red url(&quot;{image}&quot;) center/cover no-repeat"></div>
+               <div style="position:absolute;left:100px;top:0;width:100px;height:200px;
+                 background-color:red;background-image:url(&quot;{image}&quot;);
+                 background-position:center;background-size:contain;background-repeat:no-repeat"></div>
+               </body></html>"#
+        ));
+        let pixmap = paint_dom(&tree, (200.0, 200.0), None).expect("pixmap");
+
+        let cover_edge = pixmap.pixel(50, 10).expect("cover edge");
+        assert!(
+            cover_edge.blue() > 200 && cover_edge.red() < 40,
+            "cover must scale the 2:1 image to the owner's 200px block axis: {cover_edge:?}"
+        );
+
+        let contain_outside = pixmap.pixel(150, 60).expect("contain letterbox");
+        assert!(
+            contain_outside.red() > 200 && contain_outside.blue() < 40,
+            "contain must leave the area outside its centered 100x50 image unpainted: {contain_outside:?}"
+        );
+        let contain_center = pixmap.pixel(150, 100).expect("contain center");
+        assert!(
+            contain_center.blue() > 200 && contain_center.red() < 40,
+            "contain must paint the fitted image through the center: {contain_center:?}"
         );
     }
 

@@ -438,12 +438,74 @@ fn materialize_linked_stylesheet_script(link_index: usize, css: &str) -> String 
             var links = document.querySelectorAll('link[rel~="stylesheet"]');
             var link = links[{link_index}];
             if (!link || !link.parentNode) return;
-            var style = document.createElement('style');
-            style.setAttribute('data-obscura-external-stylesheets', '');
-            style.textContent = `{escaped_css}`;
-            link.parentNode.insertBefore(style, link.nextSibling);
+            var style = null;
+            function effectiveMedia() {{
+                // Until the generic Element shim reflects HTMLLinkElement.media,
+                // `this.media = "all"` creates an own property while the parsed
+                // media="print" attribute remains unchanged.
+                if (Object.prototype.hasOwnProperty.call(link, 'media')) {{
+                    return String(link.media || '');
+                }}
+                return link.getAttribute('media') || '';
+            }}
+            function applies() {{
+                var media = effectiveMedia().trim();
+                if (!media) return true;
+                try {{ return window.matchMedia(media).matches; }}
+                catch (_) {{ return false; }}
+            }}
+            function syncSheet() {{
+                var enabled = link.parentNode
+                    && !link.disabled
+                    && !link.hasAttribute('disabled')
+                    && applies();
+                if (!enabled) {{
+                    if (style && style.parentNode) style.parentNode.removeChild(style);
+                    return;
+                }}
+                if (!style) {{
+                    style = document.createElement('style');
+                    style.setAttribute('data-obscura-external-stylesheets', '');
+                    style.textContent = `{escaped_css}`;
+                }}
+                if (!style.parentNode) {{
+                    link.parentNode.insertBefore(style, link.nextSibling);
+                }}
+            }}
+
+            // A non-matching sheet still loads and fires its event. Its handler
+            // may then make the sheet applicable (the common
+            // media=print/onload="this.media='all'" async-CSS pattern).
+            syncSheet();
+            try {{ link.dispatchEvent(new Event('load')); }}
+            finally {{ syncSheet(); }}
         }})()"#
     )
+}
+
+/// Discover linked author sheets in document order.
+///
+/// Media queries control whether a loaded sheet participates in the cascade;
+/// they do not suppress its fetch or `load` event. Keep the index among all
+/// stylesheet links so the materialization script addresses the same node.
+fn linked_stylesheet_requests(dom: &DomTree) -> Vec<(usize, String)> {
+    let link_ids = dom
+        .query_selector_all("link[rel~=\"stylesheet\"]")
+        .unwrap_or_default();
+    let mut links = Vec::new();
+    for (link_index, lid) in link_ids.into_iter().enumerate() {
+        if let Some(node) = dom.get_node(lid) {
+            // Disabled alternate sheets remain dormant until script enables
+            // them. Media-gated sheets are different: they still load.
+            if node.get_attribute("disabled").is_some() {
+                continue;
+            }
+            if let Some(href) = node.get_attribute("href") {
+                links.push((link_index, href.to_string()));
+            }
+        }
+    }
+    links
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -772,53 +834,7 @@ impl Page {
     
     async fn fetch_stylesheets(&mut self) {
         let all_links = match &self.js {
-            Some(js) => {
-                js.with_dom(|dom| {
-                    // `rel` is a space-separated token list. VitePress and
-                    // other modern generators combine preload and stylesheet
-                    // (`rel="preload stylesheet"`); exact-value matching
-                    // silently skipped their entire CSS payload.
-                    let link_ids = dom
-                        .query_selector_all("link[rel~=\"stylesheet\"]")
-                        .unwrap_or_default();
-                    let mut links = Vec::new();
-                    for (link_index, lid) in link_ids.into_iter().enumerate() {
-                        if let Some(node) = dom.get_node(lid) {
-                            // Skip disabled stylesheets: a `<link ... disabled>`
-                            // does not apply until JS clears the attribute. Sites
-                            // ship alternate themes this way (e.g. Google devsite's
-                            // dark-theme.css is linked `disabled` and toggled by a
-                            // theme switcher); applying it painted whole pages dark
-                            // when Chromium renders them light. `disabled` is a
-                            // boolean attribute, so any presence means off.
-                            if node.get_attribute("disabled").is_some() {
-                                continue;
-                            }
-                            // Respect the link's `media` gate. A `<link
-                            // media="print">` must not apply on screen (the
-                            // Guardian ships a print sheet that otherwise
-                            // overrode the screen masthead), and a `<link
-                            // media="(prefers-color-scheme: dark)">` must not
-                            // apply in our light desktop context (docs.python and
-                            // other Sphinx sites link pydoctheme_dark.css this way;
-                            // injecting it painted the page dark under a light
-                            // Chromium). We render the default light context, so
-                            // skip sheets gated to print-only or dark preference.
-                            if let Some(media) = node.get_attribute("media") {
-                                let compact: String = media.chars().filter(|c| !c.is_whitespace()).flat_map(|c| c.to_lowercase()).collect();
-                                let print_only = compact.contains("print") && !compact.contains("screen") && !compact.contains("all");
-                                if print_only || compact.contains("prefers-color-scheme:dark") {
-                                    continue;
-                                }
-                            }
-                            if let Some(href) = node.get_attribute("href") {
-                                links.push((link_index, href.to_string()));
-                            }
-                        }
-                    }
-                    links
-                }).unwrap_or_default()
-            }
+            Some(js) => js.with_dom(linked_stylesheet_requests).unwrap_or_default(),
             None => {
                 tracing::info!("fetch_stylesheets: no js runtime");
                 return;
@@ -2338,9 +2354,10 @@ fn url_matches_cdp_pattern(pattern: &str, url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        materialize_linked_stylesheet_script, parse_import_url, rebase_css_urls,
-        should_restore_hydration_snapshot, split_css_imports, script_response_is_executable,
-        truncate_on_char_boundary, url_matches_cdp_pattern, HydrationStats,
+        linked_stylesheet_requests, materialize_linked_stylesheet_script, parse_import_url,
+        rebase_css_urls, should_restore_hydration_snapshot, split_css_imports,
+        script_response_is_executable, truncate_on_char_boundary, url_matches_cdp_pattern,
+        HydrationStats,
     };
     use obscura_dom::parse_html;
 
@@ -2481,6 +2498,123 @@ mod tests {
             dom.get_node(links[0])
                 .and_then(|node| node.get_attribute("href").map(str::to_owned)),
             Some("app.css".to_string())
+        );
+    }
+
+    #[test]
+    fn media_gated_stylesheets_are_fetched_but_disabled_sheets_are_not() {
+        let dom = parse_html(
+            r#"<link rel="stylesheet" href="screen.css">
+               <link rel="stylesheet" href="async.css" media="print"
+                     onload="this.media='all'">
+               <link rel="stylesheet" href="dark.css"
+                     media="(prefers-color-scheme: dark)">
+               <link rel="stylesheet" href="disabled.css" disabled>"#,
+        );
+
+        assert_eq!(
+            linked_stylesheet_requests(&dom),
+            vec![
+                (0, "screen.css".to_string()),
+                (1, "async.css".to_string()),
+                (2, "dark.css".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn print_media_onload_can_activate_a_fetched_stylesheet() {
+        let dom = parse_html(
+            r#"<html><head>
+                <link id="async" rel="stylesheet" href="async.css" media="print"
+                      onload="this.media='all';this.setAttribute('data-loaded','yes')">
+            </head><body></body></html>"#,
+        );
+        let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new();
+        runtime.set_dom(dom);
+        runtime.run_page_init();
+        runtime
+            .execute_script(
+                "<async-sheet>",
+                &materialize_linked_stylesheet_script(0, ".target{color:red}"),
+            )
+            .expect("load and materialize async linked sheet");
+
+        let state = runtime
+            .with_dom(|dom| {
+                let link = dom
+                    .query_selector("#async")
+                    .expect("valid selector")
+                    .expect("async link");
+                let styles = dom
+                    .query_selector_all("style[data-obscura-external-stylesheets]")
+                    .expect("valid selector");
+                (
+                    dom.get_node(link)
+                        .and_then(|node| {
+                            node.get_attribute("data-loaded").map(str::to_owned)
+                        }),
+                    styles.first().map(|&nid| dom.text_content(nid)),
+                )
+            })
+            .expect("live DOM");
+
+        assert_eq!(
+            state.0.as_deref(),
+            Some("yes"),
+            "link load handler must run"
+        );
+        assert_eq!(
+            state.1.as_deref(),
+            Some(".target{color:red}"),
+            "the handler's `this.media = 'all'` must activate the sheet"
+        );
+    }
+
+    #[test]
+    fn true_print_stylesheet_loads_without_entering_screen_cascade() {
+        let dom = parse_html(
+            r#"<html><head>
+                <link id="print" rel="stylesheet" href="print.css" media="print"
+                      onload="this.setAttribute('data-loaded','yes')">
+            </head><body></body></html>"#,
+        );
+        let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new();
+        runtime.set_dom(dom);
+        runtime.run_page_init();
+        runtime
+            .execute_script(
+                "<print-sheet>",
+                &materialize_linked_stylesheet_script(0, "body{display:none}"),
+            )
+            .expect("finish print linked sheet load");
+
+        let state = runtime
+            .with_dom(|dom| {
+                let link = dom
+                    .query_selector("#print")
+                    .expect("valid selector")
+                    .expect("print link");
+                (
+                    dom.get_node(link)
+                        .and_then(|node| {
+                            node.get_attribute("data-loaded").map(str::to_owned)
+                        }),
+                    dom.query_selector_all("style[data-obscura-external-stylesheets]")
+                        .expect("valid selector")
+                        .len(),
+                )
+            })
+            .expect("live DOM");
+
+        assert_eq!(
+            state.0.as_deref(),
+            Some("yes"),
+            "print link still fires load"
+        );
+        assert_eq!(
+            state.1, 0,
+            "print-only CSS must stay out of screen cascade"
         );
     }
 

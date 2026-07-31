@@ -4251,6 +4251,26 @@ fn is_full_span_column_subgrid(style: &crate::LayoutStyle) -> bool {
     )
 }
 
+/// Whether an item is wholly eligible for ordinary grid auto-placement.
+///
+/// The style model retains an explicit `grid-area:auto` as `Some(Line {
+/// Auto, Auto })`, while an omitted placement stays `None`. Both represent
+/// the same indefinite row and column spans to the grid placement algorithm.
+/// Raw named placements are never auto: an unresolved name must not enter the
+/// bounded subgrid reduction merely because it has no numeric `Line` yet.
+fn has_only_auto_grid_placement(style: &crate::LayoutStyle) -> bool {
+    if style.grid_column_raw.is_some() || style.grid_row_raw.is_some() {
+        return false;
+    }
+    let axis_is_auto = |line: Option<&taffy::Line<taffy::GridPlacement>>| {
+        line.is_none_or(|line| {
+            matches!(line.start, taffy::GridPlacement::Auto)
+                && matches!(line.end, taffy::GridPlacement::Auto)
+        })
+    };
+    axis_is_auto(style.grid_column.as_ref()) && axis_is_auto(style.grid_row.as_ref())
+}
+
 /// Collect the deliberately bounded Grid Level 2 subset used by broad
 /// "aligned rows" components: a full-span column subgrid, optionally nested
 /// through more full-span column subgrids, whose final children auto-place one
@@ -4331,7 +4351,9 @@ fn collect_column_subgrid_descendants(
         // This first subset intentionally excludes spanning and explicitly
         // placed items. It is the common data-row/card-row pattern and keeps
         // each descendant contribution attributable to one ancestor track.
-        if child_style.grid_column.is_some()
+        // Explicit `grid-area:auto` remains ordinary auto-placement in both
+        // axes and is therefore equivalent to omitting all placement values.
+        if !has_only_auto_grid_placement(child_style)
             || child_style.position == Some(taffy::Position::Absolute)
             || child_style.margin_auto[1]
             || child_style.margin_auto[3]

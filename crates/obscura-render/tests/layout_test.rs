@@ -2410,6 +2410,7 @@ fn nested_full_span_column_subgrid_shares_ancestor_tracks() {
             grid-column:1 / -1;
             grid-template-columns:subgrid;
           }
+          .inner > * { grid-area:auto }
           .inner { column-gap:20px }
           .leaf { height:20px }
           .a { width:40px }
@@ -2490,12 +2491,16 @@ fn unsafe_column_subgrid_cases_decline_the_fast_path() {
           }
           #narrow { width:200px }
           #partial { width:500px }
+          #placed { width:500px }
+          #named { width:500px }
           .subgrid, .inner {
             display:grid;
             grid-column:1 / -1;
             grid-template-columns:subgrid;
           }
           #partial-row { grid-column:1 / 3 }
+          #placed-b { grid-column:2 }
+          #named-b { grid-column:missing-line }
           .inner { column-gap:20px }
           .leaf { height:20px }
           .a { width:40px }
@@ -2516,6 +2521,20 @@ fn unsafe_column_subgrid_cases_decline_the_fast_path() {
             <div class="leaf c"></div>
           </div></div>
         </div>
+        <div id="placed" class="parent">
+          <div class="subgrid"><div class="inner">
+            <div class="leaf a"></div>
+            <div id="placed-b" class="leaf b"></div>
+            <div class="leaf c"></div>
+          </div></div>
+        </div>
+        <div id="named" class="parent">
+          <div class="subgrid"><div class="inner">
+            <div class="leaf a"></div>
+            <div id="named-b" class="leaf b"></div>
+            <div class="leaf c"></div>
+          </div></div>
+        </div>
         "#,
     );
     let layout = layout_dom(&tree, (800.0, 600.0));
@@ -2524,6 +2543,10 @@ fn unsafe_column_subgrid_cases_decline_the_fast_path() {
     let narrow_b = rect("narrow-b");
     let partial = rect("partial");
     let partial_b = rect("partial-b");
+    let placed = rect("placed");
+    let placed_b = rect("placed-b");
+    let named = rect("named");
+    let named_b = rect("named-b");
 
     assert!(
         (narrow.height - 60.0).abs() < 0.01 && (narrow_b.x - narrow.x).abs() < 0.01,
@@ -2532,6 +2555,16 @@ fn unsafe_column_subgrid_cases_decline_the_fast_path() {
     assert!(
         (partial.height - 60.0).abs() < 0.01 && (partial_b.x - partial.x).abs() < 0.01,
         "partial-span subgrid must retain the stacked fallback: {partial:?} {partial_b:?}"
+    );
+    assert!(
+        (placed.height - 40.0).abs() < 0.01 && placed_b.x > placed.x,
+        "an explicitly placed leaf must retain the existing placement fallback: \
+         {placed:?} {placed_b:?}"
+    );
+    assert!(
+        (named.height - 60.0).abs() < 0.01 && (named_b.x - named.x).abs() < 0.01,
+        "an unresolved named placement must not enter the numeric subgrid reduction: \
+         {named:?} {named_b:?}"
     );
 }
 
