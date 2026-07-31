@@ -1035,6 +1035,13 @@ function _eventTargetDispatch(target, event) {
   return !event.defaultPrevented;
 }
 
+// During custom-element upgrade, HTMLElement's constructor must return the
+// already-existing element being upgraded. A class constructor cannot be
+// invoked with `.call(existingElement)`, so the registry and Element
+// constructor coordinate through the same construction-stack shape used by
+// browser custom-element implementations.
+const _customElementConstructionStack = [];
+
 class Node {
   static ELEMENT_NODE = 1;
   static ATTRIBUTE_NODE = 2;
@@ -1746,7 +1753,21 @@ globalThis.NamedNodeMap = NamedNodeMap;
 
 class Element extends Node {
   constructor(nid) {
-    super(nid);
+    const entry = _customElementConstructionStack[_customElementConstructionStack.length - 1];
+    const matchesUpgrade = entry && new.target === entry.constructor;
+    const upgrading = matchesUpgrade && !entry.constructed ? entry.element : null;
+    super(upgrading ? upgrading._nid : nid);
+    if (matchesUpgrade && entry.constructed) {
+      throw new TypeError("Custom element is already being constructed");
+    }
+    if (upgrading) {
+      // Keep an already-constructed marker on the stack until the outer class
+      // constructor returns. Recursive `new`/`super` calls for the same
+      // definition must not steal the element currently being upgraded.
+      entry.constructed = true;
+      Object.setPrototypeOf(upgrading, new.target.prototype);
+      return upgrading;
+    }
     this._style = _styleProxy(new CSSStyleDeclaration(this));
   }
   // Element wrappers always back a nodeType-1 node (_wrap/_wrapEl only build an
@@ -3340,15 +3361,24 @@ class Document extends Node {
     return _makeXPathResult(type, _xpathFindNodes(expression, contextNode || this));
   }
   createElement(t) {
-    const el = _wrapEl(+_dom("create_element", t.toLowerCase()));
-    if (el && t.toLowerCase() === 'template') {
+    const localName = String(t).toLowerCase();
+    const el = _wrapEl(+_dom("create_element", localName));
+    if (el && localName === 'template') {
       el._templateContent = this.createDocumentFragment();
       el._templateContent._fragmentContext = 'template';
     }
+    const definition = globalThis.customElements?._registry?.get(localName);
+    if (el && definition) globalThis.customElements._upgradeElement(el, definition);
     return el;
   }
   createElementNS(ns, t) {
-    const el = this.createElement(t);
+    const namespace = ns == null ? null : String(ns);
+    if (namespace === "http://www.w3.org/1999/xhtml") {
+      const el = this.createElement(t);
+      if (el) el._ns = namespace;
+      return el;
+    }
+    const el = _wrapEl(+_dom("create_element", String(t).toLowerCase()));
     if (el) el._ns = ns;
     return el;
   }
@@ -5920,25 +5950,28 @@ class CustomElementRegistry {
     if (el.__customUpgraded) return;
     el.__customUpgraded = true;
     try {
-      // Web Components spec: copy own props from the prototype onto the
-      // element. JS-side classes define behavior via methods on the
-      // prototype; we don't truly swap prototypes (Element is shared),
-      // so attach the prototype methods directly to the instance.
-      const proto = cls.prototype;
-      for (const key of Object.getOwnPropertyNames(proto)) {
-        if (key === 'constructor') continue;
-        const desc = Object.getOwnPropertyDescriptor(proto, key);
-        if (desc) Object.defineProperty(el, key, desc);
+      // Upgrade preserves object identity but installs the definition's
+      // prototype before running its class constructor. HTMLElement's
+      // constructor consumes this entry and returns `el`, so derived class
+      // fields and constructor-side state initialize on the real DOM wrapper.
+      const constructionEntry = { element: el, constructor: cls, constructed: false };
+      _customElementConstructionStack.push(constructionEntry);
+      let constructed;
+      try {
+        constructed = Reflect.construct(cls, []);
+      } finally {
+        const pending = _customElementConstructionStack.lastIndexOf(constructionEntry);
+        if (pending !== -1) _customElementConstructionStack.splice(pending, 1);
       }
-      // Run constructor-side init on the element. Real custom elements
-      // run the class constructor, but Element instances aren't a `cls`
-      // subclass here; calling `.call(el)` runs whatever init logic the
-      // class defines without needing a new allocation.
-      try { cls.call(el); } catch (e) {}
+      if (constructed !== el) {
+        throw new TypeError("Custom element constructor did not produce the element being upgraded");
+      }
       if (typeof el.connectedCallback === 'function' && globalThis.document?.contains?.(el)) {
         try { el.connectedCallback(); } catch (e) {}
       }
-    } catch (e) {}
+    } catch (e) {
+      el.__customUpgradeFailed = true;
+    }
   }
   get(name) { return this._registry.get(name); }
   getName(cls) {

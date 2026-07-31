@@ -1898,6 +1898,133 @@ mod tests {
     }
 
     #[test]
+    fn custom_element_upgrade_runs_class_constructor_on_existing_element() {
+        let mut rt = setup_runtime(
+            r#"<html><body><svelte-like id="component"></svelte-like></body></html>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+                const before = document.getElementById("component");
+                class SvelteLike extends HTMLElement {
+                    constructor() {
+                        super();
+                        this.$$s = [];
+                        this.attachShadow({ mode: "open" });
+                    }
+                    connectedCallback() {
+                        for (const subscription of this.$$s) subscription();
+                        this.$$s.push(() => {});
+                        this.shadowRoot.textContent = "ready";
+                    }
+                }
+                customElements.define("svelte-like", SvelteLike);
+                return [
+                    document.getElementById("component") === before,
+                    before instanceof SvelteLike,
+                    before.constructor === SvelteLike,
+                    before.$$s.length,
+                    before.shadowRoot && before.shadowRoot.textContent
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                true,
+                true,
+                true,
+                1,
+                "ready"
+            ])
+        );
+    }
+
+    #[test]
+    fn create_element_synchronously_constructs_an_existing_definition() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                const testStart = true;
+                class CreatedLater extends HTMLElement {
+                    constructor() {
+                        super();
+                        this.constructorState = ["initialized"];
+                        this.attachShadow({ mode: "open" });
+                        this.shadowRoot.textContent = "constructed";
+                    }
+                    connectedCallback() {
+                        this.constructorState.push("connected");
+                    }
+                }
+                customElements.define("created-later", CreatedLater);
+                const element = document.createElement("created-later");
+                const foreign = document.createElementNS(
+                    "http://www.w3.org/2000/svg", "created-later"
+                );
+                return [
+                    element instanceof CreatedLater,
+                    element.constructor === CreatedLater,
+                    element.localName,
+                    element.constructorState,
+                    element.shadowRoot && element.shadowRoot.textContent,
+                    element.isConnected,
+                    foreign instanceof CreatedLater
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                true,
+                true,
+                "created-later",
+                ["initialized"],
+                "constructed",
+                false,
+                false
+            ])
+        );
+    }
+
+    #[test]
+    fn throwing_custom_element_constructor_marks_upgrade_failed_without_connecting() {
+        let mut rt = setup_runtime(
+            r#"<html><body><throws-during-upgrade id="target"></throws-during-upgrade></body></html>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+                let constructorCalls = 0;
+                let connectedCalls = 0;
+                class ThrowsDuringUpgrade extends HTMLElement {
+                    constructor() {
+                        super();
+                        constructorCalls++;
+                        throw new Error("expected constructor failure");
+                    }
+                    connectedCallback() {
+                        connectedCalls++;
+                    }
+                }
+                customElements.define("throws-during-upgrade", ThrowsDuringUpgrade);
+                const element = document.getElementById("target");
+                customElements.upgrade(document);
+                return [
+                    constructorCalls,
+                    connectedCalls,
+                    element.__customUpgradeFailed === true
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([1, 0, true]));
+    }
+
+    #[test]
     fn test_document_title() {
         let mut rt = setup_runtime("<html><head><title>Test</title></head><body></body></html>");
         let title = rt.evaluate("document.title").unwrap();
