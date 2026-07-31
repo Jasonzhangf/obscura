@@ -5367,28 +5367,42 @@ fn effective_container_type(style: &crate::LayoutStyle) -> crate::ContainerType 
     }
 }
 
-/// Does this auto inline-size use shrink-to-fit/content sizing rather than
-/// filling a definite containing block?
-fn container_auto_inline_size_is_intrinsic(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ContainerAutoInlineSize {
+    FillAvailable,
+    Intrinsic,
+    StretchedGridItem,
+}
+
+/// Classify how an auto inline-size is resolved. Stretched grid items need
+/// their intrinsic contribution contained without replacing the final auto
+/// size that stretch alignment consumes.
+fn container_auto_inline_size(
     tree: &DomTree,
     id: NodeId,
     style: &crate::LayoutStyle,
     styles: &HashMap<NodeId, crate::LayoutStyle>,
-) -> bool {
+) -> ContainerAutoInlineSize {
     if style.is_inline_block || style.float.is_some() {
-        return true;
+        return ContainerAutoInlineSize::Intrinsic;
     }
     if matches!(style.position, Some(taffy::Position::Absolute)) {
         // An absolutely positioned auto width is fill-available only when
         // both inline insets are definite.
-        return style.inset[1].is_none() || style.inset[3].is_none();
+        return if style.inset[1].is_none() || style.inset[3].is_none() {
+            ContainerAutoInlineSize::Intrinsic
+        } else {
+            ContainerAutoInlineSize::FillAvailable
+        };
     }
 
     let mut parent = tree.get_node(id).and_then(|node| node.parent);
     let parent_style = loop {
-        let Some(parent_id) = parent else { return false };
+        let Some(parent_id) = parent else {
+            return ContainerAutoInlineSize::FillAvailable;
+        };
         let Some(parent_style) = styles.get(&parent_id) else {
-            return false;
+            return ContainerAutoInlineSize::FillAvailable;
         };
         if parent_style.display_contents {
             parent = tree.get_node(parent_id).and_then(|node| node.parent);
@@ -5406,30 +5420,38 @@ fn container_auto_inline_size_is_intrinsic(
                 )
             );
             if row {
-                true
+                ContainerAutoInlineSize::Intrinsic
+            } else if style
+                .align_self
+                .unwrap_or(
+                    parent_style
+                        .align_items
+                        .unwrap_or(taffy::AlignItems::STRETCH),
+                )
+                == taffy::AlignSelf::STRETCH
+            {
+                ContainerAutoInlineSize::FillAvailable
             } else {
-                style
-                    .align_self
-                    .unwrap_or(
-                        parent_style
-                            .align_items
-                            .unwrap_or(taffy::AlignItems::STRETCH),
-                    )
-                    != taffy::AlignSelf::STRETCH
+                ContainerAutoInlineSize::Intrinsic
             }
         }
         crate::Display::Grid => {
-            style
+            if style
                 .justify_self
                 .unwrap_or(
                     parent_style
                         .justify_items
                         .unwrap_or(taffy::JustifyItems::STRETCH),
                 )
-                != taffy::AlignSelf::STRETCH
+                == taffy::AlignSelf::STRETCH
+            {
+                ContainerAutoInlineSize::StretchedGridItem
+            } else {
+                ContainerAutoInlineSize::Intrinsic
+            }
         }
-        crate::Display::Inline => true,
-        _ => false,
+        crate::Display::Inline => ContainerAutoInlineSize::Intrinsic,
+        _ => ContainerAutoInlineSize::FillAvailable,
     }
 }
 
@@ -5458,11 +5480,16 @@ fn apply_container_size_containment(
     }
     let ratio_transfers_inline_size =
         style.aspect_ratio.is_some() && !matches!(style.height, crate::Dimension::Auto);
-    if matches!(style.width, crate::Dimension::Auto)
-        && !ratio_transfers_inline_size
-        && container_auto_inline_size_is_intrinsic(tree, id, style, styles)
-    {
-        taffy_style.size.width = taffy::Dimension::length(0.0);
+    if matches!(style.width, crate::Dimension::Auto) && !ratio_transfers_inline_size {
+        match container_auto_inline_size(tree, id, style, styles) {
+            ContainerAutoInlineSize::Intrinsic => {
+                taffy_style.size.width = taffy::Dimension::length(0.0);
+            }
+            ContainerAutoInlineSize::StretchedGridItem => {
+                taffy_style.intrinsic_size_containment.width = true;
+            }
+            ContainerAutoInlineSize::FillAvailable => {}
+        }
     }
 
     if kind == crate::ContainerType::Size {

@@ -1091,6 +1091,63 @@ fn item_self_alignment_places_flex_and_grid_items() {
 }
 
 #[test]
+fn stretched_inline_size_container_has_zero_intrinsic_grid_contribution() {
+    // Chromium 140: size containment affects intrinsic track sizing, but not
+    // the item's later stretch alignment. In the first case the grid therefore
+    // shrink-wraps to zero. In the definite-width control the contained item
+    // contributes zero, then stretches to the 50px left after the fixed track.
+    // Its 240px child remains visible overflow in both cases.
+    let tree = parse_html(
+        r#"
+        <style>
+          html, body { margin: 0 }
+          #shrink-host { display: flex; width: 600px }
+          .grid { display: grid }
+          .item { container-type: inline-size }
+          .child { width: 240px; height: 20px }
+          #fixed-grid {
+            display: grid;
+            width: 150px;
+            grid-template-columns: auto 100px;
+          }
+          #fixed { height: 20px }
+        </style>
+        <div id="shrink-host">
+          <div id="shrink-grid" class="grid">
+            <div id="shrink-item" class="item"><div id="shrink-child" class="child"></div></div>
+          </div>
+        </div>
+        <div id="fixed-grid" class="grid">
+            <div id="fixed-item" class="item"><div id="fixed-child" class="child"></div></div>
+            <div id="fixed"></div>
+        </div>
+        "#,
+    );
+    let layout = layout_dom(&tree, (800.0, 600.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    let shrink_grid = rect("shrink-grid");
+    let shrink_item = rect("shrink-item");
+    let shrink_child = rect("shrink-child");
+    let fixed_grid = rect("fixed-grid");
+    let fixed_item = rect("fixed-item");
+    let fixed_child = rect("fixed-child");
+    let fixed = rect("fixed");
+    assert!(
+        shrink_grid.width.abs() < 0.01
+            && shrink_item.width.abs() < 0.01
+            && (shrink_child.width - 240.0).abs() < 0.01
+            && (fixed_grid.width - 150.0).abs() < 0.01
+            && (fixed_item.width - 50.0).abs() < 0.01
+            && (fixed_child.width - 240.0).abs() < 0.01
+            && (fixed.x - 50.0).abs() < 0.01
+            && (fixed.width - 100.0).abs() < 0.01,
+        "contained intrinsic contribution leaked into the grid track: \
+         shrink=({shrink_grid:?}, {shrink_item:?}, {shrink_child:?}) \
+         fixed=({fixed_grid:?}, {fixed_item:?}, {fixed_child:?}, {fixed:?})"
+    );
+}
+
+#[test]
 fn non_stretched_auto_grid_item_shrink_wraps_inside_grid_area() {
     let tree = parse_html(
         r#"

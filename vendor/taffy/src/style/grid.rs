@@ -237,6 +237,12 @@ pub trait GridContainerStyle: CoreStyle {
 
 /// The set of styles required for a CSS Grid item (child of a CSS Grid container)
 pub trait GridItemStyle: CoreStyle {
+    /// Whether descendants are ignored for intrinsic size contributions in each axis.
+    #[inline(always)]
+    fn intrinsic_size_containment(&self) -> Size<bool> {
+        Size { width: false, height: false }
+    }
+
     /// Defines which row in the grid the item should start and end at
     #[inline(always)]
     fn grid_row(&self) -> Line<GridPlacement<Self::CustomIdent>> {
