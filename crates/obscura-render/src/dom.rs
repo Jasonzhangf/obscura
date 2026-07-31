@@ -5374,6 +5374,12 @@ enum ContainerAutoInlineSize {
     StretchedGridItem,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ContainerAutoBlockSize {
+    Intrinsic,
+    StretchedGridItem,
+}
+
 /// Classify how an auto inline-size is resolved. Stretched grid items need
 /// their intrinsic contribution contained without replacing the final auto
 /// size that stretch alignment consumes.
@@ -5455,6 +5461,55 @@ fn container_auto_inline_size(
     }
 }
 
+/// Classify an auto block-size for size containment. A stretched grid item
+/// must keep its auto size so final alignment can fill a definite grid area;
+/// only its intrinsic track contribution is contained.
+fn container_auto_block_size(
+    tree: &DomTree,
+    id: NodeId,
+    style: &crate::LayoutStyle,
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+) -> ContainerAutoBlockSize {
+    // Absolutely positioned descendants are not grid items. Preserve the
+    // existing contained intrinsic-height behavior until their independent
+    // inset-based fill sizing is modeled explicitly.
+    if matches!(style.position, Some(taffy::Position::Absolute)) {
+        return ContainerAutoBlockSize::Intrinsic;
+    }
+
+    let mut parent = tree.get_node(id).and_then(|node| node.parent);
+    let parent_style = loop {
+        let Some(parent_id) = parent else {
+            return ContainerAutoBlockSize::Intrinsic;
+        };
+        let Some(parent_style) = styles.get(&parent_id) else {
+            return ContainerAutoBlockSize::Intrinsic;
+        };
+        if parent_style.display_contents {
+            parent = tree.get_node(parent_id).and_then(|node| node.parent);
+            continue;
+        }
+        break parent_style;
+    };
+
+    if parent_style.display == crate::Display::Grid
+        && style
+            .align_self
+            .unwrap_or(
+                parent_style
+                    .align_items
+                    .unwrap_or(taffy::AlignItems::STRETCH),
+            )
+            == taffy::AlignSelf::STRETCH
+        && !style.margin_auto[0]
+        && !style.margin_auto[2]
+    {
+        ContainerAutoBlockSize::StretchedGridItem
+    } else {
+        ContainerAutoBlockSize::Intrinsic
+    }
+}
+
 /// Apply the used-size part of `container-type`'s implicit size containment.
 ///
 /// The default contain-intrinsic-size is zero. Fill-available block boxes keep
@@ -5499,7 +5554,14 @@ fn apply_container_size_containment(
         let ratio_transfers_block_size =
             style.aspect_ratio.is_some() && !matches!(style.width, crate::Dimension::Auto);
         if matches!(style.height, crate::Dimension::Auto) && !ratio_transfers_block_size {
-            taffy_style.size.height = taffy::Dimension::length(0.0);
+            match container_auto_block_size(tree, id, style, styles) {
+                ContainerAutoBlockSize::Intrinsic => {
+                    taffy_style.size.height = taffy::Dimension::length(0.0);
+                }
+                ContainerAutoBlockSize::StretchedGridItem => {
+                    taffy_style.intrinsic_size_containment.height = true;
+                }
+            }
         }
     }
 }

@@ -1148,6 +1148,63 @@ fn stretched_inline_size_container_has_zero_intrinsic_grid_contribution() {
 }
 
 #[test]
+fn stretched_size_container_has_zero_intrinsic_grid_row_contribution() {
+    // Chromium 140: block-axis size containment removes the tall child's
+    // intrinsic row contribution, but leaves the grid item's auto height
+    // available for final stretch alignment. Padding and border remain inside
+    // the fixed row's stretched 100px border box.
+    let tree = parse_html(
+        r#"
+        <style>
+          html, body { margin: 0 }
+          .grid { display: grid }
+          .item { container-type: size }
+          .child { width: 20px; height: 240px }
+          #fixed-grid {
+            margin-top: 20px;
+            grid-template-rows: 100px;
+          }
+          #fixed-item {
+            padding-block: 10px;
+            border-top: 5px solid black;
+            border-bottom: 5px solid black;
+          }
+        </style>
+        <div id="shrink-grid" class="grid">
+          <div id="shrink-item" class="item">
+            <div id="shrink-child" class="child"></div>
+          </div>
+        </div>
+        <div id="fixed-grid" class="grid">
+          <div id="fixed-item" class="item">
+            <div id="fixed-child" class="child"></div>
+          </div>
+        </div>
+        "#,
+    );
+    let layout = layout_dom(&tree, (800.0, 600.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    let shrink_grid = rect("shrink-grid");
+    let shrink_item = rect("shrink-item");
+    let shrink_child = rect("shrink-child");
+    let fixed_grid = rect("fixed-grid");
+    let fixed_item = rect("fixed-item");
+    let fixed_child = rect("fixed-child");
+    assert!(
+        shrink_grid.height.abs() < 0.01
+            && shrink_item.height.abs() < 0.01
+            && (shrink_child.height - 240.0).abs() < 0.01
+            && (fixed_grid.height - 100.0).abs() < 0.01
+            && (fixed_item.height - 100.0).abs() < 0.01
+            && (fixed_child.y - fixed_item.y - 15.0).abs() < 0.01
+            && (fixed_child.height - 240.0).abs() < 0.01,
+        "contained intrinsic contribution leaked into the grid row: \
+         shrink=({shrink_grid:?}, {shrink_item:?}, {shrink_child:?}) \
+         fixed=({fixed_grid:?}, {fixed_item:?}, {fixed_child:?})"
+    );
+}
+
+#[test]
 fn non_stretched_auto_grid_item_shrink_wraps_inside_grid_area() {
     let tree = parse_html(
         r#"
