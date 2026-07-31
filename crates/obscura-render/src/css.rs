@@ -4234,6 +4234,27 @@ mod tests {
     }
 
     #[test]
+    fn supports_polygon_clip_path_activates_only_painted_shape_subset() {
+        let css = "@supports (clip-path:polygon(0 0,100% 0,50% 100%)){\
+                       .transition{height:90px}\
+                   }\
+                   @supports (clip-path:polygon(0 0,100% 0,50% 100%) content-box){\
+                       .unsupported{height:999px}\
+                   }";
+        let rules = parse_stylesheet_for_viewport(css, (1280.0, 720.0));
+        assert!(
+            rules.iter().any(|(selector, declarations)| {
+                selector == ".transition" && declarations.contains("height:90px")
+            }),
+            "the supported polygon branch must enter the cascade: {rules:?}"
+        );
+        assert!(
+            !rules.iter().any(|(selector, _)| selector == ".unsupported"),
+            "an unpainted geometry-box variant must not pass @supports: {rules:?}"
+        );
+    }
+
+    #[test]
     fn media_breakpoints_support_font_relative_lengths_and_ranges() {
         assert!(!media_query_applies_for_viewport(
             "@media (min-width: 64rem)",

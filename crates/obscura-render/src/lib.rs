@@ -235,6 +235,26 @@ impl BorderRadius {
     }
 }
 
+/// Fill rule for a CSS `clip-path: polygon(...)`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ClipPathFillRule {
+    #[default]
+    Nonzero,
+    Evenodd,
+}
+
+/// The supported CSS basic-shape clip.
+///
+/// Coordinates retain their CSS length/percentage unit until paint, where
+/// percentages resolve independently against the border box width and height.
+/// This mirrors the reference-box resolution used by browser engines and
+/// avoids baking responsive polygon geometry into computed style.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClipPathPolygon {
+    pub fill_rule: ClipPathFillRule,
+    pub points: Vec<(Dimension, Dimension)>,
+}
+
 /// The subset of CSS that influences box layout. Expanded in later phases.
 #[derive(Debug, Clone, Default)]
 pub struct LayoutStyle {
@@ -334,6 +354,9 @@ pub struct LayoutStyle {
     /// `border-radius` (uniform; the first value of the shorthand). Rounds the
     /// background fill, replaced content, border, and shadow.
     pub border_radius: BorderRadius,
+    /// `clip-path: polygon(...)`, resolved against the final border box at
+    /// paint time. `None` is the computed `none` value.
+    pub clip_path: Option<ClipPathPolygon>,
     /// RGBA for the paint step. Parsed always (cheap), used only with `paint`.
     pub background_color: Option<[u8; 4]>,
     /// `linear-gradient(...)` background: (angle in degrees clockwise from 12

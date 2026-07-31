@@ -710,6 +710,17 @@ fn paint_laid_dom_scrolled(
             Some(r) => r,
             None => continue,
         };
+        let clip_path_mask = style.clip_path.as_ref().and_then(|polygon| {
+            polygon_clip_mask(
+                pixmap.width(),
+                pixmap.height(),
+                polygon,
+                &rect,
+                style.font_size.unwrap_or(16.0),
+                root_font_size,
+                viewport,
+            )
+        });
 
         // Outset box-shadow paints behind this element's own background/border.
         // Geometry comes from the full (translate-adjusted) border box; the
@@ -751,7 +762,7 @@ fn paint_laid_dom_scrolled(
                         &paint,
                         FillRule::Winding,
                         Transform::identity(),
-                        None,
+                        clip_path_mask.as_ref(),
                     );
                 }
             }
@@ -763,6 +774,7 @@ fn paint_laid_dom_scrolled(
                         &visible_rect,
                         *center,
                         stops,
+                        clip_path_mask.as_ref(),
                     );
                 }
             }
@@ -774,11 +786,19 @@ fn paint_laid_dom_scrolled(
                     *angle,
                     *center,
                     stops,
+                    clip_path_mask.as_ref(),
                 );
             }
             if let Some((angle, stops)) = &style.background_gradient {
                 if let Some(path) = bg_path() {
-                    paint_linear_gradient(&mut pixmap, &path, &visible_rect, *angle, stops);
+                    paint_linear_gradient(
+                        &mut pixmap,
+                        &path,
+                        &visible_rect,
+                        *angle,
+                        stops,
+                        clip_path_mask.as_ref(),
+                    );
                 }
             }
         }
@@ -796,6 +816,7 @@ fn paint_laid_dom_scrolled(
                 style.background_conic_gradient.as_ref(),
                 style.mask_size,
                 style.mask_repeat,
+                clip_path_mask.as_ref(),
                 &mut pixmap,
                 image_cache,
             );
@@ -832,6 +853,7 @@ fn paint_laid_dom_scrolled(
                         image_cache,
                         None,
                         radius,
+                        clip_path_mask.as_ref(),
                     );
                 }
             }
@@ -874,7 +896,13 @@ fn paint_laid_dom_scrolled(
                 paint.set_color(Color::from_rgba8(bc[0], bc[1], bc[2], bc[3]));
                 paint.anti_alias = true;
                 let stroke = tiny_skia::Stroke { width: w, ..Default::default() };
-                pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+                pixmap.stroke_path(
+                    &path,
+                    &paint,
+                    &stroke,
+                    Transform::identity(),
+                    clip_path_mask.as_ref(),
+                );
             }
         } else if style.border.top > 0.0 || style.border.right > 0.0 || style.border.bottom > 0.0 || style.border.left > 0.0 {
             let bc = style.border_color.or(style.color).unwrap_or([0, 0, 0, 255]);
@@ -905,7 +933,13 @@ fn paint_laid_dom_scrolled(
                 push_clipped(rect.x, rect.y, style.border.left, rect.height);
             }
             if let Some(path) = path.finish() {
-                pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+                pixmap.fill_path(
+                    &path,
+                    &paint,
+                    FillRule::Winding,
+                    Transform::identity(),
+                    clip_path_mask.as_ref(),
+                );
             }
         }
 
@@ -926,6 +960,7 @@ fn paint_laid_dom_scrolled(
                         image_cache,
                         projected_image,
                         radius,
+                        clip_path_mask.as_ref(),
                     );
                 // Fall back when the image itself did not paint, following
                 // what browsers show for a broken image: a non-empty alt
@@ -2458,7 +2493,14 @@ fn raster_to_pixmap(bytes: &[u8], w: u32, h: u32) -> Option<Pixmap> {
 /// 12 o'clock (0 = to top). The gradient line length uses the CSS formula so
 /// the stops land where a browser puts them. Positionless stops are spread
 /// evenly; positions are clamped monotonic (tiny-skia requires ascending).
-fn paint_linear_gradient(pixmap: &mut Pixmap, path: &tiny_skia::Path, rect: &crate::Rect, angle: f32, stops: &[([u8; 4], Option<f32>)]) {
+fn paint_linear_gradient(
+    pixmap: &mut Pixmap,
+    path: &tiny_skia::Path,
+    rect: &crate::Rect,
+    angle: f32,
+    stops: &[([u8; 4], Option<f32>)],
+    clip: Option<&tiny_skia::Mask>,
+) {
     if stops.len() < 2 {
         return;
     }
@@ -2482,7 +2524,7 @@ fn paint_linear_gradient(pixmap: &mut Pixmap, path: &tiny_skia::Path, rect: &cra
         let mut paint = Paint::default();
         paint.shader = shader;
         paint.anti_alias = true;
-        pixmap.fill_path(path, &paint, FillRule::Winding, Transform::identity(), None);
+        pixmap.fill_path(path, &paint, FillRule::Winding, Transform::identity(), clip);
     }
 }
 
@@ -2492,6 +2534,7 @@ fn paint_radial_gradient(
     rect: &crate::Rect,
     center: (f32, f32),
     stops: &[([u8; 4], Option<f32>)],
+    clip: Option<&tiny_skia::Mask>,
 ) {
     if stops.len() < 2 {
         return;
@@ -2530,7 +2573,7 @@ fn paint_radial_gradient(
         let mut paint = Paint::default();
         paint.shader = shader;
         paint.anti_alias = true;
-        pixmap.fill_path(path, &paint, FillRule::Winding, Transform::identity(), None);
+        pixmap.fill_path(path, &paint, FillRule::Winding, Transform::identity(), clip);
     }
 }
 
@@ -2541,6 +2584,7 @@ fn paint_conic_gradient(
     angle: f32,
     center: (f32, f32),
     stops: &[([u8; 4], Option<f32>)],
+    extra_clip: Option<&tiny_skia::Mask>,
 ) {
     if rect.width <= 0.0 || rect.height <= 0.0 || stops.len() < 2 {
         return;
@@ -2564,16 +2608,36 @@ fn paint_conic_gradient(
             layer.pixels_mut()[(y * width + x) as usize] = premultiplied(color);
         }
     }
-    let clip = if border_radius.0 > 0.5 && border_radius.1 > 0.5 {
-        rounded_box_clip_mask(
-            pixmap.width(),
-            pixmap.height(),
-            rect,
-            border_radius,
-        )
-    } else {
-        None
-    };
+    let mut clip = extra_clip.cloned();
+    if border_radius.0 > 0.5 && border_radius.1 > 0.5 {
+        let path = rounded_rect_path(
+            rect.x,
+            rect.y,
+            rect.width,
+            rect.height,
+            border_radius.0,
+            border_radius.1,
+        );
+        match (clip.as_mut(), path) {
+            (Some(mask), Some(path)) => {
+                mask.intersect_path(
+                    &path,
+                    FillRule::Winding,
+                    true,
+                    Transform::identity(),
+                );
+            }
+            (None, _) => {
+                clip = rounded_box_clip_mask(
+                    pixmap.width(),
+                    pixmap.height(),
+                    rect,
+                    border_radius,
+                );
+            }
+            _ => {}
+        }
+    }
     pixmap.draw_pixmap(
         rect.x.floor() as i32,
         rect.y.floor() as i32,
@@ -2920,6 +2984,17 @@ fn paint_in_flow_generated_box(
     }
     let radius = style.border_radius.resolve(rect.width, rect.height);
     let has_radius = radius.0 > 0.5 && radius.1 > 0.5;
+    let clip_path_mask = style.clip_path.as_ref().and_then(|polygon| {
+        polygon_clip_mask(
+            pixmap.width(),
+            pixmap.height(),
+            polygon,
+            &rect,
+            style.font_size.unwrap_or(16.0),
+            root_font_size,
+            viewport,
+        )
+    });
     let path = if has_radius {
         rounded_rect_path(
             visible.x,
@@ -2947,17 +3022,39 @@ fn paint_in_flow_generated_box(
                 &paint,
                 FillRule::Winding,
                 Transform::identity(),
-                None,
+                clip_path_mask.as_ref(),
             );
         }
         if let Some((center, stops)) = &style.background_radial_gradient {
-            paint_radial_gradient(pixmap, &path, &rect, *center, stops);
+            paint_radial_gradient(
+                pixmap,
+                &path,
+                &rect,
+                *center,
+                stops,
+                clip_path_mask.as_ref(),
+            );
         }
         if let Some((angle, center, stops)) = &style.background_conic_gradient {
-            paint_conic_gradient(pixmap, &rect, radius, *angle, *center, stops);
+            paint_conic_gradient(
+                pixmap,
+                &rect,
+                radius,
+                *angle,
+                *center,
+                stops,
+                clip_path_mask.as_ref(),
+            );
         }
         if let Some((angle, stops)) = &style.background_gradient {
-            paint_linear_gradient(pixmap, &path, &rect, *angle, stops);
+            paint_linear_gradient(
+                pixmap,
+                &path,
+                &rect,
+                *angle,
+                stops,
+                clip_path_mask.as_ref(),
+            );
         }
     }
     if let Some(mask_url) = &style.mask_image {
@@ -2976,6 +3073,7 @@ fn paint_in_flow_generated_box(
             style.background_conic_gradient.as_ref(),
             style.mask_size,
             style.mask_repeat,
+            clip_path_mask.as_ref(),
             pixmap,
             image_cache,
         );
@@ -3003,6 +3101,7 @@ fn paint_in_flow_generated_box(
                 image_cache,
                 None,
                 radius,
+                clip_path_mask.as_ref(),
             );
         }
     }
@@ -3065,7 +3164,7 @@ fn paint_in_flow_generated_box(
             &border_paint,
             FillRule::Winding,
             Transform::identity(),
-            None,
+            clip_path_mask.as_ref(),
         );
     }
 }
@@ -3122,6 +3221,17 @@ fn paint_positioned_pseudo(
     let Some(visible) = visible else { return };
     let radius = style.border_radius.resolve(rect.width, rect.height);
     let has_radius = radius.0 > 0.5 && radius.1 > 0.5;
+    let clip_path_mask = style.clip_path.as_ref().and_then(|polygon| {
+        polygon_clip_mask(
+            pixmap.width(),
+            pixmap.height(),
+            polygon,
+            &rect,
+            em,
+            root_font_size,
+            viewport,
+        )
+    });
     let path = if has_radius {
         rounded_rect_path(
             visible.x,
@@ -3148,17 +3258,39 @@ fn paint_positioned_pseudo(
                 &paint,
                 FillRule::Winding,
                 Transform::identity(),
-                None,
+                clip_path_mask.as_ref(),
             );
         }
         if let Some((center, stops)) = &style.background_radial_gradient {
-            paint_radial_gradient(pixmap, &path, &rect, *center, stops);
+            paint_radial_gradient(
+                pixmap,
+                &path,
+                &rect,
+                *center,
+                stops,
+                clip_path_mask.as_ref(),
+            );
         }
         if let Some((angle, center, stops)) = &style.background_conic_gradient {
-            paint_conic_gradient(pixmap, &rect, radius, *angle, *center, stops);
+            paint_conic_gradient(
+                pixmap,
+                &rect,
+                radius,
+                *angle,
+                *center,
+                stops,
+                clip_path_mask.as_ref(),
+            );
         }
         if let Some((angle, stops)) = &style.background_gradient {
-            paint_linear_gradient(pixmap, &path, &rect, *angle, stops);
+            paint_linear_gradient(
+                pixmap,
+                &path,
+                &rect,
+                *angle,
+                stops,
+                clip_path_mask.as_ref(),
+            );
         }
     }
     if let Some(mask_url) = &style.mask_image {
@@ -3177,6 +3309,7 @@ fn paint_positioned_pseudo(
             style.background_conic_gradient.as_ref(),
             style.mask_size,
             style.mask_repeat,
+            clip_path_mask.as_ref(),
             pixmap,
             image_cache,
         );
@@ -3204,6 +3337,7 @@ fn paint_positioned_pseudo(
                 image_cache,
                 None,
                 radius,
+                clip_path_mask.as_ref(),
             );
         }
     }
@@ -3579,6 +3713,7 @@ fn paint_image(
     cache: &mut RenderResourceCache,
     transform: Option<ImageAffine>,
     clip_radius: (f32, f32),
+    extra_clip: Option<&tiny_skia::Mask>,
 ) -> bool {
     if rect.width <= 0.0 || rect.height <= 0.0 {
         return false;
@@ -3617,21 +3752,53 @@ fn paint_image(
     // the image past the box, and an ancestor clip can cut into the box
     // itself. Only the fully-inside case takes the unmasked fast path.
     let has_radius = clip_radius.0 > 0.5 && clip_radius.1 > 0.5;
-    let clip = if has_radius
+    let needs_box_clip = has_radius
         || dest.width > visible_rect.width + 0.5
         || dest.height > visible_rect.height + 0.5
         || dest.x < visible_rect.x - 0.5
-        || dest.y < visible_rect.y - 0.5
-    {
-        rounded_box_clip_mask(
-            pixmap.width(),
-            pixmap.height(),
-            visible_rect,
-            clip_radius,
-        )
-    } else {
-        None
-    };
+        || dest.y < visible_rect.y - 0.5;
+    let mut clip = extra_clip.cloned();
+    if needs_box_clip {
+        let path = if has_radius {
+            rounded_rect_path(
+                visible_rect.x,
+                visible_rect.y,
+                visible_rect.width,
+                visible_rect.height,
+                clip_radius.0,
+                clip_radius.1,
+            )
+        } else {
+            Rect::from_xywh(
+                visible_rect.x,
+                visible_rect.y,
+                visible_rect.width,
+                visible_rect.height,
+            )
+            .and_then(|rect| {
+                let mut builder = PathBuilder::new();
+                builder.push_rect(rect);
+                builder.finish()
+            })
+        };
+        match (clip.as_mut(), path) {
+            (Some(mask), Some(path)) => mask.intersect_path(
+                &path,
+                FillRule::Winding,
+                true,
+                Transform::identity(),
+            ),
+            (None, _) => {
+                clip = rounded_box_clip_mask(
+                    pixmap.width(),
+                    pixmap.height(),
+                    visible_rect,
+                    clip_radius,
+                );
+            }
+            _ => {}
+        }
+    }
     pixmap.draw_pixmap(
         dest.x as i32,
         dest.y as i32,
@@ -3728,6 +3895,57 @@ fn rounded_box_clip_mask(
         radius.1,
     )?;
     mask.fill_path(&path, FillRule::Winding, true, Transform::identity());
+    Some(mask)
+}
+
+/// Resolve a CSS polygon against its border-box reference and rasterize it as
+/// a full-surface alpha clip. Gecko's basic-shape path builder likewise
+/// resolves each x percentage against the reference width and each y
+/// percentage against its height before closing the path.
+fn polygon_clip_mask(
+    pw: u32,
+    ph: u32,
+    polygon: &crate::ClipPathPolygon,
+    rect: &crate::Rect,
+    em: f32,
+    rem: f32,
+    viewport: (f32, f32),
+) -> Option<tiny_skia::Mask> {
+    let resolve = |coordinate: crate::Dimension, basis: f32| {
+        match coordinate.resolve(
+            em,
+            rem,
+            viewport.0 / 100.0,
+            viewport.1 / 100.0,
+        ) {
+            crate::Dimension::Px(value) => Some(value),
+            crate::Dimension::Percent(value) => Some(value * basis),
+            _ => None,
+        }
+    };
+    let mut builder = PathBuilder::new();
+    for (index, &(x, y)) in polygon.points.iter().enumerate() {
+        let x = rect.x + resolve(x, rect.width)?;
+        let y = rect.y + resolve(y, rect.height)?;
+        if index == 0 {
+            builder.move_to(x, y);
+        } else {
+            builder.line_to(x, y);
+        }
+    }
+    builder.close();
+    let path = builder.finish();
+    let fill_rule = match polygon.fill_rule {
+        crate::ClipPathFillRule::Nonzero => FillRule::Winding,
+        crate::ClipPathFillRule::Evenodd => FillRule::EvenOdd,
+    };
+    let mut mask = tiny_skia::Mask::new(pw, ph)?;
+    // Degenerate polygons are valid CSS basic shapes but have no enclosed
+    // area. Keep the newly zeroed mask in that case: treating it as "no mask"
+    // would incorrectly reveal the whole element.
+    if let Some(path) = path {
+        mask.fill_path(&path, fill_rule, true, Transform::identity());
+    }
     Some(mask)
 }
 
@@ -4433,6 +4651,7 @@ fn paint_mask(
     conic_gradient: Option<&(f32, (f32, f32), Vec<([u8; 4], Option<f32>)>)>,
     mask_size: Option<(f32, f32)>,
     mask_repeat: Option<(bool, bool)>,
+    extra_clip: Option<&tiny_skia::Mask>,
     pixmap: &mut Pixmap,
     cache: &mut RenderResourceCache,
 ) -> bool {
@@ -4507,16 +4726,34 @@ fn paint_mask(
                 premultiplied(color);
         }
     }
-    let clip = if border_radius.0 > 0.5 && border_radius.1 > 0.5 {
-        rounded_box_clip_mask(
-            pixmap.width(),
-            pixmap.height(),
-            rect,
-            border_radius,
-        )
-    } else {
-        None
-    };
+    let mut clip = extra_clip.cloned();
+    if border_radius.0 > 0.5 && border_radius.1 > 0.5 {
+        let path = rounded_rect_path(
+            rect.x,
+            rect.y,
+            rect.width,
+            rect.height,
+            border_radius.0,
+            border_radius.1,
+        );
+        match (clip.as_mut(), path) {
+            (Some(mask), Some(path)) => mask.intersect_path(
+                &path,
+                FillRule::Winding,
+                true,
+                Transform::identity(),
+            ),
+            (None, _) => {
+                clip = rounded_box_clip_mask(
+                    pixmap.width(),
+                    pixmap.height(),
+                    rect,
+                    border_radius,
+                );
+            }
+            _ => {}
+        }
+    }
     pixmap.draw_pixmap(
         rect.x.floor() as i32,
         rect.y.floor() as i32,
@@ -5042,6 +5279,96 @@ mod tests {
             (outside.red(), outside.green(), outside.blue()),
             (255, 255, 255)
         );
+    }
+
+    #[test]
+    fn polygon_clip_path_paints_responsive_geometry_on_elements_and_pseudos() {
+        let tree = parse_html(
+            r#"<html><head><style>
+               html, body { margin:0 }
+               @supports (clip-path:polygon(0 0,100% 0,50% 100%)) {
+                 .triangle, #in-flow::before, #positioned::after {
+                   clip-path:polygon(0 0,100% 0,50% 100%);
+                 }
+               }
+               .triangle { position:absolute; left:0; top:0;
+                 width:80px; height:80px; background:#f00 }
+               #in-flow { position:absolute; left:100px; top:0 }
+               #in-flow::before { content:""; display:block;
+                 width:80px; height:80px; background:#0a0 }
+               #positioned { position:absolute; left:200px; top:0;
+                 width:80px; height:80px }
+               #positioned::after { content:""; position:absolute; inset:0;
+                 background:#00f }
+               </style></head><body>
+                 <div class="triangle"></div>
+                 <div id="in-flow"></div>
+                 <div id="positioned"></div>
+               </body></html>"#,
+        );
+        let pixmap = paint_dom(&tree, (300.0, 100.0), None).expect("pixmap");
+        for (name, left, channel) in [
+            ("ordinary element", 0, 0),
+            ("in-flow pseudo", 100, 1),
+            ("positioned pseudo", 200, 2),
+        ] {
+            let inside = pixmap.pixel(left + 40, 65).expect("inside pixel");
+            let colored = match channel {
+                0 => inside.red() > 180 && inside.green() < 80 && inside.blue() < 80,
+                1 => inside.green() > 100 && inside.red() < 80 && inside.blue() < 80,
+                _ => inside.blue() > 180 && inside.red() < 80 && inside.green() < 80,
+            };
+            assert!(colored, "{name} must paint inside its percentage polygon: {inside:?}");
+            let outside = pixmap.pixel(left + 4, 65).expect("outside pixel");
+            assert_eq!(
+                (outside.red(), outside.green(), outside.blue()),
+                (255, 255, 255),
+                "{name} must be clipped outside its triangle: {outside:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn polygon_clip_path_honors_evenodd_fill_rule() {
+        let tree = parse_html(
+            r#"<html><body style="margin:0">
+               <div style="width:100px;height:100px;background:#e00;
+                 clip-path:polygon(evenodd,
+                   0 0,100% 0,100% 100%,0 100%,0 25%,
+                   75% 25%,75% 75%,25% 75%,25% 25%,0 25%)"></div>
+               </body></html>"#,
+        );
+        let pixmap = paint_dom(&tree, (120.0, 120.0), None).expect("pixmap");
+        let shell = pixmap.pixel(10, 50).expect("outer shell");
+        assert!(
+            shell.red() > 180 && shell.green() < 80,
+            "the outer contour must remain painted: {shell:?}"
+        );
+        let hole = pixmap.pixel(50, 50).expect("inner hole");
+        assert_eq!(
+            (hole.red(), hole.green(), hole.blue()),
+            (255, 255, 255),
+            "evenodd must cut the inner winding out of the clip: {hole:?}"
+        );
+    }
+
+    #[test]
+    fn degenerate_polygon_clip_path_clips_the_element_away() {
+        let tree = parse_html(
+            r#"<html><body style="margin:0">
+               <div style="width:80px;height:80px;background:red;
+                 clip-path:polygon(20px 20px)"></div>
+               </body></html>"#,
+        );
+        let pixmap = paint_dom(&tree, (100.0, 100.0), None).expect("pixmap");
+        for (x, y) in [(10, 10), (20, 20), (40, 40)] {
+            let pixel = pixmap.pixel(x, y).expect("pixel");
+            assert_eq!(
+                (pixel.red(), pixel.green(), pixel.blue()),
+                (255, 255, 255),
+                "a zero-area polygon must not fall back to an unclipped box: {pixel:?}"
+            );
+        }
     }
 
     #[test]

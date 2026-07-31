@@ -755,6 +755,17 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                 style.border_radius = crate::BorderRadius::pixels(length);
             }
         }
+        "clip-path" | "-webkit-clip-path" => {
+            let lower = value.trim().to_ascii_lowercase();
+            if matches!(
+                lower.as_str(),
+                "none" | "initial" | "unset" | "revert" | "revert-layer"
+            ) {
+                style.clip_path = None;
+            } else if let Some(polygon) = parse_clip_path_polygon(value) {
+                style.clip_path = Some(polygon);
+            }
+        }
         "border" => {
             if value.split_whitespace().any(|token| {
                 token.eq_ignore_ascii_case("none") || token.eq_ignore_ascii_case("hidden")
@@ -1521,6 +1532,8 @@ pub(crate) fn supports_declaration(name: &str, value: &str) -> bool {
             | "padding-block-start"
             | "padding-block-end"
             | "border-radius"
+            | "clip-path"
+            | "-webkit-clip-path"
             | "border"
             | "border-width"
             | "border-top-width"
@@ -1703,6 +1716,9 @@ pub(crate) fn supports_declaration(name: &str, value: &str) -> bool {
         "animation-delay" => parse_animation_time_ms(value).is_some(),
         "animation-iteration-count" => parse_animation_iteration_count(value).is_some(),
         "animation-direction" => parse_animation_direction(value).is_some(),
+        "clip-path" | "-webkit-clip-path" => {
+            value.eq_ignore_ascii_case("none") || parse_clip_path_polygon(value).is_some()
+        }
         "animation-fill-mode" => parse_animation_fill_mode(value).is_some(),
         "animation-play-state" => parse_animation_play_state(value).is_some(),
         "float" => matches!(
@@ -4103,6 +4119,71 @@ fn dimension_value(tok: &str) -> crate::Dimension {
     Dimension::Auto
 }
 
+/// Parse the currently painted basic-shape subset of `clip-path`.
+///
+/// The default (and only supported) geometry box is `border-box`. Rejecting
+/// the other reference boxes here keeps `@supports` aligned with the geometry
+/// we actually paint. Functional coordinates are likewise rejected until
+/// their unresolved math can be retained through computed style.
+fn parse_clip_path_polygon(value: &str) -> Option<crate::ClipPathPolygon> {
+    let value = value.trim();
+    let lower = value.to_ascii_lowercase();
+    if !lower.starts_with("polygon(") {
+        return None;
+    }
+    let close = value.rfind(')')?;
+    let suffix = value[close + 1..].trim();
+    if !suffix.is_empty() && !suffix.eq_ignore_ascii_case("border-box") {
+        return None;
+    }
+    let inner = value["polygon(".len()..close].trim();
+    let mut components = split_top_level(inner, ',');
+    let mut fill_rule = crate::ClipPathFillRule::Nonzero;
+    if let Some(first) = components.first().map(|component| component.trim()) {
+        if first.eq_ignore_ascii_case("evenodd") {
+            fill_rule = crate::ClipPathFillRule::Evenodd;
+            components.remove(0);
+        } else if first.eq_ignore_ascii_case("nonzero") {
+            components.remove(0);
+        }
+    }
+    if components.is_empty() {
+        return None;
+    }
+    let mut points = Vec::with_capacity(components.len());
+    for component in components {
+        let coordinates = split_ws_paren(component);
+        let [x, y] = coordinates.as_slice() else {
+            return None;
+        };
+        if x.contains('(') || y.contains('(') {
+            return None;
+        }
+        let x = dimension_value(x);
+        let y = dimension_value(y);
+        if matches!(x, crate::Dimension::Auto) || matches!(y, crate::Dimension::Auto) {
+            return None;
+        }
+        let finite = |coordinate: crate::Dimension| match coordinate {
+            crate::Dimension::Auto => false,
+            crate::Dimension::Px(value)
+            | crate::Dimension::Percent(value)
+            | crate::Dimension::Em(value)
+            | crate::Dimension::Ex(value)
+            | crate::Dimension::Rem(value)
+            | crate::Dimension::Vw(value)
+            | crate::Dimension::Vh(value)
+            | crate::Dimension::Vmin(value)
+            | crate::Dimension::Vmax(value) => value.is_finite(),
+        };
+        if !finite(x) || !finite(y) {
+            return None;
+        }
+        points.push((x, y));
+    }
+    Some(crate::ClipPathPolygon { fill_rule, points })
+}
+
 /// Parse every length token in a value as px (for box shorthands).
 fn edges(value: &str) -> Option<Edges> {
     let dims: Vec<f32> = value.split_whitespace().filter_map(px_value).collect();
@@ -4878,6 +4959,46 @@ fn edges_from(dims: Vec<f32>) -> Option<Edges> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clip_path_polygon_supports_only_geometry_it_can_resolve() {
+        assert!(supports_declaration(
+            "clip-path",
+            "polygon(0 0, 100% 0, 50% 90px)"
+        ));
+        assert!(supports_declaration(
+            "-webkit-clip-path",
+            "polygon(evenodd, 0 0, 10rem 0, 10rem 10vh) border-box"
+        ));
+        for unsupported in [
+            "polygon(0 0, 100% 0, 50% 100%) content-box",
+            "content-box polygon(0 0, 100% 0, 50% 100%)",
+            "polygon(0, 100% 0)",
+            "polygon(evenodd 0 0, 100% 0)",
+            "polygon(0 0, calc(100% - 1px) 0, 0 100%)",
+            "circle(50%)",
+        ] {
+            assert!(
+                !supports_declaration("clip-path", unsupported),
+                "@supports must not advertise unpainted clip geometry: {unsupported}"
+            );
+        }
+
+        let style = compute_style(
+            "div",
+            Some("clip-path:polygon(evenodd, -10px 0, 100% 0, 50% 2em)"),
+        );
+        let polygon = style.clip_path.expect("computed polygon");
+        assert_eq!(polygon.fill_rule, crate::ClipPathFillRule::Evenodd);
+        assert_eq!(
+            polygon.points,
+            vec![
+                (crate::Dimension::Px(-10.0), crate::Dimension::Px(0.0)),
+                (crate::Dimension::Percent(1.0), crate::Dimension::Px(0.0)),
+                (crate::Dimension::Percent(0.5), crate::Dimension::Em(2.0)),
+            ]
+        );
+    }
 
     #[test]
     fn parses_display_and_size() {
