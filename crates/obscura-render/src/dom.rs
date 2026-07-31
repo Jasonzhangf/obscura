@@ -2962,13 +2962,6 @@ fn layout_dom_once(
                     }
                 }
 
-                if !static_position_candidates.is_empty() {
-                    let _ = taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
-                    resolve_static_positions_and_reparent(
-                        &mut taffy_tree,
-                        &static_position_candidates,
-                    );
-                }
                 let _ = taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
                 if repair_intrinsic_column_flex_negative_margins(
                     &mut taffy_tree,
@@ -3065,16 +3058,28 @@ fn layout_dom_once(
                         &mut measure,
                     );
                 }
-            }
-            #[cfg(not(feature = "paint"))]
-            {
+                // A fully-auto positioned axis uses the box's static position
+                // in its original formatting context. Harvest that coordinate
+                // only after every intrinsic/table/fragmentation repair has
+                // produced final in-flow geometry; otherwise reparenting pins
+                // the box to a stale preliminary document offset and can
+                // manufacture scrolling overflow. The resolver snapshots all
+                // candidates before changing any parent, preserving nested
+                // static-position candidates.
                 if !static_position_candidates.is_empty() {
-                    let _ = taffy_tree.compute_layout(taffy_root, available);
                     resolve_static_positions_and_reparent(
                         &mut taffy_tree,
                         &static_position_candidates,
                     );
+                    let _ = taffy_tree.compute_layout_with_measure(
+                        taffy_root,
+                        available,
+                        &mut measure,
+                    );
                 }
+            }
+            #[cfg(not(feature = "paint"))]
+            {
                 let _ = taffy_tree.compute_layout(taffy_root, available);
                 if repair_intrinsic_column_flex_negative_margins(
                     &mut taffy_tree,
@@ -3140,6 +3145,16 @@ fn layout_dom_once(
                     &id_map,
                     &styles,
                 ) {
+                    let _ = taffy_tree.compute_layout(taffy_root, available);
+                }
+                // Keep the no-paint geometry path in the same final-position
+                // contract as screenshots: static coordinates are resolved
+                // after every pass that can move in-flow placeholders.
+                if !static_position_candidates.is_empty() {
+                    resolve_static_positions_and_reparent(
+                        &mut taffy_tree,
+                        &static_position_candidates,
+                    );
                     let _ = taffy_tree.compute_layout(taffy_root, available);
                 }
             }
@@ -9432,6 +9447,53 @@ mod tests {
             (narrow.rects[&c_id].y - narrow.rects[&columns_id].y - 300.0).abs() < 0.1,
             "{:?}",
             narrow.rects[&c_id]
+        );
+    }
+
+    #[test]
+    fn static_positions_use_final_post_repair_geometry_without_phantom_overflow() {
+        let tree = parse_html(
+            r#"<style>
+                html,body{margin:0}
+                #columns{columns:3;width:630px;column-gap:30px}
+                #columns > div{height:100px;break-inside:avoid}
+                #holder{height:20px}
+                #outer{position:absolute;width:40px;height:40px}
+                #wrapper{margin-top:10px;height:20px}
+                #nested{position:absolute;width:5px;height:5px}
+            </style>
+            <div id="columns">
+              <div></div><div></div><div></div>
+              <div></div><div></div><div></div>
+            </div>
+            <div id="holder">
+              <div id="outer"><div id="wrapper"><div id="nested"></div></div></div>
+            </div>"#,
+        );
+        let laid = layout_dom(&tree, (800.0, 400.0));
+        let rect = |name| laid.rects[&tree.get_element_by_id(name).unwrap()];
+        let columns = rect("columns");
+        let holder = rect("holder");
+        let outer = rect("outer");
+        let wrapper = rect("wrapper");
+        let nested = rect("nested");
+
+        assert!((columns.height - 200.0).abs() < 0.01, "{columns:?}");
+        assert!((holder.y - 200.0).abs() < 0.01, "{holder:?}");
+        assert!(
+            (outer.y - holder.y).abs() < 0.01,
+            "outer static position was harvested before multicol repair: \
+             holder={holder:?} outer={outer:?}"
+        );
+        assert!(
+            (nested.y - wrapper.y).abs() < 0.01,
+            "nested static-position candidate changed while reparenting its ancestor: \
+             wrapper={wrapper:?} nested={nested:?}"
+        );
+        assert_eq!(
+            laid.scrolling_content_size(&tree, (800.0, 400.0)),
+            (800.0, 400.0),
+            "a stale preliminary static position must not create scrolling overflow"
         );
     }
 
