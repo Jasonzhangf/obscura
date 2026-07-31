@@ -3455,6 +3455,61 @@ mod tests {
 
     #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
+    async fn intersection_observer_can_be_reused_after_disconnect() {
+        let dom = parse_html(
+            r#"<html style="margin:0"><body style="margin:0">
+                <div id="stale" style="height:10px"></div>
+                <div id="first" style="height:10px"></div>
+                <div id="second" style="height:10px"></div>
+            </body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_viewport(200.0, 100.0);
+        rt.run_page_init();
+
+        let result = rt
+            .evaluate_for_cdp(
+                r#"
+                new Promise(resolve => {
+                    const deliveries = [];
+                    const observer = new IntersectionObserver(entries => {
+                        deliveries.push(entries.map(entry => entry.target.id));
+                        if (deliveries.length === 1) {
+                            observer.disconnect();
+                            observer.observe(document.getElementById("second"));
+                        } else {
+                            observer.disconnect();
+                            resolve([
+                                deliveries,
+                                globalThis.__intersectionObservers.length,
+                            ]);
+                        }
+                    });
+
+                    // A pending record from before disconnect must be discarded.
+                    observer.observe(document.getElementById("stale"));
+                    observer.disconnect();
+                    observer.observe(document.getElementById("first"));
+                    setTimeout(() => resolve(["timed out"]), 100);
+                })
+                "#,
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!([
+                [["first"], ["second"]],
+                0,
+            ])
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
     async fn intersection_observer_recomputes_after_style_mutation_and_resize() {
         let dom = parse_html(
             r#"<html style="margin:0"><body style="margin:0">

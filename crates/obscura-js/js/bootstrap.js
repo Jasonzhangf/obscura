@@ -6114,7 +6114,17 @@ globalThis.IntersectionObserver = class IntersectionObserver {
     });
   }
   observe(el) {
-    if (!el || !this._connected || this._targets.has(el)) return;
+    if (!el || this._targets.has(el)) return;
+    // `disconnect()` removes every current observation; it does not destroy
+    // the observer. Browsers allow the same object to observe targets again.
+    // Re-register lazily so dormant observers do not stay in the global
+    // geometry recomputation list forever.
+    if (!this._connected) {
+      this._connected = true;
+      if (!globalThis.__intersectionObservers.includes(this)) {
+        globalThis.__intersectionObservers.push(this);
+      }
+    }
     this._targets.add(el);
     this._previous.delete(el);
     this._check([el], true);
