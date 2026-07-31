@@ -979,6 +979,39 @@ fn clearfix_contains_a_full_width_definite_height_float() {
 }
 
 #[test]
+fn min_height_floor_keeps_a_full_width_float_at_block_start() {
+    let tree = parse_html(
+        r#"
+        <style>
+          html, body { margin: 0 }
+          #host { width: 100%; min-height: 600px }
+          #float { float: left; width: 100%; height: 600px }
+          #following { height: 20px }
+        </style>
+        <div id="host"><div id="float"></div></div>
+        <div id="following"></div>
+        "#,
+    );
+    let layout = layout_dom(&tree, (800.0, 700.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    let host = rect("host");
+    let float = rect("float");
+    let following = rect("following");
+    assert!(
+        (host.width - 800.0).abs() < 0.01 && (host.height - 600.0).abs() < 0.01,
+        "host: {host:?}"
+    );
+    assert!(
+        (float.x - 0.0).abs() < 0.01
+            && (float.y - 0.0).abs() < 0.01
+            && (float.width - 800.0).abs() < 0.01
+            && (float.height - 600.0).abs() < 0.01,
+        "float: {float:?}"
+    );
+    assert!((following.y - 600.0).abs() < 0.01, "following: {following:?}");
+}
+
+#[test]
 fn percentage_float_and_inline_sibling_share_definite_height_band() {
     let tree = parse_html(
         r#"

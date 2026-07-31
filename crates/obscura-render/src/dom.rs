@@ -7958,7 +7958,11 @@ fn build_children_with_float_zone(
                 && has_in_flow_generated_pseudo(Some(after))
         })
     });
-    if parent_has_definite_height || parent_has_clearfix {
+    let parent_min_height = styles.get(&parent_id).and_then(|parent| match parent.min_height {
+        crate::Dimension::Px(value) => Some(value),
+        _ => None,
+    });
+    if parent_has_definite_height || parent_has_clearfix || parent_min_height.is_some() {
         let fills_axis = |value: f32| (value - 1.0).abs() < 0.001;
         let substantive: Vec<NodeId> = dom_children
             .iter()
@@ -7985,12 +7989,20 @@ fn build_children_with_float_zone(
                 matches!(style.height, crate::Dimension::Percent(value) if fills_axis(value))
                     && style.size_expressions[1].is_none()
             });
-            let float_has_definite_height = float_style.is_some_and(|style| {
-                matches!(style.height, crate::Dimension::Px(_)) && style.size_expressions[1].is_none()
-            }) || float_fills_height;
+            let float_pixel_height = float_style.and_then(|style| match style.height {
+                crate::Dimension::Px(value) if style.size_expressions[1].is_none() => Some(value),
+                _ => None,
+            });
+            let float_has_definite_height = float_pixel_height.is_some() || float_fills_height;
+            let height_is_already_contained = parent_has_definite_height
+                || parent_has_clearfix
+                || parent_min_height
+                    .zip(float_pixel_height)
+                    .is_some_and(|(minimum, height)| minimum + 0.001 >= height);
             let sole_full_width_float = substantive.len() == 1
                 && float_percent_width.is_some_and(fills_axis)
-                && float_has_definite_height;
+                && float_has_definite_height
+                && height_is_already_contained;
             let split_band_flow = if parent_has_definite_height
                 && substantive.len() == 2
                 && substantive[0] == float_dom
