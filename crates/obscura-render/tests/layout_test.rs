@@ -979,6 +979,104 @@ fn clearfix_contains_a_full_width_definite_height_float() {
 }
 
 #[test]
+fn auto_width_clearfix_keeps_a_content_sized_percentage_float_at_block_start() {
+    let tree = parse_html(
+        r#"
+        <style>
+          html, body { margin: 0 }
+          #host { min-height: 600px }
+          #host::before, #host::after { content: " "; display: table }
+          #host::after { clear: both }
+          #float {
+            position: relative;
+            display: flex;
+            flex-direction: column;
+            float: left;
+            width: 100%;
+            min-height: 1px;
+          }
+          #content {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 600px;
+          }
+          #card { width: 400px; height: 300px }
+        </style>
+        <section id="host">
+          <div id="float">
+            <div id="content"><div id="card"></div></div>
+          </div>
+        </section>
+        "#,
+    );
+    let layout = layout_dom(&tree, (800.0, 700.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    let host = rect("host");
+    let float = rect("float");
+    let content = rect("content");
+    let card = rect("card");
+    assert!(
+        (host.x - 0.0).abs() < 0.01
+            && (host.y - 0.0).abs() < 0.01
+            && (host.width - 800.0).abs() < 0.01
+            && (host.height - 600.0).abs() < 0.01,
+        "host: {host:?}"
+    );
+    assert!(
+        (float.x - 0.0).abs() < 0.01
+            && (float.y - 0.0).abs() < 0.01
+            && (float.width - 800.0).abs() < 0.01
+            && (float.height - 600.0).abs() < 0.01,
+        "float: {float:?}"
+    );
+    assert!(
+        (content.x - 0.0).abs() < 0.01
+            && (content.y - 0.0).abs() < 0.01
+            && (content.width - 800.0).abs() < 0.01
+            && (content.height - 600.0).abs() < 0.01,
+        "content: {content:?}"
+    );
+    assert!(
+        (card.x - 200.0).abs() < 0.01
+            && (card.y - 150.0).abs() < 0.01
+            && (card.width - 400.0).abs() < 0.01
+            && (card.height - 300.0).abs() < 0.01,
+        "card: {card:?}"
+    );
+}
+
+#[test]
+fn min_height_alone_does_not_resolve_a_floats_percentage_height() {
+    let tree = parse_html(
+        r#"
+        <style>
+          html, body { margin: 0 }
+          #host { min-height: 600px }
+          #host::before, #host::after { content: " "; display: table }
+          #host::after { clear: both }
+          #float { float: left; width: 100%; height: 100% }
+        </style>
+        <div id="host"><div id="float"></div></div>
+        "#,
+    );
+    let layout = layout_dom(&tree, (800.0, 700.0));
+    let host = layout.rects[&tree.get_element_by_id("host").unwrap()];
+    let float = layout.rects[&tree.get_element_by_id("float").unwrap()];
+    assert!(
+        (host.width - 800.0).abs() < 0.01 && (host.height - 600.0).abs() < 0.01,
+        "host: {host:?}"
+    );
+    assert!(
+        (float.x - 0.0).abs() < 0.01
+            && (float.y - 0.0).abs() < 0.01
+            && (float.width - 800.0).abs() < 0.01
+            && float.height.abs() < 0.01,
+        "an indefinite percentage height must behave as auto: {float:?}"
+    );
+}
+
+#[test]
 fn min_height_floor_keeps_a_full_width_float_at_block_start() {
     let tree = parse_html(
         r#"

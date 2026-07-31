@@ -7767,7 +7767,7 @@ fn can_use_native_float_band(
         || matches!(parent_style.position, Some(taffy::Position::Absolute))
         || !matches!(
             parent_style.width,
-            crate::Dimension::Px(_) | crate::Dimension::Percent(_)
+            crate::Dimension::Auto | crate::Dimension::Px(_) | crate::Dimension::Percent(_)
         )
         || parent_style.size_expressions[0].is_some()
     {
