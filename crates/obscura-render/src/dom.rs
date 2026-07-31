@@ -7951,8 +7951,6 @@ fn build_children_with_float_zone(
             parent.height,
             crate::Dimension::Px(_) | crate::Dimension::Percent(_)
         ) && parent.size_expressions[1].is_none()
-            && !has_in_flow_generated_pseudo(parent.before_pseudo.as_deref())
-            && !has_in_flow_generated_pseudo(parent.after_pseudo.as_deref())
     });
     if parent_has_definite_height {
         let fills_axis = |value: f32| (value - 1.0).abs() < 0.001;

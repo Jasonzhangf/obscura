@@ -892,6 +892,8 @@ fn full_width_percentage_float_uses_definite_containing_block() {
         <style>
           html, body { margin: 0; width: 100%; height: 100% }
           #host { width: 100%; height: 100% }
+          #host::before, #host::after { content: " "; display: table }
+          #host::after { clear: both }
           #float {
             float: left;
             display: flex;
