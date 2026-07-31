@@ -111,6 +111,11 @@ pub struct ObscuraState {
     /// relayout of the same document reuses it without refetching.
     #[cfg(feature = "render")]
     pub render_resources: obscura_render::RenderResourceCache,
+    /// Script-created faces in this document's `FontFaceSet`. This is separate
+    /// from the DOM so the bridge does not manufacture a selector-visible
+    /// `<style>` element merely to feed the renderer.
+    #[cfg(feature = "render")]
+    pub dynamic_fonts: Vec<obscura_render::DynamicFontFace>,
     #[cfg(feature = "render")]
     pub viewport: (f32, f32),
     /// Root scrolling offset in CSS pixels. With render enabled this is
@@ -147,6 +152,8 @@ impl ObscuraState {
             prepared_render: None,
             #[cfg(feature = "render")]
             render_resources: obscura_render::RenderResourceCache::default(),
+            #[cfg(feature = "render")]
+            dynamic_fonts: Vec::new(),
             #[cfg(feature = "render")]
             viewport: (1280.0, 720.0),
             #[cfg(feature = "render")]
@@ -2019,6 +2026,65 @@ fn op_url_encode_query(#[string] query: &str, #[string] label: &str, special: bo
     obscura_net::url_encode_query(query, label, special).unwrap_or_else(|| query.to_string())
 }
 
+#[cfg(feature = "render")]
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DynamicFontFaceInput {
+    family: String,
+    source: String,
+    style: String,
+    weight: String,
+    unicode_range: String,
+}
+
+/// Replace the native snapshot of `document.fonts`. The JS implementation
+/// remains the source of truth for set semantics; this narrow bridge only
+/// supplies resource descriptors to the render preparation path.
+#[cfg(feature = "render")]
+#[op2(fast)]
+fn op_set_dynamic_fonts(state: &OpState, #[string] registrations: &str) -> bool {
+    let Ok(inputs) = serde_json::from_str::<Vec<DynamicFontFaceInput>>(registrations) else {
+        return false;
+    };
+    // Keep the observable registry broad enough for generated font families
+    // (large applications commonly register dozens of subset faces). The
+    // renderer independently caps decoded resources after ASCII filtering and
+    // URL deduplication. BufferSource faces arrive as data URLs, so cap their
+    // aggregate descriptor payload as well as each entry.
+    if inputs.len() > 256
+        || inputs
+            .iter()
+            .try_fold(0usize, |total, face| total.checked_add(face.source.len()))
+            .map_or(true, |total| total > 64 * 1024 * 1024)
+        || inputs.iter().any(|face| {
+            face.family.len() > 1024
+                || face.source.len() > 12 * 1024 * 1024
+                || face.style.len() > 256
+                || face.weight.len() > 256
+                || face.unicode_range.len() > 4096
+        })
+    {
+        return false;
+    }
+    let fonts = inputs
+        .into_iter()
+        .map(|face| obscura_render::DynamicFontFace {
+            family: face.family,
+            source: face.source,
+            style: face.style,
+            weight: face.weight,
+            unicode_range: face.unicode_range,
+        })
+        .collect::<Vec<_>>();
+    let shared = state.borrow::<SharedState>().clone();
+    let mut state = shared.borrow_mut();
+    if state.dynamic_fonts != fonts {
+        state.dynamic_fonts = fonts;
+        state.prepared_render = None;
+    }
+    true
+}
+
 pub fn build_extension() -> Extension {
     let mut ops = vec![
         op_dom(),
@@ -2048,6 +2114,7 @@ pub fn build_extension() -> Extension {
     // probes with typeof before calling, so the op's absence is a clean fallback.
     #[cfg(feature = "render")]
     {
+        ops.push(op_set_dynamic_fonts());
         ops.push(op_image_metadata());
         ops.push(op_layout_geometry());
         ops.push(op_layout_metrics());
@@ -2091,11 +2158,12 @@ pub(crate) fn ensure_prepared_render(
     if stale {
         let prepared = {
             let dom = state.dom.as_ref()?;
-            obscura_render::prepare_dom(
+            obscura_render::prepare_dom_with_dynamic_fonts(
                 dom,
                 viewport,
                 base_url.as_deref(),
                 &mut state.render_resources,
+                &state.dynamic_fonts,
             )?
         };
         state.prepared_render = Some(prepared);

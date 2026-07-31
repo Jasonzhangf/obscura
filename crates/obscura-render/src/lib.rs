@@ -28,9 +28,9 @@ pub use dom::{
 mod paint;
 #[cfg(feature = "paint")]
 pub use paint::{
-    paint_dom, paint_dom_scrolled, paint_prepared, prepare_dom, screenshot_png,
-    screenshot_png_scrolled, screenshot_prepared, PreparedRender, RenderResourceCache,
-    RenderResourceLoader, SelectedImage,
+    paint_dom, paint_dom_scrolled, paint_prepared, prepare_dom, prepare_dom_with_dynamic_fonts,
+    screenshot_png, screenshot_png_scrolled, screenshot_prepared, DynamicFontFace,
+    PreparedRender, RenderResourceCache, RenderResourceLoader, SelectedImage,
 };
 
 // Real inline text layout (cosmic-text) lives behind the paint feature; the
@@ -467,6 +467,12 @@ pub struct LayoutStyle {
     /// alignment keywords. Kept separate from flex/grid `align-items`: using
     /// one field for both made `text-align:left` shrink-wrap flex children.
     pub text_align: Option<taffy::AlignItems>,
+    /// Computed inherited `text-indent`. Font/viewport-relative lengths are
+    /// resolved to pixels during the top-down inheritance pass; percentages
+    /// remain typed until the final inline-formatting-context width is known.
+    /// `None` during cascade means inherit, while the root resolves to the
+    /// initial zero length.
+    pub text_indent: Option<Dimension>,
     pub align_items: Option<taffy::AlignItems>,
     pub justify_items: Option<taffy::JustifyItems>,
     pub align_self: Option<taffy::AlignSelf>,

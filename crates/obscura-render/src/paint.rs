@@ -31,6 +31,19 @@ pub trait RenderResourceLoader {
     fn load(&mut self, url: &str) -> Option<Vec<u8>>;
 }
 
+/// One script-created `FontFace` registered with the document's
+/// `FontFaceSet`. The JS runtime owns the registry and supplies this snapshot
+/// alongside the DOM when preparing a render; keeping it out of the DOM avoids
+/// exposing an implementation-only `<style>` element to page selectors.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DynamicFontFace {
+    pub family: String,
+    pub source: String,
+    pub style: String,
+    pub weight: String,
+    pub unicode_range: String,
+}
+
 impl<F> RenderResourceLoader for F
 where
     F: FnMut(&str) -> Option<Vec<u8>>,
@@ -416,6 +429,20 @@ pub fn prepare_dom(
     base_url: Option<&str>,
     resources: &mut RenderResourceCache,
 ) -> Option<PreparedRender> {
+    prepare_dom_with_dynamic_fonts(tree, viewport, base_url, resources, &[])
+}
+
+/// Prepare a DOM with the document's script-created `FontFace` registrations.
+///
+/// Authored rules and dynamic faces deliberately share the same bounded
+/// resource cache, decoder, descriptor matching, and shaping database.
+pub fn prepare_dom_with_dynamic_fonts(
+    tree: &DomTree,
+    viewport: (f32, f32),
+    base_url: Option<&str>,
+    resources: &mut RenderResourceCache,
+    dynamic_fonts: &[DynamicFontFace],
+) -> Option<PreparedRender> {
     if !viewport.0.is_finite()
         || !viewport.1.is_finite()
         || viewport.0 <= 0.0
@@ -429,7 +456,7 @@ pub fn prepare_dom(
     // each URL is still fetched at most once.
     let (mut intrinsic, mut selected_images) =
         collect_image_intrinsics(tree, viewport, base_url, resources);
-    let fonts = collect_web_fonts(tree, base_url, resources);
+    let fonts = collect_web_fonts(tree, base_url, resources, dynamic_fonts);
     // Most framework pages use web fonts and many decorative SVG icons, but
     // only SVG text needs the page font faces. Avoid cloning/loading the page
     // font database for ordinary icons and HTML-only text.
@@ -2064,6 +2091,7 @@ fn collect_web_fonts(
     tree: &DomTree,
     base_url: Option<&str>,
     cache: &mut RenderResourceCache,
+    dynamic_fonts: &[DynamicFontFace],
 ) -> Vec<crate::inline::WebFont> {
     let mut seen = std::collections::HashSet::new();
     let mut fonts = Vec::new();
@@ -2094,6 +2122,25 @@ fn collect_web_fonts(
                 font_face_italic(face),
             ));
         }
+    }
+    for face in dynamic_fonts {
+        let descriptor_block = format!(
+            "src:{};font-weight:{};font-style:{};unicode-range:{}",
+            face.source, face.weight, face.style, face.unicode_range
+        );
+        if !font_face_covers_ascii(&descriptor_block) {
+            continue;
+        }
+        let Some(src) = font_face_urls(&descriptor_block).into_iter().next() else {
+            continue;
+        };
+        rules.push((
+            font_resource_key(&src, base_url),
+            src,
+            (!face.family.is_empty()).then(|| face.family.clone()),
+            font_face_weight(&descriptor_block),
+            font_face_italic(&descriptor_block),
+        ));
     }
 
     // Critical web fonts are normally preloaded from the document with a URL
@@ -5221,6 +5268,38 @@ mod tests {
     }
 
     #[test]
+    fn negative_text_indent_clips_label_without_hiding_background_icon() {
+        let tree = parse_html(
+            r#"<html><body style="margin:0">
+               <a style="display:block;width:24px;height:24px;overflow:hidden;
+                 white-space:nowrap;text-indent:-9999px;color:black;background-color:blue;
+                 background-image:url(&quot;data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='16'%20height='16'%3E%3Crect%20width='16'%20height='16'%20fill='red'/%3E%3C/svg%3E&quot;);
+                 background-position:center;background-size:16px 16px;background-repeat:no-repeat">Bluesky (@mozilla.org)</a>
+               </body></html>"#,
+        );
+        let pixmap = paint_dom(&tree, (32.0, 32.0), None).expect("pixmap");
+        let corner = pixmap.pixel(1, 1).expect("anchor background");
+        assert!(
+            corner.blue() > 200 && corner.red() < 40 && corner.green() < 40,
+            "the anchor background must remain visible: {corner:?}"
+        );
+        let icon = pixmap.pixel(12, 12).expect("centered SVG icon");
+        assert!(
+            icon.red() > 200 && icon.green() < 40 && icon.blue() < 40,
+            "the background SVG must paint independently of indented text: {icon:?}"
+        );
+        for y in 0..24 {
+            for x in 0..24 {
+                let pixel = pixmap.pixel(x, y).expect("anchor pixel");
+                assert!(
+                    pixel.red() > 40 || pixel.green() > 40 || pixel.blue() > 40,
+                    "black label glyph leaked through the 24px overflow clip at ({x},{y})"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn contextual_background_size_preserves_auto_axis_ratio() {
         let source = "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='200'%20height='50'%3E%3C/svg%3E";
         let owner = crate::Rect {
@@ -6344,5 +6423,57 @@ mod tests {
         let face = font_face_blocks(css)[0];
         assert!(font_face_covers_ascii(face));
         assert_eq!(font_face_urls(face), vec!["example.otf"]);
+    }
+
+    #[test]
+    fn dynamic_font_face_uses_shared_fetch_decode_and_layout_path() {
+        let tree = parse_html(
+            r#"<html><body><span id="sample" style="display:inline-block;width:max-content;
+                font:40px DynamicFixture;white-space:nowrap">WWWWiiii</span></body></html>"#,
+        );
+        let sample = tree
+            .query_selector("#sample")
+            .expect("valid selector")
+            .expect("sample");
+        let fallback = prepare_dom(
+            &tree,
+            (400.0, 100.0),
+            Some("https://example.test/page/index.html"),
+            &mut RenderResourceCache::default(),
+        )
+        .expect("fallback render")
+        .document_rect(sample)
+        .expect("fallback geometry")
+        .width;
+        let loads = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let loader_loads = Arc::clone(&loads);
+        let mut resources = RenderResourceCache::with_loader(move |url: &str| {
+            loader_loads.lock().expect("font loads").push(url.to_string());
+            (url == "https://example.test/fonts/fixture.ttf")
+                .then(|| SERIF_FONT_BYTES.to_vec())
+        });
+        let prepared = prepare_dom_with_dynamic_fonts(
+            &tree,
+            (400.0, 100.0),
+            Some("https://example.test/page/index.html"),
+            &mut resources,
+            &[DynamicFontFace {
+                family: "DynamicFixture".to_string(),
+                source: "url('../../fonts/fixture.ttf') format('truetype')".to_string(),
+                style: "normal".to_string(),
+                weight: "400".to_string(),
+                unicode_range: "U+20-7E".to_string(),
+            }],
+        )
+        .expect("dynamic font render");
+        let dynamic = prepared
+            .document_rect(sample)
+            .expect("dynamic geometry")
+            .width;
+        assert_ne!(fallback, dynamic, "dynamic face must participate in shaping");
+        assert_eq!(
+            *loads.lock().expect("dynamic font loads"),
+            vec!["https://example.test/fonts/fixture.ttf".to_string()]
+        );
     }
 }

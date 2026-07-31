@@ -197,6 +197,7 @@ impl ObscuraJsRuntime {
         {
             gs.prepared_render = None;
             gs.render_resources = obscura_render::RenderResourceCache::default();
+            gs.dynamic_fonts.clear();
             gs.scroll_offset = (0.0, 0.0);
         }
     }
@@ -1120,6 +1121,7 @@ impl ObscuraJsRuntime {
         {
             state.prepared_render = None;
             state.render_resources = obscura_render::RenderResourceCache::default();
+            state.dynamic_fonts.clear();
         }
         state.dom.take()
     }
@@ -1953,6 +1955,129 @@ mod tests {
             rt.evaluate("document.getElementById('state').textContent")
                 .unwrap(),
             serde_json::json!("ready")
+        );
+    }
+
+    #[test]
+    fn font_face_set_tracks_authored_and_script_created_faces() {
+        let mut rt = setup_runtime(
+            r#"<html><head><style>
+                @font-face {
+                    font-family: "Authored One";
+                    src: url("https://assets.test/one.woff2") format("woff2");
+                    font-weight: 350 650;
+                }
+                @font-face {
+                    font-family: AuthoredTwo;
+                    src: url(data:font/woff2;base64,d09GMg==);
+                    font-style: italic;
+                }
+            </style></head><body></body></html>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const authored = Array.from(document.fonts);
+                    const cssDelete = document.fonts.delete(authored[0]);
+                    const dynamic = new FontFace("Dynamic", "url('/dynamic.ttf')", {
+                        style: "oblique 12deg",
+                        weight: "700",
+                        stretch: "condensed",
+                        unicodeRange: "U+20-7E",
+                        display: "swap"
+                    });
+                    const addResult = document.fonts.add(dynamic);
+                    const visited = [];
+                    document.fonts.forEach((value, key, set) => {
+                        visited.push(value === key && set === document.fonts);
+                    });
+                    const afterAdd = [
+                        document.fonts.size,
+                        document.fonts.has(dynamic),
+                        addResult === document.fonts,
+                        dynamic.family,
+                        dynamic.style,
+                        dynamic.weight,
+                        dynamic.stretch,
+                        dynamic.unicodeRange,
+                        dynamic.display,
+                        visited.every(Boolean)
+                    ];
+                    const deleted = document.fonts.delete(dynamic);
+                    document.fonts.clear();
+                    const bytes = new Uint8Array([0, 1, 2, 253, 254, 255]);
+                    const binary = new FontFace("Binary", bytes, { weight: 600 });
+                    return [
+                        authored.length,
+                        authored.map(face => face.family),
+                        cssDelete,
+                        afterAdd,
+                        deleted,
+                        document.fonts.size,
+                        binary.status,
+                        binary.loaded === binary.load()
+                    ];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                2,
+                ["Authored One", "AuthoredTwo"],
+                false,
+                [3, true, true, "Dynamic", "oblique 12deg", "700", "condensed", "U+20-7E", "swap", true],
+                true,
+                2,
+                "loaded",
+                true
+            ])
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn font_face_load_updates_status_set_readiness_and_matching() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "font-face-lifecycle",
+            r#"
+                globalThis.__fontEvents = [];
+                const face = new FontFace("Lifecycle", "url('/lifecycle.woff2')", {
+                    weight: "700"
+                });
+                document.fonts.onloading = event => __fontEvents.push([event.type, event.fontfaces.length]);
+                document.fonts.onloadingdone = event => __fontEvents.push([event.type, event.fontfaces.length]);
+                document.fonts.add(face);
+                globalThis.__fontBefore = [
+                    face.status,
+                    document.fonts.status,
+                    document.fonts.check("700 16px Lifecycle")
+                ];
+                globalThis.__fontLoadResult = "pending";
+                document.fonts.load("700 16px Lifecycle").then(faces => {
+                    __fontLoadResult = [faces.length, faces[0] === face, face.status,
+                        document.fonts.check("700 16px Lifecycle")];
+                });
+                document.fonts.ready.then(set => {
+                    globalThis.__fontReady = set === document.fonts;
+                });
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        let result = rt
+            .evaluate(
+                "return [__fontBefore, __fontLoadResult, __fontReady, __fontEvents];",
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                ["unloaded", "loaded", false],
+                [1, true, "loaded", true],
+                true,
+                [["loading", 1], ["loadingdone", 1]]
+            ])
         );
     }
 
@@ -3152,6 +3277,66 @@ mod tests {
             1,
             "relayout must retain successful resource bytes"
         );
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn script_registered_url_font_reaches_render_resource_collection() {
+        let loads = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let loader_loads = std::sync::Arc::clone(&loads);
+        let font = include_bytes!("../../obscura-render/assets/liberation-serif.ttf").to_vec();
+        let mut rt = parser_image_runtime(
+            r#"<html><body style="margin:0">
+                <span id="sample" style="display:inline-block;width:max-content;
+                    font-family:DynamicFixture;font-size:40px;white-space:nowrap">WWWWiiii</span>
+            </body></html>"#,
+            move |url: &str| {
+                loader_loads.lock().expect("font loads").push(url.to_string());
+                (url == "http://example.com/fonts/dynamic.ttf").then(|| font.clone())
+            },
+        );
+        rt.set_viewport(400.0, 100.0);
+        let before = rt
+            .evaluate("document.getElementById('sample').getBoundingClientRect().width")
+            .unwrap()
+            .as_f64()
+            .expect("fallback width");
+        assert!(loads.lock().expect("initial loads").is_empty());
+
+        let registered = rt
+            .evaluate(
+                r#"(() => {
+                    const face = new FontFace("DynamicFixture",
+                        "url('../fonts/dynamic.ttf') format('truetype')",
+                        { weight: "normal", style: "normal", unicodeRange: "U+20-7E" });
+                    return [document.fonts.add(face) === document.fonts,
+                        document.fonts.size, document.fonts.has(face)];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(registered, serde_json::json!([true, 1, true]));
+        {
+            let state = rt.state.borrow();
+            assert_eq!(state.dynamic_fonts.len(), 1);
+            assert!(
+                state.prepared_render.is_none(),
+                "changing the document font registry must invalidate prepared text geometry"
+            );
+        }
+
+        let after = rt
+            .evaluate("document.getElementById('sample').getBoundingClientRect().width")
+            .unwrap()
+            .as_f64()
+            .expect("dynamic font width");
+        assert_ne!(before, after, "registered face must affect final text geometry");
+        assert_eq!(
+            *loads.lock().expect("dynamic font loads"),
+            vec!["http://example.com/fonts/dynamic.ttf".to_string()]
+        );
+        rt.screenshot_prepared((400.0, 100.0), Some("http://example.com/page/index.html"))
+            .expect("dynamic font screenshot");
+        assert_eq!(loads.lock().expect("repeated font loads").len(), 1);
     }
 
     #[cfg(feature = "render")]
