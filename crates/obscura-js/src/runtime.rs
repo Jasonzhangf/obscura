@@ -2067,6 +2067,178 @@ mod tests {
         );
     }
 
+    #[test]
+    fn match_media_evaluates_query_lists_conjunctions_ranges_and_orientation() {
+        let dom = parse_html("<html><body></body></html>");
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_viewport(1280.0, 720.0);
+        rt.run_page_init();
+
+        let result = rt
+            .evaluate(
+                r#"
+                return [
+                    matchMedia("(min-width: 1024px) and (min-height: 700px)").matches,
+                    matchMedia("(min-width: 1024px) and (min-height: 900px)").matches,
+                    matchMedia("(max-width: 600px), screen and (orientation: landscape)").matches,
+                    matchMedia("not print").matches,
+                    matchMedia("not screen").matches,
+                    matchMedia("only screen and (width: 1280px) and (height = 720px)").matches,
+                    matchMedia("(1000px <= width < 1400px) and (height > 700px)").matches,
+                    matchMedia("(orientation: portrait)").matches,
+                    matchMedia("(prefers-color-scheme: light) and (pointer: fine) and (hover: hover)").matches,
+                    matchMedia("(obscura-unknown-feature: yes)").matches
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([true, false, true, true, false, true, true, false, true, false])
+        );
+    }
+
+    #[test]
+    fn match_media_matches_are_live_across_viewport_resizes() {
+        let dom = parse_html("<html><body></body></html>");
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_viewport(900.0, 600.0);
+        rt.run_page_init();
+        assert_eq!(
+            rt.evaluate(
+                r#"
+                return [
+                    (globalThis.__wideAndShort = matchMedia(
+                        "(min-width: 800px) and (max-height: 700px)"
+                    )).matches,
+                    (globalThis.__portrait = matchMedia(
+                        "(orientation: portrait)"
+                    )).matches
+                ];
+                "#,
+            )
+            .unwrap(),
+            serde_json::json!([true, false])
+        );
+
+        rt.set_viewport(600.0, 900.0);
+        assert_eq!(
+            rt.evaluate(
+                "return [__wideAndShort.matches, __portrait.matches,\
+                         matchMedia('(max-width: 600px), print').matches];",
+            )
+            .unwrap(),
+            serde_json::json!([false, true, true])
+        );
+    }
+
+    #[test]
+    fn computed_style_access_does_not_get_shadowed_by_inline_style_proxy() {
+        let mut rt = setup_runtime(
+            r#"<html><body><div id="box" style="opacity:.5;width:40px"></div></body></html>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+                const box = document.getElementById("box");
+                const computed = getComputedStyle(box);
+                return [
+                    computed.display,
+                    computed.visibility,
+                    computed.opacity,
+                    computed.width,
+                    computed.getPropertyValue("display"),
+                    computed.getPropertyValue("background-color")
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                "block",
+                "visible",
+                "0.5",
+                "40px",
+                "block",
+                "rgba(0, 0, 0, 0)"
+            ])
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn computed_style_uses_renderer_stylesheet_cascade_and_invalidates() {
+        let dom = parse_html(
+            r#"<html><head><style>
+                .base {
+                    display:flex; position:relative; z-index:7;
+                    visibility:hidden; opacity:.35;
+                    background-color:rgb(10,20,30); color:rgb(40,50,60);
+                    width:120px; height:40px; min-width:20px; max-width:160px;
+                    box-sizing:border-box; overflow-x:clip; overflow-y:visible;
+                    margin:1px 2px 3px 4px; padding:5px 6px 7px 8px;
+                    border:2px solid rgb(70,80,90);
+                    flex-direction:column; flex-wrap:wrap;
+                    align-items:center; justify-content:space-between;
+                    gap:6px 9px; transform:translate(3px,4px);
+                }
+                .alt { display:grid; width:150px; opacity:.8; }
+            </style></head><body><div id="box" class="base"></div></body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_viewport(400.0, 200.0);
+        rt.run_page_init();
+
+        let initial = rt
+            .evaluate(
+                r#"
+                const box = document.getElementById("box");
+                const c = getComputedStyle(box);
+                return [
+                    c.display, c.position, c.zIndex, c.visibility, c.opacity,
+                    c.backgroundColor, c.getPropertyValue("color"),
+                    c.width, c.height, c.minWidth, c.maxWidth, c.boxSizing,
+                    c.overflowX, c.overflowY,
+                    c.marginTop, c.marginRight, c.marginBottom, c.marginLeft,
+                    c.paddingTop, c.borderLeftWidth, c.borderLeftColor,
+                    c.flexDirection, c.flexWrap, c.alignItems,
+                    c.justifyContent, c.rowGap, c.columnGap, c.transform
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            initial,
+            serde_json::json!([
+                "flex", "relative", "7", "hidden", "0.35",
+                "rgb(10, 20, 30)", "rgb(40, 50, 60)",
+                "120px", "40px", "20px", "160px", "border-box",
+                "clip", "visible",
+                "1px", "2px", "3px", "4px",
+                "5px", "2px", "rgb(70, 80, 90)",
+                "column", "wrap", "center",
+                "space-between", "6px", "9px", "translate(3px, 4px)"
+            ])
+        );
+
+        assert_eq!(
+            rt.evaluate(
+                r#"
+                const box = document.getElementById("box");
+                box.className = "alt";
+                const c = getComputedStyle(box);
+                return [c.display, c.width, c.opacity];
+                "#,
+            )
+            .unwrap(),
+            serde_json::json!(["grid", "150px", "0.8"])
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn idle_event_loop_flushes_resolved_promise_continuations() {
         let mut rt = setup_runtime("<html><body><div id='state'>pending</div></body></html>");
@@ -3152,6 +3324,191 @@ mod tests {
         assert!(values[12..].iter().all(|value| value == &serde_json::json!(true)));
     }
 
+    /// CSSOM View exposes the viewport through the standards-mode root, but
+    /// ordinary elements (including body) report their padding box. Modern
+    /// animation libraries commonly measure a fixed 100vh sentinel through
+    /// clientHeight; the old synthetic 100x20 fallback collapsed all of their
+    /// viewport-relative trigger ranges.
+    #[cfg(feature = "render")]
+    #[test]
+    fn rendered_client_metrics_use_the_live_padding_box() {
+        let dom = parse_html(
+            r#"<html style="margin:0"><body style="margin:0">
+                <div id="tracker"
+                     style="position:fixed;top:0;width:100%;height:100vh"></div>
+                <div id="box"
+                     style="box-sizing:content-box;width:100.4px;height:50.6px;
+                            padding:5px 8.2px 6px 7.2px;
+                            border-style:solid;
+                            border-width:2px 4.1px 3px 3.1px"></div>
+                <div style="height:900px"></div>
+            </body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_viewport(320.0, 200.0);
+        rt.run_page_init();
+
+        let initial = rt
+            .evaluate(
+                r#"
+                const tracker = document.getElementById("tracker");
+                const box = document.getElementById("box");
+                return {
+                    root: [
+                        document.documentElement.clientWidth,
+                        document.documentElement.clientHeight
+                    ],
+                    body: [document.body.clientWidth, document.body.clientHeight],
+                    tracker: [
+                        tracker.clientWidth, tracker.clientHeight,
+                        tracker.offsetWidth, tracker.offsetHeight
+                    ],
+                    box: [
+                        box.clientWidth, box.clientHeight,
+                        box.getBoundingClientRect().width,
+                        box.getBoundingClientRect().height
+                    ]
+                };
+                "#,
+            )
+            .unwrap();
+        assert_eq!(initial["root"], serde_json::json!([320, 200]));
+        assert_eq!(initial["body"], serde_json::json!([320, 967]));
+        assert_eq!(initial["tracker"], serde_json::json!([320, 200, 320, 200]));
+        assert_eq!(initial["box"][0], serde_json::json!(116));
+        assert_eq!(initial["box"][1], serde_json::json!(62));
+        assert!((initial["box"][2].as_f64().unwrap() - 123.0).abs() < 0.05);
+        assert_eq!(initial["box"][3], serde_json::json!(67));
+
+        // Attribute-backed inline-style changes invalidate the retained
+        // render. Borders do not change the padding box; padding does.
+        let mutated = rt
+            .evaluate(
+                r#"
+                const tracker = document.getElementById("tracker");
+                const box = document.getElementById("box");
+                tracker.style.height = "50vh";
+                box.style.borderLeftWidth = "13px";
+                box.style.paddingLeft = "17px";
+                return [
+                    tracker.clientHeight,
+                    box.clientWidth,
+                    box.getBoundingClientRect().width
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(mutated[0], serde_json::json!(100));
+        assert_eq!(mutated[1], serde_json::json!(126));
+        assert_eq!(mutated[2], serde_json::json!(143));
+
+        // A later CDP/emulation viewport update invalidates the layout too;
+        // both the root special case and an ordinary 100vh box are live.
+        rt.set_viewport(640.0, 360.0);
+        assert_eq!(
+            rt.evaluate(
+                r#"const tracker = document.getElementById("tracker");
+                return [
+                    document.documentElement.clientWidth,
+                    document.documentElement.clientHeight,
+                    tracker.clientWidth,
+                    tracker.clientHeight
+                ]"#,
+            )
+            .unwrap(),
+            serde_json::json!([640, 360, 640, 180])
+        );
+    }
+
+    /// CSSOM View distinguishes "no associated CSS box" from a real box whose
+    /// dimensions happen to be zero. Blink and Gecko return an all-zero
+    /// bounding rect and no client rects for display:none/detached elements;
+    /// a laid-out zero-size box still contributes one client rect.
+    #[cfg(feature = "render")]
+    #[test]
+    fn rendered_cssom_rects_distinguish_no_box_from_zero_size_box() {
+        let dom = parse_html(
+            r#"<html style="margin:0"><body style="margin:0">
+                <div id="hidden" style="display:none;width:80px;height:40px"></div>
+                <div id="zero" style="display:block;width:0;height:0"></div>
+            </body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_viewport(320.0, 200.0);
+        rt.run_page_init();
+
+        let result = rt
+            .evaluate(
+                r#"
+                const hidden = document.getElementById("hidden");
+                const detached = document.createElement("div");
+                detached.style.cssText = "display:block;width:90px;height:50px";
+                const zero = document.getElementById("zero");
+                const sample = element => {
+                    const rect = element.getBoundingClientRect();
+                    const rects = element.getClientRects();
+                    return {
+                        rect: [
+                            rect.x, rect.y, rect.width, rect.height,
+                            rect.top, rect.right, rect.bottom, rect.left
+                        ],
+                        rectCount: rects.length,
+                        firstWidth: rects.length ? rects[0].width : null,
+                    };
+                };
+                return {
+                    hidden: sample(hidden),
+                    detached: sample(detached),
+                    zero: sample(zero),
+                };
+                "#,
+            )
+            .unwrap();
+
+        for name in ["hidden", "detached"] {
+            assert_eq!(
+                result[name]["rect"],
+                serde_json::json!([0, 0, 0, 0, 0, 0, 0, 0]),
+                "{name} must expose the CSSOM View no-box bounding rect"
+            );
+            assert_eq!(
+                result[name]["rectCount"],
+                serde_json::json!(0),
+                "{name} must expose an empty client rect list"
+            );
+            assert_eq!(result[name]["firstWidth"], serde_json::Value::Null);
+        }
+        assert_eq!(result["zero"]["rect"][2], serde_json::json!(0));
+        assert_eq!(result["zero"]["rect"][3], serde_json::json!(0));
+        assert_eq!(
+            result["zero"]["rectCount"],
+            serde_json::json!(1),
+            "a real zero-size layout box must not be mistaken for no box"
+        );
+        assert_eq!(result["zero"]["firstWidth"], serde_json::json!(0));
+    }
+
+    #[cfg(not(feature = "render"))]
+    #[test]
+    fn non_render_cssom_rects_keep_compatibility_geometry() {
+        let mut rt = setup_runtime(r#"<html><body><div id="box"></div></body></html>"#);
+        let result = rt
+            .evaluate(
+                r#"
+                const box = document.getElementById("box");
+                const detached = document.createElement("div");
+                return [box, detached].map(element => {
+                    const rect = element.getBoundingClientRect();
+                    return [rect.width, rect.height, element.getClientRects().length];
+                });
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([[100, 20, 1], [100, 20, 1]]));
+    }
+
     /// Chromium 150 reference (800x513 CSS-pixel viewport):
     /// top=[60,20,20,-267], bottom=[448,448,231,31,-496] at the sampled
     /// root scroll offsets. This keeps sticky distinct from fixed positioning,
@@ -3511,7 +3868,7 @@ mod tests {
     fn root_overflow_clip_preserves_cssom_scroll_range() {
         let dom = parse_html(
             r#"<html style="margin:0;height:100%;overflow:hidden">
-                <body style="margin:0;height:100%;overflow:hidden">
+                <body style="margin:0;height:100%">
                     <main id="main" style="padding-top:48px">
                         <div style="height:5000px"></div>
                     </main>

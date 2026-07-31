@@ -2261,6 +2261,7 @@ pub fn build_extension() -> Extension {
         ops.push(op_set_dynamic_fonts());
         ops.push(op_image_metadata());
         ops.push(op_layout_geometry());
+        ops.push(op_computed_style());
         ops.push(op_layout_metrics());
         ops.push(op_scroll_offset());
         ops.push(op_scroll_to());
@@ -2426,8 +2427,10 @@ pub(crate) fn clamp_scroll_offset(state: &mut ObscuraState, requested: (f32, f32
 /// cache. The cache is computed lazily on first read and cleared on navigation
 /// (see `set_dom`). Coordinates are viewport-relative after the shared root
 /// scroll offset, except for viewport-fixed subtrees. Returns JSON
-/// `{"x","y","width","height"}` in CSS pixels, or an empty string when the
-/// node has no box. Feature-gated.
+/// `{"x","y","width","height","clientWidth","clientHeight"}` in CSS pixels,
+/// or an empty string when the node has no box. The client dimensions are the
+/// unscaled padding box used by CSSOM View, whereas the rect is the visual
+/// viewport-relative border box. Feature-gated.
 #[cfg(feature = "render")]
 #[op2]
 #[string]
@@ -2441,13 +2444,39 @@ fn op_layout_geometry(state: &OpState, #[string] nid_str: String) -> String {
         let Some(rect) = prepared.viewport_rect(nid, scroll) else {
             return String::new();
         };
+        let Some((client_width, client_height)) = prepared.client_size(nid) else {
+            return String::new();
+        };
         let viewport_fixed = prepared.viewport_fixed_nodes().contains(&nid);
         return format!(
-            "{{\"x\":{},\"y\":{},\"width\":{},\"height\":{},\"viewportFixed\":{}}}",
-            rect.x, rect.y, rect.width, rect.height, viewport_fixed
+            "{{\"x\":{},\"y\":{},\"width\":{},\"height\":{},\"clientWidth\":{},\"clientHeight\":{},\"viewportFixed\":{}}}",
+            rect.x,
+            rect.y,
+            rect.width,
+            rect.height,
+            client_width,
+            client_height,
+            viewport_fixed
         );
     }
     String::new()
+}
+
+/// One renderer-computed CSS snapshot for `getComputedStyle()`. Returning all
+/// supported properties together keeps a single JS style object to one native
+/// call and one use of the retained prepared layout.
+#[cfg(feature = "render")]
+#[op2]
+#[string]
+fn op_computed_style(state: &OpState, #[string] nid_str: String) -> String {
+    let shared = state.borrow::<SharedState>().clone();
+    let nid: u32 = nid_str.parse().unwrap_or(0);
+    let nid = obscura_dom::tree::NodeId::new(nid);
+    let mut gs = shared.borrow_mut();
+    ensure_prepared_render(&mut gs)
+        .and_then(|prepared| prepared.computed_style(nid))
+        .and_then(|snapshot| serde_json::to_string(&snapshot).ok())
+        .unwrap_or_default()
 }
 
 /// Root scrolling overflow in CSS pixels. The JS CSSOM probes this op only in

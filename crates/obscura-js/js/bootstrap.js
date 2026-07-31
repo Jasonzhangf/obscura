@@ -2800,11 +2800,77 @@ class Element extends Node {
   }
   get offsetTop() { return this.getBoundingClientRect().top; }
   get offsetLeft() { return this.getBoundingClientRect().left; }
-  // documentElement / body / window expose VIEWPORT geometry, not their own content box.
-  // Puppeteer's #clickableBox clips boxes to document.documentElement.clientWidth/Height;
-  // returning 100x20 there made every element appear off-screen and broke .click().
-  get clientWidth() { return this._isViewportRoot() ? (globalThis.innerWidth || 1280) : 100; }
-  get clientHeight() { return this._isViewportRoot() ? (globalThis.innerHeight || 720) : 20; }
+  // In standards mode documentElement exposes viewport client geometry.
+  // Puppeteer's #clickableBox clips boxes to those dimensions; returning the
+  // non-render fallback 100x20 there makes every element appear off-screen.
+  get clientWidth() {
+    // In standards mode only the root element exposes the viewport. Body is
+    // an ordinary box; treating it as another viewport breaks libraries that
+    // measure the page's body or a full-viewport sizing sentinel.
+    if (this.tagName === 'HTML') return globalThis.innerWidth || 1280;
+    const metrics = this._renderClientMetrics();
+    return metrics ? metrics.width : 100;
+  }
+  get clientHeight() {
+    if (this.tagName === 'HTML') return globalThis.innerHeight || 720;
+    const metrics = this._renderClientMetrics();
+    return metrics ? metrics.height : 20;
+  }
+  _renderClientMetrics() {
+    if (typeof Deno.core.ops.op_layout_geometry !== 'function') return null;
+    try {
+      const raw = Deno.core.ops.op_layout_geometry(String(this._nid | 0));
+      if (!raw) return { width: 0, height: 0 };
+      const geometry = JSON.parse(raw);
+      if (geometry
+          && Number.isFinite(geometry.clientWidth)
+          && Number.isFinite(geometry.clientHeight)) {
+        // CSSOM View exposes Web IDL longs. The native layout retains
+        // subpixel precision for getBoundingClientRect(); client metrics round
+        // to whole CSS pixels like Chromium.
+        return {
+          width: Math.round(Math.max(0, geometry.clientWidth)),
+          height: Math.round(Math.max(0, geometry.clientHeight)),
+        };
+      }
+    } catch (_error) {}
+    return { width: 0, height: 0 };
+  }
+  // `undefined` means this is a non-render build. `null` means the render
+  // engine is present but this element has no associated CSS box (for
+  // example, display:none or a detached element). Keep those states distinct:
+  // CSSOM View returns an empty rect list for the latter, while the former
+  // deliberately retains Obscura's compatibility geometry.
+  _renderBoxGeometry() {
+    if (typeof Deno.core.ops.op_layout_geometry !== 'function') return undefined;
+    try {
+      const raw = Deno.core.ops.op_layout_geometry(String(this._nid | 0));
+      if (!raw) return null;
+      const geometry = JSON.parse(raw);
+      if (geometry
+          && Number.isFinite(geometry.x)
+          && Number.isFinite(geometry.y)
+          && Number.isFinite(geometry.width)
+          && Number.isFinite(geometry.height)) {
+        return geometry;
+      }
+    } catch (_error) {}
+    return null;
+  }
+  _rectFromRenderGeometry(geometry) {
+    const x = geometry.x, y = geometry.y;
+    const width = geometry.width, height = geometry.height;
+    const rect = {
+      x, y, width, height,
+      top: y, right: x + width, bottom: y + height, left: x,
+      toJSON() { return this; },
+    };
+    Object.defineProperty(rect, "__obscuraViewportFixed", {
+      value: !!geometry.viewportFixed,
+      enumerable: false,
+    });
+    return rect;
+  }
   get scrollWidth() {
     if (!this._isViewportRoot()) return 100;
     const metrics = this._renderScrollMetrics();
@@ -2905,26 +2971,16 @@ class Element extends Node {
     // Real layout when the render feature is compiled in: ask the Rust layout
     // cache for this element's border box. The op is absent in the default
     // build, so probe with typeof and fall through to the synthetic rect below.
-    if (typeof Deno.core.ops.op_layout_geometry === 'function') {
-      try {
-        var _geom = Deno.core.ops.op_layout_geometry(String(this._nid | 0));
-        if (_geom) {
-          var _r = JSON.parse(_geom);
-          if (_r && typeof _r.width === 'number') {
-            var _x = _r.x, _y = _r.y, _w = _r.width, _h = _r.height;
-            var _rect = {
-              x: _x, y: _y, width: _w, height: _h,
-              top: _y, right: _x + _w, bottom: _y + _h, left: _x,
-              toJSON() { return this; },
-            };
-            Object.defineProperty(_rect, "__obscuraViewportFixed", {
-              value: !!_r.viewportFixed,
-              enumerable: false,
-            });
-            return _rect;
-          }
-        }
-      } catch (_e) {}
+    const geometry = this._renderBoxGeometry();
+    if (geometry !== undefined) {
+      if (geometry) return this._rectFromRenderGeometry(geometry);
+      // CSSOM View: an element without an associated box has an all-zero
+      // bounding rect. Do not leak the non-render 100x20 compatibility cell.
+      return {
+        x: 0, y: 0, width: 0, height: 0,
+        top: 0, right: 0, bottom: 0, left: 0,
+        toJSON() { return this; },
+      };
     }
     // Default (non-render) builds keep viewport-sized roots. Without this
     // synthetic fallback every hit test against them clips down to a 100x20
@@ -2938,9 +2994,9 @@ class Element extends Node {
         toJSON() { return this; },
       };
     }
-    // No layout engine (default build) or this node has no box: synthesize a
-    // deterministic position from the node id so Playwright's actionability
-    // polling still gets a stable, distinct rect for hit-testing (issue #45).
+    // No layout engine (default build): synthesize a deterministic position
+    // from the node id so Playwright's actionability polling still gets a
+    // stable, distinct rect for hit-testing (issue #45).
     // Every nid maps to a unique cell in a 12-column grid for a 1280x720 viewport.
     const VW = 1280, VH = 720, COLS = 12, CW = 100, CH = 20, GX = 110, GY = 30;
     const rowsPerScreen = Math.max(1, Math.floor((VH - 10) / GY));
@@ -2955,7 +3011,14 @@ class Element extends Node {
       toJSON() { return this; },
     };
   }
-  getClientRects() { return new DOMRectList([this.getBoundingClientRect()]); }
+  getClientRects() {
+    const geometry = this._renderBoxGeometry();
+    if (geometry === null) return new DOMRectList([]);
+    if (geometry !== undefined) {
+      return new DOMRectList([this._rectFromRenderGeometry(geometry)]);
+    }
+    return new DOMRectList([this.getBoundingClientRect()]);
+  }
   // No layout engine: a stub that always returns true unblocks Playwright's
   // actionability polling. With a real layout we'd check display, visibility,
   // opacity and rect dimensions per spec.
@@ -5594,36 +5657,218 @@ if (typeof TextDecoder === 'undefined') {
   };
 }
 
+function _splitMediaQueryList(input) {
+  const result = [];
+  let start = 0, depth = 0, quote = '';
+  for (let i = 0; i < input.length; i++) {
+    const ch = input[i];
+    if (quote) {
+      if (ch === '\\') i++;
+      else if (ch === quote) quote = '';
+    } else if (ch === '"' || ch === "'") {
+      quote = ch;
+    } else if (ch === '(') {
+      depth++;
+    } else if (ch === ')') {
+      depth--;
+      if (depth < 0) return null;
+    } else if (ch === ',' && depth === 0) {
+      result.push(input.slice(start, i));
+      start = i + 1;
+    }
+  }
+  if (depth !== 0 || quote) return null;
+  result.push(input.slice(start));
+  return result;
+}
+
+function _splitMediaAnd(input) {
+  const result = [];
+  let start = 0, depth = 0, quote = '';
+  for (let i = 0; i < input.length; i++) {
+    const ch = input[i];
+    if (quote) {
+      if (ch === '\\') i++;
+      else if (ch === quote) quote = '';
+      continue;
+    }
+    if (ch === '"' || ch === "'") { quote = ch; continue; }
+    if (ch === '(') { depth++; continue; }
+    if (ch === ')') { depth--; continue; }
+    if (depth === 0 && input.slice(i, i + 3).toLowerCase() === 'and'
+        && (i === 0 || /\s/.test(input[i - 1]))
+        && (i + 3 === input.length || /\s/.test(input[i + 3]))) {
+      result.push(input.slice(start, i));
+      start = i + 3;
+      i += 2;
+    }
+  }
+  result.push(input.slice(start));
+  return result;
+}
+
+function _mediaViewportDimension(name) {
+  const value = name === 'width' ? Number(globalThis.innerWidth) : Number(globalThis.innerHeight);
+  if (Number.isFinite(value)) return value;
+  return name === 'width' ? 1440 : 900;
+}
+
+function _parseMediaPx(value) {
+  const match = String(value).trim().match(/^([+-]?(?:\d+(?:\.\d*)?|\.\d+))(px)?$/i);
+  if (!match || (!match[2] && Number(match[1]) !== 0)) return null;
+  const result = Number(match[1]);
+  return Number.isFinite(result) ? result : null;
+}
+
+function _compareMediaValues(left, operator, right) {
+  if (operator === '<') return left < right;
+  if (operator === '<=') return left <= right;
+  if (operator === '>') return left > right;
+  if (operator === '>=') return left >= right;
+  return left === right;
+}
+
+function _evaluateMediaDimension(feature) {
+  let match = feature.match(/^(min|max)-(width|height)\s*:\s*(.+)$/);
+  if (match) {
+    const expected = _parseMediaPx(match[3]);
+    if (expected === null) return false;
+    const actual = _mediaViewportDimension(match[2]);
+    return match[1] === 'min' ? actual >= expected : actual <= expected;
+  }
+
+  match = feature.match(/^(width|height)\s*:\s*(.+)$/);
+  if (match) {
+    const expected = _parseMediaPx(match[2]);
+    return expected !== null && _mediaViewportDimension(match[1]) === expected;
+  }
+
+  match = feature.match(/^(width|height)\s*(<=|>=|=|<|>)\s*(.+)$/);
+  if (match) {
+    const expected = _parseMediaPx(match[3]);
+    return expected !== null
+      && _compareMediaValues(_mediaViewportDimension(match[1]), match[2], expected);
+  }
+
+  match = feature.match(/^(.+?)\s*(<=|>=|=|<|>)\s*(width|height)$/);
+  if (match) {
+    const expected = _parseMediaPx(match[1]);
+    return expected !== null
+      && _compareMediaValues(expected, match[2], _mediaViewportDimension(match[3]));
+  }
+
+  match = feature.match(/^(.+?)\s*(<=|>=|<|>)\s*(width|height)\s*(<=|>=|<|>)\s*(.+)$/);
+  if (match) {
+    const lower = _parseMediaPx(match[1]);
+    const upper = _parseMediaPx(match[5]);
+    if (lower === null || upper === null) return false;
+    const actual = _mediaViewportDimension(match[3]);
+    return _compareMediaValues(lower, match[2], actual)
+      && _compareMediaValues(actual, match[4], upper);
+  }
+
+  if (feature === 'width' || feature === 'height')
+    return _mediaViewportDimension(feature) !== 0;
+  return null;
+}
+
+function _evaluateMediaFeature(raw) {
+  let feature = raw.trim().toLowerCase();
+  if (feature[0] !== '(' || feature[feature.length - 1] !== ')') return false;
+  feature = feature.slice(1, -1).trim();
+
+  const dimension = _evaluateMediaDimension(feature);
+  if (dimension !== null) return dimension;
+
+  let match = feature.match(/^orientation\s*:\s*(portrait|landscape)$/);
+  if (match) {
+    const width = _mediaViewportDimension('width');
+    const height = _mediaViewportDimension('height');
+    return match[1] === 'portrait' ? height >= width : width > height;
+  }
+
+  match = feature.match(/^prefers-color-scheme\s*:\s*(dark|light|no-preference)$/);
+  if (match) return match[1] === 'light';
+  match = feature.match(/^prefers-reduced-motion\s*:\s*(reduce|no-preference)$/);
+  if (match) return match[1] === 'no-preference';
+
+  match = feature.match(/^(pointer|any-pointer)\s*:\s*(none|coarse|fine)$/);
+  if (match) return match[2] === 'fine';
+  match = feature.match(/^(hover|any-hover)\s*:\s*(none|hover)$/);
+  if (match) return match[2] === 'hover';
+
+  if (feature === 'color') return true;
+  match = feature.match(/^color\s*:\s*(\d+)$/);
+  if (match) return Number(match[1]) === 8;
+  return false;
+}
+
+function _evaluateOneMediaQuery(raw) {
+  let query = raw.trim().toLowerCase();
+  if (!query) return false;
+
+  let negate = false;
+  let modifier = query.match(/^(not|only)\b\s*/);
+  if (modifier) {
+    negate = modifier[1] === 'not';
+    query = query.slice(modifier[0].length).trim();
+  }
+
+  let typeMatches = true;
+  if (query[0] !== '(') {
+    const type = query.match(/^([a-z][a-z0-9-]*)\b/i);
+    if (!type) return false;
+    typeMatches = type[1] === 'all' || type[1] === 'screen';
+    if (type[1] !== 'all' && type[1] !== 'screen' && type[1] !== 'print')
+      typeMatches = false;
+    query = query.slice(type[0].length).trim();
+    if (query) {
+      const conjunction = query.match(/^and\b\s*/);
+      if (!conjunction) return false;
+      query = query.slice(conjunction[0].length).trim();
+    }
+  }
+
+  let matches = typeMatches;
+  if (query) {
+    const conditions = _splitMediaAnd(query);
+    if (!conditions.length || conditions.some(condition => !condition.trim())) return false;
+    matches = matches && conditions.every(_evaluateMediaFeature);
+  }
+  return negate ? !matches : matches;
+}
+
+function _evaluateMediaQueryList(query) {
+  const list = _splitMediaQueryList(String(query));
+  return !!list && list.some(_evaluateOneMediaQuery);
+}
+
 globalThis.matchMedia = _markNative(function matchMedia(q) {
-  var s = (q || '').toLowerCase().replace(/\s+/g, '');
-  var matches = false;
-  // Match headless Chromium's default: light color scheme. Reporting dark
-  // here made every JS-driven site (mdBook, docs, apps) switch itself into a
-  // dark theme, rendering nothing like a normal headless-Chrome screenshot.
-  if (s.includes('prefers-color-scheme:dark')) matches = false;
-  else if (s.includes('prefers-color-scheme:light')) matches = true;
-  else if (s.includes('prefers-color-scheme:no-preference')) matches = false;
-  else if (s.includes('prefers-reduced-motion:no-preference')) matches = true;
-  else if (s.includes('prefers-reduced-motion:reduce')) matches = false;
-  else if (s.includes('any-pointer:fine')) matches = true;
-  else if (s.includes('any-pointer:coarse')) matches = false;
-  else if (s.includes('pointer:fine')) matches = true;
-  else if (s.includes('hover:hover')) matches = true;
-  else if (s.includes('any-hover:hover')) matches = true;
-  else if (s.includes('color)') || s === '(color)') matches = true;
-  else if (s.includes('min-width')) {
-    var m = s.match(/min-width:\s*(\d+)px/);
-    matches = m ? (globalThis.innerWidth || 1440) >= parseInt(m[1]) : false;
-  }
-  else if (s.includes('max-width')) {
-    var m2 = s.match(/max-width:\s*(\d+)px/);
-    matches = m2 ? (globalThis.innerWidth || 1440) <= parseInt(m2[1]) : false;
-  }
-  return { matches: matches, media: q, onchange: null, addListener(){}, removeListener(){}, addEventListener(){}, removeEventListener(){}, dispatchEvent(){return true;} };
+  const media = q == null ? '' : String(q);
+  return {
+    get matches() { return _evaluateMediaQueryList(media); },
+    media,
+    onchange: null,
+    addListener(){},
+    removeListener(){},
+    addEventListener(){},
+    removeEventListener(){},
+    dispatchEvent(){return true;}
+  };
 });
 globalThis.getComputedStyle = (el) => {
   if (!el) el = document.body || {};
   const style = el?.style || el?._style || new CSSStyleDeclaration();
+  // Render builds expose one immutable snapshot from the retained final
+  // cascade/layout. Fetch it once per CSSStyleDeclaration proxy: reading a
+  // dozen properties must not trigger a dozen layout/native crossings.
+  let rendered = null;
+  if (typeof Deno.core.ops.op_computed_style === 'function' && el?._nid != null) {
+    try {
+      const raw = Deno.core.ops.op_computed_style(String(el._nid | 0));
+      rendered = raw ? JSON.parse(raw) : null;
+    } catch (e) {}
+  }
   // React virtualization libraries (react-window, tanstack-virtual,
   // react-virtuoso) all compute container dimensions via getComputedStyle.
   // The defaults table previously returned `auto` for width/height and
@@ -5679,10 +5924,13 @@ globalThis.getComputedStyle = (el) => {
 
   const lookup = (rawProp) => {
     if (typeof rawProp !== 'string') return '';
-    // Inline value first.
+    const kebab = rawProp.replace(/([A-Z])/g, '-$1').toLowerCase();
+    if (rendered && Object.prototype.hasOwnProperty.call(rendered, kebab))
+      return rendered[kebab];
+    // Non-render builds and properties outside the renderer snapshot retain
+    // the lightweight inline CSSOM behavior.
     const inlineVal = target.getPropertyValue ? target.getPropertyValue(rawProp) : '';
     if (inlineVal) return inlineVal;
-    const kebab = rawProp.replace(/([A-Z])/g, '-$1').toLowerCase();
     const dim = dimensionFor(kebab);
     if (dim != null) return dim;
     if (defaultsKebab[rawProp]) return defaultsKebab[rawProp];
@@ -5694,13 +5942,23 @@ globalThis.getComputedStyle = (el) => {
   return new Proxy(style, {
     get(_, prop) {
       if (prop === Symbol.toPrimitive || prop === Symbol.toStringTag) return undefined;
-      if (prop in target) return target[prop];
       if (prop === 'getPropertyValue') return (name) => lookup(name);
       if (prop === 'getPropertyPriority') return () => '';
       if (prop === 'item') return (i) => '';
       if (prop === 'length') return 0;
       if (prop === 'cssText') return '';
       if (prop === 'parentRule') return null;
+      // CSSStyleDeclaration's `has` trap intentionally reports every known
+      // CSS IDL property. Checking `prop in target` before this lookup therefore
+      // returned the empty inline declaration for e.g. computed.display and
+      // prevented every computed/default fallback below from running.
+      if (typeof prop === 'string'
+          && (_CSS_PROP_SET.has(prop)
+              || _CSS_PROP_SET.has(_cssKebabToCamel(prop))
+              || prop.includes('-'))) {
+        return lookup(prop);
+      }
+      if (prop in target) return target[prop];
       if (typeof prop === 'string') return lookup(prop);
       return undefined;
     },
