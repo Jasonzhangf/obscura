@@ -22,6 +22,7 @@ use crate::dom::layout_dom_with_web_fonts;
 
 const DEFAULT_RESOURCE_CACHE_ENTRIES: usize = 512;
 const DEFAULT_RESOURCE_CACHE_BYTES: usize = 64 * 1024 * 1024;
+const MISSING_RESOURCE_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Synchronous byte loader used by [`RenderResourceCache`]. The default
 /// implementation uses Obscura's pooled image agent; tests and embedding
@@ -106,12 +107,70 @@ impl RenderResourceCache {
         self.retained_bytes
     }
 
+    /// Resolve, fetch, and inspect one image through the exact byte cache used
+    /// by layout and paint. The JS image-element lifecycle calls this narrow
+    /// bridge so `complete`/`naturalWidth` and the eventual screenshot are
+    /// driven by one resource outcome instead of issuing an independent fetch.
+    ///
+    /// This intentionally accepts a plain `src`, not a DOM node: responsive
+    /// `picture`/`srcset` selection remains owned by `prepare_dom`.
+    pub fn image_metadata(
+        &mut self,
+        src: &str,
+        base_url: Option<&str>,
+    ) -> Option<(String, f32, f32)> {
+        let resolved_url = resolve_resource_url(src, base_url)?;
+        let bytes = fetch_bytes(&resolved_url, None, self)?;
+        let (width, height) = image_metadata_from_bytes(&bytes)?;
+        Some((resolved_url, width, height))
+    }
+
+    /// Inspect an image only when its renderer-cache outcome is already known.
+    /// `None` means no live cache entry (the caller may queue a load);
+    /// `Some(None)` means a retained load/decode failure; `Some(Some(...))`
+    /// means success. `data:` sources have no network entry and are cheap to
+    /// inspect directly.
+    pub fn cached_image_metadata(
+        &self,
+        src: &str,
+        base_url: Option<&str>,
+    ) -> Option<Option<(String, f32, f32)>> {
+        let resolved_url = resolve_resource_url(src, base_url)?;
+        if resolved_url.starts_with("data:") {
+            let mut scratch = RenderResourceCache::with_loader_and_limits(
+                |_url: &str| None,
+                0,
+                0,
+            );
+            return Some(
+                fetch_bytes(&resolved_url, None, &mut scratch)
+                    .and_then(|bytes| image_metadata_from_bytes(&bytes))
+                    .map(|(width, height)| (resolved_url, width, height)),
+            );
+        }
+        match self.entries.get(&resolved_url) {
+            Some(CachedResource::Bytes(bytes)) => Some(
+                image_metadata_from_bytes(bytes)
+                    .map(|(width, height)| (resolved_url, width, height)),
+            ),
+            Some(CachedResource::Missing(at))
+                if at.elapsed() < MISSING_RESOURCE_RETRY_AFTER =>
+            {
+                Some(None)
+            }
+            _ => None,
+        }
+    }
+
     fn get_or_load(&mut self, url: &str) -> Option<Arc<[u8]>> {
-        const MISSING_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
         if let Some(entry) = self.entries.get(url) {
             match entry {
                 CachedResource::Bytes(bytes) => return Some(Arc::clone(bytes)),
-                CachedResource::Missing(at) if at.elapsed() < MISSING_RETRY_AFTER => return None,
+                CachedResource::Missing(at)
+                    if at.elapsed() < MISSING_RESOURCE_RETRY_AFTER =>
+                {
+                    return None;
+                }
                 CachedResource::Missing(_) => {}
             }
         }
@@ -2511,6 +2570,16 @@ fn image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
         .ok()?
         .into_dimensions()
         .ok()
+}
+
+fn image_metadata_from_bytes(bytes: &[u8]) -> Option<(f32, f32)> {
+    let (width, height) = image_dimensions(bytes)
+        .map(|(width, height)| (width as f32, height as f32))
+        .or_else(|| svg_intrinsic(bytes))?;
+    if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
+        return None;
+    }
+    Some((width, height))
 }
 
 fn background_image_rect(

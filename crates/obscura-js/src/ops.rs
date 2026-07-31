@@ -2048,6 +2048,7 @@ pub fn build_extension() -> Extension {
     // probes with typeof before calling, so the op's absence is a clean fallback.
     #[cfg(feature = "render")]
     {
+        ops.push(op_image_metadata());
         ops.push(op_layout_geometry());
         ops.push(op_layout_metrics());
         ops.push(op_scroll_offset());
@@ -2100,6 +2101,70 @@ pub(crate) fn ensure_prepared_render(
         state.prepared_render = Some(prepared);
     }
     state.prepared_render.as_ref()
+}
+
+/// Probe one ordinary `<img src>` through the renderer's page-scoped resource
+/// cache. This is deliberately a synchronous render-only op: the current
+/// renderer loader is synchronous too, and sharing it is what guarantees that
+/// HTMLImageElement lifecycle state and the subsequent paint see the same
+/// success/failure and retained bytes.
+#[cfg(feature = "render")]
+#[op2]
+#[string]
+fn op_image_metadata(state: &OpState, nid: u32, cached_only: bool) -> String {
+    let shared = state.borrow::<SharedState>().clone();
+    let mut gs = shared.borrow_mut();
+    let node_id = NodeId::new(nid);
+    let src = gs.dom.as_ref().and_then(|dom| {
+        let node = dom.get_node(node_id)?;
+        let element = node.as_element()?;
+        if element.local.as_ref() != "img" {
+            return None;
+        }
+        node.get_attribute("src").map(str::to_string)
+    });
+    let Some(src) = src.filter(|src| !src.trim().is_empty()) else {
+        return serde_json::json!({ "ok": false, "currentSrc": "" }).to_string();
+    };
+    let base_url = document_base_url(&gs);
+    let metadata = if cached_only {
+        match gs
+            .render_resources
+            .cached_image_metadata(&src, base_url.as_deref())
+        {
+            None => {
+                return serde_json::json!({ "state": "pending" }).to_string();
+            }
+            Some(metadata) => metadata,
+        }
+    } else {
+        gs.render_resources
+            .image_metadata(&src, base_url.as_deref())
+    };
+    match metadata {
+        Some((current_src, width, height)) => serde_json::json!({
+            "state": "loaded",
+            "ok": true,
+            "currentSrc": current_src,
+            "width": width,
+            "height": height,
+        })
+        .to_string(),
+        None => {
+            let current_src = base_url
+                .as_deref()
+                .and_then(|base| url::Url::parse(base).ok())
+                .and_then(|base| base.join(&src).ok())
+                .map(|url| url.to_string())
+                .unwrap_or(src);
+            serde_json::json!({
+                "state": "error",
+                "ok": false,
+                "currentSrc": current_src,
+            })
+            .to_string()
+        }
+    }
 }
 
 #[cfg(feature = "render")]

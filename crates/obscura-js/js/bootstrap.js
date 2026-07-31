@@ -3880,6 +3880,249 @@ function _parseWebVttCues(src) {
   return cues;
 }
 
+function _imageEncodingError() {
+  return new DOMException("The source image cannot be decoded.", "EncodingError");
+}
+
+// HTMLImageElement is backed by the same retained resource cache used by
+// layout/paint. The render-only native op fetches and sniffs the ordinary
+// `src`; bootstrap owns only the observable request state and event timing.
+// Responsive candidate selection remains explicitly deferred to the renderer.
+class HTMLImageElement extends Element {
+  constructor(nid) {
+    super(nid);
+    this._imageRequest = 0;
+    this._imageQueued = false;
+    this._imageComplete = !this.getAttribute("src");
+    this._imageDecoded = false;
+    this._imageNaturalWidth = 0;
+    this._imageNaturalHeight = 0;
+    this._imageCurrentSrc = "";
+    this._imageDecodeWaiters = [];
+    // Parser images stay lazy until script observes their lifecycle or paint
+    // asks for the same cache entry. Inline handlers are observers too.
+    if (!this._imageComplete
+        && (this.hasAttribute("onload") || this.hasAttribute("onerror"))) {
+      this._queueImageRequest();
+    }
+  }
+
+  get src() {
+    const raw = this.getAttribute("src");
+    if (!raw) return "";
+    try { return new URL(raw, this.baseURI || globalThis.location?.href || "about:blank").href; }
+    catch (_error) { return raw; }
+  }
+  set src(value) { this.setAttribute("src", value); }
+
+  get currentSrc() {
+    this._refreshImageFromCache();
+    this._queueImageRequest();
+    return this._imageCurrentSrc;
+  }
+  get complete() {
+    this._refreshImageFromCache();
+    this._queueImageRequest();
+    return this._imageComplete;
+  }
+  get naturalWidth() {
+    this._refreshImageFromCache();
+    this._queueImageRequest();
+    return this._imageNaturalWidth;
+  }
+  get naturalHeight() {
+    this._refreshImageFromCache();
+    this._queueImageRequest();
+    return this._imageNaturalHeight;
+  }
+  get onload() { return this._imageOnload || null; }
+  set onload(value) {
+    this._imageOnload = typeof value === "function" ? value : null;
+    if (this._imageOnload) {
+      this._refreshImageFromCache();
+      this._queueImageRequest();
+    }
+  }
+  get onerror() { return this._imageOnerror || null; }
+  set onerror(value) {
+    this._imageOnerror = typeof value === "function" ? value : null;
+    if (this._imageOnerror) {
+      this._refreshImageFromCache();
+      this._queueImageRequest();
+    }
+  }
+
+  get width() {
+    const value = Number.parseInt(this.getAttribute("width") || "", 10);
+    return Number.isFinite(value) && value >= 0 ? value : this._imageNaturalWidth;
+  }
+  set width(value) { this.setAttribute("width", Math.max(0, Number(value) || 0)); }
+  get height() {
+    const value = Number.parseInt(this.getAttribute("height") || "", 10);
+    return Number.isFinite(value) && value >= 0 ? value : this._imageNaturalHeight;
+  }
+  set height(value) { this.setAttribute("height", Math.max(0, Number(value) || 0)); }
+
+  get srcset() { return this.getAttribute("srcset") || ""; }
+  set srcset(value) { this.setAttribute("srcset", value); }
+  get sizes() { return this.getAttribute("sizes") || ""; }
+  set sizes(value) { this.setAttribute("sizes", value); }
+  get loading() { return this.getAttribute("loading") || "eager"; }
+  set loading(value) { this.setAttribute("loading", value); }
+  get decoding() { return this.getAttribute("decoding") || "auto"; }
+  set decoding(value) { this.setAttribute("decoding", value); }
+  get fetchPriority() { return this.getAttribute("fetchpriority") || "auto"; }
+  set fetchPriority(value) { this.setAttribute("fetchpriority", value); }
+  get crossOrigin() { return this.getAttribute("crossorigin"); }
+  set crossOrigin(value) {
+    if (value === null) this.removeAttribute("crossorigin");
+    else this.setAttribute("crossorigin", value);
+  }
+
+  setAttribute(name, value) {
+    const normalized = String(name).toLowerCase();
+    super.setAttribute(name, value);
+    if (normalized === "src") this._imageSourceChanged();
+    else if ((normalized === "onload" || normalized === "onerror")
+        && !this._imageComplete) this._queueImageRequest();
+  }
+
+  removeAttribute(name) {
+    const normalized = String(name).toLowerCase();
+    super.removeAttribute(name);
+    if (normalized === "src") this._imageSourceChanged();
+  }
+
+  decode() {
+    this._refreshImageFromCache();
+    if (this._imageComplete) {
+      return this._imageDecoded
+        ? Promise.resolve()
+        : Promise.reject(_imageEncodingError());
+    }
+    this._queueImageRequest();
+    return new Promise((resolve, reject) => {
+      this._imageDecodeWaiters.push({ resolve, reject, request: this._imageRequest });
+    });
+  }
+
+  _imageSourceChanged() {
+    this._rejectImageDecodes();
+    this._imageRequest++;
+    this._imageQueued = false;
+    this._imageNaturalWidth = 0;
+    this._imageNaturalHeight = 0;
+    this._imageDecoded = false;
+    this._imageCurrentSrc = "";
+    this._imageComplete = !this.getAttribute("src");
+    if (!this._imageComplete) this._queueImageRequest();
+  }
+
+  _queueImageRequest() {
+    if (this._imageQueued || this._imageComplete) return;
+    this._imageQueued = true;
+    const request = this._imageRequest;
+    Promise.resolve().then(() => {
+      this._imageQueued = false;
+      if (request === this._imageRequest && !this._imageComplete) {
+        this._runImageRequest(request);
+      }
+    });
+  }
+
+  _runImageRequest(request) {
+    let metadata = null;
+    try {
+      const op = Deno.core.ops.op_image_metadata;
+      if (typeof op === "function") {
+        metadata = JSON.parse(op(this._nid >>> 0, false));
+      } else {
+        // Non-render builds have no authoritative resource cache. Preserve the
+        // old non-blocking compatibility behavior without issuing a duplicate
+        // network fetch: the request succeeds with unknown intrinsic size.
+        metadata = { ok: true, currentSrc: this.src, width: 0, height: 0 };
+      }
+    } catch (_error) {
+      metadata = { ok: false, currentSrc: this.src };
+    }
+    if (request !== this._imageRequest) return;
+    this._applyImageMetadata(metadata, request, true);
+  }
+
+  _refreshImageFromCache() {
+    if (this._imageComplete || !this.getAttribute("src")) return;
+    try {
+      const op = Deno.core.ops.op_image_metadata;
+      if (typeof op !== "function") return;
+      const metadata = JSON.parse(op(this._nid >>> 0, true));
+      if (!metadata || metadata.state === "pending") return;
+      this._applyImageMetadata(metadata, this._imageRequest, false);
+    } catch (_error) {}
+  }
+
+  _applyImageMetadata(metadata, request, dispatchEvent) {
+    if (request !== this._imageRequest) return;
+    this._imageComplete = true;
+    this._imageCurrentSrc = metadata && metadata.currentSrc
+      ? String(metadata.currentSrc)
+      : this.src;
+    const width = Number(metadata && metadata.width);
+    const height = Number(metadata && metadata.height);
+    const loaded = !!(metadata && metadata.ok)
+      && (typeof Deno.core.ops.op_image_metadata !== "function"
+        || (Number.isFinite(width) && width > 0 && Number.isFinite(height) && height > 0));
+    if (loaded) {
+      this._imageDecoded = true;
+      this._imageNaturalWidth = Number.isFinite(width) && width > 0 ? Math.round(width) : 0;
+      this._imageNaturalHeight = Number.isFinite(height) && height > 0 ? Math.round(height) : 0;
+      this._resolveImageDecodes(request);
+      if (dispatchEvent) {
+        try { this.dispatchEvent(new Event("load")); } catch (_error) {}
+      }
+    } else {
+      this._imageDecoded = false;
+      this._imageNaturalWidth = 0;
+      this._imageNaturalHeight = 0;
+      this._rejectImageDecodes(request);
+      if (dispatchEvent) {
+        try { this.dispatchEvent(new Event("error")); } catch (_error) {}
+      }
+    }
+  }
+
+  _resolveImageDecodes(request) {
+    const remaining = [];
+    for (const waiter of this._imageDecodeWaiters) {
+      if (waiter.request === request) waiter.resolve();
+      else remaining.push(waiter);
+    }
+    this._imageDecodeWaiters = remaining;
+  }
+
+  _rejectImageDecodes(request) {
+    const remaining = [];
+    for (const waiter of this._imageDecodeWaiters) {
+      if (request === undefined || waiter.request === request) {
+        waiter.reject(_imageEncodingError());
+      } else {
+        remaining.push(waiter);
+      }
+    }
+    this._imageDecodeWaiters = remaining;
+  }
+
+  addEventListener(type, callback, options) {
+    super.addEventListener(type, callback, options);
+    if ((String(type) === "load" || String(type) === "error") && callback) {
+      this._refreshImageFromCache();
+      this._queueImageRequest();
+    }
+  }
+}
+globalThis.HTMLImageElement = HTMLImageElement;
+_markNative(HTMLImageElement);
+_markNative(HTMLImageElement.prototype.decode);
+
 // Media elements need canPlayType for codec detection fingerprinting.
 // Values match Chrome 145 on Linux x86_64 without proprietary codecs.
 class HTMLMediaElement extends Element {
@@ -3959,6 +4202,7 @@ globalThis.VTTCue = VTTCue;
 function _elementClassFor(nid) {
   const tag = _domParse("tag_name", nid);
   if (tag === "FORM" && globalThis.HTMLFormElement) return globalThis.HTMLFormElement;
+  if (tag === "IMG") return HTMLImageElement;
   if (tag === "AUDIO") return HTMLAudioElement;
   if (tag === "VIDEO") return HTMLVideoElement;
   if (tag === "TRACK") return HTMLTrackElement;
@@ -7287,7 +7531,7 @@ globalThis.HTMLDivElement = Element;
 globalThis.HTMLSpanElement = Element;
 globalThis.HTMLParagraphElement = Element;
 globalThis.HTMLAnchorElement = Element;
-globalThis.HTMLImageElement = Element;
+globalThis.HTMLImageElement = HTMLImageElement;
 globalThis.HTMLInputElement = Element;
 globalThis.HTMLButtonElement = Element;
 globalThis.HTMLFormElement = class HTMLFormElement extends Element {
@@ -9472,39 +9716,10 @@ if (typeof Image === 'undefined') {
   // `new Image().style` was `undefined` and libraries that touch it on a
   // detached image threw (issue #350). Build a real element so `.style`,
   // attribute reflection, and event dispatch all come for free.
-  const _imgSrcDesc = Object.getOwnPropertyDescriptor(globalThis.HTMLImageElement.prototype, 'src');
   globalThis.Image = function Image(width, height) {
     const img = document.createElement('img');
-    img.onload = null; img.onerror = null;
-    img.complete = false; img.naturalWidth = 0; img.naturalHeight = 0;
-    img.width = width !== undefined ? (width >>> 0) : 0;
-    img.height = height !== undefined ? (height >>> 0) : 0;
-    // There is no real image decoder, so emulate a successful decode: assigning
-    // `.src` flips `complete` and fires `load` on a microtask-later tick. Lazy
-    // loaders and preloaders that create `new Image()`, set `.src`, and wait for
-    // `onload` (or addEventListener('load')) would hang forever otherwise.
-    // Anti-bot scripts (Booking.com, issue #394) pre-define a non-configurable
-    // own `src` on <img> elements; redefining it throws "Cannot redefine
-    // property: src" and kills the constructor. Skip the load emulation then:
-    // a page that owns `src` is instrumenting loads itself.
-    const ownSrc = Object.getOwnPropertyDescriptor(img, 'src');
-    if (!ownSrc || ownSrc.configurable) {
-      Object.defineProperty(img, 'src', {
-        configurable: true, enumerable: true,
-        get() { return _imgSrcDesc.get.call(img); },
-        set(v) {
-          _imgSrcDesc.set.call(img, v);
-          if (!img.getAttribute('src')) return;
-          img.complete = false;
-          setTimeout(function () {
-            img.complete = true;
-            img.naturalWidth = img.naturalWidth || img.width || 0;
-            img.naturalHeight = img.naturalHeight || img.height || 0;
-            try { img.dispatchEvent(new Event('load')); } catch (e) {}
-          }, 0);
-        },
-      });
-    }
+    if (width !== undefined) img.width = width >>> 0;
+    if (height !== undefined) img.height = height >>> 0;
     return img;
   };
   globalThis.Image.prototype = globalThis.HTMLImageElement.prototype;

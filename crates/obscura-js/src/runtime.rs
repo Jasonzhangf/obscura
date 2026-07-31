@@ -4218,6 +4218,243 @@ mod tests {
         assert_eq!(rt.evaluate("document.links.length").unwrap().as_f64().unwrap() as i64, 1);
     }
 
+    #[cfg(feature = "render")]
+    fn parser_image_runtime(
+        html: &str,
+        loader: impl obscura_render::RenderResourceLoader + 'static,
+    ) -> ObscuraJsRuntime {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html(html));
+        rt.set_url("http://example.com/page/index.html");
+        rt.state.borrow_mut().render_resources =
+            obscura_render::RenderResourceCache::with_loader(loader);
+        rt.run_page_init();
+        rt
+    }
+
+    #[cfg(feature = "render")]
+    fn two_by_three_png() -> Vec<u8> {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .decode(
+                "iVBORw0KGgoAAAANSUhEUgAAAAIAAAADCAYAAAC56t6B\
+                 AAAAFklEQVR4nGP8z8Dwn4GBgYGJAQrgDAAxOwIE7x6DkQAAAABJRU5ErkJggg=="
+                    .replace(char::is_whitespace, ""),
+            )
+            .unwrap()
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn parser_image_lifecycle_uses_shared_render_resource() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let loader_calls = calls.clone();
+        let png = two_by_three_png();
+        let mut rt = parser_image_runtime(
+            r#"<img id="hero" src="../assets/hero.png">"#,
+            move |_url: &str| {
+                loader_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Some(png.clone())
+            },
+        );
+        rt.execute_script(
+            "observe-parser-image",
+            r#"
+                globalThis.__imageEvents = [];
+                globalThis.__decodeState = "pending";
+                const image = document.getElementById("hero");
+                globalThis.__imageInitial = [
+                    image instanceof HTMLImageElement,
+                    image.complete,
+                    image.naturalWidth,
+                    image.naturalHeight
+                ];
+                image.addEventListener("load", () => __imageEvents.push("load"));
+                image.addEventListener("error", () => __imageEvents.push("error"));
+                image.decode().then(
+                    () => { __decodeState = "resolved"; },
+                    error => { __decodeState = error.name; }
+                );
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            rt.evaluate("__imageInitial").unwrap(),
+            serde_json::json!([true, false, 0, 0])
+        );
+
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate(
+                r#"[
+                    image.complete,
+                    image.naturalWidth,
+                    image.naturalHeight,
+                    image.currentSrc,
+                    __imageEvents,
+                    __decodeState
+                ]"#,
+            )
+            .unwrap(),
+            serde_json::json!([
+                true,
+                2,
+                3,
+                "http://example.com/assets/hero.png",
+                ["load"],
+                "resolved"
+            ])
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // A subsequent request for the same URL is served by the retained
+        // renderer bytes rather than calling the loader again.
+        rt.execute_script("reload-image", r#"image.src = "../assets/hero.png";"#)
+            .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn parser_image_failure_completes_and_rejects_decode() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let loader_calls = calls.clone();
+        let mut rt = parser_image_runtime(
+            r#"<img id="broken" src="missing.png">"#,
+            move |_url: &str| {
+                loader_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                None
+            },
+        );
+        rt.execute_script(
+            "observe-broken-image",
+            r#"
+                globalThis.__brokenEvents = [];
+                globalThis.__brokenDecode = "pending";
+                const broken = document.getElementById("broken");
+                broken.onload = () => __brokenEvents.push("load");
+                broken.onerror = () => __brokenEvents.push("error");
+                broken.decode().then(
+                    () => { __brokenDecode = "resolved"; },
+                    error => { __brokenDecode = error.name; }
+                );
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate(
+                "[broken.complete, broken.naturalWidth, broken.naturalHeight, \
+                  __brokenEvents, __brokenDecode]"
+            )
+            .unwrap(),
+            serde_json::json!([true, 0, 0, ["error"], "EncodingError"])
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn parser_image_first_getter_observes_prepare_seeded_cache_synchronously() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let loader_calls = calls.clone();
+        let png = two_by_three_png();
+        let mut rt = parser_image_runtime(
+            r#"<img id="cached" src="cached.png">"#,
+            move |_url: &str| {
+                loader_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Some(png.clone())
+            },
+        );
+        {
+            let mut state = rt.state.borrow_mut();
+            assert!(ensure_prepared_render(&mut state).is_some());
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Constructing the JS wrapper happens here, after prepare_dom loaded
+        // the resource. The first complete getter must see that cache hit
+        // immediately; it must not briefly regress to pending/zero.
+        assert_eq!(
+            rt.evaluate(
+                r#"(() => {
+                    const cached = document.getElementById("cached");
+                    return [
+                        cached.complete,
+                        cached.naturalWidth,
+                        cached.naturalHeight,
+                        cached.currentSrc
+                    ];
+                })()"#,
+            )
+            .unwrap(),
+            serde_json::json!([
+                true,
+                2,
+                3,
+                "http://example.com/page/cached.png"
+            ])
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn parser_image_source_replacement_cancels_queued_completion() {
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = requests.clone();
+        let first = two_by_three_png();
+        use base64::Engine as _;
+        let second = base64::engine::general_purpose::STANDARD
+            .decode(
+                "iVBORw0KGgoAAAANSUhEUgAAAAQAAAAFCAYAAABirU3b\
+                 AAAAFUlEQVR4nGNk+M/wnwEJMDGgATIEAKVaAgg/Jbt7AAAAAElFTkSuQmCC"
+                    .replace(char::is_whitespace, ""),
+            )
+            .unwrap();
+        let mut rt = parser_image_runtime(
+            r#"<img id="swap" src="old.png">"#,
+            move |url: &str| {
+                seen.lock().unwrap().push(url.to_string());
+                if url.ends_with("/new.png") {
+                    Some(second.clone())
+                } else {
+                    Some(first.clone())
+                }
+            },
+        );
+        rt.execute_script(
+            "replace-image-source",
+            r#"
+                globalThis.__swapEvents = [];
+                const swap = document.getElementById("swap");
+                swap.addEventListener("load", () => __swapEvents.push(swap.currentSrc));
+                swap.src = "new.png";
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate(
+                "[swap.complete, swap.naturalWidth, swap.naturalHeight, \
+                  swap.currentSrc, __swapEvents]"
+            )
+            .unwrap(),
+            serde_json::json!([
+                true,
+                4,
+                5,
+                "http://example.com/page/new.png",
+                ["http://example.com/page/new.png"]
+            ])
+        );
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec!["http://example.com/page/new.png".to_string()]
+        );
+    }
+
     /// Regression for #105: `HTMLFormElement` must expose `.elements` so
     /// frameworks that probe form field collections work.
     #[test]
