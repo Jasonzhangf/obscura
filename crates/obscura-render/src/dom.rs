@@ -382,9 +382,22 @@ impl DomLayout {
                 continue;
             };
             let (tx, ty) = self.translates.get(&id).copied().unwrap_or((0.0, 0.0));
+            // Sticky constraints are solved from the box's normal-flow
+            // position, before its own transform is painted. `translates`
+            // carries the accumulated transform chain, so remove exactly this
+            // frame's resolved translate while retaining every ancestor's.
+            let (own_tx, own_ty) = style
+                .transform_translate
+                .map(|(x, y)| {
+                    (
+                        resolve_translate(x, rect.width),
+                        resolve_translate(y, rect.height),
+                    )
+                })
+                .unwrap_or((0.0, 0.0));
             let normal = Rect {
-                x: rect.x + tx,
-                y: rect.y + ty,
+                x: rect.x + tx - own_tx,
+                y: rect.y + ty - own_ty,
                 ..rect
             };
 
@@ -8178,6 +8191,78 @@ mod tests {
             (sorted[0].1 - 40.0).abs() < 0.1 && (sorted[1].1 - 60.0).abs() < 0.1,
             "children heights should be 40 and 60, got {:?}",
             sorted
+        );
+    }
+
+    #[test]
+    fn sticky_normal_flow_excludes_own_pixel_and_percentage_translates() {
+        let tree = parse_html(
+            r#"<style>
+                html,body{margin:0}
+                #flow{width:300px;height:900px}
+                .spacer{height:100px}
+                .sticky{position:sticky;top:0}
+                #pixel{width:120px;height:40px;transform:translate(7px,-15px)}
+                #percent{width:120px;height:50px;transform:translateY(-110%)}
+            </style>
+            <div id="flow">
+              <div class="spacer"></div>
+              <div id="pixel" class="sticky"></div>
+              <div class="spacer"></div>
+              <div id="percent" class="sticky"></div>
+            </div>"#,
+        );
+        let laid = layout_dom(&tree, (400.0, 240.0));
+        let sticky = laid.root_sticky_layout(&tree, (400.0, 240.0));
+
+        for name in ["pixel", "percent"] {
+            let id = tree.get_element_by_id(name).unwrap();
+            let rect = laid.rects[&id];
+            let frame = sticky.frames.iter().find(|frame| frame.id == id).unwrap();
+            assert!(
+                (frame.normal.x - rect.x).abs() < 0.01
+                    && (frame.normal.y - rect.y).abs() < 0.01,
+                "{name} own transform must not alter its sticky normal position: \
+                 rect={rect:?} frame={frame:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sticky_normal_flow_retains_transformed_ancestor_coordinates() {
+        let tree = parse_html(
+            r#"<style>
+                html,body{margin:0}
+                #ancestor{
+                    width:300px;
+                    height:700px;
+                    transform:translate(25px,30px)
+                }
+                #spacer{height:100px}
+                #sticky{
+                    position:sticky;
+                    top:0;
+                    width:120px;
+                    height:40px;
+                    transform:translate(-5px,-20px)
+                }
+            </style>
+            <div id="ancestor">
+              <div id="spacer"></div>
+              <div id="sticky"></div>
+            </div>"#,
+        );
+        let laid = layout_dom(&tree, (400.0, 240.0));
+        let id = tree.get_element_by_id("sticky").unwrap();
+        let rect = laid.rects[&id];
+        let sticky = laid.root_sticky_layout(&tree, (400.0, 240.0));
+        let frame = sticky.frames.iter().find(|frame| frame.id == id).unwrap();
+
+        assert!(
+            (frame.normal.x - (rect.x + 25.0)).abs() < 0.01
+                && (frame.normal.y - (rect.y + 30.0)).abs() < 0.01,
+            "ancestor transform must remain in sticky constraint coordinates: \
+             rect={rect:?} frame={frame:?}"
         );
     }
 
