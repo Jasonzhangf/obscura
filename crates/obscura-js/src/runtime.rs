@@ -3195,6 +3195,43 @@ mod tests {
     }
 
     #[cfg(feature = "render")]
+    #[test]
+    fn root_overflow_clip_preserves_cssom_scroll_range() {
+        let dom = parse_html(
+            r#"<html style="margin:0;height:100%;overflow:hidden">
+                <body style="margin:0;height:100%;overflow:hidden">
+                    <main id="main" style="padding-top:48px">
+                        <div style="height:5000px"></div>
+                    </main>
+                </body>
+            </html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_viewport(900.0, 1000.0);
+        rt.run_page_init();
+
+        let result = rt
+            .evaluate(
+                r#"
+                const main = document.getElementById("main");
+                const before = main.getBoundingClientRect();
+                scrollTo(0, 99999);
+                const after = main.getBoundingClientRect();
+                return [
+                    before.height,
+                    document.documentElement.scrollHeight,
+                    document.body.scrollHeight,
+                    scrollY,
+                    after.top,
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([5048, 5048, 5048, 4048, -4048]));
+    }
+
+    #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
     async fn rendered_window_scroll_events_require_actual_movement() {
         let dom = parse_html(

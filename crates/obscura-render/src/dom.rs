@@ -285,25 +285,22 @@ impl DomLayout {
         let mut right = viewport.0.max(0.0);
         let mut bottom = viewport.1.max(0.0);
 
-        for (&id, rect) in &self.rects {
-            if fixed.contains(&id) {
-                continue;
-            }
-            let (tx, ty) = self.translates.get(&id).copied().unwrap_or((0.0, 0.0));
-            let mut painted = Rect {
-                x: rect.x + tx,
-                y: rect.y + ty,
-                width: rect.width,
-                height: rect.height,
-            };
-            if let Some(clip) = self.clip_rects.get(&id).copied().flatten() {
-                let Some(clipped) = painted.intersect(&clip) else {
-                    continue;
-                };
-                painted = clipped;
-            }
-            right = right.max(painted.x + painted.width);
-            bottom = bottom.max(painted.y + painted.height);
+        if let Some(root) = tree
+            .descendants(tree.document())
+            .into_iter()
+            .find(|id| tree.get_node(*id).is_some_and(|node| node.is_element()))
+        {
+            accumulate_scrolling_overflow(
+                tree,
+                root,
+                None,
+                &fixed,
+                &self.rects,
+                &self.styles,
+                &self.translates,
+                &mut right,
+                &mut bottom,
+            );
         }
 
         (right.ceil(), bottom.ceil())
@@ -455,6 +452,69 @@ impl DomLayout {
         }
 
         layout
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn accumulate_scrolling_overflow(
+    tree: &DomTree,
+    id: NodeId,
+    inherited_clip: Option<Rect>,
+    fixed: &HashSet<NodeId>,
+    rects: &HashMap<NodeId, Rect>,
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+    translates: &HashMap<NodeId, (f32, f32)>,
+    right: &mut f32,
+    bottom: &mut f32,
+) {
+    if fixed.contains(&id) {
+        return;
+    }
+
+    let translated = rects.get(&id).map(|rect| {
+        let (tx, ty) = translates.get(&id).copied().unwrap_or((0.0, 0.0));
+        Rect {
+            x: rect.x + tx,
+            y: rect.y + ty,
+            width: rect.width,
+            height: rect.height,
+        }
+    });
+    if let Some(overflow) = translated {
+        let visible = if let Some(clip) = inherited_clip {
+            overflow.intersect(&clip)
+        } else {
+            Some(overflow)
+        };
+        if let Some(overflow) = visible {
+            *right = right.max(overflow.x + overflow.width);
+            *bottom = bottom.max(overflow.y + overflow.height);
+        }
+    }
+
+    // Overflow propagated from html/body establishes the viewport clip for
+    // painting, but it does not truncate the root scrolling area's CSSOM
+    // overflow dimensions. Ordinary descendant overflow clips still bound
+    // their subtree's contribution.
+    let is_viewport_overflow_source = tree.get_node(id).is_some_and(|node| {
+        node.as_element()
+            .is_some_and(|element| matches!(element.local.as_ref(), "html" | "body"))
+    });
+    let child_clip = match (styles.get(&id), rects.get(&id)) {
+        (Some(style), Some(rect)) if style.overflow_hidden && !is_viewport_overflow_source => {
+            let (tx, ty) = translates.get(&id).copied().unwrap_or((0.0, 0.0));
+            let own = overflow_clip_rect(rect, style, tx, ty);
+            Some(match inherited_clip {
+                Some(clip) => clip.intersect(&own).unwrap_or(Rect::default()),
+                None => own,
+            })
+        }
+        _ => inherited_clip,
+    };
+    for child in tree.children(id) {
+        accumulate_scrolling_overflow(
+            tree, child, child_clip, fixed, rects, styles, translates, right, bottom,
+        );
     }
 }
 
@@ -8162,6 +8222,38 @@ mod tests {
                 laid.rects[&root]
             );
         }
+    }
+
+    #[test]
+    fn viewport_overflow_clip_does_not_truncate_root_scrolling_overflow() {
+        let tree = parse_html(
+            r#"<style>
+                html,body{margin:0;height:100%;overflow:hidden}
+                main{padding-top:48px}
+                #long{height:5000px}
+            </style><main id="main"><div id="long"></div></main>"#,
+        );
+        let laid = layout_dom(&tree, (900.0, 1000.0));
+        let main = laid.rects[&tree.get_element_by_id("main").unwrap()];
+        let content = laid.scrolling_content_size(&tree, (900.0, 1000.0));
+        assert!((main.height - 5048.0).abs() < 0.01, "{main:?}");
+        assert_eq!(content, (900.0, 5048.0));
+    }
+
+    #[test]
+    fn descendant_overflow_clip_still_bounds_root_scrolling_overflow() {
+        let tree = parse_html(
+            r#"<style>
+                html,body{margin:0}
+                #clip{height:100px;overflow:hidden}
+                #long{height:5000px}
+            </style><div id="clip"><div id="long"></div></div>"#,
+        );
+        let laid = layout_dom(&tree, (900.0, 1000.0));
+        assert_eq!(
+            laid.scrolling_content_size(&tree, (900.0, 1000.0)),
+            (900.0, 1000.0)
+        );
     }
 
     #[test]
