@@ -173,6 +173,9 @@ tar xzf obscura-aarch64-linux.tar.gz
 # Arch Linux (AUR)
 yay -S obscura-browser
 
+# NixOS
+nix-env -iA nixpkgs.obscura
+
 # macOS Apple Silicon
 curl -LO https://github.com/h4ckf0r0day/obscura/releases/latest/download/obscura-aarch64-macos.tar.gz
 tar xzf obscura-aarch64-macos.tar.gz
