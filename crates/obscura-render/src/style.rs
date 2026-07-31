@@ -554,20 +554,27 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                     | "contents"
             ) {
                 style.internal_flex_container = false;
+                style.is_table_box = false;
                 style.is_inline_block = false;
                 style.flow_root = false;
             }
             match value {
                 "none" => style.display = crate::Display::None,
                 "flex" => style.display = crate::Display::Flex,
-                "inline-flex" => style.display = crate::Display::Flex,
+                "inline-flex" => {
+                    style.display = crate::Display::Flex;
+                    style.is_inline_block = true;
+                }
                 "inline" => style.display = crate::Display::Inline,
                 "inline-block" => {
                     style.display = crate::Display::Inline;
                     style.is_inline_block = true;
                 }
                 "grid" => style.display = crate::Display::Grid,
-                "inline-grid" => style.display = crate::Display::Grid,
+                "inline-grid" => {
+                    style.display = crate::Display::Grid;
+                    style.is_inline_block = true;
+                }
                 "block" => style.display = crate::Display::Block,
                 "flow-root" => {
                     style.display = crate::Display::Block;
@@ -580,11 +587,13 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                 "table" => {
                     style.display = crate::Display::Block;
                     style.flow_root = true;
+                    style.is_table_box = true;
                 }
                 "inline-table" => {
                     style.display = crate::Display::Inline;
                     style.is_inline_block = true;
                     style.flow_root = true;
+                    style.is_table_box = true;
                 }
                 "contents" => {
                     // `display:contents` can override an earlier `display:none`
@@ -4481,11 +4490,17 @@ mod tests {
         let table = compute_style("div", Some("display:none; display:table"));
         assert_eq!(table.display, Display::Block);
         assert!(table.flow_root);
+        assert!(table.is_table_box);
 
         let inline_table = compute_style("div", Some("display:block; display:inline-table"));
         assert_eq!(inline_table.display, Display::Inline);
         assert!(inline_table.is_inline_block);
         assert!(inline_table.flow_root);
+        assert!(inline_table.is_table_box);
+
+        let reset_table = compute_style("div", Some("display:table; display:grid"));
+        assert_eq!(reset_table.display, Display::Grid);
+        assert!(!reset_table.is_table_box);
     }
 
     #[test]

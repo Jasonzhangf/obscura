@@ -222,6 +222,13 @@ pub struct LayoutStyle {
     /// layout such as table cells, rather than the computed CSS display.
     /// Descendants are not CSS flex items in these containers.
     pub internal_flex_container: bool,
+    /// The computed inner display is `table`.
+    ///
+    /// Taffy has no table display mode, so authored table boxes are represented
+    /// by block/grid-compatible layout styles. Keep this provenance for CSS
+    /// features such as container-query axis availability that depend on the
+    /// computed display rather than our internal layout approximation.
+    pub(crate) is_table_box: bool,
     /// The HTML UA sheet's vendor `text-align` behavior for `<center>`.
     /// Unlike ordinary `text-align:center`, it also centers fixed-width block
     /// descendants while leaving auto-width blocks fill-available.

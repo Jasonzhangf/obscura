@@ -791,6 +791,7 @@ fn cascade_walk(
     matcher: &mut obscura_dom::selector::Matcher,
     styles: &mut HashMap<NodeId, crate::LayoutStyle>,
     parent_props: &std::rc::Rc<HashMap<String, String>>,
+    container_evaluator: &mut Option<&mut crate::css::ContainerQueryEvaluator<'_>>,
     quirks_mode: bool,
     viewport: (f32, f32),
     inherited_cell_padding: Option<f32>,
@@ -883,21 +884,48 @@ fn cascade_walk(
             .get_attribute("class")
             .map(|c| c.split_whitespace().map(|s| s.to_string()).collect())
             .unwrap_or_default();
-        if let Some(m) = sheet.apply(
-            tree,
-            matcher,
-            id,
-            node_id,
-            &classes,
-            elem.local.as_ref(),
-            &mut style,
-            parent_props,
-            node.get_attribute("style"),
-        ) {
+        let effective_props = if let Some(evaluator) = container_evaluator.as_deref_mut() {
+            sheet.apply_with_container_queries(
+                tree,
+                matcher,
+                id,
+                node_id,
+                &classes,
+                elem.local.as_ref(),
+                &mut style,
+                parent_props,
+                node.get_attribute("style"),
+                evaluator,
+            )
+        } else {
+            sheet.apply(
+                tree,
+                matcher,
+                id,
+                node_id,
+                &classes,
+                elem.local.as_ref(),
+                &mut style,
+                parent_props,
+                node.get_attribute("style"),
+            )
+        };
+        if let Some(m) = effective_props {
             this_props = std::rc::Rc::new(m);
         }
         let (before_pseudo, after_pseudo) =
-            sheet.pseudo_styles(tree, matcher, id, &this_props, &style);
+            if let Some(evaluator) = container_evaluator.as_deref_mut() {
+                sheet.pseudo_styles_with_container_queries(
+                    tree,
+                    matcher,
+                    id,
+                    &this_props,
+                    &style,
+                    evaluator,
+                )
+            } else {
+                sheet.pseudo_styles(tree, matcher, id, &this_props, &style)
+            };
         style.before_content = before_pseudo
             .as_ref()
             .filter(|pseudo| pseudo.position != Some(taffy::Position::Absolute))
@@ -923,6 +951,7 @@ fn cascade_walk(
             matcher,
             styles,
             &this_props,
+            container_evaluator,
             quirks_mode,
             viewport,
             descendant_cell_padding,
@@ -972,12 +1001,63 @@ pub fn layout_dom_with_resources(
     layout_dom_with_web_fonts(tree, viewport, intrinsic, &fonts)
 }
 
+const CONTAINER_LAYOUT_SAFETY_LIMIT: usize = 512;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ContainerLayoutTermination {
+    NoQueries,
+    GeometryStable,
+    SignatureStable,
+    OscillationFallback,
+    PassCapFallback,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ContainerLayoutTelemetry {
+    passes: usize,
+    termination: ContainerLayoutTermination,
+    query: crate::css::ContainerQueryStats,
+}
+
+fn container_iteration_termination<T: PartialEq>(
+    geometry_stable: bool,
+    signature: &T,
+    previous_signature: Option<&T>,
+) -> Option<ContainerLayoutTermination> {
+    if geometry_stable {
+        Some(ContainerLayoutTermination::GeometryStable)
+    } else if previous_signature == Some(signature) {
+        Some(ContainerLayoutTermination::SignatureStable)
+    } else {
+        None
+    }
+}
+
 pub(crate) fn layout_dom_with_web_fonts(
     tree: &DomTree,
     viewport: (f32, f32),
     intrinsic: &HashMap<NodeId, (f32, f32)>,
     fonts: &[crate::inline::WebFont],
 ) -> DomLayout {
+    layout_dom_with_web_fonts_measured(tree, viewport, intrinsic, fonts).0
+}
+
+fn layout_dom_with_web_fonts_measured(
+    tree: &DomTree,
+    viewport: (f32, f32),
+    intrinsic: &HashMap<NodeId, (f32, f32)>,
+    fonts: &[crate::inline::WebFont],
+) -> (DomLayout, ContainerLayoutTelemetry) {
+    layout_dom_with_web_fonts_pass_limit(tree, viewport, intrinsic, fonts, None)
+}
+
+fn layout_dom_with_web_fonts_pass_limit(
+    tree: &DomTree,
+    viewport: (f32, f32),
+    intrinsic: &HashMap<NodeId, (f32, f32)>,
+    fonts: &[crate::inline::WebFont],
+    pass_limit: Option<usize>,
+) -> (DomLayout, ContainerLayoutTelemetry) {
     let timing = std::env::var("OBSCURA_RENDER_TIMING").is_ok();
 
     // Collect the text of every <style> block in document order.
@@ -996,10 +1076,170 @@ pub(crate) fn layout_dom_with_web_fonts(
     let sheet = crate::css::Stylesheet::parse_for_viewport(tree, &css_sources, viewport);
     let t_parse = t0.elapsed();
 
+    let (mut laid, _, mut query, mut cascade_time) = layout_dom_once(
+        tree,
+        viewport,
+        intrinsic,
+        fonts,
+        &sheet,
+        None,
+    );
+    if !sheet.has_container_queries() {
+        if timing {
+            let (r, i, c, l, u) = sheet.debug_stats();
+            eprintln!("[timing] parse+index={:?} cascade={:?} rules={} id_keys={} class_keys={} local_keys={} universal={} cq_passes=1 cq_termination=no-queries", t_parse, cascade_time, r, i, c, l, u);
+        }
+        return (
+            laid,
+            ContainerLayoutTelemetry {
+                passes: 1,
+                termination: ContainerLayoutTermination::NoQueries,
+                query,
+            },
+        );
+    }
+
+    let mut snapshot = container_snapshot(tree, &laid);
+    let mut previous_candidate: Option<(
+        DomLayout,
+        crate::css::ContainerDecisionSignature,
+    )> = None;
+    let mut seen_signatures = Vec::new();
+    let mut passes = 1;
+    let mut termination = ContainerLayoutTermination::PassCapFallback;
+    // Gecko permits at most one CQ-triggered update per container element in
+    // one flush and processes ancestors before descendants. Our whole-tree
+    // passes need the same order of growth: a chain can legitimately reveal
+    // one deeper query container per pass. Scale the useful bound with DOM
+    // ancestry and nested conditional depth, retaining a high safety limit
+    // against adversarial non-convergence. Hitting it is visible telemetry and
+    // uses the conservative fallback below, never a silently stale layout.
+    let max_dom_depth = tree
+        .descendants(tree.document())
+        .into_iter()
+        .filter(|id| tree.get_node(*id).is_some_and(|node| node.is_element()))
+        .map(|id| {
+            let mut depth = 0usize;
+            let mut cursor = Some(id);
+            while let Some(node) = cursor.and_then(|cursor| tree.get_node(cursor)) {
+                depth += usize::from(node.is_element());
+                cursor = node.parent;
+            }
+            depth
+        })
+        .max()
+        .unwrap_or(1);
+    let max_passes = pass_limit.unwrap_or_else(|| {
+        (max_dom_depth + sheet.container_condition_depth() + 2)
+            .clamp(4, CONTAINER_LAYOUT_SAFETY_LIMIT)
+    });
+    let mut needs_fallback = false;
+    for pass in 2..=max_passes {
+        let (next, signature, pass_query, pass_cascade) = layout_dom_once(
+            tree,
+            viewport,
+            intrinsic,
+            fonts,
+            &sheet,
+            Some(&snapshot),
+        );
+        passes = pass;
+        query.evaluations += pass_query.evaluations;
+        query.cache_hits += pass_query.cache_hits;
+        query.ancestor_steps += pass_query.ancestor_steps;
+        cascade_time += pass_cascade;
+        let next_snapshot = container_snapshot(tree, &next);
+        let signature = signature.expect("container pass must produce a signature");
+        if let Some(reason) = container_iteration_termination(
+            next_snapshot == snapshot,
+            &signature,
+            previous_candidate
+                .as_ref()
+                .map(|(_, signature)| signature),
+        ) {
+            termination = reason;
+            // Equal adjacent signatures prove that the *previous* candidate's
+            // applied decisions match an evaluation of its own final
+            // snapshot. Returning `next` here would be off by one and could
+            // expose styles evaluated against geometry it no longer has.
+            laid = if reason == ContainerLayoutTermination::SignatureStable {
+                previous_candidate
+                    .take()
+                    .expect("stable signature requires a previous candidate")
+                    .0
+            } else {
+                next
+            };
+            break;
+        }
+        if seen_signatures.contains(&signature) {
+            termination = ContainerLayoutTermination::OscillationFallback;
+            needs_fallback = true;
+            break;
+        }
+        seen_signatures.push(signature.clone());
+        previous_candidate = Some((next, signature));
+        snapshot = next_snapshot;
+        if pass == max_passes {
+            needs_fallback = true;
+        }
+    }
+
+    if needs_fallback {
+        // Author-controlled CSS must never crash rendering, but neither may
+        // we return a layout whose conditional declarations contradict the
+        // geometry used to choose them. Disable the unstable conditional
+        // rules for this render and expose the downgrade in telemetry.
+        let (fallback, _, fallback_query, fallback_cascade) = layout_dom_once(
+            tree,
+            viewport,
+            intrinsic,
+            fonts,
+            &sheet,
+            None,
+        );
+        laid = fallback;
+        passes += 1;
+        query.evaluations += fallback_query.evaluations;
+        query.cache_hits += fallback_query.cache_hits;
+        query.ancestor_steps += fallback_query.ancestor_steps;
+        cascade_time += fallback_cascade;
+    }
+
+    if timing {
+        let (r, i, c, l, u) = sheet.debug_stats();
+        eprintln!("[timing] parse+index={:?} cascade_total={:?} rules={} id_keys={} class_keys={} local_keys={} universal={} cq_passes={} cq_termination={:?} cq_evaluations={} cq_cache_hits={} cq_ancestor_steps={}", t_parse, cascade_time, r, i, c, l, u, passes, termination, query.evaluations, query.cache_hits, query.ancestor_steps);
+    }
+    (
+        laid,
+        ContainerLayoutTelemetry {
+            passes,
+            termination,
+            query,
+        },
+    )
+}
+
+fn layout_dom_once(
+    tree: &DomTree,
+    viewport: (f32, f32),
+    intrinsic: &HashMap<NodeId, (f32, f32)>,
+    fonts: &[crate::inline::WebFont],
+    sheet: &crate::css::Stylesheet,
+    snapshot: Option<&crate::css::ContainerSnapshot>,
+) -> (
+    DomLayout,
+    Option<crate::css::ContainerDecisionSignature>,
+    crate::css::ContainerQueryStats,
+    std::time::Duration,
+) {
     let t1 = std::time::Instant::now();
     let mut matcher = tree.matcher();
     let mut styles: HashMap<NodeId, crate::LayoutStyle> = HashMap::new();
     let root_props = std::rc::Rc::new(HashMap::new());
+    let mut evaluator =
+        snapshot.map(|snapshot| crate::css::ContainerQueryEvaluator::new(tree, snapshot));
+    let mut evaluator_ref = evaluator.as_mut();
     // A real preorder walk (not a flat descendants() scan) so the matcher's
     // ancestor bloom filter tracks the current path: push before recursing
     // into children, pop on the way back out. This is what lets descendant
@@ -1020,15 +1260,20 @@ pub(crate) fn layout_dom_with_web_fonts(
         &mut matcher,
         &mut styles,
         &root_props,
+        &mut evaluator_ref,
         quirks_mode,
         viewport,
         None,
         false,
     );
-    if timing {
-        let (r, i, c, l, u) = sheet.debug_stats();
-        eprintln!("[timing] parse+index={:?} cascade={:?} rules={} id_keys={} class_keys={} local_keys={} universal={}", t_parse, t1.elapsed(), r, i, c, l, u);
-    }
+    let cascade_time = t1.elapsed();
+    let (signature, query_stats) = evaluator.map_or_else(
+        || (None, crate::css::ContainerQueryStats::default()),
+        |evaluator| {
+            let (signature, stats) = evaluator.finish();
+            (Some(signature), stats)
+        },
+    );
     grow_trailing_auto_cells(tree, &mut styles);
 
     // The leaf context is the index of a cosmic-text inline formatting
@@ -2689,20 +2934,90 @@ pub(crate) fn layout_dom_with_web_fonts(
         })
         .collect();
 
-    DomLayout {
-        rects,
-        styles,
-        clip_rects,
-        translates,
-        text_runs,
-        #[cfg(feature = "paint")]
-        text_engine: engine,
-        #[cfg(feature = "paint")]
-        ifc_items: ifc_items.whole,
-        #[cfg(feature = "paint")]
-        run_ifc_items: ifc_items.runs,
-        generated_boxes,
+    (
+        DomLayout {
+            rects,
+            styles,
+            clip_rects,
+            translates,
+            text_runs,
+            #[cfg(feature = "paint")]
+            text_engine: engine,
+            #[cfg(feature = "paint")]
+            ifc_items: ifc_items.whole,
+            #[cfg(feature = "paint")]
+            run_ifc_items: ifc_items.runs,
+            generated_boxes,
+        },
+        signature,
+        query_stats,
+        cascade_time,
+    )
+}
+
+fn container_snapshot(
+    tree: &DomTree,
+    layout: &DomLayout,
+) -> crate::css::ContainerSnapshot {
+    let root_font_size = tree
+        .descendants(tree.document())
+        .into_iter()
+        .find(|id| tree.get_node(*id).is_some_and(|node| node.is_element()))
+        .and_then(|id| layout.styles.get(&id))
+        .and_then(|style| style.font_size)
+        .filter(|size| size.is_finite() && *size > 0.0)
+        .unwrap_or(16.0);
+    let mut snapshot = crate::css::ContainerSnapshot {
+        root_font_size,
+        ..Default::default()
+    };
+    for (&id, style) in &layout.styles {
+        let available_type = if style.internal_flex_container || style.is_table_box {
+            crate::ContainerType::Normal
+        } else {
+            effective_container_type(style)
+        };
+        if (style.container_type == crate::ContainerType::Normal
+            && style.container_names.is_empty())
+            || style.display == crate::Display::None
+            || style.display_contents
+        {
+            continue;
+        }
+        let rect = layout.rects.get(&id);
+        // An inline box that computes to `container-type` is still the
+        // nearest matching query container even when size containment cannot
+        // apply to it. Inline layout may flatten that box and omit a DOM rect,
+        // but dropping it from the snapshot would incorrectly let the query
+        // fall through to a farther ancestor. Its queried axes are
+        // unavailable, so the placeholder geometry is intentionally unused.
+        if rect.is_none() && available_type != crate::ContainerType::Normal {
+            continue;
+        }
+        let horizontal_edges =
+            style.border.left + style.border.right + style.padding.left + style.padding.right;
+        let vertical_edges =
+            style.border.top + style.border.bottom + style.padding.top + style.padding.bottom;
+        snapshot.boxes.insert(
+            id,
+            crate::css::ContainerBox {
+                container_type: style.container_type,
+                available_type,
+                names: style.container_names.clone(),
+                content_width: rect
+                    .map(|rect| (rect.width - horizontal_edges).max(0.0))
+                    .unwrap_or(0.0),
+                content_height: rect
+                    .map(|rect| (rect.height - vertical_edges).max(0.0))
+                    .unwrap_or(0.0),
+                font_size: style
+                    .font_size
+                    .filter(|size| size.is_finite() && *size > 0.0)
+                    .unwrap_or(16.0),
+            },
+        );
     }
+    snapshot
 }
 
 /// HTML table auto-layout approximation: for each `<tr>`, the last `<td>`/
@@ -5034,6 +5349,129 @@ fn build_table(
     Some(table_node)
 }
 
+/// Effective size-query containment for this generated box.
+///
+/// CSS size containment has no effect on a non-atomic inline box. Keeping the
+/// check centralized also prevents such an inline from being exposed as a
+/// size-query container by `container_snapshot`.
+fn effective_container_type(style: &crate::LayoutStyle) -> crate::ContainerType {
+    if style.display == crate::Display::Inline && !style.is_inline_block {
+        crate::ContainerType::Normal
+    } else {
+        style.container_type
+    }
+}
+
+/// Does this auto inline-size use shrink-to-fit/content sizing rather than
+/// filling a definite containing block?
+fn container_auto_inline_size_is_intrinsic(
+    tree: &DomTree,
+    id: NodeId,
+    style: &crate::LayoutStyle,
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+) -> bool {
+    if style.is_inline_block || style.float.is_some() {
+        return true;
+    }
+    if matches!(style.position, Some(taffy::Position::Absolute)) {
+        // An absolutely positioned auto width is fill-available only when
+        // both inline insets are definite.
+        return style.inset[1].is_none() || style.inset[3].is_none();
+    }
+
+    let mut parent = tree.get_node(id).and_then(|node| node.parent);
+    let parent_style = loop {
+        let Some(parent_id) = parent else { return false };
+        let Some(parent_style) = styles.get(&parent_id) else {
+            return false;
+        };
+        if parent_style.display_contents {
+            parent = tree.get_node(parent_id).and_then(|node| node.parent);
+            continue;
+        }
+        break parent_style;
+    };
+    match parent_style.display {
+        crate::Display::Flex => {
+            let row = !matches!(
+                parent_style.flex_direction,
+                Some(
+                    taffy::FlexDirection::Column
+                        | taffy::FlexDirection::ColumnReverse
+                )
+            );
+            if row {
+                true
+            } else {
+                style
+                    .align_self
+                    .unwrap_or(
+                        parent_style
+                            .align_items
+                            .unwrap_or(taffy::AlignItems::STRETCH),
+                    )
+                    != taffy::AlignSelf::STRETCH
+            }
+        }
+        crate::Display::Grid => {
+            style
+                .justify_self
+                .unwrap_or(
+                    parent_style
+                        .justify_items
+                        .unwrap_or(taffy::JustifyItems::STRETCH),
+                )
+                != taffy::AlignSelf::STRETCH
+        }
+        crate::Display::Inline => true,
+        _ => false,
+    }
+}
+
+/// Apply the used-size part of `container-type`'s implicit size containment.
+///
+/// The default contain-intrinsic-size is zero. Fill-available block boxes keep
+/// their normal auto inline size, which is already descendant-independent.
+/// Shrink-to-fit boxes instead receive a zero intrinsic inline size, and a
+/// `size` container with auto block-size receives a zero intrinsic block size.
+/// Descendants remain in the layout tree and may visibly overflow; size
+/// containment is not paint containment and must not clip them.
+fn apply_container_size_containment(
+    tree: &DomTree,
+    id: NodeId,
+    style: &crate::LayoutStyle,
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+    taffy_style: &mut taffy::Style,
+) {
+    let kind = effective_container_type(style);
+    if kind == crate::ContainerType::Normal {
+        return;
+    }
+
+    if matches!(style.min_width, crate::Dimension::Auto) {
+        taffy_style.min_size.width = taffy::Dimension::length(0.0);
+    }
+    let ratio_transfers_inline_size =
+        style.aspect_ratio.is_some() && !matches!(style.height, crate::Dimension::Auto);
+    if matches!(style.width, crate::Dimension::Auto)
+        && !ratio_transfers_inline_size
+        && container_auto_inline_size_is_intrinsic(tree, id, style, styles)
+    {
+        taffy_style.size.width = taffy::Dimension::length(0.0);
+    }
+
+    if kind == crate::ContainerType::Size {
+        if matches!(style.min_height, crate::Dimension::Auto) {
+            taffy_style.min_size.height = taffy::Dimension::length(0.0);
+        }
+        let ratio_transfers_block_size =
+            style.aspect_ratio.is_some() && !matches!(style.width, crate::Dimension::Auto);
+        if matches!(style.height, crate::Dimension::Auto) && !ratio_transfers_block_size {
+            taffy_style.size.height = taffy::Dimension::length(0.0);
+        }
+    }
+}
+
 fn build(
     tree: &DomTree,
     id: NodeId,
@@ -5062,6 +5500,7 @@ fn build(
     }
 
     let mut taffy_style = to_taffy_style(style);
+    apply_container_size_containment(tree, id, style, styles, &mut taffy_style);
 
     // A non-stretched flex item in a column flex container uses fit-content
     // for its auto inline size. In a nested flex layout taffy can retain the
@@ -6365,6 +6804,7 @@ fn max_definite_descendant_width(tree: &DomTree, id: NodeId, styles: &HashMap<No
 
 fn establishes_block_formatting_context(style: &crate::LayoutStyle) -> bool {
     matches!(style.display, crate::Display::Flex | crate::Display::Grid)
+        || effective_container_type(style) != crate::ContainerType::Normal
         || style.flow_root
         || style.overflow_hidden
         || style.is_inline_block
@@ -6936,6 +7376,343 @@ mod tests {
             "children heights should be 40 and 60, got {:?}",
             sorted
         );
+    }
+
+    #[test]
+    fn container_query_uses_final_content_box_geometry() {
+        let tree = parse_html(
+            r#"<html><head><style>
+                #container {
+                    box-sizing:border-box;
+                    container-type:inline-size;
+                    width:500px;
+                    padding:20px;
+                    border:10px solid;
+                }
+                #target { width:1px; height:1px }
+                @container (width >= 440px) { #target { width:44px } }
+                @container (width > 499px) { #target { width:50px } }
+            </style></head><body>
+                <div id="container"><div id="target"></div></div>
+            </body></html>"#,
+        );
+        let (laid, telemetry) =
+            layout_dom_with_web_fonts_measured(&tree, (1280.0, 720.0), &HashMap::new(), &[]);
+        let container = tree.get_element_by_id("container").unwrap();
+        let target = tree.get_element_by_id("target").unwrap();
+        assert!((laid.rects[&container].width - 500.0).abs() < 0.1);
+        assert_eq!(laid.styles[&target].width, crate::Dimension::Px(44.0));
+        assert_eq!(telemetry.passes, 2);
+        assert_eq!(
+            telemetry.termination,
+            ContainerLayoutTermination::GeometryStable
+        );
+    }
+
+    #[test]
+    fn container_query_named_and_unnamed_lookup_choose_different_ancestors() {
+        let tree = parse_html(
+            r#"<html><head><style>
+                #outer { container: shell / inline-size; width:600px }
+                #inner { container: other / inline-size; width:300px }
+                #target { width:1px; height:1px }
+                @container shell (min-width:500px) { #target { width:11px } }
+                @container (min-width:500px) { #target { height:22px } }
+            </style></head><body>
+                <div id="outer"><div id="inner"><div id="target"></div></div></div>
+            </body></html>"#,
+        );
+        let laid = layout_dom(&tree, (1280.0, 720.0));
+        let target = tree.get_element_by_id("target").unwrap();
+        assert_eq!(laid.styles[&target].width, crate::Dimension::Px(11.0));
+        assert_eq!(laid.styles[&target].height, crate::Dimension::Px(1.0));
+    }
+
+    #[test]
+    fn nested_container_queries_select_independent_ancestors() {
+        let tree = parse_html(
+            r#"<html><head><style>
+                #outer { container: outer / inline-size; width:600px }
+                #inner { container: inner / inline-size; width:200px }
+                #target { width:1px }
+                @container outer (min-width:500px) {
+                    @container inner (min-width:200px) {
+                        #target { width:19px }
+                    }
+                }
+            </style></head><body>
+                <div id="outer"><div id="inner"><div id="target"></div></div></div>
+            </body></html>"#,
+        );
+        let laid = layout_dom(&tree, (1280.0, 720.0));
+        let target = tree.get_element_by_id("target").unwrap();
+        assert_eq!(laid.styles[&target].width, crate::Dimension::Px(19.0));
+    }
+
+    #[test]
+    fn container_query_pseudo_can_select_its_originating_element() {
+        let tree = parse_html(
+            r#"<html><head><style>
+                #container { container-type:inline-size; width:300px }
+                @container (min-width:300px) {
+                    #container::before { content:"active"; display:block }
+                }
+            </style></head><body><div id="container"></div></body></html>"#,
+        );
+        let laid = layout_dom(&tree, (1280.0, 720.0));
+        let container = tree.get_element_by_id("container").unwrap();
+        assert_eq!(
+            laid.styles[&container]
+                .before_pseudo
+                .as_ref()
+                .and_then(|pseudo| pseudo.before_content.as_deref()),
+            Some("active")
+        );
+    }
+
+    #[test]
+    fn container_type_zeroes_shrink_to_fit_inline_intrinsic_widths() {
+        let tree = parse_html(
+            r#"<style>
+                html,body{margin:0}
+                #host{width:600px}
+                .container{container-type:inline-size}
+                .wide{width:240px;height:30px}
+                #inline-block{display:inline-block}
+                #inline-flex{display:inline-flex}
+                #inline-grid{display:inline-grid}
+            </style>
+            <div id="host">
+              <div id="inline-block" class="container"><div class="wide"></div></div>
+              <div id="inline-flex" class="container"><div class="wide"></div></div>
+              <div id="inline-grid" class="container"><div class="wide"></div></div>
+            </div>"#,
+        );
+        let laid = layout_dom(&tree, (600.0, 300.0));
+        for name in ["inline-block", "inline-flex", "inline-grid"] {
+            let id = tree.get_element_by_id(name).unwrap();
+            let rect = laid.rects[&id];
+            assert!(
+                rect.width.abs() < 0.01,
+                "{name} descendants leaked into contained intrinsic width: {rect:?}"
+            );
+            assert!(
+                rect.height >= 29.9,
+                "inline-size containment must retain content-driven block size: {rect:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn size_container_auto_block_size_ignores_descendants() {
+        let tree = parse_html(
+            r#"<style>
+                html,body{margin:0}
+                .container{width:200px}
+                .child{height:80px}
+                #inline-only{container-type:inline-size}
+                #both{container-type:size}
+            </style>
+            <div id="inline-only" class="container"><div class="child"></div></div>
+            <div id="both" class="container"><div class="child"></div></div>"#,
+        );
+        let laid = layout_dom(&tree, (600.0, 300.0));
+        let inline_only = laid.rects[&tree.get_element_by_id("inline-only").unwrap()];
+        let both = laid.rects[&tree.get_element_by_id("both").unwrap()];
+        assert!((inline_only.height - 80.0).abs() < 0.01, "{inline_only:?}");
+        assert!(
+            both.height.abs() < 0.01,
+            "size containment must use the zero contain-intrinsic block size: {both:?}"
+        );
+    }
+
+    #[test]
+    fn container_type_establishes_a_float_containing_formatting_context() {
+        let tree = parse_html(
+            r#"<style>
+                html,body{margin:0}
+                #container{container-type:inline-size;width:200px}
+                #float{float:left;width:50px;height:40px}
+            </style>
+            <div id="container"><div id="float"></div></div>"#,
+        );
+        let laid = layout_dom(&tree, (600.0, 200.0));
+        let container = laid.rects[&tree.get_element_by_id("container").unwrap()];
+        assert!(
+            (container.height - 40.0).abs() < 0.01,
+            "query container must contain its descendant float: {container:?}"
+        );
+    }
+
+    #[test]
+    fn ineligible_nearest_inline_container_does_not_fall_through() {
+        let tree = parse_html(
+            r#"<style>
+                #outer{container-type:inline-size;width:500px}
+                #inner{display:inline;container-type:inline-size}
+                #target{width:1px}
+                @container (min-width:400px){#target{width:99px}}
+            </style>
+            <div id="outer"><span id="inner"><span id="target"></span></span></div>"#,
+        );
+        let laid = layout_dom(&tree, (600.0, 200.0));
+        let target = tree.get_element_by_id("target").unwrap();
+        assert_eq!(
+            laid.styles[&target].width,
+            crate::Dimension::Px(1.0),
+            "the unavailable nearest query axis must be unknown, not select the outer container"
+        );
+    }
+
+    #[test]
+    fn ineligible_nearest_table_container_does_not_fall_through() {
+        let tree = parse_html(
+            r#"<style>
+                #outer{container-type:inline-size;width:500px}
+                #inner{display:table;container-type:inline-size;width:300px}
+                #target{width:1px}
+                @container (min-width:400px){#target{width:99px}}
+            </style>
+            <div id="outer"><div id="inner"><div id="target"></div></div></div>"#,
+        );
+        let laid = layout_dom(&tree, (600.0, 200.0));
+        let inner = tree.get_element_by_id("inner").unwrap();
+        let target = tree.get_element_by_id("target").unwrap();
+        assert!(
+            laid.styles[&inner].is_table_box,
+            "the internal block approximation lost authored table provenance"
+        );
+        assert_eq!(
+            laid.styles[&target].width,
+            crate::Dimension::Px(1.0),
+            "an unavailable nearest table query axis must not fall through to the outer container"
+        );
+    }
+
+    #[test]
+    fn formerly_oscillating_inline_container_settles_consistently() {
+        let tree = parse_html(
+            r#"<style>
+                #container{display:inline-block;container-type:inline-size}
+                #child{width:200px;height:10px}
+                @container (min-width:100px){#child{width:50px}}
+            </style>
+            <div id="container"><div id="child"></div></div>"#,
+        );
+        let (laid, telemetry) =
+            layout_dom_with_web_fonts_measured(&tree, (600.0, 200.0), &HashMap::new(), &[]);
+        let container = laid.rects[&tree.get_element_by_id("container").unwrap()];
+        let child = tree.get_element_by_id("child").unwrap();
+        assert!(container.width.abs() < 0.01, "{container:?}");
+        assert_eq!(laid.styles[&child].width, crate::Dimension::Px(200.0));
+        assert!(matches!(
+            telemetry.termination,
+            ContainerLayoutTermination::GeometryStable
+                | ContainerLayoutTermination::SignatureStable
+        ));
+    }
+
+    #[test]
+    fn pass_cap_uses_visible_conservative_fallback_without_panicking() {
+        let tree = parse_html(
+            r#"<style>
+                #c0{container:c0/inline-size;width:100px}
+                #target{width:1px}
+                @container c0 (min-width:100px){
+                    #c1{container:c1/inline-size;width:100px}
+                }
+                @container c1 (min-width:100px){#target{width:99px}}
+            </style>
+            <div id="c0"><div id="c1"><div id="target"></div></div></div>"#,
+        );
+        let (laid, telemetry) = layout_dom_with_web_fonts_pass_limit(
+            &tree,
+            (600.0, 200.0),
+            &HashMap::new(),
+            &[],
+            Some(2),
+        );
+        let target = tree.get_element_by_id("target").unwrap();
+        assert_eq!(laid.styles[&target].width, crate::Dimension::Px(1.0));
+        assert_eq!(
+            telemetry.termination,
+            ContainerLayoutTermination::PassCapFallback
+        );
+        assert_eq!(telemetry.passes, 3);
+    }
+
+    #[test]
+    fn ten_level_container_activation_propagates_without_fixed_pass_truncation() {
+        let mut css = String::from(
+            "#c0{container:c0/inline-size;width:100px}#target{width:1px}",
+        );
+        for level in 0..10 {
+            css.push_str(&format!(
+                "@container c{level} (min-width:100px){{#c{}{{container:c{}/inline-size;width:100px}}}}",
+                level + 1,
+                level + 1
+            ));
+        }
+        css.push_str(
+            "@container c10 (min-width:100px){#target{width:77px}}",
+        );
+        let mut body = String::new();
+        for level in 0..=10 {
+            body.push_str(&format!("<div id=\"c{level}\">"));
+        }
+        body.push_str("<div id=\"target\"></div>");
+        for _ in 0..=10 {
+            body.push_str("</div>");
+        }
+        let tree = parse_html(&format!("<style>{css}</style>{body}"));
+        let (laid, telemetry) =
+            layout_dom_with_web_fonts_measured(&tree, (800.0, 600.0), &HashMap::new(), &[]);
+        let target = tree.get_element_by_id("target").unwrap();
+        assert_eq!(laid.styles[&target].width, crate::Dimension::Px(77.0));
+        assert!(
+            telemetry.passes > 8,
+            "deep propagation unexpectedly truncated: {telemetry:?}"
+        );
+        assert!(!matches!(
+            telemetry.termination,
+            ContainerLayoutTermination::PassCapFallback
+                | ContainerLayoutTermination::OscillationFallback
+        ));
+    }
+
+    #[test]
+    fn layout_without_container_queries_keeps_one_pass_fast_path() {
+        let tree = parse_html(
+            r#"<html><head><style>#target{width:25px}</style></head>
+               <body><div id="target"></div></body></html>"#,
+        );
+        let (_, telemetry) =
+            layout_dom_with_web_fonts_measured(&tree, (800.0, 600.0), &HashMap::new(), &[]);
+        assert_eq!(
+            telemetry,
+            ContainerLayoutTelemetry {
+                passes: 1,
+                termination: ContainerLayoutTermination::NoQueries,
+                query: crate::css::ContainerQueryStats::default(),
+            }
+        );
+    }
+
+    #[test]
+    fn container_convergence_classifies_self_consistent_stability() {
+        assert_eq!(
+            container_iteration_termination(true, &3, Some(&2)),
+            Some(ContainerLayoutTermination::GeometryStable)
+        );
+        assert_eq!(
+            container_iteration_termination(false, &3, Some(&3)),
+            Some(ContainerLayoutTermination::SignatureStable)
+        );
+        assert_eq!(
+            container_iteration_termination(false, &3, Some(&2)),
+            None
+        );
+        assert_eq!(CONTAINER_LAYOUT_SAFETY_LIMIT, 512);
     }
 
     #[test]

@@ -13,7 +13,7 @@ use std::collections::HashMap;
 
 use crate::LayoutStyle;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 struct ContainerConditionId(u32);
 
 impl ContainerConditionId {
@@ -37,16 +37,31 @@ struct ContainerQuery {
 #[derive(Clone, Debug, PartialEq)]
 enum ContainerQueryExpr {
     Feature(ContainerSizeFeature),
+    /// Syntactically valid future/general-enclosed syntax has Kleene
+    /// `unknown` truth. Retaining it prevents one unknown comma arm from
+    /// discarding supported alternatives in the same `@container` rule.
+    Unknown,
     Not(Box<ContainerQueryExpr>),
     And(Vec<ContainerQueryExpr>),
     Or(Vec<ContainerQueryExpr>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ContainerQueryAxis { Width, InlineSize }
+enum ContainerQueryAxis {
+    Width,
+    Height,
+    InlineSize,
+    BlockSize,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ContainerQueryComparison { Min, Max }
+enum ContainerQueryComparison {
+    Min,
+    Max,
+    GreaterThan,
+    LessThan,
+    Equal,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct ContainerSizeFeature {
@@ -81,6 +96,373 @@ struct PseudoRule {
     container_condition_id: ContainerConditionId,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct ContainerBox {
+    pub(crate) container_type: crate::ContainerType,
+    /// Axes on which size containment actually applies to the generated box.
+    /// This can be `Normal` even when computed `container-type` is non-normal
+    /// (for example a non-atomic inline or an internal table box).
+    pub(crate) available_type: crate::ContainerType,
+    pub(crate) names: Vec<String>,
+    pub(crate) content_width: f32,
+    pub(crate) content_height: f32,
+    pub(crate) font_size: f32,
+}
+
+impl PartialEq for ContainerBox {
+    fn eq(&self, other: &Self) -> bool {
+        if self.container_type != other.container_type
+            || self.available_type != other.available_type
+            || self.names != other.names
+        {
+            return false;
+        }
+        match self.available_type {
+            crate::ContainerType::Normal => true,
+            crate::ContainerType::InlineSize => {
+                self.content_width == other.content_width
+                    && self.font_size == other.font_size
+            }
+            crate::ContainerType::Size => {
+                self.content_width == other.content_width
+                    && self.content_height == other.content_height
+                    && self.font_size == other.font_size
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct ContainerSnapshot {
+    pub(crate) boxes: HashMap<NodeId, ContainerBox>,
+    pub(crate) root_font_size: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ContainerQueryTruth {
+    True,
+    False,
+    Unknown,
+}
+
+impl ContainerQueryTruth {
+    fn and(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::False, _) | (_, Self::False) => Self::False,
+            (Self::True, Self::True) => Self::True,
+            _ => Self::Unknown,
+        }
+    }
+
+    fn or(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::True, _) | (_, Self::True) => Self::True,
+            (Self::False, Self::False) => Self::False,
+            _ => Self::Unknown,
+        }
+    }
+
+    fn not(self) -> Self {
+        match self {
+            Self::True => Self::False,
+            Self::False => Self::True,
+            Self::Unknown => Self::Unknown,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum ContainerQuerySubjectKind {
+    Element,
+    OriginatingPseudo,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct ContainerQueryCacheKey {
+    subject: NodeId,
+    condition: ContainerConditionId,
+    kind: ContainerQuerySubjectKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ContainerQueryDecision {
+    truth: ContainerQueryTruth,
+    selected_containers: Vec<Option<NodeId>>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ContainerDecisionSignature {
+    decisions: HashMap<ContainerQueryCacheKey, ContainerQueryDecision>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ContainerQueryStats {
+    pub(crate) evaluations: usize,
+    pub(crate) cache_hits: usize,
+    pub(crate) ancestor_steps: usize,
+}
+
+pub(crate) struct ContainerQueryEvaluator<'a> {
+    tree: &'a DomTree,
+    snapshot: &'a ContainerSnapshot,
+    cache: HashMap<ContainerQueryCacheKey, ContainerQueryDecision>,
+    stats: ContainerQueryStats,
+}
+
+impl<'a> ContainerQueryEvaluator<'a> {
+    pub(crate) fn new(tree: &'a DomTree, snapshot: &'a ContainerSnapshot) -> Self {
+        Self {
+            tree,
+            snapshot,
+            cache: HashMap::new(),
+            stats: ContainerQueryStats::default(),
+        }
+    }
+
+    pub(crate) fn finish(self) -> (ContainerDecisionSignature, ContainerQueryStats) {
+        (
+            ContainerDecisionSignature {
+                decisions: self.cache,
+            },
+            self.stats,
+        )
+    }
+
+    fn condition_matches(
+        &mut self,
+        sheet: &Stylesheet,
+        subject: NodeId,
+        condition: ContainerConditionId,
+        kind: ContainerQuerySubjectKind,
+    ) -> bool {
+        self.evaluate_condition_chain(sheet, subject, condition, kind).truth
+            == ContainerQueryTruth::True
+    }
+
+    fn evaluate_condition_chain(
+        &mut self,
+        sheet: &Stylesheet,
+        subject: NodeId,
+        condition: ContainerConditionId,
+        kind: ContainerQuerySubjectKind,
+    ) -> ContainerQueryDecision {
+        if condition == ContainerConditionId::NONE {
+            return ContainerQueryDecision {
+                truth: ContainerQueryTruth::True,
+                selected_containers: Vec::new(),
+            };
+        }
+        let key = ContainerQueryCacheKey {
+            subject,
+            condition,
+            kind,
+        };
+        if let Some(decision) = self.cache.get(&key) {
+            self.stats.cache_hits += 1;
+            return decision.clone();
+        }
+        self.stats.evaluations += 1;
+        let node = &sheet.container_conditions[condition.0 as usize];
+        let mut own_truth = ContainerQueryTruth::False;
+        let mut selected_containers = Vec::with_capacity(node.alternatives.len());
+        for query in &node.alternatives {
+            let (truth, selected) = self.evaluate_query(subject, kind, query);
+            own_truth = own_truth.or(truth);
+            selected_containers.push(selected);
+            if own_truth == ContainerQueryTruth::True {
+                break;
+            }
+        }
+        if own_truth == ContainerQueryTruth::False {
+            let decision = ContainerQueryDecision {
+                truth: ContainerQueryTruth::False,
+                selected_containers,
+            };
+            self.cache.insert(key, decision.clone());
+            return decision;
+        }
+        let parent =
+            self.evaluate_condition_chain(sheet, subject, node.parent, kind);
+        selected_containers.extend(parent.selected_containers);
+        let decision = ContainerQueryDecision {
+            truth: own_truth.and(parent.truth),
+            selected_containers,
+        };
+        self.cache.insert(key, decision.clone());
+        decision
+    }
+
+    fn evaluate_query(
+        &mut self,
+        subject: NodeId,
+        kind: ContainerQuerySubjectKind,
+        query: &ContainerQuery,
+    ) -> (ContainerQueryTruth, Option<NodeId>) {
+        let required_axes = query
+            .condition
+            .as_ref()
+            .map(container_query_required_axes)
+            .unwrap_or_default();
+        let mut candidate = match kind {
+            ContainerQuerySubjectKind::Element => {
+                self.tree.get_node(subject).and_then(|node| node.parent)
+            }
+            ContainerQuerySubjectKind::OriginatingPseudo => Some(subject),
+        };
+        while let Some(id) = candidate {
+            self.stats.ancestor_steps += 1;
+            let parent = self.tree.get_node(id).and_then(|node| node.parent);
+            if let Some(container) = self.snapshot.boxes.get(&id) {
+                let supports_axis = match container.container_type {
+                    crate::ContainerType::Normal => {
+                        !required_axes.inline && !required_axes.block
+                    }
+                    crate::ContainerType::InlineSize => !required_axes.block,
+                    crate::ContainerType::Size => true,
+                };
+                let name_matches = query
+                    .name
+                    .as_ref()
+                    .map_or(true, |name| container.names.iter().any(|item| item == name));
+                if supports_axis && name_matches {
+                    let axis_available = match container.available_type {
+                        crate::ContainerType::Normal => {
+                            !required_axes.inline && !required_axes.block
+                        }
+                        crate::ContainerType::InlineSize => !required_axes.block,
+                        crate::ContainerType::Size => true,
+                    };
+                    if !axis_available {
+                        return (ContainerQueryTruth::Unknown, Some(id));
+                    }
+                    let truth = query.condition.as_ref().map_or(
+                        ContainerQueryTruth::True,
+                        |condition| {
+                            evaluate_container_query_expr(
+                                condition,
+                                container,
+                                self.snapshot.root_font_size,
+                            )
+                        },
+                    );
+                    return (truth, Some(id));
+                }
+            }
+            candidate = parent;
+        }
+        (ContainerQueryTruth::False, None)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ContainerQueryRequiredAxes {
+    inline: bool,
+    block: bool,
+}
+
+fn container_query_required_axes(expr: &ContainerQueryExpr) -> ContainerQueryRequiredAxes {
+    match expr {
+        ContainerQueryExpr::Feature(feature) => match feature.axis {
+            ContainerQueryAxis::Width | ContainerQueryAxis::InlineSize => {
+                ContainerQueryRequiredAxes {
+                    inline: true,
+                    block: false,
+                }
+            }
+            ContainerQueryAxis::Height | ContainerQueryAxis::BlockSize => {
+                ContainerQueryRequiredAxes {
+                    inline: false,
+                    block: true,
+                }
+            }
+        },
+        ContainerQueryExpr::Unknown => ContainerQueryRequiredAxes::default(),
+        ContainerQueryExpr::Not(inner) => container_query_required_axes(inner),
+        ContainerQueryExpr::And(items) | ContainerQueryExpr::Or(items) => {
+            items.iter().fold(
+                ContainerQueryRequiredAxes::default(),
+                |mut axes, item| {
+                    let item = container_query_required_axes(item);
+                    axes.inline |= item.inline;
+                    axes.block |= item.block;
+                    axes
+                },
+            )
+        }
+    }
+}
+
+fn evaluate_container_query_expr(
+    expr: &ContainerQueryExpr,
+    container: &ContainerBox,
+    root_font_size: f32,
+) -> ContainerQueryTruth {
+    match expr {
+        ContainerQueryExpr::Feature(feature) => {
+            let actual = match feature.axis {
+                ContainerQueryAxis::Width | ContainerQueryAxis::InlineSize => {
+                    container.content_width
+                }
+                ContainerQueryAxis::Height | ContainerQueryAxis::BlockSize => {
+                    container.content_height
+                }
+            };
+            let threshold = match feature.length {
+                ContainerQueryLength::Px(value) => value,
+                ContainerQueryLength::Em(value) => value * container.font_size,
+                ContainerQueryLength::Rem(value) => value * root_font_size,
+            };
+            if !actual.is_finite() || !threshold.is_finite() {
+                return ContainerQueryTruth::Unknown;
+            }
+            let matches = match feature.comparison {
+                ContainerQueryComparison::Min => actual >= threshold,
+                ContainerQueryComparison::Max => actual <= threshold,
+                ContainerQueryComparison::GreaterThan => actual > threshold,
+                ContainerQueryComparison::LessThan => actual < threshold,
+                ContainerQueryComparison::Equal => actual == threshold,
+            };
+            if matches {
+                ContainerQueryTruth::True
+            } else {
+                ContainerQueryTruth::False
+            }
+        }
+        ContainerQueryExpr::Unknown => ContainerQueryTruth::Unknown,
+        ContainerQueryExpr::Not(inner) => {
+            evaluate_container_query_expr(inner, container, root_font_size).not()
+        }
+        ContainerQueryExpr::And(items) => {
+            let mut truth = ContainerQueryTruth::True;
+            for item in items {
+                truth = truth.and(evaluate_container_query_expr(
+                    item,
+                    container,
+                    root_font_size,
+                ));
+                if truth == ContainerQueryTruth::False {
+                    break;
+                }
+            }
+            truth
+        }
+        ContainerQueryExpr::Or(items) => {
+            let mut truth = ContainerQueryTruth::False;
+            for item in items {
+                truth = truth.or(evaluate_container_query_expr(
+                    item,
+                    container,
+                    root_font_size,
+                ));
+                if truth == ContainerQueryTruth::True {
+                    break;
+                }
+            }
+            truth
+        }
+    }
+}
+
 /// An indexed set of author rules ready for fast per-element matching.
 pub struct Stylesheet {
     rules: Vec<Rule>,
@@ -104,9 +486,48 @@ pub struct Stylesheet {
 impl Stylesheet {
     /// Until Stage B supplies completed container geometry, preserved
     /// conditional rules remain inactive rather than using viewport geometry.
-    fn container_condition_is_active(&self, id: ContainerConditionId) -> bool {
+    fn container_condition_is_active(
+        &self,
+        id: ContainerConditionId,
+        subject: NodeId,
+        kind: ContainerQuerySubjectKind,
+        evaluator: &mut Option<&mut ContainerQueryEvaluator<'_>>,
+    ) -> bool {
         debug_assert!((id.0 as usize) < self.container_conditions.len());
-        id == ContainerConditionId::NONE
+        if id == ContainerConditionId::NONE {
+            return true;
+        }
+        evaluator.as_deref_mut().is_some_and(|evaluator| {
+            evaluator.condition_matches(self, subject, id, kind)
+        })
+    }
+
+    pub(crate) fn has_container_queries(&self) -> bool {
+        self.rules
+            .iter()
+            .any(|rule| rule.container_condition_id != ContainerConditionId::NONE)
+            || self
+                .before_rules
+                .iter()
+                .chain(&self.after_rules)
+                .any(|rule| rule.container_condition_id != ContainerConditionId::NONE)
+    }
+
+    pub(crate) fn container_condition_depth(&self) -> usize {
+        self.container_conditions
+            .iter()
+            .skip(1)
+            .map(|node| {
+                let mut depth = 1usize;
+                let mut parent = node.parent;
+                while parent != ContainerConditionId::NONE {
+                    depth += 1;
+                    parent = self.container_conditions[parent.0 as usize].parent;
+                }
+                depth
+            })
+            .max()
+            .unwrap_or(0)
     }
 
     /// Parse and index a set of raw CSS sources (the text of each `<style>`
@@ -207,15 +628,60 @@ impl Stylesheet {
         props: &HashMap<String, String>,
         host_style: &LayoutStyle,
     ) -> (Option<LayoutStyle>, Option<LayoutStyle>) {
-        let build = |rules: &[PseudoRule], matcher: &mut Matcher| {
-            let mut matched: Vec<(u32, usize, &PseudoRule)> = rules
-                .iter()
-                .filter(|rule| {
-                    self.container_condition_is_active(rule.container_condition_id)
-                        && matcher.matches(tree, nid, &rule.sel)
-                })
-                .map(|rule| (rule.sel.specificity(), rule.order, rule))
-                .collect();
+        self.pseudo_styles_internal(
+            tree,
+            matcher,
+            nid,
+            props,
+            host_style,
+            None,
+        )
+    }
+
+    pub(crate) fn pseudo_styles_with_container_queries(
+        &self,
+        tree: &DomTree,
+        matcher: &mut Matcher,
+        nid: NodeId,
+        props: &HashMap<String, String>,
+        host_style: &LayoutStyle,
+        evaluator: &mut ContainerQueryEvaluator<'_>,
+    ) -> (Option<LayoutStyle>, Option<LayoutStyle>) {
+        self.pseudo_styles_internal(
+            tree,
+            matcher,
+            nid,
+            props,
+            host_style,
+            Some(evaluator),
+        )
+    }
+
+    fn pseudo_styles_internal(
+        &self,
+        tree: &DomTree,
+        matcher: &mut Matcher,
+        nid: NodeId,
+        props: &HashMap<String, String>,
+        host_style: &LayoutStyle,
+        mut evaluator: Option<&mut ContainerQueryEvaluator<'_>>,
+    ) -> (Option<LayoutStyle>, Option<LayoutStyle>) {
+        let mut build = |rules: &[PseudoRule], matcher: &mut Matcher| {
+            let mut matched: Vec<(u32, usize, &PseudoRule)> = Vec::new();
+            for rule in rules {
+                // Container lookup is an ancestor walk. Keep it behind the
+                // selector match so unrelated pseudo rules remain cheap.
+                if matcher.matches(tree, nid, &rule.sel)
+                    && self.container_condition_is_active(
+                        rule.container_condition_id,
+                        nid,
+                        ContainerQuerySubjectKind::OriginatingPseudo,
+                        &mut evaluator,
+                    )
+                {
+                    matched.push((rule.sel.specificity(), rule.order, rule));
+                }
+            }
             if matched.is_empty() {
                 return None;
             }
@@ -308,14 +774,75 @@ impl Stylesheet {
         parent_props: &HashMap<String, String>,
         inline_css: Option<&str>,
     ) -> Option<HashMap<String, String>> {
+        self.apply_internal(
+            tree,
+            matcher,
+            nid,
+            id,
+            classes,
+            local,
+            style,
+            parent_props,
+            inline_css,
+            None,
+        )
+    }
+
+    pub(crate) fn apply_with_container_queries(
+        &self,
+        tree: &DomTree,
+        matcher: &mut Matcher,
+        nid: NodeId,
+        id: Option<&str>,
+        classes: &[String],
+        local: &str,
+        style: &mut LayoutStyle,
+        parent_props: &HashMap<String, String>,
+        inline_css: Option<&str>,
+        evaluator: &mut ContainerQueryEvaluator<'_>,
+    ) -> Option<HashMap<String, String>> {
+        self.apply_internal(
+            tree,
+            matcher,
+            nid,
+            id,
+            classes,
+            local,
+            style,
+            parent_props,
+            inline_css,
+            Some(evaluator),
+        )
+    }
+
+    fn apply_internal(
+        &self,
+        tree: &DomTree,
+        matcher: &mut Matcher,
+        nid: NodeId,
+        id: Option<&str>,
+        classes: &[String],
+        local: &str,
+        style: &mut LayoutStyle,
+        parent_props: &HashMap<String, String>,
+        inline_css: Option<&str>,
+        mut evaluator: Option<&mut ContainerQueryEvaluator<'_>>,
+    ) -> Option<HashMap<String, String>> {
         // (specificity, order, rule index) for each matching rule.
         let mut matched: Vec<(u32, usize, usize)> = Vec::new();
         let mut consider = |bucket: Option<&Vec<usize>>, matched: &mut Vec<(u32, usize, usize)>| {
             if let Some(idxs) = bucket {
                 for &i in idxs {
                     let rule = &self.rules[i];
-                    if self.container_condition_is_active(rule.container_condition_id)
-                        && matcher.matches(tree, nid, &rule.sel)
+                    // Container lookup is an ancestor walk. Keep it behind
+                    // selector matching and cache the result per condition.
+                    if matcher.matches(tree, nid, &rule.sel)
+                        && self.container_condition_is_active(
+                            rule.container_condition_id,
+                            nid,
+                            ContainerQuerySubjectKind::Element,
+                            &mut evaluator,
+                        )
                     {
                         matched.push((rule.sel.specificity(), rule.order, i));
                     }
@@ -849,45 +1376,54 @@ fn parse_stylesheet_for_viewport_preserving_containers(
 /// the inner rules only when the query holds for a desktop 1280px viewport.
 fn flush_at_rule(
     at: &str,
-    sel: &str,
+    _sel: &str,
     inner: &str,
     rules: &mut Vec<ParsedRule>,
     viewport: (f32, f32),
     container_conditions: &mut Vec<ContainerConditionNode>,
     container_condition_id: ContainerConditionId,
 ) {
-    if at.starts_with("media") {
-        if media_query_applies_for_viewport(sel, viewport) {
+    if let Some(prelude) = at_rule_prelude(at, "media") {
+        if media_query_applies_for_viewport(prelude, viewport) {
             rules.extend(parse_stylesheet_for_viewport_preserving_containers(
-                inner, viewport, container_conditions, container_condition_id,
+                inner,
+                viewport,
+                container_conditions,
+                container_condition_id,
             ));
         }
-    } else if at.starts_with("supports") {
-        if supports_condition_applies(sel) {
+    } else if let Some(prelude) = at_rule_prelude(at, "supports") {
+        if supports_condition_applies(prelude) {
             rules.extend(parse_stylesheet_for_viewport_preserving_containers(
-                inner, viewport, container_conditions, container_condition_id,
+                inner,
+                viewport,
+                container_conditions,
+                container_condition_id,
             ));
         }
-    } else if at.starts_with("container") {
-        let prelude = at["container".len()..].trim();
+    } else if let Some(prelude) = at_rule_prelude(at, "container") {
         if let Some(alternatives) = parse_container_query_list(prelude) {
-            let Ok(raw_id) = u32::try_from(container_conditions.len()) else { return };
+            let Ok(raw_id) = u32::try_from(container_conditions.len()) else {
+                return;
+            };
             let id = ContainerConditionId(raw_id);
             container_conditions.push(ContainerConditionNode {
                 parent: container_condition_id,
                 alternatives,
             });
             rules.extend(parse_stylesheet_for_viewport_preserving_containers(
-                inner, viewport, container_conditions, id,
+                inner,
+                viewport,
+                container_conditions,
+                id,
             ));
         }
-    } else if at.starts_with("property") {
+    } else if let Some(name) = at_rule_prelude(at, "property") {
         // `@property --x { syntax:..; initial-value: V }` declares a custom
         // property and its default. Register the initial-value as a `:root`
         // declaration so `var(--x)` resolves when nothing else sets it. Tailwind
         // v4 and modern frameworks define theme tokens this way; dropping them
         // left those `var()`s (page/section backgrounds, colors) unresolved.
-        let name = at["property".len()..].trim();
         if name.starts_with("--") {
             for decl in inner.split(';') {
                 if let Some((k, v)) = decl.split_once(':') {
@@ -895,13 +1431,16 @@ fn flush_at_rule(
                         rules.push(ParsedRule {
                             selector: ":root".to_string(),
                             declarations: format!("{}: {}", name, v.trim()),
-                            container_condition_id,
+                            // Registrations are global name-defining rules.
+                            // CSS Conditional 5 deliberately does not gate
+                            // them on an enclosing container query.
+                            container_condition_id: ContainerConditionId::NONE,
                         });
                     }
                 }
             }
         }
-    } else if at.starts_with("layer") {
+    } else if at_rule_prelude(at, "layer").is_some() {
         // Cascade layers: `@layer name { ... }` wraps ordinary rules. We do not
         // model layer priority (real CSS ranks unlayered above layered and
         // later layers above earlier); just flatten the body in source order so
@@ -912,11 +1451,41 @@ fn flush_at_rule(
         // `@layer a, b;` ordering-statement form has no block and is discarded
         // by parse_stylesheet's top-level `;` handling.
         rules.extend(parse_stylesheet_for_viewport_preserving_containers(
-            inner, viewport, container_conditions, container_condition_id,
+            inner,
+            viewport,
+            container_conditions,
+            container_condition_id,
         ));
     }
     // Other at-rules (@font-face, @keyframes, @import, ...) carry no
     // layout-relevant rules for us, so drop them.
+}
+
+/// Return the prelude after an exact ASCII-insensitive at-rule name.
+///
+/// The hand parser stores the text after `@`, so a prefix test would both
+/// reject `@CONTAINER` and misclassify unknown rules such as
+/// `@containerfoo`. The boundary accepts punctuation because whitespace is
+/// optional before a parenthesized prelude.
+fn at_rule_prelude<'a>(at: &'a str, expected: &str) -> Option<&'a str> {
+    let prefix = at.get(..expected.len())?;
+    if !prefix.eq_ignore_ascii_case(expected) {
+        return None;
+    }
+    let rest = &at[expected.len()..];
+    if rest.chars().next().is_some_and(|character| {
+        character.is_ascii_alphanumeric()
+            || matches!(character, '_' | '-' | '\\')
+            || !character.is_ascii()
+    }) {
+        return None;
+    }
+    let mut rest = rest.trim_start();
+    while let Some(comment) = rest.strip_prefix("/*") {
+        let end = comment.find("*/")?;
+        rest = comment[end + 2..].trim_start();
+    }
+    Some(rest.trim_end())
 }
 
 fn parse_container_query_list(prelude: &str) -> Option<Vec<ContainerQuery>> {
@@ -958,31 +1527,90 @@ fn parse_container_query_name(input: &str) -> Option<String> {
         return None;
     }
     let lower = ident.to_ascii_lowercase();
-    if matches!(lower.as_str(), "none" | "not" | "and" | "or") {
+    if is_reserved_container_custom_ident(&lower) {
         return None;
     }
     Some(ident.to_string())
 }
 
+fn is_reserved_container_custom_ident(lower: &str) -> bool {
+    matches!(
+        lower,
+        "none"
+            | "not"
+            | "and"
+            | "or"
+            | "default"
+            | "initial"
+            | "inherit"
+            | "unset"
+            | "revert"
+            | "revert-layer"
+    )
+}
+
+const MAX_CONTAINER_QUERY_DEPTH: usize = 64;
+
 fn parse_container_query_expr(input: &str) -> Option<ContainerQueryExpr> {
+    parse_container_query_expr_at_depth(input, 0)
+}
+
+fn parse_container_query_expr_at_depth(input: &str, depth: usize) -> Option<ContainerQueryExpr> {
+    if depth >= MAX_CONTAINER_QUERY_DEPTH {
+        return None;
+    }
     let input = input.trim();
-    if let Some(parts) = split_supports_operator(input, "or") {
+    let or_parts = split_supports_operator(input, "or");
+    let and_parts = split_supports_operator(input, "and");
+    // One grammar level is either a homogeneous AND chain or a homogeneous OR
+    // chain. Authors must parenthesize any mixture.
+    if or_parts.is_some() && and_parts.is_some() {
+        return None;
+    }
+    if let Some(parts) = or_parts {
         return Some(ContainerQueryExpr::Or(
-            parts.into_iter().map(parse_container_query_expr).collect::<Option<_>>()?,
+            parts
+                .into_iter()
+                .map(|part| parse_container_query_in_parens(part, depth + 1))
+                .collect::<Option<_>>()?,
         ));
     }
-    if let Some(parts) = split_supports_operator(input, "and") {
+    if let Some(parts) = and_parts {
         return Some(ContainerQueryExpr::And(
-            parts.into_iter().map(parse_container_query_expr).collect::<Option<_>>()?,
+            parts
+                .into_iter()
+                .map(|part| parse_container_query_in_parens(part, depth + 1))
+                .collect::<Option<_>>()?,
         ));
     }
     if let Some(rest) = strip_ascii_keyword(input, "not") {
-        return Some(ContainerQueryExpr::Not(Box::new(parse_container_query_expr(rest)?)));
+        return Some(ContainerQueryExpr::Not(Box::new(
+            parse_container_query_in_parens(rest, depth + 1)?,
+        )));
+    }
+    parse_container_query_in_parens(input, depth + 1)
+}
+
+fn parse_container_query_in_parens(input: &str, depth: usize) -> Option<ContainerQueryExpr> {
+    if depth >= MAX_CONTAINER_QUERY_DEPTH {
+        return None;
     }
     let inner = enclosing_parenthesized(input)?;
-    parse_container_size_feature(inner)
-        .map(ContainerQueryExpr::Feature)
-        .or_else(|| parse_container_query_expr(inner))
+    if let Some(feature) = parse_container_size_feature(inner) {
+        return Some(feature);
+    }
+    parse_container_query_expr_at_depth(inner, depth + 1).or_else(|| {
+        is_general_enclosed_container_query(inner).then_some(ContainerQueryExpr::Unknown)
+    })
+}
+
+fn is_general_enclosed_container_query(input: &str) -> bool {
+    let mut input = cssparser::ParserInput::new(input.trim());
+    let mut parser = cssparser::Parser::new(&mut input);
+    matches!(
+        parser.next(),
+        Ok(cssparser::Token::Ident(_)) | Ok(cssparser::Token::Function(_))
+    )
 }
 
 fn strip_ascii_keyword<'a>(input: &'a str, keyword: &str) -> Option<&'a str> {
@@ -995,20 +1623,129 @@ fn strip_ascii_keyword<'a>(input: &'a str, keyword: &str) -> Option<&'a str> {
         .map(|_| rest.trim_start())
 }
 
-fn parse_container_size_feature(input: &str) -> Option<ContainerSizeFeature> {
-    let (name, value) = input.split_once(':')?;
-    let (comparison, axis) = match name.trim().to_ascii_lowercase().as_str() {
-        "min-width" => (ContainerQueryComparison::Min, ContainerQueryAxis::Width),
-        "max-width" => (ContainerQueryComparison::Max, ContainerQueryAxis::Width),
-        "min-inline-size" => (ContainerQueryComparison::Min, ContainerQueryAxis::InlineSize),
-        "max-inline-size" => (ContainerQueryComparison::Max, ContainerQueryAxis::InlineSize),
-        _ => return None,
-    };
-    Some(ContainerSizeFeature {
-        axis,
-        comparison,
-        length: parse_container_query_length(value)?,
-    })
+fn parse_container_size_feature(input: &str) -> Option<ContainerQueryExpr> {
+    if let Some(axis) = parse_container_query_axis(input) {
+        return Some(ContainerQueryExpr::Feature(ContainerSizeFeature {
+            axis,
+            comparison: ContainerQueryComparison::GreaterThan,
+            length: ContainerQueryLength::Px(0.0),
+        }));
+    }
+    if let Some((name, value)) = input.split_once(':') {
+        let (comparison, axis) = match name.trim().to_ascii_lowercase().as_str() {
+            "min-width" => (ContainerQueryComparison::Min, ContainerQueryAxis::Width),
+            "max-width" => (ContainerQueryComparison::Max, ContainerQueryAxis::Width),
+            "width" => (ContainerQueryComparison::Equal, ContainerQueryAxis::Width),
+            "min-height" => (ContainerQueryComparison::Min, ContainerQueryAxis::Height),
+            "max-height" => (ContainerQueryComparison::Max, ContainerQueryAxis::Height),
+            "height" => (ContainerQueryComparison::Equal, ContainerQueryAxis::Height),
+            "min-inline-size" => (ContainerQueryComparison::Min, ContainerQueryAxis::InlineSize),
+            "max-inline-size" => (ContainerQueryComparison::Max, ContainerQueryAxis::InlineSize),
+            "inline-size" => (ContainerQueryComparison::Equal, ContainerQueryAxis::InlineSize),
+            "min-block-size" => (ContainerQueryComparison::Min, ContainerQueryAxis::BlockSize),
+            "max-block-size" => (ContainerQueryComparison::Max, ContainerQueryAxis::BlockSize),
+            "block-size" => (ContainerQueryComparison::Equal, ContainerQueryAxis::BlockSize),
+            _ => return None,
+        };
+        return Some(ContainerQueryExpr::Feature(ContainerSizeFeature {
+            axis,
+            comparison,
+            length: parse_container_query_length(value)?,
+        }));
+    }
+
+    let (operands, operators) = split_container_range(input)?;
+    let make_feature =
+        |axis: ContainerQueryAxis, operator: &str, value: &str, axis_on_left: bool| {
+            let comparison = match (operator, axis_on_left) {
+                (">=", true) | ("<=", false) => ContainerQueryComparison::Min,
+                ("<=", true) | (">=", false) => ContainerQueryComparison::Max,
+                (">", true) | ("<", false) => ContainerQueryComparison::GreaterThan,
+                ("<", true) | (">", false) => ContainerQueryComparison::LessThan,
+                ("=", _) => ContainerQueryComparison::Equal,
+                _ => return None,
+            };
+            Some(ContainerQueryExpr::Feature(ContainerSizeFeature {
+                axis,
+                comparison,
+                length: parse_container_query_length(value)?,
+            }))
+        };
+    match (operands.as_slice(), operators.as_slice()) {
+        ([left, right], [operator]) => {
+            if let Some(axis) = parse_container_query_axis(left) {
+                make_feature(axis, operator, right, true)
+            } else {
+                let axis = parse_container_query_axis(right)?;
+                make_feature(axis, operator, left, false)
+            }
+        }
+        ([lower, middle, upper], [lower_operator, upper_operator]) => {
+            // Chained ranges must point consistently through the feature:
+            // `10px < width <= 20px` or the fully reversed equivalent.
+            // Equality is valid only in a single comparison, and a mixed
+            // direction such as `10px < width > 20px` is not a range.
+            let forward = matches!(*lower_operator, "<" | "<=")
+                && matches!(*upper_operator, "<" | "<=");
+            let reverse = matches!(*lower_operator, ">" | ">=")
+                && matches!(*upper_operator, ">" | ">=");
+            if !forward && !reverse {
+                return None;
+            }
+            let axis = parse_container_query_axis(middle)?;
+            Some(ContainerQueryExpr::And(vec![
+                make_feature(axis, lower_operator, lower, false)?,
+                make_feature(axis, upper_operator, upper, true)?,
+            ]))
+        }
+        _ => None,
+    }
+}
+
+fn parse_container_query_axis(input: &str) -> Option<ContainerQueryAxis> {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "width" => Some(ContainerQueryAxis::Width),
+        "height" => Some(ContainerQueryAxis::Height),
+        "inline-size" => Some(ContainerQueryAxis::InlineSize),
+        "block-size" => Some(ContainerQueryAxis::BlockSize),
+        _ => None,
+    }
+}
+
+fn split_container_range(input: &str) -> Option<(Vec<&str>, Vec<&str>)> {
+    let mut operands = Vec::new();
+    let mut operators = Vec::new();
+    let mut start = 0usize;
+    let bytes = input.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if matches!(bytes[index], b'<' | b'>' | b'=') {
+            let end = if bytes.get(index + 1) == Some(&b'=') {
+                index + 2
+            } else {
+                index + 1
+            };
+            let operand = input[start..index].trim();
+            if operand.is_empty() {
+                return None;
+            }
+            operands.push(operand);
+            operators.push(&input[index..end]);
+            start = end;
+            index = end;
+            continue;
+        }
+        index += 1;
+    }
+    if operators.is_empty() || operators.len() > 2 {
+        return None;
+    }
+    let operand = input[start..].trim();
+    if operand.is_empty() {
+        return None;
+    }
+    operands.push(operand);
+    Some((operands, operators))
 }
 
 fn parse_container_query_length(input: &str) -> Option<ContainerQueryLength> {
@@ -1463,16 +2200,29 @@ fn denest(
                 let pre = prelude.trim();
                 if let Some(at) = pre.strip_prefix('@') {
                     // A nested at-rule keeps the enclosing selector for its body.
-                    if at.starts_with("media") {
-                        if media_query_applies_for_viewport(pre, viewport) {
-                            denest(sel, &inner, rules, viewport, container_conditions, container_condition_id);
+                    if let Some(prelude) = at_rule_prelude(at, "media") {
+                        if media_query_applies_for_viewport(prelude, viewport) {
+                            denest(
+                                sel,
+                                &inner,
+                                rules,
+                                viewport,
+                                container_conditions,
+                                container_condition_id,
+                            );
                         }
-                    } else if at.starts_with("supports") {
-                        if supports_condition_applies(pre) {
-                            denest(sel, &inner, rules, viewport, container_conditions, container_condition_id);
+                    } else if let Some(prelude) = at_rule_prelude(at, "supports") {
+                        if supports_condition_applies(prelude) {
+                            denest(
+                                sel,
+                                &inner,
+                                rules,
+                                viewport,
+                                container_conditions,
+                                container_condition_id,
+                            );
                         }
-                    } else if at.starts_with("container") {
-                        let prelude = at["container".len()..].trim();
+                    } else if let Some(prelude) = at_rule_prelude(at, "container") {
                         if let Some(alternatives) = parse_container_query_list(prelude) {
                             if let Ok(raw_id) = u32::try_from(container_conditions.len()) {
                                 let id = ContainerConditionId(raw_id);
@@ -1483,8 +2233,15 @@ fn denest(
                                 denest(sel, &inner, rules, viewport, container_conditions, id);
                             }
                         }
-                    } else if at.starts_with("layer") {
-                        denest(sel, &inner, rules, viewport, container_conditions, container_condition_id);
+                    } else if at_rule_prelude(at, "layer").is_some() {
+                        denest(
+                            sel,
+                            &inner,
+                            rules,
+                            viewport,
+                            container_conditions,
+                            container_condition_id,
+                        );
                     }
                 } else if !pre.is_empty() {
                     let full = combine_selectors(sel, pre);
@@ -1847,6 +2604,649 @@ mod tests {
             Some(ContainerQueryExpr::Not(_))
         ));
         assert_eq!(parse_stylesheet(css).len(), 1);
+    }
+
+    #[test]
+    fn container_at_rule_keyword_is_ascii_insensitive_and_exact() {
+        assert_eq!(
+            at_rule_prelude("CoNtAiNeR (min-width:1px)", "container"),
+            Some("(min-width:1px)")
+        );
+        assert_eq!(
+            at_rule_prelude("container/**/(min-width:1px)", "container"),
+            Some("(min-width:1px)")
+        );
+        assert!(at_rule_prelude("containerfoo (min-width:1px)", "container").is_none());
+        assert!(at_rule_prelude("container-type (min-width:1px)", "container").is_none());
+
+        let css = r#"
+            @CONTAINER (min-width:1px) {
+                .top-level { width:1px }
+            }
+            .host {
+                @CoNtAiNeR (min-width:2px) { width:2px }
+                @containerfoo (min-width:3px) { height:3px }
+            }
+            .comment-host {
+                @CONTAINER/**/(min-width:5px) { height:5px }
+            }
+            @containerfoo (min-width:4px) {
+                .unknown-prefix { width:4px }
+            }
+        "#;
+        let mut conditions = condition_arena_root();
+        let parsed = parse_stylesheet_for_viewport_preserving_containers(
+            css,
+            (1280.0, 720.0),
+            &mut conditions,
+            ContainerConditionId::NONE,
+        );
+        assert_eq!(conditions.len(), 4);
+        assert_eq!(parsed.len(), 3, "unknown prefix at-rules must be dropped");
+        assert!(parsed.iter().any(|rule| rule.selector == ".top-level"));
+        assert!(parsed
+            .iter()
+            .any(|rule| { rule.selector == ".host" && rule.declarations.contains("width:2px") }));
+        assert!(parsed.iter().any(|rule| {
+            rule.selector == ".comment-host" && rule.declarations.contains("height:5px")
+        }));
+        assert!(!parsed.iter().any(|rule| {
+            rule.selector == ".unknown-prefix" || rule.declarations.contains("height:3px")
+        }));
+    }
+
+    #[test]
+    fn global_at_rules_inside_container_are_not_conditioned() {
+        let css = r#"
+            @container (min-width:10000px) {
+                @property --cq-token {
+                    syntax: "<length>";
+                    inherits: false;
+                    initial-value: 17px;
+                }
+                .conditional { width:999px }
+            }
+        "#;
+        let mut conditions = condition_arena_root();
+        let parsed = parse_stylesheet_for_viewport_preserving_containers(
+            css,
+            (1280.0, 720.0),
+            &mut conditions,
+            ContainerConditionId::NONE,
+        );
+        assert_eq!(conditions.len(), 2);
+        let registration = parsed
+            .iter()
+            .find(|rule| rule.selector == ":root")
+            .expect("@property initial value should be registered");
+        assert_eq!(
+            registration.container_condition_id,
+            ContainerConditionId::NONE
+        );
+        assert!(registration.declarations.contains("--cq-token: 17px"));
+        let conditional = parsed
+            .iter()
+            .find(|rule| rule.selector == ".conditional")
+            .expect("ordinary conditional rule should remain indexed");
+        assert_eq!(conditional.container_condition_id, ContainerConditionId(1));
+        assert_eq!(
+            parse_stylesheet(css),
+            vec![(":root".into(), "--cq-token: 17px".into())]
+        );
+    }
+
+    #[test]
+    fn container_boolean_grammar_rejects_mixed_operators() {
+        for invalid in [
+            "(min-width:1px) and (max-width:2px) or (min-inline-size:3px)",
+            "not (min-width:1px) and (max-width:2px)",
+            "(min-width:1px) or not (max-width:2px)",
+        ] {
+            assert!(
+                parse_container_query_expr(invalid).is_none(),
+                "invalid boolean grammar was accepted: {invalid}"
+            );
+        }
+        assert!(matches!(
+            parse_container_query_expr(
+                "(min-width:1px) and ((max-width:2px) or (min-inline-size:3px))"
+            ),
+            Some(ContainerQueryExpr::And(_))
+        ));
+        assert!(matches!(
+            parse_container_query_expr("not ((min-width:1px) and (max-inline-size:2px))"),
+            Some(ContainerQueryExpr::Not(_))
+        ));
+    }
+
+    #[test]
+    fn container_custom_ident_rejects_css_wide_and_default() {
+        for reserved in [
+            "none",
+            "not",
+            "and",
+            "or",
+            "default",
+            "initial",
+            "inherit",
+            "unset",
+            "revert",
+            "revert-layer",
+        ] {
+            assert!(
+                parse_container_query_name(reserved).is_none(),
+                "reserved custom-ident was accepted: {reserved}"
+            );
+            if reserved != "not" {
+                assert!(
+                    parse_container_query(&format!("{reserved} (min-width:1px)")).is_none(),
+                    "reserved query name was accepted: {reserved}"
+                );
+            }
+        }
+        assert!(
+            matches!(
+                parse_container_query("not (min-width:1px)"),
+                Some(ContainerQuery {
+                    name: None,
+                    condition: Some(ContainerQueryExpr::Not(_)),
+                })
+            ),
+            "`not` is reserved as a name but valid as the unary query operator"
+        );
+        for valid in ["auto", "normal", "container", "--card", "main"] {
+            assert_eq!(
+                parse_container_query_name(valid).as_deref(),
+                Some(valid),
+                "valid query name was rejected: {valid}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_comma_arm_does_not_drop_supported_arm() {
+        let queries = parse_container_query_list("(future(foo)), main (min-width:1px)")
+            .expect("general-enclosed arm is valid unknown syntax");
+        assert_eq!(queries.len(), 2);
+        assert_eq!(queries[0].condition, Some(ContainerQueryExpr::Unknown));
+        assert_eq!(queries[1].name.as_deref(), Some("main"));
+        assert!(matches!(
+            queries[1].condition,
+            Some(ContainerQueryExpr::Feature(_))
+        ));
+
+        let mut conditions = condition_arena_root();
+        let parsed = parse_stylesheet_for_viewport_preserving_containers(
+            "@container (future(foo)), main (min-width:1px) {.card{display:grid}}",
+            (1280.0, 720.0),
+            &mut conditions,
+            ContainerConditionId::NONE,
+        );
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(conditions[1].alternatives.len(), 2);
+    }
+
+    #[test]
+    fn container_query_recursion_depth_is_bounded() {
+        let nested = format!(
+            "{}min-width:1px{}",
+            "(".repeat(MAX_CONTAINER_QUERY_DEPTH + 16),
+            ")".repeat(MAX_CONTAINER_QUERY_DEPTH + 16)
+        );
+        assert!(parse_container_query_expr(&nested).is_none());
+    }
+
+    #[test]
+    fn supports_accepts_container_css_wide_values() {
+        for property in ["container", "container-name", "container-type"] {
+            for keyword in ["initial", "inherit", "unset", "revert", "revert-layer"] {
+                assert!(
+                    supports_condition_applies(&format!("({property}:{keyword})")),
+                    "{property}:{keyword} is a valid whole-value CSS-wide declaration"
+                );
+            }
+        }
+    }
+
+    fn evaluate_container_styles(
+        tree: &DomTree,
+        sheet: &Stylesheet,
+        target: NodeId,
+        snapshot: &ContainerSnapshot,
+    ) -> (LayoutStyle, ContainerDecisionSignature, ContainerQueryStats) {
+        let node = tree.get_node(target).unwrap();
+        let element = node.as_element().unwrap();
+        let id = node.get_attribute("id");
+        let classes: Vec<String> = node
+            .get_attribute("class")
+            .map(|value| value.split_whitespace().map(str::to_string).collect())
+            .unwrap_or_default();
+        let mut matcher = tree.matcher();
+        let mut evaluator = ContainerQueryEvaluator::new(tree, snapshot);
+        let mut style = LayoutStyle::default();
+        sheet.apply_with_container_queries(
+            tree,
+            &mut matcher,
+            target,
+            id,
+            &classes,
+            element.local.as_ref(),
+            &mut style,
+            &HashMap::new(),
+            None,
+            &mut evaluator,
+        );
+        let (signature, stats) = evaluator.finish();
+        (style, signature, stats)
+    }
+
+    fn container_box(
+        container_type: crate::ContainerType,
+        names: &[&str],
+        content_width: f32,
+        font_size: f32,
+    ) -> ContainerBox {
+        ContainerBox {
+            container_type,
+            available_type: container_type,
+            names: names.iter().map(|name| (*name).to_string()).collect(),
+            content_width,
+            content_height: 100.0,
+            font_size,
+        }
+    }
+
+    #[test]
+    fn container_evaluator_honors_tailwind_threshold_and_cache() {
+        let tree = obscura_dom::parse_html(
+            r#"<div id="container"><div id="target"></div></div>"#,
+        );
+        let container = tree.get_element_by_id("container").unwrap();
+        let target = tree.get_element_by_id("target").unwrap();
+        let sheet = Stylesheet::parse(
+            &tree,
+            &[r#"
+                #target { width:1px; height:1px }
+                @container (min-width:28rem) {
+                    #target { width:2px }
+                    #target { height:2px }
+                }
+            "#
+            .to_string()],
+        );
+
+        let snapshot = |width| {
+            let mut snapshot = ContainerSnapshot {
+                root_font_size: 16.0,
+                ..Default::default()
+            };
+            snapshot.boxes.insert(
+                container,
+                container_box(crate::ContainerType::InlineSize, &[], width, 16.0),
+            );
+            snapshot
+        };
+        let (below, _, _) =
+            evaluate_container_styles(&tree, &sheet, target, &snapshot(447.0));
+        assert_eq!(below.width, crate::Dimension::Px(1.0));
+        assert_eq!(below.height, crate::Dimension::Px(1.0));
+
+        let (at, _, stats) =
+            evaluate_container_styles(&tree, &sheet, target, &snapshot(448.0));
+        assert_eq!(at.width, crate::Dimension::Px(2.0));
+        assert_eq!(at.height, crate::Dimension::Px(2.0));
+        assert_eq!(stats.evaluations, 1);
+        assert!(stats.cache_hits >= 1);
+    }
+
+    #[test]
+    fn container_evaluator_matches_selector_before_ancestor_lookup() {
+        let tree = obscura_dom::parse_html(
+            r#"<div id="container"><div id="target"></div></div>"#,
+        );
+        let container = tree.get_element_by_id("container").unwrap();
+        let target = tree.get_element_by_id("target").unwrap();
+        let sheet = Stylesheet::parse(
+            &tree,
+            &[r#"
+                @container (min-width:1px) {
+                    div[data-never-present] { width:999px }
+                }
+            "#
+            .to_string()],
+        );
+        let mut snapshot = ContainerSnapshot {
+            root_font_size: 16.0,
+            ..Default::default()
+        };
+        snapshot.boxes.insert(
+            container,
+            container_box(crate::ContainerType::InlineSize, &[], 500.0, 16.0),
+        );
+        let (_, signature, stats) =
+            evaluate_container_styles(&tree, &sheet, target, &snapshot);
+        assert_eq!(stats.evaluations, 0);
+        assert_eq!(stats.ancestor_steps, 0);
+        assert!(signature.decisions.is_empty());
+    }
+
+    #[test]
+    fn container_evaluator_selects_nearest_eligible_named_ancestor() {
+        let tree = obscura_dom::parse_html(
+            r#"<div id="outer"><div id="inner"><div id="target"></div></div></div>"#,
+        );
+        let outer = tree.get_element_by_id("outer").unwrap();
+        let inner = tree.get_element_by_id("inner").unwrap();
+        let target = tree.get_element_by_id("target").unwrap();
+        let sheet = Stylesheet::parse(
+            &tree,
+            &[r#"
+                #target { width:1px; height:1px }
+                @container shell (min-width:500px) { #target { width:11px } }
+                @container (min-width:500px) { #target { height:22px } }
+            "#
+            .to_string()],
+        );
+        let mut snapshot = ContainerSnapshot {
+            root_font_size: 16.0,
+            ..Default::default()
+        };
+        snapshot.boxes.insert(
+            outer,
+            container_box(
+                crate::ContainerType::InlineSize,
+                &["shell"],
+                600.0,
+                16.0,
+            ),
+        );
+        snapshot.boxes.insert(
+            inner,
+            container_box(
+                crate::ContainerType::InlineSize,
+                &["other"],
+                300.0,
+                16.0,
+            ),
+        );
+        let (style, _, stats) =
+            evaluate_container_styles(&tree, &sheet, target, &snapshot);
+        assert_eq!(style.width, crate::Dimension::Px(11.0));
+        assert_eq!(style.height, crate::Dimension::Px(1.0));
+        assert!(stats.ancestor_steps >= 3);
+    }
+
+    #[test]
+    fn container_query_em_uses_container_font_and_rem_uses_root_font() {
+        let tree = obscura_dom::parse_html(
+            r#"<div id="container"><div id="target"></div></div>"#,
+        );
+        let container = tree.get_element_by_id("container").unwrap();
+        let target = tree.get_element_by_id("target").unwrap();
+        let sheet = Stylesheet::parse(
+            &tree,
+            &[r#"
+                #target { width:1px; height:1px }
+                @container (min-width:30em) { #target { width:3px } }
+                @container (min-width:30rem) { #target { height:3px } }
+            "#
+            .to_string()],
+        );
+        let mut snapshot = ContainerSnapshot {
+            root_font_size: 20.0,
+            ..Default::default()
+        };
+        snapshot.boxes.insert(
+            container,
+            container_box(crate::ContainerType::InlineSize, &[], 400.0, 10.0),
+        );
+        let (style, _, _) =
+            evaluate_container_styles(&tree, &sheet, target, &snapshot);
+        assert_eq!(style.width, crate::Dimension::Px(3.0));
+        assert_eq!(style.height, crate::Dimension::Px(1.0));
+    }
+
+    #[test]
+    fn container_snapshot_compares_only_axes_exposed_by_container_type() {
+        let mut inline_a =
+            container_box(crate::ContainerType::InlineSize, &[], 400.0, 16.0);
+        let mut inline_b = inline_a.clone();
+        inline_a.content_height = 100.0;
+        inline_b.content_height = 900.0;
+        assert_eq!(inline_a, inline_b);
+
+        let mut size_a = container_box(crate::ContainerType::Size, &[], 400.0, 16.0);
+        let mut size_b = size_a.clone();
+        size_a.content_height = 100.0;
+        size_b.content_height = 900.0;
+        assert_ne!(size_a, size_b);
+    }
+
+    #[test]
+    fn nested_container_conditions_select_independent_containers() {
+        let tree = obscura_dom::parse_html(
+            r#"<div id="outer"><div id="inner"><div id="target"></div></div></div>"#,
+        );
+        let outer = tree.get_element_by_id("outer").unwrap();
+        let inner = tree.get_element_by_id("inner").unwrap();
+        let target = tree.get_element_by_id("target").unwrap();
+        let sheet = Stylesheet::parse(
+            &tree,
+            &[r#"
+                #target { width:1px }
+                @container outer (min-width:500px) {
+                    @container inner (min-width:200px) {
+                        #target { width:9px }
+                    }
+                }
+            "#
+            .to_string()],
+        );
+        let snapshot = |inner_width| {
+            let mut snapshot = ContainerSnapshot {
+                root_font_size: 16.0,
+                ..Default::default()
+            };
+            snapshot.boxes.insert(
+                outer,
+                container_box(
+                    crate::ContainerType::InlineSize,
+                    &["outer"],
+                    600.0,
+                    16.0,
+                ),
+            );
+            snapshot.boxes.insert(
+                inner,
+                container_box(
+                    crate::ContainerType::InlineSize,
+                    &["inner"],
+                    inner_width,
+                    16.0,
+                ),
+            );
+            snapshot
+        };
+        let (matching, _, _) =
+            evaluate_container_styles(&tree, &sheet, target, &snapshot(200.0));
+        assert_eq!(matching.width, crate::Dimension::Px(9.0));
+        let (failing, _, _) =
+            evaluate_container_styles(&tree, &sheet, target, &snapshot(199.0));
+        assert_eq!(failing.width, crate::Dimension::Px(1.0));
+    }
+
+    #[test]
+    fn unknown_container_alternative_does_not_mask_true_alternative() {
+        let tree = obscura_dom::parse_html(
+            r#"<div id="container"><div id="target"></div></div>"#,
+        );
+        let container = tree.get_element_by_id("container").unwrap();
+        let target = tree.get_element_by_id("target").unwrap();
+        let sheet = Stylesheet::parse(
+            &tree,
+            &[r#"
+                #target { width:1px }
+                @container (future(foo)), (min-width:100px) {
+                    #target { width:7px }
+                }
+            "#
+            .to_string()],
+        );
+        let mut snapshot = ContainerSnapshot {
+            root_font_size: 16.0,
+            ..Default::default()
+        };
+        snapshot.boxes.insert(
+            container,
+            container_box(crate::ContainerType::InlineSize, &[], 100.0, 16.0),
+        );
+        let (style, _, _) =
+            evaluate_container_styles(&tree, &sheet, target, &snapshot);
+        assert_eq!(style.width, crate::Dimension::Px(7.0));
+    }
+
+    #[test]
+    fn container_query_boolean_evaluation_uses_kleene_truth_tables() {
+        let container =
+            container_box(crate::ContainerType::InlineSize, &[], 200.0, 16.0);
+        let min_width = |threshold| {
+            ContainerQueryExpr::Feature(ContainerSizeFeature {
+                axis: ContainerQueryAxis::Width,
+                comparison: ContainerQueryComparison::Min,
+                length: ContainerQueryLength::Px(threshold),
+            })
+        };
+        assert_eq!(
+            evaluate_container_query_expr(
+                &ContainerQueryExpr::Or(vec![
+                    min_width(100.0),
+                    ContainerQueryExpr::Unknown,
+                ]),
+                &container,
+                16.0,
+            ),
+            ContainerQueryTruth::True
+        );
+        assert_eq!(
+            evaluate_container_query_expr(
+                &ContainerQueryExpr::And(vec![
+                    min_width(300.0),
+                    ContainerQueryExpr::Unknown,
+                ]),
+                &container,
+                16.0,
+            ),
+            ContainerQueryTruth::False
+        );
+        assert_eq!(
+            evaluate_container_query_expr(
+                &ContainerQueryExpr::Or(vec![
+                    min_width(300.0),
+                    ContainerQueryExpr::Unknown,
+                ]),
+                &container,
+                16.0,
+            ),
+            ContainerQueryTruth::Unknown
+        );
+        assert_eq!(
+            evaluate_container_query_expr(
+                &ContainerQueryExpr::Not(Box::new(ContainerQueryExpr::Unknown)),
+                &container,
+                16.0,
+            ),
+            ContainerQueryTruth::Unknown
+        );
+    }
+
+    #[test]
+    fn container_range_syntax_supports_strict_inclusive_and_chained_queries() {
+        let container =
+            container_box(crate::ContainerType::Size, &[], 200.0, 16.0);
+        for query in [
+            "(width)",
+            "(width > 199px)",
+            "(width>=200px)",
+            "(199px < width)",
+            "(199px < width <= 200px)",
+            "(height = 100px)",
+            "(block-size >= 100px)",
+        ] {
+            let expression =
+                parse_container_query_expr(query).expect("valid range query");
+            assert_eq!(
+                evaluate_container_query_expr(&expression, &container, 16.0),
+                ContainerQueryTruth::True,
+                "{query}"
+            );
+        }
+        for query in [
+            "(width > 200px)",
+            "(width < 200px)",
+            "(200px < width < 300px)",
+            "(height > 100px)",
+        ] {
+            let expression =
+                parse_container_query_expr(query).expect("valid range query");
+            assert_eq!(
+                evaluate_container_query_expr(&expression, &container, 16.0),
+                ContainerQueryTruth::False,
+                "{query}"
+            );
+        }
+        for invalid in [
+            "(100px < width > 200px)",
+            "(200px > width < 100px)",
+            "(100px = width = 100px)",
+            "(100px < width = 200px)",
+        ] {
+            assert!(
+                parse_container_query_expr(invalid).is_none(),
+                "invalid mixed/equality chain parsed: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn block_axis_query_requires_size_container() {
+        let tree = obscura_dom::parse_html(
+            r#"<div id="container"><div id="target"></div></div>"#,
+        );
+        let container = tree.get_element_by_id("container").unwrap();
+        let target = tree.get_element_by_id("target").unwrap();
+        let sheet = Stylesheet::parse(
+            &tree,
+            &[r#"
+                #target { width:1px }
+                @container (height >= 100px) { #target { width:8px } }
+            "#
+            .to_string()],
+        );
+        let snapshot = |container_type| {
+            let mut snapshot = ContainerSnapshot {
+                root_font_size: 16.0,
+                ..Default::default()
+            };
+            snapshot.boxes.insert(
+                container,
+                container_box(container_type, &[], 300.0, 16.0),
+            );
+            snapshot
+        };
+        let (inline_only, _, _) = evaluate_container_styles(
+            &tree,
+            &sheet,
+            target,
+            &snapshot(crate::ContainerType::InlineSize),
+        );
+        assert_eq!(inline_only.width, crate::Dimension::Px(1.0));
+        let (size, _, _) = evaluate_container_styles(
+            &tree,
+            &sheet,
+            target,
+            &snapshot(crate::ContainerType::Size),
+        );
+        assert_eq!(size.width, crate::Dimension::Px(8.0));
     }
 
     #[test]
