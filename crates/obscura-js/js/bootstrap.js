@@ -2059,13 +2059,7 @@ class Element extends Node {
       if (rest === "") return true;
       return this.matches(rest);
     }
-    const parent = this.parentNode;
-    if (!parent || !parent.querySelectorAll) return false;
-    const matches = parent.querySelectorAll(s);
-    for (let i = 0; i < matches.length; i++) {
-      if (matches[i]._nid === this._nid) return true;
-    }
-    return false;
+    return _dom("matches_selector", this._nid, String(s)) === "true";
   }
   closest(s) {
     let el = this;

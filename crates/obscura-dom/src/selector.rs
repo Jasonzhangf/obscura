@@ -743,6 +743,29 @@ impl DomTree {
         Ok(results)
     }
 
+    /// Test one element as the selector subject, including when it is
+    /// detached or is a direct child of a shadow-tree compatibility root.
+    pub fn matches_selector(&self, nid: NodeId, selector: &str) -> Result<bool, String> {
+        if !self.with_node(nid, |node| node.is_element()).unwrap_or(false) {
+            return Ok(false);
+        }
+        let selector_list = parse_selector(selector)?;
+        let mut caches = selectors::context::SelectorCaches::default();
+        let mut context = MatchingContext::new(
+            MatchingMode::Normal,
+            None,
+            &mut caches,
+            QuirksMode::NoQuirks,
+            NeedsSelectorFlags::No,
+            MatchingForInvalidation::No,
+        );
+        Ok(selectors::matching::matches_selector_list(
+            &selector_list,
+            &DomElement::new(self, nid),
+            &mut context,
+        ))
+    }
+
     /// Parse a single selector once for repeated single-element matching, and
     /// precompute its specificity, ancestor hashes, and "subject key" (the
     /// rightmost id/class/tag used to bucket the rule for fast candidate

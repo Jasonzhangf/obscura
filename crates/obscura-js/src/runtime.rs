@@ -1991,7 +1991,10 @@ mod tests {
                 const parsed = [
                     inside.parentNode === root,
                     inside.getRootNode() === root,
-                    root.textContent
+                    root.textContent,
+                    inside.matches("span#inside"),
+                    root.querySelector("span#inside") === inside,
+                    root.querySelectorAll("span#inside").length === 1
                 ];
 
                 const a = document.createElement("a");
@@ -2059,7 +2062,7 @@ mod tests {
                 ],
                 [true, true, true],
                 [true, true, true],
-                [true, true, "inside"],
+                [true, true, "inside", true, true, true],
                 ["b", "a", "i"],
                 [["b", "a", "x-one", "x-two", "i"], 0, true, true],
                 [["a", "x-one", "x-two", "b"], true, true],

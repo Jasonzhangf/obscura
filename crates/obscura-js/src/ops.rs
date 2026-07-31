@@ -288,6 +288,10 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                 .map(|ids| ids.iter().map(|id| id.index() as i32).collect()).unwrap_or_default();
             serde_json::to_string(&ids).unwrap_or("[]".into())
         }
+        "matches_selector" => {
+            let nid = NodeId::new(arg1.parse::<u32>().unwrap_or(0));
+            dom.matches_selector(nid, &arg2).unwrap_or(false).to_string()
+        }
         "node_type" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
             dom.with_node(NodeId::new(nid), |n| match &n.data {
