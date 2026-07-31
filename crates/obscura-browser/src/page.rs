@@ -425,6 +425,27 @@ fn parse_import_url(stmt: &str) -> Option<String> {
     Some(url)
 }
 
+/// Materialize a fetched linked sheet immediately after its source `<link>`.
+///
+/// Keeping each sheet at its document position matters when linked and inline
+/// author sheets are interleaved. Appending one aggregate `<style>` to `<head>`
+/// makes every external rule later than every inline rule, which changes the
+/// CSS cascade even when the external fetches themselves complete in order.
+fn materialize_linked_stylesheet_script(link_index: usize, css: &str) -> String {
+    let escaped_css = escape_for_js_template_literal(css);
+    format!(
+        r#"(function() {{
+            var links = document.querySelectorAll('link[rel~="stylesheet"]');
+            var link = links[{link_index}];
+            if (!link || !link.parentNode) return;
+            var style = document.createElement('style');
+            style.setAttribute('data-obscura-external-stylesheets', '');
+            style.textContent = `{escaped_css}`;
+            link.parentNode.insertBefore(style, link.nextSibling);
+        }})()"#
+    )
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct HydrationStats {
     elements: usize,
@@ -761,7 +782,7 @@ impl Page {
                         .query_selector_all("link[rel~=\"stylesheet\"]")
                         .unwrap_or_default();
                     let mut links = Vec::new();
-                    for lid in link_ids {
+                    for (link_index, lid) in link_ids.into_iter().enumerate() {
                         if let Some(node) = dom.get_node(lid) {
                             // Skip disabled stylesheets: a `<link ... disabled>`
                             // does not apply until JS clears the attribute. Sites
@@ -791,7 +812,7 @@ impl Page {
                                 }
                             }
                             if let Some(href) = node.get_attribute("href") {
-                                links.push(href.to_string());
+                                links.push((link_index, href.to_string()));
                             }
                         }
                     }
@@ -809,7 +830,7 @@ impl Page {
         let document_base = self.resolve_base_url();
 
         let mut fetch_tasks = Vec::new();
-        for href in all_links {
+        for (link_index, href) in all_links {
             let full_url = if href.starts_with("http://") || href.starts_with("https://") {
                 href.clone()
             } else if let Some(base) = &document_base {
@@ -821,28 +842,24 @@ impl Page {
 
             let client = self.http_client.clone();
             fetch_tasks.push(tokio::spawn(async move {
-                fetch_css_with_imports(client, full_url, 0).await
+                (
+                    link_index,
+                    fetch_css_with_imports(client, full_url, 0).await,
+                )
             }));
         }
 
-        let mut all_css = String::new();
         for task in fetch_tasks {
-            if let Ok(Some(css)) = task.await {
+            if let Ok((link_index, Some(css))) = task.await {
                 tracing::info!("fetch_stylesheets: fetched {} bytes of CSS", css.len());
-                all_css.push_str(&css);
-                all_css.push('\n');
-            }
-        }
-
-        if !all_css.is_empty() {
-            tracing::info!("fetch_stylesheets: injecting {} bytes of CSS", all_css.len());
-            if let Some(js) = &mut self.js {
-                let escaped_css = all_css.replace('\\', "\\\\").replace('`', "\\`").replace('$', "\\$");
-                let code = format!(
-                    "var style = document.createElement('style'); style.setAttribute('data-obscura-external-stylesheets', ''); style.textContent = `{}`; document.head.appendChild(style);",
-                    escaped_css
+                tracing::info!(
+                    "fetch_stylesheets: injecting sheet at link index {}",
+                    link_index
                 );
-                let _ = js.execute_script("<fetch_stylesheets>", &code);
+                if let Some(js) = &mut self.js {
+                    let code = materialize_linked_stylesheet_script(link_index, &css);
+                    let _ = js.execute_script("<fetch_stylesheets>", &code);
+                }
             }
         }
     }
@@ -1647,7 +1664,9 @@ impl Page {
         // Same concurrency cap as script fetches.
         use futures::StreamExt as _;
         let css_results: Vec<_> = futures::stream::iter(css_futures)
-            .buffer_unordered(16)
+            // Fetch concurrently but retain document order for the exposed
+            // aggregate CSS. Completion order is not cascade order.
+            .buffered(16)
             .collect()
             .await;
         let mut css_sources = Vec::new();
@@ -2319,9 +2338,9 @@ fn url_matches_cdp_pattern(pattern: &str, url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_import_url, rebase_css_urls, should_restore_hydration_snapshot, split_css_imports,
-        script_response_is_executable, truncate_on_char_boundary, url_matches_cdp_pattern,
-        HydrationStats,
+        materialize_linked_stylesheet_script, parse_import_url, rebase_css_urls,
+        should_restore_hydration_snapshot, split_css_imports, script_response_is_executable,
+        truncate_on_char_boundary, url_matches_cdp_pattern, HydrationStats,
     };
     use obscura_dom::parse_html;
 
@@ -2462,6 +2481,50 @@ mod tests {
             dom.get_node(links[0])
                 .and_then(|node| node.get_attribute("href").map(str::to_owned)),
             Some("app.css".to_string())
+        );
+    }
+
+    #[test]
+    fn external_stylesheets_keep_their_positions_between_inline_sheets() {
+        let dom = parse_html(
+            r#"<html><head>
+                <link rel="stylesheet" href="first.css">
+                <style data-name="inline">.target{height:20px}</style>
+                <link rel="preload stylesheet" href="second.css">
+            </head><body></body></html>"#,
+        );
+        let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new();
+        runtime.set_dom(dom);
+        runtime.run_page_init();
+        runtime
+            .execute_script(
+                "<first-sheet>",
+                &materialize_linked_stylesheet_script(0, ".target{height:10px}"),
+            )
+            .expect("materialize first linked sheet");
+        runtime
+            .execute_script(
+                "<second-sheet>",
+                &materialize_linked_stylesheet_script(1, ".target{height:30px}"),
+            )
+            .expect("materialize second linked sheet");
+
+        let sheet_text = runtime
+            .with_dom(|dom| {
+                dom.query_selector_all("style")
+                    .expect("valid selector")
+                    .into_iter()
+                    .map(|nid| dom.text_content(nid))
+                    .collect::<Vec<_>>()
+            })
+            .expect("live DOM");
+        assert_eq!(
+            sheet_text,
+            vec![
+                ".target{height:10px}",
+                ".target{height:20px}",
+                ".target{height:30px}",
+            ]
         );
     }
 
