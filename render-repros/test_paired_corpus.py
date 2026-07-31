@@ -245,5 +245,33 @@ class GeometryProbeTests(unittest.TestCase):
         self.assertEqual(comparison[1]["rects_compared"], 0)
 
 
+class AnimationSamplingTests(unittest.TestCase):
+    class FakePage:
+        def __init__(self):
+            self.calls = []
+
+        def evaluate(self, expression, *args):
+            self.calls.append((expression, args))
+            return {
+                "supported": True,
+                "requested_ms": args[0],
+                "discovered": 3,
+                "frozen": 3,
+                "failures": [],
+            }
+
+    def test_explicit_sample_pauses_and_seeks_current_animations(self):
+        page = self.FakePage()
+        result = paired_corpus.freeze_chromium_animations(page, 0)
+        self.assertEqual(result["requested_ms"], 0)
+        self.assertEqual(len(page.calls), 1)
+        expression, args = page.calls[0]
+        self.assertEqual(args, (0,))
+        self.assertIn("document.getAnimations()", expression)
+        self.assertIn("animation.pause()", expression)
+        self.assertIn("animation.currentTime = sampleMs", expression)
+        self.assertIn("getBoundingClientRect", expression)
+
+
 if __name__ == "__main__":
     unittest.main()

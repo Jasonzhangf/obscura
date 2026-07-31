@@ -704,6 +704,58 @@ def capture_chromium_state(page, geometry_selectors=None):
     return state
 
 
+def freeze_chromium_animations(page, sample_ms):
+    """Pause currently exposed Web Animations at one explicit local time.
+
+    This is opt-in: live wall-clock captures remain useful for runtime
+    failures, while deterministic CSS-animation comparisons need Chromium
+    sampled at the same T=0 used by the static renderer.
+    """
+    return page.evaluate(
+        """sampleMs => {
+          if (typeof document.getAnimations !== "function") {
+            return {
+              supported: false,
+              requested_ms: sampleMs,
+              discovered: 0,
+              frozen: 0,
+              failures: []
+            };
+          }
+          const animations = document.getAnimations();
+          const failures = [];
+          let frozen = 0;
+          for (let index = 0; index < animations.length; index++) {
+            const animation = animations[index];
+            try {
+              animation.pause();
+              animation.currentTime = sampleMs;
+              frozen++;
+            } catch (error) {
+              failures.push({
+                index,
+                name: error && error.name ? String(error.name) : "Error",
+                message: error && error.message
+                  ? String(error.message)
+                  : String(error)
+              });
+            }
+          }
+          if (document.documentElement) {
+            void document.documentElement.getBoundingClientRect().width;
+          }
+          return {
+            supported: true,
+            requested_ms: sampleMs,
+            discovered: animations.length,
+            frozen,
+            failures
+          };
+        }""",
+        sample_ms,
+    )
+
+
 def load_rgb(path):
     return np.asarray(Image.open(path).convert("RGB"))
 
@@ -872,6 +924,16 @@ def main():
     parser.add_argument("--height", type=int, default=1400)
     parser.add_argument("--settle-ms", type=int, default=3000)
     parser.add_argument(
+        "--animation-time-ms",
+        type=int,
+        choices=[0],
+        help=(
+            "pause Chromium animations currently exposed through Web Animations "
+            "at T=0 immediately before state sampling and screenshot paint; "
+            "matches Obscura's deterministic static animation sample"
+        ),
+    )
+    parser.add_argument(
         "--geometry-selector",
         action="append",
         default=[],
@@ -922,6 +984,19 @@ def main():
             "full wall-clock interval while pumping each engine; when a "
             "controlled scroll is requested, the same interval runs once "
             "after load and once after scrolling"
+        ),
+        "animation_sampling": (
+            {
+                "mode": "deterministic-active-web-animations",
+                "sample_ms": args.animation_time_ms,
+                "chromium": (
+                    "document.getAnimations() results are paused and assigned "
+                    "currentTime immediately before state and screenshot capture"
+                ),
+                "obscura": "static renderer animation sample time T=0",
+            }
+            if args.animation_time_ms is not None
+            else {"mode": "live-wall-clock", "sample_ms": None}
         ),
         "controlled_scroll": (
             {"x": controlled_scroll[0], "y": controlled_scroll[1]}
@@ -981,6 +1056,12 @@ def main():
                 "Obscura's DOM image/font readiness is sampled before paint; "
                 "paint may then fetch retained renderer resources that are not "
                 "reflected back into HTMLImageElement or FontFaceSet state."
+            ),
+            "animation_sampling": (
+                "The deterministic option controls only animations still "
+                "exposed by document.getAnimations() at capture time. Finished "
+                "fill-none animations and script-driven visual state that has "
+                "already been discarded cannot be rewound by this harness."
             ),
         },
         "pages": [],
@@ -1119,11 +1200,20 @@ def main():
                             [scroll_x, scroll_y],
                         )
                         page.wait_for_timeout(args.settle_ms)
+                    animation_sampling = None
+                    if args.animation_time_ms is not None:
+                        animation_sampling = freeze_chromium_animations(
+                            page, args.animation_time_ms
+                        )
                     chromium_state_ok = False
                     try:
                         chromium_state = capture_chromium_state(
                             page, args.geometry_selector
                         )
+                        if animation_sampling is not None:
+                            chromium_state["animation_sampling"] = (
+                                animation_sampling
+                            )
                         chromium_state["media"]["matches_configured"] = (
                             media_matches_configured(chromium_state["media"])
                         )
