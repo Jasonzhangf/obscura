@@ -96,6 +96,15 @@ struct PseudoRule {
     container_condition_id: ContainerConditionId,
 }
 
+const PROPERTY_REGISTRATION_SELECTOR_PREFIX: &str = "\0property:";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RegisteredCustomProperty {
+    syntax: String,
+    inherits: bool,
+    initial_value: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct KeyframeStop {
     /// CSS keyframes always provide an offset. Keeping this optional makes the
@@ -481,6 +490,7 @@ fn evaluate_container_query_expr(
 /// An indexed set of author rules ready for fast per-element matching.
 pub struct Stylesheet {
     rules: Vec<Rule>,
+    registered_custom_properties: HashMap<String, RegisteredCustomProperty>,
     /// Index zero is the unconditional sentinel.
     container_conditions: Vec<ContainerConditionNode>,
     /// Every offset from each `@keyframes` rule. The opacity sampler resolves
@@ -576,6 +586,7 @@ impl Stylesheet {
     ) -> Self {
         let mut sheet = Stylesheet {
             rules: Vec::new(),
+            registered_custom_properties: HashMap::new(),
             container_conditions: vec![ContainerConditionNode {
                 parent: ContainerConditionId::NONE,
                 alternatives: Vec::new(),
@@ -601,6 +612,14 @@ impl Stylesheet {
                 ContainerConditionId::NONE,
             );
             for ParsedRule { selector, declarations: decls, container_condition_id } in parsed {
+                if let Some(name) = selector.strip_prefix(PROPERTY_REGISTRATION_SELECTOR_PREFIX) {
+                    if let Some(registration) = parse_property_registration(&decls) {
+                        sheet
+                            .registered_custom_properties
+                            .insert(name.to_string(), registration);
+                    }
+                    continue;
+                }
                 let sel_trim = selector.trim();
                 if let Some(base) = strip_pseudo_element(sel_trim, "before") {
                     if let Some(sel) = tree.compile_rule_selector(base) {
@@ -919,35 +938,65 @@ impl Stylesheet {
             collect_custom(&self.rules[i].important_decls);
         }
         collect_custom(&inline_important);
-        let effective = if own.is_empty() {
-            None
-        } else {
-            let mut m = parent_props.clone();
-            for (k, v) in own {
-                match v.trim().to_ascii_lowercase().as_str() {
-                    // CSS-wide keywords on a custom property are cascade
-                    // instructions, not literal token streams. `initial`
-                    // produces the guaranteed-invalid value so var() must use
-                    // its fallback even when an ancestor defined the token.
-                    "initial" => {
-                        m.remove(&k);
-                    }
-                    // Custom properties inherit by default. `unset` therefore
-                    // has the same effect as `inherit`; approximate both
-                    // revert forms with the inherited author value as well.
-                    "inherit" | "unset" | "revert" | "revert-layer" => {
-                        if let Some(inherited) = parent_props.get(&k) {
-                            m.insert(k, inherited.clone());
-                        } else {
-                            m.remove(&k);
-                        }
-                    }
-                    _ => {
-                        m.insert(k, v);
+        let mut resolved_props = parent_props.clone();
+        for (name, registration) in &self.registered_custom_properties {
+            if registration.inherits && resolved_props.contains_key(name) {
+                continue;
+            }
+            if let Some(initial) = &registration.initial_value {
+                resolved_props.insert(name.clone(), initial.clone());
+            } else {
+                resolved_props.remove(name);
+            }
+        }
+        let registration_changed_props = resolved_props != *parent_props;
+        let has_own = !own.is_empty();
+        for (k, v) in own {
+            let registration = self.registered_custom_properties.get(&k);
+            let set_initial = |props: &mut HashMap<String, String>| {
+                if let Some(initial) = registration.and_then(|entry| entry.initial_value.as_ref()) {
+                    props.insert(k.clone(), initial.clone());
+                } else {
+                    props.remove(&k);
+                }
+            };
+            let inherit = |props: &mut HashMap<String, String>| {
+                if let Some(inherited) = parent_props.get(&k) {
+                    props.insert(k.clone(), inherited.clone());
+                } else if let Some(initial) =
+                    registration.and_then(|entry| entry.initial_value.as_ref())
+                {
+                    props.insert(k.clone(), initial.clone());
+                } else {
+                    props.remove(&k);
+                }
+            };
+            match v.trim().to_ascii_lowercase().as_str() {
+                "initial" => set_initial(&mut resolved_props),
+                "inherit" => inherit(&mut resolved_props),
+                "unset" | "revert" | "revert-layer"
+                    if registration.is_some_and(|entry| !entry.inherits) =>
+                {
+                    set_initial(&mut resolved_props);
+                }
+                "unset" | "revert" | "revert-layer" => inherit(&mut resolved_props),
+                _ => {
+                    let valid = registration.is_none_or(|entry| {
+                        substitute_var_value(&v, &resolved_props, 0)
+                            .is_some_and(|value| registered_value_matches(entry, &value))
+                    });
+                    if valid {
+                        resolved_props.insert(k, v);
+                    } else {
+                        set_initial(&mut resolved_props);
                     }
                 }
             }
-            Some(m)
+        }
+        let effective = if has_own || registration_changed_props {
+            Some(resolved_props)
+        } else {
+            None
         };
         let props = effective.as_ref().unwrap_or(parent_props);
 
@@ -1553,7 +1602,12 @@ fn parse_stylesheet_for_viewport(
     .into_iter()
     // This legacy tuple API cannot express conditional context. Keep its
     // established behavior by omitting unresolved container rules.
-    .filter(|rule| rule.container_condition_id == ContainerConditionId::NONE)
+    .filter(|rule| {
+        rule.container_condition_id == ContainerConditionId::NONE
+            && !rule
+                .selector
+                .starts_with(PROPERTY_REGISTRATION_SELECTOR_PREFIX)
+    })
     .map(|rule| (rule.selector, rule.declarations))
     .collect()
 }
@@ -1683,26 +1737,15 @@ fn flush_at_rule(
             ));
         }
     } else if let Some(name) = at_rule_prelude(at, "property") {
-        // `@property --x { syntax:..; initial-value: V }` declares a custom
-        // property and its default. Register the initial-value as a `:root`
-        // declaration so `var(--x)` resolves when nothing else sets it. Tailwind
-        // v4 and modern frameworks define theme tokens this way; dropping them
-        // left those `var()`s (page/section backgrounds, colors) unresolved.
         if name.starts_with("--") {
-            for decl in inner.split(';') {
-                if let Some((k, v)) = decl.split_once(':') {
-                    if k.trim().eq_ignore_ascii_case("initial-value") && !v.trim().is_empty() {
-                        rules.push(ParsedRule {
-                            selector: ":root".to_string(),
-                            declarations: format!("{}: {}", name, v.trim()),
-                            // Registrations are global name-defining rules.
-                            // CSS Conditional 5 deliberately does not gate
-                            // them on an enclosing container query.
-                            container_condition_id: ContainerConditionId::NONE,
-                        });
-                    }
-                }
-            }
+            rules.push(ParsedRule {
+                selector: format!("{PROPERTY_REGISTRATION_SELECTOR_PREFIX}{name}"),
+                declarations: inner.to_string(),
+                // Registrations are global name-defining rules. CSS
+                // Conditional 5 deliberately does not gate them on an
+                // enclosing container query.
+                container_condition_id: ContainerConditionId::NONE,
+            });
         }
     } else if at_rule_prelude(at, "layer").is_some() {
         // Cascade layers: `@layer name { ... }` wraps ordinary rules. We do not
@@ -1723,6 +1766,94 @@ fn flush_at_rule(
     }
     // Other at-rules (@font-face, @keyframes, @import, ...) carry no
     // layout-relevant rules for us, so drop them.
+}
+
+fn parse_property_registration(descriptors: &str) -> Option<RegisteredCustomProperty> {
+    let mut syntax = None;
+    let mut inherits = None;
+    let mut initial_value = None;
+    for declaration in crate::style::split_declarations(descriptors) {
+        let Some((name, value)) = declaration.split_once(':') else { continue };
+        let value = value.trim();
+        match name.trim().to_ascii_lowercase().as_str() {
+            "syntax" => {
+                let unquoted = value
+                    .strip_prefix('"')
+                    .and_then(|value| value.strip_suffix('"'))
+                    .or_else(|| {
+                        value
+                            .strip_prefix('\'')
+                            .and_then(|value| value.strip_suffix('\''))
+                    })?;
+                if !unquoted.is_empty() {
+                    syntax = Some(unquoted.to_string());
+                }
+            }
+            "inherits" => {
+                inherits = match value.to_ascii_lowercase().as_str() {
+                    "true" => Some(true),
+                    "false" => Some(false),
+                    _ => None,
+                };
+            }
+            "initial-value" if !value.is_empty() => initial_value = Some(value.to_string()),
+            _ => {}
+        }
+    }
+    let syntax = syntax?;
+    if !matches!(
+        syntax.as_str(),
+        "*" | "<percentage>" | "<length>" | "<number>" | "<color>"
+    ) {
+        return None;
+    }
+    if initial_value.is_none() && syntax != "*" {
+        return None;
+    }
+    let registration = RegisteredCustomProperty {
+        syntax,
+        inherits: inherits?,
+        initial_value,
+    };
+    if registration
+        .initial_value
+        .as_deref()
+        .is_some_and(|value| !registered_value_matches(&registration, value))
+    {
+        return None;
+    }
+    Some(registration)
+}
+
+fn registered_value_matches(registration: &RegisteredCustomProperty, value: &str) -> bool {
+    let value = value.trim();
+    match registration.syntax.as_str() {
+        "*" => !value.is_empty(),
+        "<percentage>" => value
+            .strip_suffix('%')
+            .and_then(|number| number.trim().parse::<f32>().ok())
+            .is_some_and(f32::is_finite),
+        "<number>" => value.parse::<f32>().ok().is_some_and(f32::is_finite),
+        "<color>" => crate::style::parse_color(value).is_some(),
+        "<length>" => {
+            if value.parse::<f32>().ok().is_some_and(|number| number == 0.0) {
+                return true;
+            }
+            let lower = value.to_ascii_lowercase();
+            [
+                "rem", "em", "ex", "vmin", "vmax", "dvw", "svw", "lvw", "dvh",
+                "svh", "lvh", "vw", "vh", "px", "pt",
+            ]
+            .iter()
+            .any(|unit| {
+                lower
+                    .strip_suffix(unit)
+                    .and_then(|number| number.trim().parse::<f32>().ok())
+                    .is_some_and(f32::is_finite)
+            })
+        }
+        _ => false,
+    }
 }
 
 /// Return the prelude after an exact ASCII-insensitive at-rule name.
@@ -3219,22 +3350,235 @@ mod tests {
         assert_eq!(conditions.len(), 2);
         let registration = parsed
             .iter()
-            .find(|rule| rule.selector == ":root")
+            .find(|rule| {
+                rule.selector
+                    == format!("{PROPERTY_REGISTRATION_SELECTOR_PREFIX}--cq-token")
+            })
             .expect("@property initial value should be registered");
         assert_eq!(
             registration.container_condition_id,
             ContainerConditionId::NONE
         );
-        assert!(registration.declarations.contains("--cq-token: 17px"));
+        assert!(registration.declarations.contains("initial-value: 17px"));
         let conditional = parsed
             .iter()
             .find(|rule| rule.selector == ".conditional")
             .expect("ordinary conditional rule should remain indexed");
         assert_eq!(conditional.container_condition_id, ContainerConditionId(1));
-        assert_eq!(
-            parse_stylesheet(css),
-            vec![(":root".into(), "--cq-token: 17px".into())]
+        assert!(parse_stylesheet(css).is_empty());
+    }
+
+    fn apply_registered_property_test_style(
+        sheet: &Stylesheet,
+        tree: &DomTree,
+        target: NodeId,
+        parent_props: &HashMap<String, String>,
+    ) -> (LayoutStyle, HashMap<String, String>) {
+        let node = tree.get_node(target).unwrap();
+        let element = node.as_element().unwrap();
+        let classes = node
+            .get_attribute("class")
+            .map(|value| value.split_whitespace().map(str::to_string).collect::<Vec<_>>())
+            .unwrap_or_default();
+        let mut matcher = tree.matcher();
+        let mut style = LayoutStyle::default();
+        let effective = sheet.apply(
+            tree,
+            &mut matcher,
+            target,
+            node.get_attribute("id"),
+            &classes,
+            element.local.as_ref(),
+            &mut style,
+            parent_props,
+            None,
         );
+        (style, effective.unwrap_or_else(|| parent_props.clone()))
+    }
+
+    #[test]
+    fn registered_custom_properties_obey_inherits_descriptors() {
+        let tree = obscura_dom::parse_html(
+            r#"<div id="parent"><div id="child"></div></div><div id="initial"></div>"#,
+        );
+        let css = r#"
+            @property --private {
+                syntax:"<percentage>";
+                inherits:false;
+                initial-value:75%;
+            }
+            @property --shared {
+                syntax:"<percentage>";
+                inherits:true;
+                initial-value:25%;
+            }
+            #parent { --private:20%; --shared:30% }
+            #child, #initial {
+                width:var(--private);
+                height:var(--shared);
+            }
+        "#;
+        let sheet = Stylesheet::parse(&tree, &[css.to_string()]);
+        let parent = tree.get_element_by_id("parent").unwrap();
+        let child = tree.get_element_by_id("child").unwrap();
+        let initial = tree.get_element_by_id("initial").unwrap();
+        let (_, parent_props) =
+            apply_registered_property_test_style(&sheet, &tree, parent, &HashMap::new());
+        let (child_style, _) =
+            apply_registered_property_test_style(&sheet, &tree, child, &parent_props);
+        assert_eq!(child_style.width, crate::Dimension::Percent(0.75));
+        assert_eq!(child_style.height, crate::Dimension::Percent(0.30));
+
+        let (initial_style, _) =
+            apply_registered_property_test_style(&sheet, &tree, initial, &HashMap::new());
+        assert_eq!(initial_style.width, crate::Dimension::Percent(0.75));
+        assert_eq!(initial_style.height, crate::Dimension::Percent(0.25));
+    }
+
+    #[test]
+    fn registered_custom_property_overrides_and_var_fallbacks_stay_distinct() {
+        let tree = obscura_dom::parse_html(
+            r#"<div id="override"></div><div id="reset"></div><div id="invalid"></div>"#,
+        );
+        let css = r#"
+            @property --registered {
+                syntax:"<percentage>";
+                inherits:false;
+                initial-value:75%;
+            }
+            #override {
+                --registered:60%;
+                width:var(--registered, 10%);
+                height:var(--missing, 12%);
+            }
+            #reset {
+                --registered:initial;
+                width:var(--registered, 10%);
+                height:var(--missing, 12%);
+            }
+            #invalid {
+                --registered:red;
+                width:var(--registered, 10%);
+            }
+        "#;
+        let sheet = Stylesheet::parse(&tree, &[css.to_string()]);
+        let override_id = tree.get_element_by_id("override").unwrap();
+        let reset_id = tree.get_element_by_id("reset").unwrap();
+        let invalid_id = tree.get_element_by_id("invalid").unwrap();
+        let (overridden, _) = apply_registered_property_test_style(
+            &sheet,
+            &tree,
+            override_id,
+            &HashMap::new(),
+        );
+        assert_eq!(overridden.width, crate::Dimension::Percent(0.60));
+        assert_eq!(overridden.height, crate::Dimension::Percent(0.12));
+        let (reset, _) =
+            apply_registered_property_test_style(&sheet, &tree, reset_id, &HashMap::new());
+        assert_eq!(reset.width, crate::Dimension::Percent(0.75));
+        assert_eq!(reset.height, crate::Dimension::Percent(0.12));
+        let (invalid, invalid_props) =
+            apply_registered_property_test_style(&sheet, &tree, invalid_id, &HashMap::new());
+        assert_eq!(invalid.width, crate::Dimension::Percent(0.75));
+        assert_eq!(
+            invalid_props.get("--registered").map(String::as_str),
+            Some("75%"),
+            "an invalid typed value computes to the registered initial value"
+        );
+    }
+
+    #[test]
+    fn wildcard_duplicate_and_invalid_property_registrations_are_bounded() {
+        let tree = obscura_dom::parse_html(
+            r#"<div id="wild"></div><div id="wild-fallback"></div><div id="typed"></div>"#,
+        );
+        let css = r#"
+            @property --wild { syntax:"*"; inherits:false }
+            @property --typed {
+                syntax:"<number>";
+                inherits:false;
+                initial-value:2;
+            }
+            @property --typed {
+                syntax:"<number>";
+                initial-value:9;
+            }
+            @property --unsupported {
+                syntax:"<angle>";
+                inherits:false;
+                initial-value:30deg;
+            }
+            @property --last {
+                syntax:"<number>";
+                inherits:false;
+                initial-value:1;
+            }
+            @property --last {
+                syntax:"<number>";
+                inherits:false;
+                initial-value:3;
+            }
+            #wild { --wild:20px; width:var(--wild, 7px) }
+            #wild-fallback { width:var(--wild, 7px) }
+            #typed {
+                opacity:var(--typed, .1);
+                height:var(--unsupported, 11px);
+            }
+        "#;
+        let sheet = Stylesheet::parse(&tree, &[css.to_string()]);
+        let wild = tree.get_element_by_id("wild").unwrap();
+        let wild_fallback = tree.get_element_by_id("wild-fallback").unwrap();
+        let typed = tree.get_element_by_id("typed").unwrap();
+        let (wild_style, _) =
+            apply_registered_property_test_style(&sheet, &tree, wild, &HashMap::new());
+        assert_eq!(wild_style.width, crate::Dimension::Px(20.0));
+        let (fallback_style, _) =
+            apply_registered_property_test_style(&sheet, &tree, wild_fallback, &HashMap::new());
+        assert_eq!(fallback_style.width, crate::Dimension::Px(7.0));
+        let (typed_style, typed_props) =
+            apply_registered_property_test_style(&sheet, &tree, typed, &HashMap::new());
+        assert_eq!(typed_style.opacity, Some(2.0));
+        assert_eq!(typed_style.height, crate::Dimension::Px(11.0));
+        assert_eq!(
+            typed_props.get("--typed").map(String::as_str),
+            Some("2"),
+            "a later invalid duplicate registration must not replace the valid one"
+        );
+        assert_eq!(
+            typed_props.get("--last").map(String::as_str),
+            Some("3"),
+            "the last valid registration wins"
+        );
+        assert!(!typed_props.contains_key("--unsupported"));
+    }
+
+    #[test]
+    fn registered_percentage_initial_value_keeps_radial_gradient_valid() {
+        let tree = obscura_dom::parse_html(r#"<div id="pulse"></div>"#);
+        let css = r#"
+            @property --pulse-outer {
+                syntax:"<percentage>";
+                inherits:false;
+                initial-value:75%;
+            }
+            #pulse {
+                background-image:radial-gradient(
+                    circle at 50% 50%,
+                    transparent var(--pulse-outer),
+                    rgb(255 255 255) 100%
+                );
+            }
+        "#;
+        let sheet = Stylesheet::parse(&tree, &[css.to_string()]);
+        let pulse = tree.get_element_by_id("pulse").unwrap();
+        let (style, props) =
+            apply_registered_property_test_style(&sheet, &tree, pulse, &HashMap::new());
+        assert_eq!(props.get("--pulse-outer").map(String::as_str), Some("75%"));
+        let (_, stops) = style
+            .background_radial_gradient
+            .expect("registered initial value should preserve the gradient");
+        assert_eq!(stops[0].1, Some(0.75));
+        assert_eq!(stops[1].1, Some(1.0));
     }
 
     #[test]
