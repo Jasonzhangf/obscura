@@ -586,23 +586,22 @@ class CSSStyleDeclaration {
     // `style` content attribute in both directions; an owner-less declaration
     // (getComputedStyle fallback, stylesheet rules) is purely in-memory.
     Object.defineProperty(this, "_owner", { value: owner || null, writable: true, enumerable: false, configurable: true });
-    // Last `style` attribute string we parsed/wrote, so a read can skip the
-    // reparse when the attribute has not changed underneath us. Held in a
-    // one-field object so the sync helpers can mutate it without a bare
-    // `this._x = …` assignment (which the style proxy would reroute into
-    // setProperty).
-    Object.defineProperty(this, "_sync", { value: { last: null }, writable: true, enumerable: false, configurable: true });
+    // Load the content attribute only when style is first observed. Keeping
+    // this as a primitive avoids allocating a separate sync object for every
+    // wrapped element.
+    Object.defineProperty(this, "_loaded", { value: !owner, writable: true, enumerable: false, configurable: true });
   }
-  // Pull the owner's `style` attribute into `_props` if it changed since our
-  // last read/write. Keeps parsed HTML and setAttribute('style', …) visible via
-  // el.style.*. No-op when owner-less.
+  // Pull the initial `style` attribute once. Later attribute mutations update
+  // the declaration directly from Element.setAttribute/removeAttribute, so
+  // repeated style reads do not cross the JS/Rust op boundary.
   _pull() {
-    const o = this._owner;
-    if (!o) return;
-    const attr = o.getAttribute("style");
-    if (attr === this._sync.last) return;
-    _parseCssInto(this._props, attr);
-    this._sync.last = attr;
+    if (this._loaded) return;
+    _parseCssInto(this._props, this._owner.getAttribute("style"));
+    this._loaded = true;
+  }
+  _replaceFromAttribute(text) {
+    _parseCssInto(this._props, text);
+    this._loaded = true;
   }
   // Serialize `_props` back onto the owner's `style` attribute after a mutation,
   // so el.style.x = … and cssText reflect into getAttribute('style') and
@@ -611,7 +610,6 @@ class CSSStyleDeclaration {
     const o = this._owner;
     if (!o) return;
     const text = _serializeCss(this._props);
-    this._sync.last = text;
     if (text) o.setAttribute("style", text);
     else o.removeAttribute("style");
   }
@@ -645,6 +643,7 @@ const _styleProxy = (decl) => new Proxy(decl, {
   },
   set(t, p, v) {
     if (typeof p === "symbol") { t[p] = v; return true; }
+    if (p === "_loaded") { t._loaded = v; return true; }
     if (p === "cssText") { t.cssText = v; return true; }
     if (/^\d+$/.test(p) || p in Object.getPrototypeOf(t)) return true;
     t.setProperty(p, v);
@@ -1443,13 +1442,15 @@ class Element extends Node {
   setAttribute(n, v) {
     n = _htmlAttrName(this, n);
     const popoverPrev = (n === "popover") ? this.popover : undefined;
-    _dom("set_attribute", this._nid, n + "\0" + String(v));
+    const value = String(v);
+    _dom("set_attribute", this._nid, n + "\0" + value);
+    if (n === "style") this._style._replaceFromAttribute(value);
     if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev);
     if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('attributes', this._nid, [], [], n);
   }
-  setAttributeNS(ns, n, v) { _dom("set_attribute", this._nid, String(n) + "\0" + String(v)); } // exact name, no HTML folding
-  removeAttribute(n) { n = _htmlAttrName(this, n); const popoverPrev = (n === "popover") ? this.popover : undefined; _dom("remove_attribute", this._nid, n); if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev); }
-  removeAttributeNS(ns, n) { _dom("remove_attribute", this._nid, String(n)); }
+  setAttributeNS(ns, n, v) { n = String(n); const value = String(v); _dom("set_attribute", this._nid, n + "\0" + value); if ((!ns || ns === "") && n === "style") this._style._replaceFromAttribute(value); } // exact name, no HTML folding
+  removeAttribute(n) { n = _htmlAttrName(this, n); const popoverPrev = (n === "popover") ? this.popover : undefined; _dom("remove_attribute", this._nid, n); if (n === "style") this._style._replaceFromAttribute(""); if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev); }
+  removeAttributeNS(ns, n) { n = String(n); _dom("remove_attribute", this._nid, n); if ((!ns || ns === "") && n === "style") this._style._replaceFromAttribute(""); }
   hasAttribute(n) { return this.getAttribute(n) !== null; }
   hasAttributes() { return true; } // Simplified
   getAttributeNames() { return _domParse("attribute_names", this._nid) || []; }
