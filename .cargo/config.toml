@@ -1,9 +1,2 @@
 [env]
 RUST_TEST_THREADS = "1"
-
-# macOS 26 (Tahoe) moved libc++ headers inside the SDK; Apple clang 17 no longer
-# finds them at the old search path. Scope the workaround to Apple targets so a
-# Linux stealth build never inherits a macOS SDK include flag. cc-rs recognizes
-# the target-suffixed CXXFLAGS variables below. See issue #136.
-CXXFLAGS_aarch64_apple_darwin = { value = "-isystem /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1", force = false }
-CXXFLAGS_x86_64_apple_darwin  = { value = "-isystem /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1", force = false }
