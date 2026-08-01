@@ -1347,6 +1347,32 @@ mod tests {
     }
 
     #[test]
+    fn insert_adjacent_html_keeps_leading_comments_in_table_contexts() {
+        let mut rt = setup_runtime(
+            r#"<html><body><table><tbody id="tb"><tr id="row"></tr></tbody></table></body></html>"#,
+        );
+        let out = rt
+            .evaluate(
+                "(function(){var tb=document.getElementById('tb');tb.insertAdjacentHTML('beforeend','<!--m--><tr><td>v</td></tr>');var row=document.getElementById('row');row.insertAdjacentHTML('beforeend','<!--n--><td>x</td>');return Array.from(tb.childNodes).map(function(n){return n.nodeName}).join('|')+';'+Array.from(row.childNodes).map(function(n){return n.nodeName}).join('|');})()",
+            )
+            .unwrap();
+        assert_eq!(out, serde_json::json!("TR|#comment|TR;#comment|TD"));
+    }
+
+    #[test]
+    fn insert_adjacent_html_uses_the_insertion_element_as_context() {
+        let mut rt = setup_runtime(
+            r#"<html><body><div id="d"></div><table id="table"><tbody id="tb"></tbody></table></body></html>"#,
+        );
+        let out = rt
+            .evaluate(
+                "(function(){var d=document.getElementById('d');d.insertAdjacentHTML('beforeend','<tr><td>v</td></tr>');var table=document.getElementById('table');table.insertAdjacentHTML('beforeend','<tr><td>x</td></tr>');var tb=document.getElementById('tb');tb.insertAdjacentHTML('beforeend','<tr><td>y</td></tr>tail');return d.firstChild.nodeName+':'+d.textContent+';'+table.lastElementChild.tagName+';'+Array.from(tb.childNodes).map(function(n){return n.nodeName+(n.data?':'+n.data:'')}).join('|');})()",
+            )
+            .unwrap();
+        assert_eq!(out, serde_json::json!("#text:v;TBODY;TR|#text:tail"));
+    }
+
+    #[test]
     fn test_document_title() {
         let mut rt = setup_runtime("<html><head><title>Test</title></head><body></body></html>");
         let title = rt.evaluate("document.title").unwrap();

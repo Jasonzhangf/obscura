@@ -243,10 +243,14 @@ pub fn parse_html(html: &str) -> DomTree {
 }
 
 pub fn parse_fragment(html: &str) -> DomTree {
-    use html5ever::tendril::TendrilSink;
-    use html5ever::{parse_fragment, ParseOpts, QualName};
-
     let context_name = QualName::new(None, ns!(html), local_name!("body"));
+    parse_fragment_with_context(html, context_name)
+}
+
+pub fn parse_fragment_with_context(html: &str, context_name: QualName) -> DomTree {
+    use html5ever::tendril::TendrilSink;
+    use html5ever::{parse_fragment, ParseOpts};
+
     let tree = DomTree::new();
     parse_fragment(tree, ParseOpts::default(), context_name, vec![])
         .from_utf8()

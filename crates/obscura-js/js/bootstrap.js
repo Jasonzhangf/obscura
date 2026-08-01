@@ -1227,44 +1227,20 @@ function _isSubmitButton(el) {
   return false;
 }
 
-// Ancestor chains required to parse table/select children, which the fragment
-// parser drops when parsed loosely (it uses a fixed <body> context). Each entry
-// is [openTags, closeTags, depth] — depth is how many lastChild hops reach the
-// container holding the parsed rows/cells/options. Classic jQuery wrapMap.
-const _wrapMap = {
-  option:   ['<select multiple="">', '</select>', 1],
-  optgroup: ['<select multiple="">', '</select>', 1],
-  tr:       ['<table><tbody>', '</tbody></table>', 2],
-  td:       ['<table><tbody><tr>', '</tr></tbody></table>', 3],
-  th:       ['<table><tbody><tr>', '</tr></tbody></table>', 3],
-  tbody:    ['<table>', '</table>', 1],
-  thead:    ['<table>', '</table>', 1],
-  tfoot:    ['<table>', '</table>', 1],
-  caption:  ['<table>', '</table>', 1],
-  colgroup: ['<table>', '</table>', 1],
-  col:      ['<table><colgroup>', '</colgroup></table>', 2],
-};
-// Parse an HTML string into an array of detached nodes. Table/select fragments
-// are wrapped in the required ancestor chain and dug back out so their children
-// survive; the wrapper is chosen from the fragment's own leading tag, falling
-// back to the insertion context element's tag.
-function _parseHTMLFragment(html, contextTag) {
+// Parse an HTML string into detached nodes using the actual insertion element
+// as html5ever's fragment context. This preserves table/select parsing rules,
+// comments, text-node order, and foreign-content namespaces without a wrap map.
+function _parseHTMLFragment(html, context) {
   html = String(html == null ? '' : html);
-  const m = /^\s*<\s*([a-zA-Z][a-zA-Z0-9]*)/.exec(html);
-  const lead = m ? m[1].toLowerCase() : '';
-  const key = _wrapMap[lead] ? lead : (contextTag ? String(contextTag).toLowerCase() : '');
-  const wrap = _wrapMap[key];
-  const tmp = document.createElement('div');
-  let container = tmp;
-  if (wrap) {
-    tmp.innerHTML = wrap[0] + html + wrap[1];
-    for (let d = 0; d < wrap[2]; d++) container = container.lastChild || container;
-  } else {
-    tmp.innerHTML = html;
-  }
+  const ns = context && context.nodeType === 1 ? context.namespaceURI : null;
+  const tag = context && context.nodeType === 1 ? context.localName : 'body';
+  const tmp = ns && ns !== 'http://www.w3.org/1999/xhtml'
+    ? document.createElementNS(ns, tag)
+    : document.createElement(tag);
+  tmp.innerHTML = html;
   const out = [];
   let child;
-  while ((child = container.firstChild)) out.push(container.removeChild(child));
+  while ((child = tmp.firstChild)) out.push(tmp.removeChild(child));
   return out;
 }
 
@@ -1526,23 +1502,21 @@ class Element extends Node {
     // table/select fragments keep the right parsing context (_parseHTMLFragment).
     const pos = String(position).toLowerCase();
     const parent = this.parentNode;
-    const contextTag = (pos === 'beforebegin' || pos === 'afterend')
-      ? (parent && parent.nodeType === 1 ? parent.tagName : 'body')
-      : this.tagName;
+    const context = (pos === 'beforebegin' || pos === 'afterend') ? parent : this;
     switch (pos) {
       case 'beforebegin':
-        if (parent) for (const n of _parseHTMLFragment(html, contextTag)) parent.insertBefore(n, this);
+        if (parent) for (const n of _parseHTMLFragment(html, context)) parent.insertBefore(n, this);
         break;
       case 'afterbegin': {
         const first = this.firstChild;
-        for (const n of _parseHTMLFragment(html, contextTag)) this.insertBefore(n, first);
+        for (const n of _parseHTMLFragment(html, context)) this.insertBefore(n, first);
         break;
       }
       case 'beforeend':
-        for (const n of _parseHTMLFragment(html, contextTag)) this.appendChild(n);
+        for (const n of _parseHTMLFragment(html, context)) this.appendChild(n);
         break;
       case 'afterend':
-        if (parent) { const next = this.nextSibling; for (const n of _parseHTMLFragment(html, contextTag)) parent.insertBefore(n, next); }
+        if (parent) { const next = this.nextSibling; for (const n of _parseHTMLFragment(html, context)) parent.insertBefore(n, next); }
         break;
       default:
         throw new DOMException(
