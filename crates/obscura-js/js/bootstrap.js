@@ -18,7 +18,7 @@
     '__obscura_hw', '__obscura_mem',
     '__documentReadyState__', '__currentUrl',
     // internal helpers (var-declared throughout the file)
-    '__processDynScriptQueue', '_markNative', '_fpRand', '_fpNoise',
+    '__processDynScriptQueue', '_decodeDataScriptUrl', '_markNative', '_fpRand', '_fpNoise',
     '_fpCache', '_getFp', '_fp', '_splitAsciiWhitespace',
     '_getElementsByClassName', '_docEncoding', '_docIsUtf8',
     '_isSpecialScheme', '_applyDocQueryEncoding', '_anchorBase',
@@ -163,6 +163,51 @@ let _fpSeed = 0;
 // when SPAs dynamically insert multiple <script module> tags at once.
 let __dynScriptQueue = [];
 let __dynScriptBusy = false;
+function _decodeDataScriptUrl(url) {
+  const comma = url.indexOf(',');
+  if (!url.startsWith('data:') || comma < 5) {
+    throw new TypeError('Invalid dynamic script data URL');
+  }
+
+  const meta = url.slice(5, comma);
+  const fragment = url.indexOf('#', comma + 1);
+  const payload = url.slice(comma + 1, fragment < 0 ? url.length : fragment);
+  if (meta.split(';').some(part => part.toLowerCase() === 'base64')) {
+    let encoded = payload.replace(/[\r\n\t\f ]/g, '');
+    const remainder = encoded.length % 4;
+    if (remainder === 1 || !/^[A-Za-z0-9+/]*={0,2}$/.test(encoded) || /=/.test(encoded.slice(0, -2))) {
+      throw new TypeError('Invalid dynamic script data URL base64');
+    }
+    if (remainder > 0) encoded += '='.repeat(4 - remainder);
+    if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)) {
+      throw new TypeError('Invalid dynamic script data URL base64');
+    }
+    return new TextDecoder().decode(_base64ToUint8Array(encoded));
+  }
+
+  const bytes = [];
+  for (let i = 0; i < payload.length; i++) {
+    const code = payload.charCodeAt(i);
+    if (code === 0x25 && i + 2 < payload.length) {
+      const hi = _hexv(payload.charCodeAt(i + 1));
+      const lo = _hexv(payload.charCodeAt(i + 2));
+      if (hi >= 0 && lo >= 0) {
+        bytes.push(hi * 16 + lo);
+        i += 2;
+        continue;
+      }
+    }
+    if (code < 0x80) {
+      bytes.push(code);
+    } else {
+      const character = String.fromCodePoint(payload.codePointAt(i));
+      if (character.length === 2) i++;
+      const encoded = new TextEncoder().encode(character);
+      for (let j = 0; j < encoded.length; j++) bytes.push(encoded[j]);
+    }
+  }
+  return new TextDecoder().decode(new Uint8Array(bytes));
+}
 async function __processDynScriptQueue() {
   if (__dynScriptBusy) return;
   __dynScriptBusy = true;
@@ -176,11 +221,16 @@ async function __processDynScriptQueue() {
         if (task.isModule) {
           await import(task.url);
         } else {
-          const raw = await Deno.core.ops.op_fetch_url(task.url, "GET", "{}", "", task.pageOrigin, "no-cors");
-          const parsed = JSON.parse(raw);
-          if (parsed.body) {
+          let body;
+          if (task.url.startsWith('data:')) {
+            body = _decodeDataScriptUrl(task.url);
+          } else {
+            const raw = await Deno.core.ops.op_fetch_url(task.url, "GET", "{}", "", task.pageOrigin, "no-cors");
+            body = JSON.parse(raw).body;
+          }
+          if (body) {
             globalThis.__currentScriptNid = task.nid;
-            try { (0, eval)(parsed.body); }
+            try { (0, eval)(body); }
             catch(e) { console.error('Dynamic script error (' + task.url + '):', e.message); }
             finally { globalThis.__currentScriptNid = task.prevNid || 0; }
           }
@@ -2626,6 +2676,13 @@ class Document extends Node {
   // returned a generic Event for every type, which broke libraries that call
   // createEvent('CustomEvent').initCustomEvent(...) — see issue #41.
   createEvent(type) {
+    const normalized = String(type || '').toLowerCase();
+    if (normalized === 'promiserejectionevent') {
+      throw new DOMException(
+        "The provided event type ('PromiseRejectionEvent') is invalid",
+        'NotSupportedError'
+      );
+    }
     const map = {
       'customevent': CustomEvent, 'customevents': CustomEvent,
       'mouseevent': MouseEvent,   'mouseevents': MouseEvent,
@@ -2640,8 +2697,9 @@ class Document extends Node {
       'popstateevent': PopStateEvent,
       'animationevent': AnimationEvent,
       'transitionevent': TransitionEvent,
+      'storageevent': StorageEvent,
     };
-    const Cls = map[String(type || '').toLowerCase()] || Event;
+    const Cls = map[normalized] || Event;
     return new Cls('');
   }
   createRange() { return new Range(); }
@@ -5019,6 +5077,40 @@ globalThis.ToggleEvent = class ToggleEvent extends Event {
   }
 };
 _markNative(globalThis.ToggleEvent);
+
+globalThis.PromiseRejectionEvent = class PromiseRejectionEvent extends Event {
+  constructor(type, init) {
+    if (arguments.length < 2 || init == null || !('promise' in Object(init))) {
+      throw new TypeError(
+        "Failed to construct 'PromiseRejectionEvent': required member promise is undefined."
+      );
+    }
+    super(type, init);
+    this.promise = init.promise;
+    this.reason = init.reason;
+  }
+};
+_markNative(globalThis.PromiseRejectionEvent);
+
+globalThis.StorageEvent = class StorageEvent extends Event {
+  constructor(type, init = {}) {
+    super(type, init);
+    this.key = init.key !== undefined ? init.key : null;
+    this.oldValue = init.oldValue !== undefined ? init.oldValue : null;
+    this.newValue = init.newValue !== undefined ? init.newValue : null;
+    this.url = init.url || "";
+    this.storageArea = init.storageArea || null;
+  }
+  initStorageEvent(type, bubbles, cancelable, key, oldValue, newValue, url, storageArea) {
+    this.initEvent(type, bubbles, cancelable);
+    this.key = key !== undefined ? key : null;
+    this.oldValue = oldValue !== undefined ? oldValue : null;
+    this.newValue = newValue !== undefined ? newValue : null;
+    this.url = url || "";
+    this.storageArea = storageArea || null;
+  }
+};
+_markNative(globalThis.StorageEvent);
 
 // AbortController / AbortSignal. AbortSignal is a real constructor with a
 // prototype, so feature-detection and `AbortSignal.prototype` access work. It
