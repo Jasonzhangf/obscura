@@ -1317,6 +1317,104 @@ mod tests {
         rt
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn string_timeout_handler_executes_in_global_scope() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.evaluate(
+            "var __timerValue='pending'; setTimeout('__timerValue=\"done\"', 0)",
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("globalThis.__timerValue").unwrap(),
+            serde_json::json!("done")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn string_interval_handler_repeats_and_can_clear_itself() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.evaluate("globalThis.__ticks=0").unwrap();
+        rt.evaluate(
+            "globalThis.__timerId=setInterval('__ticks++;if(__ticks===2)clearInterval(__timerId)',1)",
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("globalThis.__ticks").unwrap(),
+            serde_json::json!(2.0)
+        );
+    }
+
+    #[test]
+    fn performance_now_is_monotonic_under_bursty_calls() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        // Hammer performance.now() so many calls land in the same millisecond and
+        // the wall clock rolls over repeatedly; the value must never go backwards.
+        let violations = rt
+            .evaluate(
+                "(function(){var prev=-Infinity, bad=0; for(var i=0;i<500000;i++){var t=performance.now(); if(t<prev) bad++; prev=t;} return bad;})()",
+            )
+            .unwrap();
+        assert_eq!(violations.as_f64(), Some(0.0), "performance.now() went backwards");
+    }
+
+    #[test]
+    fn performance_now_does_not_outrun_elapsed_time() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let lead = rt
+            .evaluate(
+                "(function(){for(var i=0;i<500000;i++)performance.now(); return performance.now()-(Date.now()-performance.timeOrigin);})()",
+            )
+            .unwrap();
+        assert!(
+            lead.as_f64().unwrap() <= 1.0,
+            "performance.now() advanced ahead of elapsed time: {lead}"
+        );
+    }
+
+    #[test]
+    fn childnode_helpers_coerce_non_string_primitives_to_text() {
+        let mut rt = setup_runtime(r#"<html><body><div id="p"><span id="t">x</span></div></body></html>"#);
+        let before = rt
+            .evaluate("(function(){var t=document.getElementById('t'); t.before(5); return t.previousSibling ? t.previousSibling.textContent : 'NULL';})()")
+            .unwrap();
+        assert_eq!(before, serde_json::json!("5"));
+        let after = rt
+            .evaluate("(function(){var t=document.getElementById('t'); t.after(true); return t.nextSibling ? t.nextSibling.textContent : 'NULL';})()")
+            .unwrap();
+        assert_eq!(after, serde_json::json!("true"));
+        let replaced = rt
+            .evaluate("(function(){var t=document.getElementById('t'); t.replaceWith(42); return document.getElementById('p').textContent;})()")
+            .unwrap();
+        assert!(
+            replaced.as_str().unwrap().contains("42"),
+            "replaceWith(42) should leave text '42': {replaced}"
+        );
+    }
+
+    #[test]
+    fn replace_state_without_url_preserves_current_location() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let path = rt
+            .evaluate(
+                "(function(){history.pushState({}, '', '/dashboard'); history.replaceState({scroll:1}); return location.pathname;})()",
+            )
+            .unwrap();
+        assert_eq!(path, serde_json::json!("/dashboard"));
+    }
+
+    #[test]
+    fn push_state_without_url_preserves_current_location() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let path = rt
+            .evaluate(
+                "(function(){history.pushState({}, '', '/a'); history.pushState({b:1}); return location.pathname;})()",
+            )
+            .unwrap();
+        assert_eq!(path, serde_json::json!("/a"));
+    }
+
     #[test]
     fn style_attribute_parses_into_style_object() {
         // Inline styles present in the parsed HTML must be visible via el.style.*

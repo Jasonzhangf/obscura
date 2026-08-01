@@ -580,16 +580,21 @@ impl DomTree {
         // Fast path: a bare "#id" selector resolves through the id index in O(1)
         // instead of scanning every descendant. The index holds the first element
         // in tree order per id, which is exactly what the full scan would return.
-        if let Some(id) = simple_id_selector(selector) {
-            match self.get_element_by_id(id) {
-                // querySelector matches strict descendants of root only, so the
-                // indexed element must have root among its ancestors.
-                Some(nid) if self.ancestors(nid).contains(&root) => return Ok(Some(nid)),
-                // Index miss or stale entry (detached node) — fall through to full scan.
-                // The id_index is best-effort: it only registers nodes at creation time
-                // and does not update on reparent, so it can point to a detached clone
-                // while the live node (with the same id) is elsewhere in the tree.
-                _ => {}
+        // In quirks mode `#id` matches ASCII-case-insensitively, but the id
+        // index is keyed on the exact-case id, so skip the fast path and let the
+        // selector engine (below) do the case-insensitive match.
+        if !self.is_quirks() {
+            if let Some(id) = simple_id_selector(selector) {
+                match self.get_element_by_id(id) {
+                    // querySelector matches strict descendants of root only, so the
+                    // indexed element must have root among its ancestors.
+                    Some(nid) if self.ancestors(nid).contains(&root) => return Ok(Some(nid)),
+                    // Index miss or stale entry (detached node) — fall through to full scan.
+                    // The id_index is best-effort: it only registers nodes at creation time
+                    // and does not update on reparent, so it can point to a detached clone
+                    // while the live node (with the same id) is elsewhere in the tree.
+                    _ => {}
+                }
             }
         }
         let selector_list = parse_selector(selector)?;
@@ -598,7 +603,7 @@ impl DomTree {
             MatchingMode::Normal,
             None,
             &mut caches,
-            QuirksMode::NoQuirks,
+            self.selector_quirks_mode(),
             NeedsSelectorFlags::No,
             MatchingForInvalidation::No,
         );
@@ -619,6 +624,16 @@ impl DomTree {
         Ok(None)
     }
 
+    // Map the document's quirks flag onto the selector crate's QuirksMode. In
+    // quirks mode the crate matches class/id selectors ASCII-case-insensitively.
+    fn selector_quirks_mode(&self) -> QuirksMode {
+        if self.is_quirks() {
+            QuirksMode::Quirks
+        } else {
+            QuirksMode::NoQuirks
+        }
+    }
+
     pub fn query_selector_all_from(&self, root: NodeId, selector: &str) -> Result<Vec<NodeId>, String> {
         let selector_list = parse_selector(selector)?;
         let mut caches = selectors::context::SelectorCaches::default();
@@ -626,7 +641,7 @@ impl DomTree {
             MatchingMode::Normal,
             None,
             &mut caches,
-            QuirksMode::NoQuirks,
+            self.selector_quirks_mode(),
             NeedsSelectorFlags::No,
             MatchingForInvalidation::No,
         );
@@ -727,6 +742,34 @@ mod tests {
         let tree = parse_html("<div>Hello</div>");
         let result = tree.query_selector("span").unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn quirks_mode_matches_class_and_id_case_insensitively() {
+        // No doctype => quirks mode; class/id match ASCII case-insensitively.
+        let tree = parse_html(r#"<div class="Foo" id="Bar">x</div>"#);
+        assert!(
+            tree.query_selector(".foo").unwrap().is_some(),
+            ".foo should match class=\"Foo\" in quirks mode"
+        );
+        assert!(
+            tree.query_selector("#bar").unwrap().is_some(),
+            "#bar should match id=\"Bar\" in quirks mode"
+        );
+    }
+
+    #[test]
+    fn standards_mode_matches_class_and_id_case_sensitively() {
+        // With a doctype => no-quirks; class/id remain case-sensitive.
+        let tree = parse_html(r#"<!DOCTYPE html><div class="Foo" id="Bar">x</div>"#);
+        assert!(
+            tree.query_selector(".foo").unwrap().is_none(),
+            ".foo must NOT match class=\"Foo\" in standards mode"
+        );
+        assert!(
+            tree.query_selector("#bar").unwrap().is_none(),
+            "#bar must NOT match id=\"Bar\" in standards mode"
+        );
     }
 
     #[test]
