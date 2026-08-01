@@ -1370,6 +1370,28 @@ mod tests {
     }
 
     #[test]
+    fn clone_node_copies_js_assigned_inline_styles() {
+        let mut rt = setup_runtime("<html><body><div id='d'></div></body></html>");
+        let out = rt
+            .evaluate(
+                "(function(){var d=document.getElementById('d');d.style.color='red';d.style.fontSize='12px';var c=d.cloneNode(false);return c.style.color+'|'+c.style.fontSize+'|'+c.style.cssText;})()",
+            )
+            .unwrap();
+        assert_eq!(out, serde_json::json!("red|12px|color: red; font-size: 12px;"));
+    }
+
+    #[test]
+    fn clone_node_deep_copies_template_content() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let out = rt
+            .evaluate(
+                "(function(){var t=document.createElement('template');t.content.appendChild(document.createElement('option')).textContent='choice';var c=t.cloneNode(true);return c.content.childNodes.length+'|'+c.content.firstChild.tagName+'|'+c.content.firstChild.textContent;})()",
+            )
+            .unwrap();
+        assert_eq!(out, serde_json::json!("1|OPTION|choice"));
+    }
+
+    #[test]
     fn test_document_title() {
         let mut rt = setup_runtime("<html><head><title>Test</title></head><body></body></html>");
         let title = rt.evaluate("document.title").unwrap();

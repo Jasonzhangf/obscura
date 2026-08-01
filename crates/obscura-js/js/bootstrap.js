@@ -654,6 +654,10 @@ function _shallowCloneNode(node) {
     const v = node.getAttribute(name);
     if (v !== null) el.setAttribute(name, v);
   }
+  // CSS declarations currently live on the JS wrapper independently of the
+  // DOM attribute. Copy that state as well so styles assigned through
+  // `node.style` survive cloning even before attribute reflection runs.
+  if (node.style && node.style.cssText) el.style.cssText = node.style.cssText;
   return el;
 }
 
