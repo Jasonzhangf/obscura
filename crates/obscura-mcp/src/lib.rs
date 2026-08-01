@@ -770,9 +770,9 @@ fn tool_fill(args: &Value, state: &mut BrowserState) -> Result<String, String> {
         r#"(function(){{
             var el = document.querySelector({sel});
             if (!el) return "error:element not found";
-            el.value = {val};
-            el.dispatchEvent(new Event("input", {{bubbles:true}}));
-            el.dispatchEvent(new Event("change", {{bubbles:true}}));
+            globalThis.__obscura_setFieldValue(el, "value", {val});
+            el.dispatchEvent(globalThis.__obscura_markTrusted(new Event("input", {{bubbles:true}})));
+            el.dispatchEvent(globalThis.__obscura_markTrusted(new Event("change", {{bubbles:true}})));
             return "ok";
         }})()"#,
         sel = serde_json::to_string(&selector).unwrap(),
@@ -796,8 +796,8 @@ fn tool_type(args: &Value, state: &mut BrowserState) -> Result<String, String> {
         r#"(function(){{
             var el = document.querySelector({sel});
             if (!el) return "error:element not found";
-            el.value = (el.value || "") + {txt};
-            el.dispatchEvent(new Event("input", {{bubbles:true}}));
+            globalThis.__obscura_setFieldValue(el, "value", (el.value || "") + {txt});
+            el.dispatchEvent(globalThis.__obscura_markTrusted(new Event("input", {{bubbles:true}})));
             return "ok";
         }})()"#,
         sel = serde_json::to_string(&selector).unwrap(),
@@ -1329,9 +1329,9 @@ fn tool_fill_form(args: &Value, state: &mut BrowserState) -> Result<String, Stri
             _ => format!(r#"(function(){{
                 var el = document.querySelector({sel});
                 if (!el) return "error:not found";
-                el.value = {val};
-                el.dispatchEvent(new Event('input', {{bubbles:true}}));
-                el.dispatchEvent(new Event('change', {{bubbles:true}}));
+                globalThis.__obscura_setFieldValue(el, 'value', {val});
+                el.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {{bubbles:true}})));
+                el.dispatchEvent(globalThis.__obscura_markTrusted(new Event('change', {{bubbles:true}})));
                 return "ok";
             }})()"#, sel = serde_json::to_string(&selector).unwrap(), val = serde_json::to_string(value).unwrap()),
         };
@@ -1768,4 +1768,82 @@ fn tool_set_storage_state(args: &Value, state: &mut BrowserState) -> Result<Stri
         }
     }
     Ok(format!("Restored {applied} state entries."))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fill_tools_notify_controlled_input_tracker() {
+        let mut state = BrowserState::new(None, None, false);
+        state
+            .page_mut()
+            .navigate("data:text/html,<div id=root><input id=field></div>")
+            .await
+            .expect("test page should navigate");
+
+        state.page_mut().evaluate(
+            r#"(function () {
+                var root = document.getElementById('root');
+                var input = document.getElementById('field');
+                var descriptor = Object.getOwnPropertyDescriptor(input.constructor.prototype, 'value');
+                var tracked = String(input.value);
+                Object.defineProperty(input, 'value', {
+                    configurable: true,
+                    get: function () { return descriptor.get.call(this); },
+                    set: function (value) {
+                        tracked = String(value);
+                        descriptor.set.call(this, value);
+                    }
+                });
+                window.__controlledState = '';
+                window.__controlledUpdates = 0;
+                window.__lastInputTarget = '';
+                window.__lastInputTrusted = false;
+                root.addEventListener('input', function (event) {
+                    window.__lastInputTarget = event.target.id;
+                    window.__lastInputTrusted = event.isTrusted;
+                    var next = String(event.target.value);
+                    if (next !== tracked) {
+                        tracked = next;
+                        window.__controlledState = next;
+                        window.__controlledUpdates++;
+                    }
+                });
+            })()"#,
+        );
+
+        tool_fill(
+            &json!({ "selector": "#field", "value": "filled" }),
+            &mut state,
+        )
+        .expect("browser_fill should succeed");
+        tool_type(
+            &json!({ "selector": "#field", "text": "-typed" }),
+            &mut state,
+        )
+        .expect("browser_type should succeed");
+        tool_fill_form(
+            &json!({
+                "fields": [{ "selector": "#field", "value": "form-filled" }]
+            }),
+            &mut state,
+        )
+        .expect("browser_fill_form should succeed");
+
+        let actual = state.page_mut().evaluate(
+            r#"JSON.stringify({
+                domValue: document.getElementById('field').value,
+                controlledState: window.__controlledState,
+                controlledUpdates: window.__controlledUpdates,
+                lastInputTarget: window.__lastInputTarget,
+                lastInputTrusted: window.__lastInputTrusted
+            })"#,
+        );
+        assert_eq!(
+            actual,
+            json!(r#"{"domValue":"form-filled","controlledState":"form-filled","controlledUpdates":3,"lastInputTarget":"field","lastInputTrusted":true}"#),
+        );
+    }
 }
