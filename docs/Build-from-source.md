@@ -37,6 +37,15 @@ the Visual Studio C++ Build Tools, CMake, and LLVM/Clang. Ensure the directory
 containing `libclang` is available through `LIBCLANG_PATH` if bindgen cannot
 locate it automatically.
 
+On macOS 26 with the standalone Command Line Tools, Apple Clang may not find
+libc++ while compiling BoringSSL. Use the active SDK for that build:
+
+```bash
+SDK_PATH="$(xcrun --show-sdk-path)"
+SDKROOT="$SDK_PATH" CXXFLAGS="-isystem $SDK_PATH/usr/include/c++/v1" \
+  cargo build --release --features stealth
+```
+
 ## OpenSSL on older systems
 
 If the build fails on the vendored OpenSSL with an AVX-512 assembler error (common on older VPS hosts):
