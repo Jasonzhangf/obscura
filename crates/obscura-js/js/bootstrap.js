@@ -577,35 +577,75 @@ const _CSS_PROPERTY_NAMES = [
 ];
 const _CSS_PROP_SET = new Set(_CSS_PROPERTY_NAMES);
 
+// Parse a `style` attribute string (`"color: red; margin: 5px"`) into the given
+// dashed-key store, replacing its contents in place.
+function _parseCssInto(props, text) {
+  for (const k in props) delete props[k];
+  if (text) String(text).split(";").forEach((p) => {
+    const i = p.indexOf(":");
+    if (i > 0) { const k = p.slice(0, i).trim(); const v = p.slice(i + 1).trim(); if (k && v) props[_cssCamelToKebab(k)] = v; }
+  });
+}
+function _serializeCss(props) {
+  const e = Object.entries(props);
+  return e.length ? e.map(([k, v]) => `${k}: ${v}`).join("; ") + ";" : "";
+}
+
 class CSSStyleDeclaration {
-  constructor() {
-    // Non-enumerable so it never leaks through the proxy's own-key traps.
+  constructor(owner) {
+    // Non-enumerable so they never leak through the proxy's own-key traps.
     Object.defineProperty(this, "_props", { value: {}, writable: true, enumerable: false, configurable: true });
+    // The owner Element, if any. A live declaration reflects that element's
+    // `style` content attribute in both directions; an owner-less declaration
+    // (getComputedStyle fallback, stylesheet rules) is purely in-memory.
+    Object.defineProperty(this, "_owner", { value: owner || null, writable: true, enumerable: false, configurable: true });
+    // Load the content attribute only when style is first observed. Keeping
+    // this as a primitive avoids allocating a separate sync object for every
+    // wrapped element.
+    Object.defineProperty(this, "_loaded", { value: !owner, writable: true, enumerable: false, configurable: true });
+  }
+  // Pull the initial `style` attribute once. Later attribute mutations update
+  // the declaration directly from Element.setAttribute/removeAttribute, so
+  // repeated style reads do not cross the JS/Rust op boundary.
+  _pull() {
+    if (this._loaded) return;
+    _parseCssInto(this._props, this._owner.getAttribute("style"));
+    this._loaded = true;
+  }
+  _replaceFromAttribute(text) {
+    _parseCssInto(this._props, text);
+    this._loaded = true;
+  }
+  // Serialize `_props` back onto the owner's `style` attribute after a mutation,
+  // so el.style.x = … and cssText reflect into getAttribute('style') and
+  // serialization. No-op when owner-less.
+  _push() {
+    const o = this._owner;
+    if (!o) return;
+    const text = _serializeCss(this._props);
+    if (text) o.setAttribute("style", text);
+    else o.removeAttribute("style");
   }
   // Storage is keyed by the dashed CSS name, matching CSSOM. The proxy maps the
   // camelCase IDL access (el.style.fontSize) onto the dashed key (font-size), so
   // getPropertyValue('font-size') and el.style.fontSize stay in sync.
   setProperty(name, value) {
+    this._pull();
     const k = _cssCamelToKebab(String(name));
-    if (value === "" || value == null) { delete this._props[k]; return; }
-    this._props[k] = String(value);
+    if (value === "" || value == null) delete this._props[k];
+    else this._props[k] = String(value);
+    this._push();
   }
-  removeProperty(name) { const k = _cssCamelToKebab(String(name)); const old = this._props[k]; delete this._props[k]; return old || ""; }
-  getPropertyValue(name) { return this._props[_cssCamelToKebab(String(name))] || ""; }
+  removeProperty(name) { this._pull(); const k = _cssCamelToKebab(String(name)); const old = this._props[k]; delete this._props[k]; this._push(); return old || ""; }
+  getPropertyValue(name) { this._pull(); return this._props[_cssCamelToKebab(String(name))] || ""; }
   getPropertyPriority() { return ""; }
-  get cssText() {
-    const e = Object.entries(this._props);
-    return e.length ? e.map(([k, v]) => `${k}: ${v}`).join("; ") + ";" : "";
-  }
+  get cssText() { this._pull(); return _serializeCss(this._props); }
   set cssText(v) {
-    for (const k in this._props) delete this._props[k];
-    if (v) String(v).split(";").forEach((p) => {
-      const i = p.indexOf(":");
-      if (i > 0) { const k = p.slice(0, i).trim(); const val = p.slice(i + 1).trim(); if (k && val) this._props[_cssCamelToKebab(k)] = val; }
-    });
+    _parseCssInto(this._props, v);
+    this._push();
   }
-  get length() { return Object.keys(this._props).length; }
-  item(i) { return Object.keys(this._props)[i] || ""; }
+  get length() { this._pull(); return Object.keys(this._props).length; }
+  item(i) { this._pull(); return Object.keys(this._props)[i] || ""; }
 }
 
 const _styleProxy = (decl) => new Proxy(decl, {
@@ -616,6 +656,7 @@ const _styleProxy = (decl) => new Proxy(decl, {
   },
   set(t, p, v) {
     if (typeof p === "symbol") { t[p] = v; return true; }
+    if (p === "_loaded") { t._loaded = v; return true; }
     if (p === "cssText") { t.cssText = v; return true; }
     if (/^\d+$/.test(p) || p in Object.getPrototypeOf(t)) return true;
     t.setProperty(p, v);
@@ -624,11 +665,13 @@ const _styleProxy = (decl) => new Proxy(decl, {
   has(t, p) {
     if (typeof p !== "string") return Reflect.has(t, p);
     if (p in Object.getPrototypeOf(t)) return true;
+    t._pull();
     if (_cssCamelToKebab(p) in t._props) return true;
     if (_CSS_PROP_SET.has(p) || _CSS_PROP_SET.has(_cssKebabToCamel(p))) return true;
     return /^\d+$/.test(p) && +p < t.length;
   },
   ownKeys(t) {
+    t._pull();
     const keys = [];
     const n = t.length;
     for (let i = 0; i < n; i++) keys.push(String(i));
@@ -639,6 +682,7 @@ const _styleProxy = (decl) => new Proxy(decl, {
   },
   getOwnPropertyDescriptor(t, p) {
     if (typeof p !== "string") return Reflect.getOwnPropertyDescriptor(t, p);
+    t._pull();
     if (/^\d+$/.test(p) && +p < t.length) return { value: t.item(+p), writable: false, enumerable: true, configurable: true };
     if (_cssCamelToKebab(p) in t._props || _CSS_PROP_SET.has(p) || _CSS_PROP_SET.has(_cssKebabToCamel(p))) {
       return { value: t.getPropertyValue(p), writable: true, enumerable: true, configurable: true };
@@ -1243,7 +1287,7 @@ function _isSubmitButton(el) {
 class Element extends Node {
   constructor(nid) {
     super(nid);
-    this._style = _styleProxy(new CSSStyleDeclaration());
+    this._style = _styleProxy(new CSSStyleDeclaration(this));
   }
   // Element wrappers always back a nodeType-1 node (_wrap/_wrapEl only build an
   // Element for element nodes, and node ids are never freed-and-reused), so this
@@ -1411,13 +1455,15 @@ class Element extends Node {
   setAttribute(n, v) {
     n = _htmlAttrName(this, n);
     const popoverPrev = (n === "popover") ? this.popover : undefined;
-    _dom("set_attribute", this._nid, n + "\0" + String(v));
+    const value = String(v);
+    _dom("set_attribute", this._nid, n + "\0" + value);
+    if (n === "style") this._style._replaceFromAttribute(value);
     if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev);
     if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('attributes', this._nid, [], [], n);
   }
-  setAttributeNS(ns, n, v) { _dom("set_attribute", this._nid, String(n) + "\0" + String(v)); } // exact name, no HTML folding
-  removeAttribute(n) { n = _htmlAttrName(this, n); const popoverPrev = (n === "popover") ? this.popover : undefined; _dom("remove_attribute", this._nid, n); if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev); }
-  removeAttributeNS(ns, n) { _dom("remove_attribute", this._nid, String(n)); }
+  setAttributeNS(ns, n, v) { n = String(n); const value = String(v); _dom("set_attribute", this._nid, n + "\0" + value); if ((!ns || ns === "") && n === "style") this._style._replaceFromAttribute(value); } // exact name, no HTML folding
+  removeAttribute(n) { n = _htmlAttrName(this, n); const popoverPrev = (n === "popover") ? this.popover : undefined; _dom("remove_attribute", this._nid, n); if (n === "style") this._style._replaceFromAttribute(""); if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev); }
+  removeAttributeNS(ns, n) { n = String(n); _dom("remove_attribute", this._nid, n); if ((!ns || ns === "") && n === "style") this._style._replaceFromAttribute(""); }
   hasAttribute(n) { return this.getAttribute(n) !== null; }
   hasAttributes() { return true; } // Simplified
   getAttributeNames() { return _domParse("attribute_names", this._nid) || []; }
