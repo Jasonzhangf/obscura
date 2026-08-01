@@ -1347,6 +1347,75 @@ mod tests {
     }
 
     #[test]
+    fn performance_now_is_monotonic_under_bursty_calls() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        // Hammer performance.now() so many calls land in the same millisecond and
+        // the wall clock rolls over repeatedly; the value must never go backwards.
+        let violations = rt
+            .evaluate(
+                "(function(){var prev=-Infinity, bad=0; for(var i=0;i<500000;i++){var t=performance.now(); if(t<prev) bad++; prev=t;} return bad;})()",
+            )
+            .unwrap();
+        assert_eq!(violations.as_f64(), Some(0.0), "performance.now() went backwards");
+    }
+
+    #[test]
+    fn performance_now_does_not_outrun_elapsed_time() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let lead = rt
+            .evaluate(
+                "(function(){for(var i=0;i<500000;i++)performance.now(); return performance.now()-(Date.now()-performance.timeOrigin);})()",
+            )
+            .unwrap();
+        assert!(
+            lead.as_f64().unwrap() <= 1.0,
+            "performance.now() advanced ahead of elapsed time: {lead}"
+        );
+    }
+
+    #[test]
+    fn childnode_helpers_coerce_non_string_primitives_to_text() {
+        let mut rt = setup_runtime(r#"<html><body><div id="p"><span id="t">x</span></div></body></html>"#);
+        let before = rt
+            .evaluate("(function(){var t=document.getElementById('t'); t.before(5); return t.previousSibling ? t.previousSibling.textContent : 'NULL';})()")
+            .unwrap();
+        assert_eq!(before, serde_json::json!("5"));
+        let after = rt
+            .evaluate("(function(){var t=document.getElementById('t'); t.after(true); return t.nextSibling ? t.nextSibling.textContent : 'NULL';})()")
+            .unwrap();
+        assert_eq!(after, serde_json::json!("true"));
+        let replaced = rt
+            .evaluate("(function(){var t=document.getElementById('t'); t.replaceWith(42); return document.getElementById('p').textContent;})()")
+            .unwrap();
+        assert!(
+            replaced.as_str().unwrap().contains("42"),
+            "replaceWith(42) should leave text '42': {replaced}"
+        );
+    }
+
+    #[test]
+    fn replace_state_without_url_preserves_current_location() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let path = rt
+            .evaluate(
+                "(function(){history.pushState({}, '', '/dashboard'); history.replaceState({scroll:1}); return location.pathname;})()",
+            )
+            .unwrap();
+        assert_eq!(path, serde_json::json!("/dashboard"));
+    }
+
+    #[test]
+    fn push_state_without_url_preserves_current_location() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let path = rt
+            .evaluate(
+                "(function(){history.pushState({}, '', '/a'); history.pushState({b:1}); return location.pathname;})()",
+            )
+            .unwrap();
+        assert_eq!(path, serde_json::json!("/a"));
+    }
+
+    #[test]
     fn test_document_title() {
         let mut rt = setup_runtime("<html><head><title>Test</title></head><body></body></html>");
         let title = rt.evaluate("document.title").unwrap();
