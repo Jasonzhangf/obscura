@@ -456,12 +456,24 @@ const _scheduleAfter = (delay, fn) => {
   else Deno.core.ops.op_sleep(d).then(fn);
 };
 
+// Timers accept a string first arg per the HTML spec (e.g. the Aliyun WAF
+// `acw_sc__v2` challenge drives `setTimeout('reload(arg2)', 2)`). A string is
+// compiled and run in global scope, identical to a real browser; otherwise the
+// call silently no-ops and JS-triggered navigations (cookie → reload) never fire.
+const _coerceTimerFn = (fn) => {
+  if (typeof fn === "string") {
+    try { return new Function(fn); } catch (_) { return null; }
+  }
+  return typeof fn === "function" ? fn : null;
+};
+
 globalThis.setTimeout = (fn, delay = 0, ...args) => {
-  if (typeof fn !== "function") return ++_tid;
+  const f = _coerceTimerFn(fn);
+  if (f === null) return ++_tid;
   const id = ++_tid;
   _scheduleAfter(delay, () => {
     if (_clearedTimers.has(id)) return;
-    try { fn(...args); } catch(e) { console.error("Timer error:", e); }
+    try { f(...args); } catch(e) { console.error("Timer error:", e); }
   });
   return id;
 };
@@ -469,12 +481,13 @@ globalThis.setTimeout = (fn, delay = 0, ...args) => {
 globalThis.clearTimeout = (id) => { _clearedTimers.add(id); };
 
 globalThis.setInterval = (fn, delay = 0, ...args) => {
-  if (typeof fn !== "function") return ++_tid;
+  const f = _coerceTimerFn(fn);
+  if (f === null) return ++_tid;
   const id = ++_tid;
   _intervals.add(id);
   const tick = () => {
     if (!_intervals.has(id)) return;
-    try { fn(...args); } catch(e) { console.error("Interval error:", e); }
+    try { f(...args); } catch(e) { console.error("Interval error:", e); }
     if (!_intervals.has(id)) return;
     _scheduleAfter(delay, tick);
   };

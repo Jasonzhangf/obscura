@@ -1317,6 +1317,35 @@ mod tests {
         rt
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn string_timeout_handler_executes_in_global_scope() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.evaluate(
+            "var __timerValue='pending'; setTimeout('__timerValue=\"done\"', 0)",
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("globalThis.__timerValue").unwrap(),
+            serde_json::json!("done")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn string_interval_handler_repeats_and_can_clear_itself() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.evaluate("globalThis.__ticks=0").unwrap();
+        rt.evaluate(
+            "globalThis.__timerId=setInterval('__ticks++;if(__ticks===2)clearInterval(__timerId)',1)",
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("globalThis.__ticks").unwrap(),
+            serde_json::json!(2.0)
+        );
+    }
+
     #[test]
     fn performance_now_is_monotonic_under_bursty_calls() {
         let mut rt = setup_runtime("<html><body></body></html>");
