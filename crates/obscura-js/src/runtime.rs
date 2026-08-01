@@ -1346,6 +1346,40 @@ mod tests {
     }
 
     #[test]
+    fn namespaced_attribute_keeps_its_qualified_name() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let v = rt
+            .evaluate("(function(){var s=document.createElementNS('http://www.w3.org/2000/svg','svg');s.setAttributeNS('http://www.w3.org/1999/xlink','xlink:href','#g');return s.getAttribute('xlink:href')+'|'+s.getAttributeNames()[0]+'|'+s.outerHTML;})()")
+            .unwrap();
+        assert_eq!(v, serde_json::json!("#g|xlink:href|<svg xlink:href=\"#g\"></svg>"));
+    }
+
+    #[test]
+    fn parsed_xlink_attribute_is_available_through_both_apis() {
+        let mut rt = setup_runtime(
+            r##"<html><body><svg><use id="u" xlink:href="#icon"></use></svg></body></html>"##,
+        );
+        let v = rt
+            .evaluate("(function(){var u=document.getElementById('u');return u.getAttribute('xlink:href')+'|'+u.getAttributeNS('http://www.w3.org/1999/xlink','href')+'|'+u.getAttributeNames().join(',');})()")
+            .unwrap();
+        assert_eq!(v, serde_json::json!("#icon|#icon|id,xlink:href"));
+    }
+
+    #[test]
+    fn set_attribute_ns_validates_namespace_constraints() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let v = rt
+            .evaluate("(function(){var e=document.createElement('div'),out=[];for(const args of [[null,'x:y'],['urn:test','a:b:c'],['urn:test','xml:lang'],['urn:test','xmlns:x']]){try{e.setAttributeNS(args[0],args[1],'v');out.push('none')}catch(err){out.push(err.name)}}return out.join('|');})()")
+            .unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!(
+                "NamespaceError|InvalidCharacterError|NamespaceError|NamespaceError"
+            )
+        );
+    }
+
+    #[test]
     fn test_document_title() {
         let mut rt = setup_runtime("<html><head><title>Test</title></head><body></body></html>");
         let title = rt.evaluate("document.title").unwrap();

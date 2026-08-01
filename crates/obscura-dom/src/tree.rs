@@ -1,4 +1,4 @@
-use html5ever::{LocalName, Namespace, QualName};
+use html5ever::{LocalName, Namespace, Prefix, QualName};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
@@ -32,13 +32,24 @@ pub struct Attribute {
     pub value: String,
 }
 
-/// The local-name portion of an attribute name, i.e. the part after any prefix.
-/// `"xlink:href"` -> `"href"`, `"href"` -> `"href"`. Used for namespace-aware
-/// attribute lookup, which keys on `(namespace, localName)`.
-fn attr_local_suffix(name: &str) -> &str {
-    match name.rfind(':') {
-        Some(i) => &name[i + 1..],
-        None => name,
+impl Attribute {
+    pub fn qualified_name(&self) -> String {
+        match &self.name.prefix {
+            Some(prefix) => format!("{}:{}", prefix, self.name.local),
+            None => self.name.local.to_string(),
+        }
+    }
+
+    pub fn qualified_name_eq(&self, name: &str) -> bool {
+        match &self.name.prefix {
+            Some(prefix) => {
+                name.len() == prefix.len() + self.name.local.len() + 1
+                    && name.starts_with(prefix.as_ref())
+                    && name.as_bytes().get(prefix.len()) == Some(&b':')
+                    && &name[prefix.len() + 1..] == self.name.local.as_ref()
+            }
+            None => self.name.local.as_ref() == name,
+        }
     }
 }
 
@@ -115,7 +126,7 @@ impl Node {
 
     pub fn get_attribute(&self, name: &str) -> Option<&str> {
         self.attrs()?.iter().find_map(|a| {
-            if a.name.local.as_ref() == name {
+            if a.qualified_name_eq(name) {
                 Some(a.value.as_str())
             } else {
                 None
@@ -136,13 +147,10 @@ impl Node {
         }
     }
 
-    // Read a namespaced attribute by (namespace, localName). The stored local
-    // name may be qualified (e.g. "xlink:href" for setAttributeNS-created attrs)
-    // or a bare local (e.g. "href" for parser-created ones), so compare against
-    // the part after any prefix.
+    // Read a namespaced attribute by (namespace, localName).
     pub fn get_attribute_ns(&self, ns: &str, local: &str) -> Option<&str> {
         self.attrs()?.iter().find_map(|a| {
-            if a.name.ns.as_ref() == ns && attr_local_suffix(a.name.local.as_ref()) == local {
+            if a.name.ns.as_ref() == ns && a.name.local.as_ref() == local {
                 Some(a.value.as_str())
             } else {
                 None
@@ -150,21 +158,24 @@ impl Node {
         })
     }
 
-    // Set a namespaced attribute. `qualified` is the qualified name
-    // (e.g. "xlink:href"); it is stored as the local name with the namespace
-    // recorded, matching how the non-namespaced path stores names, so
-    // getAttribute(qualified) and serialization keep working unchanged.
+    // Set a namespaced attribute using a proper QualName: prefix and local name
+    // remain separate while qualified-name APIs and serialization reconstruct
+    // `prefix:local` when needed.
     pub fn set_attribute_ns(&mut self, ns: &str, qualified: &str, value: String) {
         if let NodeData::Element { attrs, .. } = &mut self.data {
-            let local = attr_local_suffix(qualified);
+            let (prefix, local) = match qualified.split_once(':') {
+                Some((prefix, local)) => (Some(Prefix::from(prefix)), local),
+                None => (None, qualified),
+            };
             if let Some(attr) = attrs
                 .iter_mut()
-                .find(|a| a.name.ns.as_ref() == ns && attr_local_suffix(a.name.local.as_ref()) == local)
+                .find(|a| a.name.ns.as_ref() == ns && a.name.local.as_ref() == local)
             {
+                attr.name.prefix = prefix;
                 attr.value = value;
             } else {
                 attrs.push(Attribute {
-                    name: QualName::new(None, Namespace::from(ns), LocalName::from(qualified)),
+                    name: QualName::new(prefix, Namespace::from(ns), LocalName::from(local)),
                     value,
                 });
             }
@@ -174,7 +185,7 @@ impl Node {
     pub fn remove_attribute_ns(&mut self, ns: &str, local: &str) {
         if let NodeData::Element { attrs, .. } = &mut self.data {
             attrs.retain(|a| {
-                !(a.name.ns.as_ref() == ns && attr_local_suffix(a.name.local.as_ref()) == local)
+                !(a.name.ns.as_ref() == ns && a.name.local.as_ref() == local)
             });
         }
     }

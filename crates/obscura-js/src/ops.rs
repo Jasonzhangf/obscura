@@ -321,7 +321,7 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
             let names: Vec<String> = dom
                 .with_node(NodeId::new(nid), |n| {
                     n.attrs()
-                        .map(|a| a.iter().map(|x| x.name.local.as_ref().to_string()).collect())
+                        .map(|a| a.iter().map(|x| x.qualified_name()).collect())
                         .unwrap_or_default()
                 })
                 .unwrap_or_default();
@@ -373,7 +373,7 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
             let nid = arg1.parse::<u32>().unwrap_or(0);
             dom.with_node_mut(NodeId::new(nid), |n| {
                 if let NodeData::Element { attrs, .. } = &mut n.data {
-                    attrs.retain(|a| a.name.local.as_ref() != arg2.as_str());
+                    attrs.retain(|a| !a.qualified_name_eq(&arg2));
                 }
             });
             "true".into()

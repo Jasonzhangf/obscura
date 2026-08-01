@@ -1402,7 +1402,12 @@ class Element extends Node {
     if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev);
     if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('attributes', this._nid, [], [], n);
   }
-  setAttributeNS(ns, n, v) { _dom("set_attribute_ns", this._nid, String(ns == null ? "" : ns) + "\0" + String(n) + "\0" + String(v)); } // n is the qualified name; stored with its namespace
+  setAttributeNS(ns, n, v) {
+    ns = ns == null || ns === '' ? '' : String(ns);
+    n = String(n);
+    _ns_validateQualifiedName(ns, n);
+    _dom("set_attribute_ns", this._nid, ns + "\0" + n + "\0" + String(v));
+  }
   removeAttribute(n) { n = _htmlAttrName(this, n); const popoverPrev = (n === "popover") ? this.popover : undefined; _dom("remove_attribute", this._nid, n); if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev); }
   removeAttributeNS(ns, n) { _dom("remove_attribute_ns", this._nid, String(ns == null ? "" : ns) + "\0" + String(n)); }
   hasAttribute(n) { return this.getAttribute(n) !== null; }
@@ -8421,6 +8426,22 @@ if (!globalThis.Attr) {
 const _ns_isValidXmlName = (name) => {
   if (typeof name !== 'string' || !name.length) return false;
   return /^[A-Za-z_:][\w.\-:]*$/.test(name);
+};
+
+const _ns_validateQualifiedName = (namespaceURI, qualifiedName) => {
+  const parts = qualifiedName.split(':');
+  if (parts.length > 2 || parts.some((part) => !_ns_isValidXmlName(part))) {
+    throw new DOMException('Invalid attribute name', 'InvalidCharacterError');
+  }
+  const prefix = parts.length === 2 ? parts[0] : null;
+  const XML = 'http://www.w3.org/XML/1998/namespace';
+  const XMLNS = 'http://www.w3.org/2000/xmlns/';
+  if ((prefix && !namespaceURI)
+      || (prefix === 'xml' && namespaceURI !== XML)
+      || ((qualifiedName === 'xmlns' || prefix === 'xmlns') && namespaceURI !== XMLNS)
+      || (namespaceURI === XMLNS && qualifiedName !== 'xmlns' && prefix !== 'xmlns')) {
+    throw new DOMException('The namespace is invalid', 'NamespaceError');
+  }
 };
 
 // Document.prototype.createAttribute: create a detached Attr node
