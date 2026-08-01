@@ -5361,14 +5361,14 @@ globalThis.XMLSerializer = class XMLSerializer {
 globalThis.performance = globalThis.performance || {
   now: (function() {
     // Monotonically non-decreasing: return the wall-clock offset, but never a
-    // value below the last one. The previous version added an uncapped per-call
-    // sub-millisecond bump that could exceed 1.0, so when the millisecond then
-    // ticked over and the bump reset to 0 the result went backwards.
-    var _last = 0;
+    // value below the last one. Equal readings are allowed, and avoiding a
+    // synthetic per-call increment keeps tight loops from advancing the clock
+    // faster than real elapsed time.
+    var _last = -Infinity;
     return function() {
       var ms = Date.now() - (globalThis.performance.timeOrigin || 0);
-      if (ms > _last) _last = ms;
-      else _last += 0.001; // same/earlier ms: advance by a tiny epsilon
+      if (ms < _last) return _last;
+      _last = ms;
       return _last;
     };
   })(),

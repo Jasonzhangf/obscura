@@ -1331,6 +1331,20 @@ mod tests {
     }
 
     #[test]
+    fn performance_now_does_not_outrun_elapsed_time() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let lead = rt
+            .evaluate(
+                "(function(){for(var i=0;i<500000;i++)performance.now(); return performance.now()-(Date.now()-performance.timeOrigin);})()",
+            )
+            .unwrap();
+        assert!(
+            lead.as_f64().unwrap() <= 1.0,
+            "performance.now() advanced ahead of elapsed time: {lead}"
+        );
+    }
+
+    #[test]
     fn test_document_title() {
         let mut rt = setup_runtime("<html><head><title>Test</title></head><body></body></html>");
         let title = rt.evaluate("document.title").unwrap();
