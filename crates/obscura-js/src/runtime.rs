@@ -1318,6 +1318,33 @@ mod tests {
     }
 
     #[test]
+    fn performance_now_is_monotonic_under_bursty_calls() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        // Hammer performance.now() so many calls land in the same millisecond and
+        // the wall clock rolls over repeatedly; the value must never go backwards.
+        let violations = rt
+            .evaluate(
+                "(function(){var prev=-Infinity, bad=0; for(var i=0;i<500000;i++){var t=performance.now(); if(t<prev) bad++; prev=t;} return bad;})()",
+            )
+            .unwrap();
+        assert_eq!(violations.as_f64(), Some(0.0), "performance.now() went backwards");
+    }
+
+    #[test]
+    fn performance_now_does_not_outrun_elapsed_time() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let lead = rt
+            .evaluate(
+                "(function(){for(var i=0;i<500000;i++)performance.now(); return performance.now()-(Date.now()-performance.timeOrigin);})()",
+            )
+            .unwrap();
+        assert!(
+            lead.as_f64().unwrap() <= 1.0,
+            "performance.now() advanced ahead of elapsed time: {lead}"
+        );
+    }
+
+    #[test]
     fn childnode_helpers_coerce_non_string_primitives_to_text() {
         let mut rt = setup_runtime(r#"<html><body><div id="p"><span id="t">x</span></div></body></html>"#);
         let before = rt

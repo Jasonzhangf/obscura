@@ -5446,11 +5446,16 @@ globalThis.XMLSerializer = class XMLSerializer {
 };
 globalThis.performance = globalThis.performance || {
   now: (function() {
-    var _lastMs = -1, _sub = 0;
+    // Monotonically non-decreasing: return the wall-clock offset, but never a
+    // value below the last one. Equal readings are allowed, and avoiding a
+    // synthetic per-call increment keeps tight loops from advancing the clock
+    // faster than real elapsed time.
+    var _last = -Infinity;
     return function() {
       var ms = Date.now() - (globalThis.performance.timeOrigin || 0);
-      if (ms !== _lastMs) { _lastMs = ms; _sub = 0; } else { _sub += 0.1; }
-      return ms + _sub;
+      if (ms < _last) return _last;
+      _last = ms;
+      return _last;
     };
   })(),
   mark(){}, measure(){},
