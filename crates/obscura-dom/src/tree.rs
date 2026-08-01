@@ -143,6 +143,9 @@ pub(crate) struct DomTreeInner {
     pub(crate) free_list: Vec<u32>,
     pub(crate) document: NodeId,
     pub(crate) id_index: HashMap<String, NodeId>,
+    // Whether the document was parsed in (full) quirks mode. In quirks mode CSS
+    // class and id selectors match ASCII-case-insensitively.
+    pub(crate) quirks: bool,
 }
 
 impl DomTree {
@@ -162,12 +165,24 @@ impl DomTree {
                 free_list: Vec::new(),
                 document: NodeId(0),
                 id_index: HashMap::new(),
+                quirks: false,
             }),
         }
     }
 
     pub fn document(&self) -> NodeId {
         self.inner.borrow().document
+    }
+
+    /// Record whether the document was parsed in (full) quirks mode.
+    pub fn set_quirks(&self, quirks: bool) {
+        self.inner.borrow_mut().quirks = quirks;
+    }
+
+    /// Whether the document is in (full) quirks mode, in which CSS class and id
+    /// selectors match ASCII-case-insensitively.
+    pub fn is_quirks(&self) -> bool {
+        self.inner.borrow().quirks
     }
 
     pub(crate) fn borrow_inner(&self) -> std::cell::Ref<'_, DomTreeInner> {
