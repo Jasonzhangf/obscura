@@ -1318,6 +1318,26 @@ mod tests {
     }
 
     #[test]
+    fn childnode_helpers_coerce_non_string_primitives_to_text() {
+        let mut rt = setup_runtime(r#"<html><body><div id="p"><span id="t">x</span></div></body></html>"#);
+        let before = rt
+            .evaluate("(function(){var t=document.getElementById('t'); t.before(5); return t.previousSibling ? t.previousSibling.textContent : 'NULL';})()")
+            .unwrap();
+        assert_eq!(before, serde_json::json!("5"));
+        let after = rt
+            .evaluate("(function(){var t=document.getElementById('t'); t.after(true); return t.nextSibling ? t.nextSibling.textContent : 'NULL';})()")
+            .unwrap();
+        assert_eq!(after, serde_json::json!("true"));
+        let replaced = rt
+            .evaluate("(function(){var t=document.getElementById('t'); t.replaceWith(42); return document.getElementById('p').textContent;})()")
+            .unwrap();
+        assert!(
+            replaced.as_str().unwrap().contains("42"),
+            "replaceWith(42) should leave text '42': {replaced}"
+        );
+    }
+
+    #[test]
     fn replace_state_without_url_preserves_current_location() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let path = rt
