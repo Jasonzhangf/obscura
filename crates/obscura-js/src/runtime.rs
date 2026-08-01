@@ -3114,6 +3114,101 @@ mod tests {
     }
 
     #[test]
+    fn test_promise_rejection_event_requires_promise() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const promise = Promise.resolve(1);
+                    const event = new PromiseRejectionEvent('unhandledrejection', {
+                        promise,
+                        reason: 'failed'
+                    });
+                    let missingPromiseThrows = false;
+                    try {
+                        new PromiseRejectionEvent('unhandledrejection');
+                    } catch (error) {
+                        missingPromiseThrows = error instanceof TypeError;
+                    }
+                    return [
+                        event instanceof Event,
+                        event.promise === promise,
+                        event.reason === 'failed',
+                        missingPromiseThrows
+                    ];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([true, true, true, true]));
+    }
+
+    #[test]
+    fn test_create_event_rejects_promise_rejection_event() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    try {
+                        document.createEvent('PromiseRejectionEvent');
+                        return null;
+                    } catch (error) {
+                        return [error.name, error instanceof DOMException];
+                    }
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!(["NotSupportedError", true])
+        );
+    }
+
+    #[test]
+    fn test_storage_event_constructor_and_legacy_factory() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const event = new StorageEvent('storage', {
+                        key: 'theme',
+                        oldValue: 'light',
+                        newValue: 'dark',
+                        url: 'https://example.test/'
+                    });
+                    const legacy = document.createEvent('StorageEvent');
+                    legacy.initStorageEvent(
+                        'storage', false, false, 'count', '1', '2',
+                        'https://example.test/', null
+                    );
+                    return [
+                        event instanceof Event,
+                        event.key,
+                        event.oldValue,
+                        event.newValue,
+                        event.url,
+                        legacy instanceof StorageEvent,
+                        legacy.key,
+                        legacy.newValue
+                    ];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                true,
+                "theme",
+                "light",
+                "dark",
+                "https://example.test/",
+                true,
+                "count",
+                "2"
+            ])
+        );
+    }
+
+    #[test]
     fn test_html_to_markdown_headings() {
         let mut rt = setup_runtime("<html><body><h1>Title</h1><h2>Sub</h2><p>Body</p></body></html>");
         let md = rt
