@@ -4180,13 +4180,13 @@ if (typeof Response === 'undefined') {
 }
 
 if (!Element.prototype.replaceWith) {
+  // _convertNodes turns any non-node argument (numbers, booleans, null, …) into
+  // a Text node via String(n), matching the spec and append()/prepend(); the
+  // old `typeof n === 'string'` check corrupted insert_before for other types.
   Element.prototype.replaceWith = function(...nodes) {
     const parent = this.parentNode;
     if (!parent) return;
-    for (const n of nodes) {
-      if (typeof n === 'string') parent.insertBefore(document.createTextNode(n), this);
-      else parent.insertBefore(n, this);
-    }
+    for (const n of _convertNodes(nodes)) parent.insertBefore(n, this);
     parent.removeChild(this);
   };
   _markNative(Element.prototype.replaceWith);
@@ -4195,10 +4195,7 @@ if (!Element.prototype.before) {
   Element.prototype.before = function(...nodes) {
     const parent = this.parentNode;
     if (!parent) return;
-    for (const n of nodes) {
-      if (typeof n === 'string') parent.insertBefore(document.createTextNode(n), this);
-      else parent.insertBefore(n, this);
-    }
+    for (const n of _convertNodes(nodes)) parent.insertBefore(n, this);
   };
   _markNative(Element.prototype.before);
 }
@@ -4207,10 +4204,7 @@ if (!Element.prototype.after) {
     const parent = this.parentNode;
     if (!parent) return;
     const ref = this.nextSibling;
-    for (const n of nodes) {
-      if (typeof n === 'string') parent.insertBefore(document.createTextNode(n), ref);
-      else parent.insertBefore(n, ref);
-    }
+    for (const n of _convertNodes(nodes)) parent.insertBefore(n, ref);
   };
   _markNative(Element.prototype.after);
 }
@@ -5710,7 +5704,10 @@ globalThis.atob = globalThis.atob || ((s) => { const c="ABCDEFGHIJKLMNOPQRSTUVWX
   const stack = [{state: null, url: undefined}]; // initial entry; url=undefined means "use document URL"
   let idx = 0;
   const resolveOrFallback = (url) => {
-    if (url === null || url === undefined) return undefined;
+    // A missing url (pushState/replaceState called with < 3 args) keeps the
+    // current document URL per the HTML spec — capture it so the entry does not
+    // reset location back to the original document URL.
+    if (url === null || url === undefined) return __currentUrl();
     try { return new URL(String(url), __currentUrl()).href; } catch (e) { return String(url); }
   };
   const applyVirtual = () => {
