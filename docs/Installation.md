@@ -59,6 +59,10 @@ See [Build from source](Build-from-source.md).
 - `obscura`: CLI and CDP server.
 - `obscura-worker`: helper for the parallel `scrape` command. Keep both in the same directory.
 
+The standard archive names contain the lean default build. Choose the matching
+archive with a `-stealth` suffix when you need the wreq/BoringSSL transport for
+TLS impersonation.
+
 ## Smoke test
 
 ```bash

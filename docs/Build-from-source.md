@@ -24,6 +24,28 @@ cargo build --release --features stealth
 
 Adds TLS fingerprint randomization and the tracker blocklist. See [Configure stealth and proxies](Configure-stealth-and-proxies.md).
 
+The stealth feature builds BoringSSL and generates Rust bindings. In addition
+to the default requirements, install CMake, Clang, and the libclang/LLVM
+development libraries. On Ubuntu/Debian:
+
+```bash
+sudo apt-get install build-essential cmake clang libclang-dev llvm-dev
+```
+
+On macOS, install the Xcode Command Line Tools and CMake. On Windows, install
+the Visual Studio C++ Build Tools, CMake, and LLVM/Clang. Ensure the directory
+containing `libclang` is available through `LIBCLANG_PATH` if bindgen cannot
+locate it automatically.
+
+On macOS 26 with the standalone Command Line Tools, Apple Clang may not find
+libc++ while compiling BoringSSL. Use the active SDK for that build:
+
+```bash
+SDK_PATH="$(xcrun --show-sdk-path)"
+SDKROOT="$SDK_PATH" CXXFLAGS="-isystem $SDK_PATH/usr/include/c++/v1" \
+  cargo build --release --features stealth
+```
+
 ## OpenSSL on older systems
 
 If the build fails on the vendored OpenSSL with an AVX-512 assembler error (common on older VPS hosts):
