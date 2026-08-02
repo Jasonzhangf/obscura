@@ -1,4 +1,5 @@
 "use strict";
+(function () {
 
 // Pre-declare all internal globals as non-enumerable so they are invisible
 // to Object.keys(window) / for-in enumeration. Must run before any var
@@ -8855,4 +8856,6 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
     try { val = globalThis[name]; } catch (e) { continue; }
     if (typeof val === 'function') { walk(val); }
   }
+})();
+
 })();
