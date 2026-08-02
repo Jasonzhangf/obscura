@@ -57,6 +57,39 @@ impl StealthHttpClient {
             .timeout(Duration::from_secs(30))
             .redirect(wreq::redirect::Policy::none());
 
+        // Honor SSL_CERT_FILE / SSL_CERT_DIR in the stealth client too.
+        //
+        // `client.rs` (the reqwest path) already reads these via `configured_root_paths()` and
+        // feeds `add_root_certificate`, so a private CA works there. This client did not, which
+        // made the *better-fingerprinted* transport the only one unable to reach hosts behind a
+        // private/national CA (measured against a Brazilian government portal whose leaf is
+        // issued by an ICP-Brasil intermediate: `--stealth` failed with CERTIFICATE_VERIFY_FAILED
+        // while the reqwest path, with SSL_CERT_FILE set, completed the handshake).
+        //
+        // Two deliberate constraints:
+        //
+        // 1. `tls_cert_store` is used, NOT `tls_options`. `emulation()` overwrites `tls_options`
+        //    wholesale ("This will overwrite the existing configuration"), so setting TLS options
+        //    here would silently discard the Chrome fingerprint — the whole point of this client.
+        //    `tls_cert_store` is a separate field on the config and composes with emulation.
+        //
+        // 2. Opt-in only. Supplying a store REPLACES the webpki roots (see `set_cert_store` in
+        //    `tls/conn/ext.rs`), it does not add to them. Applying it unconditionally would break
+        //    every ordinary site whenever the bundle is incomplete. With neither variable set,
+        //    behaviour is byte-for-byte what it was before.
+        if std::env::var_os("SSL_CERT_FILE").is_some()
+            || std::env::var_os("SSL_CERT_DIR").is_some()
+        {
+            match wreq::tls::trust::CertStore::builder().set_default_paths().build() {
+                Ok(store) => builder = builder.tls_cert_store(store),
+                Err(error) => tracing::warn!(
+                    %error,
+                    "SSL_CERT_FILE/SSL_CERT_DIR set but the certificate store failed to build; \
+                     continuing with the default roots"
+                ),
+            }
+        }
+
         if let Some(proxy) = proxy_url {
             if let Ok(p) = wreq::Proxy::all(proxy) {
                 builder = builder.proxy(p);
