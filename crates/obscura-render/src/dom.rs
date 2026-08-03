@@ -354,6 +354,26 @@ pub struct DomLayout {
     pub(crate) generated_boxes: Vec<GeneratedBox>,
 }
 
+/// One connected element attribute mutation eligible for conservative
+/// retained-style invalidation. Callers must use the ordinary full-layout
+/// path for tree/text mutations and for attributes with non-CSS rendering
+/// semantics (image sources, form state, inline style, and similar).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttributeStyleMutation {
+    pub node: NodeId,
+    pub name: String,
+    pub old_value: Option<String>,
+    pub new_value: Option<String>,
+}
+
+/// Style maps moved out of a previous layout. Moving, rather than cloning,
+/// keeps incremental restyle from retaining a second heap-heavy LayoutStyle
+/// graph beside the final used styles.
+pub(crate) struct RetainedStyleMaps {
+    pub styles: HashMap<NodeId, crate::LayoutStyle>,
+    pub custom_properties: HashMap<NodeId, std::rc::Rc<HashMap<String, String>>>,
+}
+
 /// Dense identifier for one scrolling area in a prepared render. Index zero
 /// is always the root viewport; element scroll containers follow in DOM order.
 /// The ids are rebuild-local and must never be persisted by an embedding
@@ -1872,6 +1892,7 @@ fn cascade_walk(
     viewport: (f32, f32),
     inherited_cell_padding: Option<f32>,
     inherited_color_scheme_dark: bool,
+    fresh_styles: Option<&HashSet<NodeId>>,
 ) {
     let Some(node) = tree.get_node(id) else {
         return;
@@ -1882,7 +1903,25 @@ fn cascade_walk(
     let mut this_props = parent_props.clone();
     let mut descendant_cell_padding = inherited_cell_padding;
     let mut descendant_color_scheme_dark = inherited_color_scheme_dark;
-    if let Some(elem) = node.as_element() {
+    let reuse_style = node.is_element()
+        && fresh_styles.is_some_and(|fresh| !fresh.contains(&id))
+        && styles.contains_key(&id)
+        && custom_properties.contains_key(&id);
+    if reuse_style {
+        this_props = custom_properties
+            .get(&id)
+            .cloned()
+            .unwrap_or_else(|| parent_props.clone());
+        descendant_color_scheme_dark = styles
+            .get(&id)
+            .is_some_and(|style| style.color_scheme_dark);
+        if node.as_element().is_some_and(|elem| elem.local.as_ref() == "table") {
+            descendant_cell_padding = node
+                .get_attribute("cellpadding")
+                .and_then(|value| value.trim().parse::<f32>().ok())
+                .filter(|value| value.is_finite() && *value >= 0.0);
+        }
+    } else if let Some(elem) = node.as_element() {
         if elem.local.as_ref() == "table" {
             // `cellpadding` is a table-scoped presentational hint applied to
             // its cells, below author CSS. Entering any nested table resets
@@ -2084,6 +2123,7 @@ fn cascade_walk(
             viewport,
             descendant_cell_padding,
             descendant_color_scheme_dark,
+            fresh_styles,
         );
     }
     if is_element {
@@ -2309,6 +2349,9 @@ struct ContainerLayoutTelemetry {
     passes: usize,
     termination: ContainerLayoutTermination,
     query: crate::css::ContainerQueryStats,
+    retained_reused: usize,
+    retained_fresh: usize,
+    retained_fallback: usize,
 }
 
 fn container_iteration_termination<T: PartialEq>(
@@ -2323,6 +2366,97 @@ fn container_iteration_termination<T: PartialEq>(
     } else {
         None
     }
+}
+
+enum RetainedStylePlan {
+    Reuse(HashSet<NodeId>),
+    Full,
+}
+
+fn add_style_subtree(tree: &DomTree, root: NodeId, dirty: &mut HashSet<NodeId>) {
+    dirty.insert(root);
+    dirty.extend(tree.descendants(root));
+    // Rebuild the context chain too. A retained ancestor may carry a final
+    // post-layout Px repair (native controls, blockification, table/grid
+    // fixups) where a full pass would feed its specified Auto/inherit form to
+    // the fresh descendant's normalization. Ancestors are fresh individually;
+    // their unrelated sibling subtrees remain reusable.
+    dirty.extend(tree.ancestors(root));
+}
+
+fn add_following_sibling_subtrees(
+    tree: &DomTree,
+    node: NodeId,
+    dirty: &mut HashSet<NodeId>,
+) {
+    let mut sibling = tree.get_node(node).and_then(|node| node.next_sibling);
+    while let Some(id) = sibling {
+        add_style_subtree(tree, id, dirty);
+        sibling = tree.get_node(id).and_then(|node| node.next_sibling);
+    }
+}
+
+/// Convert old/new selector keys into a conservative set of fresh cascade
+/// roots. Every selected root is expanded to its complete subtree so ordinary
+/// CSS inheritance, custom properties, generated content, and later selector
+/// compounds remain sound without retaining Gecko's full dependency chains.
+fn retained_style_plan(
+    tree: &DomTree,
+    sheet: &crate::css::Stylesheet,
+    mutations: &[AttributeStyleMutation],
+) -> RetainedStylePlan {
+    let mut dirty = HashSet::new();
+    for mutation in mutations {
+        let name = mutation.name.to_ascii_lowercase();
+        // Phase one deliberately excludes attributes with independent HTML
+        // rendering behavior. class/id and data/ARIA state cover framework
+        // hydration churn while source selection, form state, mapped
+        // presentation hints, and inline declarations retain the full path.
+        if name != "class"
+            && name != "id"
+            && !name.starts_with("data-")
+            && !name.starts_with("aria-")
+        {
+            return RetainedStylePlan::Full;
+        }
+
+        let map = sheet.invalidation_map();
+        let mut dependencies = Vec::new();
+        dependencies.extend_from_slice(map.attribute_dependencies(&name));
+        if name == "id" {
+            if let Some(old) = mutation.old_value.as_deref() {
+                dependencies.extend_from_slice(map.id_dependencies(old));
+            }
+            if let Some(new) = mutation.new_value.as_deref() {
+                dependencies.extend_from_slice(map.id_dependencies(new));
+            }
+        } else if name == "class" {
+            for class in mutation
+                .old_value
+                .iter()
+                .chain(&mutation.new_value)
+                .flat_map(|value| value.split_whitespace())
+            {
+                dependencies.extend_from_slice(map.class_dependencies(class));
+            }
+        }
+
+        for dependency in dependencies {
+            let reaches = dependency.reaches;
+            if reaches.contains(crate::css::InvalidationReaches::CONSERVATIVE) {
+                return RetainedStylePlan::Full;
+            }
+            if reaches.contains(crate::css::InvalidationReaches::SELF)
+                || reaches.contains(crate::css::InvalidationReaches::DESCENDANTS)
+            {
+                add_style_subtree(tree, mutation.node, &mut dirty);
+            }
+            if reaches.contains(crate::css::InvalidationReaches::SIBLINGS) {
+                add_following_sibling_subtrees(tree, mutation.node, &mut dirty);
+            }
+        }
+    }
+    RetainedStylePlan::Reuse(dirty)
 }
 
 pub(crate) fn layout_dom_with_web_fonts(
@@ -2348,6 +2482,30 @@ pub(crate) fn layout_dom_with_web_fonts_and_stylesheet_cache(
         fonts,
         None,
         Some(stylesheet_cache),
+        None,
+        &[],
+    )
+    .0
+}
+
+pub(crate) fn layout_dom_with_web_fonts_and_retained_styles(
+    tree: &DomTree,
+    viewport: (f32, f32),
+    intrinsic: &HashMap<NodeId, (f32, f32)>,
+    fonts: &[crate::inline::WebFont],
+    stylesheet_cache: &mut crate::css::StylesheetCache,
+    retained: RetainedStyleMaps,
+    mutations: &[AttributeStyleMutation],
+) -> DomLayout {
+    layout_dom_with_web_fonts_pass_limit(
+        tree,
+        viewport,
+        intrinsic,
+        fonts,
+        None,
+        Some(stylesheet_cache),
+        Some(retained),
+        mutations,
     )
     .0
 }
@@ -2358,7 +2516,7 @@ fn layout_dom_with_web_fonts_measured(
     intrinsic: &HashMap<NodeId, (f32, f32)>,
     fonts: &[crate::inline::WebFont],
 ) -> (DomLayout, ContainerLayoutTelemetry) {
-    layout_dom_with_web_fonts_pass_limit(tree, viewport, intrinsic, fonts, None, None)
+    layout_dom_with_web_fonts_pass_limit(tree, viewport, intrinsic, fonts, None, None, None, &[])
 }
 
 fn layout_dom_with_web_fonts_pass_limit(
@@ -2368,6 +2526,8 @@ fn layout_dom_with_web_fonts_pass_limit(
     fonts: &[crate::inline::WebFont],
     pass_limit: Option<usize>,
     stylesheet_cache: Option<&mut crate::css::StylesheetCache>,
+    retained: Option<RetainedStyleMaps>,
+    mutations: &[AttributeStyleMutation],
 ) -> (DomLayout, ContainerLayoutTelemetry) {
     let timing = std::env::var("OBSCURA_RENDER_TIMING").is_ok();
 
@@ -2397,12 +2557,38 @@ fn layout_dom_with_web_fonts_pass_limit(
     };
     let t_parse = t0.elapsed();
 
+    let retained_requested = retained.as_ref().map_or(0, |retained| retained.styles.len());
+    let retained = retained.and_then(|retained| {
+        if !stylesheet_cache_hit
+            || retained
+                .styles
+                .values()
+                .any(|style| style.container_type != crate::ContainerType::Normal)
+        {
+            return None;
+        }
+        match retained_style_plan(tree, &sheet, mutations) {
+            RetainedStylePlan::Reuse(dirty) => Some((retained, dirty)),
+            RetainedStylePlan::Full => None,
+        }
+    });
+    let retained_fresh = retained.as_ref().map_or(0, |(retained, fresh)| {
+        retained
+            .styles
+            .keys()
+            .filter(|node| fresh.contains(node))
+            .count()
+    });
+    let retained_reused = retained
+        .as_ref()
+        .map_or(0, |(retained, _)| retained.styles.len() - retained_fresh);
+    let retained_fallback = usize::from(retained_requested != 0 && retained.is_none());
     let (mut laid, _, mut query, mut cascade_time) =
-        layout_dom_once(tree, viewport, intrinsic, fonts, &sheet, None);
+        layout_dom_once(tree, viewport, intrinsic, fonts, &sheet, None, retained);
     if !sheet.has_container_queries() {
         if timing {
             let (r, i, c, a, l, u) = sheet.debug_stats();
-            eprintln!("[timing] parse+index={:?} stylesheet_cache_hit={} cascade={:?} rules={} id_keys={} class_keys={} attr_keys={} local_keys={} universal={} cq_passes=1 cq_termination=no-queries", t_parse, stylesheet_cache_hit, cascade_time, r, i, c, a, l, u);
+            eprintln!("[timing] parse+index={:?} stylesheet_cache_hit={} cascade={:?} rules={} id_keys={} class_keys={} attr_keys={} local_keys={} universal={} cq_passes=1 cq_termination=no-queries retained_reused={} retained_fresh={} retained_fallback={}", t_parse, stylesheet_cache_hit, cascade_time, r, i, c, a, l, u, retained_reused, retained_fresh, retained_fallback);
         }
         return (
             laid,
@@ -2410,6 +2596,9 @@ fn layout_dom_with_web_fonts_pass_limit(
                 passes: 1,
                 termination: ContainerLayoutTermination::NoQueries,
                 query,
+                retained_reused,
+                retained_fresh,
+                retained_fallback,
             },
         );
     }
@@ -2424,7 +2613,7 @@ fn layout_dom_with_web_fonts_pass_limit(
     if snapshot.boxes.is_empty() {
         if timing {
             let (r, i, c, a, l, u) = sheet.debug_stats();
-            eprintln!("[timing] parse+index={:?} stylesheet_cache_hit={} cascade={:?} rules={} id_keys={} class_keys={} attr_keys={} local_keys={} universal={} cq_passes=1 cq_termination=no-containers", t_parse, stylesheet_cache_hit, cascade_time, r, i, c, a, l, u);
+            eprintln!("[timing] parse+index={:?} stylesheet_cache_hit={} cascade={:?} rules={} id_keys={} class_keys={} attr_keys={} local_keys={} universal={} cq_passes=1 cq_termination=no-containers retained_reused={} retained_fresh={} retained_fallback={}", t_parse, stylesheet_cache_hit, cascade_time, r, i, c, a, l, u, retained_reused, retained_fresh, retained_fallback);
         }
         return (
             laid,
@@ -2432,6 +2621,9 @@ fn layout_dom_with_web_fonts_pass_limit(
                 passes: 1,
                 termination: ContainerLayoutTermination::NoContainers,
                 query,
+                retained_reused,
+                retained_fresh,
+                retained_fallback,
             },
         );
     }
@@ -2471,7 +2663,15 @@ fn layout_dom_with_web_fonts_pass_limit(
     let mut needs_fallback = false;
     for pass in 2..=max_passes {
         let (next, signature, pass_query, pass_cascade) =
-            layout_dom_once(tree, viewport, intrinsic, fonts, &sheet, Some(&snapshot));
+            layout_dom_once(
+                tree,
+                viewport,
+                intrinsic,
+                fonts,
+                &sheet,
+                Some(&snapshot),
+                None,
+            );
         passes = pass;
         query.evaluations += pass_query.evaluations;
         query.cache_hits += pass_query.cache_hits;
@@ -2518,7 +2718,7 @@ fn layout_dom_with_web_fonts_pass_limit(
         // geometry used to choose them. Disable the unstable conditional
         // rules for this render and expose the downgrade in telemetry.
         let (fallback, _, fallback_query, fallback_cascade) =
-            layout_dom_once(tree, viewport, intrinsic, fonts, &sheet, None);
+            layout_dom_once(tree, viewport, intrinsic, fonts, &sheet, None, None);
         laid = fallback;
         passes += 1;
         query.evaluations += fallback_query.evaluations;
@@ -2529,7 +2729,7 @@ fn layout_dom_with_web_fonts_pass_limit(
 
     if timing {
         let (r, i, c, a, l, u) = sheet.debug_stats();
-        eprintln!("[timing] parse+index={:?} stylesheet_cache_hit={} cascade_total={:?} rules={} id_keys={} class_keys={} attr_keys={} local_keys={} universal={} cq_passes={} cq_termination={:?} cq_evaluations={} cq_cache_hits={} cq_ancestor_steps={}", t_parse, stylesheet_cache_hit, cascade_time, r, i, c, a, l, u, passes, termination, query.evaluations, query.cache_hits, query.ancestor_steps);
+        eprintln!("[timing] parse+index={:?} stylesheet_cache_hit={} cascade_total={:?} rules={} id_keys={} class_keys={} attr_keys={} local_keys={} universal={} cq_passes={} cq_termination={:?} cq_evaluations={} cq_cache_hits={} cq_ancestor_steps={} retained_reused={} retained_fresh={} retained_fallback={}", t_parse, stylesheet_cache_hit, cascade_time, r, i, c, a, l, u, passes, termination, query.evaluations, query.cache_hits, query.ancestor_steps, retained_reused, retained_fresh, retained_fallback);
     }
     (
         laid,
@@ -2537,6 +2737,9 @@ fn layout_dom_with_web_fonts_pass_limit(
             passes,
             termination,
             query,
+            retained_reused,
+            retained_fresh,
+            retained_fallback,
         },
     )
 }
@@ -2548,6 +2751,7 @@ fn layout_dom_once(
     fonts: &[crate::inline::WebFont],
     sheet: &crate::css::Stylesheet,
     snapshot: Option<&crate::css::ContainerSnapshot>,
+    retained: Option<(RetainedStyleMaps, HashSet<NodeId>)>,
 ) -> (
     DomLayout,
     Option<crate::css::ContainerDecisionSignature>,
@@ -2556,8 +2760,10 @@ fn layout_dom_once(
 ) {
     let t1 = std::time::Instant::now();
     let mut matcher = tree.matcher();
-    let mut styles: HashMap<NodeId, crate::LayoutStyle> = HashMap::new();
-    let mut custom_properties = HashMap::new();
+    let (mut styles, mut custom_properties, fresh_styles) = match retained {
+        Some((retained, fresh)) => (retained.styles, retained.custom_properties, Some(fresh)),
+        None => (HashMap::new(), HashMap::new(), None),
+    };
     let root_props = std::rc::Rc::new(HashMap::new());
     let mut evaluator =
         snapshot.map(|snapshot| crate::css::ContainerQueryEvaluator::new(tree, snapshot));
@@ -2585,6 +2791,7 @@ fn layout_dom_once(
         viewport,
         None,
         false,
+        fresh_styles.as_ref(),
     );
     resolve_css_counters(tree, &mut styles);
     let cascade_time = t1.elapsed();
@@ -2771,6 +2978,142 @@ fn layout_dom_once(
             // (updated to its content width inside the block below).
             let mut child_cb_width = inh.cb_width;
             let mut child_cb_height_definite = false;
+            let reused_computed_style = fresh_styles
+                .as_ref()
+                .is_some_and(|fresh| !fresh.contains(&id));
+            if reused_computed_style {
+                // Retained styles have already passed through this destructive
+                // normalization once. Do not resolve their em/rem/percent or
+                // CSS-wide inheritance markers a second time. Seed the
+                // inherited context for a fresh descendant directly from the
+                // prior computed values, then retain the style byte-for-byte.
+                if let Some(style) = styles.get(&id) {
+                    inh.display = style.display;
+                    inh.display_contents = style.display_contents;
+                    inh.is_inline_block = style.is_inline_block;
+                    inh.flow_root = style.flow_root;
+                    inh.is_table_box = style.is_table_box;
+                    inh.color = style.color.or(inh.color);
+                    inh.font_size = style.font_size.or(inh.font_size);
+                    inh.font_weight = crate::style::used_font_weight(style);
+                    if let Some(family) = style.font_family.as_ref() {
+                        inh.font_family = Some(family.clone());
+                    }
+                    if let Some(value) = style.font_optical_sizing {
+                        inh.font_optical_sizing = value;
+                    }
+                    if let Some(settings) = style.font_variation_settings.as_ref() {
+                        inh.font_variation_settings.clone_from(settings);
+                    }
+                    if let Some(spacing) = style.letter_spacing {
+                        inh.letter_spacing = spacing;
+                    }
+                    if let Some(non_normal) = style.letter_spacing_non_normal {
+                        inh.letter_spacing_non_normal = non_normal;
+                    }
+                    inh.container_type = style.container_type;
+                    inh.container_names.clone_from(&style.container_names);
+                    if let Some(align) = style.text_align {
+                        inh.text_align = Some(align);
+                        inh.legacy_center = style.legacy_center;
+                    }
+                    if let Some(indent) = style.text_indent {
+                        inh.text_indent = indent;
+                    }
+                    inh.visibility_hidden = style
+                        .visibility_hidden
+                        .unwrap_or(inh.visibility_hidden);
+                    inh.opacity_product *= style.opacity.unwrap_or(1.0);
+                    if let Some(value) = style.list_style {
+                        inh.list_style = value;
+                    }
+                    if let Some(value) = style.line_height {
+                        inh.line_height = value;
+                    }
+                    if let Some(value) = style.white_space {
+                        inh.white_space = value;
+                    }
+                    if let Some(value) = style.overflow_wrap {
+                        inh.overflow_wrap = value;
+                    }
+                    if let Some(value) = style.word_break {
+                        inh.word_break = value;
+                    }
+                    if let Some(value) = style.text_wrap_style {
+                        inh.text_wrap_style = value;
+                    }
+                    if let Some(value) = style.text_transform {
+                        inh.text_transform = value;
+                    }
+                    if let Some(value) = style.font_style_italic {
+                        inh.italic = value;
+                    }
+                    inh.box_sizing = style.box_sizing;
+                    if let Some(value) = style.border_collapse {
+                        inh.border_collapse = value;
+                    }
+                    let is_table_part = tree.get_node(id).is_some_and(|node| {
+                        node.as_element().is_some_and(|element| {
+                            matches!(
+                                element.local.as_ref(),
+                                "tbody" | "thead" | "tfoot" | "tr" | "td" | "th"
+                            )
+                        })
+                    });
+                    if is_table_part {
+                        if let Some(value) = style.vertical_align {
+                            inh.table_vertical_align = Some(value);
+                        }
+                    }
+                    inh.overflow_x = if style.overflow_scroll_x {
+                        2
+                    } else if style.overflow_clip_x {
+                        1
+                    } else {
+                        0
+                    };
+                    inh.overflow_y = if style.overflow_scroll_y {
+                        2
+                    } else if style.overflow_clip_y {
+                        1
+                    } else {
+                        0
+                    };
+                    child_cb_height_definite = matches!(
+                        style.height,
+                        crate::Dimension::Px(_) | crate::Dimension::Percent(_)
+                    );
+                    if child_cb_height_definite {
+                        definite_height_nodes.insert(id);
+                    }
+                    let cb_w = inh.cb_width;
+                    let used_w = match style.width {
+                        crate::Dimension::Px(width) => width,
+                        crate::Dimension::Percent(percent) => percent * cb_w,
+                        _ => (cb_w - style.margin.left - style.margin.right).max(0.0),
+                    };
+                    let definite_content_box = matches!(
+                        style.width,
+                        crate::Dimension::Px(_) | crate::Dimension::Percent(_)
+                    ) && style.box_sizing == crate::BoxSizing::ContentBox;
+                    child_cb_width = if definite_content_box {
+                        used_w.max(0.0)
+                    } else {
+                        (used_w
+                            - style.padding.left
+                            - style.padding.right
+                            - style.border.left
+                            - style.border.right)
+                            .max(0.0)
+                    };
+                }
+                inh.cb_width = child_cb_width;
+                inh.cb_height_definite = child_cb_height_definite;
+                for child in tree.children(id).into_iter().rev() {
+                    queue.push((child, inh.clone()));
+                }
+                continue;
+            }
             let inherited_grid_auto_tracks = styles.get(&id).and_then(|style| {
                 (style.grid_auto_columns_inherit || style.grid_auto_rows_inherit).then(|| {
                     tree.get_node(id)
@@ -11997,6 +12340,8 @@ mod tests {
             &[],
             Some(2),
             None,
+            None,
+            &[],
         );
         let target = tree.get_element_by_id("target").unwrap();
         assert_eq!(laid.styles[&target].width, crate::Dimension::Px(1.0));
@@ -12056,6 +12401,9 @@ mod tests {
                 passes: 1,
                 termination: ContainerLayoutTermination::NoQueries,
                 query: crate::css::ContainerQueryStats::default(),
+                retained_reused: 0,
+                retained_fresh: 0,
+                retained_fallback: 0,
             }
         );
     }
@@ -12078,8 +12426,410 @@ mod tests {
                 passes: 1,
                 termination: ContainerLayoutTermination::NoContainers,
                 query: crate::css::ContainerQueryStats::default(),
+                retained_reused: 0,
+                retained_fresh: 0,
+                retained_fallback: 0,
             }
         );
+    }
+
+    #[test]
+    fn retained_attribute_styles_match_forced_full_with_dormant_container_rules() {
+        let initial_html = r#"<html><head><style>
+            html,body{margin:0}
+            .theme[data-theme=dark] .card{--card-width:42px;color:#123456}
+            .card .child{width:var(--card-width,18px);height:2em;font-size:10px}
+            .theme[data-theme=dark] .card::before{content:'dark';display:block;width:7px}
+            .toggle[data-open=true] + .panel{--peer-width:31px}
+            .panel .peer{width:var(--peer-width,13px);height:9px}
+            .counter-scope{counter-reset:step}
+            .counter-item{counter-increment:step;display:block;height:9px}
+            .counter-item[data-double=true]{counter-increment:step 2}
+            .counter-item::before{content:counter(step)}
+            .clean{width:77px;height:11px}
+            @container dormant (min-width:10px){.child{width:99px}}
+        </style></head><body>
+            <section id=theme class=theme data-theme=light><div id=card class=card><span id=child class=child></span></div></section>
+            <div id=toggle class=toggle data-open=false></div><div class=panel><span id=peer class=peer></span></div>
+            <section class=counter-scope><span id=counter-one class=counter-item></span><span id=counter-change class=counter-item data-double=false></span><span id=counter-after class=counter-item></span></section>
+            <aside id=clean class=clean></aside>
+            <div style="display:flex"><button id=control><span>button</span></button><div id=inherit style="display:inherit">x</div></div>
+        </body></html>"#;
+        let final_html = initial_html
+            .replace("data-theme=light", "data-theme=dark")
+            .replace("data-open=false", "data-open=true")
+            .replace("data-double=false", "data-double=true");
+        let tree = parse_html(initial_html);
+        let mut cache = crate::css::StylesheetCache::default();
+        let mut initial = layout_dom_with_web_fonts_and_stylesheet_cache(
+            &tree,
+            (300.0, 200.0),
+            &HashMap::new(),
+            &[],
+            &mut cache,
+        );
+        let theme = tree.get_element_by_id("theme").unwrap();
+        let toggle = tree.get_element_by_id("toggle").unwrap();
+        let counter_change = tree.get_element_by_id("counter-change").unwrap();
+        tree.with_node_mut(theme, |node| node.set_attribute("data-theme", "dark".into()));
+        tree.with_node_mut(toggle, |node| node.set_attribute("data-open", "true".into()));
+        tree.with_node_mut(counter_change, |node| {
+            node.set_attribute("data-double", "true".into())
+        });
+        let mutations = vec![
+            AttributeStyleMutation {
+                node: theme,
+                name: "data-theme".into(),
+                old_value: Some("light".into()),
+                new_value: Some("dark".into()),
+            },
+            AttributeStyleMutation {
+                node: toggle,
+                name: "data-open".into(),
+                old_value: Some("false".into()),
+                new_value: Some("true".into()),
+            },
+            AttributeStyleMutation {
+                node: counter_change,
+                name: "data-double".into(),
+                old_value: Some("false".into()),
+                new_value: Some("true".into()),
+            },
+        ];
+        let retained = RetainedStyleMaps {
+            styles: std::mem::take(&mut initial.styles),
+            custom_properties: std::mem::take(&mut initial.custom_properties),
+        };
+        let (incremental, telemetry) = layout_dom_with_web_fonts_pass_limit(
+            &tree,
+            (300.0, 200.0),
+            &HashMap::new(),
+            &[],
+            None,
+            Some(&mut cache),
+            Some(retained),
+            &mutations,
+        );
+        let final_tree = parse_html(&final_html);
+        let full = layout_dom(&final_tree, (300.0, 200.0));
+
+        assert_eq!(telemetry.termination, ContainerLayoutTermination::NoContainers);
+        assert!(telemetry.retained_reused > 0, "clean branch must be reused");
+        assert!(telemetry.retained_fresh > 0, "dirty subtrees must be fresh");
+        assert_eq!(telemetry.retained_fallback, 0);
+        for id in [
+            "card",
+            "child",
+            "peer",
+            "counter-one",
+            "counter-change",
+            "counter-after",
+            "clean",
+            "control",
+            "inherit",
+        ] {
+            let incremental_id = tree.get_element_by_id(id).unwrap();
+            let full_id = final_tree.get_element_by_id(id).unwrap();
+            assert_eq!(
+                incremental.rects.get(&incremental_id),
+                full.rects.get(&full_id),
+                "{id} rect"
+            );
+            assert_eq!(
+                incremental.styles[&incremental_id].width,
+                full.styles[&full_id].width,
+                "{id} width"
+            );
+            assert_eq!(
+                incremental.styles[&incremental_id].color,
+                full.styles[&full_id].color,
+                "{id} color"
+            );
+            assert_eq!(
+                incremental.styles[&incremental_id].before_content,
+                full.styles[&full_id].before_content,
+                "{id} generated content"
+            );
+            assert_eq!(
+                incremental.custom_properties[&incremental_id],
+                full.custom_properties[&full_id],
+                "{id} custom properties"
+            );
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum RetainedDifferentialExpectation {
+        Incremental,
+        ReuseAll,
+        ConservativeFallback,
+    }
+
+    struct RetainedDifferentialCase {
+        name: &'static str,
+        css: &'static str,
+        target: &'static str,
+        attribute: &'static str,
+        new_value: &'static str,
+        expectation: RetainedDifferentialExpectation,
+    }
+
+    /// Compare every computed-style field through its Debug representation.
+    /// `LayoutStyle` intentionally does not implement PartialEq because it is
+    /// a large, evolving renderer-internal type; keeping this check centralized
+    /// means new fields automatically enter the retained-vs-full oracle.
+    fn assert_computed_styles_match(
+        case: &str,
+        incremental: &DomLayout,
+        full: &DomLayout,
+    ) {
+        assert_eq!(
+            incremental.styles.keys().collect::<HashSet<_>>(),
+            full.styles.keys().collect::<HashSet<_>>(),
+            "{case}: computed-style node set"
+        );
+        for (node, incremental_style) in &incremental.styles {
+            assert_eq!(
+                format!("{incremental_style:#?}"),
+                format!("{:#?}", full.styles[node]),
+                "{case}: computed style for {node:?}"
+            );
+        }
+    }
+
+    fn run_retained_differential_case(case: &RetainedDifferentialCase) {
+        let html = format!(
+            r#"<!doctype html><html><head><style>
+                html,body{{margin:0}}
+                .clean{{width:71px;height:13px}}
+                {}
+            </style></head><body>
+                <section id="scope" class="scope theme-off" data-mode="off">
+                  <div id="subject" class="subject state-off" data-state="off">
+                    <span id="child" class="child"><i id="grand" class="grand leaf"></i></span>
+                  </div>
+                  <div id="adjacent" class="panel"><span id="adjacent-child" class="leaf"></span></div>
+                  <div id="following" class="panel"><span id="following-child" class="leaf"></span></div>
+                </section>
+                <aside id="clean" class="clean"><span id="clean-child"></span></aside>
+            </body></html>"#,
+            case.css
+        );
+        let tree = parse_html(&html);
+        let mut cache = crate::css::StylesheetCache::default();
+        let mut initial = layout_dom_with_web_fonts_and_stylesheet_cache(
+            &tree,
+            (320.0, 240.0),
+            &HashMap::new(),
+            &[],
+            &mut cache,
+        );
+        let target = tree.get_element_by_id(case.target).unwrap();
+        let old_value = tree
+            .get_node(target)
+            .and_then(|node| node.get_attribute(case.attribute).map(str::to_owned));
+        tree.with_node_mut(target, |node| {
+            node.set_attribute(case.attribute, case.new_value.into())
+        });
+        let retained = RetainedStyleMaps {
+            styles: std::mem::take(&mut initial.styles),
+            custom_properties: std::mem::take(&mut initial.custom_properties),
+        };
+        let (incremental, telemetry) = layout_dom_with_web_fonts_pass_limit(
+            &tree,
+            (320.0, 240.0),
+            &HashMap::new(),
+            &[],
+            None,
+            Some(&mut cache),
+            Some(retained),
+            &[AttributeStyleMutation {
+                node: target,
+                name: case.attribute.into(),
+                old_value,
+                new_value: Some(case.new_value.into()),
+            }],
+        );
+        let full = layout_dom(&tree, (320.0, 240.0));
+
+        match case.expectation {
+            RetainedDifferentialExpectation::Incremental => {
+                assert_eq!(telemetry.retained_fallback, 0, "{}", case.name);
+                assert!(telemetry.retained_fresh > 0, "{}", case.name);
+                assert!(telemetry.retained_reused > 0, "{}", case.name);
+            }
+            RetainedDifferentialExpectation::ReuseAll => {
+                assert_eq!(telemetry.retained_fallback, 0, "{}", case.name);
+                assert_eq!(telemetry.retained_fresh, 0, "{}", case.name);
+                assert!(telemetry.retained_reused > 0, "{}", case.name);
+            }
+            RetainedDifferentialExpectation::ConservativeFallback => {
+                assert_eq!(telemetry.retained_fallback, 1, "{}", case.name);
+                assert_eq!(telemetry.retained_reused, 0, "{}", case.name);
+            }
+        }
+        assert_computed_styles_match(case.name, &incremental, &full);
+        assert_eq!(incremental.rects, full.rects, "{}: border boxes", case.name);
+        assert_eq!(
+            incremental.inline_fragments, full.inline_fragments,
+            "{}: inline fragments",
+            case.name
+        );
+        assert_eq!(incremental.text_runs, full.text_runs, "{}: text runs", case.name);
+        assert_eq!(
+            incremental.custom_properties, full.custom_properties,
+            "{}: custom properties",
+            case.name
+        );
+    }
+
+    #[test]
+    fn retained_attribute_styles_match_forced_full_selector_matrix() {
+        use RetainedDifferentialExpectation::{
+            ConservativeFallback, Incremental, ReuseAll,
+        };
+        let cases = [
+            RetainedDifferentialCase {
+                name: "self attribute selector",
+                css: ".subject[data-state=on]{width:41px;height:7px;color:#123456}",
+                target: "subject",
+                attribute: "data-state",
+                new_value: "on",
+                expectation: Incremental,
+            },
+            RetainedDifferentialCase {
+                name: "child and descendant selectors",
+                css: ".subject[data-state=on]>.child .grand{width:43px;height:9px}",
+                target: "subject",
+                attribute: "data-state",
+                new_value: "on",
+                expectation: Incremental,
+            },
+            RetainedDifferentialCase {
+                name: "ancestor selector",
+                css: ".scope[data-mode=on] .grand{width:47px;height:11px}",
+                target: "scope",
+                attribute: "data-mode",
+                new_value: "on",
+                expectation: Incremental,
+            },
+            RetainedDifferentialCase {
+                name: "adjacent sibling selector",
+                css: ".subject[data-state=on]+.panel{width:53px;height:13px}",
+                target: "subject",
+                attribute: "data-state",
+                new_value: "on",
+                expectation: Incremental,
+            },
+            RetainedDifferentialCase {
+                name: "general sibling selector",
+                css: ".subject[data-state=on]~.panel{width:59px;height:15px}",
+                target: "subject",
+                attribute: "data-state",
+                new_value: "on",
+                expectation: Incremental,
+            },
+            RetainedDifferentialCase {
+                name: "inheritance and custom property",
+                css: ".scope[data-mode=on]{--leaf-width:61px;color:#234567;font-size:20px}.leaf{width:var(--leaf-width,17px);height:1em;color:inherit}",
+                target: "scope",
+                attribute: "data-mode",
+                new_value: "on",
+                expectation: Incremental,
+            },
+            RetainedDifferentialCase {
+                name: "generated before and after content",
+                css: ".subject[data-state=on]::before{content:'before';display:block;width:5px}.subject[data-state=on]::after{content:'after';display:block;width:7px}",
+                target: "subject",
+                attribute: "data-state",
+                new_value: "on",
+                expectation: Incremental,
+            },
+            RetainedDifferentialCase {
+                name: "declaration attr dependency",
+                css: ".subject::before{content:attr(data-state);display:block;width:11px}",
+                target: "subject",
+                attribute: "data-state",
+                new_value: "on",
+                expectation: Incremental,
+            },
+            RetainedDifferentialCase {
+                name: "counter propagation through retained siblings",
+                css: ".scope{counter-reset:item}.subject,.panel{counter-increment:item}.subject[data-state=on]{counter-increment:item 3}.subject::before,.panel::before{content:counter(item)}",
+                target: "subject",
+                attribute: "data-state",
+                new_value: "on",
+                expectation: Incremental,
+            },
+            RetainedDifferentialCase {
+                name: "class replacement",
+                css: ".subject.state-on .grand{width:67px;height:17px}",
+                target: "subject",
+                attribute: "class",
+                new_value: "subject state-on",
+                expectation: Incremental,
+            },
+            RetainedDifferentialCase {
+                name: "id replacement",
+                css: "#subject-on .grand{width:71px;height:19px}",
+                target: "subject",
+                attribute: "id",
+                new_value: "subject-on",
+                expectation: Incremental,
+            },
+            RetainedDifferentialCase {
+                name: "selector-list pseudo",
+                css: ".scope:is([data-mode=on],.alternate) .grand{width:73px;height:21px}",
+                target: "scope",
+                attribute: "data-mode",
+                new_value: "on",
+                expectation: Incremental,
+            },
+            RetainedDifferentialCase {
+                name: "negation pseudo",
+                css: ".subject:not([data-state=off]){width:79px;height:23px}",
+                target: "subject",
+                attribute: "data-state",
+                new_value: "on",
+                expectation: Incremental,
+            },
+            RetainedDifferentialCase {
+                name: "mixed sibling descendant traversal",
+                css: ".subject[data-state=on]~.panel .leaf{width:83px;height:25px}",
+                target: "subject",
+                attribute: "data-state",
+                new_value: "on",
+                expectation: ConservativeFallback,
+            },
+            RetainedDifferentialCase {
+                name: "relative selector ancestor traversal",
+                css: ".scope:has(.subject[data-state=on]){width:89px}",
+                target: "subject",
+                attribute: "data-state",
+                new_value: "on",
+                expectation: ConservativeFallback,
+            },
+            RetainedDifferentialCase {
+                name: "nth of selector structural traversal",
+                css: ".subject:nth-child(1 of [data-state=on]){width:97px}",
+                target: "subject",
+                attribute: "data-state",
+                new_value: "on",
+                expectation: ConservativeFallback,
+            },
+            RetainedDifferentialCase {
+                name: "unreferenced aria mutation",
+                css: ".subject{width:101px;height:27px}",
+                target: "subject",
+                attribute: "aria-expanded",
+                new_value: "true",
+                expectation: ReuseAll,
+            },
+        ];
+
+        for case in &cases {
+            run_retained_differential_case(case);
+        }
     }
 
     #[test]

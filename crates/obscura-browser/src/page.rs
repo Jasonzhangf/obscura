@@ -85,6 +85,20 @@ fn truncate_on_char_boundary(s: &str, max: usize) -> &str {
     &s[..end]
 }
 
+#[cfg(feature = "render")]
+fn remaining_settle_resource_warmup_ms(
+    max_ms: u64,
+    elapsed: std::time::Duration,
+    configured_ms: u64,
+) -> u64 {
+    std::time::Duration::from_millis(max_ms)
+        .checked_sub(elapsed)
+        .map(|remaining| {
+            (remaining.as_millis().min(u128::from(u64::MAX)) as u64).min(configured_ms)
+        })
+        .unwrap_or(0)
+}
+
 #[cfg(feature = "stealth")]
 use obscura_net::StealthHttpClient;
 
@@ -1948,6 +1962,7 @@ impl Page {
         if max_ms == 0 {
             return;
         }
+        let settle_started = std::time::Instant::now();
         if let Some(js) = &mut self.js {
             if std::env::var_os("OBSCURA_STRICT_SETTLE").is_some() {
                 Self::settle_runtime_for_duration(js, max_ms).await;
@@ -1959,6 +1974,25 @@ impl Page {
                 // absolute caller budget and V8 watchdog still bound both
                 // asynchronous work and synchronous microtask storms.
                 let _ = js.run_event_loop_until_quiescent(max_ms, 150).await;
+            }
+        }
+        #[cfg(feature = "render")]
+        {
+            // Timers, fetch completions, and framework commits commonly append
+            // images or @font-face rules during settling. Seed those resources
+            // here so a following capture remains a fast observation of the
+            // retained page rather than initiating its own network phase.
+            let warmup_ms = std::env::var("OBSCURA_RENDER_RESOURCE_SETTLE_WARMUP_MS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(1_000);
+            let remaining_ms = remaining_settle_resource_warmup_ms(
+                max_ms,
+                settle_started.elapsed(),
+                warmup_ms,
+            );
+            if remaining_ms != 0 {
+                let _ = self.prepare_screenshot_resources(remaining_ms).await;
             }
         }
     }
@@ -2252,7 +2286,7 @@ impl Page {
         // renderer's synchronous resource loader and serial network latency pins
         // V8, making framework startup take many seconds. This is deliberately
         // bounded: navigation should not wait indefinitely for decorative
-        // resources, and screenshot/PDF capture can use its longer final wait.
+        // resources.
         #[cfg(feature = "render")]
         {
             let warmup_ms = std::env::var("OBSCURA_RENDER_RESOURCE_WARMUP_MS")
@@ -2269,6 +2303,21 @@ impl Page {
         // page.click() handlers were no-ops. Now scripts run regardless
         // of waitUntil and DCL means "DOM parsed AND scripts executed".
         self.execute_scripts().await;
+
+        #[cfg(feature = "render")]
+        {
+            // Page scripts and their bounded post-script event-loop pass can
+            // create responsive images, inline styles, and @font-face rules
+            // that did not exist during the parser warmup above. Discover them
+            // before navigation becomes capture-ready. Known parser resources
+            // are filtered by the render cache, so ordinary pages pay only the
+            // inexpensive scan on this second pass.
+            let warmup_ms = std::env::var("OBSCURA_RENDER_RESOURCE_POST_SCRIPT_WARMUP_MS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(1_000);
+            let _ = self.prepare_screenshot_resources(warmup_ms).await;
+        }
 
         self.lifecycle = LifecycleState::DomContentLoaded;
 
@@ -3172,6 +3221,8 @@ mod tests {
         navigation_referrer, parse_import_url, rebase_css_urls, script_response_is_executable,
         split_css_imports, truncate_on_char_boundary, url_matches_cdp_pattern,
     };
+    #[cfg(feature = "render")]
+    use super::remaining_settle_resource_warmup_ms;
     use base64::Engine as _;
     use obscura_dom::parse_html;
 
@@ -4174,6 +4225,87 @@ mod tests {
     }
 
     #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn navigation_post_script_warmup_seeds_dynamic_images_and_fonts() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 4096];
+                let read = stream.read(&mut request).unwrap_or(0);
+                let path = String::from_utf8_lossy(&request[..read])
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_ascii_whitespace().nth(1))
+                    .unwrap_or("/")
+                    .to_string();
+                seen_tx.send(path.clone()).unwrap();
+                let (content_type, body): (&str, &[u8]) = match path.as_str() {
+                    "/page" => (
+                        "text/html",
+                        br#"<!doctype html><html><head></head><body><script>
+                            const image = document.createElement('img');
+                            image.src = '/dynamic.svg';
+                            document.body.appendChild(image);
+                            const style = document.createElement('style');
+                            style.textContent = "@font-face{font-family:Dynamic;src:url('/dynamic.woff2')}body{font-family:Dynamic}";
+                            document.head.appendChild(style);
+                        </script></body></html>"#,
+                    ),
+                    "/dynamic.svg" => (
+                        "image/svg+xml",
+                        br#"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"><rect width="20" height="10" fill="red"/></svg>"#,
+                    ),
+                    "/dynamic.woff2" => ("font/woff2", b"not-a-real-font"),
+                    _ => ("text/plain", b"not found"),
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+                stream.write_all(body).unwrap();
+            }
+        });
+
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "dynamic-render-warmup".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("dynamic-render-warmup".to_string(), context);
+        let page_url = format!("http://{address}/page");
+        page.navigate(&page_url).await.unwrap();
+
+        let mut paths = (0..3)
+            .map(|_| seen_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap())
+            .collect::<Vec<_>>();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec![
+                "/dynamic.svg".to_string(),
+                "/dynamic.woff2".to_string(),
+                "/page".to_string(),
+            ]
+        );
+        let js = page.js.as_ref().expect("navigation runtime");
+        assert!(js.render_resource_is_known(&format!(
+            "http://{address}/dynamic.svg"
+        )));
+        assert!(js.render_resource_is_known(&format!(
+            "http://{address}/dynamic.woff2"
+        )));
+    }
+
+    #[cfg(feature = "render")]
     #[test]
     fn page_screenshot_uses_the_live_window_scroll_offset() {
         let context = std::sync::Arc::new(crate::BrowserContext::new("scroll-test".to_string()));
@@ -4508,6 +4640,44 @@ mod tests {
         page.settle(100).await;
 
         assert_client_replacement_survived(&mut page);
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn settle_resource_warmup_uses_only_remaining_absolute_budget() {
+        assert_eq!(
+            remaining_settle_resource_warmup_ms(
+                1_000,
+                std::time::Duration::from_millis(250),
+                1_000,
+            ),
+            750
+        );
+        assert_eq!(
+            remaining_settle_resource_warmup_ms(
+                1_000,
+                std::time::Duration::from_millis(250),
+                100,
+            ),
+            100
+        );
+        assert_eq!(
+            remaining_settle_resource_warmup_ms(
+                1_000,
+                std::time::Duration::from_micros(999_500),
+                1_000,
+            ),
+            0,
+            "a sub-millisecond remainder cannot safely fund a millisecond timeout"
+        );
+        assert_eq!(
+            remaining_settle_resource_warmup_ms(
+                1_000,
+                std::time::Duration::from_millis(1_001),
+                1_000,
+            ),
+            0
+        );
     }
 
     #[test]

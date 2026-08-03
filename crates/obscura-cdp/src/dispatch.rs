@@ -27,6 +27,14 @@ pub(crate) struct ScreencastState {
     pub command_frame_counter: u64,
     pub session_id: i64,
     pub frames_in_flight: u8,
+    /// Last connected-document generation observed by the frame producer.
+    /// The autonomous pump uses this as a cheap compositor-damage signal, so
+    /// an idle screencast does not continuously rasterize identical frames.
+    pub observed_activity_generation: u64,
+    /// A changed generation remains pending across sampling skips and
+    /// acknowledgement backpressure. Once capacity returns, the newest page
+    /// state is captured instead of losing the change.
+    pub autonomous_frame_pending: bool,
 }
 
 pub struct CdpContext {

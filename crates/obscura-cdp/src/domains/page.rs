@@ -266,6 +266,26 @@ fn encode_screenshot(
     Ok(output)
 }
 
+/// Keep capture itself an observation of the retained page state. Chromium's
+/// capture methods do not start a hidden resource-loading phase, and doing so
+/// here added up to three seconds to every screenshot/PDF/screencast start.
+/// The browser navigation and settle paths seed render resources proactively.
+/// Retain the old environment variable only as an explicit diagnostic escape
+/// hatch for callers investigating a slow or missing asset.
+#[cfg(feature = "render")]
+pub(crate) async fn prepare_capture_resources_if_requested(
+    page: &mut obscura_browser::Page,
+) {
+    let Some(deadline_ms) = std::env::var("OBSCURA_RENDER_RESOURCE_DEADLINE_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value != 0)
+    else {
+        return;
+    };
+    let _ = page.prepare_screenshot_resources(deadline_ms).await;
+}
+
 #[cfg(feature = "render")]
 fn screencast_int32(params: &Value, name: &str) -> Result<Option<i64>, String> {
     match params.get(name) {
@@ -316,6 +336,8 @@ fn parse_screencast_state(params: &Value, session_id: i64) -> Result<ScreencastS
         command_frame_counter: 0,
         session_id,
         frames_in_flight: 0,
+        observed_activity_generation: 0,
+        autonomous_frame_pending: false,
     })
 }
 
@@ -399,7 +421,7 @@ pub(crate) fn queue_screencast_frame(
         state.clone()
     };
     let attached_session = Some(cdp_session_id.to_string());
-    let (viewport, scroll, png) = {
+    let (viewport, scroll, png, activity_generation) = {
         let page = ctx
             .get_session_page_mut(&attached_session)
             .ok_or("No page for session")?;
@@ -425,7 +447,12 @@ pub(crate) fn queue_screencast_frame(
         let png = page.screenshot(viewport).ok_or_else(|| {
             "Page.startScreencast failed: the page has no visible DOM surface to render".to_string()
         })?;
-        (viewport, scroll, png)
+        let activity_generation = page
+            .js
+            .as_ref()
+            .map(|js| js.activity_generation())
+            .unwrap_or(0);
+        (viewport, scroll, png, activity_generation)
     };
     let encoded = encode_screencast_frame(png, &state)?;
     use base64::Engine as _;
@@ -437,6 +464,8 @@ pub(crate) fn queue_screencast_frame(
         return Ok(false);
     }
     live.frames_in_flight = live.frames_in_flight.saturating_add(1);
+    live.observed_activity_generation = activity_generation;
+    live.autonomous_frame_pending = false;
     ctx.pending_events.push(CdpEvent {
         method: "Page.screencastFrame".into(),
         params: json!({
@@ -452,6 +481,56 @@ pub(crate) fn queue_screencast_frame(
         session_id: Some(cdp_session_id.to_string()),
     });
     Ok(true)
+}
+
+/// Advance active page task queues for one bounded compositor slice and emit
+/// a frame when connected-document activity has changed. Chromium feeds
+/// `Page.screencastFrame` from its video consumer on compositor frames; this
+/// is Obscura's single-threaded equivalent until it owns a real compositor.
+///
+/// Generation tracking avoids full-page raster work while the page is idle.
+/// A dirty generation is retained across `everyNthFrame` sampling and the
+/// acknowledgement window, ensuring neither mechanism loses the latest frame.
+#[cfg(feature = "render")]
+pub(crate) async fn pump_screencast_frames(ctx: &mut CdpContext) {
+    const EVENT_LOOP_SLICE_MS: u64 = 4;
+
+    let sessions: Vec<String> = ctx.screencasts.keys().cloned().collect();
+    for cdp_session_id in sessions {
+        if !ctx.screencasts.contains_key(&cdp_session_id) {
+            continue;
+        }
+        let attached_session = Some(cdp_session_id.clone());
+        let activity_generation = {
+            let Some(page) = ctx.get_session_page_mut(&attached_session) else {
+                continue;
+            };
+            let Some(js) = page.js.as_mut() else {
+                continue;
+            };
+            // A V8 watchdog bounds synchronous callbacks as well as the async
+            // timeout, so a hostile timer cannot freeze the CDP connection.
+            let _ = js.run_event_loop_bounded(EVENT_LOOP_SLICE_MS).await;
+            js.activity_generation()
+        };
+
+        let should_attempt = {
+            let Some(state) = ctx.screencasts.get_mut(&cdp_session_id) else {
+                continue;
+            };
+            if state.observed_activity_generation != activity_generation {
+                state.observed_activity_generation = activity_generation;
+                state.autonomous_frame_pending = true;
+            }
+            state.autonomous_frame_pending
+        };
+        if !should_attempt {
+            continue;
+        }
+        if let Err(error) = queue_screencast_frame(ctx, &attached_session, false) {
+            tracing::warn!(cdp_session_id, "could not produce autonomous screencast frame: {error}");
+        }
+    }
 }
 
 #[cfg(feature = "render")]
@@ -1097,16 +1176,10 @@ pub async fn handle(
                     .as_ref()
                     .ok_or("Page.startScreencast requires an attached target session")?
                     .clone();
-                let resource_deadline_ms = std::env::var("OBSCURA_RENDER_RESOURCE_DEADLINE_MS")
-                    .ok()
-                    .and_then(|value| value.parse::<u64>().ok())
-                    .unwrap_or(3_000);
                 let page = ctx
                     .get_session_page_mut(session_id)
                     .ok_or("No page for session")?;
-                let _ = page
-                    .prepare_screenshot_resources(resource_deadline_ms)
-                    .await;
+                prepare_capture_resources_if_requested(page).await;
                 let stream_id = ctx.next_screencast_session();
                 let state = parse_screencast_state(params, stream_id)?;
                 ctx.screencasts.insert(cdp_session.clone(), state);
@@ -1121,15 +1194,11 @@ pub async fn handle(
                     ctx.screencasts.remove(&cdp_session);
                     return Err(error);
                 }
-                tracing::debug!(
-                    cdp_session,
-                    stream_id,
-                    "started command-driven screencast; autonomous compositor frames unavailable"
-                );
-                // Extension fields expose the MVP boundary to direct callers.
-                Ok(
-                    json!({"obscuraFrameSource": "command-driven", "obscuraAutonomousFrames": false}),
-                )
+                tracing::debug!(cdp_session, stream_id, "started activity-driven screencast");
+                Ok(json!({
+                    "obscuraFrameSource": "activity-driven",
+                    "obscuraAutonomousFrames": true,
+                }))
             }
             #[cfg(not(feature = "render"))]
             Err("Page.startScreencast requires a build with the render feature".into())
@@ -1183,13 +1252,7 @@ pub async fn handle(
                 let page = ctx
                     .get_session_page_mut(session_id)
                     .ok_or("No page for session")?;
-                let resource_deadline_ms = std::env::var("OBSCURA_RENDER_RESOURCE_DEADLINE_MS")
-                    .ok()
-                    .and_then(|value| value.parse::<u64>().ok())
-                    .unwrap_or(3_000);
-                let _ = page
-                    .prepare_screenshot_resources(resource_deadline_ms)
-                    .await;
+                prepare_capture_resources_if_requested(page).await;
                 let viewport = page.viewport;
                 let device_scale_factor = f64::from(page.device_scale_factor);
                 let trusted_scroll = page.screenshot_scroll_offset();
@@ -1447,8 +1510,8 @@ mod tests {
         )
         .await
         .expect("start screencast");
-        assert_eq!(result["obscuraFrameSource"], "command-driven");
-        assert_eq!(result["obscuraAutonomousFrames"], false);
+        assert_eq!(result["obscuraFrameSource"], "activity-driven");
+        assert_eq!(result["obscuraAutonomousFrames"], true);
         assert_eq!(ctx.pending_events.len(), 2);
         assert_eq!(
             ctx.pending_events[0].method,
@@ -1533,6 +1596,96 @@ mod tests {
             .expect("stop");
         assert!(!ctx.screencasts.contains_key(key));
         assert!(!queue_screencast_frame(&mut ctx, &session, false).unwrap());
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn capture_methods_do_not_start_default_resource_warmups() {
+        use std::io::{Read as _, Write as _};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = std::sync::Arc::new(AtomicUsize::new(0));
+        let observed = requests.clone();
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut request = [0u8; 2048];
+                        let _ = stream.read(&mut request);
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        let body = br#"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"/>"#;
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: image/svg+xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.write_all(body);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let context = std::sync::Arc::new(
+            obscura_browser::BrowserContext::with_storage_and_network(
+                "capture-without-warmup".to_string(),
+                None,
+                false,
+                None,
+                None,
+                true,
+            ),
+        );
+        let mut ctx = CdpContext::new_with_shared_context(context);
+        let page_id = ctx.create_page();
+        let session_id = format!("{page_id}-session");
+        ctx.sessions.insert(session_id.clone(), page_id);
+        let session = Some(session_id);
+        ctx.get_session_page_mut(&session)
+            .expect("page")
+            .set_viewport((100.0, 80.0));
+        handle(
+            "navigate",
+            &json!({
+                "url": "data:text/html,<html style='margin:0'><body style='margin:0;height:160px'></body></html>",
+                "waitUntil": "load",
+            }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("navigate capture fixture");
+
+        for (index, method) in ["captureScreenshot", "startScreencast", "printToPDF"]
+            .into_iter()
+            .enumerate()
+        {
+            let asset = format!("http://{address}/capture-{index}.svg");
+            let script = format!(
+                "(function(){{const box=document.createElement('div');box.setAttribute('style','width:10px;height:10px;background-image:url('+{}+')');document.body.appendChild(box);}})()",
+                serde_json::to_string(&asset).unwrap()
+            );
+            ctx.get_session_page_mut(&session)
+                .expect("page")
+                .evaluate(&script);
+            handle(method, &json!({}), &mut ctx, &session)
+                .await
+                .unwrap_or_else(|error| panic!("{method} failed: {error}"));
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(75));
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            0,
+            "capture APIs must observe retained state without initiating network warmup"
+        );
     }
 
     #[cfg(feature = "render")]

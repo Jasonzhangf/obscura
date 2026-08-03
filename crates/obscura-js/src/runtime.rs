@@ -31,6 +31,24 @@ static SNAPSHOT: &[u8] = include_bytes!(env!("OBSCURA_SNAPSHOT_PATH"));
 /// parallel, each isolate on its own thread with no shared lock.
 static ISOLATE_CREATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+#[cfg(feature = "render")]
+fn with_sync_render_loading_disabled<R>(
+    state: &mut ObscuraState,
+    capture: impl FnOnce(&mut ObscuraState) -> R,
+) -> R {
+    let previous = state
+        .render_resources
+        .set_sync_loading_enabled(false);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| capture(state)));
+    state
+        .render_resources
+        .set_sync_loading_enabled(previous);
+    match result {
+        Ok(value) => value,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RemoteObjectInfo {
     pub js_type: String,
@@ -246,6 +264,7 @@ impl ObscuraJsRuntime {
         #[cfg(feature = "render")]
         {
             gs.prepared_render = None;
+            gs.pending_attribute_style_mutations.clear();
             gs.render_resources = obscura_render::RenderResourceCache::default();
             gs.stylesheet_cache = obscura_render::StylesheetCache::default();
             gs.dynamic_fonts.clear();
@@ -266,6 +285,7 @@ impl ObscuraJsRuntime {
                 // present. Keep already-fetched absolute bytes, but rebuild
                 // candidate selection/layout against the new base.
                 state.prepared_render = None;
+                state.pending_attribute_style_mutations.clear();
                 state.resolved_scroll = None;
             }
         }
@@ -376,6 +396,7 @@ impl ObscuraJsRuntime {
             if state.viewport != viewport {
                 state.viewport = viewport;
                 state.prepared_render = None;
+                state.pending_attribute_style_mutations.clear();
                 state.resolved_scroll = None;
             }
         }
@@ -418,21 +439,23 @@ impl ObscuraJsRuntime {
         if viewport != state.viewport || base_url != effective_base.as_deref() {
             return None;
         }
-        ensure_resolved_scroll(&mut state)?;
-        let ObscuraState {
-            dom,
-            prepared_render,
-            render_resources,
-            resolved_scroll,
-            ..
-        } = &mut *state;
-        let (_, scroll) = resolved_scroll.as_ref()?;
-        obscura_render::screenshot_prepared_with_scroll(
-            dom.as_ref()?,
-            prepared_render.as_mut()?,
-            render_resources,
-            scroll,
-        )
+        with_sync_render_loading_disabled(&mut state, |state| {
+            ensure_resolved_scroll(state)?;
+            let ObscuraState {
+                dom,
+                prepared_render,
+                render_resources,
+                resolved_scroll,
+                ..
+            } = state;
+            let (_, scroll) = resolved_scroll.as_ref()?;
+            obscura_render::screenshot_prepared_with_scroll(
+                dom.as_ref()?,
+                prepared_render.as_mut()?,
+                render_resources,
+                scroll,
+            )
+        })
     }
 
     /// Capture a document-space rectangle without changing the live viewport,
@@ -444,27 +467,29 @@ impl ObscuraJsRuntime {
         region: obscura_render::CaptureRegion,
     ) -> Result<Vec<u8>, obscura_render::CaptureError> {
         let mut state = self.state.borrow_mut();
-        ensure_resolved_scroll(&mut state).ok_or(obscura_render::CaptureError::PaintFailed)?;
-        let ObscuraState {
-            dom,
-            prepared_render,
-            render_resources,
-            resolved_scroll,
-            ..
-        } = &mut *state;
-        let (_, scroll) = resolved_scroll
-            .as_ref()
-            .ok_or(obscura_render::CaptureError::PaintFailed)?;
-        obscura_render::screenshot_prepared_region_with_scroll(
-            dom.as_ref()
-                .ok_or(obscura_render::CaptureError::PaintFailed)?,
-            prepared_render
-                .as_mut()
-                .ok_or(obscura_render::CaptureError::PaintFailed)?,
-            render_resources,
-            scroll,
-            region,
-        )
+        with_sync_render_loading_disabled(&mut state, |state| {
+            ensure_resolved_scroll(state).ok_or(obscura_render::CaptureError::PaintFailed)?;
+            let ObscuraState {
+                dom,
+                prepared_render,
+                render_resources,
+                resolved_scroll,
+                ..
+            } = state;
+            let (_, scroll) = resolved_scroll
+                .as_ref()
+                .ok_or(obscura_render::CaptureError::PaintFailed)?;
+            obscura_render::screenshot_prepared_region_with_scroll(
+                dom.as_ref()
+                    .ok_or(obscura_render::CaptureError::PaintFailed)?,
+                prepared_render
+                    .as_mut()
+                    .ok_or(obscura_render::CaptureError::PaintFailed)?,
+                render_resources,
+                scroll,
+                region,
+            )
+        })
     }
 
     /// Return the retained layout's scrollable document size without changing
@@ -473,11 +498,13 @@ impl ObscuraJsRuntime {
     #[cfg(feature = "render")]
     pub fn prepared_content_size(&self) -> Option<(f32, f32)> {
         let mut state = self.state.borrow_mut();
-        ensure_resolved_scroll(&mut state)?;
-        state
-            .prepared_render
-            .as_ref()
-            .map(|render| render.content_size())
+        with_sync_render_loading_disabled(&mut state, |state| {
+            ensure_resolved_scroll(state)?;
+            state
+                .prepared_render
+                .as_ref()
+                .map(|render| render.content_size())
+        })
     }
 
     /// Return the exact responsive candidates selected for live `<img>`
@@ -530,6 +557,7 @@ impl ObscuraJsRuntime {
             Some(bytes) => {
                 state.render_resources.seed(url, bytes);
                 state.prepared_render = None;
+                state.pending_attribute_style_mutations.clear();
                 state.resolved_scroll = None;
             }
             None => state.render_resources.seed_missing(url),
@@ -1548,6 +1576,7 @@ impl ObscuraJsRuntime {
         #[cfg(feature = "render")]
         {
             state.prepared_render = None;
+            state.pending_attribute_style_mutations.clear();
             state.render_resources = obscura_render::RenderResourceCache::default();
             state.stylesheet_cache = obscura_render::StylesheetCache::default();
             state.dynamic_fonts.clear();
@@ -6157,7 +6186,11 @@ mod tests {
         // must observe the new class on the live connected element.
         rt.evaluate("document.getElementById('box').className = 'b'")
             .unwrap();
-        assert!(rt.state.borrow().prepared_render.is_none());
+        {
+            let state = rt.state.borrow();
+            assert!(state.prepared_render.is_some());
+            assert_eq!(state.pending_attribute_style_mutations.len(), 1);
+        }
         assert_eq!(
             rt.evaluate("document.getElementById('box').getBoundingClientRect().width")
                 .unwrap()

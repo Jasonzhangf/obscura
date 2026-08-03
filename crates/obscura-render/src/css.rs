@@ -601,6 +601,96 @@ fn note_selector_for_invalidation(
     note_selector_dependencies(map, selector, InvalidationReaches::SELF, rule_order);
 }
 
+/// Record element attributes read from declaration values.
+///
+/// Selector invalidation alone is insufficient for generated content such as
+/// `.label::before { content: attr(data-label) }`: changing `data-label`
+/// changes the computed pseudo style even though the attribute does not occur
+/// in the selector.  Keep this deliberately broader than the property parser;
+/// an extra self invalidation is cheap, while missing a supported `attr()`
+/// spelling would retain stale computed values.
+fn note_declaration_attribute_dependencies(
+    map: &mut InvalidationMap,
+    declarations: &str,
+    rule_order: usize,
+) {
+    // Avoid another declaration-vector allocation on the stylesheet hot path:
+    // almost every rule exits through this byte scan, and the uncommon rule
+    // containing `attr` pays for the balanced character walk below.
+    if !declarations
+        .as_bytes()
+        .windows(4)
+        .any(|window| window.eq_ignore_ascii_case(b"attr"))
+    {
+        return;
+    }
+    let chars: Vec<char> = declarations.chars().collect();
+    let mut index = 0usize;
+    let mut quote = None;
+    while index < chars.len() {
+        let ch = chars[index];
+        if ch == '\\' {
+            index = (index + 2).min(chars.len());
+            continue;
+        }
+        if let Some(active_quote) = quote {
+            if ch == active_quote {
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+            index += 1;
+            continue;
+        }
+        if ch == '/' && chars.get(index + 1) == Some(&'*') {
+            index += 2;
+            while index + 1 < chars.len()
+                && !(chars[index] == '*' && chars[index + 1] == '/')
+            {
+                index += 1;
+            }
+            index = (index + 2).min(chars.len());
+            continue;
+        }
+        if !(ch.is_alphabetic() || ch == '_' || ch == '-' || !ch.is_ascii()) {
+            index += 1;
+            continue;
+        }
+        let (function, next) = consume_css_identifier(&chars, index);
+        index = next.max(index + 1);
+        if !function.eq_ignore_ascii_case("attr") {
+            continue;
+        }
+        let mut open = index;
+        while chars.get(open).is_some_and(|ch| ch.is_whitespace()) {
+            open += 1;
+        }
+        if chars.get(open) != Some(&'(') {
+            continue;
+        }
+        let Some(close) = matching_delimiter(&chars, open, '(', ')') else {
+            // An unterminated function cannot be consumed by the current
+            // declaration parser, so it has no live attribute dependency.
+            break;
+        };
+        let mut name_start = open + 1;
+        while chars
+            .get(name_start)
+            .is_some_and(|ch| ch.is_whitespace())
+        {
+            name_start += 1;
+        }
+        let (attribute, name_end) = consume_css_identifier(&chars, name_start);
+        if !attribute.is_empty() && name_end <= close {
+            map.push_attribute(attribute, rule_order, InvalidationReaches::SELF);
+        }
+        index = close + 1;
+    }
+}
+
 fn selector_requires_conservative_tracking(selector: &str) -> bool {
     let selector = selector.to_ascii_lowercase();
     selector.contains(":has(")
@@ -1610,6 +1700,11 @@ impl Stylesheet {
                             base,
                             order,
                         );
+                        note_declaration_attribute_dependencies(
+                            &mut sheet.invalidation_map,
+                            &decls,
+                            order,
+                        );
                         let (normal_decls, important_decls) =
                             crate::style::partition_declarations(&decls);
                         let normal_flags = declaration_stream_flags(&normal_decls);
@@ -1646,6 +1741,11 @@ impl Stylesheet {
                         note_selector_for_invalidation(
                             &mut sheet.invalidation_map,
                             base,
+                            order,
+                        );
+                        note_declaration_attribute_dependencies(
+                            &mut sheet.invalidation_map,
+                            &decls,
                             order,
                         );
                         let (normal_decls, important_decls) =
@@ -1689,6 +1789,11 @@ impl Stylesheet {
                 note_selector_for_invalidation(
                     &mut sheet.invalidation_map,
                     &selector,
+                    order,
+                );
+                note_declaration_attribute_dependencies(
+                    &mut sheet.invalidation_map,
+                    &decls,
                     order,
                 );
                 let (normal_decls, important_decls) = crate::style::partition_declarations(&decls);
@@ -5585,6 +5690,33 @@ mod tests {
             InvalidationReaches::DESCENDANTS,
         ));
         assert!(!map.requires_conservative_invalidation());
+    }
+
+    #[test]
+    fn invalidation_map_indexes_declaration_attr_dependencies() {
+        let map = test_invalidation_map(
+            r#"
+                .label::before { content: ATTR( DATA-LABEL ) }
+                .typed { --label: attr(Aria-Label string, "fallback") }
+                .noise::after {
+                    content: "attr(data-in-string)";
+                    background: url("attr(data-in-url)");
+                    color: red /* attr(data-in-comment) */;
+                }
+            "#,
+        );
+
+        assert!(dependencies_reach(
+            map.attribute_dependencies("data-label"),
+            InvalidationReaches::SELF,
+        ));
+        assert!(dependencies_reach(
+            map.attribute_dependencies("ARIA-LABEL"),
+            InvalidationReaches::SELF,
+        ));
+        assert!(map.attribute_dependencies("data-in-string").is_empty());
+        assert!(map.attribute_dependencies("data-in-url").is_empty());
+        assert!(map.attribute_dependencies("data-in-comment").is_empty());
     }
 
     #[test]

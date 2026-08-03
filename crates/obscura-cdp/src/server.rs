@@ -711,6 +711,12 @@ async fn cdp_processor(
     // registers and stays registered across iterations, so a later
     // `notify_waiters()` wakes this processor even while it is mid-dispatch.
     let mut shutdown = Box::pin(shutdown_notify.notified());
+    // Chromium's PageHandler receives compositor video frames continuously.
+    // Obscura has no separate compositor thread yet, so active screencasts get
+    // a bounded 30 Hz opportunity on this connection's owning LocalSet.
+    let mut screencast_tick = tokio::time::interval(tokio::time::Duration::from_millis(33));
+    screencast_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut connection_reply_tx: Option<mpsc::UnboundedSender<String>> = None;
 
     loop {
         // Drain any deferred messages from the previous interception window
@@ -725,6 +731,13 @@ async fn cdp_processor(
                     Some(m) => m,
                     None => break,
                 },
+                _ = screencast_tick.tick(), if has_active_screencast(&ctx) => {
+                    pump_and_forward_screencast_frames(
+                        &mut ctx,
+                        connection_reply_tx.as_ref(),
+                    ).await;
+                    continue;
+                },
                 _ = &mut shutdown => {
                     tracing::info!("Shutdown signal received (connection processor)");
                     break;
@@ -734,6 +747,7 @@ async fn cdp_processor(
 
         match msg {
             ServerMessage::NewConnection { reply_tx } => {
+                connection_reply_tx = Some(reply_tx.clone());
                 let _ = reply_tx.send(
                     json!({"__init": true})
                         .to_string(),
@@ -770,6 +784,37 @@ async fn cdp_processor(
     // The connection thread merges this context's cookie delta into the
     // persistence template after the processor stops.
     let _ = &ctx;
+}
+
+fn has_active_screencast(ctx: &CdpContext) -> bool {
+    #[cfg(feature = "render")]
+    {
+        !ctx.screencasts.is_empty()
+    }
+    #[cfg(not(feature = "render"))]
+    {
+        let _ = ctx;
+        false
+    }
+}
+
+async fn pump_and_forward_screencast_frames(
+    ctx: &mut CdpContext,
+    reply_tx: Option<&mpsc::UnboundedSender<String>>,
+) {
+    #[cfg(feature = "render")]
+    crate::domains::page::pump_screencast_frames(ctx).await;
+    #[cfg(not(feature = "render"))]
+    let _ = ctx;
+
+    let Some(reply_tx) = reply_tx else {
+        return;
+    };
+    for event in ctx.pending_events.drain(..) {
+        if let Ok(json) = serde_json::to_string(&event) {
+            let _ = reply_tx.send(json);
+        }
+    }
 }
 
 // Whether a raw CDP frame is exactly a `Page.navigate` call, and so should take
@@ -1357,6 +1402,8 @@ async fn handle_connection_ws(
 #[cfg(test)]
 mod tests {
     use super::{is_navigate_method, merge_cookie_delta, parse_cdp_headers};
+    #[cfg(feature = "render")]
+    use super::pump_and_forward_screencast_frames;
     use obscura_net::{CookieInfo, CookieJar};
     use serde_json::json;
 
@@ -1435,5 +1482,92 @@ mod tests {
     #[test]
     fn parse_cdp_headers_absent_is_none() {
         assert!(parse_cdp_headers(&json!({"url": "https://example.com"})).is_none());
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn autonomous_screencast_pumps_timers_and_retains_backpressured_damage() {
+        let mut ctx = crate::dispatch::CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = format!("{page_id}-session");
+        ctx.sessions.insert(session_id.clone(), page_id);
+        let session = Some(session_id.clone());
+        ctx.get_session_page_mut(&session)
+            .expect("page")
+            .set_viewport((96.0, 64.0));
+        crate::domains::page::handle(
+            "navigate",
+            &json!({
+                "url": "data:text/html,<html style='margin:0'><body style='margin:0;width:96px;height:64px;background:red'></body></html>",
+                "waitUntil": "load",
+            }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("navigate screencast fixture");
+        ctx.pending_events.clear();
+        crate::domains::page::handle(
+            "startScreencast",
+            &json!({}),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("start screencast");
+        let stream_id = ctx
+            .pending_events
+            .iter()
+            .find(|event| event.method == "Page.screencastFrame")
+            .and_then(|event| event.params["sessionId"].as_i64())
+            .expect("initial stream id");
+        ctx.pending_events.clear();
+
+        let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+        ctx.get_session_page_mut(&session)
+            .expect("page")
+            .evaluate(
+                "setTimeout(() => document.body.setAttribute('style', 'margin:0;width:96px;height:64px;background:green'), 0)",
+            );
+        pump_and_forward_screencast_frames(&mut ctx, Some(&reply_tx)).await;
+        let first_update: serde_json::Value = serde_json::from_str(
+            &reply_rx.try_recv().expect("timer mutation should emit a frame"),
+        )
+        .unwrap();
+        assert_eq!(first_update["method"], "Page.screencastFrame");
+        assert_eq!(first_update["params"]["sessionId"], stream_id);
+        assert!(reply_rx.try_recv().is_err());
+        assert_eq!(ctx.screencasts[&session_id].frames_in_flight, 2);
+
+        // The second mutation is pumped while the two-frame acknowledgement
+        // window is full. It must not emit yet, but its damage must remain
+        // pending and appear immediately after capacity is returned.
+        ctx.get_session_page_mut(&session)
+            .expect("page")
+            .evaluate(
+                "setTimeout(() => document.body.setAttribute('style', 'margin:0;width:96px;height:64px;background:blue'), 0)",
+            );
+        pump_and_forward_screencast_frames(&mut ctx, Some(&reply_tx)).await;
+        assert!(reply_rx.try_recv().is_err());
+        assert!(ctx.screencasts[&session_id].autonomous_frame_pending);
+
+        crate::domains::page::handle(
+            "screencastFrameAck",
+            &json!({"sessionId": stream_id}),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("ack current frame");
+        pump_and_forward_screencast_frames(&mut ctx, Some(&reply_tx)).await;
+        let after_ack: serde_json::Value = serde_json::from_str(
+            &reply_rx
+                .try_recv()
+                .expect("backpressured damage should emit after ack"),
+        )
+        .unwrap();
+        assert_eq!(after_ack["method"], "Page.screencastFrame");
+        assert_eq!(after_ack["params"]["sessionId"], stream_id);
+        assert!(!ctx.screencasts[&session_id].autonomous_frame_pending);
     }
 }

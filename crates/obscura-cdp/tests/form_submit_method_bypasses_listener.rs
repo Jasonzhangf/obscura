@@ -131,6 +131,15 @@ async fn request_submit_is_vetoed_by_prevent_default_listener() {
     )
     .await;
 
+    cdp(
+        &mut ctx,
+        4,
+        "Input.dispatchMouseEvent",
+        json!({"type": "mouseReleased", "x": 0.0, "y": 0.0, "button": "left", "clickCount": 1}),
+        session_id,
+    )
+    .await;
+
     let page = ctx.get_page_mut(&page_id).unwrap();
     assert_ne!(
         page.url.as_ref().unwrap().path(),

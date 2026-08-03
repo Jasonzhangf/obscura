@@ -27,7 +27,8 @@ pub use border::{
 
 pub mod dom;
 pub use dom::{
-    layout_dom, layout_dom_with_images, layout_dom_with_resources, DomLayout, StickyLayout,
+    layout_dom, layout_dom_with_images, layout_dom_with_resources, AttributeStyleMutation,
+    DomLayout, StickyLayout,
 };
 
 /// Whether an image MIME type names a format supported by the renderer build.
@@ -99,7 +100,8 @@ pub use paint::{
     paint_dom, paint_dom_scrolled, paint_prepared, paint_prepared_region_with_scroll,
     paint_prepared_with_scroll, prepare_dom, prepare_dom_with_dynamic_fonts,
     prepare_dom_with_dynamic_fonts_and_stylesheet_cache, screenshot_png, screenshot_png_scrolled,
-    screenshot_prepared, screenshot_prepared_region_with_scroll, screenshot_prepared_with_scroll,
+    prepare_dom_with_retained_attribute_styles, screenshot_prepared,
+    screenshot_prepared_region_with_scroll, screenshot_prepared_with_scroll,
     validate_capture_region, CaptureError, CaptureRegion, DynamicFontFace, ElementScrollMetrics,
     PreparedRender, RenderResourceCache, RenderResourceLoader, ResolvedScrollState, SelectedImage,
     MAX_CAPTURE_DIMENSION, MAX_CAPTURE_PIXELS,

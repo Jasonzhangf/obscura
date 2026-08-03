@@ -22,7 +22,10 @@ static FONT_BOLD_BYTES: &[u8] = include_bytes!("../assets/liberation-sans-bold.t
 static FONT_OBLIQUE_BYTES: &[u8] = include_bytes!("../assets/liberation-sans-oblique.ttf");
 static FONT_BOLD_OBLIQUE_BYTES: &[u8] = include_bytes!("../assets/liberation-sans-boldoblique.ttf");
 
-use crate::dom::layout_dom_with_web_fonts_and_stylesheet_cache;
+use crate::dom::{
+    layout_dom_with_web_fonts_and_retained_styles,
+    layout_dom_with_web_fonts_and_stylesheet_cache, RetainedStyleMaps,
+};
 
 const DEFAULT_RESOURCE_CACHE_ENTRIES: usize = 512;
 const DEFAULT_RESOURCE_CACHE_BYTES: usize = 64 * 1024 * 1024;
@@ -98,6 +101,7 @@ pub struct RenderResourceCache {
     max_content_image_intrinsics: usize,
     #[cfg(test)]
     content_image_layout_retries: usize,
+    sync_loading_enabled: bool,
     loader: Box<dyn RenderResourceLoader>,
 }
 
@@ -136,8 +140,17 @@ impl RenderResourceCache {
             max_content_image_intrinsics: max_entries.min(DEFAULT_CONTENT_IMAGE_INTRINSIC_ENTRIES),
             #[cfg(test)]
             content_image_layout_retries: 0,
+            sync_loading_enabled: true,
             loader: Box::new(loader),
         }
+    }
+
+    /// Temporarily control the compatibility loader used by synchronous
+    /// layout and paint. Capture callers disable it so a screenshot observes
+    /// only bytes already prepared by the page transport. Unknown URLs remain
+    /// unknown and can still be fetched by a later navigation/settle warmup.
+    pub fn set_sync_loading_enabled(&mut self, enabled: bool) -> bool {
+        std::mem::replace(&mut self.sync_loading_enabled, enabled)
     }
 
     pub fn retained_entry_count(&self) -> usize {
@@ -275,6 +288,9 @@ impl RenderResourceCache {
                 }
                 CachedResource::Missing(_) => {}
             }
+        }
+        if !self.sync_loading_enabled {
+            return None;
         }
         self.remove(url);
 
@@ -1596,6 +1612,56 @@ pub fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache(
     dynamic_fonts: &[DynamicFontFace],
     stylesheet_cache: &mut crate::css::StylesheetCache,
 ) -> Option<PreparedRender> {
+    prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
+        tree,
+        viewport,
+        base_url,
+        resources,
+        dynamic_fonts,
+        stylesheet_cache,
+        None,
+    )
+}
+
+/// Rebuild geometry while moving clean computed styles out of the previous
+/// prepared render. The renderer validates every mutation against the cached
+/// stylesheet's dependency map and automatically takes the full cascade path
+/// whenever the retained subset is not provably sound.
+pub fn prepare_dom_with_retained_attribute_styles(
+    tree: &DomTree,
+    viewport: (f32, f32),
+    base_url: Option<&str>,
+    resources: &mut RenderResourceCache,
+    dynamic_fonts: &[DynamicFontFace],
+    stylesheet_cache: &mut crate::css::StylesheetCache,
+    mut previous: PreparedRender,
+    mutations: &[crate::dom::AttributeStyleMutation],
+) -> Option<PreparedRender> {
+    let retained = RetainedStyleMaps {
+        styles: std::mem::take(&mut previous.layout.styles),
+        custom_properties: std::mem::take(&mut previous.layout.custom_properties),
+    };
+    drop(previous);
+    prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
+        tree,
+        viewport,
+        base_url,
+        resources,
+        dynamic_fonts,
+        stylesheet_cache,
+        Some((retained, mutations)),
+    )
+}
+
+fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
+    tree: &DomTree,
+    viewport: (f32, f32),
+    base_url: Option<&str>,
+    resources: &mut RenderResourceCache,
+    dynamic_fonts: &[DynamicFontFace],
+    stylesheet_cache: &mut crate::css::StylesheetCache,
+    retained: Option<(RetainedStyleMaps, &[crate::dom::AttributeStyleMutation])>,
+) -> Option<PreparedRender> {
     if !viewport.0.is_finite() || !viewport.1.is_finite() || viewport.0 <= 0.0 || viewport.1 <= 0.0
     {
         return None;
@@ -1635,13 +1701,24 @@ pub fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache(
     } else {
         svg_font_database()
     };
-    let mut laid = layout_dom_with_web_fonts_and_stylesheet_cache(
-        tree,
-        viewport,
-        &intrinsic,
-        &fonts,
-        stylesheet_cache,
-    );
+    let mut laid = match retained {
+        Some((retained, mutations)) => layout_dom_with_web_fonts_and_retained_styles(
+            tree,
+            viewport,
+            &intrinsic,
+            &fonts,
+            stylesheet_cache,
+            retained,
+            mutations,
+        ),
+        None => layout_dom_with_web_fonts_and_stylesheet_cache(
+            tree,
+            viewport,
+            &intrinsic,
+            &fonts,
+            stylesheet_cache,
+        ),
+    };
     // `content:url(...)` is computed by the author cascade, whereas ordinary
     // HTML image sources are available before layout. Pay for a second layout
     // only on the uncommon pages that actually use a CSS image as replaced
@@ -8218,6 +8295,31 @@ mod tests {
     use super::*;
     use crate::dom::layout_dom_with_web_fonts;
     use obscura_dom::tree_sink::parse_html;
+
+    #[test]
+    fn cache_only_mode_does_not_load_or_negative_cache_unknown_urls() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        let mut cache = RenderResourceCache::with_loader(move |_url: &str| {
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Some(vec![1, 2, 3])
+        });
+        let url = "https://example.test/dynamic.png";
+
+        let previous = cache.set_sync_loading_enabled(false);
+        assert!(previous);
+        assert!(cache.get_or_load(url).is_none());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(
+            !cache.has_live_outcome(url),
+            "a cache-only miss must remain eligible for later preparation"
+        );
+
+        cache.set_sync_loading_enabled(previous);
+        cache.seed(url.to_string(), vec![9, 8, 7]);
+        assert_eq!(cache.get_or_load(url).as_deref(), Some([9, 8, 7].as_slice()));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
 
     #[test]
     fn image_accept_advertises_exactly_decodable_mime_types() {

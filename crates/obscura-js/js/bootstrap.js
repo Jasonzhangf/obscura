@@ -7123,7 +7123,12 @@ globalThis.UIEvent = class extends Event {
     this.detail=detail||0;
   }
 };
-globalThis.WheelEvent = class extends Event { constructor(t,o={}) { super(t,o);this.deltaX=o.deltaX||0;this.deltaY=o.deltaY||0;this.deltaZ=o.deltaZ||0;this.deltaMode=o.deltaMode||0; } };
+// WheelEvent inherits all MouseEvent coordinates and modifier state. CDP
+// Input.dispatchMouseEvent supplies those fields and automation libraries use
+// them to distinguish wheel gestures over nested panes.
+globalThis.WheelEvent = class extends MouseEvent {
+  constructor(t,o={}) { super(t,o);this.deltaX=o.deltaX||0;this.deltaY=o.deltaY||0;this.deltaZ=o.deltaZ||0;this.deltaMode=o.deltaMode||0; }
+};
 
 globalThis.CompositionEvent = class extends Event {
   constructor(t,o={}) { super(t,o);this.view=o.view||null;this.detail=o.detail||0;this.data=o.data||""; }
@@ -11632,6 +11637,39 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
       var r = el.getBoundingClientRect();
       if (r.width === 0 || r.height === 0) continue;
       if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) {
+        // A descendant's layout rect can extend beyond an overflow clip. It
+        // must not win hit testing where its scrolling ancestor hides it —
+        // otherwise a wheel well outside a small pane scrolls that pane
+        // instead of the page behind it.
+        var visible = true;
+        var ancestor = el.parentElement;
+        while (ancestor && ancestor !== this.documentElement && ancestor !== this.body) {
+          var style = null;
+          try { style = getComputedStyle(ancestor); } catch (_e) {}
+          var ox = style ? (style.overflowX || style.overflow || '') : '';
+          var oy = style ? (style.overflowY || style.overflow || '') : '';
+          var clipsX = ox === 'auto' || ox === 'scroll' || ox === 'hidden' || ox === 'clip';
+          var clipsY = oy === 'auto' || oy === 'scroll' || oy === 'hidden' || oy === 'clip';
+          if (clipsX || clipsY) {
+            var ar = ancestor.getBoundingClientRect();
+            // Overflow clips at the padding box, inside the border. Renderer
+            // client metrics expose that box's size; computed border widths
+            // locate it within the border-box rect.
+            var borderLeft = parseFloat(style && style.borderLeftWidth) || 0;
+            var borderTop = parseFloat(style && style.borderTopWidth) || 0;
+            var clipLeft = ar.left + borderLeft;
+            var clipTop = ar.top + borderTop;
+            var clipRight = clipLeft + ancestor.clientWidth;
+            var clipBottom = clipTop + ancestor.clientHeight;
+            if ((clipsX && (x < clipLeft || x > clipRight)) ||
+                (clipsY && (y < clipTop || y > clipBottom))) {
+              visible = false;
+              break;
+            }
+          }
+          ancestor = ancestor.parentElement;
+        }
+        if (!visible) continue;
         var nid = el._nid | 0;
         if (nid > bestNid) { best = el; bestNid = nid; }
       }

@@ -135,14 +135,10 @@ pub async fn print_to_pdf(
     #[cfg(feature = "render")]
     {
         let options = parse_options(params)?;
-        let deadline_ms = std::env::var("OBSCURA_RENDER_RESOURCE_DEADLINE_MS")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(3_000);
         let page = ctx
             .get_session_page_mut(session_id)
             .ok_or("No page for session")?;
-        let _ = page.prepare_screenshot_resources(deadline_ms).await;
+        crate::domains::page::prepare_capture_resources_if_requested(page).await;
         let pdf = page
             .raster_pdf(options.raster)
             .map_err(|error| error.to_string())?;
