@@ -3459,23 +3459,63 @@ fn layout_dom_once(
                             .and_then(|n| n.as_element().map(|e| e.local.as_ref() == "table"))
                             .unwrap_or(false)
                     })
-                    .map(|(t, d)| (*t, *d, dom_depth(tree, *d)))
+                    .map(|(t, d)| (*t, *d, table_ancestor_depth(tree, *d)))
                     .collect();
-                // Deepest table first: an inner table gets its final width set
-                // before an outer table measures the subtree that contains it.
-                // Two tables at the same depth cannot be nested in one another
-                // (nesting increases depth), so their relative order is
-                // irrelevant and the final layout is deterministic even though
-                // id_map iteration order is not.
-                tables.sort_by(|a, b| b.2.cmp(&a.2));
-                for (tnode, dom, _depth) in tables {
+                // Outer tables consume their nested tables' intrinsic sizes.
+                // Only after an outer depth is fixed can a root layout expose
+                // the real cell width available to the next nested depth.
+                tables.sort_by(|a, b| a.2.cmp(&b.2));
+                let mut table_index = 0usize;
+                while table_index < tables.len() {
+                    let depth = tables[table_index].2;
+                    let mut group_end = table_index + 1;
+                    while group_end < tables.len() && tables[group_end].2 == depth {
+                        group_end += 1;
+                    }
+                    let group = &tables[table_index..group_end];
+                    let mut available_widths: HashMap<taffy::NodeId, f32> = HashMap::new();
+                    let needs_layout_snapshot = group.iter().any(|(_, dom, _)| {
+                        styles.get(dom).is_some_and(|style| {
+                            style.width == crate::Dimension::Auto
+                                && (depth > 0
+                                    || reliable_table_available_width(
+                                        tree,
+                                        *dom,
+                                        &styles,
+                                        initial_cb_width,
+                                    )
+                                    .is_none())
+                        })
+                    });
+                    if needs_layout_snapshot {
+                        // This pass is gated to layout-dependent containing
+                        // blocks and nested auto tables. Flat tables in normal
+                        // block flow use the reliable cascade-time width below
+                        // and pay no additional full-tree layout.
+                        let _ = taffy_tree.compute_layout_with_measure(
+                            taffy_root,
+                            available,
+                            &mut measure,
+                        );
+                        for &(tnode, dom, _) in group {
+                            if styles
+                                .get(&dom)
+                                .is_some_and(|style| style.width == crate::Dimension::Auto)
+                            {
+                                if let Ok(layout) = taffy_tree.layout(tnode) {
+                                    available_widths.insert(tnode, layout.size.width.max(0.0));
+                                }
+                            }
+                        }
+                    }
+                    for &(tnode, dom, _) in group {
                     let Some(table_style) = styles.get(&dom) else {
                         continue;
                     };
                     // A percentage-width table resolves against its container, so
                     // leave taffy's percentage handling in place.
-                    let width_style = Some(table_style.width);
-                    if matches!(width_style, Some(crate::Dimension::Percent(_))) {
+                    let width_style = table_style.width;
+                    if matches!(width_style, crate::Dimension::Percent(_)) {
                         continue;
                     }
                     let min_c = {
@@ -3496,7 +3536,10 @@ fn layout_dom_once(
                     // overflow it. Floor min-content by the widest fixed child,
                     // matching CSS (a table's min-content is at least any
                     // fixed-width content it contains).
-                    let min_c = min_c.max(max_definite_descendant_width(tree, dom, &styles).unwrap_or(0.0));
+                    let min_c = min_c.max(
+                        max_definite_table_content_width(tree, dom, &styles)
+                            .unwrap_or(0.0),
+                    );
                     let max_c = {
                         let _ = taffy_tree.compute_layout_with_measure(
                             tnode,
@@ -3507,15 +3550,37 @@ fn layout_dom_once(
                     };
                     let inline_outer_edges = table_inline_outer_edges(table_style);
                     let preferred_outer = match width_style {
-                        Some(crate::Dimension::Px(w))
+                        crate::Dimension::Px(w)
                             if table_style.box_sizing == crate::BoxSizing::ContentBox =>
                         {
                             w + inline_outer_edges
                         }
-                        Some(crate::Dimension::Px(w)) => w,
+                        crate::Dimension::Px(w) => w,
                         _ => max_c,
                     };
-                    let used_outer = preferred_outer.max(min_c).min(initial_cb_width.max(min_c));
+                    let used_outer = match width_style {
+                        // A definite table width is not clamped to its
+                        // containing block. Like other fixed boxes it may
+                        // overflow, while min-content can still make it wider.
+                        crate::Dimension::Px(_) => preferred_outer.max(min_c),
+                        _ => {
+                            let available_outer = available_widths
+                                .get(&tnode)
+                                .copied()
+                                .or_else(|| {
+                                    reliable_table_available_width(
+                                        tree,
+                                        dom,
+                                        &styles,
+                                        initial_cb_width,
+                                    )
+                                })
+                                .unwrap_or(initial_cb_width);
+                            preferred_outer
+                                .max(min_c)
+                                .min(available_outer.max(min_c))
+                        }
+                    };
                     let used_declaration = if table_style.box_sizing == crate::BoxSizing::ContentBox
                     {
                         (used_outer - inline_outer_edges).max(0.0)
@@ -3623,22 +3688,28 @@ fn layout_dom_once(
                         let target =
                             (used_outer - inline_outer_edges - interior_spacing)
                                 .max(0.0);
-                        // Specified column widths (a `<col>` or colspan-1 cell
-                        // width, recorded at build time) pin their columns:
-                        // px directly, percent against the table's content
-                        // width. Content min-content still floors them, so a
-                        // too-narrow spec never crushes its content. The
-                        // remaining space interpolates across the auto
-                        // columns exactly as before.
+                        // A specified length on a cell/column is a preferred
+                        // contribution, not a min-content floor. Preserve the
+                        // content minimum and raise only the preferred width so
+                        // a constrained table can interpolate below the hint.
+                        // Percentage tracks retain the existing definite-table
+                        // behavior here; broader percent balancing is separate.
                         let specified_columns = ifc_items.table_cols.get(&tnode);
                         if let Some((spec_px, spec_pct)) = specified_columns {
                             for j in 0..ncols {
-                                let spec = spec_px
+                                let fixed = spec_px
+                                    .get(j)
+                                    .copied()
+                                    .flatten();
+                                if let Some(w) = fixed {
+                                    let w = w.max(col_min[j]);
+                                    col_max[j] = w;
+                                } else if let Some(w) = spec_pct
                                     .get(j)
                                     .copied()
                                     .flatten()
-                                    .or_else(|| spec_pct.get(j).copied().flatten().map(|p| p * target));
-                                if let Some(w) = spec {
+                                    .map(|percent| percent * target)
+                                {
                                     let w = w.max(col_min[j]);
                                     col_min[j] = w;
                                     col_max[j] = w;
@@ -3726,6 +3797,8 @@ fn layout_dom_once(
                         s.size.width = length(used_declaration);
                         let _ = taffy_tree.set_style(tnode, s);
                     }
+                    }
+                    table_index = group_end;
                 }
 
                 let _ = taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
@@ -6649,22 +6722,159 @@ fn synthesize_row_rects(tree: &DomTree, rects: &mut HashMap<NodeId, Rect>) {
     }
 }
 
-/// Collect `<tr>` elements of a table in document order, descending through
-/// `<thead>`/`<tbody>`/`<tfoot>` section wrappers but never into a cell or a
-/// nested `<table>` (whose rows belong to that inner table).
-/// Number of ancestors of `id` up to the document root. Used to order nested
-/// tables deepest-first in the table used-width pass.
-fn dom_depth(tree: &DomTree, id: NodeId) -> usize {
-    let mut d = 0usize;
+/// Number of ancestor tables containing `id`. Table sizing runs outer-first:
+/// an outer table consumes an inner table's intrinsic contributions, then a
+/// root layout establishes the inner table's real cell containing block.
+fn table_ancestor_depth(tree: &DomTree, id: NodeId) -> usize {
+    let mut depth = 0usize;
     let mut cur = id;
     while let Some(p) = tree.get_node(cur).and_then(|n| n.parent) {
-        d += 1;
+        if tree.get_node(p).is_some_and(|node| {
+            node.as_element()
+                .is_some_and(|element| element.local.as_ref() == "table")
+        }) {
+            depth += 1;
+        }
         cur = p;
-        if d > 4096 {
+        if depth > 4096 {
             break;
         }
     }
-    d
+    depth
+}
+
+/// Resolve a content-box width without running layout when the complete
+/// containing-block chain is ordinary block flow. Flex/grid allocation,
+/// floats, positioned boxes, inline-blocks, and intrinsic sizing need a real
+/// Taffy pass and deliberately return `None`.
+fn reliable_normal_flow_content_width(
+    tree: &DomTree,
+    id: NodeId,
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+    initial_cb_width: f32,
+    depth: usize,
+) -> Option<f32> {
+    if depth > 4096 {
+        return None;
+    }
+    let style = styles.get(&id)?;
+    if style.float.is_some()
+        || matches!(style.position, Some(taffy::Position::Absolute))
+        || style.is_inline_block
+        || style.width_fit_content
+        || style.size_expressions[0].is_some()
+    {
+        return None;
+    }
+
+    let mut parent = tree.get_node(id).and_then(|node| node.parent);
+    while parent.is_some_and(|parent_id| {
+        styles
+            .get(&parent_id)
+            .is_some_and(|parent_style| parent_style.display_contents)
+    }) {
+        parent = parent.and_then(|parent_id| tree.get_node(parent_id).and_then(|node| node.parent));
+    }
+    let containing_width = if let Some(parent_id) = parent {
+        if let Some(parent_style) = styles.get(&parent_id) {
+            if matches!(parent_style.display, crate::Display::Flex | crate::Display::Grid)
+                || parent_style.internal_flex_container
+                || parent_style.column_count.is_some()
+            {
+                return None;
+            }
+            reliable_normal_flow_content_width(
+                tree,
+                parent_id,
+                styles,
+                initial_cb_width,
+                depth + 1,
+            )?
+        } else {
+            initial_cb_width
+        }
+    } else {
+        initial_cb_width
+    };
+
+    let horizontal_edges =
+        style.padding.left + style.padding.right + style.border.left + style.border.right;
+    let declared_content = |dimension: crate::Dimension| match dimension {
+        crate::Dimension::Px(value) => Some(if style.box_sizing == crate::BoxSizing::ContentBox {
+            value
+        } else {
+            (value - horizontal_edges).max(0.0)
+        }),
+        crate::Dimension::Percent(percent) => {
+            let value = containing_width * percent;
+            Some(if style.box_sizing == crate::BoxSizing::ContentBox {
+                value
+            } else {
+                (value - horizontal_edges).max(0.0)
+            })
+        }
+        _ => None,
+    };
+    let mut content_width = declared_content(style.width).unwrap_or_else(|| {
+        (containing_width
+            - style.margin.left
+            - style.margin.right
+            - horizontal_edges)
+            .max(0.0)
+    });
+    if let Some(minimum) = declared_content(style.min_width) {
+        content_width = content_width.max(minimum);
+    }
+    if let Some(maximum) = declared_content(style.max_width) {
+        content_width = content_width.min(maximum);
+    }
+    Some(content_width.max(0.0))
+}
+
+fn reliable_table_available_width(
+    tree: &DomTree,
+    id: NodeId,
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+    initial_cb_width: f32,
+) -> Option<f32> {
+    let table_style = styles.get(&id)?;
+    if table_style.float.is_some()
+        || matches!(table_style.position, Some(taffy::Position::Absolute))
+        || table_style.is_inline_block
+    {
+        return None;
+    }
+    let mut parent = tree.get_node(id).and_then(|node| node.parent);
+    while parent.is_some_and(|parent_id| {
+        styles
+            .get(&parent_id)
+            .is_some_and(|parent_style| parent_style.display_contents)
+    }) {
+        parent = parent.and_then(|parent_id| tree.get_node(parent_id).and_then(|node| node.parent));
+    }
+    let containing_width = match parent {
+        Some(parent_id) if styles.contains_key(&parent_id) => {
+            let parent_style = styles.get(&parent_id)?;
+            if matches!(parent_style.display, crate::Display::Flex | crate::Display::Grid)
+                || parent_style.internal_flex_container
+                || parent_style.column_count.is_some()
+            {
+                return None;
+            }
+            reliable_normal_flow_content_width(
+                tree,
+                parent_id,
+                styles,
+                initial_cb_width,
+                0,
+            )?
+        }
+        _ => initial_cb_width,
+    };
+    Some(
+        (containing_width - table_style.margin.left - table_style.margin.right)
+            .max(0.0),
+    )
 }
 
 /// Resolve the `width: fit-content` keyword after the containing inline space
@@ -6827,13 +7037,46 @@ where
     changed
 }
 
-fn collect_table_rows(tree: &DomTree, id: NodeId, rows: &mut Vec<NodeId>) {
+/// Collect rows together with the exclusive end of their originating row
+/// group. HTML rowspans never cross a thead/tbody/tfoot boundary; `rowspan=0`
+/// means the remainder of that group, not the remainder of the whole table.
+fn collect_table_rows(tree: &DomTree, id: NodeId, rows: &mut Vec<(NodeId, usize)>) {
+    let mut direct_start: Option<usize> = None;
     for cid in tree.children(id) {
         let local = tree.get_node(cid).and_then(|n| n.as_element().map(|e| e.local.to_string()));
         match local.as_deref() {
-            Some("tr") => rows.push(cid),
-            Some("thead") | Some("tbody") | Some("tfoot") => collect_table_rows(tree, cid, rows),
+            Some("tr") => {
+                direct_start.get_or_insert(rows.len());
+                rows.push((cid, 0));
+            }
+            Some("thead") | Some("tbody") | Some("tfoot") => {
+                if let Some(start) = direct_start.take() {
+                    let end = rows.len();
+                    for entry in &mut rows[start..end] {
+                        entry.1 = end;
+                    }
+                }
+                let start = rows.len();
+                for row in tree.children(cid) {
+                    if tree.get_node(row).is_some_and(|node| {
+                        node.as_element()
+                            .is_some_and(|element| element.local.as_ref() == "tr")
+                    }) {
+                        rows.push((row, 0));
+                    }
+                }
+                let end = rows.len();
+                for entry in &mut rows[start..end] {
+                    entry.1 = end;
+                }
+            }
             _ => {}
+        }
+    }
+    if let Some(start) = direct_start {
+        let end = rows.len();
+        for entry in &mut rows[start..end] {
+            entry.1 = end;
         }
     }
 }
@@ -6882,7 +7125,7 @@ fn build_table(
     styles: &HashMap<NodeId, crate::LayoutStyle>,
 ) -> Option<taffy::NodeId> {
     let style = styles.get(&id)?;
-    let mut rows: Vec<NodeId> = Vec::new();
+    let mut rows: Vec<(NodeId, usize)> = Vec::new();
     collect_table_rows(tree, id, &mut rows);
     if rows.is_empty() {
         return None;
@@ -6911,7 +7154,7 @@ fn build_table(
     let mut occupied: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
     let mut placed: Vec<(NodeId, usize, usize, usize, usize)> = Vec::new();
     let mut ncols = 0usize;
-    for (r, &tr) in rows.iter().enumerate() {
+    for (r, &(tr, group_end)) in rows.iter().enumerate() {
         let mut c = 0usize;
         for cid in tree.children(tr) {
             let local = tree.get_node(cid).and_then(|n| n.as_element().map(|e| e.local.to_string()));
@@ -6930,11 +7173,12 @@ fn build_table(
                 break;
             }
             let cs = span_attr(cid, "colspan").clamp(1, MAX_SPAN);
-            // rowspan=0 means "span to the end"; a cell can never span more rows
-            // than remain, so clamp both to the rows left (which also bounds the
-            // occupancy fill and keeps spans within taffy's range).
+            // rowspan=0 means "span to the end of this row group". Explicit
+            // spans are clipped at the same boundary by the effective cell map.
             let rs_raw = span_attr(cid, "rowspan");
-            let rs = if rs_raw == 0 { nrows - r } else { rs_raw }.clamp(1, nrows - r);
+            let rows_left_in_group = group_end.min(nrows).saturating_sub(r).max(1);
+            let rs = if rs_raw == 0 { rows_left_in_group } else { rs_raw }
+                .clamp(1, rows_left_in_group);
             for dr in 0..rs {
                 for dc in 0..cs {
                     occupied.insert((r + dr, c + dc));
@@ -7066,7 +7310,7 @@ fn build_table(
     // Row sizing: a `height` on the row or a rowspan-1 cell is a MINIMUM
     // (content can always grow a row), matching how tables treat heights.
     let mut row_min: Vec<Option<f32>> = vec![None; nrows];
-    for (r, &tr) in rows.iter().enumerate() {
+    for (r, &(tr, _)) in rows.iter().enumerate() {
         if let Some(crate::Dimension::Px(h)) = styles.get(&tr).map(|s| s.height) {
             if h > 0.0 {
                 row_min[r] = Some(h);
@@ -9031,6 +9275,48 @@ fn max_definite_descendant_width(tree: &DomTree, id: NodeId, styles: &HashMap<No
         if let Some(crate::Dimension::Px(w)) = styles.get(&d).map(|s| s.width.clone()) {
             if w > 0.0 {
                 best = Some(best.map_or(w, |b: f32| b.max(w)));
+            }
+        }
+    }
+    best
+}
+
+/// Fixed content descendants can floor a table's intrinsic minimum when the
+/// generic grid measurement fails to surface them through an intervening
+/// formatting context. Width hints on cells/rows/columns are different: the
+/// CSS table algorithm treats those as preferred column constraints, so they
+/// must remain shrinkable down to the content minimum.
+fn max_definite_table_content_width(
+    tree: &DomTree,
+    id: NodeId,
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+) -> Option<f32> {
+    let mut best: Option<f32> = None;
+    for descendant in tree.descendants(id) {
+        let structural = tree.get_node(descendant).is_some_and(|node| {
+            node.as_element().is_some_and(|element| {
+                matches!(
+                    element.local.as_ref(),
+                    "caption"
+                        | "col"
+                        | "colgroup"
+                        | "thead"
+                        | "tbody"
+                        | "tfoot"
+                        | "tr"
+                        | "td"
+                        | "th"
+                )
+            })
+        });
+        if structural {
+            continue;
+        }
+        if let Some(crate::Dimension::Px(width)) =
+            styles.get(&descendant).map(|style| style.width)
+        {
+            if width > 0.0 {
+                best = Some(best.map_or(width, |current| current.max(width)));
             }
         }
     }

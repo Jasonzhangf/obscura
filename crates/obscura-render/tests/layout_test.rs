@@ -91,6 +91,107 @@ fn hn_shaped_table_lays_out_without_site_hardcoding() {
 }
 
 #[test]
+fn table_width_uses_local_space_and_keeps_width_hints_shrinkable() {
+    let tree = parse_html(
+        r#"
+        <style>
+          html,body{margin:0;font:16px/20px Arial}
+          table{border-spacing:0;box-sizing:border-box} td{padding:0;box-sizing:border-box}
+        </style>
+        <div id="local" style="width:300px">
+          <table id="local-table"><tr><td id="local-cell">alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu</td></tr></table>
+        </div>
+        <table id="outer" style="width:300px"><tr><td id="outer-cell">
+          <table id="inner"><tr><td id="inner-cell">alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu</td></tr></table>
+        </td></tr></table>
+        <div id="narrow" style="width:300px">
+          <table id="overflow" style="width:500px"><tr><td>fixed overflow</td></tr></table>
+        </div>
+        <table id="preferred" style="width:200px"><tr>
+          <td id="preferred-wide" style="width:300px">A</td>
+          <td id="preferred-narrow" style="width:50px">B</td>
+        </tr></table>
+        "#,
+    );
+    let layout = layout_dom(&tree, (400.0, 1000.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+
+    let local = rect("local-table");
+    let local_cell = rect("local-cell");
+    assert!((local.width - 300.0).abs() < 0.01, "local table: {local:?}");
+    assert!(
+        local.height >= 39.0 && (local_cell.width - 300.0).abs() < 0.01,
+        "wrappable content must use the 300px local containing block: table={local:?} cell={local_cell:?}"
+    );
+
+    for id in ["outer", "outer-cell", "inner", "inner-cell"] {
+        let box_rect = rect(id);
+        assert!(
+            (box_rect.width - 300.0).abs() < 0.01 && box_rect.height >= 39.0,
+            "nested table sizing must settle outer-first for {id}: {box_rect:?}"
+        );
+    }
+
+    let overflow = rect("overflow");
+    assert!(
+        (overflow.width - 500.0).abs() < 0.01,
+        "a definite table width may overflow its local CB and viewport: {overflow:?}"
+    );
+
+    let preferred = rect("preferred");
+    let wide = rect("preferred-wide");
+    let narrow = rect("preferred-narrow");
+    assert!((preferred.width - 200.0).abs() < 0.01, "preferred table: {preferred:?}");
+    assert!(
+        wide.width > 160.0
+            && wide.width < 175.0
+            && narrow.width > 25.0
+            && narrow.width < 40.0
+            && (wide.width + narrow.width - 200.0).abs() < 0.01,
+        "cell width hints are preferred contributions, not minimums: wide={wide:?} narrow={narrow:?}"
+    );
+}
+
+#[test]
+fn table_rowspans_are_clipped_to_the_originating_row_group() {
+    let tree = parse_html(
+        r#"
+        <style>
+          html,body{margin:0} table{border-spacing:0} td{padding:0}
+          .span{width:20px}.short{width:20px;height:20px}.last{width:20px;height:60px}
+        </style>
+        <table id="zero"><tbody>
+          <tr><td id="zero-span" class="span" rowspan="0"></td><td class="short"></td></tr>
+          <tr><td class="short"></td></tr>
+        </tbody><tbody><tr><td id="zero-next" class="last"></td></tr></tbody></table>
+        <table id="oversized"><tbody>
+          <tr><td id="oversized-span" class="span" rowspan="999"></td><td class="short"></td></tr>
+          <tr><td class="short"></td></tr>
+        </tbody><tbody><tr><td id="oversized-next" class="last"></td></tr></tbody></table>
+        "#,
+    );
+    let layout = layout_dom(&tree, (400.0, 1000.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+
+    for (table_id, span_id, next_id) in [
+        ("zero", "zero-span", "zero-next"),
+        ("oversized", "oversized-span", "oversized-next"),
+    ] {
+        let table = rect(table_id);
+        let spanning = rect(span_id);
+        let next_group = rect(next_id);
+        assert!(
+            (spanning.height - 40.0).abs() < 0.01,
+            "{span_id} must stop at the tbody boundary: {spanning:?}"
+        );
+        assert!(
+            (next_group.x - table.x).abs() < 0.01,
+            "{next_id} must restart at column zero in its row group: table={table:?} cell={next_group:?}"
+        );
+    }
+}
+
+#[test]
 fn relative_units_resolve_against_viewport_and_font_size() {
     // 50vw of a 1000px viewport = 500px; 10em at the default 16px = 160px.
     // Both were previously mis-resolved (vw kept as raw px, em hardcoded to 16
