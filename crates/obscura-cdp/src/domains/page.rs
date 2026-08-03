@@ -6,7 +6,12 @@ use crate::types::CdpEvent;
 use crate::util::url_is_file_scheme;
 
 #[cfg(feature = "render")]
+use crate::dispatch::{ScreencastFormat, ScreencastState};
+
+#[cfg(feature = "render")]
 const DEFAULT_SCREENSHOT_QUALITY: i64 = 80;
+#[cfg(feature = "render")]
+const MAX_SCREENCAST_FRAMES_IN_FLIGHT: u8 = 2;
 
 #[cfg(feature = "render")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -271,6 +276,139 @@ fn encode_screenshot(
         }
     }
     Ok(output)
+}
+
+#[cfg(feature = "render")]
+fn screencast_int32(params: &Value, name: &str) -> Result<Option<i64>, String> {
+    match params.get(name) {
+        None => Ok(None),
+        Some(value) => value.as_i64()
+            .filter(|value| i32::try_from(*value).is_ok()).map(Some)
+            .ok_or_else(|| format!("Invalid parameters: {name} must be an integer")),
+    }
+}
+
+#[cfg(feature = "render")]
+fn parse_screencast_state(params: &Value, session_id: i64) -> Result<ScreencastState, String> {
+    if !params.is_object() { return Err("Invalid parameters: expected an object".into()); }
+    let format = match params.get("format") {
+        None => ScreencastFormat::Png,
+        Some(Value::String(value)) if value == "png" => ScreencastFormat::Png,
+        Some(Value::String(value)) if value == "jpeg" => ScreencastFormat::Jpeg,
+        Some(Value::String(_)) => return Err("Invalid parameters: screencast format must be png or jpeg".into()),
+        Some(_) => return Err("Invalid parameters: format must be a string".into()),
+    };
+    let quality = screencast_int32(params, "quality")?.unwrap_or(DEFAULT_SCREENSHOT_QUALITY);
+    let quality = if (0..=100).contains(&quality) { quality } else { DEFAULT_SCREENSHOT_QUALITY } as u8;
+    let dimension = |name: &str| -> Result<Option<u32>, String> {
+        Ok(screencast_int32(params, name)?.filter(|value| *value > 0).map(|value| value as u32))
+    };
+    let every_nth_frame = screencast_int32(params, "everyNthFrame")?.unwrap_or(1);
+    if every_nth_frame <= 0 {
+        return Err("Invalid parameters: everyNthFrame must be greater than zero".into());
+    }
+    Ok(ScreencastState {
+        format, quality,
+        max_width: dimension("maxWidth")?, max_height: dimension("maxHeight")?,
+        every_nth_frame: every_nth_frame as u32, command_frame_counter: 0,
+        session_id, frames_in_flight: 0,
+    })
+}
+
+#[cfg(feature = "render")]
+fn encode_screencast_frame(renderer_png: Vec<u8>, state: &ScreencastState) -> Result<Vec<u8>, String> {
+    if state.format == ScreencastFormat::Png && state.max_width.is_none() && state.max_height.is_none() {
+        return Ok(renderer_png);
+    }
+    let source = image::load_from_memory_with_format(&renderer_png, image::ImageFormat::Png)
+        .map_err(|error| format!("Page.startScreencast could not decode renderer PNG: {error}"))?
+        .to_rgba8();
+    let mut scale = 1.0_f64;
+    if let Some(max_width) = state.max_width {
+        scale = scale.min(f64::from(max_width) / f64::from(source.width()));
+    }
+    if let Some(max_height) = state.max_height {
+        scale = scale.min(f64::from(max_height) / f64::from(source.height()));
+    }
+    let size = (
+        (f64::from(source.width()) * scale).floor().max(1.0) as u32,
+        (f64::from(source.height()) * scale).floor().max(1.0) as u32,
+    );
+    let raster = if size == source.dimensions() { source } else {
+        image::imageops::resize(&source, size.0, size.1, image::imageops::FilterType::Triangle)
+    };
+    let format = match state.format {
+        ScreencastFormat::Png => ScreenshotFormat::Png,
+        ScreencastFormat::Jpeg => ScreenshotFormat::Jpeg,
+    };
+    encode_screenshot(&raster, ScreenshotOptions {
+        format, quality: state.quality, quality_supplied: true, clip: None,
+        from_surface: true, capture_beyond_viewport: false, optimize_for_speed: false,
+    })
+}
+
+/// Queue a visible-viewport frame through normal CDP event transport. This is
+/// intentionally command-driven until Obscura has a compositor frame pump.
+#[cfg(feature = "render")]
+pub(crate) fn queue_screencast_frame(
+    ctx: &mut CdpContext, cdp_session_id: &Option<String>, force: bool,
+) -> Result<bool, String> {
+    let cdp_session_id = cdp_session_id.as_deref()
+        .ok_or("Page.startScreencast requires an attached target session")?;
+    let state = {
+        let Some(state) = ctx.screencasts.get_mut(cdp_session_id) else { return Ok(false); };
+        if state.frames_in_flight >= MAX_SCREENCAST_FRAMES_IN_FLIGHT { return Ok(false); }
+        if !force {
+            state.command_frame_counter = state.command_frame_counter.saturating_add(1);
+            if state.command_frame_counter % u64::from(state.every_nth_frame) != 0 { return Ok(false); }
+        }
+        state.clone()
+    };
+    let attached_session = Some(cdp_session_id.to_string());
+    let (viewport, scroll, png) = {
+        let page = ctx.get_session_page_mut(&attached_session).ok_or("No page for session")?;
+        let viewport = page.viewport;
+        let scroll = page.evaluate("[window.scrollX, window.scrollY]").as_array()
+            .map(|values| (
+                values.first().and_then(Value::as_f64).unwrap_or(0.0),
+                values.get(1).and_then(Value::as_f64).unwrap_or(0.0),
+            )).unwrap_or((0.0, 0.0));
+        let png = page.screenshot(viewport).ok_or_else(||
+            "Page.startScreencast failed: the page has no visible DOM surface to render".to_string())?;
+        (viewport, scroll, png)
+    };
+    let encoded = encode_screencast_frame(png, &state)?;
+    use base64::Engine as _;
+    let data = base64::engine::general_purpose::STANDARD.encode(encoded);
+    let Some(live) = ctx.screencasts.get_mut(cdp_session_id) else { return Ok(false); };
+    if live.session_id != state.session_id { return Ok(false); }
+    live.frames_in_flight = live.frames_in_flight.saturating_add(1);
+    ctx.pending_events.push(CdpEvent {
+        method: "Page.screencastFrame".into(),
+        params: json!({
+            "data": data,
+            "metadata": {
+                "offsetTop": 0.0, "pageScaleFactor": 1.0,
+                "deviceWidth": viewport.0, "deviceHeight": viewport.1,
+                "scrollOffsetX": scroll.0, "scrollOffsetY": scroll.1,
+                "timestamp": timestamp(),
+            },
+            "sessionId": state.session_id,
+        }),
+        session_id: Some(cdp_session_id.to_string()),
+    });
+    Ok(true)
+}
+
+#[cfg(feature = "render")]
+pub(crate) fn command_can_change_screencast_frame(method: &str) -> bool {
+    matches!(method,
+        "Page.navigate" | "Page.reload" | "Page.navigateToHistoryEntry"
+        | "Runtime.evaluate" | "Runtime.callFunctionOn"
+        | "Input.dispatchMouseEvent" | "Input.dispatchKeyEvent" | "Input.dispatchTouchEvent"
+        | "Emulation.setDeviceMetricsOverride" | "Emulation.clearDeviceMetricsOverride"
+        | "DOM.setAttributeValue" | "DOM.removeNode" | "DOM.focus" | "DOM.setFileInputFiles"
+    )
 }
 
 /// Emit the post-navigation event stream into `ctx.pending_events`. Shared
@@ -813,6 +951,63 @@ pub async fn handle(
                     .to_string(),
             )
         }
+        "startScreencast" => {
+            #[cfg(feature = "render")]
+            {
+                let cdp_session = session_id.as_ref()
+                    .ok_or("Page.startScreencast requires an attached target session")?.clone();
+                let resource_deadline_ms = std::env::var("OBSCURA_RENDER_RESOURCE_DEADLINE_MS")
+                    .ok().and_then(|value| value.parse::<u64>().ok()).unwrap_or(3_000);
+                let page = ctx.get_session_page_mut(session_id).ok_or("No page for session")?;
+                let _ = page.prepare_screenshot_resources(resource_deadline_ms).await;
+                let stream_id = ctx.next_screencast_session();
+                let state = parse_screencast_state(params, stream_id)?;
+                ctx.screencasts.insert(cdp_session.clone(), state);
+                let pending_before = ctx.pending_events.len();
+                ctx.pending_events.push(CdpEvent {
+                    method: "Page.screencastVisibilityChanged".into(),
+                    params: json!({"visible": true}), session_id: session_id.clone(),
+                });
+                if let Err(error) = queue_screencast_frame(ctx, session_id, true) {
+                    ctx.pending_events.truncate(pending_before);
+                    ctx.screencasts.remove(&cdp_session);
+                    return Err(error);
+                }
+                tracing::debug!(cdp_session, stream_id,
+                    "started command-driven screencast; autonomous compositor frames unavailable");
+                // Extension fields expose the MVP boundary to direct callers.
+                Ok(json!({"obscuraFrameSource": "command-driven", "obscuraAutonomousFrames": false}))
+            }
+            #[cfg(not(feature = "render"))]
+            Err("Page.startScreencast requires a build with the render feature".into())
+        }
+        "stopScreencast" => {
+            #[cfg(feature = "render")]
+            {
+                if let Some(cdp_session) = session_id.as_ref() { ctx.screencasts.remove(cdp_session); }
+                Ok(json!({}))
+            }
+            #[cfg(not(feature = "render"))]
+            Err("Page.stopScreencast requires a build with the render feature".into())
+        }
+        "screencastFrameAck" => {
+            #[cfg(feature = "render")]
+            {
+                let acknowledged = screencast_int32(params, "sessionId")?
+                    .ok_or("Invalid parameters: sessionId is required")?;
+                if let Some(cdp_session) = session_id.as_ref() {
+                    if let Some(state) = ctx.screencasts.get_mut(cdp_session) {
+                        // Ignore delayed acknowledgements from a replaced stream.
+                        if state.session_id == acknowledged {
+                            state.frames_in_flight = state.frames_in_flight.saturating_sub(1);
+                        }
+                    }
+                }
+                Ok(json!({}))
+            }
+            #[cfg(not(feature = "render"))]
+            Err("Page.screencastFrameAck requires a build with the render feature".into())
+        }
         "captureScreenshot" => {
             #[cfg(feature = "render")]
             {
@@ -839,6 +1034,9 @@ pub async fn handle(
                 let page = ctx
                     .get_session_page_mut(session_id)
                     .ok_or("No page for session")?;
+                let resource_deadline_ms = std::env::var("OBSCURA_RENDER_RESOURCE_DEADLINE_MS")
+                    .ok().and_then(|value| value.parse::<u64>().ok()).unwrap_or(3_000);
+                let _ = page.prepare_screenshot_resources(resource_deadline_ms).await;
                 let viewport = page.viewport;
                 let scroll = if options.clip.is_some() {
                     page.evaluate("[window.scrollX, window.scrollY]")
@@ -1056,6 +1254,78 @@ mod tests {
         .await
         .expect("navigate screenshot fixture");
         (ctx, session)
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test]
+    async fn screencast_initial_frame_metadata_and_encoding_match_options() {
+        let (mut ctx, session) = screenshot_fixture().await;
+        ctx.pending_events.clear();
+        let result = handle("startScreencast", &json!({
+            "format": "jpeg", "quality": 35, "maxWidth": 50, "maxHeight": 100,
+        }), &mut ctx, &session).await.expect("start screencast");
+        assert_eq!(result["obscuraFrameSource"], "command-driven");
+        assert_eq!(result["obscuraAutonomousFrames"], false);
+        assert_eq!(ctx.pending_events.len(), 2);
+        assert_eq!(ctx.pending_events[0].method, "Page.screencastVisibilityChanged");
+        let frame = &ctx.pending_events[1];
+        assert_eq!(frame.method, "Page.screencastFrame");
+        assert_eq!(frame.session_id, session);
+        let (format, raster) = decode_capture(&frame.params);
+        assert_eq!(format, image::ImageFormat::Jpeg);
+        assert_eq!(raster.dimensions(), (50, 40));
+        assert_eq!(frame.params["metadata"]["deviceWidth"], 100.0);
+        assert_eq!(frame.params["metadata"]["deviceHeight"], 80.0);
+        assert_eq!(frame.params["metadata"]["scrollOffsetY"], 0.0);
+        assert!(frame.params["metadata"]["timestamp"].as_f64().unwrap_or(0.0) > 0.0);
+        assert_eq!(frame.params["sessionId"], 1);
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test]
+    async fn screencast_sampling_backpressure_and_stale_acks_are_bounded() {
+        let (mut ctx, session) = screenshot_fixture().await;
+        ctx.pending_events.clear();
+        handle("startScreencast", &json!({"everyNthFrame": 2}), &mut ctx, &session)
+            .await.expect("start sampled stream");
+        let old_id = ctx.pending_events[1].params["sessionId"].as_i64().unwrap();
+        ctx.pending_events.clear();
+        assert!(!queue_screencast_frame(&mut ctx, &session, false).unwrap());
+        assert!(queue_screencast_frame(&mut ctx, &session, false).unwrap());
+        assert!(!queue_screencast_frame(&mut ctx, &session, false).unwrap(),
+            "two unacknowledged frames must apply backpressure before capture");
+        let key = session.as_ref().unwrap();
+        handle("screencastFrameAck", &json!({"sessionId": old_id + 99}), &mut ctx, &session)
+            .await.expect("stale ack");
+        assert_eq!(ctx.screencasts[key].frames_in_flight, 2);
+        handle("screencastFrameAck", &json!({"sessionId": old_id}), &mut ctx, &session)
+            .await.expect("current ack");
+        assert_eq!(ctx.screencasts[key].frames_in_flight, 1);
+
+        ctx.pending_events.clear();
+        handle("startScreencast", &json!({}), &mut ctx, &session).await.expect("restart");
+        let new_id = ctx.pending_events[1].params["sessionId"].as_i64().unwrap();
+        assert!(new_id > old_id);
+        handle("screencastFrameAck", &json!({"sessionId": old_id}), &mut ctx, &session)
+            .await.expect("old generation ack");
+        assert_eq!(ctx.screencasts[key].frames_in_flight, 1);
+        handle("stopScreencast", &json!({}), &mut ctx, &session).await.expect("stop");
+        assert!(!ctx.screencasts.contains_key(key));
+        assert!(!queue_screencast_frame(&mut ctx, &session, false).unwrap());
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn screencast_options_validate_protocol_shapes() {
+        assert!(parse_screencast_state(&json!({"format": "webp"}), 1).is_err());
+        assert!(parse_screencast_state(&json!({"everyNthFrame": 0}), 1).is_err());
+        assert!(parse_screencast_state(&json!({"maxWidth": 20.5}), 1).is_err());
+        let state = parse_screencast_state(
+            &json!({"quality": 101, "maxWidth": 0, "maxHeight": -1}), 1,
+        ).expect("Chromium-compatible fallbacks");
+        assert_eq!(state.quality, DEFAULT_SCREENSHOT_QUALITY as u8);
+        assert_eq!(state.max_width, None);
+        assert_eq!(state.max_height, None);
     }
 
     #[cfg(feature = "render")]

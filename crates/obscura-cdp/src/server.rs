@@ -1106,6 +1106,8 @@ async fn process_with_interception(
 
     ctx.pages.push(page);
 
+    #[cfg(feature = "render")]
+    let navigation_succeeded = navigate_result.is_ok();
     let response = match navigate_result {
         Ok(()) => crate::types::CdpResponse::success(
             req.id,
@@ -1135,6 +1137,14 @@ async fn process_with_interception(
         wait_until,
         reached_network_idle,
     );
+    #[cfg(feature = "render")]
+    if navigation_succeeded {
+        if let Err(error) = crate::domains::page::queue_screencast_frame(
+            ctx, &session_for_events, false,
+        ) {
+            tracing::warn!("could not produce post-navigation screencast frame: {error}");
+        }
+    }
     for event in ctx.pending_events.drain(..) {
         if let Ok(json) = serde_json::to_string(&event) {
             let _ = reply_tx.send(json);

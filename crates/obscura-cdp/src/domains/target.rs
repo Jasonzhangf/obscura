@@ -204,7 +204,13 @@ pub async fn handle(method: &str, params: &Value, ctx: &mut CdpContext) -> Resul
         "setAutoAttach" => Ok(json!({})),
         // No multi-target lifecycle to manage: obscura runs one page per session.
         // Ack these so Chrome-shaped clients that call them do not warn (issue #340).
-        "detachFromTarget" => Ok(json!({})),
+        "detachFromTarget" => {
+            #[cfg(feature = "render")]
+            if let Some(session_id) = params.get("sessionId").and_then(Value::as_str) {
+                ctx.screencasts.remove(session_id);
+            }
+            Ok(json!({}))
+        }
         "activateTarget" => Ok(json!({})),
         "getBrowserContexts" => {
             let mut ids: Vec<&String> = ctx.browser_contexts.keys().collect();

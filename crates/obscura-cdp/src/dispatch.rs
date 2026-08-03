@@ -9,10 +9,31 @@ use crate::domains;
 use crate::domains::fetch::FetchInterceptState;
 use crate::types::{CdpEvent, CdpRequest, CdpResponse};
 
+#[cfg(feature = "render")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ScreencastFormat { Png, Jpeg }
+
+#[cfg(feature = "render")]
+#[derive(Clone, Debug)]
+pub(crate) struct ScreencastState {
+    pub format: ScreencastFormat,
+    pub quality: u8,
+    pub max_width: Option<u32>,
+    pub max_height: Option<u32>,
+    pub every_nth_frame: u32,
+    pub command_frame_counter: u64,
+    pub session_id: i64,
+    pub frames_in_flight: u8,
+}
+
 pub struct CdpContext {
     pub pages: Vec<Page>,
     pub sessions: HashMap<String, String>, // session_id -> page_id
     pub pending_events: Vec<CdpEvent>,
+    #[cfg(feature = "render")]
+    pub(crate) screencasts: HashMap<String, ScreencastState>,
+    #[cfg(feature = "render")]
+    next_screencast_session_id: i64,
     pub default_context: Arc<BrowserContext>,
     pub browser_contexts: HashMap<String, Arc<BrowserContext>>,
     page_counter: u32,
@@ -118,6 +139,10 @@ impl CdpContext {
             pages: Vec::new(),
             sessions: HashMap::new(),
             pending_events: Vec::new(),
+            #[cfg(feature = "render")]
+            screencasts: HashMap::new(),
+            #[cfg(feature = "render")]
+            next_screencast_session_id: 0,
             default_context,
             browser_contexts: HashMap::new(),
             page_counter: 0,
@@ -230,7 +255,21 @@ impl CdpContext {
 
     pub fn remove_page(&mut self, id: &str) {
         self.pages.retain(|p| p.id != id);
+        #[cfg(feature = "render")]
+        {
+            let removed: Vec<String> = self.sessions.iter()
+                .filter(|(_, page_id)| page_id.as_str() == id)
+                .map(|(session_id, _)| session_id.clone()).collect();
+            for session_id in removed { self.screencasts.remove(&session_id); }
+        }
         self.sessions.retain(|_, v| v != id);
+    }
+
+    #[cfg(feature = "render")]
+    pub(crate) fn next_screencast_session(&mut self) -> i64 {
+        // Never wrap a delayed acknowledgement onto a replacement stream.
+        self.next_screencast_session_id = self.next_screencast_session_id.saturating_add(1);
+        self.next_screencast_session_id
     }
 
     pub fn get_session_page(&self, session_id: &Option<String>) -> Option<&Page> {
@@ -287,7 +326,8 @@ fn is_v8_free_method(method: &str) -> bool {
         | "Page.addScriptToEvaluateOnNewDocument" | "Page.removeScriptToEvaluateOnNewDocument"
         | "Page.setInterceptFileChooserDialog" | "Page.getNavigationHistory"
         | "Page.resetNavigationHistory" | "Page.printToPDF"
-        | "Page.captureScreenshot" | "Page.captureSnapshot"
+        | "Page.captureSnapshot"
+        | "Page.stopScreencast" | "Page.screencastFrameAck"
         | "Page.createIsolatedWorld"
         | "Runtime.enable" | "Runtime.disable"
         | "Runtime.runIfWaitingForDebugger" | "Runtime.getExceptionDetails"
@@ -402,6 +442,16 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
         }
         _ => Err(format!("Unknown domain: {}", domain)),
     };
+
+    #[cfg(feature = "render")]
+    if result.is_ok() && domains::page::command_can_change_screencast_frame(&req.method) {
+        if let Err(error) = domains::page::queue_screencast_frame(ctx, &req.session_id, false) {
+            // Frame delivery is an asynchronous side effect in Chromium; it
+            // must not rewrite an otherwise successful command response.
+            tracing::warn!(method = %req.method,
+                "could not produce command-driven screencast frame: {error}");
+        }
+    }
 
     // Stop the per-command watchdog. If it fired (the handler held V8 past the
     // budget), V8 is left in a terminating state, so clear that flag before the
