@@ -3456,9 +3456,25 @@ class Document extends Node {
     return this._doctype;
   }
   get title() { return _domParse("document_title") ?? ""; }
-  set title(v) {}
+  set title(v) {
+    const value = String(v);
+    let title = this.querySelector("title");
+    if (!title) {
+      let head = this.head;
+      const root = this.documentElement;
+      if (!head && root) {
+        head = this.createElement("head");
+        root.insertBefore(head, this.body);
+      }
+      if (!head) return;
+      title = this.createElement("title");
+      head.appendChild(title);
+    }
+    title.textContent = value;
+  }
   get URL() { return _domParse("document_url") ?? ""; }
   get documentURI() { return this.URL; }
+  get referrer() { return _domParse("document_referrer") ?? ""; }
   get location() { return globalThis.location; }
   set location(url) { Deno.core.ops.op_navigate(_resolveUrl(String(url)), 'GET', ''); }
   get defaultView() { return globalThis; }
@@ -7183,7 +7199,20 @@ globalThis.DOMParser = class DOMParser {
       get head() { return findByTagName("HEAD"); },
       get title() {
         const t = findByTagName("TITLE");
-        return t ? (t.textContent || "") : "";
+        return t ? (t.textContent || "").replace(/[\t\n\f\r ]+/g, " ").trim() : "";
+      },
+      set title(value) {
+        let t = findByTagName("TITLE");
+        if (!t) {
+          let head = findByTagName("HEAD");
+          if (!head) {
+            head = document.createElement("head");
+            root.insertBefore(head, findByTagName("BODY"));
+          }
+          t = document.createElement("title");
+          head.appendChild(t);
+        }
+        t.textContent = String(value);
       },
       get firstChild() { return root; },
       get lastChild() { return root; },
@@ -7193,6 +7222,7 @@ globalThis.DOMParser = class DOMParser {
       // URL about:blank, are already fully parsed, and carry no stylesheets.
       get URL() { return "about:blank"; },
       get documentURI() { return "about:blank"; },
+      get referrer() { return ""; },
       get baseURI() { return "about:blank"; },
       get compatMode() { return "CSS1Compat"; },
       get characterSet() { return "UTF-8"; },

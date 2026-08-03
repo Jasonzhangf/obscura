@@ -74,6 +74,10 @@ pub struct ObscuraState {
     /// encoding override for `<a>`/`<area>` hrefs in legacy-charset documents.
     pub encoding: String,
     pub title: String,
+    /// URL of the document that initiated this document's navigation. Direct
+    /// browser/API navigations leave this empty; document-initiated
+    /// navigations set it to the source document URL.
+    pub referrer: String,
     pub blocked_urls: Vec<String>,
     pub cookie_jar: Option<Arc<CookieJar>>,
     pub http_client: Option<Arc<ObscuraHttpClient>>,
@@ -141,6 +145,7 @@ impl ObscuraState {
             url: "about:blank".to_string(),
             encoding: "UTF-8".to_string(),
             title: String::new(),
+            referrer: String::new(),
             blocked_urls: Vec::new(),
             cookie_jar: None,
             http_client: None,
@@ -350,8 +355,26 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
 
     match cmd.as_str() {
         "document_node_id" => dom.document().index().to_string(),
-        "document_title" => serde_json::to_string(&gs.title).unwrap_or("\"\"".into()),
+        "document_title" => {
+            // The DOM is authoritative after parsing. In particular, script
+            // changes through title.textContent must be reflected by
+            // document.title, not hidden behind the navigation-time snapshot.
+            let title = dom
+                .query_selector("title")
+                .ok()
+                .flatten()
+                .map(|title_id| {
+                    dom.text_content(title_id)
+                        .split(|ch| matches!(ch, '\t' | '\n' | '\u{000C}' | '\r' | ' '))
+                        .filter(|part| !part.is_empty())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .unwrap_or_default();
+            serde_json::to_string(&title).unwrap_or("\"\"".into())
+        }
         "document_url" => serde_json::to_string(&gs.url).unwrap_or("\"\"".into()),
+        "document_referrer" => serde_json::to_string(&gs.referrer).unwrap_or("\"\"".into()),
         "document_encoding" => serde_json::to_string(&gs.encoding).unwrap_or("\"UTF-8\"".into()),
         "document_element" => {
             for cid in dom.children(dom.document()) {

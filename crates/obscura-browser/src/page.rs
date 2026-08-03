@@ -117,6 +117,31 @@ fn subresource_allowed(page_url: Option<&Url>, resource: &str) -> bool {
     }
 }
 
+/// Compute the default `strict-origin-when-cross-origin` referrer value used
+/// for a document-initiated navigation. Direct navigations bypass this helper
+/// and use an empty referrer. Referrer-Policy overrides are not yet plumbed
+/// through the navigation request.
+fn navigation_referrer(source: &Url, target: &Url) -> String {
+    if !matches!(source.scheme(), "http" | "https")
+        || !matches!(target.scheme(), "http" | "https")
+        || (source.scheme() == "https" && target.scheme() == "http")
+    {
+        return String::new();
+    }
+
+    if source.origin() == target.origin() {
+        let mut sanitized = source.clone();
+        sanitized.set_fragment(None);
+        let _ = sanitized.set_username("");
+        let _ = sanitized.set_password(None);
+        return sanitized.to_string();
+    }
+
+    let mut origin = source.origin().ascii_serialization();
+    origin.push('/');
+    origin
+}
+
 /// Escape a value for safe inclusion inside a JavaScript template
 /// literal. The previous implementation only escaped `\`, `` ` `` and
 /// `${`; that left U+2028 / U+2029 (the JS-specific line terminators)
@@ -171,6 +196,10 @@ pub struct Page {
     pub http_client: Arc<ObscuraHttpClient>,
     pub context: Arc<BrowserContext>,
     pub title: String,
+    /// Source document URL for the current document. This is deliberately
+    /// separate from `url`: direct automation navigations have no referrer,
+    /// while a navigation requested by page script uses the previous document.
+    pub referrer: String,
     /// CSS viewport used by responsive page JavaScript and CDP screenshots.
     /// The physical `screen` fingerprint remains independent.
     pub viewport: (f32, f32),
@@ -547,6 +576,7 @@ impl Page {
             http_client,
             context,
             title: String::new(),
+            referrer: String::new(),
             viewport: (1280.0, 720.0),
             encoding: "UTF-8".to_string(),
             history: Vec::new(),
@@ -637,6 +667,7 @@ impl Page {
         rt.set_url(&self.url_string());
         rt.set_encoding(&self.encoding);
         rt.set_title(&self.title);
+        rt.set_referrer(&self.referrer);
 
         #[cfg(feature = "stealth")]
         if self.stealth_client.is_some() {
@@ -1400,7 +1431,7 @@ impl Page {
 
         let result = match tokio::time::timeout(
             nav_timeout,
-            self.navigate_with_wait_post_inner(url_str, wait_until, method, body),
+            self.navigate_with_wait_post_inner(url_str, wait_until, method, body, ""),
         )
         .await
         {
@@ -1481,13 +1512,22 @@ impl Page {
         wait_until: crate::lifecycle::WaitUntil,
         method: &str,
         body: &str,
+        initial_referrer: &str,
     ) -> Result<(), PageError> {
         let mut current_url = url_str.to_string();
         let mut current_method = method.to_string();
         let mut current_body = body.to_string();
+        let mut document_referrer = initial_referrer.to_string();
         const REDIRECT_LIMIT: usize = 10;
         for chain in 0..REDIRECT_LIMIT {
-            self.navigate_single(&current_url, wait_until, &current_method, &current_body).await?;
+            self.navigate_single(
+                &current_url,
+                wait_until,
+                &current_method,
+                &current_body,
+                &document_referrer,
+            )
+            .await?;
             if let Some((next_url, next_method, next_body)) = self.take_pending_navigation() {
                 if cross_scheme_to_file(&current_url, &next_url) {
                     // SOP gate. A web page must not be able to drive
@@ -1504,6 +1544,15 @@ impl Page {
                     break;
                 }
                 tracing::info!("JS-triggered navigation chain: {} {} -> {}", current_method, current_url, next_url);
+                document_referrer = self
+                    .url
+                    .as_ref()
+                    .and_then(|source| {
+                        Url::parse(&next_url)
+                            .ok()
+                            .map(|target| navigation_referrer(source, &target))
+                    })
+                    .unwrap_or_default();
                 current_url = next_url;
                 current_method = next_method;
                 current_body = next_body;
@@ -1527,10 +1576,12 @@ impl Page {
         wait_until: crate::lifecycle::WaitUntil,
         method: &str,
         body: &str,
+        referrer: &str,
     ) -> Result<(), PageError> {
         let url = Url::parse(url_str).map_err(|e| PageError::InvalidUrl(e.to_string()))?;
 
         self.lifecycle = LifecycleState::Loading;
+        self.referrer = referrer.to_string();
         self.url = Some(url.clone());
         self.network_events.clear();
 
@@ -2322,13 +2373,38 @@ impl Page {
 
     pub async fn process_pending_navigation(&mut self) -> Result<bool, PageError> {
         if let Some((url, method, body)) = self.take_pending_navigation() {
-            self.navigate_with_wait_post(
-                &url,
-                crate::lifecycle::WaitUntil::Load,
-                &method,
-                &body,
+            let source_url = self
+                .url
+                .as_ref()
+                .and_then(|source| {
+                    Url::parse(&url)
+                        .ok()
+                        .map(|target| navigation_referrer(source, &target))
+                })
+                .unwrap_or_default();
+            let nav_timeout_ms: u64 = std::env::var("OBSCURA_NAV_TIMEOUT_MS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(30_000);
+            let result = tokio::time::timeout(
+                tokio::time::Duration::from_millis(nav_timeout_ms),
+                self.navigate_with_wait_post_inner(
+                    &url,
+                    crate::lifecycle::WaitUntil::Load,
+                    &method,
+                    &body,
+                    &source_url,
+                ),
             )
-            .await?;
+            .await
+            .map_err(|_| {
+                self.lifecycle = crate::lifecycle::LifecycleState::Failed;
+                PageError::NetworkError(format!(
+                    "navigation exceeded {nav_timeout_ms}ms deadline"
+                ))
+            })?;
+            result?;
+            self.push_history(self.url_string());
             Ok(true)
         } else {
             Ok(false)
@@ -2385,11 +2461,96 @@ fn url_matches_cdp_pattern(pattern: &str, url: &str) -> bool {
 mod tests {
     use super::{
         linked_stylesheet_requests, materialize_linked_stylesheet_script, parse_import_url,
-        rebase_css_urls, split_css_imports,
+        navigation_referrer, rebase_css_urls, split_css_imports,
         script_response_is_executable, truncate_on_char_boundary, url_matches_cdp_pattern,
     };
     use base64::Engine as _;
     use obscura_dom::parse_html;
+
+    #[test]
+    fn default_navigation_referrer_matches_strict_origin_when_cross_origin() {
+        let source = url::Url::parse("https://user:pass@source.example/path?q=1#fragment")
+            .unwrap();
+        let same_origin = url::Url::parse("https://source.example/next").unwrap();
+        let cross_origin = url::Url::parse("https://target.example/next").unwrap();
+        let downgrade = url::Url::parse("http://source.example/next").unwrap();
+
+        assert_eq!(
+            navigation_referrer(&source, &same_origin),
+            "https://source.example/path?q=1"
+        );
+        assert_eq!(
+            navigation_referrer(&source, &cross_origin),
+            "https://source.example/"
+        );
+        assert_eq!(navigation_referrer(&source, &downgrade), "");
+
+        let data_source = url::Url::parse("data:text/html,source").unwrap();
+        assert_eq!(navigation_referrer(&data_source, &cross_origin), "");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn document_navigation_referrer_survives_http_redirects() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 2048];
+                let length = stream.read(&mut request).unwrap();
+                let request_text = String::from_utf8_lossy(&request[..length]);
+                let path = request_text
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_ascii_whitespace().nth(1))
+                    .unwrap_or("/");
+                let response = match path {
+                    "/source" => {
+                        let body = "<script>location.href='/redirect'</script>";
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len(),
+                        )
+                    }
+                    "/redirect" => "HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+                    "/final" => {
+                        let body = "<!doctype html><title>final</title>";
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len(),
+                        )
+                    }
+                    _ => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+                };
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "referrer-redirect".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("referrer-redirect".to_string(), context);
+        let source = format!("http://{address}/source");
+        page.navigate(&source).await.unwrap();
+
+        let observed = page
+            .js
+            .as_mut()
+            .unwrap()
+            .evaluate("[document.URL, document.referrer]")
+            .unwrap();
+        assert_eq!(
+            observed,
+            serde_json::json!([format!("http://{address}/final"), source])
+        );
+    }
 
     fn client_replacement_page(name: &str, deferred: bool) -> super::Page {
         let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(

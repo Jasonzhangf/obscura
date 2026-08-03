@@ -255,6 +255,14 @@ impl ObscuraJsRuntime {
         self.state.borrow_mut().title = title.to_string();
     }
 
+    /// Set the source document URL exposed as `document.referrer`. Navigation
+    /// owns this value; it is not derived from the current URL because direct
+    /// navigations and document-initiated navigations have different
+    /// referrer semantics.
+    pub fn set_referrer(&self, referrer: &str) {
+        self.state.borrow_mut().referrer = referrer.to_string();
+    }
+
     pub fn set_blocked_urls(&self, patterns: Vec<String>) {
         self.state.borrow_mut().blocked_urls = patterns;
     }
@@ -2244,7 +2252,91 @@ mod tests {
     fn test_document_title() {
         let mut rt = setup_runtime("<html><head><title>Test</title></head><body></body></html>");
         let title = rt.evaluate("document.title").unwrap();
-        assert_eq!(title, serde_json::json!("Test Page"));
+        assert_eq!(title, serde_json::json!("Test"));
+
+        let result = rt
+            .evaluate(
+                r#"
+                (function() {
+                  document.title = "A <new> title";
+                  return [
+                    document.title,
+                    document.querySelector("head > title").textContent,
+                    document.querySelectorAll("title").length
+                  ];
+                })()
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!(["A <new> title", "A <new> title", 1])
+        );
+
+        let normalized = rt
+            .evaluate(
+                r#"
+                (function() {
+                  document.querySelector("title").textContent = "  live\n\tDOM   title  ";
+                  return document.title;
+                })()
+                "#,
+            )
+            .unwrap();
+        assert_eq!(normalized, serde_json::json!("live DOM title"));
+    }
+
+    #[test]
+    fn document_title_setter_creates_missing_title_element() {
+        let mut rt = setup_runtime("<html><body><main>content</main></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                (function() {
+                  document.title = "Created";
+                  return [
+                    document.title,
+                    document.head.tagName,
+                    document.head.firstElementChild.tagName,
+                    document.head.firstElementChild.textContent,
+                    document.documentElement.firstElementChild === document.head
+                  ];
+                })()
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!(["Created", "HEAD", "TITLE", "Created", true])
+        );
+
+        let detached = rt
+            .evaluate(
+                r#"
+                (function() {
+                  const doc = document.implementation.createHTMLDocument();
+                  doc.title = "  Detached   title  ";
+                  return [doc.title, doc.querySelector("title").textContent, doc.referrer];
+                })()
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            detached,
+            serde_json::json!(["Detached title", "  Detached   title  ", ""])
+        );
+    }
+
+    #[test]
+    fn document_referrer_has_explicit_navigation_state() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_eq!(rt.evaluate("document.referrer").unwrap(), serde_json::json!(""));
+
+        rt.set_referrer("https://source.example/path?q=1");
+        assert_eq!(
+            rt.evaluate("document.referrer").unwrap(),
+            serde_json::json!("https://source.example/path?q=1")
+        );
     }
 
     #[test]
@@ -6052,7 +6144,7 @@ mod tests {
         let result = rt
             .call_function_on("() => document.title", None, &[], true)
             .await.unwrap();
-        assert_eq!(result.value.unwrap(), serde_json::json!("Test Page"));
+        assert_eq!(result.value.unwrap(), serde_json::json!("Test"));
     }
 
     #[tokio::test(flavor = "current_thread")]
