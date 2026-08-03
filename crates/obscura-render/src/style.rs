@@ -675,6 +675,8 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                     | "flow-root"
                     | "table"
                     | "inline-table"
+                    | "-webkit-box"
+                    | "-webkit-inline-box"
                     | "contents"
                     | "inherit"
                     | "initial"
@@ -690,6 +692,7 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                 style.flow_root = false;
                 style.display_contents = false;
                 style.display_inherit = false;
+                style.webkit_box_display = None;
             }
             match value.as_str() {
                 "none" => style.display = crate::Display::None,
@@ -727,6 +730,19 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                     style.is_inline_block = true;
                     style.flow_root = true;
                     style.is_table_box = true;
+                }
+                "-webkit-box" => {
+                    // The unclamped legacy display is an old flexbox. When it
+                    // forms a vertical line-clamp root, the post-declaration
+                    // adjustment below converts it to a flow-root just as
+                    // Blink and Gecko do at computed-value time.
+                    style.display = crate::Display::Flex;
+                    style.webkit_box_display = Some(false);
+                }
+                "-webkit-inline-box" => {
+                    style.display = crate::Display::Flex;
+                    style.is_inline_block = true;
+                    style.webkit_box_display = Some(true);
                 }
                 "contents" => {
                     // `display:contents` can override an earlier `display:none`
@@ -1438,6 +1454,27 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                 _ => style.white_space,
             };
         }
+        "text-overflow" => {
+            style.text_overflow = match value.trim().to_ascii_lowercase().as_str() {
+                "ellipsis" => crate::TextOverflow::Ellipsis,
+                "clip" | "initial" | "unset" | "revert" | "revert-layer" => {
+                    crate::TextOverflow::Clip
+                }
+                _ => style.text_overflow,
+            };
+        }
+        "-webkit-line-clamp" => {
+            if let Some(lines) = webkit_line_clamp_value(value) {
+                style.webkit_line_clamp = lines;
+            }
+        }
+        "-webkit-box-orient" => {
+            style.webkit_box_orient_vertical = match value.trim().to_ascii_lowercase().as_str() {
+                "vertical" | "block-axis" => true,
+                "horizontal" | "inline-axis" | "initial" | "unset" | "revert" | "revert-layer" => false,
+                _ => style.webkit_box_orient_vertical,
+            };
+        }
         "overflow-wrap" | "word-wrap" => {
             style.overflow_wrap = match value.trim().to_ascii_lowercase().as_str() {
                 "normal" | "initial" => Some(crate::OverflowWrap::Normal),
@@ -1617,6 +1654,49 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         }
         _ => {}
     }
+    normalize_webkit_line_clamp_display(style);
+}
+
+/// Apply the legacy WebKit line-clamp display adjustment from specified
+/// provenance. Calling this after every accepted declaration makes the result
+/// independent of whether display, orientation, or clamp appeared first.
+pub(crate) fn normalize_webkit_line_clamp_display(style: &mut LayoutStyle) {
+    let Some(inline) = style.webkit_box_display else { return };
+    if style.webkit_box_orient_vertical && style.webkit_line_clamp.is_some() {
+        style.display = crate::Display::Block;
+        style.is_inline_block = inline;
+        style.flow_root = true;
+    } else {
+        style.display = crate::Display::Flex;
+        style.is_inline_block = inline;
+        style.flow_root = false;
+    }
+}
+
+/// Parse the legacy positive-integer clamp and match Chromium's saturation at
+/// the signed 32-bit maximum. CSS accepts arbitrarily long integer tokens;
+/// rejecting them because a Rust integer conversion overflowed would make
+/// both `CSS.supports()` and the cascade diverge from the browser.
+fn webkit_line_clamp_value(value: &str) -> Option<Option<u32>> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("none")
+        || matches!(
+            value.to_ascii_lowercase().as_str(),
+            "initial" | "unset" | "revert" | "revert-layer"
+        )
+    {
+        return Some(None);
+    }
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let first_nonzero = value.bytes().find(|byte| *byte != b'0')?;
+    debug_assert!(first_nonzero.is_ascii_digit());
+    let lines = value
+        .parse::<u64>()
+        .unwrap_or(u64::MAX)
+        .min(i32::MAX as u64) as u32;
+    Some(Some(lines))
 }
 
 /// Whether a declaration is syntactically supported by the renderer's CSS
@@ -1745,6 +1825,9 @@ pub fn supports_declaration(name: &str, value: &str) -> bool {
             | "text-decoration-line"
             | "line-height"
             | "white-space"
+            | "text-overflow"
+            | "-webkit-line-clamp"
+            | "-webkit-box-orient"
             | "overflow-wrap"
             | "word-wrap"
             | "word-break"
@@ -1866,6 +1949,8 @@ pub fn supports_declaration(name: &str, value: &str) -> bool {
                 | "flow-root"
                 | "table"
                 | "inline-table"
+                | "-webkit-box"
+                | "-webkit-inline-box"
                 | "contents"
         ),
         "position" => matches!(
@@ -1890,6 +1975,15 @@ pub fn supports_declaration(name: &str, value: &str) -> bool {
         "white-space" => matches!(
             value.to_ascii_lowercase().as_str(),
             "normal" | "nowrap" | "pre" | "pre-wrap" | "pre-line" | "break-spaces"
+        ),
+        "text-overflow" => matches!(
+            value.to_ascii_lowercase().as_str(),
+            "clip" | "ellipsis"
+        ),
+        "-webkit-line-clamp" => webkit_line_clamp_value(value).is_some(),
+        "-webkit-box-orient" => matches!(
+            value.to_ascii_lowercase().as_str(),
+            "horizontal" | "vertical" | "inline-axis" | "block-axis"
         ),
         "overflow-wrap" | "word-wrap" => matches!(
             value.to_ascii_lowercase().as_str(),
@@ -7414,6 +7508,75 @@ mod tests {
         assert!(supports_declaration("text-indent", "-9999px"));
         assert!(supports_declaration("text-indent", "25%"));
         assert!(!supports_declaration("text-indent", "10px hanging"));
+    }
+
+    #[test]
+    fn truncation_properties_parse_strictly_and_share_support_truth() {
+        assert!(supports_declaration("text-overflow", "clip"));
+        assert!(supports_declaration("text-overflow", "ellipsis"));
+        assert!(!supports_declaration("text-overflow", "clip ellipsis"));
+        assert!(!supports_declaration("text-overflow", "fade"));
+
+        for value in ["1", "2", "4294967295", "999999999999999999999", "none"] {
+            assert!(supports_declaration("-webkit-line-clamp", value), "{value}");
+        }
+        for value in ["0", "-1", "1.5", "2px", ""] {
+            assert!(!supports_declaration("-webkit-line-clamp", value), "{value}");
+        }
+        for value in ["horizontal", "vertical", "inline-axis", "block-axis"] {
+            assert!(supports_declaration("-webkit-box-orient", value), "{value}");
+        }
+        assert!(supports_declaration("display", "-webkit-box"));
+        assert!(supports_declaration("display", "-webkit-inline-box"));
+
+        let invalid = compute_style(
+            "div",
+            Some("text-overflow:ellipsis;text-overflow:fade;-webkit-line-clamp:2;-webkit-line-clamp:0"),
+        );
+        assert_eq!(invalid.text_overflow, crate::TextOverflow::Ellipsis);
+        assert_eq!(invalid.webkit_line_clamp, Some(2));
+
+        let saturated = compute_style(
+            "div",
+            Some("-webkit-line-clamp:999999999999999999999"),
+        );
+        assert_eq!(saturated.webkit_line_clamp, Some(i32::MAX as u32));
+    }
+
+    #[test]
+    fn webkit_clamp_display_adjustment_is_declaration_order_independent() {
+        for css in [
+            "display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2",
+            "-webkit-line-clamp:2;display:-webkit-box;-webkit-box-orient:block-axis",
+            "-webkit-box-orient:vertical;-webkit-line-clamp:2;display:-webkit-box",
+        ] {
+            let style = compute_style("div", Some(css));
+            assert_eq!(style.display, crate::Display::Block, "{css}");
+            assert!(style.flow_root, "{css}");
+            assert!(!style.is_inline_block, "{css}");
+        }
+
+        let inline = compute_style(
+            "span",
+            Some("display:-webkit-inline-box;-webkit-box-orient:vertical;-webkit-line-clamp:2"),
+        );
+        assert_eq!(inline.display, crate::Display::Block);
+        assert!(inline.flow_root);
+        assert!(inline.is_inline_block);
+
+        let horizontal = compute_style(
+            "div",
+            Some("display:-webkit-box;-webkit-box-orient:horizontal;-webkit-line-clamp:2"),
+        );
+        assert_eq!(horizontal.display, crate::Display::Flex);
+        assert!(!horizontal.flow_root);
+
+        let cleared = compute_style(
+            "div",
+            Some("display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;-webkit-line-clamp:none"),
+        );
+        assert_eq!(cleared.display, crate::Display::Flex);
+        assert!(!cleared.flow_root);
     }
 
     #[test]

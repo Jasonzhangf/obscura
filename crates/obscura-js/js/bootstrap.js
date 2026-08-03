@@ -6024,7 +6024,12 @@ globalThis.getComputedStyle = (el) => {
   const lookup = (rawProp) => {
     if (typeof rawProp !== 'string') return '';
     refreshRendered();
-    const kebab = rawProp.replace(/([A-Z])/g, '-$1').toLowerCase();
+    let kebab = rawProp.replace(/([A-Z])/g, '-$1').toLowerCase();
+    // CSSOM camelCase vendor properties omit the punctuation from their JS
+    // spelling (`webkitLineClamp`) but computed-property names retain it
+    // (`-webkit-line-clamp`). Normalize the prefix once for every WebKit
+    // property instead of adding per-property aliases to the native snapshot.
+    if (kebab.startsWith('webkit-')) kebab = '-' + kebab;
     if (rendered && Object.prototype.hasOwnProperty.call(rendered, kebab))
       return rendered[kebab];
     // Non-render builds and properties outside the renderer snapshot retain

@@ -2649,6 +2649,55 @@ mod tests {
 
     #[cfg(feature = "render")]
     #[test]
+    fn webkit_truncation_computed_names_use_native_support_and_vendor_prefixes() {
+        let dom = parse_html(
+            r#"<html><head><style>
+              #clamp { display:-webkit-box; -webkit-box-orient:vertical;
+                       -webkit-line-clamp:2; overflow:hidden; }
+              #legacy { display:-webkit-inline-box; -webkit-box-orient:horizontal; }
+            </style></head><body>
+              <div id="clamp">one two three four five six seven eight</div>
+              <span id="legacy">legacy</span>
+            </body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_viewport(120.0, 200.0);
+        rt.run_page_init();
+
+        let result = rt
+            .evaluate(
+                r#"
+                const clamp = getComputedStyle(document.getElementById("clamp"));
+                const legacy = getComputedStyle(document.getElementById("legacy"));
+                return {
+                  supports: [
+                    CSS.supports("text-overflow", "ellipsis"),
+                    CSS.supports("-webkit-line-clamp", "2"),
+                    CSS.supports("-webkit-line-clamp", "0"),
+                    CSS.supports("display", "-webkit-box"),
+                    CSS.supports("-webkit-box-orient", "vertical")
+                  ],
+                  clamp: [clamp.display, clamp.webkitLineClamp,
+                    clamp.webkitBoxOrient,
+                    clamp.getPropertyValue("-webkit-line-clamp")],
+                  legacy: [legacy.display, legacy.webkitBoxOrient]
+                };
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "supports": [true, true, false, true, true],
+                "clamp": ["flow-root", "2", "vertical", "2"],
+                "legacy": ["-webkit-inline-box", "horizontal"]
+            })
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
     fn computed_typography_uses_resolved_renderer_values() {
         let dom = parse_html(
             r#"<html><head><style>

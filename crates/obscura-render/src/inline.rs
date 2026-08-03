@@ -417,6 +417,25 @@ pub struct InlineItem {
     /// Canonical axis tuples, populated only when this IFC actually contains
     /// variable text. Glyph metadata stores a one-based index.
     variation_sets: Vec<Arc<FontVariations>>,
+    /// Direct pure-text legacy clamp. Nested block descendants do not enter
+    /// this IFC and are intentionally left to the future block-line iterator.
+    line_clamp: Option<usize>,
+    /// Ordinary single-value ellipsis is active only when inline-axis
+    /// overflow is non-visible. The full buffer remains intact for natural
+    /// overflow metrics and overflow-visible clamp painting.
+    ellipsis_overflow: bool,
+    /// Separately shaped marker using the same final text attributes. Keeping
+    /// this distinct avoids mutating DOM text or the natural content buffer.
+    marker_buffer: Option<Buffer>,
+    marker: Option<MarkerPlacement>,
+}
+
+#[derive(Clone, Copy)]
+struct MarkerPlacement {
+    line_index: usize,
+    x: f32,
+    y: f32,
+    content_end: f32,
 }
 
 /// Owns the font set and shaping caches for one render pass, plus every
@@ -1138,6 +1157,16 @@ impl TextEngine {
                 }
             }
         }
+        let line_clamp = (base.webkit_box_display.is_some()
+            && base.webkit_box_orient_vertical)
+            .then_some(base.webkit_line_clamp)
+            .flatten()
+            .map(|lines| lines as usize);
+        let ellipsis_overflow = base.text_overflow == crate::TextOverflow::Ellipsis
+            && base.clips_overflow_x();
+        let marker_attrs = (line_clamp.is_some() || ellipsis_overflow)
+            .then(|| spans.last().map(|(_, attrs)| attrs.clone()))
+            .flatten();
         let rich = spans.iter().map(|(text, attrs)| {
             let variation_index = attrs
                 .variations
@@ -1160,6 +1189,31 @@ impl TextEngine {
             Shaping::Advanced,
             None,
         );
+
+        let marker_buffer = marker_attrs.map(|attrs| {
+            let variation_index = attrs
+                .variations
+                .as_ref()
+                .and_then(|variations| {
+                    variation_sets
+                        .iter()
+                        .position(|existing| **existing == **variations)
+                })
+                .map_or(0, |index| index + 1);
+            let mut marker = Buffer::new(&mut self.font_system, metrics);
+            marker.set_wrap(&mut self.font_system, Wrap::None);
+            let marker_attrs = attrs.to_attrs(variation_index);
+            marker.set_rich_text(
+                &mut self.font_system,
+                [("…", marker_attrs)],
+                &Attrs::new().family(Family::Name(FAMILY)),
+                Shaping::Advanced,
+                None,
+            );
+            marker.set_size(&mut self.font_system, None, None);
+            marker.shape_until_scroll(&mut self.font_system, false);
+            marker
+        });
 
         let align = match base.text_align {
             Some(taffy::AlignItems::CENTER) => Some(Align::Center),
@@ -1190,6 +1244,10 @@ impl TextEngine {
             clip: None,
             clip_fills,
             variation_sets,
+            line_clamp,
+            ellipsis_overflow,
+            marker_buffer,
+            marker: None,
         });
         Some(idx)
     }
@@ -1216,8 +1274,16 @@ impl TextEngine {
         let TextEngine { font_system, items, .. } = self;
         let item = &mut items[idx];
         shape_with_text_indent(font_system, item, width, wrap);
-        let (width, height) = buffer_size(&item.buffer, item.first_line_offset);
-        (width, height.max(item.forced_min_height))
+        let (width, height, clamped) =
+            buffer_size(&item.buffer, item.first_line_offset, item.line_clamp);
+        (
+            width,
+            if clamped {
+                height
+            } else {
+                height.max(item.forced_min_height)
+            },
+        )
     }
 
     /// Exact max-content size for one fallback word item. Paragraph IFCs keep
@@ -1326,6 +1392,68 @@ impl TextEngine {
                 Some(Align::End | Align::Right) => 1.0,
                 _ => 0.0,
             };
+        item.marker = None;
+        let marker_width = item
+            .marker_buffer
+            .as_ref()
+            .and_then(|buffer| buffer.layout_runs().next().map(|run| run.line_w));
+        if let Some(marker_width) = marker_width {
+            let mut nonempty = 0usize;
+            let mut clamp_target = None;
+            let mut clamp_has_following_line = false;
+            let mut overflow_target = None;
+            for (line_index, run) in item.buffer.layout_runs().enumerate() {
+                if run.glyphs.is_empty() {
+                    continue;
+                }
+                nonempty += 1;
+                let line_offset = if line_index == 0 {
+                    item.first_line_offset
+                } else {
+                    0.0
+                };
+                let content_end = run
+                    .glyphs
+                    .iter()
+                    .map(|glyph| glyph.x + glyph.w + line_offset)
+                    .fold(0.0f32, f32::max);
+                if item.line_clamp == Some(nonempty) {
+                    clamp_target = Some((line_index, run.line_y, content_end));
+                } else if item.line_clamp.is_some_and(|limit| nonempty > limit) {
+                    clamp_has_following_line = true;
+                }
+                if overflow_target.is_none()
+                    && item.ellipsis_overflow
+                    && content_end > content_width + 0.01
+                {
+                    overflow_target = Some((line_index, run.line_y, content_end));
+                }
+            }
+            let target = if clamp_has_following_line {
+                clamp_target.map(|target| (target, true))
+            } else {
+                overflow_target.map(|target| (target, false))
+            };
+            if let Some(((line_index, line_y, natural_end), is_clamp)) = target {
+                let available_marker_start = (content_width - marker_width).max(0.0);
+                let marker_x = if is_clamp {
+                    natural_end.min(available_marker_start)
+                } else {
+                    available_marker_start
+                };
+                let marker_line_y = item
+                    .marker_buffer
+                    .as_ref()
+                    .and_then(|buffer| buffer.layout_runs().next().map(|run| run.line_y))
+                    .unwrap_or(0.0);
+                item.marker = Some(MarkerPlacement {
+                    line_index,
+                    x: marker_x,
+                    y: line_y - marker_line_y,
+                    content_end: marker_x,
+                });
+            }
+        }
         item.origin = (content_origin.0 + alignment_inset, content_origin.1);
         item.clip = clip;
     }
@@ -1775,9 +1903,15 @@ fn push_text(
 }
 
 /// Total shaped size of a buffer: widest line, and the bottom of the last line.
-fn buffer_size(buffer: &Buffer, first_line_offset: f32) -> (f32, f32) {
+fn buffer_size(
+    buffer: &Buffer,
+    first_line_offset: f32,
+    line_clamp: Option<usize>,
+) -> (f32, f32, bool) {
     let mut w = 0.0f32;
     let mut h = 0.0f32;
+    let mut nonempty_lines = 0usize;
+    let mut clamp_height = None;
     for (line_index, run) in buffer.layout_runs().enumerate() {
         let offset = if line_index == 0 {
             first_line_offset
@@ -1786,8 +1920,19 @@ fn buffer_size(buffer: &Buffer, first_line_offset: f32) -> (f32, f32) {
         };
         w = w.max((run.line_w + offset).max(0.0));
         h = h.max(run.line_top + run.line_height);
+        if !run.glyphs.is_empty() {
+            nonempty_lines += 1;
+            if line_clamp == Some(nonempty_lines) {
+                clamp_height = Some(run.line_top + run.line_height);
+            }
+        }
     }
-    (w.ceil(), h)
+    let clamped = line_clamp.is_some_and(|limit| nonempty_lines > limit);
+    (
+        w.ceil(),
+        if clamped { clamp_height.unwrap_or(h) } else { h },
+        clamped,
+    )
 }
 
 fn used_text_indent(value: Dimension, width: Option<f32>) -> f32 {
@@ -2188,6 +2333,16 @@ impl TextEngine {
             let base_y = run.line_y;
             let mut seg: Option<(f32, f32, f32, [u8; 4])> = None; // x0, x1, font_size, color
             for g in run.glyphs {
+                // Keep decoration and background-clip bounds in lockstep with
+                // glyph painting. A truncated glyph must not leave an
+                // underline tail or expand a gradient's sampling bounds past
+                // the separately painted ellipsis marker.
+                if item.marker.is_some_and(|marker| {
+                    marker.line_index == line_index
+                        && g.x + line_offset + g.w > marker.content_end
+                }) {
+                    continue;
+                }
                 let underlined = g.metadata & META_UNDERLINE != 0;
                 if let Some(fill_index) = metadata_fill(g.metadata) {
                     if let Some(bounds) = fill_bounds.get_mut(fill_index) {
@@ -2253,6 +2408,12 @@ impl TextEngine {
                 0.0
             };
             for glyph in run.glyphs {
+                if item.marker.is_some_and(|marker| {
+                    marker.line_index == line_index
+                        && glyph.x + line_offset + glyph.w > marker.content_end
+                }) {
+                    continue;
+                }
                 let physical = glyph.physical((line_offset, 0.0), 1.0);
                 let glyph_color = glyph.color_opt.unwrap_or(default);
                 let fill_index = metadata_fill(glyph.metadata);
@@ -2346,6 +2507,50 @@ impl TextEngine {
                     );
                 }
             }
+        }
+
+        // The marker owns its own shaped buffer so it uses a real U+2026
+        // glyph from the selected font without changing DOM text or the
+        // natural content buffer. The direct pure-text slice is LTR-only;
+        // logical-start marker placement arrives with the bidi foundation.
+        if let (Some(marker), Some(marker_buffer)) = (item.marker, item.marker_buffer.as_ref()) {
+            marker_buffer.draw(font_system, swash, default, |x, y, _, _, color| {
+                let px = ox as i32 + marker.x.round() as i32 + x;
+                let py = oy as i32 + marker.y.round() as i32 + y;
+                if let Some((cx0, cy0, cx1, cy1)) = clip_bounds {
+                    if (px as f32) < cx0
+                        || (px as f32) >= cx1
+                        || (py as f32) < cy0
+                        || (py as f32) >= cy1
+                    {
+                        return;
+                    }
+                }
+                if px < 0 || px >= pw || py < 0 || py >= ph {
+                    return;
+                }
+                let alpha = color.a() as u32;
+                if alpha == 0 {
+                    return;
+                }
+                let index = (py * pw + px) as usize;
+                let dst = pixels[index];
+                let inverse = 255 - alpha;
+                let out_alpha = alpha + dst.alpha() as u32 * inverse / 255;
+                let out_red = color.r() as u32 * alpha / 255
+                    + dst.red() as u32 * inverse / 255;
+                let out_green = color.g() as u32 * alpha / 255
+                    + dst.green() as u32 * inverse / 255;
+                let out_blue = color.b() as u32 * alpha / 255
+                    + dst.blue() as u32 * inverse / 255;
+                pixels[index] = tiny_skia::PremultipliedColorU8::from_rgba(
+                    out_red as u8,
+                    out_green as u8,
+                    out_blue as u8,
+                    out_alpha as u8,
+                )
+                .unwrap_or(dst);
+            });
         }
 
         // Stroke underline segments with the same authored alpha as their

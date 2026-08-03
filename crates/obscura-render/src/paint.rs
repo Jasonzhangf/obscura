@@ -412,10 +412,19 @@ impl PreparedRender {
         let rect = self.layout.rects.get(&id);
         let mut out = HashMap::new();
 
+        let active_webkit_clamp = style.webkit_box_display.is_some()
+            && style.webkit_box_orient_vertical
+            && style.webkit_line_clamp.is_some();
         let display = if style.display_contents {
             "contents"
         } else if style.display == crate::Display::None {
             "none"
+        } else if active_webkit_clamp && style.webkit_box_display == Some(false) {
+            "flow-root"
+        } else if style.webkit_box_display == Some(false) && !active_webkit_clamp {
+            "-webkit-box"
+        } else if style.webkit_box_display == Some(true) && !active_webkit_clamp {
+            "-webkit-inline-box"
         } else if style.internal_flex_container {
             "block"
         } else {
@@ -498,6 +507,27 @@ impl PreparedRender {
                 crate::WhiteSpace::PreWrap => "pre-wrap",
                 crate::WhiteSpace::PreLine => "pre-line",
                 crate::WhiteSpace::BreakSpaces => "break-spaces",
+            }
+            .to_string(),
+        );
+        out.insert(
+            "text-overflow",
+            match style.text_overflow {
+                crate::TextOverflow::Clip => "clip",
+                crate::TextOverflow::Ellipsis => "ellipsis",
+            }
+            .to_string(),
+        );
+        out.insert(
+            "-webkit-line-clamp",
+            style.webkit_line_clamp.map_or_else(|| "none".to_string(), |lines| lines.to_string()),
+        );
+        out.insert(
+            "-webkit-box-orient",
+            if style.webkit_box_orient_vertical {
+                "vertical"
+            } else {
+                "horizontal"
             }
             .to_string(),
         );
@@ -6936,6 +6966,111 @@ mod tests {
         assert_eq!((rect.width, rect.height), (40.0, 20.0));
         assert_eq!(prepared.layout.styles[&id].outline.specified_width, 9.0);
         assert_eq!(prepared.computed_style(id).unwrap()["outline-width"], "0px");
+    }
+
+    #[test]
+    fn direct_pure_text_webkit_clamp_matches_line_geometry_and_computed_values() {
+        let tree = parse_html(
+            r#"<html><body style="margin:0">
+              <div id="clamped" style="width:120px;font:16px/20px Arial;
+                display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;
+                overflow:hidden">one<br>two<br>three<br>four<br>five</div>
+              <div id="exact" style="width:120px;font:16px/20px Arial;
+                display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;
+                overflow:hidden">one<br>two</div>
+              <div id="inactive" style="width:120px;font:16px/20px Arial;
+                -webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden">
+                one<br>two<br>three<br>four<br>five</div>
+              <div id="nested" style="width:120px;font:16px/20px Arial;
+                display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;
+                overflow:hidden"><div>one</div><div>two</div><div>three</div></div>
+            </body></html>"#,
+        );
+        let clamped = tree.get_element_by_id("clamped").unwrap();
+        let exact = tree.get_element_by_id("exact").unwrap();
+        let inactive = tree.get_element_by_id("inactive").unwrap();
+        let nested = tree.get_element_by_id("nested").unwrap();
+        let mut resources = RenderResourceCache::default();
+        let prepared = prepare_dom(&tree, (300.0, 300.0), None, &mut resources).unwrap();
+
+        assert_eq!(prepared.document_rect(clamped).unwrap().height, 40.0);
+        assert_eq!(prepared.document_rect(exact).unwrap().height, 40.0);
+        assert_eq!(prepared.document_rect(inactive).unwrap().height, 100.0);
+        assert_eq!(
+            prepared.document_rect(nested).unwrap().height,
+            60.0,
+            "this slice must not fake descendant block-line counting by clipping children"
+        );
+        let computed = prepared.computed_style(clamped).unwrap();
+        assert_eq!(computed["display"], "flow-root");
+        assert_eq!(computed["-webkit-line-clamp"], "2");
+        assert_eq!(computed["-webkit-box-orient"], "vertical");
+        assert_eq!(computed["text-overflow"], "clip");
+    }
+
+    #[test]
+    fn truncation_markers_are_shaped_and_painted_without_changing_dom_text() {
+        let ellipsis_tree = parse_html(
+            r#"<html><body style="margin:0"><div id="nowrap" style="position:absolute;top:0;width:120px;font:16px/20px Arial;
+              white-space:nowrap;overflow:hidden;text-overflow:ellipsis">ABCDEFGHIJKLMNO</div>
+              <div id="clamp" style="position:absolute;top:20px;width:120px;font:16px/20px Arial;display:-webkit-box;
+              -webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden">one<br>two<br>three</div>
+              <div id="exact" style="position:absolute;top:80px;width:120px;font:16px/20px Arial;display:-webkit-box;
+              -webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden">one<br>two</div>
+              <div id="visible" style="position:absolute;top:120px;width:120px;font:16px/20px Arial;
+              white-space:nowrap;overflow:visible;text-overflow:ellipsis">ABCDEFGHIJKLMNO</div>
+              </body></html>"#,
+        );
+        let clip_tree = parse_html(
+            r#"<html><body style="margin:0"><div id="nowrap" style="position:absolute;top:0;width:120px;font:16px/20px Arial;
+              white-space:nowrap;overflow:hidden;text-overflow:clip">ABCDEFGHIJKLMNO</div>
+              <div id="clamp" style="position:absolute;top:20px;width:120px;font:16px/20px Arial;overflow:hidden">one<br>two<br>three</div>
+              <div id="exact" style="position:absolute;top:80px;width:120px;font:16px/20px Arial;overflow:hidden">one<br>two</div>
+              <div id="visible" style="position:absolute;top:120px;width:120px;font:16px/20px Arial;
+              white-space:nowrap;overflow:visible;text-overflow:clip">ABCDEFGHIJKLMNO</div>
+              </body></html>"#,
+        );
+        let ellipsis = paint_dom(&ellipsis_tree, (180.0, 160.0), None).unwrap();
+        let clip = paint_dom(&clip_tree, (180.0, 160.0), None).unwrap();
+
+        let nowrap_edge_difference = (85..120)
+            .flat_map(|x| (0..20).map(move |y| (x, y)))
+            .filter(|&(x, y)| ellipsis.pixel(x, y) != clip.pixel(x, y))
+            .count();
+        assert!(
+            nowrap_edge_difference > 8,
+            "ellipsis must replace end glyph pixels: {nowrap_edge_difference}"
+        );
+        let clamp_marker_difference = (20..55)
+            .flat_map(|x| (40..60).map(move |y| (x, y)))
+            .filter(|&(x, y)| ellipsis.pixel(x, y) != clip.pixel(x, y))
+            .count();
+        assert!(
+            clamp_marker_difference > 4,
+            "line clamp must paint a separately shaped marker: {clamp_marker_difference}"
+        );
+        let exact_line_difference = (0..140)
+            .flat_map(|x| (80..120).map(move |y| (x, y)))
+            .filter(|&(x, y)| ellipsis.pixel(x, y) != clip.pixel(x, y))
+            .count();
+        assert_eq!(
+            exact_line_difference, 0,
+            "an exactly-full clamp must not synthesize an overflow marker"
+        );
+        let visible_overflow_difference = (0..180)
+            .flat_map(|x| (120..140).map(move |y| (x, y)))
+            .filter(|&(x, y)| ellipsis.pixel(x, y) != clip.pixel(x, y))
+            .count();
+        assert_eq!(
+            visible_overflow_difference, 0,
+            "text-overflow must not synthesize a marker when overflow is visible"
+        );
+        for id in ["nowrap", "clamp", "exact", "visible"] {
+            assert_eq!(
+                ellipsis_tree.text_content(ellipsis_tree.get_element_by_id(id).unwrap()),
+                clip_tree.text_content(clip_tree.get_element_by_id(id).unwrap()),
+            );
+        }
     }
 
     #[test]
