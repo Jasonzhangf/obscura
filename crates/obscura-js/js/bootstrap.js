@@ -703,6 +703,33 @@ const _styleProxy = (decl) => new Proxy(decl, {
   },
 });
 
+// Clone a single node (no children), used by Node.cloneNode. Elements are built
+// with createElement/createElementNS and their content attributes copied, so no
+// HTML parsing context is involved and every attribute (including style) is
+// preserved. Text/Comment/DocumentFragment map to their factory; anything else
+// yields null.
+function _shallowCloneNode(node) {
+  const nt = node.nodeType;
+  if (nt === 3) return document.createTextNode(node.data != null ? node.data : (node.textContent || ""));
+  if (nt === 8) return document.createComment(node.data != null ? node.data : (node.nodeValue || ""));
+  if (nt === 11) return document.createDocumentFragment();
+  if (nt !== 1) return null;
+  const ns = node.namespaceURI;
+  const el = (ns && ns !== "http://www.w3.org/1999/xhtml")
+    ? document.createElementNS(ns, node.nodeName)
+    : document.createElement(node.localName || node.nodeName.toLowerCase());
+  const names = node.getAttributeNames ? node.getAttributeNames() : [];
+  for (const name of names) {
+    const v = node.getAttribute(name);
+    if (v !== null) el.setAttribute(name, v);
+  }
+  // CSS declarations currently live on the JS wrapper independently of the
+  // DOM attribute. Copy that state as well so styles assigned through
+  // `node.style` survive cloning even before attribute reflection runs.
+  if (node.style && node.style.cssText) el.style.cssText = node.style.cssText;
+  return el;
+}
+
 class Node {
   static ELEMENT_NODE = 1;
   static ATTRIBUTE_NODE = 2;
@@ -893,32 +920,38 @@ class Node {
   contains(o) { return o ? _dom("contains", this._nid, o._nid) === "true" : false; }
   hasChildNodes() { return _dom("has_child_nodes", this._nid) === "true"; }
   cloneNode(deep) {
-    const t = this.nodeType;
-    if (t === 1) {
-      if (deep) {
-        const wrapper = document.createElement('div');
-        wrapper.innerHTML = _domParse("outer_html", this._nid) || "";
-        const clone = wrapper.firstChild;
-        return clone;
-      }
-      const el = document.createElement(this.nodeName.toLowerCase());
-      const html = _domParse("outer_html", this._nid) || "";
-      const attrMatch = html.match(/^<[a-zA-Z][^\s>]*([\s\S]*?)>/);
-      if (attrMatch && attrMatch[1]) {
-        const attrStr = attrMatch[1].trim();
-        const re = /([a-zA-Z_:][a-zA-Z0-9_.:-]*)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|(\S+)))?/g;
-        let m;
-        while ((m = re.exec(attrStr)) !== null) {
-          const name = m[1];
-          const val = m[2] !== undefined ? m[2] : m[3] !== undefined ? m[3] : m[4] || "";
-          if (name !== this.nodeName.toLowerCase()) el.setAttribute(name, val);
+    // Clone structurally via real DOM nodes rather than round-tripping through a
+    // throwaway <div>.innerHTML: the fragment parser discards elements that are
+    // not valid children of <div> (<tr>, <td>, <option>, …), so the old path
+    // returned null for them and lost JS-set inline styles. Building each node
+    // directly with createElement(NS) + attribute copy avoids any parsing
+    // context, and an explicit stack keeps a deep subtree from overflowing the
+    // JS stack (issue #490).
+    const root = _shallowCloneNode(this);
+    if (!deep || !root) return root;
+    const stack = [[this, root]];
+    while (stack.length) {
+      const [src, dst] = stack.pop();
+      // A <template>'s children hang off its content fragment, not childNodes,
+      // so clone them into the clone's fragment. Gated on the tag name because
+      // .content means something else on other elements (e.g. <meta>).
+      if (src.localName === 'template' && dst.localName === 'template') {
+        const sc = src.content, dc = dst.content;
+        if (sc && dc && sc.childNodes) {
+          const tk = sc.childNodes;
+          for (let i = 0; i < tk.length; i++) {
+            const c = _shallowCloneNode(tk[i]);
+            if (c) { dc.appendChild(c); stack.push([tk[i], c]); }
+          }
         }
       }
-      return el;
+      const kids = src.childNodes;
+      for (let i = 0; i < kids.length; i++) {
+        const c = _shallowCloneNode(kids[i]);
+        if (c) { dst.appendChild(c); stack.push([kids[i], c]); }
+      }
     }
-    if (t === 3) return document.createTextNode(this.textContent);
-    if (t === 8) return document.createComment(this.nodeValue || "");
-    return null;
+    return root;
   }
   compareDocumentPosition(other) {
     if (!other) return 0;

@@ -1476,6 +1476,80 @@ mod tests {
     }
 
     #[test]
+    fn clone_node_deep_preserves_context_sensitive_elements() {
+        // A <tr> is not a valid child of <div>, so cloning through a throwaway
+        // <div>.innerHTML dropped it and returned null. A structural clone keeps it.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let tag = rt
+            .evaluate("(document.createElement('tr').cloneNode(true) || {}).tagName || 'NULL'")
+            .unwrap();
+        assert_eq!(tag, serde_json::json!("TR"));
+        let td = rt
+            .evaluate("(document.createElement('td').cloneNode(true) || {}).tagName || 'NULL'")
+            .unwrap();
+        assert_eq!(td, serde_json::json!("TD"));
+    }
+
+    #[test]
+    fn clone_node_deep_copies_children_and_attributes() {
+        let mut rt = setup_runtime(r#"<html><body><ul id="l"><li class="a">one</li><li class="b">two</li></ul></body></html>"#);
+        let out = rt
+            .evaluate(
+                "(function(){var c=document.getElementById('l').cloneNode(true); return c.children.length + '|' + c.children[0].className + '|' + c.children[1].textContent;})()",
+            )
+            .unwrap();
+        assert_eq!(out, serde_json::json!("2|a|two"));
+    }
+
+    #[test]
+    fn clone_node_deep_preserves_table_rows() {
+        let mut rt = setup_runtime(
+            r#"<html><body><table id="t"><tbody><tr><td>1</td><td>2</td></tr></tbody></table></body></html>"#,
+        );
+        // Navigate the detached clone directly (querySelector does not traverse
+        // detached subtrees). tbody > tr > (td, td).
+        let out = rt
+            .evaluate(
+                "(function(){var tb=document.querySelector('#t tbody').cloneNode(true); var tr=tb.children[0]; return tr.tagName + '|' + tr.children.length + '|' + tr.children[1].textContent;})()",
+            )
+            .unwrap();
+        assert_eq!(out, serde_json::json!("TR|2|2"));
+    }
+
+    #[test]
+    fn clone_node_shallow_copies_attributes_without_children() {
+        let mut rt = setup_runtime(r#"<html><body><div id="d" data-x="7"><span>kid</span></div></body></html>"#);
+        let out = rt
+            .evaluate(
+                "(function(){var c=document.getElementById('d').cloneNode(false); return c.getAttribute('data-x') + '|' + c.childNodes.length;})()",
+            )
+            .unwrap();
+        assert_eq!(out, serde_json::json!("7|0"));
+    }
+
+    #[test]
+    fn clone_node_copies_js_assigned_inline_styles() {
+        let mut rt = setup_runtime("<html><body><div id='d'></div></body></html>");
+        let out = rt
+            .evaluate(
+                "(function(){var d=document.getElementById('d');d.style.color='red';d.style.fontSize='12px';var c=d.cloneNode(false);return c.style.color+'|'+c.style.fontSize+'|'+c.style.cssText;})()",
+            )
+            .unwrap();
+        assert_eq!(out, serde_json::json!("red|12px|color: red; font-size: 12px;"));
+    }
+
+    #[test]
+    fn clone_node_deep_copies_template_content() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let out = rt
+            .evaluate(
+                "(function(){var t=document.createElement('template');t.content.appendChild(document.createElement('option')).textContent='choice';var c=t.cloneNode(true);return c.content.childNodes.length+'|'+c.content.firstChild.tagName+'|'+c.content.firstChild.textContent;})()",
+            )
+            .unwrap();
+        assert_eq!(out, serde_json::json!("1|OPTION|choice"));
+    }
+
+    #[test]
     fn test_document_title() {
         let mut rt = setup_runtime("<html><head><title>Test</title></head><body></body></html>");
         let title = rt.evaluate("document.title").unwrap();
