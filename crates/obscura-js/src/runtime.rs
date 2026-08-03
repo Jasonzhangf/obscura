@@ -860,15 +860,14 @@ impl ObscuraJsRuntime {
     }
 
     /// Whether the serialized dynamic-script queue is still fetching or
-    /// evaluating a script. The queue variables are global lexicals rather
-    /// than window properties, so page code cannot overwrite this state.
+    /// evaluating a script. The queue stays private to the bootstrap closure;
+    /// Rust reads it through a hidden status function so page declarations
+    /// cannot collide with or overwrite the queue itself.
     pub fn has_pending_dynamic_scripts(&mut self) -> bool {
-        self.evaluate(
-            "typeof __dynScriptBusy !== 'undefined' && (__dynScriptBusy || __dynScriptQueue.length > 0)",
-        )
-        .ok()
-        .and_then(|value| value.as_bool())
-        .unwrap_or(false)
+        self.evaluate("globalThis.__obscura_hasPendingDynamicScripts?.() === true")
+            .ok()
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
     }
 
     /// Arm a hard wall-clock backstop on synchronous V8 work. A page stuck in a
@@ -2498,6 +2497,55 @@ mod tests {
         .unwrap();
         let result = rt.evaluate("globalThis.__result").unwrap();
         assert_eq!(result, serde_json::json!(["A", "B"]));
+    }
+
+    #[test]
+    fn page_var_declarations_do_not_collide_with_dom_interfaces() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+
+        rt.execute_script(
+            "legacy-node-guard",
+            "if (!window.Node) { var Node = {}; } globalThis.__legacyNodeRan = true;",
+        )
+        .unwrap();
+        assert_eq!(
+            rt.evaluate("globalThis.__legacyNodeRan").unwrap(),
+            serde_json::json!(true)
+        );
+
+        rt.execute_script(
+            "page-element",
+            "var Element = function PageElement() {}; globalThis.__createdTag = document.createElement('div').tagName;",
+        )
+        .unwrap();
+        assert_eq!(
+            rt.evaluate("globalThis.__createdTag").unwrap(),
+            serde_json::json!("DIV")
+        );
+    }
+
+    #[test]
+    fn dynamic_script_status_bridge_is_hidden_and_idle() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert!(!rt.has_pending_dynamic_scripts());
+        assert_eq!(
+            rt.evaluate("typeof __dynScriptBusy").unwrap(),
+            serde_json::json!("undefined")
+        );
+        assert_eq!(
+            rt.evaluate(
+                "Object.getOwnPropertyNames(globalThis).includes('__obscura_hasPendingDynamicScripts')"
+            )
+            .unwrap(),
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            rt.evaluate(
+                "Reflect.ownKeys(globalThis).includes('__obscura_hasPendingDynamicScripts')"
+            )
+            .unwrap(),
+            serde_json::json!(false)
+        );
     }
 
     /// Regression test for #147: a TypeError in one script must not poison
