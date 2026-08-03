@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use deno_core::{JsRuntime, RuntimeOptions};
-use obscura_dom::DomTree;
+use obscura_dom::{DomTree, NodeId};
 
 /// Re-exported so other crates (obscura-browser, obscura-cdp) can name the V8
 /// isolate handle without taking a direct dependency on deno_core.
@@ -13,7 +13,10 @@ use crate::import_map::ImportMap;
 use crate::module_loader::ObscuraModuleLoader;
 #[cfg(feature = "render")]
 use crate::ops::{clamp_scroll_offset, document_base_url, ensure_prepared_render};
-use crate::ops::{build_extension, ObscuraState, StoredNetworkResponseBody};
+use crate::ops::{
+    build_extension, mark_script_subtree_started, node_is_script, ObscuraState,
+    StoredNetworkResponseBody,
+};
 
 static SNAPSHOT: &[u8] = include_bytes!(env!("OBSCURA_SNAPSHOT_PATH"));
 
@@ -217,6 +220,7 @@ impl ObscuraJsRuntime {
     pub fn set_dom(&self, dom: DomTree) {
         let mut gs = self.state.borrow_mut();
         gs.dom = Some(dom);
+        gs.already_started_scripts.borrow_mut().clear();
         // A new document owns a fresh retained scene and resource cache.
         #[cfg(feature = "render")]
         {
@@ -1204,6 +1208,39 @@ impl ObscuraJsRuntime {
         state.dom.take()
     }
 
+    /// Export document-owned script preparation state before the runtime realm
+    /// is temporarily destroyed.  Page suspension keeps the DOM alive, so the
+    /// HTML "already started" flags must travel with it rather than resetting
+    /// like window-global JavaScript state.
+    pub fn started_script_ids(&self) -> Vec<u32> {
+        let state = self.state.borrow();
+        let mut ids = state
+            .already_started_scripts
+            .borrow()
+            .iter()
+            .map(|node_id| node_id.raw())
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Restore script preparation state only onto script nodes in the current
+    /// DOM.  Callers use this exclusively for the same DomTree surviving a
+    /// suspend/resume cycle; normal set_dom navigation starts from an empty set.
+    pub fn restore_started_script_ids(&self, ids: &[u32]) {
+        let state = self.state.borrow();
+        let Some(dom) = state.dom.as_ref() else {
+            return;
+        };
+        let valid = ids
+            .iter()
+            .copied()
+            .map(NodeId::new)
+            .filter(|node_id| node_is_script(dom, *node_id))
+            .collect::<Vec<_>>();
+        state.already_started_scripts.borrow_mut().extend(valid);
+    }
+
     pub fn with_dom<R>(&self, f: impl FnOnce(&DomTree) -> R) -> Option<R> {
         let state = self.state.borrow();
         state.dom.as_ref().map(f)
@@ -1235,6 +1272,9 @@ impl ObscuraJsRuntime {
             let fragment = obscura_dom::parse_fragment(html);
             let root = fragment.fragment_root();
             dom.import_children_from(body, &fragment, root);
+            for child in dom.children(body) {
+                mark_script_subtree_started(&state, child);
+            }
         }
         #[cfg(feature = "render")]
         {
@@ -8111,5 +8151,169 @@ mod tests {
                 true, true, true, 1, 1, 3, "Hello", -2, 80, 1, true, "metadata"
             ])
         );
+    }
+
+    #[test]
+    fn html_string_scripts_remain_inert_when_connected() {
+        let mut rt = setup_runtime("<html><head></head><body><div id=target></div></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                var scriptTestSetup = true;
+                globalThis.__fragmentScriptRuns = 0;
+
+                const direct = document.createElement("div");
+                direct.innerHTML = "<script>globalThis.__fragmentScriptRuns++<\/script>";
+                document.body.appendChild(direct.firstChild);
+
+                const nested = document.createElement("div");
+                nested.innerHTML = "<section><script>globalThis.__fragmentScriptRuns++<\/script></section>";
+                document.body.appendChild(nested.firstChild);
+
+                const template = document.createElement("template");
+                template.innerHTML = "<script>globalThis.__fragmentScriptRuns++<\/script>";
+                document.body.appendChild(template.content.firstChild);
+
+                const nestedTemplateHolder = document.createElement("div");
+                nestedTemplateHolder.innerHTML =
+                    "<template><script>globalThis.__fragmentScriptRuns++<\/script></template>";
+                document.body.appendChild(
+                    nestedTemplateHolder.firstChild.content.firstChild
+                );
+
+                document.getElementById("target").insertAdjacentHTML(
+                    "beforeend",
+                    "<script>globalThis.__fragmentScriptRuns++<\/script>"
+                );
+
+                const parsed = new DOMParser().parseFromString(
+                    "<body><script>globalThis.__fragmentScriptRuns++<\/script></body>",
+                    "text/html"
+                );
+                document.body.appendChild(parsed.querySelector("script"));
+
+                let externalFetches = 0;
+                const originalFetchOp = Deno.core.ops.op_fetch_url;
+                try {
+                    Deno.core.ops.op_fetch_url = () => {
+                        externalFetches++;
+                        return JSON.stringify({
+                            status: 200,
+                            headers: {"content-type": "text/javascript"},
+                            body: "globalThis.__fragmentScriptRuns++",
+                            url: "http://example.com/inert.js"
+                        });
+                    };
+                    const external = document.createElement("div");
+                    external.innerHTML = "<script src=/inert.js><\/script>";
+                    document.head.appendChild(external.firstChild);
+                } finally {
+                    Deno.core.ops.op_fetch_url = originalFetchOp;
+                }
+                return [globalThis.__fragmentScriptRuns, externalFetches];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([0, 0]));
+    }
+
+    #[test]
+    fn connected_insertion_prepares_dynamic_script_subtrees_once() {
+        let mut rt = setup_runtime("<html><head></head><body><i id=anchor></i></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                var scriptTestSetup = true;
+                globalThis.__dynamicScriptRuns = [];
+
+                const detached = document.createElement("div");
+                const delayed = document.createElement("script");
+                delayed.textContent = "globalThis.__dynamicScriptRuns.push('delayed')";
+                detached.appendChild(delayed);
+                const beforeConnection = globalThis.__dynamicScriptRuns.length;
+                document.body.appendChild(detached);
+                document.head.appendChild(delayed);
+
+                const before = document.createElement("script");
+                before.textContent = "globalThis.__dynamicScriptRuns.push('before')";
+                document.body.insertBefore(before, document.getElementById("anchor"));
+
+                const replacement = document.createElement("script");
+                replacement.textContent = "globalThis.__dynamicScriptRuns.push('replace')";
+                document.body.replaceChild(replacement, document.getElementById("anchor"));
+
+                const subtree = document.createElement("section");
+                const nested = document.createElement("script");
+                nested.textContent = "globalThis.__dynamicScriptRuns.push('nested')";
+                subtree.appendChild(nested);
+                document.body.appendChild(subtree);
+
+                return [beforeConnection, globalThis.__dynamicScriptRuns];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([0, ["delayed", "before", "replace", "nested"]])
+        );
+    }
+
+    #[test]
+    fn script_clone_preserves_started_state() {
+        let mut rt = setup_runtime(
+            "<html><head></head><body><script id=parser>globalThis.__cloneScriptRuns++</script></body></html>",
+        );
+        let result = rt
+            .evaluate(
+                r#"
+                var scriptTestSetup = true;
+                globalThis.__cloneScriptRuns = 0;
+                const parser = document.getElementById("parser");
+                globalThis.__markParserScripts([parser._nid]);
+                document.head.appendChild(parser);
+                document.body.appendChild(parser.cloneNode(true));
+
+                const dynamic = document.createElement("script");
+                dynamic.textContent = "globalThis.__cloneScriptRuns++";
+                document.body.appendChild(dynamic);
+                document.body.appendChild(dynamic.cloneNode(true));
+
+                const holder = document.createElement("div");
+                holder.innerHTML = "<script>globalThis.__cloneScriptRuns++<\/script>";
+                document.body.appendChild(holder.firstChild.cloneNode(true));
+
+                const fragment = document.createDocumentFragment();
+                fragment.appendChild(dynamic.cloneNode(true));
+                document.body.appendChild(fragment.cloneNode(true));
+                return globalThis.__cloneScriptRuns;
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!(1.0));
+    }
+
+    #[test]
+    fn contextual_fragment_and_document_write_keep_executable_script_policy() {
+        let mut rt = setup_runtime("<html><head></head><body><div id=context></div></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                var scriptTestSetup = true;
+                globalThis.__executableFragmentRuns = [];
+                const range = document.createRange();
+                range.selectNode(document.getElementById("context"));
+                const fragment = range.createContextualFragment(
+                    "<template><script>globalThis.__executableFragmentRuns.push('template')<\/script></template>" +
+                    "<script>globalThis.__executableFragmentRuns.push('range')<\/script>"
+                );
+                document.body.appendChild(fragment);
+                document.write(
+                    "<script>globalThis.__executableFragmentRuns.push('write')<\/script>"
+                );
+                return globalThis.__executableFragmentRuns;
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!(["range", "write"]));
     }
 }

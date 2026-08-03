@@ -86,6 +86,7 @@ const _DOM_MUTATION_COMMANDS = new Set([
   "append_child", "insert_before", "remove_child",
   "set_attribute", "remove_attribute",
   "set_text_content", "set_inner_html", "set_inner_html_context",
+  "set_fragment_html_executable",
   "create_element", "create_text_node", "create_comment_node",
   "create_document_fragment", "clone_node",
 ]);
@@ -239,13 +240,11 @@ function _decodeDataScriptUrl(url) {
   }
   return new TextDecoder().decode(new Uint8Array(bytes));
 }
-// A script element executes at most once. Parser-discovered scripts are marked
-// before page execution starts, and dynamically inserted scripts are marked
-// when they are queued. Framework hydration may move existing <script> nodes;
-// moving one must not execute its source or inline body a second time.
-let __startedScriptNids = new Set();
+// A script element executes at most once.  The authoritative flag lives in
+// native per-document state so it survives wrapper churn, fragment parsing,
+// moves, and cloneNode().
 globalThis.__markParserScripts = function(nids) {
-  for (const nid of nids || []) __startedScriptNids.add(+nid);
+  for (const nid of nids || []) Deno.core.ops.op_script_mark_started(+nid);
 };
 async function __processDynScriptQueue() {
   if (__dynScriptBusy) return;
@@ -1054,6 +1053,111 @@ function _eventTargetDispatch(target, event) {
 // browser custom-element implementations.
 const _customElementConstructionStack = [];
 
+function __prepareInsertedScript(script) {
+  if (!Deno.core.ops.op_script_try_start(script._nid)) return;
+  const scriptType = (script.getAttribute('type') || '').trim().toLowerCase();
+  const isModule = scriptType === 'module';
+  const isImportMap = scriptType === 'importmap';
+  if (isImportMap) {
+    const src = script.getAttribute('src');
+    let error = '';
+    if (src) {
+      error = 'External import maps are not supported';
+    } else {
+      const base = script.baseURI
+        || globalThis.location?.href
+        || 'about:blank';
+      try {
+        error = Deno.core.ops.op_add_import_map(script.textContent || '', base) || '';
+      } catch (e) {
+        error = e && e.message ? e.message : String(e);
+      }
+    }
+    if (error) {
+      console.error('Import map error:', error);
+      queueMicrotask(() => {
+        try { script.dispatchEvent(new Event('error')); } catch (_) {}
+      });
+    }
+    return;
+  }
+  if (scriptType && !isModule && scriptType !== 'text/javascript' && scriptType !== 'application/javascript') {
+    return;
+  }
+  const src = script.getAttribute('src');
+  const code = src ? "" : script.textContent;
+  if (!src && !code) return;
+  const prevNid = globalThis.__currentScriptNid;
+  if (src) {
+    let baseHref;
+    try {
+      const baseEl = globalThis.document?.querySelector('base[href]');
+      baseHref = baseEl ? baseEl.getAttribute('href') : null;
+    } catch(e) { baseHref = null; }
+    const docUrl = globalThis.location?.href || 'http://localhost/';
+    let baseUrl;
+    try { baseUrl = baseHref ? new URL(baseHref, docUrl).href : docUrl; }
+    catch(e) { baseUrl = docUrl; }
+    let fullUrl;
+    try {
+      fullUrl = src.startsWith('http') || src.startsWith('data:')
+        ? src
+        : new URL(src, baseUrl).href;
+    } catch(e) {
+      console.error('Dynamic script URL resolve failed (' + src + '):', e.message);
+      fullUrl = src;
+    }
+    const pageOrigin = (function() { try { return new URL(baseUrl).origin; } catch(e) { return ""; } })();
+    __dynScriptQueue.push({
+      url: fullUrl,
+      isModule,
+      nid: script._nid,
+      prevNid,
+      pageOrigin,
+      dispatchEvent: (ev) => { try { script.dispatchEvent(ev); } catch(e) {} },
+    });
+    __processDynScriptQueue();
+  } else if (isModule) {
+    const dataUrl = 'data:text/javascript;base64,' + btoa(unescape(encodeURIComponent(code)));
+    __dynScriptQueue.push({
+      url: dataUrl,
+      isModule: true,
+      nid: script._nid,
+      prevNid,
+      pageOrigin: "",
+      dispatchEvent: (ev) => { try { script.dispatchEvent(ev); } catch(e) {} },
+    });
+    __processDynScriptQueue();
+  } else {
+    globalThis.__currentScriptNid = script._nid;
+    try { (0, eval)(code); }
+    catch(e) { console.error('Dynamic inline script error:', e.message); }
+    finally { globalThis.__currentScriptNid = prevNid || 0; }
+  }
+}
+
+function __prepareInsertedSubtree(root) {
+  // HTML's script preparation algorithm leaves a disconnected script
+  // unstarted.  When an ancestor is later connected, insertion steps visit
+  // every script in that subtree in tree order.
+  if (!root || !root.isConnected) return;
+  const scripts = [];
+  const seen = new Set();
+  if (root.nodeType === 1 && root.tagName === 'SCRIPT') {
+    scripts.push(root);
+    seen.add(root._nid);
+  }
+  const ids = _domParse("query_selector_all_scoped", root._nid, "script") || [];
+  for (const nid of ids) {
+    const script = _wrapEl(+nid);
+    if (script && !seen.has(script._nid)) {
+      scripts.push(script);
+      seen.add(script._nid);
+    }
+  }
+  for (const script of scripts) __prepareInsertedScript(script);
+}
+
 class Node {
   static ELEMENT_NODE = 1;
   static ATTRIBUTE_NODE = 2;
@@ -1157,99 +1261,7 @@ class Node {
     if (c._shadowParent) c._shadowParent.removeChild(c);
     _dom("append_child", this._nid, c._nid);
     if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('childList', this._nid, [c._nid], []);
-    if (c instanceof Element && c.tagName === 'SCRIPT') {
-      if (__startedScriptNids.has(c._nid)) return c;
-      const scriptType = (c.getAttribute('type') || '').trim().toLowerCase();
-      const isModule = scriptType === 'module';
-      const isImportMap = scriptType === 'importmap';
-      if (isImportMap) {
-        __startedScriptNids.add(c._nid);
-        const src = c.getAttribute('src');
-        let error = '';
-        if (src) {
-          error = 'External import maps are not supported';
-        } else {
-          const base = c.baseURI
-            || globalThis.location?.href
-            || 'about:blank';
-          try {
-            error = Deno.core.ops.op_add_import_map(c.textContent || '', base) || '';
-          } catch (e) {
-            error = e && e.message ? e.message : String(e);
-          }
-        }
-        if (error) {
-          console.error('Import map error:', error);
-          queueMicrotask(() => {
-            try { c.dispatchEvent(new Event('error')); } catch (_) {}
-          });
-        }
-        return c;
-      }
-      if (scriptType && !isModule && scriptType !== 'text/javascript' && scriptType !== 'application/javascript') {
-        return c;
-      }
-      const src = c.getAttribute('src');
-      const code = src ? "" : c.textContent;
-      if (!src && !code) return c;
-      __startedScriptNids.add(c._nid);
-      const prevNid = globalThis.__currentScriptNid;
-      if (src) {
-        // Resolve against <base href> when present, else the document URL.
-        // The base href is resolved to an absolute URL first: a bare path like
-        // <base href="/"> (the common Angular form) is not a valid URL base on
-        // its own and would otherwise throw. Both the base and the final
-        // resolution are guarded so a bad value can never escape appendChild.
-        let baseHref;
-        try {
-          const baseEl = globalThis.document?.querySelector('base[href]');
-          baseHref = baseEl ? baseEl.getAttribute('href') : null;
-        } catch(e) { baseHref = null; }
-        const docUrl = globalThis.location?.href || 'http://localhost/';
-        let baseUrl;
-        try { baseUrl = baseHref ? new URL(baseHref, docUrl).href : docUrl; }
-        catch(e) { baseUrl = docUrl; }
-        let fullUrl;
-        try {
-          fullUrl = src.startsWith('http') || src.startsWith('data:')
-            ? src
-            : new URL(src, baseUrl).href;
-        } catch(e) {
-          console.error('Dynamic script URL resolve failed (' + src + '):', e.message);
-          fullUrl = src;
-        }
-        const pageOrigin = (function() { try { return new URL(baseUrl).origin; } catch(e) { return ""; } })();
-        // Enqueue — serialized via __processDynScriptQueue to prevent
-        // concurrent import() calls from triggering deno_core RefCell panic.
-        __dynScriptQueue.push({
-          url: fullUrl,
-          isModule,
-          nid: c._nid,
-          prevNid,
-          pageOrigin,
-          dispatchEvent: (ev) => { try { c.dispatchEvent(ev); } catch(e) {} },
-        });
-        __processDynScriptQueue();
-      } else {
-        if (isModule) {
-          const dataUrl = 'data:text/javascript;base64,' + btoa(unescape(encodeURIComponent(code)));
-          __dynScriptQueue.push({
-            url: dataUrl,
-            isModule: true,
-            nid: c._nid,
-            prevNid,
-            pageOrigin: "",
-            dispatchEvent: (ev) => { try { c.dispatchEvent(ev); } catch(e) {} },
-          });
-          __processDynScriptQueue();
-        } else {
-          globalThis.__currentScriptNid = c._nid;
-          try { (0, eval)(code); }
-          catch(e) { console.error('Dynamic inline script error:', e.message); }
-          finally { globalThis.__currentScriptNid = prevNid || 0; }
-        }
-      }
-    }
+    __prepareInsertedSubtree(c);
     if (c instanceof Element && c.tagName === 'LINK') {
       _loadLinkedStylesheet(c);
     }
@@ -1279,6 +1291,7 @@ class Node {
     if (newChild._shadowParent) newChild._shadowParent.removeChild(newChild);
     _dom("insert_before", newChild._nid, oldChild._nid);
     _dom("remove_child", oldChild._nid);
+    __prepareInsertedSubtree(newChild);
     return oldChild;
   }
   insertBefore(n, ref) {
@@ -1291,6 +1304,7 @@ class Node {
     }
     if (n._shadowParent) n._shadowParent.removeChild(n);
     _dom("insert_before", n._nid, ref._nid);
+    __prepareInsertedSubtree(n);
     return n;
   }
   contains(o) { return o ? _dom("contains", this._nid, o._nid) === "true" : false; }
@@ -3894,9 +3908,9 @@ class Document extends Node {
     if (!html) return;
     var body = this.body;
     if (!body) return;
-    var temp = this.createElement('div');
-    temp.innerHTML = html;
-    var children = temp.childNodes;
+    var temp = this.createDocumentFragment();
+    _dom("set_fragment_html_executable", temp._nid, "body\0" + html);
+    var children = Array.from(temp.childNodes);
     for (var i = 0; i < children.length; i++) {
       body.appendChild(children[i]);
     }
@@ -3955,8 +3969,9 @@ class DocumentFragment extends Node {
     return null;
   }
   cloneNode(deep) {
-    const frag = document.createDocumentFragment();
-    if (deep) frag.innerHTML = this.innerHTML;
+    const nid = +_dom("clone_node", this._nid, deep ? "true" : "false");
+    const frag = new DocumentFragment(nid);
+    _cache.set(nid, frag);
     return frag;
   }
 }
@@ -8342,7 +8357,11 @@ globalThis.Range = class Range {
     const node = this._sc;
     const ownerDoc = (node && node.ownerDocument) || globalThis.document;
     const frag = ownerDoc.createDocumentFragment();
-    frag.innerHTML = String(html);
+    let context = node;
+    if (context && context.nodeType !== 1) context = context.parentElement;
+    let contextName = (context && context.localName) || 'body';
+    if (contextName === 'html') contextName = 'body';
+    _dom("set_fragment_html_executable", frag._nid, contextName + "\0" + String(html));
     return frag;
   }
   toString() {
@@ -10922,7 +10941,6 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
 globalThis.__obscura_init = function() {
   _fpSeed = Date.now() ^ (Math.random() * 0xFFFFFFFF >>> 0);
   _fpCache = null;
-  __startedScriptNids.clear();
   // A real navigation just completed (this runs after set_url), so drop any
   // URL a location setter previewed synchronously and let document_url drive
   // location.href again, including any redirect target.

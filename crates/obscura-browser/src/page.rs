@@ -197,6 +197,10 @@ pub struct Page {
     // contract. Includes `Runtime.addBinding` shims so puppeteer's
     // `exposeFunction` bindings exist before inline `<script>` tags execute.
     preload_scripts: Vec<String>,
+    /// Document-owned HTML script preparation flags saved while the V8 realm
+    /// is suspended for CDP/MCP tab switching.  These are restored only when
+    /// the same surviving DomTree is resumed; navigation clears them.
+    suspended_started_script_ids: Vec<u32>,
     /// Passive on_request/on_response callbacks, scoped to this page (issue
     /// #408): they fire only for requests this page drives and die with it.
     /// Arc because the JS runtime state holds a second handle for fetch()/XHR.
@@ -677,6 +681,7 @@ impl Page {
             blocked_url_patterns: Vec::new(),
             intercept_tx: None,
             preload_scripts: Vec::new(),
+            suspended_started_script_ids: Vec::new(),
             callbacks: Arc::new(CallbackRegistry::new()),
             #[cfg(feature = "stealth")]
             stealth_client,
@@ -726,6 +731,11 @@ impl Page {
             .await
     }
     fn init_js(&mut self) {
+        // init_js is also the new-document path.  Only resume_js explicitly
+        // takes these IDs out before entering here and restores them after the
+        // same DomTree is installed; a navigation must never inherit IDs from
+        // a suspended prior document whose allocator may reuse them.
+        self.suspended_started_script_ids.clear();
         // Drop any existing runtime so the JS realm starts clean on
         // every navigation. The old code reused the V8 isolate and
         // only re-bound `globalThis.document`, leaving window.onload,
@@ -2332,10 +2342,16 @@ impl Page {
     }
 
     pub fn suspend_js(&mut self) {
-        if let Some(js) = &self.js {
-            if let Some(dom) = js.take_dom() {
-                self.dom = Some(dom);
-            }
+        let Some(js) = &self.js else {
+            return;
+        };
+        let started_script_ids = js.started_script_ids();
+        let dom = js.take_dom();
+        if let Some(dom) = dom {
+            self.dom = Some(dom);
+            self.suspended_started_script_ids = started_script_ids;
+        } else {
+            self.suspended_started_script_ids.clear();
         }
         self.js = None;
     }
@@ -2344,7 +2360,11 @@ impl Page {
         if self.js.is_some() {
             return;
         }
+        let started_script_ids = std::mem::take(&mut self.suspended_started_script_ids);
         self.init_js();
+        if let Some(js) = &self.js {
+            js.restore_started_script_ids(&started_script_ids);
+        }
     }
 
     pub fn has_js(&self) -> bool {
@@ -2551,6 +2571,113 @@ mod tests {
         assert!(!script_response_is_executable(401));
         assert!(!script_response_is_executable(404));
         assert!(!script_response_is_executable(500));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn suspend_resume_preserves_document_script_start_state() {
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "script-state-suspend".to_string(), None, false, None, None, true,
+        ));
+        let mut page = super::Page::new("script-state-suspend".to_string(), context);
+        page.url = Some(url::Url::parse("http://example.com/suspend.html").unwrap());
+        page.dom = Some(parse_html(
+            r#"<html><head></head><body data-parser-runs="0" data-dynamic-runs="0" data-inert-runs="0">
+            <script id="parser">
+              document.body.setAttribute("data-parser-runs", String(Number(document.body.getAttribute("data-parser-runs")) + 1));
+            </script>
+            </body></html>"#,
+        ));
+        page.init_js();
+        page.execute_scripts().await;
+
+        let before = page
+            .js
+            .as_mut()
+            .unwrap()
+            .evaluate(
+                r#"
+                var scriptStateSetup = true;
+                const dynamic = document.createElement("script");
+                dynamic.id = "dynamic";
+                dynamic.textContent =
+                  'document.body.setAttribute("data-dynamic-runs", String(Number(document.body.getAttribute("data-dynamic-runs")) + 1))';
+                document.body.appendChild(dynamic);
+
+                const holder = document.createElement("div");
+                holder.innerHTML =
+                  '<script id="inert">document.body.setAttribute("data-inert-runs", String(Number(document.body.getAttribute("data-inert-runs")) + 1))<\/script>';
+                document.body.appendChild(holder.firstChild);
+                return [
+                  document.body.getAttribute("data-parser-runs"),
+                  document.body.getAttribute("data-dynamic-runs"),
+                  document.body.getAttribute("data-inert-runs")
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(before, serde_json::json!(["1", "1", "0"]));
+
+        page.suspend_js();
+        page.suspend_js();
+        page.resume_js();
+
+        let after = page
+            .js
+            .as_mut()
+            .unwrap()
+            .evaluate(
+                r#"
+                var scriptStateCheck = true;
+                for (const id of ["parser", "dynamic", "inert"]) {
+                  const script = document.getElementById(id);
+                  document.head.appendChild(script);
+                  document.body.appendChild(script.cloneNode(true));
+                }
+                return [
+                  document.body.getAttribute("data-parser-runs"),
+                  document.body.getAttribute("data-dynamic-runs"),
+                  document.body.getAttribute("data-inert-runs")
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(after, serde_json::json!(["1", "1", "0"]));
+    }
+
+    #[test]
+    fn new_document_does_not_inherit_suspended_script_ids() {
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "script-state-navigation".to_string(), None, false, None, None, true,
+        ));
+        let mut page = super::Page::new("script-state-navigation".to_string(), context);
+        page.url = Some(url::Url::parse("http://example.com/old.html").unwrap());
+        page.dom = Some(parse_html(
+            "<html><head></head><body><script id=old></script></body></html>",
+        ));
+        page.init_js();
+        page.js
+            .as_mut()
+            .unwrap()
+            .evaluate(
+                "var setup = true; const old = document.getElementById('old'); globalThis.__markParserScripts([old._nid]); return old._nid;",
+            )
+            .unwrap();
+        page.suspend_js();
+
+        page.url = Some(url::Url::parse("http://example.com/new.html").unwrap());
+        page.dom = Some(parse_html(
+            "<html><head></head><body data-fresh-runs=0><script id=fresh>document.body.setAttribute('data-fresh-runs', '1')</script></body></html>",
+        ));
+        page.init_js();
+        let result = page
+            .js
+            .as_mut()
+            .unwrap()
+            .evaluate(
+                "var check = true; document.head.appendChild(document.getElementById('fresh')); return document.body.getAttribute('data-fresh-runs');",
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!("1"));
     }
 
     fn import_map_test_page(name: &str, base: &str, html: &str) -> super::Page {

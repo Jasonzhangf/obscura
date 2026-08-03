@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -128,6 +128,10 @@ pub struct ObscuraState {
     /// Window-global import-map state shared by parser-discovered scripts,
     /// dynamically inserted import maps, and the module loader.
     pub(crate) import_map: Rc<RefCell<ImportMap>>,
+    /// HTML's per-script "already started" flag.  This is native page state,
+    /// rather than wrapper state, because it must survive moves and clones and
+    /// because fragment parsing can create nodes before a JS wrapper exists.
+    pub(crate) already_started_scripts: RefCell<HashSet<NodeId>>,
 }
 
 impl ObscuraState {
@@ -164,8 +168,92 @@ impl ObscuraState {
             #[cfg(feature = "render")]
             scroll_offset: (0.0, 0.0),
             import_map: Rc::new(RefCell::new(ImportMap::default())),
+            already_started_scripts: RefCell::new(HashSet::new()),
         }
     }
+}
+
+pub(crate) fn node_is_script(dom: &DomTree, node_id: NodeId) -> bool {
+    dom.with_node(node_id, |node| {
+        node.as_element()
+            .map(|name| name.local.as_ref().eq_ignore_ascii_case("script"))
+            .unwrap_or(false)
+    })
+    .unwrap_or(false)
+}
+
+fn script_nodes_including_template_contents(dom: &DomTree, root: NodeId) -> Vec<NodeId> {
+    let mut scripts = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node_id) = stack.pop() {
+        if node_is_script(dom, node_id) {
+            scripts.push(node_id);
+        }
+        let template_contents = dom
+            .with_node(node_id, |node| match &node.data {
+                NodeData::Element { template_contents, .. } => *template_contents,
+                _ => None,
+            })
+            .flatten();
+        if let Some(contents) = template_contents {
+            stack.push(contents);
+        }
+        let children = dom.children(node_id);
+        for child in children.into_iter().rev() {
+            stack.push(child);
+        }
+    }
+    scripts
+}
+
+pub(crate) fn mark_script_subtree_started(state: &ObscuraState, root: NodeId) {
+    let Some(dom) = state.dom.as_ref() else {
+        return;
+    };
+    let scripts = script_nodes_including_template_contents(dom, root);
+    state.already_started_scripts.borrow_mut().extend(scripts);
+}
+
+fn propagate_script_start_state(
+    dom: &DomTree,
+    source_root: NodeId,
+    cloned_root: NodeId,
+    started: &RefCell<HashSet<NodeId>>,
+) {
+    let mut pairs = vec![(source_root, cloned_root)];
+    let mut additions = Vec::new();
+    let current = started.borrow();
+    while let Some((source, cloned)) = pairs.pop() {
+        if current.contains(&source) {
+            additions.push(cloned);
+        }
+
+        let source_template = dom
+            .with_node(source, |node| match &node.data {
+                NodeData::Element { template_contents, .. } => *template_contents,
+                _ => None,
+            })
+            .flatten();
+        let cloned_template = dom
+            .with_node(cloned, |node| match &node.data {
+                NodeData::Element { template_contents, .. } => *template_contents,
+                _ => None,
+            })
+            .flatten();
+        if let (Some(source_contents), Some(cloned_contents)) =
+            (source_template, cloned_template)
+        {
+            pairs.push((source_contents, cloned_contents));
+        }
+
+        let source_children = dom.children(source);
+        let cloned_children = dom.children(cloned);
+        for pair in source_children.into_iter().zip(cloned_children).rev() {
+            pairs.push(pair);
+        }
+    }
+    drop(current);
+    started.borrow_mut().extend(additions);
 }
 
 fn response_body_entry_limit() -> usize {
@@ -183,6 +271,38 @@ fn response_body_byte_limit() -> usize {
 }
 
 pub type SharedState = Rc<RefCell<ObscuraState>>;
+
+#[op2(fast)]
+fn op_script_mark_started(state: &OpState, nid: u32) -> bool {
+    let shared = state.borrow::<SharedState>().clone();
+    let state = shared.borrow();
+    let Some(dom) = state.dom.as_ref() else {
+        return false;
+    };
+    let node_id = NodeId::new(nid);
+    if !node_is_script(dom, node_id) {
+        return false;
+    }
+    state.already_started_scripts.borrow_mut().insert(node_id);
+    true
+}
+
+/// Atomically claim an executable script.  A false result means the node was
+/// created inert by an HTML-string API or has already been prepared once.
+#[op2(fast)]
+fn op_script_try_start(state: &OpState, nid: u32) -> bool {
+    let shared = state.borrow::<SharedState>().clone();
+    let state = shared.borrow();
+    let Some(dom) = state.dom.as_ref() else {
+        return false;
+    };
+    let node_id = NodeId::new(nid);
+    if !node_is_script(dom, node_id) {
+        return false;
+    }
+    let newly_started = state.already_started_scripts.borrow_mut().insert(node_id);
+    newly_started
+}
 
 #[op2]
 #[string]
@@ -491,6 +611,9 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                 };
                 let import_root = fragment.fragment_root();
                 dom.import_children_from(target, &fragment, import_root);
+                for child in dom.children(target) {
+                    mark_script_subtree_started(&gs, child);
+                }
             }
             "true".into()
         }
@@ -514,6 +637,32 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                 );
                 let fragment = obscura_dom::parse_fragment_with_context(html, context_name);
                 let import_root = fragment.fragment_root();
+                dom.import_children_from(target, &fragment, import_root);
+                for child in dom.children(target) {
+                    mark_script_subtree_started(&gs, child);
+                }
+            }
+            "true".into()
+        }
+        // Range.createContextualFragment has a deliberately different script
+        // policy from innerHTML: scripts remain eligible and are prepared when
+        // the returned fragment is inserted into a connected document.
+        "set_fragment_html_executable" => {
+            let nid = match arg1.parse::<u32>() {
+                Ok(n) if n > 0 => n,
+                _ => return "false".into(),
+            };
+            let target = NodeId::new(nid);
+            let (context, html) = arg2
+                .split_once('\0')
+                .unwrap_or(("body", arg2.as_str()));
+            for child in dom.children(target) {
+                dom.detach(child);
+            }
+            if !html.is_empty() {
+                let fragment =
+                    obscura_dom::parse_fragment_with_context(html, context);
+                let import_root = fragment.find_body_or_root();
                 dom.import_children_from(target, &fragment, import_root);
             }
             "true".into()
@@ -547,9 +696,19 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                 Ok(n) => n,
                 Err(_) => return "-1".into(),
             };
-            dom.clone_node(NodeId::new(nid), arg2 == "true")
-                .map(|id| id.index().to_string())
-                .unwrap_or("-1".into())
+            let source = NodeId::new(nid);
+            match dom.clone_node(source, arg2 == "true") {
+                Some(cloned) => {
+                    propagate_script_start_state(
+                        dom,
+                        source,
+                        cloned,
+                        &gs.already_started_scripts,
+                    );
+                    cloned.index().to_string()
+                }
+                None => "-1".into(),
+            }
         }
         "create_element" => {
             dom.new_node(NodeData::Element {
@@ -2265,6 +2424,8 @@ fn op_set_dynamic_fonts(state: &OpState, #[string] registrations: &str) -> bool 
 pub fn build_extension() -> Extension {
     let mut ops = vec![
         op_dom(),
+        op_script_mark_started(),
+        op_script_try_start(),
         op_console_msg(),
         op_fetch_url(),
         op_get_cookies(),
