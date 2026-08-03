@@ -10346,6 +10346,57 @@ mod tests {
     }
 
     #[test]
+    fn overflowing_grid_item_auto_margins_use_safe_logical_start() {
+        let tree = parse_html(
+            r#"<style>
+                html,body{margin:0}
+                .grid{display:grid;grid-template-columns:300px;grid-template-rows:20px;width:300px;position:relative}
+                .item{height:20px}
+                .wide{width:600px;height:1px}
+                .left{margin-left:auto}
+                .both{margin-left:auto;margin-right:auto}
+                .center{justify-self:center}
+                .end{justify-self:end}
+                .absolute{position:absolute;grid-area:1/1;width:600px;height:20px}
+            </style>
+            <div id="ltr-center-grid" class="grid"><div id="ltr-center" class="item left center"><div class="wide"></div></div></div>
+            <div id="ltr-end-grid" class="grid"><div id="ltr-end" class="item both end"><div class="wide"></div></div></div>
+            <div id="absolute-center-grid" class="grid"><div id="absolute-center" class="absolute left center"></div></div>
+            <div id="absolute-end-grid" class="grid"><div id="absolute-end" class="absolute left end"></div></div>"#,
+        );
+        let laid = layout_dom(&tree, (800.0, 300.0));
+        let rect = |id: &str| laid.rects[&tree.get_element_by_id(id).unwrap()];
+
+        for (grid_id, item_id, expected_x) in [
+            ("ltr-center-grid", "ltr-center", 0.0),
+            ("ltr-end-grid", "ltr-end", 0.0),
+        ] {
+            let grid = rect(grid_id);
+            let item = rect(item_id);
+            assert!(
+                (item.width - 600.0).abs() < 0.01,
+                "{item_id} lost its min-content floor: {item:?}"
+            );
+            assert!(
+                (item.x - grid.x - expected_x).abs() < 0.01,
+                "{item_id} did not use safe logical-start overflow: grid={grid:?} item={item:?}"
+            );
+        }
+
+        for (grid_id, item_id, expected_x) in [
+            ("absolute-center-grid", "absolute-center", -150.0),
+            ("absolute-end-grid", "absolute-end", -300.0),
+        ] {
+            let grid = rect(grid_id);
+            let item = rect(item_id);
+            assert!(
+                (item.x - grid.x - expected_x).abs() < 0.01,
+                "{item_id} incorrectly used the in-flow auto-margin fallback: grid={grid:?} item={item:?}"
+            );
+        }
+    }
+
+    #[test]
     fn root_and_body_inline_outer_geometry_matches_blockification_rules() {
         for display in ["inline-block", "inline-flex", "inline-grid"] {
             let tree = parse_html(&format!(

@@ -370,7 +370,20 @@ pub(super) fn align_item_within_area(
     };
 
     let overflows = resolved_size + non_auto_margin.sum() > grid_area_size;
-    let alignment_keyword = resolve_self_alignment_safety(alignment_style, overflows);
+    // In-flow auto margins take precedence over self-alignment and are always
+    // safe. When the item overflows there is no positive free space for the
+    // auto margins to absorb, so safe alignment falls back to the logical
+    // start edge rather than honoring an authored unsafe center/end alignment.
+    // Absolutely positioned items use their authored self-alignment here;
+    // their auto margins are resolved by the abs-pos constraint equation.
+    let alignment_keyword = if position != Position::Absolute
+        && auto_margin_count > 0
+        && overflows
+    {
+        AlignItemsKeyword::Start
+    } else {
+        resolve_self_alignment_safety(alignment_style, overflows)
+    };
 
     // Compute offset in the axis
     let alignment_based_offset = match alignment_keyword {
@@ -611,5 +624,70 @@ mod tests {
             BoxSizing::ContentBox,
         );
         assert_eq!(content_box_max, 290.0);
+    }
+
+    #[test]
+    fn overflowing_auto_margins_override_unsafe_self_alignment() {
+        let area = Line { start: 0.0, end: 300.0 };
+        let oversized = 600.0;
+        let margin_cases = [
+            Line { start: None, end: Some(0.0) },
+            Line { start: Some(0.0), end: None },
+            Line { start: None, end: None },
+        ];
+
+        for alignment in [AlignSelf::CENTER, AlignSelf::END] {
+            for margin in margin_cases {
+                let (ltr_start, ltr_margin) = super::align_item_within_area(
+                    area,
+                    alignment,
+                    oversized,
+                    Position::Relative,
+                    Line { start: None, end: None },
+                    margin,
+                    0.0,
+                    crate::Direction::Ltr,
+                );
+                assert_eq!(ltr_start, 0.0);
+                assert_eq!(ltr_margin, Line { start: 0.0, end: 0.0 });
+
+                let (rtl_start, rtl_margin) = super::align_item_within_area(
+                    area,
+                    alignment,
+                    oversized,
+                    Position::Relative,
+                    Line { start: None, end: None },
+                    margin,
+                    0.0,
+                    crate::Direction::Rtl,
+                );
+                assert_eq!(rtl_start, -300.0);
+                assert_eq!(rtl_margin, Line { start: 0.0, end: 0.0 });
+            }
+        }
+
+        let (absolute_center, _) = super::align_item_within_area(
+            area,
+            AlignSelf::CENTER,
+            oversized,
+            Position::Absolute,
+            Line { start: None, end: None },
+            Line { start: None, end: Some(0.0) },
+            0.0,
+            crate::Direction::Ltr,
+        );
+        assert_eq!(absolute_center, -150.0);
+
+        let (absolute_end, _) = super::align_item_within_area(
+            area,
+            AlignSelf::END,
+            oversized,
+            Position::Absolute,
+            Line { start: None, end: None },
+            Line { start: None, end: Some(0.0) },
+            0.0,
+            crate::Direction::Ltr,
+        );
+        assert_eq!(absolute_end, -300.0);
     }
 }
