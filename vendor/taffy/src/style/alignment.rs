@@ -20,6 +20,8 @@ use crate::util::parse::{CssParseResult, FromCss, Parser, Token};
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[repr(u8)]
 pub enum AlignItemsKeyword {
+    /// Use the layout mode's normal alignment behavior.
+    Normal,
     /// Items are packed toward the start of the axis.
     Start,
     /// Items are packed toward the end of the axis.
@@ -131,6 +133,8 @@ pub struct AlignItems {
 }
 
 impl AlignItems {
+    /// Use the layout mode's normal alignment behavior.
+    pub const NORMAL: Self = Self { keyword: AlignItemsKeyword::Normal, safety: AlignmentSafety::Unsafe };
     /// Items are packed toward the start of the axis.
     pub const START: Self = Self { keyword: AlignItemsKeyword::Start, safety: AlignmentSafety::Unsafe };
     /// Items are packed toward the end of the axis.
@@ -172,6 +176,12 @@ impl AlignItems {
     pub const fn keyword(self) -> AlignItemsKeyword {
         self.keyword
     }
+
+    /// Resolve the context-dependent `normal` keyword to its used alignment.
+    #[inline]
+    pub const fn resolve_normal(self, normal: Self) -> Self {
+        if matches!(self.keyword, AlignItemsKeyword::Normal) { normal } else { self }
+    }
 }
 
 #[cfg(feature = "parse")]
@@ -201,6 +211,7 @@ impl FromCss for AlignItems {
                     _ => Err(input.new_unexpected_token_error(Token::Ident(pos))),
                 }
             },
+            "normal" => Ok(Self::NORMAL),
             "start" => Ok(Self::START),
             "end" => Ok(Self::END),
             "flex-start" => Ok(Self::FLEX_START),
@@ -362,6 +373,7 @@ pub type JustifyContent = AlignContent;
 /// `unknown_variant` errors. Mirrors the spellings produced by `Serialize`.
 #[cfg(feature = "serde")]
 const ALIGN_ITEMS_NAMES: &[&str] = &[
+    "Normal",
     "Start",
     "End",
     "FlexStart",
@@ -380,6 +392,7 @@ const ALIGN_ITEMS_NAMES: &[&str] = &[
 impl serde::Serialize for AlignItems {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let name = match (self.keyword, self.safety) {
+            (AlignItemsKeyword::Normal, _) => "Normal",
             (AlignItemsKeyword::Start, AlignmentSafety::Unsafe) => "Start",
             (AlignItemsKeyword::End, AlignmentSafety::Unsafe) => "End",
             (AlignItemsKeyword::FlexStart, AlignmentSafety::Unsafe) => "FlexStart",
@@ -408,6 +421,7 @@ impl<'de> serde::Deserialize<'de> for AlignItems {
             }
             fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
                 Ok(match v {
+                    "Normal" => AlignItems::NORMAL,
                     "Start" => AlignItems::START,
                     "End" => AlignItems::END,
                     "FlexStart" => AlignItems::FLEX_START,

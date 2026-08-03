@@ -3816,3 +3816,191 @@ fn closed_details_content_does_not_paint() {
         "closed details content must leave the page background untouched"
     );
 }
+
+#[test]
+fn grid_replaced_normal_and_explicit_stretch_match_browser_geometry() {
+    let tree = parse_html(
+        r#"
+        <style>
+          html, body { margin:0 }
+          .grid { display:grid; grid-template:200px / 300px; width:300px; height:200px }
+        </style>
+        <div class="grid"><img id="normal"></div>
+        <div class="grid"><img id="min-inline" style="min-width:50%"></div>
+        <div class="grid"><img id="min-block" style="min-height:50%"></div>
+        <div class="grid"><img id="normal-inline" style="justify-self:normal;min-width:50%"></div>
+        <div class="grid"><img id="start" style="justify-self:start;min-width:50%"></div>
+        <div class="grid"><img id="auto-margin" style="min-width:50%;margin-left:auto"></div>
+        <div class="grid"><img id="stretch-inline" style="justify-self:stretch"></div>
+        <div class="grid"><img id="stretch-block" style="align-self:stretch"></div>
+        <div class="grid"><img id="stretch-both" style="place-self:stretch"></div>
+        <div class="grid"><img id="definite-inline" style="width:120px;align-self:stretch"></div>
+        <div class="grid"><img id="definite-block" style="height:80px;justify-self:stretch"></div>
+        <div class="grid" style="justify-items:stretch"><img id="parent-stretch"></div>
+        <div class="grid" style="justify-items:normal"><img id="parent-normal" style="min-width:50%"></div>
+        <div class="grid"><img id="intrinsic-border-box" style="box-sizing:border-box;width:120px;padding:10px;border:5px solid"></div>
+        <div class="grid"><img id="intrinsic-content-box" style="box-sizing:content-box;width:120px;padding:10px;border:5px solid"></div>
+        <div class="grid"><img id="authored-border-box" style="box-sizing:border-box;width:120px;padding:10px;border:5px solid;aspect-ratio:1"></div>
+        <div class="grid"><img id="authored-content-box" style="box-sizing:content-box;width:120px;padding:10px;border:5px solid;aspect-ratio:1"></div>
+        <div class="grid"><img id="conflicting-min-inline" style="min-width:250px;max-height:80px"></div>
+        <div class="grid"><img id="conflicting-min-block" style="max-width:120px;min-height:100px"></div>
+        "#,
+    );
+    let ids = [
+        "normal",
+        "min-inline",
+        "min-block",
+        "normal-inline",
+        "start",
+        "auto-margin",
+        "stretch-inline",
+        "stretch-block",
+        "stretch-both",
+        "definite-inline",
+        "definite-block",
+        "parent-stretch",
+        "parent-normal",
+        "intrinsic-border-box",
+        "intrinsic-content-box",
+        "authored-border-box",
+        "authored-content-box",
+        "conflicting-min-inline",
+        "conflicting-min-block",
+    ];
+    let intrinsic: HashMap<_, _> = ids
+        .iter()
+        .map(|name| (tree.get_element_by_id(name).unwrap(), (100.0, 50.0)))
+        .collect();
+    let layout = layout_dom_with_images(&tree, (800.0, 3000.0), &intrinsic);
+    let rect = |name| layout.rects[&tree.get_element_by_id(name).unwrap()];
+    let size = |name| {
+        let rect = rect(name);
+        (rect.width, rect.height)
+    };
+
+    assert_eq!(size("normal"), (100.0, 50.0));
+    assert_eq!(size("min-inline"), (150.0, 75.0));
+    assert_eq!(size("min-block"), (200.0, 100.0));
+    assert_eq!(size("normal-inline"), (150.0, 75.0));
+    assert_eq!(size("start"), (150.0, 75.0));
+    assert_eq!(size("auto-margin"), (150.0, 75.0));
+    assert_eq!(size("stretch-inline"), (300.0, 150.0));
+    assert_eq!(size("stretch-block"), (400.0, 200.0));
+    assert_eq!(size("stretch-both"), (300.0, 200.0));
+    assert_eq!(size("definite-inline"), (120.0, 200.0));
+    assert_eq!(size("definite-block"), (300.0, 80.0));
+    assert_eq!(size("parent-stretch"), (300.0, 150.0));
+    assert_eq!(size("parent-normal"), (150.0, 75.0));
+    assert_eq!(size("intrinsic-border-box"), (120.0, 75.0));
+    assert_eq!(size("intrinsic-content-box"), (150.0, 90.0));
+    assert_eq!(size("authored-border-box"), (120.0, 120.0));
+    assert_eq!(size("authored-content-box"), (150.0, 150.0));
+    assert_eq!(size("conflicting-min-inline"), (250.0, 80.0));
+    assert_eq!(size("conflicting-min-block"), (120.0, 100.0));
+
+    let item = rect("auto-margin");
+    let parent = tree
+        .get_node(tree.get_element_by_id("auto-margin").unwrap())
+        .and_then(|node| node.parent)
+        .unwrap();
+    assert_eq!(item.x - layout.rects[&parent].x, 150.0);
+}
+
+#[test]
+fn grid_replaced_classification_keeps_controls_stretched_and_media_natural() {
+    let tree = parse_html(
+        r#"
+        <style>
+          html, body { margin:0 }
+          .grid { display:grid; grid-template:300px / 400px; width:400px; height:300px }
+        </style>
+        <div class="grid"><svg id="svg" viewBox="0 0 100 50"></svg></div>
+        <div class="grid"><svg id="svg-border-box" viewBox="0 0 100 50" style="box-sizing:border-box;width:120px;padding:10px;border:5px solid"></svg></div>
+        <div class="grid"><img id="mapped-border-box" width="100" height="50" style="box-sizing:border-box;width:120px;height:auto;padding:10px;border:5px solid"></div>
+        <div class="grid"><canvas id="canvas"></canvas></div>
+        <div class="grid"><video id="video"></video></div>
+        <div class="grid"><audio id="audio"></audio></div>
+        <div class="grid"><audio id="audio-controls" controls></audio></div>
+        <div class="grid"><iframe id="iframe"></iframe></div>
+        <div class="grid"><embed id="embed" src="about:blank"></embed></div>
+        <div class="grid"><embed id="empty-embed"></embed></div>
+        <div class="grid"><object id="object"></object></div>
+        <div class="grid"><progress id="progress"></progress></div>
+        <div class="grid"><meter id="meter"></meter></div>
+        <div class="grid"><input id="image-input" type="image" width="100" height="50"></div>
+        <div class="grid"><button id="button">Hi</button></div>
+        <div class="grid" id="auto-button-grid"><button id="auto-button" style="margin-left:auto">Hi</button></div>
+        <div class="grid"><input id="text-input"></div>
+        <div class="grid"><select id="select"><option>Hi</option></select></div>
+        "#,
+    );
+    let layout = layout_dom(&tree, (800.0, 5000.0));
+    let size = |name| {
+        let rect = layout.rects[&tree.get_element_by_id(name).unwrap()];
+        (rect.width, rect.height)
+    };
+
+    assert_eq!(size("svg"), (400.0, 200.0));
+    assert_eq!(size("svg-border-box"), (120.0, 75.0));
+    assert_eq!(size("mapped-border-box"), (120.0, 75.0));
+    for name in ["canvas", "video", "embed", "object"] {
+        assert_eq!(size(name), (300.0, 150.0), "{name}");
+    }
+    assert_eq!(size("iframe"), (304.0, 154.0));
+    assert_eq!(size("empty-embed"), (0.0, 0.0));
+    assert_eq!(size("audio"), (0.0, 0.0));
+    assert_eq!(size("audio-controls"), (300.0, 54.0));
+    assert_eq!(size("progress"), (160.0, 16.0));
+    assert_eq!(size("meter"), (80.0, 16.0));
+    assert_eq!(size("image-input"), (100.0, 50.0));
+    assert_eq!(
+        layout.styles[&tree.get_element_by_id("button").unwrap()].width,
+        obscura_render::Dimension::Auto,
+        "grid-normal stretch must preserve the button's auto inline size"
+    );
+    for name in ["button", "text-input", "select"] {
+        assert_eq!(size(name), (400.0, 300.0), "{name}");
+    }
+    let auto_button = layout.rects[&tree.get_element_by_id("auto-button").unwrap()];
+    let auto_button_grid = layout.rects[&tree.get_element_by_id("auto-button-grid").unwrap()];
+    assert!(auto_button.width > 20.0 && auto_button.width < 30.0);
+    assert_eq!(auto_button.height, 300.0);
+    assert_eq!(auto_button.x + auto_button.width, auto_button_grid.x + auto_button_grid.width);
+}
+
+#[test]
+fn grid_ordinary_aspect_ratio_preserves_normal_alignment_provenance() {
+    let tree = parse_html(
+        r#"
+        <style>
+          html, body { margin:0 }
+          .grid { display:grid; grid-template:200px / 300px; width:300px; height:200px }
+          .item { aspect-ratio:2 }
+        </style>
+        <div class="grid"><div class="item" id="normal"></div></div>
+        <div class="grid"><div class="item" id="align-stretch" style="align-self:stretch"></div></div>
+        <div class="grid"><div class="item" id="justify-stretch" style="justify-self:stretch"></div></div>
+        <div class="grid"><div class="item" id="both-stretch" style="place-self:stretch"></div></div>
+        <div class="grid"><div class="item" id="both-normal" style="place-self:normal"></div></div>
+        <div class="grid"><div class="item" id="align-start" style="align-self:start"></div></div>
+        <div class="grid"><div class="item" id="justify-start" style="justify-self:start"></div></div>
+        <div class="grid" style="align-items:stretch"><div class="item" id="parent-align-stretch"></div></div>
+        <div class="grid" style="justify-items:stretch"><div class="item" id="parent-justify-stretch"></div></div>
+        "#,
+    );
+    let layout = layout_dom(&tree, (800.0, 2000.0));
+    let size = |name| {
+        let rect = layout.rects[&tree.get_element_by_id(name).unwrap()];
+        (rect.width, rect.height)
+    };
+
+    assert_eq!(size("normal"), (300.0, 150.0));
+    assert_eq!(size("align-stretch"), (400.0, 200.0));
+    assert_eq!(size("justify-stretch"), (300.0, 150.0));
+    assert_eq!(size("both-stretch"), (300.0, 200.0));
+    assert_eq!(size("both-normal"), (300.0, 150.0));
+    assert_eq!(size("align-start"), (300.0, 150.0));
+    assert_eq!(size("justify-start"), (400.0, 200.0));
+    assert_eq!(size("parent-align-stretch"), (400.0, 200.0));
+    assert_eq!(size("parent-justify-stretch"), (300.0, 150.0));
+}

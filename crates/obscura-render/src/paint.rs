@@ -813,6 +813,7 @@ fn css_color([r, g, b, a]: [u8; 4]) -> String {
 
 fn align_items_css(value: taffy::AlignItems) -> String {
     let keyword = match value.keyword {
+        taffy::AlignItemsKeyword::Normal => "normal",
         taffy::AlignItemsKeyword::Start => "start",
         taffy::AlignItemsKeyword::End => "end",
         taffy::AlignItemsKeyword::FlexStart => "flex-start",

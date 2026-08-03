@@ -19,6 +19,11 @@ use super::common::alignment::apply_alignment_fallback;
 #[cfg(feature = "content_size")]
 use super::common::content_size::compute_content_size_contribution;
 
+#[inline]
+fn resolve_flex_normal(alignment: AlignSelf) -> AlignSelf {
+    if alignment.keyword == AlignItemsKeyword::Normal { AlignSelf::STRETCH } else { alignment }
+}
+
 /// The intermediate results of a flexbox calculation for a single item
 struct FlexItem {
     /// The identifier for the associated node
@@ -451,7 +456,7 @@ fn compute_constants(
     let box_sizing_adjustment =
         if style.box_sizing() == BoxSizing::ContentBox { padding_border_sum } else { Size::ZERO };
 
-    let align_items = style.align_items().unwrap_or(AlignItems::STRETCH);
+    let align_items = resolve_flex_normal(style.align_items().unwrap_or(AlignItems::STRETCH));
     let align_content = style.align_content().unwrap_or(AlignContent::STRETCH);
     let justify_content = style.justify_content();
     let layout_direction = style.direction();
@@ -569,7 +574,7 @@ fn generate_anonymous_flex_items(
                 border: child_style
                     .border()
                     .resolve_or_zero(constants.node_inner_size.width, |val, basis| tree.calc(val, basis)),
-                align_self: child_style.align_self().unwrap_or(constants.align_items),
+                align_self: resolve_flex_normal(child_style.align_self().unwrap_or(constants.align_items)),
                 overflow: child_style.overflow(),
                 scrollbar_width: child_style.scrollbar_width(),
                 flex_grow: child_style.flex_grow(),
@@ -1847,7 +1852,7 @@ fn align_flex_items_along_cross_axis(
                 }
             }
         }
-        AlignItemsKeyword::Stretch => {
+        AlignItemsKeyword::Normal | AlignItemsKeyword::Stretch => {
             if constants.is_wrap_reverse ^ cross_axis_should_reverse {
                 free_space
             } else {
@@ -2182,7 +2187,7 @@ fn perform_absolute_layout_on_absolute_children(
         let overflow = child_style.overflow();
         let scrollbar_width = child_style.scrollbar_width();
         let aspect_ratio = child_style.aspect_ratio();
-        let align_self = child_style.align_self().unwrap_or(constants.align_items);
+        let align_self = resolve_flex_normal(child_style.align_self().unwrap_or(constants.align_items));
         let margin = child_style
             .margin()
             .map(|margin| margin.resolve_to_option(inset_relative_size.width, |val, basis| tree.calc(val, basis)));
@@ -2453,11 +2458,23 @@ fn perform_absolute_layout_on_absolute_children(
                 (AlignItemsKeyword::End, true) => {
                     constants.content_box_inset.cross_start(constants.dir) + resolved_margin.cross_start(constants.dir)
                 }
-                (AlignItemsKeyword::Baseline | AlignItemsKeyword::Stretch | AlignItemsKeyword::FlexStart, false)
+                (
+                    AlignItemsKeyword::Normal
+                    | AlignItemsKeyword::Baseline
+                    | AlignItemsKeyword::Stretch
+                    | AlignItemsKeyword::FlexStart,
+                    false,
+                )
                 | (AlignItemsKeyword::FlexEnd, true) => {
                     constants.content_box_inset.cross_start(constants.dir) + resolved_margin.cross_start(constants.dir)
                 }
-                (AlignItemsKeyword::Baseline | AlignItemsKeyword::Stretch | AlignItemsKeyword::FlexStart, true)
+                (
+                    AlignItemsKeyword::Normal
+                    | AlignItemsKeyword::Baseline
+                    | AlignItemsKeyword::Stretch
+                    | AlignItemsKeyword::FlexStart,
+                    true,
+                )
                 | (AlignItemsKeyword::FlexEnd, false) => {
                     constants.container_size.cross(constants.dir)
                         - constants.content_box_inset.cross_end(constants.dir)

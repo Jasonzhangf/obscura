@@ -534,6 +534,9 @@ pub struct LayoutStyle {
     /// missing dimension from the given one, so a `width:100%` image gets a
     /// real height instead of collapsing to zero.
     pub aspect_ratio: Option<f32>,
+    /// Whether the preferred ratio came from decoded intrinsic media and
+    /// therefore applies to the content box regardless of `box-sizing`.
+    pub aspect_ratio_is_intrinsic: bool,
     /// Fetched intrinsic CSS-pixel size for a replaced element. Kept alongside
     /// `aspect_ratio` so its taffy leaf can contribute a real min/max-content
     /// size when percentage dimensions are resolved through an auto-sized
@@ -551,6 +554,11 @@ pub struct LayoutStyle {
     /// cannot be inferred from intrinsic dimensions because an unloaded or
     /// broken image remains replaced.
     pub(crate) is_replaced_box: bool,
+    /// Whether this element uses the intrinsic replaced-element sizing
+    /// algorithm. This is narrower than `is_replaced_box`: form controls such
+    /// as buttons are atomic inline boxes but still use ordinary grid `normal`
+    /// stretch behavior in Chromium and Gecko.
+    pub(crate) has_replaced_sizing: bool,
     pub margin: Edges,
     /// Which margin sides are `auto` (top, right, bottom, left). `margin: 0
     /// auto` / `margin-inline: auto` centering needs a real Auto margin, which
@@ -1360,6 +1368,8 @@ fn read_node(tree: &TaffyTree, id: NodeId) -> NodeRect {
 
 pub(crate) fn to_taffy_style(style: &LayoutStyle) -> Style {
     let mut s = Style::DEFAULT;
+    s.item_is_replaced = style.has_replaced_sizing;
+    s.item_aspect_ratio_is_intrinsic = style.aspect_ratio_is_intrinsic;
     s.box_sizing = match style.box_sizing {
         BoxSizing::ContentBox => taffy::BoxSizing::ContentBox,
         BoxSizing::BorderBox => taffy::BoxSizing::BorderBox,

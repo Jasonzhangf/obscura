@@ -34,6 +34,80 @@ mod track_sizing;
 mod types;
 mod util;
 
+/// Resolve grid item `normal` alignment without losing the authored/default
+/// provenance needed by preferred-aspect-ratio sizing. With an aspect ratio,
+/// one implicit stretch axis supplies the other; an explicit alignment in the
+/// opposite axis decides which implicit axis remains stretchable.
+#[inline]
+fn resolve_item_alignment(
+    horizontal: AlignSelf,
+    vertical: AlignSelf,
+    is_compressible_replaced: bool,
+    has_preferred_aspect_ratio: bool,
+) -> InBothAbsAxis<AlignSelf> {
+    if is_compressible_replaced {
+        return InBothAbsAxis {
+            horizontal: horizontal.resolve_normal(AlignSelf::START),
+            vertical: vertical.resolve_normal(AlignSelf::START),
+        };
+    }
+    if !has_preferred_aspect_ratio {
+        return InBothAbsAxis {
+            horizontal: horizontal.resolve_normal(AlignSelf::STRETCH),
+            vertical: vertical.resolve_normal(AlignSelf::STRETCH),
+        };
+    }
+
+    let horizontal_is_normal = horizontal == AlignSelf::NORMAL;
+    let vertical_is_normal = vertical == AlignSelf::NORMAL;
+    InBothAbsAxis {
+        horizontal: if horizontal_is_normal {
+            if !vertical_is_normal && vertical == AlignSelf::STRETCH {
+                AlignSelf::START
+            } else {
+                AlignSelf::STRETCH
+            }
+        } else {
+            horizontal
+        },
+        vertical: if vertical_is_normal {
+            if !horizontal_is_normal && horizontal != AlignSelf::STRETCH {
+                AlignSelf::STRETCH
+            } else {
+                AlignSelf::START
+            }
+        } else {
+            vertical
+        },
+    }
+}
+
+#[inline]
+fn apply_preferred_aspect_ratio(
+    size: Size<Option<f32>>,
+    aspect_ratio: Option<f32>,
+    box_sizing_adjustment: Size<f32>,
+) -> Size<Option<f32>> {
+    let Some(aspect_ratio) = aspect_ratio else { return size };
+    match size {
+        Size { width: Some(width), height: None } => Size {
+            width: Some(width),
+            height: Some(
+                f32_max(width - box_sizing_adjustment.width, 0.0) / aspect_ratio
+                    + box_sizing_adjustment.height,
+            ),
+        },
+        Size { width: None, height: Some(height) } => Size {
+            width: Some(
+                f32_max(height - box_sizing_adjustment.height, 0.0) * aspect_ratio
+                    + box_sizing_adjustment.width,
+            ),
+            height: Some(height),
+        },
+        _ => size,
+    }
+}
+
 /// Grid layout algorithm
 /// This consists of a few phases:
 ///   - Resolving the explicit grid
@@ -225,8 +299,8 @@ pub fn compute_grid_layout<Tree: LayoutGridContainer>(
         in_flow_children_iter,
         direction,
         style.grid_auto_flow(),
-        align_items.unwrap_or(AlignItems::STRETCH),
-        justify_items.unwrap_or(AlignItems::STRETCH),
+        align_items.unwrap_or(AlignItems::NORMAL),
+        justify_items.unwrap_or(AlignItems::NORMAL),
         &name_resolver,
     );
 

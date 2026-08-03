@@ -1242,6 +1242,7 @@ fn apply_presentational_hints(node: &obscura_dom::tree::Node, style: &mut crate:
             if w > 0.0 && h > 0.0 {
                 style.aspect_ratio = Some(w / h);
                 style.aspect_ratio_is_mapped = true;
+                style.aspect_ratio_is_intrinsic = true;
             }
         }
     }
@@ -1265,6 +1266,7 @@ fn apply_presentational_hints(node: &obscura_dom::tree::Node, style: &mut crate:
                 .collect();
             if values.len() == 4 && values[2] > 0.0 && values[3] > 0.0 {
                 style.aspect_ratio = Some(values[2] / values[3]);
+                style.aspect_ratio_is_intrinsic = true;
             }
         }
     }
@@ -1355,6 +1357,7 @@ fn apply_picture_source_hints(
         _ => None,
     };
     style.aspect_ratio_is_mapped = style.aspect_ratio.is_some();
+    style.aspect_ratio_is_intrinsic = style.aspect_ratio.is_some();
 }
 
 /// Compute the UA + author style for every element in preorder, maintaining
@@ -1394,6 +1397,11 @@ fn cascade_walk(
         }
         let mut style = crate::style::ua_style(elem.local.as_ref());
         style.is_replaced_box = crate::inline::is_replaced(elem.local.as_ref());
+        style.has_replaced_sizing = crate::inline::has_replaced_sizing(elem.local.as_ref())
+            || (elem.local.as_ref() == "input"
+                && node
+                    .get_attribute("type")
+                    .is_some_and(|value| value.eq_ignore_ascii_case("image")));
         style.color_scheme_dark = inherited_color_scheme_dark;
         if matches!(elem.local.as_ref(), "dir" | "dl" | "menu" | "ol" | "ul") {
             let mut list_ancestor_count = 0usize;
@@ -1527,6 +1535,7 @@ fn cascade_walk(
         }
         custom_properties.insert(id, this_props.clone());
         style.is_replaced_box |= style.content_image.is_some();
+        style.has_replaced_sizing |= style.content_image.is_some();
         let (mut before_pseudo, mut after_pseudo) =
             if let Some(evaluator) = container_evaluator.as_deref_mut() {
                 sheet.pseudo_styles_with_container_queries(
@@ -1545,6 +1554,7 @@ fn cascade_walk(
             .flatten()
         {
             pseudo.is_replaced_box = pseudo.content_image.is_some();
+            pseudo.has_replaced_sizing = pseudo.content_image.is_some();
         }
         style.before_content = before_pseudo
             .as_ref()
@@ -3030,7 +3040,11 @@ fn layout_dom_once(
             .filter_map(|(&id, style)| {
                 let node = tree.get_node(id)?;
                 let element = node.as_element()?;
-                (element.local.as_ref() == "button" && style.width == crate::Dimension::Auto).then(
+                (element.local.as_ref() == "button"
+                    && style.width == crate::Dimension::Auto
+                    && container_auto_inline_size(tree, id, style, &styles)
+                        != ContainerAutoInlineSize::StretchedGridItem)
+                .then(
                     || {
                         let font_size = style.font_size.unwrap_or(13.333_333).max(1.0);
                         (
@@ -3041,6 +3055,24 @@ fn layout_dom_once(
                 )
             })
             .collect();
+        let native_control_grid_stretch: HashMap<NodeId, (bool, bool)> = styles
+            .iter()
+            .filter_map(|(&id, style)| {
+                let node = tree.get_node(id)?;
+                let element = node.as_element()?;
+                matches!(element.local.as_ref(), "input" | "select").then(|| {
+                    (
+                        id,
+                        (
+                            container_auto_inline_size(tree, id, style, &styles)
+                                == ContainerAutoInlineSize::StretchedGridItem,
+                            container_auto_block_size(tree, id, style, &styles)
+                                == ContainerAutoBlockSize::StretchedGridItem,
+                        ),
+                    )
+                })
+            })
+            .collect();
         for (&id, style) in styles.iter_mut() {
             let Some(node) = tree.get_node(id) else {
                 continue;
@@ -3048,7 +3080,10 @@ fn layout_dom_once(
             let Some(element) = node.as_element() else {
                 continue;
             };
-            if element.local.as_ref() == "button" && style.width == crate::Dimension::Auto {
+            if element.local.as_ref() == "button"
+                && style.width == crate::Dimension::Auto
+                && native_button_contents.contains_key(&id)
+            {
                 // Buttons remain intrinsically sized form controls even when
                 // author CSS changes their inner display to flex/grid. Treating
                 // `display:flex` as an ordinary block makes an auto-width
@@ -3160,7 +3195,9 @@ fn layout_dom_once(
                 let intrinsic_height =
                     crate::inline::used_line_height(style).max(1.0) * rows
                         + vertical_edges;
-                if style.width == crate::Dimension::Auto {
+                let (stretch_inline, stretch_block) =
+                    native_control_grid_stretch.get(&id).copied().unwrap_or_default();
+                if style.width == crate::Dimension::Auto && !stretch_inline {
                     style.width = crate::Dimension::Px(
                         if style.box_sizing == crate::BoxSizing::ContentBox {
                             label_width
@@ -3169,7 +3206,7 @@ fn layout_dom_once(
                         },
                     );
                 }
-                if style.height == crate::Dimension::Auto {
+                if style.height == crate::Dimension::Auto && !stretch_block {
                     style.height = crate::Dimension::Px(
                         if style.box_sizing == crate::BoxSizing::ContentBox {
                             (intrinsic_height - vertical_edges).max(0.0)
@@ -3194,6 +3231,8 @@ fn layout_dom_once(
             }
 
             let font_size = style.font_size.unwrap_or(13.333_333).max(1.0);
+            let (stretch_inline, stretch_block) =
+                native_control_grid_stretch.get(&id).copied().unwrap_or_default();
             let horizontal_edges = style.padding.left
                 + style.padding.right
                 + style.border.left
@@ -3240,7 +3279,7 @@ fn layout_dom_once(
                     )
                 }
             };
-            if style.width == crate::Dimension::Auto {
+            if style.width == crate::Dimension::Auto && !stretch_inline {
                 let declared_width = if style.box_sizing == crate::BoxSizing::ContentBox {
                     (intrinsic_width - horizontal_edges).max(0.0)
                 } else {
@@ -3248,7 +3287,7 @@ fn layout_dom_once(
                 };
                 style.width = crate::Dimension::Px(declared_width);
             }
-            if style.height == crate::Dimension::Auto {
+            if style.height == crate::Dimension::Auto && !stretch_block {
                 let declared_height = if style.box_sizing == crate::BoxSizing::ContentBox {
                     (intrinsic_height - vertical_edges).max(0.0)
                 } else {
@@ -3350,6 +3389,7 @@ fn layout_dom_once(
                 if s.aspect_ratio.is_none() || s.aspect_ratio_is_mapped {
                     s.aspect_ratio = Some(iw / ih);
                     s.aspect_ratio_is_mapped = false;
+                    s.aspect_ratio_is_intrinsic = true;
                 }
             }
         }
@@ -4420,7 +4460,9 @@ fn is_full_span_column_subgrid(style: &crate::LayoutStyle) -> bool {
         || style.overflow_hidden
         || style.position == Some(taffy::Position::Absolute)
         || style.width != crate::Dimension::Auto
-        || style.justify_self.is_some_and(|value| value != taffy::AlignSelf::STRETCH)
+        || style
+            .justify_self
+            .is_some_and(|value| value.resolve_normal(taffy::AlignSelf::STRETCH) != taffy::AlignSelf::STRETCH)
         || style.margin_auto[1]
         || style.margin_auto[3]
     {
@@ -6695,12 +6737,24 @@ where
                             && !matches!(style.position, Some(taffy::Position::Absolute))
                     }
                     taffy::Display::Grid => {
-                        let child_align = taffy_tree
-                            .style(node)
-                            .ok()
+                        let child_style = taffy_tree.style(node).ok();
+                        let horizontal = child_style
                             .and_then(|child| child.justify_self)
                             .or(parent_style.justify_items)
-                            .unwrap_or(taffy::AlignItems::STRETCH);
+                            .unwrap_or(taffy::AlignItems::NORMAL);
+                        let vertical = child_style
+                            .and_then(|child| child.align_self)
+                            .or(parent_style.align_items)
+                            .unwrap_or(taffy::AlignItems::NORMAL);
+                        let normal = if child_style.is_some_and(|child| child.item_is_replaced)
+                            || (child_style.is_some_and(|child| child.aspect_ratio.is_some())
+                                && vertical == taffy::AlignItems::STRETCH)
+                        {
+                            taffy::AlignItems::START
+                        } else {
+                            taffy::AlignItems::STRETCH
+                        };
+                        let child_align = horizontal.resolve_normal(normal);
                         child_align == taffy::AlignItems::STRETCH
                     }
                     taffy::Display::Flex
@@ -6715,7 +6769,8 @@ where
                             .ok()
                             .and_then(|child| child.align_self)
                             .or(parent_style.align_items)
-                            .unwrap_or(taffy::AlignItems::STRETCH);
+                            .unwrap_or(taffy::AlignItems::NORMAL)
+                            .resolve_normal(taffy::AlignItems::STRETCH);
                         child_align == taffy::AlignItems::STRETCH
                     }
                     _ => false,
@@ -7095,6 +7150,57 @@ fn effective_container_type(style: &crate::LayoutStyle) -> crate::ContainerType 
     }
 }
 
+#[inline]
+fn used_flex_alignment(value: Option<taffy::AlignSelf>, parent: Option<taffy::AlignItems>) -> taffy::AlignSelf {
+    value
+        .or(parent)
+        .unwrap_or(taffy::AlignSelf::NORMAL)
+        .resolve_normal(taffy::AlignSelf::STRETCH)
+}
+
+#[inline]
+fn used_grid_alignments(
+    style: &crate::LayoutStyle,
+    parent: &crate::LayoutStyle,
+) -> (taffy::AlignSelf, taffy::AlignSelf) {
+    let horizontal = style.justify_self.or(parent.justify_items).unwrap_or(taffy::AlignSelf::NORMAL);
+    let vertical = style.align_self.or(parent.align_items).unwrap_or(taffy::AlignSelf::NORMAL);
+    if style.has_replaced_sizing {
+        return (
+            horizontal.resolve_normal(taffy::AlignSelf::START),
+            vertical.resolve_normal(taffy::AlignSelf::START),
+        );
+    }
+    if style.aspect_ratio.is_none() {
+        return (
+            horizontal.resolve_normal(taffy::AlignSelf::STRETCH),
+            vertical.resolve_normal(taffy::AlignSelf::STRETCH),
+        );
+    }
+
+    let horizontal_is_normal = horizontal == taffy::AlignSelf::NORMAL;
+    let vertical_is_normal = vertical == taffy::AlignSelf::NORMAL;
+    let horizontal = if horizontal_is_normal {
+        if !vertical_is_normal && vertical == taffy::AlignSelf::STRETCH {
+            taffy::AlignSelf::START
+        } else {
+            taffy::AlignSelf::STRETCH
+        }
+    } else {
+        horizontal
+    };
+    let vertical = if vertical_is_normal {
+        if !horizontal_is_normal && horizontal != taffy::AlignSelf::STRETCH {
+            taffy::AlignSelf::STRETCH
+        } else {
+            taffy::AlignSelf::START
+        }
+    } else {
+        vertical
+    };
+    (horizontal, vertical)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ContainerAutoInlineSize {
     FillAvailable,
@@ -7117,7 +7223,11 @@ fn container_auto_inline_size(
     style: &crate::LayoutStyle,
     styles: &HashMap<NodeId, crate::LayoutStyle>,
 ) -> ContainerAutoInlineSize {
-    if style.is_inline_block || style.float.is_some() {
+    // Grid items are blockified and their float is ignored. Their original
+    // inline-block/float provenance must not suppress grid self-alignment.
+    if (style.is_inline_block || style.float.is_some())
+        && !is_in_flow_grid_item(tree, id, style, styles)
+    {
         return ContainerAutoInlineSize::Intrinsic;
     }
     if matches!(style.position, Some(taffy::Position::Absolute)) {
@@ -7155,11 +7265,8 @@ fn container_auto_inline_size(
             );
             if row {
                 ContainerAutoInlineSize::Intrinsic
-            } else if style.align_self.unwrap_or(
-                    parent_style
-                        .align_items
-                        .unwrap_or(taffy::AlignItems::STRETCH),
-            ) == taffy::AlignSelf::STRETCH
+            } else if used_flex_alignment(style.align_self, parent_style.align_items)
+                == taffy::AlignSelf::STRETCH
             {
                 ContainerAutoInlineSize::FillAvailable
             } else {
@@ -7167,11 +7274,9 @@ fn container_auto_inline_size(
             }
         }
         crate::Display::Grid => {
-            if style.justify_self.unwrap_or(
-                    parent_style
-                        .justify_items
-                        .unwrap_or(taffy::JustifyItems::STRETCH),
-            ) == taffy::AlignSelf::STRETCH
+            if used_grid_alignments(style, parent_style).0 == taffy::AlignSelf::STRETCH
+                && !style.margin_auto[1]
+                && !style.margin_auto[3]
             {
                 ContainerAutoInlineSize::StretchedGridItem
             } else {
@@ -7215,11 +7320,7 @@ fn container_auto_block_size(
     };
 
     if parent_style.display == crate::Display::Grid
-        && style.align_self.unwrap_or(
-                parent_style
-                    .align_items
-                    .unwrap_or(taffy::AlignItems::STRETCH),
-        ) == taffy::AlignSelf::STRETCH
+        && used_grid_alignments(style, parent_style).1 == taffy::AlignSelf::STRETCH
         && !style.margin_auto[0]
         && !style.margin_auto[2]
     {
@@ -7513,6 +7614,27 @@ fn resolve_deferred_flex_inline_sizes(
     true
 }
 
+fn is_in_flow_grid_item(
+    tree: &DomTree,
+    id: NodeId,
+    style: &crate::LayoutStyle,
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+) -> bool {
+    if matches!(style.position, Some(taffy::Position::Absolute)) {
+        return false;
+    }
+    let mut parent = tree.get_node(id).and_then(|node| node.parent);
+    loop {
+        let Some(parent_id) = parent else { return false };
+        let Some(parent_style) = styles.get(&parent_id) else { return false };
+        if parent_style.display_contents {
+            parent = tree.get_node(parent_id).and_then(|node| node.parent);
+            continue;
+        }
+        return parent_style.display == crate::Display::Grid;
+    }
+}
+
 fn build(
     tree: &DomTree,
     id: NodeId,
@@ -7572,19 +7694,7 @@ fn build(
     if matches!(style.max_width, crate::Dimension::Percent(_))
         && matches!(style.min_width, crate::Dimension::Auto)
     {
-        let mut parent = node.parent;
-        let grid_item = loop {
-            let Some(parent_id) = parent else { break false };
-            let Some(parent_style) = styles.get(&parent_id) else {
-                break false;
-            };
-            if parent_style.display_contents {
-                parent = tree.get_node(parent_id).and_then(|node| node.parent);
-                continue;
-            }
-            break parent_style.display == crate::Display::Grid;
-        };
-        if grid_item {
+        if is_in_flow_grid_item(tree, id, style, styles) {
             taffy_style.min_size.width = taffy::Dimension::length(0.0);
         }
     }
@@ -7685,6 +7795,21 @@ fn build(
         }
     }
 
+    if let Some((width, height)) =
+        crate::inline::default_replaced_intrinsic_size(
+            _name.local.as_ref(),
+            style.font_size.unwrap_or(16.0),
+            node.get_attribute("controls").is_some(),
+            _name.local.as_ref() != "embed"
+                || node.get_attribute("src").is_some_and(|value| !value.trim().is_empty()),
+        )
+    {
+        let context = engine.register_replaced(width, height, style);
+        let leaf = taffy_tree.new_leaf_with_context(taffy_style, context).ok()?;
+        id_map.insert(leaf, id);
+        return Some(leaf);
+    }
+
     // A replaced image is a measured leaf, even when CSS gives it a percentage
     // width. Its intrinsic dimensions participate in an auto-sized ancestor's
     // max-content measurement; once the percentage axis becomes definite, the
@@ -7762,6 +7887,7 @@ fn build(
             if matches!(style.width, crate::Dimension::Auto)
                 && matches!(style.height, crate::Dimension::Auto)
                 && !has_percentage_constraint
+                && !is_in_flow_grid_item(tree, id, style, styles)
             {
                 let constrained =
                     crate::inline::constrained_auto_replaced_size(width, height, style);
@@ -8589,10 +8715,7 @@ fn needs_column_flex_text_fit_content_cap(
         return false;
     }
 
-    style
-        .align_self
-        .unwrap_or(parent_style.align_items.unwrap_or(taffy::AlignItems::STRETCH))
-        != taffy::AlignSelf::STRETCH
+    used_flex_alignment(style.align_self, parent_style.align_items) != taffy::AlignSelf::STRETCH
 }
 
 /// Expand `display: contents` wrappers so their children partition into the

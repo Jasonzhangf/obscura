@@ -125,6 +125,11 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
     } else if tag == "a" {
         style.color = Some([0, 0, 238, 255]); // blue
         style.underline = Some(true); // UA default: links are underlined
+    } else if tag == "iframe" {
+        // HTML's UA sheet gives frames a two-pixel inset border. The paint
+        // model does not distinguish inset yet, but border-box geometry still
+        // includes these edges around the 300x150 default object size.
+        style.border = Edges { top: 2.0, right: 2.0, bottom: 2.0, left: 2.0 };
     } else if tag == "button" {
         // HTML buttons are inline-block controls whose anonymous inner
         // content is centered by the browser UA sheet. Keep the atomic outer
@@ -829,6 +834,7 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         "aspect-ratio" => {
             style.aspect_ratio = parse_aspect_ratio(value);
             style.aspect_ratio_is_mapped = false;
+            style.aspect_ratio_is_intrinsic = false;
         }
         "margin" => apply_margin_shorthand(style, value),
         "margin-top" => set_margin_side(style, 0, value),
@@ -2252,7 +2258,7 @@ fn self_alignment_value(value: &str) -> Option<Option<taffy::AlignSelf>> {
     let normalized = value.trim().to_ascii_lowercase();
     let alignment = match normalized.as_str() {
         "auto" => return Some(None),
-        "normal" => taffy::AlignSelf::STRETCH,
+        "normal" => taffy::AlignSelf::NORMAL,
         "start" | "self-start" => taffy::AlignSelf::START,
         "end" | "self-end" => taffy::AlignSelf::END,
         "flex-start" => taffy::AlignSelf::FLEX_START,
@@ -6193,8 +6199,8 @@ mod tests {
         assert_eq!(reset.justify_self, None);
 
         let normal = compute_style("div", Some("align-self:normal;justify-self:normal"));
-        assert_eq!(normal.align_self, Some(taffy::AlignSelf::STRETCH));
-        assert_eq!(normal.justify_self, Some(taffy::JustifySelf::STRETCH));
+        assert_eq!(normal.align_self, Some(taffy::AlignSelf::NORMAL));
+        assert_eq!(normal.justify_self, Some(taffy::JustifySelf::NORMAL));
 
         let shorthand = compute_style("div", Some("place-self:safe center flex-end"));
         assert_eq!(shorthand.align_self, Some(taffy::AlignSelf::SAFE_CENTER));

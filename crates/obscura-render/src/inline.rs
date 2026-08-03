@@ -1974,6 +1974,37 @@ pub(crate) fn is_replaced(local: &str) -> bool {
     )
 }
 
+/// Elements that use CSS's intrinsic replaced-size algorithm. This is
+/// deliberately narrower than `is_replaced`: ordinary form controls are
+/// atomic inline boxes, but grid `normal` stretches them like non-replaced
+/// boxes in Chromium and Gecko.
+pub(crate) fn has_replaced_sizing(local: &str) -> bool {
+    matches!(
+        local,
+        "img" | "canvas" | "video" | "audio" | "iframe" | "embed"
+            | "object" | "progress" | "meter"
+    )
+}
+
+/// HTML's default object size for replaced media whose intrinsic metadata is
+/// not available yet. Canvas dimensions and decoded video metadata can replace
+/// these defaults before layout when present.
+pub(crate) fn default_replaced_intrinsic_size(
+    local: &str,
+    font_size: f32,
+    has_controls: bool,
+    has_resource: bool,
+) -> Option<(f32, f32)> {
+    match local {
+        "canvas" | "video" | "iframe" | "object" => Some((300.0, 150.0)),
+        "embed" if has_resource => Some((300.0, 150.0)),
+        "audio" if has_controls => Some((300.0, 54.0)),
+        "progress" => Some((font_size * 10.0, font_size)),
+        "meter" => Some((font_size * 5.0, font_size)),
+        _ => None,
+    }
+}
+
 /// Is `cid` (and its whole subtree) inline-level, in-flow content safe to fold
 /// into a shaped buffer? Sets `has_text` if it contributes any non-whitespace
 /// text. Inline wrappers (`<a>`, `<span>`, `<b>`, `<code>`, `<sup>`, ...) are

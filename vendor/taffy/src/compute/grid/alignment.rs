@@ -103,11 +103,12 @@ pub(super) fn align_and_position_item(
 
     let box_sizing_adjustment =
         if style.box_sizing() == BoxSizing::ContentBox { padding_border_size } else { Size::ZERO };
+    let aspect_ratio_adjustment =
+        if style.aspect_ratio_uses_content_box() { padding_border_size } else { box_sizing_adjustment };
 
     let inherent_size = style
         .size()
         .maybe_resolve(grid_area_size, |val, basis| tree.calc(val, basis))
-        .maybe_apply_aspect_ratio(aspect_ratio)
         .maybe_add(box_sizing_adjustment);
     let min_size = style
         .min_size()
@@ -122,26 +123,15 @@ pub(super) fn align_and_position_item(
         .maybe_apply_aspect_ratio(aspect_ratio)
         .maybe_add(box_sizing_adjustment);
 
-    // Resolve default alignment styles if they are set on neither the parent or the node itself
-    // Note: if the child has a preferred aspect ratio but neither width or height are set, then the width is stretched
-    // and the then height is calculated from the width according the aspect ratio
-    // See: https://www.w3.org/TR/css-grid-1/#grid-item-sizing
-    let alignment_styles = InBothAbsAxis {
-        horizontal: justify_self.or(container_alignment_styles.horizontal).unwrap_or_else(|| {
-            if inherent_size.width.is_some() {
-                AlignSelf::START
-            } else {
-                AlignSelf::STRETCH
-            }
-        }),
-        vertical: align_self.or(container_alignment_styles.vertical).unwrap_or_else(|| {
-            if inherent_size.height.is_some() || aspect_ratio.is_some() {
-                AlignSelf::START
-            } else {
-                AlignSelf::STRETCH
-            }
-        }),
-    };
+    // Preserve `normal` provenance until both axes and the preferred aspect
+    // ratio are known. Explicit stretch in one axis can make the other normal
+    // axis ratio-derived, while two normal axes prefer inline-axis stretch.
+    let alignment_styles = super::resolve_item_alignment(
+        justify_self.or(container_alignment_styles.horizontal).unwrap_or(AlignSelf::NORMAL),
+        align_self.or(container_alignment_styles.vertical).unwrap_or(AlignSelf::NORMAL),
+        style.is_compressible_replaced(),
+        aspect_ratio.is_some(),
+    );
 
     // Note: This is not a bug. It is part of the CSS spec that both horizontal and vertical margins
     // resolve against the WIDTH of the grid area.
@@ -179,10 +169,7 @@ pub(super) fn align_and_position_item(
         None
     });
 
-    // Reapply aspect ratio after stretch and absolute position width adjustments
-    let Size { width, height } = Size { width, height: inherent_size.height }.maybe_apply_aspect_ratio(aspect_ratio);
-
-    let height = height.or_else(|| {
+    let height = inherent_size.height.or_else(|| {
         if position == Position::Absolute {
             if let (Some(top), Some(bottom)) = (inset_vertical.start, inset_vertical.end) {
                 return Some(f32_max(grid_area_minus_item_margins_size.height - top - bottom, 0.0));
@@ -203,8 +190,12 @@ pub(super) fn align_and_position_item(
 
         None
     });
-    // Reapply aspect ratio after stretch and absolute position height adjustments
-    let Size { width, height } = Size { width, height }.maybe_apply_aspect_ratio(aspect_ratio);
+    // Stretch is resolved before preferred-ratio transfer. If both axes are
+    // stretched (or otherwise definite), the ratio does not overwrite either
+    // one. If only one axis is definite, it supplies the other through the
+    // ratio. This matches replaced grid sizing in Blink and Gecko.
+    let Size { width, height } =
+        super::apply_preferred_aspect_ratio(Size { width, height }, aspect_ratio, aspect_ratio_adjustment);
 
     // Clamp size by min and max width/height
     let Size { width, height } = Size { width, height }.maybe_clamp(min_size, max_size);
@@ -290,7 +281,7 @@ pub(super) fn align_and_position_item(
 
     let (x, x_margin) = align_item_within_area(
         Line { start: grid_area.left, end: grid_area.right },
-        justify_self.unwrap_or(alignment_styles.horizontal),
+        alignment_styles.horizontal,
         width,
         position,
         inset_horizontal,
@@ -300,7 +291,7 @@ pub(super) fn align_and_position_item(
     );
     let (y, y_margin) = align_item_within_area(
         Line { start: grid_area.top, end: grid_area.bottom },
-        align_self.unwrap_or(alignment_styles.vertical),
+        alignment_styles.vertical,
         height,
         position,
         inset_vertical,
@@ -388,7 +379,8 @@ pub(super) fn align_item_within_area(
     // Compute offset in the axis
     let alignment_based_offset = match alignment_keyword {
         // TODO: Add support for baseline alignment. For now we treat it as "start".
-        AlignItemsKeyword::Start
+        AlignItemsKeyword::Normal
+        | AlignItemsKeyword::Start
         | AlignItemsKeyword::FlexStart
         | AlignItemsKeyword::Baseline
         | AlignItemsKeyword::Stretch => {
@@ -444,6 +436,7 @@ pub(super) fn align_item_within_area(
 mod tests {
     use super::{f32_max, f32_min};
     use crate::prelude::*;
+    use crate::Point;
 
     #[derive(Clone, Copy)]
     struct IntrinsicInlineSize {
@@ -465,6 +458,46 @@ mod tests {
             AvailableSpace::Definite(available) => f32_max(intrinsic.min, f32_min(available, intrinsic.max)),
         });
         Size { width, height: known_dimensions.height.unwrap_or(10.0) }
+    }
+
+    #[derive(Clone, Copy)]
+    struct ReplacedIntrinsicSize {
+        width: f32,
+        height: f32,
+    }
+
+    fn measure_replaced_child(
+        known_dimensions: Size<Option<f32>>,
+        _available_space: Size<AvailableSpace>,
+        _node: NodeId,
+        context: Option<&mut ReplacedIntrinsicSize>,
+        _style: &Style,
+    ) -> Size<f32> {
+        let intrinsic = context.copied().unwrap_or(ReplacedIntrinsicSize { width: 0.0, height: 0.0 });
+        let ratio = intrinsic.width / intrinsic.height;
+        match known_dimensions {
+            Size { width: Some(width), height: Some(height) } => Size { width, height },
+            Size { width: Some(width), height: None } => Size { width, height: width / ratio },
+            Size { width: None, height: Some(height) } => Size { width: height * ratio, height },
+            Size { width: None, height: None } => Size { width: intrinsic.width, height: intrinsic.height },
+        }
+    }
+
+    fn layout_replaced_grid_item(mut item_style: Style, mut root_style: Style) -> (Point<f32>, Size<f32>) {
+        let mut tree = TaffyTree::new();
+        tree.disable_rounding();
+        item_style.aspect_ratio = Some(2.0);
+        let item = tree
+            .new_leaf_with_context(item_style, ReplacedIntrinsicSize { width: 100.0, height: 50.0 })
+            .unwrap();
+        root_style.display = Display::Grid;
+        root_style.size = Size { width: length(300.0), height: length(200.0) };
+        root_style.grid_template_columns = vec![length(300.0)];
+        root_style.grid_template_rows = vec![length(200.0)];
+        let root = tree.new_with_children(root_style, &[item]).unwrap();
+        tree.compute_layout_with_measure(root, Size::MAX_CONTENT, measure_replaced_child).unwrap();
+        let layout = tree.layout(item).unwrap();
+        (layout.location, layout.size)
     }
 
     fn inline_margins(left_auto: bool, right_auto: bool) -> Rect<LengthPercentageAuto> {
@@ -624,6 +657,130 @@ mod tests {
             BoxSizing::ContentBox,
         );
         assert_eq!(content_box_max, 290.0);
+    }
+
+    #[test]
+    fn grid_normal_uses_natural_replaced_size_but_stretches_ordinary_items() {
+        let (_, replaced) = layout_replaced_grid_item(
+            Style { item_is_replaced: true, ..Style::default() },
+            Style::default(),
+        );
+        assert_eq!(replaced, Size { width: 100.0, height: 50.0 });
+
+        let (_, ordinary) = layout_replaced_grid_item(Style::default(), Style::default());
+        assert_eq!(ordinary, Size { width: 300.0, height: 150.0 });
+    }
+
+    #[test]
+    fn ordinary_grid_aspect_ratio_preserves_normal_alignment_provenance() {
+        let cases = [
+            (None, None, None, None, Size { width: 300.0, height: 150.0 }),
+            (None, Some(AlignSelf::STRETCH), None, None, Size { width: 400.0, height: 200.0 }),
+            (Some(AlignSelf::STRETCH), None, None, None, Size { width: 300.0, height: 150.0 }),
+            (
+                Some(AlignSelf::STRETCH),
+                Some(AlignSelf::STRETCH),
+                None,
+                None,
+                Size { width: 300.0, height: 200.0 },
+            ),
+            (None, Some(AlignSelf::START), None, None, Size { width: 300.0, height: 150.0 }),
+            (Some(AlignSelf::START), None, None, None, Size { width: 400.0, height: 200.0 }),
+            (None, None, Some(AlignItems::STRETCH), None, Size { width: 400.0, height: 200.0 }),
+            (None, None, None, Some(AlignItems::STRETCH), Size { width: 300.0, height: 150.0 }),
+        ];
+        for (justify_self, align_self, align_items, justify_items, expected) in cases {
+            let (_, actual) = layout_replaced_grid_item(
+                Style { justify_self, align_self, ..Style::default() },
+                Style { align_items, justify_items, ..Style::default() },
+            );
+            assert_eq!(actual, expected, "justify={justify_self:?}, align={align_self:?}");
+        }
+    }
+
+    #[test]
+    fn replaced_grid_normal_applies_percentage_minimums_without_implicit_stretch() {
+        let (_, inline_min) = layout_replaced_grid_item(
+            Style {
+                item_is_replaced: true,
+                min_size: Size { width: percent(0.5), height: Dimension::auto() },
+                ..Style::default()
+            },
+            Style::default(),
+        );
+        assert_eq!(inline_min, Size { width: 150.0, height: 75.0 });
+
+        let (_, block_min) = layout_replaced_grid_item(
+            Style {
+                item_is_replaced: true,
+                min_size: Size { width: Dimension::auto(), height: percent(0.5) },
+                ..Style::default()
+            },
+            Style::default(),
+        );
+        assert_eq!(block_min, Size { width: 200.0, height: 100.0 });
+    }
+
+    #[test]
+    fn replaced_grid_explicit_stretch_precedes_aspect_ratio_transfer() {
+        let base = Style { item_is_replaced: true, ..Style::default() };
+
+        let (_, inline_stretch) = layout_replaced_grid_item(
+            Style { justify_self: Some(AlignSelf::STRETCH), ..base.clone() },
+            Style::default(),
+        );
+        assert_eq!(inline_stretch, Size { width: 300.0, height: 150.0 });
+
+        let (_, block_stretch) = layout_replaced_grid_item(
+            Style { align_self: Some(AlignSelf::STRETCH), ..base.clone() },
+            Style::default(),
+        );
+        assert_eq!(block_stretch, Size { width: 400.0, height: 200.0 });
+
+        let (_, both_stretch) = layout_replaced_grid_item(
+            Style {
+                justify_self: Some(AlignSelf::STRETCH),
+                align_self: Some(AlignSelf::STRETCH),
+                ..base.clone()
+            },
+            Style::default(),
+        );
+        assert_eq!(both_stretch, Size { width: 300.0, height: 200.0 });
+
+        let (_, definite_inline) = layout_replaced_grid_item(
+            Style {
+                size: Size { width: length(120.0), height: Dimension::auto() },
+                align_self: Some(AlignSelf::STRETCH),
+                ..base.clone()
+            },
+            Style::default(),
+        );
+        assert_eq!(definite_inline, Size { width: 120.0, height: 200.0 });
+
+        let (_, definite_block) = layout_replaced_grid_item(
+            Style {
+                size: Size { width: Dimension::auto(), height: length(80.0) },
+                justify_self: Some(AlignSelf::STRETCH),
+                ..base
+            },
+            Style::default(),
+        );
+        assert_eq!(definite_block, Size { width: 300.0, height: 80.0 });
+    }
+
+    #[test]
+    fn replaced_grid_normal_and_auto_margins_remain_natural() {
+        let (location, size) = layout_replaced_grid_item(
+            Style {
+                item_is_replaced: true,
+                min_size: Size { width: percent(0.5), height: Dimension::auto() },
+                margin: Rect { left: auto(), right: zero(), top: zero(), bottom: zero() },
+                ..Style::default()
+            },
+            Style { justify_items: Some(AlignItems::NORMAL), ..Style::default() },
+        );
+        assert_eq!(size, Size { width: 150.0, height: 75.0 });
+        assert_eq!(location.x, 150.0);
     }
 
     #[test]
