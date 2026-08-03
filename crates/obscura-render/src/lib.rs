@@ -547,6 +547,25 @@ pub struct BackgroundPosition {
     pub y: BackgroundPositionAxis,
 }
 
+/// Box used to establish a background layer's positioning area.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BackgroundOrigin {
+    BorderBox,
+    #[default]
+    PaddingBox,
+    ContentBox,
+}
+
+/// Box (or glyph shape) that limits background painting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BackgroundClip {
+    #[default]
+    BorderBox,
+    PaddingBox,
+    ContentBox,
+    Text,
+}
+
 impl BackgroundPosition {
     pub const fn new(x: BackgroundPositionAxis, y: BackgroundPositionAxis) -> Self {
         Self { x, y }
@@ -827,6 +846,11 @@ pub struct LayoutStyle {
     /// Explicit `(repeat-x, repeat-y)` choice. `None` is the CSS initial
     /// `repeat` in both axes.
     pub background_repeat: Option<(bool, bool)>,
+    /// Geometry longhands retained independently: gradients and images are
+    /// authored in `background-origin`, while `background-clip` only limits
+    /// which portion becomes visible.
+    pub background_origin: BackgroundOrigin,
+    pub background_clip: BackgroundClip,
     /// `background-clip: text` / `-webkit-background-clip: text`: the background
     /// paints only through the element's glyphs, not as a filled box. Combined
     /// with a transparent text color this is the common gradient-text technique

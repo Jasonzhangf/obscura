@@ -962,7 +962,13 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                 style.background_size_fit = parse_background_size_fit(value);
                 style.background_position = crate::BackgroundPosition::default();
                 style.background_repeat = parse_image_repeat(value);
-                style.background_clip_text = false;
+                style.background_origin = crate::BackgroundOrigin::default();
+                style.background_clip = crate::BackgroundClip::default();
+                if let Some((origin, clip)) = parse_background_box_shorthand(value) {
+                    style.background_origin = origin;
+                    style.background_clip = clip;
+                }
+                style.background_clip_text = style.background_clip == crate::BackgroundClip::Text;
             }
         }
         "background-image" => {
@@ -979,6 +985,9 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         "background-repeat" => {
             style.background_repeat = parse_image_repeat(value);
         }
+        "background-origin" => {
+            style.background_origin = parse_background_origin(value).unwrap_or_default();
+        }
         // On replaced elements, an image-valued `content` replaces the
         // ordinary source and participates in intrinsic sizing. String-valued
         // generated content is handled separately for pseudo-elements.
@@ -991,10 +1000,8 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
             style.mask_repeat = parse_image_repeat(value);
         }
         "background-clip" | "-webkit-background-clip" => {
-            // `text` clips the background to the element's glyphs (the gradient/
-            // solid-color text technique). Any box value (border-box/padding-box/
-            // content-box) is an ordinary background, so clear the flag.
-            style.background_clip_text = value.trim().eq_ignore_ascii_case("text");
+            style.background_clip = parse_background_clip(value).unwrap_or_default();
+            style.background_clip_text = style.background_clip == crate::BackgroundClip::Text;
         }
         // Blink/WebKit gradient text commonly makes the glyph fill
         // transparent through this inherited property while clipping a
@@ -1801,6 +1808,7 @@ pub fn supports_declaration(name: &str, value: &str) -> bool {
             | "background-size"
             | "background-position"
             | "background-repeat"
+            | "background-origin"
             | "background-clip"
             | "-webkit-background-clip"
             | "mask-image"
@@ -2436,7 +2444,8 @@ fn supports_conservative_known_value(name: &str, value: &str) -> bool {
         "background-size" | "mask-size" | "-webkit-mask-size" => {
             matches!(lower.as_str(), "auto" | "cover" | "contain") || parse_background_size(value).is_some()
         }
-        "background-clip" | "-webkit-background-clip" => matches!(lower.as_str(), "border-box" | "padding-box" | "content-box" | "text"),
+        "background-origin" => parse_background_origin(value).is_some(),
+        "background-clip" | "-webkit-background-clip" => parse_background_clip(value).is_some(),
         "font-size" => is_font_size_token(value),
         "font-weight" => specified_font_weight(value).is_some(),
         "font-family" => !value.trim().is_empty(),
@@ -6700,6 +6709,49 @@ fn parse_image_repeat(value: &str) -> Option<(bool, bool)> {
     }
 }
 
+fn parse_background_origin(value: &str) -> Option<crate::BackgroundOrigin> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "border-box" => Some(crate::BackgroundOrigin::BorderBox),
+        "padding-box" => Some(crate::BackgroundOrigin::PaddingBox),
+        "content-box" => Some(crate::BackgroundOrigin::ContentBox),
+        _ => None,
+    }
+}
+
+fn parse_background_clip(value: &str) -> Option<crate::BackgroundClip> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "border-box" => Some(crate::BackgroundClip::BorderBox),
+        "padding-box" => Some(crate::BackgroundClip::PaddingBox),
+        "content-box" => Some(crate::BackgroundClip::ContentBox),
+        "text" => Some(crate::BackgroundClip::Text),
+        _ => None,
+    }
+}
+
+/// One visual-box token in the shorthand sets both origin and clip; a second
+/// token overrides only clip. Function arguments are excluded by
+/// `split_ws_paren`, so a URL or gradient payload cannot be mistaken for box
+/// geometry.
+fn parse_background_box_shorthand(
+    value: &str,
+) -> Option<(crate::BackgroundOrigin, crate::BackgroundClip)> {
+    let first_layer = split_top_level(value, ',').into_iter().next()?;
+    let boxes = split_ws_paren(first_layer)
+        .into_iter()
+        .filter_map(|token| parse_background_clip(token).map(|clip| (token, clip)))
+        .collect::<Vec<_>>();
+    match boxes.as_slice() {
+        [] => None,
+        [(_, crate::BackgroundClip::Text)] => Some((
+            crate::BackgroundOrigin::default(),
+            crate::BackgroundClip::Text,
+        )),
+        [(token, clip)] => Some((parse_background_origin(token)?, *clip)),
+        [(origin, _), (_, clip)] => Some((parse_background_origin(origin)?, *clip)),
+        _ => None,
+    }
+}
+
 fn background_size_expression(value: &str) -> Option<String> {
     let (_, size) = value.rsplit_once('/')?;
     let mut depth = 0i32;
@@ -8420,6 +8472,8 @@ mod tests {
         assert_eq!(s.background_size_expression, None);
         assert_eq!(s.background_size_fit, None);
         assert_eq!(s.background_position, crate::BackgroundPosition::default());
+        assert_eq!(s.background_origin, crate::BackgroundOrigin::PaddingBox);
+        assert_eq!(s.background_clip, crate::BackgroundClip::BorderBox);
         assert!(!s.background_clip_text);
 
         let cover = compute_style(
@@ -8442,6 +8496,43 @@ mod tests {
             contextual.background_size_expression.as_deref(),
             Some("calc(100% - 2rem) auto")
         );
+    }
+
+    #[test]
+    fn background_box_longhands_and_shorthand_retain_independent_geometry() {
+        let longhands = compute_style(
+            "div",
+            Some("background-origin:content-box;background-clip:padding-box"),
+        );
+        assert_eq!(longhands.background_origin, crate::BackgroundOrigin::ContentBox);
+        assert_eq!(longhands.background_clip, crate::BackgroundClip::PaddingBox);
+        assert!(!longhands.background_clip_text);
+
+        let shorthand = compute_style(
+            "div",
+            Some(
+                "background:linear-gradient(90deg,red,blue) content-box padding-box no-repeat",
+            ),
+        );
+        assert_eq!(shorthand.background_origin, crate::BackgroundOrigin::ContentBox);
+        assert_eq!(shorthand.background_clip, crate::BackgroundClip::PaddingBox);
+
+        let one_box = compute_style("div", Some("background:red content-box"));
+        assert_eq!(one_box.background_origin, crate::BackgroundOrigin::ContentBox);
+        assert_eq!(one_box.background_clip, crate::BackgroundClip::ContentBox);
+
+        let text = compute_style(
+            "h1",
+            Some("background-origin:border-box;background-clip:text"),
+        );
+        assert_eq!(text.background_origin, crate::BackgroundOrigin::BorderBox);
+        assert_eq!(text.background_clip, crate::BackgroundClip::Text);
+        assert!(text.background_clip_text);
+
+        assert!(supports_declaration("background-origin", "border-box"));
+        assert!(supports_declaration("background-origin", "padding-box"));
+        assert!(supports_declaration("background-origin", "content-box"));
+        assert!(!supports_declaration("background-origin", "text"));
     }
 
     #[test]

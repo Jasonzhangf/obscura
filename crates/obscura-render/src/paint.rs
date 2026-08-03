@@ -128,6 +128,32 @@ impl RenderResourceCache {
         self.retained_bytes
     }
 
+    pub fn has_live_outcome(&self, url: &str) -> bool {
+        match self.entries.get(url) {
+            Some(CachedResource::Bytes(_)) => true,
+            Some(CachedResource::Missing(at)) => at.elapsed() < MISSING_RESOURCE_RETRY_AFTER,
+            None => false,
+        }
+    }
+
+    /// Seed bytes fetched by the owning page's asynchronous browser transport.
+    ///
+    /// Layout and paint are synchronous, so letting them open their own HTTP
+    /// requests serializes every image/font behind the capture call.  The page
+    /// layer uses this entry point to fetch a bounded resource batch through
+    /// its cookie/proxy/CORS-aware connection pool before entering layout.
+    pub fn seed(&mut self, url: String, bytes: Vec<u8>) {
+        self.remove(&url);
+        self.insert_bytes(url, Arc::from(bytes));
+    }
+
+    /// Retain a page-transport failure so capture does not immediately repeat
+    /// the same slow request through the renderer's compatibility loader.
+    pub fn seed_missing(&mut self, url: String) {
+        self.remove(&url);
+        self.insert_missing(url);
+    }
+
     /// Resolve, fetch, and inspect one image through the exact byte cache used
     /// by layout and paint. The JS image-element lifecycle calls this narrow
     /// bridge so `complete`/`naturalWidth` and the eventual screenshot are
@@ -682,6 +708,25 @@ impl PreparedRender {
         out.insert(
             "background-color",
             css_color(style.background_color.unwrap_or([0, 0, 0, 0])),
+        );
+        out.insert(
+            "background-origin",
+            match style.background_origin {
+                crate::BackgroundOrigin::BorderBox => "border-box",
+                crate::BackgroundOrigin::PaddingBox => "padding-box",
+                crate::BackgroundOrigin::ContentBox => "content-box",
+            }
+            .to_string(),
+        );
+        out.insert(
+            "background-clip",
+            match style.background_clip {
+                crate::BackgroundClip::BorderBox => "border-box",
+                crate::BackgroundClip::PaddingBox => "padding-box",
+                crate::BackgroundClip::ContentBox => "content-box",
+                crate::BackgroundClip::Text => "text",
+            }
+            .to_string(),
         );
         out.insert("color", css_color(style.color.unwrap_or([0, 0, 0, 255])));
         out.insert("font-size", css_px(style.font_size.unwrap_or(16.0)));
@@ -1992,8 +2037,13 @@ fn paint_laid_dom_scrolled(
             },
             None => cull_rect,
         };
-        let box_rect = match Rect::from_xywh(visible_rect.x, visible_rect.y, visible_rect.width, visible_rect.height) {
-            Some(r) => r,
+        let box_rect = match Rect::from_xywh(
+            visible_rect.x,
+            visible_rect.y,
+            visible_rect.width,
+            visible_rect.height,
+        ) {
+            Some(rect) => rect,
             None => continue,
         };
         let clip_path_mask = style.clip_path.as_ref().and_then(|polygon| {
@@ -2047,89 +2097,82 @@ fn paint_laid_dom_scrolled(
         }
         }
 
-        // Box path (rounded if border-radius), reused for gradient/color fill.
+        // Background positioning and clipping are independent. Keep the
+        // authored gradient/image coordinates tied to the origin box even
+        // when the clip box or an ancestor overflow clip reveals only a
+        // smaller portion.
         let radius = style.border_model.radii.resolve(rect.width, rect.height);
         let has_radius = !radius.is_zero();
-        let bg_path = || {
-            if has_radius {
-            rounded_rect_path_radii(
-                visible_rect.x,
-                visible_rect.y,
-                visible_rect.width,
-                visible_rect.height,
-                radius,
-            )
-        } else {
-            let mut pb = PathBuilder::new();
-            pb.push_rect(box_rect);
-            pb.finish()
-            }
-        };
+        let background = background_geometry(&rect, style);
+        let background_path = background_clip_path(background);
+        let background_mask = background_extra_clip(&pixmap, clip, clip_path_mask.as_ref());
         // A linear-gradient background (heavily used by modern hero sections);
         // without this it paints white. Takes precedence over a solid color.
         // `background-clip: text` clips the background to the glyphs, so it must
         // not paint as a box here; the text paint path fills the glyphs instead.
         if !paints_inline_fragments && style.mask_image.is_none() && !style.background_clip_text {
             if let Some(bg) = style.background_color {
-                if let Some(path) = bg_path() {
+                if let Some(path) = background_path.as_ref() {
                     let mut paint = Paint::default();
                     paint.set_color(Color::from_rgba8(bg[0], bg[1], bg[2], bg[3]));
-                    paint.anti_alias = has_radius;
+                    paint.anti_alias = !background.clip_radii.is_zero();
                     pixmap.fill_path(
-                        &path,
+                        path,
                         &paint,
                         FillRule::Winding,
                         Transform::identity(),
-                        clip_path_mask.as_ref(),
+                        background_mask.as_ref(),
                     );
                 }
             }
             if !style.background_gradient_layers.is_empty() {
-                if let Some(path) = bg_path() {
+                if let Some(path) = background_path.as_ref() {
                     paint_background_gradient_layers(
                         &mut pixmap,
-                        &path,
-                        &visible_rect,
-                        radius,
+                        path,
+                        &background.origin_rect,
+                        &background.clip_rect,
+                        background.clip_radii,
                         style,
                         root_font_size,
                         viewport,
-                        clip_path_mask.as_ref(),
+                        background_mask.as_ref(),
                     );
                 }
             } else {
             if let Some((center, stops)) = &style.background_radial_gradient {
-                if let Some(path) = bg_path() {
+                if let Some(path) = background_path.as_ref() {
                     paint_radial_gradient(
                         &mut pixmap,
-                        &path,
-                        &visible_rect,
+                        path,
+                        &background.origin_rect,
                         *center,
                         stops,
-                        clip_path_mask.as_ref(),
+                        background_mask.as_ref(),
                     );
                 }
             }
             if let Some((angle, center, stops)) = &style.background_conic_gradient {
-                paint_conic_gradient(
+                paint_conic_gradient_sampled(
                     &mut pixmap,
-                    &visible_rect,
-                    radius,
+                    &background.clip_rect,
+                    &background.origin_rect,
+                    background.clip_radii,
                     *angle,
                     *center,
                     stops,
-                    clip_path_mask.as_ref(),
+                    background_mask.as_ref(),
                 );
             }
             if let Some((angle, stops)) = &style.background_gradient {
-                if let Some(path) = bg_path() {
+                if let Some(path) = background_path.as_ref() {
                     paint_linear_gradient(
                         &mut pixmap,
-                        &path,
-                        &visible_rect,
+                        path,
+                        &background.origin_rect,
                         *angle,
                         stops,
-                        clip_path_mask.as_ref(),
+                        background_mask.as_ref(),
                     );
                 }
             }
@@ -2158,7 +2201,7 @@ fn paint_laid_dom_scrolled(
             if let Some(img_rect) = background_image_rect(
                 bg_url,
                 base_url,
-                &rect,
+                &background.origin_rect,
                 style.background_size,
                 style.background_size_expression.as_deref(),
                 style.background_size_fit,
@@ -2172,22 +2215,18 @@ fn paint_laid_dom_scrolled(
                 // box and then to inherited overflow. Keep its full destination
                 // rect separate from that clip: intersecting first and then
                 // scaling would resize a partially clipped image.
-                let visible = match clip {
-                    Some(c) => rect.intersect(&c),
-                    None => Some(rect),
-                };
-                if let Some(visible) = visible {
+                if background.clip_rect.width > 0.0 && background.clip_rect.height > 0.0 {
                     paint_image(
                         bg_url,
                         base_url,
                         &img_rect,
-                        &visible,
+                        &background.clip_rect,
                         crate::ObjectFit::Fill,
                         &mut pixmap,
                         image_cache,
                         None,
-                        radius,
-                        clip_path_mask.as_ref(),
+                        background.clip_radii,
+                        background_mask.as_ref(),
                     );
                 }
             }
@@ -2602,13 +2641,9 @@ fn paint_inline_fragment_decorations(
             y: fragment.y + offset.1,
             ..*fragment
         };
-        let visible = match clip {
-            Some(clip) => match fragment.intersect(&clip) {
-                Some(visible) => visible,
-                None => continue,
-            },
-            None => fragment,
-        };
+        if clip.is_some_and(|clip| fragment.intersect(&clip).is_none()) {
+            continue;
+        }
         let first = index == 0;
         let last = index + 1 == fragments.len();
         fragment_style.border.left = style.border.left;
@@ -2628,7 +2663,6 @@ fn paint_inline_fragment_decorations(
             .border_model
             .radii
             .resolve(fragment.width, fragment.height);
-        let has_radius = !radius.is_zero();
         let clip_path_mask = fragment_style.clip_path.as_ref().and_then(|polygon| {
             polygon_clip_mask(
                 pixmap.width(),
@@ -2640,23 +2674,13 @@ fn paint_inline_fragment_decorations(
                 viewport,
             )
         });
-        let path = if has_radius {
-            rounded_rect_path_radii(
-                visible.x,
-                visible.y,
-                visible.width,
-                visible.height,
-                radius,
-            )
-        } else {
-            Rect::from_xywh(visible.x, visible.y, visible.width, visible.height).and_then(
-                |rect| {
-                    let mut builder = PathBuilder::new();
-                    builder.push_rect(rect);
-                    builder.finish()
-                },
-            )
-        };
+        let background = background_geometry(&fragment, &fragment_style);
+        // Keep the positioning area stable across fragments.  The per-fragment
+        // style has its sliced edge borders removed, which is correct for the
+        // clip but must not move the shared background coordinate system.
+        let background_origin = background_geometry(&union, style).origin_rect;
+        let background_path = background_clip_path(background);
+        let background_mask = background_extra_clip(pixmap, clip, clip_path_mask.as_ref());
 
         if let Some(shadow) = fragment_style.box_shadow {
             paint_box_shadow(
@@ -2668,71 +2692,71 @@ fn paint_inline_fragment_decorations(
             );
         }
         if fragment_style.mask_image.is_none() && !fragment_style.background_clip_text {
-            if let (Some(background), Some(path)) = (fragment_style.background_color, path.as_ref()) {
+            if let (Some(color), Some(path)) =
+                (fragment_style.background_color, background_path.as_ref())
+            {
                 let mut paint = Paint::default();
                 paint.set_color(Color::from_rgba8(
-                    background[0],
-                    background[1],
-                    background[2],
-                    background[3],
+                    color[0], color[1], color[2], color[3],
                 ));
-                paint.anti_alias = has_radius;
+                paint.anti_alias = !background.clip_radii.is_zero();
                 pixmap.fill_path(
                     path,
                     &paint,
                     FillRule::Winding,
                     Transform::identity(),
-                    clip_path_mask.as_ref(),
+                    background_mask.as_ref(),
                 );
             }
             if !fragment_style.background_gradient_layers.is_empty() {
-                if let Some(path) = path.as_ref() {
+                if let Some(path) = background_path.as_ref() {
                     paint_background_gradient_layers(
                         pixmap,
                         path,
-                        &union,
-                        radius,
+                        &background_origin,
+                        &background.clip_rect,
+                        background.clip_radii,
                         &fragment_style,
                         root_font_size,
                         viewport,
-                        clip_path_mask.as_ref(),
+                        background_mask.as_ref(),
                     );
                 }
             } else {
                 if let (Some((center, stops)), Some(path)) =
-                    (&fragment_style.background_radial_gradient, path.as_ref())
+                    (&fragment_style.background_radial_gradient, background_path.as_ref())
                 {
                     paint_radial_gradient(
                         pixmap,
                         path,
-                        &union,
+                        &background_origin,
                         *center,
                         stops,
-                        clip_path_mask.as_ref(),
+                        background_mask.as_ref(),
                     );
                 }
                 if let Some((angle, center, stops)) = &fragment_style.background_conic_gradient {
                     paint_conic_gradient_sampled(
                         pixmap,
-                        &fragment,
-                        &union,
-                        radius,
+                        &background.clip_rect,
+                        &background_origin,
+                        background.clip_radii,
                         *angle,
                         *center,
                         stops,
-                        clip_path_mask.as_ref(),
+                        background_mask.as_ref(),
                     );
                 }
                 if let (Some((angle, stops)), Some(path)) =
-                    (&fragment_style.background_gradient, path.as_ref())
+                    (&fragment_style.background_gradient, background_path.as_ref())
                 {
                     paint_linear_gradient(
                         pixmap,
                         path,
-                        &union,
+                        &background_origin,
                         *angle,
                         stops,
-                        clip_path_mask.as_ref(),
+                        background_mask.as_ref(),
                     );
                 }
             }
@@ -2762,7 +2786,7 @@ fn paint_inline_fragment_decorations(
             if let Some(image_rect) = background_image_rect(
                 background_url,
                 base_url,
-                &union,
+                &background_origin,
                 fragment_style.background_size,
                 fragment_style.background_size_expression.as_deref(),
                 fragment_style.background_size_fit,
@@ -2776,13 +2800,13 @@ fn paint_inline_fragment_decorations(
                     background_url,
                     base_url,
                     &image_rect,
-                    &visible,
+                    &background.clip_rect,
                     crate::ObjectFit::Fill,
                     pixmap,
                     image_cache,
                     None,
-                    radius,
-                    clip_path_mask.as_ref(),
+                    background.clip_radii,
+                    background_mask.as_ref(),
                 );
             }
         }
@@ -4640,6 +4664,125 @@ fn paint_linear_gradient_layer(
     }
 }
 
+#[derive(Clone, Copy)]
+struct BackgroundGeometry {
+    origin_rect: crate::Rect,
+    clip_rect: crate::Rect,
+    clip_radii: crate::ResolvedBorderRadii,
+}
+
+fn inset_rect(rect: &crate::Rect, insets: crate::Sides<f32>) -> crate::Rect {
+    crate::Rect {
+        x: rect.x + insets.left,
+        y: rect.y + insets.top,
+        width: (rect.width - insets.left - insets.right).max(0.0),
+        height: (rect.height - insets.top - insets.bottom).max(0.0),
+    }
+}
+
+fn add_sides(a: crate::Sides<f32>, b: crate::Sides<f32>) -> crate::Sides<f32> {
+    crate::Sides {
+        top: a.top + b.top,
+        right: a.right + b.right,
+        bottom: a.bottom + b.bottom,
+        left: a.left + b.left,
+    }
+}
+
+fn background_geometry(rect: &crate::Rect, style: &crate::LayoutStyle) -> BackgroundGeometry {
+    let border = crate::Sides {
+        top: style.border.top,
+        right: style.border.right,
+        bottom: style.border.bottom,
+        left: style.border.left,
+    };
+    let padding = crate::Sides {
+        top: style.padding.top,
+        right: style.padding.right,
+        bottom: style.padding.bottom,
+        left: style.padding.left,
+    };
+    let content = add_sides(border, padding);
+    let origin_insets = match style.background_origin {
+        crate::BackgroundOrigin::BorderBox => crate::Sides::all(0.0),
+        crate::BackgroundOrigin::PaddingBox => border,
+        crate::BackgroundOrigin::ContentBox => content,
+    };
+    let clip_insets = match style.background_clip {
+        crate::BackgroundClip::BorderBox | crate::BackgroundClip::Text => crate::Sides::all(0.0),
+        crate::BackgroundClip::PaddingBox => border,
+        crate::BackgroundClip::ContentBox => content,
+    };
+    let outer_radii = style.border_model.radii.resolve(rect.width, rect.height);
+    BackgroundGeometry {
+        origin_rect: inset_rect(rect, origin_insets),
+        clip_rect: inset_rect(rect, clip_insets),
+        clip_radii: outer_radii.inset(clip_insets),
+    }
+}
+
+fn background_clip_path(geometry: BackgroundGeometry) -> Option<tiny_skia::Path> {
+    if geometry.clip_rect.width <= 0.0 || geometry.clip_rect.height <= 0.0 {
+        return None;
+    }
+    if !geometry.clip_radii.is_zero() {
+        return rounded_rect_path_radii(
+            geometry.clip_rect.x,
+            geometry.clip_rect.y,
+            geometry.clip_rect.width,
+            geometry.clip_rect.height,
+            geometry.clip_radii,
+        );
+    }
+    Rect::from_xywh(
+        geometry.clip_rect.x,
+        geometry.clip_rect.y,
+        geometry.clip_rect.width,
+        geometry.clip_rect.height,
+    )
+    .and_then(|rect| {
+        let mut builder = PathBuilder::new();
+        builder.push_rect(rect);
+        builder.finish()
+    })
+}
+
+fn background_extra_clip(
+    pixmap: &Pixmap,
+    ancestor_clip: Option<crate::Rect>,
+    polygon_clip: Option<&tiny_skia::Mask>,
+) -> Option<tiny_skia::Mask> {
+    let mut mask = polygon_clip.cloned();
+    if let Some(clip) = ancestor_clip {
+        let path = Rect::from_xywh(clip.x, clip.y, clip.width, clip.height).and_then(|rect| {
+            let mut builder = PathBuilder::new();
+            builder.push_rect(rect);
+            builder.finish()
+        });
+        if let Some(path) = path {
+            match mask.as_mut() {
+                Some(mask) => mask.intersect_path(
+                    &path,
+                    FillRule::Winding,
+                    true,
+                    Transform::identity(),
+                ),
+                None => {
+                    let mut new_mask = tiny_skia::Mask::new(pixmap.width(), pixmap.height())?;
+                    new_mask.fill_path(
+                        &path,
+                        FillRule::Winding,
+                        true,
+                        Transform::identity(),
+                    );
+                    mask = Some(new_mask);
+                }
+            }
+        }
+    }
+    mask
+}
+
 fn paint_radial_gradient(
     pixmap: &mut Pixmap,
     path: &tiny_skia::Path,
@@ -4692,8 +4835,9 @@ fn paint_radial_gradient(
 fn paint_background_gradient_layers(
     pixmap: &mut Pixmap,
     path: &tiny_skia::Path,
-    rect: &crate::Rect,
-    border_radius: crate::ResolvedBorderRadii,
+    origin_rect: &crate::Rect,
+    clip_rect: &crate::Rect,
+    clip_radii: crate::ResolvedBorderRadii,
     style: &crate::LayoutStyle,
     root_font_size: f32,
     viewport: (f32, f32),
@@ -4701,9 +4845,19 @@ fn paint_background_gradient_layers(
 ) {
     let layers = &style.background_gradient_layers;
     let em = style.font_size.unwrap_or(16.0);
-    let tile_size = background_gradient_tile_size(style, rect, em, root_font_size, viewport);
-    let needs_tile =
-        (tile_size.0 - rect.width).abs() > 0.01 || (tile_size.1 - rect.height).abs() > 0.01;
+    let tile_size =
+        background_gradient_tile_size(style, origin_rect, em, root_font_size, viewport);
+    let clip_differs_from_origin = (clip_rect.x - origin_rect.x).abs() > 0.01
+        || (clip_rect.y - origin_rect.y).abs() > 0.01
+        || (clip_rect.width - origin_rect.width).abs() > 0.01
+        || (clip_rect.height - origin_rect.height).abs() > 0.01;
+    let needs_tile = (tile_size.0 - origin_rect.width).abs() > 0.01
+        || (tile_size.1 - origin_rect.height).abs() > 0.01
+        // Even a default-sized image must be treated as a tile when the
+        // painting area extends beyond its positioning area.  Filling the
+        // clip directly would incorrectly stretch/pad the authored gradient
+        // coordinates and would also ignore `background-repeat: no-repeat`.
+        || clip_differs_from_origin;
     if needs_tile && tile_size.0 > 0.0 && tile_size.1 > 0.0 {
         let width = tile_size.0.ceil().clamp(1.0, 4096.0) as u32;
         let height = tile_size.1.ceil().clamp(1.0, 4096.0) as u32;
@@ -4725,6 +4879,7 @@ fn paint_background_gradient_layers(
                     &mut tile,
                     &tile_path,
                     &tile_rect,
+                    &tile_rect,
                     crate::ResolvedBorderRadii::default(),
                     layers,
                     em,
@@ -4732,16 +4887,16 @@ fn paint_background_gradient_layers(
                     viewport,
                     None,
                 );
-                let tile_x = rect.x
+                let tile_x = origin_rect.x
                     + style
                         .background_position
                         .x
-                        .resolve(rect.width - tile_size.0);
-                let tile_y = rect.y
+                        .resolve(origin_rect.width - tile_size.0);
+                let tile_y = origin_rect.y
                     + style
                         .background_position
                         .y
-                        .resolve(rect.height - tile_size.1);
+                        .resolve(origin_rect.height - tile_size.1);
                 let repeats = style.background_repeat.unwrap_or((true, true));
                 if repeats == (true, true) {
                     let mut paint = Paint::default();
@@ -4767,22 +4922,22 @@ fn paint_background_gradient_layers(
                     }
                 }
                 let start_x = if repeats.0 {
-                    tile_x - ((tile_x - rect.x) / width as f32).ceil() * width as f32
+                    tile_x - ((tile_x - clip_rect.x) / width as f32).ceil() * width as f32
                 } else {
                     tile_x
                 };
                 let start_y = if repeats.1 {
-                    tile_y - ((tile_y - rect.y) / height as f32).ceil() * height as f32
+                    tile_y - ((tile_y - clip_rect.y) / height as f32).ceil() * height as f32
                 } else {
                     tile_y
                 };
                 let end_x = if repeats.0 {
-                    rect.x + rect.width
+                    clip_rect.x + clip_rect.width
                 } else {
                     tile_x + 0.5
                 };
                 let end_y = if repeats.1 {
-                    rect.y + rect.height
+                    clip_rect.y + clip_rect.height
                 } else {
                     tile_y + 0.5
                 };
@@ -4816,8 +4971,9 @@ fn paint_background_gradient_layers(
     paint_gradient_layer_stack(
         pixmap,
         path,
-        rect,
-        border_radius,
+        origin_rect,
+        clip_rect,
+        clip_radii,
         layers,
         em,
         root_font_size,
@@ -4829,8 +4985,9 @@ fn paint_background_gradient_layers(
 fn paint_gradient_layer_stack(
     pixmap: &mut Pixmap,
     path: &tiny_skia::Path,
-    rect: &crate::Rect,
-    border_radius: crate::ResolvedBorderRadii,
+    sampling_rect: &crate::Rect,
+    clip_rect: &crate::Rect,
+    clip_radii: crate::ResolvedBorderRadii,
     layers: &[crate::BackgroundGradientLayer],
     em: f32,
     root_font_size: f32,
@@ -4850,7 +5007,7 @@ fn paint_gradient_layer_stack(
                 paint_linear_gradient_layer(
                     pixmap,
                     path,
-                    rect,
+                    sampling_rect,
                     *angle,
                     stops,
                     stop_positions,
@@ -4862,14 +5019,23 @@ fn paint_gradient_layer_stack(
                 );
             }
             crate::BackgroundGradientLayer::Radial { center, stops } => {
-                paint_radial_gradient(pixmap, path, rect, *center, stops, clip);
+                paint_radial_gradient(pixmap, path, sampling_rect, *center, stops, clip);
             }
             crate::BackgroundGradientLayer::Conic {
                 angle,
                 center,
                 stops,
             } => {
-                paint_conic_gradient(pixmap, rect, border_radius, *angle, *center, stops, clip);
+                paint_conic_gradient_sampled(
+                    pixmap,
+                    clip_rect,
+                    sampling_rect,
+                    clip_radii,
+                    *angle,
+                    *center,
+                    stops,
+                    clip,
+                );
             }
         }
     }
@@ -4915,27 +5081,6 @@ fn background_gradient_tile_size(
         return (width, height);
     }
     style.background_size.unwrap_or((rect.width, rect.height))
-}
-
-fn paint_conic_gradient(
-    pixmap: &mut Pixmap,
-    rect: &crate::Rect,
-    border_radius: crate::ResolvedBorderRadii,
-    angle: f32,
-    center: (f32, f32),
-    stops: &[([u8; 4], Option<f32>)],
-    extra_clip: Option<&tiny_skia::Mask>,
-) {
-    paint_conic_gradient_sampled(
-        pixmap,
-        rect,
-        rect,
-        border_radius,
-        angle,
-        center,
-        stops,
-        extra_clip,
-    );
 }
 
 fn paint_conic_gradient_sampled(
@@ -5335,7 +5480,6 @@ fn paint_in_flow_generated_box(
         paint_box_shadow(pixmap, &shadow, &rect, style.border_model.radii, clip);
     }
     let radius = style.border_model.radii.resolve(rect.width, rect.height);
-    let has_radius = !radius.is_zero();
     let clip_path_mask = style.clip_path.as_ref().and_then(|polygon| {
         polygon_clip_mask(
             pixmap.width(),
@@ -5347,70 +5491,72 @@ fn paint_in_flow_generated_box(
             viewport,
         )
     });
-    let path = if has_radius {
-        rounded_rect_path_radii(
-            visible.x,
-            visible.y,
-            visible.width,
-            visible.height,
-            radius,
-        )
-    } else {
-        Rect::from_xywh(visible.x, visible.y, visible.width, visible.height).and_then(|rect| {
-            let mut builder = PathBuilder::new();
-            builder.push_rect(rect);
-            builder.finish()
-        })
-    };
-    let Some(path) = path else { return };
+    let background = background_geometry(&rect, style);
+    let background_path = background_clip_path(background);
+    let background_mask = background_extra_clip(pixmap, clip, clip_path_mask.as_ref());
     if style.mask_image.is_none() && !style.background_clip_text {
-        if let Some(color) = style.background_color {
+        if let (Some(color), Some(path)) = (style.background_color, background_path.as_ref()) {
             let mut paint = Paint::default();
             paint.set_color(Color::from_rgba8(color[0], color[1], color[2], color[3]));
-            paint.anti_alias = has_radius;
+            paint.anti_alias = !background.clip_radii.is_zero();
             pixmap.fill_path(
-                &path,
+                path,
                 &paint,
                 FillRule::Winding,
                 Transform::identity(),
-                clip_path_mask.as_ref(),
+                background_mask.as_ref(),
             );
         }
         if !style.background_gradient_layers.is_empty() {
-            paint_background_gradient_layers(
-                pixmap,
-                &path,
-                &rect,
-                radius,
-                style,
-                root_font_size,
-                viewport,
-                clip_path_mask.as_ref(),
-            );
+            if let Some(path) = background_path.as_ref() {
+                paint_background_gradient_layers(
+                    pixmap,
+                    path,
+                    &background.origin_rect,
+                    &background.clip_rect,
+                    background.clip_radii,
+                    style,
+                    root_font_size,
+                    viewport,
+                    background_mask.as_ref(),
+                );
+            }
         } else {
         if let Some((center, stops)) = &style.background_radial_gradient {
-            paint_radial_gradient(
-                pixmap,
-                &path,
-                &rect,
-                *center,
-                stops,
-                clip_path_mask.as_ref(),
-            );
+            if let Some(path) = background_path.as_ref() {
+                paint_radial_gradient(
+                    pixmap,
+                    path,
+                    &background.origin_rect,
+                    *center,
+                    stops,
+                    background_mask.as_ref(),
+                );
+            }
         }
         if let Some((angle, center, stops)) = &style.background_conic_gradient {
-            paint_conic_gradient(
+            paint_conic_gradient_sampled(
                 pixmap,
-                &rect,
-                radius,
+                &background.clip_rect,
+                &background.origin_rect,
+                background.clip_radii,
                 *angle,
                 *center,
                 stops,
-                clip_path_mask.as_ref(),
+                background_mask.as_ref(),
             );
         }
         if let Some((angle, stops)) = &style.background_gradient {
-                paint_linear_gradient(pixmap, &path, &rect, *angle, stops, clip_path_mask.as_ref());
+                if let Some(path) = background_path.as_ref() {
+                    paint_linear_gradient(
+                        pixmap,
+                        path,
+                        &background.origin_rect,
+                        *angle,
+                        stops,
+                        background_mask.as_ref(),
+                    );
+                }
             }
         }
     }
@@ -5438,7 +5584,7 @@ fn paint_in_flow_generated_box(
         if let Some(image_rect) = background_image_rect(
             background_url,
             base_url,
-            &rect,
+            &background.origin_rect,
             style.background_size,
             style.background_size_expression.as_deref(),
             style.background_size_fit,
@@ -5452,13 +5598,13 @@ fn paint_in_flow_generated_box(
                 background_url,
                 base_url,
                 &image_rect,
-                &visible,
+                &background.clip_rect,
                 crate::ObjectFit::Fill,
                 pixmap,
                 image_cache,
                 None,
-                radius,
-                clip_path_mask.as_ref(),
+                background.clip_radii,
+                background_mask.as_ref(),
             );
         }
     }
@@ -5541,7 +5687,6 @@ fn paint_positioned_pseudo(
     };
     let Some(visible) = visible else { return };
     let radius = style.border_model.radii.resolve(rect.width, rect.height);
-    let has_radius = !radius.is_zero();
     let clip_path_mask = style.clip_path.as_ref().and_then(|polygon| {
         polygon_clip_mask(
             pixmap.width(),
@@ -5553,69 +5698,72 @@ fn paint_positioned_pseudo(
             viewport,
         )
     });
-    let path = if has_radius {
-        rounded_rect_path_radii(
-            visible.x,
-            visible.y,
-            visible.width,
-            visible.height,
-            radius,
-        )
-    } else {
-        Rect::from_xywh(visible.x, visible.y, visible.width, visible.height).and_then(|rect| {
-            let mut builder = PathBuilder::new();
-            builder.push_rect(rect);
-            builder.finish()
-        })
-    };
-    let Some(path) = path else { return };
-    if style.mask_image.is_none() {
-        if let Some(color) = style.background_color {
+    let background = background_geometry(&rect, style);
+    let background_path = background_clip_path(background);
+    let background_mask =
+        background_extra_clip(pixmap, ancestor_clip, clip_path_mask.as_ref());
+    if style.mask_image.is_none() && !style.background_clip_text {
+        if let (Some(color), Some(path)) = (style.background_color, background_path.as_ref()) {
             let mut paint = Paint::default();
             paint.set_color(Color::from_rgba8(color[0], color[1], color[2], color[3]));
             pixmap.fill_path(
-                &path,
+                path,
                 &paint,
                 FillRule::Winding,
                 Transform::identity(),
-                clip_path_mask.as_ref(),
+                background_mask.as_ref(),
             );
         }
         if !style.background_gradient_layers.is_empty() {
-            paint_background_gradient_layers(
-                pixmap,
-                &path,
-                &rect,
-                radius,
-                style,
-                root_font_size,
-                viewport,
-                clip_path_mask.as_ref(),
-            );
+            if let Some(path) = background_path.as_ref() {
+                paint_background_gradient_layers(
+                    pixmap,
+                    path,
+                    &background.origin_rect,
+                    &background.clip_rect,
+                    background.clip_radii,
+                    style,
+                    root_font_size,
+                    viewport,
+                    background_mask.as_ref(),
+                );
+            }
         } else {
         if let Some((center, stops)) = &style.background_radial_gradient {
-            paint_radial_gradient(
-                pixmap,
-                &path,
-                &rect,
-                *center,
-                stops,
-                clip_path_mask.as_ref(),
-            );
+            if let Some(path) = background_path.as_ref() {
+                paint_radial_gradient(
+                    pixmap,
+                    path,
+                    &background.origin_rect,
+                    *center,
+                    stops,
+                    background_mask.as_ref(),
+                );
+            }
         }
         if let Some((angle, center, stops)) = &style.background_conic_gradient {
-            paint_conic_gradient(
+            paint_conic_gradient_sampled(
                 pixmap,
-                &rect,
-                radius,
+                &background.clip_rect,
+                &background.origin_rect,
+                background.clip_radii,
                 *angle,
                 *center,
                 stops,
-                clip_path_mask.as_ref(),
+                background_mask.as_ref(),
             );
         }
         if let Some((angle, stops)) = &style.background_gradient {
-                paint_linear_gradient(pixmap, &path, &rect, *angle, stops, clip_path_mask.as_ref());
+                if let Some(path) = background_path.as_ref() {
+                    paint_linear_gradient(
+                        pixmap,
+                        path,
+                        &background.origin_rect,
+                        *angle,
+                        stops,
+                        background_mask.as_ref(),
+                    );
+                }
             }
         }
     }
@@ -5643,7 +5791,7 @@ fn paint_positioned_pseudo(
         if let Some(image_rect) = background_image_rect(
             bg_url,
             base_url,
-            &rect,
+            &background.origin_rect,
             style.background_size,
             style.background_size_expression.as_deref(),
             style.background_size_fit,
@@ -5657,13 +5805,13 @@ fn paint_positioned_pseudo(
                 bg_url,
                 base_url,
                 &image_rect,
-                &visible,
+                &background.clip_rect,
                 crate::ObjectFit::Fill,
                 pixmap,
                 image_cache,
                 None,
-                radius,
-                clip_path_mask.as_ref(),
+                background.clip_radii,
+                background_mask.as_ref(),
             );
         }
     }
@@ -7617,6 +7765,72 @@ mod tests {
         assert_eq!(outside.red(), 255);
         assert_eq!(outside.green(), 255);
         assert_eq!(outside.blue(), 255);
+    }
+
+    /// Chromium 150 oracle for CSS Backgrounds box geometry. Transparent
+    /// borders make each clip edge directly observable, asymmetric insets
+    /// distinguish authored gradient coordinates from the visible clip, and
+    /// the rounded content box verifies that inner radii shrink per side.
+    #[test]
+    fn background_origin_clip_boxes_radii_and_sampling_match_chromium() {
+        let tree = parse_html(
+            r#"<html style="margin:0;background:white"><body style="margin:0;background:white">
+              <style>
+                .box { position:absolute;top:0;width:60px;height:40px;padding:10px;
+                       border:10px solid transparent;background:#00aa00 }
+                #border { left:0;background-clip:border-box }
+                #padding { left:110px;background-clip:padding-box }
+                #content { left:220px;background-clip:content-box }
+                #radius { left:330px;border-radius:40px;background-clip:content-box }
+                #gradient { position:absolute;left:0;top:100px;width:100px;height:40px;
+                            border-left:20px solid transparent;padding-left:20px;
+                            background-image:linear-gradient(90deg,red 0 50%,blue 50%);
+                            background-origin:border-box;background-clip:content-box;
+                            background-repeat:no-repeat }
+                #wrapper { position:absolute;left:170px;top:100px;width:60px;height:40px;
+                           overflow:hidden }
+                #wide { width:140px;height:40px;
+                        background:linear-gradient(90deg,red 0 50%,blue 50%) }
+                #origin { position:absolute;left:280px;top:100px;width:100px;height:40px;
+                          border-left:20px solid transparent;padding-left:20px;
+                          background-image:linear-gradient(90deg,red,blue);
+                          background-size:20px 20px;background-repeat:no-repeat;
+                          background-origin:content-box;background-clip:border-box }
+              </style>
+              <div id="border" class="box"></div>
+              <div id="padding" class="box"></div>
+              <div id="content" class="box"></div>
+              <div id="radius" class="box"></div>
+              <div id="gradient"></div>
+              <div id="wrapper"><div id="wide"></div></div>
+              <div id="origin"></div>
+            </body></html>"#,
+        );
+        let pixmap = paint_dom(&tree, (500.0, 220.0), None).expect("background geometry");
+        let is_white = |x, y| {
+            let pixel = pixmap.pixel(x, y).expect("pixel");
+            pixel.red() > 240 && pixel.green() > 240 && pixel.blue() > 240
+        };
+        let is_green = |x, y| {
+            let pixel = pixmap.pixel(x, y).expect("pixel");
+            pixel.green() > 140 && pixel.red() < 30 && pixel.blue() < 30
+        };
+        let is_red = |x, y| {
+            let pixel = pixmap.pixel(x, y).expect("pixel");
+            pixel.red() > 220 && pixel.blue() < 40
+        };
+        let is_blue = |x, y| {
+            let pixel = pixmap.pixel(x, y).expect("pixel");
+            pixel.blue() > 220 && pixel.red() < 40
+        };
+
+        assert!(is_green(5, 30), "border-box clip paints beneath transparent border");
+        assert!(is_white(115, 30) && is_green(125, 30), "padding-box excludes border");
+        assert!(is_white(225, 30) && is_white(235, 30) && is_green(245, 30));
+        assert!(is_white(351, 21) && is_green(370, 40), "content radius must inset to 20px");
+        assert!(is_red(60, 120) && is_blue(80, 120), "clip must not rebase gradient line");
+        assert!(is_red(220, 120), "ancestor clipping must not resize gradient coordinates");
+        assert!(is_white(300, 120) && !is_white(325, 110), "content origin anchors no-repeat tile");
     }
 
     #[test]
