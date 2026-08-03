@@ -46,6 +46,104 @@ pub struct InvalidationDependency {
     pub reaches: InvalidationReaches,
 }
 
+/// A cheap positive key from the compound which anchors one `:has()`.
+///
+/// This is only an early rejection filter. Compounds without a direct key
+/// remain unkeyed rather than borrowing a key from `:is()`/`:not()`, whose
+/// boolean structure cannot be represented by one key without false negatives.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RelationalSelectorKey {
+    Id(String),
+    Class(String),
+    Attribute(String),
+    LocalName(String),
+}
+
+/// Invalidation metadata for one `:has()` occurrence.
+///
+/// Gecko models the selector inside `:has()` as an upward dependency chain
+/// (parent/ancestors/previous siblings), then resumes the ordinary selector
+/// path outside the anchor. Obscura stores the smaller information needed by
+/// its whole-subtree cascade: an optional anchor key, the outward reach, and
+/// whether a key-independent child-list side effect can change the match.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RelationalInvalidation {
+    pub rule_order: usize,
+    anchor_key: Option<RelationalSelectorKey>,
+    relative_keys: Vec<RelationalSelectorKey>,
+    pub anchor_reaches: InvalidationReaches,
+    pub unkeyed_subject: bool,
+    pub sibling_side_effect: bool,
+    pub structural_side_effect: bool,
+    pub text_side_effect: bool,
+    pub unrepresentable_outer_path: bool,
+}
+
+impl RelationalInvalidation {
+    pub(crate) fn anchor_may_match(&self, tree: &DomTree, node: NodeId) -> bool {
+        let Some(dom_node) = tree.get_node(node) else {
+            return false;
+        };
+        if dom_node.as_element().is_none() {
+            return false;
+        }
+        let quirks = tree.is_quirks();
+        match self.anchor_key.as_ref() {
+            None => true,
+            Some(RelationalSelectorKey::Id(expected)) => dom_node
+                .get_attribute("id")
+                .is_some_and(|actual| {
+                    actual == expected || (quirks && actual.eq_ignore_ascii_case(expected))
+                }),
+            Some(RelationalSelectorKey::Class(expected)) => dom_node
+                .get_attribute("class")
+                .is_some_and(|classes| {
+                    classes.split_whitespace().any(|actual| {
+                        actual == expected || (quirks && actual.eq_ignore_ascii_case(expected))
+                    })
+                }),
+            Some(RelationalSelectorKey::Attribute(expected)) => {
+                dom_node.get_attribute(expected).is_some()
+            }
+            Some(RelationalSelectorKey::LocalName(expected)) => dom_node
+                .as_element()
+                .is_some_and(|element| element.local.as_ref().eq_ignore_ascii_case(expected)),
+        }
+    }
+
+    pub(crate) fn relative_path_may_match(&self, tree: &DomTree, node: NodeId) -> bool {
+        let Some(dom_node) = tree.get_node(node) else {
+            return false;
+        };
+        let Some(element) = dom_node.as_element() else {
+            return false;
+        };
+        let quirks = tree.is_quirks();
+        self.relative_keys.iter().any(|key| match key {
+            RelationalSelectorKey::Id(expected) => dom_node
+                .get_attribute("id")
+                .is_some_and(|actual| {
+                    actual == expected || (quirks && actual.eq_ignore_ascii_case(expected))
+                }),
+            RelationalSelectorKey::Class(expected) => dom_node
+                .get_attribute("class")
+                .is_some_and(|classes| {
+                    classes.split_whitespace().any(|actual| {
+                        actual == expected || (quirks && actual.eq_ignore_ascii_case(expected))
+                    })
+                }),
+            RelationalSelectorKey::Attribute(expected) => dom_node.attrs().is_some_and(|attrs| {
+                attrs
+                    .iter()
+                    .any(|attribute| attribute.name.local.as_ref().eq_ignore_ascii_case(expected))
+            }),
+            RelationalSelectorKey::LocalName(expected) => {
+                element.local.as_ref().eq_ignore_ascii_case(expected)
+            }
+        })
+    }
+}
+
 /// Selector dependencies retained alongside the compiled stylesheet.
 ///
 /// This follows Gecko's conservative invalidation-map shape: live mutations
@@ -62,6 +160,7 @@ pub struct InvalidationMap {
     conservative_rule_orders: Vec<usize>,
     relational_rule_orders: Vec<usize>,
     unkeyed_relational_rule_orders: Vec<usize>,
+    relational_invalidations: Vec<RelationalInvalidation>,
 }
 
 impl InvalidationMap {
@@ -108,6 +207,10 @@ impl InvalidationMap {
 
     pub fn has_unkeyed_relational_rules(&self) -> bool {
         !self.unkeyed_relational_rule_orders.is_empty()
+    }
+
+    pub(crate) fn relational_invalidations(&self) -> &[RelationalInvalidation] {
+        &self.relational_invalidations
     }
 
     pub fn dependency_count(&self) -> usize {
@@ -190,6 +293,12 @@ impl InvalidationMap {
         }
         if unkeyed && !self.unkeyed_relational_rule_orders.contains(&rule_order) {
             self.unkeyed_relational_rule_orders.push(rule_order);
+        }
+    }
+
+    fn push_relational_invalidation(&mut self, invalidation: RelationalInvalidation) {
+        if !self.relational_invalidations.contains(&invalidation) {
+            self.relational_invalidations.push(invalidation);
         }
     }
 }
@@ -567,6 +676,259 @@ fn relative_selector_subject_has_key(selector: &str) -> bool {
     false
 }
 
+/// Pick one positive key which every match of this exact anchor compound must
+/// have. Functional pseudos are skipped as opaque boolean expressions; using
+/// a key from one `:is()` arm as a mandatory filter would be unsound.
+fn relational_anchor_key(compound: &str) -> Option<RelationalSelectorKey> {
+    if let Some(local_name) = compound_local_name(compound) {
+        return Some(RelationalSelectorKey::LocalName(local_name));
+    }
+    let chars = compound.chars().collect::<Vec<_>>();
+    let mut index = 0usize;
+    while index < chars.len() {
+        match chars[index] {
+            '#' => {
+                let (id, next) = consume_css_identifier(&chars, index + 1);
+                if !id.is_empty() {
+                    return Some(RelationalSelectorKey::Id(id));
+                }
+                index = next.max(index + 1);
+            }
+            '.' => {
+                let (class, next) = consume_css_identifier(&chars, index + 1);
+                if !class.is_empty() {
+                    return Some(RelationalSelectorKey::Class(class));
+                }
+                index = next.max(index + 1);
+            }
+            '[' => {
+                let close = matching_delimiter(&chars, index, '[', ']')?;
+                let mut name_index = index + 1;
+                while chars.get(name_index).is_some_and(|ch| ch.is_whitespace()) {
+                    name_index += 1;
+                }
+                // `Node::get_attribute` is intentionally the unqualified HTML
+                // lookup. A namespace-qualified selector cannot use that as a
+                // mandatory anchor filter without risking a false rejection.
+                if chars.get(name_index) == Some(&'*') || chars.get(name_index) == Some(&'|') {
+                    index = close + 1;
+                    continue;
+                }
+                let (first, first_end) = consume_css_identifier(&chars, name_index);
+                if chars.get(first_end) == Some(&'|') {
+                    index = close + 1;
+                    continue;
+                }
+                let (attribute, end) = (first, first_end);
+                if !attribute.is_empty() && end <= close {
+                    return Some(RelationalSelectorKey::Attribute(
+                        attribute.to_ascii_lowercase(),
+                    ));
+                }
+                index = close + 1;
+            }
+            ':' => {
+                let pseudo_start = index + usize::from(chars.get(index + 1) == Some(&':')) + 1;
+                let (_, next) = consume_css_identifier(&chars, pseudo_start);
+                if chars.get(next) == Some(&'(') {
+                    let close = matching_delimiter(&chars, next, '(', ')')?;
+                    index = close + 1;
+                } else {
+                    index = next.max(index + 1);
+                }
+            }
+            '\\' => index = (index + 2).min(chars.len()),
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+fn push_relational_selector_key(
+    keys: &mut Vec<RelationalSelectorKey>,
+    key: RelationalSelectorKey,
+) {
+    if !keys.contains(&key) {
+        keys.push(key);
+    }
+}
+
+/// Collect cheap positive keys anywhere along a relative-selector path.  A
+/// child-list insertion which contains none of these keys cannot make the path
+/// start matching.  This is an early rejection only: each key is treated as an
+/// alternative trigger, so compounds requiring several keys remain sound.
+fn collect_relational_selector_keys(
+    selector: &str,
+    keys: &mut Vec<RelationalSelectorKey>,
+) {
+    let selector = selector.trim();
+    let selector = selector
+        .chars()
+        .next()
+        .filter(|character| matches!(character, '>' | '+' | '~'))
+        .map(|character| selector[character.len_utf8()..].trim_start())
+        .unwrap_or(selector);
+    let (compounds, _) = invalidation_compounds(selector);
+    for (compound, _) in compounds {
+        collect_relational_compound_keys(&compound, keys);
+    }
+}
+
+fn collect_relational_compound_keys(
+    compound: &str,
+    keys: &mut Vec<RelationalSelectorKey>,
+) {
+    if let Some(local_name) = compound_local_name(compound) {
+        push_relational_selector_key(keys, RelationalSelectorKey::LocalName(local_name));
+    }
+    let chars = compound.chars().collect::<Vec<_>>();
+    let mut index = 0usize;
+    while index < chars.len() {
+        match chars[index] {
+            '#' => {
+                let (id, next) = consume_css_identifier(&chars, index + 1);
+                if !id.is_empty() {
+                    push_relational_selector_key(keys, RelationalSelectorKey::Id(id));
+                }
+                index = next.max(index + 1);
+            }
+            '.' => {
+                let (class, next) = consume_css_identifier(&chars, index + 1);
+                if !class.is_empty() {
+                    push_relational_selector_key(keys, RelationalSelectorKey::Class(class));
+                }
+                index = next.max(index + 1);
+            }
+            '[' => {
+                let Some(close) = matching_delimiter(&chars, index, '[', ']') else {
+                    return;
+                };
+                let mut name_index = index + 1;
+                while chars.get(name_index).is_some_and(|ch| ch.is_whitespace()) {
+                    name_index += 1;
+                }
+                let (first, first_end) = if chars.get(name_index) == Some(&'*') {
+                    (String::new(), name_index + 1)
+                } else {
+                    consume_css_identifier(&chars, name_index)
+                };
+                let (attribute, end) = if chars.get(first_end) == Some(&'|') {
+                    consume_css_identifier(&chars, first_end + 1)
+                } else {
+                    (first, first_end)
+                };
+                if !attribute.is_empty() && end <= close {
+                    push_relational_selector_key(
+                        keys,
+                        RelationalSelectorKey::Attribute(attribute.to_ascii_lowercase()),
+                    );
+                }
+                index = close + 1;
+            }
+            ':' => {
+                let pseudo_start = index + usize::from(chars.get(index + 1) == Some(&':')) + 1;
+                let (name, next) = consume_css_identifier(&chars, pseudo_start);
+                if chars.get(next) != Some(&'(') {
+                    index = next.max(index + 1);
+                    continue;
+                }
+                let Some(close) = matching_delimiter(&chars, next, '(', ')') else {
+                    return;
+                };
+                let arguments = chars[next + 1..close].iter().collect::<String>();
+                match name.to_ascii_lowercase().as_str() {
+                    "is" | "where" | "not" | "has" => {
+                        for alternative in split_selector_list(&arguments) {
+                            collect_relational_selector_keys(alternative.trim(), keys);
+                        }
+                    }
+                    "nth-child" | "nth-last-child" | "nth-of-type" | "nth-last-of-type" => {
+                        if let Some(of_selector) = nth_of_selector(&arguments) {
+                            for alternative in split_selector_list(of_selector) {
+                                collect_relational_selector_keys(alternative.trim(), keys);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                index = close + 1;
+            }
+            '\\' => index = (index + 2).min(chars.len()),
+            _ => index += 1,
+        }
+    }
+}
+
+fn selector_contains_pseudo(selector: &str, names: &[&str]) -> bool {
+    let chars = selector.chars().collect::<Vec<_>>();
+    let mut index = 0usize;
+    let mut quote = None;
+    let mut bracket_depth = 0usize;
+    while index < chars.len() {
+        let ch = chars[index];
+        if ch == '\\' {
+            index = (index + 2).min(chars.len());
+            continue;
+        }
+        if let Some(active_quote) = quote {
+            if ch == active_quote {
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            ':' if bracket_depth == 0 && chars.get(index + 1) != Some(&':') => {
+                let (name, next) = consume_css_identifier(&chars, index + 1);
+                if names
+                    .iter()
+                    .any(|expected| name.eq_ignore_ascii_case(expected))
+                {
+                    return true;
+                }
+                index = next.max(index + 1);
+                continue;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    false
+}
+
+fn selector_contains_adjacent_combinator(selector: &str) -> bool {
+    let chars = selector.chars().collect::<Vec<_>>();
+    let mut index = 0usize;
+    let mut quote = None;
+    let mut bracket_depth = 0usize;
+    while index < chars.len() {
+        let ch = chars[index];
+        if ch == '\\' {
+            index = (index + 2).min(chars.len());
+            continue;
+        }
+        if let Some(active_quote) = quote {
+            if ch == active_quote {
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '+' if bracket_depth == 0 => return true,
+            _ => {}
+        }
+        index += 1;
+    }
+    false
+}
+
 fn note_compound_dependencies(
     map: &mut InvalidationMap,
     compound: &str,
@@ -688,10 +1050,55 @@ fn note_compound_dependencies(
                         );
                         map.mark_conservative(rule_order);
                         let alternatives = split_selector_list(&arguments);
+                        let mut relative_keys = Vec::new();
+                        for alternative in &alternatives {
+                            collect_relational_selector_keys(
+                                alternative.trim(),
+                                &mut relative_keys,
+                            );
+                        }
                         let unkeyed = alternatives.iter().any(|alternative| {
                             !relative_selector_subject_has_key(alternative.trim())
                         });
                         map.mark_relational(rule_order, unkeyed);
+                        let sibling_side_effect = alternatives
+                            .iter()
+                            .any(|alternative| {
+                                selector_contains_adjacent_combinator(alternative.trim())
+                            });
+                        let structural_side_effect = alternatives.iter().any(|alternative| {
+                            selector_contains_pseudo(
+                                alternative.trim(),
+                                &[
+                                    "empty",
+                                    "first-child",
+                                    "last-child",
+                                    "only-child",
+                                    "first-of-type",
+                                    "last-of-type",
+                                    "only-of-type",
+                                    "nth-child",
+                                    "nth-last-child",
+                                    "nth-of-type",
+                                    "nth-last-of-type",
+                                ],
+                            )
+                        });
+                        let text_side_effect = alternatives.iter().any(|alternative| {
+                            selector_contains_pseudo(alternative.trim(), &["empty"])
+                        });
+                        map.push_relational_invalidation(RelationalInvalidation {
+                            rule_order,
+                            anchor_key: relational_anchor_key(compound),
+                            relative_keys,
+                            anchor_reaches: reaches,
+                            unkeyed_subject: unkeyed,
+                            sibling_side_effect,
+                            structural_side_effect,
+                            text_side_effect,
+                            unrepresentable_outer_path: reaches
+                                .contains(InvalidationReaches::CONSERVATIVE),
+                        });
                         for alternative in alternatives {
                             note_selector_dependencies(
                                 map,
@@ -5970,6 +6377,59 @@ mod tests {
                 "{selector}"
             );
         }
+    }
+
+    #[test]
+    fn relational_invalidation_records_anchor_reach_and_tree_side_effects() {
+        let map = test_invalidation_map(
+            r#"
+                .host:has(.signal) .out { color:red }
+                .row:has(+ :is(.notice,.warning)) { color:red }
+                .card:has(.item:first-child) { color:red }
+                .shell:has(.label:empty) { color:red }
+                .anchor:has(.signal) ~ .panel .leaf { color:red }
+            "#,
+        );
+        let entries = map.relational_invalidations();
+        assert_eq!(entries.len(), 5);
+        assert!(entries[0]
+            .anchor_reaches
+            .contains(InvalidationReaches::DESCENDANTS));
+        assert!(!entries[0].unkeyed_subject);
+        assert!(entries[1].sibling_side_effect);
+        assert!(!entries[1].unkeyed_subject);
+        assert!(entries[2].structural_side_effect);
+        assert!(!entries[2].text_side_effect);
+        assert!(entries[3].structural_side_effect);
+        assert!(entries[3].text_side_effect);
+        assert!(entries[4].unrepresentable_outer_path);
+
+        let tree = obscura_dom::parse_html(
+            "<section id=host class=host></section><section id=other class=other></section>",
+        );
+        assert!(entries[0].anchor_may_match(
+            &tree,
+            tree.get_element_by_id("host").unwrap(),
+        ));
+        assert!(!entries[0].anchor_may_match(
+            &tree,
+            tree.get_element_by_id("other").unwrap(),
+        ));
+    }
+
+    #[test]
+    fn relational_anchor_filter_never_unqualifies_namespaced_attributes() {
+        for compound in [
+            "[xlink|href]:has(.signal)",
+            "[*|href]:has(.signal)",
+            "[|href]:has(.signal)",
+        ] {
+            assert_eq!(relational_anchor_key(compound), None, "{compound}");
+        }
+        assert_eq!(
+            relational_anchor_key("[xlink|href].host:has(.signal)"),
+            Some(RelationalSelectorKey::Class("host".into())),
+        );
     }
 
     #[test]

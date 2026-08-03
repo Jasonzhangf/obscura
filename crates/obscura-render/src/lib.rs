@@ -1007,6 +1007,10 @@ pub struct LayoutStyle {
     // resolved to line placements on children in a later pass.
     pub grid_template_columns: Vec<taffy::GridTemplateComponent<String>>,
     pub grid_template_rows: Vec<taffy::GridTemplateComponent<String>>,
+    /// Keeps the opaque `calc()` handles embedded in grid track sizing
+    /// functions alive until every Taffy layout pass has completed.
+    pub(crate) grid_calc_expressions:
+        [Vec<std::sync::Arc<crate::style::GridCalcExpression>>; 4],
     /// Track sizing functions for columns created outside the explicit grid.
     /// An empty list is the CSS initial `auto` value: taffy supplies one
     /// automatic implicit track and cycles a non-empty authored list.
@@ -1605,7 +1609,15 @@ pub struct NodeRect {
 /// Lay out `root` within a `viewport` (width, height) in CSS pixels and return
 /// the border-box geometry per node, mirroring the input tree.
 pub fn layout(root: &LayoutNode, viewport: (f32, f32)) -> NodeRect {
-    let mut tree: TaffyTree = TaffyTree::new();
+    let root_font_size = root.style.font_size.unwrap_or(16.0);
+    initialize_grid_calc_contexts(
+        root,
+        root_font_size,
+        root_font_size,
+        viewport.0 / 100.0,
+        viewport.1 / 100.0,
+    );
+    let mut tree: TaffyTree = new_taffy_tree();
     let root_id = build_node(&mut tree, root);
     let _ = tree.compute_layout(
         root_id,
@@ -1615,6 +1627,28 @@ pub fn layout(root: &LayoutNode, viewport: (f32, f32)) -> NodeRect {
         },
     );
     read_node(&tree, root_id)
+}
+
+fn initialize_grid_calc_contexts(
+    node: &LayoutNode,
+    inherited_font_size: f32,
+    root_font_size: f32,
+    vw: f32,
+    vh: f32,
+) {
+    let font_size = node.style.font_size.unwrap_or(inherited_font_size);
+    crate::style::set_grid_calc_context(&node.style, font_size, root_font_size, vw, vh);
+    for child in &node.children {
+        initialize_grid_calc_contexts(child, font_size, root_font_size, vw, vh);
+    }
+}
+
+pub(crate) fn new_taffy_tree<NodeContext>() -> TaffyTree<NodeContext> {
+    let mut tree = TaffyTree::new();
+    // Every opaque handle is backed by an Arc retained in the LayoutStyle
+    // map/input tree, which outlives all computations on `tree`.
+    tree.set_calc_resolver(crate::style::resolve_grid_calc);
+    tree
 }
 
 fn build_node(tree: &mut TaffyTree, node: &LayoutNode) -> NodeId {
@@ -1958,6 +1992,49 @@ mod tests {
             out.children[0].border_box.y,
             out.children[1].border_box.y
         );
+    }
+
+    #[test]
+    fn grid_calc_tracks_resolve_against_container_width() {
+        let grid = crate::style::compute_style(
+            "div",
+            Some(
+                "display:grid;width:1440px;height:20px;\
+                 grid-template-columns:\
+                 minmax(0,calc((100% - (50rem + 20vw))/2)) 1fr \
+                 minmax(0,calc((100% - (50rem + 20vw))/2))",
+            ),
+        );
+        let child = || {
+            LayoutNode::leaf(crate::style::compute_style(
+                "div",
+                Some("display:block;height:10px"),
+            ))
+        };
+        let output = layout(
+            &LayoutNode {
+                style: grid.clone(),
+                text: None,
+                children: vec![child(), child(), child()],
+            },
+            (1440.0, 100.0),
+        );
+
+        assert!((output.children[0].border_box.width - 176.0).abs() < 0.01);
+        assert!((output.children[1].border_box.x - 176.0).abs() < 0.01);
+        assert!((output.children[1].border_box.width - 1088.0).abs() < 0.01);
+
+        let resized = layout(
+            &LayoutNode {
+                style: grid,
+                text: None,
+                children: vec![child(), child(), child()],
+            },
+            (1000.0, 100.0),
+        );
+        assert!((resized.children[0].border_box.width - 220.0).abs() < 0.01);
+        assert!((resized.children[1].border_box.x - 220.0).abs() < 0.01);
+        assert!((resized.children[1].border_box.width - 1000.0).abs() < 0.01);
     }
 
     #[test]

@@ -2884,6 +2884,66 @@ fn sample_gradient(
     ]
 }
 
+/// Whether one shaped inline item can contribute ink to the destination
+/// surface. `SwashCache::with_pixels` rasterizes a glyph before its callback
+/// can reject out-of-bounds pixels, so letting a long document reach that
+/// callback for every offscreen glyph makes viewport screenshots scale with
+/// the full page height. Keep this test deliberately conservative: line boxes
+/// are expanded by four ems for unusual font ink bounds, and every authored
+/// relative-inline offset participates in the envelope. Translation and
+/// isolated transform layers arrive through `offset`, in the same coordinate
+/// space as the destination pixmap.
+fn inline_item_may_intersect_surface(
+    item: &InlineItem,
+    offset: (f32, f32),
+    clip: Option<Rect>,
+    surface_height: u32,
+    raster_scale: f32,
+) -> bool {
+    if !raster_scale.is_finite() || raster_scale <= 0.0 || surface_height == 0 {
+        return false;
+    }
+    let surface_bottom = surface_height as f32 / raster_scale;
+    if let Some(clip) = clip {
+        if clip.y >= surface_bottom || clip.y + clip.height <= 0.0 {
+            return false;
+        }
+    }
+
+    let mut line_top = f32::INFINITY;
+    let mut line_bottom = f32::NEG_INFINITY;
+    let mut max_font_size = 0.0f32;
+    for run in item.buffer.layout_runs() {
+        line_top = line_top.min(run.line_top);
+        line_bottom = line_bottom.max(run.line_top + run.line_height);
+        for glyph in run.glyphs {
+            if glyph.font_size.is_finite() {
+                max_font_size = max_font_size.max(glyph.font_size.max(0.0));
+            }
+        }
+    }
+    if !line_top.is_finite() || !line_bottom.is_finite() {
+        return false;
+    }
+
+    // Some fonts have ink well outside their ascender/descender metrics. Four
+    // ems on each side is intentionally much larger than normal glyph ink,
+    // while still culling text that is genuinely pages away from the viewport.
+    let ink_guard = max_font_size.mul_add(4.0, 4.0);
+    let mut relative_top = 0.0f32;
+    let mut relative_bottom = 0.0f32;
+    for range in &item.relative_owner_ranges {
+        if range.offset.1.is_finite() {
+            relative_top = relative_top.min(range.offset.1);
+            relative_bottom = relative_bottom.max(range.offset.1);
+        }
+    }
+    let origin_y = item.origin.1 + offset.1;
+    let visual_top = origin_y + line_top + relative_top - ink_guard;
+    let visual_bottom = origin_y + line_bottom + relative_bottom + ink_guard;
+    visual_top < surface_bottom && visual_bottom > 0.0
+}
+
 impl TextEngine {
     /// Rasterize inline context `idx` into `pixmap`, honoring its finalized
     /// clip. Tests and generated items whose coordinates do not change between
@@ -2964,6 +3024,16 @@ impl TextEngine {
         let Some(item) = items.get_mut(idx) else {
             return;
         };
+        let clip = clip_override.or(item.clip);
+        if !inline_item_may_intersect_surface(
+            item,
+            offset,
+            clip,
+            pixmap.height(),
+            raster_scale,
+        ) {
+            return;
+        }
         let (ox, oy) = (
             (item.origin.0 + offset.0) * raster_scale,
             (item.origin.1 + offset.1) * raster_scale,
@@ -2972,7 +3042,6 @@ impl TextEngine {
         // but the clip is already in screen space (owner-shifted at
         // `resolve_clip_rects`) and must not move with the container, or a
         // translated slide would drag its viewport's clip along with it.
-        let clip = clip_override.or(item.clip);
         let pw = pixmap.width() as i32;
         let ph = pixmap.height() as i32;
         let clip_bounds = clip.map(|c| {
@@ -3355,6 +3424,103 @@ mod tests {
 
     const RED: [u8; 4] = [255, 0, 0, 255];
     const BLUE: [u8; 4] = [0, 0, 255, 255];
+
+    fn surface_cull_fixture() -> (TextEngine, usize) {
+        let tree = obscura_dom::parse_html("<p id='copy'>Visible text</p>");
+        let copy = tree.get_element_by_id("copy").unwrap();
+        let style = LayoutStyle {
+            display: Display::Block,
+            font_size: Some(16.0),
+            line_height: Some(crate::LineHeight::Px(20.0)),
+            ..Default::default()
+        };
+        let mut engine = TextEngine::new();
+        let item = engine
+            .try_build(&tree, copy, &HashMap::from([(copy, style)]))
+            .unwrap();
+        engine.finalize(item, (0.0, 10.0), 200.0, None);
+        (engine, item)
+    }
+
+    #[test]
+    fn text_surface_cull_is_conservative_for_offsets_and_ink_overhang() {
+        let (mut engine, item) = surface_cull_fixture();
+        assert!(inline_item_may_intersect_surface(
+            &engine.items[item],
+            (0.0, 0.0),
+            None,
+            100,
+            1.0,
+        ));
+
+        engine.items[item].origin.1 = -60.0;
+        assert!(
+            inline_item_may_intersect_surface(
+                &engine.items[item],
+                (0.0, 0.0),
+                None,
+                100,
+                1.0,
+            ),
+            "the four-em ink guard must preserve unusual glyph overhang"
+        );
+        engine.items[item].origin.1 = -500.0;
+        assert!(!inline_item_may_intersect_surface(
+            &engine.items[item],
+            (0.0, 0.0),
+            None,
+            100,
+            1.0,
+        ));
+        engine.items[item].origin.1 = 500.0;
+        assert!(!inline_item_may_intersect_surface(
+            &engine.items[item],
+            (0.0, 0.0),
+            None,
+            100,
+            1.0,
+        ));
+        assert!(
+            inline_item_may_intersect_surface(
+                &engine.items[item],
+                (0.0, -490.0),
+                None,
+                100,
+                1.0,
+            ),
+            "the transform/layer translation must be applied before culling"
+        );
+
+        engine.items[item]
+            .relative_owner_ranges
+            .push(RelativeOwnerTextRange {
+                start: 0,
+                end: 1,
+                offset: (0.0, -490.0),
+            });
+        assert!(
+            inline_item_may_intersect_surface(
+                &engine.items[item],
+                (0.0, 0.0),
+                None,
+                100,
+                1.0,
+            ),
+            "a relatively positioned inline may move visible ink into the surface"
+        );
+        assert!(!inline_item_may_intersect_surface(
+            &engine.items[item],
+            (0.0, 0.0),
+            Some(Rect {
+                x: 0.0,
+                y: 200.0,
+                width: 100.0,
+                height: 20.0,
+            }),
+            100,
+            1.0,
+        ));
+    }
 
     #[test]
     fn system_ui_resolves_in_stack_order_to_chromium_linux_face() {

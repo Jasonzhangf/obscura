@@ -1687,14 +1687,16 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
             };
         }
         "grid-template-columns" => {
-            let (tracks, names) = parse_track_list_named(value);
+            let (tracks, names, calc_expressions) = parse_track_list_named(value);
             style.grid_template_columns_subgrid = is_subgrid_track_list(value);
             style.grid_template_columns = tracks;
+            style.grid_calc_expressions[0] = calc_expressions;
             style.grid_col_line_names = (!names.is_empty()).then(|| build_line_map(names));
         }
         "grid-template-rows" => {
-            let (tracks, names) = parse_track_list_named(value);
+            let (tracks, names, calc_expressions) = parse_track_list_named(value);
             style.grid_template_rows = tracks;
+            style.grid_calc_expressions[1] = calc_expressions;
             style.grid_row_line_names = (!names.is_empty()).then(|| build_line_map(names));
         }
         "grid-auto-columns" => apply_grid_auto_tracks(style, value, true),
@@ -2553,7 +2555,7 @@ fn supports_conservative_known_value(name: &str, value: &str) -> bool {
                     .all(|token| matches!(*token, "row" | "column" | "dense"))
         }
         "grid-template-columns" | "grid-template-rows" => {
-            let (tracks, _) = parse_track_list_named(value);
+            let (tracks, _, _) = parse_track_list_named(value);
             !tracks.is_empty() || lower.starts_with("subgrid")
         }
         "grid-template-areas" => !parse_grid_areas(value).is_empty() || lower == "none",
@@ -3499,6 +3501,141 @@ fn scale_number(s: &str) -> Option<f32> {
 /// Parse a CSS grid track list (`min-content 1fr min-content`, `12.25rem
 /// minmax(0,1fr)`) into taffy sizing functions. Tokenizes respecting the
 /// parentheses in `minmax(...)` / `fit-content(...)`.
+#[repr(align(8))]
+#[derive(Debug)]
+pub(crate) struct GridCalcExpression {
+    expression: String,
+    em_px: std::sync::atomic::AtomicU32,
+    rem_px: std::sync::atomic::AtomicU32,
+    vw: std::sync::atomic::AtomicU32,
+    vh: std::sync::atomic::AtomicU32,
+    context_initialized: std::sync::atomic::AtomicBool,
+}
+
+impl GridCalcExpression {
+    fn parse(value: &str) -> Option<Self> {
+        let value = value.trim().to_ascii_lowercase();
+        if !(value.starts_with("calc(")
+            || value.starts_with("min(")
+            || value.starts_with("max(")
+            || value.starts_with("clamp(")
+            || value.starts_with("round("))
+        {
+            return None;
+        }
+
+        // Track math is resolved late against the actual grid-axis basis.
+        // Accept only supported length units, numbers, and math function
+        // names. The computed font and viewport contexts are attached by the
+        // top-down style pass before Taffy resolves the percentage basis.
+        for word in value
+            .split(|character: char| !character.is_ascii_alphabetic() && character != '-')
+            .filter(|word| !word.is_empty() && *word != "-")
+        {
+            if !matches!(
+                word,
+                "calc"
+                    | "min"
+                    | "max"
+                    | "clamp"
+                    | "round"
+                    | "nearest"
+                    | "up"
+                    | "down"
+                    | "to-zero"
+                    | "px"
+                    | "pt"
+                    | "em"
+                    | "rem"
+                    | "ex"
+                    | "vw"
+                    | "vh"
+                    | "dvw"
+                    | "dvh"
+                    | "svw"
+                    | "svh"
+                    | "lvw"
+                    | "lvh"
+                    | "vmin"
+                    | "vmax"
+            ) {
+                return None;
+            }
+        }
+
+        // Probe more than one basis so malformed expressions and non-finite
+        // arithmetic never become an opaque Taffy handle.
+        for basis in [0.0, 100.0] {
+            let resolved = resolve_contextual_length(&value, 16.0, 16.0, 10.0, 10.0, basis)?;
+            if !resolved.is_finite() {
+                return None;
+            }
+        }
+        Some(Self {
+            expression: value,
+            em_px: std::sync::atomic::AtomicU32::new(16.0f32.to_bits()),
+            rem_px: std::sync::atomic::AtomicU32::new(16.0f32.to_bits()),
+            vw: std::sync::atomic::AtomicU32::new(0.0f32.to_bits()),
+            vh: std::sync::atomic::AtomicU32::new(0.0f32.to_bits()),
+            context_initialized: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    fn set_context(&self, em_px: f32, rem_px: f32, vw: f32, vh: f32) {
+        use std::sync::atomic::Ordering;
+        // Viewport units are used values and must follow every new layout
+        // viewport, including repeated calls through the public LayoutNode API.
+        self.vw.store(vw.to_bits(), Ordering::Relaxed);
+        self.vh.store(vh.to_bits(), Ordering::Relaxed);
+        // A cloned handle represents the same computed track value. In
+        // particular, explicit `inherit` must preserve the parent's em basis
+        // even when the child has a different font-size.
+        if self.context_initialized.load(Ordering::Acquire) {
+            return;
+        }
+        self.em_px.store(em_px.to_bits(), Ordering::Relaxed);
+        self.rem_px.store(rem_px.to_bits(), Ordering::Relaxed);
+        self.context_initialized.store(true, Ordering::Release);
+    }
+}
+
+pub(crate) fn set_grid_calc_context(
+    style: &LayoutStyle,
+    em_px: f32,
+    rem_px: f32,
+    vw: f32,
+    vh: f32,
+) {
+    for expression in style.grid_calc_expressions.iter().flatten() {
+        expression.set_context(em_px, rem_px, vw, vh);
+    }
+}
+
+/// Resolve an Arc-backed grid calc handle installed in Taffy.
+///
+/// # Safety
+///
+/// `value` must point to a live `GridCalcExpression`. `LayoutStyle` retains
+/// the Arc owners for the entire lifetime of every layout tree computation.
+#[allow(unsafe_code)]
+pub(crate) fn resolve_grid_calc(value: *const (), basis: f32) -> f32 {
+    // SAFETY: upheld by `new_taffy_tree` and the Arc ownership documented on
+    // `LayoutStyle::grid_calc_expressions`.
+    let calc = unsafe { &*value.cast::<GridCalcExpression>() };
+    use std::sync::atomic::Ordering;
+    resolve_contextual_length(
+        &calc.expression,
+        f32::from_bits(calc.em_px.load(Ordering::Relaxed)),
+        f32::from_bits(calc.rem_px.load(Ordering::Relaxed)),
+        f32::from_bits(calc.vw.load(Ordering::Relaxed)),
+        f32::from_bits(calc.vh.load(Ordering::Relaxed)),
+        basis,
+    )
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.0)
+        .max(0.0)
+}
+
 /// Parse a track list into taffy sizing functions plus the `[line-name]` map
 /// (name -> 1-based grid line number). `repeat(n, ...)` is expanded to n copies;
 /// auto-fill/auto-fit remain typed repetitions so layout can derive their count
@@ -3509,10 +3646,12 @@ pub(crate) fn parse_track_list_named(
 ) -> (
     Vec<taffy::GridTemplateComponent<String>>,
     Vec<(String, i16)>,
+    Vec<std::sync::Arc<GridCalcExpression>>,
 ) {
     let tokens = tokenize_tracks(value);
     let mut tracks = Vec::new();
     let mut names = Vec::new();
+    let mut calc_expressions = Vec::new();
     let mut line: i16 = 1;
     // A subgridded axis owns line names but no sizing functions. Do not turn
     // the keyword into the generic unknown-token => auto-track fallback.
@@ -3521,15 +3660,22 @@ pub(crate) fn parse_track_list_named(
         .map(|token| token.eq_ignore_ascii_case("subgrid"))
         .unwrap_or(false);
     for tok in tokens.into_iter().skip(usize::from(is_subgrid)) {
-        expand_track_token(&tok, &mut tracks, &mut names, &mut line);
+        expand_track_token(
+            &tok,
+            &mut tracks,
+            &mut names,
+            &mut calc_expressions,
+            &mut line,
+        );
     }
-    (tracks, names)
+    (tracks, names, calc_expressions)
 }
 
 fn expand_track_token(
     tok: &str,
     tracks: &mut Vec<taffy::GridTemplateComponent<String>>,
     names: &mut Vec<(String, i16)>,
+    calc_expressions: &mut Vec<std::sync::Arc<GridCalcExpression>>,
     line: &mut i16,
 ) {
     let t = tok.trim();
@@ -3554,7 +3700,7 @@ fn expand_track_token(
                 let repeated_tracks = subtoks
                     .iter()
                     .filter(|st| !st.trim_start().starts_with('['))
-                    .map(|st| track(st))
+                    .map(|st| track(st, calc_expressions))
                     .collect();
                 tracks.push(taffy::GridTemplateComponent::Repeat(
                     taffy::GridTemplateRepetition {
@@ -3569,13 +3715,16 @@ fn expand_track_token(
             let count = cnt.trim().parse::<usize>().unwrap_or(1).min(1000);
             for _ in 0..count {
                 for st in &subtoks {
-                    expand_track_token(st, tracks, names, line);
+                    expand_track_token(st, tracks, names, calc_expressions, line);
                 }
             }
         }
         return;
     }
-    tracks.push(taffy::GridTemplateComponent::Single(track(t)));
+    tracks.push(taffy::GridTemplateComponent::Single(track(
+        t,
+        calc_expressions,
+    )));
     *line += 1;
 }
 
@@ -3626,7 +3775,10 @@ fn tokenize_tracks(value: &str) -> Vec<String> {
     out
 }
 
-fn track(tok: &str) -> taffy::TrackSizingFunction {
+fn track(
+    tok: &str,
+    calc_expressions: &mut Vec<std::sync::Arc<GridCalcExpression>>,
+) -> taffy::TrackSizingFunction {
     use taffy::MinMax;
     let t = tok.trim();
     let lower = t.to_ascii_lowercase();
@@ -3634,10 +3786,11 @@ fn track(tok: &str) -> taffy::TrackSizingFunction {
         .strip_prefix("minmax(")
         .and_then(|s| s.strip_suffix(')'))
     {
-        if let Some((a, b)) = inner.split_once(',') {
+        let arguments = split_top_level(inner, ',');
+        if let [a, b] = arguments.as_slice() {
             return MinMax {
-                min: min_track(a.trim()),
-                max: max_track(b.trim()),
+                min: min_track(a.trim(), calc_expressions),
+                max: max_track(b.trim(), calc_expressions),
             };
         }
     }
@@ -3645,15 +3798,28 @@ fn track(tok: &str) -> taffy::TrackSizingFunction {
         .strip_prefix("fit-content(")
         .and_then(|s| s.strip_suffix(')'))
     {
-        let px = px_value(inner.trim()).unwrap_or(0.0);
+        let limit = inner.trim();
+        let max = if let Some(percent) = limit
+            .strip_suffix('%')
+            .and_then(|number| number.trim().parse::<f32>().ok())
+        {
+            taffy::MaxTrackSizingFunction::fit_content_percent(percent / 100.0)
+        } else if let Some(px) = px_value(limit) {
+            taffy::MaxTrackSizingFunction::fit_content_px(px)
+        } else {
+            // Taffy has no opaque-calc form for fit-content's distinct clamp
+            // semantics. Preserve a non-collapsing intrinsic fallback rather
+            // than turning a valid expression into fit-content(0px).
+            taffy::MaxTrackSizingFunction::auto()
+        };
         return MinMax {
             min: taffy::MinTrackSizingFunction::auto(),
-            max: taffy::MaxTrackSizingFunction::fit_content_px(px),
+            max,
         };
     }
     MinMax {
-        min: min_track(t),
-        max: max_track(t),
+        min: min_track(t, calc_expressions),
+        max: max_track(t, calc_expressions),
     }
 }
 
@@ -3661,7 +3827,12 @@ fn track(tok: &str) -> taffy::TrackSizingFunction {
 /// `grid-auto-rows`. Unlike template track lists, implicit track lists do not
 /// accept line names or `repeat()`: the authored list itself is repeated as
 /// needed for successive implicit tracks.
-fn parse_grid_auto_track_list(value: &str) -> Option<Vec<taffy::TrackSizingFunction>> {
+fn parse_grid_auto_track_list(
+    value: &str,
+) -> Option<(
+    Vec<taffy::TrackSizingFunction>,
+    Vec<std::sync::Arc<GridCalcExpression>>,
+)> {
     let tokens = tokenize_tracks(value);
     if tokens.is_empty()
         || tokens.iter().any(|token| {
@@ -3678,7 +3849,12 @@ fn parse_grid_auto_track_list(value: &str) -> Option<Vec<taffy::TrackSizingFunct
     {
         return None;
     }
-    Some(tokens.iter().map(|token| track(token)).collect())
+    let mut calc_expressions = Vec::new();
+    let tracks = tokens
+        .iter()
+        .map(|token| track(token, &mut calc_expressions))
+        .collect();
+    Some((tracks, calc_expressions))
 }
 
 fn valid_grid_auto_track(value: &str) -> bool {
@@ -3716,6 +3892,9 @@ fn valid_grid_track_breadth(value: &str, flex_allowed: bool) -> bool {
 
 fn valid_grid_track_length_percentage(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
+    if GridCalcExpression::parse(&lower).is_some() {
+        return true;
+    }
     if lower == "0" {
         return true;
     }
@@ -3735,30 +3914,37 @@ fn valid_grid_track_length_percentage(value: &str) -> bool {
 
 fn apply_grid_auto_tracks(style: &mut LayoutStyle, value: &str, columns: bool) {
     let lower = value.trim().to_ascii_lowercase();
-    let (tracks, inherit) = match lower.as_str() {
-        "inherit" => (Vec::new(), true),
+    let (tracks, inherit, calc_expressions) = match lower.as_str() {
+        "inherit" => (Vec::new(), true, Vec::new()),
         // These properties are non-inherited. The compact cascade has no
         // retained lower-origin/layer declaration for revert, so it follows
         // the existing non-inherited-property policy and uses the initial
         // automatic implicit track.
-        "initial" | "unset" | "revert" | "revert-layer" => (Vec::new(), false),
+        "initial" | "unset" | "revert" | "revert-layer" => {
+            (Vec::new(), false, Vec::new())
+        }
         _ => {
-            let Some(tracks) = parse_grid_auto_track_list(value) else {
+            let Some((tracks, calc_expressions)) = parse_grid_auto_track_list(value) else {
                 return;
             };
-            (tracks, false)
+            (tracks, false, calc_expressions)
         }
     };
     if columns {
         style.grid_auto_columns = tracks;
+        style.grid_calc_expressions[2] = calc_expressions;
         style.grid_auto_columns_inherit = inherit;
     } else {
         style.grid_auto_rows = tracks;
+        style.grid_calc_expressions[3] = calc_expressions;
         style.grid_auto_rows_inherit = inherit;
     }
 }
 
-fn min_track(tok: &str) -> taffy::MinTrackSizingFunction {
+fn min_track(
+    tok: &str,
+    calc_expressions: &mut Vec<std::sync::Arc<GridCalcExpression>>,
+) -> taffy::MinTrackSizingFunction {
     use taffy::MinTrackSizingFunction as M;
     let lower = tok.to_ascii_lowercase();
     match lower.as_str() {
@@ -3776,6 +3962,11 @@ fn min_track(tok: &str) -> taffy::MinTrackSizingFunction {
                 M::percent(p / 100.0)
             } else if let Some(px) = px_value(other) {
                 M::length(px)
+            } else if let Some(calc) = GridCalcExpression::parse(other) {
+                let calc = std::sync::Arc::new(calc);
+                let handle = std::sync::Arc::as_ptr(&calc).cast();
+                calc_expressions.push(calc);
+                M::calc(handle)
             } else {
                 M::auto()
             }
@@ -3783,7 +3974,10 @@ fn min_track(tok: &str) -> taffy::MinTrackSizingFunction {
     }
 }
 
-fn max_track(tok: &str) -> taffy::MaxTrackSizingFunction {
+fn max_track(
+    tok: &str,
+    calc_expressions: &mut Vec<std::sync::Arc<GridCalcExpression>>,
+) -> taffy::MaxTrackSizingFunction {
     use taffy::MaxTrackSizingFunction as M;
     let lower = tok.to_ascii_lowercase();
     match lower.as_str() {
@@ -3803,6 +3997,11 @@ fn max_track(tok: &str) -> taffy::MaxTrackSizingFunction {
                 M::percent(p / 100.0)
             } else if let Some(px) = px_value(other) {
                 M::length(px)
+            } else if let Some(calc) = GridCalcExpression::parse(other) {
+                let calc = std::sync::Arc::new(calc);
+                let handle = std::sync::Arc::as_ptr(&calc).cast();
+                calc_expressions.push(calc);
+                M::calc(handle)
             } else {
                 M::auto()
             }
@@ -3849,14 +4048,16 @@ fn parse_grid_template(style: &mut LayoutStyle, value: &str) {
         // Rows side carries area strings interleaved with row track sizes.
         style.grid_areas = Some(parse_grid_areas(rows_part));
     } else if !rows_part.is_empty() {
-        let (tracks, names) = parse_track_list_named(rows_part);
+        let (tracks, names, calc_expressions) = parse_track_list_named(rows_part);
         style.grid_template_rows = tracks;
+        style.grid_calc_expressions[1] = calc_expressions;
         style.grid_row_line_names = (!names.is_empty()).then(|| build_line_map(names));
     }
     if let Some(cols) = cols_part {
-        let (tracks, names) = parse_track_list_named(cols);
+        let (tracks, names, calc_expressions) = parse_track_list_named(cols);
         style.grid_template_columns_subgrid = is_subgrid_track_list(cols);
         style.grid_template_columns = tracks;
+        style.grid_calc_expressions[0] = calc_expressions;
         style.grid_col_line_names = (!names.is_empty()).then(|| build_line_map(names));
     }
 }
@@ -3873,9 +4074,11 @@ fn parse_grid_shorthand(style: &mut LayoutStyle, value: &str) {
     let columns = columns.trim();
     if rows.to_ascii_lowercase().contains("auto-flow") {
         style.grid_template_rows.clear();
-        let (tracks, names) = parse_track_list_named(columns);
+        style.grid_calc_expressions[1].clear();
+        let (tracks, names, calc_expressions) = parse_track_list_named(columns);
         style.grid_template_columns_subgrid = is_subgrid_track_list(columns);
         style.grid_template_columns = tracks;
+        style.grid_calc_expressions[0] = calc_expressions;
         style.grid_col_line_names = (!names.is_empty()).then(|| build_line_map(names));
         style.grid_auto_flow = Some(if rows.to_ascii_lowercase().contains("dense") {
             taffy::GridAutoFlow::RowDense
@@ -3884,9 +4087,11 @@ fn parse_grid_shorthand(style: &mut LayoutStyle, value: &str) {
         });
     } else if columns.to_ascii_lowercase().contains("auto-flow") {
         style.grid_template_columns.clear();
+        style.grid_calc_expressions[0].clear();
         style.grid_template_columns_subgrid = false;
-        let (tracks, names) = parse_track_list_named(rows);
+        let (tracks, names, calc_expressions) = parse_track_list_named(rows);
         style.grid_template_rows = tracks;
+        style.grid_calc_expressions[1] = calc_expressions;
         style.grid_row_line_names = (!names.is_empty()).then(|| build_line_map(names));
         style.grid_auto_flow = Some(if columns.to_ascii_lowercase().contains("dense") {
             taffy::GridAutoFlow::ColumnDense
@@ -8510,6 +8715,56 @@ mod tests {
         let shorthand = compute_style("div", Some("display:grid;grid:auto-flow/repeat(3,1fr)"));
         assert_eq!(shorthand.grid_auto_flow, Some(taffy::GridAutoFlow::Row));
         assert_eq!(shorthand.grid_template_columns.len(), 3);
+    }
+
+    #[test]
+    fn grid_track_math_is_deferred_to_the_used_axis_basis() {
+        let style = compute_style(
+            "div",
+            Some(
+                "grid-template-columns:\
+                 minmax(0,calc((100% - 84rem)/2)) 1fr \
+                 minmax(0,max(10px,min(calc(25% - 5px),clamp(20px,10%,200px))))",
+            ),
+        );
+        let owners = &style.grid_calc_expressions[0];
+        assert_eq!(owners.len(), 2);
+
+        set_grid_calc_context(&style, 16.0, 16.0, 14.4, 10.0);
+        let first = std::sync::Arc::as_ptr(&owners[0]).cast();
+        assert!((resolve_grid_calc(first, 1440.0) - 48.0).abs() < 0.01);
+        let nested = std::sync::Arc::as_ptr(&owners[1]).cast();
+        assert!((resolve_grid_calc(nested, 1000.0) - 100.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn winning_grid_track_declaration_releases_overridden_calc_owners() {
+        let style = compute_style(
+            "div",
+            Some(
+                "grid-template-columns:calc(50% - 10px);\
+                 grid-template-rows:calc(25% - 5px);\
+                 grid-template-columns:1fr",
+            ),
+        );
+        assert!(style.grid_calc_expressions[0].is_empty());
+        // A non-minmax breadth supplies both the minimum and maximum sizing
+        // function, each with its own stable opaque handle.
+        assert_eq!(style.grid_calc_expressions[1].len(), 2);
+    }
+
+    #[test]
+    fn inherited_grid_calc_preserves_parent_em_context() {
+        let parent = compute_style("div", Some("grid-auto-columns:calc(1em + 10%)"));
+        set_grid_calc_context(&parent, 20.0, 16.0, 10.0, 10.0);
+
+        let mut child = compute_style("div", Some("grid-auto-columns:inherit"));
+        child.grid_auto_columns = parent.grid_auto_columns.clone();
+        child.grid_calc_expressions[2] = parent.grid_calc_expressions[2].clone();
+        set_grid_calc_context(&child, 40.0, 16.0, 10.0, 10.0);
+
+        let handle = std::sync::Arc::as_ptr(&child.grid_calc_expressions[2][0]).cast();
+        assert!((resolve_grid_calc(handle, 100.0) - 30.0).abs() < 0.01);
     }
 
     #[test]

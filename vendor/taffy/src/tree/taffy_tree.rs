@@ -80,11 +80,23 @@ impl std::error::Error for TaffyError {}
 pub(crate) struct TaffyConfig {
     /// Whether to round layout values
     pub(crate) use_rounding: bool,
+    /// Resolves an opaque `calc()` handle against its percentage basis.
+    #[cfg(feature = "calc")]
+    pub(crate) calc_resolver: fn(*const (), f32) -> f32,
+}
+
+#[cfg(feature = "calc")]
+fn default_calc_resolver(_value: *const (), _basis: f32) -> f32 {
+    0.0
 }
 
 impl Default for TaffyConfig {
     fn default() -> Self {
-        Self { use_rounding: true }
+        Self {
+            use_rounding: true,
+            #[cfg(feature = "calc")]
+            calc_resolver: default_calc_resolver,
+        }
     }
 }
 
@@ -388,8 +400,8 @@ where
     }
 
     #[inline(always)]
-    fn resolve_calc_value(&self, _val: *const (), _basis: f32) -> f32 {
-        0.0
+    fn resolve_calc_value(&self, val: *const (), basis: f32) -> f32 {
+        (self.taffy.config.calc_resolver)(val, basis)
     }
 
     #[inline(always)]
@@ -564,6 +576,16 @@ impl<NodeContext> TaffyTree<NodeContext> {
     /// Disable rounding of layout values. Rounding is enabled by default.
     pub fn disable_rounding(&mut self) {
         self.config.use_rounding = false;
+    }
+
+    /// Installs the resolver used for opaque `calc()` handles.
+    ///
+    /// Every calc handle stored in a node style must be understood by
+    /// `resolver` and remain alive for every layout computation performed by
+    /// this tree. Taffy treats handles as opaque and never dereferences them.
+    #[cfg(feature = "calc")]
+    pub fn set_calc_resolver(&mut self, resolver: fn(*const (), f32) -> f32) {
+        self.config.calc_resolver = resolver;
     }
 
     /// Creates and adds a new unattached leaf node to the tree, and returns the node of the new node

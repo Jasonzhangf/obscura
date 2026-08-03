@@ -2460,68 +2460,140 @@ fn node_is_style_text(tree: &DomTree, node: NodeId, parent: Option<NodeId>) -> b
     })
 }
 
-fn dependencies_include_relational_rule(
-    map: &crate::css::InvalidationMap,
-    dependencies: &[crate::css::InvalidationDependency],
-) -> bool {
-    dependencies
-        .iter()
-        .any(|dependency| {
-            map.is_relational_rule(dependency.rule_order)
-                && dependency
-                    .reaches
-                    .contains(crate::css::InvalidationReaches::CONSERVATIVE)
-        })
-}
-
-fn subtree_may_affect_relational_selector(
+fn subtree_may_match_relational_path(
     tree: &DomTree,
-    map: &crate::css::InvalidationMap,
+    invalidation: &crate::css::RelationalInvalidation,
     root: NodeId,
 ) -> bool {
-    if map.has_unkeyed_relational_rules() {
-        return true;
-    }
     std::iter::once(root)
         .chain(tree.descendants(root))
-        .any(|id| {
-            let Some(node) = tree.get_node(id) else {
-                return false;
+        .any(|id| invalidation.relative_path_may_match(tree, id))
+}
+
+/// Candidate anchors after an insertion. Relative selectors search from the
+/// changed subtree toward ancestors and earlier siblings; only the boundary
+/// can connect the already-fresh inserted subtree to retained elements.
+fn add_inserted_relational_anchor_candidates(
+    tree: &DomTree,
+    node: NodeId,
+    candidates: &mut HashSet<NodeId>,
+) {
+    let mut current = Some(node);
+    while let Some(id) = current {
+        let mut sibling = tree.get_node(id).and_then(|node| node.prev_sibling);
+        while let Some(previous) = sibling {
+            candidates.insert(previous);
+            sibling = tree.get_node(previous).and_then(|node| node.prev_sibling);
+        }
+        current = tree.get_node(id).and_then(|node| node.parent);
+        if let Some(parent) = current {
+            candidates.insert(parent);
+        }
+    }
+}
+
+/// Removal has already destroyed the old sibling links. As Gecko does for a
+/// removal side effect, inspect every sibling at each old ancestor boundary;
+/// this includes the old previous/next neighbors without retaining a DOM
+/// snapshot in every mutation record.
+fn add_removed_relational_anchor_candidates(
+    tree: &DomTree,
+    old_parent: NodeId,
+    candidates: &mut HashSet<NodeId>,
+) {
+    let mut current = Some(old_parent);
+    while let Some(id) = current {
+        candidates.insert(id);
+        candidates.extend(tree.children(id));
+        let parent = tree.get_node(id).and_then(|node| node.parent);
+        if let Some(parent) = parent {
+            candidates.extend(tree.children(parent));
+        }
+        current = parent;
+    }
+}
+
+fn add_relational_anchor_scope(
+    tree: &DomTree,
+    anchor: NodeId,
+    reaches: crate::css::InvalidationReaches,
+    dirty: &mut HashSet<NodeId>,
+) {
+    // Re-cascading the anchor subtree covers anchor-self changes, inheritance,
+    // and every descendant subject. It is intentionally broader than the
+    // dependency's exact reach but keeps the retained-style implementation
+    // independent of selector matching internals.
+    add_style_subtree(tree, anchor, dirty);
+    if reaches.contains(crate::css::InvalidationReaches::SIBLINGS) {
+        add_following_sibling_subtrees(tree, anchor, dirty);
+    }
+}
+
+/// Apply Gecko-style upward `:has()` invalidation for one child-list or text
+/// mutation. Returns false only when the path outside the anchor combines
+/// traversals which the renderer's flat reach bits cannot represent soundly.
+fn add_relational_tree_invalidation(
+    tree: &DomTree,
+    map: &crate::css::InvalidationMap,
+    mutation: &TreeStyleMutation,
+    dirty: &mut HashSet<NodeId>,
+) -> bool {
+    if map.relational_invalidations().is_empty() {
+        return true;
+    }
+    let mut candidates = HashSet::new();
+    match *mutation {
+        TreeStyleMutation::Insert {
+            node,
+            old_parent,
+            ..
+        } => {
+            add_inserted_relational_anchor_candidates(tree, node, &mut candidates);
+            if let Some(old_parent) = old_parent {
+                add_removed_relational_anchor_candidates(tree, old_parent, &mut candidates);
+            }
+        }
+        TreeStyleMutation::Remove { old_parent, .. } => {
+            add_removed_relational_anchor_candidates(tree, old_parent, &mut candidates);
+        }
+        TreeStyleMutation::Text { node, parent } => {
+            add_inserted_relational_anchor_candidates(tree, node, &mut candidates);
+            if let Some(parent) = parent {
+                candidates.insert(parent);
+            }
+        }
+    }
+
+    for invalidation in map.relational_invalidations() {
+        let triggered = match mutation {
+                TreeStyleMutation::Remove { .. } => true,
+                TreeStyleMutation::Insert { node, .. } => {
+                    subtree_may_match_relational_path(tree, invalidation, *node)
+                        || invalidation.unkeyed_subject
+                        || invalidation.sibling_side_effect
+                        || invalidation.structural_side_effect
+                }
+                TreeStyleMutation::Text { .. } => invalidation.text_side_effect,
             };
-            let Some(_element) = node.as_element() else {
+        if !triggered {
+            continue;
+        }
+        for anchor in candidates.iter().copied() {
+            if !invalidation.anchor_may_match(tree, anchor) {
+                continue;
+            }
+            if invalidation.unrepresentable_outer_path {
                 return false;
-            };
-            if node.get_attribute("id").is_some_and(|id| {
-                dependencies_include_relational_rule(map, map.id_dependencies(id))
-            }) {
-                return true;
             }
-            if node.get_attribute("class").is_some_and(|classes| {
-                classes.split_whitespace().any(|class| {
-                    dependencies_include_relational_rule(map, map.class_dependencies(class))
-                })
-            }) {
-                return true;
-            }
-            if dependencies_include_relational_rule(
-                map,
-                map.local_name_dependencies(
-                    node.as_element()
-                        .map(|element| element.local.as_ref())
-                        .unwrap_or_default(),
-                ),
-            ) {
-                return true;
-            }
-            node.attrs().is_some_and(|attributes| {
-                attributes.iter().any(|attribute| {
-                    dependencies_include_relational_rule(
-                        map,
-                        map.attribute_dependencies(&attribute.qualified_name()),
-                    )
-                })
-            })
-        })
+            add_relational_anchor_scope(
+                tree,
+                anchor,
+                invalidation.anchor_reaches,
+                dirty,
+            );
+        }
+    }
+    true
 }
 
 /// A child-list change can alter every structural/sibling match under each
@@ -2580,12 +2652,7 @@ fn retained_style_plan(
                     {
                         return RetainedStylePlan::Full;
                     }
-                    if subtree_may_affect_relational_selector(tree, map, node)
-                        || old_parent.is_some_and(|parent| {
-                            subtree_may_affect_relational_selector(tree, map, parent)
-                        })
-                        || subtree_may_affect_relational_selector(tree, map, new_parent)
-                    {
+                    if !add_relational_tree_invalidation(tree, map, mutation, &mut dirty) {
                         return RetainedStylePlan::Full;
                     }
                     add_style_subtree(tree, node, &mut dirty);
@@ -2600,9 +2667,7 @@ fn retained_style_plan(
                     {
                         return RetainedStylePlan::Full;
                     }
-                    if subtree_may_affect_relational_selector(tree, map, node)
-                        || subtree_may_affect_relational_selector(tree, map, old_parent)
-                    {
+                    if !add_relational_tree_invalidation(tree, map, mutation, &mut dirty) {
                         return RetainedStylePlan::Full;
                     }
                     add_tree_parent_scope(tree, old_parent, dirty_parent_siblings, &mut dirty);
@@ -2611,7 +2676,7 @@ fn retained_style_plan(
                     if node_is_style_text(tree, node, parent) {
                         return RetainedStylePlan::Full;
                     }
-                    if !map.state_dependencies("has").is_empty() {
+                    if !add_relational_tree_invalidation(tree, map, mutation, &mut dirty) {
                         return RetainedStylePlan::Full;
                     }
                     if let Some(parent) = parent {
@@ -3037,7 +3102,7 @@ fn layout_dom_once(
 
     // The leaf context is the index of a cosmic-text inline formatting
     // context in `engine`; leaves without text carry no context.
-    let mut taffy_tree: TaffyTree<usize> = TaffyTree::new();
+    let mut taffy_tree: TaffyTree<usize> = crate::new_taffy_tree();
     let mut id_map: HashMap<taffy::NodeId, NodeId> = HashMap::new();
     let mut words: HashMap<taffy::NodeId, (NodeId, String)> = HashMap::new();
     let mut engine = crate::inline::TextEngine::new_with_web_fonts(fonts);
@@ -3219,6 +3284,13 @@ fn layout_dom_once(
                 // inherited context for a fresh descendant directly from the
                 // prior computed values, then retain the style byte-for-byte.
                 if let Some(style) = styles.get(&id) {
+                    crate::style::set_grid_calc_context(
+                        style,
+                        style.font_size.or(inh.font_size).unwrap_or(16.0),
+                        root_fs,
+                        vw,
+                        vh,
+                    );
                     inh.display = style.display;
                     inh.display_contents = style.display_contents;
                     inh.is_inline_block = style.is_inline_block;
@@ -3354,6 +3426,8 @@ fn layout_dom_once(
                             (
                                 parent.grid_auto_columns.clone(),
                                 parent.grid_auto_rows.clone(),
+                                parent.grid_calc_expressions[2].clone(),
+                                parent.grid_calc_expressions[3].clone(),
                             )
                         })
                         .unwrap_or_default()
@@ -3365,12 +3439,20 @@ fn layout_dom_once(
                         .as_ref()
                         .map(|tracks| tracks.0.clone())
                         .unwrap_or_default();
+                    style.grid_calc_expressions[2] = inherited_grid_auto_tracks
+                        .as_ref()
+                        .map(|tracks| tracks.2.clone())
+                        .unwrap_or_default();
                     style.grid_auto_columns_inherit = false;
                 }
                 if style.grid_auto_rows_inherit {
                     style.grid_auto_rows = inherited_grid_auto_tracks
                         .as_ref()
                         .map(|tracks| tracks.1.clone())
+                        .unwrap_or_default();
+                    style.grid_calc_expressions[3] = inherited_grid_auto_tracks
+                        .as_ref()
+                        .map(|tracks| tracks.3.clone())
                         .unwrap_or_default();
                     style.grid_auto_rows_inherit = false;
                 }
@@ -3419,6 +3501,7 @@ fn layout_dom_once(
                 // em in non-font-size properties is relative to this element's
                 // OWN computed font-size; resolve every relative length now.
                 let em_px = style.font_size.unwrap_or(parent_fs);
+                crate::style::set_grid_calc_context(style, em_px, root_fs, vw, vh);
                 if let Some(expression) = style.letter_spacing_expression.as_deref() {
                     style.letter_spacing = crate::style::resolve_contextual_length(
                         expression, em_px, root_fs, vw, vh, em_px,
@@ -3823,6 +3906,8 @@ fn layout_dom_once(
                 let host_is_table_box = style.is_table_box;
                 let host_grid_auto_columns = style.grid_auto_columns.clone();
                 let host_grid_auto_rows = style.grid_auto_rows.clone();
+                let host_grid_auto_column_calcs = style.grid_calc_expressions[2].clone();
+                let host_grid_auto_row_calcs = style.grid_calc_expressions[3].clone();
                 let host_overflow_x = if style.overflow_scroll_x {
                     2
                 } else if style.overflow_clip_x {
@@ -3840,10 +3925,12 @@ fn layout_dom_once(
                 let settle_pseudo = |pseudo: &mut crate::LayoutStyle| {
                     if pseudo.grid_auto_columns_inherit {
                         pseudo.grid_auto_columns = host_grid_auto_columns.clone();
+                        pseudo.grid_calc_expressions[2] = host_grid_auto_column_calcs.clone();
                         pseudo.grid_auto_columns_inherit = false;
                     }
                     if pseudo.grid_auto_rows_inherit {
                         pseudo.grid_auto_rows = host_grid_auto_rows.clone();
+                        pseudo.grid_calc_expressions[3] = host_grid_auto_row_calcs.clone();
                         pseudo.grid_auto_rows_inherit = false;
                     }
                     if pseudo.display_inherit {
@@ -3886,6 +3973,7 @@ fn layout_dom_once(
                         pseudo.font_size = Some(host_font_size);
                     }
                     let pseudo_em = pseudo.font_size.unwrap_or(host_font_size);
+                    crate::style::set_grid_calc_context(pseudo, pseudo_em, root_fs, vw, vh);
                     if let Some(expression) = pseudo.letter_spacing_expression.as_deref() {
                         pseudo.letter_spacing = crate::style::resolve_contextual_length(
                             expression, pseudo_em, root_fs, vw, vh, pseudo_em,
@@ -13244,11 +13332,11 @@ mod tests {
             Incremental,
         );
 
-        // Keyed :has() rules do not poison unrelated mutations, but a matching
-        // inserted key still takes the correctness-first full path.
+        // Keyed :has() rules do not poison unrelated mutations. A matching
+        // insertion walks upward to the keyed anchor and retains clean peers.
         for (name, inserted_class, expectation) in [
             ("unrelated keyed has insertion", "other", Incremental),
-            ("matching keyed has insertion", "signal", ConservativeFallback),
+            ("matching keyed has insertion", "signal", Incremental),
         ] {
             let html = format!(
                 r#"<style>.host:has(.signal) .dependent{{width:101px}}.clean{{height:19px}}</style>
@@ -13283,7 +13371,7 @@ mod tests {
 
         for (name, inserted_tag, expectation) in [
             ("unrelated keyed tag has insertion", "i", Incremental),
-            ("matching keyed tag has insertion", "span", ConservativeFallback),
+            ("matching keyed tag has insertion", "span", Incremental),
         ] {
             let html = format!(
                 r#"<style>.host:has(> span) .dependent{{width:103px}}.clean{{height:21px}}</style>
@@ -13346,6 +13434,367 @@ mod tests {
             },
             ConservativeFallback,
         );
+    }
+
+    #[test]
+    fn retained_relational_styles_match_forced_full_direction_matrix() {
+        use RetainedDifferentialExpectation::{ConservativeFallback, Incremental};
+
+        // Descendant/child traversal and selector-list pseudos all invalidate
+        // the keyed anchor without cascading an unrelated sibling branch.
+        for (name, relative) in [
+            ("has descendant insertion", ".signal"),
+            ("has child insertion", "> .signal"),
+            ("has is insertion", ":is(.signal,.alternate)"),
+            ("has where insertion", ":where(.signal,.alternate)"),
+        ] {
+            let tree = parse_html(&format!(
+                r#"<style>.host:has({relative}) .dependent{{width:111px;height:7px}}.clean{{height:9px}}</style>
+                   <main><section id=host class=host><div id=target><i id=signal class=signal></i></div><span class=dependent></span></section><aside class=clean></aside></main>"#,
+            ));
+            let target = tree.get_element_by_id("target").unwrap();
+            let signal = tree.get_element_by_id("signal").unwrap();
+            tree.remove_child(signal);
+            let mut cache = crate::css::StylesheetCache::default();
+            let initial = layout_dom_with_web_fonts_and_stylesheet_cache(
+                &tree,
+                (360.0, 260.0),
+                &HashMap::new(),
+                &[],
+                &mut cache,
+            );
+            tree.append_child(target, signal);
+            finish_retained_tree_case(
+                name,
+                &tree,
+                &mut cache,
+                initial,
+                TreeStyleMutation::Insert {
+                    node: signal,
+                    old_parent: None,
+                    new_parent: target,
+                },
+                Incremental,
+            );
+        }
+
+        // A relative sibling combinator searches toward earlier siblings of
+        // the changed boundary. Both exact and general sibling paths retain a
+        // clean branch.
+        for (name, combinator) in [
+            ("has adjacent sibling insertion", "+"),
+            ("has general sibling insertion", "~"),
+        ] {
+            let tree = parse_html(&format!(
+                r#"<style>.host:has({combinator} .signal){{width:113px;height:11px}}.clean{{height:13px}}</style>
+                   <main id=parent><section id=host class=host></section><i id=signal class=signal></i><aside id=clean class=clean></aside></main>"#,
+            ));
+            let parent = tree.get_element_by_id("parent").unwrap();
+            let signal = tree.get_element_by_id("signal").unwrap();
+            let clean = tree.get_element_by_id("clean").unwrap();
+            tree.remove_child(signal);
+            let mut cache = crate::css::StylesheetCache::default();
+            let initial = layout_dom_with_web_fonts_and_stylesheet_cache(
+                &tree,
+                (360.0, 260.0),
+                &HashMap::new(),
+                &[],
+                &mut cache,
+            );
+            tree.insert_before(clean, signal);
+            finish_retained_tree_case(
+                name,
+                &tree,
+                &mut cache,
+                initial,
+                TreeStyleMutation::Insert {
+                    node: signal,
+                    old_parent: None,
+                    new_parent: parent,
+                },
+                Incremental,
+            );
+        }
+
+        // Inserting an unrelated node can break `+`, even though the inserted
+        // subtree has none of the selector's indexed keys.
+        let tree = parse_html(
+            r#"<style>.host:has(> .left + .right){width:127px}.clean{height:15px}</style>
+               <main><section id=host class=host><i class=left></i><b id=blocker></b><i id=right class=right></i></section><aside class=clean></aside></main>"#,
+        );
+        let host = tree.get_element_by_id("host").unwrap();
+        let blocker = tree.get_element_by_id("blocker").unwrap();
+        let right = tree.get_element_by_id("right").unwrap();
+        tree.remove_child(blocker);
+        let mut cache = crate::css::StylesheetCache::default();
+        let initial = layout_dom_with_web_fonts_and_stylesheet_cache(
+            &tree,
+            (360.0, 260.0),
+            &HashMap::new(),
+            &[],
+            &mut cache,
+        );
+        tree.insert_before(right, blocker);
+        finish_retained_tree_case(
+            "has adjacent insertion side effect",
+            &tree,
+            &mut cache,
+            initial,
+            TreeStyleMutation::Insert {
+                node: blocker,
+                old_parent: None,
+                new_parent: host,
+            },
+            Incremental,
+        );
+
+        // Structural matching changes even when the inserted node does not
+        // carry the keyed relative subject class.
+        let tree = parse_html(
+            r#"<style>.host:has(> .signal:first-child){width:131px}.clean{height:17px}</style>
+               <main><section id=host class=host><b id=blocker></b><i id=signal class=signal></i></section><aside class=clean></aside></main>"#,
+        );
+        let host = tree.get_element_by_id("host").unwrap();
+        let blocker = tree.get_element_by_id("blocker").unwrap();
+        let signal = tree.get_element_by_id("signal").unwrap();
+        tree.remove_child(blocker);
+        let mut cache = crate::css::StylesheetCache::default();
+        let initial = layout_dom_with_web_fonts_and_stylesheet_cache(
+            &tree,
+            (360.0, 260.0),
+            &HashMap::new(),
+            &[],
+            &mut cache,
+        );
+        tree.insert_before(signal, blocker);
+        finish_retained_tree_case(
+            "has structural insertion side effect",
+            &tree,
+            &mut cache,
+            initial,
+            TreeStyleMutation::Insert {
+                node: blocker,
+                old_parent: None,
+                new_parent: host,
+            },
+            Incremental,
+        );
+
+        // Character data can toggle :empty without changing any indexed key.
+        let tree = parse_html(
+            r#"<style>.host:has(.label:empty){width:133px}.clean{height:18px}</style>
+               <main><section id=host class=host><span id=label class=label>x</span></section><aside class=clean></aside></main>"#,
+        );
+        let label = tree.get_element_by_id("label").unwrap();
+        let text = tree.children(label)[0];
+        let mut cache = crate::css::StylesheetCache::default();
+        let initial = layout_dom_with_web_fonts_and_stylesheet_cache(
+            &tree,
+            (360.0, 260.0),
+            &HashMap::new(),
+            &[],
+            &mut cache,
+        );
+        tree.with_node_mut(text, |node| {
+            if let obscura_dom::tree::NodeData::Text { contents } = &mut node.data {
+                contents.clear();
+            }
+        });
+        finish_retained_tree_case(
+            "has empty text side effect",
+            &tree,
+            &mut cache,
+            initial,
+            TreeStyleMutation::Text {
+                node: text,
+                parent: Some(label),
+            },
+            Incremental,
+        );
+
+        // The old sibling links are gone by the time removal invalidation
+        // runs. Broadening each old ancestor boundary must cover both a keyed
+        // removal and an adjacency match created by removing an interloper.
+        for (name, css, removed_id) in [
+            (
+                "has descendant removal",
+                ".host:has(.signal){width:137px}",
+                "signal",
+            ),
+            (
+                "has adjacent removal side effect",
+                ".host:has(> .left + .right){width:139px}",
+                "blocker",
+            ),
+        ] {
+            let tree = parse_html(&format!(
+                r#"<style>{css}.clean{{height:19px}}</style><main><section id=host class=host><i class=left></i><b id=blocker></b><i class=right></i><i id=signal class=signal></i></section><aside class=clean></aside></main>"#,
+            ));
+            let host = tree.get_element_by_id("host").unwrap();
+            let removed = tree.get_element_by_id(removed_id).unwrap();
+            let mut cache = crate::css::StylesheetCache::default();
+            let initial = layout_dom_with_web_fonts_and_stylesheet_cache(
+                &tree,
+                (360.0, 260.0),
+                &HashMap::new(),
+                &[],
+                &mut cache,
+            );
+            tree.remove_child(removed);
+            finish_retained_tree_case(
+                name,
+                &tree,
+                &mut cache,
+                initial,
+                TreeStyleMutation::Remove {
+                    node: removed,
+                    old_parent: host,
+                },
+                Incremental,
+            );
+        }
+
+        // Detached nodes are mutable before the queued render flush. Removal
+        // invalidation must not depend on selector keys still being present in
+        // the post-mutation subtree.
+        let tree = parse_html(
+            r#"<style>.host:has(.signal){width:141px}.clean{height:20px}</style><main><section id=host class=host><i id=signal class=signal></i></section><aside class=clean></aside></main>"#,
+        );
+        let host = tree.get_element_by_id("host").unwrap();
+        let signal = tree.get_element_by_id("signal").unwrap();
+        let mut cache = crate::css::StylesheetCache::default();
+        let initial = layout_dom_with_web_fonts_and_stylesheet_cache(
+            &tree,
+            (360.0, 260.0),
+            &HashMap::new(),
+            &[],
+            &mut cache,
+        );
+        tree.remove_child(signal);
+        tree.with_node_mut(signal, |node| {
+            node.set_attribute("class", "detached-and-renamed".into())
+        });
+        finish_retained_tree_case(
+            "has removal after detached key mutation",
+            &tree,
+            &mut cache,
+            initial,
+            TreeStyleMutation::Remove {
+                node: signal,
+                old_parent: host,
+            },
+            Incremental,
+        );
+
+        // Reparenting changes anchors in both old and new ancestor chains.
+        let tree = parse_html(
+            r#"<style>.host:has(> .signal){width:149px}.clean{height:21px}</style>
+               <main><section id=old class=host><i id=signal class=signal></i></section><section id=new class=host></section><aside class=clean></aside></main>"#,
+        );
+        let old = tree.get_element_by_id("old").unwrap();
+        let new = tree.get_element_by_id("new").unwrap();
+        let signal = tree.get_element_by_id("signal").unwrap();
+        let mut cache = crate::css::StylesheetCache::default();
+        let initial = layout_dom_with_web_fonts_and_stylesheet_cache(
+            &tree,
+            (360.0, 260.0),
+            &HashMap::new(),
+            &[],
+            &mut cache,
+        );
+        tree.append_child(new, signal);
+        finish_retained_tree_case(
+            "has reparent old and new anchors",
+            &tree,
+            &mut cache,
+            initial,
+            TreeStyleMutation::Insert {
+                node: signal,
+                old_parent: Some(old),
+                new_parent: new,
+            },
+            Incremental,
+        );
+
+        // A sibling-then-descendant path outside the anchor is deliberately
+        // left on the correctness-first full path until dependency chains can
+        // encode the continuation explicitly.
+        let tree = parse_html(
+            r#"<style>.host:has(.signal)~.panel .leaf{width:151px}</style><main><section id=host class=host><i id=signal class=signal></i></section><div class=panel><b class=leaf></b></div></main>"#,
+        );
+        let host = tree.get_element_by_id("host").unwrap();
+        let signal = tree.get_element_by_id("signal").unwrap();
+        tree.remove_child(signal);
+        let mut cache = crate::css::StylesheetCache::default();
+        let initial = layout_dom_with_web_fonts_and_stylesheet_cache(
+            &tree,
+            (360.0, 260.0),
+            &HashMap::new(),
+            &[],
+            &mut cache,
+        );
+        tree.append_child(host, signal);
+        finish_retained_tree_case(
+            "has unrepresentable outer mixed traversal",
+            &tree,
+            &mut cache,
+            initial,
+            TreeStyleMutation::Insert {
+                node: signal,
+                old_parent: None,
+                new_parent: host,
+            },
+            ConservativeFallback,
+        );
+    }
+
+    #[test]
+    fn retained_relational_invalidation_keeps_two_thousand_node_peer_clean() {
+        let mut clean = String::new();
+        for index in 0..2_000 {
+            clean.push_str(&format!("<span class=clean data-index={index}></span>"));
+        }
+        let tree = parse_html(&format!(
+            r#"<style>.host:has(> .signal) .dependent{{width:157px}}.clean{{height:1px}}</style>
+               <main><section id=host class=host><i id=signal class=signal></i><b class=dependent></b></section><aside>{clean}</aside></main>"#,
+        ));
+        let host = tree.get_element_by_id("host").unwrap();
+        let signal = tree.get_element_by_id("signal").unwrap();
+        tree.remove_child(signal);
+        let mut cache = crate::css::StylesheetCache::default();
+        let mut initial = layout_dom_with_web_fonts_and_stylesheet_cache(
+            &tree,
+            (800.0, 600.0),
+            &HashMap::new(),
+            &[],
+            &mut cache,
+        );
+        tree.append_child(host, signal);
+        let retained = RetainedStyleMaps {
+            styles: std::mem::take(&mut initial.styles),
+            custom_properties: std::mem::take(&mut initial.custom_properties),
+        };
+        let (incremental, telemetry) = layout_dom_with_web_fonts_pass_limit(
+            &tree,
+            (800.0, 600.0),
+            &HashMap::new(),
+            &[],
+            None,
+            Some(&mut cache),
+            Some(retained),
+            &[TreeStyleMutation::Insert {
+                node: signal,
+                old_parent: None,
+                new_parent: host,
+            }
+            .into()],
+        );
+        let full = layout_dom(&tree, (800.0, 600.0));
+        assert_computed_styles_match("relational 2k clean peer", &incremental, &full);
+        assert_eq!(incremental.rects, full.rects);
+        assert_eq!(telemetry.retained_fallback, 0, "{telemetry:?}");
+        assert!(telemetry.retained_reused >= 2_000, "{telemetry:?}");
+        assert!(telemetry.retained_fresh < 24, "{telemetry:?}");
     }
 
     #[test]
@@ -14505,6 +14954,28 @@ mod tests {
         assert_eq!(pseudo.font_family, host.font_family);
         assert_eq!(pseudo.font_weight, host.font_weight);
         assert_eq!(pseudo.line_height, host.line_height);
+    }
+
+    #[test]
+    fn generated_pseudo_grid_calc_uses_computed_font_and_viewport_context() {
+        let tree = parse_html(
+            r#"<style>
+                html { font-size:16px }
+                #host { font-size:20px }
+                #host::before {
+                    content:""; display:grid;
+                    grid-template-columns:calc(1em + 1rem + 10vw);
+                }
+            </style>
+            <div id="host"></div>"#,
+        );
+        let laid = layout_dom(&tree, (1000.0, 400.0));
+        let host = tree.get_element_by_id("host").unwrap();
+        let pseudo = laid.styles[&host].before_pseudo.as_ref().unwrap();
+        let calc = &pseudo.grid_calc_expressions[0][0];
+        let handle = std::sync::Arc::as_ptr(calc).cast();
+
+        assert!((crate::style::resolve_grid_calc(handle, 1000.0) - 136.0).abs() < 0.01);
     }
 
     #[test]
