@@ -354,6 +354,17 @@ pub(crate) fn apply_animation_declarations(style: &mut LayoutStyle, css: &str) {
     }
 }
 
+/// Apply one already-cascaded keyframe declaration through the ordinary
+/// computed-style parser. The animation sampler deliberately reuses this
+/// path instead of maintaining a second, subtly different value parser.
+pub(crate) fn apply_animation_property_value(
+    style: &mut LayoutStyle,
+    name: &str,
+    value: &str,
+) {
+    apply_value(style, name, value);
+}
+
 fn apply_color_scheme(
     style: &mut LayoutStyle,
     value: &str,

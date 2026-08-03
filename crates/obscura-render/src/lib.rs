@@ -495,6 +495,14 @@ impl BackgroundPositionAxis {
     pub fn resolve(self, leftover_space: f32) -> f32 {
         self.length + self.percentage * leftover_space
     }
+
+    pub(crate) fn interpolate(self, other: Self, position: f32) -> Self {
+        Self {
+            length: self.length + (other.length - self.length) * position,
+            percentage: self.percentage
+                + (other.percentage - self.percentage) * position,
+        }
+    }
 }
 
 /// The two axes of CSS `background-position`.
@@ -510,6 +518,13 @@ pub struct BackgroundPosition {
 impl BackgroundPosition {
     pub const fn new(x: BackgroundPositionAxis, y: BackgroundPositionAxis) -> Self {
         Self { x, y }
+    }
+
+    pub(crate) fn interpolate(self, other: Self, position: f32) -> Self {
+        Self {
+            x: self.x.interpolate(other.x, position),
+            y: self.y.interpolate(other.y, position),
+        }
     }
 }
 

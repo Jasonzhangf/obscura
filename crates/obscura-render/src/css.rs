@@ -210,6 +210,8 @@ fn compare_rule_cascade(
 }
 
 const PROPERTY_REGISTRATION_SELECTOR_PREFIX: &str = "\0property:";
+const KEYFRAMES_SELECTOR_PREFIX: &str = "\0keyframes:";
+const WEBKIT_KEYFRAMES_SELECTOR_PREFIX: &str = "\0webkit-keyframes:";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RegisteredCustomProperty {
@@ -228,9 +230,61 @@ struct KeyframeStop {
     source_order: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum AnimatedProperty {
+    Transform,
+    Translate,
+    Rotate,
+    Scale,
+    Width,
+    Height,
+    MinWidth,
+    MinHeight,
+    MaxWidth,
+    MaxHeight,
+    Top,
+    Right,
+    Bottom,
+    Left,
+    MarginTop,
+    MarginRight,
+    MarginBottom,
+    MarginLeft,
+    PaddingTop,
+    PaddingRight,
+    PaddingBottom,
+    PaddingLeft,
+    RowGap,
+    ColumnGap,
+    FlexBasis,
+    Opacity,
+    Color,
+    BackgroundColor,
+    BorderTopColor,
+    BorderRightColor,
+    BorderBottomColor,
+    BorderLeftColor,
+    BackgroundPosition,
+    Visibility,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AnimatedDeclaration {
+    name: String,
+    value: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct PropertyTrackStop {
+    offset: f32,
+    source_order: usize,
+    declaration: AnimatedDeclaration,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 struct Keyframes {
     stops: Vec<KeyframeStop>,
+    tracks: HashMap<AnimatedProperty, Vec<PropertyTrackStop>>,
 }
 
 #[derive(Clone, Debug)]
@@ -716,10 +770,9 @@ impl Stylesheet {
         };
         let mut order = 0usize;
         let mut layers = LayerRegistry::default();
+        let mut keyframe_winners =
+            HashMap::<String, (Option<LayerOrder>, bool, usize)>::new();
         for src in sources {
-            for (name, keyframes) in extract_keyframes(src) {
-                sheet.keyframes.insert(name, keyframes);
-            }
             let parsed = parse_stylesheet_for_viewport_preserving_containers_in_layer(
                 src,
                 viewport,
@@ -735,6 +788,37 @@ impl Stylesheet {
                 layer,
             } in parsed
             {
+                let keyframe = selector
+                    .strip_prefix(KEYFRAMES_SELECTOR_PREFIX)
+                    .map(|name| (name, false))
+                    .or_else(|| {
+                        selector
+                            .strip_prefix(WEBKIT_KEYFRAMES_SELECTOR_PREFIX)
+                            .map(|name| (name, true))
+                    });
+                if let Some((name, prefixed)) = keyframe {
+                    let replaces = keyframe_winners.get(name).is_none_or(
+                        |(winning_layer, winning_prefixed, winning_order)| {
+                            compare_layer_order(layer.as_ref(), winning_layer.as_ref())
+                                .then_with(|| match (*winning_prefixed, prefixed) {
+                                    (true, false) => std::cmp::Ordering::Greater,
+                                    (false, true) => std::cmp::Ordering::Less,
+                                    _ => order.cmp(winning_order),
+                                })
+                                .is_gt()
+                        },
+                    );
+                    if replaces {
+                        let keyframes = compile_keyframe_body(&decls);
+                        sheet.keyframes.insert(name.to_string(), keyframes);
+                        keyframe_winners.insert(
+                            name.to_string(),
+                            (layer.clone(), prefixed, order),
+                        );
+                    }
+                    order += 1;
+                    continue;
+                }
                 if let Some(name) = selector.strip_prefix(PROPERTY_REGISTRATION_SELECTOR_PREFIX) {
                     if let Some(registration) = parse_property_registration(&decls) {
                         sheet
@@ -1260,7 +1344,7 @@ impl Stylesheet {
         // computed timing, while the animated value itself remains below the
         // important author origin. Resolve those controls on a temporary style
         // before sampling, then let the ordinary important pass override the
-        // sampled opacity where appropriate.
+        // sampled values where appropriate.
         let mut animation_style = style.clone();
         for &(_, _, i) in &important_matched {
             let expanded = substitute_declarations(&self.rules[i].important_decls, props);
@@ -1270,15 +1354,13 @@ impl Stylesheet {
         crate::style::apply_animation_declarations(&mut animation_style, &expanded);
         if let Some(name) = animation_style.animation_name.as_deref() {
             if let Some(keyframes) = self.keyframes.get(name) {
-                if let Some(opacity) = sample_animation_opacity(
+                sample_animation_properties(
                     keyframes,
-                    style.opacity.unwrap_or(1.0),
+                    style,
                     &animation_style.animation_timing,
                     self.animation_sample_time,
                     props,
-                ) {
-                    style.opacity = Some(opacity);
-                }
+                );
             }
         }
 
@@ -1295,90 +1377,172 @@ impl Stylesheet {
     }
 }
 
-/// Collect every offset and declaration block from standard and prefixed
-/// keyframes rules. Keyframe selectors are percentages rather than DOM
-/// selectors and must never enter the ordinary rule index.
-fn extract_keyframes(css: &str) -> Vec<(String, Keyframes)> {
-    let lower = css.to_ascii_lowercase();
-    let mut found = Vec::new();
-    let mut cursor = 0usize;
-
-    while cursor < css.len() {
-        let standard = lower[cursor..].find("@keyframes").map(|offset| {
-            (cursor + offset, "@keyframes".len())
-        });
-        let webkit = lower[cursor..].find("@-webkit-keyframes").map(|offset| {
-            (cursor + offset, "@-webkit-keyframes".len())
-        });
-        let Some((start, keyword_len)) = (match (standard, webkit) {
-            (Some(a), Some(b)) => Some(if a.0 <= b.0 { a } else { b }),
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(b),
-            (None, None) => None,
-        }) else {
-            break;
-        };
-
-        let after_keyword = start + keyword_len;
-        let Some(open_rel) = css[after_keyword..].find('{') else { break };
-        let open = after_keyword + open_rel;
-        let name = css[after_keyword..open].trim();
-        if name.is_empty() {
-            cursor = open + 1;
-            continue;
+/// Compile a keyframes body into sparse per-property tracks. Values remain in
+/// specified form because `var()` and color-scheme resolution are element
+/// dependent, but declaration splitting, shorthand-to-longhand membership,
+/// offset distribution, and duplicate-offset ordering are all paid once.
+fn compile_keyframe_body(css: &str) -> Keyframes {
+    let mut stops = Vec::new();
+    for (source_order, (selector, declarations)) in
+        parse_stylesheet_for_viewport(css, (1280.0, 720.0))
+            .into_iter()
+            .enumerate()
+    {
+        for part in selector.split(',') {
+            if let Some(offset) = parse_keyframe_offset(part) {
+                stops.push(KeyframeStop {
+                    offset: Some(offset),
+                    declarations: declarations.clone(),
+                    source_order,
+                });
+            }
         }
+    }
+    if stops.is_empty() {
+        return Keyframes::default();
+    }
 
-        let mut depth = 1i32;
-        let mut in_quote: Option<char> = None;
-        let mut escaped = false;
-        let mut close = None;
-        for (offset, ch) in css[open + 1..].char_indices() {
-            if let Some(quote) = in_quote {
-                if escaped {
-                    escaped = false;
-                } else if ch == '\\' {
-                    escaped = true;
-                } else if ch == quote {
-                    in_quote = None;
-                }
+    let mut tracks = HashMap::<AnimatedProperty, Vec<PropertyTrackStop>>::new();
+    for (offset, stop) in normalized_keyframe_offsets(&stops) {
+        // CSS Animations ignores important declarations in keyframes.
+        let (normal, _) = crate::style::partition_declarations(&stop.declarations);
+        let mut declarations = HashMap::<AnimatedProperty, AnimatedDeclaration>::new();
+        for raw in crate::style::split_declarations(&normal) {
+            let Some((name, value)) = raw.trim().split_once(':') else { continue };
+            let name = name.trim().to_ascii_lowercase();
+            let value = value.trim();
+            if value.is_empty()
+                || (!value.contains("var(")
+                    && !supports_animation_declaration(&name, value))
+            {
                 continue;
             }
-            if ch == '"' || ch == '\'' {
-                in_quote = Some(ch);
-            } else if ch == '{' {
-                depth += 1;
-            } else if ch == '}' {
-                depth -= 1;
-                if depth == 0 {
-                    close = Some(open + 1 + offset);
-                    break;
-                }
+            let declaration = AnimatedDeclaration {
+                name: name.clone(),
+                value: value.to_string(),
+            };
+            for property in animated_properties_for_declaration(&name) {
+                declarations.insert(property, declaration.clone());
             }
         }
-        let Some(close) = close else { break };
-        let inner = &css[open + 1..close];
-        let mut stops = Vec::new();
-        for (source_order, (selector, declarations)) in
-            parse_stylesheet_for_viewport(inner, (1280.0, 720.0))
-                .into_iter()
-                .enumerate()
-        {
-            for part in selector.split(',') {
-                if let Some(offset) = parse_keyframe_offset(part) {
-                    stops.push(KeyframeStop {
-                        offset: Some(offset),
-                        declarations: declarations.clone(),
-                        source_order,
-                    });
-                }
-            }
+        for (property, declaration) in declarations {
+            tracks.entry(property).or_default().push(PropertyTrackStop {
+                offset,
+                source_order: stop.source_order,
+                declaration,
+            });
         }
-        if !stops.is_empty() {
-            found.push((name.to_string(), Keyframes { stops }));
-        }
-        cursor = close + 1;
     }
-    found
+    for track in tracks.values_mut() {
+        track.sort_by(|left, right| {
+            left.offset
+                .total_cmp(&right.offset)
+                .then(left.source_order.cmp(&right.source_order))
+        });
+        let mut merged = Vec::<PropertyTrackStop>::with_capacity(track.len());
+        for stop in track.drain(..) {
+            if merged.last().is_some_and(|last| last.offset == stop.offset) {
+                *merged.last_mut().unwrap() = stop;
+            } else {
+                merged.push(stop);
+            }
+        }
+        *track = merged;
+    }
+    Keyframes { stops, tracks }
+}
+
+fn supports_animation_declaration(name: &str, value: &str) -> bool {
+    crate::style::supports_declaration(name, value)
+        || (name == "background" && crate::style::parse_color(value).is_some())
+}
+
+#[cfg(test)]
+fn extract_keyframes(css: &str) -> Vec<(String, Keyframes)> {
+    let mut conditions = vec![ContainerConditionNode {
+        parent: ContainerConditionId::NONE,
+        alternatives: Vec::new(),
+    }];
+    let parsed = parse_stylesheet_for_viewport_preserving_containers(
+        css,
+        (1280.0, 720.0),
+        &mut conditions,
+        ContainerConditionId::NONE,
+    );
+    parsed
+        .into_iter()
+        .filter_map(|rule| {
+            let name = rule
+                .selector
+                .strip_prefix(KEYFRAMES_SELECTOR_PREFIX)
+                .or_else(|| rule.selector.strip_prefix(WEBKIT_KEYFRAMES_SELECTOR_PREFIX))?;
+            Some((name.to_string(), compile_keyframe_body(&rule.declarations)))
+        })
+        .collect()
+}
+
+fn animated_properties_for_declaration(name: &str) -> Vec<AnimatedProperty> {
+    use AnimatedProperty::*;
+    match name {
+        "transform" => vec![Transform],
+        "translate" => vec![Translate],
+        "rotate" => vec![Rotate],
+        "scale" => vec![Scale],
+        "width" => vec![Width],
+        "height" => vec![Height],
+        "min-width" => vec![MinWidth],
+        "min-height" => vec![MinHeight],
+        "max-width" => vec![MaxWidth],
+        "max-height" => vec![MaxHeight],
+        "top" | "inset-block-start" => vec![Top],
+        "right" | "inset-inline-end" => vec![Right],
+        "bottom" | "inset-block-end" => vec![Bottom],
+        "left" | "inset-inline-start" => vec![Left],
+        "inset" => vec![Top, Right, Bottom, Left],
+        "inset-inline" => vec![Left, Right],
+        "inset-block" => vec![Top, Bottom],
+        "margin" => vec![MarginTop, MarginRight, MarginBottom, MarginLeft],
+        "margin-top" | "margin-block-start" => vec![MarginTop],
+        "margin-right" | "margin-inline-end" => vec![MarginRight],
+        "margin-bottom" | "margin-block-end" => vec![MarginBottom],
+        "margin-left" | "margin-inline-start" => vec![MarginLeft],
+        "margin-inline" => vec![MarginLeft, MarginRight],
+        "margin-block" => vec![MarginTop, MarginBottom],
+        "padding" => vec![PaddingTop, PaddingRight, PaddingBottom, PaddingLeft],
+        "padding-top" | "padding-block-start" => vec![PaddingTop],
+        "padding-right" | "padding-inline-end" => vec![PaddingRight],
+        "padding-bottom" | "padding-block-end" => vec![PaddingBottom],
+        "padding-left" | "padding-inline-start" => vec![PaddingLeft],
+        "padding-inline" => vec![PaddingLeft, PaddingRight],
+        "padding-block" => vec![PaddingTop, PaddingBottom],
+        "gap" | "grid-gap" => vec![RowGap, ColumnGap],
+        "row-gap" | "grid-row-gap" => vec![RowGap],
+        "column-gap" | "grid-column-gap" | "-webkit-column-gap" => vec![ColumnGap],
+        "flex-basis" => vec![FlexBasis],
+        "opacity" => vec![Opacity],
+        "color" | "-webkit-text-fill-color" => vec![Color],
+        "background-color" => vec![BackgroundColor],
+        "background" => vec![BackgroundColor, BackgroundPosition],
+        "border-color" => vec![
+            BorderTopColor,
+            BorderRightColor,
+            BorderBottomColor,
+            BorderLeftColor,
+        ],
+        "border" => vec![
+            BorderTopColor,
+            BorderRightColor,
+            BorderBottomColor,
+            BorderLeftColor,
+        ],
+        "border-top" | "border-top-color" => vec![BorderTopColor],
+        "border-right" | "border-right-color" => vec![BorderRightColor],
+        "border-bottom" | "border-bottom-color" => vec![BorderBottomColor],
+        "border-left" | "border-left-color" => vec![BorderLeftColor],
+        "background-position" => vec![BackgroundPosition],
+        "visibility" => vec![Visibility],
+        _ => Vec::new(),
+    }
 }
 
 fn parse_keyframe_offset(value: &str) -> Option<f32> {
@@ -1403,74 +1567,751 @@ enum AnimationPhase {
     After,
 }
 
-fn sample_animation_opacity(
+#[derive(Clone, Debug)]
+enum AnimatedLength {
+    Auto,
+    Dimension(crate::Dimension),
+    Expression(String),
+}
+
+#[derive(Clone, Debug)]
+enum AnimationValue {
+    Length(AnimatedLength),
+    Number(f32),
+    Color([u8; 4]),
+    Transform(Vec<crate::TransformOp>),
+    Translate(crate::TransformLength, crate::TransformLength),
+    Rotate(f32),
+    Scale(f32, f32),
+    BackgroundPosition(crate::BackgroundPosition),
+    Visibility(bool),
+}
+
+fn sample_animation_properties(
     keyframes: &Keyframes,
-    underlying: f32,
+    style: &mut LayoutStyle,
     timing: &crate::AnimationTiming,
     sample_time: crate::AnimationSampleTime,
     props: &HashMap<String, String>,
-) -> Option<f32> {
-    let progress = animation_directed_progress(timing, sample_time)?;
-    let normalized = normalized_keyframe_offsets(&keyframes.stops);
-    let mut opacity_stops = Vec::<(f32, usize, f32)>::new();
-    for (offset, stop) in normalized {
-        let expanded = substitute_declarations(&stop.declarations, props);
-        if let Some(opacity) = opacity_from_declarations(&expanded) {
-            opacity_stops.push((offset, stop.source_order, opacity));
+) {
+    let Some(progress) = animation_directed_progress(timing, sample_time) else {
+        return;
+    };
+    // Keep the base style immutable while resolving every property. Otherwise
+    // one sampled property could accidentally become another track's implicit
+    // endpoint, which is not how the animation cascade origin is defined.
+    let underlying = style.clone();
+    for (&property, track) in &keyframes.tracks {
+        if let Some(value) = sample_property_track(property, track, &underlying, progress, props) {
+            apply_animation_value(style, property, value);
         }
     }
-    if opacity_stops.is_empty() {
-        return None;
-    }
-    opacity_stops.sort_by(|left, right| {
-        left.0
-            .total_cmp(&right.0)
-            .then(left.1.cmp(&right.1))
-    });
-    let mut merged = Vec::<(f32, f32)>::new();
-    for (offset, _, opacity) in opacity_stops {
-        if merged.last().is_some_and(|last| last.0 == offset) {
-            merged.last_mut().unwrap().1 = opacity;
-        } else {
-            merged.push((offset, opacity));
-        }
-    }
-    if merged.first().is_none_or(|stop| stop.0 > 0.0) {
-        merged.insert(0, (0.0, underlying));
-    }
-    if merged.last().is_none_or(|stop| stop.0 < 1.0) {
-        merged.push((1.0, underlying));
-    }
-    if progress <= merged[0].0 {
-        return Some(merged[0].1.clamp(0.0, 1.0));
-    }
-    for pair in merged.windows(2) {
-        let (from_offset, from_value) = pair[0];
-        let (to_offset, to_value) = pair[1];
-        if progress <= to_offset {
-            if progress == to_offset || to_offset == from_offset {
-                return Some(to_value.clamp(0.0, 1.0));
-            }
-            let position = (progress - from_offset) / (to_offset - from_offset);
-            return Some((from_value + (to_value - from_value) * position).clamp(0.0, 1.0));
-        }
-    }
-    Some(merged.last().unwrap().1.clamp(0.0, 1.0))
 }
 
-fn opacity_from_declarations(declarations: &str) -> Option<f32> {
-    let mut opacity = None;
-    for declaration in crate::style::split_declarations(declarations) {
-        let Some((name, value)) = declaration.split_once(':') else { continue };
-        if name.trim().eq_ignore_ascii_case("opacity") {
-            if let Ok(parsed) = value.trim().parse::<f32>() {
-                if parsed.is_finite() {
-                    opacity = Some(parsed);
-                }
-            }
+fn sample_property_track(
+    property: AnimatedProperty,
+    track: &[PropertyTrackStop],
+    underlying: &LayoutStyle,
+    progress: f32,
+    props: &HashMap<String, String>,
+) -> Option<AnimationValue> {
+    let underlying_value = animation_value_from_style(property, underlying)?;
+    let mut resolved = Vec::<(f32, AnimationValue)>::with_capacity(track.len() + 2);
+    for stop in track {
+        let Some(value) = substitute_var_value(&stop.declaration.value, props, 0) else {
+            continue;
+        };
+        if !supports_animation_declaration(&stop.declaration.name, &value) {
+            continue;
+        }
+        let mut endpoint = underlying.clone();
+        crate::style::apply_animation_property_value(
+            &mut endpoint,
+            &stop.declaration.name,
+            &value,
+        );
+        if let Some(value) = animation_value_from_style(property, &endpoint) {
+            resolved.push((stop.offset, value));
         }
     }
-    opacity
+    if resolved.is_empty() {
+        return None;
+    }
+    if resolved.first().is_none_or(|stop| stop.0 > 0.0) {
+        resolved.insert(0, (0.0, underlying_value.clone()));
+    }
+    if resolved.last().is_none_or(|stop| stop.0 < 1.0) {
+        resolved.push((1.0, underlying_value));
+    }
+    if progress <= resolved[0].0 {
+        return Some(resolved.remove(0).1);
+    }
+    for pair in resolved.windows(2) {
+        let (from_offset, from_value) = (&pair[0].0, &pair[0].1);
+        let (to_offset, to_value) = (&pair[1].0, &pair[1].1);
+        if progress <= *to_offset {
+            if progress == *to_offset || to_offset == from_offset {
+                return Some(to_value.clone());
+            }
+            let position = (progress - *from_offset) / (*to_offset - *from_offset);
+            return Some(interpolate_animation_value(from_value, to_value, position));
+        }
+    }
+    resolved.last().map(|stop| stop.1.clone())
+}
+
+fn animation_value_from_style(
+    property: AnimatedProperty,
+    style: &LayoutStyle,
+) -> Option<AnimationValue> {
+    use AnimatedProperty::*;
+    match property {
+        Transform => Some(AnimationValue::Transform(style.transform_ops.clone())),
+        Translate => {
+            let (x, y) = style.individual_translate.unwrap_or((
+                crate::Dimension::Px(0.0),
+                crate::Dimension::Px(0.0),
+            ));
+            Some(AnimationValue::Translate(
+                crate::TransformLength {
+                    value: x,
+                    expression: style.individual_translate_expressions[0].clone(),
+                },
+                crate::TransformLength {
+                    value: y,
+                    expression: style.individual_translate_expressions[1].clone(),
+                },
+            ))
+        }
+        Rotate => Some(AnimationValue::Rotate(
+            style.individual_rotate.unwrap_or(0.0),
+        )),
+        Scale => {
+            let (x, y) = style.individual_scale.unwrap_or((1.0, 1.0));
+            Some(AnimationValue::Scale(x, y))
+        }
+        Width | Height | MinWidth | MinHeight | MaxWidth | MaxHeight => {
+            let index = match property {
+                Width => 0,
+                Height => 1,
+                MinWidth => 2,
+                MinHeight => 3,
+                MaxWidth => 4,
+                MaxHeight => 5,
+                _ => unreachable!(),
+            };
+            if matches!(property, Width) && style.width_fit_content {
+                return None;
+            }
+            let dimension = match property {
+                Width => style.width,
+                Height => style.height,
+                MinWidth => style.min_width,
+                MinHeight => style.min_height,
+                MaxWidth => style.max_width,
+                MaxHeight => style.max_height,
+                _ => unreachable!(),
+            };
+            Some(AnimationValue::Length(length_with_expression(
+                dimension,
+                &style.size_expressions[index],
+            )))
+        }
+        Top | Right | Bottom | Left => {
+            let index = physical_side_index(property);
+            Some(AnimationValue::Length(match &style.inset_expressions[index] {
+                Some(expression) => AnimatedLength::Expression(expression.clone()),
+                None => style.inset[index]
+                    .map(AnimatedLength::Dimension)
+                    .unwrap_or(AnimatedLength::Auto),
+            }))
+        }
+        MarginTop | MarginRight | MarginBottom | MarginLeft => {
+            let index = physical_side_index(property);
+            Some(AnimationValue::Length(margin_length(style, index)))
+        }
+        PaddingTop | PaddingRight | PaddingBottom | PaddingLeft => {
+            let index = physical_side_index(property);
+            Some(AnimationValue::Length(padding_length(style, index)))
+        }
+        RowGap | ColumnGap => {
+            let (value, expression) = if property == RowGap {
+                (style.row_gap, &style.row_gap_expression)
+            } else {
+                (style.column_gap, &style.column_gap_expression)
+            };
+            Some(AnimationValue::Length(match expression {
+                Some(expression) => AnimatedLength::Expression(expression.clone()),
+                None => value
+                    .map(|value| AnimatedLength::Dimension(crate::Dimension::Px(value)))
+                    .unwrap_or(AnimatedLength::Auto),
+            }))
+        }
+        FlexBasis => Some(AnimationValue::Length(AnimatedLength::Dimension(
+            style.flex_basis,
+        ))),
+        Opacity => Some(AnimationValue::Number(
+            style.opacity.unwrap_or(1.0).clamp(0.0, 1.0),
+        )),
+        Color => Some(AnimationValue::Color(
+            style.color.unwrap_or([0, 0, 0, 255]),
+        )),
+        BackgroundColor => Some(AnimationValue::Color(
+            style.background_color.unwrap_or([0, 0, 0, 0]),
+        )),
+        BorderTopColor | BorderRightColor | BorderBottomColor | BorderLeftColor => {
+            let colors = style.border_model.colors;
+            let color = match property {
+                BorderTopColor => colors.top,
+                BorderRightColor => colors.right,
+                BorderBottomColor => colors.bottom,
+                BorderLeftColor => colors.left,
+                _ => unreachable!(),
+            }
+            .or(style.color)
+            .unwrap_or([0, 0, 0, 255]);
+            Some(AnimationValue::Color(color))
+        }
+        BackgroundPosition => Some(AnimationValue::BackgroundPosition(
+            style.background_position,
+        )),
+        Visibility => Some(AnimationValue::Visibility(
+            !style.visibility_hidden.unwrap_or(false),
+        )),
+    }
+}
+
+fn apply_animation_value(
+    style: &mut LayoutStyle,
+    property: AnimatedProperty,
+    value: AnimationValue,
+) {
+    use AnimatedProperty::*;
+    match (property, value) {
+        (Transform, AnimationValue::Transform(operations)) => {
+            style.transform_ops = operations;
+            set_animation_containing_block_trigger(
+                style,
+                crate::CB_TRIGGER_TRANSFORM,
+                !style.transform_ops.is_empty(),
+            );
+        }
+        (Translate, AnimationValue::Translate(x, y)) => {
+            style.individual_translate = Some((x.value, y.value));
+            style.individual_translate_expressions = [x.expression, y.expression];
+            set_animation_containing_block_trigger(style, crate::CB_TRIGGER_TRANSLATE, true);
+        }
+        (Rotate, AnimationValue::Rotate(value)) => {
+            style.individual_rotate = Some(value);
+            set_animation_containing_block_trigger(style, crate::CB_TRIGGER_ROTATE, true);
+        }
+        (Scale, AnimationValue::Scale(x, y)) => {
+            style.individual_scale = Some((x, y));
+            set_animation_containing_block_trigger(style, crate::CB_TRIGGER_SCALE, true);
+        }
+        (Width | Height | MinWidth | MinHeight | MaxWidth | MaxHeight, AnimationValue::Length(value)) => {
+            set_size_animation_value(style, property, value);
+        }
+        (Top | Right | Bottom | Left, AnimationValue::Length(value)) => {
+            let index = physical_side_index(property);
+            set_inset_animation_value(style, index, value);
+        }
+        (MarginTop | MarginRight | MarginBottom | MarginLeft, AnimationValue::Length(value)) => {
+            let index = physical_side_index(property);
+            set_margin_animation_value(style, index, value);
+        }
+        (PaddingTop | PaddingRight | PaddingBottom | PaddingLeft, AnimationValue::Length(value)) => {
+            let index = physical_side_index(property);
+            set_padding_animation_value(style, index, value);
+        }
+        (RowGap | ColumnGap, AnimationValue::Length(value)) => {
+            set_gap_animation_value(style, property == RowGap, value);
+        }
+        (FlexBasis, AnimationValue::Length(AnimatedLength::Dimension(value))) => {
+            style.flex_basis = value;
+        }
+        (Opacity, AnimationValue::Number(value)) => {
+            style.opacity = Some(value.clamp(0.0, 1.0));
+        }
+        (Color, AnimationValue::Color(value)) => style.color = Some(value),
+        (BackgroundColor, AnimationValue::Color(value)) => {
+            style.background_color = Some(value)
+        }
+        (BorderTopColor, AnimationValue::Color(value)) => {
+            style.border_model.colors.top = Some(value)
+        }
+        (BorderRightColor, AnimationValue::Color(value)) => {
+            style.border_model.colors.right = Some(value)
+        }
+        (BorderBottomColor, AnimationValue::Color(value)) => {
+            style.border_model.colors.bottom = Some(value)
+        }
+        (BorderLeftColor, AnimationValue::Color(value)) => {
+            style.border_model.colors.left = Some(value)
+        }
+        (BackgroundPosition, AnimationValue::BackgroundPosition(value)) => {
+            style.background_position = value
+        }
+        (Visibility, AnimationValue::Visibility(visible)) => {
+            style.visibility_hidden = Some(!visible)
+        }
+        _ => return,
+    }
+    let colors = style.border_model.colors;
+    style.border_color = (colors.top == colors.right
+        && colors.top == colors.bottom
+        && colors.top == colors.left)
+        .then_some(colors.top)
+        .flatten();
+}
+
+fn interpolate_animation_value(
+    from: &AnimationValue,
+    to: &AnimationValue,
+    position: f32,
+) -> AnimationValue {
+    match (from, to) {
+        (AnimationValue::Length(from), AnimationValue::Length(to)) => {
+            AnimationValue::Length(interpolate_animated_length(from, to, position))
+        }
+        (AnimationValue::Number(from), AnimationValue::Number(to)) => {
+            AnimationValue::Number(from + (to - from) * position)
+        }
+        (AnimationValue::Color(from), AnimationValue::Color(to)) => {
+            AnimationValue::Color(interpolate_color(*from, *to, position))
+        }
+        (AnimationValue::Transform(from), AnimationValue::Transform(to)) => {
+            AnimationValue::Transform(interpolate_transform_list(from, to, position))
+        }
+        (AnimationValue::Translate(from_x, from_y), AnimationValue::Translate(to_x, to_y)) => {
+            let x = interpolate_transform_length(from_x, to_x, position);
+            let y = interpolate_transform_length(from_y, to_y, position);
+            match (x, y) {
+                (Some(x), Some(y)) => AnimationValue::Translate(x, y),
+                _ if position < 0.5 => from.clone(),
+                _ => to.clone(),
+            }
+        }
+        (AnimationValue::Rotate(from), AnimationValue::Rotate(to)) => {
+            AnimationValue::Rotate(from + (to - from) * position)
+        }
+        (AnimationValue::Scale(from_x, from_y), AnimationValue::Scale(to_x, to_y)) => {
+            AnimationValue::Scale(
+                from_x + (to_x - from_x) * position,
+                from_y + (to_y - from_y) * position,
+            )
+        }
+        (
+            AnimationValue::BackgroundPosition(from),
+            AnimationValue::BackgroundPosition(to),
+        ) => AnimationValue::BackgroundPosition(from.interpolate(*to, position)),
+        (AnimationValue::Visibility(from), AnimationValue::Visibility(to)) => {
+            // visibility has a special discrete interpolation: if either end
+            // is visible, every interior value is visible.
+            AnimationValue::Visibility(if *from || *to {
+                position > 0.0 && position < 1.0 || if position <= 0.0 { *from } else { *to }
+            } else {
+                false
+            })
+        }
+        _ if position < 0.5 => from.clone(),
+        _ => to.clone(),
+    }
+}
+
+fn physical_side_index(property: AnimatedProperty) -> usize {
+    use AnimatedProperty::*;
+    match property {
+        Top | MarginTop | PaddingTop | BorderTopColor => 0,
+        Right | MarginRight | PaddingRight | BorderRightColor => 1,
+        Bottom | MarginBottom | PaddingBottom | BorderBottomColor => 2,
+        Left | MarginLeft | PaddingLeft | BorderLeftColor => 3,
+        _ => unreachable!("property has no physical side"),
+    }
+}
+
+fn edge_value(edges: crate::Edges, index: usize) -> f32 {
+    match index {
+        0 => edges.top,
+        1 => edges.right,
+        2 => edges.bottom,
+        3 => edges.left,
+        _ => unreachable!(),
+    }
+}
+
+fn edge_value_mut(edges: &mut crate::Edges, index: usize) -> &mut f32 {
+    match index {
+        0 => &mut edges.top,
+        1 => &mut edges.right,
+        2 => &mut edges.bottom,
+        3 => &mut edges.left,
+        _ => unreachable!(),
+    }
+}
+
+fn length_with_expression(
+    dimension: crate::Dimension,
+    expression: &Option<String>,
+) -> AnimatedLength {
+    expression
+        .as_ref()
+        .map(|expression| AnimatedLength::Expression(expression.clone()))
+        .unwrap_or(AnimatedLength::Dimension(dimension))
+}
+
+fn margin_length(style: &LayoutStyle, index: usize) -> AnimatedLength {
+    if style.margin_auto[index] {
+        AnimatedLength::Auto
+    } else if let Some(expression) = &style.margin_expressions[index] {
+        AnimatedLength::Expression(expression.clone())
+    } else if let Some(percentage) = style.margin_percent[index] {
+        AnimatedLength::Dimension(crate::Dimension::Percent(percentage))
+    } else if let Some(relative) = style.margin_relative[index] {
+        AnimatedLength::Dimension(relative)
+    } else {
+        AnimatedLength::Dimension(crate::Dimension::Px(edge_value(style.margin, index)))
+    }
+}
+
+fn padding_length(style: &LayoutStyle, index: usize) -> AnimatedLength {
+    if let Some(expression) = &style.padding_expressions[index] {
+        AnimatedLength::Expression(expression.clone())
+    } else if let Some(percentage) = style.padding_percent[index] {
+        AnimatedLength::Dimension(crate::Dimension::Percent(percentage))
+    } else if let Some(relative) = style.padding_relative[index] {
+        AnimatedLength::Dimension(relative)
+    } else {
+        AnimatedLength::Dimension(crate::Dimension::Px(edge_value(style.padding, index)))
+    }
+}
+
+fn set_size_animation_value(
+    style: &mut LayoutStyle,
+    property: AnimatedProperty,
+    value: AnimatedLength,
+) {
+    use AnimatedProperty::*;
+    let index = match property {
+        Width => 0,
+        Height => 1,
+        MinWidth => 2,
+        MinHeight => 3,
+        MaxWidth => 4,
+        MaxHeight => 5,
+        _ => unreachable!(),
+    };
+    let (dimension, expression) = match value {
+        AnimatedLength::Auto => (crate::Dimension::Auto, None),
+        AnimatedLength::Dimension(value) => (value, None),
+        AnimatedLength::Expression(value) => (crate::Dimension::Auto, Some(value)),
+    };
+    style.size_expressions[index] = expression;
+    match property {
+        Width => {
+            style.width = dimension;
+            style.width_set = true;
+            style.width_fit_content = false;
+        }
+        Height => {
+            style.height = dimension;
+            style.height_set = true;
+        }
+        MinWidth => style.min_width = dimension,
+        MinHeight => style.min_height = dimension,
+        MaxWidth => style.max_width = dimension,
+        MaxHeight => style.max_height = dimension,
+        _ => unreachable!(),
+    }
+}
+
+fn set_inset_animation_value(style: &mut LayoutStyle, index: usize, value: AnimatedLength) {
+    match value {
+        AnimatedLength::Auto => {
+            style.inset[index] = None;
+            style.inset_expressions[index] = None;
+        }
+        AnimatedLength::Dimension(value) => {
+            style.inset[index] = Some(value);
+            style.inset_expressions[index] = None;
+        }
+        AnimatedLength::Expression(value) => {
+            style.inset[index] = None;
+            style.inset_expressions[index] = Some(value);
+        }
+    }
+}
+
+fn set_margin_animation_value(style: &mut LayoutStyle, index: usize, value: AnimatedLength) {
+    style.margin_auto[index] = false;
+    style.margin_percent[index] = None;
+    style.margin_relative[index] = None;
+    style.margin_expressions[index] = None;
+    *edge_value_mut(&mut style.margin, index) = 0.0;
+    match value {
+        AnimatedLength::Auto => style.margin_auto[index] = true,
+        AnimatedLength::Dimension(crate::Dimension::Px(value)) => {
+            *edge_value_mut(&mut style.margin, index) = value
+        }
+        AnimatedLength::Dimension(crate::Dimension::Percent(value)) => {
+            style.margin_percent[index] = Some(value)
+        }
+        AnimatedLength::Dimension(crate::Dimension::Auto) => style.margin_auto[index] = true,
+        AnimatedLength::Dimension(value) => style.margin_relative[index] = Some(value),
+        AnimatedLength::Expression(value) => style.margin_expressions[index] = Some(value),
+    }
+}
+
+fn set_padding_animation_value(style: &mut LayoutStyle, index: usize, value: AnimatedLength) {
+    style.padding_percent[index] = None;
+    style.padding_relative[index] = None;
+    style.padding_expressions[index] = None;
+    *edge_value_mut(&mut style.padding, index) = 0.0;
+    match value {
+        AnimatedLength::Auto | AnimatedLength::Dimension(crate::Dimension::Auto) => {}
+        AnimatedLength::Dimension(crate::Dimension::Px(value)) => {
+            *edge_value_mut(&mut style.padding, index) = value
+        }
+        AnimatedLength::Dimension(crate::Dimension::Percent(value)) => {
+            style.padding_percent[index] = Some(value)
+        }
+        AnimatedLength::Dimension(value) => style.padding_relative[index] = Some(value),
+        AnimatedLength::Expression(value) => style.padding_expressions[index] = Some(value),
+    }
+}
+
+fn set_gap_animation_value(
+    style: &mut LayoutStyle,
+    row: bool,
+    value: AnimatedLength,
+) {
+    let (slot, expression) = if row {
+        (&mut style.row_gap, &mut style.row_gap_expression)
+    } else {
+        (&mut style.column_gap, &mut style.column_gap_expression)
+    };
+    match value {
+        AnimatedLength::Auto | AnimatedLength::Dimension(crate::Dimension::Auto) => {
+            *slot = None;
+            *expression = None;
+        }
+        AnimatedLength::Dimension(crate::Dimension::Px(value)) => {
+            *slot = Some(value);
+            *expression = None;
+        }
+        AnimatedLength::Dimension(value) => {
+            *slot = None;
+            *expression = Some(dimension_to_css(value));
+        }
+        AnimatedLength::Expression(value) => {
+            *slot = None;
+            *expression = Some(value);
+        }
+    }
+}
+
+fn dimension_to_css(value: crate::Dimension) -> String {
+    match value {
+        crate::Dimension::Auto => "auto".to_string(),
+        crate::Dimension::Px(value) => format!("{value}px"),
+        crate::Dimension::Percent(value) => format!("{}%", value * 100.0),
+        crate::Dimension::Em(value) => format!("{value}em"),
+        crate::Dimension::Ex(value) => format!("{value}ex"),
+        crate::Dimension::Rem(value) => format!("{value}rem"),
+        crate::Dimension::Vw(value) => format!("{value}vw"),
+        crate::Dimension::Vh(value) => format!("{value}vh"),
+        crate::Dimension::Vmin(value) => format!("{value}vmin"),
+        crate::Dimension::Vmax(value) => format!("{value}vmax"),
+    }
+}
+
+fn interpolate_animated_length(
+    from: &AnimatedLength,
+    to: &AnimatedLength,
+    position: f32,
+) -> AnimatedLength {
+    match (from, to) {
+        (AnimatedLength::Dimension(from), AnimatedLength::Dimension(to)) => {
+            interpolate_dimension(*from, *to, position)
+                .map(AnimatedLength::Dimension)
+                .unwrap_or_else(|| {
+                    AnimatedLength::Dimension(if position < 0.5 { *from } else { *to })
+                })
+        }
+        (AnimatedLength::Auto, AnimatedLength::Auto) => AnimatedLength::Auto,
+        (AnimatedLength::Expression(from), AnimatedLength::Expression(to)) if from == to => {
+            AnimatedLength::Expression(from.clone())
+        }
+        _ if position < 0.5 => from.clone(),
+        _ => to.clone(),
+    }
+}
+
+fn interpolate_dimension(
+    from: crate::Dimension,
+    to: crate::Dimension,
+    position: f32,
+) -> Option<crate::Dimension> {
+    use crate::Dimension::*;
+    let lerp = |from: f32, to: f32| from + (to - from) * position;
+    Some(match (from, to) {
+        (Auto, Auto) => Auto,
+        (Px(from), Px(to)) => Px(lerp(from, to)),
+        (Percent(from), Percent(to)) => Percent(lerp(from, to)),
+        (Em(from), Em(to)) => Em(lerp(from, to)),
+        (Ex(from), Ex(to)) => Ex(lerp(from, to)),
+        (Rem(from), Rem(to)) => Rem(lerp(from, to)),
+        (Vw(from), Vw(to)) => Vw(lerp(from, to)),
+        (Vh(from), Vh(to)) => Vh(lerp(from, to)),
+        (Vmin(from), Vmin(to)) => Vmin(lerp(from, to)),
+        (Vmax(from), Vmax(to)) => Vmax(lerp(from, to)),
+        _ => return None,
+    })
+}
+
+fn interpolate_color(from: [u8; 4], to: [u8; 4], position: f32) -> [u8; 4] {
+    let channel = |from: u8, to: u8| {
+        (f32::from(from) + (f32::from(to) - f32::from(from)) * position)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    [
+        channel(from[0], to[0]),
+        channel(from[1], to[1]),
+        channel(from[2], to[2]),
+        channel(from[3], to[3]),
+    ]
+}
+
+fn interpolate_transform_length(
+    from: &crate::TransformLength,
+    to: &crate::TransformLength,
+    position: f32,
+) -> Option<crate::TransformLength> {
+    match (&from.expression, &to.expression) {
+        (None, None) => Some(crate::TransformLength {
+            value: interpolate_dimension(from.value, to.value, position)?,
+            expression: None,
+        }),
+        (Some(from_expression), Some(to_expression)) if from_expression == to_expression => {
+            Some(crate::TransformLength {
+                value: interpolate_dimension(from.value, to.value, position)
+                    .unwrap_or(from.value),
+                expression: Some(from_expression.clone()),
+            })
+        },
+        _ => None,
+    }
+}
+
+fn interpolate_transform_list(
+    from: &[crate::TransformOp],
+    to: &[crate::TransformOp],
+    position: f32,
+) -> Vec<crate::TransformOp> {
+    let from_list = if from.is_empty() && !to.is_empty() {
+        to.iter()
+            .map(identity_transform_operation)
+            .collect::<Vec<_>>()
+    } else {
+        from.to_vec()
+    };
+    let to_list = if to.is_empty() && !from.is_empty() {
+        from.iter()
+            .map(identity_transform_operation)
+            .collect::<Vec<_>>()
+    } else {
+        to.to_vec()
+    };
+    if from_list.len() != to_list.len() {
+        return if position < 0.5 { from_list } else { to_list };
+    }
+    let mut result = Vec::with_capacity(from_list.len());
+    for (from, to) in from_list.iter().zip(&to_list) {
+        let Some(operation) = interpolate_transform_operation(from, to, position) else {
+            return if position < 0.5 { from_list } else { to_list };
+        };
+        result.push(operation);
+    }
+    result
+}
+
+fn identity_transform_operation(operation: &crate::TransformOp) -> crate::TransformOp {
+    match operation {
+        crate::TransformOp::Translate(x, y) => crate::TransformOp::Translate(
+            zero_transform_length(x),
+            zero_transform_length(y),
+        ),
+        crate::TransformOp::Scale(_, _) => crate::TransformOp::Scale(1.0, 1.0),
+        crate::TransformOp::Rotate(_) => crate::TransformOp::Rotate(0.0),
+        crate::TransformOp::Skew(_, _) => crate::TransformOp::Skew(0.0, 0.0),
+        crate::TransformOp::Matrix(_) => crate::TransformOp::Matrix(crate::Affine2::IDENTITY),
+    }
+}
+
+fn zero_transform_length(value: &crate::TransformLength) -> crate::TransformLength {
+    crate::TransformLength {
+        value: match value.value {
+            crate::Dimension::Percent(_) => crate::Dimension::Percent(0.0),
+            crate::Dimension::Em(_) => crate::Dimension::Em(0.0),
+            crate::Dimension::Ex(_) => crate::Dimension::Ex(0.0),
+            crate::Dimension::Rem(_) => crate::Dimension::Rem(0.0),
+            crate::Dimension::Vw(_) => crate::Dimension::Vw(0.0),
+            crate::Dimension::Vh(_) => crate::Dimension::Vh(0.0),
+            crate::Dimension::Vmin(_) => crate::Dimension::Vmin(0.0),
+            crate::Dimension::Vmax(_) => crate::Dimension::Vmax(0.0),
+            _ => crate::Dimension::Px(0.0),
+        },
+        expression: value.expression.as_ref().map(|_| "0px".to_string()),
+    }
+}
+
+fn interpolate_transform_operation(
+    from: &crate::TransformOp,
+    to: &crate::TransformOp,
+    position: f32,
+) -> Option<crate::TransformOp> {
+    let lerp = |from: f32, to: f32| from + (to - from) * position;
+    Some(match (from, to) {
+        (crate::TransformOp::Translate(from_x, from_y), crate::TransformOp::Translate(to_x, to_y)) => {
+            crate::TransformOp::Translate(
+                interpolate_transform_length(from_x, to_x, position)?,
+                interpolate_transform_length(from_y, to_y, position)?,
+            )
+        }
+        (crate::TransformOp::Scale(from_x, from_y), crate::TransformOp::Scale(to_x, to_y)) => {
+            crate::TransformOp::Scale(lerp(*from_x, *to_x), lerp(*from_y, *to_y))
+        }
+        (crate::TransformOp::Rotate(from), crate::TransformOp::Rotate(to)) => {
+            crate::TransformOp::Rotate(lerp(*from, *to))
+        }
+        (crate::TransformOp::Skew(from_x, from_y), crate::TransformOp::Skew(to_x, to_y)) => {
+            crate::TransformOp::Skew(lerp(*from_x, *to_x), lerp(*from_y, *to_y))
+        }
+        (crate::TransformOp::Matrix(from), crate::TransformOp::Matrix(to)) => {
+            crate::TransformOp::Matrix(crate::Affine2 {
+                a: lerp(from.a, to.a),
+                b: lerp(from.b, to.b),
+                c: lerp(from.c, to.c),
+                d: lerp(from.d, to.d),
+                e: lerp(from.e, to.e),
+                f: lerp(from.f, to.f),
+            })
+        }
+        _ => return None,
+    })
+}
+
+fn set_animation_containing_block_trigger(
+    style: &mut LayoutStyle,
+    trigger: u16,
+    enabled: bool,
+) {
+    if enabled {
+        style.containing_block_triggers |= trigger;
+    } else {
+        style.containing_block_triggers &= !trigger;
+    }
 }
 
 fn animation_directed_progress(
@@ -2293,6 +3134,26 @@ fn flush_at_rule(
                 current_layer.cloned(),
             ));
         }
+    } else if let Some((name, prefixed)) = at_rule_prelude(at, "keyframes")
+        .map(|name| (name, false))
+        .or_else(|| at_rule_prelude(at, "-webkit-keyframes").map(|name| (name, true)))
+    {
+        let name = name.trim();
+        if !name.is_empty() {
+            rules.push(ParsedRule {
+                selector: format!(
+                    "{}{name}",
+                    if prefixed {
+                        WEBKIT_KEYFRAMES_SELECTOR_PREFIX
+                    } else {
+                        KEYFRAMES_SELECTOR_PREFIX
+                    }
+                ),
+                declarations: inner.to_string(),
+                container_condition_id: ContainerConditionId::NONE,
+                layer: current_layer.cloned(),
+            });
+        }
     } else if let Some(name) = at_rule_prelude(at, "property") {
         if name.starts_with("--") {
             rules.push(ParsedRule {
@@ -2322,7 +3183,7 @@ fn flush_at_rule(
             Some(layer),
         ));
     }
-    // Other at-rules (@font-face, @keyframes, @import, ...) carry no
+    // Other at-rules (@font-face, @import, ...) carry no
     // layout-relevant rules for us, so drop them.
 }
 
@@ -3820,6 +4681,218 @@ mod tests {
         assert!(
             (actual - expected).abs() < 0.0001,
             "expected opacity {expected}, got {actual}"
+        );
+    }
+
+    #[test]
+    fn animation_samples_geometry_transform_and_paint_properties_at_t0() {
+        let css = r#"
+            @keyframes demo {
+                from {
+                    transform:translateX(100px);
+                    translate:20px 30px;
+                    rotate:10deg;
+                    scale:2 3;
+                    width:300px;
+                    height:80px;
+                    min-width:120px;
+                    max-height:90px;
+                    inset:1px 2px 3px 4px;
+                    margin:5px 6px 7px 8px;
+                    padding:9px 10px 11px 12px;
+                    gap:13px 14px;
+                    flex-basis:150px;
+                    color:rgb(10,20,30);
+                    background:red;
+                    border-color:blue green yellow black;
+                    background-position:25% 40%;
+                    visibility:hidden;
+                    opacity:.25;
+                }
+                to { opacity:.75 }
+            }
+            #target { width:50px; animation:demo 10s both }
+        "#;
+        let style = sampled_animation_style(css, 0.0, "target");
+        assert_eq!(style.width, crate::Dimension::Px(300.0));
+        assert_eq!(style.height, crate::Dimension::Px(80.0));
+        assert_eq!(style.min_width, crate::Dimension::Px(120.0));
+        assert_eq!(style.max_height, crate::Dimension::Px(90.0));
+        assert_eq!(style.inset[3], Some(crate::Dimension::Px(4.0)));
+        assert_eq!(style.margin.left, 8.0);
+        assert_eq!(style.padding.bottom, 11.0);
+        assert_eq!(style.row_gap, Some(13.0));
+        assert_eq!(style.column_gap, Some(14.0));
+        assert_eq!(style.flex_basis, crate::Dimension::Px(150.0));
+        assert_eq!(style.color, Some([10, 20, 30, 255]));
+        assert_eq!(style.background_color, Some([255, 0, 0, 255]));
+        assert_eq!(style.border_model.colors.top, Some([0, 0, 255, 255]));
+        assert_eq!(style.border_model.colors.right, Some([0, 128, 0, 255]));
+        assert_eq!(style.visibility_hidden, Some(true));
+        assert_opacity(style.opacity.unwrap(), 0.25);
+        assert!(matches!(
+            style.transform_ops.as_slice(),
+            [crate::TransformOp::Translate(x, y)]
+                if x.value == crate::Dimension::Px(100.0)
+                    && y.value == crate::Dimension::Px(0.0)
+        ));
+        assert_eq!(
+            style.individual_translate,
+            Some((crate::Dimension::Px(20.0), crate::Dimension::Px(30.0)))
+        );
+        assert_eq!(style.individual_rotate, Some(10.0));
+        assert_eq!(style.individual_scale, Some((2.0, 3.0)));
+    }
+
+    #[test]
+    fn animation_t0_geometry_reaches_the_real_layout_pass() {
+        let tree = obscura_dom::parse_html(
+            r#"
+                <style>
+                    html,body { margin:0 }
+                    #row { display:flex }
+                    @keyframes size {
+                        from { width:300px; height:20px }
+                        to { width:400px; height:40px }
+                    }
+                    #target { width:50px; animation:size 10s both }
+                    #sibling { width:10px; height:10px }
+                </style>
+                <div id="row"><div id="target"></div><div id="sibling"></div></div>
+            "#,
+        );
+        let target = tree.get_element_by_id("target").unwrap();
+        let sibling = tree.get_element_by_id("sibling").unwrap();
+        let laid = crate::dom::layout_dom(&tree, (800.0, 600.0));
+        assert_eq!(laid.rects[&target].width, 300.0);
+        assert_eq!(laid.rects[&target].height, 20.0);
+        assert_eq!(laid.rects[&sibling].x, 300.0);
+    }
+
+    #[test]
+    fn animation_sparse_tracks_ignore_unrelated_intermediate_keyframes() {
+        let css = r#"
+            @keyframes sparse {
+                from { width:100px; opacity:0; background-color:red }
+                50% { opacity:1 }
+                to { width:300px; opacity:0; background-color:blue }
+            }
+            #target { animation:sparse 1s linear both }
+        "#;
+        let style = sampled_animation_style(css, 500.0, "target");
+        assert_eq!(style.width, crate::Dimension::Px(200.0));
+        assert_opacity(style.opacity.unwrap(), 1.0);
+        assert_eq!(style.background_color, Some([128, 0, 128, 255]));
+
+        let implicit = r#"
+            @keyframes middle { 50% { width:150px } }
+            #target { width:50px; animation:middle 1s linear both }
+        "#;
+        assert_eq!(
+            sampled_animation_style(implicit, 250.0, "target").width,
+            crate::Dimension::Px(100.0)
+        );
+        assert_eq!(
+            sampled_animation_style(implicit, 750.0, "target").width,
+            crate::Dimension::Px(100.0)
+        );
+    }
+
+    #[test]
+    fn keyframe_duplicate_offsets_merge_per_property_and_ignore_important() {
+        let css = r#"
+            @keyframes merged {
+                0% { width:100px; color:red; opacity:.1 }
+                from { width:999px !important; opacity:.8 }
+            }
+            #target { width:40px; animation:merged 1s both }
+        "#;
+        let style = sampled_animation_style(css, 0.0, "target");
+        assert_eq!(style.width, crate::Dimension::Px(100.0));
+        assert_eq!(style.color, Some([255, 0, 0, 255]));
+        assert_opacity(style.opacity.unwrap(), 0.8);
+    }
+
+    #[test]
+    fn author_important_overrides_every_sampled_animation_property() {
+        let css = r#"
+            @keyframes forced { from, to { width:300px; background-color:red } }
+            #target {
+                animation:forced 1s both;
+                width:80px !important;
+                background-color:blue !important;
+            }
+        "#;
+        let style = sampled_animation_style(css, 0.0, "target");
+        assert_eq!(style.width, crate::Dimension::Px(80.0));
+        assert_eq!(style.background_color, Some([0, 0, 255, 255]));
+    }
+
+    #[test]
+    fn conditional_keyframes_and_empty_later_definitions_follow_browser_selection() {
+        let css = r#"
+            @keyframes chosen { from, to { width:222px } }
+            @media (max-width:100px) {
+                @keyframes chosen { from, to { width:111px } }
+            }
+            @supports (unknown-parity-property:value) {
+                @keyframes chosen { from, to { width:123px } }
+            }
+            #target { width:50px; animation:chosen 1s both }
+        "#;
+        assert_eq!(
+            sampled_animation_style(css, 0.0, "target").width,
+            crate::Dimension::Px(222.0)
+        );
+
+        let empty = r#"
+            @keyframes cleared { from, to { width:300px } }
+            @keyframes cleared {}
+            #target { width:50px; animation:cleared 1s both }
+        "#;
+        assert_eq!(
+            sampled_animation_style(empty, 0.0, "target").width,
+            crate::Dimension::Px(50.0)
+        );
+    }
+
+    #[test]
+    fn keyframe_names_follow_cascade_layer_order_and_standard_prefix_priority() {
+        let unlayered = r#"
+            @keyframes chosen { from, to { width:222px } }
+            @layer outer { @keyframes chosen { from, to { width:111px } } }
+            #target { animation:chosen 1s both }
+        "#;
+        assert_eq!(
+            sampled_animation_style(unlayered, 0.0, "target").width,
+            crate::Dimension::Px(222.0)
+        );
+
+        let ordered = r#"
+            @layer weak, strong;
+            @layer strong { @keyframes chosen { from, to { width:333px } } }
+            @layer weak { @keyframes chosen { from, to { width:444px } } }
+            #target { animation:chosen 1s both }
+        "#;
+        assert_eq!(
+            sampled_animation_style(ordered, 0.0, "target").width,
+            crate::Dimension::Px(333.0)
+        );
+
+        let reversed = ordered.replace("@layer weak, strong", "@layer strong, weak");
+        assert_eq!(
+            sampled_animation_style(&reversed, 0.0, "target").width,
+            crate::Dimension::Px(444.0)
+        );
+
+        let prefix = r#"
+            @keyframes chosen { from, to { width:555px } }
+            @-webkit-keyframes chosen { from, to { width:666px } }
+            #target { animation:chosen 1s both }
+        "#;
+        assert_eq!(
+            sampled_animation_style(prefix, 0.0, "target").width,
+            crate::Dimension::Px(555.0)
         );
     }
 
