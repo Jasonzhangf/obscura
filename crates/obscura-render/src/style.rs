@@ -127,9 +127,10 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
         style.underline = Some(true); // UA default: links are underlined
     } else if tag == "iframe" {
         // HTML's UA sheet gives frames a two-pixel inset border. The paint
-        // model does not distinguish inset yet, but border-box geometry still
-        // includes these edges around the 300x150 default object size.
+        // and geometry models share the same four-side used state.
         style.border = Edges { top: 2.0, right: 2.0, bottom: 2.0, left: 2.0 };
+        style.border_model.specified_widths = crate::Sides::all(2.0);
+        style.border_model.styles = crate::Sides::all(crate::BorderStyle::Inset);
     } else if tag == "button" {
         // HTML buttons are inline-block controls whose anonymous inner
         // content is centered by the browser UA sheet. Keep the atomic outer
@@ -172,6 +173,9 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
             bottom: 1.0,
             left: 1.0,
         };
+        style.border_model.specified_widths = crate::Sides::all(1.0);
+        style.border_model.styles = crate::Sides::all(crate::BorderStyle::Solid);
+        style.border_model.colors = crate::Sides::all(Some([118, 118, 118, 255]));
         style.border_color = Some([118, 118, 118, 255]);
         style.background_color = Some([255, 255, 255, 255]);
     } else if tag == "input" {
@@ -198,6 +202,9 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
             bottom: 2.0,
             left: 2.0,
         };
+        style.border_model.specified_widths = crate::Sides::all(2.0);
+        style.border_model.styles = crate::Sides::all(crate::BorderStyle::Solid);
+        style.border_model.colors = crate::Sides::all(Some([118, 118, 118, 255]));
         style.border_color = Some([118, 118, 118, 255]);
         style.background_color = Some([255, 255, 255, 255]);
     } else if matches!(tag, "table" | "tbody" | "thead" | "tfoot") {
@@ -859,30 +866,11 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         "padding-block" => { let (s, e) = two(value); set_padding_side(style, 0, s); set_padding_side(style, 2, e); }
         "padding-block-start" => set_padding_side(style, 0, value),
         "padding-block-end" => set_padding_side(style, 2, value),
-        "border-radius" => {
-            // Uniform radius from the first value (ignore per-corner / the
-            // `/` vertical-radius form; the common case is one
-            // <length-percentage>). A percentage must remain unresolved until
-            // paint knows both axes of the final border box.
-            let token = value.split('/').next().and_then(|part| part.split_whitespace().next());
-            if matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "initial" | "unset" | "revert" | "revert-layer"
-            ) {
-                style.border_radius = crate::BorderRadius::default();
-            } else if let Some(percentage) = token
-                .and_then(|token| token.strip_suffix('%'))
-                .and_then(|number| number.parse::<f32>().ok())
-                .filter(|number| number.is_finite() && *number >= 0.0)
-            {
-                style.border_radius = crate::BorderRadius::percentage(percentage / 100.0);
-            } else if let Some(length) = token
-                .and_then(px)
-                .filter(|length| length.is_finite() && *length >= 0.0)
-            {
-                style.border_radius = crate::BorderRadius::pixels(length);
-            }
-        }
+        "border-radius" => apply_border_radius_shorthand(style, value),
+        "border-top-left-radius" => set_corner_radius(style, 0, value),
+        "border-top-right-radius" => set_corner_radius(style, 1, value),
+        "border-bottom-right-radius" => set_corner_radius(style, 2, value),
+        "border-bottom-left-radius" => set_corner_radius(style, 3, value),
         "clip-path" | "-webkit-clip-path" => {
             let lower = value.trim().to_ascii_lowercase();
             if matches!(
@@ -894,37 +882,31 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                 style.clip_path = Some(polygon);
             }
         }
-        "border" => {
-            if value.split_whitespace().any(|token| {
-                token.eq_ignore_ascii_case("none") || token.eq_ignore_ascii_case("hidden")
-            }) {
-                style.border = Edges::default();
-                style.border_color = None;
-                return;
-            }
-            for p in split_ws_paren(value) {
-                if let Some(c) =
-                    parse_color_for_scheme(p, style.color_scheme_dark)
-                {
-                    style.border_color = Some(c);
-                } else if p.ends_with("px") || p.chars().all(|c| c.is_ascii_digit()) {
-                    if let Some(e) = edges(p) { style.border = e; }
-                }
-            }
-        }
-        "border-width" => { if let Some(e) = edges(value) { style.border = e; } }
-        "border-top-width" | "border-top" => {
-            set_edge(&mut style.border, Side::Top, border_side_width(value))
-        }
-        "border-right-width" | "border-right" => {
-            set_edge(&mut style.border, Side::Right, border_side_width(value))
-        }
-        "border-bottom-width" | "border-bottom" => {
-            set_edge(&mut style.border, Side::Bottom, border_side_width(value))
-        }
-        "border-left-width" | "border-left" => {
-            set_edge(&mut style.border, Side::Left, border_side_width(value))
-        }
+        "border" => apply_border_shorthand(style, None, value),
+        "border-top" => apply_border_shorthand(style, Some(Side::Top), value),
+        "border-right" => apply_border_shorthand(style, Some(Side::Right), value),
+        "border-bottom" => apply_border_shorthand(style, Some(Side::Bottom), value),
+        "border-left" => apply_border_shorthand(style, Some(Side::Left), value),
+        "border-width" => apply_border_widths(style, value),
+        "border-top-width" => set_border_width(style, Side::Top, value),
+        "border-right-width" => set_border_width(style, Side::Right, value),
+        "border-bottom-width" => set_border_width(style, Side::Bottom, value),
+        "border-left-width" => set_border_width(style, Side::Left, value),
+        "border-style" => apply_border_styles(style, value),
+        "border-top-style" => set_border_style(style, Side::Top, value),
+        "border-right-style" => set_border_style(style, Side::Right, value),
+        "border-bottom-style" => set_border_style(style, Side::Bottom, value),
+        "border-left-style" => set_border_style(style, Side::Left, value),
+        "border-color" => apply_border_colors(style, value),
+        "border-top-color" => set_border_color(style, Side::Top, value),
+        "border-right-color" => set_border_color(style, Side::Right, value),
+        "border-bottom-color" => set_border_color(style, Side::Bottom, value),
+        "border-left-color" => set_border_color(style, Side::Left, value),
+        "outline" => apply_outline_shorthand(style, value),
+        "outline-width" => set_outline_width(style, value),
+        "outline-style" => set_outline_style(style, value),
+        "outline-color" => set_outline_color(style, value),
+        "outline-offset" => set_outline_offset(style, value),
         "background-color" => {
             style.background_color =
                 parse_color_for_scheme(value, style.color_scheme_dark)
@@ -1011,10 +993,6 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
             ))
         }
         "stroke-width" => style.svg_stroke_width = Some(value.trim().to_string()),
-        "border-color" => {
-            style.border_color =
-                parse_color_for_scheme(value, style.color_scheme_dark)
-        }
         "font-size" => {
             // Absolute lengths resolve now; font/viewport-relative ones defer
             // to the inheritance pass (they need parent/root font-size).
@@ -1697,6 +1675,10 @@ pub(crate) fn supports_declaration(name: &str, value: &str) -> bool {
             | "padding-block-start"
             | "padding-block-end"
             | "border-radius"
+            | "border-top-left-radius"
+            | "border-top-right-radius"
+            | "border-bottom-right-radius"
+            | "border-bottom-left-radius"
             | "clip-path"
             | "-webkit-clip-path"
             | "border"
@@ -1705,6 +1687,15 @@ pub(crate) fn supports_declaration(name: &str, value: &str) -> bool {
             | "border-right-width"
             | "border-bottom-width"
             | "border-left-width"
+            | "border-style"
+            | "border-top-style"
+            | "border-right-style"
+            | "border-bottom-style"
+            | "border-left-style"
+            | "border-top-color"
+            | "border-right-color"
+            | "border-bottom-color"
+            | "border-left-color"
             | "border-top"
             | "border-right"
             | "border-bottom"
@@ -1729,6 +1720,11 @@ pub(crate) fn supports_declaration(name: &str, value: &str) -> bool {
             | "stroke"
             | "stroke-width"
             | "border-color"
+            | "outline"
+            | "outline-width"
+            | "outline-style"
+            | "outline-color"
+            | "outline-offset"
             | "color-scheme"
             | "font-size"
             | "letter-spacing"
@@ -1947,7 +1943,42 @@ pub(crate) fn supports_declaration(name: &str, value: &str) -> bool {
         "grid-auto-columns" | "grid-auto-rows" => {
             parse_grid_auto_track_list(value).is_some()
         }
-        "color" | "-webkit-text-fill-color" | "background-color" | "border-color" => {
+        "border" | "border-top" | "border-right" | "border-bottom" | "border-left" => {
+            parse_border_shorthand(value, false).is_some()
+        }
+        "border-width" => {
+            let values = split_ws_paren(value)
+                .iter()
+                .map(|token| border_width(token))
+                .collect::<Option<Vec<_>>>();
+            values.and_then(|values| crate::border::expand_sides(&values)).is_some()
+        }
+        "border-top-width" | "border-right-width" | "border-bottom-width" | "border-left-width"
+        | "outline-width" => border_width(value).is_some(),
+        "border-style" => {
+            let values = split_ws_paren(value)
+                .iter()
+                .map(|token| border_style(token))
+                .collect::<Option<Vec<_>>>();
+            values.and_then(|values| crate::border::expand_sides(&values)).is_some()
+        }
+        "border-top-style" | "border-right-style" | "border-bottom-style" | "border-left-style" => {
+            border_style(value).is_some()
+        }
+        "border-color" => parse_border_colors(value, false).is_some(),
+        "border-top-color" | "border-right-color" | "border-bottom-color" | "border-left-color"
+        | "outline-color" => border_color(value, false).is_some(),
+        "border-radius" => parsed_border_radii(value).is_some(),
+        "border-top-left-radius" | "border-top-right-radius" | "border-bottom-right-radius"
+        | "border-bottom-left-radius" => {
+            let tokens = split_ws_paren(value);
+            matches!(tokens.as_slice(), [one] if radius_value(one).is_some())
+                || matches!(tokens.as_slice(), [x, y] if radius_value(x).is_some() && radius_value(y).is_some())
+        }
+        "outline" => parse_outline_shorthand(value, false).is_some(),
+        "outline-style" => outline_style(value).is_some(),
+        "outline-offset" => strict_border_length(value).is_some(),
+        "color" | "-webkit-text-fill-color" | "background-color" => {
             parse_color(value).is_some()
         }
         "color-scheme" => {
@@ -3879,25 +3910,475 @@ fn hsl_to_rgba(h: f32, s: f32, l: f32, a: u8) -> [u8; 4] {
     ]
 }
 
+#[derive(Clone, Copy)]
 enum Side { Top, Right, Bottom, Left }
 
-fn border_side_width(value: &str) -> Option<f32> {
-    if value.split_whitespace().any(|token| {
-        token.eq_ignore_ascii_case("none") || token.eq_ignore_ascii_case("hidden")
-    }) {
-        Some(0.0)
-    } else {
-        px(value)
+fn border_style(value: &str) -> Option<crate::BorderStyle> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "none" => Some(crate::BorderStyle::None),
+        "hidden" => Some(crate::BorderStyle::Hidden),
+        "dotted" => Some(crate::BorderStyle::Dotted),
+        "dashed" => Some(crate::BorderStyle::Dashed),
+        "solid" => Some(crate::BorderStyle::Solid),
+        "double" => Some(crate::BorderStyle::Double),
+        "groove" => Some(crate::BorderStyle::Groove),
+        "ridge" => Some(crate::BorderStyle::Ridge),
+        "inset" => Some(crate::BorderStyle::Inset),
+        "outset" => Some(crate::BorderStyle::Outset),
+        _ => None,
     }
 }
 
-fn set_edge(edges: &mut Edges, side: Side, v: Option<f32>) {
-    let v = match v { Some(v) => v, None => return };
+fn outline_style(value: &str) -> Option<crate::BorderStyle> {
+    if value.trim().eq_ignore_ascii_case("auto") {
+        Some(crate::BorderStyle::Auto)
+    } else {
+        border_style(value).filter(|style| *style != crate::BorderStyle::Hidden)
+    }
+}
+
+fn border_width(value: &str) -> Option<f32> {
+    let value = value.trim();
+    let width = match value.to_ascii_lowercase().as_str() {
+        "thin" => 1.0,
+        "medium" => crate::border::MEDIUM_BORDER_WIDTH,
+        "thick" => 5.0,
+        _ => strict_border_length(value)?,
+    };
+    width.is_finite().then_some(width).filter(|width| *width >= 0.0)
+}
+
+fn strict_border_length(value: &str) -> Option<f32> {
+    let value = value.trim();
+    if value == "0" || value == "+0" || value == "-0" {
+        return Some(0.0);
+    }
+    let lower = value.to_ascii_lowercase();
+    if lower.contains('(') {
+        if lower.contains('%') {
+            return None;
+        }
+        return px(value);
+    }
+    const UNITS: [&str; 5] = ["rem", "px", "pt", "em", "ex"];
+    let unit = UNITS.iter().find(|unit| lower.ends_with(**unit))?;
+    let number = lower[..lower.len() - unit.len()].trim().parse::<f32>().ok()?;
+    number.is_finite().then(|| px(value)).flatten()
+}
+
+fn border_color(value: &str, dark_scheme: bool) -> Option<Option<[u8; 4]>> {
+    if value.trim().eq_ignore_ascii_case("currentcolor") {
+        Some(None)
+    } else {
+        parse_color_for_scheme(value, dark_scheme).map(Some)
+    }
+}
+
+fn sync_used_border(style: &mut LayoutStyle) {
+    let used = style.border_model.used_widths();
+    style.border = Edges {
+        top: used.top,
+        right: used.right,
+        bottom: used.bottom,
+        left: used.left,
+    };
+}
+
+fn side_widths_mut(model: &mut crate::BorderModel, side: Side) -> &mut f32 {
     match side {
-        Side::Top => edges.top = v,
-        Side::Right => edges.right = v,
-        Side::Bottom => edges.bottom = v,
-        Side::Left => edges.left = v,
+        Side::Top => &mut model.specified_widths.top,
+        Side::Right => &mut model.specified_widths.right,
+        Side::Bottom => &mut model.specified_widths.bottom,
+        Side::Left => &mut model.specified_widths.left,
+    }
+}
+
+fn side_styles_mut(
+    model: &mut crate::BorderModel,
+    side: Side,
+) -> &mut crate::BorderStyle {
+    match side {
+        Side::Top => &mut model.styles.top,
+        Side::Right => &mut model.styles.right,
+        Side::Bottom => &mut model.styles.bottom,
+        Side::Left => &mut model.styles.left,
+    }
+}
+
+fn side_colors_mut(
+    model: &mut crate::BorderModel,
+    side: Side,
+) -> &mut Option<[u8; 4]> {
+    match side {
+        Side::Top => &mut model.colors.top,
+        Side::Right => &mut model.colors.right,
+        Side::Bottom => &mut model.colors.bottom,
+        Side::Left => &mut model.colors.left,
+    }
+}
+
+fn apply_border_widths(style: &mut LayoutStyle, value: &str) {
+    if matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "initial" | "unset" | "revert" | "revert-layer"
+    ) {
+        style.border_model.specified_widths =
+            crate::Sides::all(crate::border::MEDIUM_BORDER_WIDTH);
+        sync_used_border(style);
+        return;
+    }
+    let tokens = split_ws_paren(value);
+    let Some(values) = tokens
+        .iter()
+        .map(|token| border_width(token))
+        .collect::<Option<Vec<_>>>()
+        .and_then(|values| crate::border::expand_sides(&values))
+    else {
+        return;
+    };
+    style.border_model.specified_widths = values;
+    sync_used_border(style);
+}
+
+fn set_border_width(style: &mut LayoutStyle, side: Side, value: &str) {
+    let width = if matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "initial" | "unset" | "revert" | "revert-layer"
+    ) {
+        Some(crate::border::MEDIUM_BORDER_WIDTH)
+    } else {
+        border_width(value)
+    };
+    if let Some(width) = width {
+        *side_widths_mut(&mut style.border_model, side) = width;
+        sync_used_border(style);
+    }
+}
+
+fn apply_border_styles(style: &mut LayoutStyle, value: &str) {
+    if matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "initial" | "unset" | "revert" | "revert-layer"
+    ) {
+        style.border_model.styles = crate::Sides::all(crate::BorderStyle::None);
+        sync_used_border(style);
+        return;
+    }
+    let tokens = split_ws_paren(value);
+    let Some(values) = tokens
+        .iter()
+        .map(|token| border_style(token))
+        .collect::<Option<Vec<_>>>()
+        .and_then(|values| crate::border::expand_sides(&values))
+    else {
+        return;
+    };
+    style.border_model.styles = values;
+    sync_used_border(style);
+}
+
+fn set_border_style(style: &mut LayoutStyle, side: Side, value: &str) {
+    let line_style = if matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "initial" | "unset" | "revert" | "revert-layer"
+    ) {
+        Some(crate::BorderStyle::None)
+    } else {
+        border_style(value)
+    };
+    if let Some(line_style) = line_style {
+        *side_styles_mut(&mut style.border_model, side) = line_style;
+        sync_used_border(style);
+    }
+}
+
+fn parse_border_colors(
+    value: &str,
+    dark_scheme: bool,
+) -> Option<crate::Sides<Option<[u8; 4]>>> {
+    let tokens = split_ws_paren(value);
+    let values = tokens
+        .iter()
+        .map(|token| border_color(token, dark_scheme))
+        .collect::<Option<Vec<_>>>()?;
+    crate::border::expand_sides(&values)
+}
+
+fn apply_border_colors(style: &mut LayoutStyle, value: &str) {
+    if matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "initial" | "unset" | "revert" | "revert-layer"
+    ) {
+        style.border_model.colors = crate::Sides::all(None);
+        style.border_color = None;
+    } else if let Some(colors) = parse_border_colors(value, style.color_scheme_dark) {
+        style.border_model.colors = colors;
+        style.border_color = (colors.top == colors.right
+            && colors.right == colors.bottom
+            && colors.bottom == colors.left)
+            .then_some(colors.top)
+            .flatten();
+    }
+}
+
+fn set_border_color(style: &mut LayoutStyle, side: Side, value: &str) {
+    let color = if matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "initial" | "unset" | "revert" | "revert-layer"
+    ) {
+        Some(None)
+    } else {
+        border_color(value, style.color_scheme_dark)
+    };
+    if let Some(color) = color {
+        *side_colors_mut(&mut style.border_model, side) = color;
+        let colors = style.border_model.colors;
+        style.border_color = (colors.top == colors.right
+            && colors.right == colors.bottom
+            && colors.bottom == colors.left)
+            .then_some(colors.top)
+            .flatten();
+    }
+}
+
+#[derive(Clone, Copy)]
+struct BorderShorthand {
+    width: f32,
+    style: crate::BorderStyle,
+    color: Option<[u8; 4]>,
+}
+
+fn parse_border_shorthand(value: &str, dark_scheme: bool) -> Option<BorderShorthand> {
+    let lower = value.trim().to_ascii_lowercase();
+    if matches!(lower.as_str(), "initial" | "unset" | "revert" | "revert-layer") {
+        return Some(BorderShorthand {
+            width: crate::border::MEDIUM_BORDER_WIDTH,
+            style: crate::BorderStyle::None,
+            color: None,
+        });
+    }
+    if value.trim().is_empty() || lower == "inherit" {
+        return None;
+    }
+    let mut width = None;
+    let mut style = None;
+    let mut color = None;
+    let mut saw_color = false;
+    for token in split_ws_paren(value) {
+        if width.is_none() {
+            if let Some(parsed) = border_width(token) {
+                width = Some(parsed);
+                continue;
+            }
+        }
+        if style.is_none() {
+            if let Some(parsed) = border_style(token) {
+                style = Some(parsed);
+                continue;
+            }
+        }
+        if !saw_color {
+            if let Some(parsed) = border_color(token, dark_scheme) {
+                color = parsed;
+                saw_color = true;
+                continue;
+            }
+        }
+        return None;
+    }
+    Some(BorderShorthand {
+        width: width.unwrap_or(crate::border::MEDIUM_BORDER_WIDTH),
+        style: style.unwrap_or(crate::BorderStyle::None),
+        color,
+    })
+}
+
+fn apply_border_shorthand(style: &mut LayoutStyle, side: Option<Side>, value: &str) {
+    let Some(parsed) = parse_border_shorthand(value, style.color_scheme_dark) else {
+        return;
+    };
+    if let Some(side) = side {
+        *side_widths_mut(&mut style.border_model, side) = parsed.width;
+        *side_styles_mut(&mut style.border_model, side) = parsed.style;
+        *side_colors_mut(&mut style.border_model, side) = parsed.color;
+    } else {
+        style.border_model.specified_widths = crate::Sides::all(parsed.width);
+        style.border_model.styles = crate::Sides::all(parsed.style);
+        style.border_model.colors = crate::Sides::all(parsed.color);
+        style.border_color = parsed.color;
+    }
+    let colors = style.border_model.colors;
+    style.border_color = (colors.top == colors.right
+        && colors.right == colors.bottom
+        && colors.bottom == colors.left)
+        .then_some(colors.top)
+        .flatten();
+    sync_used_border(style);
+}
+
+fn radius_value(value: &str) -> Option<crate::RadiusValue> {
+    let value = value.trim();
+    if let Some(number) = value.strip_suffix('%') {
+        let percentage = number.trim().parse::<f32>().ok()? / 100.0;
+        return (percentage.is_finite() && percentage >= 0.0)
+            .then_some(crate::RadiusValue::percentage(percentage));
+    }
+    let length = strict_border_length(value)?;
+    (length.is_finite() && length >= 0.0).then_some(crate::RadiusValue::pixels(length))
+}
+
+fn parsed_border_radii(value: &str) -> Option<crate::BorderRadii> {
+    let axes = split_top_level(value, '/');
+    if axes.is_empty() || axes.len() > 2 {
+        return None;
+    }
+    let horizontal_tokens = split_ws_paren(axes[0]);
+    let horizontal = horizontal_tokens
+        .iter()
+        .map(|token| radius_value(token))
+        .collect::<Option<Vec<_>>>()
+        .and_then(|values| crate::border::expand_sides(&values))?;
+    let vertical = if axes.len() == 2 {
+        let vertical_tokens = split_ws_paren(axes[1]);
+        vertical_tokens
+            .iter()
+            .map(|token| radius_value(token))
+            .collect::<Option<Vec<_>>>()
+            .and_then(|values| crate::border::expand_sides(&values))?
+    } else {
+        horizontal
+    };
+    Some(crate::BorderRadii {
+        top_left: crate::CornerRadius { x: horizontal.top, y: vertical.top },
+        top_right: crate::CornerRadius { x: horizontal.right, y: vertical.right },
+        bottom_right: crate::CornerRadius { x: horizontal.bottom, y: vertical.bottom },
+        bottom_left: crate::CornerRadius { x: horizontal.left, y: vertical.left },
+    })
+}
+
+fn apply_border_radius_shorthand(style: &mut LayoutStyle, value: &str) {
+    if matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "initial" | "unset" | "revert" | "revert-layer"
+    ) {
+        style.border_model.radii = crate::BorderRadii::default();
+    } else if let Some(radii) = parsed_border_radii(value) {
+        style.border_model.radii = radii;
+    }
+}
+
+fn set_corner_radius(style: &mut LayoutStyle, corner: usize, value: &str) {
+    let parsed = if matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "initial" | "unset" | "revert" | "revert-layer"
+    ) {
+        Some(crate::CornerRadius::default())
+    } else {
+        let tokens = split_ws_paren(value);
+        match tokens.as_slice() {
+            [x] => radius_value(x).map(crate::CornerRadius::circular),
+            [x, y] => radius_value(x).zip(radius_value(y)).map(|(x, y)| {
+                crate::CornerRadius { x, y }
+            }),
+            _ => None,
+        }
+    };
+    let Some(parsed) = parsed else { return };
+    match corner {
+        0 => style.border_model.radii.top_left = parsed,
+        1 => style.border_model.radii.top_right = parsed,
+        2 => style.border_model.radii.bottom_right = parsed,
+        3 => style.border_model.radii.bottom_left = parsed,
+        _ => {}
+    }
+}
+
+fn parse_outline_shorthand(value: &str, dark_scheme: bool) -> Option<crate::OutlineModel> {
+    let lower = value.trim().to_ascii_lowercase();
+    if matches!(lower.as_str(), "initial" | "unset" | "revert" | "revert-layer") {
+        return Some(crate::OutlineModel::default());
+    }
+    if value.trim().is_empty() || lower == "inherit" {
+        return None;
+    }
+    let mut outline = crate::OutlineModel::default();
+    let mut saw_width = false;
+    let mut saw_style = false;
+    let mut saw_color = false;
+    for token in split_ws_paren(value) {
+        if !saw_width {
+            if let Some(width) = border_width(token) {
+                outline.specified_width = width;
+                saw_width = true;
+                continue;
+            }
+        }
+        if !saw_style {
+            if let Some(style) = outline_style(token) {
+                outline.style = style;
+                saw_style = true;
+                continue;
+            }
+        }
+        if !saw_color {
+            if let Some(color) = border_color(token, dark_scheme) {
+                outline.color = color;
+                saw_color = true;
+                continue;
+            }
+        }
+        return None;
+    }
+    Some(outline)
+}
+
+fn apply_outline_shorthand(style: &mut LayoutStyle, value: &str) {
+    if let Some(outline) = parse_outline_shorthand(value, style.color_scheme_dark) {
+        style.outline = outline;
+    }
+}
+
+fn set_outline_width(style: &mut LayoutStyle, value: &str) {
+    let width = if matches!(value.trim().to_ascii_lowercase().as_str(), "initial" | "unset" | "revert" | "revert-layer") {
+        Some(crate::border::MEDIUM_BORDER_WIDTH)
+    } else {
+        border_width(value)
+    };
+    if let Some(width) = width {
+        style.outline.specified_width = width;
+    }
+}
+
+fn set_outline_style(style: &mut LayoutStyle, value: &str) {
+    let line_style = if matches!(value.trim().to_ascii_lowercase().as_str(), "initial" | "unset" | "revert" | "revert-layer") {
+        Some(crate::BorderStyle::None)
+    } else {
+        outline_style(value)
+    };
+    if let Some(line_style) = line_style {
+        style.outline.style = line_style;
+    }
+}
+
+fn set_outline_color(style: &mut LayoutStyle, value: &str) {
+    let color = if matches!(value.trim().to_ascii_lowercase().as_str(), "initial" | "unset" | "revert" | "revert-layer") {
+        Some(None)
+    } else {
+        border_color(value, style.color_scheme_dark)
+    };
+    if let Some(color) = color {
+        style.outline.color = color;
+    }
+}
+
+fn set_outline_offset(style: &mut LayoutStyle, value: &str) {
+    let offset = if matches!(value.trim().to_ascii_lowercase().as_str(), "initial" | "unset" | "revert" | "revert-layer") {
+        Some(0.0)
+    } else {
+        strict_border_length(value).filter(|value| value.is_finite())
+    };
+    if let Some(offset) = offset {
+        style.outline.offset = offset;
     }
 }
 
@@ -4886,21 +5367,6 @@ fn parse_clip_path_polygon(value: &str) -> Option<crate::ClipPathPolygon> {
         points.push((x, y));
     }
     Some(crate::ClipPathPolygon { fill_rule, points })
-}
-
-/// Parse every length token in a value as px (for box shorthands).
-fn edges(value: &str) -> Option<Edges> {
-    // Keep functional lengths intact while tokenizing. Design systems commonly
-    // expose border widths through custom properties such as
-    // `--stroke:calc(1*1px)`; after var() substitution that calc is still one
-    // valid border-width token. Splitting on every internal space and calling
-    // px_value() dropped it, leaving an otherwise fully-authored control with
-    // no painted border.
-    let dims: Vec<f32> = split_ws_paren(value)
-        .into_iter()
-        .map(px)
-        .collect::<Option<Vec<_>>>()?;
-    edges_from(dims)
 }
 
 /// Split a 1-or-2 value shorthand into (start, end); a single value applies to
@@ -5900,18 +6366,6 @@ fn split_ws_paren(s: &str) -> Vec<&str> {
     out
 }
 
-/// CSS box shorthand: 1 value applies to all sides; 2 values are (v, h);
-/// 3 values are (top, h, bottom); 4 values are (top, right, bottom, left).
-fn edges_from(dims: Vec<f32>) -> Option<Edges> {
-    match dims.len() {
-        0 => None,
-        1 => Some(Edges { top: dims[0], right: dims[0], bottom: dims[0], left: dims[0] }),
-        2 => Some(Edges { top: dims[0], right: dims[1], bottom: dims[0], left: dims[1] }),
-        3 => Some(Edges { top: dims[0], right: dims[1], bottom: dims[2], left: dims[1] }),
-        _ => Some(Edges { top: dims[0], right: dims[1], bottom: dims[2], left: dims[3] }),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6159,6 +6613,10 @@ mod tests {
     fn border_none_clears_native_and_per_side_widths() {
         let input = compute_style("input", Some("border:none"));
         assert_eq!(input.border, Edges::default());
+        assert_eq!(
+            input.border_model.specified_widths,
+            crate::Sides::all(crate::border::MEDIUM_BORDER_WIDTH)
+        );
 
         let side = compute_style(
             "div",
@@ -6171,15 +6629,59 @@ mod tests {
     }
 
     #[test]
-    fn uniform_border_radius_retains_percentage_until_box_resolution() {
+    fn border_radius_expands_ellipses_and_scales_overlaps() {
         let percentage = compute_style("div", Some("border-radius:50%"));
-        assert_eq!(percentage.border_radius.resolve(80.0, 40.0), (40.0, 20.0));
+        assert_eq!(
+            percentage.border_model.radii.resolve(80.0, 40.0).top_left,
+            (40.0, 20.0)
+        );
 
-        let pixels = compute_style("div", Some("border-radius:20px"));
-        assert_eq!(pixels.border_radius.resolve(80.0, 40.0), (20.0, 20.0));
+        let elliptical = compute_style(
+            "div",
+            Some("border-radius:80px 60px 40px 20px/50px 40px 30px 10px"),
+        );
+        let resolved = elliptical.border_model.radii.resolve(100.0, 50.0);
+        assert!((resolved.top_left.0 - 80.0 * 5.0 / 7.0).abs() < 0.001);
+        assert!((resolved.bottom_right.1 - 30.0 * 5.0 / 7.0).abs() < 0.001);
 
-        let reset = compute_style("div", Some("border-radius:50%;border-radius:initial"));
-        assert!(reset.border_radius.is_zero());
+        let reset = compute_style("div", Some("border-radius:50%;border-radius:revert"));
+        assert!(reset.border_model.radii.is_zero());
+    }
+
+    #[test]
+    fn invalid_border_declarations_retain_the_previous_cascade_value() {
+        let style = compute_style(
+            "div",
+            Some(
+                "border:4px dashed red;\
+                 border-width:10%;border-style:solid nonsense;\
+                 border-color:red green blue purple orange;\
+                 border-radius:12px;border-radius:10px/",
+            ),
+        );
+        assert_eq!(style.border, Edges { top: 4.0, right: 4.0, bottom: 4.0, left: 4.0 });
+        assert_eq!(style.border_model.styles, crate::Sides::all(crate::BorderStyle::Dashed));
+        assert_eq!(style.border_model.colors, crate::Sides::all(Some([255, 0, 0, 255])));
+        assert_eq!(style.border_model.radii.top_left.x, crate::RadiusValue::pixels(12.0));
+        assert!(!supports_declaration("border-width", "10%"));
+        assert!(!supports_declaration("border-width", "4"));
+    }
+
+    #[test]
+    fn border_and_outline_shorthands_reset_omitted_longhands() {
+        let style = compute_style(
+            "div",
+            Some(
+                "border:10px dashed red;border:solid;\
+                 outline:8px dotted blue;outline:green",
+            ),
+        );
+        assert_eq!(style.border, Edges { top: 3.0, right: 3.0, bottom: 3.0, left: 3.0 });
+        assert_eq!(style.border_model.styles, crate::Sides::all(crate::BorderStyle::Solid));
+        assert_eq!(style.border_model.colors, crate::Sides::all(None));
+        assert_eq!(style.outline.specified_width, 3.0);
+        assert_eq!(style.outline.style, crate::BorderStyle::None);
+        assert_eq!(style.outline.color, Some([0, 128, 0, 255]));
     }
 
     #[test]
@@ -6656,11 +7158,11 @@ mod tests {
                 left: 1.0,
             }
         );
-        assert_eq!(style.border_color, Some([208, 217, 251, 102]));
+        assert_eq!(style.border_model.colors, crate::Sides::all(Some([208, 217, 251, 102])));
 
         let asymmetric = compute_style(
             "div",
-            Some("border-width:calc(1px * 2) 3px calc(2px + 2px) 5px"),
+            Some("border-style:solid;border-width:calc(1px * 2) 3px calc(2px + 2px) 5px"),
         );
         assert_eq!(
             asymmetric.border,
@@ -7167,7 +7669,7 @@ mod tests {
         );
         assert_eq!(style.color, Some([0x12, 0x34, 0x56, 255]));
         assert_eq!(style.background_color, Some([1, 2, 3, 255]));
-        assert_eq!(style.border_color, Some([255, 0, 0, 255]));
+        assert_eq!(style.border_model.colors, crate::Sides::all(Some([255, 0, 0, 255])));
         assert!(supports_declaration(
             "color",
             "light-dark(rgb(1, 2, 3), color-mix(in srgb, white 50%, black))"

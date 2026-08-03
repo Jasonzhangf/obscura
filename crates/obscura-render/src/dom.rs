@@ -6439,7 +6439,7 @@ fn pseudo_requires_generated_box(style: &crate::LayoutStyle, content: Option<&st
         || style.background_image.is_some()
         || style.mask_image.is_some()
         || style.box_shadow.is_some()
-        || !style.border_radius.is_zero()
+        || !style.border_model.radii.is_zero()
         || style.overflow_hidden
         || style.transform_translate.is_some()
         || style.individual_translate.is_some()

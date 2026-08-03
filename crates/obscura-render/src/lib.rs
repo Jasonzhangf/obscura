@@ -19,6 +19,12 @@ pub use css::Stylesheet;
 pub mod style;
 pub use style::compute_style;
 
+pub mod border;
+pub use border::{
+    BorderModel, BorderRadii, BorderStyle, CornerRadius, OutlineModel, RadiusValue,
+    ResolvedBorderRadii, Sides,
+};
+
 pub mod dom;
 pub use dom::{
     layout_dom, layout_dom_with_images, layout_dom_with_resources, DomLayout, StickyLayout,
@@ -294,37 +300,6 @@ pub struct FontVariationSetting {
     pub value: f32,
 }
 
-/// The supported uniform `border-radius` value as a CSS
-/// `<length-percentage>`. Percentages resolve independently against the
-/// border box's width and height, so `50%` produces an ellipse on a rectangle
-/// and a circle on a square.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub struct BorderRadius {
-    length: f32,
-    percentage: f32,
-}
-
-impl BorderRadius {
-    pub const fn pixels(length: f32) -> Self {
-        Self { length, percentage: 0.0 }
-    }
-
-    pub const fn percentage(percentage: f32) -> Self {
-        Self { length: 0.0, percentage }
-    }
-
-    pub fn resolve(self, width: f32, height: f32) -> (f32, f32) {
-        (
-            (self.length + self.percentage * width).max(0.0),
-            (self.length + self.percentage * height).max(0.0),
-        )
-    }
-
-    pub fn is_zero(self) -> bool {
-        self.length == 0.0 && self.percentage == 0.0
-    }
-}
-
 /// One axis of a CSS `background-position`.
 ///
 /// CSS positions combine an absolute offset with a percentage of the space
@@ -592,9 +567,13 @@ pub struct LayoutStyle {
     /// Deferred `calc()`/`min()`/`max()`/`clamp()` padding expressions.
     pub padding_expressions: [Option<String>; 4],
     pub border: Edges,
-    /// `border-radius` (uniform; the first value of the shorthand). Rounds the
-    /// background fill, replaced content, border, and shadow.
-    pub border_radius: BorderRadius,
+    /// Specified border state. `border` above is the derived used-width view
+    /// consumed by layout; it is zero on `none`/`hidden` sides while this
+    /// model retains their specified widths for later cascade declarations.
+    pub border_model: BorderModel,
+    /// Outline paint state. It deliberately has no counterpart in Taffy:
+    /// outlines never contribute to box geometry.
+    pub outline: OutlineModel,
     /// `clip-path: polygon(...)`, resolved against the final border box at
     /// paint time. `None` is the computed `none` value.
     pub clip_path: Option<ClipPathPolygon>,
@@ -666,6 +645,8 @@ pub struct LayoutStyle {
     pub svg_fill: Option<String>,
     pub svg_stroke: Option<String>,
     pub svg_stroke_width: Option<String>,
+    /// Compatibility mirror for uniform border colors. New code should use
+    /// `border_model.colors`; this remains for programmatic LayoutStyle users.
     pub border_color: Option<[u8; 4]>,
     /// Used color scheme for CSS Color 5 `light-dark()`. The renderer's
     /// current user preference is light; an inherited `color-scheme: dark`

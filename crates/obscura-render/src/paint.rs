@@ -616,19 +616,42 @@ impl PreparedRender {
         ] {
             out.insert(name, css_px(value));
         }
-        let border_color = css_color(style.border_color.or(style.color).unwrap_or([0, 0, 0, 255]));
-        out.insert("border-top-color", border_color.clone());
-        out.insert("border-right-color", border_color.clone());
-        out.insert("border-bottom-color", border_color.clone());
-        out.insert("border-left-color", border_color);
-        for (name, width) in [
-            ("border-top-style", style.border.top),
-            ("border-right-style", style.border.right),
-            ("border-bottom-style", style.border.bottom),
-            ("border-left-style", style.border.left),
+        let current_color = style.color.unwrap_or([0, 0, 0, 255]);
+        for (name, color) in [
+            ("border-top-color", style.border_model.colors.top),
+            ("border-right-color", style.border_model.colors.right),
+            ("border-bottom-color", style.border_model.colors.bottom),
+            ("border-left-color", style.border_model.colors.left),
         ] {
-            out.insert(name, if width > 0.0 { "solid" } else { "none" }.to_string());
+            out.insert(
+                name,
+                css_color(color.or(style.border_color).unwrap_or(current_color)),
+            );
         }
+        let effective_border_styles = effective_border_styles(style);
+        for (name, line_style) in [
+            ("border-top-style", effective_border_styles.top),
+            ("border-right-style", effective_border_styles.right),
+            ("border-bottom-style", effective_border_styles.bottom),
+            ("border-left-style", effective_border_styles.left),
+        ] {
+            out.insert(name, line_style.css_name().to_string());
+        }
+        for (name, radius) in [
+            ("border-top-left-radius", style.border_model.radii.top_left),
+            ("border-top-right-radius", style.border_model.radii.top_right),
+            ("border-bottom-right-radius", style.border_model.radii.bottom_right),
+            ("border-bottom-left-radius", style.border_model.radii.bottom_left),
+        ] {
+            out.insert(name, corner_radius_css(radius));
+        }
+        out.insert("outline-width", css_px(style.outline.used_width()));
+        out.insert("outline-style", style.outline.style.css_name().to_string());
+        out.insert(
+            "outline-color",
+            css_color(style.outline.color.unwrap_or(current_color)),
+        );
+        out.insert("outline-offset", css_px(style.outline.offset));
 
         out.insert(
             "flex-direction",
@@ -798,6 +821,24 @@ fn dimension_css(value: crate::Dimension, auto: &str) -> String {
         crate::Dimension::Vmin(v) => format!("{}vmin", css_number(v)),
         crate::Dimension::Vmax(v) => format!("{}vmax", css_number(v)),
     }
+}
+
+fn radius_value_css(value: crate::RadiusValue) -> String {
+    match (value.length, value.percentage) {
+        (length, 0.0) => css_px(length),
+        (0.0, percentage) => format!("{}%", css_number(percentage * 100.0)),
+        (length, percentage) => format!(
+            "calc({} + {}%)",
+            css_px(length),
+            css_number(percentage * 100.0)
+        ),
+    }
+}
+
+fn corner_radius_css(radius: crate::CornerRadius) -> String {
+    let x = radius_value_css(radius.x);
+    let y = radius_value_css(radius.y);
+    if x == y { x } else { format!("{x} {y}") }
 }
 
 fn css_color([r, g, b, a]: [u8; 4]) -> String {
@@ -1409,21 +1450,20 @@ fn paint_laid_dom_scrolled(
         // ancestor overflow clip is reapplied inside so the shadow is clipped by
         // an ancestor exactly as the box itself is.
         if let Some(shadow) = style.box_shadow {
-            paint_box_shadow(&mut pixmap, &shadow, &rect, style.border_radius, clip);
+            paint_box_shadow(&mut pixmap, &shadow, &rect, style.border_model.radii, clip);
         }
 
         // Box path (rounded if border-radius), reused for gradient/color fill.
-        let radius = style.border_radius.resolve(rect.width, rect.height);
-        let has_radius = radius.0 > 0.5 && radius.1 > 0.5;
+        let radius = style.border_model.radii.resolve(rect.width, rect.height);
+        let has_radius = !radius.is_zero();
         let bg_path = || {
             if has_radius {
-            rounded_rect_path(
+            rounded_rect_path_radii(
                 visible_rect.x,
                 visible_rect.y,
                 visible_rect.width,
                 visible_rect.height,
-                radius.0,
-                radius.1,
+                radius,
             )
         } else {
             let mut pb = PathBuilder::new();
@@ -1613,73 +1653,18 @@ fn paint_laid_dom_scrolled(
             );
         }
 
-        // Rounded, uniform border: stroke the rounded-rect outline instead of
-        // four sharp edge rects.
-        let uniform_border = style.border.top == style.border.right
-            && style.border.right == style.border.bottom
-            && style.border.bottom == style.border.left
-            && style.border.top > 0.0;
-        if has_radius && uniform_border {
-            let bc = style.border_color.or(style.color).unwrap_or([0, 0, 0, 255]);
-            let w = style.border.top;
-            if let Some(path) = rounded_rect_path(
-                rect.x + w / 2.0,
-                rect.y + w / 2.0,
-                rect.width - w,
-                rect.height - w,
-                (radius.0 - w / 2.0).max(0.0),
-                (radius.1 - w / 2.0).max(0.0),
-            ) {
-                let mut paint = Paint::default();
-                paint.set_color(Color::from_rgba8(bc[0], bc[1], bc[2], bc[3]));
-                paint.anti_alias = true;
-                let stroke = tiny_skia::Stroke { width: w, ..Default::default() };
-                pixmap.stroke_path(
-                    &path,
-                    &paint,
-                    &stroke,
-                    Transform::identity(),
-                    clip_path_mask.as_ref(),
-                );
-            }
-        } else if style.border.top > 0.0 || style.border.right > 0.0 || style.border.bottom > 0.0 || style.border.left > 0.0 {
-            let bc = style.border_color.or(style.color).unwrap_or([0, 0, 0, 255]);
-            let mut paint = Paint::default();
-            paint.set_color(Color::from_rgba8(bc[0], bc[1], bc[2], bc[3]));
-            paint.anti_alias = false;
-
-            let mut path = PathBuilder::new();
-            let mut push_clipped = |x: f32, y: f32, w: f32, h: f32| {
-                let edge = crate::Rect { x, y, width: w, height: h };
-                let edge = match clip { Some(c) => edge.intersect(&c), None => Some(edge) };
-                if let Some(e) = edge {
-                    if let Some(r) = Rect::from_xywh(e.x, e.y, e.width, e.height) {
-                        path.push_rect(r);
-                    }
-                }
-            };
-            if style.border.top > 0.0 {
-                push_clipped(rect.x, rect.y, rect.width, style.border.top);
-            }
-            if style.border.right > 0.0 {
-                push_clipped(rect.x + rect.width - style.border.right, rect.y, style.border.right, rect.height);
-            }
-            if style.border.bottom > 0.0 {
-                push_clipped(rect.x, rect.y + rect.height - style.border.bottom, rect.width, style.border.bottom);
-            }
-            if style.border.left > 0.0 {
-                push_clipped(rect.x, rect.y, style.border.left, rect.height);
-            }
-            if let Some(path) = path.finish() {
-                pixmap.fill_path(
-                    &path,
-                    &paint,
-                    FillRule::Winding,
-                    Transform::identity(),
-                    clip_path_mask.as_ref(),
-                );
-            }
-        }
+        paint_css_border(
+            &mut pixmap,
+            &rect,
+            style,
+            clip_path_mask.as_ref(),
+        );
+        paint_css_outline(
+            &mut pixmap,
+            &rect,
+            style,
+            clip_path_mask.as_ref(),
+        );
 
         if name.local.as_ref() == "img" {
             if let Some(source) = selected_images.get(&nid) {
@@ -1775,7 +1760,7 @@ fn paint_laid_dom_scrolled(
                 &svg_fonts,
             ) {
                 let mask = if clip.is_some() || has_radius {
-                    rounded_box_clip_mask(
+                    rounded_box_clip_mask_radii(
                         pixmap.width(),
                         pixmap.height(),
                         &visible_rect,
@@ -2323,31 +2308,515 @@ fn rounded_rect_path(
     rx: f32,
     ry: f32,
 ) -> Option<tiny_skia::Path> {
+    rounded_rect_path_radii(
+        x,
+        y,
+        w,
+        h,
+        crate::ResolvedBorderRadii {
+            top_left: (rx, ry),
+            top_right: (rx, ry),
+            bottom_right: (rx, ry),
+            bottom_left: (rx, ry),
+        },
+    )
+}
+
+fn rounded_rect_path_radii(
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    radii: crate::ResolvedBorderRadii,
+) -> Option<tiny_skia::Path> {
     if w <= 0.0 || h <= 0.0 {
         return None;
     }
-    let mut rx = rx.max(0.0);
-    let mut ry = ry.max(0.0);
-    if rx <= f32::EPSILON || ry <= f32::EPSILON {
+    if radii.is_zero() {
         let mut pb = PathBuilder::new();
         pb.push_rect(Rect::from_xywh(x, y, w, h)?);
         return pb.finish();
     }
-    let scale = 1.0f32.min(w / (2.0 * rx)).min(h / (2.0 * ry));
-    rx *= scale;
-    ry *= scale;
+    let tl = radii.top_left;
+    let tr = radii.top_right;
+    let br = radii.bottom_right;
+    let bl = radii.bottom_left;
     let mut pb = PathBuilder::new();
-    pb.move_to(x + rx, y);
-    pb.line_to(x + w - rx, y);
-    pb.quad_to(x + w, y, x + w, y + ry);
-    pb.line_to(x + w, y + h - ry);
-    pb.quad_to(x + w, y + h, x + w - rx, y + h);
-    pb.line_to(x + rx, y + h);
-    pb.quad_to(x, y + h, x, y + h - ry);
-    pb.line_to(x, y + ry);
-    pb.quad_to(x, y, x + rx, y);
+    pb.move_to(x + tl.0, y);
+    pb.line_to(x + w - tr.0, y);
+    pb.quad_to(x + w, y, x + w, y + tr.1);
+    pb.line_to(x + w, y + h - br.1);
+    pb.quad_to(x + w, y + h, x + w - br.0, y + h);
+    pb.line_to(x + bl.0, y + h);
+    pb.quad_to(x, y + h, x, y + h - bl.1);
+    pb.line_to(x, y + tl.1);
+    pb.quad_to(x, y, x + tl.0, y);
     pb.close();
     pb.finish()
+}
+
+#[derive(Clone, Copy)]
+enum Side {
+    Top,
+    Right,
+    Bottom,
+    Left,
+}
+
+fn effective_border_styles(style: &crate::LayoutStyle) -> crate::Sides<crate::BorderStyle> {
+    let mut styles = style.border_model.styles;
+    // Preserve the public LayoutStyle contract for embedding code and older
+    // renderer tests that construct used `border` edges directly. Cascaded
+    // CSS never reaches this branch: none/hidden declarations synchronize the
+    // used edges to zero before layout.
+    if style.border.top > 0.0 && !styles.top.is_visible() {
+        styles.top = crate::BorderStyle::Solid;
+    }
+    if style.border.right > 0.0 && !styles.right.is_visible() {
+        styles.right = crate::BorderStyle::Solid;
+    }
+    if style.border.bottom > 0.0 && !styles.bottom.is_visible() {
+        styles.bottom = crate::BorderStyle::Solid;
+    }
+    if style.border.left > 0.0 && !styles.left.is_visible() {
+        styles.left = crate::BorderStyle::Solid;
+    }
+    styles
+}
+
+fn paint_css_border(
+    pixmap: &mut Pixmap,
+    rect: &crate::Rect,
+    style: &crate::LayoutStyle,
+    mask: Option<&tiny_skia::Mask>,
+) {
+    let widths = crate::Sides {
+        top: style.border.top,
+        right: style.border.right,
+        bottom: style.border.bottom,
+        left: style.border.left,
+    };
+    if widths.as_array().iter().all(|width| *width <= 0.0) {
+        return;
+    }
+    let current = style.color.unwrap_or([0, 0, 0, 255]);
+    let colors = style
+        .border_model
+        .colors
+        .map(|color| color.or(style.border_color).unwrap_or(current));
+    let styles = effective_border_styles(style);
+    let radii = style.border_model.radii.resolve(rect.width, rect.height);
+    let uniform = widths.top == widths.right
+        && widths.right == widths.bottom
+        && widths.bottom == widths.left
+        && styles.top == styles.right
+        && styles.right == styles.bottom
+        && styles.bottom == styles.left
+        && colors.top == colors.right
+        && colors.right == colors.bottom
+        && colors.bottom == colors.left;
+    if uniform
+        && !matches!(
+            styles.top,
+            crate::BorderStyle::Inset
+                | crate::BorderStyle::Outset
+                | crate::BorderStyle::Groove
+                | crate::BorderStyle::Ridge
+        )
+    {
+        paint_uniform_border(
+            pixmap,
+            rect,
+            widths.top,
+            styles.top,
+            colors.top,
+            radii,
+            mask,
+        );
+        return;
+    }
+
+    for side in [Side::Top, Side::Right, Side::Bottom, Side::Left] {
+        let (width, line_style, color) = match side {
+            Side::Top => (widths.top, styles.top, colors.top),
+            Side::Right => (widths.right, styles.right, colors.right),
+            Side::Bottom => (widths.bottom, styles.bottom, colors.bottom),
+            Side::Left => (widths.left, styles.left, colors.left),
+        };
+        if width <= 0.0 || !line_style.is_visible() {
+            continue;
+        }
+        match line_style {
+            crate::BorderStyle::Solid | crate::BorderStyle::Auto => {
+                fill_solid_border_side(pixmap, rect, widths, radii, side, color, mask);
+            }
+            crate::BorderStyle::Inset
+            | crate::BorderStyle::Outset
+            | crate::BorderStyle::Groove
+            | crate::BorderStyle::Ridge => {
+                // CSS's relief styles are two-tone. Preserve the directional
+                // light source even in the compact painter; groove/ridge use
+                // the same side polarity as inset/outset at narrow widths.
+                let top_left = matches!(side, Side::Top | Side::Left);
+                let dark_side = match line_style {
+                    crate::BorderStyle::Inset | crate::BorderStyle::Groove => top_left,
+                    crate::BorderStyle::Outset | crate::BorderStyle::Ridge => !top_left,
+                    _ => false,
+                };
+                let color = shade_border_color(color, if dark_side { -0.28 } else { 0.28 });
+                fill_solid_border_side(pixmap, rect, widths, radii, side, color, mask);
+            }
+            crate::BorderStyle::Double => {
+                if width < 3.0 {
+                    fill_solid_border_side(pixmap, rect, widths, radii, side, color, mask);
+                } else {
+                    paint_straight_border_side(
+                        pixmap,
+                        rect,
+                        side,
+                        width / 3.0,
+                        width / 6.0,
+                        color,
+                        None,
+                        mask,
+                    );
+                    paint_straight_border_side(
+                        pixmap,
+                        rect,
+                        side,
+                        width / 3.0,
+                        width * 5.0 / 6.0,
+                        color,
+                        None,
+                        mask,
+                    );
+                }
+            }
+            crate::BorderStyle::Dashed | crate::BorderStyle::Dotted => {
+                paint_straight_border_side(
+                    pixmap,
+                    rect,
+                    side,
+                    width,
+                    width / 2.0,
+                    color,
+                    Some(line_style),
+                    mask,
+                );
+            }
+            crate::BorderStyle::None | crate::BorderStyle::Hidden => {}
+        }
+    }
+}
+
+fn paint_css_outline(
+    pixmap: &mut Pixmap,
+    rect: &crate::Rect,
+    style: &crate::LayoutStyle,
+    mask: Option<&tiny_skia::Mask>,
+) {
+    let width = style.outline.used_width();
+    if width <= 0.0 {
+        return;
+    }
+    let center_expansion = style.outline.offset + width / 2.0;
+    let center_rect = crate::Rect {
+        x: rect.x - center_expansion,
+        y: rect.y - center_expansion,
+        width: rect.width + 2.0 * center_expansion,
+        height: rect.height + 2.0 * center_expansion,
+    };
+    if center_rect.width <= 0.0 || center_rect.height <= 0.0 {
+        return;
+    }
+    let radii = style
+        .border_model
+        .radii
+        .resolve(rect.width, rect.height)
+        .outset(crate::Sides::all(center_expansion));
+    let color = style
+        .outline
+        .color
+        .or(style.color)
+        .unwrap_or([0, 0, 0, 255]);
+    stroke_rounded_border_path(
+        pixmap,
+        &center_rect,
+        width,
+        style.outline.style,
+        color,
+        radii,
+        mask,
+    );
+}
+
+fn paint_uniform_border(
+    pixmap: &mut Pixmap,
+    rect: &crate::Rect,
+    width: f32,
+    line_style: crate::BorderStyle,
+    color: [u8; 4],
+    radii: crate::ResolvedBorderRadii,
+    mask: Option<&tiny_skia::Mask>,
+) {
+    if width <= 0.0 || !line_style.is_visible() {
+        return;
+    }
+    if line_style == crate::BorderStyle::Double && width >= 3.0 {
+        let stripe = width / 3.0;
+        for inset in [stripe / 2.0, width - stripe / 2.0] {
+            let stripe_rect = crate::Rect {
+                x: rect.x + inset,
+                y: rect.y + inset,
+                width: rect.width - 2.0 * inset,
+                height: rect.height - 2.0 * inset,
+            };
+            if stripe_rect.width > 0.0 && stripe_rect.height > 0.0 {
+                stroke_rounded_border_path(
+                    pixmap,
+                    &stripe_rect,
+                    stripe,
+                    crate::BorderStyle::Solid,
+                    color,
+                    radii.inset(crate::Sides::all(inset)),
+                    mask,
+                );
+            }
+        }
+        return;
+    }
+    let center = width / 2.0;
+    let center_rect = crate::Rect {
+        x: rect.x + center,
+        y: rect.y + center,
+        width: rect.width - width,
+        height: rect.height - width,
+    };
+    if center_rect.width <= 0.0 || center_rect.height <= 0.0 {
+        return;
+    }
+    stroke_rounded_border_path(
+        pixmap,
+        &center_rect,
+        width,
+        line_style,
+        color,
+        radii.inset(crate::Sides::all(center)),
+        mask,
+    );
+}
+
+fn stroke_rounded_border_path(
+    pixmap: &mut Pixmap,
+    center_rect: &crate::Rect,
+    width: f32,
+    line_style: crate::BorderStyle,
+    color: [u8; 4],
+    radii: crate::ResolvedBorderRadii,
+    mask: Option<&tiny_skia::Mask>,
+) {
+    let Some(path) = rounded_rect_path_radii(
+        center_rect.x,
+        center_rect.y,
+        center_rect.width,
+        center_rect.height,
+        radii,
+    ) else {
+        return;
+    };
+    let mut paint = Paint::default();
+    paint.set_color(Color::from_rgba8(color[0], color[1], color[2], color[3]));
+    paint.anti_alias = !radii.is_zero();
+    let mut stroke = tiny_skia::Stroke {
+        width,
+        ..Default::default()
+    };
+    match line_style {
+        crate::BorderStyle::Dashed => {
+            stroke.dash = tiny_skia::StrokeDash::new(vec![width * 3.0, width * 3.0], 0.0);
+        }
+        crate::BorderStyle::Dotted => {
+            stroke.dash = tiny_skia::StrokeDash::new(vec![0.0, width * 2.0], 0.0);
+            stroke.line_cap = tiny_skia::LineCap::Round;
+        }
+        _ => {}
+    }
+    pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), mask);
+}
+
+fn fill_solid_border_side(
+    pixmap: &mut Pixmap,
+    rect: &crate::Rect,
+    widths: crate::Sides<f32>,
+    radii: crate::ResolvedBorderRadii,
+    side: Side,
+    color: [u8; 4],
+    mask: Option<&tiny_skia::Mask>,
+) {
+    let Some(path) = solid_border_side_path(rect, widths, radii, side) else {
+        return;
+    };
+    let mut paint = Paint::default();
+    paint.set_color(Color::from_rgba8(color[0], color[1], color[2], color[3]));
+    paint.anti_alias = !radii.is_zero();
+    pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), mask);
+}
+
+fn arc_point(center: (f32, f32), radius: (f32, f32), degrees: f32) -> (f32, f32) {
+    let angle = degrees.to_radians();
+    (
+        center.0 + radius.0 * angle.cos(),
+        center.1 + radius.1 * angle.sin(),
+    )
+}
+
+fn append_arc(
+    path: &mut PathBuilder,
+    center: (f32, f32),
+    radius: (f32, f32),
+    start: f32,
+    end: f32,
+) {
+    for step in 0..=4 {
+        let angle = start + (end - start) * step as f32 / 4.0;
+        let point = arc_point(center, radius, angle);
+        path.line_to(point.0, point.1);
+    }
+}
+
+fn solid_border_side_path(
+    rect: &crate::Rect,
+    widths: crate::Sides<f32>,
+    outer: crate::ResolvedBorderRadii,
+    side: Side,
+) -> Option<tiny_skia::Path> {
+    let inner = outer.inset(widths);
+    let x = rect.x;
+    let y = rect.y;
+    let right = x + rect.width;
+    let bottom = y + rect.height;
+    let ix = x + widths.left;
+    let iy = y + widths.top;
+    let iright = right - widths.right;
+    let ibottom = bottom - widths.bottom;
+    let outer_centers = [
+        (x + outer.top_left.0, y + outer.top_left.1),
+        (right - outer.top_right.0, y + outer.top_right.1),
+        (right - outer.bottom_right.0, bottom - outer.bottom_right.1),
+        (x + outer.bottom_left.0, bottom - outer.bottom_left.1),
+    ];
+    let inner_centers = [
+        (ix + inner.top_left.0, iy + inner.top_left.1),
+        (iright - inner.top_right.0, iy + inner.top_right.1),
+        (iright - inner.bottom_right.0, ibottom - inner.bottom_right.1),
+        (ix + inner.bottom_left.0, ibottom - inner.bottom_left.1),
+    ];
+    let outer_radii = [outer.top_left, outer.top_right, outer.bottom_right, outer.bottom_left];
+    let inner_radii = [inner.top_left, inner.top_right, inner.bottom_right, inner.bottom_left];
+    let (a, b, outer_a, outer_b, inner_b, inner_a) = match side {
+        Side::Top => (225.0, 270.0, 0, 1, 1, 0),
+        Side::Right => (315.0, 360.0, 1, 2, 2, 1),
+        Side::Bottom => (45.0, 90.0, 2, 3, 3, 2),
+        Side::Left => (135.0, 180.0, 3, 0, 0, 3),
+    };
+    let second_start = match side {
+        Side::Top => 270.0,
+        Side::Right => 0.0,
+        Side::Bottom => 90.0,
+        Side::Left => 180.0,
+    };
+    let second_end = match side {
+        Side::Top => 315.0,
+        Side::Right => 45.0,
+        Side::Bottom => 135.0,
+        Side::Left => 225.0,
+    };
+    let mut path = PathBuilder::new();
+    let start = arc_point(outer_centers[outer_a], outer_radii[outer_a], a);
+    path.move_to(start.0, start.1);
+    append_arc(&mut path, outer_centers[outer_a], outer_radii[outer_a], a, b);
+    append_arc(
+        &mut path,
+        outer_centers[outer_b],
+        outer_radii[outer_b],
+        second_start,
+        second_end,
+    );
+    append_arc(
+        &mut path,
+        inner_centers[inner_b],
+        inner_radii[inner_b],
+        second_end,
+        second_start,
+    );
+    append_arc(
+        &mut path,
+        inner_centers[inner_a],
+        inner_radii[inner_a],
+        b,
+        a,
+    );
+    path.close();
+    path.finish()
+}
+
+fn paint_straight_border_side(
+    pixmap: &mut Pixmap,
+    rect: &crate::Rect,
+    side: Side,
+    stroke_width: f32,
+    inward: f32,
+    color: [u8; 4],
+    pattern: Option<crate::BorderStyle>,
+    mask: Option<&tiny_skia::Mask>,
+) {
+    let mut path = PathBuilder::new();
+    match side {
+        Side::Top => {
+            path.move_to(rect.x, rect.y + inward);
+            path.line_to(rect.x + rect.width, rect.y + inward);
+        }
+        Side::Right => {
+            path.move_to(rect.x + rect.width - inward, rect.y);
+            path.line_to(rect.x + rect.width - inward, rect.y + rect.height);
+        }
+        Side::Bottom => {
+            path.move_to(rect.x + rect.width, rect.y + rect.height - inward);
+            path.line_to(rect.x, rect.y + rect.height - inward);
+        }
+        Side::Left => {
+            path.move_to(rect.x + inward, rect.y + rect.height);
+            path.line_to(rect.x + inward, rect.y);
+        }
+    }
+    let Some(path) = path.finish() else { return };
+    let mut paint = Paint::default();
+    paint.set_color(Color::from_rgba8(color[0], color[1], color[2], color[3]));
+    let mut stroke = tiny_skia::Stroke {
+        width: stroke_width,
+        ..Default::default()
+    };
+    if pattern == Some(crate::BorderStyle::Dashed) {
+        stroke.dash = tiny_skia::StrokeDash::new(
+            vec![stroke_width * 3.0, stroke_width * 3.0],
+            0.0,
+        );
+    } else if pattern == Some(crate::BorderStyle::Dotted) {
+        stroke.dash = tiny_skia::StrokeDash::new(vec![0.0, stroke_width * 2.0], 0.0);
+        stroke.line_cap = tiny_skia::LineCap::Round;
+    }
+    pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), mask);
+}
+
+fn shade_border_color(color: [u8; 4], amount: f32) -> [u8; 4] {
+    let target = if amount >= 0.0 { 255.0 } else { 0.0 };
+    let factor = amount.abs().min(1.0);
+    let channel = |value: u8| {
+        (value as f32 + (target - value as f32) * factor)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    [channel(color[0]), channel(color[1]), channel(color[2]), color[3]]
 }
 
 /// Paint an outset `box-shadow` layer behind the element's own box. `rect` is
@@ -2364,7 +2833,7 @@ fn paint_box_shadow(
     pixmap: &mut Pixmap,
     shadow: &crate::BoxShadow,
     rect: &crate::Rect,
-    border_radius: crate::BorderRadius,
+    border_radius: crate::BorderRadii,
     clip: Option<crate::Rect>,
 ) {
     if shadow.inset || shadow.color[3] == 0 {
@@ -2378,7 +2847,7 @@ fn paint_box_shadow(
     if w0 <= 0.0 || h0 <= 0.0 {
         return;
     }
-    let radius = border_radius.resolve(rect.width, rect.height);
+    let radius = border_radius.resolve(rect.width, rect.height).top_left;
     let rx0 = (radius.0 + spread).max(0.0);
     let ry0 = (radius.1 + spread).max(0.0);
     let blur = shadow.blur.max(0.0);
@@ -3491,7 +3960,7 @@ fn paint_background_gradient_layers(
     pixmap: &mut Pixmap,
     path: &tiny_skia::Path,
     rect: &crate::Rect,
-    border_radius: (f32, f32),
+    border_radius: crate::ResolvedBorderRadii,
     style: &crate::LayoutStyle,
     root_font_size: f32,
     viewport: (f32, f32),
@@ -3523,7 +3992,7 @@ fn paint_background_gradient_layers(
                     &mut tile,
                     &tile_path,
                     &tile_rect,
-                    (0.0, 0.0),
+                    crate::ResolvedBorderRadii::default(),
                     layers,
                     em,
                     root_font_size,
@@ -3628,7 +4097,7 @@ fn paint_gradient_layer_stack(
     pixmap: &mut Pixmap,
     path: &tiny_skia::Path,
     rect: &crate::Rect,
-    border_radius: (f32, f32),
+    border_radius: crate::ResolvedBorderRadii,
     layers: &[crate::BackgroundGradientLayer],
     em: f32,
     root_font_size: f32,
@@ -3718,7 +4187,7 @@ fn background_gradient_tile_size(
 fn paint_conic_gradient(
     pixmap: &mut Pixmap,
     rect: &crate::Rect,
-    border_radius: (f32, f32),
+    border_radius: crate::ResolvedBorderRadii,
     angle: f32,
     center: (f32, f32),
     stops: &[([u8; 4], Option<f32>)],
@@ -3747,14 +4216,13 @@ fn paint_conic_gradient(
         }
     }
     let mut clip = extra_clip.cloned();
-    if border_radius.0 > 0.5 && border_radius.1 > 0.5 {
-        let path = rounded_rect_path(
+    if !border_radius.is_zero() {
+        let path = rounded_rect_path_radii(
             rect.x,
             rect.y,
             rect.width,
             rect.height,
-            border_radius.0,
-            border_radius.1,
+            border_radius,
         );
         match (clip.as_mut(), path) {
             (Some(mask), Some(path)) => {
@@ -3766,7 +4234,7 @@ fn paint_conic_gradient(
                 );
             }
             (None, _) => {
-                clip = rounded_box_clip_mask(
+                clip = rounded_box_clip_mask_radii(
                     pixmap.width(),
                     pixmap.height(),
                     rect,
@@ -4109,10 +4577,10 @@ fn paint_in_flow_generated_box(
     }
 
     if let Some(shadow) = style.box_shadow {
-        paint_box_shadow(pixmap, &shadow, &rect, style.border_radius, clip);
+        paint_box_shadow(pixmap, &shadow, &rect, style.border_model.radii, clip);
     }
-    let radius = style.border_radius.resolve(rect.width, rect.height);
-    let has_radius = radius.0 > 0.5 && radius.1 > 0.5;
+    let radius = style.border_model.radii.resolve(rect.width, rect.height);
+    let has_radius = !radius.is_zero();
     let clip_path_mask = style.clip_path.as_ref().and_then(|polygon| {
         polygon_clip_mask(
             pixmap.width(),
@@ -4125,13 +4593,12 @@ fn paint_in_flow_generated_box(
         )
     });
     let path = if has_radius {
-        rounded_rect_path(
+        rounded_rect_path_radii(
             visible.x,
             visible.y,
             visible.width,
             visible.height,
-            radius.0,
-            radius.1,
+            radius,
         )
     } else {
         Rect::from_xywh(visible.x, visible.y, visible.width, visible.height).and_then(|rect| {
@@ -4241,67 +4708,8 @@ fn paint_in_flow_generated_box(
         }
     }
 
-    let border_color = style.border_color.or(style.color).unwrap_or([0, 0, 0, 255]);
-    let mut border_paint = Paint::default();
-    border_paint.set_color(Color::from_rgba8(
-        border_color[0],
-        border_color[1],
-        border_color[2],
-        border_color[3],
-    ));
-    let mut borders = PathBuilder::new();
-    let mut push_edge = |edge: crate::Rect| {
-        let edge = match clip {
-            Some(clip) => edge.intersect(&clip),
-            None => Some(edge),
-        };
-        if let Some(edge) = edge {
-            if let Some(rect) = Rect::from_xywh(edge.x, edge.y, edge.width, edge.height) {
-                borders.push_rect(rect);
-            }
-        }
-    };
-    if style.border.top > 0.0 {
-        push_edge(crate::Rect {
-            x: rect.x,
-            y: rect.y,
-            width: rect.width,
-            height: style.border.top,
-        });
-    }
-    if style.border.right > 0.0 {
-        push_edge(crate::Rect {
-            x: rect.x + rect.width - style.border.right,
-            y: rect.y,
-            width: style.border.right,
-            height: rect.height,
-        });
-    }
-    if style.border.bottom > 0.0 {
-        push_edge(crate::Rect {
-            x: rect.x,
-            y: rect.y + rect.height - style.border.bottom,
-            width: rect.width,
-            height: style.border.bottom,
-        });
-    }
-    if style.border.left > 0.0 {
-        push_edge(crate::Rect {
-            x: rect.x,
-            y: rect.y,
-            width: style.border.left,
-            height: rect.height,
-        });
-    }
-    if let Some(path) = borders.finish() {
-        pixmap.fill_path(
-            &path,
-            &border_paint,
-            FillRule::Winding,
-            Transform::identity(),
-            clip_path_mask.as_ref(),
-        );
-    }
+    paint_css_border(pixmap, &rect, style, clip_path_mask.as_ref());
+    paint_css_outline(pixmap, &rect, style, clip_path_mask.as_ref());
 }
 
 fn paint_positioned_pseudo(
@@ -4377,8 +4785,8 @@ fn paint_positioned_pseudo(
         None => Some(rect),
     };
     let Some(visible) = visible else { return };
-    let radius = style.border_radius.resolve(rect.width, rect.height);
-    let has_radius = radius.0 > 0.5 && radius.1 > 0.5;
+    let radius = style.border_model.radii.resolve(rect.width, rect.height);
+    let has_radius = !radius.is_zero();
     let clip_path_mask = style.clip_path.as_ref().and_then(|polygon| {
         polygon_clip_mask(
             pixmap.width(),
@@ -4391,13 +4799,12 @@ fn paint_positioned_pseudo(
         )
     });
     let path = if has_radius {
-        rounded_rect_path(
+        rounded_rect_path_radii(
             visible.x,
             visible.y,
             visible.width,
             visible.height,
-            radius.0,
-            radius.1,
+            radius,
         )
     } else {
         Rect::from_xywh(visible.x, visible.y, visible.width, visible.height).and_then(|rect| {
@@ -4505,6 +4912,8 @@ fn paint_positioned_pseudo(
             );
         }
     }
+    paint_css_border(pixmap, &rect, style, clip_path_mask.as_ref());
+    paint_css_outline(pixmap, &rect, style, clip_path_mask.as_ref());
     if let Some(item) = generated_item {
         let (text_width, text_height) = generated_intrinsic.unwrap_or_default();
         // `text-align` positions inline content within the pseudo's content
@@ -4882,7 +5291,7 @@ fn paint_image(
     pixmap: &mut Pixmap,
     cache: &mut RenderResourceCache,
     transform: Option<ImageAffine>,
-    clip_radius: (f32, f32),
+    clip_radius: crate::ResolvedBorderRadii,
     extra_clip: Option<&tiny_skia::Mask>,
 ) -> bool {
     if rect.width <= 0.0 || rect.height <= 0.0 {
@@ -4921,7 +5330,7 @@ fn paint_image(
     // intersected with the ancestor overflow clip): `Cover`/`None` can size
     // the image past the box, and an ancestor clip can cut into the box
     // itself. Only the fully-inside case takes the unmasked fast path.
-    let has_radius = clip_radius.0 > 0.5 && clip_radius.1 > 0.5;
+    let has_radius = !clip_radius.is_zero();
     let needs_box_clip = has_radius
         || dest.width > visible_rect.width + 0.5
         || dest.height > visible_rect.height + 0.5
@@ -4930,13 +5339,12 @@ fn paint_image(
     let mut clip = extra_clip.cloned();
     if needs_box_clip {
         let path = if has_radius {
-            rounded_rect_path(
+            rounded_rect_path_radii(
                 visible_rect.x,
                 visible_rect.y,
                 visible_rect.width,
                 visible_rect.height,
-                clip_radius.0,
-                clip_radius.1,
+                clip_radius,
             )
         } else {
             Rect::from_xywh(
@@ -4959,7 +5367,7 @@ fn paint_image(
                 Transform::identity(),
             ),
             (None, _) => {
-                clip = rounded_box_clip_mask(
+                clip = rounded_box_clip_mask_radii(
                     pixmap.width(),
                     pixmap.height(),
                     visible_rect,
@@ -5043,26 +5451,22 @@ fn box_clip_mask(pw: u32, ph: u32, rect: &crate::Rect) -> Option<tiny_skia::Mask
     Some(mask)
 }
 
-/// A full-pixmap clip mask for a border box with a uniform elliptical radius.
-/// Used by replaced and background images, whose raster content otherwise
-/// ignores the owner's rounded corners.
-fn rounded_box_clip_mask(
+fn rounded_box_clip_mask_radii(
     pw: u32,
     ph: u32,
     rect: &crate::Rect,
-    radius: (f32, f32),
+    radii: crate::ResolvedBorderRadii,
 ) -> Option<tiny_skia::Mask> {
-    if radius.0 <= 0.5 || radius.1 <= 0.5 {
+    if radii.is_zero() {
         return box_clip_mask(pw, ph, rect);
     }
     let mut mask = tiny_skia::Mask::new(pw, ph)?;
-    let path = rounded_rect_path(
+    let path = rounded_rect_path_radii(
         rect.x,
         rect.y,
         rect.width,
         rect.height,
-        radius.0,
-        radius.1,
+        radii,
     )?;
     mask.fill_path(&path, FillRule::Winding, true, Transform::identity());
     Some(mask)
@@ -5841,7 +6245,7 @@ fn paint_mask(
     src: &str,
     base_url: Option<&str>,
     rect: &crate::Rect,
-    border_radius: (f32, f32),
+    border_radius: crate::ResolvedBorderRadii,
     fill: [u8; 4],
     radial_gradient: Option<&((f32, f32), Vec<([u8; 4], Option<f32>)>)>,
     linear_gradient: Option<&(f32, Vec<([u8; 4], Option<f32>)>)>,
@@ -5924,14 +6328,13 @@ fn paint_mask(
         }
     }
     let mut clip = extra_clip.cloned();
-    if border_radius.0 > 0.5 && border_radius.1 > 0.5 {
-        let path = rounded_rect_path(
+    if !border_radius.is_zero() {
+        let path = rounded_rect_path_radii(
             rect.x,
             rect.y,
             rect.width,
             rect.height,
-            border_radius.0,
-            border_radius.1,
+            border_radius,
         );
         match (clip.as_mut(), path) {
             (Some(mask), Some(path)) => mask.intersect_path(
@@ -5941,7 +6344,7 @@ fn paint_mask(
                 Transform::identity(),
             ),
             (None, _) => {
-                clip = rounded_box_clip_mask(
+                clip = rounded_box_clip_mask_radii(
                     pixmap.width(),
                     pixmap.height(),
                     rect,
@@ -6438,6 +6841,101 @@ mod tests {
             interior.red() > 245 && interior.green() > 245 && interior.blue() > 245,
             "the border must not consume the content box: {interior:?}"
         );
+    }
+
+    #[test]
+    fn border_outline_computed_geometry_and_pixels_share_one_used_model() {
+        let tree = parse_html(
+            r##"<html><body style="margin:0;background:white">
+              <div id="none" style="width:100px;height:50px;border-width:10px;border-style:none"></div>
+              <div id="decorated" style="position:absolute;left:30px;top:90px;width:100px;height:50px;
+                   border-width:8px;border-style:solid;border-color:red green blue purple;
+                   border-radius:30px 20px 14px 8px/20px 12px 10px 6px;
+                   outline:4px dashed black;outline-offset:3px;background:#ffff00"></div>
+            </body></html>"##,
+        );
+        let none = tree.get_element_by_id("none").expect("none");
+        let decorated = tree.get_element_by_id("decorated").expect("decorated");
+        let mut resources = RenderResourceCache::default();
+        let mut prepared = prepare_dom(&tree, (180.0, 180.0), None, &mut resources)
+            .expect("prepare");
+
+        let none_rect = prepared.document_rect(none).expect("none rect");
+        assert_eq!((none_rect.width, none_rect.height), (100.0, 50.0));
+        let none_style = prepared.computed_style(none).expect("none style");
+        assert_eq!(none_style["border-top-width"], "0px");
+        assert_eq!(none_style["border-top-style"], "none");
+
+        let rect = prepared.document_rect(decorated).expect("decorated rect");
+        assert_eq!((rect.width, rect.height), (116.0, 66.0));
+        let computed = prepared.computed_style(decorated).expect("computed style");
+        assert_eq!(computed["border-top-color"], "rgb(255, 0, 0)");
+        assert_eq!(computed["border-right-color"], "rgb(0, 128, 0)");
+        assert_eq!(computed["border-bottom-color"], "rgb(0, 0, 255)");
+        assert_eq!(computed["border-left-color"], "rgb(128, 0, 128)");
+        assert_eq!(computed["border-top-left-radius"], "30px 20px");
+        assert_eq!(computed["border-bottom-left-radius"], "8px 6px");
+        assert_eq!(computed["outline-width"], "4px");
+        assert_eq!(computed["outline-style"], "dashed");
+        assert_eq!(computed["outline-offset"], "3px");
+
+        let pixmap = paint_prepared(
+            &tree,
+            &mut prepared,
+            &mut resources,
+            (0.0, 0.0),
+        )
+        .expect("paint");
+        let sample = |x: u32, y: u32| pixmap.pixel(x, y).expect("pixel");
+        let top = sample((rect.x + rect.width / 2.0) as u32, (rect.y + 2.0) as u32);
+        let right = sample((rect.x + rect.width - 2.0) as u32, (rect.y + rect.height / 2.0) as u32);
+        let bottom = sample((rect.x + rect.width / 2.0) as u32, (rect.y + rect.height - 2.0) as u32);
+        let left = sample((rect.x + 2.0) as u32, (rect.y + rect.height / 2.0) as u32);
+        assert!(top.red() > 220 && top.green() < 40 && top.blue() < 40, "{top:?}");
+        assert!(right.green() > 90 && right.red() < 40 && right.blue() < 40, "{right:?}");
+        assert!(bottom.blue() > 220 && bottom.red() < 40 && bottom.green() < 40, "{bottom:?}");
+        assert!(left.red() > 90 && left.blue() > 90 && left.green() < 40, "{left:?}");
+
+        let rounded_corner = sample((rect.x + 1.0) as u32, (rect.y + 1.0) as u32);
+        assert!(
+            !(rounded_corner.red() > 220
+                && rounded_corner.green() > 220
+                && rounded_corner.blue() < 40),
+            "asymmetric elliptical corner must stay outside the yellow background: {rounded_corner:?}"
+        );
+        let mut outline_pixels = 0;
+        let outer_x = (rect.x - 8.0).max(0.0) as u32;
+        let outer_y = (rect.y - 8.0).max(0.0) as u32;
+        let outer_right = (rect.x + rect.width + 8.0) as u32;
+        let outer_bottom = (rect.y + rect.height + 8.0) as u32;
+        for y in outer_y..outer_bottom.min(pixmap.height()) {
+            for x in outer_x..outer_right.min(pixmap.width()) {
+                let outside = (x as f32) < rect.x
+                    || (x as f32) >= rect.x + rect.width
+                    || (y as f32) < rect.y
+                    || (y as f32) >= rect.y + rect.height;
+                let pixel = sample(x, y);
+                if outside && pixel.red() < 30 && pixel.green() < 30 && pixel.blue() < 30 {
+                    outline_pixels += 1;
+                }
+            }
+        }
+        assert!(outline_pixels > 40, "dashed outline should paint outside layout: {outline_pixels}");
+    }
+
+    #[test]
+    fn outline_none_retains_width_but_does_not_change_geometry_or_computed_used_width() {
+        let tree = parse_html(
+            r#"<html><body style="margin:0"><div id="box" style="width:40px;height:20px;
+                outline-width:9px;outline-style:none"></div></body></html>"#,
+        );
+        let id = tree.get_element_by_id("box").unwrap();
+        let mut resources = RenderResourceCache::default();
+        let prepared = prepare_dom(&tree, (80.0, 50.0), None, &mut resources).unwrap();
+        let rect = prepared.document_rect(id).unwrap();
+        assert_eq!((rect.width, rect.height), (40.0, 20.0));
+        assert_eq!(prepared.layout.styles[&id].outline.specified_width, 9.0);
+        assert_eq!(prepared.computed_style(id).unwrap()["outline-width"], "0px");
     }
 
     #[test]
