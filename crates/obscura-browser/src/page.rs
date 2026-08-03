@@ -3,7 +3,10 @@ use std::sync::Arc;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use obscura_dom::{parse_html, DomTree};
 use obscura_js::runtime::ObscuraJsRuntime;
-use obscura_net::{CallbackRegistry, ObscuraHttpClient, ObscuraNetError, RequestCallback, Response, ResponseCallback};
+use obscura_net::{
+    CallbackRegistry, ObscuraHttpClient, ObscuraNetError, RequestCallback, ResourceRequest,
+    ResourceType, Response, ResponseCallback,
+};
 use url::Url;
 
 use crate::context::BrowserContext;
@@ -238,46 +241,55 @@ pub struct Page {
     pub stealth_client: Option<Arc<StealthHttpClient>>,
 }
 
-/// Fetch an external stylesheet and inline any `@import`ed sheets it references,
-/// recursively, so the imported CSS actually reaches the cascade. Sphinx docs
-/// (and other older/theme-chained sites) ship the real layout in a base sheet
-/// pulled in with `@import url("basic.css")` from the linked `classic.css`;
-/// dropping it left the page effectively unstyled. Imports resolve against the
-/// importing sheet's own URL and are inlined before its rules (CSS orders every
-/// `@import` ahead of the sheet's other statements). A depth cap guards against
-/// import cycles.
-fn fetch_css_with_imports(
-    client: Arc<ObscuraHttpClient>,
-    url: String,
-    depth: u8,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>> {
-    Box::pin(async move {
-        let parsed = url::Url::parse(&url).ok()?;
-        let resp = tokio::time::timeout(tokio::time::Duration::from_secs(5), client.fetch(&parsed))
-            .await
-            .ok()?
-            .ok()?;
-        let css = obscura_net::decode_non_html(&resp.body, resp.content_type());
-        // Stop recursing at the cap but keep this level's CSS as-is.
-        if depth >= 4 {
-            return Some(rebase_css_urls(&css, &parsed));
+const MAX_STYLESHEET_IMPORT_DEPTH: u8 = 4;
+const MAX_STYLESHEET_RESOURCES: usize = 128;
+
+#[derive(Clone)]
+struct LoadedStylesheet {
+    response_url: Url,
+    imports: Vec<String>,
+    rules: String,
+}
+
+fn canonical_stylesheet_url(mut url: Url) -> (String, Url) {
+    url.set_fragment(None);
+    (url.to_string(), url)
+}
+
+/// Expand a cached stylesheet graph in CSS cascade order. Network deduplication
+/// is separate from expansion: a shared import is downloaded once but expanded
+/// at each import position, while the active stack cuts cycles.
+fn materialize_stylesheet_graph(
+    key: &str,
+    sheets: &std::collections::HashMap<String, LoadedStylesheet>,
+    aliases: &std::collections::HashMap<String, String>,
+    active: &mut std::collections::HashSet<String>,
+) -> Option<String> {
+    let actual_key = aliases.get(key).map(String::as_str).unwrap_or(key);
+    if !active.insert(actual_key.to_string()) {
+        return None;
+    }
+    let Some(sheet) = sheets.get(actual_key).cloned() else {
+        active.remove(actual_key);
+        return None;
+    };
+
+    let mut output = String::new();
+    for import in &sheet.imports {
+        let Ok(import_url) = sheet.response_url.join(import) else {
+            continue;
+        };
+        let (import_key, _) = canonical_stylesheet_url(import_url);
+        if let Some(imported) =
+            materialize_stylesheet_graph(&import_key, sheets, aliases, active)
+        {
+            output.push_str(&imported);
+            output.push('\n');
         }
-        let (imports, stripped) = split_css_imports(&css);
-        if imports.is_empty() {
-            return Some(rebase_css_urls(&css, &parsed));
-        }
-        let mut out = String::new();
-        for imp in imports {
-            if let Ok(iu) = parsed.join(&imp) {
-                if let Some(sub) = fetch_css_with_imports(client.clone(), iu.to_string(), depth + 1).await {
-                    out.push_str(&sub);
-                    out.push('\n');
-                }
-            }
-        }
-        out.push_str(&rebase_css_urls(&stripped, &parsed));
-        Some(out)
-    })
+    }
+    output.push_str(&rebase_css_urls(&sheet.rules, &sheet.response_url));
+    active.remove(actual_key);
+    Some(output)
 }
 
 /// Preserve the URL base of a fetched stylesheet after it is materialized as
@@ -752,52 +764,194 @@ impl Page {
         }
     }
     
-    async fn fetch_stylesheets(&mut self) {
+    async fn fetch_stylesheets(&mut self) -> Vec<(usize, String)> {
         let all_links = match &self.js {
             Some(js) => js.with_dom(linked_stylesheet_requests).unwrap_or_default(),
             None => {
                 tracing::info!("fetch_stylesheets: no js runtime");
-                return;
+                return Vec::new();
             }
         };
 
         tracing::info!("fetch_stylesheets: found {} stylesheet links", all_links.len());
 
-        let document_base = self.resolve_base_url();
-
-        let mut fetch_tasks = Vec::new();
+        let Some(document_url) = self.url.clone() else {
+            return Vec::new();
+        };
+        let document_base = self.resolve_base_url().unwrap_or_else(|| document_url.clone());
+        let mut roots = Vec::new();
+        let mut scheduled = std::collections::HashSet::new();
+        let mut pending = Vec::new();
         for (link_index, href) in all_links {
-            let full_url = if href.starts_with("http://") || href.starts_with("https://") {
-                href.clone()
-            } else if let Some(base) = &document_base {
-                base.join(&href).map(|u| u.to_string()).unwrap_or_else(|_| href.clone())
-            } else {
-                href.clone()
+            let Ok(resolved) = document_base.join(&href) else {
+                continue;
             };
-            tracing::info!("fetch_stylesheets: fetching {}", full_url);
-
-            let client = self.http_client.clone();
-            fetch_tasks.push(tokio::spawn(async move {
-                (
-                    link_index,
-                    fetch_css_with_imports(client, full_url, 0).await,
-                )
-            }));
-        }
-
-        for task in fetch_tasks {
-            if let Ok((link_index, Some(css))) = task.await {
-                tracing::info!("fetch_stylesheets: fetched {} bytes of CSS", css.len());
-                tracing::info!(
-                    "fetch_stylesheets: injecting sheet at link index {}",
-                    link_index
+            let (key, resolved) = canonical_stylesheet_url(resolved);
+            if !subresource_allowed(Some(&document_url), resolved.as_str()) {
+                tracing::warn!(
+                    "blocking cross-scheme <link rel=stylesheet href>: page={} href={}",
+                    self.url_string(),
+                    resolved,
                 );
-                if let Some(js) = &mut self.js {
-                    let code = materialize_linked_stylesheet_script(link_index, &css);
-                    let _ = js.execute_script("<fetch_stylesheets>", &code);
+                continue;
+            }
+            if self.should_block_url(resolved.as_str()) {
+                tracing::info!("Blocked stylesheet by interception: {}", resolved);
+                continue;
+            }
+            roots.push((link_index, key.clone()));
+            if scheduled.insert(key.clone()) {
+                if scheduled.len() <= MAX_STYLESHEET_RESOURCES {
+                    pending.push((key, resolved, 0u8));
                 }
             }
         }
+
+        let mut sheets = std::collections::HashMap::new();
+        let mut aliases = std::collections::HashMap::new();
+        while !pending.is_empty() {
+            let batch = std::mem::take(&mut pending);
+            let client = self.http_client.clone();
+            #[cfg(feature = "stealth")]
+            let stealth_client = self.stealth_client.clone();
+            let callbacks = self.callbacks.clone();
+            let initiator = document_url.clone();
+            use futures::StreamExt as _;
+            let results: Vec<_> = futures::stream::iter(batch.into_iter().map(
+                |(key, requested_url, depth)| {
+                    let client = client.clone();
+                    #[cfg(feature = "stealth")]
+                    let stealth_client = stealth_client.clone();
+                    let callbacks = callbacks.clone();
+                    let initiator = initiator.clone();
+                    async move {
+                        let request =
+                            ResourceRequest::subresource(ResourceType::Stylesheet, &initiator);
+                        #[cfg(feature = "stealth")]
+                        let result = if let Some(stealth_client) = stealth_client {
+                            stealth_client
+                                .fetch_resource_with_callbacks(
+                                    &requested_url,
+                                    request,
+                                    Some(&callbacks),
+                                )
+                                .await
+                        } else {
+                            client
+                                .fetch_resource_with_callbacks(
+                                    &requested_url,
+                                    request,
+                                    Some(&callbacks),
+                                )
+                                .await
+                        };
+                        #[cfg(not(feature = "stealth"))]
+                        let result = client
+                            .fetch_resource_with_callbacks(
+                                &requested_url,
+                                request,
+                                Some(&callbacks),
+                            )
+                            .await;
+                        (key, requested_url, depth, result)
+                    }
+                },
+            ))
+            .buffered(16)
+            .collect()
+            .await;
+
+            for (key, requested_url, depth, result) in results {
+                let response = match result {
+                    Ok(response) => response,
+                    Err(error) => {
+                        tracing::debug!(
+                            "Failed to fetch stylesheet {}: {}",
+                            requested_url,
+                            error
+                        );
+                        continue;
+                    }
+                };
+                let response_url = response.url.clone();
+                self.record_network_event_with_body(
+                    response_url.as_str(),
+                    "GET",
+                    "Stylesheet",
+                    response.status,
+                    &response.headers,
+                    &response.body,
+                    false,
+                );
+
+                let (response_key, response_url) = canonical_stylesheet_url(response_url);
+                if let Some(existing) = aliases.get(&response_key).cloned() {
+                    aliases.insert(key, existing);
+                    continue;
+                }
+                let css = obscura_net::decode_non_html(
+                    &response.body,
+                    response.content_type(),
+                );
+                let (imports, rules) = split_css_imports(&css);
+                let imports = if depth < MAX_STYLESHEET_IMPORT_DEPTH {
+                    imports
+                } else {
+                    Vec::new()
+                };
+                aliases.insert(key.clone(), key.clone());
+                aliases.insert(response_key, key.clone());
+                sheets.insert(
+                    key,
+                    LoadedStylesheet {
+                        response_url: response_url.clone(),
+                        imports: imports.clone(),
+                        rules,
+                    },
+                );
+
+                if depth >= MAX_STYLESHEET_IMPORT_DEPTH {
+                    continue;
+                }
+                for import in imports {
+                    let Ok(import_url) = response_url.join(&import) else {
+                        continue;
+                    };
+                    let (import_key, import_url) = canonical_stylesheet_url(import_url);
+                    if aliases.contains_key(&import_key) || scheduled.contains(&import_key) {
+                        continue;
+                    }
+                    if scheduled.len() >= MAX_STYLESHEET_RESOURCES {
+                        tracing::warn!(
+                            "stylesheet resource cap reached at {} resources",
+                            MAX_STYLESHEET_RESOURCES
+                        );
+                        continue;
+                    }
+                    if !subresource_allowed(Some(&document_url), import_url.as_str())
+                        || self.should_block_url(import_url.as_str())
+                    {
+                        tracing::info!("Blocked stylesheet import: {}", import_url);
+                        continue;
+                    }
+                    scheduled.insert(import_key.clone());
+                    pending.push((import_key, import_url, depth + 1));
+                }
+            }
+        }
+
+        roots
+            .into_iter()
+            .filter_map(|(link_index, key)| {
+                materialize_stylesheet_graph(
+                    &key,
+                    &sheets,
+                    &aliases,
+                    &mut std::collections::HashSet::new(),
+                )
+                .map(|css| (link_index, css))
+            })
+            .collect()
     }
 
     async fn execute_scripts(&mut self) {
@@ -1691,95 +1845,20 @@ impl Page {
             .map(|title_id| dom.text_content(title_id))
             .unwrap_or_default();
 
-        let stylesheet_urls: Vec<String> = dom
-            .query_selector_all("link")
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|&nid| {
-                // Borrow the node instead of deep-cloning it; rel keywords are
-                // ASCII so eq_ignore_ascii_case matches to_lowercase() exactly
-                // without allocating a lowercased String.
-                dom.with_node(nid, |node| {
-                    let rel = node.get_attribute("rel")?;
-                    if !rel.eq_ignore_ascii_case("stylesheet") {
-                        return None;
-                    }
-                    node.get_attribute("href").map(|s| s.to_string())
-                })
-                .flatten()
-            })
-            .collect();
-
-        let mut css_fetch_urls: Vec<String> = Vec::new();
-        for href in &stylesheet_urls {
-            let full_url = if href.starts_with("http://") || href.starts_with("https://") {
-                href.clone()
-            } else if let Some(base) = &self.url {
-                base.join(href).map(|u| u.to_string()).unwrap_or_else(|_| href.clone())
-            } else {
-                href.clone()
-            };
-            if !subresource_allowed(self.url.as_ref(), &full_url) {
-                tracing::warn!(
-                    "blocking cross-scheme <link rel=stylesheet href>: page={} href={}",
-                    self.url_string(),
-                    full_url,
-                );
-                continue;
-            }
-            if self.should_block_url(&full_url) {
-                tracing::info!("Blocked stylesheet by interception: {}", full_url);
-                continue;
-            }
-            css_fetch_urls.push(full_url);
-        }
-
-        let client = self.http_client.clone();
-        let page_callbacks = self.callbacks.clone();
-        let css_futures: Vec<_> = css_fetch_urls.iter().map(|full_url| {
-            let client = client.clone();
-            let cbs = page_callbacks.clone();
-            let url_str = full_url.clone();
-            async move {
-                let parsed = Url::parse(&url_str).unwrap_or_else(|_| Url::parse("about:blank").unwrap());
-                match client.fetch_with_callbacks(&parsed, Some(&cbs)).await {
-                    Ok(resp) => Some((url_str, resp)),
-                    Err(e) => {
-                        tracing::debug!("Failed to fetch stylesheet {}: {}", url_str, e);
-                        None
-                    }
-                }
-            }
-        }).collect();
-
-        // Same concurrency cap as script fetches.
-        use futures::StreamExt as _;
-        let css_results: Vec<_> = futures::stream::iter(css_futures)
-            // Fetch concurrently but retain document order for the exposed
-            // aggregate CSS. Completion order is not cascade order.
-            .buffered(16)
-            .collect()
-            .await;
-        let mut css_sources = Vec::new();
-        for result in css_results {
-            if let Some((url_str, resp)) = result {
-                // CSS bodies: honor the Content-Type charset; CSS @charset is
-                // out of scope for the current scrape-focused pipeline.
-                let css = obscura_net::decode_non_html(&resp.body, resp.content_type());
-                self.record_network_event_with_body(&url_str, "GET", "Stylesheet", resp.status, &resp.headers, &resp.body, false);
-                css_sources.push(css);
-            }
-        }
-
         self.dom = Some(dom);
         self.init_js();
+        let linked_stylesheets = self.fetch_stylesheets().await;
 
         // Inject CSS as a global so getComputedStyle and any CSS-aware shim
         // can read it. Has to happen before scripts run, regardless of
         // waitUntil, so handlers that read window.__obscura_css see it.
-        if !css_sources.is_empty() {
+        if !linked_stylesheets.is_empty() {
             if let Some(js) = &mut self.js {
-                let combined_css = css_sources.join("\n");
+                let combined_css = linked_stylesheets
+                    .iter()
+                    .map(|(_, css)| css.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
                 // Use the thorough template-literal escape that
                 // covers U+2028 / U+2029 and other control chars.
                 // The previous escaper only handled `, \, and ${,
@@ -1789,6 +1868,10 @@ impl Page {
                 let escaped = escape_for_js_template_literal(&combined_css);
                 let code = format!("globalThis.__obscura_css = `{}`;", escaped);
                 let _ = js.execute_script("<css>", &code);
+                for (link_index, css) in &linked_stylesheets {
+                    let code = materialize_linked_stylesheet_script(*link_index, css);
+                    let _ = js.execute_script("<fetch_stylesheets>", &code);
+                }
             }
         }
         if let Some(js) = &mut self.js {
@@ -1802,7 +1885,6 @@ impl Page {
         // listeners never registered, frameworks never bootstrapped,
         // page.click() handlers were no-ops. Now scripts run regardless
         // of waitUntil and DCL means "DOM parsed AND scripts executed".
-        self.fetch_stylesheets().await;
         self.execute_scripts().await;
 
         self.lifecycle = LifecycleState::DomContentLoaded;
@@ -2467,6 +2549,68 @@ mod tests {
     use base64::Engine as _;
     use obscura_dom::parse_html;
 
+    fn spawn_stylesheet_graph_server(
+        expected_requests: usize,
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let origin = format!("http://{address}");
+        let response_origin = origin.clone();
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            for _ in 0..expected_requests {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 4096];
+                let length = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..length]);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_ascii_whitespace().nth(1))
+                    .unwrap_or("/")
+                    .to_string();
+                request_tx.send(path.clone()).unwrap();
+                let (content_type, body) = match path.as_str() {
+                    "/" => (
+                        "text/html",
+                        r#"<!doctype html><html><head>
+                            <link rel="stylesheet" href="/css/root.css#first">
+                            <link rel="stylesheet" href="/css/root.css#second">
+                            <link rel="preload stylesheet" href="/theme/second.css">
+                        </head><body></body></html>"#
+                            .to_string(),
+                    ),
+                    "/css/root.css" => (
+                        "text/css",
+                        "@import '/css/nested/shared.css';@import '/blocked.css';@import '/intercepted.css';.root{background:url('img/root.png')}".to_string(),
+                    ),
+                    "/theme/second.css" => (
+                        "text/css",
+                        "@import '../css/nested/shared.css';.second{background:url('img/second.png')}".to_string(),
+                    ),
+                    "/css/nested/shared.css" => (
+                        "text/css",
+                        "@import '../root.css';.shared{background:url('../img/shared.png')}".to_string(),
+                    ),
+                    _ => ("text/plain", "unexpected".to_string()),
+                };
+                let status = if path == "/blocked.css" || path == "/intercepted.css" {
+                    "500 Unexpected Request"
+                } else {
+                    "200 OK"
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\nX-Origin: {response_origin}\r\n\r\n{body}",
+                    body.len(),
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        (origin, request_rx)
+    }
+
     #[test]
     fn default_navigation_referrer_matches_strict_origin_when_cross_origin() {
         let source = url::Url::parse("https://user:pass@source.example/path?q=1#fragment")
@@ -2550,6 +2694,96 @@ mod tests {
             observed,
             serde_json::json!([format!("http://{address}/final"), source])
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn linked_stylesheet_graph_fetches_once_and_preserves_order_and_bases() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (origin, requests) = spawn_stylesheet_graph_server(4);
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "stylesheet-graph".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("stylesheet-graph".to_string(), context);
+        page.set_blocked_urls(vec!["*blocked.css".to_string()]);
+        page.intercept_block_patterns = vec!["*intercepted.css".to_string()];
+        page.enable_intercept(true);
+
+        let request_count = std::sync::Arc::new(AtomicUsize::new(0));
+        let response_count = std::sync::Arc::new(AtomicUsize::new(0));
+        let observed_requests = request_count.clone();
+        page.on_request(std::sync::Arc::new(move |request| {
+            if request.resource_type == obscura_net::ResourceType::Stylesheet {
+                observed_requests.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+        let observed_responses = response_count.clone();
+        page.on_response(std::sync::Arc::new(move |request, _| {
+            if request.resource_type == obscura_net::ResourceType::Stylesheet {
+                observed_responses.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+
+        page.navigate(&format!("{origin}/")).await.unwrap();
+
+        let mut paths = (0..4)
+            .map(|_| requests.recv_timeout(std::time::Duration::from_secs(1)).unwrap())
+            .collect::<Vec<_>>();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec![
+                "/".to_string(),
+                "/css/nested/shared.css".to_string(),
+                "/css/root.css".to_string(),
+                "/theme/second.css".to_string(),
+            ]
+        );
+        assert_eq!(request_count.load(Ordering::SeqCst), 3);
+        assert_eq!(response_count.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            page.network_events
+                .iter()
+                .filter(|event| event.resource_type == "Stylesheet")
+                .count(),
+            3
+        );
+
+        let sheets = page
+            .js
+            .as_ref()
+            .unwrap()
+            .with_dom(|dom| {
+                dom.query_selector_all("style[data-obscura-external-stylesheets]")
+                    .unwrap()
+                    .into_iter()
+                    .map(|nid| dom.text_content(nid))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap();
+        assert_eq!(sheets.len(), 3);
+        assert_eq!(sheets[0], sheets[1], "duplicate links reuse one download");
+        let shared = sheets[0].find(".shared").unwrap();
+        let root = sheets[0].find(".root").unwrap();
+        assert!(shared < root, "imports precede the importing sheet");
+        assert!(sheets[0].contains(&format!(
+            "url(\"{origin}/css/img/shared.png\")"
+        )));
+        assert!(sheets[0].contains(&format!(
+            "url(\"{origin}/css/img/root.png\")"
+        )));
+        let root = sheets[2].find(".root").unwrap();
+        let shared = sheets[2].find(".shared").unwrap();
+        let second = sheets[2].find(".second").unwrap();
+        assert!(root < shared && shared < second, "cycle is cut without reordering rules");
+        assert!(sheets[2].contains(&format!(
+            "url(\"{origin}/theme/img/second.png\")"
+        )));
     }
 
     fn client_replacement_page(name: &str, deferred: bool) -> super::Page {
