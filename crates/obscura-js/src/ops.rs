@@ -129,6 +129,15 @@ pub struct ObscuraState {
     /// read by CSSOM geometry and screenshot paint.
     #[cfg(feature = "render")]
     pub scroll_offset: (f32, f32),
+    /// Element scroll offsets persist by DOM identity across relayout. Dense
+    /// renderer ScrollIds are rebuild-local and are resolved only into the
+    /// cached snapshot below.
+    #[cfg(feature = "render")]
+    pub element_scroll_offsets: HashMap<NodeId, (f32, f32)>,
+    #[cfg(feature = "render")]
+    pub scroll_generation: u64,
+    #[cfg(feature = "render")]
+    pub resolved_scroll: Option<(u64, obscura_render::ResolvedScrollState)>,
     /// Window-global import-map state shared by parser-discovered scripts,
     /// dynamically inserted import maps, and the module loader.
     pub(crate) import_map: Rc<RefCell<ImportMap>>,
@@ -172,6 +181,12 @@ impl ObscuraState {
             viewport: (1280.0, 720.0),
             #[cfg(feature = "render")]
             scroll_offset: (0.0, 0.0),
+            #[cfg(feature = "render")]
+            element_scroll_offsets: HashMap::new(),
+            #[cfg(feature = "render")]
+            scroll_generation: 0,
+            #[cfg(feature = "render")]
+            resolved_scroll: None,
             import_map: Rc::new(RefCell::new(ImportMap::default())),
             already_started_scripts: RefCell::new(HashSet::new()),
         }
@@ -330,22 +345,81 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
 fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> String {
     let shared = state.borrow::<SharedState>().clone();
     #[cfg(feature = "render")]
-    if matches!(
-        cmd.as_str(),
-        "set_attribute"
-            | "remove_attribute"
-            | "append_child"
-            | "remove_child"
-            | "insert_before"
-            | "set_inner_html"
-            | "set_inner_html_context"
-            | "set_text_content"
-    ) {
+    {
+        // Scroll offsets belong to a node at its current tree position.
+        // Temporary box/style loss keeps that latent state, but DOM removal,
+        // reparenting, and subtree replacement reset the affected identities,
+        // matching Chromium's lifecycle behavior.
+        let reset_nodes = {
+            let state = shared.borrow();
+            let mut roots = Vec::new();
+            if let Some(dom) = state.dom.as_ref() {
+                match cmd.as_str() {
+                    "remove_child" => {
+                        if let Ok(node) = arg1.parse::<u32>() {
+                            roots.push(NodeId::new(node));
+                        }
+                    }
+                    "append_child" => {
+                        if let Ok(node) = arg2.parse::<u32>() {
+                            let node = NodeId::new(node);
+                            if dom.get_node(node).and_then(|node| node.parent).is_some() {
+                                roots.push(node);
+                            }
+                        }
+                    }
+                    "insert_before" => {
+                        if let Ok(node) = arg1.parse::<u32>() {
+                            let node = NodeId::new(node);
+                            if dom.get_node(node).and_then(|node| node.parent).is_some() {
+                                roots.push(node);
+                            }
+                        }
+                    }
+                    "set_inner_html" | "set_inner_html_context" | "set_text_content" => {
+                        if let Ok(node) = arg1.parse::<u32>() {
+                            roots.extend(dom.children(NodeId::new(node)));
+                        }
+                    }
+                    _ => {}
+                }
+                roots
+                    .into_iter()
+                    .flat_map(|root| {
+                        let mut nodes = vec![root];
+                        nodes.extend(dom.descendants(root));
+                        nodes
+                    })
+                    .collect::<HashSet<_>>()
+            } else {
+                HashSet::new()
+            }
+        };
         // Any attribute can participate in an author selector, so even a
         // seemingly non-geometric attribute may change computed layout.
         // Detached-node creation and every read-only op deliberately skip this
         // invalidation; the next geometry/scroll read rebuilds at most once.
-        shared.borrow_mut().prepared_render = None;
+        let mut state = shared.borrow_mut();
+        if !reset_nodes.is_empty() {
+            state
+                .element_scroll_offsets
+                .retain(|node, _| !reset_nodes.contains(node));
+            state.scroll_generation = state.scroll_generation.wrapping_add(1);
+        }
+        if matches!(
+            cmd.as_str(),
+            "set_attribute"
+                | "remove_attribute"
+                | "append_child"
+                | "remove_child"
+                | "insert_before"
+                | "set_inner_html"
+                | "set_inner_html_context"
+                | "set_text_content"
+        ) {
+            state.prepared_render = None;
+            state.resolved_scroll = None;
+        }
     }
     let gs = shared.borrow();
     let dom = match &gs.dom {
@@ -2440,6 +2514,7 @@ fn op_set_dynamic_fonts(state: &OpState, #[string] registrations: &str) -> bool 
     if state.dynamic_fonts != fonts {
         state.dynamic_fonts = fonts;
         state.prepared_render = None;
+        state.resolved_scroll = None;
     }
     true
 }
@@ -2482,6 +2557,8 @@ pub fn build_extension() -> Extension {
         ops.push(op_computed_style());
         ops.push(op_css_supports());
         ops.push(op_layout_metrics());
+        ops.push(op_element_scroll_metrics());
+        ops.push(op_element_scroll_to());
         ops.push(op_scroll_offset());
         ops.push(op_scroll_to());
     }
@@ -2531,8 +2608,51 @@ pub(crate) fn ensure_prepared_render(
             )?
         };
         state.prepared_render = Some(prepared);
+        state.resolved_scroll = None;
     }
     state.prepared_render.as_ref()
+}
+
+#[cfg(feature = "render")]
+pub(crate) fn ensure_resolved_scroll(state: &mut ObscuraState) -> Option<()> {
+    ensure_prepared_render(state)?;
+    if state
+        .resolved_scroll
+        .as_ref()
+        .is_some_and(|(generation, _)| *generation == state.scroll_generation)
+    {
+        return Some(());
+    }
+
+    let valid = state
+        .prepared_render
+        .as_ref()?
+        .scroll_container_nodes()
+        .collect::<HashSet<_>>();
+    let snapshot = {
+        let dom = state.dom.as_ref()?;
+        state.prepared_render.as_ref()?.resolve_scroll_state(
+            dom,
+            state.scroll_offset,
+            &state.element_scroll_offsets,
+        )
+    };
+    state.scroll_offset = snapshot.root_offset();
+    for node in valid {
+        let offset = state
+            .prepared_render
+            .as_ref()?
+            .element_scroll_metrics(node, &snapshot)
+            .map(|metrics| metrics.offset)
+            .unwrap_or((0.0, 0.0));
+        if offset == (0.0, 0.0) {
+            state.element_scroll_offsets.remove(&node);
+        } else {
+            state.element_scroll_offsets.insert(node, offset);
+        }
+    }
+    state.resolved_scroll = Some((state.scroll_generation, snapshot));
+    Some(())
 }
 
 /// Probe one ordinary `<img src>` through the renderer's page-scoped resource
@@ -2636,9 +2756,14 @@ fn op_image_metadata(state: &OpState, nid: u32, cached_only: bool) -> String {
 
 #[cfg(feature = "render")]
 pub(crate) fn clamp_scroll_offset(state: &mut ObscuraState, requested: (f32, f32)) -> (f32, f32) {
-    state.scroll_offset = ensure_prepared_render(state)
+    let clamped = ensure_prepared_render(state)
         .map(|prepared| prepared.clamp_scroll(requested))
         .unwrap_or((0.0, 0.0));
+    if state.scroll_offset != clamped {
+        state.scroll_offset = clamped;
+        state.scroll_generation = state.scroll_generation.wrapping_add(1);
+        state.resolved_scroll = None;
+    }
     state.scroll_offset
 }
 
@@ -2659,15 +2784,20 @@ fn op_layout_geometry(state: &OpState, #[string] nid_str: String) -> String {
     let nid: u32 = nid_str.parse().unwrap_or(0);
     let nid = obscura_dom::tree::NodeId::new(nid);
     let mut gs = shared.borrow_mut();
-    let scroll = gs.scroll_offset;
-    if let Some(prepared) = ensure_prepared_render(&mut gs) {
-        let Some(rect) = prepared.viewport_rect(nid, scroll) else {
+    if ensure_resolved_scroll(&mut gs).is_some() {
+        let Some((_, scroll)) = gs.resolved_scroll.as_ref() else {
+            return String::new();
+        };
+        let Some(prepared) = gs.prepared_render.as_ref() else {
+            return String::new();
+        };
+        let Some(rect) = prepared.viewport_rect_with_scroll(nid, scroll) else {
             return String::new();
         };
         let Some((client_width, client_height)) = prepared.client_size(nid) else {
             return String::new();
         };
-        let Some(client_rects) = prepared.viewport_client_rects(nid, scroll) else {
+        let Some(client_rects) = prepared.viewport_client_rects_with_scroll(nid, scroll) else {
             return String::new();
         };
         let client_rects = client_rects
@@ -2753,6 +2883,86 @@ fn op_layout_metrics(state: &OpState) -> String {
         "{{\"scrollWidth\":{},\"scrollHeight\":{},\"clientWidth\":{},\"clientHeight\":{}}}",
         content.0, content.1, viewport.0, viewport.1
     )
+}
+
+#[cfg(feature = "render")]
+#[op2]
+#[string]
+fn op_element_scroll_metrics(state: &OpState, #[string] nid_str: String) -> String {
+    let shared = state.borrow::<SharedState>().clone();
+    let nid = NodeId::new(nid_str.parse().unwrap_or(0));
+    let mut gs = shared.borrow_mut();
+    if ensure_resolved_scroll(&mut gs).is_none() {
+        return String::new();
+    }
+    let Some((_, scroll)) = gs.resolved_scroll.as_ref() else {
+        return String::new();
+    };
+    let Some(metrics) = gs
+        .prepared_render
+        .as_ref()
+        .and_then(|prepared| prepared.element_scroll_metrics(nid, scroll))
+    else {
+        // The op exists in render builds, so an unboxed/detached node must not
+        // fall through to bootstrap's synthetic non-render metrics.
+        return r#"{"scrollWidth":0,"scrollHeight":0,"clientWidth":0,"clientHeight":0,"x":0,"y":0,"maxX":0,"maxY":0,"hasBox":false}"#.to_string();
+    };
+    serde_json::json!({
+        "scrollWidth": metrics.content_size.0,
+        "scrollHeight": metrics.content_size.1,
+        "clientWidth": metrics.client_size.0,
+        "clientHeight": metrics.client_size.1,
+        "x": metrics.offset.0,
+        "y": metrics.offset.1,
+        "maxX": metrics.max_offset.0,
+        "maxY": metrics.max_offset.1,
+        "hasBox": true,
+    })
+    .to_string()
+}
+
+#[cfg(feature = "render")]
+#[op2]
+#[string]
+fn op_element_scroll_to(
+    state: &OpState,
+    #[string] nid_str: String,
+    x: f64,
+    y: f64,
+) -> String {
+    let shared = state.borrow::<SharedState>().clone();
+    let nid = NodeId::new(nid_str.parse().unwrap_or(0));
+    let mut gs = shared.borrow_mut();
+    if ensure_resolved_scroll(&mut gs).is_none() {
+        return String::new();
+    }
+    let current = gs.resolved_scroll.as_ref().and_then(|(_, scroll)| {
+        gs.prepared_render
+            .as_ref()?
+            .element_scroll_metrics(nid, scroll)
+    });
+    let Some(current) = current else {
+        return String::new();
+    };
+    let clamp = |value: f64, max: f32| {
+        if value.is_finite() {
+            obscura_render::quantize_scroll_value(value as f32, 1.0).clamp(0.0, max)
+        } else {
+            0.0
+        }
+    };
+    let requested = (clamp(x, current.max_offset.0), clamp(y, current.max_offset.1));
+    if requested != current.offset {
+        if requested == (0.0, 0.0) {
+            gs.element_scroll_offsets.remove(&nid);
+        } else {
+            gs.element_scroll_offsets.insert(nid, requested);
+        }
+        gs.scroll_generation = gs.scroll_generation.wrapping_add(1);
+        gs.resolved_scroll = None;
+        return format!("{{\"x\":{},\"y\":{}}}", requested.0, requested.1);
+    }
+    format!("{{\"x\":{},\"y\":{}}}", current.offset.0, current.offset.1)
 }
 
 #[cfg(feature = "render")]

@@ -2960,14 +2960,30 @@ class Element extends Node {
     return rect;
   }
   get scrollWidth() {
-    if (!this._isViewportRoot()) return 100;
-    const metrics = this._renderScrollMetrics();
-    return metrics ? metrics.scrollWidth : (globalThis.innerWidth || 1280);
+    if (this._isViewportRoot()) {
+      const metrics = this._renderScrollMetrics();
+      return metrics
+        ? Math.round(Math.max(0, metrics.scrollWidth || 0))
+        : (globalThis.innerWidth || 1280);
+    }
+    const metrics = this._renderElementScrollMetrics();
+    if (metrics !== undefined) {
+      return metrics ? Math.round(Math.max(0, metrics.scrollWidth || 0)) : 0;
+    }
+    return 100;
   }
   get scrollHeight() {
-    if (!this._isViewportRoot()) return 20;
-    const metrics = this._renderScrollMetrics();
-    return metrics ? metrics.scrollHeight : (globalThis.innerHeight || 720);
+    if (this._isViewportRoot()) {
+      const metrics = this._renderScrollMetrics();
+      return metrics
+        ? Math.round(Math.max(0, metrics.scrollHeight || 0))
+        : (globalThis.innerHeight || 720);
+    }
+    const metrics = this._renderElementScrollMetrics();
+    if (metrics !== undefined) {
+      return metrics ? Math.round(Math.max(0, metrics.scrollHeight || 0)) : 0;
+    }
+    return 20;
   }
   _isViewportRoot() {
     const t = this.tagName;
@@ -2978,6 +2994,17 @@ class Element extends Node {
     try {
       const raw = Deno.core.ops.op_layout_metrics();
       return raw ? JSON.parse(raw) : null;
+    } catch (_e) {
+      return null;
+    }
+  }
+  _renderElementScrollMetrics() {
+    if (typeof Deno.core.ops.op_element_scroll_metrics !== 'function') return undefined;
+    try {
+      const raw = Deno.core.ops.op_element_scroll_metrics(String(this._nid | 0));
+      if (!raw) return null;
+      const metrics = JSON.parse(raw);
+      return metrics && metrics.hasBox !== false ? metrics : null;
     } catch (_e) {
       return null;
     }
@@ -3000,14 +3027,25 @@ class Element extends Node {
       return null;
     }
   }
-  // Render builds clamp the viewport root against measured document overflow.
-  // Nested element scrollers still use synthetic, deliberately unclamped state:
-  // their contents do not yet participate in scroll-container layout, and a
-  // guessed maximum would pin lazy-loading scrollers at zero.
+  _setRenderElementScroll(x, y) {
+    if (typeof Deno.core.ops.op_element_scroll_to !== 'function') return null;
+    try {
+      const raw = Deno.core.ops.op_element_scroll_to(String(this._nid | 0), +x || 0, +y || 0);
+      return raw ? JSON.parse(raw) : null;
+    } catch (_e) {
+      return null;
+    }
+  }
+  // Render builds clamp both viewport and element scroll areas against the
+  // exact overflow used by geometry and paint. Non-render builds retain the
+  // synthetic compatibility state.
   get scrollTop() {
     if (this._isViewportRoot()) {
       const offset = this._renderScrollOffset();
       if (offset) return offset.y || 0;
+    } else {
+      const metrics = this._renderElementScrollMetrics();
+      if (metrics !== undefined) return metrics ? (metrics.y || 0) : 0;
     }
     return this._scrollTop || 0;
   }
@@ -3020,11 +3058,18 @@ class Element extends Node {
       const offset = this._renderScrollOffset();
       const updated = offset && this._setRenderScroll(offset.x, nv);
       if (updated) actual = updated.y || 0;
+    } else {
+      const metrics = this._renderElementScrollMetrics();
+      if (metrics !== undefined) {
+        actual = metrics ? (metrics.y || 0) : 0;
+        const updated = metrics && this._setRenderElementScroll(metrics.x, nv);
+        if (updated) actual = updated.y || 0;
+      }
     }
     const changed = actual !== old;
     this._scrollTop = actual;
     if (changed && !this._scrollSuppress) this._fireScroll();
-    if (changed && this._isViewportRoot() &&
+    if (changed &&
         typeof globalThis.__obscura_recompute_intersections === "function") {
       globalThis.__obscura_recompute_intersections();
     }
@@ -3033,6 +3078,9 @@ class Element extends Node {
     if (this._isViewportRoot()) {
       const offset = this._renderScrollOffset();
       if (offset) return offset.x || 0;
+    } else {
+      const metrics = this._renderElementScrollMetrics();
+      if (metrics !== undefined) return metrics ? (metrics.x || 0) : 0;
     }
     return this._scrollLeft || 0;
   }
@@ -3045,11 +3093,18 @@ class Element extends Node {
       const offset = this._renderScrollOffset();
       const updated = offset && this._setRenderScroll(nv, offset.y);
       if (updated) actual = updated.x || 0;
+    } else {
+      const metrics = this._renderElementScrollMetrics();
+      if (metrics !== undefined) {
+        actual = metrics ? (metrics.x || 0) : 0;
+        const updated = metrics && this._setRenderElementScroll(nv, metrics.y);
+        if (updated) actual = updated.x || 0;
+      }
     }
     const changed = actual !== old;
     this._scrollLeft = actual;
     if (changed && !this._scrollSuppress) this._fireScroll();
-    if (changed && this._isViewportRoot() &&
+    if (changed &&
         typeof globalThis.__obscura_recompute_intersections === "function") {
       globalThis.__obscura_recompute_intersections();
     }
@@ -3180,26 +3235,66 @@ class Element extends Node {
     let left, top;
     if (x !== null && typeof x === 'object') { left = x.left; top = x.top; }
     else { left = x; top = y; }
+    const oldLeft = this.scrollLeft, oldTop = this.scrollTop;
+    let native = false, updated = null;
+    if (this._isViewportRoot()) {
+      const offset = this._renderScrollOffset();
+      if (offset) {
+        native = true;
+        updated = this._setRenderScroll(
+          left === undefined ? offset.x : (+left || 0),
+          top === undefined ? offset.y : (+top || 0),
+        );
+      }
+    } else {
+      const metrics = this._renderElementScrollMetrics();
+      if (metrics !== undefined) {
+        native = true;
+        updated = metrics
+          ? this._setRenderElementScroll(
+              left === undefined ? metrics.x : (+left || 0),
+              top === undefined ? metrics.y : (+top || 0),
+            )
+          : { x: 0, y: 0 };
+      }
+    }
+    if (native) {
+      const actualLeft = updated ? (updated.x || 0) : oldLeft;
+      const actualTop = updated ? (updated.y || 0) : oldTop;
+      this._scrollLeft = actualLeft;
+      this._scrollTop = actualTop;
+      if (actualLeft !== oldLeft || actualTop !== oldTop) {
+        if (typeof globalThis.__obscura_recompute_intersections === "function") {
+          globalThis.__obscura_recompute_intersections();
+        }
+        this._fireScroll();
+      }
+      return;
+    }
     this._scrollSuppress = true;
     if (left !== undefined) this.scrollLeft = +left || 0;
     if (top !== undefined) this.scrollTop = +top || 0;
     this._scrollSuppress = false;
-    this._fireScroll();
+    if (this.scrollLeft !== oldLeft || this.scrollTop !== oldTop) this._fireScroll();
   }
   scroll(x, y) { this.scrollTo(x, y); }
   scrollBy(x, y) {
     let dl, dt;
     if (x !== null && typeof x === 'object') { dl = x.left; dt = x.top; }
     else { dl = x; dt = y; }
-    this._scrollSuppress = true;
-    this.scrollLeft = (this.scrollLeft || 0) + (+dl || 0);
-    this.scrollTop = (this.scrollTop || 0) + (+dt || 0);
-    this._scrollSuppress = false;
-    this._fireScroll();
+    this.scrollTo({
+      left: (this.scrollLeft || 0) + (+dl || 0),
+      top: (this.scrollTop || 0) + (+dt || 0),
+    });
   }
   _fireScroll() {
+    if (this._scrollEventPending) return;
+    this._scrollEventPending = true;
     const self = this;
-    setTimeout(() => { try { self.dispatchEvent(new Event('scroll', { bubbles: false })); } catch (e) {} }, 0);
+    setTimeout(() => {
+      self._scrollEventPending = false;
+      try { self.dispatchEvent(new Event('scroll', { bubbles: false })); } catch (e) {}
+    }, 0);
   }
   animate(keyframes, options) {
     const duration = typeof options === 'number' ? options : (options?.duration || 0);

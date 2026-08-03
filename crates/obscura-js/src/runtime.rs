@@ -12,7 +12,11 @@ pub use deno_core::v8::IsolateHandle;
 use crate::import_map::ImportMap;
 use crate::module_loader::ObscuraModuleLoader;
 #[cfg(feature = "render")]
-use crate::ops::{clamp_scroll_offset, document_base_url, ensure_prepared_render};
+use crate::ops::{
+    clamp_scroll_offset, document_base_url, ensure_resolved_scroll,
+};
+#[cfg(all(test, feature = "render"))]
+use crate::ops::ensure_prepared_render;
 use crate::ops::{
     build_extension, node_is_script, ObscuraState, StoredNetworkResponseBody,
 };
@@ -227,6 +231,9 @@ impl ObscuraJsRuntime {
             gs.render_resources = obscura_render::RenderResourceCache::default();
             gs.dynamic_fonts.clear();
             gs.scroll_offset = (0.0, 0.0);
+            gs.element_scroll_offsets.clear();
+            gs.scroll_generation = 0;
+            gs.resolved_scroll = None;
         }
     }
 
@@ -240,6 +247,7 @@ impl ObscuraJsRuntime {
                 // present. Keep already-fetched absolute bytes, but rebuild
                 // candidate selection/layout against the new base.
                 state.prepared_render = None;
+                state.resolved_scroll = None;
             }
         }
     }
@@ -340,6 +348,7 @@ impl ObscuraJsRuntime {
             let mut state = self.state.borrow_mut();
             state.viewport = (width as f32, height as f32);
             state.prepared_render = None;
+            state.resolved_scroll = None;
         }
         let _ = self.runtime.execute_script(
             "<set-viewport>",
@@ -380,20 +389,16 @@ impl ObscuraJsRuntime {
         if viewport != state.viewport || base_url != effective_base.as_deref() {
             return None;
         }
-        ensure_prepared_render(&mut state)?;
-        let requested = state.scroll_offset;
-        let scroll = state
-            .prepared_render
-            .as_ref()
-            .map(|prepared| prepared.clamp_scroll(requested))?;
-        state.scroll_offset = scroll;
+        ensure_resolved_scroll(&mut state)?;
         let ObscuraState {
             dom,
             prepared_render,
             render_resources,
+            resolved_scroll,
             ..
         } = &mut *state;
-        obscura_render::screenshot_prepared(
+        let (_, scroll) = resolved_scroll.as_ref()?;
+        obscura_render::screenshot_prepared_with_scroll(
             dom.as_ref()?,
             prepared_render.as_mut()?,
             render_resources,
@@ -1211,6 +1216,8 @@ impl ObscuraJsRuntime {
             state.prepared_render = None;
             state.render_resources = obscura_render::RenderResourceCache::default();
             state.dynamic_fonts.clear();
+            state.element_scroll_offsets.clear();
+            state.resolved_scroll = None;
         }
         state.dom.take()
     }
@@ -3254,7 +3261,11 @@ mod tests {
 
     #[test]
     fn element_scroll_methods_update_scroll_offsets() {
-        let mut rt = setup_runtime(r#"<div id="scroller"></div>"#);
+        let mut rt = setup_runtime(
+            r#"<div id="scroller" style="width:100px;height:100px;overflow:auto">
+                   <div style="width:300px;height:300px"></div>
+               </div>"#,
+        );
         let result = rt
             .evaluate(
                 r#"
@@ -3954,6 +3965,403 @@ mod tests {
         assert_eq!(values[8], values[10]);
         assert_eq!(values[9], values[11]);
         assert!(values[12..].iter().all(|value| value == &serde_json::json!(true)));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn nested_scroll_metrics_geometry_pixels_and_relayout_share_one_state() {
+        let dom = parse_html(
+            r#"<html style="margin:0"><body style="margin:0">
+                <div id="outer" style="box-sizing:border-box;width:120px;height:100px;
+                     border:4px solid red;overflow:hidden;position:relative;background:red">
+                  <div id="inner" style="width:220px;height:200px;overflow:hidden;
+                       position:relative;background:blue">
+                    <div id="target" style="position:absolute;left:300px;top:280px;
+                         width:30px;height:20px;background:lime"></div>
+                  </div>
+                </div>
+            </body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_viewport(360.0, 240.0);
+        rt.run_page_init();
+
+        let top = rt
+            .screenshot_prepared((360.0, 240.0), Some("about:blank"))
+            .expect("top screenshot");
+        let result = rt
+            .evaluate(
+                r#"
+                const outer = document.getElementById('outer');
+                const inner = document.getElementById('inner');
+                const target = document.getElementById('target');
+                const before = {
+                  outer: outer.getBoundingClientRect(),
+                  inner: inner.getBoundingClientRect(),
+                  target: target.getBoundingClientRect(),
+                };
+                outer.scrollTo(9999, 9999);
+                inner.scrollTo(9999, 9999);
+                const after = {
+                  outer: outer.getBoundingClientRect(),
+                  inner: inner.getBoundingClientRect(),
+                  target: target.getBoundingClientRect(),
+                };
+                const first = [target.getBoundingClientRect().left, target.getBoundingClientRect().top];
+                outer.scrollTo(0, 0); inner.scrollTo(0, 0);
+                outer.scrollTo(9999, 9999); inner.scrollTo(9999, 9999);
+                const repeated = [target.getBoundingClientRect().left, target.getBoundingClientRect().top];
+                return {
+                  outerMetrics: [outer.clientWidth, outer.clientHeight, outer.scrollWidth, outer.scrollHeight],
+                  innerMetrics: [inner.clientWidth, inner.clientHeight, inner.scrollWidth, inner.scrollHeight],
+                  offsets: [outer.scrollLeft, outer.scrollTop, inner.scrollLeft, inner.scrollTop],
+                  outerDelta: [after.outer.left - before.outer.left, after.outer.top - before.outer.top],
+                  innerDelta: [after.inner.left - before.inner.left, after.inner.top - before.inner.top],
+                  targetDelta: [after.target.left - before.target.left, after.target.top - before.target.top],
+                  repeated: [first[0] === repeated[0], first[1] === repeated[1]],
+                };
+                "#,
+            )
+            .expect("nested scroll state");
+        assert_eq!(result["outerMetrics"], serde_json::json!([112, 92, 220, 200]));
+        assert_eq!(result["innerMetrics"], serde_json::json!([220, 200, 330, 300]));
+        assert_eq!(result["offsets"], serde_json::json!([108, 108, 110, 100]));
+        assert_eq!(result["outerDelta"], serde_json::json!([0, 0]));
+        assert_eq!(result["innerDelta"], serde_json::json!([-108, -108]));
+        assert_eq!(result["targetDelta"], serde_json::json!([-218, -208]));
+        assert_eq!(result["repeated"], serde_json::json!([true, true]));
+
+        let scrolled = rt
+            .screenshot_prepared((360.0, 240.0), Some("about:blank"))
+            .expect("scrolled screenshot");
+        let scrolled_repeat = rt
+            .screenshot_prepared((360.0, 240.0), Some("about:blank"))
+            .expect("repeat screenshot");
+        assert_ne!(top, scrolled, "nested scroll must move painted pixels");
+        assert_eq!(scrolled, scrolled_repeat, "capture must not accumulate movement");
+
+        let retained = rt
+            .evaluate(
+                r#"
+                const outer = document.getElementById('outer');
+                const inner = document.getElementById('inner');
+                outer.setAttribute('data-relayout', '1');
+                return [outer.scrollLeft, outer.scrollTop, inner.scrollLeft, inner.scrollTop];
+                "#,
+            )
+            .expect("retained offsets");
+        assert_eq!(retained, serde_json::json!([108, 108, 110, 100]));
+
+        let reclamped = rt
+            .evaluate(
+                r#"
+                const outer = document.getElementById('outer');
+                const inner = document.getElementById('inner');
+                inner.setAttribute('style', 'width:150px;height:120px;overflow:hidden;position:relative;background:blue');
+                document.getElementById('target').setAttribute(
+                  'style',
+                  'position:absolute;left:100px;top:80px;width:30px;height:20px;background:lime'
+                );
+                return [outer.scrollLeft, outer.scrollTop, inner.scrollLeft, inner.scrollTop];
+                "#,
+            )
+            .expect("reclamped offsets");
+        assert_eq!(reclamped, serde_json::json!([38, 28, 0, 0]));
+
+        rt.evaluate("(function(){ document.getElementById('outer').remove(); document.documentElement.getBoundingClientRect(); return true; })()")
+            .expect("remove scroller");
+        assert!(
+            rt.state.borrow().element_scroll_offsets.is_empty(),
+            "removed scroll containers must be pruned after relayout"
+        );
+    }
+
+    /// Chromium 150 oracle for CSSOM scrolling overflow. Visible and clip
+    /// boxes expose descendant overflow but cannot move; an actual scrolling
+    /// box includes trailing padding. A clip boundary suppresses propagation
+    /// only on its clipped axis, and ordinary inline boxes expose zero metrics.
+    #[cfg(feature = "render")]
+    #[test]
+    fn element_scroll_metrics_match_chromium_overflow_oracles() {
+        let dom = parse_html(
+            r#"<html style="margin:0"><body style="margin:0">
+              <style>
+                .box { width:100px;height:80px;padding:10px;border:2px solid;position:absolute }
+                .child { width:200px;height:150px }
+              </style>
+              <div id="visible" class="box" style="overflow:visible;top:0"><div class="child"></div></div>
+              <div id="clip" class="box" style="overflow:clip;top:150px"><div class="child"></div></div>
+              <div id="hidden" class="box" style="overflow:hidden;top:300px"><div class="child"></div></div>
+              <div id="outer" style="width:100px;height:80px;overflow:visible;position:absolute;top:450px">
+                <div id="axis" style="width:150px;height:120px;overflow-x:visible;overflow-y:clip">
+                  <div style="width:300px;height:250px"></div>
+                </div>
+              </div>
+              <div id="f1" style="width:10px;overflow:visible"><div style="width:100.1px;height:1px"></div></div>
+              <div id="f2" style="width:10px;overflow:visible"><div style="width:100.6px;height:1px"></div></div>
+              <span id="inline">long inline text</span>
+            </body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_viewport(420.0, 700.0);
+        rt.run_page_init();
+
+        let result = rt
+            .evaluate(
+                r#"
+                const visible = document.getElementById('visible');
+                const clip = document.getElementById('clip');
+                const hidden = document.getElementById('hidden');
+                const outer = document.getElementById('outer');
+                const axis = document.getElementById('axis');
+                const inline = document.getElementById('inline');
+                visible.scrollTo(99, 99);
+                clip.scrollTo(99, 99);
+                hidden.scrollTo(99, 99);
+                return {
+                  visible: [visible.scrollWidth, visible.scrollHeight, visible.scrollLeft, visible.scrollTop],
+                  clip: [clip.scrollWidth, clip.scrollHeight, clip.scrollLeft, clip.scrollTop],
+                  hidden: [hidden.scrollWidth, hidden.scrollHeight, hidden.scrollLeft, hidden.scrollTop],
+                  axis: [outer.scrollWidth, outer.scrollHeight, axis.scrollWidth, axis.scrollHeight],
+                  fractional: [document.getElementById('f1').scrollWidth, document.getElementById('f2').scrollWidth],
+                  inline: [inline.scrollWidth, inline.scrollHeight, inline.clientWidth, inline.clientHeight],
+                };
+                "#,
+            )
+            .expect("overflow oracle metrics");
+        assert_eq!(result["visible"], serde_json::json!([210, 160, 0, 0]));
+        assert_eq!(result["clip"], serde_json::json!([210, 160, 0, 0]));
+        assert_eq!(result["hidden"], serde_json::json!([220, 170, 99, 70]));
+        assert_eq!(result["axis"], serde_json::json!([300, 120, 300, 250]));
+        assert_eq!(result["fractional"], serde_json::json!([100, 101]));
+        assert_eq!(result["inline"], serde_json::json!([0, 0, 0, 0]));
+    }
+
+    /// Chromium quantizes effective scrolling ranges and assigned offsets to
+    /// the current device-pixel grid. At the renderer's present 1x scale a
+    /// 100.4px area cannot move a 100px scrollport, while 100.6px rounds to a
+    /// one-pixel range and assigning `.5` moves geometry and paint by 1px.
+    #[cfg(feature = "render")]
+    #[test]
+    fn fractional_scroll_ranges_quantize_geometry_and_pixels_at_one_x() {
+        let dom = parse_html(
+            r#"<html style="margin:0"><body style="margin:0">
+              <div id="low" style="width:100px;height:40px;overflow:auto;position:absolute;top:0">
+                <div style="width:100.4px;height:40px;position:relative;background:white">
+                  <div id="lowChild" style="position:absolute;left:40px;top:5px;width:10px;height:25px;background:red"></div>
+                </div>
+              </div>
+              <div id="high" style="width:100px;height:40px;overflow:auto;position:absolute;top:60px">
+                <div style="width:100.6px;height:40px;position:relative;background:white">
+                  <div id="highChild" style="position:absolute;left:40px;top:5px;width:10px;height:25px;background:blue"></div>
+                </div>
+              </div>
+            </body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_viewport(160.0, 120.0);
+        rt.run_page_init();
+
+        let initial = rt
+            .screenshot_prepared((160.0, 120.0), Some("about:blank"))
+            .expect("initial fractional screenshot");
+        let low = rt
+            .evaluate(
+                r#"
+                const low = document.getElementById('low');
+                const child = document.getElementById('lowChild');
+                const before = child.getBoundingClientRect();
+                low.scrollLeft = 999;
+                const after = child.getBoundingClientRect();
+                return [low.scrollWidth, low.clientWidth, low.scrollLeft, after.left - before.left];
+                "#,
+            )
+            .expect("low fractional range");
+        assert_eq!(low, serde_json::json!([100, 100, 0, 0]));
+        let after_low = rt
+            .screenshot_prepared((160.0, 120.0), Some("about:blank"))
+            .expect("low fractional screenshot");
+        assert_eq!(initial, after_low, "a rounded-zero range cannot move pixels");
+
+        let high = rt
+            .evaluate(
+                r#"
+                const high = document.getElementById('high');
+                const child = document.getElementById('highChild');
+                const before = child.getBoundingClientRect();
+                high.scrollLeft = .5;
+                const after = child.getBoundingClientRect();
+                return [high.scrollWidth, high.clientWidth, high.scrollLeft, after.left - before.left];
+                "#,
+            )
+            .expect("high fractional range");
+        assert_eq!(high, serde_json::json!([101, 100, 1, -1]));
+        let after_high = rt
+            .screenshot_prepared((160.0, 120.0), Some("about:blank"))
+            .expect("high fractional screenshot");
+        assert_ne!(after_low, after_high, "the quantized pixel must repaint");
+
+        let root_dom = parse_html(
+            r#"<html style="margin:0"><body style="margin:0">
+                 <div id="wide" style="width:100.6px;height:20px"></div>
+               </body></html>"#,
+        );
+        let mut root_rt = ObscuraJsRuntime::new();
+        root_rt.set_dom(root_dom);
+        root_rt.set_viewport(100.0, 60.0);
+        root_rt.run_page_init();
+        let root = root_rt
+            .evaluate(
+                r#"
+                const wide = document.getElementById('wide');
+                const before = wide.getBoundingClientRect();
+                window.scrollTo(.5, 0);
+                const after = wide.getBoundingClientRect();
+                const high = [document.documentElement.scrollWidth, window.scrollX, after.left - before.left];
+                wide.style.width = '100.4px';
+                window.scrollTo(999, 0);
+                return { high, low: [document.documentElement.scrollWidth, window.scrollX] };
+                "#,
+            )
+            .expect("root fractional range");
+        assert_eq!(root["high"], serde_json::json!([101, 1, -1]));
+        assert_eq!(root["low"], serde_json::json!([100, 0]));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn element_scroll_offsets_follow_chromium_box_and_dom_lifecycles() {
+        let dom = parse_html(
+            r#"<html style="margin:0"><body style="margin:0">
+              <div id="first"><div id="scroller" style="width:100px;height:80px;overflow:auto">
+                <div style="width:250px;height:200px"></div>
+              </div></div>
+              <div id="second"></div>
+            </body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_viewport(360.0, 240.0);
+        rt.run_page_init();
+
+        let result = rt
+            .evaluate(
+                r#"
+                const scroller = document.getElementById('scroller');
+                const first = document.getElementById('first');
+                const second = document.getElementById('second');
+                scroller.scrollTo(70, 60);
+                const initial = [scroller.scrollLeft, scroller.scrollTop];
+                scroller.style.overflow = 'visible';
+                const visible = [scroller.scrollLeft, scroller.scrollTop];
+                scroller.style.overflow = 'auto';
+                const restoredStyle = [scroller.scrollLeft, scroller.scrollTop];
+                scroller.style.display = 'none';
+                const noBox = [scroller.scrollWidth, scroller.scrollHeight, scroller.scrollLeft, scroller.scrollTop];
+                scroller.scrollTo(5, 5);
+                scroller.style.display = 'block';
+                const restoredDisplay = [scroller.scrollLeft, scroller.scrollTop];
+                second.appendChild(scroller);
+                const moved = [scroller.scrollLeft, scroller.scrollTop];
+                scroller.scrollTo(40, 30);
+                second.removeChild(scroller);
+                first.appendChild(scroller);
+                const reattached = [scroller.scrollLeft, scroller.scrollTop];
+                scroller.scrollTo(20, 10);
+                first.textContent = 'replacement';
+                document.body.appendChild(scroller);
+                const textReplacement = [scroller.scrollLeft, scroller.scrollTop];
+                const detached = document.createElement('div');
+                detached.style.cssText = 'width:100px;height:80px;overflow:auto';
+                let recomputes = 0;
+                globalThis.__obscura_recompute_intersections = () => { recomputes++; };
+                detached.scrollTo(30, 20);
+                scroller.scrollTo(11, 12);
+                return {
+                  initial, visible, restoredStyle, noBox, restoredDisplay,
+                  moved, reattached, textReplacement,
+                  detached: [detached.scrollWidth, detached.scrollHeight, detached.scrollLeft, detached.scrollTop],
+                  atomic: [scroller.scrollLeft, scroller.scrollTop, recomputes],
+                };
+                "#,
+            )
+            .expect("scroll lifecycle state");
+        assert_eq!(result["initial"], serde_json::json!([70, 60]));
+        assert_eq!(result["visible"], serde_json::json!([0, 0]));
+        assert_eq!(result["restoredStyle"], serde_json::json!([70, 60]));
+        assert_eq!(result["noBox"], serde_json::json!([0, 0, 0, 0]));
+        assert_eq!(result["restoredDisplay"], serde_json::json!([70, 60]));
+        assert_eq!(result["moved"], serde_json::json!([0, 0]));
+        assert_eq!(result["reattached"], serde_json::json!([0, 0]));
+        assert_eq!(result["textReplacement"], serde_json::json!([0, 0]));
+        assert_eq!(result["detached"], serde_json::json!([0, 0, 0, 0]));
+        assert_eq!(result["atomic"], serde_json::json!([11, 12, 1]));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn fixed_panels_scroll_locally_and_transformed_descendants_remain_supported() {
+        let dom = parse_html(
+            r#"<html style="margin:0"><body style="margin:0;height:1800px">
+              <div id="modal" style="position:fixed;left:20px;top:20px;width:140px;height:120px;background:red">
+                <div id="panel" style="width:100px;height:80px;overflow:hidden;position:relative;background:blue">
+                  <div id="fixedTarget" style="position:absolute;left:180px;top:160px;width:20px;height:20px;background:lime"></div>
+                </div>
+              </div>
+              <div id="transformedScroller" style="position:absolute;top:300px;width:100px;height:80px;overflow:hidden">
+                <div id="transformedTarget" style="width:240px;height:180px;transform:scale(1.1)"></div>
+              </div>
+              <div style="position:absolute;top:600px;transform:scale(1.2)">
+                <div id="affineAncestorScroller" style="width:100px;height:80px;overflow:hidden">
+                  <div style="width:240px;height:180px"></div>
+                </div>
+              </div>
+            </body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_viewport(360.0, 240.0);
+        rt.run_page_init();
+
+        let result = rt
+            .evaluate(
+                r#"
+                const modal = document.getElementById('modal');
+                const panel = document.getElementById('panel');
+                const fixedTarget = document.getElementById('fixedTarget');
+                const transformedScroller = document.getElementById('transformedScroller');
+                const transformedTarget = document.getElementById('transformedTarget');
+                const affineAncestorScroller = document.getElementById('affineAncestorScroller');
+                const before = {
+                  modal: modal.getBoundingClientRect(),
+                  fixedTarget: fixedTarget.getBoundingClientRect(),
+                  transformedTarget: transformedTarget.getBoundingClientRect(),
+                };
+                panel.scrollTo(60, 50);
+                transformedScroller.scrollTo(50, 40);
+                affineAncestorScroller.scrollTo(50, 40);
+                window.scrollTo(0, 500);
+                const after = {
+                  modal: modal.getBoundingClientRect(),
+                  fixedTarget: fixedTarget.getBoundingClientRect(),
+                  transformedTarget: transformedTarget.getBoundingClientRect(),
+                };
+                return {
+                  modalDelta: [after.modal.left - before.modal.left, after.modal.top - before.modal.top],
+                  fixedDelta: [after.fixedTarget.left - before.fixedTarget.left, after.fixedTarget.top - before.fixedTarget.top],
+                  transformedDelta: [after.transformedTarget.left - before.transformedTarget.left, after.transformedTarget.top - before.transformedTarget.top],
+                  offsets: [panel.scrollLeft, panel.scrollTop, transformedScroller.scrollLeft, transformedScroller.scrollTop, affineAncestorScroller.scrollLeft, affineAncestorScroller.scrollTop],
+                };
+                "#,
+            )
+            .expect("fixed and transformed scroll state");
+        assert_eq!(result["modalDelta"], serde_json::json!([0, 0]));
+        assert_eq!(result["fixedDelta"], serde_json::json!([-60, -50]));
+        assert_eq!(result["transformedDelta"], serde_json::json!([-50, -540]));
+        assert_eq!(result["offsets"], serde_json::json!([60, 50, 50, 40, 0, 0]));
     }
 
     /// CSSOM View exposes the viewport through the standards-mode root, but

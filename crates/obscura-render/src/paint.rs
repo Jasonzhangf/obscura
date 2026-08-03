@@ -306,6 +306,48 @@ pub struct SelectedImage {
     pub density: f32,
 }
 
+/// CSSOM scrolling metrics for one element box. Non-scroll containers expose
+/// their padding-box size on both surfaces and retain a zero offset.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ElementScrollMetrics {
+    pub client_size: (f32, f32),
+    pub content_size: (f32, f32),
+    pub offset: (f32, f32),
+    pub max_offset: (f32, f32),
+}
+
+/// One fully resolved scrolling snapshot shared by geometry and paint. Node
+/// movement and inherited clips are dense vectors indexed directly by
+/// `NodeId`, so a capture pays one top-down resolution pass and no hot-path
+/// ancestor walks or per-node scroll hash lookups.
+#[derive(Clone, Debug)]
+pub struct ResolvedScrollState {
+    root_offset: (f32, f32),
+    container_offsets: Vec<(f32, f32)>,
+    node_movement: Vec<(f32, f32)>,
+    inherited_clips: Vec<Option<crate::dom::OverflowClip>>,
+}
+
+impl ResolvedScrollState {
+    pub fn root_offset(&self) -> (f32, f32) {
+        self.root_offset
+    }
+
+    fn movement_for(&self, id: obscura_dom::tree::NodeId) -> (f32, f32) {
+        self.node_movement
+            .get(id.index())
+            .copied()
+            .unwrap_or((0.0, 0.0))
+    }
+
+    fn inherited_clip_for(
+        &self,
+        id: obscura_dom::tree::NodeId,
+    ) -> Option<crate::dom::OverflowClip> {
+        self.inherited_clips.get(id.index()).copied().flatten()
+    }
+}
+
 /// A final image/font-aware document layout retained across viewport paints.
 /// The DOM must not be mutated while this value is reused.
 pub struct PreparedRender {
@@ -315,6 +357,7 @@ pub struct PreparedRender {
     content_size: (f32, f32),
     viewport_fixed: std::collections::HashSet<obscura_dom::tree::NodeId>,
     sticky: crate::StickyLayout,
+    scroll_tree: crate::dom::ScrollTree,
     selected_images: HashMap<obscura_dom::tree::NodeId, SelectedImage>,
     svg_fonts: Arc<usvg::fontdb::Database>,
     layout: crate::DomLayout,
@@ -350,7 +393,10 @@ impl PreparedRender {
     pub fn clamp_scroll(&self, requested: (f32, f32)) -> (f32, f32) {
         let clamp_axis = |requested: f32, content: f32, viewport: f32| {
             if requested.is_finite() {
-                requested.clamp(0.0, (content - viewport).max(0.0))
+                crate::quantize_scroll_value(requested, 1.0).clamp(
+                    0.0,
+                    crate::quantized_scroll_range(content, viewport, 1.0),
+                )
             } else {
                 0.0
             }
@@ -359,6 +405,173 @@ impl PreparedRender {
             clamp_axis(requested.0, self.content_size.0, self.viewport.0),
             clamp_axis(requested.1, self.content_size.1, self.viewport.1),
         )
+    }
+
+    /// Element scroll containers in this prepared layout, in stable DOM order.
+    pub fn scroll_container_nodes(&self) -> impl Iterator<Item = obscura_dom::tree::NodeId> + '_ {
+        self.scroll_tree
+            .containers
+            .iter()
+            .skip(1)
+            .filter_map(|container| container.node)
+    }
+
+    /// Resolve persistent NodeId-keyed offsets into this layout's dense scroll
+    /// topology. Unknown/removed nodes are ignored; every retained offset is
+    /// clamped against the final local scrolling overflow.
+    pub fn resolve_scroll_state(
+        &self,
+        tree: &DomTree,
+        requested_root: (f32, f32),
+        requested_elements: &HashMap<obscura_dom::tree::NodeId, (f32, f32)>,
+    ) -> ResolvedScrollState {
+        let root = self.clamp_scroll(requested_root);
+        let mut offsets = vec![(0.0, 0.0); self.scroll_tree.containers.len()];
+        offsets[0] = root;
+        for (index, container) in self.scroll_tree.containers.iter().enumerate().skip(1) {
+            let requested = container
+                .node
+                .and_then(|node| requested_elements.get(&node).copied())
+                .unwrap_or((0.0, 0.0));
+            let clamp = |value: f32, max: f32| {
+                if value.is_finite() {
+                    crate::quantize_scroll_value(value, 1.0).clamp(0.0, max)
+                } else {
+                    0.0
+                }
+            };
+            offsets[index] = (
+                clamp(requested.0, container.max_offset.0),
+                clamp(requested.1, container.max_offset.1),
+            );
+        }
+
+        let mut cumulative = vec![(0.0, 0.0); offsets.len()];
+        cumulative[0] = (-root.0, -root.1);
+        for index in 1..offsets.len() {
+            let container = self.scroll_tree.containers[index];
+            let inherited = container
+                .parent
+                .map(|parent| cumulative[parent.index()])
+                .unwrap_or((0.0, 0.0));
+            cumulative[index] = (
+                inherited.0 - offsets[index].0,
+                inherited.1 - offsets[index].1,
+            );
+        }
+
+        let node_len = self.scroll_tree.movement_owner.len();
+        let mut node_movement = vec![(0.0, 0.0); node_len];
+        for (index, owner) in self.scroll_tree.movement_owner.iter().copied().enumerate() {
+            if let Some(owner) = owner {
+                node_movement[index] = cumulative[owner.index()];
+            }
+        }
+        // Stage 1 keeps the established root sticky behavior. Nested sticky is
+        // intentionally absent from ScrollTree until its constraints are made
+        // scroll-container-relative in Stage 2.
+        for (id, sticky) in self.sticky.translations(self.viewport, root) {
+            if let Some(movement) = node_movement.get_mut(id.index()) {
+                movement.0 += sticky.0;
+                movement.1 += sticky.1;
+            }
+        }
+
+        let mut inherited_clips = vec![None; node_len];
+        fn resolve_clips(
+            tree: &DomTree,
+            laid: &crate::DomLayout,
+            movement: &[(f32, f32)],
+            id: obscura_dom::tree::NodeId,
+            inherited: Option<crate::dom::OverflowClip>,
+            out: &mut [Option<crate::dom::OverflowClip>],
+        ) {
+            if let Some(slot) = out.get_mut(id.index()) {
+                *slot = inherited;
+            }
+            let next = match (laid.styles.get(&id), laid.rects.get(&id)) {
+                (Some(style), Some(rect))
+                    if style.overflow_hidden && !style.overflow_propagated_to_viewport =>
+                {
+                    let authored = laid.translates.get(&id).copied().unwrap_or((0.0, 0.0));
+                    let scroll = movement.get(id.index()).copied().unwrap_or((0.0, 0.0));
+                    let own = crate::dom::OverflowClip::for_box(
+                        rect,
+                        style,
+                        authored.0 + scroll.0,
+                        authored.1 + scroll.1,
+                    );
+                    Some(match inherited {
+                        Some(clip) => clip.intersect(own),
+                        None => own,
+                    })
+                }
+                _ => inherited,
+            };
+            for child in crate::dom::rendered_children(tree, id) {
+                resolve_clips(tree, laid, movement, child, next, out);
+            }
+        }
+        if let Some(root_node) = tree
+            .descendants(tree.document())
+            .into_iter()
+            .find(|id| tree.get_node(*id).is_some_and(|node| node.is_element()))
+        {
+            resolve_clips(
+                tree,
+                &self.layout,
+                &node_movement,
+                root_node,
+                None,
+                &mut inherited_clips,
+            );
+        }
+
+        ResolvedScrollState {
+            root_offset: root,
+            container_offsets: offsets,
+            node_movement,
+            inherited_clips,
+        }
+    }
+
+    pub fn element_scroll_metrics(
+        &self,
+        id: obscura_dom::tree::NodeId,
+        state: &ResolvedScrollState,
+    ) -> Option<ElementScrollMetrics> {
+        let client = self.client_size(id)?;
+        let sid = self
+            .scroll_tree
+            .node_container
+            .get(id.index())
+            .copied()
+            .flatten();
+        let Some(sid) = sid else {
+            let content = self
+                .scroll_tree
+                .node_content_size
+                .get(id.index())
+                .copied()
+                .flatten()?;
+            return Some(ElementScrollMetrics {
+                client_size: client,
+                content_size: content,
+                offset: (0.0, 0.0),
+                max_offset: (0.0, 0.0),
+            });
+        };
+        let container = self.scroll_tree.containers[sid.index()];
+        Some(ElementScrollMetrics {
+            client_size: container.client_size,
+            content_size: container.content_size,
+            offset: state
+                .container_offsets
+                .get(sid.index())
+                .copied()
+                .unwrap_or((0.0, 0.0)),
+            max_offset: container.max_offset,
+        })
     }
 
     /// Axis-aligned bounds of the transformed border box in immutable document
@@ -797,6 +1010,21 @@ impl PreparedRender {
         Some(rect)
     }
 
+    /// Border box in the viewport using a pre-resolved root + element scroll
+    /// snapshot. This is the production CSSOM path; the tuple-only method
+    /// above remains for compatibility callers that cannot own element state.
+    pub fn viewport_rect_with_scroll(
+        &self,
+        id: obscura_dom::tree::NodeId,
+        scroll: &ResolvedScrollState,
+    ) -> Option<crate::Rect> {
+        let mut rect = self.document_rect(id)?;
+        let movement = scroll.movement_for(id);
+        rect.x += movement.0;
+        rect.y += movement.1;
+        Some(rect)
+    }
+
     /// Every CSS border-box fragment in the current root viewport. Ordinary
     /// inlines can have one fragment per line; all other boxes expose their
     /// single border box. Keeping this separate from the bounding union is
@@ -819,6 +1047,39 @@ impl PreparedRender {
             let sticky = self.sticky.translation_for(id, self.viewport, scroll);
             (sticky.0 - scroll.0, sticky.1 - scroll.1)
         };
+        Some(
+            source
+                .into_iter()
+                .map(|rect| {
+                    let rect = self
+                        .layout
+                        .transforms
+                        .get(&id)
+                        .copied()
+                        .map(|transform| transform.map_rect(rect))
+                        .unwrap_or(rect);
+                    crate::Rect {
+                        x: rect.x + movement.0,
+                        y: rect.y + movement.1,
+                        ..rect
+                    }
+                })
+                .collect(),
+        )
+    }
+
+    pub fn viewport_client_rects_with_scroll(
+        &self,
+        id: obscura_dom::tree::NodeId,
+        scroll: &ResolvedScrollState,
+    ) -> Option<Vec<crate::Rect>> {
+        let source = self
+            .layout
+            .inline_fragments
+            .get(&id)
+            .cloned()
+            .or_else(|| self.layout.rects.get(&id).copied().map(|rect| vec![rect]))?;
+        let movement = scroll.movement_for(id);
         Some(
             source
                 .into_iter()
@@ -1061,6 +1322,7 @@ pub fn prepare_dom_with_dynamic_fonts(
     let content_size = laid.scrolling_content_size(tree, viewport);
     let viewport_fixed = laid.viewport_fixed_nodes(tree);
     let sticky = laid.root_sticky_layout(tree, viewport);
+    let scroll_tree = laid.scroll_tree(tree, viewport, content_size, &viewport_fixed);
     let root_font_size = tree
         .query_selector("html")
         .ok()
@@ -1075,6 +1337,7 @@ pub fn prepare_dom_with_dynamic_fonts(
         content_size,
         viewport_fixed,
         sticky,
+        scroll_tree,
         selected_images,
         svg_fonts,
         layout: laid,
@@ -1097,6 +1360,41 @@ pub fn paint_prepared(
         prepared.viewport,
         prepared.base_url.as_deref(),
         scroll,
+        None,
+        pixmap,
+        resources,
+        &prepared.selected_images,
+        &prepared.svg_fonts,
+        prepared.content_size,
+        &prepared.viewport_fixed,
+        &prepared.sticky,
+        &mut prepared.layout,
+        None,
+        None,
+        None,
+        None,
+        None,
+        (0.0, 0.0),
+    )
+}
+
+/// Paint from the same resolved root + element scroll snapshot used by CSSOM
+/// geometry. No layout or scroll-tree work is performed by this call.
+pub fn paint_prepared_with_scroll(
+    tree: &DomTree,
+    prepared: &mut PreparedRender,
+    resources: &mut RenderResourceCache,
+    scroll: &ResolvedScrollState,
+) -> Option<Pixmap> {
+    let (w, h) = (prepared.viewport.0 as u32, prepared.viewport.1 as u32);
+    let mut pixmap = Pixmap::new(w, h)?;
+    pixmap.fill(Color::WHITE);
+    paint_laid_dom_scrolled(
+        tree,
+        prepared.viewport,
+        prepared.base_url.as_deref(),
+        scroll.root_offset(),
+        Some(scroll),
         pixmap,
         resources,
         &prepared.selected_images,
@@ -1217,6 +1515,7 @@ fn paint_laid_dom_scrolled(
     viewport: (f32, f32),
     base_url: Option<&str>,
     scroll: (f32, f32),
+    resolved_scroll: Option<&ResolvedScrollState>,
     mut pixmap: Pixmap,
     image_cache: &mut RenderResourceCache,
     selected_images: &HashMap<obscura_dom::tree::NodeId, SelectedImage>,
@@ -1232,16 +1531,26 @@ fn paint_laid_dom_scrolled(
     clip_scope_root: Option<obscura_dom::tree::NodeId>,
     surface_offset: (f32, f32),
 ) -> Option<Pixmap> {
-    let scroll_state = ScrollPaintState::new(
-        tree,
-        viewport,
-        scroll,
-        content_size,
-        viewport_fixed,
-        sticky,
-        clip_scope_root,
-        surface_offset,
-    );
+    let scroll_state = match resolved_scroll {
+        Some(resolved) => ScrollPaintState::from_resolved(
+            tree,
+            viewport,
+            viewport_fixed,
+            resolved,
+            clip_scope_root,
+            surface_offset,
+        ),
+        None => ScrollPaintState::new(
+            tree,
+            viewport,
+            scroll,
+            content_size,
+            viewport_fixed,
+            sticky,
+            clip_scope_root,
+            surface_offset,
+        ),
+    };
     let root_font_size = tree
         .query_selector("html")
         .ok()
@@ -1410,6 +1719,7 @@ fn paint_laid_dom_scrolled(
                 viewport,
                 base_url,
                 scroll,
+                resolved_scroll,
                 pixmap,
                 image_cache,
                 selected_images,
@@ -1490,6 +1800,7 @@ fn paint_laid_dom_scrolled(
                     viewport,
                     base_url,
                     scroll,
+                    resolved_scroll,
                     pixmap,
                     image_cache,
                     selected_images,
@@ -1558,6 +1869,7 @@ fn paint_laid_dom_scrolled(
                 viewport,
                 base_url,
                 scroll,
+                resolved_scroll,
                 layer,
                 image_cache,
                 selected_images,
@@ -1623,6 +1935,7 @@ fn paint_laid_dom_scrolled(
                 viewport,
                 base_url,
                 scroll,
+                resolved_scroll,
                 layer,
                 image_cache,
                 selected_images,
@@ -2488,6 +2801,7 @@ struct ScrollPaintState<'a> {
     viewport_fixed: &'a std::collections::HashSet<obscura_dom::tree::NodeId>,
     sticky: std::collections::HashMap<obscura_dom::tree::NodeId, (f32, f32)>,
     sticky_clips: std::collections::HashMap<obscura_dom::tree::NodeId, (f32, f32)>,
+    resolved: Option<&'a ResolvedScrollState>,
     clip_scope_root: Option<obscura_dom::tree::NodeId>,
     surface_offset: (f32, f32),
     active: bool,
@@ -2505,16 +2819,18 @@ impl<'a> ScrollPaintState<'a> {
         surface_offset: (f32, f32),
     ) -> Self {
         let scroll_x = if requested.0.is_finite() {
-            requested
-                .0
-                .clamp(0.0, (content.0 - viewport.0).max(0.0))
+            crate::quantize_scroll_value(requested.0, 1.0).clamp(
+                0.0,
+                crate::quantized_scroll_range(content.0, viewport.0, 1.0),
+            )
         } else {
             0.0
         };
         let scroll_y = if requested.1.is_finite() {
-            requested
-                .1
-                .clamp(0.0, (content.1 - viewport.1).max(0.0))
+            crate::quantize_scroll_value(requested.1, 1.0).clamp(
+                0.0,
+                crate::quantized_scroll_range(content.1, viewport.1, 1.0),
+            )
         } else {
             0.0
         };
@@ -2528,6 +2844,7 @@ impl<'a> ScrollPaintState<'a> {
                 viewport_fixed,
                 sticky: std::collections::HashMap::new(),
                 sticky_clips: std::collections::HashMap::new(),
+                resolved: None,
                 clip_scope_root,
                 surface_offset,
                 active,
@@ -2543,9 +2860,32 @@ impl<'a> ScrollPaintState<'a> {
             viewport_fixed,
             sticky,
             sticky_clips,
+            resolved: None,
             clip_scope_root,
             surface_offset,
             active,
+        }
+    }
+
+    fn from_resolved(
+        tree: &'a DomTree,
+        viewport: (f32, f32),
+        viewport_fixed: &'a std::collections::HashSet<obscura_dom::tree::NodeId>,
+        resolved: &'a ResolvedScrollState,
+        clip_scope_root: Option<obscura_dom::tree::NodeId>,
+        surface_offset: (f32, f32),
+    ) -> Self {
+        Self {
+            tree,
+            viewport,
+            scroll: resolved.root_offset(),
+            viewport_fixed,
+            sticky: std::collections::HashMap::new(),
+            sticky_clips: std::collections::HashMap::new(),
+            resolved: Some(resolved),
+            clip_scope_root,
+            surface_offset,
+            active: true,
         }
     }
 
@@ -2555,6 +2895,13 @@ impl<'a> ScrollPaintState<'a> {
         id: obscura_dom::tree::NodeId,
     ) -> (f32, f32) {
         let base = laid.translates.get(&id).copied().unwrap_or((0.0, 0.0));
+        if let Some(resolved) = self.resolved {
+            let movement = resolved.movement_for(id);
+            return (
+                base.0 + movement.0 + self.surface_offset.0,
+                base.1 + movement.1 + self.surface_offset.1,
+            );
+        }
         if !self.active || self.viewport_fixed.contains(&id) {
             return (base.0 + self.surface_offset.0, base.1 + self.surface_offset.1);
         }
@@ -2614,6 +2961,11 @@ impl<'a> ScrollPaintState<'a> {
                 }
                 return clip;
             }
+        }
+        if let Some(resolved) = self.resolved {
+            let mut clip = resolved.inherited_clip_for(id)?;
+            clip.translate(self.surface_offset.0, self.surface_offset.1);
+            return Some(clip);
         }
         let mut clip = laid.clip_rects.get(&id).copied().flatten()?;
         if self.active && !self.viewport_fixed.contains(&id) {
@@ -3376,6 +3728,17 @@ pub fn screenshot_prepared(
     scroll: (f32, f32),
 ) -> Option<Vec<u8>> {
     paint_prepared(tree, prepared, resources, scroll)?
+        .encode_png()
+        .ok()
+}
+
+pub fn screenshot_prepared_with_scroll(
+    tree: &DomTree,
+    prepared: &mut PreparedRender,
+    resources: &mut RenderResourceCache,
+    scroll: &ResolvedScrollState,
+) -> Option<Vec<u8>> {
+    paint_prepared_with_scroll(tree, prepared, resources, scroll)?
         .encode_png()
         .ok()
 }
@@ -9427,6 +9790,92 @@ mod tests {
         assert_eq!(
             *loads.lock().expect("dynamic font loads"),
             vec!["https://example.test/fonts/fixture.ttf".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolved_nested_scroll_keeps_owner_and_clip_stationary_while_pixels_move() {
+        let tree = parse_html(
+            r#"<html style="margin:0"><body style="margin:0">
+                <div id="outer" style="box-sizing:border-box;width:120px;height:100px;
+                     border:4px solid red;overflow:hidden;position:relative;background:red">
+                  <div id="inner" style="width:220px;height:200px;overflow:hidden;
+                       position:relative;background:blue">
+                    <div id="target" style="position:absolute;left:300px;top:280px;
+                         width:30px;height:20px;background:lime"></div>
+                  </div>
+                </div>
+            </body></html>"#,
+        );
+        let outer = tree.get_element_by_id("outer").expect("outer");
+        let inner = tree.get_element_by_id("inner").expect("inner");
+        let target = tree.get_element_by_id("target").expect("target");
+        let mut resources = RenderResourceCache::with_loader(|_url: &str| None);
+        let mut prepared = prepare_dom(&tree, (360.0, 240.0), None, &mut resources)
+            .expect("prepared render");
+        let top_state = prepared.resolve_scroll_state(&tree, (0.0, 0.0), &HashMap::new());
+        let top_outer = prepared
+            .viewport_rect_with_scroll(outer, &top_state)
+            .expect("top outer");
+        let top_target = prepared
+            .viewport_rect_with_scroll(target, &top_state)
+            .expect("top target");
+        let top = paint_prepared_with_scroll(&tree, &mut prepared, &mut resources, &top_state)
+            .expect("top paint");
+
+        let offsets = HashMap::from([(outer, (9999.0, 9999.0)), (inner, (9999.0, 9999.0))]);
+        let scrolled_state = prepared.resolve_scroll_state(&tree, (0.0, 0.0), &offsets);
+        let outer_metrics = prepared
+            .element_scroll_metrics(outer, &scrolled_state)
+            .expect("outer metrics");
+        let inner_metrics = prepared
+            .element_scroll_metrics(inner, &scrolled_state)
+            .expect("inner metrics");
+        assert_eq!(outer_metrics.client_size, (112.0, 92.0));
+        assert_eq!(outer_metrics.content_size, (220.0, 200.0));
+        assert_eq!(outer_metrics.offset, (108.0, 108.0));
+        assert_eq!(inner_metrics.content_size, (330.0, 300.0));
+        assert_eq!(inner_metrics.offset, (110.0, 100.0));
+
+        let scrolled_outer = prepared
+            .viewport_rect_with_scroll(outer, &scrolled_state)
+            .expect("scrolled outer");
+        let scrolled_target = prepared
+            .viewport_rect_with_scroll(target, &scrolled_state)
+            .expect("scrolled target");
+        assert_eq!(scrolled_outer, top_outer, "scroller chrome must not move with its content");
+        assert_eq!(scrolled_target.x, top_target.x - 218.0);
+        assert_eq!(scrolled_target.y, top_target.y - 208.0);
+
+        let scrolled = paint_prepared_with_scroll(
+            &tree,
+            &mut prepared,
+            &mut resources,
+            &scrolled_state,
+        )
+        .expect("scrolled paint");
+        let repeated = paint_prepared_with_scroll(
+            &tree,
+            &mut prepared,
+            &mut resources,
+            &scrolled_state,
+        )
+        .expect("repeated paint");
+        assert_ne!(top.data(), scrolled.data());
+        assert_eq!(scrolled.data(), repeated.data(), "scroll deltas must not accumulate");
+        let pixel = |pixmap: &Pixmap, x: u32, y: u32| {
+            pixmap.pixels()[(y * pixmap.width() + x) as usize]
+        };
+        assert_eq!(pixel(&top, 2, 2), pixel(&scrolled, 2, 2), "outer border moved");
+        assert_eq!(
+            pixel(&top, 125, 50),
+            pixel(&scrolled, 125, 50),
+            "content escaped the stationary outer clip"
+        );
+        assert_ne!(
+            pixel(&top, 95, 85),
+            pixel(&scrolled, 95, 85),
+            "newly visible nested content did not move into the scrollport"
         );
     }
 }

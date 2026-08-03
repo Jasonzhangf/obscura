@@ -282,6 +282,49 @@ pub struct DomLayout {
     pub(crate) generated_boxes: Vec<GeneratedBox>,
 }
 
+/// Dense identifier for one scrolling area in a prepared render. Index zero
+/// is always the root viewport; element scroll containers follow in DOM order.
+/// The ids are rebuild-local and must never be persisted by an embedding
+/// runtime (persist element offsets by `NodeId` instead).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ScrollId(pub(crate) u32);
+
+impl ScrollId {
+    pub(crate) const ROOT: Self = Self(0);
+
+    pub(crate) fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ScrollContainer {
+    pub node: Option<NodeId>,
+    pub parent: Option<ScrollId>,
+    pub client_size: (f32, f32),
+    pub content_size: (f32, f32),
+    pub max_offset: (f32, f32),
+}
+
+/// Immutable scrolling topology derived from one final layout. Hot paint and
+/// geometry paths index the two node vectors directly by `NodeId`; they never
+/// walk ancestors or hash a node to discover which scrolling area moves it.
+#[derive(Debug, Clone)]
+pub(crate) struct ScrollTree {
+    pub containers: Vec<ScrollContainer>,
+    /// Scrolling area established by this node, if any.
+    pub node_container: Vec<Option<ScrollId>>,
+    /// CSSOM scrolling-overflow size for every node with a layout box. This is
+    /// populated even for `overflow:visible` and `overflow:clip`: those values
+    /// expose real `scrollWidth`/`scrollHeight`, although only an actual scroll
+    /// container receives a `ScrollId` and can change its offset.
+    pub node_content_size: Vec<Option<(f32, f32)>>,
+    /// Area whose content movement applies to this node's own box. A scroll
+    /// container's border/background therefore retain the parent's owner,
+    /// while its descendants use the container itself.
+    pub movement_owner: Vec<Option<ScrollId>>,
+}
+
 /// Root-scroll sticky-position constraints captured from normal-flow layout.
 ///
 /// The normal boxes stay immutable in the layout cache. A scroll offset is
@@ -470,6 +513,283 @@ impl DomLayout {
         }
 
         fixed
+    }
+
+    /// Build the dense element-scroll topology and local scrolling overflow.
+    ///
+    /// This is deliberately one pair of DOM-order passes. The first assigns
+    /// each box to its nearest scrolling-content owner; the second unions each
+    /// box into exactly that owner. A nested scroller's own border box thus
+    /// contributes to the outer area, while its hidden inner overflow only
+    /// contributes to the nested area.
+    pub(crate) fn scroll_tree(
+        &self,
+        tree: &DomTree,
+        viewport: (f32, f32),
+        root_content_size: (f32, f32),
+        viewport_fixed: &HashSet<NodeId>,
+    ) -> ScrollTree {
+        let nodes = tree.descendants(tree.document());
+        let node_capacity = nodes
+            .iter()
+            .map(|id| id.index())
+            .max()
+            .map_or(0, |max| max + 1);
+        let mut node_container = vec![None; node_capacity];
+        let mut movement_owner = vec![None; node_capacity];
+        let mut node_content_size = vec![None; node_capacity];
+        let mut containers = vec![ScrollContainer {
+            node: None,
+            parent: None,
+            client_size: viewport,
+            content_size: root_content_size,
+            max_offset: (
+                crate::quantized_scroll_range(root_content_size.0, viewport.0, 1.0),
+                crate::quantized_scroll_range(root_content_size.1, viewport.1, 1.0),
+            ),
+        }];
+
+        // `transforms` is accumulated top-down, so a non-translation matrix on
+        // the candidate identifies either its own transform or an affine
+        // ancestor. Stage 1 cannot insert scroll movement in that coordinate
+        // space without making geometry and pixels disagree. A transformed
+        // *descendant* is safe: its visual overflow is measured below and the
+        // scrolling translation applies to the already transformed subtree.
+        let mut affine_coordinate_space = vec![false; node_capacity];
+        for &id in &nodes {
+            if let Some(slot) = affine_coordinate_space.get_mut(id.index()) {
+                *slot = self
+                    .transforms
+                    .get(&id)
+                    .is_some_and(|transform| !transform.is_translation());
+            }
+        }
+
+        let root = nodes
+            .iter()
+            .copied()
+            .find(|id| tree.get_node(*id).is_some_and(|node| node.is_element()));
+        fn assign(
+            laid: &DomLayout,
+            tree: &DomTree,
+            id: NodeId,
+            inherited_owner: Option<ScrollId>,
+            viewport_fixed: &HashSet<NodeId>,
+            affine_coordinate_space: &[bool],
+            containers: &mut Vec<ScrollContainer>,
+            node_container: &mut [Option<ScrollId>],
+            movement_owner: &mut [Option<ScrollId>],
+        ) {
+            let fixed = viewport_fixed.contains(&id);
+            let parent_fixed = tree
+                .get_node(id)
+                .and_then(|node| node.parent)
+                .is_some_and(|parent| viewport_fixed.contains(&parent));
+            // Only the boundary that enters the viewport-fixed coordinate
+            // space drops root movement. Descendants inherit that zero-based
+            // space and may establish ordinary nested scrolling areas.
+            let starts_viewport_fixed = fixed && !parent_fixed;
+            let owner = if starts_viewport_fixed {
+                None
+            } else {
+                inherited_owner
+            };
+            if let Some(slot) = movement_owner.get_mut(id.index()) {
+                *slot = owner;
+            }
+
+            let style = laid.styles.get(&id);
+            let rect = laid.rects.get(&id).copied();
+            let establishes = style.is_some_and(|style| {
+                    style.overflow_scroll_container && !style.overflow_propagated_to_viewport
+                })
+                && rect.is_some()
+                && !affine_coordinate_space
+                    .get(id.index())
+                    .copied()
+                    .unwrap_or(false);
+            let child_owner = if establishes {
+                let style = style.expect("scroll container style");
+                let rect = rect.expect("scroll container rect");
+                let client = (
+                    (rect.width - style.border.left - style.border.right).max(0.0),
+                    (rect.height - style.border.top - style.border.bottom).max(0.0),
+                );
+                let sid = ScrollId(containers.len() as u32);
+                containers.push(ScrollContainer {
+                    node: Some(id),
+                    parent: owner,
+                    client_size: client,
+                    content_size: client,
+                    max_offset: (0.0, 0.0),
+                });
+                if let Some(slot) = node_container.get_mut(id.index()) {
+                    *slot = Some(sid);
+                }
+                Some(sid)
+            } else {
+                owner
+            };
+
+            for child in rendered_children(tree, id) {
+                assign(
+                    laid,
+                    tree,
+                    child,
+                    child_owner,
+                    viewport_fixed,
+                    affine_coordinate_space,
+                    containers,
+                    node_container,
+                    movement_owner,
+                );
+            }
+        }
+        if let Some(root) = root {
+            assign(
+                self,
+                tree,
+                root,
+                Some(ScrollId::ROOT),
+                viewport_fixed,
+                &affine_coordinate_space,
+                &mut containers,
+                &mut node_container,
+                &mut movement_owner,
+            );
+        }
+
+        // Compute scrolling overflow for every boxed node in one reverse pass.
+        // A clipping/scrolling child contributes only its own border box to an
+        // ancestor, while still exposing its complete local overflow through
+        // CSSOM. Visible descendants propagate their union upward.
+        let mut overflow_bounds = vec![None; node_capacity];
+        for &id in nodes.iter().rev() {
+            let Some(rect) = self.rects.get(&id).copied() else {
+                continue;
+            };
+            let style = self.styles.get(&id);
+            let visual = |rect: Rect| {
+                self.transforms
+                    .get(&id)
+                    .copied()
+                    .map(|transform| transform.map_rect(rect))
+                    .unwrap_or(rect)
+            };
+            let padding_rect = style.map_or(rect, |style| Rect {
+                x: rect.x + style.border.left,
+                y: rect.y + style.border.top,
+                width: (rect.width - style.border.left - style.border.right).max(0.0),
+                height: (rect.height - style.border.top - style.border.bottom).max(0.0),
+            });
+            let visual_padding = visual(padding_rect);
+            let mut local = visual_padding;
+            for child in rendered_children(tree, id) {
+                let Some(child_overflow) = overflow_bounds
+                    .get(child.index())
+                    .copied()
+                    .flatten()
+                else {
+                    continue;
+                };
+                let contribution = if let Some(style) = self.styles.get(&child).filter(|style| {
+                    style.overflow_hidden && !style.overflow_propagated_to_viewport
+                }) {
+                    let border_box = self.rects
+                        .get(&child)
+                        .copied()
+                        .map(|rect| {
+                            self.transforms
+                                .get(&child)
+                                .copied()
+                                .map(|transform| transform.map_rect(rect))
+                                .unwrap_or(rect)
+                        })
+                        .unwrap_or(child_overflow);
+                    let x0 = if style.clips_overflow_x() {
+                        border_box.x
+                    } else {
+                        child_overflow.x
+                    };
+                    let x1 = if style.clips_overflow_x() {
+                        border_box.x + border_box.width
+                    } else {
+                        child_overflow.x + child_overflow.width
+                    };
+                    let y0 = if style.clips_overflow_y() {
+                        border_box.y
+                    } else {
+                        child_overflow.y
+                    };
+                    let y1 = if style.clips_overflow_y() {
+                        border_box.y + border_box.height
+                    } else {
+                        child_overflow.y + child_overflow.height
+                    };
+                    Rect {
+                        x: x0,
+                        y: y0,
+                        width: (x1 - x0).max(0.0),
+                        height: (y1 - y0).max(0.0),
+                    }
+                } else {
+                    child_overflow
+                };
+                local = local.union(&contribution);
+            }
+            let mut content = (
+                (local.x + local.width - visual_padding.x)
+                    .max(visual_padding.width),
+                (local.y + local.height - visual_padding.y)
+                    .max(visual_padding.height),
+            );
+            // Scroll containers include trailing end padding in their
+            // scrolling area. Visible/clip boxes expose descendant overflow
+            // but, matching Chromium, do not append that trailing padding.
+            if let Some(style) = style.filter(|style| style.overflow_scroll_container) {
+                if content.0 > visual_padding.width {
+                    content.0 += style.padding.right;
+                }
+                if content.1 > visual_padding.height {
+                    content.1 += style.padding.bottom;
+                }
+            }
+            if let Some(slot) = node_content_size.get_mut(id.index()) {
+                *slot = Some(if style.is_some_and(|style| style.ignores_used_box_sizes()) {
+                    (0.0, 0.0)
+                } else {
+                    content
+                });
+            }
+            if let Some(slot) = overflow_bounds.get_mut(id.index()) {
+                *slot = Some(local);
+            }
+        }
+        for container in containers.iter_mut().skip(1) {
+            container.content_size = container
+                .node
+                .and_then(|node| node_content_size.get(node.index()).copied().flatten())
+                .unwrap_or(container.client_size);
+            container.max_offset = (
+                crate::quantized_scroll_range(
+                    container.content_size.0,
+                    container.client_size.0,
+                    1.0,
+                ),
+                crate::quantized_scroll_range(
+                    container.content_size.1,
+                    container.client_size.1,
+                    1.0,
+                ),
+            );
+        }
+
+        ScrollTree {
+            containers,
+            node_container,
+            node_content_size,
+            movement_owner,
+        }
     }
 
     /// Root scrolling overflow in CSS pixels. This is the union of laid-out

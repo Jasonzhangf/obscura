@@ -93,9 +93,11 @@ mod image_capability_tests {
 mod paint;
 #[cfg(feature = "paint")]
 pub use paint::{
-    paint_dom, paint_dom_scrolled, paint_prepared, prepare_dom, prepare_dom_with_dynamic_fonts,
-    screenshot_png, screenshot_png_scrolled, screenshot_prepared, DynamicFontFace,
-    PreparedRender, RenderResourceCache, RenderResourceLoader, SelectedImage,
+    paint_dom, paint_dom_scrolled, paint_prepared, paint_prepared_with_scroll, prepare_dom,
+    prepare_dom_with_dynamic_fonts, screenshot_png, screenshot_png_scrolled,
+    screenshot_prepared, screenshot_prepared_with_scroll, DynamicFontFace,
+    ElementScrollMetrics, PreparedRender, RenderResourceCache, RenderResourceLoader,
+    ResolvedScrollState, SelectedImage,
 };
 
 // Real inline text layout (cosmic-text) lives behind the paint feature; the
@@ -355,6 +357,36 @@ impl Rect {
         let y1 = (self.y + self.height).max(other.y + other.height);
         Rect { x: x0, y: y0, width: x1 - x0, height: y1 - y0 }
     }
+}
+
+/// Snap a CSS scrolling value to the raster device-pixel grid.
+///
+/// Captures currently use one device pixel per CSS pixel, but keeping the
+/// scale explicit makes the same rule usable when page-level device scale is
+/// introduced. CSSOM integer extents and effective offsets must share this
+/// quantization or a fractional range can move geometry without moving a
+/// screenshot pixel.
+#[doc(hidden)]
+pub fn quantize_scroll_value(value: f32, device_scale_factor: f32) -> f32 {
+    if !value.is_finite() {
+        return 0.0;
+    }
+    let scale = if device_scale_factor.is_finite() && device_scale_factor > 0.0 {
+        device_scale_factor
+    } else {
+        1.0
+    };
+    (value * scale).round() / scale
+}
+
+pub(crate) fn quantized_scroll_range(
+    content: f32,
+    client: f32,
+    device_scale_factor: f32,
+) -> f32 {
+    (quantize_scroll_value(content, device_scale_factor)
+        - quantize_scroll_value(client, device_scale_factor))
+    .max(0.0)
 }
 
 /// Per-edge box values (margin / padding / border) in CSS pixels.
