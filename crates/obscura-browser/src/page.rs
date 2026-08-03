@@ -402,6 +402,106 @@ fn rebase_css_urls(css: &str, base: &url::Url) -> String {
     out
 }
 
+/// Extract network-backed `url(...)` assets while respecting CSS comments and
+/// strings. Linked sheets have already been rebased before materialization;
+/// inline declarations are resolved against the document base here.
+fn css_resource_urls(css: &str, base: &url::Url) -> Vec<String> {
+    let mut urls = Vec::new();
+    let mut index = 0usize;
+    while index < css.len() {
+        let rest = &css[index..];
+        if rest.starts_with("/*") {
+            if let Some(end) = rest[2..].find("*/") {
+                index += end + 4;
+            } else {
+                break;
+            }
+            continue;
+        }
+        let Some(first) = rest.chars().next() else { break };
+        if first == '"' || first == '\'' {
+            let quote = first;
+            let mut escaped = false;
+            let mut length = quote.len_utf8();
+            for ch in rest[quote.len_utf8()..].chars() {
+                length += ch.len_utf8();
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == quote {
+                    break;
+                }
+            }
+            index += length;
+            continue;
+        }
+        if !rest.get(..4).is_some_and(|prefix| prefix.eq_ignore_ascii_case("url(")) {
+            index += first.len_utf8();
+            continue;
+        }
+        let mut quote = None;
+        let mut escaped = false;
+        let mut end = None;
+        for (offset, ch) in rest[4..].char_indices() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            match quote {
+                Some(open) if ch == open => quote = None,
+                Some(_) => {}
+                None if ch == '"' || ch == '\'' => quote = Some(ch),
+                None if ch == ')' => {
+                    end = Some(4 + offset);
+                    break;
+                }
+                None => {}
+            }
+        }
+        let Some(end) = end else { break };
+        let raw = rest[4..end].trim();
+        let value = if raw.len() >= 2
+            && ((raw.starts_with('"') && raw.ends_with('"'))
+                || (raw.starts_with('\'') && raw.ends_with('\'')))
+        {
+            &raw[1..raw.len() - 1]
+        } else {
+            raw
+        };
+        if !value.is_empty()
+            && !value.starts_with('#')
+            && !value.starts_with("data:")
+            && !value.contains("var(")
+        {
+            if let Ok(mut url) = base.join(value) {
+                url.set_fragment(None);
+                if matches!(url.scheme(), "http" | "https") {
+                    urls.push(url.to_string());
+                }
+            }
+        }
+        index += end + 1;
+    }
+    urls
+}
+
+fn render_resource_type(url: &url::Url) -> ResourceType {
+    let path = url.path().to_ascii_lowercase();
+    if [".woff", ".woff2", ".ttf", ".otf", ".eot"]
+        .iter()
+        .any(|extension| path.ends_with(extension))
+    {
+        ResourceType::Font
+    } else {
+        ResourceType::Image
+    }
+}
+
 /// Pull leading `@import` rules out of a stylesheet. Returns each import target
 /// URL (skipping print-only and `prefers-color-scheme: dark` conditional
 /// imports, which must not apply in our light desktop context) plus the CSS
@@ -955,6 +1055,11 @@ impl Page {
     }
 
     async fn execute_scripts(&mut self) {
+        self.execute_scripts_with_module_budget(None).await;
+    }
+
+    async fn execute_scripts_with_module_budget(&mut self, module_budget_override: Option<u64>) {
+        let scripts_started = std::time::Instant::now();
         tracing::info!("execute_scripts called, js runtime exists: {}", self.js.is_some());
         // Soft deadline on the entire script-execution phase. Heavy SPAs
         // (GitHub, Linear, CodeSandbox) ship 50+ scripts and our serial
@@ -1280,13 +1385,19 @@ impl Page {
                     })
                 })
                 .unwrap_or(0);
-            let short_ms: u64 = std::env::var("OBSCURA_MODULE_BUDGET_MS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(3_000);
+            let short_ms: u64 = module_budget_override.unwrap_or_else(|| {
+                std::env::var("OBSCURA_MODULE_BUDGET_MS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(3_000)
+            });
             // A rendered body has hundreds of descendants; an unmounted Vite/Next
             // shell is <root> plus maybe a spinner.
-            if body_nodes > 50 { short_ms } else { script_deadline_ms }
+            if module_budget_override.is_some() || body_nodes > 50 {
+                short_ms
+            } else {
+                script_deadline_ms
+            }
         };
 
         enum ScheduledScript {
@@ -1294,8 +1405,21 @@ impl Page {
             Module {
                 prepared: obscura_js::runtime::PreparedModule,
                 url: Option<String>,
+                deadline: tokio::time::Instant,
+                started: std::time::Instant,
             },
         }
+
+        let remaining_budget_ms = |deadline: tokio::time::Instant| -> Option<u64> {
+            let remaining = deadline.checked_duration_since(tokio::time::Instant::now())?;
+            if remaining.is_zero() {
+                return None;
+            }
+            let millis = remaining.as_millis().saturating_add(u128::from(
+                remaining.subsec_nanos() % 1_000_000 != 0,
+            ));
+            Some(millis.min(u128::from(u64::MAX)) as u64)
+        };
 
         let execute_classic = |
             page: &mut Self,
@@ -1375,6 +1499,19 @@ impl Page {
                     }
                 }
                 ScriptKind::Module => {
+                    // This is one load+evaluation budget, not one allowance per
+                    // phase. Cap it by the page-wide script deadline as well.
+                    let module_started = std::time::Instant::now();
+                    let module_deadline = std::cmp::min(
+                        script_deadline,
+                        tokio::time::Instant::now()
+                            + tokio::time::Duration::from_millis(module_budget_ms),
+                    );
+                    let Some(prepare_budget_ms) = remaining_budget_ms(module_deadline) else {
+                        tracing::warn!("ES module budget exhausted before graph preparation");
+                        continue;
+                    };
+                    let prepare_started = std::time::Instant::now();
                     let (prepared, module_url) = if let Some(src) = &script.src {
                         let full_url = if src.starts_with("http://")
                             || src.starts_with("https://")
@@ -1390,9 +1527,17 @@ impl Page {
                         };
                         tracing::info!("Preparing ES module graph: {}", full_url);
                         let result = match &mut self.js {
-                            Some(js) => js.prepare_module(&full_url, module_budget_ms).await,
+                            Some(js) => js.prepare_module(&full_url, prepare_budget_ms).await,
                             None => continue,
                         };
+                        tracing::debug!(
+                            phase = "module-graph",
+                            module = %full_url,
+                            elapsed_ms = prepare_started.elapsed().as_millis(),
+                            budget_ms = prepare_budget_ms,
+                            success = result.is_ok(),
+                            "ES module phase complete",
+                        );
                         match result {
                             Ok(prepared) => (prepared, Some(full_url)),
                             Err(error) => {
@@ -1403,10 +1548,18 @@ impl Page {
                     } else {
                         let result = match &mut self.js {
                             Some(js) => js.prepare_inline_module(
-                                &script.inline, &script.base_url, module_budget_ms,
+                                &script.inline, &script.base_url, prepare_budget_ms,
                             ).await,
                             None => continue,
                         };
+                        tracing::debug!(
+                            phase = "module-graph",
+                            module = "<inline>",
+                            elapsed_ms = prepare_started.elapsed().as_millis(),
+                            budget_ms = prepare_budget_ms,
+                            success = result.is_ok(),
+                            "ES module phase complete",
+                        );
                         match result {
                             Ok(prepared) => (prepared, None),
                             Err(error) => {
@@ -1418,15 +1571,42 @@ impl Page {
                     let scheduled = ScheduledScript::Module {
                         prepared,
                         url: module_url,
+                        deadline: module_deadline,
+                        started: module_started,
                     };
                     if script.is_async {
-                        let ScheduledScript::Module { prepared, url } = scheduled else {
+                        let ScheduledScript::Module {
+                            prepared,
+                            url,
+                            deadline,
+                            started,
+                        } = scheduled else {
                             unreachable!();
                         };
+                        let Some(evaluation_budget_ms) = remaining_budget_ms(deadline) else {
+                            tracing::warn!(
+                                module = url.as_deref().unwrap_or("<inline>"),
+                                elapsed_ms = started.elapsed().as_millis(),
+                                "ES module exhausted its shared budget before evaluation",
+                            );
+                            continue;
+                        };
+                        let evaluation_started = std::time::Instant::now();
                         let result = match &mut self.js {
-                            Some(js) => js.evaluate_prepared_module(prepared, module_budget_ms).await,
+                            Some(js) => js
+                                .evaluate_prepared_module(prepared, evaluation_budget_ms)
+                                .await,
                             None => continue,
                         };
+                        tracing::debug!(
+                            phase = "module-evaluation",
+                            module = url.as_deref().unwrap_or("<inline>"),
+                            elapsed_ms = evaluation_started.elapsed().as_millis(),
+                            total_elapsed_ms = started.elapsed().as_millis(),
+                            budget_ms = evaluation_budget_ms,
+                            success = result.is_ok(),
+                            "ES module phase complete",
+                        );
                         if let Err(error) = result {
                             tracing::warn!("ES module evaluation error: {}", error);
                         } else if let Some(url) = url {
@@ -1454,11 +1634,36 @@ impl Page {
                     let fetched_script = fetched.remove(&index);
                     execute_classic(self, script, fetched_script);
                 }
-                ScheduledScript::Module { prepared, url } => {
+                ScheduledScript::Module {
+                    prepared,
+                    url,
+                    deadline,
+                    started,
+                } => {
+                    let Some(evaluation_budget_ms) = remaining_budget_ms(deadline) else {
+                        tracing::warn!(
+                            module = url.as_deref().unwrap_or("<inline>"),
+                            elapsed_ms = started.elapsed().as_millis(),
+                            "ES module exhausted its shared budget before post-parse evaluation",
+                        );
+                        continue;
+                    };
+                    let evaluation_started = std::time::Instant::now();
                     let result = match &mut self.js {
-                        Some(js) => js.evaluate_prepared_module(prepared, module_budget_ms).await,
+                        Some(js) => js
+                            .evaluate_prepared_module(prepared, evaluation_budget_ms)
+                            .await,
                         None => continue,
                     };
+                    tracing::debug!(
+                        phase = "module-evaluation",
+                        module = url.as_deref().unwrap_or("<inline>"),
+                        elapsed_ms = evaluation_started.elapsed().as_millis(),
+                        total_elapsed_ms = started.elapsed().as_millis(),
+                        budget_ms = evaluation_budget_ms,
+                        success = result.is_ok(),
+                        "ES module phase complete",
+                    );
                     if let Err(error) = result {
                         tracing::warn!("ES module evaluation error: {}", error);
                     } else if let Some(url) = url {
@@ -1548,6 +1753,12 @@ impl Page {
                 js.disarm_watchdog(token);
             }
         }
+        tracing::debug!(
+            phase = "script-execution-total",
+            elapsed_ms = scripts_started.elapsed().as_millis(),
+            budget_ms = script_deadline_ms,
+            "script execution phase complete",
+        );
     }
 
     pub async fn navigate(&mut self, url_str: &str) -> Result<(), PageError> {
@@ -1984,6 +2195,157 @@ impl Page {
             return js.with_dom(f);
         }
         self.dom.as_ref().map(f)
+    }
+
+    /// Concurrently seed the synchronous renderer cache through the owning
+    /// page transport. This removes serial image/font HTTP from the first
+    /// screenshot while retaining cookies, proxy policy, interception, CORS,
+    /// response limits, and connection pooling.
+    #[cfg(feature = "render")]
+    pub async fn prepare_screenshot_resources(&mut self, max_ms: u64) -> usize {
+        let started = std::time::Instant::now();
+        if max_ms == 0 || self.js.is_none() {
+            return 0;
+        }
+        let Some(document_url) = self.url.clone() else {
+            return 0;
+        };
+        let base_url = self.resolve_base_url().unwrap_or_else(|| document_url.clone());
+        let mut candidates = std::collections::BTreeMap::new();
+
+        if let Some(js) = &self.js {
+            for raw in js.pending_render_image_urls() {
+                if let Ok(mut url) = url::Url::parse(&raw) {
+                    url.set_fragment(None);
+                    candidates.insert(url.to_string(), ResourceType::Image);
+                }
+            }
+            let css_sources = js.with_dom(|dom| {
+                let mut sources = Vec::new();
+                for id in dom.descendants(dom.document()) {
+                    let Some(node) = dom.get_node(id) else { continue };
+                    if node
+                        .as_element()
+                        .is_some_and(|element| element.local.as_ref() == "style")
+                    {
+                        sources.push(dom.text_content(id));
+                    }
+                    if let Some(style) = node.get_attribute("style") {
+                        sources.push(style.to_string());
+                    }
+                    if node
+                        .as_element()
+                        .is_some_and(|element| element.local.as_ref() == "use")
+                    {
+                        if let Some(href) = node
+                            .get_attribute("href")
+                            .or_else(|| node.get_attribute("xlink:href"))
+                        {
+                            sources.push(format!("url({href})"));
+                        }
+                    }
+                }
+                sources
+            }).unwrap_or_default();
+            for css in css_sources {
+                for raw in css_resource_urls(&css, &base_url) {
+                    if let Ok(url) = url::Url::parse(&raw) {
+                        candidates.insert(raw, render_resource_type(&url));
+                    }
+                }
+            }
+            candidates.retain(|url, _| !js.render_resource_is_known(url));
+        }
+
+        candidates.retain(|url, _| {
+            subresource_allowed(Some(&document_url), url) && !self.should_block_url(url)
+        });
+        if candidates.len() > 128 {
+            candidates = candidates.into_iter().take(128).collect();
+        }
+        if candidates.is_empty() {
+            return 0;
+        }
+
+        let requested: Vec<(String, ResourceType)> = candidates.into_iter().collect();
+        let client = self.http_client.clone();
+        #[cfg(feature = "stealth")]
+        let stealth_client = self.stealth_client.clone();
+        let callbacks = self.callbacks.clone();
+        let initiator = document_url.clone();
+        use futures::StreamExt as _;
+        let requests = futures::stream::iter(requested.clone().into_iter().map(|(raw, kind)| {
+            let client = client.clone();
+            #[cfg(feature = "stealth")]
+            let stealth_client = stealth_client.clone();
+            let callbacks = callbacks.clone();
+            let initiator = initiator.clone();
+            async move {
+                let parsed = url::Url::parse(&raw).expect("validated render resource URL");
+                let request = ResourceRequest::subresource(kind, &initiator);
+                #[cfg(feature = "stealth")]
+                let result = if let Some(stealth_client) = stealth_client {
+                    stealth_client
+                        .fetch_resource_with_callbacks(&parsed, request, Some(&callbacks))
+                        .await
+                } else {
+                    client
+                        .fetch_resource_with_callbacks(&parsed, request, Some(&callbacks))
+                        .await
+                };
+                #[cfg(not(feature = "stealth"))]
+                let result = client
+                    .fetch_resource_with_callbacks(&parsed, request, Some(&callbacks))
+                    .await;
+                (raw, kind, result)
+            }
+        })).buffer_unordered(16);
+        futures::pin_mut!(requests);
+        let deadline = tokio::time::Instant::now()
+            + tokio::time::Duration::from_millis(max_ms);
+        let mut outcomes = std::collections::HashMap::new();
+        loop {
+            match tokio::time::timeout_at(deadline, requests.next()).await {
+                Ok(Some((raw, kind, result))) => {
+                    outcomes.insert(raw, (kind, result));
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+        drop(requests);
+
+        let mut loaded = 0usize;
+        for (raw, kind) in requested {
+            let bytes = match outcomes.remove(&raw) {
+                Some((_, Ok(response))) => {
+                    self.record_network_event_with_body(
+                        response.url.as_str(),
+                        "GET",
+                        match kind { ResourceType::Font => "Font", _ => "Image" },
+                        response.status,
+                        &response.headers,
+                        &response.body,
+                        true,
+                    );
+                    if (200..300).contains(&response.status) {
+                        loaded += 1;
+                        Some(response.body)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            if let Some(js) = &mut self.js {
+                js.seed_render_resource(raw, bytes);
+            }
+        }
+        tracing::debug!(
+            loaded,
+            elapsed_ms = started.elapsed().as_millis(),
+            "prepared screenshot resources through page transport"
+        );
+        loaded
     }
 
     /// Rasterize the current DOM to PNG bytes at `viewport` (CSS pixels), when
@@ -2542,12 +2904,32 @@ fn url_matches_cdp_pattern(pattern: &str, url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        linked_stylesheet_requests, materialize_linked_stylesheet_script, parse_import_url,
-        navigation_referrer, rebase_css_urls, split_css_imports,
+        css_resource_urls, linked_stylesheet_requests, materialize_linked_stylesheet_script,
+        parse_import_url, navigation_referrer, rebase_css_urls, split_css_imports,
         script_response_is_executable, truncate_on_char_boundary, url_matches_cdp_pattern,
     };
     use base64::Engine as _;
     use obscura_dom::parse_html;
+
+    #[test]
+    fn css_resource_discovery_ignores_strings_comments_data_and_fragments() {
+        let base = url::Url::parse("https://example.test/css/app/main.css").unwrap();
+        let css = r#"
+            /* url(ignored.png) */
+            .copy::before { content: "url(also-ignored.png)"; }
+            .hero { background: url('../img/hero.png'); }
+            .icon { mask: URL("https://cdn.test/icon.svg#shape"); }
+            .inline { background: url(data:image/svg+xml,<svg/>); }
+            .local { mask: url(#local); }
+        "#;
+        assert_eq!(
+            css_resource_urls(css, &base),
+            vec![
+                "https://example.test/css/img/hero.png".to_string(),
+                "https://cdn.test/icon.svg".to_string(),
+            ]
+        );
+    }
 
     fn spawn_stylesheet_graph_server(
         expected_requests: usize,
@@ -3022,6 +3404,73 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn module_graph_and_evaluation_share_one_absolute_budget() {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 2048];
+            let length = stream.read(&mut request).unwrap();
+            let path = String::from_utf8_lossy(&request[..length])
+                .lines()
+                .next()
+                .and_then(|line| line.split_ascii_whitespace().nth(1))
+                .unwrap_or("/")
+                .to_string();
+            request_tx.send(path).unwrap();
+
+            // Spend part of the module's allowance loading its graph. The
+            // synchronous top-level work then fits in a freshly reset budget,
+            // but cannot fit in the one absolute load+evaluation budget.
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let body = "export const delayed = true;";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let base = format!("http://{address}");
+        let mut page = import_map_test_page(
+            "shared-module-budget",
+            &base,
+            r#"<html><head><script type="module">
+                import "./delayed.js";
+                globalThis.__shared_deadline_started = true;
+                const until = Date.now() + 300;
+                while (Date.now() < until) {}
+                globalThis.__shared_deadline_completed = true;
+            </script></head><body></body></html>"#,
+        );
+        page.execute_scripts_with_module_budget(Some(350)).await;
+
+        assert_eq!(
+            request_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap(),
+            "/app/delayed.js",
+        );
+        let state = page
+            .js
+            .as_mut()
+            .unwrap()
+            .evaluate(
+                "[globalThis.__shared_deadline_started === true, \
+                  globalThis.__shared_deadline_completed === true]",
+            )
+            .unwrap();
+        assert_eq!(
+            state,
+            serde_json::json!([true, false]),
+            "evaluation must be terminated at the remaining shared deadline",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn parser_import_map_before_first_module_controls_resolution() {
         let (base, requests) = spawn_parser_import_map_server(1);
         let mut page = import_map_test_page("import-map-order", &base, r#"<html><head>
@@ -3166,6 +3615,70 @@ mod tests {
             serde_json::json!("before-first-module"),
         );
         assert_eq!(requests.recv_timeout(std::time::Duration::from_secs(1)).unwrap(), "/app/before.js");
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn page_transport_prefetches_once_and_capture_reuses_the_bytes() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut request = [0u8; 2048];
+                        let read = stream.read(&mut request).unwrap_or(0);
+                        let first = String::from_utf8_lossy(&request[..read])
+                            .lines().next().unwrap_or_default().to_string();
+                        seen_tx.send(first).unwrap();
+                        let body = br##"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"><rect width="20" height="10" fill="#f00"/></svg>"##;
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: image/svg+xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        stream.write_all(response.as_bytes()).unwrap();
+                        stream.write_all(body).unwrap();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "render-prefetch".to_string(), None, false, None, None, true,
+        ));
+        let mut page = super::Page::new("render-prefetch".to_string(), context);
+        page.set_viewport((100.0, 80.0));
+        let page_url = format!("http://{address}/page");
+        let asset_url = format!("http://{address}/asset.svg");
+        let dom = parse_html(&format!(
+            r#"<html><body><img src="{asset_url}" style="width:20px;height:10px"></body></html>"#
+        ));
+        let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new();
+        runtime.set_dom(dom);
+        runtime.set_url(&page_url);
+        runtime.set_viewport(100.0, 80.0);
+        runtime.run_page_init();
+        page.js = Some(runtime);
+        page.url = Some(url::Url::parse(&page_url).unwrap());
+
+        assert_eq!(page.prepare_screenshot_resources(1_000).await, 1);
+        page.screenshot(page.viewport).expect("prefetched capture");
+        assert!(seen_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap()
+            .starts_with("GET /asset.svg "));
+        assert!(
+            seen_rx.recv_timeout(std::time::Duration::from_millis(200)).is_err(),
+            "capture must not open a second synchronous renderer request"
+        );
     }
 
     #[cfg(feature = "render")]

@@ -93,11 +93,12 @@ mod image_capability_tests {
 mod paint;
 #[cfg(feature = "paint")]
 pub use paint::{
-    paint_dom, paint_dom_scrolled, paint_prepared, paint_prepared_with_scroll, prepare_dom,
-    prepare_dom_with_dynamic_fonts, screenshot_png, screenshot_png_scrolled,
-    screenshot_prepared, screenshot_prepared_with_scroll, DynamicFontFace,
+    paint_dom, paint_dom_scrolled, paint_prepared, paint_prepared_region_with_scroll,
+    paint_prepared_with_scroll, prepare_dom, prepare_dom_with_dynamic_fonts, screenshot_png,
+    screenshot_png_scrolled, screenshot_prepared, screenshot_prepared_region_with_scroll,
+    screenshot_prepared_with_scroll, CaptureError, CaptureRegion, DynamicFontFace,
     ElementScrollMetrics, PreparedRender, RenderResourceCache, RenderResourceLoader,
-    ResolvedScrollState, SelectedImage,
+    ResolvedScrollState, SelectedImage, MAX_CAPTURE_DIMENSION, MAX_CAPTURE_PIXELS,
 };
 
 // Real inline text layout (cosmic-text) lives behind the paint feature; the

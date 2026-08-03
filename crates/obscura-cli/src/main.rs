@@ -781,6 +781,11 @@ async fn run_fetch(
     if let Some(ref path) = screenshot {
         #[cfg(feature = "render")]
         {
+            let resource_deadline_ms = std::env::var("OBSCURA_RENDER_RESOURCE_DEADLINE_MS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(3_000);
+            let _ = page.prepare_screenshot_resources(resource_deadline_ms).await;
             // Default CSS-pixel viewport, matching the engine's innerWidth/Height.
             // OBSCURA_SHOT_W / OBSCURA_SHOT_H override it (e.g. a tall viewport to
             // capture below-the-fold content in one shot).

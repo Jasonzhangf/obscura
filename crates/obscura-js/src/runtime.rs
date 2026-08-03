@@ -64,6 +64,19 @@ pub struct PreparedModule {
     description: String,
 }
 
+fn remaining_deadline_ms(deadline: tokio::time::Instant) -> Option<u64> {
+    let remaining = deadline.checked_duration_since(tokio::time::Instant::now())?;
+    if remaining.is_zero() {
+        return None;
+    }
+    // Round up so a positive sub-millisecond remainder still gets one bounded
+    // event-loop turn. The watchdog supplies the hard wall-clock boundary.
+    let millis = remaining.as_millis().saturating_add(
+        u128::from(remaining.subsec_nanos() % 1_000_000 != 0),
+    );
+    Some(millis.min(u128::from(u64::MAX)) as u64)
+}
+
 /// Handle to an armed V8 execution watchdog (see [`ObscuraJsRuntime::arm_watchdog`]).
 /// Holds the cancel channel and the watchdog thread; pass it back to
 /// `disarm_watchdog` to stop the watchdog and learn whether it fired.
@@ -404,6 +417,91 @@ impl ObscuraJsRuntime {
             render_resources,
             scroll,
         )
+    }
+
+    /// Capture a document-space rectangle without changing the live viewport,
+    /// root scroll, element scroll offsets, or retained layout. The current
+    /// resolved scroll snapshot supplies fixed/sticky and nested-scroll state.
+    #[cfg(feature = "render")]
+    pub fn screenshot_prepared_region(
+        &self,
+        region: obscura_render::CaptureRegion,
+    ) -> Result<Vec<u8>, obscura_render::CaptureError> {
+        let mut state = self.state.borrow_mut();
+        ensure_resolved_scroll(&mut state).ok_or(obscura_render::CaptureError::PaintFailed)?;
+        let ObscuraState {
+            dom,
+            prepared_render,
+            render_resources,
+            resolved_scroll,
+            ..
+        } = &mut *state;
+        let (_, scroll) = resolved_scroll
+            .as_ref()
+            .ok_or(obscura_render::CaptureError::PaintFailed)?;
+        obscura_render::screenshot_prepared_region_with_scroll(
+            dom.as_ref()
+                .ok_or(obscura_render::CaptureError::PaintFailed)?,
+            prepared_render
+                .as_mut()
+                .ok_or(obscura_render::CaptureError::PaintFailed)?,
+            render_resources,
+            scroll,
+            region,
+        )
+    }
+
+    /// Return the exact responsive candidates selected for live `<img>`
+    /// elements without loading them.  The browser layer can then fetch them
+    /// concurrently through the page-owned transport before synchronous layout
+    /// or paint observes the cache.
+    #[cfg(feature = "render")]
+    pub fn pending_render_image_urls(&self) -> Vec<String> {
+        let state = self.state.borrow();
+        let base_url = document_base_url(&state);
+        let Some(dom) = state.dom.as_ref() else {
+            return Vec::new();
+        };
+        let mut urls = Vec::new();
+        for id in dom.descendants(dom.document()) {
+            let Some(node) = dom.get_node(id) else { continue };
+            if node
+                .as_element()
+                .is_none_or(|element| element.local.as_ref() != "img")
+            {
+                continue;
+            }
+            let Some((url, _, known, _)) = state.render_resources
+                .cached_image_element_metadata(dom, id, state.viewport, base_url.as_deref())
+            else {
+                continue;
+            };
+            if !known && !url.starts_with("data:") {
+                urls.push(url);
+            }
+        }
+        urls.sort();
+        urls.dedup();
+        urls
+    }
+
+    /// Insert one page-transport resource outcome into the retained renderer
+    /// cache. A new successful byte body can change intrinsic geometry, so any
+    /// previously prepared layout is invalidated.
+    #[cfg(feature = "render")]
+    pub fn seed_render_resource(&mut self, url: String, bytes: Option<Vec<u8>>) {
+        let mut state = self.state.borrow_mut();
+        match bytes {
+            Some(bytes) => state.render_resources.seed(url, bytes),
+            None => state.render_resources.seed_missing(url),
+        }
+        state.prepared_render = None;
+        state.resolved_scroll = None;
+    }
+
+    #[cfg(feature = "render")]
+    pub fn render_resource_is_known(&self, url: &str) -> bool {
+        self.state.borrow().render_resources.has_live_outcome(url)
     }
 
     /// Run __obscura_init() after all per-page properties (UA, platform, stealth, etc.)
@@ -786,8 +884,13 @@ impl ObscuraJsRuntime {
         self.object_store.clear();
     }
     pub async fn load_module(&mut self, url: &str, budget_ms: u64) -> Result<(), String> {
+        let deadline = tokio::time::Instant::now()
+            + tokio::time::Duration::from_millis(budget_ms);
         let prepared = self.prepare_module(url, budget_ms).await?;
-        self.evaluate_prepared_module(prepared, budget_ms).await
+        let remaining_ms = remaining_deadline_ms(deadline).ok_or_else(|| {
+            format!("Module {} exhausted its {}ms load+evaluation budget", url, budget_ms)
+        })?;
+        self.evaluate_prepared_module(prepared, remaining_ms).await
     }
 
     pub async fn prepare_module(&mut self, url: &str, budget_ms: u64) -> Result<PreparedModule, String> {
@@ -869,10 +972,15 @@ impl ObscuraJsRuntime {
     }
 
     pub async fn load_inline_module(&mut self, code: &str, base_url: &str, budget_ms: u64) -> Result<(), String> {
+        let deadline = tokio::time::Instant::now()
+            + tokio::time::Duration::from_millis(budget_ms);
         let prepared = self
             .prepare_inline_module(code, base_url, budget_ms)
             .await?;
-        self.evaluate_prepared_module(prepared, budget_ms).await
+        let remaining_ms = remaining_deadline_ms(deadline).ok_or_else(|| {
+            format!("Inline module exhausted its {}ms load+evaluation budget", budget_ms)
+        })?;
+        self.evaluate_prepared_module(prepared, remaining_ms).await
     }
 
     pub async fn prepare_inline_module(
@@ -923,8 +1031,27 @@ impl ObscuraJsRuntime {
         prepared: PreparedModule,
         budget_ms: u64,
     ) -> Result<(), String> {
-        self.drive_module_eval(prepared.module_id, budget_ms, &prepared.description)
-            .await
+        let PreparedModule {
+            module_id,
+            description,
+        } = prepared;
+        // Tokio timeouts cannot run while synchronous top-level module work
+        // pins the runtime thread in V8. Pair the async timeout with a hard V8
+        // watchdog so this budget is a real wall-clock ceiling for both forms
+        // of evaluation.
+        let watchdog = self.arm_watchdog(std::time::Duration::from_millis(budget_ms));
+        let result = self
+            .drive_module_eval(module_id, budget_ms, &description)
+            .await;
+        let watchdog_fired = self.disarm_watchdog(watchdog);
+        if watchdog_fired {
+            Err(format!(
+                "{} evaluation timed out after {}ms",
+                description, budget_ms
+            ))
+        } else {
+            result
+        }
     }
 
     fn execute_classic_script(&mut self, name: &str, source: &str) -> Result<(), String> {
@@ -4805,6 +4932,109 @@ mod tests {
 
     #[cfg(feature = "render")]
     #[test]
+    fn document_region_capture_preserves_live_runtime_state_and_resource_cache() {
+        let dom = parse_html(
+            r#"<html style="margin:0"><body style="margin:0;height:260px">
+                <div style="height:120px;background:red"></div>
+                <img src="http://example.test/marker.svg"
+                     style="display:block;width:20px;height:20px">
+                <div style="height:120px;background:blue"></div>
+                <div style="position:fixed;left:0;top:0;width:10px;height:10px;background:lime"></div>
+            </body></html>"#,
+        );
+        let loads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let loader_loads = loads.clone();
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_url("http://example.test/page");
+        rt.set_viewport(80.0, 60.0);
+        rt.state.borrow_mut().render_resources =
+            obscura_render::RenderResourceCache::with_loader(move |url: &str| {
+                assert_eq!(url, "http://example.test/marker.svg");
+                loader_loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Some(
+                    br##"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20">
+                        <rect width="20" height="20" fill="#ffff00"/>
+                    </svg>"##
+                        .to_vec(),
+                )
+            });
+        rt.run_page_init();
+        assert_eq!(
+            rt.evaluate("(function(){ window.scrollTo(0, 50); return window.scrollY; })()")
+                .expect("live scroll")
+                .as_f64(),
+            Some(50.0)
+        );
+        let live_before = rt
+            .screenshot_prepared((80.0, 60.0), Some("http://example.test/page"))
+            .expect("live screenshot");
+        let (prepared_address, viewport, scroll_offset, scroll_generation, resolved_root, full_height) = {
+            let state = rt.state.borrow();
+            let prepared = state.prepared_render.as_ref().expect("prepared render");
+            (
+                prepared as *const obscura_render::PreparedRender as usize,
+                state.viewport,
+                state.scroll_offset,
+                state.scroll_generation,
+                state
+                    .resolved_scroll
+                    .as_ref()
+                    .expect("resolved scroll")
+                    .1
+                    .root_offset(),
+                prepared.content_size().1,
+            )
+        };
+        assert_eq!(loads.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let region_png = rt
+            .screenshot_prepared_region(obscura_render::CaptureRegion::new(
+                0.0, 115.0, 80.0, 40.0, 1.5,
+            ))
+            .expect("offscreen scaled region");
+        let full_png = rt
+            .screenshot_prepared_region(obscura_render::CaptureRegion::new(
+                0.0, 0.0, 80.0, full_height, 1.0,
+            ))
+            .expect("full-content region");
+        let png_size = |bytes: &[u8]| {
+            assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+            (
+                u32::from_be_bytes(bytes[16..20].try_into().expect("PNG width")),
+                u32::from_be_bytes(bytes[20..24].try_into().expect("PNG height")),
+            )
+        };
+        assert_eq!(png_size(&region_png), (120, 60));
+        assert_eq!(png_size(&full_png), (80, full_height.ceil() as u32));
+
+        let live_after = rt
+            .screenshot_prepared((80.0, 60.0), Some("http://example.test/page"))
+            .expect("unchanged live screenshot");
+        assert_eq!(live_after, live_before);
+        let state = rt.state.borrow();
+        let prepared = state.prepared_render.as_ref().expect("retained render");
+        assert_eq!(
+            prepared as *const obscura_render::PreparedRender as usize,
+            prepared_address
+        );
+        assert_eq!(state.viewport, viewport);
+        assert_eq!(state.scroll_offset, scroll_offset);
+        assert_eq!(state.scroll_generation, scroll_generation);
+        assert_eq!(
+            state
+                .resolved_scroll
+                .as_ref()
+                .expect("retained resolved scroll")
+                .1
+                .root_offset(),
+            resolved_root
+        );
+        assert_eq!(loads.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
     fn script_registered_url_font_reaches_render_resource_collection() {
         let loads = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let loader_loads = std::sync::Arc::clone(&loads);
@@ -8348,7 +8578,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            error.contains("Inline module evaluation timed out after 20ms"),
+            error.contains("Inline module evaluation timed out after"),
             "expected evaluation timeout, got: {}",
             error
         );

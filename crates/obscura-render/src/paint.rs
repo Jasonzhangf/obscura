@@ -354,6 +354,91 @@ pub struct ResolvedScrollState {
     inherited_clips: Vec<Option<crate::dom::OverflowClip>>,
 }
 
+/// A rectangle in immutable document CSS-pixel coordinates.
+///
+/// `scale` controls output pixels per CSS pixel without changing the prepared
+/// layout viewport. This is the same separation Chromium makes between the
+/// page-space clip and the screenshot surface scale.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CaptureRegion {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub scale: f32,
+}
+
+impl CaptureRegion {
+    pub fn new(x: f32, y: f32, width: f32, height: f32, scale: f32) -> Self {
+        Self {
+            x,
+            y,
+            width,
+            height,
+            scale,
+        }
+    }
+}
+
+/// Hard surface limits for one capture. The byte cap bounds both the native
+/// CSS-pixel raster and the scaled output before either allocation occurs.
+pub const MAX_CAPTURE_DIMENSION: u32 = 32_768;
+pub const MAX_CAPTURE_PIXELS: u64 = 64 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaptureError {
+    InvalidRegion,
+    AllocationLimitExceeded,
+    PaintFailed,
+    EncodeFailed,
+}
+
+fn checked_capture_dimensions(
+    region: CaptureRegion,
+) -> Result<(u32, u32, u32, u32), CaptureError> {
+    if !region.x.is_finite()
+        || !region.y.is_finite()
+        || !region.width.is_finite()
+        || !region.height.is_finite()
+        || !region.scale.is_finite()
+        || region.width <= 0.0
+        || region.height <= 0.0
+        || region.scale <= 0.0
+    {
+        return Err(CaptureError::InvalidRegion);
+    }
+    let native_width = region.width.ceil();
+    let native_height = region.height.ceil();
+    let output_width = (region.width * region.scale).ceil();
+    let output_height = (region.height * region.scale).ceil();
+    if !native_width.is_finite()
+        || !native_height.is_finite()
+        || !output_width.is_finite()
+        || !output_height.is_finite()
+        || native_width > MAX_CAPTURE_DIMENSION as f32
+        || native_height > MAX_CAPTURE_DIMENSION as f32
+        || output_width > MAX_CAPTURE_DIMENSION as f32
+        || output_height > MAX_CAPTURE_DIMENSION as f32
+    {
+        return Err(CaptureError::AllocationLimitExceeded);
+    }
+    let dimensions = (
+        native_width as u32,
+        native_height as u32,
+        output_width as u32,
+        output_height as u32,
+    );
+    for (width, height) in [
+        (dimensions.0, dimensions.1),
+        (dimensions.2, dimensions.3),
+    ] {
+        if u64::from(width).saturating_mul(u64::from(height)) > MAX_CAPTURE_PIXELS {
+            return Err(CaptureError::AllocationLimitExceeded);
+        }
+    }
+    Ok(dimensions)
+}
+
 impl ResolvedScrollState {
     pub fn root_offset(&self) -> (f32, f32) {
         self.root_offset
@@ -1419,6 +1504,7 @@ pub fn paint_prepared(
         None,
         None,
         None,
+        None,
         (0.0, 0.0),
     )
 }
@@ -1453,8 +1539,78 @@ pub fn paint_prepared_with_scroll(
         None,
         None,
         None,
+        None,
         (0.0, 0.0),
     )
+}
+
+/// Paint an arbitrary document-space rectangle from one retained layout and
+/// resolved scroll snapshot. The live root viewport remains the containing
+/// block for fixed and sticky descendants, while ordinary document content is
+/// translated directly to the requested page-space origin.
+pub fn paint_prepared_region_with_scroll(
+    tree: &DomTree,
+    prepared: &mut PreparedRender,
+    resources: &mut RenderResourceCache,
+    scroll: &ResolvedScrollState,
+    region: CaptureRegion,
+) -> Result<Pixmap, CaptureError> {
+    let (native_width, native_height, output_width, output_height) =
+        checked_capture_dimensions(region)?;
+    let mut pixmap = Pixmap::new(native_width, native_height)
+        .ok_or(CaptureError::AllocationLimitExceeded)?;
+    pixmap.fill(Color::WHITE);
+
+    // Resolved node movement already contains `-root_scroll` for ordinary
+    // document content and zero root movement for fixed content. Adding the
+    // live root offset back before subtracting the capture origin therefore
+    // maps ordinary nodes to page space while leaving fixed/sticky nodes at
+    // their live viewport's document-space position.
+    let root = scroll.root_offset();
+    let surface_offset = (root.0 - region.x, root.1 - region.y);
+    let pixmap = paint_laid_dom_scrolled(
+        tree,
+        prepared.viewport,
+        prepared.base_url.as_deref(),
+        root,
+        Some(scroll),
+        pixmap,
+        resources,
+        &prepared.selected_images,
+        &prepared.svg_fonts,
+        prepared.content_size,
+        &prepared.viewport_fixed,
+        &prepared.sticky,
+        &mut prepared.layout,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some((region.width, region.height)),
+        surface_offset,
+    )
+    .ok_or(CaptureError::PaintFailed)?;
+
+    if output_width == native_width && output_height == native_height {
+        return Ok(pixmap);
+    }
+
+    // The retained painter currently rasterizes glyphs and decoded images in
+    // CSS-pixel space. Keep scale out of layout and scroll state, then use one
+    // premultiplied-alpha high-quality surface transform. Vector primitives
+    // still take the direct raster path whenever scale is 1.
+    let source = image::RgbaImage::from_raw(native_width, native_height, pixmap.data().to_vec())
+        .ok_or(CaptureError::PaintFailed)?;
+    let scaled = image::imageops::resize(
+        &source,
+        output_width,
+        output_height,
+        image::imageops::FilterType::Lanczos3,
+    );
+    let size = tiny_skia::IntSize::from_wh(output_width, output_height)
+        .ok_or(CaptureError::AllocationLimitExceeded)?;
+    Pixmap::from_vec(scaled.into_raw(), size).ok_or(CaptureError::PaintFailed)
 }
 
 /// The used `z-index` for an element which participates in stacking order.
@@ -1574,6 +1730,7 @@ fn paint_laid_dom_scrolled(
     suppress_stacking_for: Option<obscura_dom::tree::NodeId>,
     suppress_transform_for: Option<obscura_dom::tree::NodeId>,
     clip_scope_root: Option<obscura_dom::tree::NodeId>,
+    surface_extent: Option<(f32, f32)>,
     surface_offset: (f32, f32),
 ) -> Option<Pixmap> {
     let scroll_state = match resolved_scroll {
@@ -1583,6 +1740,7 @@ fn paint_laid_dom_scrolled(
             viewport_fixed,
             resolved,
             clip_scope_root,
+            surface_extent,
             surface_offset,
         ),
         None => ScrollPaintState::new(
@@ -1593,6 +1751,7 @@ fn paint_laid_dom_scrolled(
             viewport_fixed,
             sticky,
             clip_scope_root,
+            surface_extent,
             surface_offset,
         ),
     };
@@ -1778,6 +1937,7 @@ fn paint_laid_dom_scrolled(
                 Some(nid),
                 suppress_transform_for,
                 clip_scope_root,
+                surface_extent,
                 surface_offset,
             )?;
             continue;
@@ -1859,6 +2019,7 @@ fn paint_laid_dom_scrolled(
                     suppress_stacking_for,
                     Some(nid),
                     clip_scope_root,
+                    surface_extent,
                     surface_offset,
                 )?;
                 continue;
@@ -1928,6 +2089,7 @@ fn paint_laid_dom_scrolled(
                 suppress_stacking_for,
                 Some(nid),
                 Some(nid),
+                surface_extent,
                 (
                     surface_offset.0 + layer_delta.0,
                     surface_offset.1 + layer_delta.1,
@@ -1994,6 +2156,7 @@ fn paint_laid_dom_scrolled(
                 suppress_stacking_for,
                 suppress_transform_for,
                 clip_scope_root,
+                surface_extent,
                 surface_offset,
             )?;
             let group_paint = tiny_skia::PixmapPaint {
@@ -2827,6 +2990,7 @@ struct ScrollPaintState<'a> {
     sticky_clips: std::collections::HashMap<obscura_dom::tree::NodeId, (f32, f32)>,
     resolved: Option<&'a ResolvedScrollState>,
     clip_scope_root: Option<obscura_dom::tree::NodeId>,
+    surface_extent: Option<(f32, f32)>,
     surface_offset: (f32, f32),
     active: bool,
 }
@@ -2840,6 +3004,7 @@ impl<'a> ScrollPaintState<'a> {
         viewport_fixed: &'a std::collections::HashSet<obscura_dom::tree::NodeId>,
         sticky_layout: &crate::StickyLayout,
         clip_scope_root: Option<obscura_dom::tree::NodeId>,
+        surface_extent: Option<(f32, f32)>,
         surface_offset: (f32, f32),
     ) -> Self {
         let scroll_x = if requested.0.is_finite() {
@@ -2870,6 +3035,7 @@ impl<'a> ScrollPaintState<'a> {
                 sticky_clips: std::collections::HashMap::new(),
                 resolved: None,
                 clip_scope_root,
+                surface_extent,
                 surface_offset,
                 active,
             };
@@ -2886,6 +3052,7 @@ impl<'a> ScrollPaintState<'a> {
             sticky_clips,
             resolved: None,
             clip_scope_root,
+            surface_extent,
             surface_offset,
             active,
         }
@@ -2897,6 +3064,7 @@ impl<'a> ScrollPaintState<'a> {
         viewport_fixed: &'a std::collections::HashSet<obscura_dom::tree::NodeId>,
         resolved: &'a ResolvedScrollState,
         clip_scope_root: Option<obscura_dom::tree::NodeId>,
+        surface_extent: Option<(f32, f32)>,
         surface_offset: (f32, f32),
     ) -> Self {
         Self {
@@ -2908,6 +3076,7 @@ impl<'a> ScrollPaintState<'a> {
             sticky_clips: std::collections::HashMap::new(),
             resolved: Some(resolved),
             clip_scope_root,
+            surface_extent,
             surface_offset,
             active: true,
         }
@@ -2942,7 +3111,7 @@ impl<'a> ScrollPaintState<'a> {
         id: obscura_dom::tree::NodeId,
     ) -> Option<crate::Rect> {
         self.overflow_clip_for(laid, id)
-            .map(|clip| clip.viewport_rect(self.viewport))
+            .map(|clip| clip.viewport_rect(self.surface_extent.unwrap_or(self.viewport)))
     }
 
     fn overflow_clip_for(
@@ -3015,7 +3184,8 @@ impl<'a> ScrollPaintState<'a> {
         let inherited = self.overflow_clip_for(laid, id);
         let style = laid.styles.get(&id)?;
         if !style.overflow_hidden || style.overflow_propagated_to_viewport {
-            return inherited.map(|clip| clip.viewport_rect(self.viewport));
+            return inherited
+                .map(|clip| clip.viewport_rect(self.surface_extent.unwrap_or(self.viewport)));
         }
         let rect = laid.rects.get(&id)?;
         let (ox, oy) = self.translation_for(laid, id);
@@ -3025,7 +3195,7 @@ impl<'a> ScrollPaintState<'a> {
                 Some(clip) => clip.intersect(own),
                 None => own,
             }
-            .viewport_rect(self.viewport),
+            .viewport_rect(self.surface_extent.unwrap_or(self.viewport)),
         )
     }
 
@@ -3765,6 +3935,19 @@ pub fn screenshot_prepared_with_scroll(
     paint_prepared_with_scroll(tree, prepared, resources, scroll)?
         .encode_png()
         .ok()
+}
+
+/// PNG convenience wrapper for [`paint_prepared_region_with_scroll`].
+pub fn screenshot_prepared_region_with_scroll(
+    tree: &DomTree,
+    prepared: &mut PreparedRender,
+    resources: &mut RenderResourceCache,
+    scroll: &ResolvedScrollState,
+    region: CaptureRegion,
+) -> Result<Vec<u8>, CaptureError> {
+    paint_prepared_region_with_scroll(tree, prepared, resources, scroll, region)?
+        .encode_png()
+        .map_err(|_| CaptureError::EncodeFailed)
 }
 
 /// A representative visible color for `background-clip: text` text whose own
@@ -10090,6 +10273,150 @@ mod tests {
             pixel(&top, 95, 85),
             pixel(&scrolled, 95, 85),
             "newly visible nested content did not move into the scrollport"
+        );
+    }
+
+    #[test]
+    fn document_region_capture_reuses_layout_scroll_and_resources() {
+        let tree = parse_html(
+            r#"<html style="margin:0"><body style="margin:0;height:300px;background:white">
+                <div style="height:80px;background:red"></div>
+                <div id="sticky" style="position:sticky;z-index:1;top:0;margin-left:20px;
+                     width:10px;height:10px;background:yellow"></div>
+                <div style="height:210px;background:green"></div>
+                <div id="offscreen" style="position:absolute;left:40px;top:150px;
+                     width:10px;height:10px;background:magenta"></div>
+                <img src="fixture.svg" style="position:absolute;left:60px;top:200px;
+                     width:10px;height:10px">
+                <div id="fixed" style="position:fixed;left:0;top:0;width:10px;
+                     height:10px;background:blue"></div>
+            </body></html>"#,
+        );
+        let loads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let loader_loads = loads.clone();
+        let mut resources = RenderResourceCache::with_loader(move |url: &str| {
+            assert_eq!(url, "https://example.test/fixture.svg");
+            loader_loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Some(
+                br##"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10">
+                    <rect width="10" height="10" fill="#00ffff"/>
+                </svg>"##
+                    .to_vec(),
+            )
+        });
+        let mut prepared = prepare_dom(
+            &tree,
+            (80.0, 60.0),
+            Some("https://example.test/page"),
+            &mut resources,
+        )
+        .expect("prepared render");
+        assert_eq!(loads.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let scroll = prepared.resolve_scroll_state(&tree, (0.0, 100.0), &HashMap::new());
+        let fixed = tree.get_element_by_id("fixed").expect("fixed");
+        let before_fixed = prepared
+            .viewport_rect_with_scroll(fixed, &scroll)
+            .expect("fixed geometry");
+
+        let offscreen = paint_prepared_region_with_scroll(
+            &tree,
+            &mut prepared,
+            &mut resources,
+            &scroll,
+            CaptureRegion::new(0.0, 100.0, 80.0, 80.0, 1.0),
+        )
+        .expect("offscreen region");
+        assert_eq!((offscreen.width(), offscreen.height()), (80, 80));
+        let fixed_pixel = offscreen.pixel(5, 5).expect("fixed pixel");
+        assert!(fixed_pixel.blue() > 240 && fixed_pixel.red() < 20);
+        let sticky_pixel = offscreen.pixel(25, 5).expect("sticky pixel");
+        assert!(sticky_pixel.red() > 240 && sticky_pixel.green() > 240);
+        let target_pixel = offscreen.pixel(45, 55).expect("offscreen target");
+        assert!(target_pixel.red() > 240 && target_pixel.blue() > 240);
+
+        let full_height = prepared.content_size().1;
+        let full = paint_prepared_region_with_scroll(
+            &tree,
+            &mut prepared,
+            &mut resources,
+            &scroll,
+            CaptureRegion::new(0.0, 0.0, 80.0, full_height, 1.0),
+        )
+        .expect("full-content region");
+        assert_eq!(full.height(), full_height.ceil() as u32);
+        let fixed_at_live_viewport = full.pixel(5, 105).expect("full fixed pixel");
+        assert!(fixed_at_live_viewport.blue() > 240 && fixed_at_live_viewport.red() < 20);
+        let fixed_not_duplicated = full.pixel(5, 5).expect("document top pixel");
+        assert!(fixed_not_duplicated.red() > 240 && fixed_not_duplicated.blue() < 20);
+
+        let scaled = paint_prepared_region_with_scroll(
+            &tree,
+            &mut prepared,
+            &mut resources,
+            &scroll,
+            CaptureRegion::new(40.0, 150.0, 10.0, 10.0, 2.0),
+        )
+        .expect("scaled region");
+        assert_eq!((scaled.width(), scaled.height()), (20, 20));
+        let scaled_center = scaled.pixel(10, 10).expect("scaled center");
+        assert!(scaled_center.red() > 240 && scaled_center.blue() > 240);
+
+        assert_eq!(scroll.root_offset(), (0.0, 100.0));
+        assert_eq!(
+            prepared
+                .viewport_rect_with_scroll(fixed, &scroll)
+                .expect("unchanged fixed geometry"),
+            before_fixed
+        );
+        assert_eq!(loads.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn document_region_capture_rejects_invalid_and_oversized_surfaces_before_paint() {
+        let tree = parse_html("<div style='width:10px;height:10px;background:red'></div>");
+        let mut resources = RenderResourceCache::with_loader(|_url: &str| None);
+        let mut prepared = prepare_dom(&tree, (20.0, 20.0), None, &mut resources)
+            .expect("prepared render");
+        let scroll = prepared.resolve_scroll_state(&tree, (0.0, 0.0), &HashMap::new());
+
+        for invalid in [
+            CaptureRegion::new(0.0, 0.0, 0.0, 10.0, 1.0),
+            CaptureRegion::new(f32::NAN, 0.0, 10.0, 10.0, 1.0),
+            CaptureRegion::new(0.0, 0.0, 10.0, 10.0, f32::INFINITY),
+        ] {
+            assert_eq!(
+                paint_prepared_region_with_scroll(
+                    &tree,
+                    &mut prepared,
+                    &mut resources,
+                    &scroll,
+                    invalid,
+                )
+                .unwrap_err(),
+                CaptureError::InvalidRegion
+            );
+        }
+        assert_eq!(
+            paint_prepared_region_with_scroll(
+                &tree,
+                &mut prepared,
+                &mut resources,
+                &scroll,
+                CaptureRegion::new(0.0, 0.0, MAX_CAPTURE_DIMENSION as f32, 10.0, 2.0),
+            )
+            .unwrap_err(),
+            CaptureError::AllocationLimitExceeded
+        );
+        assert_eq!(
+            paint_prepared_region_with_scroll(
+                &tree,
+                &mut prepared,
+                &mut resources,
+                &scroll,
+                CaptureRegion::new(0.0, 0.0, 9000.0, 9000.0, 1.0),
+            )
+            .unwrap_err(),
+            CaptureError::AllocationLimitExceeded
         );
     }
 }
