@@ -8,13 +8,14 @@ use core::cmp::{max, min};
 use core::fmt;
 use core::mem;
 use core::ops::Range;
+use unicode_linebreak::{break_property, linebreaks, BreakClass};
 use unicode_script::{Script, UnicodeScript};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::fallback::FontFallbackIter;
 use crate::{
-    math, Align, AttrsList, CacheKeyFlags, Color, Font, FontSystem, LayoutGlyph, LayoutLine,
-    Metrics, Wrap,
+    math, Align, AttrsList, CacheKeyFlags, Color, CssLineBreak, CssOverflowWrap, CssWordBreak,
+    Font, FontSystem, LayoutGlyph, LayoutLine, Metrics, Wrap,
 };
 
 /// The shaping strategy of some text.
@@ -687,6 +688,16 @@ impl ShapeGlyph {
 pub struct ShapeWord {
     pub blank: bool,
     pub glyphs: Vec<ShapeGlyph>,
+    /// Additional ordinary soft-wrap positions inside this UAX#14 word.
+    /// Values are glyph indices and therefore never split a shaped cluster.
+    soft_breaks: Vec<usize>,
+    /// Emergency positions used by constrained layout.
+    emergency_breaks: Vec<usize>,
+    /// Emergency positions that also contribute to min-content.
+    min_content_breaks: Vec<usize>,
+    /// Whether this word came from CSS-policy-bearing rich text. When false,
+    /// cosmic-text's historical `WordOrGlyph` behavior remains unchanged.
+    custom_line_breaks: bool,
 }
 
 impl ShapeWord {
@@ -697,7 +708,90 @@ impl ShapeWord {
         Self {
             blank: true,
             glyphs: Vec::default(),
+            soft_breaks: Vec::new(),
+            emergency_breaks: Vec::new(),
+            min_content_breaks: Vec::new(),
+            custom_line_breaks: false,
         }
+    }
+
+    fn glyph_indices_for_offsets(&self, mut offsets: Vec<usize>) -> Vec<usize> {
+        offsets.sort_unstable();
+        offsets.dedup();
+        (1..self.glyphs.len())
+            .filter(|&index| {
+                let before = &self.glyphs[index - 1];
+                let after = &self.glyphs[index];
+                let offset = if before.end <= after.start {
+                    after.start
+                } else if after.end <= before.start {
+                    before.start
+                } else {
+                    return false;
+                };
+                offsets.binary_search(&offset).is_ok()
+            })
+            .collect()
+    }
+
+    fn set_line_breaks(
+        &mut self,
+        custom: bool,
+        soft_offsets: impl Iterator<Item = usize>,
+        emergency_offsets: impl Iterator<Item = usize>,
+        min_content_offsets: impl Iterator<Item = usize>,
+    ) {
+        let soft_breaks = self.glyph_indices_for_offsets(soft_offsets.collect());
+        let emergency_breaks = self.glyph_indices_for_offsets(emergency_offsets.collect());
+        let min_content_breaks =
+            self.glyph_indices_for_offsets(min_content_offsets.collect());
+        self.custom_line_breaks = custom;
+        self.soft_breaks = soft_breaks;
+        self.emergency_breaks = emergency_breaks;
+        self.min_content_breaks = min_content_breaks;
+    }
+
+    fn reverse_glyphs(&mut self) {
+        self.glyphs.reverse();
+        let len = self.glyphs.len();
+        for breaks in [
+            &mut self.soft_breaks,
+            &mut self.emergency_breaks,
+            &mut self.min_content_breaks,
+        ] {
+            for index in breaks.iter_mut() {
+                *index = len.saturating_sub(*index);
+            }
+            breaks.sort_unstable();
+        }
+    }
+
+    fn cluster_boundaries(&self) -> Vec<usize> {
+        (1..self.glyphs.len())
+            .filter(|&index| {
+                let before = &self.glyphs[index - 1];
+                let after = &self.glyphs[index];
+                before.end <= after.start || after.end <= before.start
+            })
+            .collect()
+    }
+
+    fn break_indices(&self, wrap: Wrap, use_emergency: bool) -> Vec<usize> {
+        if wrap == Wrap::Glyph || (!self.custom_line_breaks && use_emergency) {
+            return self.cluster_boundaries();
+        }
+        let mut breaks = self.soft_breaks.clone();
+        if use_emergency {
+            let emergency = if wrap == Wrap::WordOrGlyphMinContent {
+                &self.min_content_breaks
+            } else {
+                &self.emergency_breaks
+            };
+            breaks.extend(emergency.iter().copied());
+            breaks.sort_unstable();
+            breaks.dedup();
+        }
+        breaks
     }
 
     /// Shape a word into a set of glyphs.
@@ -785,6 +879,10 @@ impl ShapeWord {
 
         self.blank = blank;
         self.glyphs = glyphs;
+        self.soft_breaks.clear();
+        self.emergency_breaks.clear();
+        self.min_content_breaks.clear();
+        self.custom_line_breaks = false;
     }
 
     /// Get the width of the [`ShapeWord`] in pixels, using the [`ShapeGlyph::width`] function.
@@ -795,6 +893,219 @@ impl ShapeWord {
         }
         width
     }
+}
+
+#[derive(Clone, Copy)]
+struct GraphemeBreakData {
+    end: usize,
+    /// The unmodified UAX#14 class, used by `keep-all`.
+    class: BreakClass,
+    /// Blink's break-all iterator tailors a small number of characters before
+    /// consulting its pair table. Keep that tailoring out of `keep-all`.
+    break_all_class: BreakClass,
+    vertical_line: bool,
+    policy: Option<CssLineBreak>,
+}
+
+fn grapheme_break_class(grapheme: &str) -> BreakClass {
+    grapheme
+        .chars()
+        .map(|ch| break_property(ch as u32))
+        .find(|class| {
+            !matches!(
+                class,
+                BreakClass::CombiningMark | BreakClass::ZeroWidthJoiner
+            )
+        })
+        .unwrap_or(BreakClass::CombiningMark)
+}
+
+/// Letter/number-like UAX#14 classes governed by `word-break`'s "within
+/// words" rules. Complex-context scripts deliberately stay out of keep-all,
+/// matching Blink's exemption for Southeast Asian dictionary breaking.
+fn keep_all_word_class(class: BreakClass) -> bool {
+    matches!(
+        class,
+        BreakClass::Alphabetic
+            | BreakClass::Ambiguous
+            | BreakClass::HebrewLetter
+            | BreakClass::Numeric
+            | BreakClass::Ideographic
+            | BreakClass::ConditionalJapaneseStarter
+            | BreakClass::HangulLvSyllable
+            | BreakClass::HangulLvtSyllable
+            | BreakClass::HangulLJamo
+            | BreakClass::HangulVJamo
+            | BreakClass::HangulTJamo
+    )
+}
+
+/// CSS `break-all` adds opportunities between typographic letter units. The
+/// surrounding UAX#14 iterator continues to own punctuation, emoji, spaces,
+/// joiners, and mandatory breaks; this is the key distinction from terminal
+/// style "break character" wrapping.
+fn break_all_class(grapheme: &str) -> BreakClass {
+    // Blink tailors PLUS SIGN to the alphabetic class for break-all.
+    if grapheme == "+" {
+        BreakClass::Alphabetic
+    } else {
+        grapheme_break_class(grapheme)
+    }
+}
+
+fn break_all_pair(before: GraphemeBreakData, after: GraphemeBreakData) -> bool {
+    use BreakClass::{
+        After, Alphabetic, Ambiguous, CloseParenthesis, ClosePunctuation, ComplexContext,
+        Exclamation, HebrewLetter, Hyphen, InfixSeparator, Numeric, OpenPunctuation, Postfix,
+        Prefix, Symbol,
+    };
+
+    let before_class = before.break_all_class;
+    let after_class = after.break_all_class;
+    let after_vertical_line = after_class == After && after.vertical_line;
+    let al_like_after = matches!(
+        after_class,
+        Ambiguous
+            | Alphabetic
+            | Hyphen
+            | Numeric
+            | OpenPunctuation
+            | Prefix
+            | ComplexContext
+            | HebrewLetter
+    ) || after_vertical_line;
+    match before_class {
+        Ambiguous | Alphabetic | After | Numeric | ComplexContext | Symbol | HebrewLetter => {
+            al_like_after
+        }
+        ClosePunctuation => {
+            matches!(
+                after_class,
+                Ambiguous | Alphabetic | Hyphen | Numeric | Prefix | HebrewLetter
+            ) || after_vertical_line
+        }
+        CloseParenthesis => {
+            matches!(
+                after_class,
+                Ambiguous
+                    | Alphabetic
+                    | Hyphen
+                    | Numeric
+                    | Prefix
+                    | ComplexContext
+                    | HebrewLetter
+            ) || after_vertical_line
+        }
+        Exclamation | Postfix => matches!(
+            after_class,
+            Ambiguous
+                | Alphabetic
+                | Hyphen
+                | Numeric
+                | Postfix
+                | Prefix
+                | HebrewLetter
+        ) || after_vertical_line,
+        InfixSeparator => {
+            matches!(
+                after_class,
+                Ambiguous | Alphabetic | Hyphen | Numeric | HebrewLetter
+            ) || after_vertical_line
+        }
+        Hyphen => after_class == Numeric,
+        Prefix => after_class == Postfix,
+        _ => false,
+    }
+}
+
+fn blink_normal_break(
+    normal_break: bool,
+    before: GraphemeBreakData,
+    after: GraphemeBreakData,
+) -> bool {
+    if !normal_break {
+        return false;
+    }
+
+    // unicode-linebreak follows the default UAX#14 pair table, while Blink's
+    // ICU iterator keeps ASCII solidus and vertical line inside ordinary word
+    // runs (`a/b`, `a|b`). Blink's break-all tailoring then adds the narrower
+    // opportunities explicitly. Keep this browser-specific adjustment behind
+    // CssLineBreak so cosmic-text's existing non-browser behavior is stable.
+    !(before.vertical_line
+        || (before.class == BreakClass::Symbol && keep_all_word_class(after.class)))
+}
+
+struct CssBreakData {
+    word_breaks: Vec<usize>,
+    soft_breaks: Vec<usize>,
+    emergency_breaks: Vec<usize>,
+    min_content_breaks: Vec<usize>,
+}
+
+fn css_break_data(span: &str, span_start: usize, attrs_list: &AttrsList) -> CssBreakData {
+    let normal_breaks: Vec<usize> = linebreaks(span).map(|(offset, _)| offset).collect();
+    let graphemes: Vec<GraphemeBreakData> = span
+        .grapheme_indices(true)
+        .map(|(start, grapheme)| {
+            let class = grapheme_break_class(grapheme);
+            GraphemeBreakData {
+                end: start + grapheme.len(),
+                class,
+                break_all_class: break_all_class(grapheme),
+                vertical_line: grapheme == "|",
+                policy: attrs_list.get_span(span_start + start).css_line_break,
+            }
+        })
+        .collect();
+    let mut data = CssBreakData {
+        word_breaks: Vec::new(),
+        soft_breaks: Vec::new(),
+        emergency_breaks: Vec::new(),
+        min_content_breaks: Vec::new(),
+    };
+
+    for pair in graphemes.windows(2) {
+        let before = pair[0];
+        let after = pair[1];
+        let offset = before.end;
+        let absolute = span_start + offset;
+        let normal_break = normal_breaks.binary_search(&offset).is_ok();
+        let Some(policy) = before.policy else {
+            if normal_break {
+                data.word_breaks.push(offset);
+            }
+            continue;
+        };
+        if !policy.wrap {
+            continue;
+        }
+
+        let keep_all = policy.word_break == CssWordBreak::KeepAll
+            && keep_all_word_class(before.class)
+            && keep_all_word_class(after.class);
+        if blink_normal_break(normal_break, before, after) && !keep_all {
+            data.word_breaks.push(offset);
+        } else if policy.word_break == CssWordBreak::BreakAll && break_all_pair(before, after) {
+            data.soft_breaks.push(absolute);
+        }
+
+        let anywhere = policy.word_break == CssWordBreak::BreakWord
+            || policy.overflow_wrap == CssOverflowWrap::Anywhere;
+        let emergency = anywhere || policy.overflow_wrap == CssOverflowWrap::BreakWord;
+        if emergency {
+            data.emergency_breaks.push(absolute);
+        }
+        if anywhere {
+            data.min_content_breaks.push(absolute);
+        }
+    }
+    // ShapeLine represents one mandatory-line segment. Its end must terminate
+    // the final word even when the preceding CSS span disables soft wrapping.
+    data.word_breaks.push(span.len());
+    data.word_breaks.sort_unstable();
+    data.word_breaks.dedup();
+    data
 }
 
 /// A shaped span (for bidirectional processing)
@@ -871,8 +1182,9 @@ impl ShapeSpan {
             cached_words.extend(words.drain(..).rev());
         }
 
+        let breaks = css_break_data(span, span_range.start, attrs_list);
         let mut start_word = 0;
-        for (end_lb, _) in unicode_linebreak::linebreaks(span) {
+        for end_lb in breaks.word_breaks.iter().copied() {
             let mut start_lb = end_lb;
             for (i, c) in span[start_word..end_lb].char_indices().rev() {
                 // TODO: Not all whitespace characters are linebreakable, e.g. 00A0 (No-break
@@ -896,6 +1208,43 @@ impl ShapeSpan {
                     false,
                     shaping,
                 );
+                let absolute = (span_range.start + start_word)..(span_range.start + start_lb);
+                let custom = line[absolute.clone()]
+                    .char_indices()
+                    .any(|(offset, _)| {
+                        attrs_list
+                            .get_span(absolute.start + offset)
+                            .css_line_break
+                            .is_some()
+                    });
+                let soft_start = breaks
+                    .soft_breaks
+                    .partition_point(|offset| *offset <= absolute.start);
+                let soft_end = breaks
+                    .soft_breaks
+                    .partition_point(|offset| *offset < absolute.end);
+                let emergency_start = breaks
+                    .emergency_breaks
+                    .partition_point(|offset| *offset <= absolute.start);
+                let emergency_end = breaks
+                    .emergency_breaks
+                    .partition_point(|offset| *offset < absolute.end);
+                let min_start = breaks
+                    .min_content_breaks
+                    .partition_point(|offset| *offset <= absolute.start);
+                let min_end = breaks
+                    .min_content_breaks
+                    .partition_point(|offset| *offset < absolute.end);
+                word.set_line_breaks(
+                    custom,
+                    breaks.soft_breaks[soft_start..soft_end].iter().copied(),
+                    breaks.emergency_breaks[emergency_start..emergency_end]
+                        .iter()
+                        .copied(),
+                    breaks.min_content_breaks[min_start..min_end]
+                        .iter()
+                        .copied(),
+                );
                 words.push(word);
             }
             if start_lb < end_lb {
@@ -912,6 +1261,18 @@ impl ShapeSpan {
                         true,
                         shaping,
                     );
+                    let absolute = (span_range.start + start_lb + i)
+                        ..(span_range.start + start_lb + i + c.len_utf8());
+                    let custom = attrs_list
+                        .get_span(absolute.start)
+                        .css_line_break
+                        .is_some();
+                    word.set_line_breaks(
+                        custom,
+                        core::iter::empty(),
+                        core::iter::empty(),
+                        core::iter::empty(),
+                    );
                     words.push(word);
                 }
             }
@@ -921,7 +1282,7 @@ impl ShapeSpan {
         // Reverse glyphs in RTL lines
         if line_rtl {
             for word in &mut words {
-                word.glyphs.reverse();
+                word.reverse_glyphs();
             }
         }
 
@@ -1338,13 +1699,21 @@ impl ShapeLine {
                             }
                             word_range_width += word_width;
                             continue;
-                        } else if wrap == Wrap::Glyph
-                            // Make sure that the word is able to fit on it's own line, if not, fall back to Glyph wrapping.
-                            || (wrap == Wrap::WordOrGlyph && word_width > width_opt.unwrap_or(f32::INFINITY))
-                        {
+                        } else {
+                            let emergency = wrap == Wrap::Glyph
+                                || (matches!(
+                                    wrap,
+                                    Wrap::WordOrGlyph | Wrap::WordOrGlyphMinContent
+                                ) && word_width > width_opt.unwrap_or(f32::INFINITY));
+                            let break_indices = word.break_indices(wrap, emergency);
+                            if !break_indices.is_empty() {
                             // Commit the current line so that the word starts on the next line.
                             if word_range_width > 0.
-                                && wrap == Wrap::WordOrGlyph
+                                && word.soft_breaks.is_empty()
+                                && matches!(
+                                    wrap,
+                                    Wrap::WordOrGlyph | Wrap::WordOrGlyphMinContent
+                                )
                                 && word_width > width_opt.unwrap_or(f32::INFINITY)
                             {
                                 add_to_visual_line(
@@ -1365,18 +1734,29 @@ impl ShapeLine {
                                 fitting_start = (i, 0);
                             }
 
-                            for (glyph_i, glyph) in word.glyphs.iter().enumerate().rev() {
-                                let glyph_width = glyph.width(font_size);
-                                if current_visual_line.w + (word_range_width + glyph_width)
+                            let mut boundaries = Vec::with_capacity(break_indices.len() + 2);
+                            boundaries.push(0);
+                            boundaries.extend(break_indices);
+                            boundaries.push(word.glyphs.len());
+                            for chunk in boundaries.windows(2).rev() {
+                                let start = chunk[0];
+                                let end = chunk[1];
+                                let chunk_width = word.glyphs[start..end]
+                                    .iter()
+                                    .map(|glyph| glyph.width(font_size))
+                                    .sum::<f32>();
+                                if current_visual_line.w + (word_range_width + chunk_width)
                                     <= width_opt.unwrap_or(f32::INFINITY)
+                                    || (current_visual_line.ranges.is_empty()
+                                        && word_range_width == 0.)
                                 {
-                                    word_range_width += glyph_width;
+                                    word_range_width += chunk_width;
                                     continue;
                                 } else {
                                     add_to_visual_line(
                                         &mut current_visual_line,
                                         span_index,
-                                        (i, glyph_i + 1),
+                                        (i, end),
                                         fitting_start,
                                         word_range_width,
                                         number_of_blanks,
@@ -1386,8 +1766,8 @@ impl ShapeLine {
                                         cached_visual_lines.pop().unwrap_or_default();
 
                                     number_of_blanks = 0;
-                                    word_range_width = glyph_width;
-                                    fitting_start = (i, glyph_i + 1);
+                                    word_range_width = chunk_width;
+                                    fitting_start = (i, end);
                                 }
                             }
                         } else {
@@ -1435,6 +1815,7 @@ impl ShapeLine {
                                 word_range_width = word_width;
                                 fitting_start = (i + 1, 0);
                             }
+                            }
                         }
                     }
                     add_to_visual_line(
@@ -1464,13 +1845,21 @@ impl ShapeLine {
                             }
                             word_range_width += word_width;
                             continue;
-                        } else if wrap == Wrap::Glyph
-                            // Make sure that the word is able to fit on it's own line, if not, fall back to Glyph wrapping.
-                            || (wrap == Wrap::WordOrGlyph && word_width > width_opt.unwrap_or(f32::INFINITY))
-                        {
+                        } else {
+                            let emergency = wrap == Wrap::Glyph
+                                || (matches!(
+                                    wrap,
+                                    Wrap::WordOrGlyph | Wrap::WordOrGlyphMinContent
+                                ) && word_width > width_opt.unwrap_or(f32::INFINITY));
+                            let break_indices = word.break_indices(wrap, emergency);
+                            if !break_indices.is_empty() {
                             // Commit the current line so that the word starts on the next line.
                             if word_range_width > 0.
-                                && wrap == Wrap::WordOrGlyph
+                                && word.soft_breaks.is_empty()
+                                && matches!(
+                                    wrap,
+                                    Wrap::WordOrGlyph | Wrap::WordOrGlyphMinContent
+                                )
                                 && word_width > width_opt.unwrap_or(f32::INFINITY)
                             {
                                 add_to_visual_line(
@@ -1491,19 +1880,30 @@ impl ShapeLine {
                                 fitting_start = (i, 0);
                             }
 
-                            for (glyph_i, glyph) in word.glyphs.iter().enumerate() {
-                                let glyph_width = glyph.width(font_size);
-                                if current_visual_line.w + (word_range_width + glyph_width)
+                            let mut boundaries = Vec::with_capacity(break_indices.len() + 2);
+                            boundaries.push(0);
+                            boundaries.extend(break_indices);
+                            boundaries.push(word.glyphs.len());
+                            for chunk in boundaries.windows(2) {
+                                let start = chunk[0];
+                                let end = chunk[1];
+                                let chunk_width = word.glyphs[start..end]
+                                    .iter()
+                                    .map(|glyph| glyph.width(font_size))
+                                    .sum::<f32>();
+                                if current_visual_line.w + (word_range_width + chunk_width)
                                     <= width_opt.unwrap_or(f32::INFINITY)
+                                    || (current_visual_line.ranges.is_empty()
+                                        && word_range_width == 0.)
                                 {
-                                    word_range_width += glyph_width;
+                                    word_range_width += chunk_width;
                                     continue;
                                 } else {
                                     add_to_visual_line(
                                         &mut current_visual_line,
                                         span_index,
                                         fitting_start,
-                                        (i, glyph_i),
+                                        (i, start),
                                         word_range_width,
                                         number_of_blanks,
                                     );
@@ -1512,8 +1912,8 @@ impl ShapeLine {
                                         cached_visual_lines.pop().unwrap_or_default();
 
                                     number_of_blanks = 0;
-                                    word_range_width = glyph_width;
-                                    fitting_start = (i, glyph_i);
+                                    word_range_width = chunk_width;
+                                    fitting_start = (i, start);
                                 }
                             }
                         } else {
@@ -1557,6 +1957,7 @@ impl ShapeLine {
                             } else {
                                 word_range_width = word_width;
                                 fitting_start = (i, 0);
+                            }
                             }
                         }
                     }

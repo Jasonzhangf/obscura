@@ -1454,6 +1454,28 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                 _ => style.white_space,
             };
         }
+        "overflow-wrap" | "word-wrap" => {
+            style.overflow_wrap = match value.trim().to_ascii_lowercase().as_str() {
+                "normal" | "initial" => Some(crate::OverflowWrap::Normal),
+                "break-word" => Some(crate::OverflowWrap::BreakWord),
+                "anywhere" => Some(crate::OverflowWrap::Anywhere),
+                // Both properties inherit. With no lower-origin declaration
+                // in the compact cascade, revert also exposes the inherited
+                // value, as Blink and Gecko do for these inherited longhands.
+                "inherit" | "unset" | "revert" | "revert-layer" => None,
+                _ => style.overflow_wrap,
+            };
+        }
+        "word-break" => {
+            style.word_break = match value.trim().to_ascii_lowercase().as_str() {
+                "normal" | "initial" => Some(crate::WordBreak::Normal),
+                "break-all" => Some(crate::WordBreak::BreakAll),
+                "keep-all" => Some(crate::WordBreak::KeepAll),
+                "break-word" => Some(crate::WordBreak::BreakWord),
+                "inherit" | "unset" | "revert" | "revert-layer" => None,
+                _ => style.word_break,
+            };
+        }
         "text-wrap" => {
             style.text_wrap_style = match value.trim().to_ascii_lowercase().as_str() {
                 "auto" | "wrap" | "initial" | "revert" | "revert-layer" => {
@@ -1717,6 +1739,9 @@ pub(crate) fn supports_declaration(name: &str, value: &str) -> bool {
             | "text-decoration-line"
             | "line-height"
             | "white-space"
+            | "overflow-wrap"
+            | "word-wrap"
+            | "word-break"
             | "text-wrap"
             | "text-wrap-style"
             | "align-items"
@@ -1857,6 +1882,14 @@ pub(crate) fn supports_declaration(name: &str, value: &str) -> bool {
         "white-space" => matches!(
             value.to_ascii_lowercase().as_str(),
             "normal" | "nowrap" | "pre" | "pre-wrap" | "pre-line" | "break-spaces"
+        ),
+        "overflow-wrap" | "word-wrap" => matches!(
+            value.to_ascii_lowercase().as_str(),
+            "normal" | "break-word" | "anywhere"
+        ),
+        "word-break" => matches!(
+            value.to_ascii_lowercase().as_str(),
+            "normal" | "break-all" | "keep-all" | "break-word"
         ),
         "text-wrap" => matches!(
             value.to_ascii_lowercase().as_str(),
@@ -6458,6 +6491,55 @@ mod tests {
         assert!(supports_declaration("text-indent", "-9999px"));
         assert!(supports_declaration("text-indent", "25%"));
         assert!(!supports_declaration("text-indent", "10px hanging"));
+    }
+
+    #[test]
+    fn text_break_longhands_parse_alias_and_css_wide_values() {
+        let values = compute_style(
+            "div",
+            Some(
+                "overflow-wrap:break-word;\
+                 word-wrap:anywhere;\
+                 word-break:break-all",
+            ),
+        );
+        assert_eq!(values.overflow_wrap, Some(crate::OverflowWrap::Anywhere));
+        assert_eq!(values.word_break, Some(crate::WordBreak::BreakAll));
+
+        let legacy = compute_style("div", Some("word-break:break-word"));
+        assert_eq!(legacy.word_break, Some(crate::WordBreak::BreakWord));
+
+        for keyword in ["inherit", "unset", "revert", "revert-layer"] {
+            let style = compute_style(
+                "div",
+                Some(&format!(
+                    "overflow-wrap:anywhere;overflow-wrap:{keyword};\
+                     word-break:break-all;word-break:{keyword}"
+                )),
+            );
+            assert_eq!(style.overflow_wrap, None, "{keyword}");
+            assert_eq!(style.word_break, None, "{keyword}");
+        }
+        let initial = compute_style(
+            "div",
+            Some(
+                "overflow-wrap:anywhere;overflow-wrap:initial;\
+                 word-break:break-all;word-break:initial",
+            ),
+        );
+        assert_eq!(initial.overflow_wrap, Some(crate::OverflowWrap::Normal));
+        assert_eq!(initial.word_break, Some(crate::WordBreak::Normal));
+
+        for property in ["overflow-wrap", "word-wrap"] {
+            assert!(supports_declaration(property, "normal"));
+            assert!(supports_declaration(property, "break-word"));
+            assert!(supports_declaration(property, "anywhere"));
+            assert!(!supports_declaration(property, "break-all"));
+        }
+        for value in ["normal", "break-all", "keep-all", "break-word"] {
+            assert!(supports_declaration("word-break", value), "{value}");
+        }
+        assert!(!supports_declaration("word-break", "anywhere"));
     }
 
     #[test]

@@ -120,6 +120,10 @@ pub enum Wrap {
     Word,
     /// Wraps at the word level, or fallback to glyph level if a word can't fit on a line by itself
     WordOrGlyph,
+    /// Browser min-content wrapping. Like [`Self::WordOrGlyph`], but only
+    /// span boundaries contributed by `overflow-wrap:anywhere` (and legacy
+    /// `word-break:break-word`) participate.
+    WordOrGlyphMinContent,
 }
 
 impl Display for Wrap {
@@ -128,6 +132,7 @@ impl Display for Wrap {
             Self::None => write!(f, "No Wrap"),
             Self::Word => write!(f, "Word Wrap"),
             Self::WordOrGlyph => write!(f, "Word Wrap or Character"),
+            Self::WordOrGlyphMinContent => write!(f, "Min-content Word Wrap or Character"),
             Self::Glyph => write!(f, "Character"),
         }
     }

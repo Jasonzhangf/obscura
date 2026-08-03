@@ -501,6 +501,25 @@ impl PreparedRender {
             }
             .to_string(),
         );
+        let overflow_wrap = match style.overflow_wrap.unwrap_or_default() {
+            crate::OverflowWrap::Normal => "normal",
+            crate::OverflowWrap::BreakWord => "break-word",
+            crate::OverflowWrap::Anywhere => "anywhere",
+        }
+        .to_string();
+        out.insert("overflow-wrap", overflow_wrap.clone());
+        // CSSOM retains the legacy alias as a separately addressable property.
+        out.insert("word-wrap", overflow_wrap);
+        out.insert(
+            "word-break",
+            match style.word_break.unwrap_or_default() {
+                crate::WordBreak::Normal => "normal",
+                crate::WordBreak::BreakAll => "break-all",
+                crate::WordBreak::KeepAll => "keep-all",
+                crate::WordBreak::BreakWord => "break-word",
+            }
+            .to_string(),
+        );
         out.insert(
             "text-align",
             match style.text_align {
@@ -7884,6 +7903,23 @@ mod tests {
             found |= pixel.blue() > 120 && pixel.green() > 80 && pixel.red() < 40;
         }
         assert!(found, "computed color should resolve currentColor in inline svg");
+    }
+
+    #[test]
+    fn computed_style_exposes_text_break_longhands_and_alias() {
+        let tree = parse_html(
+            r#"<style>#copy{overflow-wrap:anywhere;word-break:keep-all}</style>
+               <p id="copy">copy</p>"#,
+        );
+        let copy = tree.get_element_by_id("copy").unwrap();
+        let mut resources = RenderResourceCache::default();
+        let prepared = prepare_dom(&tree, (320.0, 200.0), None, &mut resources)
+            .expect("prepared render");
+        let computed = prepared.computed_style(copy).expect("computed style");
+
+        assert_eq!(computed.get("overflow-wrap").map(String::as_str), Some("anywhere"));
+        assert_eq!(computed.get("word-wrap").map(String::as_str), Some("anywhere"));
+        assert_eq!(computed.get("word-break").map(String::as_str), Some("keep-all"));
     }
 
     #[test]

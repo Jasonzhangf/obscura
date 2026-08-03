@@ -11,6 +11,51 @@ use crate::{CacheKeyFlags, Metrics};
 
 pub use fontdb::{Family, Stretch, Style, Weight};
 
+/// CSS-compatible line-breaking policy attached to a rich-text span.
+///
+/// This is optional on [`Attrs`] so existing cosmic-text users retain the
+/// library's ordinary `Wrap` behavior. Browser integrations can opt in when
+/// line-breaking rules vary inside one shaped paragraph.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct CssLineBreak {
+    /// Whether soft wrapping is enabled for this span.
+    pub wrap: bool,
+    /// CSS `word-break` behavior.
+    pub word_break: CssWordBreak,
+    /// CSS `overflow-wrap` behavior.
+    pub overflow_wrap: CssOverflowWrap,
+}
+
+impl Default for CssLineBreak {
+    fn default() -> Self {
+        Self {
+            wrap: true,
+            word_break: CssWordBreak::Normal,
+            overflow_wrap: CssOverflowWrap::Normal,
+        }
+    }
+}
+
+/// CSS `word-break` values used by the line-breaking adapter.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum CssWordBreak {
+    #[default]
+    Normal,
+    BreakAll,
+    KeepAll,
+    /// Legacy `word-break: break-word` compatibility behavior.
+    BreakWord,
+}
+
+/// CSS `overflow-wrap` values used by the line-breaking adapter.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum CssOverflowWrap {
+    #[default]
+    Normal,
+    BreakWord,
+    Anywhere,
+}
+
 /// Text color
 #[derive(Clone, Copy, Debug, PartialOrd, Ord, Eq, Hash, PartialEq)]
 pub struct Color(pub u32);
@@ -349,6 +394,8 @@ pub struct Attrs<'a> {
     pub letter_spacing_opt: Option<LetterSpacing>,
     pub font_features: FontFeatures,
     pub font_variations: FontVariations,
+    /// Optional browser-grade line-breaking policy for this text span.
+    pub css_line_break: Option<CssLineBreak>,
 }
 
 impl<'a> Attrs<'a> {
@@ -372,6 +419,7 @@ impl<'a> Attrs<'a> {
             letter_spacing_opt: None,
             font_features: FontFeatures::new(),
             font_variations: FontVariations::new(),
+            css_line_break: None,
         }
     }
 
@@ -468,6 +516,12 @@ impl<'a> Attrs<'a> {
         self
     }
 
+    /// Attach CSS line-breaking behavior to this span.
+    pub fn css_line_break(mut self, policy: CssLineBreak) -> Self {
+        self.css_line_break = Some(policy);
+        self
+    }
+
     /// Check if font matches
     pub fn matches(&self, face: &fontdb::FaceInfo) -> bool {
         //TODO: smarter way of including emoji
@@ -529,6 +583,7 @@ pub struct AttrsOwned {
     pub letter_spacing_opt: Option<LetterSpacing>,
     pub font_features: FontFeatures,
     pub font_variations: FontVariations,
+    pub css_line_break: Option<CssLineBreak>,
 }
 
 impl AttrsOwned {
@@ -549,6 +604,7 @@ impl AttrsOwned {
             letter_spacing_opt: attrs.letter_spacing_opt,
             font_features: attrs.font_features.clone(),
             font_variations: attrs.font_variations.clone(),
+            css_line_break: attrs.css_line_break,
         }
     }
 
@@ -569,6 +625,7 @@ impl AttrsOwned {
             letter_spacing_opt: self.letter_spacing_opt,
             font_features: self.font_features.clone(),
             font_variations: self.font_variations.clone(),
+            css_line_break: self.css_line_break,
         }
     }
 }

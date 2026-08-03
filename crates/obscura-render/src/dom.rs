@@ -2128,6 +2128,8 @@ fn layout_dom_once(
             list_style: crate::ListStyle,
             line_height: crate::LineHeight,
             white_space: crate::WhiteSpace,
+            overflow_wrap: crate::OverflowWrap,
+            word_break: crate::WordBreak,
             text_wrap_style: crate::TextWrapStyle,
             text_transform: crate::TextTransform,
             italic: bool,
@@ -2177,6 +2179,8 @@ fn layout_dom_once(
                     list_style: crate::ListStyle::Disc,
                     line_height: crate::LineHeight::Normal,
                     white_space: crate::WhiteSpace::Normal,
+                    overflow_wrap: crate::OverflowWrap::Normal,
+                    word_break: crate::WordBreak::Normal,
                     text_wrap_style: crate::TextWrapStyle::Auto,
                     text_transform: crate::TextTransform::None,
                     italic: false,
@@ -2587,6 +2591,8 @@ fn layout_dom_once(
                 match style.list_style { Some(v) => inh.list_style = v, None => style.list_style = Some(inh.list_style) }
                 match style.line_height { Some(v) => inh.line_height = v, None => style.line_height = Some(inh.line_height) }
                 match style.white_space { Some(v) => inh.white_space = v, None => style.white_space = Some(inh.white_space) }
+                match style.overflow_wrap { Some(v) => inh.overflow_wrap = v, None => style.overflow_wrap = Some(inh.overflow_wrap) }
+                match style.word_break { Some(v) => inh.word_break = v, None => style.word_break = Some(inh.word_break) }
                 match style.text_wrap_style { Some(v) => inh.text_wrap_style = v, None => style.text_wrap_style = Some(inh.text_wrap_style) }
                 match style.text_transform { Some(v) => inh.text_transform = v, None => style.text_transform = Some(inh.text_transform) }
                 match style.font_style_italic { Some(v) => inh.italic = v, None => style.font_style_italic = Some(inh.italic) }
@@ -2708,6 +2714,8 @@ fn layout_dom_once(
                 let host_variation_settings = style.font_variation_settings.clone();
                 let host_line_height = style.line_height;
                 let host_white_space = style.white_space;
+                let host_overflow_wrap = style.overflow_wrap;
+                let host_word_break = style.word_break;
                 let host_text_wrap_style = style.text_wrap_style;
                 let host_transform = style.text_transform;
                 let host_italic = style.font_style_italic;
@@ -2934,6 +2942,12 @@ fn layout_dom_once(
                     }
                     if pseudo.white_space.is_none() {
                         pseudo.white_space = host_white_space;
+                    }
+                    if pseudo.overflow_wrap.is_none() {
+                        pseudo.overflow_wrap = host_overflow_wrap;
+                    }
+                    if pseudo.word_break.is_none() {
+                        pseudo.word_break = host_word_break;
                     }
                     if pseudo.text_wrap_style.is_none() {
                         pseudo.text_wrap_style = host_text_wrap_style;
@@ -11758,6 +11772,245 @@ mod tests {
         assert_eq!(laid.styles[&grid].grid_auto_rows.len(), 1);
         assert!(!laid.styles[&grid].grid_auto_columns_inherit);
         assert!(!laid.styles[&grid].grid_auto_rows_inherit);
+    }
+
+    #[cfg(feature = "paint")]
+    #[test]
+    fn text_break_modes_match_chromium_fixed_width_geometry() {
+        // Chromium 145 at DPR 1 with Liberation Sans produces the same
+        // 20/40px line boxes. `break-word` and `anywhere` are emergency
+        // wrapping modes; `break-all` adds typographic-letter opportunities.
+        // keep-all must retain ordinary Latin word/space behavior.
+        let tree = parse_html(
+            r#"<style>
+                html,body { margin:0 }
+                .fixed { width:80px;font:16px/20px "Liberation Sans" }
+                #normal { overflow-wrap:normal }
+                #break-word { overflow-wrap:break-word }
+                #anywhere { overflow-wrap:anywhere }
+                #break-all { word-break:break-all }
+                #keep-all { word-break:keep-all }
+                #legacy { word-break:break-word }
+            </style>
+            <div id="normal" class="fixed">abcdefghijklmnop</div>
+            <div id="break-word" class="fixed">abcdefghijklmnop</div>
+            <div id="anywhere" class="fixed">abcdefghijklmnop</div>
+            <div id="break-all" class="fixed">abcdefghijklmnop</div>
+            <div id="latin-normal" class="fixed">alpha beta gamma</div>
+            <div id="keep-all" class="fixed">alpha beta gamma</div>
+            <div id="legacy" class="fixed">abcdefghijklmnop</div>"#,
+        );
+        let laid = layout_dom(&tree, (500.0, 500.0));
+        let rect = |id| laid.rects[&tree.get_element_by_id(id).unwrap()];
+
+        assert_eq!(
+            rect("normal"),
+            Rect { x: 0.0, y: 0.0, width: 80.0, height: 20.0 }
+        );
+        assert_eq!(
+            rect("break-word"),
+            Rect { x: 0.0, y: 20.0, width: 80.0, height: 40.0 }
+        );
+        assert_eq!(
+            rect("anywhere"),
+            Rect { x: 0.0, y: 60.0, width: 80.0, height: 40.0 }
+        );
+        assert_eq!(
+            rect("break-all"),
+            Rect { x: 0.0, y: 100.0, width: 80.0, height: 40.0 }
+        );
+        assert_eq!(rect("latin-normal").height, 40.0);
+        assert_eq!(rect("keep-all").height, rect("latin-normal").height);
+        assert_eq!(rect("legacy").height, 40.0);
+    }
+
+    #[cfg(feature = "paint")]
+    #[test]
+    fn text_break_inheritance_alias_and_css_wide_values_match_chromium() {
+        let tree = parse_html(
+            r#"<style>
+                html,body { margin:0 }
+                .parent { overflow-wrap:anywhere;word-break:break-all;font:16px/20px "Liberation Sans" }
+                .fixed { width:80px }
+                #initial { overflow-wrap:initial;word-break:initial }
+                #unset { overflow-wrap:unset;word-break:unset }
+                #inherit { overflow-wrap:inherit;word-break:inherit }
+                #revert { overflow-wrap:revert;word-break:revert }
+                #revert-layer { overflow-wrap:revert-layer;word-break:revert-layer }
+                #alias { word-wrap:anywhere;word-break:normal }
+                #inherited::before { content:"";display:none }
+            </style>
+            <section class="parent">
+                <div id="inherited" class="fixed">abcdefghijklmnop</div>
+                <div id="initial" class="fixed">abcdefghijklmnop</div>
+                <div id="unset" class="fixed">abcdefghijklmnop</div>
+                <div id="inherit" class="fixed">abcdefghijklmnop</div>
+                <div id="revert" class="fixed">abcdefghijklmnop</div>
+                <div id="revert-layer" class="fixed">abcdefghijklmnop</div>
+                <div id="alias" class="fixed">abcdefghijklmnop</div>
+            </section>"#,
+        );
+        let laid = layout_dom(&tree, (500.0, 500.0));
+        let node = |id| tree.get_element_by_id(id).unwrap();
+        let style = |id| &laid.styles[&node(id)];
+        let height = |id| laid.rects[&node(id)].height;
+
+        assert_eq!(style("inherited").overflow_wrap, Some(crate::OverflowWrap::Anywhere));
+        assert_eq!(style("inherited").word_break, Some(crate::WordBreak::BreakAll));
+        assert_eq!(height("inherited"), 40.0);
+        assert_eq!(
+            style("inherited").before_pseudo.as_ref().unwrap().overflow_wrap,
+            Some(crate::OverflowWrap::Anywhere)
+        );
+        assert_eq!(
+            style("inherited").before_pseudo.as_ref().unwrap().word_break,
+            Some(crate::WordBreak::BreakAll)
+        );
+
+        assert_eq!(style("initial").overflow_wrap, Some(crate::OverflowWrap::Normal));
+        assert_eq!(style("initial").word_break, Some(crate::WordBreak::Normal));
+        assert_eq!(height("initial"), 20.0);
+        for id in ["unset", "inherit", "revert", "revert-layer"] {
+            assert_eq!(style(id).overflow_wrap, Some(crate::OverflowWrap::Anywhere), "{id}");
+            assert_eq!(style(id).word_break, Some(crate::WordBreak::BreakAll), "{id}");
+            assert_eq!(height(id), 40.0, "{id}");
+        }
+        assert_eq!(style("alias").overflow_wrap, Some(crate::OverflowWrap::Anywhere));
+        assert_eq!(style("alias").word_break, Some(crate::WordBreak::Normal));
+        assert_eq!(height("alias"), 40.0);
+    }
+
+    #[cfg(feature = "paint")]
+    #[test]
+    fn anywhere_but_not_break_word_reduces_min_content() {
+        let tree = parse_html(
+            r#"<style>
+                html,body { margin:0 }
+                .grid { display:grid;grid-template-columns:min-content;font:16px/20px "Liberation Sans" }
+                .cell { display:block }
+                #normal { overflow-wrap:normal }
+                #break-word { overflow-wrap:break-word }
+                #anywhere { overflow-wrap:anywhere }
+                #break-all { word-break:break-all }
+            </style>
+            <div class="grid"><div id="normal" class="cell">abcdefghijklmnop</div></div>
+            <div class="grid"><div id="break-word" class="cell">abcdefghijklmnop</div></div>
+            <div class="grid"><div id="anywhere" class="cell">abcdefghijklmnop</div></div>
+            <div class="grid"><div id="break-all" class="cell">abcdefghijklmnop</div></div>"#,
+        );
+        let laid = layout_dom(&tree, (500.0, 1000.0));
+        let width = |id: &str| laid.rects[&tree.get_element_by_id(id).unwrap()].width;
+
+        assert_eq!(width("normal"), 125.0);
+        assert_eq!(width("break-word"), 125.0);
+        assert_eq!(width("anywhere"), 14.0);
+        assert_eq!(width("break-all"), 14.0);
+    }
+
+    #[cfg(feature = "paint")]
+    #[test]
+    fn inline_descendant_break_policies_stay_at_their_style_boundaries() {
+        let tree = parse_html(
+            r#"<style>
+                html,body { margin:0 }
+                .fixed { width:80px;font:16px/20px "Liberation Sans" }
+                .normal { word-break:normal;overflow-wrap:normal }
+                .break-all { word-break:break-all }
+                .anywhere { overflow-wrap:anywhere }
+            </style>
+            <div id="child-break-all" class="fixed normal"><span class="break-all">abcdefghijklmnop</span></div>
+            <div id="child-normal" class="fixed break-all"><span class="normal">abcdefghijklmnop</span></div>
+            <div id="child-anywhere" class="fixed normal"><span class="anywhere">abcdefghijklmnop</span></div>"#,
+        );
+        let laid = layout_dom(&tree, (500.0, 300.0));
+        let height = |id| laid.rects[&tree.get_element_by_id(id).unwrap()].height;
+
+        assert_eq!(height("child-break-all"), 40.0);
+        assert_eq!(height("child-normal"), 20.0);
+        assert_eq!(height("child-anywhere"), 40.0);
+    }
+
+    #[cfg(feature = "paint")]
+    #[test]
+    fn break_all_keeps_uax14_punctuation_pairs_in_min_content() {
+        let tree = parse_html(
+            r#"<style>
+                html,body { margin:0 }
+                .grid { display:grid;grid-template-columns:min-content;font:16px/20px "Liberation Sans" }
+                #break-all { word-break:break-all }
+                #anywhere { overflow-wrap:anywhere }
+            </style>
+            <div class="grid"><span id="break-all">(ab)</span></div>
+            <div class="grid"><span id="anywhere">(ab)</span></div>"#,
+        );
+        let laid = layout_dom(&tree, (500.0, 300.0));
+        let rect = |id| laid.rects[&tree.get_element_by_id(id).unwrap()];
+
+        assert!(rect("break-all").width > rect("anywhere").width);
+        assert_eq!(rect("break-all").height, 40.0);
+        assert_eq!(rect("anywhere").height, 80.0);
+    }
+
+    #[cfg(feature = "paint")]
+    #[test]
+    fn break_all_uses_blink_punctuation_pair_semantics() {
+        let tree = parse_html(
+            r#"<style>
+                html,body { margin:0 }
+                .grid { display:grid;grid-template-columns:min-content;font:20px/24px monospace }
+                .break { word-break:break-all }
+            </style>
+            <div class="grid"><span id="close-normal">)a</span></div>
+            <div class="grid"><span id="close-break" class="break">)a</span></div>
+            <div class="grid"><span id="closing-normal">a)</span></div>
+            <div class="grid"><span id="closing-break" class="break">a)</span></div>
+            <div class="grid"><span id="slash-normal">a/b</span></div>
+            <div class="grid"><span id="slash-break" class="break">a/b</span></div>
+            <div class="grid"><span id="hyphen-normal">a-b</span></div>
+            <div class="grid"><span id="hyphen-break" class="break">a-b</span></div>
+            <div class="grid"><span id="bar-normal">a|b</span></div>
+            <div class="grid"><span id="bar-break" class="break">a|b</span></div>
+            <div class="grid"><span id="plus-normal">a+b</span></div>
+            <div class="grid"><span id="plus-break" class="break">a+b</span></div>
+            <div class="grid"><span id="prefix-normal">$a</span></div>
+            <div class="grid"><span id="prefix-break" class="break">$a</span></div>
+            <div class="grid"><span id="postfix-normal">a%</span></div>
+            <div class="grid"><span id="postfix-break" class="break">a%</span></div>"#,
+        );
+        let laid = layout_dom(&tree, (500.0, 1000.0));
+        let width = |id: &str| laid.rects[&tree.get_element_by_id(id).unwrap()].width;
+
+        for stem in ["close", "slash", "hyphen", "bar", "plus"] {
+            assert!(
+                width(&format!("{stem}-break")) < width(&format!("{stem}-normal")),
+                "break-all should expose a narrower opportunity for {stem}"
+            );
+        }
+        for stem in ["closing", "prefix", "postfix"] {
+            assert_eq!(
+                width(&format!("{stem}-break")),
+                width(&format!("{stem}-normal")),
+                "break-all must retain the prohibited boundary for {stem}"
+            );
+        }
+    }
+
+    #[cfg(feature = "paint")]
+    #[test]
+    fn keep_all_suppresses_mixed_cjk_latin_word_boundaries() {
+        let tree = parse_html(
+            r#"<style>
+                html,body { margin:0 }
+                .grid { display:grid;grid-template-columns:min-content;font:16px/20px "Liberation Sans" }
+                #keep { word-break:keep-all }
+            </style>
+            <div class="grid"><span id="normal">標（準）萬ab國.碼</span></div>
+            <div class="grid"><span id="keep">標（準）萬ab國.碼</span></div>"#,
+        );
+        let laid = layout_dom(&tree, (500.0, 500.0));
+        let width = |id| laid.rects[&tree.get_element_by_id(id).unwrap()].width;
+
+        assert!(width("keep") > width("normal"));
     }
 
 }

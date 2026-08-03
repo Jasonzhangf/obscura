@@ -15,9 +15,9 @@
 use std::{collections::HashMap, sync::Arc};
 
 use cosmic_text::{
-    Align, Attrs, Buffer, CacheKey, CacheKeyFlags, Color, Family, FeatureTag, FontFeatures,
-    FontSystem, FontVariations, Metrics, Shaping, Style, SwashCache, SwashImage, VariationTag,
-    Weight, Wrap,
+    Align, Attrs, Buffer, CacheKey, CacheKeyFlags, Color, CssLineBreak, CssOverflowWrap,
+    CssWordBreak, Family, FeatureTag, FontFeatures, FontSystem, FontVariations, Metrics, Shaping,
+    Style, SwashCache, SwashImage, VariationTag, Weight, Wrap,
 };
 use swash::scale::{image::Content as SwashContent, Render, ScaleContext, Source, StrikeWith};
 use swash::zeno::{Angle, Format, Transform, Vector};
@@ -381,6 +381,12 @@ fn metadata_variation(metadata: usize) -> Option<usize> {
 /// paint it (filled in after layout).
 pub struct InlineItem {
     buffer: Buffer,
+    /// Wrapping used for definite-width layout and final paint.
+    layout_wrap: Wrap,
+    /// Wrapping used only for an intrinsic min-content query. This differs
+    /// from `layout_wrap` for `overflow-wrap: break-word`: emergency breaks
+    /// are available during reflow but do not reduce min-content.
+    min_content_wrap: Wrap,
     /// Unmodified shaped content retained only when `text-indent` is nonzero.
     /// Each Taffy measurement can then derive a first-line-only wrap boundary
     /// without accumulating synthetic hard breaks across repeated probes.
@@ -1019,6 +1025,9 @@ impl TextEngine {
             color: context.color,
             family: context.family,
             clip_fill: context.clip_fill,
+            white_space: context.white_space,
+            overflow_wrap: context.overflow_wrap,
+            word_break: context.word_break,
         };
         let mut spans = Vec::new();
         push_text(
@@ -1043,6 +1052,19 @@ impl TextEngine {
         clip_fills: Vec<ClipTextFill>,
     ) -> Option<usize> {
         let white_space = base.white_space.unwrap_or_default();
+        let layout_wrap = if spans.iter().any(|(_, attrs)| attrs.has_layout_emergency_breaks()) {
+            Wrap::WordOrGlyph
+        } else {
+            Wrap::Word
+        };
+        let min_content_wrap = if spans
+            .iter()
+            .any(|(_, attrs)| attrs.has_min_content_emergency_breaks())
+        {
+            Wrap::WordOrGlyphMinContent
+        } else {
+            Wrap::Word
+        };
         // Collapsible trailing whitespace does not widen the last line.
         if matches!(
             white_space,
@@ -1095,22 +1117,12 @@ impl TextEngine {
         let cosmic_size = base_size.max(1.0);
         let metrics = Metrics::new(cosmic_size, line_h.max(1.0));
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
-        // Break only at word boundaries, never mid-word. This keeps the
-        // min-content width (measured at width 0) equal to the longest word,
-        // so a table/flex column never squeezes narrower than a whole word
-        // and forces an ugly mid-word break; a single word wider than its
-        // column overflows instead, matching normal `overflow-wrap: normal`.
-        buffer.set_wrap(
-            &mut self.font_system,
-            if matches!(
-                white_space,
-                crate::WhiteSpace::NoWrap | crate::WhiteSpace::Pre
-            ) {
-                Wrap::None
-            } else {
-                Wrap::Word
-            },
-        );
+        // Install the used-layout mode now; intrinsic measurement temporarily
+        // swaps to `min_content_wrap` below. Keeping those modes separate is
+        // what prevents `overflow-wrap: break-word` from shrinking a
+        // table/flex min-content contribution while still permitting an
+        // emergency break once the actual line width is known.
+        buffer.set_wrap(&mut self.font_system, layout_wrap);
         // Always Advanced shaping: Basic mis-maps per-span attribute
         // boundaries in the shaping backend (a multi-color run like body text
         // with links ends up coloring the wrong glyphs), and shaping is a
@@ -1166,6 +1178,8 @@ impl TextEngine {
             .then(|| buffer.clone());
         self.items.push(InlineItem {
             buffer,
+            layout_wrap,
+            min_content_wrap,
             source_buffer,
             text_indent,
             first_line_offset: 0.0,
@@ -1189,9 +1203,19 @@ impl TextEngine {
                 .size(taffy::Size { width, height: None });
             return (size.width, size.height);
         }
+        let wrap = self.items[idx].layout_wrap;
+        self.measure_text_with_wrap(idx, width, wrap)
+    }
+
+    fn measure_text_with_wrap(
+        &mut self,
+        idx: usize,
+        width: Option<f32>,
+        wrap: Wrap,
+    ) -> (f32, f32) {
         let TextEngine { font_system, items, .. } = self;
         let item = &mut items[idx];
-        shape_with_text_indent(font_system, item, width);
+        shape_with_text_indent(font_system, item, width, wrap);
         let (width, height) = buffer_size(&item.buffer, item.first_line_offset);
         (width, height.max(item.forced_min_height))
     }
@@ -1207,7 +1231,8 @@ impl TextEngine {
         let Some(item) = items.get_mut(idx) else {
             return (0.0, 0.0);
         };
-        shape_with_text_indent(font_system, item, None);
+        let wrap = item.layout_wrap;
+        shape_with_text_indent(font_system, item, None, wrap);
         let mut width = 0.0f32;
         let mut height = 0.0f32;
         for (line_index, run) in item.buffer.layout_runs().enumerate() {
@@ -1257,12 +1282,19 @@ impl TextEngine {
             }
             return size;
         }
+        let min_content_query =
+            known.width.is_none() && matches!(available.width, taffy::AvailableSpace::MinContent);
         let width = known.width.or(match available.width {
             taffy::AvailableSpace::Definite(width) => Some(width),
             taffy::AvailableSpace::MinContent => Some(0.0),
             taffy::AvailableSpace::MaxContent => None,
         });
-        let (width, height) = self.measure(idx, width);
+        let wrap = if min_content_query {
+            self.items[idx].min_content_wrap
+        } else {
+            self.items[idx].layout_wrap
+        };
+        let (width, height) = self.measure_text_with_wrap(idx, width, wrap);
         taffy::Size { width, height }
     }
 
@@ -1281,7 +1313,8 @@ impl TextEngine {
         } = self;
         let item = &mut items[idx];
         let content_width = content_width.max(0.0);
-        shape_with_text_indent(font_system, item, Some(content_width));
+        let wrap = item.layout_wrap;
+        shape_with_text_indent(font_system, item, Some(content_width), wrap);
         let balanced_width = item
             .balance_wrap
             .then(|| balance_wrap_width(font_system, &mut item.buffer, content_width))
@@ -1315,9 +1348,31 @@ struct SpanAttrs {
     color: [u8; 4],
     family: Arc<str>,
     clip_fill: Option<usize>,
+    white_space: crate::WhiteSpace,
+    overflow_wrap: crate::OverflowWrap,
+    word_break: crate::WordBreak,
 }
 
 impl SpanAttrs {
+    fn wrapping_enabled(&self) -> bool {
+        !matches!(
+            self.white_space,
+            crate::WhiteSpace::NoWrap | crate::WhiteSpace::Pre
+        )
+    }
+
+    fn has_layout_emergency_breaks(&self) -> bool {
+        self.wrapping_enabled()
+            && (self.word_break == crate::WordBreak::BreakWord
+                || self.overflow_wrap != crate::OverflowWrap::Normal)
+    }
+
+    fn has_min_content_emergency_breaks(&self) -> bool {
+        self.wrapping_enabled()
+            && (self.word_break == crate::WordBreak::BreakWord
+                || self.overflow_wrap == crate::OverflowWrap::Anywhere)
+    }
+
     fn to_attrs(&self, variation_index: usize) -> Attrs<'_> {
         let mut a = Attrs::new().family(Family::Name(self.family.as_ref()));
         // Inline descendants keep their own computed font metrics inside the
@@ -1371,6 +1426,22 @@ impl SpanAttrs {
         if let Some(variations) = self.variations.as_ref() {
             a = a.font_variations((**variations).clone());
         }
+        let word_break = match self.word_break {
+            crate::WordBreak::Normal => CssWordBreak::Normal,
+            crate::WordBreak::BreakAll => CssWordBreak::BreakAll,
+            crate::WordBreak::KeepAll => CssWordBreak::KeepAll,
+            crate::WordBreak::BreakWord => CssWordBreak::BreakWord,
+        };
+        let overflow_wrap = match self.overflow_wrap {
+            crate::OverflowWrap::Normal => CssOverflowWrap::Normal,
+            crate::OverflowWrap::BreakWord => CssOverflowWrap::BreakWord,
+            crate::OverflowWrap::Anywhere => CssOverflowWrap::Anywhere,
+        };
+        a = a.css_line_break(CssLineBreak {
+            wrap: self.wrapping_enabled(),
+            word_break,
+            overflow_wrap,
+        });
         a = a.metadata(fill | variation | usize::from(self.underline));
         a
     }
@@ -1394,6 +1465,8 @@ struct SpanCtx {
     underline: bool,
     transform: TextTransform,
     white_space: crate::WhiteSpace,
+    overflow_wrap: crate::OverflowWrap,
+    word_break: crate::WordBreak,
     family: Arc<str>,
     clip_fill: Option<usize>,
 }
@@ -1460,6 +1533,8 @@ fn base_span_ctx(
         underline: base.underline.unwrap_or(false),
         transform: base.text_transform.unwrap_or(TextTransform::None),
         white_space: base.white_space.unwrap_or_default(),
+        overflow_wrap: base.overflow_wrap.unwrap_or_default(),
+        word_break: base.word_break.unwrap_or_default(),
         family: font.family,
         clip_fill,
     }
@@ -1518,6 +1593,9 @@ fn collect_node_spans(
                 color: ctx.color,
                 family: Arc::clone(&ctx.family),
                 clip_fill: ctx.clip_fill,
+                white_space: ctx.white_space,
+                overflow_wrap: ctx.overflow_wrap,
+                word_break: ctx.word_break,
             };
             push_text(
                 contents,
@@ -1552,6 +1630,9 @@ fn collect_node_spans(
                     color: ctx.color,
                     family: Arc::clone(&ctx.family),
                     clip_fill: ctx.clip_fill,
+                    white_space: ctx.white_space,
+                    overflow_wrap: ctx.overflow_wrap,
+                    word_break: ctx.word_break,
                     },
                 ));
                 c.last_was_space = true;
@@ -1623,6 +1704,10 @@ fn collect_node_spans(
                 white_space: style
                     .and_then(|s| s.white_space)
                     .unwrap_or(ctx.white_space),
+                overflow_wrap: style
+                    .and_then(|s| s.overflow_wrap)
+                    .unwrap_or(ctx.overflow_wrap),
+                word_break: style.and_then(|s| s.word_break).unwrap_or(ctx.word_break),
                 family: font.family,
                 clip_fill,
             };
@@ -1725,6 +1810,7 @@ fn shape_with_text_indent(
     font_system: &mut FontSystem,
     item: &mut InlineItem,
     width: Option<f32>,
+    wrap: Wrap,
 ) {
     let indent = used_text_indent(item.text_indent, width);
     item.first_line_offset = indent
@@ -1735,12 +1821,14 @@ fn shape_with_text_indent(
         };
 
     let Some(source) = item.source_buffer.as_ref() else {
+        item.buffer.set_wrap(font_system, wrap);
         item.buffer
             .set_size(font_system, width.map(|value| value.max(0.0)), None);
         item.buffer.shape_until_scroll(font_system, false);
         return;
     };
     item.buffer = source.clone();
+    item.buffer.set_wrap(font_system, wrap);
 
     let mut first_break = None;
     if let Some(full_width) = width {
@@ -1755,6 +1843,7 @@ fn shape_with_text_indent(
     }
 
     item.buffer = source.clone();
+    item.buffer.set_wrap(font_system, wrap);
     if let (Some(mut split), Some(first_line)) =
         (first_break, item.buffer.lines.first())
     {
@@ -2758,6 +2847,9 @@ mod tests {
             color: [1, 2, 3, 255],
             family: Arc::from(FAMILY),
             clip_fill: Some(37),
+            white_space: crate::WhiteSpace::Normal,
+            overflow_wrap: crate::OverflowWrap::Normal,
+            word_break: crate::WordBreak::Normal,
         };
         let shaped = attrs.to_attrs(42);
         assert_ne!(shaped.metadata & META_UNDERLINE, 0);
@@ -2835,6 +2927,9 @@ mod tests {
             color: [0, 0, 0, 255],
             family: Arc::from(FAMILY),
             clip_fill: None,
+            white_space: crate::WhiteSpace::Normal,
+            overflow_wrap: crate::OverflowWrap::Normal,
+            word_break: crate::WordBreak::Normal,
         };
         let attrs = span.to_attrs(1);
         assert_eq!(attrs.letter_spacing_opt.unwrap().0, 0.1);
@@ -2848,6 +2943,36 @@ mod tests {
         let mut zero = span;
         zero.letter_spacing = 0.0;
         assert!(zero.to_attrs(1).font_features.features.is_empty());
+    }
+
+    #[test]
+    fn keep_all_never_inserts_controls_inside_grapheme_clusters() {
+        let source = "각각 か\u{3099}か\u{3099} 👨‍👩‍👧‍👦 👍🏽";
+        let tree = obscura_dom::parse_html(&format!("<p id='copy'>{source}</p>"));
+        let copy = tree.get_element_by_id("copy").unwrap();
+        let base = LayoutStyle {
+            display: Display::Block,
+            font_size: Some(40.0),
+            line_height: Some(crate::LineHeight::Px(48.0)),
+            ..Default::default()
+        };
+        let mut keep = base.clone();
+        keep.word_break = Some(crate::WordBreak::KeepAll);
+
+        let mut normal_engine = TextEngine::new();
+        let normal_item = normal_engine
+            .try_build(&tree, copy, &HashMap::from([(copy, base)]))
+            .unwrap();
+        let normal_size = normal_engine.measure(normal_item, None);
+
+        let mut keep_engine = TextEngine::new();
+        let keep_item = keep_engine
+            .try_build(&tree, copy, &HashMap::from([(copy, keep)]))
+            .unwrap();
+        let keep_size = keep_engine.measure(keep_item, None);
+
+        assert_eq!(keep_engine.item_text(keep_item), source);
+        assert_eq!(keep_size, normal_size);
     }
 
     fn variable_font_fixture() -> Vec<u8> {

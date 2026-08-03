@@ -945,6 +945,19 @@ pub struct LayoutStyle {
     /// value (or the initial `normal`). The inline shaper uses this to retain
     /// author/source newlines in code blocks and to select wrapping behavior.
     pub white_space: Option<WhiteSpace>,
+    /// `overflow-wrap` (legacy alias: `word-wrap`). Inherited; `None` means
+    /// inherit the nearest ancestor's value (or the initial `normal`).
+    ///
+    /// `Anywhere` contributes its emergency grapheme opportunities to
+    /// min-content sizing, while legacy `BreakWord` uses those opportunities
+    /// only for actual line layout.
+    pub overflow_wrap: Option<OverflowWrap>,
+    /// `word-break`. Inherited; `None` means inherit the nearest ancestor's
+    /// value (or the initial `normal`). Kept separate from `overflow-wrap`
+    /// because `break-all` adds typographic-letter opportunities while
+    /// retaining UAX#14 punctuation constraints, whereas `keep-all`
+    /// suppresses eligible letter/number boundaries without altering text.
+    pub word_break: Option<WordBreak>,
     /// `text-wrap-style`. Inherited; `None` means inherit the nearest
     /// ancestor's value (or the initial `auto`). `Balance` keeps the natural
     /// line count but tightens the effective line-breaking width during the
@@ -1164,6 +1177,27 @@ pub enum WhiteSpace {
     PreWrap,
     PreLine,
     BreakSpaces,
+}
+
+/// Emergency wrapping behavior for otherwise-unbreakable text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OverflowWrap {
+    #[default]
+    Normal,
+    BreakWord,
+    Anywhere,
+}
+
+/// The supported `word-break` values. `BreakWord` is the legacy compatibility
+/// value whose effective behavior is `word-break: normal` plus
+/// `overflow-wrap: anywhere`, matching Blink and Gecko.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WordBreak {
+    #[default]
+    Normal,
+    BreakAll,
+    KeepAll,
+    BreakWord,
 }
 
 /// Deterministic CSS animation sample time relative to the animation's
