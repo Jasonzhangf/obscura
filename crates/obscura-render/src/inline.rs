@@ -2933,6 +2933,27 @@ impl TextEngine {
         clip_mask: Option<&tiny_skia::Mask>,
         raster_scale: f32,
     ) {
+        self.paint_item_with_clip_mask_scaled_for_print(
+            idx,
+            pixmap,
+            offset,
+            clip_override,
+            clip_mask,
+            raster_scale,
+            false,
+        );
+    }
+
+    pub(crate) fn paint_item_with_clip_mask_scaled_for_print(
+        &mut self,
+        idx: usize,
+        pixmap: &mut tiny_skia::Pixmap,
+        offset: (f32, f32),
+        clip_override: Option<Rect>,
+        clip_mask: Option<&tiny_skia::Mask>,
+        raster_scale: f32,
+        print_economy: bool,
+    ) {
         let TextEngine {
             font_system,
             swash,
@@ -3030,10 +3051,13 @@ impl TextEngine {
                         });
                     }
                 }
-                let col = g
+                let mut col = g
                     .color_opt
                     .map(|c| [c.r(), c.g(), c.b(), c.a()])
                     .unwrap_or([0, 0, 0, 255]);
+                if print_economy {
+                    col = crate::paint::print_economy_color(col);
+                }
                 if underlined {
                     match &mut seg {
                         Some((_, x1, fs, c, prior_relative))
@@ -3125,6 +3149,9 @@ impl TextEngine {
                 let physical = glyph.physical((line_offset + relative.0, relative.1), raster_scale);
                 let glyph_color = glyph.color_opt.unwrap_or(default);
                 let fill_index = metadata_fill(glyph.metadata);
+                if print_economy && fill_index.is_some() {
+                    continue;
+                }
                 let mut draw_pixel = |x, y, color: Color| {
                     // cosmic-text's mask rasterizer replaces the authored
                     // alpha with glyph coverage (see its `blend base alpha?`
@@ -3136,7 +3163,7 @@ impl TextEngine {
                     }
                     let gx = physical.x + x;
                     let gy = (run.line_y * raster_scale) as i32 + physical.y + y;
-                    let (r, g, b) = fill_index
+                    let (mut r, mut g, mut b) = fill_index
                         .and_then(|index| {
                             let fill = clip_fills.get(index)?;
                             let (x0, y0, x1, y1) = fill_bounds.get(index).copied().flatten()?;
@@ -3150,6 +3177,10 @@ impl TextEngine {
                             Some((sampled[0], sampled[1], sampled[2]))
                         })
                         .unwrap_or_else(|| (color.r(), color.g(), color.b()));
+                    if print_economy {
+                        let adjusted = crate::paint::print_economy_color([r, g, b, 255]);
+                        (r, g, b) = (adjusted[0], adjusted[1], adjusted[2]);
+                    }
                     let px = ox as i32 + gx;
                     let py = oy as i32 + gy;
                     if let Some((cx0, cy0, cx1, cy1)) = clip_bounds {

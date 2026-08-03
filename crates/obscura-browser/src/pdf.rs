@@ -21,6 +21,7 @@ const MAX_PDF_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RasterPdfOptions {
     pub landscape: bool,
+    pub print_background: bool,
     pub paper_width_in: f32,
     pub paper_height_in: f32,
     pub margin_top_in: f32,
@@ -33,6 +34,7 @@ impl Default for RasterPdfOptions {
     fn default() -> Self {
         Self {
             landscape: false,
+            print_background: false,
             paper_width_in: 8.5,
             paper_height_in: 11.0,
             // CDP's defaults are one centimetre.
@@ -232,13 +234,10 @@ impl Page {
                 let y = page_index as f32 * plan.css_page_height;
                 let slice_height = (content_height - y).min(plan.css_page_height);
                 let png = js
-                    .screenshot_prepared_region(CaptureRegion::new(
-                        0.0,
-                        y,
-                        content_width,
-                        slice_height,
-                        1.0,
-                    ))
+                    .screenshot_prepared_region_with_backgrounds(
+                        CaptureRegion::new(0.0, y, content_width, slice_height, 1.0),
+                        options.print_background,
+                    )
                     .map_err(|error| RasterPdfError::CaptureFailed(format!("{error:?}")))?;
                 let decoded = image::load_from_memory_with_format(&png, image::ImageFormat::Png)
                     .map_err(|error| RasterPdfError::ImageDecode(error.to_string()))?;

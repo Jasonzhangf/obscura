@@ -48,17 +48,20 @@ pub struct InvalidationDependency {
 
 /// Selector dependencies retained alongside the compiled stylesheet.
 ///
-/// This follows Gecko's conservative invalidation-map shape: mutations look
-/// up the changed id/class/attribute/state and receive one or more traversal
-/// reaches. Phase 1 only builds and exposes this metadata; it deliberately does
-/// not alter mutation handling or skip any cascade work.
+/// This follows Gecko's conservative invalidation-map shape: live mutations
+/// look up the changed id/class/attribute/local-name/state and receive one or
+/// more traversal reaches. The renderer uses those reaches to retain clean
+/// computed styles, with a full-cascade fallback for unrepresentable paths.
 #[derive(Clone, Debug, Default)]
 pub struct InvalidationMap {
     ids: HashMap<String, Vec<InvalidationDependency>>,
     classes: HashMap<String, Vec<InvalidationDependency>>,
     attributes: HashMap<String, Vec<InvalidationDependency>>,
+    local_names: HashMap<String, Vec<InvalidationDependency>>,
     states: HashMap<String, Vec<InvalidationDependency>>,
     conservative_rule_orders: Vec<usize>,
+    relational_rule_orders: Vec<usize>,
+    unkeyed_relational_rule_orders: Vec<usize>,
 }
 
 impl InvalidationMap {
@@ -73,6 +76,13 @@ impl InvalidationMap {
     pub fn attribute_dependencies(&self, attribute: &str) -> &[InvalidationDependency] {
         self.attributes
             .get(&attribute.to_ascii_lowercase())
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    pub fn local_name_dependencies(&self, local_name: &str) -> &[InvalidationDependency] {
+        self.local_names
+            .get(&local_name.to_ascii_lowercase())
             .map(Vec::as_slice)
             .unwrap_or(&[])
     }
@@ -92,11 +102,20 @@ impl InvalidationMap {
         !self.conservative_rule_orders.is_empty()
     }
 
+    pub fn is_relational_rule(&self, rule_order: usize) -> bool {
+        self.relational_rule_orders.contains(&rule_order)
+    }
+
+    pub fn has_unkeyed_relational_rules(&self) -> bool {
+        !self.unkeyed_relational_rule_orders.is_empty()
+    }
+
     pub fn dependency_count(&self) -> usize {
         self.ids
             .values()
             .chain(self.classes.values())
             .chain(self.attributes.values())
+            .chain(self.local_names.values())
             .chain(self.states.values())
             .map(Vec::len)
             .sum()
@@ -139,6 +158,15 @@ impl InvalidationMap {
         );
     }
 
+    fn push_local_name(&mut self, key: String, rule_order: usize, reaches: InvalidationReaches) {
+        Self::push(
+            &mut self.local_names,
+            key.to_ascii_lowercase(),
+            rule_order,
+            reaches,
+        );
+    }
+
     fn push_state(&mut self, key: String, rule_order: usize, reaches: InvalidationReaches) {
         Self::push(
             &mut self.states,
@@ -153,6 +181,15 @@ impl InvalidationMap {
             && !self.conservative_rule_orders.contains(&rule_order)
         {
             self.conservative_rule_orders.push(rule_order);
+        }
+    }
+
+    fn mark_relational(&mut self, rule_order: usize, unkeyed: bool) {
+        if !self.relational_rule_orders.contains(&rule_order) {
+            self.relational_rule_orders.push(rule_order);
+        }
+        if unkeyed && !self.unkeyed_relational_rule_orders.contains(&rule_order) {
+            self.unkeyed_relational_rule_orders.push(rule_order);
         }
     }
 }
@@ -422,12 +459,123 @@ fn nth_of_selector(arguments: &str) -> Option<&str> {
     None
 }
 
+fn compound_local_name(compound: &str) -> Option<String> {
+    let chars = compound.trim().chars().collect::<Vec<_>>();
+    let index;
+    if chars.first() == Some(&'|') {
+        index = 1;
+    } else if chars.first() == Some(&'*') {
+        if chars.get(1) != Some(&'|') {
+            return None;
+        }
+        index = 2;
+    } else {
+        let (first, end) = consume_css_identifier(&chars, 0);
+        if first.is_empty() {
+            return None;
+        }
+        if chars.get(end) != Some(&'|') {
+            return Some(first.to_ascii_lowercase());
+        }
+        index = end + 1;
+    }
+    if chars.get(index) == Some(&'*') {
+        return None;
+    }
+    let (local, _) = consume_css_identifier(&chars, index);
+    (!local.is_empty()).then(|| local.to_ascii_lowercase())
+}
+
+/// Whether the relative selector's subject compound has a positive key which
+/// an inserted/removed subtree can look up. Keys hidden only inside `:is()` or
+/// negation are deliberately not credited; treating those as unkeyed costs a
+/// broader invalidation but cannot miss an activation.
+fn relative_selector_subject_has_key(selector: &str) -> bool {
+    let selector = selector.trim();
+    let selector = selector
+        .chars()
+        .next()
+        .filter(|character| matches!(character, '>' | '+' | '~'))
+        .map(|character| selector[character.len_utf8()..].trim_start())
+        .unwrap_or(selector);
+    let (compounds, malformed) = invalidation_compounds(selector);
+    if malformed {
+        return false;
+    }
+    let Some((subject, _)) = compounds.last() else {
+        return false;
+    };
+    if compound_local_name(subject).is_some() {
+        return true;
+    }
+    let chars = subject.chars().collect::<Vec<_>>();
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut quote = None;
+    let mut index = 0usize;
+    while index < chars.len() {
+        let ch = chars[index];
+        if ch == '\\' {
+            index = (index + 2).min(chars.len());
+            continue;
+        }
+        if let Some(active_quote) = quote {
+            if ch == active_quote {
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+        } else if ch == ':' && paren_depth == 0 && bracket_depth == 0 {
+            let (name, next) = consume_css_identifier(&chars, index + 1);
+            if matches!(name.to_ascii_lowercase().as_str(), "is" | "where")
+                && chars.get(next) == Some(&'(')
+            {
+                let Some(close) = matching_delimiter(&chars, next, '(', ')') else {
+                    return false;
+                };
+                let arguments = chars[next + 1..close].iter().collect::<String>();
+                let alternatives = split_selector_list(&arguments);
+                if !alternatives.is_empty()
+                    && alternatives.iter().all(|alternative| {
+                        relative_selector_subject_has_key(alternative.trim())
+                    })
+                {
+                    return true;
+                }
+                index = close + 1;
+                continue;
+            }
+        } else if ch == '(' {
+            paren_depth += 1;
+        } else if ch == ')' {
+            paren_depth = paren_depth.saturating_sub(1);
+        } else if ch == '[' && paren_depth == 0 {
+            if bracket_depth == 0 {
+                return true;
+            }
+            bracket_depth += 1;
+        } else if ch == ']' && paren_depth == 0 {
+            bracket_depth = bracket_depth.saturating_sub(1);
+        } else if paren_depth == 0 && bracket_depth == 0 && matches!(ch, '#' | '.') {
+            return true;
+        }
+        index += 1;
+    }
+    false
+}
+
 fn note_compound_dependencies(
     map: &mut InvalidationMap,
     compound: &str,
     reaches: InvalidationReaches,
     rule_order: usize,
 ) {
+    if let Some(local_name) = compound_local_name(compound) {
+        map.push_local_name(local_name, rule_order, reaches);
+    }
     let chars: Vec<char> = compound.chars().collect();
     let mut index = 0usize;
     while index < chars.len() {
@@ -533,8 +681,18 @@ fn note_compound_dependencies(
                     "has" => {
                         // Relative selectors invalidate anchors upwards, which
                         // Self/Descendants/Siblings cannot express soundly.
+                        map.push_state(
+                            name.clone(),
+                            rule_order,
+                            InvalidationReaches::CONSERVATIVE,
+                        );
                         map.mark_conservative(rule_order);
-                        for alternative in split_selector_list(&arguments) {
+                        let alternatives = split_selector_list(&arguments);
+                        let unkeyed = alternatives.iter().any(|alternative| {
+                            !relative_selector_subject_has_key(alternative.trim())
+                        });
+                        map.mark_relational(rule_order, unkeyed);
+                        for alternative in alternatives {
                             note_selector_dependencies(
                                 map,
                                 alternative.trim(),
@@ -2299,13 +2457,25 @@ impl Stylesheet {
                 .iter()
                 .any(|&(_, _, i)| self.rules[i].important_flags.has_custom_properties);
 
-        // Most elements neither declare custom properties nor participate in
-        // an `@property` registration. Reuse the inherited map directly in
-        // that case instead of parsing every declaration stream, cloning the
-        // map, and comparing the clone back to its source.
-        let effective = if !has_own_custom_properties
-            && self.registered_custom_properties.is_empty()
-        {
+        // Registered properties are already represented in the parent's
+        // computed map. Most descendants need no changes: inherited
+        // registrations keep that value, while a non-inherited registration
+        // whose parent already holds its initial value also stays identical.
+        // Detect the uncommon transition before cloning the potentially large
+        // custom-property map. This follows the browser rule-tree model where
+        // unchanged computed values are shared down the tree.
+        let registrations_change_parent = self.registered_custom_properties.iter().any(
+            |(name, registration)| {
+                if registration.inherits && parent_props.contains_key(name) {
+                    return false;
+                }
+                match &registration.initial_value {
+                    Some(initial) => parent_props.get(name) != Some(initial),
+                    None => parent_props.contains_key(name),
+                }
+            },
+        );
+        let effective = if !has_own_custom_properties && !registrations_change_parent {
             None
         } else {
             let mut own: Vec<(String, String)> = Vec::new();
@@ -2349,7 +2519,7 @@ impl Stylesheet {
                     resolved_props.remove(name);
                 }
             }
-            let registration_changed_props = resolved_props != *parent_props;
+            let registration_changed_props = registrations_change_parent;
             let has_own = !own.is_empty();
             let mut own_names = std::collections::HashSet::new();
             for (k, v) in own {
@@ -5674,6 +5844,10 @@ mod tests {
             InvalidationReaches::SELF,
         ));
         assert!(dependencies_reach(
+            map.local_name_dependencies("BUTTON"),
+            InvalidationReaches::SELF,
+        ));
+        assert!(dependencies_reach(
             map.attribute_dependencies("disabled"),
             InvalidationReaches::SELF,
         ));
@@ -5735,6 +5909,7 @@ mod tests {
 
         assert!(map.requires_conservative_invalidation());
         assert!(map.conservative_rule_orders().len() >= 3);
+        assert!(!map.has_unkeyed_relational_rules());
         assert!(dependencies_reach(
             map.class_dependencies("badge"),
             InvalidationReaches::CONSERVATIVE,
@@ -5766,6 +5941,33 @@ mod tests {
             assert!(
                 !map.state_dependencies(state).is_empty(),
                 "missing conservative state dependency for :{state}",
+            );
+        }
+    }
+
+    #[test]
+    fn invalidation_map_distinguishes_keyed_and_unkeyed_relational_subjects() {
+        let keyed = test_invalidation_map(
+            ".card:has(> .badge), .row:has(.icon[data-live]), .copy:has(> span), .choice:has(:is(.yes,button)) { color:red }",
+        );
+        assert!(!keyed.has_unkeyed_relational_rules());
+        assert!(keyed
+            .class_dependencies("badge")
+            .iter()
+            .any(|dependency| keyed.is_relational_rule(dependency.rule_order)));
+        assert!(keyed
+            .local_name_dependencies("span")
+            .iter()
+            .any(|dependency| keyed.is_relational_rule(dependency.rule_order)));
+
+        for selector in [
+            ".card:has(> *){color:red}",
+            ".card:has(:is(.badge,*)){color:red}",
+            ".card:has(:empty){color:red}",
+        ] {
+            assert!(
+                test_invalidation_map(selector).has_unkeyed_relational_rules(),
+                "{selector}"
             );
         }
     }
@@ -7071,6 +7273,69 @@ mod tests {
             apply_registered_property_test_style(&sheet, &tree, initial, &HashMap::new());
         assert_eq!(initial_style.width, crate::Dimension::Percent(0.75));
         assert_eq!(initial_style.height, crate::Dimension::Percent(0.25));
+    }
+
+    #[test]
+    fn registered_custom_properties_reuse_an_unchanged_parent_map() {
+        let tree = obscura_dom::parse_html(r#"<div id="target"></div>"#);
+        let css = r#"
+            @property --private {
+                syntax:"<percentage>";
+                inherits:false;
+                initial-value:75%;
+            }
+            @property --shared {
+                syntax:"<percentage>";
+                inherits:true;
+                initial-value:25%;
+            }
+            #target { width:var(--private); height:var(--shared) }
+        "#;
+        let sheet = Stylesheet::parse(&tree, &[css.to_string()]);
+        let target = tree.get_element_by_id("target").unwrap();
+        let parent_props = HashMap::from([
+            ("--private".to_string(), "75%".to_string()),
+            ("--shared".to_string(), "30%".to_string()),
+        ]);
+        let mut matcher = tree.matcher();
+        let mut style = LayoutStyle::default();
+        let effective = sheet.apply(
+            &tree,
+            &mut matcher,
+            target,
+            Some("target"),
+            &[],
+            "div",
+            &mut style,
+            &parent_props,
+            None,
+        );
+        assert!(effective.is_none());
+        assert_eq!(style.width, crate::Dimension::Percent(0.75));
+        assert_eq!(style.height, crate::Dimension::Percent(0.30));
+
+        let overridden_parent = HashMap::from([
+            ("--private".to_string(), "60%".to_string()),
+            ("--shared".to_string(), "30%".to_string()),
+        ]);
+        let mut style = LayoutStyle::default();
+        let effective = sheet
+            .apply(
+                &tree,
+                &mut matcher,
+                target,
+                Some("target"),
+                &[],
+                "div",
+                &mut style,
+                &overridden_parent,
+                None,
+            )
+            .expect("non-inherited registered property must reset on the child");
+        assert_eq!(effective.get("--private").map(String::as_str), Some("75%"));
+        assert_eq!(effective.get("--shared").map(String::as_str), Some("30%"));
+        assert_eq!(style.width, crate::Dimension::Percent(0.75));
+        assert_eq!(style.height, crate::Dimension::Percent(0.30));
     }
 
     #[test]

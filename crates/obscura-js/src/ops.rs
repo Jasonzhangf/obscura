@@ -129,11 +129,11 @@ pub struct ObscuraState {
     /// DOM/style/viewport changes clear this value but retain resource bytes.
     #[cfg(feature = "render")]
     pub prepared_render: Option<obscura_render::PreparedRender>,
-    /// Connected attribute mutations awaiting dependency-indexed retained
-    /// style refresh. Tree/text and non-attribute invalidations still discard
-    /// the prepared render immediately.
+    /// Connected mutations awaiting dependency-indexed retained style refresh.
+    /// Tree changes carry stable node/parent ids so a later geometry read can
+    /// coalesce framework DOM churn into one conservative local cascade.
     #[cfg(feature = "render")]
-    pub pending_attribute_style_mutations: Vec<obscura_render::AttributeStyleMutation>,
+    pub pending_style_mutations: Vec<obscura_render::RetainedStyleMutation>,
     /// Page-lifetime raw image/font bytes. A new document resets this cache;
     /// relayout of the same document reuses it without refetching.
     #[cfg(feature = "render")]
@@ -202,7 +202,7 @@ impl ObscuraState {
             #[cfg(feature = "render")]
             prepared_render: None,
             #[cfg(feature = "render")]
-            pending_attribute_style_mutations: Vec::new(),
+            pending_style_mutations: Vec::new(),
             #[cfg(feature = "render")]
             render_resources: obscura_render::RenderResourceCache::default(),
             #[cfg(feature = "render")]
@@ -473,17 +473,18 @@ fn render_mutation_impact(
 }
 
 #[cfg(feature = "render")]
-fn retained_attribute_style_mutation(
+fn retained_style_mutation(
     dom: &DomTree,
     cmd: &str,
     arg1: &str,
     arg2: &str,
-) -> Option<obscura_render::AttributeStyleMutation> {
+) -> Option<obscura_render::RetainedStyleMutation> {
     let node = NodeId::new(arg1.parse::<u32>().ok()?);
     let can_retain = |name: &str| {
         let name = name.to_ascii_lowercase();
         name == "class"
             || name == "id"
+            || name == "style"
             || name.starts_with("data-")
             || name.starts_with("aria-")
     };
@@ -493,23 +494,78 @@ fn retained_attribute_style_mutation(
             if !can_retain(name) {
                 return None;
             }
+            let keeps_selector_value = !name.eq_ignore_ascii_case("style");
             Some(obscura_render::AttributeStyleMutation {
                 node,
                 name: name.to_string(),
-                old_value: dom
-                    .with_node(node, |node| node.get_attribute(name).map(str::to_owned))
+                old_value: keeps_selector_value
+                    .then(|| {
+                        dom.with_node(node, |node| {
+                            node.get_attribute(name).map(str::to_owned)
+                        })
+                        .flatten()
+                    })
                     .flatten(),
-                new_value: Some(value.to_string()),
-            })
+                new_value: keeps_selector_value.then(|| value.to_string()),
+            }
+            .into())
         }
-        "remove_attribute" => can_retain(arg2).then(|| obscura_render::AttributeStyleMutation {
-            node,
-            name: arg2.to_string(),
-            old_value: dom
-                .with_node(node, |node| node.get_attribute(arg2).map(str::to_owned))
-                .flatten(),
-            new_value: None,
+        "remove_attribute" => can_retain(arg2).then(|| {
+            let keeps_selector_value = !arg2.eq_ignore_ascii_case("style");
+            obscura_render::AttributeStyleMutation {
+                node,
+                name: arg2.to_string(),
+                old_value: keeps_selector_value
+                    .then(|| {
+                        dom.with_node(node, |node| {
+                            node.get_attribute(arg2).map(str::to_owned)
+                        })
+                        .flatten()
+                    })
+                    .flatten(),
+                new_value: None,
+            }
+            .into()
         }),
+        "append_child" => {
+            let child = NodeId::new(arg2.parse::<u32>().ok()?);
+            dom.get_node(node)?;
+            let old_parent = dom.get_node(child)?.parent;
+            Some(
+                obscura_render::TreeStyleMutation::Insert {
+                    node: child,
+                    old_parent,
+                    new_parent: node,
+                }
+                .into(),
+            )
+        }
+        "remove_child" => {
+            let old_parent = dom.get_node(node)?.parent?;
+            Some(
+                obscura_render::TreeStyleMutation::Remove { node, old_parent }.into(),
+            )
+        }
+        "insert_before" => {
+            let reference = NodeId::new(arg2.parse::<u32>().ok()?);
+            let new_parent = dom.get_node(reference)?.parent?;
+            let old_parent = dom.get_node(node)?.parent;
+            Some(
+                obscura_render::TreeStyleMutation::Insert {
+                    node,
+                    old_parent,
+                    new_parent,
+                }
+                .into(),
+            )
+        }
+        "set_text_content" => Some(
+            obscura_render::TreeStyleMutation::Text {
+                node,
+                parent: dom.get_node(node)?.parent,
+            }
+            .into(),
+        ),
         _ => None,
     }
 }
@@ -655,10 +711,10 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
             .map(|dom| render_mutation_impact(dom, &cmd, &arg1, &arg2))
             .unwrap_or_default();
         #[cfg(feature = "render")]
-        let retained_attribute_mutation = state
+        let retained_style_mutation = state
             .dom
             .as_ref()
-            .and_then(|dom| retained_attribute_style_mutation(dom, &cmd, &arg1, &arg2));
+            .and_then(|dom| retained_style_mutation(dom, &cmd, &arg1, &arg2));
         let invalidate = impact.connected && impact.actual_change;
         if invalidate {
             state.activity_generation = state.activity_generation.wrapping_add(1);
@@ -674,18 +730,18 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
         let had_prepared_render = state.prepared_render.is_some();
         #[cfg(feature = "render")]
         if invalidate {
-            if let Some(mutation) = retained_attribute_mutation {
+            if let Some(mutation) = retained_style_mutation {
                 if state.prepared_render.is_some()
-                    && state.pending_attribute_style_mutations.len() < 256
+                    && state.pending_style_mutations.len() < 256
                 {
-                    state.pending_attribute_style_mutations.push(mutation);
+                    state.pending_style_mutations.push(mutation);
                 } else {
                     state.prepared_render = None;
-                    state.pending_attribute_style_mutations.clear();
+                    state.pending_style_mutations.clear();
                 }
             } else {
                 state.prepared_render = None;
-                state.pending_attribute_style_mutations.clear();
+                state.pending_style_mutations.clear();
             }
             state.resolved_scroll = None;
         }
@@ -3024,7 +3080,7 @@ fn op_set_dynamic_fonts(state: &OpState, #[string] registrations: &str) -> bool 
     if state.dynamic_fonts != fonts {
         state.dynamic_fonts = fonts;
         state.prepared_render = None;
-        state.pending_attribute_style_mutations.clear();
+        state.pending_style_mutations.clear();
         state.resolved_scroll = None;
     }
     true
@@ -3108,13 +3164,13 @@ pub(crate) fn ensure_prepared_render(
     let stale = state.prepared_render.as_ref().map_or(true, |prepared| {
         prepared.viewport() != viewport || prepared.base_url() != base_url.as_deref()
     });
-    if stale || !state.pending_attribute_style_mutations.is_empty() {
+    if stale || !state.pending_style_mutations.is_empty() {
         let previous = (!stale).then(|| state.prepared_render.take()).flatten();
-        let mutations = std::mem::take(&mut state.pending_attribute_style_mutations);
+        let mutations = std::mem::take(&mut state.pending_style_mutations);
         let prepared = {
             let dom = state.dom.as_ref()?;
             match previous {
-                Some(previous) => obscura_render::prepare_dom_with_retained_attribute_styles(
+                Some(previous) => obscura_render::prepare_dom_with_retained_styles(
                     dom,
                     viewport,
                     base_url.as_deref(),

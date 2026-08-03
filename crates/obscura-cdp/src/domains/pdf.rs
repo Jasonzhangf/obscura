@@ -66,10 +66,6 @@ fn parse_options(params: &Value) -> Result<ParsedPdfOptions, String> {
             ));
         }
     }
-    // Current Puppeteer and Playwright always send their false default. The
-    // raster paginator cannot suppress backgrounds without a second paint
-    // mode, so accept the protocol shape and disclose the limitation in the
-    // extension capability fields returned with the result.
     let requested_print_background = boolean(params, "printBackground", false)?;
     // Puppeteer currently sends true by default. Raster PDFs have no semantic
     // structure to tag, but rejecting the request makes the standard client
@@ -114,6 +110,7 @@ fn parse_options(params: &Value) -> Result<ParsedPdfOptions, String> {
     Ok(ParsedPdfOptions {
         raster: obscura_browser::RasterPdfOptions {
             landscape: boolean(params, "landscape", defaults.landscape)?,
+            print_background: requested_print_background,
             paper_width_in: number(params, "paperWidth", defaults.paper_width_in)?,
             paper_height_in: number(params, "paperHeight", defaults.paper_height_in)?,
             margin_top_in: number(params, "marginTop", defaults.margin_top_in)?,
@@ -144,20 +141,18 @@ pub async fn print_to_pdf(
             .map_err(|error| error.to_string())?;
         let mut response = json!({
             "obscuraPrintMode": "screen-raster",
-            "obscuraPrintBackground": true,
+            "obscuraPrintBackground": options.requested_print_background,
             "obscuraRequestedPrintBackground": options.requested_print_background,
             "obscuraTaggedPDF": false,
             "obscuraRequestedTaggedPDF": options.requested_tagged_pdf,
             "obscuraCapabilities": {
                 "cssPagedMedia": false,
-                "honorsPrintBackground": false,
+                "honorsPrintBackground": true,
+                "printColorAdjustExact": false,
                 "taggedPdf": false,
             },
         });
         let mut ignored_options = Vec::new();
-        if !options.requested_print_background {
-            ignored_options.push("printBackground");
-        }
         if options.requested_tagged_pdf {
             ignored_options.push("generateTaggedPDF");
         }
@@ -215,6 +210,7 @@ mod tests {
         .expect("current Puppeteer defaults must be accepted");
         assert_eq!(standard.transfer_mode, PdfTransferMode::ReturnAsStream);
         assert!(!standard.requested_print_background);
+        assert!(!standard.raster.print_background);
         assert!(standard.requested_tagged_pdf);
 
         for params in [
@@ -315,13 +311,17 @@ mod tests {
         .await
         .expect("Puppeteer/Playwright-shaped stream request");
         assert_eq!(streamed["data"], "");
-        assert_eq!(streamed["obscuraPrintBackground"], true);
+        assert_eq!(streamed["obscuraPrintBackground"], false);
         assert_eq!(streamed["obscuraRequestedPrintBackground"], false);
+        assert_eq!(
+            streamed["obscuraCapabilities"]["honorsPrintBackground"],
+            true
+        );
         assert_eq!(streamed["obscuraTaggedPDF"], false);
         assert_eq!(streamed["obscuraRequestedTaggedPDF"], true);
         assert_eq!(
             streamed["obscuraIgnoredOptions"],
-            json!(["printBackground", "generateTaggedPDF"])
+            json!(["generateTaggedPDF"])
         );
         let handle = streamed["stream"].as_str().expect("protocol stream handle");
         let mut streamed_bytes = Vec::new();

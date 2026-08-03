@@ -1634,8 +1634,37 @@ pub fn prepare_dom_with_retained_attribute_styles(
     resources: &mut RenderResourceCache,
     dynamic_fonts: &[DynamicFontFace],
     stylesheet_cache: &mut crate::css::StylesheetCache,
-    mut previous: PreparedRender,
+    previous: PreparedRender,
     mutations: &[crate::dom::AttributeStyleMutation],
+) -> Option<PreparedRender> {
+    let mutations = mutations
+        .iter()
+        .cloned()
+        .map(crate::dom::RetainedStyleMutation::Attribute)
+        .collect::<Vec<_>>();
+    prepare_dom_with_retained_styles(
+        tree,
+        viewport,
+        base_url,
+        resources,
+        dynamic_fonts,
+        stylesheet_cache,
+        previous,
+        &mutations,
+    )
+}
+
+/// Rebuild geometry while retaining clean styles across both selector-key
+/// attribute changes and conservatively scoped tree/text changes.
+pub fn prepare_dom_with_retained_styles(
+    tree: &DomTree,
+    viewport: (f32, f32),
+    base_url: Option<&str>,
+    resources: &mut RenderResourceCache,
+    dynamic_fonts: &[DynamicFontFace],
+    stylesheet_cache: &mut crate::css::StylesheetCache,
+    mut previous: PreparedRender,
+    mutations: &[crate::dom::RetainedStyleMutation],
 ) -> Option<PreparedRender> {
     let retained = RetainedStyleMaps {
         styles: std::mem::take(&mut previous.layout.styles),
@@ -1660,7 +1689,7 @@ fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
     resources: &mut RenderResourceCache,
     dynamic_fonts: &[DynamicFontFace],
     stylesheet_cache: &mut crate::css::StylesheetCache,
-    retained: Option<(RetainedStyleMaps, &[crate::dom::AttributeStyleMutation])>,
+    retained: Option<(RetainedStyleMaps, &[crate::dom::RetainedStyleMutation])>,
 ) -> Option<PreparedRender> {
     if !viewport.0.is_finite() || !viewport.1.is_finite() || viewport.0 <= 0.0 || viewport.1 <= 0.0
     {
@@ -1812,6 +1841,7 @@ pub fn paint_prepared(
         None,
         (0.0, 0.0),
         1.0,
+        false,
     )
 }
 
@@ -1856,6 +1886,7 @@ pub fn paint_prepared_with_scroll(
         None,
         (0.0, 0.0),
         1.0,
+        false,
     )
 }
 
@@ -1869,6 +1900,27 @@ pub fn paint_prepared_region_with_scroll(
     resources: &mut RenderResourceCache,
     scroll: &ResolvedScrollState,
     region: CaptureRegion,
+) -> Result<Pixmap, CaptureError> {
+    paint_prepared_region_with_scroll_policy(tree, prepared, resources, scroll, region, false)
+}
+
+fn paint_prepared_region_with_scroll_with_print_economy(
+    tree: &DomTree,
+    prepared: &mut PreparedRender,
+    resources: &mut RenderResourceCache,
+    scroll: &ResolvedScrollState,
+    region: CaptureRegion,
+) -> Result<Pixmap, CaptureError> {
+    paint_prepared_region_with_scroll_policy(tree, prepared, resources, scroll, region, true)
+}
+
+fn paint_prepared_region_with_scroll_policy(
+    tree: &DomTree,
+    prepared: &mut PreparedRender,
+    resources: &mut RenderResourceCache,
+    scroll: &ResolvedScrollState,
+    region: CaptureRegion,
+    print_economy: bool,
 ) -> Result<Pixmap, CaptureError> {
     let (native_width, native_height, output_width, output_height) =
         checked_capture_dimensions(region)?;
@@ -1917,6 +1969,7 @@ pub fn paint_prepared_region_with_scroll(
         Some((region.width, region.height)),
         surface_offset,
         raster_scale,
+        print_economy,
     )
     .ok_or(CaptureError::PaintFailed)?;
 
@@ -2140,6 +2193,7 @@ fn paint_laid_dom_scrolled(
     surface_extent: Option<(f32, f32)>,
     surface_offset: (f32, f32),
     raster_scale: f32,
+    print_economy: bool,
 ) -> Option<Pixmap> {
     let scroll_state = match resolved_scroll {
         Some(resolved) => ScrollPaintState::from_resolved(
@@ -2348,6 +2402,7 @@ fn paint_laid_dom_scrolled(
                 surface_extent,
                 surface_offset,
                 raster_scale,
+                print_economy,
             )?;
             continue;
         }
@@ -2372,13 +2427,14 @@ fn paint_laid_dom_scrolled(
                     )
                 });
                 for &item in items {
-                    laid.text_engine.paint_item_with_clip_mask_scaled(
+                    laid.text_engine.paint_item_with_clip_mask_scaled_for_print(
                         item,
                         &mut pixmap,
                         offset,
                         clip,
                         clip_mask.as_ref(),
                         raster_scale,
+                        print_economy,
                     );
                 }
             } else {
@@ -2445,6 +2501,7 @@ fn paint_laid_dom_scrolled(
                     surface_extent,
                     surface_offset,
                     raster_scale,
+                    print_economy,
                 )?;
                 continue;
             }
@@ -2519,6 +2576,7 @@ fn paint_laid_dom_scrolled(
                     surface_offset.1 + layer_delta.1,
                 ),
                 raster_scale,
+                print_economy,
             )?;
             let transform =
                 display_transform.then(crate::Affine2::translate(-layer_delta.0, -layer_delta.1));
@@ -2587,6 +2645,7 @@ fn paint_laid_dom_scrolled(
                 surface_extent,
                 surface_offset,
                 raster_scale,
+                print_economy,
             )?;
             let group_paint = tiny_skia::PixmapPaint {
                 opacity: own_opacity,
@@ -3277,26 +3336,28 @@ fn paint_laid_dom_scrolled(
             )
         });
         if let Some(idx) = whole {
-            laid.text_engine.paint_item_with_clip_mask_scaled(
+            laid.text_engine.paint_item_with_clip_mask_scaled_for_print(
                 idx,
                 &mut pixmap,
                 off,
                 clip,
                 clip_mask.as_ref(),
                 raster_scale,
+                print_economy,
             );
         }
         // Anonymous inline-run leaves of a mixed block (see
         // `build_mixed_block`), pinned to their own boxes at finalize.
         if let Some(items) = run_items {
             for idx in items {
-                laid.text_engine.paint_item_with_clip_mask_scaled(
+                laid.text_engine.paint_item_with_clip_mask_scaled_for_print(
                     idx,
                     &mut pixmap,
                     off,
                     clip,
                     clip_mask.as_ref(),
                     raster_scale,
+                    print_economy,
                 );
             }
         }
@@ -4547,6 +4608,144 @@ pub fn screenshot_prepared_region_with_scroll(
     paint_prepared_region_with_scroll(tree, prepared, resources, scroll, region)?
         .encode_png()
         .map_err(|_| CaptureError::EncodeFailed)
+}
+
+/// Capture a retained region using the PDF print-background policy. Ordinary
+/// screenshots pass `true`. When false, authored fills are replaced with the
+/// browser print-economy white fill and light text is darkened for legibility;
+/// borders, shadows, replaced content, and masks remain paintable.
+pub fn screenshot_prepared_region_with_scroll_and_backgrounds(
+    tree: &DomTree,
+    prepared: &mut PreparedRender,
+    resources: &mut RenderResourceCache,
+    scroll: &ResolvedScrollState,
+    region: CaptureRegion,
+    paint_backgrounds: bool,
+) -> Result<Vec<u8>, CaptureError> {
+    if paint_backgrounds {
+        return screenshot_prepared_region_with_scroll(tree, prepared, resources, scroll, region);
+    }
+
+    let snapshots = prepared
+        .layout
+        .styles
+        .iter_mut()
+        .map(|(&node, style)| (node, PrintEconomyStyleSnapshot::apply(style)))
+        .collect::<Vec<_>>();
+    let result = paint_prepared_region_with_scroll_with_print_economy(
+        tree, prepared, resources, scroll, region,
+    )
+    .and_then(|pixmap| pixmap.encode_png().map_err(|_| CaptureError::EncodeFailed));
+    for (node, snapshot) in snapshots {
+        if let Some(style) = prepared.layout.styles.get_mut(&node) {
+            snapshot.restore(style);
+        }
+    }
+    result
+}
+
+struct PrintEconomyStyleSnapshot {
+    background_color: Option<[u8; 4]>,
+    background_gradient: Option<(f32, Vec<([u8; 4], Option<f32>)>)>,
+    background_radial_gradient: Option<((f32, f32), Vec<([u8; 4], Option<f32>)>)>,
+    background_conic_gradient: Option<(f32, (f32, f32), Vec<([u8; 4], Option<f32>)>)>,
+    background_gradient_layers: Vec<crate::BackgroundGradientLayer>,
+    background_image: Option<String>,
+    color: Option<[u8; 4]>,
+    before_pseudo: Option<Box<PrintEconomyStyleSnapshot>>,
+    after_pseudo: Option<Box<PrintEconomyStyleSnapshot>>,
+}
+
+impl PrintEconomyStyleSnapshot {
+    fn apply(style: &mut crate::LayoutStyle) -> Self {
+        let background_color = style.background_color.take();
+        let background_gradient = style.background_gradient.take();
+        let background_radial_gradient = style.background_radial_gradient.take();
+        let background_conic_gradient = style.background_conic_gradient.take();
+        let background_gradient_layers = std::mem::take(&mut style.background_gradient_layers);
+        let background_image = style.background_image.take();
+        let had_background = background_color.is_some_and(|color| color[3] != 0)
+            || background_gradient.is_some()
+            || background_radial_gradient.is_some()
+            || background_conic_gradient.is_some()
+            || !background_gradient_layers.is_empty()
+            || background_image.is_some();
+        style.background_color = had_background.then_some([255, 255, 255, 255]);
+        let color = style.color;
+        style.color = color.map(print_economy_color);
+        let before_pseudo = style
+            .before_pseudo
+            .as_deref_mut()
+            .map(Self::apply)
+            .map(Box::new);
+        let after_pseudo = style
+            .after_pseudo
+            .as_deref_mut()
+            .map(Self::apply)
+            .map(Box::new);
+        Self {
+            background_color,
+            background_gradient,
+            background_radial_gradient,
+            background_conic_gradient,
+            background_gradient_layers,
+            background_image,
+            color,
+            before_pseudo,
+            after_pseudo,
+        }
+    }
+
+    fn restore(self, style: &mut crate::LayoutStyle) {
+        style.background_color = self.background_color;
+        style.background_gradient = self.background_gradient;
+        style.background_radial_gradient = self.background_radial_gradient;
+        style.background_conic_gradient = self.background_conic_gradient;
+        style.background_gradient_layers = self.background_gradient_layers;
+        style.background_image = self.background_image;
+        style.color = self.color;
+        if let (Some(snapshot), Some(pseudo)) =
+            (self.before_pseudo, style.before_pseudo.as_deref_mut())
+        {
+            snapshot.restore(pseudo);
+        }
+        if let (Some(snapshot), Some(pseudo)) =
+            (self.after_pseudo, style.after_pseudo.as_deref_mut())
+        {
+            snapshot.restore(pseudo);
+        }
+    }
+}
+
+/// Blink's print-economy foreground correction: colors too close to white
+/// move one third down the HSV value axis while preserving hue and alpha.
+pub(crate) fn print_economy_color(color: [u8; 4]) -> [u8; 4] {
+    const MIN_DIFFERENCE_SQUARED: i32 = 65_025;
+    let difference = |target: u8| -> i32 {
+        color[..3]
+            .iter()
+            .map(|component| {
+                let delta = i32::from(*component) - i32::from(target);
+                delta * delta
+            })
+            .sum()
+    };
+    if difference(255) > MIN_DIFFERENCE_SQUARED {
+        return color;
+    }
+    let max = color[0].max(color[1]).max(color[2]) as f32 / 255.0;
+    if max <= f32::EPSILON {
+        return color;
+    }
+    let scale = (max - 0.33).max(0.0) / max;
+    let adjusted =
+        |component: u8| ((f32::from(component) / 255.0 * scale * 256.0) as u16).min(255) as u8;
+    [
+        adjusted(color[0]),
+        adjusted(color[1]),
+        adjusted(color[2]),
+        color[3],
+    ]
 }
 
 /// A representative visible color for `background-clip: text` text whose own
@@ -11690,6 +11889,69 @@ mod tests {
             before_fixed
         );
         assert_eq!(loads.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn print_background_policy_matches_chromium_economy_and_restores_screen_paint() {
+        assert_eq!(
+            print_economy_color([255, 255, 255, 255]),
+            [171, 171, 171, 255]
+        );
+        assert_eq!(
+            print_economy_color([105, 105, 105, 255]),
+            [105, 105, 105, 255]
+        );
+        assert_eq!(print_economy_color([110, 110, 110, 255]), [25, 25, 25, 255]);
+        assert_eq!(print_economy_color([255, 0, 0, 255]), [255, 0, 0, 255]);
+        let tree = parse_html(
+            r#"<html style="margin:0"><body style="margin:0;background:#123456">
+                <div style="box-sizing:border-box;width:100px;height:100px;
+                     background:#ff0000;border:10px solid #0000ff;
+                     color:#ffffff;font:40px sans-serif">X</div>
+                <div style="position:relative;width:120px;height:120px">
+                    <img src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Crect width='120' height='120' fill='orange'/%3E%3C/svg%3E"
+                         style="position:absolute;inset:0;width:120px;height:120px">
+                    <div style="position:absolute;left:20px;top:20px;width:80px;height:80px;
+                         background-image:linear-gradient(#00ff00,#00ff00)"></div>
+                </div>
+            </body></html>"#,
+        );
+        let mut resources = RenderResourceCache::default();
+        let mut prepared = prepare_dom(&tree, (120.0, 220.0), None, &mut resources)
+            .expect("prepared print fixture");
+        let scroll = prepared.resolve_scroll_state(&tree, (0.0, 0.0), &HashMap::new());
+        let region = CaptureRegion::new(0.0, 0.0, 120.0, 220.0, 1.0);
+
+        let screen_before = screenshot_prepared_region_with_scroll_and_backgrounds(
+            &tree, &mut prepared, &mut resources, &scroll, region, true,
+        )
+        .expect("screen capture before print");
+        let economy = screenshot_prepared_region_with_scroll_and_backgrounds(
+            &tree, &mut prepared, &mut resources, &scroll, region, false,
+        )
+        .expect("print economy capture");
+        let screen_after = screenshot_prepared_region_with_scroll_and_backgrounds(
+            &tree, &mut prepared, &mut resources, &scroll, region, true,
+        )
+        .expect("screen capture after print");
+        assert_eq!(screen_before, screen_after, "print paint must not mutate retained style");
+
+        let screen = image::load_from_memory_with_format(&screen_before, image::ImageFormat::Png)
+            .unwrap()
+            .into_rgb8();
+        let economy = image::load_from_memory_with_format(&economy, image::ImageFormat::Png)
+            .unwrap()
+            .into_rgb8();
+        assert_eq!(screen.get_pixel(80, 80).0, [255, 0, 0]);
+        assert_eq!(economy.get_pixel(80, 80).0, [255, 255, 255]);
+        assert_eq!(economy.get_pixel(5, 50).0, [0, 0, 255]);
+        assert_eq!(screen.get_pixel(50, 150).0, [0, 255, 0]);
+        assert_eq!(economy.get_pixel(5, 105).0, [255, 165, 0]);
+        assert_eq!(economy.get_pixel(50, 150).0, [255, 255, 255]);
+        assert!((10..90).any(|y| (10..90).any(|x| {
+            let [r, g, b] = economy.get_pixel(x, y).0;
+            (140..=200).contains(&r) && r.abs_diff(g) <= 2 && r.abs_diff(b) <= 2
+        })));
     }
 
     #[test]

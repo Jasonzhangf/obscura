@@ -355,15 +355,56 @@ pub struct DomLayout {
 }
 
 /// One connected element attribute mutation eligible for conservative
-/// retained-style invalidation. Callers must use the ordinary full-layout
-/// path for tree/text mutations and for attributes with non-CSS rendering
-/// semantics (image sources, form state, inline style, and similar).
+/// retained-style invalidation. Attributes with independent HTML rendering
+/// semantics (image sources, form state, inline style, and similar) still use
+/// the ordinary full-layout path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AttributeStyleMutation {
     pub node: NodeId,
     pub name: String,
     pub old_value: Option<String>,
     pub new_value: Option<String>,
+}
+
+/// A connected tree change which can reuse computed styles from the previous
+/// render.  Node ids are stable across detach/reparent operations; recording
+/// both parents lets the post-mutation traversal invalidate the old and new
+/// sibling scopes without retaining a second DOM snapshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TreeStyleMutation {
+    Insert {
+        node: NodeId,
+        old_parent: Option<NodeId>,
+        new_parent: NodeId,
+    },
+    Remove {
+        node: NodeId,
+        old_parent: NodeId,
+    },
+    Text {
+        node: NodeId,
+        parent: Option<NodeId>,
+    },
+}
+
+/// Mutation input for a retained-style rebuild. Attribute invalidation uses
+/// selector-key dependencies; tree invalidation uses parent/sibling scopes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RetainedStyleMutation {
+    Attribute(AttributeStyleMutation),
+    Tree(TreeStyleMutation),
+}
+
+impl From<AttributeStyleMutation> for RetainedStyleMutation {
+    fn from(mutation: AttributeStyleMutation) -> Self {
+        Self::Attribute(mutation)
+    }
+}
+
+impl From<TreeStyleMutation> for RetainedStyleMutation {
+    fn from(mutation: TreeStyleMutation) -> Self {
+        Self::Tree(mutation)
+    }
 }
 
 /// Style maps moved out of a previous layout. Moving, rather than cloning,
@@ -2396,6 +2437,111 @@ fn add_following_sibling_subtrees(
     }
 }
 
+fn subtree_contains_style_element(tree: &DomTree, root: NodeId) -> bool {
+    std::iter::once(root)
+        .chain(tree.descendants(root))
+        .any(|id| {
+            tree.get_node(id).is_some_and(|node| {
+                node.as_element()
+                    .is_some_and(|element| element.local.as_ref() == "style")
+            })
+        })
+}
+
+fn node_is_style_text(tree: &DomTree, node: NodeId, parent: Option<NodeId>) -> bool {
+    parent.is_some_and(|parent| {
+        tree.get_node(parent).is_some_and(|node| {
+            node.as_element()
+                .is_some_and(|element| element.local.as_ref() == "style")
+        })
+    }) || tree.get_node(node).is_some_and(|node| {
+        node.as_element()
+            .is_some_and(|element| element.local.as_ref() == "style")
+    })
+}
+
+fn dependencies_include_relational_rule(
+    map: &crate::css::InvalidationMap,
+    dependencies: &[crate::css::InvalidationDependency],
+) -> bool {
+    dependencies
+        .iter()
+        .any(|dependency| {
+            map.is_relational_rule(dependency.rule_order)
+                && dependency
+                    .reaches
+                    .contains(crate::css::InvalidationReaches::CONSERVATIVE)
+        })
+}
+
+fn subtree_may_affect_relational_selector(
+    tree: &DomTree,
+    map: &crate::css::InvalidationMap,
+    root: NodeId,
+) -> bool {
+    if map.has_unkeyed_relational_rules() {
+        return true;
+    }
+    std::iter::once(root)
+        .chain(tree.descendants(root))
+        .any(|id| {
+            let Some(node) = tree.get_node(id) else {
+                return false;
+            };
+            let Some(_element) = node.as_element() else {
+                return false;
+            };
+            if node.get_attribute("id").is_some_and(|id| {
+                dependencies_include_relational_rule(map, map.id_dependencies(id))
+            }) {
+                return true;
+            }
+            if node.get_attribute("class").is_some_and(|classes| {
+                classes.split_whitespace().any(|class| {
+                    dependencies_include_relational_rule(map, map.class_dependencies(class))
+                })
+            }) {
+                return true;
+            }
+            if dependencies_include_relational_rule(
+                map,
+                map.local_name_dependencies(
+                    node.as_element()
+                        .map(|element| element.local.as_ref())
+                        .unwrap_or_default(),
+                ),
+            ) {
+                return true;
+            }
+            node.attrs().is_some_and(|attributes| {
+                attributes.iter().any(|attribute| {
+                    dependencies_include_relational_rule(
+                        map,
+                        map.attribute_dependencies(&attribute.qualified_name()),
+                    )
+                })
+            })
+        })
+}
+
+/// A child-list change can alter every structural/sibling match under each
+/// affected parent. Re-cascade that complete parent subtree, the parent's
+/// following siblings (for `:empty +/~ ...`), and the ancestor context chain.
+/// This deliberately does not depend on whether the current sheet happens to
+/// contain nth/sibling selectors: the broad local scope remains correct when
+/// multiple queued mutations introduce selector keys before the next flush.
+fn add_tree_parent_scope(
+    tree: &DomTree,
+    parent: NodeId,
+    dirty_following_siblings: bool,
+    dirty: &mut HashSet<NodeId>,
+) {
+    add_style_subtree(tree, parent, dirty);
+    if dirty_following_siblings {
+        add_following_sibling_subtrees(tree, parent, dirty);
+    }
+}
+
 /// Convert old/new selector keys into a conservative set of fresh cascade
 /// roots. Every selected root is expanded to its complete subtree so ordinary
 /// CSS inheritance, custom properties, generated content, and later selector
@@ -2403,10 +2549,80 @@ fn add_following_sibling_subtrees(
 fn retained_style_plan(
     tree: &DomTree,
     sheet: &crate::css::Stylesheet,
-    mutations: &[AttributeStyleMutation],
+    mutations: &[RetainedStyleMutation],
 ) -> RetainedStylePlan {
     let mut dirty = HashSet::new();
     for mutation in mutations {
+        let RetainedStyleMutation::Attribute(mutation) = mutation else {
+            let RetainedStyleMutation::Tree(mutation) = mutation else {
+                unreachable!()
+            };
+            let map = sheet.invalidation_map();
+            let dirty_parent_siblings = map.state_dependencies("empty").iter().any(|dependency| {
+                dependency
+                    .reaches
+                    .contains(crate::css::InvalidationReaches::SIBLINGS)
+                    || dependency
+                        .reaches
+                        .contains(crate::css::InvalidationReaches::CONSERVATIVE)
+            });
+            match *mutation {
+                TreeStyleMutation::Insert {
+                    node,
+                    old_parent,
+                    new_parent,
+                } => {
+                    // Inserting or moving a style subtree changes the ordered
+                    // author stylesheet, so parsing/index reuse is forbidden.
+                    if subtree_contains_style_element(tree, node)
+                        || node_is_style_text(tree, node, old_parent)
+                        || node_is_style_text(tree, node, Some(new_parent))
+                    {
+                        return RetainedStylePlan::Full;
+                    }
+                    if subtree_may_affect_relational_selector(tree, map, node)
+                        || old_parent.is_some_and(|parent| {
+                            subtree_may_affect_relational_selector(tree, map, parent)
+                        })
+                        || subtree_may_affect_relational_selector(tree, map, new_parent)
+                    {
+                        return RetainedStylePlan::Full;
+                    }
+                    add_style_subtree(tree, node, &mut dirty);
+                    if let Some(parent) = old_parent {
+                        add_tree_parent_scope(tree, parent, dirty_parent_siblings, &mut dirty);
+                    }
+                    add_tree_parent_scope(tree, new_parent, dirty_parent_siblings, &mut dirty);
+                }
+                TreeStyleMutation::Remove { node, old_parent } => {
+                    if subtree_contains_style_element(tree, node)
+                        || node_is_style_text(tree, node, Some(old_parent))
+                    {
+                        return RetainedStylePlan::Full;
+                    }
+                    if subtree_may_affect_relational_selector(tree, map, node)
+                        || subtree_may_affect_relational_selector(tree, map, old_parent)
+                    {
+                        return RetainedStylePlan::Full;
+                    }
+                    add_tree_parent_scope(tree, old_parent, dirty_parent_siblings, &mut dirty);
+                }
+                TreeStyleMutation::Text { node, parent } => {
+                    if node_is_style_text(tree, node, parent) {
+                        return RetainedStylePlan::Full;
+                    }
+                    if !map.state_dependencies("has").is_empty() {
+                        return RetainedStylePlan::Full;
+                    }
+                    if let Some(parent) = parent {
+                        add_tree_parent_scope(tree, parent, dirty_parent_siblings, &mut dirty);
+                    } else {
+                        dirty.insert(node);
+                    }
+                }
+            }
+            continue;
+        };
         let name = mutation.name.to_ascii_lowercase();
         // Phase one deliberately excludes attributes with independent HTML
         // rendering behavior. class/id and data/ARIA state cover framework
@@ -2414,10 +2630,18 @@ fn retained_style_plan(
         // presentation hints, and inline declarations retain the full path.
         if name != "class"
             && name != "id"
+            && name != "style"
             && !name.starts_with("data-")
             && !name.starts_with("aria-")
         {
             return RetainedStylePlan::Full;
+        }
+
+        // Inline declarations always change this element's cascade and may
+        // change inherited values/custom properties throughout its subtree,
+        // even when no author selector explicitly mentions `[style]`.
+        if name == "style" {
+            add_style_subtree(tree, mutation.node, &mut dirty);
         }
 
         let map = sheet.invalidation_map();
@@ -2495,7 +2719,7 @@ pub(crate) fn layout_dom_with_web_fonts_and_retained_styles(
     fonts: &[crate::inline::WebFont],
     stylesheet_cache: &mut crate::css::StylesheetCache,
     retained: RetainedStyleMaps,
-    mutations: &[AttributeStyleMutation],
+    mutations: &[RetainedStyleMutation],
 ) -> DomLayout {
     layout_dom_with_web_fonts_pass_limit(
         tree,
@@ -2527,7 +2751,7 @@ fn layout_dom_with_web_fonts_pass_limit(
     pass_limit: Option<usize>,
     stylesheet_cache: Option<&mut crate::css::StylesheetCache>,
     retained: Option<RetainedStyleMaps>,
-    mutations: &[AttributeStyleMutation],
+    mutations: &[RetainedStyleMutation],
 ) -> (DomLayout, ContainerLayoutTelemetry) {
     let timing = std::env::var("OBSCURA_RENDER_TIMING").is_ok();
 
@@ -2558,7 +2782,7 @@ fn layout_dom_with_web_fonts_pass_limit(
     let t_parse = t0.elapsed();
 
     let retained_requested = retained.as_ref().map_or(0, |retained| retained.styles.len());
-    let retained = retained.and_then(|retained| {
+    let retained = retained.and_then(|mut retained| {
         if !stylesheet_cache_hit
             || retained
                 .styles
@@ -2567,6 +2791,13 @@ fn layout_dom_with_web_fonts_pass_limit(
         {
             return None;
         }
+        let connected = std::iter::once(tree.document())
+            .chain(tree.descendants(tree.document()))
+            .collect::<HashSet<_>>();
+        retained.styles.retain(|node, _| connected.contains(node));
+        retained
+            .custom_properties
+            .retain(|node, _| connected.contains(node));
         match retained_style_plan(tree, &sheet, mutations) {
             RetainedStylePlan::Reuse(dirty) => Some((retained, dirty)),
             RetainedStylePlan::Full => None,
@@ -12482,19 +12713,22 @@ mod tests {
                 name: "data-theme".into(),
                 old_value: Some("light".into()),
                 new_value: Some("dark".into()),
-            },
+            }
+            .into(),
             AttributeStyleMutation {
                 node: toggle,
                 name: "data-open".into(),
                 old_value: Some("false".into()),
                 new_value: Some("true".into()),
-            },
+            }
+            .into(),
             AttributeStyleMutation {
                 node: counter_change,
                 name: "data-double".into(),
                 old_value: Some("false".into()),
                 new_value: Some("true".into()),
-            },
+            }
+            .into(),
         ];
         let retained = RetainedStyleMaps {
             styles: std::mem::take(&mut initial.styles),
@@ -12648,7 +12882,8 @@ mod tests {
                 name: case.attribute.into(),
                 old_value,
                 new_value: Some(case.new_value.into()),
-            }],
+            }
+            .into()],
         );
         let full = layout_dom(&tree, (320.0, 240.0));
 
@@ -12754,6 +12989,22 @@ mod tests {
                 expectation: Incremental,
             },
             RetainedDifferentialCase {
+                name: "inline style and inherited custom property",
+                css: ".subject .grand{width:var(--leaf-width,17px);color:inherit}",
+                target: "subject",
+                attribute: "style",
+                new_value: "width:113px;height:29px;--leaf-width:37px;color:#345678",
+                expectation: Incremental,
+            },
+            RetainedDifferentialCase {
+                name: "inline style attribute selector reaches sibling",
+                css: ".subject[style]+.panel{width:127px;height:31px}",
+                target: "subject",
+                attribute: "style",
+                new_value: "height:23px",
+                expectation: Incremental,
+            },
+            RetainedDifferentialCase {
                 name: "counter propagation through retained siblings",
                 css: ".scope{counter-reset:item}.subject,.panel{counter-increment:item}.subject[data-state=on]{counter-increment:item 3}.subject::before,.panel::before{content:counter(item)}",
                 target: "subject",
@@ -12830,6 +13081,320 @@ mod tests {
         for case in &cases {
             run_retained_differential_case(case);
         }
+    }
+
+    fn finish_retained_tree_case(
+        name: &str,
+        tree: &DomTree,
+        cache: &mut crate::css::StylesheetCache,
+        mut initial: DomLayout,
+        mutation: TreeStyleMutation,
+        expectation: RetainedDifferentialExpectation,
+    ) -> DomLayout {
+        let retained = RetainedStyleMaps {
+            styles: std::mem::take(&mut initial.styles),
+            custom_properties: std::mem::take(&mut initial.custom_properties),
+        };
+        let (incremental, telemetry) = layout_dom_with_web_fonts_pass_limit(
+            tree,
+            (360.0, 260.0),
+            &HashMap::new(),
+            &[],
+            None,
+            Some(cache),
+            Some(retained),
+            &[mutation.into()],
+        );
+        let full = layout_dom(tree, (360.0, 260.0));
+        match expectation {
+            RetainedDifferentialExpectation::Incremental => {
+                assert_eq!(telemetry.retained_fallback, 0, "{name}");
+                assert!(telemetry.retained_fresh > 0, "{name}");
+                assert!(telemetry.retained_reused > 0, "{name}");
+            }
+            RetainedDifferentialExpectation::ReuseAll => {
+                assert_eq!(telemetry.retained_fallback, 0, "{name}");
+                assert_eq!(telemetry.retained_fresh, 0, "{name}");
+                assert!(telemetry.retained_reused > 0, "{name}");
+            }
+            RetainedDifferentialExpectation::ConservativeFallback => {
+                assert_eq!(telemetry.retained_fallback, 1, "{name}");
+                assert_eq!(telemetry.retained_reused, 0, "{name}");
+            }
+        }
+        assert_computed_styles_match(name, &incremental, &full);
+        assert_eq!(incremental.rects, full.rects, "{name}: border boxes");
+        assert_eq!(
+            incremental.inline_fragments, full.inline_fragments,
+            "{name}: inline fragments"
+        );
+        assert_eq!(incremental.text_runs, full.text_runs, "{name}: text runs");
+        assert_eq!(
+            incremental.custom_properties, full.custom_properties,
+            "{name}: custom properties"
+        );
+        incremental
+    }
+
+    #[test]
+    fn retained_tree_styles_match_forced_full_mutation_matrix() {
+        use RetainedDifferentialExpectation::{ConservativeFallback, Incremental};
+
+        // A fresh insertion must cascade the inserted subtree and every
+        // structurally affected sibling while retaining an unrelated branch.
+        let tree = parse_html(
+            r#"<style>
+                .list{counter-reset:item}.item{counter-increment:item;height:9px}
+                .item::before{content:counter(item)}
+                .item:nth-child(2){width:83px}.item:first-child{color:#123456}
+                .list:empty + .after{height:77px}.clean{width:91px;height:13px}
+            </style><main><section id="list" class="list">
+                <i id="first" class="item"></i><i id="insert" class="item"></i><i id="last" class="item"></i>
+            </section><div class="after"></div><aside class="clean"></aside></main>"#,
+        );
+        let list = tree.get_element_by_id("list").unwrap();
+        let insert = tree.get_element_by_id("insert").unwrap();
+        let last = tree.get_element_by_id("last").unwrap();
+        tree.remove_child(insert);
+        let mut cache = crate::css::StylesheetCache::default();
+        let initial = layout_dom_with_web_fonts_and_stylesheet_cache(
+            &tree,
+            (360.0, 260.0),
+            &HashMap::new(),
+            &[],
+            &mut cache,
+        );
+        tree.insert_before(last, insert);
+        finish_retained_tree_case(
+            "fresh insert with nth, counters, and pseudos",
+            &tree,
+            &mut cache,
+            initial,
+            TreeStyleMutation::Insert {
+                node: insert,
+                old_parent: None,
+                new_parent: list,
+            },
+            Incremental,
+        );
+
+        // Removing a subtree must purge its now-detached style/custom-property
+        // entries instead of growing the retained maps forever.
+        let tree = parse_html(
+            r#"<style>.row:nth-child(even){width:72px}.row::before{content:'x'}.clean{height:15px}</style>
+               <main id="rows"><div class="row"></div><div id="removed" class="row"><b id="removed-child"></b></div><div class="row"></div></main><aside class="clean"></aside>"#,
+        );
+        let rows = tree.get_element_by_id("rows").unwrap();
+        let removed = tree.get_element_by_id("removed").unwrap();
+        let removed_child = tree.get_element_by_id("removed-child").unwrap();
+        let mut cache = crate::css::StylesheetCache::default();
+        let initial = layout_dom_with_web_fonts_and_stylesheet_cache(
+            &tree,
+            (360.0, 260.0),
+            &HashMap::new(),
+            &[],
+            &mut cache,
+        );
+        tree.remove_child(removed);
+        let incremental = finish_retained_tree_case(
+            "remove and purge detached subtree",
+            &tree,
+            &mut cache,
+            initial,
+            TreeStyleMutation::Remove {
+                node: removed,
+                old_parent: rows,
+            },
+            Incremental,
+        );
+        assert!(!incremental.styles.contains_key(&removed));
+        assert!(!incremental.styles.contains_key(&removed_child));
+        assert!(!incremental.custom_properties.contains_key(&removed));
+        assert!(!incremental.custom_properties.contains_key(&removed_child));
+
+        // Character-data changes keep selector matching local but must rebuild
+        // text shaping and parent geometry.
+        let tree = parse_html(
+            r#"<style>#label{display:block;width:120px}.clean{height:17px}</style><div id="label">a</div><aside class="clean"></aside>"#,
+        );
+        let label = tree.get_element_by_id("label").unwrap();
+        let text = tree.children(label)[0];
+        let mut cache = crate::css::StylesheetCache::default();
+        let initial = layout_dom_with_web_fonts_and_stylesheet_cache(
+            &tree,
+            (360.0, 260.0),
+            &HashMap::new(),
+            &[],
+            &mut cache,
+        );
+        tree.with_node_mut(text, |node| {
+            if let obscura_dom::tree::NodeData::Text { contents } = &mut node.data {
+                *contents = "a substantially longer replacement".into();
+            }
+        });
+        finish_retained_tree_case(
+            "text replacement",
+            &tree,
+            &mut cache,
+            initial,
+            TreeStyleMutation::Text {
+                node: text,
+                parent: Some(label),
+            },
+            Incremental,
+        );
+
+        // Keyed :has() rules do not poison unrelated mutations, but a matching
+        // inserted key still takes the correctness-first full path.
+        for (name, inserted_class, expectation) in [
+            ("unrelated keyed has insertion", "other", Incremental),
+            ("matching keyed has insertion", "signal", ConservativeFallback),
+        ] {
+            let html = format!(
+                r#"<style>.host:has(.signal) .dependent{{width:101px}}.clean{{height:19px}}</style>
+                   <section id="host" class="host"><div id="target"><i id="insert" class="{inserted_class}"></i></div><span class="dependent"></span></section><aside class="clean"></aside>"#
+            );
+            let tree = parse_html(&html);
+            let target = tree.get_element_by_id("target").unwrap();
+            let insert = tree.get_element_by_id("insert").unwrap();
+            tree.remove_child(insert);
+            let mut cache = crate::css::StylesheetCache::default();
+            let initial = layout_dom_with_web_fonts_and_stylesheet_cache(
+                &tree,
+                (360.0, 260.0),
+                &HashMap::new(),
+                &[],
+                &mut cache,
+            );
+            tree.append_child(target, insert);
+            finish_retained_tree_case(
+                name,
+                &tree,
+                &mut cache,
+                initial,
+                TreeStyleMutation::Insert {
+                    node: insert,
+                    old_parent: None,
+                    new_parent: target,
+                },
+                expectation,
+            );
+        }
+
+        for (name, inserted_tag, expectation) in [
+            ("unrelated keyed tag has insertion", "i", Incremental),
+            ("matching keyed tag has insertion", "span", ConservativeFallback),
+        ] {
+            let html = format!(
+                r#"<style>.host:has(> span) .dependent{{width:103px}}.clean{{height:21px}}</style>
+                   <section id="host" class="host"><{inserted_tag} id="insert"></{inserted_tag}><div class="dependent"></div></section><aside class="clean"></aside>"#
+            );
+            let tree = parse_html(&html);
+            let target = tree.get_element_by_id("host").unwrap();
+            let insert = tree.get_element_by_id("insert").unwrap();
+            tree.remove_child(insert);
+            let mut cache = crate::css::StylesheetCache::default();
+            let initial = layout_dom_with_web_fonts_and_stylesheet_cache(
+                &tree,
+                (360.0, 260.0),
+                &HashMap::new(),
+                &[],
+                &mut cache,
+            );
+            tree.append_child(target, insert);
+            finish_retained_tree_case(
+                name,
+                &tree,
+                &mut cache,
+                initial,
+                TreeStyleMutation::Insert {
+                    node: insert,
+                    old_parent: None,
+                    new_parent: target,
+                },
+                expectation,
+            );
+        }
+
+        // Style text changes alter the cache key and must never reuse styles.
+        let tree = parse_html(
+            r#"<style id="sheet">.subject{width:20px}</style><div class="subject"></div>"#,
+        );
+        let style = tree.get_element_by_id("sheet").unwrap();
+        let text = tree.children(style)[0];
+        let mut cache = crate::css::StylesheetCache::default();
+        let initial = layout_dom_with_web_fonts_and_stylesheet_cache(
+            &tree,
+            (360.0, 260.0),
+            &HashMap::new(),
+            &[],
+            &mut cache,
+        );
+        tree.with_node_mut(text, |node| {
+            if let obscura_dom::tree::NodeData::Text { contents } = &mut node.data {
+                *contents = ".subject{width:140px}".into();
+            }
+        });
+        finish_retained_tree_case(
+            "style text fallback",
+            &tree,
+            &mut cache,
+            initial,
+            TreeStyleMutation::Text {
+                node: text,
+                parent: Some(style),
+            },
+            ConservativeFallback,
+        );
+    }
+
+    #[test]
+    fn retained_tree_invalidation_keeps_large_unrelated_branch_clean() {
+        let mut clean = String::new();
+        for index in 0..2_000 {
+            clean.push_str(&format!("<span class=clean data-index={index}></span>"));
+        }
+        let tree = parse_html(&format!(
+            r#"<style>.item:nth-child(2){{width:88px}}.clean{{height:1px}}</style>
+               <main><section id=list><i class=item></i><i id=insert class=item></i></section><aside>{clean}</aside></main>"#
+        ));
+        let list = tree.get_element_by_id("list").unwrap();
+        let insert = tree.get_element_by_id("insert").unwrap();
+        tree.remove_child(insert);
+        let mut cache = crate::css::StylesheetCache::default();
+        let mut initial = layout_dom_with_web_fonts_and_stylesheet_cache(
+            &tree,
+            (800.0, 600.0),
+            &HashMap::new(),
+            &[],
+            &mut cache,
+        );
+        tree.append_child(list, insert);
+        let retained = RetainedStyleMaps {
+            styles: std::mem::take(&mut initial.styles),
+            custom_properties: std::mem::take(&mut initial.custom_properties),
+        };
+        let (incremental, telemetry) = layout_dom_with_web_fonts_pass_limit(
+            &tree,
+            (800.0, 600.0),
+            &HashMap::new(),
+            &[],
+            None,
+            Some(&mut cache),
+            Some(retained),
+            &[TreeStyleMutation::Insert {
+                node: insert,
+                old_parent: None,
+                new_parent: list,
+            }
+            .into()],
+        );
+        let full = layout_dom(&tree, (800.0, 600.0));
+        assert_computed_styles_match("large unrelated branch", &incremental, &full);
+        assert_eq!(incremental.rects, full.rects);
+        assert_eq!(telemetry.retained_fallback, 0);
+        assert!(telemetry.retained_reused >= 2_000, "{telemetry:?}");
+        assert!(telemetry.retained_fresh < 16, "{telemetry:?}");
     }
 
     #[test]

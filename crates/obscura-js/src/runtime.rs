@@ -264,7 +264,7 @@ impl ObscuraJsRuntime {
         #[cfg(feature = "render")]
         {
             gs.prepared_render = None;
-            gs.pending_attribute_style_mutations.clear();
+            gs.pending_style_mutations.clear();
             gs.render_resources = obscura_render::RenderResourceCache::default();
             gs.stylesheet_cache = obscura_render::StylesheetCache::default();
             gs.dynamic_fonts.clear();
@@ -285,7 +285,7 @@ impl ObscuraJsRuntime {
                 // present. Keep already-fetched absolute bytes, but rebuild
                 // candidate selection/layout against the new base.
                 state.prepared_render = None;
-                state.pending_attribute_style_mutations.clear();
+                state.pending_style_mutations.clear();
                 state.resolved_scroll = None;
             }
         }
@@ -396,7 +396,7 @@ impl ObscuraJsRuntime {
             if state.viewport != viewport {
                 state.viewport = viewport;
                 state.prepared_render = None;
-                state.pending_attribute_style_mutations.clear();
+                state.pending_style_mutations.clear();
                 state.resolved_scroll = None;
             }
         }
@@ -466,6 +466,17 @@ impl ObscuraJsRuntime {
         &self,
         region: obscura_render::CaptureRegion,
     ) -> Result<Vec<u8>, obscura_render::CaptureError> {
+        self.screenshot_prepared_region_with_backgrounds(region, true)
+    }
+
+    /// Capture a document-space rectangle with the PDF print-background
+    /// policy without mutating the page DOM or retained geometry.
+    #[cfg(feature = "render")]
+    pub fn screenshot_prepared_region_with_backgrounds(
+        &self,
+        region: obscura_render::CaptureRegion,
+        paint_backgrounds: bool,
+    ) -> Result<Vec<u8>, obscura_render::CaptureError> {
         let mut state = self.state.borrow_mut();
         with_sync_render_loading_disabled(&mut state, |state| {
             ensure_resolved_scroll(state).ok_or(obscura_render::CaptureError::PaintFailed)?;
@@ -479,7 +490,7 @@ impl ObscuraJsRuntime {
             let (_, scroll) = resolved_scroll
                 .as_ref()
                 .ok_or(obscura_render::CaptureError::PaintFailed)?;
-            obscura_render::screenshot_prepared_region_with_scroll(
+            obscura_render::screenshot_prepared_region_with_scroll_and_backgrounds(
                 dom.as_ref()
                     .ok_or(obscura_render::CaptureError::PaintFailed)?,
                 prepared_render
@@ -488,6 +499,7 @@ impl ObscuraJsRuntime {
                 render_resources,
                 scroll,
                 region,
+                paint_backgrounds,
             )
         })
     }
@@ -557,7 +569,7 @@ impl ObscuraJsRuntime {
             Some(bytes) => {
                 state.render_resources.seed(url, bytes);
                 state.prepared_render = None;
-                state.pending_attribute_style_mutations.clear();
+                state.pending_style_mutations.clear();
                 state.resolved_scroll = None;
             }
             None => state.render_resources.seed_missing(url),
@@ -1576,7 +1588,7 @@ impl ObscuraJsRuntime {
         #[cfg(feature = "render")]
         {
             state.prepared_render = None;
-            state.pending_attribute_style_mutations.clear();
+            state.pending_style_mutations.clear();
             state.render_resources = obscura_render::RenderResourceCache::default();
             state.stylesheet_cache = obscura_render::StylesheetCache::default();
             state.dynamic_fonts.clear();
@@ -6141,10 +6153,19 @@ mod tests {
             "document.getElementById('box').setAttribute('style', 'height:60px;width:40px')",
         )
         .unwrap();
-        assert!(
-            rt.state.borrow().prepared_render.is_none(),
-            "a changed attribute on a connected element must invalidate layout"
-        );
+        {
+            let state = rt.state.borrow();
+            assert!(
+                state.prepared_render.is_some(),
+                "a retained inline-style change must keep the prior style maps until flush"
+            );
+            assert!(matches!(
+                state.pending_style_mutations.as_slice(),
+                [obscura_render::RetainedStyleMutation::Attribute(
+                    obscura_render::AttributeStyleMutation { name, .. }
+                )] if name == "style"
+            ));
+        }
         assert_eq!(
             rt.evaluate("document.getElementById('box').getBoundingClientRect().height")
                 .unwrap()
@@ -6189,7 +6210,7 @@ mod tests {
         {
             let state = rt.state.borrow();
             assert!(state.prepared_render.is_some());
-            assert_eq!(state.pending_attribute_style_mutations.len(), 1);
+            assert_eq!(state.pending_style_mutations.len(), 1);
         }
         assert_eq!(
             rt.evaluate("document.getElementById('box').getBoundingClientRect().width")
@@ -6233,6 +6254,98 @@ mod tests {
         let state = rt.state.borrow();
         assert_eq!(state.stylesheet_cache.miss_count(), 3);
         assert_eq!(state.stylesheet_cache.hit_count(), 1);
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn connected_tree_mutations_queue_retained_styles_until_geometry_flush() {
+        let dom = parse_html(
+            r#"<html style="margin:0"><head><style>
+                .item{display:block;width:40px;height:12px}
+                .item:nth-child(2){width:80px}
+            </style></head><body style="margin:0">
+                <main id="list"><div id="first" class="item"></div></main>
+            </body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_viewport(200.0, 100.0);
+        rt.run_page_init();
+
+        assert_eq!(
+            rt.evaluate("document.getElementById('first').getBoundingClientRect().width")
+                .unwrap()
+                .as_f64(),
+            Some(40.0)
+        );
+        rt.evaluate(
+            "const added=document.createElement('div');added.id='added';added.className='item';document.getElementById('list').appendChild(added)",
+        )
+        .unwrap();
+        {
+            let state = rt.state.borrow();
+            assert!(state.prepared_render.is_some());
+            assert!(matches!(
+                state.pending_style_mutations.as_slice(),
+                [obscura_render::RetainedStyleMutation::Tree(
+                    obscura_render::TreeStyleMutation::Insert { .. }
+                )]
+            ));
+        }
+        assert_eq!(
+            rt.evaluate("document.getElementById('added').getBoundingClientRect().width")
+                .unwrap()
+                .as_f64(),
+            Some(80.0)
+        );
+        assert!(rt.state.borrow().pending_style_mutations.is_empty());
+
+        rt.evaluate("document.getElementById('added').style.width='65px'")
+            .unwrap();
+        {
+            let state = rt.state.borrow();
+            assert!(state.prepared_render.is_some());
+            assert!(matches!(
+                state.pending_style_mutations.as_slice(),
+                [obscura_render::RetainedStyleMutation::Attribute(
+                    obscura_render::AttributeStyleMutation { name, .. }
+                )] if name == "style"
+            ));
+        }
+        assert_eq!(
+            rt.evaluate("document.getElementById('added').getBoundingClientRect().width")
+                .unwrap()
+                .as_f64(),
+            Some(65.0)
+        );
+        assert_eq!(
+            rt.evaluate("(function(){const added=document.getElementById('added');added.style.width='';return added.getBoundingClientRect().width})()")
+                .unwrap()
+                .as_f64(),
+            Some(80.0)
+        );
+
+        rt.evaluate(
+            "document.getElementById('list').removeChild(document.getElementById('first'))",
+        )
+        .unwrap();
+        {
+            let state = rt.state.borrow();
+            assert!(state.prepared_render.is_some());
+            assert!(matches!(
+                state.pending_style_mutations.as_slice(),
+                [obscura_render::RetainedStyleMutation::Tree(
+                    obscura_render::TreeStyleMutation::Remove { .. }
+                )]
+            ));
+        }
+        assert_eq!(
+            rt.evaluate("document.getElementById('added').getBoundingClientRect().width")
+                .unwrap()
+                .as_f64(),
+            Some(40.0)
+        );
+        assert!(rt.state.borrow().pending_style_mutations.is_empty());
     }
 
     #[cfg(feature = "render")]
