@@ -9,7 +9,7 @@ use crate::style::{
     Position,
 };
 use crate::tree::{Layout, LayoutPartialTreeExt, NodeId, SizingMode};
-use crate::util::sys::f32_max;
+use crate::util::sys::{f32_max, f32_min};
 use crate::util::{MaybeMath, MaybeResolve, ResolveOrZero};
 
 #[cfg(feature = "content_size")]
@@ -209,6 +209,17 @@ pub(super) fn align_and_position_item(
     // Clamp size by min and max width/height
     let Size { width, height } = Size { width, height }.maybe_clamp(min_size, max_size);
 
+    // Auto margins disable self-alignment in their axis. In particular, an
+    // auto inline margin disables the default `stretch`, so an auto-width
+    // in-flow item must use fit-content sizing even though its resolved
+    // justify-self value is still `stretch`.
+    //
+    // At this point a genuinely stretched (or otherwise definite) width is
+    // `Some`, while an auto width whose effective alignment is non-stretch is
+    // `None`. Absolutely-positioned items use their separate shrink-to-fit
+    // path below.
+    let uses_inline_fit_content = position != Position::Absolute && width.is_none();
+
     // Layout node
     drop(style);
 
@@ -238,20 +249,32 @@ pub(super) fn align_and_position_item(
     // Resolve final size
     let mut resolved_size = size.unwrap_or(layout_output.size).maybe_clamp(min_size, max_size);
 
-    // An auto-sized grid item that is not stretched uses fit-content sizing
-    // in the inline axis. The inherent-size layout above obtains its
-    // max-content size; if that exceeds the definite grid area, lay it out
-    // again at the available size so descendants resolve against the actual
-    // shrink-to-fit width.
-    if size.width.is_none()
-        && alignment_styles.horizontal != AlignSelf::STRETCH
-        && resolved_size.width > grid_area_minus_item_margins_size.width
-    {
-        let constrained_size = Size {
-            width: Some(grid_area_minus_item_margins_size.width)
-                .maybe_clamp(min_size.width, max_size.width),
-            height: size.height,
-        };
+    // An auto-sized grid item that is not effectively stretched uses
+    // fit-content sizing in the inline axis:
+    //
+    //   max(min-content, min(available, max-content))
+    //
+    // The inherent-size layout above obtains the max-content size. Only pay
+    // for a min-content measurement when the available width would actually
+    // clamp it. This preserves intrinsic overflow for unbreakable content,
+    // while breakable content is laid out again at the available width.
+    if uses_inline_fit_content && resolved_size.width > grid_area_minus_item_margins_size.width {
+        let min_content_width = tree.measure_child_size(
+            node,
+            Size { width: None, height: size.height },
+            grid_area_size.map(Option::Some),
+            Size {
+                width: AvailableSpace::MinContent,
+                height: AvailableSpace::Definite(grid_area_minus_item_margins_size.height),
+            },
+            SizingMode::InherentSize,
+            crate::AbsoluteAxis::Horizontal,
+            Line::FALSE,
+        );
+        let fit_content_width =
+            f32_max(min_content_width, f32_min(grid_area_minus_item_margins_size.width, resolved_size.width))
+                .maybe_clamp(min_size.width, max_size.width);
+        let constrained_size = Size { width: Some(fit_content_width), height: size.height };
         layout_output = tree.perform_child_layout(
             node,
             constrained_size,
@@ -402,4 +425,191 @@ pub(super) fn align_item_within_area(
     }
 
     (start, resolved_margin)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{f32_max, f32_min};
+    use crate::prelude::*;
+
+    #[derive(Clone, Copy)]
+    struct IntrinsicInlineSize {
+        min: f32,
+        max: f32,
+    }
+
+    fn measure_intrinsic_child(
+        known_dimensions: Size<Option<f32>>,
+        available_space: Size<AvailableSpace>,
+        _node: NodeId,
+        context: Option<&mut IntrinsicInlineSize>,
+        _style: &Style,
+    ) -> Size<f32> {
+        let intrinsic = context.copied().unwrap_or(IntrinsicInlineSize { min: 0.0, max: 0.0 });
+        let width = known_dimensions.width.unwrap_or_else(|| match available_space.width {
+            AvailableSpace::MinContent => intrinsic.min,
+            AvailableSpace::MaxContent => intrinsic.max,
+            AvailableSpace::Definite(available) => f32_max(intrinsic.min, f32_min(available, intrinsic.max)),
+        });
+        Size { width, height: known_dimensions.height.unwrap_or(10.0) }
+    }
+
+    fn inline_margins(left_auto: bool, right_auto: bool) -> Rect<LengthPercentageAuto> {
+        Rect {
+            left: if left_auto { auto() } else { zero() },
+            right: if right_auto { auto() } else { zero() },
+            top: zero(),
+            bottom: zero(),
+        }
+    }
+
+    fn layout_nested_grid_item(
+        intrinsic: IntrinsicInlineSize,
+        margin: Rect<LengthPercentageAuto>,
+        justify_self: Option<AlignSelf>,
+        min_width: Dimension,
+        max_width: Dimension,
+        padding: Rect<LengthPercentage>,
+        border: Rect<LengthPercentage>,
+        box_sizing: BoxSizing,
+    ) -> f32 {
+        let mut tree = TaffyTree::new();
+        tree.disable_rounding();
+
+        let text = tree.new_leaf_with_context(Style::default(), intrinsic).unwrap();
+        let item = tree
+            .new_with_children(
+                Style {
+                    display: Display::Grid,
+                    grid_template_columns: vec![fr(1.0)],
+                    margin,
+                    justify_self,
+                    min_size: Size { width: min_width, height: Dimension::auto() },
+                    max_size: Size { width: max_width, height: Dimension::auto() },
+                    padding,
+                    border,
+                    box_sizing,
+                    ..Style::default()
+                },
+                &[text],
+            )
+            .unwrap();
+        let root = tree
+            .new_with_children(
+                Style {
+                    display: Display::Grid,
+                    size: Size { width: length(300.0), height: auto() },
+                    grid_template_columns: vec![length(300.0)],
+                    ..Style::default()
+                },
+                &[item],
+            )
+            .unwrap();
+
+        tree.compute_layout_with_measure(root, Size::MAX_CONTENT, measure_intrinsic_child).unwrap();
+        tree.layout(item).unwrap().size.width
+    }
+
+    fn unconstrained_item_width(
+        intrinsic: IntrinsicInlineSize,
+        margin: Rect<LengthPercentageAuto>,
+        justify_self: Option<AlignSelf>,
+    ) -> f32 {
+        layout_nested_grid_item(
+            intrinsic,
+            margin,
+            justify_self,
+            Dimension::auto(),
+            Dimension::auto(),
+            Rect::zero(),
+            Rect::zero(),
+            BoxSizing::BorderBox,
+        )
+    }
+
+    #[test]
+    fn breakable_fit_content_honors_auto_margin_and_self_alignment_matrix() {
+        let breakable = IntrinsicInlineSize { min: 100.0, max: 600.0 };
+        let cases = [
+            (inline_margins(true, true), None),
+            (inline_margins(true, false), None),
+            (inline_margins(false, true), None),
+            (inline_margins(true, true), Some(AlignSelf::STRETCH)),
+            (inline_margins(false, false), Some(AlignSelf::START)),
+            (inline_margins(false, false), Some(AlignSelf::CENTER)),
+            (inline_margins(false, false), Some(AlignSelf::END)),
+        ];
+
+        for (margin, justify_self) in cases {
+            assert_eq!(unconstrained_item_width(breakable, margin, justify_self), 300.0);
+        }
+    }
+
+    #[test]
+    fn unbreakable_fit_content_preserves_the_min_content_floor() {
+        let unbreakable = IntrinsicInlineSize { min: 600.0, max: 600.0 };
+        let cases = [
+            (inline_margins(true, true), None),
+            (inline_margins(true, false), None),
+            (inline_margins(false, true), None),
+            (inline_margins(true, true), Some(AlignSelf::STRETCH)),
+            (inline_margins(false, false), Some(AlignSelf::START)),
+            (inline_margins(false, false), Some(AlignSelf::CENTER)),
+            (inline_margins(false, false), Some(AlignSelf::END)),
+        ];
+
+        for (margin, justify_self) in cases {
+            assert_eq!(unconstrained_item_width(unbreakable, margin, justify_self), 600.0);
+        }
+
+        assert_eq!(
+            unconstrained_item_width(unbreakable, inline_margins(false, false), None),
+            300.0,
+            "stretch remains active when neither inline margin is auto"
+        );
+    }
+
+    #[test]
+    fn fit_content_applies_author_min_max_and_box_edges() {
+        let breakable = IntrinsicInlineSize { min: 100.0, max: 600.0 };
+        let unbreakable = IntrinsicInlineSize { min: 600.0, max: 600.0 };
+        let auto_margins = inline_margins(true, true);
+
+        let author_min = layout_nested_grid_item(
+            breakable,
+            auto_margins,
+            None,
+            length(350.0),
+            Dimension::auto(),
+            Rect::zero(),
+            Rect::zero(),
+            BoxSizing::BorderBox,
+        );
+        assert_eq!(author_min, 350.0);
+
+        let author_max = layout_nested_grid_item(
+            unbreakable,
+            auto_margins,
+            None,
+            Dimension::auto(),
+            length(250.0),
+            Rect::zero(),
+            Rect::zero(),
+            BoxSizing::BorderBox,
+        );
+        assert_eq!(author_max, 250.0);
+
+        let edges = Rect { left: length(10.0), right: length(10.0), top: zero(), bottom: zero() };
+        let content_box_max = layout_nested_grid_item(
+            unbreakable,
+            auto_margins,
+            None,
+            Dimension::auto(),
+            length(250.0),
+            edges,
+            edges,
+            BoxSizing::ContentBox,
+        );
+        assert_eq!(content_box_max, 290.0);
+    }
 }
