@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use obscura_dom::{parse_html, DomTree, NodeData, NodeId};
+use obscura_dom::{parse_html, DomTree};
 use obscura_js::runtime::ObscuraJsRuntime;
 use obscura_net::{CallbackRegistry, ObscuraHttpClient, ObscuraNetError, RequestCallback, Response, ResponseCallback};
 use url::Url;
@@ -510,127 +510,6 @@ fn linked_stylesheet_requests(dom: &DomTree) -> Vec<(usize, String)> {
         }
     }
     links
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct HydrationStats {
-    elements: usize,
-    text_chars: usize,
-}
-
-struct HydrationSnapshot {
-    body_html: String,
-    stats: HydrationStats,
-}
-
-fn capture_hydration_snapshot(js: &ObscuraJsRuntime) -> Option<HydrationSnapshot> {
-    js.with_dom(|dom| {
-        let body = dom.query_selector("body").ok().flatten()?;
-        Some(HydrationSnapshot {
-            body_html: dom.inner_html(body),
-            stats: hydration_stats(dom, body),
-        })
-    })
-    .flatten()
-}
-
-fn capture_hydration_stats(js: &ObscuraJsRuntime) -> Option<HydrationStats> {
-    js.with_dom(|dom| {
-        let body = dom.query_selector("body").ok().flatten()?;
-        Some(hydration_stats(dom, body))
-    })
-    .flatten()
-}
-
-fn hydration_stats(dom: &DomTree, body: NodeId) -> HydrationStats {
-    let mut elements = 0;
-    let mut text_chars = 0;
-
-    for node_id in dom.descendants(body) {
-        let Some(node) = dom.get_node(node_id) else {
-            continue;
-        };
-        match &node.data {
-            NodeData::Element { name, .. } => {
-                if !matches!(
-                    name.local.as_ref(),
-                    "script" | "style" | "link" | "meta" | "template" | "noscript"
-                ) {
-                    elements += 1;
-                }
-            }
-            NodeData::Text { contents } => {
-                if !has_non_content_ancestor(dom, node.parent, body) {
-                    text_chars += contents.chars().filter(|c| !c.is_whitespace()).count();
-                }
-            }
-            _ => {}
-        }
-    }
-
-    HydrationStats {
-        elements,
-        text_chars,
-    }
-}
-
-fn has_non_content_ancestor(
-    dom: &DomTree,
-    mut current: Option<NodeId>,
-    body: NodeId,
-) -> bool {
-    while let Some(node_id) = current {
-        if node_id == body {
-            return false;
-        }
-        let Some(node) = dom.get_node(node_id) else {
-            return false;
-        };
-        if node
-            .as_element()
-            .is_some_and(|name| matches!(name.local.as_ref(), "script" | "style" | "template" | "noscript"))
-        {
-            return true;
-        }
-        current = node.parent;
-    }
-    false
-}
-
-/// A server-rendered body should only be restored for an unmistakable wipe:
-/// a substantial document lost at least seven eighths of its real elements
-/// and visible text, leaving almost no content. This deliberately does not
-/// second-guess ordinary framework rerenders or client-only application shells.
-fn should_restore_hydration_snapshot(
-    before: HydrationStats,
-    after: HydrationStats,
-) -> bool {
-    before.elements >= 40
-        && before.text_chars >= 200
-        && after.elements <= 12
-        && after.text_chars <= 128
-        && after.elements.saturating_mul(8) < before.elements
-        && after.text_chars.saturating_mul(8) < before.text_chars
-}
-
-fn restore_hydration_snapshot_if_needed(
-    js: &ObscuraJsRuntime,
-    before: HydrationSnapshot,
-) -> bool {
-    let Some(after) = capture_hydration_stats(js) else {
-        return false;
-    };
-    if !should_restore_hydration_snapshot(before.stats, after) {
-        return false;
-    }
-    tracing::warn!(
-        before_elements = before.stats.elements,
-        after_elements = after.elements,
-        before_text_chars = before.stats.text_chars,
-        after_text_chars = after.text_chars,
-        "restoring server-rendered body after catastrophic hydration wipe"
-    );
-    js.replace_body_inner_html(&before.body_html)
 }
 
 impl Page {
@@ -1550,7 +1429,6 @@ impl Page {
         if max_ms == 0 {
             return;
         }
-        let hydration_snapshot = self.js.as_ref().and_then(capture_hydration_snapshot);
         if let Some(js) = &mut self.js {
             if std::env::var_os("OBSCURA_STRICT_SETTLE").is_some() {
                 // Paired browser measurements need the same wall-clock interval
@@ -1569,10 +1447,6 @@ impl Page {
                 // storms: a plain tokio timeout cannot preempt a page that pins
                 // the thread inside V8, so settle uses the watchdog path.
                 let _ = js.run_event_loop_bounded(max_ms).await;
-            }
-
-            if let Some(before) = hydration_snapshot {
-                let _ = restore_hydration_snapshot_if_needed(js, before);
             }
         }
     }
@@ -1878,11 +1752,7 @@ impl Page {
         // page.click() handlers were no-ops. Now scripts run regardless
         // of waitUntil and DCL means "DOM parsed AND scripts executed".
         self.fetch_stylesheets().await;
-        let hydration_snapshot = self.js.as_ref().and_then(capture_hydration_snapshot);
         self.execute_scripts().await;
-        if let (Some(js), Some(before)) = (&self.js, hydration_snapshot) {
-            let _ = restore_hydration_snapshot_if_needed(js, before);
-        }
 
         self.lifecycle = LifecycleState::DomContentLoaded;
 
@@ -2515,11 +2385,76 @@ fn url_matches_cdp_pattern(pattern: &str, url: &str) -> bool {
 mod tests {
     use super::{
         linked_stylesheet_requests, materialize_linked_stylesheet_script, parse_import_url,
-        rebase_css_urls, should_restore_hydration_snapshot, split_css_imports,
+        rebase_css_urls, split_css_imports,
         script_response_is_executable, truncate_on_char_boundary, url_matches_cdp_pattern,
-        HydrationStats,
     };
+    use base64::Engine as _;
     use obscura_dom::parse_html;
+
+    fn client_replacement_page(name: &str, deferred: bool) -> super::Page {
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            name.to_string(), None, false, None, None, true,
+        ));
+        let mut page = super::Page::new(name.to_string(), context);
+        let server_content = (0..45)
+            .map(|index| format!("<p>server content item {index} with enough text</p>"))
+            .collect::<String>();
+        let start = if deferred {
+            "window.addEventListener('mount-client', () => setTimeout(mountClient, 0));"
+        } else {
+            "mountClient();"
+        };
+        let html = format!(
+            r#"<!doctype html><html><body><main id="ssr">{server_content}</main><script>
+                function mountClient() {{
+                    document.body.innerHTML = '<button id="client" data-clicks="0">Client view</button>';
+                    const button = document.getElementById('client');
+                    button.addEventListener('click', () => {{
+                        button.setAttribute('data-clicks', String(Number(button.getAttribute('data-clicks')) + 1));
+                    }});
+                }}
+                {start}
+            </script></body></html>"#,
+        );
+        let encoded = base64::engine::general_purpose::STANDARD.encode(html);
+        page.url = Some(
+            url::Url::parse(&format!("data:text/html;base64,{encoded}"))
+                .expect("data URL"),
+        );
+        page
+    }
+
+    fn assert_client_replacement_survived(page: &mut super::Page) {
+        let state = page
+            .js
+            .as_mut()
+            .expect("page runtime")
+            .evaluate(
+                r#"
+                var clientReplacementCheck = true;
+                const button = document.getElementById('client');
+                if (button) button.dispatchEvent(new Event('click'));
+                return {
+                    staleServerContent: !!document.getElementById('ssr'),
+                    clientPresent: !!button,
+                    clientText: button ? button.textContent : null,
+                    clicks: button ? button.getAttribute('data-clicks') : null,
+                    bodyElements: document.querySelectorAll('body *').length
+                };
+                "#,
+            )
+            .expect("inspect client replacement");
+        assert_eq!(
+            state,
+            serde_json::json!({
+                "staleServerContent": false,
+                "clientPresent": true,
+                "clientText": "Client view",
+                "clicks": "1",
+                "bodyElements": 1,
+            }),
+        );
+    }
 
     fn spawn_parser_import_map_server(
         expected_requests: usize,
@@ -3127,42 +3062,35 @@ mod tests {
         );
     }
 
-    #[test]
-    fn hydration_recovery_requires_a_catastrophic_content_wipe() {
-        assert!(should_restore_hydration_snapshot(
-            HydrationStats {
-                elements: 520,
-                text_chars: 8_000,
-            },
-            HydrationStats {
-                elements: 4,
-                text_chars: 0,
-            },
-        ));
+    #[tokio::test(flavor = "current_thread")]
+    async fn parser_script_body_replacement_survives_navigation() {
+        let mut page = client_replacement_page("parser-client-replacement", false);
+        let target = page.url_string();
+
+        page.navigate(&target).await.expect("navigate replacement page");
+
+        assert_client_replacement_survived(&mut page);
     }
 
-    #[test]
-    fn hydration_recovery_does_not_override_normal_rerenders() {
-        assert!(!should_restore_hydration_snapshot(
-            HydrationStats {
-                elements: 520,
-                text_chars: 8_000,
-            },
-            HydrationStats {
-                elements: 180,
-                text_chars: 3_000,
-            },
-        ));
-        assert!(!should_restore_hydration_snapshot(
-            HydrationStats {
-                elements: 12,
-                text_chars: 80,
-            },
-            HydrationStats {
-                elements: 1,
-                text_chars: 0,
-            },
-        ));
+    #[tokio::test(flavor = "current_thread")]
+    async fn timer_body_replacement_survives_settle() {
+        let mut page = client_replacement_page("timer-client-replacement", true);
+        let target = page.url_string();
+        page.navigate(&target).await.expect("navigate deferred replacement page");
+
+        let before_timer = page
+            .js
+            .as_mut()
+            .expect("page runtime")
+            .evaluate(
+                "var scheduleClientReplacement = true; window.dispatchEvent(new Event('mount-client')); return !!document.getElementById('ssr');",
+            )
+            .expect("schedule client replacement");
+        assert_eq!(before_timer, serde_json::json!(true));
+
+        page.settle(100).await;
+
+        assert_client_replacement_survived(&mut page);
     }
 
     #[test]

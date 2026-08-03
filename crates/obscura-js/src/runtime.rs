@@ -14,8 +14,7 @@ use crate::module_loader::ObscuraModuleLoader;
 #[cfg(feature = "render")]
 use crate::ops::{clamp_scroll_offset, document_base_url, ensure_prepared_render};
 use crate::ops::{
-    build_extension, mark_script_subtree_started, node_is_script, ObscuraState,
-    StoredNetworkResponseBody,
+    build_extension, node_is_script, ObscuraState, StoredNetworkResponseBody,
 };
 
 static SNAPSHOT: &[u8] = include_bytes!(env!("OBSCURA_SNAPSHOT_PATH"));
@@ -1244,43 +1243,6 @@ impl ObscuraJsRuntime {
     pub fn with_dom<R>(&self, f: impl FnOnce(&DomTree) -> R) -> Option<R> {
         let state = self.state.borrow();
         state.dom.as_ref().map(f)
-    }
-
-    /// Replace the body's children while preserving the body node itself.
-    ///
-    /// Keeping the document/body node IDs stable matters because JavaScript
-    /// wrappers cache those IDs. This is used by the browser's narrowly
-    /// guarded hydration recovery path after a framework catastrophically
-    /// clears an otherwise complete server-rendered document.
-    pub fn replace_body_inner_html(&self, html: &str) -> bool {
-        #[allow(unused_mut)]
-        let mut state = self.state.borrow_mut();
-        let Some(dom) = state.dom.as_ref() else {
-            return false;
-        };
-        let Ok(Some(body)) = dom.query_selector("body") else {
-            return false;
-        };
-
-        for child in dom.children(body) {
-            // Detach instead of recycling the node slot: wrappers held by a
-            // failed hydration attempt must not start referring to a newly
-            // restored, unrelated node that reused the same ID.
-            dom.detach(child);
-        }
-        if !html.is_empty() {
-            let fragment = obscura_dom::parse_fragment(html);
-            let root = fragment.fragment_root();
-            dom.import_children_from(body, &fragment, root);
-            for child in dom.children(body) {
-                mark_script_subtree_started(&state, child);
-            }
-        }
-        #[cfg(feature = "render")]
-        {
-            state.prepared_render = None;
-        }
-        true
     }
 
     /// Absolute URLs the page requested via fetch()/XHR, in request order
