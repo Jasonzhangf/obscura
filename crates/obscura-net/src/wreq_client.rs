@@ -8,6 +8,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 #[cfg(feature = "stealth")]
+use futures_util::StreamExt;
+#[cfg(feature = "stealth")]
 use tokio::sync::RwLock;
 #[cfg(feature = "stealth")]
 use url::Url;
@@ -15,7 +17,12 @@ use url::Url;
 #[cfg(feature = "stealth")]
 use crate::cookies::CookieJar;
 #[cfg(feature = "stealth")]
-use crate::client::{Response, ObscuraNetError};
+use crate::client::{
+    CallbackRegistry, InFlightGuard, ObscuraNetError, RequestInfo, RequestMode,
+    ResourceRequest, Response, cors_required, fetch_file_url, redirect_taints_origin,
+    request_fetch_site, request_referrer, response_too_large, serialized_request_origin,
+    validate_cors_response, validate_request_mode, validate_url,
+};
 
 #[cfg(feature = "stealth")]
 pub const STEALTH_USER_AGENT: &str =
@@ -31,6 +38,86 @@ pub const STEALTH_NAVIGATOR_PLATFORM: &str = "Win32";
 pub const STEALTH_UA_PLATFORM: &str = "Windows";
 #[cfg(feature = "stealth")]
 pub const STEALTH_UA_PLATFORM_VERSION: &str = "15.0.0";
+
+#[cfg(feature = "stealth")]
+fn wreq_response_header_value<'a>(
+    headers: &'a wreq::header::HeaderMap,
+    name: &'static str,
+    url: &Url,
+) -> Result<Option<&'a str>, ObscuraNetError> {
+    let mut values = headers.get_all(name).iter();
+    let Some(first) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(ObscuraNetError::Cors(format!(
+            "{} returned multiple {} headers",
+            url, name
+        )));
+    }
+    first.to_str().map(Some).map_err(|_| {
+        ObscuraNetError::Cors(format!("{} returned an invalid {} header", url, name))
+    })
+}
+
+#[cfg(feature = "stealth")]
+fn validate_wreq_cors_response(
+    request: &ResourceRequest,
+    target: &Url,
+    serialized_origin: &str,
+    headers: &wreq::header::HeaderMap,
+) -> Result<(), ObscuraNetError> {
+    if !cors_required(request, target) {
+        return Ok(());
+    }
+    let allow_origin =
+        wreq_response_header_value(headers, "access-control-allow-origin", target)?;
+    let allow_credentials =
+        wreq_response_header_value(headers, "access-control-allow-credentials", target)?;
+    validate_cors_response(
+        request,
+        target,
+        serialized_origin,
+        allow_origin,
+        allow_credentials,
+    )
+}
+
+#[cfg(feature = "stealth")]
+async fn read_wreq_body_limited(
+    response: wreq::Response,
+    url: &Url,
+    limit: usize,
+) -> Result<Vec<u8>, ObscuraNetError> {
+    if response
+        .headers()
+        .get("content-length")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(response_too_large(url, limit));
+    }
+
+    let capacity = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or(0)
+        .min(limit);
+    let stream = response.bytes_stream();
+    futures_util::pin_mut!(stream);
+    let mut body = Vec::with_capacity(capacity);
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| {
+            ObscuraNetError::Network(format!("Failed to read body: {}", error))
+        })?;
+        if chunk.len() > limit.saturating_sub(body.len()) {
+            return Err(response_too_large(url, limit));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
 
 #[cfg(feature = "stealth")]
 pub struct StealthHttpClient {
@@ -108,6 +195,39 @@ impl StealthHttpClient {
     }
 
     pub async fn fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
+        self.fetch_with_callbacks(url, None).await
+    }
+
+    pub async fn fetch_with_callbacks(
+        &self,
+        url: &Url,
+        callbacks: Option<&CallbackRegistry>,
+    ) -> Result<Response, ObscuraNetError> {
+        self.fetch_with_profile(url, ResourceRequest::navigation(), callbacks)
+            .await
+    }
+
+    pub async fn fetch_resource_with_callbacks(
+        &self,
+        url: &Url,
+        request: ResourceRequest,
+        callbacks: Option<&CallbackRegistry>,
+    ) -> Result<Response, ObscuraNetError> {
+        self.fetch_with_profile(url, request, callbacks).await
+    }
+
+    async fn fetch_with_profile(
+        &self,
+        url: &Url,
+        request: ResourceRequest,
+        callbacks: Option<&CallbackRegistry>,
+    ) -> Result<Response, ObscuraNetError> {
+        validate_url(url, false)?;
+        validate_request_mode(&request, url)?;
+        if url.scheme() == "file" {
+            return fetch_file_url(url, request.max_response_bytes).await;
+        }
+
         let mut current_url = url.clone();
 
         if let Some(host) = current_url.host_str() {
@@ -124,31 +244,78 @@ impl StealthHttpClient {
         }
 
         let mut redirects = Vec::new();
+        let mut redirect_tainted = false;
+        let mut request_callback_fired = false;
 
         for _ in 0..20 {
+            validate_request_mode(&request, &current_url)?;
             let mut req = self.client.get(current_url.as_str());
 
-            let cookie_header = self.cookie_jar.get_cookie_header(&current_url);
+            req = req
+                .header("accept", request.accept())
+                .header("sec-fetch-site", request_fetch_site(&request, &current_url))
+                .header("sec-fetch-mode", request.mode.header_value())
+                .header("sec-fetch-dest", request.destination());
+            if request.mode == RequestMode::Navigate {
+                req = req
+                    .header("upgrade-insecure-requests", "1")
+                    .header("sec-fetch-user", "?1");
+            }
+            if let Some(referer) = request_referrer(&request, &current_url) {
+                req = req.header("referer", referer);
+            }
+            let request_origin = serialized_request_origin(&request, redirect_tainted);
+
+            let cookie_header = if request.sends_credentials_to(&current_url) {
+                self.cookie_jar.get_cookie_header(&current_url)
+            } else {
+                String::new()
+            };
             if !cookie_header.is_empty() {
                 req = req.header("Cookie", &cookie_header);
             }
 
             for (k, v) in self.extra_headers.read().await.iter() {
+                if k.eq_ignore_ascii_case("origin") {
+                    continue;
+                }
                 req = req.header(k.as_str(), v.as_str());
             }
+            if cors_required(&request, &current_url) {
+                req = req.header("origin", &request_origin);
+            }
 
-            self.in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let request_info = RequestInfo {
+                url: current_url.clone(),
+                method: "GET".to_string(),
+                headers: self.extra_headers.read().await.clone(),
+                resource_type: request.resource_type,
+            };
+            if !request_callback_fired {
+                if let Some(callbacks) = callbacks {
+                    callbacks.fire_request(&request_info).await;
+                }
+                request_callback_fired = true;
+            }
+
+            let in_flight = InFlightGuard::new(&self.in_flight);
             let resp = req.send().await.map_err(|e| {
-                self.in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 ObscuraNetError::Network(format!("{}: {} (source: {:?})", current_url, e, e.source()))
             })?;
-            self.in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
 
             let status = resp.status();
+            validate_wreq_cors_response(
+                &request,
+                &current_url,
+                &request_origin,
+                resp.headers(),
+            )?;
 
-            for val in resp.headers().get_all("set-cookie") {
-                if let Ok(s) = val.to_str() {
-                    self.cookie_jar.set_cookie(s, &current_url);
+            if request.sends_credentials_to(&current_url) {
+                for val in resp.headers().get_all("set-cookie") {
+                    if let Ok(s) = val.to_str() {
+                        self.cookie_jar.set_cookie(s, &current_url);
+                    }
                 }
             }
 
@@ -166,23 +333,31 @@ impl StealthHttpClient {
                     let next_url = current_url.join(location_str).map_err(|e| {
                         ObscuraNetError::Network(format!("Invalid redirect URL: {}", e))
                     })?;
+                    validate_url(&next_url, false)?;
+                    validate_request_mode(&request, &next_url)?;
+                    redirect_tainted |=
+                        redirect_taints_origin(&request, &current_url, &next_url);
                     redirects.push(current_url.clone());
                     current_url = next_url;
                     continue;
                 }
             }
 
-            let body = resp.bytes().await.map_err(|e| {
-                ObscuraNetError::Network(format!("Failed to read body: {}", e))
-            })?.to_vec();
+            let body = read_wreq_body_limited(resp, &current_url, request.max_response_bytes)
+                .await?;
+            drop(in_flight);
 
-            return Ok(Response {
+            let response = Response {
                 url: current_url,
                 status: status.as_u16(),
                 headers: response_headers,
                 body,
                 redirected_from: redirects,
-            });
+            };
+            if let Some(callbacks) = callbacks {
+                callbacks.fire_response(&request_info, &response).await;
+            }
+            return Ok(response);
         }
 
         Err(ObscuraNetError::TooManyRedirects(url.to_string()))
@@ -234,12 +409,10 @@ impl StealthHttpClient {
             req = req.body(body.to_string());
         }
 
-        self.in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let in_flight = InFlightGuard::new(&self.in_flight);
         let resp = req.send().await.map_err(|e| {
-            self.in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             ObscuraNetError::Network(format!("{}: {}", url, e))
         })?;
-        self.in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
 
         let status = resp.status();
         if store_cookies {
@@ -254,11 +427,8 @@ impl StealthHttpClient {
             .iter()
             .map(|(k, v)| (k.as_str().to_lowercase(), v.to_str().unwrap_or("").to_string()))
             .collect();
-        let resp_body = resp
-            .bytes()
-            .await
-            .map_err(|e| ObscuraNetError::Network(format!("Failed to read body: {}", e)))?
-            .to_vec();
+        let resp_body = read_wreq_body_limited(resp, url, 64 * 1024 * 1024).await?;
+        drop(in_flight);
 
         Ok(Response {
             url: url.clone(),

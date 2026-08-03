@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use std::net::{IpAddr, SocketAddr};
@@ -123,7 +124,7 @@ pub struct RequestInfo {
     pub resource_type: ResourceType,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResourceType {
     Document,
     Script,
@@ -154,7 +155,7 @@ pub enum RequestCredentials {
 }
 
 impl RequestMode {
-    fn header_value(self) -> &'static str {
+    pub(crate) fn header_value(self) -> &'static str {
         match self {
             Self::Navigate => "navigate",
             Self::NoCors => "no-cors",
@@ -170,6 +171,9 @@ pub struct ResourceRequest {
     pub initiator: Option<Url>,
     pub mode: RequestMode,
     pub credentials: RequestCredentials,
+    /// Hard limit for the decoded response body retained by this request.
+    /// Callers can lower it for especially constrained resource consumers.
+    pub max_response_bytes: usize,
 }
 
 impl ResourceRequest {
@@ -179,6 +183,7 @@ impl ResourceRequest {
             initiator: None,
             mode: RequestMode::Navigate,
             credentials: RequestCredentials::Include,
+            max_response_bytes: 64 * 1024 * 1024,
         }
     }
 
@@ -206,10 +211,23 @@ impl ResourceRequest {
             initiator: Some(initiator.clone()),
             mode,
             credentials,
+            max_response_bytes: match resource_type {
+                ResourceType::Stylesheet | ResourceType::Font => 16 * 1024 * 1024,
+                ResourceType::Script | ResourceType::Other => 32 * 1024 * 1024,
+                ResourceType::Document
+                | ResourceType::Image
+                | ResourceType::Xhr
+                | ResourceType::Fetch => 64 * 1024 * 1024,
+            },
         }
     }
 
-    fn destination(&self) -> &'static str {
+    pub fn with_max_response_bytes(mut self, max_response_bytes: usize) -> Self {
+        self.max_response_bytes = max_response_bytes;
+        self
+    }
+
+    pub(crate) fn destination(&self) -> &'static str {
         match self.resource_type {
             ResourceType::Document => "document",
             ResourceType::Script => "script",
@@ -220,7 +238,7 @@ impl ResourceRequest {
         }
     }
 
-    fn accept(&self) -> &'static str {
+    pub(crate) fn accept(&self) -> &'static str {
         match self.resource_type {
             ResourceType::Document => "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
             ResourceType::Stylesheet => "text/css,*/*;q=0.1",
@@ -236,7 +254,7 @@ impl ResourceRequest {
         }
     }
 
-    fn sends_credentials_to(&self, target: &Url) -> bool {
+    pub(crate) fn sends_credentials_to(&self, target: &Url) -> bool {
         match self.credentials {
             RequestCredentials::Omit => false,
             RequestCredentials::Include => true,
@@ -248,7 +266,124 @@ impl ResourceRequest {
     }
 }
 
-fn request_fetch_site(request: &ResourceRequest, target: &Url) -> &'static str {
+pub(crate) struct InFlightGuard {
+    counter: Arc<AtomicU32>,
+}
+
+impl InFlightGuard {
+    pub(crate) fn new(counter: &Arc<AtomicU32>) -> Self {
+        counter.fetch_add(1, Ordering::AcqRel);
+        Self {
+            counter: counter.clone(),
+        }
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+pub(crate) fn same_origin(request: &ResourceRequest, target: &Url) -> bool {
+    request
+        .initiator
+        .as_ref()
+        .is_some_and(|initiator| initiator.origin() == target.origin())
+}
+
+pub(crate) fn cors_required(request: &ResourceRequest, target: &Url) -> bool {
+    request.mode == RequestMode::Cors && !same_origin(request, target)
+}
+
+/// Serialize the request origin used by both the Origin request header and the
+/// response CORS check. A redirect chain that changes origin after it has
+/// already left the initiator origin is tainted and serializes to `null`.
+pub(crate) fn serialized_request_origin(
+    request: &ResourceRequest,
+    redirect_tainted: bool,
+) -> String {
+    if redirect_tainted {
+        return "null".to_string();
+    }
+    request
+        .initiator
+        .as_ref()
+        .filter(|url| matches!(url.scheme(), "http" | "https"))
+        .map(|url| url.origin().ascii_serialization())
+        .unwrap_or_else(|| "null".to_string())
+}
+
+pub(crate) fn redirect_taints_origin(
+    request: &ResourceRequest,
+    current: &Url,
+    next: &Url,
+) -> bool {
+    current.origin() != next.origin()
+        && request
+            .initiator
+            .as_ref()
+            .is_none_or(|initiator| initiator.origin() != current.origin())
+}
+
+pub(crate) fn validate_request_mode(
+    request: &ResourceRequest,
+    target: &Url,
+) -> Result<(), ObscuraNetError> {
+    if request.mode == RequestMode::SameOrigin && !same_origin(request, target) {
+        return Err(ObscuraNetError::Cors(format!(
+            "same-origin request blocked for {}",
+            target
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_cors_response(
+    request: &ResourceRequest,
+    target: &Url,
+    serialized_origin: &str,
+    allow_origin: Option<&str>,
+    allow_credentials: Option<&str>,
+) -> Result<(), ObscuraNetError> {
+    if !cors_required(request, target) {
+        return Ok(());
+    }
+
+    let allow_origin = allow_origin.ok_or_else(|| {
+        ObscuraNetError::Cors(format!(
+            "{} did not include Access-Control-Allow-Origin for origin {}",
+            target, serialized_origin
+        ))
+    })?;
+    if request.credentials != RequestCredentials::Include && allow_origin == "*" {
+        return Ok(());
+    }
+    if allow_origin != serialized_origin {
+        return Err(ObscuraNetError::Cors(format!(
+            "{} returned Access-Control-Allow-Origin {:?}, expected {:?}",
+            target, allow_origin, serialized_origin
+        )));
+    }
+    if request.credentials == RequestCredentials::Include
+        && allow_credentials != Some("true")
+    {
+        return Err(ObscuraNetError::Cors(format!(
+            "credentialed response from {} requires Access-Control-Allow-Credentials: true",
+            target
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn response_too_large(url: &Url, limit: usize) -> ObscuraNetError {
+    ObscuraNetError::ResponseTooLarge {
+        url: url.to_string(),
+        limit,
+    }
+}
+
+pub(crate) fn request_fetch_site(request: &ResourceRequest, target: &Url) -> &'static str {
     let Some(initiator) = request.initiator.as_ref() else {
         return "none";
     };
@@ -262,7 +397,7 @@ fn request_fetch_site(request: &ResourceRequest, target: &Url) -> &'static str {
     }
 }
 
-fn request_referrer(request: &ResourceRequest, target: &Url) -> Option<String> {
+pub(crate) fn request_referrer(request: &ResourceRequest, target: &Url) -> Option<String> {
     let source = request.initiator.as_ref()?;
     if !matches!(source.scheme(), "http" | "https")
         || !matches!(target.scheme(), "http" | "https")
@@ -479,7 +614,7 @@ impl Resolve for SsrfGuardResolver {
     }
 }
 
-fn validate_url(url: &Url, allow_private_network: bool) -> Result<(), ObscuraNetError> {
+pub(crate) fn validate_url(url: &Url, allow_private_network: bool) -> Result<(), ObscuraNetError> {
     let allow_private_network = allow_private_network || env_allows_private_network();
     let scheme = url.scheme();
     if scheme != "http" && scheme != "https" && scheme != "file" {
@@ -530,13 +665,24 @@ fn validate_url(url: &Url, allow_private_network: bool) -> Result<(), ObscuraNet
     Ok(())
 }
 
-async fn fetch_file_url(url: &Url) -> Result<Response, ObscuraNetError> {
+pub(crate) async fn fetch_file_url(
+    url: &Url,
+    max_response_bytes: usize,
+) -> Result<Response, ObscuraNetError> {
     let path = url
         .to_file_path()
         .map_err(|_| ObscuraNetError::Network("Invalid file URL".to_string()))?;
+    if let Ok(metadata) = tokio::fs::metadata(&path).await {
+        if metadata.len() > max_response_bytes as u64 {
+            return Err(response_too_large(url, max_response_bytes));
+        }
+    }
     let body = tokio::fs::read(&path)
         .await
         .map_err(|e| ObscuraNetError::Network(format!("Failed to read file: {}", e)))?;
+    if body.len() > max_response_bytes {
+        return Err(response_too_large(url, max_response_bytes));
+    }
 
     let mut headers = HashMap::new();
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
@@ -563,6 +709,98 @@ async fn fetch_file_url(url: &Url) -> Result<Response, ObscuraNetError> {
         body,
         redirected_from: Vec::new(),
     })
+}
+
+fn response_header_value<'a>(
+    headers: &'a HeaderMap,
+    name: &'static str,
+    url: &Url,
+) -> Result<Option<&'a str>, ObscuraNetError> {
+    let mut values = headers.get_all(name).iter();
+    let Some(first) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(ObscuraNetError::Cors(format!(
+            "{} returned multiple {} headers",
+            url, name
+        )));
+    }
+    first.to_str().map(Some).map_err(|_| {
+        ObscuraNetError::Cors(format!("{} returned an invalid {} header", url, name))
+    })
+}
+
+fn validate_reqwest_cors_response(
+    request: &ResourceRequest,
+    target: &Url,
+    serialized_origin: &str,
+    headers: &HeaderMap,
+) -> Result<(), ObscuraNetError> {
+    if !cors_required(request, target) {
+        return Ok(());
+    }
+    let allow_origin = response_header_value(
+        headers,
+        "access-control-allow-origin",
+        target,
+    )?;
+    let allow_credentials = response_header_value(
+        headers,
+        "access-control-allow-credentials",
+        target,
+    )?;
+    validate_cors_response(
+        request,
+        target,
+        serialized_origin,
+        allow_origin,
+        allow_credentials,
+    )
+}
+
+fn reject_oversized_content_length(
+    headers: &HeaderMap,
+    url: &Url,
+    limit: usize,
+) -> Result<(), ObscuraNetError> {
+    let Some(value) = headers.get(reqwest::header::CONTENT_LENGTH) else {
+        return Ok(());
+    };
+    let Ok(value) = value.to_str() else {
+        return Ok(());
+    };
+    if value
+        .trim()
+        .parse::<u64>()
+        .is_ok_and(|length| length > limit as u64)
+    {
+        return Err(response_too_large(url, limit));
+    }
+    Ok(())
+}
+
+async fn read_reqwest_body_limited(
+    mut response: reqwest::Response,
+    url: &Url,
+    limit: usize,
+) -> Result<Vec<u8>, ObscuraNetError> {
+    reject_oversized_content_length(response.headers(), url, limit)?;
+    let capacity = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or(0)
+        .min(limit);
+    let mut body = Vec::with_capacity(capacity);
+    while let Some(chunk) = response.chunk().await.map_err(|error| {
+        ObscuraNetError::Network(format!("Failed to read body: {}", error))
+    })? {
+        if chunk.len() > limit.saturating_sub(body.len()) {
+            return Err(response_too_large(url, limit));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 pub struct ObscuraHttpClient {
@@ -659,7 +897,7 @@ impl ObscuraHttpClient {
         self.client.get_or_init(|| async {
             let mut builder = Client::builder()
                 .redirect(Policy::none())
-                .timeout(Duration::from_secs(30))
+                .timeout(self.timeout)
                 .danger_accept_invalid_certs(false)
                 // SSRF guard: reject hostnames that resolve to a private/loopback IP.
                 .dns_resolver(Arc::new(SsrfGuardResolver::new(self.allow_private_network)))
@@ -770,9 +1008,10 @@ impl ObscuraHttpClient {
         request: ResourceRequest,
     ) -> Result<Response, ObscuraNetError> {
         validate_url(url, self.allow_private_network)?;
+        validate_request_mode(&request, url)?;
 
         if url.scheme() == "file" {
-            return fetch_file_url(url).await;
+            return fetch_file_url(url, request.max_response_bytes).await;
         }
 
         let mut method = initial_method;
@@ -795,8 +1034,11 @@ impl ObscuraHttpClient {
         let mut current_url = url.clone();
         let mut redirects = Vec::new();
         let max_redirects = 20;
+        let mut redirect_tainted = false;
+        let mut request_callback_fired = false;
 
         for _redirect_count in 0..max_redirects {
+            validate_request_mode(&request, &current_url)?;
             let request_info = RequestInfo {
                 url: current_url.clone(),
                 method: method.to_string(),
@@ -820,8 +1062,11 @@ impl ObscuraHttpClient {
                 }
             }
 
-            if let Some(cbs) = callbacks {
-                cbs.fire_request(&request_info).await;
+            if !request_callback_fired {
+                if let Some(cbs) = callbacks {
+                    cbs.fire_request(&request_info).await;
+                }
+                request_callback_fired = true;
             }
 
             let ua = self.user_agent.read().await.clone();
@@ -871,6 +1116,7 @@ impl ObscuraHttpClient {
                     headers.insert(reqwest::header::REFERER, value);
                 }
             }
+            let request_origin = serialized_request_origin(&request, redirect_tainted);
             headers.insert(
                 reqwest::header::ACCEPT_LANGUAGE,
                 HeaderValue::from_static("en-US,en;q=0.9"),
@@ -919,6 +1165,15 @@ impl ObscuraHttpClient {
                     headers.insert(name, val);
                 }
             }
+            // Origin is a forbidden browser request header. Keep it derived
+            // from the initiator even when callers supplied extra headers.
+            if cors_required(&request, &current_url) {
+                if let Ok(value) = HeaderValue::from_str(&request_origin) {
+                    headers.insert(reqwest::header::ORIGIN, value);
+                }
+            } else {
+                headers.remove(reqwest::header::ORIGIN);
+            }
 
             let mut req_builder = self.get_client().await.request(method.clone(), current_url.as_str())
                 .headers(headers);
@@ -933,18 +1188,24 @@ impl ObscuraHttpClient {
                 req_builder = req_builder.body(b.clone());
             }
 
-            self.in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let in_flight = InFlightGuard::new(&self.in_flight);
             let resp = req_builder.send().await.map_err(|e| {
-                self.in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 ObscuraNetError::Network(format!("{}: {}", current_url, e))
             })?;
-            self.in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
 
             let status = resp.status();
+            validate_reqwest_cors_response(
+                &request,
+                &current_url,
+                &request_origin,
+                resp.headers(),
+            )?;
 
-            for val in resp.headers().get_all(reqwest::header::SET_COOKIE) {
-                if let Ok(s) = val.to_str() {
-                    self.cookie_jar.set_cookie(s, &current_url);
+            if request.sends_credentials_to(&current_url) {
+                for val in resp.headers().get_all(reqwest::header::SET_COOKIE) {
+                    if let Ok(s) = val.to_str() {
+                        self.cookie_jar.set_cookie(s, &current_url);
+                    }
                 }
             }
 
@@ -963,6 +1224,9 @@ impl ObscuraHttpClient {
                         ObscuraNetError::Network(format!("Invalid redirect URL: {}", e))
                     })?;
                     validate_url(&next_url, self.allow_private_network)?;
+                    validate_request_mode(&request, &next_url)?;
+                    redirect_tainted |=
+                        redirect_taints_origin(&request, &current_url, &next_url);
                     redirects.push(current_url.clone());
                     current_url = next_url;
                     if status == reqwest::StatusCode::MOVED_PERMANENTLY
@@ -976,9 +1240,13 @@ impl ObscuraHttpClient {
                 }
             }
 
-            let body_bytes = resp.bytes().await.map_err(|e| {
-                ObscuraNetError::Network(format!("Failed to read body: {}", e))
-            })?.to_vec();
+            let body_bytes = read_reqwest_body_limited(
+                resp,
+                &current_url,
+                request.max_response_bytes,
+            )
+            .await?;
+            drop(in_flight);
 
             let response = Response {
                 url: current_url,
@@ -1031,20 +1299,27 @@ pub enum ObscuraNetError {
 
     #[error("Request blocked: {0}")]
     Blocked(String),
+
+    #[error("CORS error: {0}")]
+    Cors(String),
+
+    #[error("Response body exceeded {limit} byte limit: {url}")]
+    ResponseTooLarge { url: String, limit: usize },
 }
 
 #[cfg(test)]
 mod ssrf_tests {
     use super::{
         is_forbidden_ip, request_fetch_site, request_referrer, validate_url,
-        ObscuraHttpClient, RequestCredentials, RequestMode, ResourceRequest, ResourceType,
-        SsrfGuardResolver,
+        CallbackRegistry, ObscuraHttpClient, ObscuraNetError, RequestCredentials, RequestMode,
+        ResourceRequest, ResourceType, SsrfGuardResolver,
     };
     use crate::cookies::CookieJar;
     use reqwest::dns::{Name, Resolve};
     use std::net::IpAddr;
     use std::str::FromStr;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use url::Url;
 
     fn ip(s: &str) -> IpAddr {
@@ -1154,6 +1429,250 @@ mod ssrf_tests {
             Some("https://app.example/")
         );
         assert_eq!(request_referrer(&request, &downgrade), None);
+    }
+
+    async fn http_fixture(
+        responses: Vec<String>,
+    ) -> (Url, tokio::sync::mpsc::UnboundedReceiver<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            for response in responses {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 2048];
+                loop {
+                    let Ok(read) = stream.read(&mut buffer).await else {
+                        return;
+                    };
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let _ = request_tx.send(String::from_utf8_lossy(&request).into_owned());
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (
+            Url::parse(&format!("http://{address}/resource")).unwrap(),
+            request_rx,
+        )
+    }
+
+    fn ok_response(headers: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[tokio::test]
+    async fn cross_origin_font_sends_origin_and_omits_cross_origin_cookies() {
+        let (target, mut received) = http_fixture(vec![ok_response(
+            "Access-Control-Allow-Origin: *\r\nSet-Cookie: rejected=1; Path=/\r\n",
+            "font",
+        )])
+        .await;
+        let initiator = Url::parse("http://127.0.0.1:1/page").unwrap();
+        let jar = Arc::new(CookieJar::new());
+        jar.set_cookie("seed=1; Path=/", &target);
+        let client = ObscuraHttpClient::with_full_options(jar.clone(), None, true);
+
+        let response = client
+            .fetch_resource_with_callbacks(
+                &target,
+                ResourceRequest::subresource(ResourceType::Font, &initiator),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.body, b"font");
+        let request = received.recv().await.unwrap().to_ascii_lowercase();
+        assert!(request.contains("origin: http://127.0.0.1:1\r\n"));
+        assert!(request.contains("sec-fetch-mode: cors\r\n"));
+        assert!(request.contains("sec-fetch-dest: font\r\n"));
+        assert!(!request.contains("cookie:"));
+        assert_eq!(jar.get_cookie_header(&target), "seed=1");
+    }
+
+    #[tokio::test]
+    async fn credentialed_cors_rejects_wildcard_and_accepts_exact_origin() {
+        let initiator = Url::parse("http://127.0.0.1:1/page").unwrap();
+        let wildcard = ok_response(
+            "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Credentials: true\r\n",
+            "blocked",
+        );
+        let exact = ok_response(
+            "Access-Control-Allow-Origin: http://127.0.0.1:1\r\nAccess-Control-Allow-Credentials: true\r\nSet-Cookie: accepted=1; Path=/\r\n",
+            "allowed",
+        );
+        let (target, mut received) = http_fixture(vec![wildcard, exact]).await;
+        let jar = Arc::new(CookieJar::new());
+        jar.set_cookie("seed=1; Path=/", &target);
+        let client = ObscuraHttpClient::with_full_options(jar.clone(), None, true);
+        let mut request = ResourceRequest::subresource(ResourceType::Image, &initiator);
+        request.mode = RequestMode::Cors;
+        request.credentials = RequestCredentials::Include;
+
+        let error = client
+            .fetch_resource_with_callbacks(&target, request.clone(), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ObscuraNetError::Cors(_)));
+        client
+            .fetch_resource_with_callbacks(&target, request, None)
+            .await
+            .unwrap();
+
+        let first = received.recv().await.unwrap().to_ascii_lowercase();
+        let second = received.recv().await.unwrap().to_ascii_lowercase();
+        assert!(first.contains("cookie: seed=1\r\n"));
+        assert!(second.contains("cookie: seed=1\r\n"));
+        let cookies = jar.get_cookie_header(&target);
+        assert!(cookies.contains("seed=1"));
+        assert!(cookies.contains("accepted=1"));
+    }
+
+    #[tokio::test]
+    async fn same_origin_font_needs_no_cors_header_and_sends_cookies() {
+        let (target, mut received) = http_fixture(vec![ok_response("", "same")]).await;
+        let mut initiator = target.clone();
+        initiator.set_path("/page");
+        let jar = Arc::new(CookieJar::new());
+        jar.set_cookie("same=1; Path=/", &target);
+        let client = ObscuraHttpClient::with_full_options(jar, None, true);
+        client
+            .fetch_resource_with_callbacks(
+                &target,
+                ResourceRequest::subresource(ResourceType::Font, &initiator),
+                None,
+            )
+            .await
+            .unwrap();
+        let request = received.recv().await.unwrap().to_ascii_lowercase();
+        assert!(!request.contains("origin:"));
+        assert!(request.contains("cookie: same=1\r\n"));
+    }
+
+    #[tokio::test]
+    async fn response_limits_reject_content_length_and_streamed_overflow() {
+        let advertised = "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n";
+        let chunked = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n4\r\nabcd\r\n4\r\nefgh\r\n0\r\n\r\n";
+        let (target, _) = http_fixture(vec![advertised.to_string(), chunked.to_string()]).await;
+        let client = ObscuraHttpClient::with_full_options(
+            Arc::new(CookieJar::new()),
+            None,
+            true,
+        );
+        let initiator = target.clone();
+        let request = ResourceRequest::subresource(ResourceType::Image, &initiator)
+            .with_max_response_bytes(6);
+
+        for _ in 0..2 {
+            let error = client
+                .fetch_resource_with_callbacks(&target, request.clone(), None)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                ObscuraNetError::ResponseTooLarge { limit: 6, .. }
+            ));
+            assert_eq!(client.active_requests(), 0);
+        }
+    }
+
+    async fn hanging_fixture() -> (Url, tokio::sync::oneshot::Receiver<()>) {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buffer = [0u8; 2048];
+            let _ = stream.read(&mut buffer).await;
+            let _ = started_tx.send(());
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        });
+        (
+            Url::parse(&format!("http://{address}/hang")).unwrap(),
+            started_rx,
+        )
+    }
+
+    #[tokio::test]
+    async fn cancellation_returns_active_requests_to_zero() {
+        let (target, started) = hanging_fixture().await;
+        let client = Arc::new(ObscuraHttpClient::with_full_options(
+            Arc::new(CookieJar::new()),
+            None,
+            true,
+        ));
+        let task = tokio::spawn({
+            let client = client.clone();
+            async move { client.fetch(&target).await }
+        });
+        started.await.unwrap();
+        assert_eq!(client.active_requests(), 1);
+        task.abort();
+        let _ = task.await;
+        assert_eq!(client.active_requests(), 0);
+    }
+
+    #[tokio::test]
+    async fn transport_timeout_returns_active_requests_to_zero() {
+        let (target, started) = hanging_fixture().await;
+        let mut client = ObscuraHttpClient::with_full_options(
+            Arc::new(CookieJar::new()),
+            None,
+            true,
+        );
+        client.timeout = std::time::Duration::from_millis(25);
+        let fetch = client.fetch(&target);
+        let (_, result) = tokio::join!(started, fetch);
+        assert!(result.is_err());
+        assert_eq!(client.active_requests(), 0);
+    }
+
+    #[tokio::test]
+    async fn callbacks_fire_once_across_redirects() {
+        let redirect = "HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let (target, _) = http_fixture(vec![redirect.to_string(), ok_response("", "done")]).await;
+        let client = ObscuraHttpClient::with_full_options(
+            Arc::new(CookieJar::new()),
+            None,
+            true,
+        );
+        let callbacks = CallbackRegistry::new();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let responses = Arc::new(AtomicUsize::new(0));
+        let request_count = requests.clone();
+        callbacks.add_request(Arc::new(move |_| {
+            request_count.fetch_add(1, Ordering::SeqCst);
+        }));
+        let response_count = responses.clone();
+        callbacks.add_response(Arc::new(move |_, _| {
+            response_count.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        client
+            .fetch_with_callbacks(&target, Some(&callbacks))
+            .await
+            .unwrap();
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert_eq!(responses.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
