@@ -122,6 +122,21 @@ class RepresentativeSuiteTests(unittest.TestCase):
             "bottom",
         ])
 
+    def test_live_capture_does_not_freeze_chromium_animations(self):
+        result, arguments, _, _ = self.run_wrapper(
+            extra_environment={"CAPTURE_MODE": "live"},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("--animation-time-ms", arguments)
+
+    def test_invalid_capture_mode_is_rejected_before_capture(self):
+        result, arguments, _, _ = self.run_wrapper(
+            extra_environment={"CAPTURE_MODE": "almost-live"},
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(arguments, [])
+        self.assertIn("CAPTURE_MODE must be", result.stderr)
+
     def test_site_corpus_is_https_and_has_no_duplicates(self):
         urls = [
             line.strip()

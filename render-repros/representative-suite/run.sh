@@ -11,6 +11,8 @@ PYTHON="${PYTHON_BIN:-python3}"
 usage() {
   echo "usage: $0 OUT_DIR [SCROLL_Y]" >&2
   echo "SCROLL_Y is an integer CSS-pixel offset or 'bottom'." >&2
+  echo "Set CAPTURE_MODE=live to leave animations and runtime state unfrozen." >&2
+  echo "CAPTURE_MODE defaults to deterministic (Chromium animations sampled at T=0)." >&2
 }
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
@@ -23,6 +25,11 @@ if (( $# < 1 || $# > 2 )); then
 fi
 
 OUT="$1"
+CAPTURE_MODE="${CAPTURE_MODE:-deterministic}"
+if [[ "$CAPTURE_MODE" != "deterministic" && "$CAPTURE_MODE" != "live" ]]; then
+  echo "CAPTURE_MODE must be 'deterministic' or 'live': $CAPTURE_MODE" >&2
+  exit 2
+fi
 if [[ -e "$OUT" ]]; then
   echo "output path already exists: $OUT" >&2
   exit 2
@@ -40,7 +47,6 @@ args=(
   --width 1440
   --height 1000
   --settle-ms 3000
-  --animation-time-ms 0
   --geometry-selector "header, nav, footer"
   --geometry-selector "main, article"
   --geometry-selector "section"
@@ -49,6 +55,10 @@ args=(
   --geometry-selector "pre"
   --geometry-selector "table"
 )
+
+if [[ "$CAPTURE_MODE" == "deterministic" ]]; then
+  args+=(--animation-time-ms 0)
+fi
 
 if [[ -n "${CHROMIUM_BIN:-}" ]]; then
   args+=(--chromium-bin "$CHROMIUM_BIN")
