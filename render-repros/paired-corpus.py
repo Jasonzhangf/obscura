@@ -90,19 +90,52 @@ def geometry_probe_javascript(selectors_expression):
         "class_name:typeof child.className==='string'?child.className:''}))},"
         "computed:{display:style.display,float:style.cssFloat,"
         "clear:style.clear,position:style.position,"
+        "visibility:style.visibility,opacity:style.opacity,"
         "box_sizing:style.boxSizing,width:style.width,height:style.height,"
         "min_width:style.minWidth,min_height:style.minHeight,"
         "max_width:style.maxWidth,max_height:style.maxHeight,"
+        "aspect_ratio:style.aspectRatio,object_fit:style.objectFit,"
+        "object_position:style.objectPosition,"
         "margin_top:style.marginTop,margin_right:style.marginRight,"
         "margin_bottom:style.marginBottom,margin_left:style.marginLeft,"
         "padding_top:style.paddingTop,padding_right:style.paddingRight,"
         "padding_bottom:style.paddingBottom,padding_left:style.paddingLeft,"
+        "border_top_width:style.borderTopWidth,"
+        "border_right_width:style.borderRightWidth,"
+        "border_bottom_width:style.borderBottomWidth,"
+        "border_left_width:style.borderLeftWidth,"
+        "border_top_style:style.borderTopStyle,"
+        "border_right_style:style.borderRightStyle,"
+        "border_bottom_style:style.borderBottomStyle,"
+        "border_left_style:style.borderLeftStyle,"
+        "border_top_color:style.borderTopColor,"
+        "border_right_color:style.borderRightColor,"
+        "border_bottom_color:style.borderBottomColor,"
+        "border_left_color:style.borderLeftColor,"
+        "border_top_left_radius:style.borderTopLeftRadius,"
+        "border_top_right_radius:style.borderTopRightRadius,"
+        "border_bottom_right_radius:style.borderBottomRightRadius,"
+        "border_bottom_left_radius:style.borderBottomLeftRadius,"
         "font_family:style.fontFamily,font_size:style.fontSize,"
         "font_weight:style.fontWeight,line_height:style.lineHeight,"
         "letter_spacing:style.letterSpacing,white_space:style.whiteSpace,"
-        "flex_direction:style.flexDirection,"
+        "word_break:style.wordBreak,overflow_wrap:style.overflowWrap,"
+        "text_overflow:style.textOverflow,"
+        "flex_direction:style.flexDirection,flex_wrap:style.flexWrap,"
+        "flex_grow:style.flexGrow,flex_shrink:style.flexShrink,"
+        "flex_basis:style.flexBasis,align_self:style.alignSelf,"
         "align_items:style.alignItems,justify_content:style.justifyContent,"
-        "text_align:style.textAlign,contain:style.contain,"
+        "justify_items:style.justifyItems,justify_self:style.justifySelf,"
+        "grid_template_columns:style.gridTemplateColumns,"
+        "grid_template_rows:style.gridTemplateRows,"
+        "grid_column:style.gridColumn,grid_row:style.gridRow,"
+        "column_gap:style.columnGap,row_gap:style.rowGap,"
+        "text_align:style.textAlign,color:style.color,"
+        "background_color:style.backgroundColor,"
+        "background_image:style.backgroundImage,"
+        "contain:style.contain,content_visibility:style.contentVisibility,"
+        "transform:style.transform,filter:style.filter,"
+        "backdrop_filter:style.backdropFilter,"
         "overflow_x:style.overflowX,overflow_y:style.overflowY},"
         "visible:clientRectCount>0&&rect.width>0&&rect.height>0"
         "&&style.display!=='none'&&style.visibility!=='hidden'"
@@ -1133,6 +1166,18 @@ def compare_geometry_probes(obscura, chromium):
                     and isinstance(right, (int, float))
                     else None
                 )
+            obscura_computed = obscura_rect.get("computed") or {}
+            chromium_computed = chromium_rect.get("computed") or {}
+            computed_differences = {
+                field: {
+                    "obscura": obscura_computed.get(field),
+                    "chromium": chromium_computed.get(field),
+                }
+                for field in sorted(
+                    set(obscura_computed) | set(chromium_computed)
+                )
+                if obscura_computed.get(field) != chromium_computed.get(field)
+            }
             rect_deltas.append(
                 {
                     "index": rect_index,
@@ -1141,6 +1186,8 @@ def compare_geometry_probes(obscura, chromium):
                         "obscura": obscura_rect.get("visible"),
                         "chromium": chromium_rect.get("visible"),
                     },
+                    "computed_difference_count": len(computed_differences),
+                    "computed_differences": computed_differences,
                 }
             )
         obscura_count = (obscura_probe or {}).get("count")
@@ -1368,8 +1415,10 @@ def main():
                 "bounding size, display/visibility permit paint, and opacity > 0"
             ),
             "comparison_semantics": (
-                "raw per-selector counts, rect deltas in document order, and "
-                "visibility observations; no aggregate parity verdict"
+                "raw per-selector counts, rect deltas in document order, "
+                "visibility observations, and exact differences between the "
+                "computed values that won each engine's cascade; no aggregate "
+                "parity verdict"
             ),
         }
     manifest["obscura_identity_probe"] = probe_obscura_identity(args.obscura_bin)

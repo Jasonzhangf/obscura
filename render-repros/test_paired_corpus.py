@@ -368,6 +368,12 @@ class GeometryProbeTests(unittest.TestCase):
         self.assertIn("font_family:style.fontFamily", expression)
         self.assertIn("line_height:style.lineHeight", expression)
         self.assertIn("white_space:style.whiteSpace", expression)
+        self.assertIn(
+            "grid_template_columns:style.gridTemplateColumns", expression
+        )
+        self.assertIn("border_left_style:style.borderLeftStyle", expression)
+        self.assertIn("object_fit:style.objectFit", expression)
+        self.assertIn("content_visibility:style.contentVisibility", expression)
         self.assertIn("geometry_probes: geometryProbes", expression)
         self.assertIn(
             f'sampled_phase: "{paired_corpus.CAPTURE_BOUNDARY_PHASE}"',
@@ -388,6 +394,11 @@ class GeometryProbeTests(unittest.TestCase):
                             "width": 100,
                             "height": 40,
                             "visible": True,
+                            "computed": {
+                                "display": "grid",
+                                "width": "100px",
+                                "align_items": "stretch",
+                            },
                         }
                     ],
                     "error": None,
@@ -414,6 +425,11 @@ class GeometryProbeTests(unittest.TestCase):
                             "width": 98,
                             "height": 40,
                             "visible": False,
+                            "computed": {
+                                "display": "grid",
+                                "width": "98px",
+                                "align_items": "normal",
+                            },
                         }
                     ],
                     "error": None,
@@ -437,6 +453,16 @@ class GeometryProbeTests(unittest.TestCase):
         self.assertEqual(
             comparison[0]["rect_deltas"][0]["visibility"],
             {"obscura": True, "chromium": False},
+        )
+        self.assertEqual(
+            comparison[0]["rect_deltas"][0]["computed_difference_count"], 2
+        )
+        self.assertEqual(
+            comparison[0]["rect_deltas"][0]["computed_differences"],
+            {
+                "align_items": {"obscura": "stretch", "chromium": "normal"},
+                "width": {"obscura": "100px", "chromium": "98px"},
+            },
         )
         self.assertEqual(comparison[1]["valid"], {"obscura": False, "chromium": False})
         self.assertIsNone(comparison[1]["counts"]["delta"])
