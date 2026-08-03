@@ -2683,7 +2683,7 @@ mod tests {
                 "1px", "2px", "3px", "4px",
                 "5px", "2px", "rgb(70, 80, 90)",
                 "column", "wrap", "center",
-                "space-between", "6px", "9px", "translate(3px, 4px)"
+                "space-between", "6px", "9px", "matrix(1, 0, 0, 1, 3, 4)"
             ])
         );
 
@@ -5598,6 +5598,125 @@ mod tests {
                     .replace(char::is_whitespace, ""),
             )
             .unwrap()
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn parser_image_data_src_mutation_does_not_restart_lifecycle() {
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = requests.clone();
+        let png = two_by_three_png();
+        let mut rt = parser_image_runtime(
+            r#"<img id="image" src="real.png" data-src="deferred.png">"#,
+            move |url: &str| {
+                seen.lock().unwrap().push(url.to_string());
+                Some(png.clone())
+            },
+        );
+        rt.execute_script(
+            "observe-data-src-mutation",
+            r#"
+                globalThis.__dataSrcEvents = [];
+                const image = document.getElementById("image");
+                image.addEventListener("load", () => __dataSrcEvents.push(image.currentSrc));
+                void image.complete;
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("[image.complete, image.currentSrc, __dataSrcEvents]")
+                .unwrap(),
+            serde_json::json!([
+                true,
+                "http://example.com/page/real.png",
+                ["http://example.com/page/real.png"]
+            ])
+        );
+
+        rt.execute_script(
+            "mutate-non-source-data-attribute",
+            r#"
+                image.dataset.src = "ignored.png";
+                globalThis.__afterDataSrcMutation = [image.complete, image.currentSrc];
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("[__afterDataSrcMutation, __dataSrcEvents]")
+                .unwrap(),
+            serde_json::json!([
+                [true, "http://example.com/page/real.png"],
+                ["http://example.com/page/real.png"]
+            ])
+        );
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec!["http://example.com/page/real.png".to_string()]
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn parser_image_data_src_is_inert_until_script_assigns_src() {
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = requests.clone();
+        let png = two_by_three_png();
+        let mut rt = parser_image_runtime(
+            r#"<img id="image" data-src="promoted.png">"#,
+            move |url: &str| {
+                seen.lock().unwrap().push(url.to_string());
+                Some(png.clone())
+            },
+        );
+        assert_eq!(
+            rt.evaluate(
+                r#"(() => {
+                    globalThis.image = document.getElementById("image");
+                    globalThis.__promotedEvents = [];
+                    image.addEventListener("load", () => __promotedEvents.push(image.currentSrc));
+                    return [image.src, image.currentSrc, image.complete,
+                            image.naturalWidth, image.naturalHeight];
+                })()"#,
+            )
+            .unwrap(),
+            serde_json::json!(["", "", true, 0, 0])
+        );
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert!(requests.lock().unwrap().is_empty());
+
+        rt.execute_script(
+            "promote-data-src-through-page-script",
+            r#"
+                image.src = image.dataset.src;
+                globalThis.__afterSrcPromotion = [image.complete, image.currentSrc];
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            rt.evaluate("__afterSrcPromotion").unwrap(),
+            serde_json::json!([false, "http://example.com/page/promoted.png"])
+        );
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate(
+                "[image.complete, image.naturalWidth, image.naturalHeight, \
+                  image.currentSrc, __promotedEvents]"
+            )
+            .unwrap(),
+            serde_json::json!([
+                true,
+                2,
+                3,
+                "http://example.com/page/promoted.png",
+                ["http://example.com/page/promoted.png"]
+            ])
+        );
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec!["http://example.com/page/promoted.png".to_string()]
+        );
     }
 
     #[cfg(feature = "render")]

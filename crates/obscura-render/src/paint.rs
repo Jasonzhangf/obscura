@@ -5166,12 +5166,10 @@ fn collect_content_image_intrinsics(
 
 /// Choose the URL to paint for an `<img>`. Browsers do not use `src` alone:
 /// a wrapping `<picture>`'s `<source>`s, `srcset`, and `sizes` select by
-/// type/media/viewport/density, and lazy-loaded images keep the real URL in
-/// `data-src`/`data-srcset` with `src` holding a 1x1 placeholder until script
-/// swaps it in. Since obscura may not have run the site's lazy-load script,
-/// resolve the same URL the browser would end up with: a matching `<picture>`
-/// source first, then a real candidate from `srcset`/`data-srcset`, then a
-/// non-inline `src`/`data-*` URL, then any `src` (an inlined data: image).
+/// type/media/viewport/density. Non-standard lazy-loader attributes such as
+/// `data-src` are deliberately ignored until page script copies them into the
+/// real `src`/`srcset`; promoting them here changes `currentSrc`, lifecycle
+/// events, and resource timing relative to browsers.
 fn resolve_img_url(
     tree: &DomTree,
     nid: obscura_dom::tree::NodeId,
@@ -5184,30 +5182,15 @@ fn resolve_img_url(
         return Some(pick);
     }
     let sizes = node.get_attribute("sizes");
-    for a in ["srcset", "data-srcset"] {
-        if let Some(v) = node.get_attribute(a) {
-            if let Some(pick) = best_srcset_candidate(v, sizes, viewport) {
-                return Some(pick);
-            }
+    if let Some(v) = node.get_attribute("srcset") {
+        if let Some(pick) = best_srcset_candidate(v, sizes, viewport) {
+            return Some(pick);
         }
     }
-    let url_attrs = ["src", "data-src", "data-lazy-src", "data-original", "data-fallback-src", "data-lazy"];
-    // A non-inline URL first (a data: src is usually the lazy-load placeholder).
-    for a in url_attrs {
-        if let Some(v) = node.get_attribute(a) {
-            let v = v.trim();
-            if !v.is_empty() && !v.starts_with("data:") {
-                return Some((v.to_string(), 1.0));
-            }
-        }
-    }
-    // Otherwise fall back to whatever is there (an inlined data: image).
-    for a in url_attrs {
-        if let Some(v) = node.get_attribute(a) {
-            let v = v.trim();
-            if !v.is_empty() {
-                return Some((v.to_string(), 1.0));
-            }
+    if let Some(v) = node.get_attribute("src") {
+        let v = v.trim();
+        if !v.is_empty() {
+            return Some((v.to_string(), 1.0));
         }
     }
     None
@@ -6536,6 +6519,65 @@ mod tests {
             picture_source_url(&tree, hero, (800.0, 600.0)),
             Some(("supported.webp".to_string(), 1.0))
         );
+    }
+
+    #[test]
+    fn data_source_attributes_are_not_image_candidates_or_fetches() {
+        let tree = parse_html(
+            r#"<img id="lazy" data-src="real.png"
+                     data-srcset="small.png 1x, large.png 2x"
+                     data-lazy-src="other.png" data-original="original.png">"#,
+        );
+        let lazy = tree.get_element_by_id("lazy").expect("lazy image");
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let loader_calls = calls.clone();
+        let mut resources = RenderResourceCache::with_loader(move |_url: &str| {
+            loader_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            None
+        });
+
+        assert_eq!(resolve_img_url(&tree, lazy, (800.0, 600.0)), None);
+        assert_eq!(
+            resources.image_element_metadata(
+                &tree,
+                lazy,
+                (800.0, 600.0),
+                Some("https://example.test/page"),
+            ),
+            None
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn data_uri_src_remains_selected_when_data_src_is_present() {
+        const PLACEHOLDER: &str = "data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20width=%221%22%20height=%221%22/%3E";
+        let tree = parse_html(&format!(
+            r#"<img id="lazy" src="{PLACEHOLDER}" data-src="real.png">"#
+        ));
+        let lazy = tree.get_element_by_id("lazy").expect("lazy image");
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let loader_calls = calls.clone();
+        let mut resources = RenderResourceCache::with_loader(move |_url: &str| {
+            loader_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            None
+        });
+
+        assert_eq!(
+            resolve_img_url(&tree, lazy, (800.0, 600.0)),
+            Some((PLACEHOLDER.to_string(), 1.0))
+        );
+        let metadata = resources
+            .image_element_metadata(
+                &tree,
+                lazy,
+                (800.0, 600.0),
+                Some("https://example.test/page"),
+            )
+            .expect("selected placeholder");
+        assert_eq!(metadata.0, PLACEHOLDER);
+        assert_eq!(metadata.2, Some((1.0, 1.0)));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[test]

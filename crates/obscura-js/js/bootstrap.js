@@ -4216,8 +4216,7 @@ class HTMLImageElement extends Element {
   setAttribute(name, value) {
     const normalized = String(name).toLowerCase();
     super.setAttribute(name, value);
-    if (normalized === "src" || normalized === "srcset" || normalized === "sizes"
-        || normalized === "data-src" || normalized === "data-srcset") {
+    if (normalized === "src" || normalized === "srcset" || normalized === "sizes") {
       this._imageSourceChanged();
     }
     else if ((normalized === "onload" || normalized === "onerror")
@@ -4227,8 +4226,7 @@ class HTMLImageElement extends Element {
   removeAttribute(name) {
     const normalized = String(name).toLowerCase();
     super.removeAttribute(name);
-    if (normalized === "src" || normalized === "srcset" || normalized === "sizes"
-        || normalized === "data-src" || normalized === "data-srcset") {
+    if (normalized === "src" || normalized === "srcset" || normalized === "sizes") {
       this._imageSourceChanged();
     }
   }
