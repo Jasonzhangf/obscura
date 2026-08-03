@@ -374,6 +374,12 @@ class GeometryProbeTests(unittest.TestCase):
         self.assertIn("border_left_style:style.borderLeftStyle", expression)
         self.assertIn("object_fit:style.objectFit", expression)
         self.assertIn("content_visibility:style.contentVisibility", expression)
+        self.assertIn("transform_origin:style.transformOrigin", expression)
+        self.assertIn("transform_box:style.transformBox", expression)
+        self.assertIn("translate:style.translate", expression)
+        self.assertIn("rotate:style.rotate", expression)
+        self.assertIn("scale:style.scale", expression)
+        self.assertIn("perspective:style.perspective", expression)
         self.assertIn("geometry_probes: geometryProbes", expression)
         self.assertIn(
             f'sampled_phase: "{paired_corpus.CAPTURE_BOUNDARY_PHASE}"',
