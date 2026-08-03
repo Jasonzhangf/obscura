@@ -4284,6 +4284,71 @@ fn layout_dom_once(
         }
     }
 
+    // Pure-text IFC descendants do not own Taffy nodes. Once their shared
+    // buffer has its final line breaks, derive their real continuations from
+    // shaping provenance and install those fragments as canonical DOM geometry.
+    // The common paragraph with no nested inline owner skips both this work and
+    // the second clip-tree walk.
+    #[cfg(feature = "paint")]
+    if engine.has_inline_owners() {
+        let canonical = synthesize_shaped_inline_fragments(tree, &mut rects, &styles, &engine);
+        if !canonical.is_empty() {
+            let relative_offsets = canonical
+                .keys()
+                .filter_map(|&owner| {
+                    folded_inline_relative_offset(tree, owner, &rects, &styles)
+                        .filter(|offset| *offset != (0.0, 0.0))
+                        .map(|offset| (owner, offset))
+                })
+                .collect();
+            engine.set_inline_owner_offsets(&relative_offsets);
+            inline_fragments.extend(canonical);
+            clip_rects.clear();
+            translates.clear();
+            transforms.clear();
+            if let Some(root_id) = root {
+                let root_font_size = styles
+                    .get(&root_id)
+                    .and_then(|style| style.font_size)
+                    .unwrap_or(16.0);
+                resolve_clip_rects(
+                    tree,
+                    root_id,
+                    None,
+                    0.0,
+                    0.0,
+                    &rects,
+                    &styles,
+                    &mut clip_rects,
+                    &mut translates,
+                    crate::Affine2::IDENTITY,
+                    &mut transforms,
+                    root_font_size,
+                    viewport,
+                );
+            }
+            for (nid, &idx) in &ifc_items.whole {
+                engine.set_clip(
+                    idx,
+                    shaped_item_clip(*nid, &rects, &styles, &clip_rects, &translates, viewport),
+                );
+            }
+            for (parent, items) in &ifc_items.runs {
+                let clip = shaped_item_clip(
+                    *parent,
+                    &rects,
+                    &styles,
+                    &clip_rects,
+                    &translates,
+                    viewport,
+                );
+                for &idx in items {
+                    engine.set_clip(idx, clip);
+                }
+            }
+        }
+    }
+
     let generated_boxes = ifc_items
         .generated
         .iter()
@@ -4369,6 +4434,180 @@ fn synthesize_ordinary_inline_fragments(
         rects.insert(id, union);
     }
     fragments
+}
+
+#[cfg(feature = "paint")]
+fn shaped_item_clip(
+    owner: NodeId,
+    rects: &HashMap<NodeId, Rect>,
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+    clip_rects: &HashMap<NodeId, Option<OverflowClip>>,
+    translates: &HashMap<NodeId, (f32, f32)>,
+    viewport: (f32, f32),
+) -> Option<Rect> {
+    let inherited = clip_rects.get(&owner).copied().flatten();
+    let clip = match (styles.get(&owner), rects.get(&owner)) {
+        (Some(style), Some(rect)) if style.overflow_hidden => {
+            let (tx, ty) = translates.get(&owner).copied().unwrap_or((0.0, 0.0));
+            let own = OverflowClip::for_box(rect, style, tx, ty);
+            Some(match inherited {
+                Some(clip) => clip.intersect(own),
+                None => own,
+            })
+        }
+        _ => inherited,
+    };
+    clip.map(|clip| clip.viewport_rect(viewport))
+}
+
+#[cfg(feature = "paint")]
+fn synthesize_shaped_inline_fragments(
+    tree: &DomTree,
+    rects: &mut HashMap<NodeId, Rect>,
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+    engine: &crate::inline::TextEngine,
+) -> HashMap<NodeId, Vec<Rect>> {
+    let mut fragments: HashMap<NodeId, Vec<((usize, usize), Rect)>> = HashMap::new();
+    for shaped in engine.inline_owner_line_fragments() {
+        let Some(style) = styles.get(&shaped.owner) else {
+            continue;
+        };
+        let (ascent, descent) = engine.inline_font_box_metrics(style);
+        let Some((relative_x, relative_y)) =
+            folded_inline_relative_offset(tree, shaped.owner, rects, styles)
+        else {
+            // Keep the pre-existing Taffy surrogate geometry when an inset
+            // cannot be resolved faithfully. Installing a knowingly wrong
+            // shaped fragment would make the DOM geometry canonical.
+            continue;
+        };
+        let rect = Rect {
+            x: shaped.x + relative_x,
+            y: shaped.baseline_y - ascent - style.padding.top - style.border.top + relative_y,
+            width: shaped.width,
+            height: ascent
+                + descent
+                + style.padding.top
+                + style.padding.bottom
+                + style.border.top
+                + style.border.bottom,
+        };
+        fragments
+            .entry(shaped.owner)
+            .or_default()
+            .push(((shaped.item_index, shaped.line_index), rect));
+    }
+
+    let mut canonical = HashMap::with_capacity(fragments.len());
+    for (owner, mut pieces) in fragments {
+        pieces.sort_by(|(order_a, rect_a), (order_b, rect_b)| {
+            order_a
+                .cmp(order_b)
+                .then_with(|| rect_a.x.total_cmp(&rect_b.x))
+        });
+        let fragments = pieces.into_iter().map(|(_, rect)| rect).collect::<Vec<_>>();
+        let mut union = fragments[0];
+        for fragment in &fragments[1..] {
+            let left = union.x.min(fragment.x);
+            let top = union.y.min(fragment.y);
+            let right = (union.x + union.width).max(fragment.x + fragment.width);
+            let bottom = (union.y + union.height).max(fragment.y + fragment.height);
+            union = Rect {
+                x: left,
+                y: top,
+                width: (right - left).max(0.0),
+                height: (bottom - top).max(0.0),
+            };
+        }
+        rects.insert(owner, union);
+        canonical.insert(owner, fragments);
+    }
+    canonical
+}
+
+#[cfg(feature = "paint")]
+fn folded_inline_relative_offset(
+    tree: &DomTree,
+    owner: NodeId,
+    rects: &HashMap<NodeId, Rect>,
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+) -> Option<(f32, f32)> {
+    fn containing_block_size(
+        tree: &DomTree,
+        owner: NodeId,
+        rects: &HashMap<NodeId, Rect>,
+        styles: &HashMap<NodeId, crate::LayoutStyle>,
+    ) -> Option<(f32, f32)> {
+        let mut ancestor = tree.get_node(owner).and_then(|node| node.parent);
+        while let Some(id) = ancestor {
+            let style = styles.get(&id)?;
+            if !style.ignores_used_box_sizes() && !style.display_contents {
+                let rect = rects.get(&id)?;
+                return Some((
+                    (rect.width
+                        - style.border.left
+                        - style.border.right
+                        - style.padding.left
+                        - style.padding.right)
+                        .max(0.0),
+                    (rect.height
+                        - style.border.top
+                        - style.border.bottom
+                        - style.padding.top
+                        - style.padding.bottom)
+                        .max(0.0),
+                ));
+            }
+            ancestor = tree.get_node(id).and_then(|node| node.parent);
+        }
+        None
+    }
+
+    let mut offset = (0.0, 0.0);
+    let mut current = Some(owner);
+    while let Some(id) = current {
+        let Some(style) = styles.get(&id) else {
+            return None;
+        };
+        if !style.ignores_used_box_sizes() {
+            break;
+        }
+        if style.position == Some(taffy::Position::Relative) && !style.position_sticky {
+            let basis = containing_block_size(tree, id, rects, styles);
+            let resolve = |value: Option<crate::Dimension>, horizontal: bool| match value {
+                None | Some(crate::Dimension::Auto) => Ok(None),
+                Some(crate::Dimension::Px(value)) if value.is_finite() => Ok(Some(value)),
+                Some(crate::Dimension::Percent(value)) if value.is_finite() => basis
+                    .map(|size| Some(value * if horizontal { size.0 } else { size.1 }))
+                    .ok_or(()),
+                _ => Err(()),
+            };
+            // Failed calc()/var() resolution is represented by an expression
+            // with no corresponding used Dimension. Do not reinterpret it as
+            // `auto` merely because this sidecar runs after style resolution.
+            for index in 0..4 {
+                if style.inset_expressions[index].is_some() && style.inset[index].is_none() {
+                    return None;
+                }
+            }
+            let left = resolve(style.inset[3], true).ok()?;
+            let right = resolve(style.inset[1], true).ok()?;
+            let top = resolve(style.inset[0], false).ok()?;
+            let bottom = resolve(style.inset[2], false).ok()?;
+            if let Some(left) = left {
+                offset.0 += left;
+            } else if let Some(right) = right {
+                offset.0 -= right;
+            }
+            if let Some(top) = top {
+                offset.1 += top;
+            } else if let Some(bottom) = bottom {
+                offset.1 -= bottom;
+            }
+        }
+        current = tree.get_node(id).and_then(|node| node.parent);
+    }
+    Some(offset)
 }
 
 fn container_snapshot(
@@ -11487,7 +11726,7 @@ mod tests {
                </section>"#,
         );
         let laid = layout_dom(&tree, (1280.0, 720.0));
-        let rect = |id| laid.rects[&tree.get_element_by_id(id).unwrap()];
+        let rect = |id: &str| -> Rect { laid.rects[&tree.get_element_by_id(id).unwrap()] };
         let row = rect("row");
         let column = rect("column");
         let quote = rect("quote");
@@ -11526,7 +11765,7 @@ mod tests {
                </section>"#
         ));
         let laid = layout_dom(&tree, (1280.0, 720.0));
-        let rect = |id| laid.rects[&tree.get_element_by_id(id).unwrap()];
+        let rect = |id: &str| -> Rect { laid.rects[&tree.get_element_by_id(id).unwrap()] };
         let column = rect("column");
         let quote = rect("quote");
         let logo = rect("logo");
@@ -12016,9 +12255,12 @@ mod tests {
         assert_eq!(laid.rects[&control_host].height, 40.0);
         assert_eq!(laid.rects[&token].height, expected_fragment_height);
         assert_eq!(laid.inline_fragments[&token], vec![laid.rects[&token]]);
-        assert_eq!(
-            laid.rects[&token].y - laid.rects[&host].y,
-            (40.0 - raw_font_height) / 2.0 - 5.0 - 2.0
+        assert!(
+            ((laid.rects[&token].y - laid.rects[&host].y)
+                - ((40.0 - raw_font_height) / 2.0 - 5.0 - 2.0))
+                .abs()
+                < 0.5,
+            "final shaped baseline must retain the expected centered font box"
         );
         assert_eq!(
             laid.rects[&control].y - laid.rects[&control_host].y,
@@ -12028,7 +12270,111 @@ mod tests {
     }
 
     #[test]
-    fn fallback_word_boxes_shape_and_paint_with_the_loaded_webfont() {
+    fn nested_inline_uses_final_shaping_for_its_canonical_fragment() {
+        let tree = parse_html(
+            r#"<style>
+                html,body,p { margin:0 }
+                p { width:300px; font:16px/20px monospace }
+            </style>
+            <p id="host">before <span id="token">plain nested text</span> after</p>"#,
+        );
+        let laid = layout_dom(&tree, (400.0, 100.0));
+        let token = tree.get_element_by_id("token").unwrap();
+        let fragments = &laid.inline_fragments[&token];
+
+        assert_eq!(fragments.len(), 1, "{fragments:?}");
+        assert_eq!(laid.rects[&token], fragments[0]);
+        assert!(fragments[0].width > 100.0, "{fragments:?}");
+        assert_eq!(laid.ifc_items.len(), 1, "the span must stay in one shaped IFC");
+    }
+
+    #[test]
+    fn wrapped_decorated_inline_exposes_three_ordered_font_box_fragments() {
+        let tree = parse_html(
+            r#"<style>
+                html,body,p { margin:0 }
+                p { width:80px; font:16px/20px monospace }
+                code {
+                    padding-top:2px; padding-bottom:3px;
+                    border-top:1px solid; border-bottom:2px solid;
+                    background:red
+                }
+            </style>
+            <p><code id="token">alpha beta gamma</code></p>"#,
+        );
+        let laid = layout_dom(&tree, (300.0, 120.0));
+        let token = tree.get_element_by_id("token").unwrap();
+        let fragments = &laid.inline_fragments[&token];
+
+        assert_eq!(fragments.len(), 3, "one canonical fragment per visual line: {fragments:?}");
+        assert!(fragments.windows(2).all(|pair| pair[0].y < pair[1].y));
+        assert!(fragments.iter().all(|fragment| fragment.width > 0.0));
+        let left = fragments.iter().map(|rect| rect.x).fold(f32::INFINITY, f32::min);
+        let top = fragments.iter().map(|rect| rect.y).fold(f32::INFINITY, f32::min);
+        let right = fragments
+            .iter()
+            .map(|rect| rect.x + rect.width)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let bottom = fragments
+            .iter()
+            .map(|rect| rect.y + rect.height)
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert_eq!(
+            laid.rects[&token],
+            Rect { x: left, y: top, width: right - left, height: bottom - top }
+        );
+    }
+
+    #[test]
+    fn inline_provenance_maps_repeated_multibyte_text_across_hard_breaks() {
+        let tree = parse_html(
+            r#"<style>
+                html,body,p { margin:0 }
+                p { width:200px; font:18px/24px sans-serif }
+            </style>
+            <p><span id="token">é界<br>é界</span></p>"#,
+        );
+        let laid = layout_dom(&tree, (300.0, 100.0));
+        let token = tree.get_element_by_id("token").unwrap();
+        let fragments = &laid.inline_fragments[&token];
+
+        assert_eq!(fragments.len(), 2, "{fragments:?}");
+        assert!((fragments[0].width - fragments[1].width).abs() < 0.01, "{fragments:?}");
+        assert!((fragments[1].y - fragments[0].y - 24.0).abs() < 0.01, "{fragments:?}");
+    }
+
+    #[test]
+    fn relative_inline_offsets_move_canonical_fragments_in_pixels_and_percentages() {
+        let tree = parse_html(
+            r#"<style>
+                html,body,p { margin:0 }
+                p { width:200px; height:20px; font:16px/20px monospace }
+                #pixels { position:relative; left:7px; top:5px }
+                #percent { position:relative; left:10%; top:10% }
+            </style>
+            <p id="base-host"><span id="base">token</span></p>
+            <p id="pixel-host"><span id="pixels">token</span></p>
+            <p id="percent-host"><span id="percent">token</span></p>"#,
+        );
+        let laid = layout_dom(&tree, (400.0, 120.0));
+        let rect = |id: &str| -> Rect { laid.rects[&tree.get_element_by_id(id).unwrap()] };
+        let local = |token: &str, host: &str| {
+            let token = rect(token);
+            let host = rect(host);
+            (token.x - host.x, token.y - host.y)
+        };
+        let base = local("base", "base-host");
+        let pixels = local("pixels", "pixel-host");
+        let percent = local("percent", "percent-host");
+
+        assert!((pixels.0 - base.0 - 7.0).abs() < 0.01, "{base:?} {pixels:?}");
+        assert!((pixels.1 - base.1 - 5.0).abs() < 0.01, "{base:?} {pixels:?}");
+        assert!((percent.0 - base.0 - 20.0).abs() < 0.01, "{base:?} {percent:?}");
+        assert!((percent.1 - base.1 - 2.0).abs() < 0.01, "{base:?} {percent:?}");
+    }
+
+    #[test]
+    fn canonical_inline_fragments_shape_with_the_loaded_webfont() {
         let tree = parse_html(
             r#"<style>
                 html,body,p { margin:0 }
@@ -12043,7 +12389,6 @@ mod tests {
             <p><span id="token">WWWWiiii</span></p>"#,
         );
         let token = tree.get_element_by_id("token").unwrap();
-        let text = rendered_children(&tree, token)[0];
         let fallback = layout_dom(&tree, (500.0, 150.0));
         let loaded = layout_dom_with_web_fonts(
             &tree,
@@ -12057,10 +12402,7 @@ mod tests {
             }],
         );
 
-        assert!(
-            loaded.word_ifc_items.get(&text).is_some_and(|items| !items.is_empty()),
-            "a decorated/relative inline fallback must retain shaped word items"
-        );
+        assert!(loaded.inline_fragments.contains_key(&token));
         assert_ne!(
             fallback.rects[&token].width, loaded.rects[&token].width,
             "the loaded face's advances must drive fallback inline geometry"

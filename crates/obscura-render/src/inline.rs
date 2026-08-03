@@ -15,7 +15,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use cosmic_text::{
-    Align, Attrs, Buffer, CacheKey, CacheKeyFlags, Color, CssLineBreak, CssOverflowWrap,
+    Align, Attrs, Buffer, CacheKey, CacheKeyFlags, Color, CssLineBreak, CssOverflowWrap, Cursor,
     CssWordBreak, Family, FeatureTag, FontFeatures, FontSystem, FontVariations, Metrics, Shaping,
     Style, SwashCache, SwashImage, VariationTag, Weight, Wrap,
 };
@@ -307,9 +307,9 @@ fn normal_line_height(font_size: f32, metrics: FaceMetrics) -> f32 {
 /// participation uses [`used_line_height_with_metrics`], while its painted
 /// fragment/client rect uses this raw font box plus block-axis padding and
 /// border. Chromium and Gecko both fit ascent and descent independently.
-fn font_box_height(font_size: f32, metrics: FaceMetrics) -> f32 {
+fn fitted_font_box_metrics(font_size: f32, metrics: FaceMetrics) -> (f32, f32) {
     let scale = font_size / metrics.units_per_em.max(1.0);
-    (metrics.ascent * scale).round() + (metrics.descent * scale).round()
+    ((metrics.ascent * scale).round(), (metrics.descent * scale).round())
 }
 
 fn font_metrics(
@@ -428,6 +428,42 @@ pub struct InlineItem {
     /// this distinct avoids mutating DOM text or the natural content buffer.
     marker_buffer: Option<Buffer>,
     marker: Option<MarkerPlacement>,
+    /// Canonical collapsed/transformed text used to map shaped byte ranges back
+    /// to ordinary inline DOM owners. Absent for the overwhelmingly common IFC
+    /// with no nested inline owner, keeping that path allocation-free.
+    owner_text: Option<String>,
+    owner_ranges: Vec<OwnerTextRange>,
+    /// Nonzero used relative-position offsets, projected onto text ranges.
+    /// Empty for ordinary IFCs and for nested inlines that remain at their
+    /// normal-flow position, so paint pays no provenance cost on that path.
+    relative_owner_ranges: Vec<RelativeOwnerTextRange>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OwnerTextRange {
+    owner: NodeId,
+    start: usize,
+    end: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RelativeOwnerTextRange {
+    start: usize,
+    end: usize,
+    offset: (f32, f32),
+}
+
+/// One ordinary inline owner's horizontal continuation on a finalized visual
+/// line. DOM layout supplies the owner's font box and decorations around this
+/// baseline-relative shaped extent.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct InlineOwnerLineFragment {
+    pub owner: NodeId,
+    pub item_index: usize,
+    pub line_index: usize,
+    pub x: f32,
+    pub baseline_y: f32,
+    pub width: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -890,13 +926,18 @@ impl TextEngine {
     /// deliberately not CSS `line-height`: leading belongs to the containing
     /// line and must not enlarge backgrounds, borders, or DOM client rects.
     pub(crate) fn inline_font_box_height(&self, style: &LayoutStyle) -> f32 {
+        let (ascent, descent) = self.inline_font_box_metrics(style);
+        ascent + descent
+    }
+
+    pub(crate) fn inline_font_box_metrics(&self, style: &LayoutStyle) -> (f32, f32) {
         let font = resolve_loaded_font(
             style.font_family.as_deref(),
             crate::style::used_font_weight(style),
             style.font_style_italic.unwrap_or(false),
             &self.loaded_families,
         );
-        font_box_height(style.font_size.unwrap_or(16.0), font.metrics)
+        fitted_font_box_metrics(style.font_size.unwrap_or(16.0), font.metrics)
     }
 
     /// Used line-height for the same selected face. Kept beside
@@ -935,7 +976,7 @@ impl TextEngine {
             return None;
         }
         let base = styles.get(&id)?;
-        let mut collector = Collector { last_was_space: true, clip_fills: Vec::new() };
+        let mut collector = Collector::new();
         let font = resolve_loaded_font(
             base.font_family.as_deref(),
             crate::style::used_font_weight(base),
@@ -954,7 +995,13 @@ impl TextEngine {
             &mut collector,
             &self.loaded_families,
         );
-        self.push_shaped_item(base, line_height, spans, collector.clip_fills)
+        self.push_shaped_item(
+            base,
+            line_height,
+            spans,
+            collector.clip_fills,
+            collector.owner_ranges,
+        )
     }
 
     /// Build an inline formatting context from a *run* of consecutive
@@ -981,7 +1028,7 @@ impl TextEngine {
             return None;
         }
         let base = styles.get(&parent)?;
-        let mut collector = Collector { last_was_space: true, clip_fills: Vec::new() };
+        let mut collector = Collector::new();
         let font = resolve_loaded_font(
             base.font_family.as_deref(),
             crate::style::used_font_weight(base),
@@ -1002,7 +1049,13 @@ impl TextEngine {
                 &self.loaded_families,
             );
         }
-        self.push_shaped_item(base, line_height, spans, collector.clip_fills)
+        self.push_shaped_item(
+            base,
+            line_height,
+            spans,
+            collector.clip_fills,
+            collector.owner_ranges,
+        )
     }
 
     /// Shape generated text that owns a positioned pseudo box.
@@ -1017,10 +1070,7 @@ impl TextEngine {
         text: &str,
         style: &LayoutStyle,
     ) -> Option<usize> {
-        let mut collector = Collector {
-            last_was_space: true,
-            clip_fills: Vec::new(),
-        };
+        let mut collector = Collector::new();
         let font = resolve_loaded_font(
             style.font_family.as_deref(),
             crate::style::used_font_weight(style),
@@ -1057,7 +1107,13 @@ impl TextEngine {
             &mut spans,
             &mut collector,
         );
-        self.push_shaped_item(style, line_height, spans, collector.clip_fills)
+        self.push_shaped_item(
+            style,
+            line_height,
+            spans,
+            collector.clip_fills,
+            collector.owner_ranges,
+        )
     }
 
     /// Shared tail of [`try_build`] / [`try_build_run`]: shape the collected
@@ -1069,6 +1125,7 @@ impl TextEngine {
         line_h: f32,
         mut spans: Vec<(String, SpanAttrs)>,
         clip_fills: Vec<ClipTextFill>,
+        mut owner_ranges: Vec<OwnerTextRange>,
     ) -> Option<usize> {
         let white_space = base.white_space.unwrap_or_default();
         let layout_wrap = if spans.iter().any(|(_, attrs)| attrs.has_layout_emergency_breaks()) {
@@ -1109,6 +1166,19 @@ impl TextEngine {
         }) {
             return None;
         }
+        let text_len = spans.iter().map(|(text, _)| text.len()).sum::<usize>();
+        owner_ranges.retain_mut(|range| {
+            range.start = range.start.min(text_len);
+            range.end = range.end.min(text_len);
+            range.start < range.end
+        });
+        let owner_text = (!owner_ranges.is_empty()).then(|| {
+            let mut text = String::with_capacity(text_len);
+            for (span, _) in &spans {
+                text.push_str(span);
+            }
+            text
+        });
 
         let base_size = base.font_size.unwrap_or(16.0);
         // Explicit line-height stays fractional. `normal` is derived from the
@@ -1248,6 +1318,9 @@ impl TextEngine {
             ellipsis_overflow,
             marker_buffer,
             marker: None,
+            owner_text,
+            owner_ranges,
+            relative_owner_ranges: Vec::new(),
         });
         Some(idx)
     }
@@ -1457,6 +1530,101 @@ impl TextEngine {
         item.origin = (content_origin.0 + alignment_inset, content_origin.1);
         item.clip = clip;
     }
+
+    /// Replace only the finalized clip without reshaping. Used when canonical
+    /// inline fragment rects make a second clip/transform tree walk necessary.
+    pub(crate) fn set_clip(&mut self, idx: usize, clip: Option<Rect>) {
+        if let Some(item) = self.items.get_mut(idx) {
+            item.clip = clip;
+        }
+    }
+
+    pub(crate) fn has_inline_owners(&self) -> bool {
+        self.items.iter().any(|item| !item.owner_ranges.is_empty())
+    }
+
+    /// Install cumulative used offsets for relative ordinary-inline owners.
+    /// DOM resolves percentages against the real containing block. Selecting
+    /// the deepest matching range at paint time is therefore sufficient even
+    /// for nested relative inlines: its offset already includes its ancestors.
+    pub(crate) fn set_inline_owner_offsets(
+        &mut self,
+        offsets: &HashMap<NodeId, (f32, f32)>,
+    ) {
+        for item in &mut self.items {
+            item.relative_owner_ranges = item
+                .owner_ranges
+                .iter()
+                .filter_map(|range| {
+                    let offset = offsets.get(&range.owner).copied()?;
+                    (offset != (0.0, 0.0)).then_some(RelativeOwnerTextRange {
+                        start: range.start,
+                        end: range.end,
+                        offset,
+                    })
+                })
+                .collect();
+        }
+    }
+
+    /// Derive ordinary inline continuation extents from finalized shaping.
+    /// Provenance is a sidecar rather than glyph metadata, so changing DOM
+    /// owners never creates a font-shaping boundary or disables ligatures.
+    pub(crate) fn inline_owner_line_fragments(&self) -> Vec<InlineOwnerLineFragment> {
+        let mut out: Vec<InlineOwnerLineFragment> = Vec::new();
+        for (item_index, item) in self.items.iter().enumerate() {
+            let Some(source) = item.owner_text.as_deref() else {
+                continue;
+            };
+            let line_starts = source_line_starts(&item.buffer, source);
+
+            for (line_index, run) in item.buffer.layout_runs().enumerate() {
+                let Some(&line_start) = line_starts.get(run.line_i) else {
+                    continue;
+                };
+                let line_end = line_start.saturating_add(run.text.len());
+                let first_line_offset = if line_index == 0 {
+                    item.first_line_offset
+                } else {
+                    0.0
+                };
+                for range in &item.owner_ranges {
+                    let start = range.start.max(line_start);
+                    let end = range.end.min(line_end);
+                    if start >= end {
+                        continue;
+                    }
+                    let start = Cursor::new(run.line_i, start - line_start);
+                    let end = Cursor::new(run.line_i, end - line_start);
+                    let Some((x, width)) = run.highlight(start, end) else {
+                        continue;
+                    };
+                    let x = item.origin.0 + first_line_offset + x;
+                    let baseline_y = item.origin.1 + run.line_y;
+                    if let Some(existing) = out.iter_mut().find(|fragment| {
+                        fragment.owner == range.owner
+                            && fragment.item_index == item_index
+                            && fragment.line_index == line_index
+                    }) {
+                        let left = existing.x.min(x);
+                        let right = (existing.x + existing.width).max(x + width);
+                        existing.x = left;
+                        existing.width = (right - left).max(0.0);
+                    } else {
+                        out.push(InlineOwnerLineFragment {
+                            owner: range.owner,
+                            item_index,
+                            line_index,
+                            x,
+                            baseline_y,
+                            width: width.max(0.0),
+                        });
+                    }
+                }
+            }
+        }
+        out
+    }
 }
 
 /// A run of same-styled inline text.
@@ -1602,6 +1770,33 @@ struct SpanCtx {
 struct Collector {
     last_was_space: bool,
     clip_fills: Vec<ClipTextFill>,
+    owners: Vec<NodeId>,
+    owner_ranges: Vec<OwnerTextRange>,
+    text_len: usize,
+}
+
+impl Collector {
+    fn new() -> Self {
+        Self {
+            last_was_space: true,
+            clip_fills: Vec::new(),
+            owners: Vec::new(),
+            owner_ranges: Vec::new(),
+            text_len: 0,
+        }
+    }
+
+    fn record_text(&mut self, byte_len: usize) {
+        let start = self.text_len;
+        self.text_len = self.text_len.saturating_add(byte_len);
+        for &owner in &self.owners {
+            self.owner_ranges.push(OwnerTextRange {
+                owner,
+                start,
+                end: self.text_len,
+            });
+        }
+    }
 }
 
 /// DFS the inline subtree, appending whitespace-collapsed text runs. Adjacent
@@ -1763,8 +1958,15 @@ fn collect_node_spans(
                     word_break: ctx.word_break,
                     },
                 ));
+                c.text_len = c.text_len.saturating_add(1);
                 c.last_was_space = true;
                 return;
+            }
+            let owns_inline_fragment = style.is_some_and(|style| {
+                style.ignores_used_box_sizes() && !style.display_contents
+            });
+            if owns_inline_fragment {
+                c.owners.push(cid);
             }
             let own_clip_fill = style.and_then(clip_text_fill).map(|fill| {
                 let index = c.clip_fills.len();
@@ -1848,6 +2050,10 @@ fn collect_node_spans(
                 c,
                 loaded_families,
             );
+            if owns_inline_fragment {
+                let popped = c.owners.pop();
+                debug_assert_eq!(popped, Some(cid));
+            }
         }
     }
 }
@@ -1893,6 +2099,7 @@ fn push_text(
     if buf.is_empty() {
         return;
     }
+    c.record_text(buf.len());
     if let Some((last_text, last_attrs)) = out.last_mut() {
         if last_attrs == attrs {
             last_text.push_str(&buf);
@@ -1933,6 +2140,52 @@ fn buffer_size(
         if clamped { clamp_height.unwrap_or(h) } else { h },
         clamped,
     )
+}
+
+/// Map each cosmic-text BufferLine back to its byte start in the canonical
+/// collapsed source. Buffer lines normally correspond to authored hard
+/// breaks; text-indent can also split the first line synthetically.
+fn source_line_starts(buffer: &Buffer, source: &str) -> Vec<usize> {
+    let mut starts = Vec::with_capacity(buffer.lines.len());
+    let mut source_offset = 0usize;
+    for line in &buffer.lines {
+        while source.as_bytes().get(source_offset) == Some(&b'\n') {
+            source_offset += 1;
+        }
+        let text = line.text();
+        let start = if source
+            .get(source_offset..)
+            .is_some_and(|tail| tail.starts_with(text))
+        {
+            source_offset
+        } else {
+            source
+                .get(source_offset..)
+                .and_then(|tail| tail.find(text))
+                .map_or(source_offset, |relative| source_offset + relative)
+        };
+        starts.push(start);
+        source_offset = start.saturating_add(text.len()).min(source.len());
+    }
+    starts
+}
+
+fn glyph_relative_offset(
+    ranges: &[RelativeOwnerTextRange],
+    line_start: usize,
+    glyph_start: usize,
+    glyph_end: usize,
+) -> (f32, f32) {
+    if ranges.is_empty() {
+        return (0.0, 0.0);
+    }
+    let start = line_start.saturating_add(glyph_start);
+    let end = line_start.saturating_add(glyph_end);
+    ranges
+        .iter()
+        .rev()
+        .find(|range| range.start < end && range.end > start)
+        .map_or((0.0, 0.0), |range| range.offset)
 }
 
 fn used_text_indent(value: Dimension, width: Option<f32>) -> f32 {
@@ -2190,7 +2443,7 @@ fn inline_child_ok(tree: &DomTree, cid: NodeId, styles: &std::collections::HashM
             // general path; so does an element with generated ::before/::after
             // content (lost if folded) or an overflow clip of its own.
             let foldable_inline = style.display == Display::Inline
-                && style.position.is_none()
+                && !matches!(style.position, Some(taffy::Position::Absolute))
                 && style.float.is_none()
                 && !style.overflow_hidden
                 && style.before_pseudo.is_none()
@@ -2316,6 +2569,12 @@ impl TextEngine {
         let pw = pixmap.width() as i32;
         let ph = pixmap.height() as i32;
         let clip_bounds = clip.map(|c| (c.x, c.y, c.x + c.width, c.y + c.height));
+        let line_source_starts = item
+            .owner_text
+            .as_deref()
+            .filter(|_| !item.relative_owner_ranges.is_empty())
+            .map(|source| source_line_starts(&item.buffer, source))
+            .unwrap_or_default();
 
         // Collect underline segments before drawing glyphs (both borrow the
         // buffer). Underline is carried per glyph via metadata; group runs of
@@ -2330,8 +2589,9 @@ impl TextEngine {
             } else {
                 0.0
             };
+            let line_source_start = line_source_starts.get(run.line_i).copied().unwrap_or(0);
             let base_y = run.line_y;
-            let mut seg: Option<(f32, f32, f32, [u8; 4])> = None; // x0, x1, font_size, color
+            let mut seg: Option<(f32, f32, f32, [u8; 4], (f32, f32))> = None;
             for g in run.glyphs {
                 // Keep decoration and background-clip bounds in lockstep with
                 // glyph painting. A truncated glyph must not leave an
@@ -2343,14 +2603,20 @@ impl TextEngine {
                 }) {
                     continue;
                 }
+                let relative = glyph_relative_offset(
+                    &item.relative_owner_ranges,
+                    line_source_start,
+                    g.start,
+                    g.end,
+                );
                 let underlined = g.metadata & META_UNDERLINE != 0;
                 if let Some(fill_index) = metadata_fill(g.metadata) {
                     if let Some(bounds) = fill_bounds.get_mut(fill_index) {
                         let glyph_bounds = (
-                            g.x + line_offset,
-                            run.line_top,
-                            g.x + line_offset + g.w,
-                            run.line_top + run.line_height,
+                            g.x + line_offset + relative.0,
+                            run.line_top + relative.1,
+                            g.x + line_offset + g.w + relative.0,
+                            run.line_top + run.line_height + relative.1,
                         );
                         *bounds = Some(match *bounds {
                             Some((x0, y0, x1, y1)) => (
@@ -2366,28 +2632,31 @@ impl TextEngine {
                 let col = g.color_opt.map(|c| [c.r(), c.g(), c.b(), c.a()]).unwrap_or([0, 0, 0, 255]);
                 if underlined {
                     match &mut seg {
-                        Some((_, x1, fs, c)) if *c == col => {
-                            *x1 = g.x + line_offset + g.w;
+                        Some((_, x1, fs, c, prior_relative))
+                            if *c == col && *prior_relative == relative =>
+                        {
+                            *x1 = g.x + line_offset + g.w + relative.0;
                             *fs = fs.max(g.font_size);
                         }
                         _ => {
-                            if let Some((x0, x1, fs, c)) = seg.take() {
-                                underlines.push((x0, x1, base_y + (fs * 0.12).max(1.0), (fs / 14.0).max(1.0), c));
+                            if let Some((x0, x1, fs, c, prior_relative)) = seg.take() {
+                                underlines.push((x0, x1, base_y + prior_relative.1 + (fs * 0.12).max(1.0), (fs / 14.0).max(1.0), c));
                             }
                             seg = Some((
-                                g.x + line_offset,
-                                g.x + line_offset + g.w,
+                                g.x + line_offset + relative.0,
+                                g.x + line_offset + g.w + relative.0,
                                 g.font_size,
                                 col,
+                                relative,
                             ));
                         }
                     }
-                } else if let Some((x0, x1, fs, c)) = seg.take() {
-                    underlines.push((x0, x1, base_y + (fs * 0.12).max(1.0), (fs / 14.0).max(1.0), c));
+                } else if let Some((x0, x1, fs, c, relative)) = seg.take() {
+                    underlines.push((x0, x1, base_y + relative.1 + (fs * 0.12).max(1.0), (fs / 14.0).max(1.0), c));
                 }
             }
-            if let Some((x0, x1, fs, c)) = seg.take() {
-                underlines.push((x0, x1, base_y + (fs * 0.12).max(1.0), (fs / 14.0).max(1.0), c));
+            if let Some((x0, x1, fs, c, relative)) = seg.take() {
+                underlines.push((x0, x1, base_y + relative.1 + (fs * 0.12).max(1.0), (fs / 14.0).max(1.0), c));
             }
         }
 
@@ -2407,6 +2676,7 @@ impl TextEngine {
             } else {
                 0.0
             };
+            let line_source_start = line_source_starts.get(run.line_i).copied().unwrap_or(0);
             for glyph in run.glyphs {
                 if item.marker.is_some_and(|marker| {
                     marker.line_index == line_index
@@ -2414,7 +2684,16 @@ impl TextEngine {
                 }) {
                     continue;
                 }
-                let physical = glyph.physical((line_offset, 0.0), 1.0);
+                let relative = glyph_relative_offset(
+                    &item.relative_owner_ranges,
+                    line_source_start,
+                    glyph.start,
+                    glyph.end,
+                );
+                let physical = glyph.physical(
+                    (line_offset + relative.0, relative.1),
+                    1.0,
+                );
                 let glyph_color = glyph.color_opt.unwrap_or(default);
                 let fill_index = metadata_fill(glyph.metadata);
                 let mut draw_pixel = |x, y, color: Color| {
@@ -3056,10 +3335,7 @@ mod tests {
             font_weight: Some("725".to_string()),
             ..Default::default()
         };
-        let mut collector = Collector {
-            last_was_space: true,
-            clip_fills: Vec::new(),
-        };
+        let mut collector = Collector::new();
         let context = base_span_ctx(&style, resolved, &mut collector);
         assert_eq!(context.weight, 725);
     }
