@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SUITE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SUITE_DIR/../.." && pwd)"
+PAIRED_CORPUS="$REPO_ROOT/render-repros/paired-corpus.py"
+SITES="$SUITE_DIR/sites.txt"
+OBSCURA="${OBSCURA_BIN:-$REPO_ROOT/target/release/obscura}"
+PYTHON="${PYTHON_BIN:-python3}"
+
+usage() {
+  echo "usage: $0 OUT_DIR [SCROLL_Y]" >&2
+  echo "SCROLL_Y is an integer CSS-pixel offset or 'bottom'." >&2
+}
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  usage
+  exit 0
+fi
+if (( $# < 1 || $# > 2 )); then
+  usage
+  exit 2
+fi
+
+OUT="$1"
+if [[ -e "$OUT" ]]; then
+  echo "output path already exists: $OUT" >&2
+  exit 2
+fi
+if [[ ! -x "$OBSCURA" ]]; then
+  echo "Obscura binary is not executable: $OBSCURA" >&2
+  exit 2
+fi
+
+args=(
+  "$PAIRED_CORPUS"
+  "$SITES"
+  --obscura-bin "$OBSCURA"
+  --out "$OUT"
+  --width 1440
+  --height 1000
+  --settle-ms 3000
+  --animation-time-ms 0
+  --geometry-selector "header, nav, footer"
+  --geometry-selector "main, article"
+  --geometry-selector "section"
+  --geometry-selector "form, fieldset, input, button, select, textarea"
+  --geometry-selector "img, svg, video, canvas"
+  --geometry-selector "pre"
+  --geometry-selector "table"
+)
+
+if [[ -n "${CHROMIUM_BIN:-}" ]]; then
+  args+=(--chromium-bin "$CHROMIUM_BIN")
+fi
+if [[ -n "${BASELINE_BIN:-}" ]]; then
+  args+=(--baseline-bin "$BASELINE_BIN")
+fi
+if (( $# == 2 )); then
+  args+=(--scroll-y "$2")
+fi
+
+exec env PYTHONDONTWRITEBYTECODE=1 "$PYTHON" "${args[@]}"
