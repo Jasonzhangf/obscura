@@ -310,6 +310,7 @@ pub struct SelectedImage {
 /// The DOM must not be mutated while this value is reused.
 pub struct PreparedRender {
     viewport: (f32, f32),
+    root_font_size: f32,
     base_url: Option<String>,
     content_size: (f32, f32),
     viewport_fixed: std::collections::HashSet<obscura_dom::tree::NodeId>,
@@ -360,24 +361,21 @@ impl PreparedRender {
         )
     }
 
-    /// Border box in immutable document space, including authored translate
-    /// transforms but excluding root-scroll and sticky movement.
+    /// Axis-aligned bounds of the transformed border box in immutable document
+    /// space, excluding root-scroll and sticky movement.
     pub fn document_rect(
         &self,
         id: obscura_dom::tree::NodeId,
     ) -> Option<crate::Rect> {
         let rect = *self.layout.rects.get(&id)?;
-        let offset = self
-            .layout
-            .translates
-            .get(&id)
-            .copied()
-            .unwrap_or((0.0, 0.0));
-        Some(crate::Rect {
-            x: rect.x + offset.0,
-            y: rect.y + offset.1,
-            ..rect
-        })
+        Some(
+            self.layout
+                .transforms
+                .get(&id)
+                .copied()
+                .map(|transform| transform.map_rect(rect))
+                .unwrap_or(rect),
+        )
     }
 
     /// Unscaled padding-box size used by CSSOM View's `clientWidth` and
@@ -739,9 +737,33 @@ impl PreparedRender {
             .to_string(),
         );
 
-        out.insert("transform", transform_css(style));
+        out.insert(
+            "transform",
+            transform_css(style, rect, self.root_font_size, self.viewport),
+        );
         out
             .insert("transform-origin", transform_origin_css(style, rect));
+        out.insert(
+            "translate",
+            style.individual_translate.map_or_else(
+                || "none".to_string(),
+                |(x, y)| format!("{} {}", dimension_css(x, "0px"), dimension_css(y, "0px")),
+            ),
+        );
+        out.insert(
+            "rotate",
+            style.individual_rotate.map_or_else(
+                || "none".to_string(),
+                |angle| format!("{}deg", css_number(angle)),
+            ),
+        );
+        out.insert(
+            "scale",
+            style.individual_scale.map_or_else(
+                || "none".to_string(),
+                |(x, y)| format!("{} {}", css_number(x), css_number(y)),
+            ),
+        );
         Some(out)
     }
 
@@ -790,29 +812,29 @@ impl PreparedRender {
             .get(&id)
             .cloned()
             .or_else(|| self.layout.rects.get(&id).copied().map(|rect| vec![rect]))?;
-        let transform = self
-            .layout
-            .translates
-            .get(&id)
-            .copied()
-            .unwrap_or((0.0, 0.0));
         let scroll = self.clamp_scroll(requested_scroll);
         let movement = if self.viewport_fixed.contains(&id) {
-            transform
+            (0.0, 0.0)
         } else {
             let sticky = self.sticky.translation_for(id, self.viewport, scroll);
-            (
-                transform.0 + sticky.0 - scroll.0,
-                transform.1 + sticky.1 - scroll.1,
-            )
+            (sticky.0 - scroll.0, sticky.1 - scroll.1)
         };
         Some(
             source
                 .into_iter()
-                .map(|rect| crate::Rect {
-                    x: rect.x + movement.0,
-                    y: rect.y + movement.1,
-                    ..rect
+                .map(|rect| {
+                    let rect = self
+                        .layout
+                        .transforms
+                        .get(&id)
+                        .copied()
+                        .map(|transform| transform.map_rect(rect))
+                        .unwrap_or(rect);
+                    crate::Rect {
+                        x: rect.x + movement.0,
+                        y: rect.y + movement.1,
+                        ..rect
+                    }
                 })
                 .collect(),
         )
@@ -919,39 +941,27 @@ fn align_content_css(value: taffy::AlignContent) -> String {
     }
 }
 
-fn transform_css(style: &crate::LayoutStyle) -> String {
-    let mut parts = Vec::new();
-    if let Some((x, y)) = style.transform_translate {
-        parts.push(format!(
-            "translate({}, {})",
-            dimension_css(x, "0px"),
-            dimension_css(y, "0px")
-        ));
+fn transform_css(
+    style: &crate::LayoutStyle,
+    rect: Option<&crate::Rect>,
+    root_font_size: f32,
+    viewport: (f32, f32),
+) -> String {
+    if style.transform_ops.is_empty() {
+        return "none".to_string();
     }
-    if let Some((x, y)) = style.individual_translate {
-        parts.push(format!(
-            "translate({}, {})",
-            dimension_css(x, "0px"),
-            dimension_css(y, "0px")
-        ));
-    }
-    if let Some((x, y)) = style.transform_scale {
-        parts.push(format!("scale({}, {})", css_number(x), css_number(y)));
-    }
-    if let Some([a, b, c, d]) = style.transform_projection {
-        parts.push(format!(
-            "matrix({}, {}, {}, {}, 0, 0)",
-            css_number(a),
-            css_number(b),
-            css_number(c),
-            css_number(d)
-        ));
-    }
-    if parts.is_empty() {
-        "none".to_string()
-    } else {
-        parts.join(" ")
-    }
+    let fallback = crate::Rect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 };
+    let matrix = crate::dom::resolved_transform_property_matrix(
+        style,
+        rect.unwrap_or(&fallback),
+        root_font_size,
+        viewport,
+    );
+    format!(
+        "matrix({}, {}, {}, {}, {}, {})",
+        css_number(matrix.a), css_number(matrix.b), css_number(matrix.c),
+        css_number(matrix.d), css_number(matrix.e), css_number(matrix.f),
+    )
 }
 
 fn transform_origin_css(style: &crate::LayoutStyle, rect: Option<&crate::Rect>) -> String {
@@ -1051,8 +1061,16 @@ pub fn prepare_dom_with_dynamic_fonts(
     let content_size = laid.scrolling_content_size(tree, viewport);
     let viewport_fixed = laid.viewport_fixed_nodes(tree);
     let sticky = laid.root_sticky_layout(tree, viewport);
+    let root_font_size = tree
+        .query_selector("html")
+        .ok()
+        .flatten()
+        .and_then(|root| laid.styles.get(&root))
+        .and_then(|style| style.font_size)
+        .unwrap_or(16.0);
     Some(PreparedRender {
         viewport,
+        root_font_size,
         base_url: base_url.map(str::to_string),
         content_size,
         viewport_fixed,
@@ -1090,6 +1108,9 @@ pub fn paint_prepared(
         None,
         None,
         None,
+        None,
+        None,
+        (0.0, 0.0),
     )
 }
 
@@ -1131,6 +1152,63 @@ fn stacking_z_index(
     None
 }
 
+fn has_authored_transform(style: &crate::LayoutStyle) -> bool {
+    !style.transform_ops.is_empty()
+        || style.individual_translate.is_some()
+        || style.individual_rotate.is_some()
+        || style.individual_scale.is_some()
+}
+
+/// Untransformed source bounds for one atomic transform layer, expressed in
+/// the parent surface's coordinates. Keeping this tight both preserves source
+/// pixels that begin outside the viewport and avoids a viewport-sized surface
+/// for every transformed icon or badge.
+fn transform_subtree_source_bounds(
+    tree: &DomTree,
+    laid: &crate::DomLayout,
+    scroll_state: &ScrollPaintState<'_>,
+    root: obscura_dom::tree::NodeId,
+) -> Option<crate::Rect> {
+    let mut bounds: Option<crate::Rect> = None;
+    for id in std::iter::once(root).chain(tree.descendants(root)) {
+        let Some(rect) = laid.rects.get(&id) else {
+            continue;
+        };
+        let (x, y) = scroll_state.translation_for(laid, id);
+        let mut visual = crate::Rect {
+            x: rect.x + x,
+            y: rect.y + y,
+            width: rect.width,
+            height: rect.height,
+        };
+        if let Some(shadow) = laid
+            .styles
+            .get(&id)
+            .and_then(|style| style.box_shadow)
+            .filter(|shadow| !shadow.inset && shadow.color[3] != 0)
+        {
+            let expansion = shadow.spread + shadow.blur.max(0.0);
+            let shadow_rect = crate::Rect {
+                x: visual.x + shadow.offset_x - expansion,
+                y: visual.y + shadow.offset_y - expansion,
+                width: (visual.width + 2.0 * expansion).max(0.0),
+                height: (visual.height + 2.0 * expansion).max(0.0),
+            };
+            visual = visual.union(&shadow_rect);
+        }
+        bounds = Some(match bounds {
+            Some(current) => current.union(&visual),
+            None => visual,
+        });
+    }
+    bounds.map(|bounds| crate::Rect {
+        x: bounds.x - 2.0,
+        y: bounds.y - 2.0,
+        width: bounds.width + 4.0,
+        height: bounds.height + 4.0,
+    })
+}
+
 /// Paint an already prepared layout without changing its document-space
 /// geometry. Root scrolling and sticky positioning are per-shot visual state,
 /// so alternating captures can safely reuse the same layout.
@@ -1150,13 +1228,20 @@ fn paint_laid_dom_scrolled(
     paint_root: Option<obscura_dom::tree::NodeId>,
     suppress_opacity_for: Option<obscura_dom::tree::NodeId>,
     suppress_stacking_for: Option<obscura_dom::tree::NodeId>,
+    suppress_transform_for: Option<obscura_dom::tree::NodeId>,
+    clip_scope_root: Option<obscura_dom::tree::NodeId>,
+    surface_offset: (f32, f32),
 ) -> Option<Pixmap> {
-    let scroll_state =
-        ScrollPaintState::new(viewport, scroll, content_size, viewport_fixed, sticky);
-    // Only raster images inside an actually rotated/scaled subtree receive an
-    // affine entry. Ordinary pages pay one fast style scan and allocate no
-    // matrix map; transformed pages do matrix work only along those subtrees.
-    let projected_images = collect_projected_image_transforms(tree, laid, &scroll_state);
+    let scroll_state = ScrollPaintState::new(
+        tree,
+        viewport,
+        scroll,
+        content_size,
+        viewport_fixed,
+        sticky,
+        clip_scope_root,
+        surface_offset,
+    );
     let root_font_size = tree
         .query_selector("html")
         .ok()
@@ -1209,10 +1294,12 @@ fn paint_laid_dom_scrolled(
                 .get(&nid)
                 .and_then(|style| style.opacity)
                 .is_some_and(|opacity| opacity.clamp(0.0, 1.0) < 1.0);
+        let is_transform_root = suppress_transform_for != Some(nid)
+            && laid.styles.get(&nid).is_some_and(has_authored_transform);
         let z = (suppress_stacking_for != Some(nid))
             .then(|| stacking_z_index(tree, laid, nid))
             .flatten();
-        if is_opacity_root {
+        if is_opacity_root || is_transform_root {
             let mut sub = vec![nid];
             sub.extend(tree.descendants(nid));
             for &member in &sub {
@@ -1334,6 +1421,9 @@ fn paint_laid_dom_scrolled(
                 Some(nid),
                 suppress_opacity_for,
                 Some(nid),
+                suppress_transform_for,
+                clip_scope_root,
+                surface_offset,
             )?;
             continue;
         }
@@ -1377,6 +1467,141 @@ fn paint_laid_dom_scrolled(
             None => continue,
         };
 
+        let style = match laid.styles.get(&nid) {
+            Some(s) => s,
+            None => continue,
+        };
+
+        if suppress_transform_for != Some(nid) && has_authored_transform(style) {
+            opacity_subtree_skip.insert(nid);
+            opacity_subtree_skip.extend(tree.descendants(nid));
+            let transform = crate::dom::resolved_transform_matrix(
+                style,
+                &rect,
+                root_font_size,
+                viewport,
+            );
+            if transform.is_translation() {
+                // Translation-only transforms retain the direct offset path:
+                // no surface allocation and no resampling for carousels and
+                // centering utilities.
+                pixmap = paint_laid_dom_scrolled(
+                    tree,
+                    viewport,
+                    base_url,
+                    scroll,
+                    pixmap,
+                    image_cache,
+                    selected_images,
+                    svg_fonts,
+                    content_size,
+                    viewport_fixed,
+                    sticky,
+                    laid,
+                    Some(nid),
+                    suppress_opacity_for,
+                    suppress_stacking_for,
+                    Some(nid),
+                    clip_scope_root,
+                    surface_offset,
+                )?;
+                continue;
+            }
+
+            // A transform wraps the complete atomic child display list. Paint
+            // that list in its untransformed coordinate space, with clips
+            // established inside this subtree, then map the finished surface.
+            // This makes text, borders, shadows, SVG, images, and pseudos share
+            // one transform exactly like Gecko's nsDisplayTransform wrapper.
+            let outside_clip = scroll_state.clip_for(laid, nid);
+            let movement = scroll_state.translation_for(laid, nid);
+            let display_transform = crate::Affine2::translate(movement.0, movement.1)
+                .then(transform)
+                .then(crate::Affine2::translate(-movement.0, -movement.1));
+            let target = crate::Rect {
+                x: 0.0,
+                y: 0.0,
+                width: pixmap.width() as f32,
+                height: pixmap.height() as f32,
+            };
+            let target = match outside_clip {
+                Some(clip) => match target.intersect(&clip) {
+                    Some(target) => target,
+                    None => continue,
+                },
+                None => target,
+            };
+            let Some(inverse) = display_transform.inverse() else {
+                // A singular transform has no two-dimensional painted area.
+                continue;
+            };
+            let needed_source = inverse.map_rect(target);
+            let Some(source_bounds) = transform_subtree_source_bounds(
+                tree,
+                laid,
+                &scroll_state,
+                nid,
+            )
+            .and_then(|bounds| bounds.intersect(&needed_source)) else {
+                continue;
+            };
+            let left = source_bounds.x.floor();
+            let top = source_bounds.y.floor();
+            let right = (source_bounds.x + source_bounds.width).ceil();
+            let bottom = (source_bounds.y + source_bounds.height).ceil();
+            let layer_width = (right - left).max(1.0) as u32;
+            let layer_height = (bottom - top).max(1.0) as u32;
+            let layer_delta = (-left, -top);
+            let layer = Pixmap::new(layer_width, layer_height)?;
+            let layer = paint_laid_dom_scrolled(
+                tree,
+                viewport,
+                base_url,
+                scroll,
+                layer,
+                image_cache,
+                selected_images,
+                svg_fonts,
+                content_size,
+                viewport_fixed,
+                sticky,
+                laid,
+                Some(nid),
+                suppress_opacity_for,
+                suppress_stacking_for,
+                Some(nid),
+                Some(nid),
+                (
+                    surface_offset.0 + layer_delta.0,
+                    surface_offset.1 + layer_delta.1,
+                ),
+            )?;
+            let transform = display_transform.then(crate::Affine2::translate(
+                -layer_delta.0,
+                -layer_delta.1,
+            ));
+            let transform = Transform::from_row(
+                transform.a,
+                transform.b,
+                transform.c,
+                transform.d,
+                transform.e,
+                transform.f,
+            );
+            let clip_mask = outside_clip
+                .as_ref()
+                .and_then(|clip| box_clip_mask(pixmap.width(), pixmap.height(), clip));
+            pixmap.draw_pixmap(
+                0,
+                0,
+                layer.as_ref(),
+                &tiny_skia::PixmapPaint::default(),
+                transform,
+                clip_mask.as_ref(),
+            );
+            continue;
+        }
+
         let own_opacity = laid
             .styles
             .get(&nid)
@@ -1409,6 +1634,9 @@ fn paint_laid_dom_scrolled(
                 Some(nid),
                 Some(nid),
                 suppress_stacking_for,
+                suppress_transform_for,
+                clip_scope_root,
+                surface_offset,
             )?;
             let group_paint = tiny_skia::PixmapPaint {
                 opacity: own_opacity,
@@ -1424,11 +1652,6 @@ fn paint_laid_dom_scrolled(
             );
             continue;
         }
-
-        let style = match laid.styles.get(&nid) {
-            Some(s) => s,
-            None => continue,
-        };
 
         if style.effectively_invisible {
             continue;
@@ -1448,10 +1671,7 @@ fn paint_laid_dom_scrolled(
         // ubiquitous 1x1 clipped "visually hidden" accessibility pattern
         // actually invisible instead of painting text wherever it lands).
         let clip = scroll_state.clip_for(laid, nid);
-        let projected_image = projected_images.get(&nid).copied();
-        let cull_rect = projected_image
-            .map(|transform| transform.map_rect(rect))
-            .unwrap_or(rect);
+        let cull_rect = rect;
         let visible_rect = match clip {
             Some(c) => match cull_rect.intersect(&c) {
                 Some(r) => r,
@@ -1710,7 +1930,7 @@ fn paint_laid_dom_scrolled(
                         style.object_fit,
                         &mut pixmap,
                         image_cache,
-                        projected_image,
+                        None,
                         radius,
                         clip_path_mask.as_ref(),
                     );
@@ -2008,23 +2228,28 @@ fn paint_laid_dom_scrolled(
 /// document-space [`DomLayout`]. Keeping these deltas out of the layout avoids
 /// accumulating movement when the same prepared document paints more than one
 /// frame.
-#[derive(Debug)]
 struct ScrollPaintState<'a> {
+    tree: &'a DomTree,
     viewport: (f32, f32),
     scroll: (f32, f32),
     viewport_fixed: &'a std::collections::HashSet<obscura_dom::tree::NodeId>,
     sticky: std::collections::HashMap<obscura_dom::tree::NodeId, (f32, f32)>,
     sticky_clips: std::collections::HashMap<obscura_dom::tree::NodeId, (f32, f32)>,
+    clip_scope_root: Option<obscura_dom::tree::NodeId>,
+    surface_offset: (f32, f32),
     active: bool,
 }
 
 impl<'a> ScrollPaintState<'a> {
     fn new(
+        tree: &'a DomTree,
         viewport: (f32, f32),
         requested: (f32, f32),
         content: (f32, f32),
         viewport_fixed: &'a std::collections::HashSet<obscura_dom::tree::NodeId>,
         sticky_layout: &crate::StickyLayout,
+        clip_scope_root: Option<obscura_dom::tree::NodeId>,
+        surface_offset: (f32, f32),
     ) -> Self {
         let scroll_x = if requested.0.is_finite() {
             requested
@@ -2044,11 +2269,14 @@ impl<'a> ScrollPaintState<'a> {
         let active = scroll != (0.0, 0.0) || !sticky_layout.is_empty();
         if !active {
             return Self {
+                tree,
                 viewport,
                 scroll,
                 viewport_fixed,
                 sticky: std::collections::HashMap::new(),
                 sticky_clips: std::collections::HashMap::new(),
+                clip_scope_root,
+                surface_offset,
                 active,
             };
         }
@@ -2056,11 +2284,14 @@ impl<'a> ScrollPaintState<'a> {
         let sticky = sticky_layout.translations(viewport, scroll);
         let sticky_clips = sticky_layout.clip_translations_from(&sticky);
         Self {
+            tree,
             viewport,
             scroll,
             viewport_fixed,
             sticky,
             sticky_clips,
+            clip_scope_root,
+            surface_offset,
             active,
         }
     }
@@ -2072,12 +2303,12 @@ impl<'a> ScrollPaintState<'a> {
     ) -> (f32, f32) {
         let base = laid.translates.get(&id).copied().unwrap_or((0.0, 0.0));
         if !self.active || self.viewport_fixed.contains(&id) {
-            return base;
+            return (base.0 + self.surface_offset.0, base.1 + self.surface_offset.1);
         }
         let sticky = self.sticky.get(&id).copied().unwrap_or((0.0, 0.0));
         (
-            base.0 + sticky.0 - self.scroll.0,
-            base.1 + sticky.1 - self.scroll.1,
+            base.0 + sticky.0 - self.scroll.0 + self.surface_offset.0,
+            base.1 + sticky.1 - self.scroll.1 + self.surface_offset.1,
         )
     }
 
@@ -2095,19 +2326,55 @@ impl<'a> ScrollPaintState<'a> {
         laid: &crate::DomLayout,
         id: obscura_dom::tree::NodeId,
     ) -> Option<crate::dom::OverflowClip> {
-        let mut clip = laid.clip_rects.get(&id).copied().flatten()?;
-        if !self.active || self.viewport_fixed.contains(&id) {
-            return Some(clip);
+        if let Some(root) = self.clip_scope_root {
+            if id == root {
+                return None;
+            }
+            let mut owners = Vec::new();
+            let mut current = self.tree.get_node(id).and_then(|node| node.parent);
+            let mut found = false;
+            while let Some(owner) = current {
+                owners.push(owner);
+                if owner == root {
+                    found = true;
+                    break;
+                }
+                current = self.tree.get_node(owner).and_then(|node| node.parent);
+            }
+            if found {
+                let mut clip: Option<crate::dom::OverflowClip> = None;
+                for owner in owners.into_iter().rev() {
+                    let (Some(style), Some(rect)) =
+                        (laid.styles.get(&owner), laid.rects.get(&owner))
+                    else {
+                        continue;
+                    };
+                    if !style.overflow_hidden || style.overflow_propagated_to_viewport {
+                        continue;
+                    }
+                    let (x, y) = self.translation_for(laid, owner);
+                    let own = crate::dom::OverflowClip::for_box(rect, style, x, y);
+                    clip = Some(match clip {
+                        Some(current) => current.intersect(own),
+                        None => own,
+                    });
+                }
+                return clip;
+            }
         }
-        let sticky = self
-            .sticky_clips
-            .get(&id)
-            .copied()
-            .unwrap_or((0.0, 0.0));
-        clip.translate(
-            sticky.0 - self.scroll.0,
-            sticky.1 - self.scroll.1,
-        );
+        let mut clip = laid.clip_rects.get(&id).copied().flatten()?;
+        if self.active && !self.viewport_fixed.contains(&id) {
+            let sticky = self
+                .sticky_clips
+                .get(&id)
+                .copied()
+                .unwrap_or((0.0, 0.0));
+            clip.translate(
+                sticky.0 - self.scroll.0,
+                sticky.1 - self.scroll.1,
+            );
+        }
+        clip.translate(self.surface_offset.0, self.surface_offset.1);
         Some(clip)
     }
 
@@ -2144,186 +2411,6 @@ impl<'a> ScrollPaintState<'a> {
     ) -> Option<crate::Rect> {
         self.descendant_clip_for(laid, id)
     }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct ImageAffine {
-    a: f32,
-    b: f32,
-    c: f32,
-    d: f32,
-    e: f32,
-    f: f32,
-}
-
-impl ImageAffine {
-    const IDENTITY: Self = Self {
-        a: 1.0,
-        b: 0.0,
-        c: 0.0,
-        d: 1.0,
-        e: 0.0,
-        f: 0.0,
-    };
-
-    /// Compose `self(other(point))`.
-    fn then(self, other: Self) -> Self {
-        Self {
-            a: self.a * other.a + self.c * other.b,
-            b: self.b * other.a + self.d * other.b,
-            c: self.a * other.c + self.c * other.d,
-            d: self.b * other.c + self.d * other.d,
-            e: self.a * other.e + self.c * other.f + self.e,
-            f: self.b * other.e + self.d * other.f + self.f,
-        }
-    }
-
-    fn around(origin: (f32, f32), linear: [f32; 4]) -> Self {
-        let [a, b, c, d] = linear;
-        Self {
-            a,
-            b,
-            c,
-            d,
-            e: origin.0 - a * origin.0 - c * origin.1,
-            f: origin.1 - b * origin.0 - d * origin.1,
-        }
-    }
-
-    fn map(self, x: f32, y: f32) -> (f32, f32) {
-        (
-            self.a * x + self.c * y + self.e,
-            self.b * x + self.d * y + self.f,
-        )
-    }
-
-    fn map_rect(self, rect: crate::Rect) -> crate::Rect {
-        let points = [
-            self.map(rect.x, rect.y),
-            self.map(rect.x + rect.width, rect.y),
-            self.map(rect.x, rect.y + rect.height),
-            self.map(rect.x + rect.width, rect.y + rect.height),
-        ];
-        let left = points.iter().map(|point| point.0).fold(f32::INFINITY, f32::min);
-        let top = points.iter().map(|point| point.1).fold(f32::INFINITY, f32::min);
-        let right = points
-            .iter()
-            .map(|point| point.0)
-            .fold(f32::NEG_INFINITY, f32::max);
-        let bottom = points
-            .iter()
-            .map(|point| point.1)
-            .fold(f32::NEG_INFINITY, f32::max);
-        crate::Rect {
-            x: left,
-            y: top,
-            width: (right - left).max(0.0),
-            height: (bottom - top).max(0.0),
-        }
-    }
-
-    fn tiny_skia(self) -> Transform {
-        Transform::from_row(self.a, self.b, self.c, self.d, self.e, self.f)
-    }
-
-    fn is_identity(self) -> bool {
-        (self.a - 1.0).abs() < f32::EPSILON
-            && self.b.abs() < f32::EPSILON
-            && self.c.abs() < f32::EPSILON
-            && (self.d - 1.0).abs() < f32::EPSILON
-            && self.e.abs() < f32::EPSILON
-            && self.f.abs() < f32::EPSILON
-    }
-}
-
-/// Accumulate rotation/scale matrices through transformed subtrees, storing
-/// entries only for raster `<img>` descendants. Translation comes from the
-/// per-shot visual state so the document-space layout remains reusable.
-fn collect_projected_image_transforms(
-    tree: &DomTree,
-    layout: &crate::DomLayout,
-    scroll_state: &ScrollPaintState,
-) -> std::collections::HashMap<obscura_dom::tree::NodeId, ImageAffine> {
-    if !layout.styles.values().any(|style| {
-        style.transform_projection.is_some() || style.transform_scale.is_some()
-    }) {
-        return std::collections::HashMap::new();
-    }
-
-    fn walk(
-        tree: &DomTree,
-        layout: &crate::DomLayout,
-        scroll_state: &ScrollPaintState,
-        id: obscura_dom::tree::NodeId,
-        parent: ImageAffine,
-        active: bool,
-        out: &mut std::collections::HashMap<obscura_dom::tree::NodeId, ImageAffine>,
-    ) {
-        let style = layout.styles.get(&id);
-        let own_active = style.is_some_and(|style| {
-            style.transform_projection.is_some() || style.transform_scale.is_some()
-        });
-        let mut combined = parent;
-        if own_active {
-            let style = style.unwrap();
-            let projection = style
-                .transform_projection
-                .unwrap_or([1.0, 0.0, 0.0, 1.0]);
-            let (scale_x, scale_y) = style.transform_scale.unwrap_or((1.0, 1.0));
-            let linear = [
-                scale_x * projection[0],
-                scale_y * projection[1],
-                scale_x * projection[2],
-                scale_y * projection[3],
-            ];
-            if let Some(rect) = layout.rects.get(&id) {
-                let offset = scroll_state.translation_for(layout, id);
-                let (origin_x, origin_y) = style.transform_origin.unwrap_or((
-                    crate::Dimension::Percent(0.5),
-                    crate::Dimension::Percent(0.5),
-                ));
-                let origin = (
-                    rect.x + offset.0 + crate::dom::resolve_translate(origin_x, rect.width),
-                    rect.y + offset.1 + crate::dom::resolve_translate(origin_y, rect.height),
-                );
-                combined = parent.then(ImageAffine::around(origin, linear));
-            }
-        }
-
-        let transformed = active || own_active;
-        if transformed
-            && !combined.is_identity()
-            && tree.get_node(id).is_some_and(|node| {
-                node.as_element()
-                    .is_some_and(|element| element.local.as_ref() == "img")
-            })
-        {
-            out.insert(id, combined);
-        }
-        for child in tree.children(id) {
-            walk(
-                tree,
-                layout,
-                scroll_state,
-                child,
-                combined,
-                transformed,
-                out,
-            );
-        }
-    }
-
-    let mut out = std::collections::HashMap::new();
-    walk(
-        tree,
-        layout,
-        scroll_state,
-        tree.document(),
-        ImageAffine::IDENTITY,
-        false,
-        &mut out,
-    );
-    out
 }
 
 /// A closed rounded-rectangle path, corners approximated by quadratic curves
@@ -5320,7 +5407,7 @@ fn paint_image(
     object_fit: crate::ObjectFit,
     pixmap: &mut Pixmap,
     cache: &mut RenderResourceCache,
-    transform: Option<ImageAffine>,
+    transform: Option<crate::Affine2>,
     clip_radius: crate::ResolvedBorderRadii,
     extra_clip: Option<&tiny_skia::Mask>,
 ) -> bool {
@@ -5413,7 +5500,14 @@ fn paint_image(
         content.as_ref(),
         &tiny_skia::PixmapPaint::default(),
         transform
-            .map(ImageAffine::tiny_skia)
+            .map(|transform| Transform::from_row(
+                transform.a,
+                transform.b,
+                transform.c,
+                transform.d,
+                transform.e,
+                transform.f,
+            ))
             .unwrap_or_else(Transform::identity),
         clip.as_ref(),
     );
@@ -8217,6 +8311,152 @@ mod tests {
         // Nothing painted at the pre-transform origin: both boxes moved away.
         let origin = pixmap.pixel(5, 5).expect("pixel");
         assert_eq!((origin.red(), origin.green(), origin.blue()), (255, 255, 255));
+    }
+
+    #[test]
+    fn rotate_and_scale_paint_complete_mixed_subtrees() {
+        let tree = parse_html(
+            r#"<html><body style="margin:0">
+              <div style="position:absolute;left:20px;top:20px;width:60px;height:40px;
+                          background:#ff0000;transform-origin:0 0;transform:scale(2)">
+                <span style="color:#0000ff;font:12px sans-serif">MMMM</span>
+                <img alt="" src="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='10'%20height='10'%3E%3Crect%20width='10'%20height='10'%20fill='%2300ff00'/%3E%3C/svg%3E"
+                     style="position:absolute;left:40px;top:20px;width:10px;height:10px">
+              </div>
+              <div style="position:absolute;left:180px;top:20px;width:30px;height:20px;
+                          background:#ff00ff;transform-origin:0 0;transform:rotate(90deg)">
+                <span style="color:#0000ff;font:10px sans-serif">M</span>
+                <img alt="" src="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='10'%20height='10'%3E%3Crect%20width='10'%20height='10'%20fill='%2300ffff'/%3E%3C/svg%3E"
+                     style="position:absolute;left:20px;top:0;width:10px;height:10px">
+              </div>
+            </body></html>"#,
+        );
+        let pixmap = paint_dom(&tree, (240.0, 120.0), None).expect("pixmap");
+
+        let scaled_box = pixmap.pixel(30, 70).expect("scaled box");
+        assert!(scaled_box.red() > 220 && scaled_box.green() < 40);
+        let scaled_image = pixmap.pixel(110, 70).expect("scaled image");
+        assert!(scaled_image.green() > 220 && scaled_image.red() < 40);
+        assert!(
+            (20..100).any(|x| (20..60).any(|y| {
+                let pixel = pixmap.pixel(x, y).expect("scaled text region");
+                pixel.red() < 80 && pixel.green() < 80 && pixel.blue() < 80
+            })),
+            "text must be rasterized inside the scaled atomic subtree"
+        );
+
+        let rotated_box = pixmap.pixel(165, 25).expect("rotated box");
+        assert!(rotated_box.red() > 220 && rotated_box.blue() > 220);
+        let rotated_image = pixmap.pixel(175, 45).expect("rotated image");
+        assert!(rotated_image.green() > 220 && rotated_image.blue() > 220);
+    }
+
+    #[test]
+    fn transform_function_order_nested_world_matrices_and_cssom_aabbs() {
+        let tree = parse_html(
+            r#"<html><body style="margin:0">
+              <div id="translate-rotate" style="position:absolute;left:50px;top:50px;
+                   width:20px;height:10px;transform-origin:0 0;
+                   transform:translateX(100px) rotate(90deg)"></div>
+              <div id="rotate-translate" style="position:absolute;left:50px;top:50px;
+                   width:20px;height:10px;transform-origin:0 0;
+                   transform:rotate(90deg) translateX(100px)"></div>
+              <div id="parent" style="position:absolute;left:50px;top:200px;width:100px;
+                   height:100px;transform-origin:0 0;transform:scale(2)">
+                <div id="child" style="position:absolute;left:10px;top:20px;width:10px;
+                     height:20px;transform-origin:0 0;transform:rotate(90deg)"></div>
+                <div id="captured-fixed" style="position:fixed;left:0;top:0;width:10px;
+                     height:10px"></div>
+              </div>
+              <div id="center-origin" style="position:absolute;left:100px;top:400px;
+                   width:20px;height:10px;transform:rotate(90deg)"></div>
+              <div id="cssom-transform" style="position:absolute;left:200px;top:400px;
+                   width:20px;height:10px;transform:translateX(50%);translate:7px;
+                   rotate:30deg;scale:2"></div>
+            </body></html>"#,
+        );
+        let mut resources = RenderResourceCache::default();
+        let prepared = prepare_dom(&tree, (500.0, 600.0), None, &mut resources)
+            .expect("prepared transform geometry");
+        let assert_rect = |actual: crate::Rect, expected: crate::Rect| {
+            assert!((actual.x - expected.x).abs() < 0.02, "x: {actual:?}");
+            assert!((actual.y - expected.y).abs() < 0.02, "y: {actual:?}");
+            assert!((actual.width - expected.width).abs() < 0.02, "width: {actual:?}");
+            assert!((actual.height - expected.height).abs() < 0.02, "height: {actual:?}");
+        };
+        let first = tree.get_element_by_id("translate-rotate").unwrap();
+        let second = tree.get_element_by_id("rotate-translate").unwrap();
+        assert_rect(
+            prepared.document_rect(first).unwrap(),
+            crate::Rect { x: 140.0, y: 50.0, width: 10.0, height: 20.0 },
+        );
+        assert_rect(
+            prepared.document_rect(second).unwrap(),
+            crate::Rect { x: 40.0, y: 150.0, width: 10.0, height: 20.0 },
+        );
+        let child = tree.get_element_by_id("child").unwrap();
+        let child_rect = crate::Rect { x: 30.0, y: 240.0, width: 40.0, height: 20.0 };
+        assert_rect(prepared.document_rect(child).unwrap(), child_rect);
+        assert_rect(
+            prepared.viewport_client_rects(child, (0.0, 0.0)).unwrap()[0],
+            child_rect,
+        );
+        let fixed = tree.get_element_by_id("captured-fixed").unwrap();
+        assert_rect(
+            prepared.document_rect(fixed).unwrap(),
+            crate::Rect { x: 50.0, y: 200.0, width: 20.0, height: 20.0 },
+        );
+        let centered = tree.get_element_by_id("center-origin").unwrap();
+        assert_rect(
+            prepared.document_rect(centered).unwrap(),
+            crate::Rect { x: 105.0, y: 395.0, width: 10.0, height: 20.0 },
+        );
+        let cssom = tree.get_element_by_id("cssom-transform").unwrap();
+        let computed = prepared.computed_style(cssom).unwrap();
+        assert_eq!(computed["transform"], "matrix(1, 0, 0, 1, 10, 0)");
+        assert_eq!(computed["translate"], "7px 0px");
+        assert_eq!(computed["rotate"], "30deg");
+        assert_eq!(computed["scale"], "2 2");
+    }
+
+    #[test]
+    fn transformed_subtree_is_clipped_by_outside_ancestor() {
+        let tree = parse_html(
+            r#"<html><body style="margin:0">
+              <div style="position:absolute;left:20px;top:20px;width:40px;height:40px;
+                          overflow:hidden">
+                <div style="position:absolute;left:30px;top:10px;width:20px;height:20px;
+                            background:#00aa00;transform-origin:0 0;transform:scale(2)"></div>
+              </div>
+            </body></html>"#,
+        );
+        let pixmap = paint_dom(&tree, (100.0, 80.0), None).expect("pixmap");
+        let inside = pixmap.pixel(55, 40).expect("inside ancestor clip");
+        assert!(inside.green() > 120 && inside.red() < 40);
+        let outside = pixmap.pixel(65, 40).expect("outside ancestor clip");
+        assert_eq!((outside.red(), outside.green(), outside.blue()), (255, 255, 255));
+    }
+
+    #[test]
+    fn no_transform_keeps_identity_geometry_and_baseline_paint() {
+        let tree = parse_html(
+            r#"<html><body style="margin:0"><div id="plain" style="position:absolute;
+               left:10px;top:12px;width:20px;height:15px;background:#ff0000"></div>
+               </body></html>"#,
+        );
+        let mut resources = RenderResourceCache::default();
+        let prepared = prepare_dom(&tree, (80.0, 60.0), None, &mut resources).unwrap();
+        let plain = tree.get_element_by_id("plain").unwrap();
+        assert!(prepared.layout().transforms.is_empty());
+        assert_eq!(
+            prepared.document_rect(plain),
+            Some(crate::Rect { x: 10.0, y: 12.0, width: 20.0, height: 15.0 })
+        );
+        let pixmap = paint_dom(&tree, (80.0, 60.0), None).unwrap();
+        let painted = pixmap.pixel(15, 15).unwrap();
+        assert!(painted.red() > 220 && painted.green() < 40);
+        let empty = pixmap.pixel(5, 5).unwrap();
+        assert_eq!((empty.red(), empty.green(), empty.blue()), (255, 255, 255));
     }
 
     #[test]

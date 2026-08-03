@@ -1611,6 +1611,7 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         "transform" => parse_transform(style, value),
         "transform-origin" => style.transform_origin = parse_transform_origin(value),
         "translate" => parse_individual_translate(style, value),
+        "rotate" => parse_individual_rotate(style, value),
         "scale" => parse_individual_scale(style, value),
         "filter" => set_containing_block_trigger(
             style,
@@ -1918,6 +1919,7 @@ pub fn supports_declaration(name: &str, value: &str) -> bool {
             | "transform"
             | "transform-origin"
             | "translate"
+            | "rotate"
             | "scale"
             | "filter"
             | "backdrop-filter"
@@ -2409,6 +2411,7 @@ fn supports_conservative_known_value(name: &str, value: &str) -> bool {
         "grid-column-start" | "grid-column-end" | "grid-row-start" | "grid-row-end" => parse_grid_line_kind(value).is_some(),
         "transform-origin" => parse_transform_origin(value).is_some(),
         "translate" => lower == "none" || dimensions(value, false, 3),
+        "rotate" => lower == "none" || angle_degrees(value).is_some(),
         "scale" => lower == "none" || {
             let values = value.split_whitespace().collect::<Vec<_>>();
             !values.is_empty() && values.len() <= 2 && values.iter().all(|value| scale_number(value).is_some())
@@ -2466,19 +2469,7 @@ fn supports_transform_value(value: &str) -> bool {
     if value.trim().eq_ignore_ascii_case("none") {
         return true;
     }
-    let functions = transform_functions(value);
-    !functions.is_empty() && functions.into_iter().all(|(name, arguments)| {
-        let values = arguments.split(',').map(str::trim).filter(|value| !value.is_empty()).collect::<Vec<_>>();
-        match name.to_ascii_lowercase().as_str() {
-            "translate" => (1..=2).contains(&values.len()) && values.iter().all(|value| !matches!(dimension_value(value), crate::Dimension::Auto)),
-            "translate3d" => values.len() == 3 && values.iter().all(|value| !matches!(dimension_value(value), crate::Dimension::Auto)),
-            "translatex" | "translatey" => values.len() == 1 && !matches!(dimension_value(values[0]), crate::Dimension::Auto),
-            "scale" => (1..=2).contains(&values.len()) && values.iter().all(|value| scale_number(value).is_some()),
-            "scalex" | "scaley" => values.len() == 1 && scale_number(values[0]).is_some(),
-            "rotate" | "rotatex" | "rotatey" | "rotatez" => values.len() == 1 && angle_degrees(values[0]).is_some(),
-            _ => false,
-        }
-    })
+    parse_transform_ops(value).is_some()
 }
 
 fn apply_animation_shorthand(style: &mut LayoutStyle, value: &str) {
@@ -2858,143 +2849,203 @@ fn content_alignment_pair(
     None
 }
 
-/// Parse the transform functions used by the scoped paint model. Translation
-/// stays unresolved until the final border box is known. Scale is captured
-/// separately, while rotations are multiplied as 3×3 matrices and projected
-/// onto the input z=0 plane; this exactly represents rotateX/Y/Z chains that
-/// do not introduce perspective.
 fn parse_transform(style: &mut LayoutStyle, value: &str) {
     let v = value.trim();
     if v.is_empty() {
         return;
     }
-    // `transform: none` resets any transform from a lower-priority rule (the
-    // carousel idiom: a class translates the track, an inline style clears it
-    // for the untransformed state).
-    if v.eq_ignore_ascii_case("none") {
-        style.transform_translate = None;
-        style.transform_scale = None;
-        style.transform_projection = None;
+    if matches!(
+        v.to_ascii_lowercase().as_str(),
+        "none" | "initial" | "unset" | "revert" | "revert-layer"
+    ) {
+        style.transform_ops.clear();
         set_containing_block_trigger(style, crate::CB_TRIGGER_TRANSFORM, false);
         return;
     }
-    let functions = transform_functions(v);
-    if functions.is_empty() {
+    let Some(operations) = parse_transform_ops(v) else {
         return;
-    }
+    };
+    style.transform_ops = operations;
     set_containing_block_trigger(style, crate::CB_TRIGGER_TRANSFORM, true);
-    let zero = crate::Dimension::Px(0.0);
-    let (mut tx, mut ty): (Option<crate::Dimension>, Option<crate::Dimension>) = (None, None);
-    let (mut sx, mut sy): (Option<f32>, Option<f32>) = (None, None);
-    let mut rotation = [
-        1.0f32, 0.0, 0.0,
-        0.0, 1.0, 0.0,
-        0.0, 0.0, 1.0,
-    ];
-    let mut has_rotation = false;
-    for (func, args) in functions {
-        let parts: Vec<&str> = args.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
-        match func.to_ascii_lowercase().as_str() {
-            // translate3d's z component is ignored (no perspective model);
-            // Swiper and similar carousels position their track exclusively
-            // through translate3d, so dropping it left every slide stacked.
-            "translate" | "translate3d" => {
-                if let Some(a) = parts.first() {
-                    tx = Some(dimension_value(a));
-                }
-                // A missing second component is 0 (translateY), not inherited.
-                ty = Some(parts.get(1).map(|a| dimension_value(a)).unwrap_or(zero));
-            }
-            "translatex" => {
-                if let Some(a) = parts.first() {
-                    tx = Some(dimension_value(a));
-                }
-            }
-            "translatey" => {
-                if let Some(a) = parts.first() {
-                    ty = Some(dimension_value(a));
-                }
-            }
-            "scale" => {
-                if let Some(a) = parts.first().and_then(|s| scale_number(s)) {
-                    // scale(s) is uniform; scale(sx, sy) sets each axis.
-                    sy = Some(parts.get(1).and_then(|s| scale_number(s)).unwrap_or(a));
-                    sx = Some(a);
-                }
-            }
-            "scalex" => {
-                if let Some(a) = parts.first().and_then(|s| scale_number(s)) {
-                    sx = Some(a);
-                }
-            }
-            "scaley" => {
-                if let Some(a) = parts.first().and_then(|s| scale_number(s)) {
-                    sy = Some(a);
-                }
-            }
-            "rotate" | "rotatez" => {
-                if let Some(angle) = parts.first().and_then(|value| angle_degrees(value)) {
-                    rotation = matrix3_mul(rotation, rotate_z_matrix(angle));
-                    has_rotation = true;
-                }
-            }
-            "rotatex" => {
-                if let Some(angle) = parts.first().and_then(|value| angle_degrees(value)) {
-                    rotation = matrix3_mul(rotation, rotate_x_matrix(angle));
-                    has_rotation = true;
-                }
-            }
-            "rotatey" => {
-                if let Some(angle) = parts.first().and_then(|value| angle_degrees(value)) {
-                    rotation = matrix3_mul(rotation, rotate_y_matrix(angle));
-                    has_rotation = true;
-                }
-            }
-            // Skew, matrix, and perspective remain outside the scoped affine
-            // image projection. Other supported functions in the same value
-            // still take effect.
-            _ => {}
+}
+
+fn parse_transform_length(value: &str) -> Option<crate::TransformLength> {
+    let value = value.trim();
+    if value.contains('(') {
+        let functions = transform_functions(value);
+        if functions.len() != 1 {
+            return None;
         }
-    }
-    if tx.is_some() || ty.is_some() {
-        style.transform_translate = Some((tx.unwrap_or(zero), ty.unwrap_or(zero)));
-    }
-    if sx.is_some() || sy.is_some() {
-        style.transform_scale = Some((sx.unwrap_or(1.0), sy.unwrap_or(1.0)));
-    }
-    style.transform_projection = has_rotation.then_some([
-        rotation[0],
-        rotation[3],
-        rotation[1],
-        rotation[4],
-    ]);
-}
-
-fn matrix3_mul(left: [f32; 9], right: [f32; 9]) -> [f32; 9] {
-    let mut out = [0.0; 9];
-    for row in 0..3 {
-        for column in 0..3 {
-            out[row * 3 + column] = (0..3)
-                .map(|inner| left[row * 3 + inner] * right[inner * 3 + column])
-                .sum();
+        let (name, arguments) = &functions[0];
+        let valid = match name.to_ascii_lowercase().as_str() {
+            "calc" | "min" | "max" | "clamp" => resolve_contextual_length(
+                value, 16.0, 16.0, 10.0, 10.0, 100.0,
+            )
+            .is_some_and(f32::is_finite),
+            "var" => {
+                let parts = split_top_level(arguments, ',');
+                (1..=2).contains(&parts.len())
+                    && parts[0].trim().starts_with("--")
+                    && parts[0].trim().len() > 2
+                    && parts.get(1).is_none_or(|fallback| {
+                        !fallback.trim().is_empty()
+                            && parse_transform_length(fallback).is_some()
+                    })
+            }
+            _ => false,
+        };
+        if !valid {
+            return None;
         }
+        return Some(crate::TransformLength {
+            value: crate::Dimension::Px(0.0),
+            expression: Some(value.to_string()),
+        });
     }
-    out
+    let value = dimension_value(value);
+    (!matches!(value, crate::Dimension::Auto)).then_some(crate::TransformLength {
+        value,
+        expression: None,
+    })
 }
 
-fn rotate_x_matrix(angle: f32) -> [f32; 9] {
-    let (sin, cos) = angle.to_radians().sin_cos();
-    [1.0, 0.0, 0.0, 0.0, cos, -sin, 0.0, sin, cos]
+fn parse_transform_z_length(value: &str) -> Option<crate::TransformLength> {
+    // The Z coordinate is `<length>`, not `<length-percentage>`.
+    if value.contains('%') {
+        return None;
+    }
+    parse_transform_length(value)
 }
 
-fn rotate_y_matrix(angle: f32) -> [f32; 9] {
-    let (sin, cos) = angle.to_radians().sin_cos();
-    [cos, 0.0, sin, 0.0, 1.0, 0.0, -sin, 0.0, cos]
-}
-
-fn rotate_z_matrix(angle: f32) -> [f32; 9] {
-    let (sin, cos) = angle.to_radians().sin_cos();
-    [cos, -sin, 0.0, sin, cos, 0.0, 0.0, 0.0, 1.0]
+fn parse_transform_ops(value: &str) -> Option<Vec<crate::TransformOp>> {
+    let functions = transform_functions(value);
+    if functions.is_empty() {
+        return None;
+    }
+    let mut operations = Vec::with_capacity(functions.len());
+    for (name, arguments) in functions {
+        let values = split_top_level(&arguments, ',')
+            .into_iter()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>();
+        let operation = match name.to_ascii_lowercase().as_str() {
+            "translate" if (1..=2).contains(&values.len()) => {
+                let y = if let Some(value) = values.get(1) {
+                    parse_transform_length(value)?
+                } else {
+                    crate::TransformLength::px(0.0)
+                };
+                crate::TransformOp::Translate(
+                    parse_transform_length(values[0])?,
+                    y,
+                )
+            }
+            "translatex" if values.len() == 1 => crate::TransformOp::Translate(
+                parse_transform_length(values[0])?,
+                crate::TransformLength::px(0.0),
+            ),
+            "translatey" if values.len() == 1 => crate::TransformOp::Translate(
+                crate::TransformLength::px(0.0),
+                parse_transform_length(values[0])?,
+            ),
+            "translate3d" if values.len() == 3 => {
+                // Without perspective, translation along Z does not change the
+                // projection of the element's plane. Keep accepting it so the
+                // useful X/Y part of common compositor transforms is retained.
+                parse_transform_z_length(values[2])?;
+                crate::TransformOp::Translate(
+                    parse_transform_length(values[0])?,
+                    parse_transform_length(values[1])?,
+                )
+            }
+            "translatez" if values.len() == 1 => {
+                parse_transform_z_length(values[0])?;
+                crate::TransformOp::Matrix(crate::Affine2::IDENTITY)
+            }
+            "scale" if (1..=2).contains(&values.len()) => {
+                let x = scale_number(values[0])?;
+                crate::TransformOp::Scale(x, values.get(1).and_then(|value| scale_number(value)).unwrap_or(x))
+            }
+            "scalex" if values.len() == 1 => crate::TransformOp::Scale(scale_number(values[0])?, 1.0),
+            "scaley" if values.len() == 1 => crate::TransformOp::Scale(1.0, scale_number(values[0])?),
+            "scale3d" if values.len() == 3 => {
+                let x = scale_number(values[0])?;
+                let y = scale_number(values[1])?;
+                scale_number(values[2])?;
+                crate::TransformOp::Scale(x, y)
+            }
+            "scalez" if values.len() == 1 && scale_number(values[0]).is_some() => {
+                crate::TransformOp::Matrix(crate::Affine2::IDENTITY)
+            }
+            "rotate" | "rotatez" if values.len() == 1 => {
+                crate::TransformOp::Rotate(angle_degrees(values[0])?)
+            }
+            "rotatex" if values.len() == 1 => {
+                let radians = angle_degrees(values[0])?.to_radians();
+                crate::TransformOp::Scale(1.0, radians.cos())
+            }
+            "rotatey" if values.len() == 1 => {
+                let radians = angle_degrees(values[0])?.to_radians();
+                crate::TransformOp::Scale(radians.cos(), 1.0)
+            }
+            "rotate3d" if values.len() == 4 => {
+                let x = values[0].parse::<f32>().ok()?;
+                let y = values[1].parse::<f32>().ok()?;
+                let z = values[2].parse::<f32>().ok()?;
+                if !x.is_finite() || !y.is_finite() || !z.is_finite() {
+                    return None;
+                }
+                let angle = angle_degrees(values[3])?;
+                if x != 0.0 && y == 0.0 && z == 0.0 {
+                    crate::TransformOp::Scale(1.0, (angle * x.signum()).to_radians().cos())
+                } else if x == 0.0 && y != 0.0 && z == 0.0 {
+                    crate::TransformOp::Scale((angle * y.signum()).to_radians().cos(), 1.0)
+                } else if x == 0.0 && y == 0.0 && z != 0.0 {
+                    crate::TransformOp::Rotate(angle * z.signum())
+                } else {
+                    // A mixed 3D rotation axis cannot be represented by the
+                    // affine renderer without tracking Z between operations.
+                    return None;
+                }
+            }
+            "skew" if (1..=2).contains(&values.len()) => crate::TransformOp::Skew(
+                angle_degrees(values[0])?,
+                values.get(1).and_then(|value| angle_degrees(value)).unwrap_or(0.0),
+            ),
+            "skewx" if values.len() == 1 => crate::TransformOp::Skew(angle_degrees(values[0])?, 0.0),
+            "skewy" if values.len() == 1 => crate::TransformOp::Skew(0.0, angle_degrees(values[0])?),
+            "matrix" if values.len() == 6 => {
+                let numbers = values.iter().map(|value| value.parse::<f32>().ok()).collect::<Option<Vec<_>>>()?;
+                if numbers.iter().any(|value| !value.is_finite()) {
+                    return None;
+                }
+                crate::TransformOp::Matrix(crate::Affine2 {
+                    a: numbers[0], b: numbers[1], c: numbers[2],
+                    d: numbers[3], e: numbers[4], f: numbers[5],
+                })
+            }
+            "matrix3d" if values.len() == 16 => {
+                let numbers = values.iter().map(|value| value.parse::<f32>().ok()).collect::<Option<Vec<_>>>()?;
+                if numbers.iter().any(|value| !value.is_finite())
+                    || numbers[2] != 0.0 || numbers[3] != 0.0
+                    || numbers[6] != 0.0 || numbers[7] != 0.0
+                    || numbers[8] != 0.0 || numbers[9] != 0.0
+                    || numbers[10] != 1.0 || numbers[11] != 0.0
+                    || numbers[14] != 0.0 || numbers[15] != 1.0
+                {
+                    return None;
+                }
+                crate::TransformOp::Matrix(crate::Affine2 {
+                    a: numbers[0], b: numbers[1], c: numbers[4],
+                    d: numbers[5], e: numbers[12], f: numbers[13],
+                })
+            }
+            _ => return None,
+        };
+        operations.push(operation);
+    }
+    Some(operations)
 }
 
 fn angle_degrees(value: &str) -> Option<f32> {
@@ -3024,16 +3075,19 @@ fn angle_degrees(value: &str) -> Option<f32> {
         .strip_prefix("calc(")
         .and_then(|value| value.strip_suffix(')'))
     else {
-        return primitive(value);
+        return primitive(value).filter(|value| value.is_finite());
     };
-    if let Some((angle, factor)) = inner.split_once('*') {
-        return Some(primitive(angle)? * factor.trim().parse::<f32>().ok()?);
-    }
-    if let Some((angle, divisor)) = inner.split_once('/') {
+    let result = if let Some((angle, factor)) = inner.split_once('*') {
+        Some(primitive(angle)? * factor.trim().parse::<f32>().ok()?)
+    } else if let Some((angle, divisor)) = inner.split_once('/') {
         let divisor = divisor.trim().parse::<f32>().ok()?;
-        return (divisor != 0.0).then(|| primitive(angle).map(|angle| angle / divisor)).flatten();
-    }
-    primitive(inner)
+        (divisor != 0.0)
+            .then(|| primitive(angle).map(|angle| angle / divisor))
+            .flatten()
+    } else {
+        primitive(inner)
+    };
+    result.filter(|value| value.is_finite())
 }
 
 fn parse_transform_origin(value: &str) -> Option<(crate::Dimension, crate::Dimension)> {
@@ -3061,8 +3115,12 @@ fn parse_transform_origin(value: &str) -> Option<(crate::Dimension, crate::Dimen
 }
 
 fn parse_individual_scale(style: &mut LayoutStyle, value: &str) {
-    if value.trim().eq_ignore_ascii_case("none") {
-        style.transform_scale = None;
+    if matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "none" | "initial" | "unset" | "revert" | "revert-layer"
+    ) {
+        style.individual_scale = None;
+        set_containing_block_trigger(style, crate::CB_TRIGGER_SCALE, false);
         return;
     }
     let values: Vec<f32> = value
@@ -3072,8 +3130,23 @@ fn parse_individual_scale(style: &mut LayoutStyle, value: &str) {
         .collect();
     let Some(&x) = values.first() else { return };
     let y = values.get(1).copied().unwrap_or(x);
-    style.transform_scale = Some((x, y));
-    set_containing_block_trigger(style, crate::CB_TRIGGER_TRANSFORM, true);
+    style.individual_scale = Some((x, y));
+    set_containing_block_trigger(style, crate::CB_TRIGGER_SCALE, true);
+}
+
+fn parse_individual_rotate(style: &mut LayoutStyle, value: &str) {
+    let value = value.trim();
+    if matches!(
+        value.to_ascii_lowercase().as_str(),
+        "none" | "initial" | "unset" | "revert" | "revert-layer"
+    ) {
+        style.individual_rotate = None;
+        set_containing_block_trigger(style, crate::CB_TRIGGER_ROTATE, false);
+        return;
+    }
+    let Some(angle) = angle_degrees(value) else { return };
+    style.individual_rotate = Some(angle);
+    set_containing_block_trigger(style, crate::CB_TRIGGER_ROTATE, true);
 }
 
 fn parse_individual_translate(style: &mut LayoutStyle, value: &str) {
@@ -3137,43 +3210,50 @@ fn set_containing_block_trigger(style: &mut LayoutStyle, trigger: u16, enabled: 
     }
 }
 
-/// Split a `transform` value into its `name(args)` functions, in source order.
-/// Tokenizes on parentheses (tracking depth so a nested `calc(...)` inside an
-/// argument stays intact); the function name is the trailing identifier run
-/// just before each `(`.
+/// Strictly split a `transform` value into `name(args)` functions in source
+/// order. Any non-whitespace between functions, missing delimiter, or
+/// unbalanced parenthesis invalidates the whole declaration.
 fn transform_functions(value: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    let mut rest = value;
-    while let Some(open) = rest.find('(') {
-        let name: String = rest[..open]
-            .chars()
-            .rev()
-            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
-        let after = &rest[open + 1..];
+    let bytes = value.as_bytes();
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor == bytes.len() {
+            break;
+        }
+        let name_start = cursor;
+        while cursor < bytes.len()
+            && (bytes[cursor].is_ascii_alphanumeric() || bytes[cursor] == b'-')
+        {
+            cursor += 1;
+        }
+        if cursor == name_start || cursor >= bytes.len() || bytes[cursor] != b'(' {
+            return Vec::new();
+        }
+        let name = value[name_start..cursor].to_string();
+        cursor += 1;
+        let args_start = cursor;
         let mut depth = 1i32;
         let mut end = None;
-        for (i, c) in after.char_indices() {
+        for (offset, c) in value[cursor..].char_indices() {
             match c {
                 '(' => depth += 1,
                 ')' => {
                     depth -= 1;
                     if depth == 0 {
-                        end = Some(i);
+                        end = Some(cursor + offset);
                         break;
                     }
                 }
                 _ => {}
             }
         }
-        let Some(e) = end else { break };
-        if !name.is_empty() {
-            out.push((name, after[..e].to_string()));
-        }
-        rest = &after[e + 1..];
+        let Some(end) = end else { return Vec::new() };
+        out.push((name, value[args_start..end].to_string()));
+        cursor = end + 1;
     }
     out
 }
@@ -3183,9 +3263,14 @@ fn transform_functions(value: &str) -> Vec<(String, String)> {
 fn scale_number(s: &str) -> Option<f32> {
     let t = s.trim();
     if let Some(p) = t.strip_suffix('%') {
-        return p.trim().parse::<f32>().ok().map(|v| v / 100.0);
+        return p
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .map(|value| value / 100.0)
+            .filter(|value| value.is_finite());
     }
-    t.parse::<f32>().ok()
+    t.parse::<f32>().ok().filter(|value| value.is_finite())
 }
 
 /// Parse a CSS grid track list (`min-content 1fr min-content`, `12.25rem
@@ -6877,6 +6962,37 @@ mod tests {
         assert!(!supports_declaration("display", "grid;"));
         assert!(!supports_declaration("color", "red !important"));
         assert!(!supports_declaration("display", "banana"));
+    }
+
+    #[test]
+    fn transform_support_rejects_invalid_z_types_nonfinite_numbers_and_fake_math() {
+        for value in [
+            "translateZ(10px)",
+            "translate3d(1px, 2px, 3rem)",
+            "scale3d(1, 2, 3)",
+            "rotate3d(0, 0, 1, 45deg)",
+            "translateX(calc(10px + 5%))",
+            "translateX(var(--offset))",
+            "translateX(var(--offset, 10px))",
+        ] {
+            assert!(supports_declaration("transform", value), "{value}");
+        }
+        for value in [
+            "translateZ(10%)",
+            "translate3d(1px, 2px, 10%)",
+            "scale3d(1, 2, garbage)",
+            "scale3d(1, 2, NaN)",
+            "scale(NaN)",
+            "rotate(NaNdeg)",
+            "rotate(calc(1deg / 0))",
+            "rotate3d(NaN, 0, 1, 45deg)",
+            "translateX(garbage(10px))",
+            "translateX(calc(garbage))",
+            "translateX(var(x))",
+            "translateX(var(--x, garbage(1px)))",
+        ] {
+            assert!(!supports_declaration("transform", value), "{value}");
+        }
     }
 
     #[test]

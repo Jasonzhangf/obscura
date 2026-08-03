@@ -247,6 +247,10 @@ pub struct DomLayout {
     /// px. Only nodes with a non-zero accumulation are present; paint shifts
     /// each box by this to reach screen space.
     pub translates: HashMap<NodeId, (f32, f32)>,
+    /// Accumulated authored transforms in immutable document coordinates.
+    /// Entries exist only inside a non-identity transformed subtree, keeping
+    /// ordinary documents on the allocation-free identity path.
+    pub transforms: HashMap<NodeId, crate::Affine2>,
     /// Per-word geometry for text nodes: a text DOM node lays out as one
     /// taffy leaf per word (see `build_text_words`), each wrapping
     /// independently within its container, so its rendered content is a list
@@ -489,6 +493,7 @@ impl DomLayout {
                 &self.rects,
                 &self.styles,
                 &self.translates,
+                &self.transforms,
                 &mut right,
                 &mut bottom,
             );
@@ -653,6 +658,7 @@ fn accumulate_scrolling_overflow(
     rects: &HashMap<NodeId, Rect>,
     styles: &HashMap<NodeId, crate::LayoutStyle>,
     translates: &HashMap<NodeId, (f32, f32)>,
+    transforms: &HashMap<NodeId, crate::Affine2>,
     right: &mut f32,
     bottom: &mut f32,
 ) {
@@ -661,13 +667,11 @@ fn accumulate_scrolling_overflow(
     }
 
     let translated = rects.get(&id).map(|rect| {
-        let (tx, ty) = translates.get(&id).copied().unwrap_or((0.0, 0.0));
-        Rect {
-            x: rect.x + tx,
-            y: rect.y + ty,
-            width: rect.width,
-            height: rect.height,
-        }
+        transforms
+            .get(&id)
+            .copied()
+            .map(|transform| transform.map_rect(*rect))
+            .unwrap_or(*rect)
     });
     if let Some(overflow) = translated {
         let visible = if let Some(clip) = inherited_clip {
@@ -700,7 +704,7 @@ fn accumulate_scrolling_overflow(
     };
     for child in tree.children(id) {
         accumulate_scrolling_overflow(
-            tree, child, child_clip, fixed, rects, styles, translates, right, bottom,
+            tree, child, child_clip, fixed, rects, styles, translates, transforms, right, bottom,
         );
     }
 }
@@ -1092,6 +1096,8 @@ fn resolve_clip_rects(
     styles: &HashMap<NodeId, crate::LayoutStyle>,
     clip_rects: &mut HashMap<NodeId, Option<OverflowClip>>,
     translates: &mut HashMap<NodeId, (f32, f32)>,
+    parent_transform: crate::Affine2,
+    transforms: &mut HashMap<NodeId, crate::Affine2>,
     root_font_size: f32,
     viewport: (f32, f32),
 ) {
@@ -1105,6 +1111,14 @@ fn resolve_clip_rects(
     let (tx, ty) = (tx + own_tx, ty + own_ty);
     if tx != 0.0 || ty != 0.0 {
         translates.insert(id, (tx, ty));
+    }
+    let own_transform = styles.get(&id).map_or(crate::Affine2::IDENTITY, |style| {
+        let rect = rects.get(&id).copied().unwrap_or_default();
+        resolved_transform_matrix(style, &rect, root_font_size, viewport)
+    });
+    let transform = parent_transform.then(own_transform);
+    if !transform.is_identity() {
+        transforms.insert(id, transform);
     }
     // Overflow propagated from html/body establishes the root scrolling
     // viewport. It is anchored to the capture surface, not to document
@@ -1134,6 +1148,8 @@ fn resolve_clip_rects(
             styles,
             clip_rects,
             translates,
+            transform,
+            transforms,
             root_font_size,
             viewport,
         );
@@ -1146,37 +1162,112 @@ fn resolved_own_translate(
     root_font_size: f32,
     viewport: (f32, f32),
 ) -> (f32, f32) {
-    let mut offset = style
-        .transform_translate
-        .map(|(x, y)| {
-            (
-                resolve_translate(x, rect.width),
-                resolve_translate(y, rect.height),
+    let transform = resolved_transform_matrix(style, rect, root_font_size, viewport);
+    if transform.is_translation() {
+        (transform.e, transform.f)
+    } else {
+        (0.0, 0.0)
+    }
+}
+
+fn resolve_transform_length(
+    length: &crate::TransformLength,
+    axis: usize,
+    style: &crate::LayoutStyle,
+    rect: &Rect,
+    root_font_size: f32,
+    viewport: (f32, f32),
+) -> f32 {
+    let basis = if axis == 0 { rect.width } else { rect.height };
+    let em = style.font_size.unwrap_or(16.0);
+    length
+        .expression
+        .as_deref()
+        .and_then(|expression| {
+            crate::style::resolve_contextual_length(
+                expression,
+                em,
+                root_font_size,
+                viewport.0 / 100.0,
+                viewport.1 / 100.0,
+                basis,
             )
         })
-        .unwrap_or((0.0, 0.0));
-    let Some((x, y)) = style.individual_translate else {
-        return offset;
-    };
-    let em = style.font_size.unwrap_or(16.0);
-    let resolve_axis = |axis: usize, value: crate::Dimension, basis: f32| {
-        style.individual_translate_expressions[axis]
-            .as_deref()
-            .and_then(|expression| {
-                crate::style::resolve_contextual_length(
-                    expression,
-                    em,
-                    root_font_size,
-                    viewport.0 / 100.0,
-                    viewport.1 / 100.0,
-                    basis,
-                )
-            })
-            .unwrap_or_else(|| resolve_translate(value, basis))
-    };
-    offset.0 += resolve_axis(0, x, rect.width);
-    offset.1 += resolve_axis(1, y, rect.height);
-    offset
+        .unwrap_or_else(|| resolve_translate(length.value, basis))
+}
+
+pub(crate) fn resolved_transform_matrix(
+    style: &crate::LayoutStyle,
+    rect: &Rect,
+    root_font_size: f32,
+    viewport: (f32, f32),
+) -> crate::Affine2 {
+    let mut matrix = crate::Affine2::IDENTITY;
+    if let Some((x, y)) = style.individual_translate {
+        let lengths = [
+            crate::TransformLength {
+                value: x,
+                expression: style.individual_translate_expressions[0].clone(),
+            },
+            crate::TransformLength {
+                value: y,
+                expression: style.individual_translate_expressions[1].clone(),
+            },
+        ];
+        matrix = matrix.then(crate::Affine2::translate(
+            resolve_transform_length(&lengths[0], 0, style, rect, root_font_size, viewport),
+            resolve_transform_length(&lengths[1], 1, style, rect, root_font_size, viewport),
+        ));
+    }
+    if let Some(angle) = style.individual_rotate {
+        matrix = matrix.then(crate::Affine2::rotate(angle));
+    }
+    if let Some((x, y)) = style.individual_scale {
+        matrix = matrix.then(crate::Affine2::scale(x, y));
+    }
+    matrix = matrix.then(resolved_transform_property_matrix(
+        style,
+        rect,
+        root_font_size,
+        viewport,
+    ));
+    if matrix.is_identity() {
+        return matrix;
+    }
+    let (origin_x, origin_y) = style.transform_origin.unwrap_or((
+        crate::Dimension::Percent(0.5),
+        crate::Dimension::Percent(0.5),
+    ));
+    matrix.around((
+        rect.x + resolve_translate(origin_x, rect.width),
+        rect.y + resolve_translate(origin_y, rect.height),
+    ))
+}
+
+/// Resolved value of the `transform` property alone. Individual transform
+/// properties and `transform-origin` are intentionally excluded: CSSOM
+/// serializes them as separate computed properties.
+pub(crate) fn resolved_transform_property_matrix(
+    style: &crate::LayoutStyle,
+    rect: &Rect,
+    root_font_size: f32,
+    viewport: (f32, f32),
+) -> crate::Affine2 {
+    let mut matrix = crate::Affine2::IDENTITY;
+    for operation in &style.transform_ops {
+        let operation = match operation {
+            crate::TransformOp::Translate(x, y) => crate::Affine2::translate(
+                resolve_transform_length(x, 0, style, rect, root_font_size, viewport),
+                resolve_transform_length(y, 1, style, rect, root_font_size, viewport),
+            ),
+            crate::TransformOp::Scale(x, y) => crate::Affine2::scale(*x, *y),
+            crate::TransformOp::Rotate(angle) => crate::Affine2::rotate(*angle),
+            crate::TransformOp::Skew(x, y) => crate::Affine2::skew(*x, *y),
+            crate::TransformOp::Matrix(matrix) => *matrix,
+        };
+        matrix = matrix.then(operation);
+    }
+    matrix
 }
 
 /// The CSS overflow clip is the padding box, not the outer border box. This is
@@ -4086,6 +4177,7 @@ fn layout_dom_once(
 
     let mut clip_rects = HashMap::new();
     let mut translates = HashMap::new();
+    let mut transforms = HashMap::new();
     if let Some(root_id) = root {
         let root_font_size = styles
             .get(&root_id)
@@ -4101,6 +4193,8 @@ fn layout_dom_once(
             &styles,
             &mut clip_rects,
             &mut translates,
+            crate::Affine2::IDENTITY,
+            &mut transforms,
             root_font_size,
             viewport,
         );
@@ -4211,6 +4305,7 @@ fn layout_dom_once(
             custom_properties,
             clip_rects,
             translates,
+            transforms,
             text_runs,
             #[cfg(feature = "paint")]
             text_engine: engine,
@@ -6514,9 +6609,10 @@ fn pseudo_requires_generated_box(style: &crate::LayoutStyle, content: Option<&st
         || style.box_shadow.is_some()
         || !style.border_model.radii.is_zero()
         || style.overflow_hidden
-        || style.transform_translate.is_some()
+        || !style.transform_ops.is_empty()
         || style.individual_translate.is_some()
-        || style.transform_scale.is_some()
+        || style.individual_rotate.is_some()
+        || style.individual_scale.is_some()
 }
 
 fn has_in_flow_generated_pseudo(pseudo: Option<&crate::LayoutStyle>) -> bool {

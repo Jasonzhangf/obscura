@@ -176,6 +176,160 @@ pub struct Rect {
     pub height: f32,
 }
 
+/// One two-dimensional affine transform in CSS pixel coordinates.
+///
+/// The six components use the CSS `matrix(a,b,c,d,e,f)` convention:
+/// `x' = a*x + c*y + e`, `y' = b*x + d*y + f`. Keeping this renderer-owned
+/// type independent of the raster backend lets layout geometry, scrolling
+/// overflow, CSSOM, and paint consume exactly the same resolved transform.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Affine2 {
+    pub a: f32,
+    pub b: f32,
+    pub c: f32,
+    pub d: f32,
+    pub e: f32,
+    pub f: f32,
+}
+
+impl Default for Affine2 {
+    fn default() -> Self {
+        Self::IDENTITY
+    }
+}
+
+impl Affine2 {
+    pub const IDENTITY: Self = Self {
+        a: 1.0,
+        b: 0.0,
+        c: 0.0,
+        d: 1.0,
+        e: 0.0,
+        f: 0.0,
+    };
+
+    /// Compose `self(other(point))`.
+    pub fn then(self, other: Self) -> Self {
+        Self {
+            a: self.a * other.a + self.c * other.b,
+            b: self.b * other.a + self.d * other.b,
+            c: self.a * other.c + self.c * other.d,
+            d: self.b * other.c + self.d * other.d,
+            e: self.a * other.e + self.c * other.f + self.e,
+            f: self.b * other.e + self.d * other.f + self.f,
+        }
+    }
+
+    pub fn translate(x: f32, y: f32) -> Self {
+        Self { e: x, f: y, ..Self::IDENTITY }
+    }
+
+    pub fn scale(x: f32, y: f32) -> Self {
+        Self { a: x, d: y, ..Self::IDENTITY }
+    }
+
+    pub fn rotate(degrees: f32) -> Self {
+        let (sin, cos) = degrees.to_radians().sin_cos();
+        Self { a: cos, b: sin, c: -sin, d: cos, e: 0.0, f: 0.0 }
+    }
+
+    pub fn skew(x_degrees: f32, y_degrees: f32) -> Self {
+        Self {
+            a: 1.0,
+            b: y_degrees.to_radians().tan(),
+            c: x_degrees.to_radians().tan(),
+            d: 1.0,
+            e: 0.0,
+            f: 0.0,
+        }
+    }
+
+    pub fn around(self, origin: (f32, f32)) -> Self {
+        Self::translate(origin.0, origin.1)
+            .then(self)
+            .then(Self::translate(-origin.0, -origin.1))
+    }
+
+    pub fn map_point(self, x: f32, y: f32) -> (f32, f32) {
+        (self.a * x + self.c * y + self.e, self.b * x + self.d * y + self.f)
+    }
+
+    pub fn map_rect(self, rect: Rect) -> Rect {
+        let points = [
+            self.map_point(rect.x, rect.y),
+            self.map_point(rect.x + rect.width, rect.y),
+            self.map_point(rect.x, rect.y + rect.height),
+            self.map_point(rect.x + rect.width, rect.y + rect.height),
+        ];
+        let left = points.iter().map(|point| point.0).fold(f32::INFINITY, f32::min);
+        let top = points.iter().map(|point| point.1).fold(f32::INFINITY, f32::min);
+        let right = points.iter().map(|point| point.0).fold(f32::NEG_INFINITY, f32::max);
+        let bottom = points.iter().map(|point| point.1).fold(f32::NEG_INFINITY, f32::max);
+        Rect {
+            x: left,
+            y: top,
+            width: (right - left).max(0.0),
+            height: (bottom - top).max(0.0),
+        }
+    }
+
+    pub fn inverse(self) -> Option<Self> {
+        let determinant = self.a * self.d - self.b * self.c;
+        if !determinant.is_finite() || determinant.abs() < 1.0e-8 {
+            return None;
+        }
+        let inverse = 1.0 / determinant;
+        Some(Self {
+            a: self.d * inverse,
+            b: -self.b * inverse,
+            c: -self.c * inverse,
+            d: self.a * inverse,
+            e: (self.c * self.f - self.d * self.e) * inverse,
+            f: (self.b * self.e - self.a * self.f) * inverse,
+        })
+    }
+
+    pub fn is_identity(self) -> bool {
+        (self.a - 1.0).abs() < f32::EPSILON
+            && self.b.abs() < f32::EPSILON
+            && self.c.abs() < f32::EPSILON
+            && (self.d - 1.0).abs() < f32::EPSILON
+            && self.e.abs() < f32::EPSILON
+            && self.f.abs() < f32::EPSILON
+    }
+
+    pub fn is_translation(self) -> bool {
+        (self.a - 1.0).abs() < f32::EPSILON
+            && self.b.abs() < f32::EPSILON
+            && self.c.abs() < f32::EPSILON
+            && (self.d - 1.0).abs() < f32::EPSILON
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct TransformLength {
+    pub value: Dimension,
+    pub expression: Option<String>,
+}
+
+impl TransformLength {
+    pub fn px(value: f32) -> Self {
+        Self { value: Dimension::Px(value), expression: None }
+    }
+}
+
+/// One authored operation in a `transform` function list. Source order is
+/// significant and is intentionally retained until the final reference box
+/// resolves percentage translations.
+#[derive(Clone, Debug)]
+pub enum TransformOp {
+    Translate(TransformLength, TransformLength),
+    Scale(f32, f32),
+    Rotate(f32),
+    Skew(f32, f32),
+    Matrix(Affine2),
+}
+
 impl Rect {
     /// The overlap of two rects, or `None` if they do not intersect (or the
     /// overlap is degenerate). Used to accumulate an ancestor clip chain for
@@ -993,35 +1147,25 @@ pub struct LayoutStyle {
     /// `Fill` (default) stretches to the box, the rest preserve aspect ratio.
     /// Only consulted in the image paint path.
     pub object_fit: ObjectFit,
-    /// `transform: translate(x[, y])` / `translateX` / `translateY`, stored
-    /// unresolved as (dx, dy). Applied at paint time as an offset to the
-    /// element's own box AND its whole descendant subtree; percentages resolve
-    /// against the element's own border-box size then. This is what makes the
-    /// canonical `translate(-50%,-50%)` centering of an absolutely-positioned
-    /// box land in the right place, and moves a `translate(-9999px,0)`
-    /// off-screen skip-link out of view instead of painting it on-screen. Not
-    /// inherited (transform is a non-inherited property).
-    pub transform_translate: Option<(Dimension, Dimension)>,
+    /// Ordered operations in the non-inherited `transform` property. Length
+    /// percentages remain unresolved until the final border box is known.
+    pub transform_ops: Vec<TransformOp>,
     /// Individual CSS `translate` property. This composes independently with
     /// the legacy `transform` property, so `transform:none` must not clear it.
     /// Functional values are retained separately until the final border box
     /// is known because percentages resolve against that box's own axes.
     pub individual_translate: Option<(Dimension, Dimension)>,
     pub individual_translate_expressions: [Option<String>; 2],
+    /// Individual CSS `rotate` property, in degrees. It composes after
+    /// individual translate and before individual scale and `transform`.
+    pub individual_rotate: Option<f32>,
+    /// Individual CSS `scale` property. Kept separate from `transform` so
+    /// declaration order cannot accidentally overwrite either property.
+    pub individual_scale: Option<(f32, f32)>,
     /// Independent CSS-property triggers that establish containing blocks for
     /// absolute and fixed descendants. Kept as a bitset so `filter:none`
     /// cannot clear a transform/containment trigger from another property.
     pub containing_block_triggers: u16,
-    /// `transform: scale(sx[, sy])` / `scaleX` / `scaleY`, or the individual
-    /// `scale` property, captured as (sx, sy). Raster-image paint applies it to
-    /// the element's subtree together with [`LayoutStyle::transform_projection`].
-    pub transform_scale: Option<(f32, f32)>,
-    /// The affine x/y projection of authored `rotate`, `rotateX`, `rotateY`,
-    /// and `rotateZ` transform functions. CSS transforms without perspective
-    /// remain affine when their input plane has z=0, so this preserves modern
-    /// 3D-tilted image cards without introducing a full scene graph.
-    /// Stored as `[a, b, c, d]` for `x'=a*x+c*y`, `y'=b*x+d*y`.
-    pub transform_projection: Option<[f32; 4]>,
     /// Authored `transform-origin`, unresolved so percentages use the final
     /// border-box dimensions. `None` is the CSS initial value, 50% 50%.
     pub transform_origin: Option<(Dimension, Dimension)>,
@@ -1060,6 +1204,8 @@ pub(crate) const CB_TRIGGER_CONTAIN: u16 = 1 << 4;
 pub(crate) const CB_TRIGGER_WILL_CHANGE: u16 = 1 << 5;
 pub(crate) const CB_TRIGGER_CONTENT_VISIBILITY: u16 = 1 << 6;
 pub(crate) const CB_TRIGGER_TRANSLATE: u16 = 1 << 7;
+pub(crate) const CB_TRIGGER_ROTATE: u16 = 1 << 8;
+pub(crate) const CB_TRIGGER_SCALE: u16 = 1 << 9;
 
 impl LayoutStyle {
     /// Whether CSS box sizes compute normally but do not apply to this box's
