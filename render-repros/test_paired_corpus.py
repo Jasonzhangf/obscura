@@ -138,7 +138,9 @@ class ControlledScrollTests(unittest.TestCase):
         self.assertIn("outer_html_fnv1a32", expression)
         self.assertIn("data-obscura-external-stylesheets", expression)
         self.assertIn("normalized_outer_html_fnv1a32", expression)
-        self.assertIn("visible_text_fnv1a32", expression)
+        self.assertIn("body_text_fnv1a32", expression)
+        self.assertIn("body.textContent", expression)
+        self.assertNotIn("body.innerText", expression)
         self.assertIn("injectedStyles.reduce", expression)
         self.assertNotIn("cloneNode", expression)
         self.assertNotIn("window.scrollTo", expression)
@@ -186,10 +188,10 @@ class ControlledScrollTests(unittest.TestCase):
                 "element_count": 9,
                 "outer_html_utf16": 100,
                 "normalized_outer_html_utf16": 90,
-                "visible_text_utf16": 30,
+                "body_text_utf16": 30,
                 "outer_html_fnv1a32": "aaaaaaaa",
                 "normalized_outer_html_fnv1a32": "dddddddd",
-                "visible_text_fnv1a32": "bbbbbbbb",
+                "body_text_fnv1a32": "bbbbbbbb",
             },
             "geometry": {"document_scroll_height": 1200, "scroll_y": 300},
         }
@@ -199,10 +201,10 @@ class ControlledScrollTests(unittest.TestCase):
                 "element_count": 7,
                 "outer_html_utf16": 95,
                 "normalized_outer_html_utf16": 90,
-                "visible_text_utf16": 30,
+                "body_text_utf16": 30,
                 "outer_html_fnv1a32": "cccccccc",
                 "normalized_outer_html_fnv1a32": "dddddddd",
-                "visible_text_fnv1a32": "bbbbbbbb",
+                "body_text_fnv1a32": "bbbbbbbb",
             },
             "geometry": {"document_scroll_height": 1000, "scroll_y": 250},
         }
@@ -212,7 +214,7 @@ class ControlledScrollTests(unittest.TestCase):
         self.assertFalse(comparison["outer_html_fingerprint_equal"])
         self.assertTrue(comparison["normalized_outer_html_fingerprint_equal"])
         self.assertEqual(comparison["normalized_outer_html_utf16_delta"], 0)
-        self.assertTrue(comparison["visible_text_fingerprint_equal"])
+        self.assertTrue(comparison["body_text_fingerprint_equal"])
         self.assertEqual(
             comparison["geometry_delta"]["document_scroll_height"], 200
         )
@@ -229,7 +231,7 @@ class GeometryProbeTests(unittest.TestCase):
         return {
             "document": {
                 "outer_html_sha256": "outer",
-                "visible_text_sha256": "text",
+                "body_text_sha256": "text",
             },
             "geometry_probes": [],
         }
@@ -247,6 +249,7 @@ class GeometryProbeTests(unittest.TestCase):
         obscura_expression = paired_corpus.obscura_state_eval_expression(None)
         self.assertNotIn("sampleGeometrySelector", obscura_expression)
         self.assertNotIn("geometry_probes", obscura_expression)
+        self.assertIn("feature_probes:featureProbes", obscura_expression)
 
         page = self.FakePage(self.chromium_state())
         paired_corpus.capture_chromium_state(page)
@@ -255,6 +258,7 @@ class GeometryProbeTests(unittest.TestCase):
         self.assertEqual(args, ())
         self.assertNotIn("sampleGeometrySelector", expression)
         self.assertNotIn("geometry_probes", expression)
+        self.assertIn("feature_probes: featureProbes", expression)
         self.assertNotIn("async ", expression)
         self.assertNotIn("await ", expression)
         self.assertNotIn("crypto.subtle", expression)
@@ -263,13 +267,107 @@ class GeometryProbeTests(unittest.TestCase):
             expression,
         )
 
+    def test_feature_discovery_is_bounded_selector_free_and_avoids_nested_scroll(self):
+        expression = paired_corpus.feature_probe_javascript("no quads")
+        self.assertIn(
+            f"Math.min(featureProbeElements.length,{paired_corpus.FEATURE_PROBE_SCAN_LIMIT})",
+            expression,
+        )
+        self.assertIn(
+            f"category.candidates.length<{paired_corpus.FEATURE_PROBE_CANDIDATE_LIMIT}",
+            expression,
+        )
+        self.assertIn("style.transform!=='none'", expression)
+        self.assertIn("style.translate!=='none'", expression)
+        self.assertIn("style.rotate!=='none'", expression)
+        self.assertIn("style.scale!=='none'", expression)
+        self.assertIn("style.perspective!=='none'", expression)
+        self.assertIn("style.textOverflow!=='clip'", expression)
+        self.assertIn("style.webkitLineClamp!=='none'", expression)
+        self.assertIn("box_quads:null", expression)
+        self.assertIn("comparison_index:comparisonIndex", expression)
+        self.assertIn("data-obscura-external-stylesheets", expression)
+        self.assertNotIn("querySelector", expression)
+        self.assertNotIn("scrollWidth", expression)
+        self.assertNotIn("scrollHeight", expression)
+        self.assertNotIn("clientWidth", expression)
+        self.assertNotIn("clientHeight", expression)
+
+    def test_obscura_records_quad_capability_instead_of_fabricated_corners(self):
+        expression = paired_corpus.obscura_state_eval_expression(None)
+        self.assertIn(
+            "Obscura CLI capture does not expose node-scoped CDP",
+            expression,
+        )
+        self.assertIn("box_quads:null", expression)
+        self.assertNotIn("rect.left,rect.top,rect.right", expression)
+
+    def test_chromium_cdp_attaches_content_and_border_quads_once_per_element(self):
+        class FakeSession:
+            def __init__(self):
+                self.calls = []
+
+            def send(self, method, params):
+                self.calls.append((method, params))
+                if method == "Runtime.evaluate":
+                    return {"result": {"objectId": "candidate-7"}}
+                if method == "DOM.getBoxModel":
+                    return {
+                        "model": {
+                            "content": [1, 2, 3, 2, 3, 4, 1, 4],
+                            "border": [0, 1, 4, 1, 4, 5, 0, 5],
+                        }
+                    }
+                return {}
+
+        transform = {"dom_index": 7, "box_quads": None}
+        truncation = {"dom_index": 7, "box_quads": None}
+        state = {
+            "feature_probes": {
+                "categories": {
+                    "transform": {"candidates": [transform]},
+                    "text_truncation": {"candidates": [truncation]},
+                }
+            }
+        }
+        session = FakeSession()
+        paired_corpus.attach_chromium_box_quads(session, state)
+        methods = [method for method, _ in session.calls]
+        self.assertEqual(methods.count("Runtime.evaluate"), 1)
+        self.assertEqual(methods.count("DOM.getBoxModel"), 1)
+        self.assertEqual(methods.count("Runtime.releaseObjectGroup"), 1)
+        self.assertEqual(
+            transform["box_quads"]["content"],
+            [1, 2, 3, 2, 3, 4, 1, 4],
+        )
+        self.assertEqual(transform["box_quads"], truncation["box_quads"])
+        capability = state["feature_probes"]["box_quads"]
+        self.assertTrue(capability["available"])
+        self.assertEqual(capability["attempted_candidates"], 1)
+        self.assertEqual(capability["captured_candidates"], 1)
+        self.assertEqual(capability["coordinate_space"], "viewport-css-px")
+
+    def test_missing_chromium_cdp_session_leaves_quads_null(self):
+        candidate = {"dom_index": 2, "box_quads": None}
+        state = {
+            "feature_probes": {
+                "categories": {"transform": {"candidates": [candidate]}}
+            }
+        }
+        paired_corpus.prepare_chromium_feature_probes(state, None)
+        self.assertIsNone(candidate["box_quads"])
+        capability = state["feature_probes"]["box_quads"]
+        self.assertFalse(capability["available"])
+        self.assertIsNone(capability["source"])
+        self.assertIn("did not receive a CDP session", capability["reason"])
+
     def test_chromium_snapshot_paints_before_host_hashing(self):
         events = []
         first_state = {
             "_hash_sources": {
                 "dom": "<html></html>",
                 "normalized_dom": "<html></html>",
-                "visible_text": "hello",
+                "body_text": "hello",
             },
             "document": {},
         }
@@ -277,7 +375,7 @@ class GeometryProbeTests(unittest.TestCase):
             "_hash_sources": {
                 "dom": "<html></html>",
                 "normalized_dom": "<html></html>",
-                "visible_text": "hello",
+                "body_text": "hello",
             },
             "document": {},
         }
@@ -323,7 +421,7 @@ class GeometryProbeTests(unittest.TestCase):
             hashlib.sha256(b"<html></html>").hexdigest(),
         )
         self.assertEqual(
-            captured["document"]["visible_text_sha256"],
+            captured["document"]["body_text_sha256"],
             hashlib.sha256(b"hello").hexdigest(),
         )
 
@@ -477,6 +575,100 @@ class GeometryProbeTests(unittest.TestCase):
         self.assertEqual(comparison[1]["valid"], {"obscura": False, "chromium": False})
         self.assertIsNone(comparison[1]["counts"]["delta"])
         self.assertEqual(comparison[1]["rects_compared"], 0)
+
+    def test_feature_comparison_reports_presence_computed_geometry_and_quad_capability(self):
+        obscura = {
+            "feature_probes": {
+                "bounds": {"scan_limit": 2000},
+                "scanned_elements": 12,
+                "scan_truncated": False,
+                "box_quads": {
+                    "available": False,
+                    "source": None,
+                    "reason": "CLI has no node-scoped CDP",
+                },
+                "categories": {
+                    "transform": {
+                        "matches_seen": 1,
+                        "candidates_truncated": False,
+                        "candidates": [
+                            {
+                                "dom_index": 4,
+                                "candidate_reasons": ["transform"],
+                                "x": 12,
+                                "y": 18,
+                                "width": 30,
+                                "height": 40,
+                                "visible": True,
+                                "computed": {
+                                    "transform": "matrix(1, 0, 0, 1, 2, 0)"
+                                },
+                                "box_quads": None,
+                            }
+                        ],
+                    }
+                },
+            }
+        }
+        chromium = {
+            "feature_probes": {
+                "bounds": {"scan_limit": 2000},
+                "scanned_elements": 12,
+                "scan_truncated": False,
+                "box_quads": {
+                    "available": True,
+                    "source": "cdp.DOM.getBoxModel",
+                },
+                "categories": {
+                    "transform": {
+                        "matches_seen": 2,
+                        "candidates_truncated": False,
+                        "candidates": [
+                            {
+                                "dom_index": 4,
+                                "candidate_reasons": ["transform"],
+                                "x": 10,
+                                "y": 20,
+                                "width": 30,
+                                "height": 39,
+                                "visible": True,
+                                "computed": {
+                                    "transform": "matrix(1, 0, 0, 1, 0, 0)"
+                                },
+                                "box_quads": {
+                                    "coordinate_space": "viewport-css-px",
+                                    "content": [10, 20, 40, 20, 40, 59, 10, 59],
+                                    "border": [10, 20, 40, 20, 40, 59, 10, 59],
+                                },
+                            },
+                            {
+                                "dom_index": 8,
+                                "candidate_reasons": ["rotate"],
+                                "computed": {"rotate": "10deg"},
+                                "box_quads": None,
+                            },
+                        ],
+                    }
+                },
+            }
+        }
+        comparison = paired_corpus.compare_feature_probes(obscura, chromium)
+        category = comparison["categories"][0]
+        self.assertEqual(category["kind"], "transform")
+        self.assertEqual(category["matches_seen"]["delta"], -1)
+        first = category["candidates"][0]
+        self.assertEqual(
+            first["geometry_delta"],
+            {"x": 2, "y": -2, "width": 0, "height": 1},
+        )
+        self.assertEqual(first["computed_difference_count"], 1)
+        self.assertFalse(first["box_quads"]["obscura_available"])
+        self.assertTrue(first["box_quads"]["chromium_available"])
+        self.assertIsNone(first["box_quads"]["content_delta"])
+        second = category["candidates"][1]
+        self.assertEqual(
+            second["present"], {"obscura": False, "chromium": True}
+        )
 
 
 class AnimationSamplingTests(unittest.TestCase):

@@ -63,6 +63,8 @@ BRAND_PERMUTATIONS = [
     [2, 1, 0],
 ]
 GEOMETRY_PROBE_RECT_LIMIT = 200
+FEATURE_PROBE_SCAN_LIMIT = 2000
+FEATURE_PROBE_CANDIDATE_LIMIT = 40
 CAPTURE_BOUNDARY_PHASE = "capture-boundary-before-screenshot"
 RESOURCE_WARMUP_PHASE = "before-final-scroll-reassert-and-state-sample"
 
@@ -164,6 +166,102 @@ def geometry_probe_javascript(selectors_expression):
         "error:{name:error&&error.name?String(error.name):'Error',"
         "message:error&&error.message?String(error.message):String(error)}};}};"
         f"const geometryProbes={selectors_expression}.map(sampleGeometrySelector);"
+    )
+
+
+def feature_probe_javascript(box_quad_unavailable_reason):
+    """Return bounded selector-free transform/truncation discovery JavaScript."""
+    return (
+        "const featureProbeElements=document.getElementsByTagName('*');"
+        "const featureProbeScanned=Math.min(featureProbeElements.length,"
+        f"{FEATURE_PROBE_SCAN_LIMIT}"
+        ");"
+        "const featureProbeCategories={"
+        "transform:{matches_seen:0,candidates:[]},"
+        "text_truncation:{matches_seen:0,candidates:[]}};"
+        "const featureProbeCandidate=(kind,element,domIndex,comparisonIndex,"
+        "style,reasons)=>{"
+        "const rect=element.getBoundingClientRect();"
+        "const opacity=Number.parseFloat(style.opacity);"
+        "const clientRectCount=element.getClientRects().length;"
+        "const common={display:style.display,position:style.position,"
+        "visibility:style.visibility,opacity:style.opacity,"
+        "overflow_x:style.overflowX,overflow_y:style.overflowY};"
+        "const computed=kind==='transform'?Object.assign(common,{"
+        "transform:style.transform,transform_origin:style.transformOrigin,"
+        "transform_box:style.transformBox,translate:style.translate,"
+        "rotate:style.rotate,scale:style.scale,"
+        "perspective:style.perspective,"
+        "perspective_origin:style.perspectiveOrigin}):Object.assign(common,{"
+        "white_space:style.whiteSpace,text_overflow:style.textOverflow,"
+        "webkit_line_clamp:style.webkitLineClamp,"
+        "webkit_box_orient:style.webkitBoxOrient,"
+        "line_height:style.lineHeight,height:style.height,"
+        "max_height:style.maxHeight});"
+        "return {kind:kind,dom_index:domIndex,"
+        "comparison_index:comparisonIndex,candidate_reasons:reasons,"
+        "dom:{tag:String(element.tagName||'').toLowerCase(),"
+        "id:element.id||'',class_name:typeof element.className==='string'"
+        "?element.className:''},x:rect.left,y:rect.top,width:rect.width,"
+        "height:rect.height,visible:clientRectCount>0&&rect.width>0"
+        "&&rect.height>0&&style.display!=='none'"
+        "&&style.visibility!=='hidden'&&style.visibility!=='collapse'"
+        "&&(!Number.isFinite(opacity)||opacity>0),"
+        "client_rect_count:clientRectCount,computed:computed,box_quads:null};};"
+        "let featureProbeComparisonIndex=0;"
+        "for(let domIndex=0;domIndex<featureProbeScanned;domIndex++){"
+        "const element=featureProbeElements[domIndex];"
+        "const obscuraStyleMirror=element.tagName==='STYLE'&&"
+        "(element.hasAttribute('data-obscura-external-stylesheets')||"
+        "element.hasAttribute('data-obscura-linked'));"
+        "if(obscuraStyleMirror)continue;"
+        "const comparisonIndex=featureProbeComparisonIndex++;"
+        "const style=getComputedStyle(element);"
+        "const transformReasons=[];"
+        "if(style.transform&&style.transform!=='none')"
+        "transformReasons.push('transform');"
+        "if(style.translate&&style.translate!=='none')"
+        "transformReasons.push('translate');"
+        "if(style.rotate&&style.rotate!=='none')"
+        "transformReasons.push('rotate');"
+        "if(style.scale&&style.scale!=='none')"
+        "transformReasons.push('scale');"
+        "if(style.perspective&&style.perspective!=='none')"
+        "transformReasons.push('perspective');"
+        "if(transformReasons.length){"
+        "const category=featureProbeCategories.transform;"
+        "category.matches_seen++;"
+        f"if(category.candidates.length<{FEATURE_PROBE_CANDIDATE_LIMIT})"
+        "category.candidates.push(featureProbeCandidate("
+        "'transform',element,domIndex,comparisonIndex,style,transformReasons));}"
+        "const truncationReasons=[];"
+        "if(style.textOverflow&&style.textOverflow!=='clip')"
+        "truncationReasons.push('text-overflow');"
+        "if(style.webkitLineClamp&&style.webkitLineClamp!=='none')"
+        "truncationReasons.push('-webkit-line-clamp');"
+        "if(truncationReasons.length){"
+        "const category=featureProbeCategories.text_truncation;"
+        "category.matches_seen++;"
+        f"if(category.candidates.length<{FEATURE_PROBE_CANDIDATE_LIMIT})"
+        "category.candidates.push(featureProbeCandidate("
+        "'text_truncation',element,domIndex,comparisonIndex,style,"
+        "truncationReasons));}}"
+        "for(const category of Object.values(featureProbeCategories)){"
+        "category.candidates_truncated=category.matches_seen>"
+        f"{FEATURE_PROBE_CANDIDATE_LIMIT}"
+        ";}"
+        "const featureProbes={version:1,bounds:{scan_limit:"
+        f"{FEATURE_PROBE_SCAN_LIMIT},candidate_limit_per_category:"
+        f"{FEATURE_PROBE_CANDIDATE_LIMIT}"
+        "},scanned_elements:featureProbeScanned,"
+        "comparable_scanned_elements:featureProbeComparisonIndex,"
+        "scan_truncated:featureProbeElements.length>featureProbeScanned,"
+        "total_elements:featureProbeElements.length,"
+        "categories:featureProbeCategories,box_quads:{available:false,"
+        "source:null,coordinate_space:null,attempted_candidates:0,"
+        "captured_candidates:0,failures:[],reason:"
+        f"{json.dumps(box_quad_unavailable_reason)}"
+        "}};"
     )
 
 
@@ -318,15 +416,20 @@ def obscura_state_eval_expression(
         ")):[];"
         "const normalizedDom=injectedStyles.reduce((html,node)=>"
         "typeof node.outerHTML==='string'?html.replace(node.outerHTML,''):html,dom);"
-        "const text=body?body.innerText.replace(/\\s+/g,' ').trim():'';"
+        "const bodyText=body?(body.textContent||'').replace(/\\s+/g,' ').trim():'';"
         "const images=Array.from(document.images||[]),fonts=document.fonts;"
         "const hash=value=>{let h=2166136261;"
         "for(let i=0;i<value.length;i++){h^=value.charCodeAt(i);"
         "h=Math.imul(h,16777619)}"
         "return ('00000000'+(h>>>0).toString(16)).slice(-8)};"
+        + feature_probe_javascript(
+            "Obscura CLI capture does not expose node-scoped CDP "
+            "DOM.getBoxModel at the screenshot boundary"
+        )
         + geometry_setup
         + "return JSON.stringify({"
         f"sampled_phase:{json.dumps(sampled_phase)},"
+        "feature_probes:featureProbes,"
         + geometry_result
         + f"requested:{requested},"
         + f"controlled_scroll:{controlled_scroll_result},"
@@ -336,7 +439,7 @@ def obscura_state_eval_expression(
         "outer_html_utf16:dom.length,outer_html_fnv1a32:hash(dom),"
         "normalized_outer_html_utf16:normalizedDom.length,"
         "normalized_outer_html_fnv1a32:hash(normalizedDom),"
-        "visible_text_utf16:text.length,visible_text_fnv1a32:hash(text)},"
+        "body_text_utf16:bodyText.length,body_text_fnv1a32:hash(bodyText)},"
         "geometry:{inner_width:innerWidth,inner_height:innerHeight,"
         "scroll_x:scrollX,scroll_y:scrollY,"
         "document_client_width:root?root.clientWidth:null,"
@@ -760,8 +863,8 @@ def capture_chromium_state(page, geometry_selectors=None):
               : html,
             dom
           );
-          const visibleText = body ? body.innerText : "";
-          const normalizedText = visibleText.replace(/\\s+/g, " ").trim();
+          const bodyText = body ? (body.textContent || "") : "";
+          const normalizedBodyText = bodyText.replace(/\\s+/g, " ").trim();
           const images = Array.from(document.images || []);
           const fonts = document.fonts;
           const media = {
@@ -778,7 +881,7 @@ def capture_chromium_state(page, geometry_selectors=None):
             _hash_sources: {
               dom,
               normalized_dom: normalizedDom,
-              visible_text: normalizedText
+              body_text: normalizedBodyText
             },
             sampled_phase: __CAPTURE_BOUNDARY_PHASE__,
             url: location.href,
@@ -804,9 +907,9 @@ def capture_chromium_state(page, geometry_selectors=None):
               normalized_outer_html_fnv1a32: fnv1a32(normalizedDom),
               normalized_outer_html_bytes:
                 new TextEncoder().encode(normalizedDom).length,
-              visible_text_utf16: normalizedText.length,
-              visible_text_fnv1a32: fnv1a32(normalizedText),
-              visible_text_bytes: new TextEncoder().encode(normalizedText).length,
+              body_text_utf16: normalizedBodyText.length,
+              body_text_fnv1a32: fnv1a32(normalizedBodyText),
+              body_text_bytes: new TextEncoder().encode(normalizedBodyText).length,
             },
             geometry: {
               inner_width: innerWidth,
@@ -861,6 +964,20 @@ def capture_chromium_state(page, geometry_selectors=None):
     expression = expression.replace(
         "__CAPTURE_BOUNDARY_PHASE__", json.dumps(CAPTURE_BOUNDARY_PHASE), 1
     )
+    expression = expression.replace(
+        "          const root = document.documentElement;",
+        feature_probe_javascript(
+            "Chromium CDP box quads have not been attached by the capture adapter"
+        )
+        + "          const root = document.documentElement;",
+        1,
+    )
+    expression = expression.replace(
+        "          return {\n            _hash_sources:",
+        "          return {\n            feature_probes: featureProbes,\n"
+        "            _hash_sources:",
+        1,
+    )
     if geometry_selectors:
         expression = expression.replace(
             "() => {", "geometrySelectors => {", 1
@@ -872,8 +989,10 @@ def capture_chromium_state(page, geometry_selectors=None):
             1,
         )
         expression = expression.replace(
-            "          return {\n            _hash_sources:",
+            "          return {\n            feature_probes: featureProbes,\n"
+            "            _hash_sources:",
             '          return {\n            geometry_probes: geometryProbes,\n'
+            "            feature_probes: featureProbes,\n"
             "            _hash_sources:",
             1,
         )
@@ -894,10 +1013,120 @@ def finalize_chromium_state_hashes(state):
         document_state["normalized_outer_html_sha256"] = hashlib.sha256(
             hash_sources["normalized_dom"].encode()
         ).hexdigest()
-        document_state["visible_text_sha256"] = hashlib.sha256(
-            hash_sources["visible_text"].encode()
+        document_state["body_text_sha256"] = hashlib.sha256(
+            hash_sources["body_text"].encode()
         ).hexdigest()
     return state
+
+
+def attach_chromium_box_quads(session, state):
+    """Attach truthful CDP box-model quads to selector-free candidates.
+
+    DOM.getBoxModel reports viewport-space quads after transforms. Keep these
+    distinct from getBoundingClientRect's viewport-space axis-aligned box.
+    """
+    feature_probes = state.get("feature_probes") or {}
+    categories = feature_probes.get("categories") or {}
+    candidates = [
+        candidate
+        for category in categories.values()
+        for candidate in (category.get("candidates") or [])
+    ]
+    unique_indices = sorted(
+        {
+            candidate.get("dom_index")
+            for candidate in candidates
+            if isinstance(candidate.get("dom_index"), int)
+        }
+    )
+    capability = {
+        "available": True,
+        "source": "cdp.DOM.getBoxModel",
+        "coordinate_space": "viewport-css-px",
+        "attempted_candidates": len(unique_indices),
+        "captured_candidates": 0,
+        "failures": [],
+        "reason": None,
+    }
+    models = {}
+    object_group = "obscura-parity-feature-probes"
+    try:
+        for dom_index in unique_indices:
+            try:
+                remote = session.send(
+                    "Runtime.evaluate",
+                    {
+                        "expression": (
+                            "document.getElementsByTagName('*')["
+                            f"{dom_index}]"
+                        ),
+                        "objectGroup": object_group,
+                        "returnByValue": False,
+                        "silent": True,
+                    },
+                ).get("result") or {}
+                object_id = remote.get("objectId")
+                if not object_id:
+                    raise RuntimeError("candidate did not resolve to a remote object")
+                model = session.send(
+                    "DOM.getBoxModel", {"objectId": object_id}
+                ).get("model") or {}
+                content = model.get("content")
+                border = model.get("border")
+                if not (
+                    isinstance(content, list)
+                    and len(content) == 8
+                    and isinstance(border, list)
+                    and len(border) == 8
+                ):
+                    raise RuntimeError("CDP returned an incomplete box model")
+                models[dom_index] = {
+                    "source": "cdp.DOM.getBoxModel",
+                    "coordinate_space": "viewport-css-px",
+                    "content": content,
+                    "border": border,
+                }
+                capability["captured_candidates"] += 1
+            except Exception as error:
+                capability["failures"].append(
+                    {
+                        "dom_index": dom_index,
+                        "name": type(error).__name__,
+                        "message": str(error),
+                    }
+                )
+    finally:
+        try:
+            session.send("Runtime.releaseObjectGroup", {"objectGroup": object_group})
+        except Exception:
+            pass
+    for candidate in candidates:
+        candidate["box_quads"] = models.get(candidate.get("dom_index"))
+    feature_probes["box_quads"] = capability
+    state["feature_probes"] = feature_probes
+    return state
+
+
+def mark_chromium_box_quads_unavailable(state):
+    """Record an absent CDP adapter explicitly; never synthesize AABB quads."""
+    feature_probes = state.get("feature_probes") or {}
+    feature_probes["box_quads"] = {
+        "available": False,
+        "source": None,
+        "coordinate_space": None,
+        "attempted_candidates": 0,
+        "captured_candidates": 0,
+        "failures": [],
+        "reason": "Chromium capture did not receive a CDP session",
+    }
+    state["feature_probes"] = feature_probes
+    return state
+
+
+def prepare_chromium_feature_probes(state, cdp_session):
+    if cdp_session is None:
+        return mark_chromium_box_quads_unavailable(state)
+    return attach_chromium_box_quads(cdp_session, state)
 
 
 def chromium_capture_signature(state):
@@ -936,6 +1165,32 @@ def chromium_capture_signature(state):
                 ],
             }
         )
+    feature_probes = state.get("feature_probes") or {}
+    feature_categories = {}
+    for kind, category in sorted((feature_probes.get("categories") or {}).items()):
+        feature_categories[kind] = {
+            "matches_seen": category.get("matches_seen"),
+            "candidates_truncated": category.get("candidates_truncated"),
+            "candidates": [
+                {
+                    key: candidate.get(key)
+                    for key in (
+                        "dom_index",
+                        "comparison_index",
+                        "candidate_reasons",
+                        "x",
+                        "y",
+                        "width",
+                        "height",
+                        "visible",
+                        "client_rect_count",
+                        "computed",
+                        "box_quads",
+                    )
+                }
+                for candidate in category.get("candidates") or []
+            ],
+        }
     return {
         "document": {
             key: document.get(key)
@@ -976,18 +1231,31 @@ def chromium_capture_signature(state):
             )
         },
         "geometry_probes": probes,
+        "feature_probes": {
+            "scanned_elements": feature_probes.get("scanned_elements"),
+            "comparable_scanned_elements": feature_probes.get(
+                "comparable_scanned_elements"
+            ),
+            "scan_truncated": feature_probes.get("scan_truncated"),
+            "total_elements": feature_probes.get("total_elements"),
+            "categories": feature_categories,
+        },
     }
 
 
-def capture_chromium_image(page, screenshot, geometry_selectors=None):
+def capture_chromium_image(
+    page, screenshot, geometry_selectors=None, cdp_session=None
+):
     """Bracket one Chromium PNG with synchronous capture-critical samples."""
     state = capture_chromium_state(page, geometry_selectors)
+    prepare_chromium_feature_probes(state, cdp_session)
     page.screenshot(
         path=str(screenshot),
         full_page=False,
         timeout=50000,
     )
     post_capture_state = capture_chromium_state(page, geometry_selectors)
+    prepare_chromium_feature_probes(post_capture_state, cdp_session)
     before_signature = chromium_capture_signature(state)
     after_signature = chromium_capture_signature(post_capture_state)
     post_capture_state.pop("_hash_sources", None)
@@ -1114,9 +1382,9 @@ def compare_page_states(obscura, chromium):
             obscura_document.get("outer_html_utf16"),
             chromium_document.get("outer_html_utf16"),
         ),
-        "visible_text_utf16_delta": delta(
-            obscura_document.get("visible_text_utf16"),
-            chromium_document.get("visible_text_utf16"),
+        "body_text_utf16_delta": delta(
+            obscura_document.get("body_text_utf16"),
+            chromium_document.get("body_text_utf16"),
         ),
         "outer_html_fingerprint_equal": (
             obscura_document.get("outer_html_fnv1a32") is not None
@@ -1132,10 +1400,10 @@ def compare_page_states(obscura, chromium):
             and obscura_document.get("normalized_outer_html_fnv1a32")
             == chromium_document.get("normalized_outer_html_fnv1a32")
         ),
-        "visible_text_fingerprint_equal": (
-            obscura_document.get("visible_text_fnv1a32") is not None
-            and obscura_document.get("visible_text_fnv1a32")
-            == chromium_document.get("visible_text_fnv1a32")
+        "body_text_fingerprint_equal": (
+            obscura_document.get("body_text_fnv1a32") is not None
+            and obscura_document.get("body_text_fnv1a32")
+            == chromium_document.get("body_text_fnv1a32")
         ),
         "geometry_delta": {
             field: delta(
@@ -1232,6 +1500,166 @@ def compare_geometry_probes(obscura, chromium):
             }
         )
     return comparisons
+
+
+def compare_feature_probes(obscura, chromium):
+    """Compare selector-free candidates by category and document element index."""
+    obscura_features = (obscura or {}).get("feature_probes") or {}
+    chromium_features = (chromium or {}).get("feature_probes") or {}
+    obscura_categories = obscura_features.get("categories") or {}
+    chromium_categories = chromium_features.get("categories") or {}
+
+    def numeric_delta(left, right):
+        if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+            return left - right
+        return None
+
+    def quad_delta(left, right):
+        if not (
+            isinstance(left, list)
+            and isinstance(right, list)
+            and len(left) == len(right) == 8
+            and all(isinstance(value, (int, float)) for value in left + right)
+        ):
+            return None
+        return [left[index] - right[index] for index in range(8)]
+
+    category_comparisons = []
+    for kind in sorted(set(obscura_categories) | set(chromium_categories)):
+        obscura_category = obscura_categories.get(kind) or {}
+        chromium_category = chromium_categories.get(kind) or {}
+        obscura_candidates = {
+            candidate.get("comparison_index", candidate.get("dom_index")): candidate
+            for candidate in obscura_category.get("candidates") or []
+            if isinstance(
+                candidate.get("comparison_index", candidate.get("dom_index")), int
+            )
+        }
+        chromium_candidates = {
+            candidate.get("comparison_index", candidate.get("dom_index")): candidate
+            for candidate in chromium_category.get("candidates") or []
+            if isinstance(
+                candidate.get("comparison_index", candidate.get("dom_index")), int
+            )
+        }
+        candidate_comparisons = []
+        for comparison_index in sorted(
+            set(obscura_candidates) | set(chromium_candidates)
+        ):
+            obscura_candidate = obscura_candidates.get(comparison_index)
+            chromium_candidate = chromium_candidates.get(comparison_index)
+            obscura_computed = (obscura_candidate or {}).get("computed") or {}
+            chromium_computed = (chromium_candidate or {}).get("computed") or {}
+            computed_differences = {
+                field: {
+                    "obscura": obscura_computed.get(field),
+                    "chromium": chromium_computed.get(field),
+                }
+                for field in sorted(set(obscura_computed) | set(chromium_computed))
+                if obscura_computed.get(field) != chromium_computed.get(field)
+            }
+            obscura_quads = (obscura_candidate or {}).get("box_quads") or {}
+            chromium_quads = (chromium_candidate or {}).get("box_quads") or {}
+            quad_spaces_equal = (
+                obscura_quads.get("coordinate_space") is not None
+                and obscura_quads.get("coordinate_space")
+                == chromium_quads.get("coordinate_space")
+            )
+            candidate_comparisons.append(
+                {
+                    "comparison_index": comparison_index,
+                    "dom_index": {
+                        "obscura": (obscura_candidate or {}).get("dom_index"),
+                        "chromium": (chromium_candidate or {}).get("dom_index"),
+                    },
+                    "present": {
+                        "obscura": obscura_candidate is not None,
+                        "chromium": chromium_candidate is not None,
+                    },
+                    "candidate_reasons": {
+                        "obscura": (obscura_candidate or {}).get(
+                            "candidate_reasons"
+                        ),
+                        "chromium": (chromium_candidate or {}).get(
+                            "candidate_reasons"
+                        ),
+                    },
+                    "geometry_delta": {
+                        field: numeric_delta(
+                            (obscura_candidate or {}).get(field),
+                            (chromium_candidate or {}).get(field),
+                        )
+                        for field in ("x", "y", "width", "height")
+                    },
+                    "visibility": {
+                        "obscura": (obscura_candidate or {}).get("visible"),
+                        "chromium": (chromium_candidate or {}).get("visible"),
+                    },
+                    "computed_difference_count": len(computed_differences),
+                    "computed_differences": computed_differences,
+                    "box_quads": {
+                        "obscura_available": bool(obscura_quads),
+                        "chromium_available": bool(chromium_quads),
+                        "coordinate_spaces_equal": quad_spaces_equal,
+                        "content_delta": (
+                            quad_delta(
+                                obscura_quads.get("content"),
+                                chromium_quads.get("content"),
+                            )
+                            if quad_spaces_equal
+                            else None
+                        ),
+                        "border_delta": (
+                            quad_delta(
+                                obscura_quads.get("border"),
+                                chromium_quads.get("border"),
+                            )
+                            if quad_spaces_equal
+                            else None
+                        ),
+                    },
+                }
+            )
+        obscura_seen = obscura_category.get("matches_seen")
+        chromium_seen = chromium_category.get("matches_seen")
+        category_comparisons.append(
+            {
+                "kind": kind,
+                "matches_seen": {
+                    "obscura": obscura_seen,
+                    "chromium": chromium_seen,
+                    "delta": numeric_delta(obscura_seen, chromium_seen),
+                },
+                "candidates_truncated": {
+                    "obscura": obscura_category.get("candidates_truncated"),
+                    "chromium": chromium_category.get("candidates_truncated"),
+                },
+                "candidates": candidate_comparisons,
+            }
+        )
+    return {
+        "bounds": {
+            "obscura": obscura_features.get("bounds"),
+            "chromium": chromium_features.get("bounds"),
+        },
+        "scan": {
+            "obscura_scanned_elements": obscura_features.get("scanned_elements"),
+            "chromium_scanned_elements": chromium_features.get("scanned_elements"),
+            "obscura_comparable_scanned_elements": obscura_features.get(
+                "comparable_scanned_elements"
+            ),
+            "chromium_comparable_scanned_elements": chromium_features.get(
+                "comparable_scanned_elements"
+            ),
+            "obscura_truncated": obscura_features.get("scan_truncated"),
+            "chromium_truncated": chromium_features.get("scan_truncated"),
+        },
+        "box_quad_capabilities": {
+            "obscura": obscura_features.get("box_quads"),
+            "chromium": chromium_features.get("box_quads"),
+        },
+        "categories": category_comparisons,
+    }
 
 
 def main():
@@ -1389,7 +1817,7 @@ def main():
                 "content sizes can still clamp the same request differently."
             ),
             "page_state": (
-                "DOM/text fingerprints and length deltas expose different live "
+                "DOM/body-text fingerprints and length deltas expose different live "
                 "page states. They are provenance tripwires, not proof that "
                 "equal states contain equal layout or that unequal serialized "
                 "DOM necessarily represents a rendering failure. Normalized DOM "
@@ -1411,6 +1839,27 @@ def main():
                 "fill-none animations and script-driven visual state that has "
                 "already been discarded cannot be rewound by this harness."
             ),
+            "automatic_feature_probes": (
+                "Transform and text-truncation candidates are discovered by "
+                "bounded document-order scans, not site-specific selectors. "
+                "A candidate proves that a relevant computed value won the "
+                "cascade, not that its visual effect is correct. Candidate "
+                "matching by document element index is meaningful only with "
+                "the adjacent DOM/body-text provenance evidence. Obscura's marked "
+                "external-stylesheet mirror nodes are excluded from that "
+                "comparison index while each engine retains its raw DOM index "
+                "for CDP lookup. Nested element "
+                "scroll metrics are intentionally excluded because Obscura's "
+                "current CLI surface cannot yet provide trustworthy values."
+            ),
+            "box_quads": (
+                "Chromium content and border quads come from CDP "
+                "DOM.getBoxModel in viewport CSS pixels. Obscura CLI capture "
+                "does not expose an equivalent node-scoped CDP call at the "
+                "shared screenshot boundary, so its capability is recorded "
+                "as unavailable and candidate quads remain null; bounding "
+                "rect corners are never relabeled as quads."
+            ),
         },
         "pages": [],
     }
@@ -1430,6 +1879,25 @@ def main():
                 "parity verdict"
             ),
         }
+    manifest["automatic_feature_probes"] = {
+        "scan_limit": FEATURE_PROBE_SCAN_LIMIT,
+        "candidate_limit_per_category": FEATURE_PROBE_CANDIDATE_LIMIT,
+        "categories": {
+            "transform": (
+                "computed non-none transform, translate, rotate, scale, or "
+                "perspective"
+            ),
+            "text_truncation": (
+                "computed non-clip text-overflow or non-none "
+                "-webkit-line-clamp"
+            ),
+        },
+        "comparison_semantics": (
+            "normalized document-index candidate presence, raw viewport AABB deltas, "
+            "exact computed-value differences, and box-quad capability/data; "
+            "no aggregate parity verdict"
+        ),
+    }
     manifest["obscura_identity_probe"] = probe_obscura_identity(args.obscura_bin)
     manifest["obscura_css_media_probe"] = probe_obscura_css_media(args.obscura_bin)
     if args.baseline_bin:
@@ -1502,7 +1970,8 @@ def main():
                     color_scheme=CANONICAL_COLOR_SCHEME,
                     reduced_motion=CANONICAL_REDUCED_MOTION,
                 )
-                chromium_identity_override(context.new_cdp_session(page))
+                chromium_session = context.new_cdp_session(page)
+                chromium_identity_override(chromium_session)
                 chrome_messages = []
                 page.on("console", lambda message: chrome_messages.append(f"console {message.type}: {message.text}"))
                 page.on("pageerror", lambda error: chrome_messages.append(f"pageerror: {error}"))
@@ -1574,6 +2043,7 @@ def main():
                             page,
                             chrome_path,
                             args.geometry_selector,
+                            chromium_session,
                         )
                         if not chromium_capture_boundary["stable"]:
                             chrome_messages.append(
@@ -1642,6 +2112,12 @@ def main():
                         page_result["obscura"].get("state"),
                         chromium_state,
                     )
+                    page_result["feature_probe_comparison"] = (
+                        compare_feature_probes(
+                            page_result["obscura"].get("state"),
+                            chromium_state,
+                        )
+                    )
                     if args.geometry_selector:
                         page_result["geometry_probe_comparison"] = (
                             compare_geometry_probes(
@@ -1656,6 +2132,12 @@ def main():
                 ):
                     page_result["baseline_page_state_comparison"] = (
                         compare_page_states(
+                            page_result["baseline"].get("state"),
+                            chromium_state,
+                        )
+                    )
+                    page_result["baseline_feature_probe_comparison"] = (
+                        compare_feature_probes(
                             page_result["baseline"].get("state"),
                             chromium_state,
                         )
