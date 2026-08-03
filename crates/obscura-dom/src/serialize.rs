@@ -99,8 +99,11 @@ impl DomTree {
                         buf.push_str(tag);
                         for attr in attrs {
                             buf.push(' ');
-                            let attr_name = attr.name.local.as_ref();
-                            buf.push_str(attr_name);
+                            if let Some(prefix) = &attr.name.prefix {
+                                buf.push_str(prefix);
+                                buf.push(':');
+                            }
+                            buf.push_str(attr.name.local.as_ref());
                             buf.push_str("=\"");
                             escape_attr(&attr.value, buf);
                             buf.push('"');

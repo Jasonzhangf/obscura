@@ -1523,9 +1523,21 @@ class Element extends Node {
     if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev);
     if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('attributes', this._nid, [], [], n);
   }
-  setAttributeNS(ns, n, v) { n = String(n); const value = String(v); _dom("set_attribute", this._nid, n + "\0" + value); if ((!ns || ns === "") && n === "style") this._style._replaceFromAttribute(value); } // exact name, no HTML folding
+  setAttributeNS(ns, n, v) {
+    ns = ns == null || ns === '' ? '' : String(ns);
+    n = String(n);
+    const value = String(v);
+    _ns_validateQualifiedName(ns, n);
+    _dom("set_attribute_ns", this._nid, ns + "\0" + n + "\0" + value);
+    if (ns === "" && n === "style") this._style._replaceFromAttribute(value);
+  }
   removeAttribute(n) { n = _htmlAttrName(this, n); const popoverPrev = (n === "popover") ? this.popover : undefined; _dom("remove_attribute", this._nid, n); if (n === "style") this._style._replaceFromAttribute(""); if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev); }
-  removeAttributeNS(ns, n) { n = String(n); _dom("remove_attribute", this._nid, n); if ((!ns || ns === "") && n === "style") this._style._replaceFromAttribute(""); }
+  removeAttributeNS(ns, n) {
+    ns = String(ns == null ? "" : ns);
+    n = String(n);
+    _dom("remove_attribute_ns", this._nid, ns + "\0" + n);
+    if (ns === "" && n === "style") this._style._replaceFromAttribute("");
+  }
   hasAttribute(n) { return this.getAttribute(n) !== null; }
   hasAttributes() { return true; } // Simplified
   getAttributeNames() { return _domParse("attribute_names", this._nid) || []; }
@@ -1557,7 +1569,7 @@ class Element extends Node {
     }
     return list;
   }
-  getAttributeNS(ns, n) { return _domParse("get_attribute", this._nid, String(n)); }
+  getAttributeNS(ns, n) { return _domParse("get_attribute_ns", this._nid, String(ns == null ? "" : ns) + "\0" + String(n)); }
   querySelector(s) { return _wrapEl(+_dom("query_selector_scoped", this._nid, s)); }
   querySelectorAll(s) {
     const ids = _domParse("query_selector_all_scoped", this._nid, s) || [];
@@ -8557,6 +8569,22 @@ if (!globalThis.Attr) {
 const _ns_isValidXmlName = (name) => {
   if (typeof name !== 'string' || !name.length) return false;
   return /^[A-Za-z_:][\w.\-:]*$/.test(name);
+};
+
+const _ns_validateQualifiedName = (namespaceURI, qualifiedName) => {
+  const parts = qualifiedName.split(':');
+  if (parts.length > 2 || parts.some((part) => !_ns_isValidXmlName(part))) {
+    throw new DOMException('Invalid attribute name', 'InvalidCharacterError');
+  }
+  const prefix = parts.length === 2 ? parts[0] : null;
+  const XML = 'http://www.w3.org/XML/1998/namespace';
+  const XMLNS = 'http://www.w3.org/2000/xmlns/';
+  if ((prefix && !namespaceURI)
+      || (prefix === 'xml' && namespaceURI !== XML)
+      || ((qualifiedName === 'xmlns' || prefix === 'xmlns') && namespaceURI !== XMLNS)
+      || (namespaceURI === XMLNS && qualifiedName !== 'xmlns' && prefix !== 'xmlns')) {
+    throw new DOMException('The namespace is invalid', 'NamespaceError');
+  }
 };
 
 // Document.prototype.createAttribute: create a detached Attr node

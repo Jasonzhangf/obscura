@@ -1,4 +1,4 @@
-use html5ever::{LocalName, Namespace, QualName};
+use html5ever::{LocalName, Namespace, Prefix, QualName};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
@@ -30,6 +30,27 @@ impl fmt::Display for NodeId {
 pub struct Attribute {
     pub name: QualName,
     pub value: String,
+}
+
+impl Attribute {
+    pub fn qualified_name(&self) -> String {
+        match &self.name.prefix {
+            Some(prefix) => format!("{}:{}", prefix, self.name.local),
+            None => self.name.local.to_string(),
+        }
+    }
+
+    pub fn qualified_name_eq(&self, name: &str) -> bool {
+        match &self.name.prefix {
+            Some(prefix) => {
+                name.len() == prefix.len() + self.name.local.len() + 1
+                    && name.starts_with(prefix.as_ref())
+                    && name.as_bytes().get(prefix.len()) == Some(&b':')
+                    && &name[prefix.len() + 1..] == self.name.local.as_ref()
+            }
+            None => self.name.local.as_ref() == name,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -105,7 +126,7 @@ impl Node {
 
     pub fn get_attribute(&self, name: &str) -> Option<&str> {
         self.attrs()?.iter().find_map(|a| {
-            if a.name.local.as_ref() == name {
+            if a.qualified_name_eq(name) {
                 Some(a.value.as_str())
             } else {
                 None
@@ -123,6 +144,49 @@ impl Node {
                     value,
                 });
             }
+        }
+    }
+
+    // Read a namespaced attribute by (namespace, localName).
+    pub fn get_attribute_ns(&self, ns: &str, local: &str) -> Option<&str> {
+        self.attrs()?.iter().find_map(|a| {
+            if a.name.ns.as_ref() == ns && a.name.local.as_ref() == local {
+                Some(a.value.as_str())
+            } else {
+                None
+            }
+        })
+    }
+
+    // Set a namespaced attribute using a proper QualName: prefix and local name
+    // remain separate while qualified-name APIs and serialization reconstruct
+    // `prefix:local` when needed.
+    pub fn set_attribute_ns(&mut self, ns: &str, qualified: &str, value: String) {
+        if let NodeData::Element { attrs, .. } = &mut self.data {
+            let (prefix, local) = match qualified.split_once(':') {
+                Some((prefix, local)) => (Some(Prefix::from(prefix)), local),
+                None => (None, qualified),
+            };
+            if let Some(attr) = attrs
+                .iter_mut()
+                .find(|a| a.name.ns.as_ref() == ns && a.name.local.as_ref() == local)
+            {
+                attr.name.prefix = prefix;
+                attr.value = value;
+            } else {
+                attrs.push(Attribute {
+                    name: QualName::new(prefix, Namespace::from(ns), LocalName::from(local)),
+                    value,
+                });
+            }
+        }
+    }
+
+    pub fn remove_attribute_ns(&mut self, ns: &str, local: &str) {
+        if let NodeData::Element { attrs, .. } = &mut self.data {
+            attrs.retain(|a| {
+                !(a.name.ns.as_ref() == ns && a.name.local.as_ref() == local)
+            });
         }
     }
 

@@ -321,7 +321,7 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
             let names: Vec<String> = dom
                 .with_node(NodeId::new(nid), |n| {
                     n.attrs()
-                        .map(|a| a.iter().map(|x| x.name.local.as_ref().to_string()).collect())
+                        .map(|a| a.iter().map(|x| x.qualified_name()).collect())
                         .unwrap_or_default()
                 })
                 .unwrap_or_default();
@@ -373,9 +373,39 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
             let nid = arg1.parse::<u32>().unwrap_or(0);
             dom.with_node_mut(NodeId::new(nid), |n| {
                 if let NodeData::Element { attrs, .. } = &mut n.data {
-                    attrs.retain(|a| a.name.local.as_ref() != arg2.as_str());
+                    attrs.retain(|a| !a.qualified_name_eq(&arg2));
                 }
             });
+            "true".into()
+        }
+        // Namespace-aware attribute ops. arg2 packs the pieces with a NUL:
+        //   get/remove: "<namespace>\0<localName>"
+        //   set:        "<namespace>\0<qualifiedName>\0<value>"
+        "get_attribute_ns" => {
+            let nid = arg1.parse::<u32>().unwrap_or(0);
+            let (ns, local) = arg2.split_once('\0').unwrap_or(("", arg2.as_str()));
+            let val = dom
+                .with_node(NodeId::new(nid), |n| n.get_attribute_ns(ns, local).map(|s| s.to_string()))
+                .flatten();
+            serde_json::to_string(&val).unwrap_or("null".into())
+        }
+        "set_attribute_ns" => {
+            let nid = arg1.parse::<u32>().unwrap_or(0);
+            let mut parts = arg2.splitn(3, '\0');
+            let ns = parts.next().unwrap_or("");
+            let qualified = parts.next().unwrap_or("");
+            let value = parts.next().unwrap_or("");
+            if !qualified.is_empty() {
+                dom.with_node_mut(NodeId::new(nid), |n| {
+                    n.set_attribute_ns(ns, qualified, value.to_string())
+                });
+            }
+            "true".into()
+        }
+        "remove_attribute_ns" => {
+            let nid = arg1.parse::<u32>().unwrap_or(0);
+            let (ns, local) = arg2.split_once('\0').unwrap_or(("", arg2.as_str()));
+            dom.with_node_mut(NodeId::new(nid), |n| n.remove_attribute_ns(ns, local));
             "true".into()
         }
         "set_inner_html" => {

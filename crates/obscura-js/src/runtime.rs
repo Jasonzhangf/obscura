@@ -1443,6 +1443,17 @@ mod tests {
     }
 
     #[test]
+    fn null_namespace_style_attribute_stays_in_sync() {
+        let mut rt = setup_runtime(r#"<html><body><div id="d">hi</div></body></html>"#);
+        let result = rt
+            .evaluate(
+                "(function(){var e=document.getElementById('d'); e.setAttributeNS(null,'style','color: green'); var before=e.style.color; e.removeAttributeNS(null,'style'); return before+'|'+e.style.color+'|'+String(e.getAttribute('style'));})()",
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!("green||null"));
+    }
+
+    #[test]
     fn setting_style_property_updates_the_attribute_and_serialization() {
         let mut rt = setup_runtime(r#"<html><body><div id="d">hi</div></body></html>"#);
         let attr = rt
@@ -1602,6 +1613,68 @@ mod tests {
             )
             .unwrap();
         assert_eq!(out, serde_json::json!("#text:v;TBODY;TR|#text:tail"));
+    }
+
+    #[test]
+    fn set_attribute_ns_is_retrievable_by_namespace_and_local_name() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let v = rt
+            .evaluate("(function(){var s=document.createElementNS('http://www.w3.org/2000/svg','svg'); s.setAttributeNS('http://www.w3.org/1999/xlink','xlink:href','#g'); return s.getAttributeNS('http://www.w3.org/1999/xlink','href');})()")
+            .unwrap();
+        assert_eq!(v, serde_json::json!("#g"));
+    }
+
+    #[test]
+    fn remove_attribute_ns_removes_by_namespace() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let v = rt
+            .evaluate("(function(){var s=document.createElementNS('http://www.w3.org/2000/svg','svg'); s.setAttributeNS('http://www.w3.org/1999/xlink','xlink:href','#g'); s.removeAttributeNS('http://www.w3.org/1999/xlink','href'); return s.getAttributeNS('http://www.w3.org/1999/xlink','href');})()")
+            .unwrap();
+        assert_eq!(v, serde_json::json!(null));
+    }
+
+    #[test]
+    fn get_attribute_ns_reads_plain_attributes_with_null_namespace() {
+        // Backward-compat: getAttributeNS(null, name) still reads a plain attr.
+        let mut rt = setup_runtime(r#"<html><body><div id="d" title="hi"></div></body></html>"#);
+        let v = rt
+            .evaluate("document.getElementById('d').getAttributeNS(null,'title')")
+            .unwrap();
+        assert_eq!(v, serde_json::json!("hi"));
+    }
+
+    #[test]
+    fn namespaced_attribute_keeps_its_qualified_name() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let v = rt
+            .evaluate("(function(){var s=document.createElementNS('http://www.w3.org/2000/svg','svg');s.setAttributeNS('http://www.w3.org/1999/xlink','xlink:href','#g');return s.getAttribute('xlink:href')+'|'+s.getAttributeNames()[0]+'|'+s.outerHTML;})()")
+            .unwrap();
+        assert_eq!(v, serde_json::json!("#g|xlink:href|<svg xlink:href=\"#g\"></svg>"));
+    }
+
+    #[test]
+    fn parsed_xlink_attribute_is_available_through_both_apis() {
+        let mut rt = setup_runtime(
+            r##"<html><body><svg><use id="u" xlink:href="#icon"></use></svg></body></html>"##,
+        );
+        let v = rt
+            .evaluate("(function(){var u=document.getElementById('u');return u.getAttribute('xlink:href')+'|'+u.getAttributeNS('http://www.w3.org/1999/xlink','href')+'|'+u.getAttributeNames().join(',');})()")
+            .unwrap();
+        assert_eq!(v, serde_json::json!("#icon|#icon|id,xlink:href"));
+    }
+
+    #[test]
+    fn set_attribute_ns_validates_namespace_constraints() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let v = rt
+            .evaluate("(function(){var e=document.createElement('div'),out=[];for(const args of [[null,'x:y'],['urn:test','a:b:c'],['urn:test','xml:lang'],['urn:test','xmlns:x']]){try{e.setAttributeNS(args[0],args[1],'v');out.push('none')}catch(err){out.push(err.name)}}return out.join('|');})()")
+            .unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!(
+                "NamespaceError|InvalidCharacterError|NamespaceError|NamespaceError"
+            )
+        );
     }
 
     #[test]
