@@ -2457,6 +2457,7 @@ pub fn build_extension() -> Extension {
         ops.push(op_image_metadata());
         ops.push(op_layout_geometry());
         ops.push(op_computed_style());
+        ops.push(op_css_supports());
         ops.push(op_layout_metrics());
         ops.push(op_scroll_offset());
         ops.push(op_scroll_to());
@@ -2701,6 +2702,15 @@ fn op_computed_style(state: &OpState, #[string] nid_str: String) -> String {
         object.insert(name, serde_json::Value::String(value));
     }
     serde_json::Value::Object(object).to_string()
+}
+
+/// Use the renderer's declaration parser as the single feature-query source
+/// of truth. Keeping this bridge synchronous and state-free makes the common
+/// two-argument `CSS.supports()` overload a single native call.
+#[cfg(feature = "render")]
+#[op2(fast)]
+fn op_css_supports(#[string] name: &str, #[string] value: &str) -> bool {
+    obscura_render::style::supports_declaration(name, value)
 }
 
 /// Root scrolling overflow in CSS pixels. The JS CSSOM probes this op only in

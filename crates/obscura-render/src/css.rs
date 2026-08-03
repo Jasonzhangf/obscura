@@ -2517,13 +2517,13 @@ pub(crate) fn supports_condition_applies(condition: &str) -> bool {
         .or_else(|| condition.strip_prefix("supports"))
         .unwrap_or(condition)
         .trim();
-    eval_supports_condition(condition)
+    eval_supports_condition(condition).unwrap_or(false)
 }
 
-fn eval_supports_condition(condition: &str) -> bool {
+fn eval_supports_condition(condition: &str) -> Option<bool> {
     let condition = condition.trim();
-    if condition.is_empty() {
-        return false;
+    if condition.is_empty() || !balanced_supports_syntax(condition) {
+        return None;
     }
     if let Some(inner) = enclosing_parenthesized(condition) {
         return eval_supports_condition(inner);
@@ -2536,23 +2536,76 @@ fn eval_supports_condition(condition: &str) -> bool {
             .get(3)
             .is_some_and(u8::is_ascii_whitespace)
     {
-        return !eval_supports_condition(condition[3..].trim());
+        return eval_supports_condition(condition[3..].trim()).map(|result| !result);
     }
-    if let Some(parts) = split_supports_operator(condition, "or") {
-        return parts.into_iter().any(eval_supports_condition);
+    let or_parts = split_supports_operator(condition, "or");
+    let and_parts = split_supports_operator(condition, "and");
+    // CSS Conditional Rules does not permit `and` and `or` at the same
+    // nesting level. Treat the entire condition as invalid rather than
+    // inventing JavaScript-like precedence.
+    if or_parts.is_some() && and_parts.is_some() {
+        return None;
     }
-    if let Some(parts) = split_supports_operator(condition, "and") {
-        return parts.into_iter().all(eval_supports_condition);
+    if let Some(parts) = or_parts {
+        let results = parts
+            .into_iter()
+            .map(eval_supports_condition)
+            .collect::<Option<Vec<_>>>()?;
+        return Some(results.into_iter().any(|result| result));
+    }
+    if let Some(parts) = and_parts {
+        let results = parts
+            .into_iter()
+            .map(eval_supports_condition)
+            .collect::<Option<Vec<_>>>()?;
+        return Some(results.into_iter().all(|result| result));
     }
     let lower = condition.to_ascii_lowercase();
     if lower.starts_with("selector(") && condition.ends_with(')') {
         let inner = &condition["selector(".len()..condition.len() - 1];
-        return obscura_dom::selector::parse_selector(inner.trim()).is_ok();
+        return Some(obscura_dom::selector::parse_selector(inner.trim()).is_ok());
     }
     let Some((name, value)) = condition.split_once(':') else {
-        return false;
+        // A syntactically balanced unknown functional condition is a valid
+        // general-enclosed leaf whose result is false. Everything else is a
+        // malformed condition, important for `not`: invalid syntax must not
+        // become true merely because it was negated.
+        return condition
+            .find('(')
+            .filter(|index| *index > 0 && condition.ends_with(')'))
+            .map(|_| false);
     };
-    crate::style::supports_declaration(name, value)
+    Some(crate::style::supports_declaration(name, value))
+}
+
+fn balanced_supports_syntax(condition: &str) -> bool {
+    let mut stack = Vec::new();
+    let mut quote = None;
+    let mut escaped = false;
+    for character in condition.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(active) = quote {
+            if character == active {
+                quote = None;
+            }
+            continue;
+        }
+        match character {
+            '\'' | '"' => quote = Some(character),
+            '(' => stack.push(')'),
+            '[' => stack.push(']'),
+            ')' | ']' if stack.pop() != Some(character) => return false,
+            _ => {}
+        }
+    }
+    !escaped && quote.is_none() && stack.is_empty()
 }
 
 /// Return the contents when one outer parenthesis pair encloses the complete
@@ -4669,6 +4722,21 @@ mod tests {
             }),
             "true supports branch should remain: {rules:?}"
         );
+    }
+
+    #[test]
+    fn supports_conditions_reject_invalid_boolean_grammar() {
+        assert!(supports_condition_applies("(display:grid) and (word-break:break-all)"));
+        assert!(supports_condition_applies("(display:grid) or (unknown:value)"));
+        assert!(!supports_condition_applies(
+            "(display:grid) and (word-break:break-all) or (display:flex)"
+        ));
+        assert!(!supports_condition_applies(
+            "not ((display:grid) and (word-break:break-all) or (display:flex))"
+        ));
+        assert!(!supports_condition_applies("not ()"));
+        assert!(!supports_condition_applies("(display:grid;)"));
+        assert!(!supports_condition_applies("not (display:grid"));
     }
 
     #[test]

@@ -3086,13 +3086,19 @@ mod tests {
                     CSS.supports("color", "light-dark(rgb(1, 2, 3), color-mix(in srgb, white 50%, black))"),
                     CSS.supports("(color:light-dark(red, light-dark(white, black)))"),
                     CSS.supports("color", "light-dark(red)"),
-                    CSS.supports("color", "light-dark(red, rgb(1, 2, 3)")
+                    CSS.supports("color", "light-dark(red, rgb(1, 2, 3)"),
+                    CSS.supports("border", "2px dashed red"),
+                    CSS.supports("border-width", "10%"),
+                    CSS.supports("word-break", "break-all"),
+                    CSS.supports("filter", "blur(2px)"),
+                    CSS.supports("content", "attr(data-label)"),
+                    CSS.supports("display", "grid;")
                 ])"#,
             )
             .unwrap();
         assert_eq!(
             result,
-            serde_json::json!("[false,false,false,true,false,true,true,true,false,false,false,true,false,true,true,false,false]")
+            serde_json::json!("[false,false,false,false,false,true,true,true,false,false,false,true,false,true,true,false,false,true,false,true,false,true,false]")
         );
     }
 

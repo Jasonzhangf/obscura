@@ -1625,10 +1625,13 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
 /// modern framework sheets use negative feature probes to isolate legacy
 /// browser fallbacks, and activating those fallbacks corrupts the modern
 /// cascade.
-pub(crate) fn supports_declaration(name: &str, value: &str) -> bool {
+/// Return whether the renderer accepts and faithfully implements a CSS
+/// declaration. This is also exposed to the JavaScript runtime so
+/// `CSS.supports(property, value)` and stylesheet `@supports` cannot drift.
+pub fn supports_declaration(name: &str, value: &str) -> bool {
     let name = name.trim().to_ascii_lowercase();
     let value = value.trim();
-    if value.is_empty() {
+    if value.is_empty() || has_invalid_supports_value_syntax(value) {
         return false;
     }
     if name.starts_with("--") {
@@ -1715,6 +1718,7 @@ pub(crate) fn supports_declaration(name: &str, value: &str) -> bool {
             | "mask-repeat"
             | "-webkit-mask-repeat"
             | "color"
+            | "content"
             | "-webkit-text-fill-color"
             | "fill"
             | "stroke"
@@ -1860,6 +1864,8 @@ pub(crate) fn supports_declaration(name: &str, value: &str) -> bool {
                 | "inline-grid"
                 | "block"
                 | "flow-root"
+                | "table"
+                | "inline-table"
                 | "contents"
         ),
         "position" => matches!(
@@ -1908,6 +1914,16 @@ pub(crate) fn supports_declaration(name: &str, value: &str) -> bool {
         "clip-path" | "-webkit-clip-path" => {
             value.eq_ignore_ascii_case("none") || parse_clip_path_polygon(value).is_some()
         }
+        // These properties currently participate only in containing-block
+        // bookkeeping. Advertising an effect that is not painted is worse
+        // than a conservative false result because feature queries commonly
+        // use them to select the only visible implementation of an effect.
+        "filter" | "backdrop-filter" | "-webkit-backdrop-filter" | "perspective" => {
+            value.eq_ignore_ascii_case("none")
+        }
+        "contain" => value.eq_ignore_ascii_case("none"),
+        "content-visibility" => value.eq_ignore_ascii_case("visible"),
+        "content" => supports_content_value(value),
         "animation-fill-mode" => parse_animation_fill_mode(value).is_some(),
         "animation-play-state" => parse_animation_play_state(value).is_some(),
         "float" => matches!(
@@ -1997,8 +2013,378 @@ pub(crate) fn supports_declaration(name: &str, value: &str) -> bool {
                     )
                 })
         }
-        _ => true,
+        _ => supports_conservative_known_value(&name, value),
     }
+}
+
+/// CSS.supports() parses a declaration value, not an entire declaration list.
+/// A top-level semicolon, brace, or `!important` therefore makes the overload
+/// invalid. Delimiters inside strings or functions remain ordinary tokens.
+fn has_invalid_supports_value_syntax(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut depth = 0i32;
+    let mut quote = None;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if let Some(active) = quote {
+            if byte == b'\\' {
+                index += 2;
+                continue;
+            }
+            if byte == active {
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        match byte {
+            b'\\' => index += 1,
+            b'\'' | b'"' => quote = Some(byte),
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => {
+                depth -= 1;
+                if depth < 0 {
+                    return true;
+                }
+            }
+            b';' | b'{' | b'}' if depth == 0 => return true,
+            b'!' if depth == 0
+                && value[index + 1..]
+                    .trim_start()
+                    .get(..9)
+                    .is_some_and(|word| word.eq_ignore_ascii_case("important")) =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    depth != 0 || quote.is_some()
+}
+
+fn supports_content_value(value: &str) -> bool {
+    let lower = value.trim().to_ascii_lowercase();
+    if matches!(lower.as_str(), "none" | "normal") || supports_single_url(value) {
+        return true;
+    }
+    let mut rest = value.trim();
+    let mut found = false;
+    while !rest.is_empty() {
+        rest = rest.trim_start();
+        let Some(first) = rest.chars().next() else { break };
+        if matches!(first, '\'' | '"') {
+            let mut escaped = false;
+            let mut end = None;
+            for (offset, character) in rest[first.len_utf8()..].char_indices() {
+                if escaped {
+                    escaped = false;
+                } else if character == '\\' {
+                    escaped = true;
+                } else if character == first {
+                    end = Some(first.len_utf8() + offset + first.len_utf8());
+                    break;
+                }
+            }
+            let Some(end) = end else { return false };
+            rest = &rest[end..];
+            found = true;
+            continue;
+        }
+        let name_end = rest
+            .char_indices()
+            .find_map(|(index, ch)| (!ch.is_alphanumeric() && !matches!(ch, '-' | '_' | '\\')).then_some(index))
+            .unwrap_or(rest.len());
+        let name = rest[..name_end].to_ascii_lowercase();
+        let tail = rest[name_end..].trim_start();
+        if matches!(
+            name.as_str(),
+            "open-quote" | "close-quote" | "no-open-quote" | "no-close-quote"
+        ) {
+            rest = tail;
+            found = true;
+            continue;
+        }
+        if !matches!(name.as_str(), "attr" | "counter" | "counters") || !tail.starts_with('(') {
+            return false;
+        }
+        let mut depth = 0i32;
+        let mut quote = None;
+        let mut escaped = false;
+        let mut end = None;
+        for (offset, character) in tail.char_indices() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if character == '\\' {
+                escaped = true;
+                continue;
+            }
+            if let Some(active) = quote {
+                if character == active {
+                    quote = None;
+                }
+                continue;
+            }
+            match character {
+                '\'' | '"' => quote = Some(character),
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(offset + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(end) = end else { return false };
+        let arguments = tail[1..end - 1].trim();
+        if !supports_content_function(&name, arguments) {
+            return false;
+        }
+        rest = &tail[end..];
+        found = true;
+    }
+    found
+}
+
+fn supports_single_url(value: &str) -> bool {
+    let value = value.trim();
+    if !value
+        .get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("url("))
+        || !value.ends_with(')')
+    {
+        return false;
+    }
+    let mut depth = 0i32;
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, character) in value.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(active) = quote {
+            if character == active {
+                quote = None;
+            }
+            continue;
+        }
+        match character {
+            '\'' | '"' => quote = Some(character),
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return index + character.len_utf8() == value.len()
+                        && parse_url(value).is_some();
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn supports_content_function(name: &str, arguments: &str) -> bool {
+    let arguments = split_top_level(arguments, ',');
+    let ident = |value: &str| {
+        let value = value.trim();
+        !value.is_empty()
+            && value
+                .chars()
+                .all(|character| character.is_alphanumeric() || matches!(character, '-' | '_' | '\\'))
+    };
+    let counter_style = |value: &str| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "decimal"
+                | "decimal-leading-zero"
+                | "lower-alpha"
+                | "lower-latin"
+                | "upper-alpha"
+                | "upper-latin"
+                | "lower-roman"
+                | "upper-roman"
+        )
+    };
+    match name {
+        "attr" => arguments.len() == 1
+            && arguments[0]
+                .split_whitespace()
+                .next()
+                .is_some_and(ident),
+        "counter" => (1..=2).contains(&arguments.len())
+            && ident(arguments[0])
+            && arguments.get(1).is_none_or(|value| counter_style(value)),
+        "counters" => (2..=3).contains(&arguments.len())
+            && ident(arguments[0])
+            && {
+                let separator = arguments[1].trim();
+                separator.len() >= 2
+                    && matches!(separator.as_bytes()[0], b'\'' | b'"')
+                    && separator.as_bytes().last() == separator.as_bytes().first()
+            }
+            && arguments.get(2).is_none_or(|value| counter_style(value)),
+        _ => false,
+    }
+}
+
+fn supports_conservative_known_value(name: &str, value: &str) -> bool {
+    let lower = value.trim().to_ascii_lowercase();
+    let finite_number = |input: &str| {
+        input
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .is_some_and(|number| number.is_finite())
+    };
+    let dimension = |input: &str, auto: bool| {
+        let input = input.trim();
+        (auto && input.eq_ignore_ascii_case("auto"))
+            || (!matches!(dimension_value(input), crate::Dimension::Auto)
+                && resolve_contextual_length(input, 16.0, 16.0, 1.0, 1.0, 100.0).is_some())
+            || (input.contains('(')
+                && resolve_contextual_length(input, 16.0, 16.0, 1.0, 1.0, 100.0).is_some())
+    };
+    let dimensions = |input: &str, auto: bool, max: usize| {
+        let tokens = split_ws_paren(input);
+        !tokens.is_empty() && tokens.len() <= max && tokens.iter().all(|token| dimension(token, auto))
+    };
+    match name {
+        "width" => lower == "fit-content" || dimension(value, true),
+        "height" | "min-width" | "min-height" | "max-width" | "max-height" | "flex-basis" => {
+            dimension(value, true)
+        }
+        "margin" | "margin-inline" | "margin-block" => dimensions(value, true, 4),
+        "margin-top" | "margin-right" | "margin-bottom" | "margin-left"
+        | "margin-inline-start" | "margin-inline-end" | "margin-block-start"
+        | "margin-block-end" => dimension(value, true),
+        "padding" | "padding-inline" | "padding-block" | "inset" => dimensions(value, false, 4),
+        "padding-top" | "padding-right" | "padding-bottom" | "padding-left"
+        | "padding-inline-start" | "padding-inline-end" | "padding-block-start"
+        | "padding-block-end" => dimension(value, false),
+        "top" | "right" | "bottom" | "left" | "inset-inline" | "inset-block" => {
+            dimensions(value, true, 2)
+        }
+        "inset-inline-start" | "inset-inline-end" | "inset-block-start" | "inset-block-end" => {
+            dimension(value, true)
+        }
+        "aspect-ratio" => lower == "auto" || parse_aspect_ratio(value).is_some(),
+        "align-items" | "justify-items" | "align-self" | "justify-self" => {
+            self_alignment_value(value).is_some()
+        }
+        "place-items" | "place-self" => self_alignment_pair(value).is_some(),
+        "align-content" => content_alignment_value(value).is_some(),
+        "justify-content" => matches!(lower.as_str(), "left" | "right") || content_alignment_value(value).is_some(),
+        "place-content" => content_alignment_pair(value).is_some(),
+        "flex-direction" => matches!(lower.as_str(), "row" | "row-reverse" | "column" | "column-reverse"),
+        "flex-wrap" => matches!(lower.as_str(), "nowrap" | "wrap" | "wrap-reverse"),
+        "flex-grow" | "flex-shrink" => finite_number(value) && value.trim().parse::<f32>().is_ok_and(|number| number >= 0.0),
+        "flex" => supports_flex_value(value),
+        "order" => value.trim().parse::<i32>().is_ok(),
+        "opacity" => finite_number(value),
+        "z-index" => lower == "auto" || value.trim().parse::<i32>().is_ok(),
+        "clear" => matches!(lower.as_str(), "none" | "left" | "right" | "both" | "inline-start" | "inline-end"),
+        "vertical-align" => matches!(lower.as_str(), "top" | "baseline" | "text-top" | "middle" | "bottom" | "text-bottom"),
+        "border-collapse" => matches!(lower.as_str(), "collapse" | "separate"),
+        "border-spacing" => dimensions(value, false, 2),
+        "column-count" | "-webkit-column-count" => lower == "auto" || parse_column_count(value).is_some(),
+        "columns" | "-webkit-columns" => split_ws_paren(value).into_iter().any(|token| parse_column_count(token).is_some()),
+        "break-inside" => matches!(lower.as_str(), "auto" | "avoid" | "avoid-column"),
+        "-webkit-column-break-inside" => matches!(lower.as_str(), "auto" | "avoid"),
+        "grid-auto-flow" => {
+            let tokens = lower.split_whitespace().collect::<Vec<_>>();
+            !tokens.is_empty() && tokens.len() <= 2 && tokens.iter().all(|token| matches!(*token, "row" | "column" | "dense"))
+        }
+        "grid-template-columns" | "grid-template-rows" => {
+            let (tracks, _) = parse_track_list_named(value);
+            !tracks.is_empty() || lower.starts_with("subgrid")
+        }
+        "grid-template-areas" => !parse_grid_areas(value).is_empty() || lower == "none",
+        "grid-column" | "grid-row" => split_top_level(value, '/').into_iter().all(|part| parse_grid_line_kind(part.trim()).is_some()),
+        "grid-column-start" | "grid-column-end" | "grid-row-start" | "grid-row-end" => parse_grid_line_kind(value).is_some(),
+        "transform-origin" => parse_transform_origin(value).is_some(),
+        "translate" => lower == "none" || dimensions(value, false, 3),
+        "scale" => lower == "none" || {
+            let values = value.split_whitespace().collect::<Vec<_>>();
+            !values.is_empty() && values.len() <= 2 && values.iter().all(|value| scale_number(value).is_some())
+        },
+        "transform" => supports_transform_value(value),
+        "background-color" | "color" | "-webkit-text-fill-color" => parse_color(value).is_some(),
+        "background-image" | "mask-image" | "-webkit-mask-image" => {
+            lower == "none" || parse_url(value).is_some() || !parse_background_gradient_layers(value, false).is_empty()
+        }
+        "background-repeat" | "mask-repeat" | "-webkit-mask-repeat" => parse_image_repeat(value).is_some(),
+        "background-size" | "mask-size" | "-webkit-mask-size" => {
+            matches!(lower.as_str(), "auto" | "cover" | "contain") || parse_background_size(value).is_some()
+        }
+        "background-clip" | "-webkit-background-clip" => matches!(lower.as_str(), "border-box" | "padding-box" | "content-box" | "text"),
+        "font-size" => is_font_size_token(value),
+        "font-weight" => specified_font_weight(value).is_some(),
+        "font-family" => !value.trim().is_empty(),
+        "font-style" => lower == "normal" || lower == "italic" || lower.starts_with("oblique"),
+        "text-align" => matches!(lower.as_str(), "left" | "right" | "start" | "end" | "center" | "justify"),
+        "text-transform" => matches!(lower.as_str(), "none" | "uppercase" | "lowercase" | "capitalize"),
+        "text-decoration" | "text-decoration-line" => lower.split_whitespace().all(|token| matches!(token, "none" | "underline")),
+        "line-height" => lower == "normal" || finite_number(value) || dimension(value, false),
+        "gap" | "grid-gap" => dimensions(value, false, 2),
+        "row-gap" | "grid-row-gap" | "column-gap" | "grid-column-gap" | "-webkit-column-gap" => lower == "normal" || dimension(value, false),
+        "counter-reset" | "counter-increment" | "counter-set" => parse_counter_directives(value, 0).is_some(),
+        "list-style-type" => list_style_keyword(value.trim()).is_some(),
+        "list-style" => value.split_whitespace().any(|token| list_style_keyword(token).is_some()),
+        "animation" | "animation-name" => !value.trim().is_empty(),
+        "background" | "font" | "grid-template" | "grid" | "box-shadow" | "-webkit-box-shadow" | "fill" | "stroke" | "stroke-width" | "letter-spacing" | "will-change" => false,
+        _ => false,
+    }
+}
+
+fn supports_flex_value(value: &str) -> bool {
+    let lower = value.trim().to_ascii_lowercase();
+    if matches!(lower.as_str(), "none" | "auto" | "initial") {
+        return true;
+    }
+    let tokens = split_ws_paren(value);
+    if tokens.is_empty() || tokens.len() > 3 {
+        return false;
+    }
+    let mut numbers = 0usize;
+    for token in tokens {
+        if token.parse::<f32>().ok().is_some_and(|number| number.is_finite() && number >= 0.0) {
+            numbers += 1;
+        } else if matches!(dimension_value(token), crate::Dimension::Auto) && !token.eq_ignore_ascii_case("auto") {
+            return false;
+        }
+    }
+    numbers <= 2
+}
+
+fn supports_transform_value(value: &str) -> bool {
+    if value.trim().eq_ignore_ascii_case("none") {
+        return true;
+    }
+    let functions = transform_functions(value);
+    !functions.is_empty() && functions.into_iter().all(|(name, arguments)| {
+        let values = arguments.split(',').map(str::trim).filter(|value| !value.is_empty()).collect::<Vec<_>>();
+        match name.to_ascii_lowercase().as_str() {
+            "translate" => (1..=2).contains(&values.len()) && values.iter().all(|value| !matches!(dimension_value(value), crate::Dimension::Auto)),
+            "translate3d" => values.len() == 3 && values.iter().all(|value| !matches!(dimension_value(value), crate::Dimension::Auto)),
+            "translatex" | "translatey" => values.len() == 1 && !matches!(dimension_value(values[0]), crate::Dimension::Auto),
+            "scale" => (1..=2).contains(&values.len()) && values.iter().all(|value| scale_number(value).is_some()),
+            "scalex" | "scaley" => values.len() == 1 && scale_number(values[0]).is_some(),
+            "rotate" | "rotatex" | "rotatey" | "rotatez" => values.len() == 1 && angle_degrees(values[0]).is_some(),
+            _ => false,
+        }
+    })
 }
 
 fn apply_animation_shorthand(style: &mut LayoutStyle, value: &str) {
@@ -6369,6 +6755,35 @@ fn split_ws_paren(s: &str) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn supports_reports_only_implemented_value_subsets() {
+        for value in ["normal", "break-all", "keep-all", "break-word"] {
+            assert!(supports_declaration("word-break", value), "{value}");
+        }
+        for property in ["filter", "backdrop-filter", "-webkit-backdrop-filter"] {
+            assert!(supports_declaration(property, "none"), "{property}");
+            assert!(!supports_declaration(property, "blur(2px)"), "{property}");
+        }
+        assert!(!supports_declaration("perspective", "800px"));
+        assert!(!supports_declaration("contain", "paint"));
+        assert!(!supports_declaration("content-visibility", "auto"));
+        for content in [
+            "none",
+            "\"new\"",
+            "attr(data-label)",
+            "counter(item) '. '",
+            "url(icon.svg)",
+        ] {
+            assert!(supports_declaration("content", content), "{content}");
+        }
+        assert!(!supports_declaration("content", "unknown-function(x)"));
+        assert!(!supports_declaration("content", "counter(item, banana)"));
+        assert!(!supports_declaration("content", "url(icon.svg) garbage()"));
+        assert!(!supports_declaration("display", "grid;"));
+        assert!(!supports_declaration("color", "red !important"));
+        assert!(!supports_declaration("display", "banana"));
+    }
 
     #[test]
     fn clip_path_polygon_supports_only_geometry_it_can_resolve() {
