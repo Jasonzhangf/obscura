@@ -368,6 +368,10 @@ class GeometryProbeTests(unittest.TestCase):
         self.assertIn("font_family:style.fontFamily", expression)
         self.assertIn("line_height:style.lineHeight", expression)
         self.assertIn("white_space:style.whiteSpace", expression)
+        self.assertIn("webkit_line_clamp:style.webkitLineClamp", expression)
+        self.assertIn("webkit_box_orient:style.webkitBoxOrient", expression)
+        self.assertIn("direction:style.direction", expression)
+        self.assertIn("unicode_bidi:style.unicodeBidi", expression)
         self.assertIn(
             "grid_template_columns:style.gridTemplateColumns", expression
         )
