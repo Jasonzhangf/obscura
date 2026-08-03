@@ -1870,16 +1870,53 @@ pub fn paint_prepared_region_with_scroll(
 /// intermediate surfaces retain the proven CSS-raster + resample path until
 /// those layers can carry an explicit source/device transform.
 fn native_raster_scale_supported(tree: &DomTree, laid: &crate::DomLayout) -> bool {
+    fn direct_gradient_geometry_supported(style: &crate::LayoutStyle) -> bool {
+        if style.background_size.is_some()
+            || style.background_size_expression.is_some()
+            || style.background_size_fit.is_some()
+        {
+            return false;
+        }
+
+        // The direct vector painter is scale-safe only when no logical-pixel
+        // tile surface is needed. Equal positioning and clipping boxes make
+        // the implicit gradient tile exactly the painted path; position and
+        // repeat then have no leftover space on which to operate.
+        let geometry = background_geometry(
+            &crate::Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 100.0,
+            },
+            style,
+        );
+        (geometry.origin_rect.x - geometry.clip_rect.x).abs() <= 0.01
+            && (geometry.origin_rect.y - geometry.clip_rect.y).abs() <= 0.01
+            && (geometry.origin_rect.width - geometry.clip_rect.width).abs() <= 0.01
+            && (geometry.origin_rect.height - geometry.clip_rect.height).abs() <= 0.01
+    }
+
     fn style_supported(style: &crate::LayoutStyle) -> bool {
+        let has_gradient = style.background_gradient.is_some()
+            || style.background_radial_gradient.is_some()
+            || !style.background_gradient_layers.is_empty();
+        let gradients_supported = style.background_conic_gradient.is_none()
+            && style
+                .background_gradient_layers
+                .iter()
+                .all(|layer| match layer {
+                    crate::BackgroundGradientLayer::Linear { repeating, .. } => !repeating,
+                    crate::BackgroundGradientLayer::Radial { .. } => true,
+                    crate::BackgroundGradientLayer::Conic { .. } => false,
+                })
+            && (!has_gradient || direct_gradient_geometry_supported(style));
         let simple = !has_authored_transform(style)
             && style.opacity.is_none_or(|opacity| opacity >= 1.0)
             && style.clip_path.is_none()
             && style.background_image.is_none()
             && style.mask_image.is_none()
-            && style.background_gradient.is_none()
-            && style.background_radial_gradient.is_none()
-            && style.background_conic_gradient.is_none()
-            && style.background_gradient_layers.is_empty()
+            && gradients_supported
             && !style.background_clip_text
             && style.box_shadow.is_none()
             && style.content_image.is_none()
@@ -2641,6 +2678,7 @@ fn paint_laid_dom_scrolled(
                         root_font_size,
                         viewport,
                         background_mask.as_ref(),
+                        raster_scale,
                     );
                 }
             } else {
@@ -2653,6 +2691,7 @@ fn paint_laid_dom_scrolled(
                             *center,
                             stops,
                             background_mask.as_ref(),
+                            raster_scale,
                         );
                     }
                 }
@@ -2677,6 +2716,7 @@ fn paint_laid_dom_scrolled(
                             *angle,
                             stops,
                             background_mask.as_ref(),
+                            raster_scale,
                         );
                     }
                 }
@@ -3302,6 +3342,7 @@ fn paint_inline_fragment_decorations(
                         root_font_size,
                         viewport,
                         background_mask.as_ref(),
+                        raster_scale,
                     );
                 }
             } else {
@@ -3316,6 +3357,7 @@ fn paint_inline_fragment_decorations(
                         *center,
                         stops,
                         background_mask.as_ref(),
+                        raster_scale,
                     );
                 }
                 if let Some((angle, center, stops)) = &fragment_style.background_conic_gradient {
@@ -3341,6 +3383,7 @@ fn paint_inline_fragment_decorations(
                         *angle,
                         stops,
                         background_mask.as_ref(),
+                        raster_scale,
                     );
                 }
             }
@@ -5238,6 +5281,7 @@ fn paint_linear_gradient(
     angle: f32,
     stops: &[([u8; 4], Option<f32>)],
     clip: Option<&tiny_skia::Mask>,
+    raster_scale: f32,
 ) {
     if stops.len() < 2 {
         return;
@@ -5270,7 +5314,13 @@ fn paint_linear_gradient(
         let mut paint = Paint::default();
         paint.shader = shader;
         paint.anti_alias = true;
-        pixmap.fill_path(path, &paint, FillRule::Winding, Transform::identity(), clip);
+        pixmap.fill_path(
+            path,
+            &paint,
+            FillRule::Winding,
+            raster_transform(raster_scale),
+            clip,
+        );
     }
 }
 
@@ -5286,6 +5336,7 @@ fn paint_linear_gradient_layer(
     rem: f32,
     viewport: (f32, f32),
     clip: Option<&tiny_skia::Mask>,
+    raster_scale: f32,
 ) {
     if stops.len() < 2 {
         return;
@@ -5351,7 +5402,13 @@ fn paint_linear_gradient_layer(
         let color = gradient_stop_color(stops, last_index);
         let mut paint = Paint::default();
         paint.set_color(Color::from_rgba8(color[0], color[1], color[2], color[3]));
-        pixmap.fill_path(path, &paint, FillRule::Winding, Transform::identity(), clip);
+        pixmap.fill_path(
+            path,
+            &paint,
+            FillRule::Winding,
+            raster_transform(raster_scale),
+            clip,
+        );
         return;
     }
     let (start, end, spread, normalize) = if repeating {
@@ -5393,7 +5450,13 @@ fn paint_linear_gradient_layer(
         let mut paint = Paint::default();
         paint.shader = shader;
         paint.anti_alias = true;
-        pixmap.fill_path(path, &paint, FillRule::Winding, Transform::identity(), clip);
+        pixmap.fill_path(
+            path,
+            &paint,
+            FillRule::Winding,
+            raster_transform(raster_scale),
+            clip,
+        );
     }
 }
 
@@ -5494,6 +5557,7 @@ fn paint_radial_gradient(
     center: (f32, f32),
     stops: &[([u8; 4], Option<f32>)],
     clip: Option<&tiny_skia::Mask>,
+    raster_scale: f32,
 ) {
     if stops.len() < 2 {
         return;
@@ -5532,7 +5596,13 @@ fn paint_radial_gradient(
         let mut paint = Paint::default();
         paint.shader = shader;
         paint.anti_alias = true;
-        pixmap.fill_path(path, &paint, FillRule::Winding, Transform::identity(), clip);
+        pixmap.fill_path(
+            path,
+            &paint,
+            FillRule::Winding,
+            raster_transform(raster_scale),
+            clip,
+        );
     }
 }
 
@@ -5546,6 +5616,7 @@ fn paint_background_gradient_layers(
     root_font_size: f32,
     viewport: (f32, f32),
     clip: Option<&tiny_skia::Mask>,
+    raster_scale: f32,
 ) {
     let layers = &style.background_gradient_layers;
     let em = style.font_size.unwrap_or(16.0);
@@ -5562,6 +5633,7 @@ fn paint_background_gradient_layers(
         // coordinates and would also ignore `background-repeat: no-repeat`.
         || clip_differs_from_origin;
     if needs_tile && tile_size.0 > 0.0 && tile_size.1 > 0.0 {
+        debug_assert_eq!(raster_scale, 1.0);
         let width = tile_size.0.ceil().clamp(1.0, 4096.0) as u32;
         let height = tile_size.1.ceil().clamp(1.0, 4096.0) as u32;
         if let Some(mut tile) = Pixmap::new(width, height) {
@@ -5589,6 +5661,7 @@ fn paint_background_gradient_layers(
                     root_font_size,
                     viewport,
                     None,
+                    1.0,
                 );
                 let tile_x = origin_rect.x
                     + style
@@ -5682,6 +5755,7 @@ fn paint_background_gradient_layers(
         root_font_size,
         viewport,
         clip,
+        raster_scale,
     );
 }
 
@@ -5696,6 +5770,7 @@ fn paint_gradient_layer_stack(
     root_font_size: f32,
     viewport: (f32, f32),
     clip: Option<&tiny_skia::Mask>,
+    raster_scale: f32,
 ) {
     // CSS lists the topmost background first. Paint back-to-front so every
     // translucent layer composites over the layers authored after it.
@@ -5719,10 +5794,19 @@ fn paint_gradient_layer_stack(
                     root_font_size,
                     viewport,
                     clip,
+                    raster_scale,
                 );
             }
             crate::BackgroundGradientLayer::Radial { center, stops } => {
-                paint_radial_gradient(pixmap, path, sampling_rect, *center, stops, clip);
+                paint_radial_gradient(
+                    pixmap,
+                    path,
+                    sampling_rect,
+                    *center,
+                    stops,
+                    clip,
+                    raster_scale,
+                );
             }
             crate::BackgroundGradientLayer::Conic {
                 angle,
@@ -6231,6 +6315,7 @@ fn paint_in_flow_generated_box(
                     root_font_size,
                     viewport,
                     background_mask.as_ref(),
+                    raster_scale,
                 );
             }
         } else {
@@ -6243,6 +6328,7 @@ fn paint_in_flow_generated_box(
                         *center,
                         stops,
                         background_mask.as_ref(),
+                        raster_scale,
                     );
                 }
             }
@@ -6267,6 +6353,7 @@ fn paint_in_flow_generated_box(
                         *angle,
                         stops,
                         background_mask.as_ref(),
+                        raster_scale,
                     );
                 }
             }
@@ -6452,6 +6539,7 @@ fn paint_positioned_pseudo(
                     root_font_size,
                     viewport,
                     background_mask.as_ref(),
+                    raster_scale,
                 );
             }
         } else {
@@ -6464,6 +6552,7 @@ fn paint_positioned_pseudo(
                         *center,
                         stops,
                         background_mask.as_ref(),
+                        raster_scale,
                     );
                 }
             }
@@ -6488,6 +6577,7 @@ fn paint_positioned_pseudo(
                         *angle,
                         stops,
                         background_mask.as_ref(),
+                        raster_scale,
                     );
                 }
             }
@@ -11647,16 +11737,96 @@ mod tests {
     }
 
     #[test]
+    fn direct_vector_gradients_rasterize_natively_at_two_x() {
+        let tree = parse_html(
+            r#"<html style="margin:0"><body style="margin:0">
+                <div style="width:20px;height:16px;background:linear-gradient(90deg,#f00 0%,#00f 100%)"></div>
+                <div style="width:20px;height:16px;background:radial-gradient(circle at 50% 50%,#fff 0%,#000 100%)"></div>
+            </body></html>"#,
+        );
+        let mut resources = RenderResourceCache::with_loader(|_url: &str| None);
+        let mut prepared =
+            prepare_dom(&tree, (30.0, 40.0), None, &mut resources).expect("prepared render");
+        assert!(
+            native_raster_scale_supported(&tree, &prepared.layout),
+            "direct non-repeating linear/radial gradients should use device-scale paint"
+        );
+        let scroll = prepared.resolve_scroll_state(&tree, (0.0, 0.0), &HashMap::new());
+        let one_x = paint_prepared_region_with_scroll(
+            &tree,
+            &mut prepared,
+            &mut resources,
+            &scroll,
+            CaptureRegion::new(0.0, 0.0, 30.0, 40.0, 1.0),
+        )
+        .unwrap();
+        let two_x = paint_prepared_region_with_scroll(
+            &tree,
+            &mut prepared,
+            &mut resources,
+            &scroll,
+            CaptureRegion::new(0.0, 0.0, 30.0, 40.0, 2.0),
+        )
+        .unwrap();
+        assert_eq!((one_x.width(), one_x.height()), (30, 40));
+        assert_eq!((two_x.width(), two_x.height()), (60, 80));
+
+        let linear_left = two_x.pixel(1, 8).unwrap();
+        let linear_right = two_x.pixel(38, 8).unwrap();
+        assert!(
+            linear_left.red() > 220 && linear_left.blue() < 40,
+            "linear gradient start must remain red at 2x: {linear_left:?}"
+        );
+        assert!(
+            linear_right.blue() > 220 && linear_right.red() < 40,
+            "linear gradient end must remain blue at 2x: {linear_right:?}"
+        );
+        let radial_center = two_x.pixel(20, 48).unwrap();
+        let radial_edge = two_x.pixel(1, 48).unwrap();
+        assert!(
+            radial_center.red() > 230,
+            "radial center must remain light at 2x: {radial_center:?}"
+        );
+        assert!(
+            radial_edge.red() < 100,
+            "radial edge must remain dark at 2x: {radial_edge:?}"
+        );
+
+        let source =
+            image::RgbaImage::from_raw(one_x.width(), one_x.height(), one_x.data().to_vec())
+                .unwrap();
+        let post_scaled = image::imageops::resize(
+            &source,
+            two_x.width(),
+            two_x.height(),
+            image::imageops::FilterType::Lanczos3,
+        );
+        let differing = two_x
+            .data()
+            .iter()
+            .zip(post_scaled.as_raw())
+            .filter(|(native, post)| native != post)
+            .count();
+        assert!(
+            differing > 200,
+            "2x vector gradient samples must be rerasterized, not resize-equivalent ({differing} differing channels)"
+        );
+    }
+
+    #[test]
     fn effectful_region_capture_keeps_the_proven_bounded_resample_fallback() {
         let tree = parse_html(
             r#"<html style="margin:0"><body style="margin:0">
-                <div style="width:20px;height:20px;background:linear-gradient(red,blue)"></div>
+                <div style="width:20px;height:20px;background:conic-gradient(red,blue,red)"></div>
             </body></html>"#,
         );
         let mut resources = RenderResourceCache::with_loader(|_url: &str| None);
         let mut prepared =
             prepare_dom(&tree, (30.0, 30.0), None, &mut resources).expect("prepared render");
-        assert!(!native_raster_scale_supported(&tree, &prepared.layout));
+        assert!(
+            !native_raster_scale_supported(&tree, &prepared.layout),
+            "sampled conic gradients must retain the logical-pixel fallback"
+        );
         let scroll = prepared.resolve_scroll_state(&tree, (0.0, 0.0), &HashMap::new());
         let one_x = paint_prepared_region_with_scroll(
             &tree,
