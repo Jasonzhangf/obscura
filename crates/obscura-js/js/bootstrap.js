@@ -36,6 +36,18 @@
     '_rngAncestors', '_rngOrder', '_rngCmp', '_rngCheckOffset',
     '_idbRequest', '_idbObjectStore', '_idbTransaction', '_idbDatabase',
     '_makeListenerBox',
+    // WebIDL interfaces. A real browser exposes these on the global as
+    // enumerable:false; here they were assigned with `globalThis.X = X`, which
+    // defaults to enumerable:true and is detectable in one line:
+    //   Object.getOwnPropertyDescriptor(window, 'Node').enumerable
+    // Pre-declaring them non-enumerable here is enough -- per the note above,
+    // the later `globalThis.X = X` assignments only update the value.
+    'Node', 'Element', 'Document', 'DocumentFragment', 'DocumentType',
+    'Text', 'Comment', 'CDATASection', 'ProcessingInstruction', 'CharacterData',
+    'CSSStyleDeclaration', 'DOMTokenList', 'Screen', 'NetworkInformation',
+    'MessageChannel', 'MessagePort', 'CustomElementRegistry',
+    'XMLHttpRequestEventTarget', 'HTMLMediaElement', 'HTMLVideoElement',
+    'HTMLAudioElement', 'WebGL2RenderingContext',
   ];
   var _desc = { value: undefined, writable: true, enumerable: false, configurable: true };
   for (var _i = 0; _i < _names.length; _i++) {
