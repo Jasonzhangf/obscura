@@ -1694,13 +1694,44 @@ fn paint_laid_dom_scrolled(
                 viewport,
             )
         });
+        let has_background_box_paint = !style.background_clip_text
+            && (style.background_color.is_some()
+                || style.background_image.is_some()
+                || style.mask_image.is_some()
+                || style.background_gradient.is_some()
+                || style.background_radial_gradient.is_some()
+                || style.background_conic_gradient.is_some()
+                || !style.background_gradient_layers.is_empty());
+        let has_inline_box_paint = style.box_shadow.is_some()
+            || has_background_box_paint
+            || style.border != crate::Edges::default();
+        let inline_pieces = (style.ignores_used_box_sizes() && has_inline_box_paint)
+            .then(|| laid.inline_fragments.get(&nid))
+            .flatten();
+        let paints_inline_fragments = inline_pieces.is_some();
+        if let Some(pieces) = inline_pieces {
+            paint_inline_fragment_decorations(
+                &mut pixmap,
+                pieces,
+                (ox, oy),
+                &rect,
+                style,
+                clip,
+                root_font_size,
+                viewport,
+                base_url,
+                image_cache,
+            );
+        }
 
         // Outset box-shadow paints behind this element's own background/border.
         // Geometry comes from the full (translate-adjusted) border box; the
         // ancestor overflow clip is reapplied inside so the shadow is clipped by
         // an ancestor exactly as the box itself is.
+        if !paints_inline_fragments {
         if let Some(shadow) = style.box_shadow {
             paint_box_shadow(&mut pixmap, &shadow, &rect, style.border_model.radii, clip);
+        }
         }
 
         // Box path (rounded if border-radius), reused for gradient/color fill.
@@ -1725,7 +1756,7 @@ fn paint_laid_dom_scrolled(
         // without this it paints white. Takes precedence over a solid color.
         // `background-clip: text` clips the background to the glyphs, so it must
         // not paint as a box here; the text paint path fills the glyphs instead.
-        if style.mask_image.is_none() && !style.background_clip_text {
+        if !paints_inline_fragments && style.mask_image.is_none() && !style.background_clip_text {
             if let Some(bg) = style.background_color {
                 if let Some(path) = bg_path() {
                     let mut paint = Paint::default();
@@ -1792,6 +1823,7 @@ fn paint_laid_dom_scrolled(
         }
         }
 
+        if !paints_inline_fragments {
         if let Some(mask_url) = &style.mask_image {
             let fill = style.background_color.or(style.color).unwrap_or([0, 0, 0, 255]);
             paint_mask(
@@ -1846,6 +1878,7 @@ fn paint_laid_dom_scrolled(
                     );
                 }
             }
+        }
         }
         let positioned_pseudo_containing_block = {
             let mut ancestor = Some(nid);
@@ -1903,12 +1936,14 @@ fn paint_laid_dom_scrolled(
             );
         }
 
-        paint_css_border(
-            &mut pixmap,
-            &rect,
-            style,
-            clip_path_mask.as_ref(),
-        );
+        if !paints_inline_fragments {
+            paint_css_border(
+                &mut pixmap,
+                &rect,
+                style,
+                clip_path_mask.as_ref(),
+            );
+        }
         paint_css_outline(
             &mut pixmap,
             &rect,
@@ -2222,6 +2257,224 @@ fn paint_laid_dom_scrolled(
     }
 
     Some(pixmap)
+}
+
+/// Paint an ordinary inline's sliced border boxes instead of its multiline
+/// bounding union. Background coordinates stay anchored to the union so
+/// gradients and images remain one joined `box-decoration-break:slice`
+/// decoration, while left/right borders and radii appear only on the first
+/// and last continuation respectively.
+fn paint_inline_fragment_decorations(
+    pixmap: &mut Pixmap,
+    fragments: &[crate::Rect],
+    offset: (f32, f32),
+    union: &crate::Rect,
+    style: &crate::LayoutStyle,
+    clip: Option<crate::Rect>,
+    root_font_size: f32,
+    viewport: (f32, f32),
+    base_url: Option<&str>,
+    image_cache: &mut RenderResourceCache,
+) {
+    let union = crate::Rect {
+        x: union.x,
+        y: union.y,
+        width: union.width,
+        height: union.height,
+    };
+    let mut fragment_style = style.clone();
+    for (index, fragment) in fragments.iter().enumerate() {
+        let fragment = crate::Rect {
+            x: fragment.x + offset.0,
+            y: fragment.y + offset.1,
+            ..*fragment
+        };
+        let visible = match clip {
+            Some(clip) => match fragment.intersect(&clip) {
+                Some(visible) => visible,
+                None => continue,
+            },
+            None => fragment,
+        };
+        let first = index == 0;
+        let last = index + 1 == fragments.len();
+        fragment_style.border.left = style.border.left;
+        fragment_style.border.right = style.border.right;
+        fragment_style.border_model.radii = style.border_model.radii;
+        if !first {
+            fragment_style.border.left = 0.0;
+            fragment_style.border_model.radii.top_left = crate::CornerRadius::default();
+            fragment_style.border_model.radii.bottom_left = crate::CornerRadius::default();
+        }
+        if !last {
+            fragment_style.border.right = 0.0;
+            fragment_style.border_model.radii.top_right = crate::CornerRadius::default();
+            fragment_style.border_model.radii.bottom_right = crate::CornerRadius::default();
+        }
+        let radius = fragment_style
+            .border_model
+            .radii
+            .resolve(fragment.width, fragment.height);
+        let has_radius = !radius.is_zero();
+        let clip_path_mask = fragment_style.clip_path.as_ref().and_then(|polygon| {
+            polygon_clip_mask(
+                pixmap.width(),
+                pixmap.height(),
+                polygon,
+                &fragment,
+                fragment_style.font_size.unwrap_or(16.0),
+                root_font_size,
+                viewport,
+            )
+        });
+        let path = if has_radius {
+            rounded_rect_path_radii(
+                visible.x,
+                visible.y,
+                visible.width,
+                visible.height,
+                radius,
+            )
+        } else {
+            Rect::from_xywh(visible.x, visible.y, visible.width, visible.height).and_then(
+                |rect| {
+                    let mut builder = PathBuilder::new();
+                    builder.push_rect(rect);
+                    builder.finish()
+                },
+            )
+        };
+
+        if let Some(shadow) = fragment_style.box_shadow {
+            paint_box_shadow(
+                pixmap,
+                &shadow,
+                &fragment,
+                fragment_style.border_model.radii,
+                clip,
+            );
+        }
+        if fragment_style.mask_image.is_none() && !fragment_style.background_clip_text {
+            if let (Some(background), Some(path)) = (fragment_style.background_color, path.as_ref()) {
+                let mut paint = Paint::default();
+                paint.set_color(Color::from_rgba8(
+                    background[0],
+                    background[1],
+                    background[2],
+                    background[3],
+                ));
+                paint.anti_alias = has_radius;
+                pixmap.fill_path(
+                    path,
+                    &paint,
+                    FillRule::Winding,
+                    Transform::identity(),
+                    clip_path_mask.as_ref(),
+                );
+            }
+            if !fragment_style.background_gradient_layers.is_empty() {
+                if let Some(path) = path.as_ref() {
+                    paint_background_gradient_layers(
+                        pixmap,
+                        path,
+                        &union,
+                        radius,
+                        &fragment_style,
+                        root_font_size,
+                        viewport,
+                        clip_path_mask.as_ref(),
+                    );
+                }
+            } else {
+                if let (Some((center, stops)), Some(path)) =
+                    (&fragment_style.background_radial_gradient, path.as_ref())
+                {
+                    paint_radial_gradient(
+                        pixmap,
+                        path,
+                        &union,
+                        *center,
+                        stops,
+                        clip_path_mask.as_ref(),
+                    );
+                }
+                if let Some((angle, center, stops)) = &fragment_style.background_conic_gradient {
+                    paint_conic_gradient_sampled(
+                        pixmap,
+                        &fragment,
+                        &union,
+                        radius,
+                        *angle,
+                        *center,
+                        stops,
+                        clip_path_mask.as_ref(),
+                    );
+                }
+                if let (Some((angle, stops)), Some(path)) =
+                    (&fragment_style.background_gradient, path.as_ref())
+                {
+                    paint_linear_gradient(
+                        pixmap,
+                        path,
+                        &union,
+                        *angle,
+                        stops,
+                        clip_path_mask.as_ref(),
+                    );
+                }
+            }
+        }
+
+        if let Some(mask_url) = &fragment_style.mask_image {
+            let fill = fragment_style
+                .background_color
+                .or(fragment_style.color)
+                .unwrap_or([0, 0, 0, 255]);
+            paint_mask(
+                mask_url,
+                base_url,
+                &fragment,
+                radius,
+                fill,
+                fragment_style.background_radial_gradient.as_ref(),
+                fragment_style.background_gradient.as_ref(),
+                fragment_style.background_conic_gradient.as_ref(),
+                fragment_style.mask_size,
+                fragment_style.mask_repeat,
+                clip_path_mask.as_ref(),
+                pixmap,
+                image_cache,
+            );
+        } else if let Some(background_url) = &fragment_style.background_image {
+            if let Some(image_rect) = background_image_rect(
+                background_url,
+                base_url,
+                &union,
+                fragment_style.background_size,
+                fragment_style.background_size_expression.as_deref(),
+                fragment_style.background_size_fit,
+                fragment_style.background_position,
+                fragment_style.font_size.unwrap_or(16.0),
+                root_font_size,
+                viewport,
+                image_cache,
+            ) {
+                paint_image(
+                    background_url,
+                    base_url,
+                    &image_rect,
+                    &visible,
+                    crate::ObjectFit::Fill,
+                    pixmap,
+                    image_cache,
+                    None,
+                    radius,
+                    clip_path_mask.as_ref(),
+                );
+            }
+        }
+        paint_css_border(pixmap, &fragment, &fragment_style, clip_path_mask.as_ref());
+    }
 }
 
 /// Per-capture root-scroll and sticky offsets layered over an immutable
@@ -4310,6 +4563,28 @@ fn paint_conic_gradient(
     stops: &[([u8; 4], Option<f32>)],
     extra_clip: Option<&tiny_skia::Mask>,
 ) {
+    paint_conic_gradient_sampled(
+        pixmap,
+        rect,
+        rect,
+        border_radius,
+        angle,
+        center,
+        stops,
+        extra_clip,
+    );
+}
+
+fn paint_conic_gradient_sampled(
+    pixmap: &mut Pixmap,
+    rect: &crate::Rect,
+    sampling_rect: &crate::Rect,
+    border_radius: crate::ResolvedBorderRadii,
+    angle: f32,
+    center: (f32, f32),
+    stops: &[([u8; 4], Option<f32>)],
+    extra_clip: Option<&tiny_skia::Mask>,
+) {
     if rect.width <= 0.0 || rect.height <= 0.0 || stops.len() < 2 {
         return;
     }
@@ -4322,7 +4597,7 @@ fn paint_conic_gradient(
     for y in 0..height {
         for x in 0..width {
             let color = conic_color_at(
-                rect,
+                sampling_rect,
                 angle,
                 center,
                 &normalized,
@@ -8210,6 +8485,49 @@ mod tests {
                 pixel.blue() > 230 && pixel.red() < 30 && pixel.green() < 30
             })),
             "a higher-z sibling must cover the lower item's background, border, and shaped text as one unit"
+        );
+    }
+
+    #[test]
+    fn wrapped_inline_background_and_slice_borders_paint_per_continuation() {
+        let tree = parse_html(
+            r#"<style>
+                html,body,p { margin:0 }
+                p { width:70px; font:16px/24px monospace }
+                #token {
+                    color:transparent; background:#ff0000; padding:0 10px;
+                    border-left:2px solid #0000ff;
+                    border-right:2px solid #0000ff
+                }
+            </style>
+            <p><span id="token">aaaa aaaa aaaa</span></p>"#,
+        );
+        let token = tree.get_element_by_id("token").unwrap();
+        let mut resources = RenderResourceCache::default();
+        let mut prepared = prepare_dom(&tree, (120.0, 100.0), None, &mut resources).unwrap();
+        let fragments = prepared.layout.inline_fragments[&token].clone();
+        assert_eq!(fragments.len(), 3, "{fragments:?}");
+        let pixmap = paint_prepared(&tree, &mut prepared, &mut resources, (0.0, 0.0)).unwrap();
+        let rgb = |x: f32, y: f32| {
+            let pixel = pixmap
+                .pixel(x.floor().max(0.0) as u32, y.floor().max(0.0) as u32)
+                .unwrap();
+            (pixel.red(), pixel.green(), pixel.blue())
+        };
+        let first = fragments[0];
+        let middle = fragments[1];
+        let last = fragments[2];
+        assert_eq!(rgb(first.x + 0.5, first.y + 1.0), (0, 0, 255));
+        assert_eq!(rgb(middle.x + 0.5, middle.y + 1.0), (255, 0, 0));
+        assert_eq!(
+            rgb(last.x + last.width - 0.5, last.y + 1.0),
+            (0, 0, 255)
+        );
+        let gap_y = (first.y + first.height + middle.y) * 0.5;
+        assert_eq!(
+            rgb(5.0, gap_y),
+            (255, 255, 255),
+            "the multiline bounding union must not fill the inter-line gap"
         );
     }
 

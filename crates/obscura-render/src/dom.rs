@@ -12326,6 +12326,75 @@ mod tests {
     }
 
     #[test]
+    fn inline_horizontal_edges_advance_adjacent_content_but_margins_stay_outside_rect() {
+        let tree = parse_html(
+            r#"<style>
+                html,body,p { margin:0 }
+                p { font:16px/20px monospace; white-space:nowrap }
+                #token {
+                    margin-left:3px; padding:0 4px;
+                    border-left:2px solid; border-right:2px solid;
+                    margin-right:5px
+                }
+            </style>
+            <p id="decorated"><span id="token">aa</span><span id="after">bb</span></p>
+            <p id="plain-host"><span id="plain">aa</span><span id="plain-after">bb</span></p>"#,
+        );
+        let laid = layout_dom(&tree, (400.0, 100.0));
+        let rect = |id: &str| -> Rect { laid.rects[&tree.get_element_by_id(id).unwrap()] };
+        let local_x = |id: &str, host: &str| rect(id).x - rect(host).x;
+
+        assert!((rect("token").width - rect("plain").width - 12.0).abs() < 0.01);
+        assert!((local_x("token", "decorated") - local_x("plain", "plain-host") - 3.0).abs() < 0.01);
+        assert!((local_x("after", "decorated") - local_x("plain-after", "plain-host") - 20.0).abs() < 0.01);
+        assert!((rect("after").x - (rect("token").x + rect("token").width) - 5.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn inline_edges_participate_in_wrapping_and_slice_only_outer_continuation_sides() {
+        let tree = parse_html(
+            r#"<style>
+                html,body,p { margin:0 }
+                p { width:70px; font:16px/20px monospace }
+                #token { padding:0 10px; border-left:2px solid; border-right:2px solid }
+            </style>
+            <p><span id="token">aaaa aaaa aaaa</span></p>"#,
+        );
+        let laid = layout_dom(&tree, (200.0, 100.0));
+        let token = tree.get_element_by_id("token").unwrap();
+        let fragments = &laid.inline_fragments[&token];
+
+        assert_eq!(fragments.len(), 3, "{fragments:?}");
+        assert!((fragments[0].width - fragments[1].width - 12.0).abs() < 0.01, "{fragments:?}");
+        assert!(fragments[2].width > fragments[1].width, "last continuation owns its end side: {fragments:?}");
+        assert!(fragments.iter().all(|fragment| fragment.width <= 70.01));
+    }
+
+    #[test]
+    fn empty_decorated_inline_has_a_box_and_advances_following_text() {
+        let tree = parse_html(
+            r#"<style>
+                html,body,p { margin:0 }
+                p { font:16px/20px monospace; white-space:nowrap }
+                #empty {
+                    margin:0 3px; padding:2px 5px; border:1px solid;
+                    border-left-width:2px; border-right-width:2px
+                }
+            </style>
+            <p id="decorated">x<span id="empty"></span><span id="after">y</span></p>
+            <p id="plain-host">x<span id="plain-after">y</span></p>"#,
+        );
+        let laid = layout_dom(&tree, (300.0, 100.0));
+        let rect = |id: &str| -> Rect { laid.rects[&tree.get_element_by_id(id).unwrap()] };
+
+        assert!((rect("empty").width - 14.0).abs() < 0.01, "{:?}", rect("empty"));
+        assert!((rect("empty").height - laid.text_engine.inline_font_box_height(&laid.styles[&tree.get_element_by_id("empty").unwrap()]) - 6.0).abs() < 0.01);
+        let decorated_after = rect("after").x - rect("decorated").x;
+        let plain_after = rect("plain-after").x - rect("plain-host").x;
+        assert!((decorated_after - plain_after - 20.0).abs() < 0.01);
+    }
+
+    #[test]
     fn inline_provenance_maps_repeated_multibyte_text_across_hard_breaks() {
         let tree = parse_html(
             r#"<style>

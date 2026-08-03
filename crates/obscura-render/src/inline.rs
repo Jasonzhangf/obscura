@@ -433,6 +433,8 @@ pub struct InlineItem {
     /// with no nested inline owner, keeping that path allocation-free.
     owner_text: Option<String>,
     owner_ranges: Vec<OwnerTextRange>,
+    owner_boxes: Vec<InlineOwnerBox>,
+    boundary_events: Vec<InlineBoundaryEvent>,
     /// Nonzero used relative-position offsets, projected onto text ranges.
     /// Empty for ordinary IFCs and for nested inlines that remain at their
     /// normal-flow position, so paint pays no provenance cost on that path.
@@ -444,6 +446,51 @@ struct OwnerTextRange {
     owner: NodeId,
     start: usize,
     end: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct InlineEdge {
+    margin: f32,
+    border: f32,
+    padding: f32,
+}
+
+impl InlineEdge {
+    fn advance(self) -> f32 {
+        self.margin + self.border + self.padding
+    }
+
+    fn border_padding(self) -> f32 {
+        self.border + self.padding
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct InlineOwnerBox {
+    owner: NodeId,
+    start: usize,
+    end: usize,
+    start_edge: InlineEdge,
+    end_edge: InlineEdge,
+    start_event: usize,
+    end_event: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct InlineBoundaryEvent {
+    owner: NodeId,
+    position: usize,
+    is_start: bool,
+    edge: InlineEdge,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ActiveInlineOwner {
+    owner: NodeId,
+    start: usize,
+    start_edge: InlineEdge,
+    end_edge: InlineEdge,
+    start_event: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1001,6 +1048,8 @@ impl TextEngine {
             spans,
             collector.clip_fills,
             collector.owner_ranges,
+            collector.owner_boxes,
+            collector.boundary_events,
         )
     }
 
@@ -1055,6 +1104,8 @@ impl TextEngine {
             spans,
             collector.clip_fills,
             collector.owner_ranges,
+            collector.owner_boxes,
+            collector.boundary_events,
         )
     }
 
@@ -1113,6 +1164,8 @@ impl TextEngine {
             spans,
             collector.clip_fills,
             collector.owner_ranges,
+            collector.owner_boxes,
+            collector.boundary_events,
         )
     }
 
@@ -1126,6 +1179,8 @@ impl TextEngine {
         mut spans: Vec<(String, SpanAttrs)>,
         clip_fills: Vec<ClipTextFill>,
         mut owner_ranges: Vec<OwnerTextRange>,
+        mut owner_boxes: Vec<InlineOwnerBox>,
+        mut boundary_events: Vec<InlineBoundaryEvent>,
     ) -> Option<usize> {
         let white_space = base.white_space.unwrap_or_default();
         let layout_wrap = if spans.iter().any(|(_, attrs)| attrs.has_layout_emergency_breaks()) {
@@ -1154,7 +1209,7 @@ impl TextEngine {
                 }
             }
         }
-        if spans.iter().all(|(text, _)| {
+        if owner_boxes.is_empty() && spans.iter().all(|(text, _)| {
                 text.is_empty()
                     || (matches!(
                         white_space,
@@ -1172,7 +1227,14 @@ impl TextEngine {
             range.end = range.end.min(text_len);
             range.start < range.end
         });
-        let owner_text = (!owner_ranges.is_empty()).then(|| {
+        for owner in &mut owner_boxes {
+            owner.start = owner.start.min(text_len);
+            owner.end = owner.end.min(text_len);
+        }
+        for event in &mut boundary_events {
+            event.position = event.position.min(text_len);
+        }
+        let owner_text = (!owner_boxes.is_empty()).then(|| {
             let mut text = String::with_capacity(text_len);
             for (span, _) in &spans {
                 text.push_str(span);
@@ -1198,6 +1260,11 @@ impl TextEngine {
         }
         let forced_lines =
             forced_breaks + usize::from(forced_breaks > 0 && visible_after_last_break);
+        let forced_lines = if owner_boxes.is_empty() {
+            forced_lines
+        } else {
+            forced_lines.max(1)
+        };
         let forced_min_height = forced_lines as f32 * line_h.max(1.0);
         // cosmic-text asserts (an uncatchable process abort) if font size OR
         // line height is 0. `font-size:0` is a common whitespace-collapse trick
@@ -1298,7 +1365,8 @@ impl TextEngine {
 
         let idx = self.items.len();
         let text_indent = base.text_indent.unwrap_or(Dimension::Px(0.0));
-        let source_buffer = (!matches!(text_indent, Dimension::Px(value) if value == 0.0))
+        let source_buffer = (!matches!(text_indent, Dimension::Px(value) if value == 0.0)
+            || !boundary_events.is_empty())
             .then(|| buffer.clone());
         self.items.push(InlineItem {
             buffer,
@@ -1320,6 +1388,8 @@ impl TextEngine {
             marker: None,
             owner_text,
             owner_ranges,
+            owner_boxes,
+            boundary_events,
             relative_owner_ranges: Vec::new(),
         });
         Some(idx)
@@ -1347,8 +1417,7 @@ impl TextEngine {
         let TextEngine { font_system, items, .. } = self;
         let item = &mut items[idx];
         shape_with_text_indent(font_system, item, width, wrap);
-        let (width, height, clamped) =
-            buffer_size(&item.buffer, item.first_line_offset, item.line_clamp);
+        let (width, height, clamped) = buffer_size(item);
         (
             width,
             if clamped {
@@ -1374,13 +1443,22 @@ impl TextEngine {
         shape_with_text_indent(font_system, item, None, wrap);
         let mut width = 0.0f32;
         let mut height = 0.0f32;
+        let starts = item
+            .owner_text
+            .as_deref()
+            .map(|source| source_line_starts(&item.buffer, source))
+            .unwrap_or_default();
         for (line_index, run) in item.buffer.layout_runs().enumerate() {
             let offset = if line_index == 0 {
                 item.first_line_offset
             } else {
                 0.0
             };
-            width = width.max((run.line_w + offset).max(0.0));
+            let line_start = starts.get(run.line_i).copied().unwrap_or(0);
+            let line_end = line_start + run.text.len();
+            width = width.max(
+                (run.line_w + offset + line_edge_advance(item, line_start, line_end)).max(0.0),
+            );
             height = height.max(run.line_top + run.line_height);
         }
         (width, height.max(item.forced_min_height))
@@ -1540,7 +1618,7 @@ impl TextEngine {
     }
 
     pub(crate) fn has_inline_owners(&self) -> bool {
-        self.items.iter().any(|item| !item.owner_ranges.is_empty())
+        self.items.iter().any(|item| !item.owner_boxes.is_empty())
     }
 
     /// Install cumulative used offsets for relative ordinary-inline owners.
@@ -1588,21 +1666,49 @@ impl TextEngine {
                 } else {
                     0.0
                 };
-                for range in &item.owner_ranges {
-                    let start = range.start.max(line_start);
-                    let end = range.end.min(line_end);
-                    if start >= end {
+                let alignment_shift = line_edge_alignment_shift(item, line_start, line_end);
+                for owner in &item.owner_boxes {
+                    let empty = owner.start == owner.end;
+                    let intersects = if empty {
+                        (owner.start >= line_start && owner.start < line_end)
+                            || (line_end == source.len() && owner.start == line_end)
+                    } else {
+                        owner.start < line_end && owner.end > line_start
+                    };
+                    if !intersects {
                         continue;
                     }
-                    let start = Cursor::new(run.line_i, start - line_start);
-                    let end = Cursor::new(run.line_i, end - line_start);
-                    let Some((x, width)) = run.highlight(start, end) else {
-                        continue;
+                    let first = owner.start >= line_start && owner.start < line_end || empty;
+                    let last = owner.end > line_start && owner.end <= line_end || empty;
+                    let raw_left = if first {
+                        run_cursor_x(&run, owner.start.saturating_sub(line_start))
+                            + line_advance_before_event(
+                                item,
+                                owner.start_event,
+                                line_start,
+                                line_end,
+                            )
+                            + owner.start_edge.margin
+                    } else {
+                        run_cursor_x(&run, 0)
                     };
-                    let x = item.origin.0 + first_line_offset + x;
+                    let raw_right = if last {
+                        run_cursor_x(&run, owner.end.saturating_sub(line_start))
+                            + line_advance_before_event(
+                                item,
+                                owner.end_event,
+                                line_start,
+                                line_end,
+                            )
+                            + owner.end_edge.border_padding()
+                    } else {
+                        run.line_w + line_edge_advance(item, line_start, line_end)
+                    };
+                    let x = item.origin.0 + first_line_offset + alignment_shift + raw_left;
+                    let width = (raw_right - raw_left).max(0.0);
                     let baseline_y = item.origin.1 + run.line_y;
                     if let Some(existing) = out.iter_mut().find(|fragment| {
-                        fragment.owner == range.owner
+                        fragment.owner == owner.owner
                             && fragment.item_index == item_index
                             && fragment.line_index == line_index
                     }) {
@@ -1612,7 +1718,7 @@ impl TextEngine {
                         existing.width = (right - left).max(0.0);
                     } else {
                         out.push(InlineOwnerLineFragment {
-                            owner: range.owner,
+                            owner: owner.owner,
                             item_index,
                             line_index,
                             x,
@@ -1770,8 +1876,10 @@ struct SpanCtx {
 struct Collector {
     last_was_space: bool,
     clip_fills: Vec<ClipTextFill>,
-    owners: Vec<NodeId>,
+    owners: Vec<ActiveInlineOwner>,
     owner_ranges: Vec<OwnerTextRange>,
+    owner_boxes: Vec<InlineOwnerBox>,
+    boundary_events: Vec<InlineBoundaryEvent>,
     text_len: usize,
 }
 
@@ -1782,6 +1890,8 @@ impl Collector {
             clip_fills: Vec::new(),
             owners: Vec::new(),
             owner_ranges: Vec::new(),
+            owner_boxes: Vec::new(),
+            boundary_events: Vec::new(),
             text_len: 0,
         }
     }
@@ -1789,13 +1899,61 @@ impl Collector {
     fn record_text(&mut self, byte_len: usize) {
         let start = self.text_len;
         self.text_len = self.text_len.saturating_add(byte_len);
-        for &owner in &self.owners {
+        for owner in &self.owners {
             self.owner_ranges.push(OwnerTextRange {
-                owner,
+                owner: owner.owner,
                 start,
                 end: self.text_len,
             });
         }
+    }
+
+    fn begin_owner(&mut self, owner: NodeId, style: &LayoutStyle) {
+        let start_edge = InlineEdge {
+            margin: style.margin.left,
+            border: style.border.left,
+            padding: style.padding.left,
+        };
+        let end_edge = InlineEdge {
+            margin: style.margin.right,
+            border: style.border.right,
+            padding: style.padding.right,
+        };
+        let start_event = self.boundary_events.len();
+        self.boundary_events.push(InlineBoundaryEvent {
+            owner,
+            position: self.text_len,
+            is_start: true,
+            edge: start_edge,
+        });
+        self.owners.push(ActiveInlineOwner {
+            owner,
+            start: self.text_len,
+            start_edge,
+            end_edge,
+            start_event,
+        });
+    }
+
+    fn end_owner(&mut self, owner: NodeId) {
+        let active = self.owners.pop().expect("balanced inline owner stack");
+        debug_assert_eq!(active.owner, owner);
+        let end_event = self.boundary_events.len();
+        self.boundary_events.push(InlineBoundaryEvent {
+            owner,
+            position: self.text_len,
+            is_start: false,
+            edge: active.end_edge,
+        });
+        self.owner_boxes.push(InlineOwnerBox {
+            owner,
+            start: active.start,
+            end: self.text_len,
+            start_edge: active.start_edge,
+            end_edge: active.end_edge,
+            start_event: active.start_event,
+            end_event,
+        });
     }
 }
 
@@ -1966,7 +2124,7 @@ fn collect_node_spans(
                 style.ignores_used_box_sizes() && !style.display_contents
             });
             if owns_inline_fragment {
-                c.owners.push(cid);
+                c.begin_owner(cid, style.expect("inline owner style"));
             }
             let own_clip_fill = style.and_then(clip_text_fill).map(|fill| {
                 let index = c.clip_fills.len();
@@ -2051,8 +2209,7 @@ fn collect_node_spans(
                 loaded_families,
             );
             if owns_inline_fragment {
-                let popped = c.owners.pop();
-                debug_assert_eq!(popped, Some(cid));
+                c.end_owner(cid);
             }
         }
     }
@@ -2109,32 +2266,104 @@ fn push_text(
     out.push((buf, attrs.clone()));
 }
 
+fn boundary_event_on_line(
+    item: &InlineItem,
+    event: &InlineBoundaryEvent,
+    line_start: usize,
+    line_end: usize,
+) -> bool {
+    let source_end = item.owner_text.as_ref().map_or(0, String::len);
+    let empty = item
+        .owner_boxes
+        .iter()
+        .find(|owner| owner.owner == event.owner)
+        .is_some_and(|owner| owner.start == owner.end);
+    if empty {
+        (event.position >= line_start && event.position < line_end)
+            || (line_end == source_end && event.position == line_end)
+    } else if event.is_start {
+        event.position >= line_start && event.position < line_end
+    } else {
+        event.position > line_start && event.position <= line_end
+    }
+}
+
+fn line_edge_advance(item: &InlineItem, line_start: usize, line_end: usize) -> f32 {
+    item.boundary_events
+        .iter()
+        .filter(|event| boundary_event_on_line(item, event, line_start, line_end))
+        .map(|event| event.edge.advance())
+        .sum()
+}
+
+fn line_edge_alignment_shift(item: &InlineItem, line_start: usize, line_end: usize) -> f32 {
+    -line_edge_advance(item, line_start, line_end)
+        * match item.align {
+            Some(Align::Center) => 0.5,
+            Some(Align::End | Align::Right) => 1.0,
+            _ => 0.0,
+        }
+}
+
+fn line_advance_before_event(
+    item: &InlineItem,
+    event_index: usize,
+    line_start: usize,
+    line_end: usize,
+) -> f32 {
+    item.boundary_events[..event_index]
+        .iter()
+        .filter(|event| boundary_event_on_line(item, event, line_start, line_end))
+        .map(|event| event.edge.advance())
+        .sum()
+}
+
+fn line_advance_before_text(
+    item: &InlineItem,
+    global_position: usize,
+    line_start: usize,
+    line_end: usize,
+) -> f32 {
+    item.boundary_events
+        .iter()
+        .filter(|event| {
+            boundary_event_on_line(item, event, line_start, line_end)
+                && event.position <= global_position
+        })
+        .map(|event| event.edge.advance())
+        .sum()
+}
+
 /// Total shaped size of a buffer: widest line, and the bottom of the last line.
-fn buffer_size(
-    buffer: &Buffer,
-    first_line_offset: f32,
-    line_clamp: Option<usize>,
-) -> (f32, f32, bool) {
+fn buffer_size(item: &InlineItem) -> (f32, f32, bool) {
     let mut w = 0.0f32;
     let mut h = 0.0f32;
     let mut nonempty_lines = 0usize;
     let mut clamp_height = None;
-    for (line_index, run) in buffer.layout_runs().enumerate() {
+    let line_starts = item
+        .owner_text
+        .as_deref()
+        .map(|source| source_line_starts(&item.buffer, source))
+        .unwrap_or_default();
+    for (line_index, run) in item.buffer.layout_runs().enumerate() {
         let offset = if line_index == 0 {
-            first_line_offset
+            item.first_line_offset
         } else {
             0.0
         };
-        w = w.max((run.line_w + offset).max(0.0));
+        let line_start = line_starts.get(run.line_i).copied().unwrap_or(0);
+        let line_end = line_start + run.text.len();
+        let edges = line_edge_advance(item, line_start, line_end);
+        w = w.max((run.line_w + offset + edges).max(0.0));
         h = h.max(run.line_top + run.line_height);
         if !run.glyphs.is_empty() {
             nonempty_lines += 1;
-            if line_clamp == Some(nonempty_lines) {
+            if item.line_clamp == Some(nonempty_lines) {
                 clamp_height = Some(run.line_top + run.line_height);
             }
         }
     }
-    let clamped = line_clamp.is_some_and(|limit| nonempty_lines > limit);
+    let clamped = item.line_clamp.is_some_and(|limit| nonempty_lines > limit);
     (
         w.ceil(),
         if clamped { clamp_height.unwrap_or(h) } else { h },
@@ -2170,6 +2399,20 @@ fn source_line_starts(buffer: &Buffer, source: &str) -> Vec<usize> {
     starts
 }
 
+fn run_cursor_x(run: &cosmic_text::LayoutRun<'_>, byte: usize) -> f32 {
+    let cursor = Cursor::new(run.line_i, byte.min(run.text.len()));
+    if let Some((x, _)) = run.highlight(cursor, cursor) {
+        return x;
+    }
+    if byte == 0 {
+        run.glyphs.first().map_or(0.0, |glyph| glyph.x)
+    } else {
+        run.glyphs
+            .last()
+            .map_or(run.line_w, |glyph| glyph.x + glyph.w)
+    }
+}
+
 fn glyph_relative_offset(
     ranges: &[RelativeOwnerTextRange],
     line_start: usize,
@@ -2197,13 +2440,14 @@ fn used_text_indent(value: Dimension, width: Option<f32>) -> f32 {
     if indent.is_finite() { indent } else { 0.0 }
 }
 
-/// Shape one IFC with a first-line-only indent.
+/// Shape one IFC with first-line indent and ordinary-inline boundary advances.
 ///
-/// cosmic-text accepts one wrap width for every visual line. To retain the
-/// browser model, first probe the pristine paragraph at `width - indent`, take
-/// its first wrap boundary, split there, and reshape the tail at the full
-/// content width. The synthetic split lives only in the working clone, so
-/// repeated intrinsic/final Taffy measurements never accumulate hard breaks.
+/// The pristine buffer remains one shaping stream across DOM owners. For a
+/// definite width we probe cosmic-text's own UAX/CSS wrap boundary, subtract
+/// the ordered margin/border/padding events that fall on that candidate line,
+/// and monotonically retry if those edges force an earlier break. Only final
+/// visual-line boundaries split BufferLines, so ligatures and kerning are not
+/// broken merely because an inline element starts or ends.
 fn shape_with_text_indent(
     font_system: &mut FontSystem,
     item: &mut InlineItem,
@@ -2228,34 +2472,113 @@ fn shape_with_text_indent(
     item.buffer = source.clone();
     item.buffer.set_wrap(font_system, wrap);
 
-    let mut first_break = None;
-    if let Some(full_width) = width {
+    if let (Some(full_width), Some(source_text)) = (width, item.owner_text.as_deref()) {
+        let metrics = item.buffer.metrics();
+        let mono = item.buffer.monospace_width();
+        let tab_width = item.buffer.tab_width();
+        let mut line_index = 0usize;
+        while line_index < item.buffer.lines.len() {
+            let starts = source_line_starts(&item.buffer, source_text);
+            let global_start = starts.get(line_index).copied().unwrap_or(0);
+            let first_indent = if line_index == 0 { indent } else { 0.0 };
+            let base_available = (full_width - first_indent).max(0.0);
+            // Negative inline margins can admit content that would not fit in
+            // the text-only probe. Begin at the widest possible candidate and
+            // retain the same monotonic-decrease convergence used for positive
+            // padding/border advances.
+            let line_source_end = global_start + item.buffer.lines[line_index].text().len();
+            let negative_edges = item
+                .boundary_events
+                .iter()
+                .filter(|event| {
+                    event.position >= global_start && event.position <= line_source_end
+                })
+                .map(|event| event.edge.advance().min(0.0))
+                .sum::<f32>();
+            let mut available = (base_available - negative_edges).max(0.0);
+            let mut split = None;
+
+            for _ in 0..=item.boundary_events.len() {
+                let (candidate, line_width) = {
+                    let line = &mut item.buffer.lines[line_index];
+                    let layouts = line.layout(
+                        font_system,
+                        metrics.font_size,
+                        Some(available),
+                        wrap,
+                        mono,
+                        tab_width,
+                    );
+                    let Some(first) = layouts.first() else {
+                        break;
+                    };
+                    (
+                        first.glyphs.iter().map(|glyph| glyph.end).max(),
+                        first.w,
+                    )
+                };
+                let Some(candidate) = candidate else {
+                    break;
+                };
+                let candidate_end = global_start.saturating_add(candidate);
+                let edges = line_edge_advance(item, global_start, candidate_end);
+                let required_available = (base_available - edges).max(0.0);
+                split = Some(candidate);
+                if line_width + edges <= base_available + 0.01
+                    || required_available + 0.01 >= available
+                {
+                    break;
+                }
+                available = required_available;
+                item.buffer.lines[line_index].reset_layout();
+            }
+
+            let Some(mut split) = split else {
+                line_index += 1;
+                continue;
+            };
+            let text = item.buffer.lines[line_index].text();
+            while split < text.len() {
+                let Some(ch) = text[split..].chars().next() else {
+                    break;
+                };
+                if !ch.is_whitespace() {
+                    break;
+                }
+                split += ch.len_utf8();
+            }
+            if split > 0 && split < text.len() {
+                let tail = item.buffer.lines[line_index].split_off(split);
+                item.buffer.lines.insert(line_index + 1, tail);
+            }
+            line_index += 1;
+        }
+    } else if let Some(full_width) = width {
         item.buffer
             .set_size(font_system, Some((full_width - indent).max(0.0)), None);
         item.buffer.shape_until_scroll(font_system, false);
-        first_break = item
+        let first_break = item
             .buffer
             .layout_runs()
             .next()
             .and_then(|run| run.glyphs.iter().map(|glyph| glyph.end).max());
-    }
-
-    item.buffer = source.clone();
-    item.buffer.set_wrap(font_system, wrap);
-    if let (Some(mut split), Some(first_line)) =
-        (first_break, item.buffer.lines.first())
-    {
-        let text = first_line.text();
-        while split < text.len() {
-            let Some(ch) = text[split..].chars().next() else { break };
-            if !ch.is_whitespace() {
-                break;
+        item.buffer = source.clone();
+        item.buffer.set_wrap(font_system, wrap);
+        if let (Some(mut split), Some(first_line)) = (first_break, item.buffer.lines.first()) {
+            let text = first_line.text();
+            while split < text.len() {
+                let Some(ch) = text[split..].chars().next() else {
+                    break;
+                };
+                if !ch.is_whitespace() {
+                    break;
+                }
+                split += ch.len_utf8();
             }
-            split += ch.len_utf8();
-        }
-        if split > 0 && split < text.len() {
-            let tail = item.buffer.lines[0].split_off(split);
-            item.buffer.lines.insert(1, tail);
+            if split > 0 && split < text.len() {
+                let tail = item.buffer.lines[0].split_off(split);
+                item.buffer.lines.insert(1, tail);
+            }
         }
     }
     item.buffer
@@ -2451,6 +2774,12 @@ fn inline_child_ok(tree: &DomTree, cid: NodeId, styles: &std::collections::HashM
             if !foldable_inline {
                 return false;
             }
+            if style.margin != crate::Edges::default()
+                || style.padding != crate::Edges::default()
+                || style.border != crate::Edges::default()
+            {
+                *has_text = true;
+            }
             for gc in crate::dom::rendered_children(tree, cid) {
                 if !inline_child_ok(tree, gc, styles, has_text) {
                     return false;
@@ -2572,7 +2901,9 @@ impl TextEngine {
         let line_source_starts = item
             .owner_text
             .as_deref()
-            .filter(|_| !item.relative_owner_ranges.is_empty())
+            .filter(|_| {
+                !item.relative_owner_ranges.is_empty() || !item.boundary_events.is_empty()
+            })
             .map(|source| source_line_starts(&item.buffer, source))
             .unwrap_or_default();
 
@@ -2590,6 +2921,9 @@ impl TextEngine {
                 0.0
             };
             let line_source_start = line_source_starts.get(run.line_i).copied().unwrap_or(0);
+            let line_source_end = line_source_start + run.text.len();
+            let inline_alignment =
+                line_edge_alignment_shift(item, line_source_start, line_source_end);
             let base_y = run.line_y;
             let mut seg: Option<(f32, f32, f32, [u8; 4], (f32, f32))> = None;
             for g in run.glyphs {
@@ -2603,12 +2937,19 @@ impl TextEngine {
                 }) {
                     continue;
                 }
-                let relative = glyph_relative_offset(
+                let mut relative = glyph_relative_offset(
                     &item.relative_owner_ranges,
                     line_source_start,
                     g.start,
                     g.end,
                 );
+                relative.0 += inline_alignment
+                    + line_advance_before_text(
+                        item,
+                        line_source_start + g.start,
+                        line_source_start,
+                        line_source_end,
+                    );
                 let underlined = g.metadata & META_UNDERLINE != 0;
                 if let Some(fill_index) = metadata_fill(g.metadata) {
                     if let Some(bounds) = fill_bounds.get_mut(fill_index) {
@@ -2677,6 +3018,9 @@ impl TextEngine {
                 0.0
             };
             let line_source_start = line_source_starts.get(run.line_i).copied().unwrap_or(0);
+            let line_source_end = line_source_start + run.text.len();
+            let inline_alignment =
+                line_edge_alignment_shift(item, line_source_start, line_source_end);
             for glyph in run.glyphs {
                 if item.marker.is_some_and(|marker| {
                     marker.line_index == line_index
@@ -2684,12 +3028,19 @@ impl TextEngine {
                 }) {
                     continue;
                 }
-                let relative = glyph_relative_offset(
+                let mut relative = glyph_relative_offset(
                     &item.relative_owner_ranges,
                     line_source_start,
                     glyph.start,
                     glyph.end,
                 );
+                relative.0 += inline_alignment
+                    + line_advance_before_text(
+                        item,
+                        line_source_start + glyph.start,
+                        line_source_start,
+                        line_source_end,
+                    );
                 let physical = glyph.physical(
                     (line_offset + relative.0, relative.1),
                     1.0,
