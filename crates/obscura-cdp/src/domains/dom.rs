@@ -236,6 +236,25 @@ pub async fn handle(
             let _ = page.evaluate(&code);
             Ok(json!({}))
         }
+        "scrollIntoViewIfNeeded" => {
+            let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
+            let node_id = resolve_node_id(page, params)?;
+            // Obscura has no layout viewport to move, but the JS shim records
+            // this element for the hit testing used by subsequent input events.
+            let code = format!(
+                "(function() {{ var el = globalThis._wrap && globalThis._wrap({0}); \
+                 if (!el || typeof el.scrollIntoView !== 'function') return false; \
+                 el.scrollIntoView(); return true; }})()",
+                node_id
+            );
+            let did_scroll = page.evaluate(&code).as_bool().unwrap_or(false);
+            if !did_scroll {
+                return Err(format!(
+                    "node {node_id} could not be resolved to a scrollable element"
+                ));
+            }
+            Ok(json!({}))
+        }
         "setFileInputFiles" => {
             // Puppeteer's ElementHandle.uploadFile / Playwright's setInputFiles
             // drive an <input type=file> through this CDP call (issue #359). Read
@@ -523,6 +542,102 @@ mod tests {
             active,
             json!("INPUT"),
             "DOM.focus must set document.activeElement to the focused input"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn scroll_into_view_if_needed_resolves_all_node_identifiers() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page_id);
+
+        crate::domains::page::handle(
+            "navigate",
+            &json!({
+                "url": "data:text/html,<main><button id=target>Go</button></main>",
+                "waitUntil": "load"
+            }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("navigate should succeed");
+
+        let query = handle(
+            "querySelector",
+            &json!({ "selector": "#target" }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("querySelector should succeed");
+        let node_id = query["nodeId"].as_u64().expect("button nodeId");
+
+        let resolved = handle(
+            "resolveNode",
+            &json!({ "nodeId": node_id }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("resolveNode should succeed");
+        let object_id = resolved["object"]["objectId"]
+            .as_str()
+            .expect("button objectId")
+            .to_string();
+
+        for params in [
+            json!({ "nodeId": node_id }),
+            json!({ "backendNodeId": node_id }),
+            json!({ "objectId": object_id }),
+        ] {
+            ctx.get_session_page_mut(&session)
+                .unwrap()
+                .evaluate("globalThis.__obscura_click_target = null");
+
+            handle("scrollIntoViewIfNeeded", &params, &mut ctx, &session)
+                .await
+                .expect("scrollIntoViewIfNeeded should succeed");
+
+            let target_id = ctx
+                .get_session_page_mut(&session)
+                .unwrap()
+                .evaluate("globalThis.__obscura_click_target && globalThis.__obscura_click_target.id");
+            assert_eq!(target_id, json!("target"));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn scroll_into_view_if_needed_requires_a_node_identifier() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page_id);
+
+        let error = handle(
+            "scrollIntoViewIfNeeded",
+            &json!({}),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect_err("missing node identifier should fail");
+
+        assert_eq!(error, "nodeId, backendNodeId, or objectId required");
+
+        let error = handle(
+            "scrollIntoViewIfNeeded",
+            &json!({ "nodeId": 999_999 }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect_err("an unknown node should fail");
+
+        assert_eq!(
+            error,
+            "node 999999 could not be resolved to a scrollable element"
         );
     }
 
