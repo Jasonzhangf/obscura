@@ -1887,6 +1887,7 @@ dependencies = [
  "anyhow",
  "base64",
  "futures-util",
+ "image",
  "libc",
  "obscura-browser",
  "obscura-dom",

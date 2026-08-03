@@ -5,6 +5,274 @@ use crate::dispatch::CdpContext;
 use crate::types::CdpEvent;
 use crate::util::url_is_file_scheme;
 
+#[cfg(feature = "render")]
+const DEFAULT_SCREENSHOT_QUALITY: i64 = 80;
+
+#[cfg(feature = "render")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScreenshotFormat {
+    Png,
+    Jpeg,
+    Webp,
+}
+
+#[cfg(feature = "render")]
+#[derive(Clone, Copy, Debug)]
+struct ScreenshotClip {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    scale: f64,
+}
+
+#[cfg(feature = "render")]
+#[derive(Clone, Copy, Debug)]
+struct ScreenshotOptions {
+    format: ScreenshotFormat,
+    quality: u8,
+    quality_supplied: bool,
+    clip: Option<ScreenshotClip>,
+    from_surface: bool,
+    capture_beyond_viewport: bool,
+    optimize_for_speed: bool,
+}
+
+#[cfg(feature = "render")]
+fn screenshot_bool(params: &Value, name: &str, default: bool) -> Result<bool, String> {
+    match params.get(name) {
+        None => Ok(default),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(_) => Err(format!("Invalid parameters: {name} must be a boolean")),
+    }
+}
+
+#[cfg(feature = "render")]
+fn screenshot_number(object: &serde_json::Map<String, Value>, name: &str) -> Result<f64, String> {
+    let value = object
+        .get(name)
+        .ok_or_else(|| format!("Invalid parameters: mandatory clip.{name} field missing"))?
+        .as_f64()
+        .ok_or_else(|| format!("Invalid parameters: clip.{name} must be a number"))?;
+    if !value.is_finite() {
+        return Err(format!("Invalid parameters: clip.{name} must be finite"));
+    }
+    Ok(value)
+}
+
+#[cfg(feature = "render")]
+fn parse_screenshot_options(params: &Value) -> Result<ScreenshotOptions, String> {
+    if !params.is_object() {
+        return Err("Invalid parameters: expected an object".to_string());
+    }
+
+    let format = match params.get("format") {
+        None => ScreenshotFormat::Png,
+        Some(Value::String(value)) => match value.as_str() {
+            "png" => ScreenshotFormat::Png,
+            "jpeg" => ScreenshotFormat::Jpeg,
+            "webp" => ScreenshotFormat::Webp,
+            _ => return Err("Invalid image format".to_string()),
+        },
+        Some(_) => return Err("Invalid parameters: format must be a string".to_string()),
+    };
+
+    let quality_supplied = params.get("quality").is_some();
+    let quality = match params.get("quality") {
+        None => DEFAULT_SCREENSHOT_QUALITY,
+        Some(value) => value
+            .as_i64()
+            .filter(|value| i32::try_from(*value).is_ok())
+            .ok_or_else(|| "Invalid parameters: quality must be an integer".to_string())?,
+    };
+    // Chromium accepts an int32 outside [0, 100], but deliberately falls back
+    // to its default quality instead of rejecting the request.
+    let quality = if (0..=100).contains(&quality) {
+        quality
+    } else {
+        DEFAULT_SCREENSHOT_QUALITY
+    } as u8;
+
+    let clip = match params.get("clip") {
+        None => None,
+        Some(Value::Object(object)) => {
+            let clip = ScreenshotClip {
+                x: screenshot_number(object, "x")?,
+                y: screenshot_number(object, "y")?,
+                width: screenshot_number(object, "width")?,
+                height: screenshot_number(object, "height")?,
+                scale: screenshot_number(object, "scale")?,
+            };
+            if clip.width == 0.0 {
+                return Err("Cannot take screenshot with 0 width.".to_string());
+            }
+            if clip.height == 0.0 {
+                return Err("Cannot take screenshot with 0 height.".to_string());
+            }
+            // Chromium's current handler only checks zero, but negative sizes
+            // and scales enter invalid gfx sizes and may stall the request.
+            // Fail deterministically instead of risking an allocation or hang.
+            if clip.width < 0.0 {
+                return Err("Cannot take screenshot with negative width.".to_string());
+            }
+            if clip.height < 0.0 {
+                return Err("Cannot take screenshot with negative height.".to_string());
+            }
+            if clip.scale <= 0.0 {
+                return Err("Cannot take screenshot with non-positive scale.".to_string());
+            }
+            Some(clip)
+        }
+        Some(_) => return Err("Invalid parameters: clip must be an object".to_string()),
+    };
+
+    Ok(ScreenshotOptions {
+        format,
+        quality,
+        quality_supplied,
+        clip,
+        from_surface: screenshot_bool(params, "fromSurface", true)?,
+        capture_beyond_viewport: screenshot_bool(params, "captureBeyondViewport", false)?,
+        optimize_for_speed: screenshot_bool(params, "optimizeForSpeed", false)?,
+    })
+}
+
+#[cfg(feature = "render")]
+fn screenshot_output_size(clip: ScreenshotClip) -> Result<(u32, u32), String> {
+    // Chromium converts the CSS clip size to an integer gfx::Size before
+    // applying scale to the requested output bitmap.
+    let width = (clip.width.trunc() * clip.scale).round();
+    let height = (clip.height.trunc() * clip.scale).round();
+    const MAX_DIMENSION: f64 = 128.0 * 1024.0;
+    if width <= 0.0 || height <= 0.0 {
+        return Err("Screenshot clip is too small at the requested scale.".to_string());
+    }
+    if width >= MAX_DIMENSION || height >= MAX_DIMENSION {
+        return Err("Page is too large.".to_string());
+    }
+    let pixels = width * height;
+    // Four RGBA bytes per pixel keeps this guard below a 256 MiB surface.
+    if !pixels.is_finite() || pixels > 64.0 * 1024.0 * 1024.0 {
+        return Err("Screenshot bitmap is too large.".to_string());
+    }
+    Ok((width as u32, height as u32))
+}
+
+#[cfg(feature = "render")]
+fn sample_screenshot_region(
+    source: &image::RgbaImage,
+    clip: ScreenshotClip,
+    relative_x: f64,
+    relative_y: f64,
+) -> Result<image::RgbaImage, String> {
+    let (output_width, output_height) = screenshot_output_size(clip)?;
+    let mut output = image::RgbaImage::new(output_width, output_height);
+    let source_width = source.width() as i64;
+    let source_height = source.height() as i64;
+
+    // Sampling pixel centers gives exact copies for integral, scale=1 clips
+    // while also handling fractional clip origins and non-integral scales.
+    for output_y in 0..output_height {
+        let sample_y =
+            relative_y + (f64::from(output_y) + 0.5) * clip.height / f64::from(output_height) - 0.5;
+        let y0 = sample_y.floor() as i64;
+        let y1 = y0 + 1;
+        let fy = sample_y - y0 as f64;
+        for output_x in 0..output_width {
+            let sample_x = relative_x
+                + (f64::from(output_x) + 0.5) * clip.width / f64::from(output_width)
+                - 0.5;
+            let x0 = sample_x.floor() as i64;
+            let x1 = x0 + 1;
+            let fx = sample_x - x0 as f64;
+            let pixel = |x: i64, y: i64| {
+                source.get_pixel(
+                    x.clamp(0, source_width - 1) as u32,
+                    y.clamp(0, source_height - 1) as u32,
+                )
+            };
+            let p00 = pixel(x0, y0);
+            let p10 = pixel(x1, y0);
+            let p01 = pixel(x0, y1);
+            let p11 = pixel(x1, y1);
+            let mut rgba = [0u8; 4];
+            for channel in 0..4 {
+                let top = f64::from(p00[channel]) * (1.0 - fx) + f64::from(p10[channel]) * fx;
+                let bottom = f64::from(p01[channel]) * (1.0 - fx) + f64::from(p11[channel]) * fx;
+                rgba[channel] = (top * (1.0 - fy) + bottom * fy).round().clamp(0.0, 255.0) as u8;
+            }
+            output.put_pixel(output_x, output_y, image::Rgba(rgba));
+        }
+    }
+    Ok(output)
+}
+
+#[cfg(feature = "render")]
+fn encode_screenshot(
+    image: &image::RgbaImage,
+    options: ScreenshotOptions,
+) -> Result<Vec<u8>, String> {
+    use image::ImageEncoder as _;
+
+    let mut output = Vec::new();
+    match options.format {
+        ScreenshotFormat::Png => {
+            let encoder = if options.optimize_for_speed {
+                image::codecs::png::PngEncoder::new_with_quality(
+                    &mut output,
+                    image::codecs::png::CompressionType::Fast,
+                    image::codecs::png::FilterType::NoFilter,
+                )
+            } else {
+                image::codecs::png::PngEncoder::new(&mut output)
+            };
+            encoder
+                .write_image(
+                    image.as_raw(),
+                    image.width(),
+                    image.height(),
+                    image::ExtendedColorType::Rgba8,
+                )
+                .map_err(|error| format!("PNG screenshot encoding failed: {error}"))?;
+        }
+        ScreenshotFormat::Jpeg => {
+            let rgb = image::DynamicImage::ImageRgba8(image.clone()).to_rgb8();
+            // image's pure-Rust JPEG encoder defines its quality range as
+            // 1..=100; Chromium permits zero, whose effective result is the
+            // lowest-quality encoding.
+            let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(
+                &mut output,
+                options.quality.max(1),
+            );
+            encoder
+                .write_image(
+                    rgb.as_raw(),
+                    rgb.width(),
+                    rgb.height(),
+                    image::ExtendedColorType::Rgb8,
+                )
+                .map_err(|error| format!("JPEG screenshot encoding failed: {error}"))?;
+        }
+        ScreenshotFormat::Webp => {
+            if options.quality_supplied {
+                return Err(
+                    "WebP screenshot quality is not supported by the current lossless encoder"
+                        .to_string(),
+                );
+            }
+            image::codecs::webp::WebPEncoder::new_lossless(&mut output)
+                .write_image(
+                    image.as_raw(),
+                    image.width(),
+                    image.height(),
+                    image::ExtendedColorType::Rgba8,
+                )
+                .map_err(|error| format!("WebP screenshot encoding failed: {error}"))?;
+        }
+    }
+    Ok(output)
+}
+
 /// Emit the post-navigation event stream into `ctx.pending_events`. Shared
 /// by both the in-process `do_navigate` path and the spawned path in
 /// `server::process_navigation`, so the recent goto-returns-Response /
@@ -548,18 +816,90 @@ pub async fn handle(
         "captureScreenshot" => {
             #[cfg(feature = "render")]
             {
-                let page = ctx.get_session_page(session_id).ok_or("No page for session")?;
-                match page.screenshot(page.viewport) {
-                    Some(png) => {
-                        use base64::Engine as _;
-                        let data = base64::engine::general_purpose::STANDARD.encode(&png);
-                        Ok(json!({ "data": data }))
-                    }
-                    None => Err(
-                        "Page.captureScreenshot failed: the page has no DOM to render"
+                let options = parse_screenshot_options(params)?;
+                if !options.from_surface {
+                    return Err(
+                        "Page.captureScreenshot fromSurface=false is not supported: Obscura has no separate browser-window compositor surface"
                             .to_string(),
-                    ),
+                    );
                 }
+                if options.capture_beyond_viewport && options.clip.is_none() {
+                    return Err(
+                        "Page.captureScreenshot full-page captureBeyondViewport=true is not supported without a clip: Obscura cannot yet record an off-viewport surface without relayout or scripted scrolling"
+                            .to_string(),
+                    );
+                }
+                if options.format == ScreenshotFormat::Webp && options.quality_supplied {
+                    return Err(
+                        "WebP screenshot quality is not supported by the current lossless encoder"
+                            .to_string(),
+                    );
+                }
+
+                let page = ctx
+                    .get_session_page_mut(session_id)
+                    .ok_or("No page for session")?;
+                let viewport = page.viewport;
+                let scroll = if options.clip.is_some() {
+                    page.evaluate("[window.scrollX, window.scrollY]")
+                        .as_array()
+                        .map(|values| {
+                            (
+                                values.first().and_then(Value::as_f64).unwrap_or(0.0),
+                                values.get(1).and_then(Value::as_f64).unwrap_or(0.0),
+                            )
+                        })
+                        .unwrap_or((0.0, 0.0))
+                } else {
+                    (0.0, 0.0)
+                };
+                let png = page.screenshot(viewport).ok_or_else(|| {
+                    "Page.captureScreenshot failed: the page has no DOM to render".to_string()
+                })?;
+
+                // Keep the common path allocation-free and byte-for-byte
+                // compatible with the renderer's native PNG encoder.
+                let encoded = if options.format == ScreenshotFormat::Png
+                    && options.clip.is_none()
+                    && !options.optimize_for_speed
+                {
+                    png
+                } else {
+                    let source = image::load_from_memory_with_format(&png, image::ImageFormat::Png)
+                        .map_err(|error| {
+                            format!("Page.captureScreenshot could not decode renderer PNG: {error}")
+                        })?
+                        .to_rgba8();
+
+                    let raster = if let Some(clip) = options.clip {
+                        let relative_x = clip.x - scroll.0;
+                        let relative_y = clip.y - scroll.1;
+                        let epsilon = 1e-6;
+                        if relative_x < -epsilon
+                            || relative_y < -epsilon
+                            || relative_x + clip.width > f64::from(source.width()) + epsilon
+                            || relative_y + clip.height > f64::from(source.height()) + epsilon
+                        {
+                            return Err(format!(
+                                "Page.captureScreenshot clip lies outside the current viewport surface; Obscura cannot yet record off-viewport pixels even with captureBeyondViewport=true (visible page rect: x={} y={} width={} height={})",
+                                scroll.0, scroll.1, viewport.0, viewport.1
+                            ));
+                        }
+                        sample_screenshot_region(
+                            &source,
+                            clip,
+                            relative_x.max(0.0),
+                            relative_y.max(0.0),
+                        )?
+                    } else {
+                        source
+                    };
+                    encode_screenshot(&raster, options)?
+                };
+
+                use base64::Engine as _;
+                let data = base64::engine::general_purpose::STANDARD.encode(encoded);
+                Ok(json!({ "data": data }))
             }
             #[cfg(not(feature = "render"))]
             Err(
@@ -678,6 +1018,240 @@ mod tests {
         assert_ne!(
             top_data, scrolled_data,
             "CDP captureScreenshot must paint the current scroll offset"
+        );
+    }
+
+    #[cfg(feature = "render")]
+    fn decode_capture(result: &Value) -> (image::ImageFormat, image::RgbaImage) {
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(result["data"].as_str().expect("screenshot data"))
+            .expect("base64 screenshot");
+        let format = image::guess_format(&bytes).expect("image format");
+        let raster = image::load_from_memory(&bytes)
+            .expect("decodable screenshot")
+            .to_rgba8();
+        (format, raster)
+    }
+
+    #[cfg(feature = "render")]
+    async fn screenshot_fixture() -> (CdpContext, Option<String>) {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = format!("{page_id}-session");
+        ctx.sessions.insert(session_id.clone(), page_id);
+        let session = Some(session_id);
+        ctx.get_session_page_mut(&session)
+            .expect("page")
+            .set_viewport((100.0, 80.0));
+        handle(
+            "navigate",
+            &json!({
+                "url": "data:text/html,<html style='margin:0'><body style='margin:0;height:160px;background:red'><div style='position:absolute;left:50px;top:0;width:50px;height:80px;background:blue'></div><div style='position:absolute;left:0;top:80px;width:100px;height:80px;background:green'></div></body></html>",
+                "waitUntil": "load",
+            }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("navigate screenshot fixture");
+        (ctx, session)
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test]
+    async fn capture_screenshot_preserves_default_png_and_honors_clip_scale() {
+        let (mut ctx, session) = screenshot_fixture().await;
+        let native = {
+            let page = ctx.get_session_page(&session).expect("page");
+            page.screenshot(page.viewport).expect("native png")
+        };
+        let default = handle("captureScreenshot", &json!({}), &mut ctx, &session)
+            .await
+            .expect("default screenshot");
+        use base64::Engine as _;
+        let default_bytes = base64::engine::general_purpose::STANDARD
+            .decode(default["data"].as_str().expect("default data"))
+            .expect("default base64");
+        assert_eq!(
+            default_bytes, native,
+            "default CDP path must preserve the renderer PNG bytes exactly"
+        );
+
+        let clipped = handle(
+            "captureScreenshot",
+            &json!({
+                "captureBeyondViewport": true,
+                "clip": {"x": 50.0, "y": 0.0, "width": 50.0, "height": 40.0, "scale": 2.0}
+            }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("clipped screenshot");
+        let (format, raster) = decode_capture(&clipped);
+        assert_eq!(format, image::ImageFormat::Png);
+        assert_eq!(raster.dimensions(), (100, 80));
+        let center = raster.get_pixel(50, 40).0;
+        assert!(
+            center[2] > 200 && center[0] < 50,
+            "clip x/y must select the blue half of the live surface: {center:?}"
+        );
+
+        ctx.get_session_page_mut(&session)
+            .expect("page")
+            .evaluate("window.scrollTo(0, 80)");
+        let page_coordinate_clip = handle(
+            "captureScreenshot",
+            &json!({
+                "clip": {"x": 0.0, "y": 80.0, "width": 20.0, "height": 20.0, "scale": 1.0}
+            }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("clip in page coordinates after scroll");
+        let (_, raster) = decode_capture(&page_coordinate_clip);
+        let center = raster.get_pixel(10, 10).0;
+        assert!(
+            center[1] > 80 && center[0] < 50 && center[2] < 50,
+            "clip coordinates must remain page-relative after scrolling: {center:?}"
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test]
+    async fn capture_screenshot_encodes_jpeg_and_lossless_webp() {
+        let (mut ctx, session) = screenshot_fixture().await;
+        let jpeg = handle(
+            "captureScreenshot",
+            &json!({"format": "jpeg", "quality": 35}),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("jpeg screenshot");
+        let (format, raster) = decode_capture(&jpeg);
+        assert_eq!(format, image::ImageFormat::Jpeg);
+        assert_eq!(raster.dimensions(), (100, 80));
+
+        let fast_png = handle(
+            "captureScreenshot",
+            &json!({"optimizeForSpeed": true}),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("fast PNG screenshot");
+        let (format, raster) = decode_capture(&fast_png);
+        assert_eq!(format, image::ImageFormat::Png);
+        assert_eq!(raster.dimensions(), (100, 80));
+
+        let webp = handle(
+            "captureScreenshot",
+            &json!({"format": "webp"}),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("lossless webp screenshot");
+        let (format, raster) = decode_capture(&webp);
+        assert_eq!(format, image::ImageFormat::WebP);
+        assert_eq!(raster.dimensions(), (100, 80));
+
+        let error = handle(
+            "captureScreenshot",
+            &json!({"format": "webp", "quality": 35}),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect_err("lossy WebP must not be silently faked");
+        assert!(error.contains("lossless encoder"), "{error}");
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn capture_screenshot_validates_like_chromium() {
+        let options = parse_screenshot_options(&json!({
+            "format": "jpeg",
+            "quality": -1,
+        }))
+        .expect("out-of-range integer quality falls back");
+        assert_eq!(options.quality, 80);
+        let options = parse_screenshot_options(&json!({
+            "format": "jpeg",
+            "quality": 101,
+        }))
+        .expect("out-of-range integer quality falls back");
+        assert_eq!(options.quality, 80);
+        assert_eq!(
+            parse_screenshot_options(&json!({"format": "gif"})).expect_err("bad format"),
+            "Invalid image format"
+        );
+        assert!(parse_screenshot_options(&json!({"format": 3}))
+            .expect_err("format type")
+            .contains("format must be a string"));
+        assert!(parse_screenshot_options(&json!({"quality": 50.5}))
+            .expect_err("quality type")
+            .contains("quality must be an integer"));
+        assert!(parse_screenshot_options(&json!({"fromSurface": "false"}))
+            .expect_err("fromSurface type")
+            .contains("fromSurface must be a boolean"));
+        assert!(parse_screenshot_options(&json!({"captureBeyondViewport": 1}))
+            .expect_err("captureBeyondViewport type")
+            .contains("captureBeyondViewport must be a boolean"));
+        assert_eq!(
+            parse_screenshot_options(&json!({
+                "clip": {"x": 0, "y": 0, "width": 0, "height": 10, "scale": 1}
+            }))
+            .expect_err("zero width"),
+            "Cannot take screenshot with 0 width."
+        );
+        assert!(parse_screenshot_options(&json!({
+            "clip": {"x": 0, "y": 0, "width": 10, "height": 10}
+        }))
+        .expect_err("missing scale")
+        .contains("mandatory clip.scale field missing"));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test]
+    async fn capture_screenshot_rejects_unrepresented_surfaces() {
+        let (mut ctx, session) = screenshot_fixture().await;
+        let beyond = handle(
+            "captureScreenshot",
+            &json!({"captureBeyondViewport": true}),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect_err("full-page recording is unsupported");
+        assert!(beyond.contains("captureBeyondViewport=true"), "{beyond}");
+
+        let off_surface = handle(
+            "captureScreenshot",
+            &json!({"fromSurface": false}),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect_err("browser-window compositor is unsupported");
+        assert!(off_surface.contains("fromSurface=false"), "{off_surface}");
+
+        let off_viewport = handle(
+            "captureScreenshot",
+            &json!({
+                "clip": {"x": 90, "y": 0, "width": 20, "height": 20, "scale": 1}
+            }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect_err("partial off-viewport clip is unsupported");
+        assert!(
+            off_viewport.contains("outside the current viewport surface"),
+            "{off_viewport}"
         );
     }
 
