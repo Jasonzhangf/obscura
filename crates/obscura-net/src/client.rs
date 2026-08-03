@@ -135,6 +135,152 @@ pub enum ResourceType {
     Other,
 }
 
+/// Fetch metadata for a browser-owned request. Navigation keeps its existing
+/// profile; render resources use this type so they do not masquerade as HTML
+/// documents when they move onto the page's asynchronous transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestMode {
+    Navigate,
+    NoCors,
+    Cors,
+    SameOrigin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestCredentials {
+    Omit,
+    SameOrigin,
+    Include,
+}
+
+impl RequestMode {
+    fn header_value(self) -> &'static str {
+        match self {
+            Self::Navigate => "navigate",
+            Self::NoCors => "no-cors",
+            Self::Cors => "cors",
+            Self::SameOrigin => "same-origin",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceRequest {
+    pub resource_type: ResourceType,
+    pub initiator: Option<Url>,
+    pub mode: RequestMode,
+    pub credentials: RequestCredentials,
+}
+
+impl ResourceRequest {
+    pub fn navigation() -> Self {
+        Self {
+            resource_type: ResourceType::Document,
+            initiator: None,
+            mode: RequestMode::Navigate,
+            credentials: RequestCredentials::Include,
+        }
+    }
+
+    pub fn subresource(resource_type: ResourceType, initiator: &Url) -> Self {
+        let mode = match resource_type {
+            ResourceType::Font | ResourceType::Xhr | ResourceType::Fetch => RequestMode::Cors,
+            ResourceType::Document => RequestMode::Navigate,
+            ResourceType::Script
+            | ResourceType::Stylesheet
+            | ResourceType::Image
+            | ResourceType::Other => RequestMode::NoCors,
+        };
+        let credentials = match resource_type {
+            ResourceType::Document
+            | ResourceType::Script
+            | ResourceType::Stylesheet
+            | ResourceType::Image
+            | ResourceType::Other => RequestCredentials::Include,
+            ResourceType::Font | ResourceType::Xhr | ResourceType::Fetch => {
+                RequestCredentials::SameOrigin
+            }
+        };
+        Self {
+            resource_type,
+            initiator: Some(initiator.clone()),
+            mode,
+            credentials,
+        }
+    }
+
+    fn destination(&self) -> &'static str {
+        match self.resource_type {
+            ResourceType::Document => "document",
+            ResourceType::Script => "script",
+            ResourceType::Stylesheet => "style",
+            ResourceType::Image => "image",
+            ResourceType::Font => "font",
+            ResourceType::Xhr | ResourceType::Fetch | ResourceType::Other => "empty",
+        }
+    }
+
+    fn accept(&self) -> &'static str {
+        match self.resource_type {
+            ResourceType::Document => "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+            ResourceType::Stylesheet => "text/css,*/*;q=0.1",
+            // AVIF is intentionally omitted until obscura's decoder can paint
+            // it. Advertising a format and then discarding the selected body
+            // is less faithful than negotiating the best format we can use.
+            ResourceType::Image => "image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+            ResourceType::Script
+            | ResourceType::Font
+            | ResourceType::Xhr
+            | ResourceType::Fetch
+            | ResourceType::Other => "*/*",
+        }
+    }
+
+    fn sends_credentials_to(&self, target: &Url) -> bool {
+        match self.credentials {
+            RequestCredentials::Omit => false,
+            RequestCredentials::Include => true,
+            RequestCredentials::SameOrigin => self
+                .initiator
+                .as_ref()
+                .is_some_and(|initiator| initiator.origin() == target.origin()),
+        }
+    }
+}
+
+fn request_fetch_site(request: &ResourceRequest, target: &Url) -> &'static str {
+    let Some(initiator) = request.initiator.as_ref() else {
+        return "none";
+    };
+    if initiator.origin() == target.origin() {
+        "same-origin"
+    } else {
+        // A public-suffix-aware `same-site` classification will be added with
+        // the page resource scheduler. Until then, cross-site is the safe
+        // conservative value; it never overstates ambient trust.
+        "cross-site"
+    }
+}
+
+fn request_referrer(request: &ResourceRequest, target: &Url) -> Option<String> {
+    let source = request.initiator.as_ref()?;
+    if !matches!(source.scheme(), "http" | "https")
+        || !matches!(target.scheme(), "http" | "https")
+        || (source.scheme() == "https" && target.scheme() == "http")
+    {
+        return None;
+    }
+    if source.origin() == target.origin() {
+        let mut value = source.clone();
+        let _ = value.set_username("");
+        let _ = value.set_password(None);
+        value.set_fragment(None);
+        Some(value.to_string())
+    } else {
+        Some(format!("{}/", source.origin().ascii_serialization()))
+    }
+}
+
 pub type RequestCallback = Arc<dyn Fn(&RequestInfo) + Send + Sync>;
 pub type ResponseCallback = Arc<dyn Fn(&RequestInfo, &Response) + Send + Sync>;
 
@@ -591,6 +737,38 @@ impl ObscuraHttpClient {
         initial_body: Option<Vec<u8>>,
         callbacks: Option<&CallbackRegistry>,
     ) -> Result<Response, ObscuraNetError> {
+        self.fetch_with_profile(
+            initial_method,
+            url,
+            initial_body,
+            callbacks,
+            ResourceRequest::navigation(),
+        )
+        .await
+    }
+
+    /// Fetch a non-navigation resource through the same validated client,
+    /// cookie jar, proxy, connection pool, interception and callback path as
+    /// the owning page. The renderer can seed its byte cache from this result
+    /// instead of opening a second synchronous HTTP stack.
+    pub async fn fetch_resource_with_callbacks(
+        &self,
+        url: &Url,
+        request: ResourceRequest,
+        callbacks: Option<&CallbackRegistry>,
+    ) -> Result<Response, ObscuraNetError> {
+        self.fetch_with_profile(Method::GET, url, None, callbacks, request)
+            .await
+    }
+
+    async fn fetch_with_profile(
+        &self,
+        initial_method: Method,
+        url: &Url,
+        initial_body: Option<Vec<u8>>,
+        callbacks: Option<&CallbackRegistry>,
+        request: ResourceRequest,
+    ) -> Result<Response, ObscuraNetError> {
         validate_url(url, self.allow_private_network)?;
 
         if url.scheme() == "file" {
@@ -623,7 +801,7 @@ impl ObscuraHttpClient {
                 url: current_url.clone(),
                 method: method.to_string(),
                 headers: self.extra_headers.read().await.clone(),
-                resource_type: ResourceType::Document,
+                resource_type: request.resource_type.clone(),
             };
 
             if let Some(interceptor) = self.interceptor.read().await.as_ref() {
@@ -663,24 +841,46 @@ impl ObscuraHttpClient {
                 HeaderValue::from_str(&sec_ch_ua_platform)
                     .unwrap_or_else(|_| HeaderValue::from_static("\"Windows\"")),
             );
-            headers.insert(HeaderName::from_static("upgrade-insecure-requests"), HeaderValue::from_static("1"));
+            if request.mode == RequestMode::Navigate {
+                headers.insert(HeaderName::from_static("upgrade-insecure-requests"), HeaderValue::from_static("1"));
+            }
             headers.insert(USER_AGENT, HeaderValue::from_str(&ua).unwrap_or_else(|_| {
                 HeaderValue::from_static("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36")
             }));
             headers.insert(
                 reqwest::header::ACCEPT,
-                HeaderValue::from_static("text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"),
+                HeaderValue::from_static(request.accept()),
             );
-            headers.insert(HeaderName::from_static("sec-fetch-site"), HeaderValue::from_static("none"));
-            headers.insert(HeaderName::from_static("sec-fetch-mode"), HeaderValue::from_static("navigate"));
-            headers.insert(HeaderName::from_static("sec-fetch-user"), HeaderValue::from_static("?1"));
-            headers.insert(HeaderName::from_static("sec-fetch-dest"), HeaderValue::from_static("document"));
+            headers.insert(
+                HeaderName::from_static("sec-fetch-site"),
+                HeaderValue::from_static(request_fetch_site(&request, &current_url)),
+            );
+            headers.insert(
+                HeaderName::from_static("sec-fetch-mode"),
+                HeaderValue::from_static(request.mode.header_value()),
+            );
+            if request.mode == RequestMode::Navigate {
+                headers.insert(HeaderName::from_static("sec-fetch-user"), HeaderValue::from_static("?1"));
+            }
+            headers.insert(
+                HeaderName::from_static("sec-fetch-dest"),
+                HeaderValue::from_static(request.destination()),
+            );
+            if let Some(referer) = request_referrer(&request, &current_url) {
+                if let Ok(value) = HeaderValue::from_str(&referer) {
+                    headers.insert(reqwest::header::REFERER, value);
+                }
+            }
             headers.insert(
                 reqwest::header::ACCEPT_LANGUAGE,
                 HeaderValue::from_static("en-US,en;q=0.9"),
             );
 
-            let cookie_header = self.cookie_jar.get_cookie_header(&current_url);
+            let cookie_header = if request.sends_credentials_to(&current_url) {
+                self.cookie_jar.get_cookie_header(&current_url)
+            } else {
+                String::new()
+            };
             tracing::debug!(
                 "Cookie header for {}: {} cookies ({} bytes)",
                 current_url.host_str().unwrap_or("?"),
@@ -835,7 +1035,11 @@ pub enum ObscuraNetError {
 
 #[cfg(test)]
 mod ssrf_tests {
-    use super::{is_forbidden_ip, validate_url, ObscuraHttpClient, SsrfGuardResolver};
+    use super::{
+        is_forbidden_ip, request_fetch_site, request_referrer, validate_url,
+        ObscuraHttpClient, RequestCredentials, RequestMode, ResourceRequest, ResourceType,
+        SsrfGuardResolver,
+    };
     use crate::cookies::CookieJar;
     use reqwest::dns::{Name, Resolve};
     use std::net::IpAddr;
@@ -899,6 +1103,57 @@ mod ssrf_tests {
         assert!(validate_url(&Url::parse("http://example.com/").unwrap(), false).is_ok());
         // The allow flag bypasses the guard (local-dev escape hatch).
         assert!(validate_url(&Url::parse("http://127.0.0.1/").unwrap(), true).is_ok());
+    }
+
+    #[test]
+    fn resource_profiles_use_type_specific_fetch_metadata() {
+        let document = Url::parse("https://app.example/page?q=1#fragment").unwrap();
+        let image = ResourceRequest::subresource(ResourceType::Image, &document);
+        assert_eq!(image.mode, RequestMode::NoCors);
+        assert_eq!(image.credentials, RequestCredentials::Include);
+        assert_eq!(image.destination(), "image");
+        assert!(image.accept().starts_with("image/webp"));
+
+        let stylesheet = ResourceRequest::subresource(ResourceType::Stylesheet, &document);
+        assert_eq!(stylesheet.destination(), "style");
+        assert_eq!(stylesheet.accept(), "text/css,*/*;q=0.1");
+
+        let font = ResourceRequest::subresource(ResourceType::Font, &document);
+        assert_eq!(font.mode, RequestMode::Cors);
+        assert_eq!(font.credentials, RequestCredentials::SameOrigin);
+        assert_eq!(font.destination(), "font");
+        assert_eq!(font.accept(), "*/*");
+
+        assert!(image.sends_credentials_to(
+            &Url::parse("https://cdn.example/image.png").unwrap()
+        ));
+        assert!(font.sends_credentials_to(
+            &Url::parse("https://app.example/font.woff2").unwrap()
+        ));
+        assert!(!font.sends_credentials_to(
+            &Url::parse("https://cdn.example/font.woff2").unwrap()
+        ));
+    }
+
+    #[test]
+    fn subresource_referrer_and_fetch_site_follow_default_browser_policy() {
+        let source = Url::parse("https://user:secret@app.example/path?q=1#frag").unwrap();
+        let request = ResourceRequest::subresource(ResourceType::Image, &source);
+        let same_origin = Url::parse("https://app.example/image.png").unwrap();
+        let cross_origin = Url::parse("https://cdn.example/image.png").unwrap();
+        let downgrade = Url::parse("http://cdn.example/image.png").unwrap();
+
+        assert_eq!(request_fetch_site(&request, &same_origin), "same-origin");
+        assert_eq!(request_fetch_site(&request, &cross_origin), "cross-site");
+        assert_eq!(
+            request_referrer(&request, &same_origin).as_deref(),
+            Some("https://app.example/path?q=1")
+        );
+        assert_eq!(
+            request_referrer(&request, &cross_origin).as_deref(),
+            Some("https://app.example/")
+        );
+        assert_eq!(request_referrer(&request, &downgrade), None);
     }
 
     #[tokio::test]
