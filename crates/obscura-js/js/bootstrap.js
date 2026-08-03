@@ -1,4 +1,5 @@
 "use strict";
+(function () {
 
 // Pre-declare all internal globals as non-enumerable so they are invisible
 // to Object.keys(window) / for-in enumeration. Must run before any var
@@ -175,6 +176,12 @@ let _fpSeed = 0;
 // when SPAs dynamically insert multiple <script module> tags at once.
 let __dynScriptQueue = [];
 let __dynScriptBusy = false;
+Object.defineProperty(globalThis, '__obscura_hasPendingDynamicScripts', {
+  value: function() { return __dynScriptBusy || __dynScriptQueue.length > 0; },
+  writable: false,
+  enumerable: false,
+  configurable: false,
+});
 function _decodeDataScriptUrl(url) {
   const comma = url.indexOf(',');
   if (!url.startsWith('data:') || comma < 5) {
@@ -8958,4 +8965,6 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
     try { val = globalThis[name]; } catch (e) { continue; }
     if (typeof val === 'function') { walk(val); }
   }
+})();
+
 })();
