@@ -13,6 +13,8 @@ use obscura_net::{CallbackRegistry, CookieJar, ObscuraHttpClient, RequestInfo, R
 use obscura_net::StealthHttpClient;
 use tokio::sync::Mutex;
 
+use crate::import_map::ImportMap;
+
 pub type InterceptCallback = Arc<Mutex<Option<Box<dyn Fn(String, String, String) -> Option<(u16, String, String)> + Send + Sync>>>>;
 
 #[derive(Debug)]
@@ -123,6 +125,9 @@ pub struct ObscuraState {
     /// read by CSSOM geometry and screenshot paint.
     #[cfg(feature = "render")]
     pub scroll_offset: (f32, f32),
+    /// Window-global import-map state shared by parser-discovered scripts,
+    /// dynamically inserted import maps, and the module loader.
+    pub(crate) import_map: Rc<RefCell<ImportMap>>,
 }
 
 impl ObscuraState {
@@ -158,6 +163,7 @@ impl ObscuraState {
             viewport: (1280.0, 720.0),
             #[cfg(feature = "render")]
             scroll_offset: (0.0, 0.0),
+            import_map: Rc::new(RefCell::new(ImportMap::default())),
         }
     }
 }
@@ -2142,6 +2148,29 @@ fn op_url_resolve(#[string] href: &str, #[string] base: &str) -> String {
     .unwrap_or_default()
 }
 
+#[op2]
+#[string]
+fn op_add_import_map(
+    state: &OpState,
+    #[string] source: String,
+    #[string] base_url: String,
+) -> String {
+    let shared = state.borrow::<SharedState>().clone();
+    let import_map = shared.borrow().import_map.clone();
+    let parsed = match ImportMap::parse(&source, &base_url) {
+        Ok(map) => map,
+        Err(error) => return error,
+    };
+    let result = match import_map.try_borrow_mut() {
+        Ok(mut current) => {
+            current.merge(parsed);
+            String::new()
+        }
+        Err(_) => "Import map is already borrowed".to_string(),
+    };
+    result
+}
+
 /// Canonical (lowercased) WHATWG name for a TextDecoder label, or "" if the
 /// label is unknown (the JS constructor turns "" into a RangeError).
 #[op2]
@@ -2254,6 +2283,7 @@ pub fn build_extension() -> Extension {
         op_url_parse(),
         op_url_set(),
         op_url_resolve(),
+        op_add_import_map(),
         op_encoding_for_label(),
         op_text_decode(),
         op_url_encode_query(),

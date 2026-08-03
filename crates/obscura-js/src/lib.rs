@@ -1,4 +1,5 @@
 pub mod cdp_watchdog;
+mod import_map;
 pub mod module_loader;
 pub mod runtime;
 pub mod ops;

@@ -11,6 +11,7 @@ use deno_core::ModuleSourceCode;
 use deno_core::ModuleSpecifier;
 use deno_core::RequestedModuleType;
 
+use crate::import_map::ImportMap;
 use crate::ops::ObscuraState;
 
 pub struct ObscuraModuleLoader {
@@ -27,6 +28,7 @@ pub struct ObscuraModuleLoader {
     /// Directly-constructed loaders still use Obscura's network policy and
     /// connection pool; they simply have an isolated cookie jar.
     standalone_client: Option<Arc<obscura_net::ObscuraHttpClient>>,
+    import_map: Rc<RefCell<ImportMap>>,
 }
 
 impl ObscuraModuleLoader {
@@ -35,6 +37,15 @@ impl ObscuraModuleLoader {
     }
 
     pub fn with_proxy(base_url: &str, proxy_url: Option<String>) -> Self {
+        let import_map = Rc::new(RefCell::new(ImportMap::default()));
+        Self::with_proxy_and_import_map(base_url, proxy_url, import_map)
+    }
+
+    fn with_proxy_and_import_map(
+        base_url: &str,
+        proxy_url: Option<String>,
+        import_map: Rc<RefCell<ImportMap>>,
+    ) -> Self {
         let standalone_client = Arc::new(obscura_net::ObscuraHttpClient::with_options(
             Arc::new(obscura_net::CookieJar::new()),
             proxy_url.as_deref(),
@@ -44,6 +55,7 @@ impl ObscuraModuleLoader {
             proxy_url,
             page_state: None,
             standalone_client: Some(standalone_client),
+            import_map,
         }
     }
 
@@ -51,12 +63,14 @@ impl ObscuraModuleLoader {
         base_url: &str,
         proxy_url: Option<String>,
         page_state: &Rc<RefCell<ObscuraState>>,
+        import_map: Rc<RefCell<ImportMap>>,
     ) -> Self {
         ObscuraModuleLoader {
             base_url: base_url.to_string(),
             proxy_url,
             page_state: Some(Rc::downgrade(page_state)),
             standalone_client: None,
+            import_map,
         }
     }
 }
@@ -72,9 +86,17 @@ impl ModuleLoader for ObscuraModuleLoader {
         referrer: &str,
         _kind: deno_core::ResolutionKind,
     ) -> Result<ModuleSpecifier, ModuleLoaderError> {
+        // deno_core represents the root passed to load_side_es_module with a
+        // synthetic "." referrer. A browser resolves <script type=module src>
+        // as a resource URL before it starts a graph; the document import map
+        // must not remap that root URL.
+        if referrer == "." {
+            return deno_core::resolve_import(specifier, &self.base_url)
+                .map_err(|error| error.into());
+        }
+
         let base = if referrer.is_empty()
             || referrer.starts_with('<')
-            || referrer == "."
             || referrer == "about:blank"
         {
             &self.base_url
@@ -82,7 +104,13 @@ impl ModuleLoader for ObscuraModuleLoader {
             referrer
         };
 
-        deno_core::resolve_import(specifier, base).map_err(|e| e.into())
+        let base = ModuleSpecifier::parse(base)
+            .map_err(|e| io_err(format!("Invalid module referrer {}: {}", base, e)))?;
+        self.import_map
+            .try_borrow_mut()
+            .map_err(|_| io_err("Import map is already borrowed".to_string()))?
+            .resolve(specifier, &base)
+            .map_err(io_err)
     }
 
     fn load(

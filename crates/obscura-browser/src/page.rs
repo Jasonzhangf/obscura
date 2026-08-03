@@ -882,8 +882,6 @@ impl Page {
 
     async fn execute_scripts(&mut self) {
         tracing::info!("execute_scripts called, js runtime exists: {}", self.js.is_some());
-        // Compute document base URL, respecting <base href>.
-        let document_base = self.resolve_base_url();
         // Soft deadline on the entire script-execution phase. Heavy SPAs
         // (GitHub, Linear, CodeSandbox) ship 50+ scripts and our serial
         // fetch + execute loop can blow past a Puppeteer/Playwright goto
@@ -915,37 +913,80 @@ impl Page {
             .as_mut()
             .map(|js| js.arm_watchdog(std::time::Duration::from_millis(script_deadline_ms + 1000)));
 
+        #[derive(Debug, Clone, Copy)]
+        enum ScriptKind {
+            Classic,
+            Module,
+            ImportMap,
+        }
+
         #[derive(Debug)]
         struct ScriptInfo {
             src: Option<String>,
             inline: String,
             is_defer: bool,
             is_async: bool,
-            is_module: bool,
+            kind: ScriptKind,
             nid: u32,
+            /// Document base URL at this element's parser encounter point.
+            base_url: String,
         }
 
         let all_scripts = match &self.js {
             Some(js) => {
+                let document_url = self.url_string();
                 js.with_dom(|dom| {
                     let script_ids = dom.query_selector_all("script").unwrap_or_default();
+                    let mut bases_at_script = std::collections::HashMap::new();
+                    let mut active_base = url::Url::parse(&document_url).ok();
+                    let mut found_base = false;
+                    for nid in dom.descendants(dom.document()) {
+                        let Some(node) = dom.get_node(nid) else {
+                            continue;
+                        };
+                        let Some(name) = node.as_element() else {
+                            continue;
+                        };
+                        if name.local.as_ref() == "base" && !found_base {
+                            if let Some(href) = node.get_attribute("href") {
+                                found_base = true;
+                                if let Some(resolved) = active_base
+                                    .as_ref()
+                                    .and_then(|base| base.join(href).ok())
+                                {
+                                    active_base = Some(resolved);
+                                }
+                            }
+                        } else if name.local.as_ref() == "script" {
+                            bases_at_script.insert(
+                                nid.raw(),
+                                active_base
+                                    .as_ref()
+                                    .map(ToString::to_string)
+                                    .unwrap_or_else(|| document_url.clone()),
+                            );
+                        }
+                    }
                     let mut scripts = Vec::new();
 
                     for sid in script_ids {
                         if let Some(node) = dom.get_node(sid) {
                             let src = node.get_attribute("src").map(|s| s.to_string());
-                            let script_type = node.get_attribute("type").unwrap_or("").to_string();
+                            let script_type = node
+                                .get_attribute("type")
+                                .unwrap_or("")
+                                .trim()
+                                .to_ascii_lowercase();
                             let is_defer = node.get_attribute("defer").is_some();
                             let is_async = node.get_attribute("async").is_some();
-                            let is_module = script_type == "module";
-
-                            if !script_type.is_empty()
-                                && script_type != "text/javascript"
-                                && script_type != "application/javascript"
-                                && script_type != "module"
-                            {
-                                continue;
-                            }
+                            let kind = match script_type.as_str() {
+                                "module" => ScriptKind::Module,
+                                "importmap" => ScriptKind::ImportMap,
+                                "" | "text/javascript" | "application/javascript" => {
+                                    ScriptKind::Classic
+                                }
+                                _ => continue,
+                            };
 
                             let inline_code = if src.is_none() {
                                 dom.text_content(sid)
@@ -953,14 +994,21 @@ impl Page {
                                 String::new()
                             };
 
-                            if src.is_some() || !inline_code.trim().is_empty() {
+                            if matches!(kind, ScriptKind::ImportMap)
+                                || src.is_some()
+                                || !inline_code.trim().is_empty()
+                            {
                                 scripts.push(ScriptInfo {
                                     src,
                                     inline: inline_code,
                                     is_defer,
                                     is_async,
-                                    is_module,
+                                    kind,
                                     nid: sid.raw(),
+                                    base_url: bases_at_script
+                                        .get(&sid.raw())
+                                        .cloned()
+                                        .unwrap_or_else(|| document_url.clone()),
                                 });
                             }
                         }
@@ -987,45 +1035,22 @@ impl Page {
             );
         }
 
-        let mut regular = Vec::new();
-        let mut deferred = Vec::new();
-        let mut async_scripts = Vec::new();
-
-        let mut module_scripts = Vec::new();
-
-        for script in all_scripts {
-            if script.is_module {
-                module_scripts.push(script);
-                continue;
-            }
-            if script.is_defer {
-                deferred.push(script);
-            } else if script.is_async {
-                async_scripts.push(script);
-            } else {
-                regular.push(script);
-            }
-        }
-
-        let scripts = regular;
-
-        tracing::info!("Found {} regular + {} deferred + {} async scripts", scripts.len(), deferred.len(), async_scripts.len());
-        let all_to_execute: Vec<ScriptInfo> = scripts.into_iter()
-            .chain(deferred.into_iter())
-            .chain(async_scripts.into_iter())
-            .collect();
-
-        let mut resolved: Vec<(usize, String)> = Vec::new();
+        tracing::info!("Found {} parser-discovered scripts", all_scripts.len());
         let mut fetch_tasks: Vec<(usize, String)> = Vec::new();
 
-        for (i, script) in all_to_execute.iter().enumerate() {
+        for (i, script) in all_scripts.iter().enumerate() {
+            if !matches!(script.kind, ScriptKind::Classic) {
+                continue;
+            }
             if let Some(src_url) = &script.src {
                 let full_url = if src_url.starts_with("http://") || src_url.starts_with("https://") {
                     src_url.clone()
-                } else if let Some(base) = &document_base {
-                    base.join(src_url).map(|u| u.to_string()).unwrap_or_else(|_| src_url.clone())
                 } else {
-                    src_url.clone()
+                    url::Url::parse(&script.base_url)
+                        .ok()
+                        .and_then(|base| base.join(src_url).ok())
+                        .map(|url| url.to_string())
+                        .unwrap_or_else(|| src_url.clone())
                 };
 
                 if !subresource_allowed(self.url.as_ref(), &full_url) {
@@ -1045,7 +1070,6 @@ impl Page {
                     tracing::info!("Blocked script by interception: {}", full_url);
                     continue;
                 }
-                resolved.push((i, full_url.clone()));
                 fetch_tasks.push((i, full_url));
             }
         }
@@ -1162,37 +1186,6 @@ impl Page {
             }
         }
 
-        for (i, script) in all_to_execute.iter().enumerate() {
-            if tokio::time::Instant::now() >= script_deadline {
-                tracing::warn!(
-                    "execute_scripts: deadline reached, skipping {} remaining scripts",
-                    all_to_execute.len() - i,
-                );
-                break;
-            }
-            if script.src.is_some() {
-                if let Some((url, code, resp)) = fetched.remove(&i) {
-                    tracing::info!("Executing script ({} bytes): {}", code.len(), url);
-                    self.record_network_event_with_body(&url, "GET", "Script", resp.status, &resp.headers, &resp.body, false);
-                    if let Some(js) = &mut self.js {
-                        let _ = js.execute_script("<current-script>", &format!("globalThis.__currentScriptNid={};", script.nid));
-                        if let Err(e) = js.execute_script_guarded(&url, &code) {
-                            tracing::warn!("Script error ({}): {}", url, e);
-                        }
-                        let _ = js.execute_script("<current-script>", "globalThis.__currentScriptNid=0;");
-                    }
-                }
-            } else if !script.inline.is_empty() {
-                if let Some(js) = &mut self.js {
-                    let _ = js.execute_script("<current-script>", &format!("globalThis.__currentScriptNid={};", script.nid));
-                    if let Err(e) = js.execute_script_guarded("<inline>", &script.inline) {
-                        tracing::warn!("Inline script error: {}", e);
-                    }
-                    let _ = js.execute_script("<current-script>", "globalThis.__currentScriptNid=0;");
-                }
-            }
-        }
-
         // Per-module budget. Modules on an already-rendered page are
         // enhancement, not the app: give them a short budget so one slow
         // non-essential module (e.g. YC's bookface, whose top-level eval
@@ -1222,37 +1215,184 @@ impl Page {
             if body_nodes > 50 { short_ms } else { script_deadline_ms }
         };
 
-        for module_script in &module_scripts {
+        enum ScheduledScript {
+            Classic(usize),
+            Module {
+                prepared: obscura_js::runtime::PreparedModule,
+                url: Option<String>,
+            },
+        }
+
+        let execute_classic = |
+            page: &mut Self,
+            script: &ScriptInfo,
+            fetched_script: Option<(String, String, obscura_net::Response)>,
+        | {
+            if script.src.is_some() {
+                if let Some((url, code, resp)) = fetched_script {
+                    tracing::info!("Executing script ({} bytes): {}", code.len(), url);
+                    let execution_url = resp.url.to_string();
+                    page.record_network_event_with_body(
+                        &url, "GET", "Script", resp.status, &resp.headers, &resp.body, false,
+                    );
+                    if let Some(js) = &mut page.js {
+                        let _ = js.execute_script(
+                            "<current-script>",
+                            &format!("globalThis.__currentScriptNid={};", script.nid),
+                        );
+                        if let Err(error) = js.execute_script_guarded(&execution_url, &code) {
+                            tracing::warn!("Script error ({}): {}", execution_url, error);
+                        }
+                        let _ = js.execute_script(
+                            "<current-script>",
+                            "globalThis.__currentScriptNid=0;",
+                        );
+                    }
+                }
+            } else if !script.inline.is_empty() {
+                if let Some(js) = &mut page.js {
+                    let _ = js.execute_script(
+                        "<current-script>",
+                        &format!("globalThis.__currentScriptNid={};", script.nid),
+                    );
+                    if let Err(error) = js.execute_script_guarded(&script.base_url, &script.inline) {
+                        tracing::warn!("Inline script error: {}", error);
+                    }
+                    let _ = js.execute_script(
+                        "<current-script>",
+                        "globalThis.__currentScriptNid=0;",
+                    );
+                }
+            }
+        };
+
+        let mut post_parse = Vec::new();
+
+        // Process parser-discovered scripts in encounter order. Import maps
+        // register at their exact position; module graphs start there too, but
+        // evaluation of non-async modules remains post-parse.
+        for (index, script) in all_scripts.iter().enumerate() {
             if tokio::time::Instant::now() >= script_deadline {
-                tracing::warn!("execute_scripts: deadline reached, skipping remaining module scripts");
+                tracing::warn!(
+                    "execute_scripts: deadline reached, skipping {} remaining scripts",
+                    all_scripts.len() - index,
+                );
                 break;
             }
-            if let Some(ref src) = module_script.src {
-                let full_url = if src.starts_with("http://") || src.starts_with("https://") {
-                    src.clone()
-                } else if let Some(base) = &document_base {
-                    base.join(src).map(|u| u.to_string()).unwrap_or_else(|_| src.clone())
-                } else {
-                    src.clone()
-                };
 
-                tracing::info!("Loading ES module: {}", full_url);
-                if let Some(js) = &mut self.js {
-                    match js.load_module(&full_url, module_budget_ms).await {
-                        Ok(()) => {
-                            tracing::info!("ES module loaded: {}", full_url);
-                            self.record_network_event(&full_url, "GET", "Script", 200, &std::collections::HashMap::new(), 0);
-                        }
-                        Err(e) => {
-                            tracing::warn!("ES module error ({}): {}", full_url, e);
+            match script.kind {
+                ScriptKind::ImportMap => {
+                    if script.src.is_some() {
+                        tracing::warn!("External import maps are not supported");
+                        continue;
+                    }
+                    if let Some(js) = &self.js {
+                        if let Err(error) = js.add_import_map(&script.inline, &script.base_url) {
+                            tracing::warn!("Ignoring invalid import map: {}", error);
                         }
                     }
                 }
-            } else if !module_script.inline.is_empty() {
-                let base = self.url_string();
-                if let Some(js) = &mut self.js {
-                    if let Err(e) = js.load_inline_module(&module_script.inline, &base, module_budget_ms).await {
-                        tracing::warn!("Inline ES module error: {}", e);
+                ScriptKind::Classic => {
+                    if script.is_defer && !script.is_async && script.src.is_some() {
+                        post_parse.push(ScheduledScript::Classic(index));
+                    } else {
+                        let fetched_script = fetched.remove(&index);
+                        execute_classic(self, script, fetched_script);
+                    }
+                }
+                ScriptKind::Module => {
+                    let (prepared, module_url) = if let Some(src) = &script.src {
+                        let full_url = if src.starts_with("http://")
+                            || src.starts_with("https://")
+                            || src.starts_with("data:")
+                        {
+                            src.clone()
+                        } else {
+                            url::Url::parse(&script.base_url)
+                                .ok()
+                                .and_then(|base| base.join(src).ok())
+                                .map(|url| url.to_string())
+                                .unwrap_or_else(|| src.clone())
+                        };
+                        tracing::info!("Preparing ES module graph: {}", full_url);
+                        let result = match &mut self.js {
+                            Some(js) => js.prepare_module(&full_url, module_budget_ms).await,
+                            None => continue,
+                        };
+                        match result {
+                            Ok(prepared) => (prepared, Some(full_url)),
+                            Err(error) => {
+                                tracing::warn!("ES module error ({}): {}", full_url, error);
+                                continue;
+                            }
+                        }
+                    } else {
+                        let result = match &mut self.js {
+                            Some(js) => js.prepare_inline_module(
+                                &script.inline, &script.base_url, module_budget_ms,
+                            ).await,
+                            None => continue,
+                        };
+                        match result {
+                            Ok(prepared) => (prepared, None),
+                            Err(error) => {
+                                tracing::warn!("Inline ES module error: {}", error);
+                                continue;
+                            }
+                        }
+                    };
+                    let scheduled = ScheduledScript::Module {
+                        prepared,
+                        url: module_url,
+                    };
+                    if script.is_async {
+                        let ScheduledScript::Module { prepared, url } = scheduled else {
+                            unreachable!();
+                        };
+                        let result = match &mut self.js {
+                            Some(js) => js.evaluate_prepared_module(prepared, module_budget_ms).await,
+                            None => continue,
+                        };
+                        if let Err(error) = result {
+                            tracing::warn!("ES module evaluation error: {}", error);
+                        } else if let Some(url) = url {
+                            tracing::info!("ES module loaded: {}", url);
+                            self.record_network_event(
+                                &url, "GET", "Script", 200,
+                                &std::collections::HashMap::new(), 0,
+                            );
+                        }
+                    } else {
+                        post_parse.push(scheduled);
+                    }
+                }
+            }
+        }
+
+        for scheduled in post_parse {
+            if tokio::time::Instant::now() >= script_deadline {
+                tracing::warn!("execute_scripts: deadline reached during post-parse scripts");
+                break;
+            }
+            match scheduled {
+                ScheduledScript::Classic(index) => {
+                    let script = &all_scripts[index];
+                    let fetched_script = fetched.remove(&index);
+                    execute_classic(self, script, fetched_script);
+                }
+                ScheduledScript::Module { prepared, url } => {
+                    let result = match &mut self.js {
+                        Some(js) => js.evaluate_prepared_module(prepared, module_budget_ms).await,
+                        None => continue,
+                    };
+                    if let Err(error) = result {
+                        tracing::warn!("ES module evaluation error: {}", error);
+                    } else if let Some(url) = url {
+                        tracing::info!("ES module loaded: {}", url);
+                        self.record_network_event(
+                            &url, "GET", "Script", 200,
+                            &std::collections::HashMap::new(), 0,
+                        );
                     }
                 }
             }
@@ -2361,6 +2501,46 @@ mod tests {
     };
     use obscura_dom::parse_html;
 
+    fn spawn_parser_import_map_server(
+        expected_requests: usize,
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            for _ in 0..expected_requests {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 2048];
+                let length = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..length]);
+                let path = request
+                    .lines().next()
+                    .and_then(|line| line.split_ascii_whitespace().nth(1))
+                    .unwrap_or("/").to_string();
+                request_tx.send(path.clone()).unwrap();
+                let (status, body) = match path.as_str() {
+                    "/app/before.js" => ("200 OK", "export const value = 'before-first-module';"),
+                    "/app/later.js" => ("200 OK", "export const value = 'later-map';"),
+                    "/app/async.js" => (
+                        "200 OK",
+                        "import('too-late')\
+                           .then(module => globalThis.__async_before_map = module.value)\
+                           .catch(() => globalThis.__async_before_map = 'rejected');",
+                    ),
+                    _ => ("404 Not Found", "not found"),
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        (format!("http://{}", address), request_rx)
+    }
+
     #[test]
     fn external_scripts_require_a_successful_http_status() {
         assert!(script_response_is_executable(200));
@@ -2371,6 +2551,164 @@ mod tests {
         assert!(!script_response_is_executable(401));
         assert!(!script_response_is_executable(404));
         assert!(!script_response_is_executable(500));
+    }
+
+    fn import_map_test_page(name: &str, base: &str, html: &str) -> super::Page {
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            name.to_string(), None, false, None, None, true,
+        ));
+        let mut page = super::Page::new(name.to_string(), context);
+        page.url = Some(url::Url::parse(&format!("{}/app/index.html", base)).unwrap());
+        page.dom = Some(parse_html(html));
+        page.init_js();
+        page
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn parser_import_map_before_first_module_controls_resolution() {
+        let (base, requests) = spawn_parser_import_map_server(1);
+        let mut page = import_map_test_page("import-map-order", &base, r#"<html><head>
+            <script type="importmap">{"imports":{"ordered":"./before.js"}}</script>
+            <script type="module">
+                import { value } from "ordered";
+                globalThis.__parser_import_map_value = value;
+            </script>
+            <script type="importmap">{"imports":{"ordered":"./after.js"}}</script>
+        </head><body></body></html>"#);
+        page.execute_scripts().await;
+
+        assert_eq!(
+            page.js.as_mut().unwrap().evaluate("globalThis.__parser_import_map_value").unwrap(),
+            serde_json::json!("before-first-module"),
+        );
+        assert_eq!(requests.recv_timeout(std::time::Duration::from_secs(1)).unwrap(), "/app/before.js");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn later_import_map_adds_unrelated_rule_without_rebinding_resolved_rule() {
+        let (base, requests) = spawn_parser_import_map_server(2);
+        let mut page = import_map_test_page("multiple-import-map-order", &base, r#"<html><head>
+            <script type="importmap">{"imports":{"fixed":"./before.js"}}</script>
+            <script type="module">
+                import { value } from "fixed";
+                globalThis.__first_map_value = value;
+            </script>
+            <script type="importmap">{"imports":{"fixed":"./after.js","later":"./later.js"}}</script>
+            <script type="module">
+                import { value as fixed } from "fixed";
+                import { value as later } from "later";
+                globalThis.__later_map_values = [fixed, later];
+            </script>
+        </head><body></body></html>"#);
+        page.execute_scripts().await;
+
+        let js = page.js.as_mut().unwrap();
+        assert_eq!(js.evaluate("globalThis.__first_map_value").unwrap(), serde_json::json!("before-first-module"));
+        assert_eq!(js.evaluate("globalThis.__later_map_values").unwrap(), serde_json::json!(["before-first-module", "later-map"]));
+        let paths = (0..2)
+            .map(|_| requests.recv_timeout(std::time::Duration::from_secs(1)).unwrap())
+            .collect::<Vec<_>>();
+        assert!(paths.contains(&"/app/before.js".to_string()), "{paths:?}");
+        assert!(paths.contains(&"/app/later.js".to_string()), "{paths:?}");
+        assert!(!paths.contains(&"/app/after.js".to_string()), "{paths:?}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn classic_dynamic_import_does_not_see_a_later_parser_import_map() {
+        let (base, _requests) = spawn_parser_import_map_server(1);
+        let mut page = import_map_test_page("classic-before-import-map", &base, r#"<html><head>
+            <script>
+                import("too-late")
+                    .then(() => globalThis.__classic_before_map = "resolved")
+                    .catch(() => globalThis.__classic_before_map = "rejected");
+            </script>
+            <script type="importmap">{"imports":{"too-late":"./later.js"}}</script>
+        </head><body></body></html>"#);
+        page.execute_scripts().await;
+        assert_eq!(
+            page.js.as_mut().unwrap().evaluate("globalThis.__classic_before_map").unwrap(),
+            serde_json::json!("rejected"),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ready_async_classic_script_runs_before_a_later_parser_import_map() {
+        let (base, requests) = spawn_parser_import_map_server(2);
+        let mut page = import_map_test_page("async-classic-before-map", &base, r#"<html><head>
+            <script async src="./async.js"></script>
+            <script type="importmap">{"imports":{"too-late":"./later.js"}}</script>
+        </head><body></body></html>"#);
+        page.execute_scripts().await;
+        assert_eq!(
+            page.js.as_mut().unwrap().evaluate("globalThis.__async_before_map").unwrap(),
+            serde_json::json!("rejected"),
+        );
+        assert_eq!(requests.recv_timeout(std::time::Duration::from_secs(1)).unwrap(), "/app/async.js");
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dynamically_inserted_import_map_controls_later_dynamic_import() {
+        let (base, requests) = spawn_parser_import_map_server(1);
+        let mut page = import_map_test_page("dynamic-import-map", &base, r#"<html><head></head><body>
+            <script>
+                const map = document.createElement("script");
+                map.type = "importmap";
+                map.textContent = JSON.stringify({imports:{dynamicName:"./later.js"}});
+                document.head.appendChild(map);
+                import("dynamicName")
+                    .then(module => globalThis.__dynamic_map_value = module.value)
+                    .catch(error => globalThis.__dynamic_map_value = error.message);
+            </script>
+        </body></html>"#);
+        page.execute_scripts().await;
+        assert_eq!(
+            page.js.as_mut().unwrap().evaluate("globalThis.__dynamic_map_value").unwrap(),
+            serde_json::json!("later-map"),
+        );
+        assert_eq!(requests.recv_timeout(std::time::Duration::from_secs(1)).unwrap(), "/app/later.js");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dynamic_import_map_uses_live_document_base_at_insertion() {
+        let (base, requests) = spawn_parser_import_map_server(1);
+        let mut page = import_map_test_page("dynamic-import-map-base", &base, r#"<html><head><base href="/old/"></head><body>
+            <script>
+                document.querySelector("base").setAttribute("href", "/app/");
+                const map = document.createElement("script");
+                map.type = "importmap";
+                map.textContent = JSON.stringify({imports:{liveBase:"./later.js"}});
+                document.head.appendChild(map);
+                import("liveBase")
+                    .then(module => globalThis.__dynamic_map_base = module.value)
+                    .catch(error => globalThis.__dynamic_map_base = error.message);
+            </script>
+        </body></html>"#);
+        page.execute_scripts().await;
+        assert_eq!(
+            page.js.as_mut().unwrap().evaluate("globalThis.__dynamic_map_base").unwrap(),
+            serde_json::json!("later-map"),
+        );
+        assert_eq!(requests.recv_timeout(std::time::Duration::from_secs(1)).unwrap(), "/app/later.js");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn later_base_element_does_not_rebase_an_earlier_import_map() {
+        let (base, requests) = spawn_parser_import_map_server(1);
+        let mut page = import_map_test_page("temporal-import-map-base", &base, r#"<html><head>
+            <script type="importmap">{"imports":{"fixed":"./before.js"}}</script>
+            <base href="/assets/">
+            <script type="module">
+                import { value } from "fixed";
+                globalThis.__temporal_base_value = value;
+            </script>
+        </head><body></body></html>"#);
+        page.execute_scripts().await;
+        assert_eq!(
+            page.js.as_mut().unwrap().evaluate("globalThis.__temporal_base_value").unwrap(),
+            serde_json::json!("before-first-module"),
+        );
+        assert_eq!(requests.recv_timeout(std::time::Duration::from_secs(1)).unwrap(), "/app/before.js");
     }
 
     #[cfg(feature = "render")]

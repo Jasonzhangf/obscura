@@ -1159,8 +1159,33 @@ class Node {
     if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('childList', this._nid, [c._nid], []);
     if (c instanceof Element && c.tagName === 'SCRIPT') {
       if (__startedScriptNids.has(c._nid)) return c;
-      const scriptType = c.getAttribute('type') || '';
+      const scriptType = (c.getAttribute('type') || '').trim().toLowerCase();
       const isModule = scriptType === 'module';
+      const isImportMap = scriptType === 'importmap';
+      if (isImportMap) {
+        __startedScriptNids.add(c._nid);
+        const src = c.getAttribute('src');
+        let error = '';
+        if (src) {
+          error = 'External import maps are not supported';
+        } else {
+          const base = c.baseURI
+            || globalThis.location?.href
+            || 'about:blank';
+          try {
+            error = Deno.core.ops.op_add_import_map(c.textContent || '', base) || '';
+          } catch (e) {
+            error = e && e.message ? e.message : String(e);
+          }
+        }
+        if (error) {
+          console.error('Import map error:', error);
+          queueMicrotask(() => {
+            try { c.dispatchEvent(new Event('error')); } catch (_) {}
+          });
+        }
+        return c;
+      }
       if (scriptType && !isModule && scriptType !== 'text/javascript' && scriptType !== 'application/javascript') {
         return c;
       }

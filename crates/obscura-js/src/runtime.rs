@@ -9,6 +9,7 @@ use obscura_dom::DomTree;
 /// isolate handle without taking a direct dependency on deno_core.
 pub use deno_core::v8::IsolateHandle;
 
+use crate::import_map::ImportMap;
 use crate::module_loader::ObscuraModuleLoader;
 #[cfg(feature = "render")]
 use crate::ops::{clamp_scroll_offset, document_base_url, ensure_prepared_render};
@@ -43,10 +44,18 @@ pub struct ObscuraJsRuntime {
     state: Rc<RefCell<ObscuraState>>,
     object_store: HashMap<String, String>,
     object_counter: u64,
+    import_map: Rc<RefCell<ImportMap>>,
     /// Thread-safe handle to this runtime's V8 isolate, captured at
     /// construction. Lets a watchdog be armed from `&self` (the CDP dispatcher
     /// only holds `&Page` on the hot path) and is stable for the isolate's life.
     isolate_handle: IsolateHandle,
+}
+
+/// A fetched and instantiated module graph whose evaluation is intentionally
+/// delayed until the HTML script scheduler reaches its post-parse turn.
+pub struct PreparedModule {
+    module_id: deno_core::ModuleId,
+    description: String,
 }
 
 /// Handle to an armed V8 execution watchdog (see [`ObscuraJsRuntime::arm_watchdog`]).
@@ -129,9 +138,10 @@ impl ObscuraJsRuntime {
     pub fn with_base_url_and_proxy(base_url: &str, proxy_url: Option<String>) -> Self {
         let state = Rc::new(RefCell::new(ObscuraState::new()));
         let state_clone = state.clone();
+        let import_map = state.borrow().import_map.clone();
 
         let module_loader = Rc::new(ObscuraModuleLoader::with_page_state(
-            base_url, proxy_url, &state,
+            base_url, proxy_url, &state, import_map.clone(),
         ));
 
         // Build the isolate under the process-wide creation lock so two
@@ -166,8 +176,21 @@ impl ObscuraJsRuntime {
             state,
             object_store: HashMap::new(),
             object_counter: 0,
+            import_map,
             isolate_handle,
         }
+    }
+
+    /// Parse and merge an inline document import map. Rules which would alter
+    /// already-observed module resolutions are discarded while unrelated new
+    /// rules remain available, matching Chromium's multiple-map model.
+    pub fn add_import_map(&self, source: &str, base_url: &str) -> Result<(), String> {
+        let map = ImportMap::parse(source, base_url)?;
+        self.import_map
+            .try_borrow_mut()
+            .map_err(|_| "Import map is already borrowed".to_string())?
+            .merge(map);
+        Ok(())
     }
 
     pub fn set_cookie_jar(&self, jar: std::sync::Arc<obscura_net::CookieJar>) {
@@ -747,6 +770,11 @@ impl ObscuraJsRuntime {
         self.object_store.clear();
     }
     pub async fn load_module(&mut self, url: &str, budget_ms: u64) -> Result<(), String> {
+        let prepared = self.prepare_module(url, budget_ms).await?;
+        self.evaluate_prepared_module(prepared, budget_ms).await
+    }
+
+    pub async fn prepare_module(&mut self, url: &str, budget_ms: u64) -> Result<PreparedModule, String> {
         let budget = tokio::time::Duration::from_millis(budget_ms);
         let specifier = deno_core::ModuleSpecifier::parse(url)
             .map_err(|e| format!("Invalid module URL {}: {}", url, e))?;
@@ -775,8 +803,10 @@ impl ObscuraJsRuntime {
         // Return as soon as the module finishes evaluating rather than waiting
         // for the loop to go fully idle: a page timer (setInterval) keeps the
         // loop busy forever and would otherwise burn the whole budget (#374).
-        self.drive_module_eval(module_id, budget_ms, &format!("Module {}", url))
-            .await
+        Ok(PreparedModule {
+            module_id,
+            description: format!("Module {}", url),
+        })
     }
 
     /// Drive a just-started module evaluation to completion, or up to
@@ -823,13 +853,26 @@ impl ObscuraJsRuntime {
     }
 
     pub async fn load_inline_module(&mut self, code: &str, base_url: &str, budget_ms: u64) -> Result<(), String> {
-        let budget = tokio::time::Duration::from_millis(budget_ms);
-        let specifier = deno_core::ModuleSpecifier::parse(
-            &format!("{}#inline-module-{}", base_url, self.object_counter),
-        )
-        .unwrap_or_else(|_| deno_core::ModuleSpecifier::parse("about:blank").unwrap());
+        let prepared = self
+            .prepare_inline_module(code, base_url, budget_ms)
+            .await?;
+        self.evaluate_prepared_module(prepared, budget_ms).await
+    }
 
-        self.object_counter += 1;
+    pub async fn prepare_inline_module(
+        &mut self,
+        code: &str,
+        base_url: &str,
+        budget_ms: u64,
+    ) -> Result<PreparedModule, String> {
+        let budget = tokio::time::Duration::from_millis(budget_ms);
+        // Inline modules use the document base URL as their module URL. This is
+        // observable through import.meta.url and is also the referrer used for
+        // relative imports and import-map scope matching. deno_core permits
+        // multiple side modules with this name; the returned ModuleId keeps
+        // each prepared module distinct until its scheduled evaluation.
+        let specifier = deno_core::ModuleSpecifier::parse(base_url)
+        .unwrap_or_else(|_| deno_core::ModuleSpecifier::parse("about:blank").unwrap());
 
         let module_id = match tokio::time::timeout(
             budget,
@@ -853,34 +896,95 @@ impl ObscuraJsRuntime {
         // keeps the loop busy forever, and waiting for idle burned the whole
         // budget on this preamble module and starved the module that mounts the
         // app, leaving #root empty (issue #374).
-        self.drive_module_eval(module_id, budget_ms, "Inline module").await
+        Ok(PreparedModule {
+            module_id,
+            description: "Inline module".to_string(),
+        })
     }
 
-    pub fn execute_script(&mut self, _name: &str, source: &str) -> Result<(), String> {
-        self.runtime
-            .execute_script("<script>", source.to_string())
-            .map_err(|e| format!("JS error: {}", e))?;
+    pub async fn evaluate_prepared_module(
+        &mut self,
+        prepared: PreparedModule,
+        budget_ms: u64,
+    ) -> Result<(), String> {
+        self.drive_module_eval(prepared.module_id, budget_ms, &prepared.description)
+            .await
+    }
+
+    fn execute_classic_script(&mut self, name: &str, source: &str) -> Result<(), String> {
+        // JsRuntime::execute_script in deno_core 0.350 restricts `name` to a
+        // &'static str. Browser script URLs are runtime data, and V8 uses this
+        // origin as import()'s referrer, so compile in the runtime's main
+        // context directly instead of substituting the fixed "<script>" name.
+        let scope = &mut self.runtime.handle_scope();
+        let source = deno_core::v8::String::new(scope, source)
+            .ok_or_else(|| "JS error: source allocation failed".to_string())?;
+        let name = deno_core::v8::String::new(scope, name)
+            .ok_or_else(|| "JS error: script URL allocation failed".to_string())?;
+        let origin = deno_core::v8::ScriptOrigin::new(
+            scope,
+            name.into(),
+            0,
+            0,
+            false,
+            0,
+            None,
+            false,
+            false,
+            false,
+            None,
+        );
+        let scope = &mut deno_core::v8::TryCatch::new(scope);
+        let script = deno_core::v8::Script::compile(scope, source, Some(&origin));
+        let Some(script) = script else {
+            if scope.is_execution_terminating() {
+                scope.cancel_terminate_execution();
+                return Err("JS error: Uncaught Error: execution terminated".to_string());
+            }
+            return match scope.exception() {
+                Some(exception) => {
+                    let error = deno_core::error::JsError::from_v8_exception(scope, exception);
+                    Err(format!("JS error: {error}"))
+                }
+                None => Err("JS error: script compilation failed without an exception".to_string()),
+            };
+        };
+        if script.run(scope).is_none() {
+            if scope.is_execution_terminating() {
+                scope.cancel_terminate_execution();
+                return Err("JS error: Uncaught Error: execution terminated".to_string());
+            }
+            return match scope.exception() {
+                Some(exception) => {
+                    let error = deno_core::error::JsError::from_v8_exception(scope, exception);
+                    Err(format!("JS error: {error}"))
+                }
+                None => Err("JS error: script execution failed without an exception".to_string()),
+            };
+        }
         Ok(())
     }
 
-    pub fn execute_script_guarded(&mut self, _name: &str, source: &str) -> Result<(), String> {
+    pub fn execute_script(&mut self, name: &str, source: &str) -> Result<(), String> {
+        self.execute_classic_script(name, source)
+    }
+
+    pub fn execute_script_guarded(&mut self, name: &str, source: &str) -> Result<(), String> {
         if source.len() < 10_000 {
-            self.execute_script(_name, source)
+            self.execute_script(name, source)
         } else {
-            self.execute_script_with_timeout(source, std::time::Duration::from_secs(5))
+            self.execute_script_with_timeout(name, source, std::time::Duration::from_secs(5))
         }
     }
 
     pub fn execute_script_with_timeout(
         &mut self,
+        name: &str,
         source: &str,
         timeout: std::time::Duration,
     ) -> Result<(), String> {
         if timeout.is_zero() {
-            self.runtime
-                .execute_script("<script>", source.to_string())
-                .map_err(|e| format!("JS error: {}", e))?;
-            return Ok(());
+            return self.execute_classic_script(name, source);
         }
 
         let isolate_handle = self.runtime.v8_isolate().thread_safe_handle();
@@ -911,9 +1015,7 @@ impl ObscuraJsRuntime {
             }
         });
 
-        let result = self
-            .runtime
-            .execute_script("<script>", source.to_string());
+        let result = self.execute_classic_script(name, source);
 
         {
             let (lock, cvar) = &*pair;
@@ -924,15 +1026,13 @@ impl ObscuraJsRuntime {
         let _ = watchdog.join();
 
         match result {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                let msg = e.to_string();
+            Ok(()) => Ok(()),
+            Err(msg) => {
                 if msg.contains("Uncaught Error: execution terminated") {
                     tracing::warn!("Script killed after {}s timeout", timeout.as_secs());
-                    self.runtime.execute_script("<reset>", "undefined".to_string()).ok();
                     Ok(())
                 } else {
-                    Err(format!("JS error: {}", msg))
+                    Err(msg)
                 }
             }
         }
@@ -7166,6 +7266,78 @@ mod tests {
         (format!("http://{}", address), requests_rx)
     }
 
+    fn spawn_import_map_server() -> (String, std::sync::mpsc::Receiver<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (requests_tx, requests_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 2048];
+                let length = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..length]);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_ascii_whitespace().nth(1))
+                    .unwrap_or("/")
+                    .to_string();
+                requests_tx.send(path.clone()).unwrap();
+                let (status, body) = match path.as_str() {
+                    "/vendor/pkg/feature.js" => ("200 OK", "export const value = 'prefix-static';"),
+                    "/vendor/dynamic.js" => ("200 OK", "export const value = 'exact-dynamic';"),
+                    _ => ("404 Not Found", "not found"),
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\n\
+                     Content-Type: application/javascript\r\n\
+                     Content-Length: {}\r\n\
+                     Connection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        (format!("http://{}", address), requests_rx)
+    }
+
+    fn spawn_root_module_import_map_server() -> (String, std::sync::mpsc::Receiver<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (requests_tx, requests_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 2048];
+            let length = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..length]);
+            let path = request
+                .lines()
+                .next()
+                .and_then(|line| line.split_ascii_whitespace().nth(1))
+                .unwrap_or("/")
+                .to_string();
+            requests_tx.send(path.clone()).unwrap();
+            let body = if path == "/entry.js" {
+                "globalThis.__root_module_identity = 'entry';"
+            } else {
+                "globalThis.__root_module_identity = 'remapped';"
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\n\
+                 Content-Type: application/javascript\r\n\
+                 Content-Length: {}\r\n\
+                 Connection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        (format!("http://{}", address), requests_rx)
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn entry_module_http_failure_is_not_evaluated_as_empty_source() {
         let base = spawn_one_response_server("404 Not Found", "not found");
@@ -7300,6 +7472,159 @@ mod tests {
                 "GET /child.js HTTP/1.1",
             ],
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn import_map_resolves_prefix_static_and_exact_dynamic_imports() {
+        let (base, requests) = spawn_import_map_server();
+        let jar = std::sync::Arc::new(obscura_net::CookieJar::new());
+        let client = std::sync::Arc::new(obscura_net::ObscuraHttpClient::with_full_options(
+            jar, None, true,
+        ));
+        let mut rt = ObscuraJsRuntime::with_base_url(&format!("{}/app/index.html", base));
+        rt.set_http_client(client);
+        rt.add_import_map(
+            r#"{
+                "imports": {
+                    "pkg/": "../vendor/pkg/",
+                    "dynamic-pkg": "../vendor/dynamic.js"
+                }
+            }"#,
+            &format!("{}/config/import-map.json", base),
+        )
+        .unwrap();
+
+        rt.load_inline_module(
+            "import { value as prefix } from 'pkg/feature.js'; \
+             const dynamic = (await import('dynamic-pkg')).value; \
+             globalThis.__import_map_values = [prefix, dynamic];",
+            &format!("{}/app/index.html", base),
+            1_000,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            rt.evaluate("globalThis.__import_map_values").unwrap(),
+            serde_json::json!(["prefix-static", "exact-dynamic"]),
+        );
+        let paths = (0..2)
+            .map(|_| requests.recv_timeout(std::time::Duration::from_secs(1)).unwrap())
+            .collect::<Vec<_>>();
+        assert!(paths.contains(&"/vendor/pkg/feature.js".to_string()), "{paths:?}");
+        assert!(paths.contains(&"/vendor/dynamic.js".to_string()), "{paths:?}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn import_map_does_not_remap_external_root_module_url() {
+        let (base, requests) = spawn_root_module_import_map_server();
+        let jar = std::sync::Arc::new(obscura_net::CookieJar::new());
+        let client = std::sync::Arc::new(obscura_net::ObscuraHttpClient::with_full_options(
+            jar, None, true,
+        ));
+        let mut rt = ObscuraJsRuntime::with_base_url(&format!("{}/index.html", base));
+        rt.set_http_client(client);
+        rt.add_import_map(
+            &format!(r#"{{"imports":{{"{base}/entry.js":"{base}/remapped.js"}}}}"#),
+            &format!("{}/index.html", base),
+        )
+        .unwrap();
+
+        rt.load_module(&format!("{}/entry.js", base), 1_000).await.unwrap();
+        assert_eq!(
+            rt.evaluate("globalThis.__root_module_identity").unwrap(),
+            serde_json::json!("entry"),
+        );
+        assert_eq!(
+            requests.recv_timeout(std::time::Duration::from_secs(1)).unwrap(),
+            "/entry.js",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn inline_modules_expose_document_base_as_import_meta_url() {
+        let mut rt = ObscuraJsRuntime::with_base_url("https://example.com/page/index.html");
+        rt.load_inline_module(
+            "globalThis.__first_inline_url = import.meta.url;",
+            "https://example.com/base/",
+            1_000,
+        ).await.unwrap();
+        rt.load_inline_module(
+            "globalThis.__second_inline_url = import.meta.url;",
+            "https://example.com/base/",
+            1_000,
+        ).await.unwrap();
+
+        assert_eq!(
+            rt.evaluate("[globalThis.__first_inline_url, globalThis.__second_inline_url]").unwrap(),
+            serde_json::json!(["https://example.com/base/", "https://example.com/base/"])
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn classic_script_url_is_dynamic_import_referrer() {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let request_thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 2048];
+            let length = stream.read(&mut request).unwrap();
+            let path = String::from_utf8_lossy(&request[..length])
+                .lines().next()
+                .and_then(|line| line.split_ascii_whitespace().nth(1))
+                .unwrap_or("/").to_string();
+            let body = "export const value = 'scoped-classic';";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            path
+        });
+        let base = format!("http://{address}");
+        let jar = std::sync::Arc::new(obscura_net::CookieJar::new());
+        let client = std::sync::Arc::new(obscura_net::ObscuraHttpClient::with_full_options(
+            jar, None, true,
+        ));
+        let mut rt = ObscuraJsRuntime::with_base_url(&format!("{base}/page/index.html"));
+        rt.set_http_client(client);
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.run_page_init();
+        rt.add_import_map(
+            &format!(r#"{{"scopes":{{"{base}/classic/":{{"pkg":"{base}/scoped.js"}}}}}}"#),
+            &format!("{base}/page/index.html"),
+        ).unwrap();
+
+        rt.execute_script(
+            &format!("{base}/classic/entry.js"),
+            "document.documentElement.setAttribute('data-classic-op', 'ran'); \
+             import('pkg').then(module => { globalThis.__classic_import = module.value; });",
+        ).unwrap();
+        rt.run_event_loop().await.unwrap();
+
+        assert_eq!(rt.evaluate("globalThis.__classic_import").unwrap(), serde_json::json!("scoped-classic"));
+        assert_eq!(
+            rt.evaluate("document.documentElement.getAttribute('data-classic-op')").unwrap(),
+            serde_json::json!("ran")
+        );
+        assert_eq!(request_thread.join().unwrap(), "/scoped.js");
+    }
+
+    #[test]
+    fn timed_out_classic_script_leaves_runtime_reusable() {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.execute_script_with_timeout(
+            "https://example.test/hang.js",
+            "while (true) {}",
+            std::time::Duration::from_millis(20),
+        ).unwrap();
+        rt.execute_script(
+            "https://example.test/after-timeout.js",
+            "globalThis.__after_timeout = true;",
+        ).unwrap();
+        assert_eq!(rt.evaluate("globalThis.__after_timeout").unwrap(), serde_json::json!(true));
     }
 
     #[tokio::test(flavor = "current_thread")]
