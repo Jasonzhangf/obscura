@@ -1443,6 +1443,17 @@ mod tests {
     }
 
     #[test]
+    fn null_namespace_style_attribute_stays_in_sync() {
+        let mut rt = setup_runtime(r#"<html><body><div id="d">hi</div></body></html>"#);
+        let result = rt
+            .evaluate(
+                "(function(){var e=document.getElementById('d'); e.setAttributeNS(null,'style','color: green'); var before=e.style.color; e.removeAttributeNS(null,'style'); return before+'|'+e.style.color+'|'+String(e.getAttribute('style'));})()",
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!("green||null"));
+    }
+
+    #[test]
     fn setting_style_property_updates_the_attribute_and_serialization() {
         let mut rt = setup_runtime(r#"<html><body><div id="d">hi</div></body></html>"#);
         let attr = rt
