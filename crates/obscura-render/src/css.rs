@@ -77,6 +77,7 @@ struct ParsedRule {
     selector: String,
     declarations: String,
     container_condition_id: ContainerConditionId,
+    layer: Option<LayerOrder>,
 }
 
 struct Rule {
@@ -86,6 +87,7 @@ struct Rule {
     /// Source order, for breaking specificity ties (later wins).
     order: usize,
     container_condition_id: ContainerConditionId,
+    layer: Option<LayerOrder>,
 }
 
 struct PseudoRule {
@@ -94,6 +96,117 @@ struct PseudoRule {
     important_decls: String,
     order: usize,
     container_condition_id: ContainerConditionId,
+    layer: Option<LayerOrder>,
+}
+
+/// A cascade layer's first-declaration position at each nesting level.
+///
+/// The terminal (direct declarations in a parent layer) is intentionally not
+/// stored. [`compare_layer_order`] treats a shorter prefix as the implicit
+/// final sub-layer, matching CSS Cascade 5: normal declarations directly in a
+/// layer outrank its nested layers, and the order reverses for `!important`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct LayerOrder(Vec<u32>);
+
+/// Global author-layer name table for one `Stylesheet` parse. Layer ordering
+/// spans all style sources in document order, so this registry must outlive
+/// each individual `<style>`/linked stylesheet source.
+#[derive(Default)]
+struct LayerRegistry {
+    named: HashMap<(Vec<u32>, String), LayerOrder>,
+    next_child: HashMap<Vec<u32>, u32>,
+}
+
+impl LayerRegistry {
+    fn allocate(&mut self, parent: &[u32]) -> LayerOrder {
+        let next = self.next_child.entry(parent.to_vec()).or_default();
+        let order = *next;
+        *next = (*next).saturating_add(1);
+        let mut path = parent.to_vec();
+        path.push(order);
+        LayerOrder(path)
+    }
+
+    fn register_named(
+        &mut self,
+        parent: Option<&LayerOrder>,
+        qualified_name: &str,
+    ) -> Option<LayerOrder> {
+        let mut path = parent.map_or_else(Vec::new, |layer| layer.0.clone());
+        for component in qualified_name.split('.') {
+            let component = component.trim();
+            if component.is_empty() {
+                return None;
+            }
+            let key = (path.clone(), component.to_string());
+            let layer = if let Some(layer) = self.named.get(&key) {
+                layer.clone()
+            } else {
+                let layer = self.allocate(&path);
+                self.named.insert(key, layer.clone());
+                layer
+            };
+            path = layer.0.clone();
+        }
+        Some(LayerOrder(path))
+    }
+
+    fn register_anonymous(&mut self, parent: Option<&LayerOrder>) -> LayerOrder {
+        self.allocate(parent.map(|layer| layer.0.as_slice()).unwrap_or_default())
+    }
+
+    fn register_statement(&mut self, parent: Option<&LayerOrder>, prelude: &str) {
+        for name in prelude.split(',') {
+            let _ = self.register_named(parent, name.trim());
+        }
+    }
+}
+
+/// Compare author layer precedence from weak to strong for normal declarations.
+/// Unlayered declarations beat every layered declaration. Within layers, later
+/// siblings win; declarations directly in a parent layer are its implicit last
+/// sub-layer. `!important` uses the exact reverse order.
+fn compare_layer_order(
+    left: Option<&LayerOrder>,
+    right: Option<&LayerOrder>,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (left, right) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Greater,
+        (Some(_), None) => Ordering::Less,
+        (Some(left), Some(right)) => {
+            for (a, b) in left.0.iter().zip(&right.0) {
+                match a.cmp(b) {
+                    Ordering::Equal => {}
+                    ordering => return ordering,
+                }
+            }
+            match left.0.len().cmp(&right.0.len()) {
+                // A direct declaration in the containing layer is the
+                // implicit final sub-layer, not an early prefix.
+                Ordering::Less => Ordering::Greater,
+                Ordering::Greater => Ordering::Less,
+                Ordering::Equal => Ordering::Equal,
+            }
+        }
+    }
+}
+
+fn compare_rule_cascade(
+    left_layer: Option<&LayerOrder>,
+    left_specificity: u32,
+    left_order: usize,
+    right_layer: Option<&LayerOrder>,
+    right_specificity: u32,
+    right_order: usize,
+    important: bool,
+) -> std::cmp::Ordering {
+    let layer = compare_layer_order(left_layer, right_layer);
+    let layer = if important { layer.reverse() } else { layer };
+    layer
+        .then(left_specificity.cmp(&right_specificity))
+        .then(left_order.cmp(&right_order))
 }
 
 const PROPERTY_REGISTRATION_SELECTOR_PREFIX: &str = "\0property:";
@@ -602,17 +715,26 @@ impl Stylesheet {
             after_rules: Vec::new(),
         };
         let mut order = 0usize;
+        let mut layers = LayerRegistry::default();
         for src in sources {
             for (name, keyframes) in extract_keyframes(src) {
                 sheet.keyframes.insert(name, keyframes);
             }
-            let parsed = parse_stylesheet_for_viewport_preserving_containers(
+            let parsed = parse_stylesheet_for_viewport_preserving_containers_in_layer(
                 src,
                 viewport,
                 &mut sheet.container_conditions,
                 ContainerConditionId::NONE,
+                &mut layers,
+                None,
             );
-            for ParsedRule { selector, declarations: decls, container_condition_id } in parsed {
+            for ParsedRule {
+                selector,
+                declarations: decls,
+                container_condition_id,
+                layer,
+            } in parsed
+            {
                 if let Some(name) = selector.strip_prefix(PROPERTY_REGISTRATION_SELECTOR_PREFIX) {
                     if let Some(registration) = parse_property_registration(&decls) {
                         sheet
@@ -632,6 +754,7 @@ impl Stylesheet {
                             important_decls,
                             order,
                             container_condition_id,
+                            layer,
                         });
                     }
                     order += 1;
@@ -647,6 +770,7 @@ impl Stylesheet {
                             important_decls,
                             order,
                             container_condition_id,
+                            layer,
                         });
                     }
                     order += 1;
@@ -662,7 +786,12 @@ impl Stylesheet {
                     SelectorKey::Universal => sheet.universal.push(idx),
                 }
                 sheet.rules.push(Rule {
-                    sel, normal_decls, important_decls, order, container_condition_id,
+                    sel,
+                    normal_decls,
+                    important_decls,
+                    order,
+                    container_condition_id,
+                    layer,
                 });
                 order += 1;
             }
@@ -735,7 +864,30 @@ impl Stylesheet {
             if matched.is_empty() {
                 return None;
             }
-            matched.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+            let mut normal_matched = matched.clone();
+            normal_matched.sort_unstable_by(|a, b| {
+                compare_rule_cascade(
+                    a.2.layer.as_ref(),
+                    a.0,
+                    a.1,
+                    b.2.layer.as_ref(),
+                    b.0,
+                    b.1,
+                    false,
+                )
+            });
+            let mut important_matched = matched;
+            important_matched.sort_unstable_by(|a, b| {
+                compare_rule_cascade(
+                    a.2.layer.as_ref(),
+                    a.0,
+                    a.1,
+                    b.2.layer.as_ref(),
+                    b.0,
+                    b.1,
+                    true,
+                )
+            });
             // Generated ::before/::after boxes have an inline outer display
             // by default. LayoutStyle's general default is block because it
             // primarily represents ordinary DOM boxes, so set the pseudo
@@ -747,7 +899,7 @@ impl Stylesheet {
             style.color_scheme_dark = host_style.color_scheme_dark;
             let inherited_color_scheme_dark = host_style.color_scheme_dark;
             let mut generated_content = None;
-            for &(_, _, rule) in &matched {
+            for &(_, _, rule) in &normal_matched {
                 let expanded = substitute_declarations(&rule.normal_decls, props);
                 crate::style::apply_color_scheme_declarations_from(
                     &mut style,
@@ -755,7 +907,7 @@ impl Stylesheet {
                     inherited_color_scheme_dark,
                 );
             }
-            for &(_, _, rule) in &matched {
+            for &(_, _, rule) in &important_matched {
                 let expanded = substitute_declarations(&rule.important_decls, props);
                 crate::style::apply_color_scheme_declarations_from(
                     &mut style,
@@ -763,7 +915,7 @@ impl Stylesheet {
                     inherited_color_scheme_dark,
                 );
             }
-            for &(_, _, rule) in &matched {
+            for &(_, _, rule) in &normal_matched {
                 let expanded = substitute_declarations(&rule.normal_decls, props);
                 crate::style::apply_declarations_with_locked_color_scheme(
                     &mut style,
@@ -773,7 +925,7 @@ impl Stylesheet {
                     generated_content = value;
                 }
             }
-            for &(_, _, rule) in &matched {
+            for &(_, _, rule) in &important_matched {
                 let expanded = substitute_declarations(&rule.important_decls, props);
                 crate::style::apply_declarations_with_locked_color_scheme(
                     &mut style,
@@ -914,7 +1066,34 @@ impl Stylesheet {
             consider(Some(&self.universal), &mut matched);
         }
 
-        matched.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        let mut normal_matched = matched.clone();
+        normal_matched.sort_unstable_by(|a, b| {
+            let left = &self.rules[a.2];
+            let right = &self.rules[b.2];
+            compare_rule_cascade(
+                left.layer.as_ref(),
+                a.0,
+                a.1,
+                right.layer.as_ref(),
+                b.0,
+                b.1,
+                false,
+            )
+        });
+        let mut important_matched = matched;
+        important_matched.sort_unstable_by(|a, b| {
+            let left = &self.rules[a.2];
+            let right = &self.rules[b.2];
+            compare_rule_cascade(
+                left.layer.as_ref(),
+                a.0,
+                a.1,
+                right.layer.as_ref(),
+                b.0,
+                b.1,
+                true,
+            )
+        });
 
         let (inline_normal, inline_important) = inline_css
             .map(crate::style::partition_declarations)
@@ -934,11 +1113,11 @@ impl Stylesheet {
                 }
             }
         };
-        for &(_, _, i) in &matched {
+        for &(_, _, i) in &normal_matched {
             collect_custom(&self.rules[i].normal_decls);
         }
         collect_custom(&inline_normal);
-        for &(_, _, i) in &matched {
+        for &(_, _, i) in &important_matched {
             collect_custom(&self.rules[i].important_decls);
         }
         collect_custom(&inline_important);
@@ -1034,7 +1213,7 @@ impl Stylesheet {
         // scheme, not the declaration order. Determine the scheme winner
         // across the complete author cascade before applying any color-valued
         // property. The style starts with its inherited scheme.
-        for &(_, _, i) in &matched {
+        for &(_, _, i) in &normal_matched {
             let expanded =
                 substitute_declarations(&self.rules[i].normal_decls, props);
             crate::style::apply_color_scheme_declarations_from(
@@ -1049,7 +1228,7 @@ impl Stylesheet {
             &expanded,
             inherited_color_scheme_dark,
         );
-        for &(_, _, i) in &matched {
+        for &(_, _, i) in &important_matched {
             let expanded =
                 substitute_declarations(&self.rules[i].important_decls, props);
             crate::style::apply_color_scheme_declarations_from(
@@ -1067,7 +1246,7 @@ impl Stylesheet {
 
         // Pass 2: apply normal declarations with `var()` substituted against
         // the resolved custom-property map.
-        for &(_, _, i) in &matched {
+        for &(_, _, i) in &normal_matched {
             let expanded = substitute_declarations(&self.rules[i].normal_decls, props);
             crate::style::apply_declarations_with_locked_color_scheme(
                 style,
@@ -1083,7 +1262,7 @@ impl Stylesheet {
         // before sampling, then let the ordinary important pass override the
         // sampled opacity where appropriate.
         let mut animation_style = style.clone();
-        for &(_, _, i) in &matched {
+        for &(_, _, i) in &important_matched {
             let expanded = substitute_declarations(&self.rules[i].important_decls, props);
             crate::style::apply_animation_declarations(&mut animation_style, &expanded);
         }
@@ -1103,7 +1282,7 @@ impl Stylesheet {
             }
         }
 
-        for &(_, _, i) in &matched {
+        for &(_, _, i) in &important_matched {
             let expanded = substitute_declarations(&self.rules[i].important_decls, props);
             crate::style::apply_declarations_with_locked_color_scheme(
                 style,
@@ -1963,6 +2142,25 @@ fn parse_stylesheet_for_viewport_preserving_containers(
     container_conditions: &mut Vec<ContainerConditionNode>,
     container_condition_id: ContainerConditionId,
 ) -> Vec<ParsedRule> {
+    let mut layers = LayerRegistry::default();
+    parse_stylesheet_for_viewport_preserving_containers_in_layer(
+        css,
+        viewport,
+        container_conditions,
+        container_condition_id,
+        &mut layers,
+        None,
+    )
+}
+
+fn parse_stylesheet_for_viewport_preserving_containers_in_layer(
+    css: &str,
+    viewport: (f32, f32),
+    container_conditions: &mut Vec<ContainerConditionNode>,
+    container_condition_id: ContainerConditionId,
+    layers: &mut LayerRegistry,
+    current_layer: Option<LayerOrder>,
+) -> Vec<ParsedRule> {
     let mut rules = Vec::new();
     let mut current_selector = String::new();
     let mut current_decls = String::new();
@@ -2004,6 +2202,7 @@ fn parse_stylesheet_for_viewport_preserving_containers(
                     flush_at_rule(
                         at, sel, decls, &mut rules, viewport,
                         container_conditions, container_condition_id,
+                        layers, current_layer.as_ref(),
                     );
                 } else {
                     // The body may contain nested rules (CSS Nesting, ubiquitous
@@ -2013,6 +2212,7 @@ fn parse_stylesheet_for_viewport_preserving_containers(
                     denest(
                         sel, decls, &mut rules, viewport,
                         container_conditions, container_condition_id,
+                        layers, current_layer.as_ref(),
                     );
                 }
                 current_selector.clear();
@@ -2021,10 +2221,14 @@ fn parse_stylesheet_for_viewport_preserving_containers(
                 current_decls.push(c);
             }
         } else if c == ';' && block_depth == 0 {
-            // A `;` at the top level terminates an at-statement that carries no
-            // rules (`@layer a, b;`, `@import ...;`, `@charset ...;`). Discard
-            // the buffered text so it cannot bleed into the next rule's selector
-            // and take a real rule down with it.
+            // Layer ordering statements establish slots even though they emit
+            // no selector rules. All other statement at-rules are discarded so
+            // their prelude cannot bleed into the next selector.
+            if let Some(at) = current_selector.trim().strip_prefix('@') {
+                if let Some(prelude) = at_rule_prelude(at, "layer") {
+                    layers.register_statement(current_layer.as_ref(), prelude);
+                }
+            }
             current_selector.clear();
         } else if block_depth > 0 {
             current_decls.push(c);
@@ -2045,23 +2249,29 @@ fn flush_at_rule(
     viewport: (f32, f32),
     container_conditions: &mut Vec<ContainerConditionNode>,
     container_condition_id: ContainerConditionId,
+    layers: &mut LayerRegistry,
+    current_layer: Option<&LayerOrder>,
 ) {
     if let Some(prelude) = at_rule_prelude(at, "media") {
         if media_query_applies_for_viewport(prelude, viewport) {
-            rules.extend(parse_stylesheet_for_viewport_preserving_containers(
+            rules.extend(parse_stylesheet_for_viewport_preserving_containers_in_layer(
                 inner,
                 viewport,
                 container_conditions,
                 container_condition_id,
+                layers,
+                current_layer.cloned(),
             ));
         }
     } else if let Some(prelude) = at_rule_prelude(at, "supports") {
         if supports_condition_applies(prelude) {
-            rules.extend(parse_stylesheet_for_viewport_preserving_containers(
+            rules.extend(parse_stylesheet_for_viewport_preserving_containers_in_layer(
                 inner,
                 viewport,
                 container_conditions,
                 container_condition_id,
+                layers,
+                current_layer.cloned(),
             ));
         }
     } else if let Some(prelude) = at_rule_prelude(at, "container") {
@@ -2074,11 +2284,13 @@ fn flush_at_rule(
                 parent: container_condition_id,
                 alternatives,
             });
-            rules.extend(parse_stylesheet_for_viewport_preserving_containers(
+            rules.extend(parse_stylesheet_for_viewport_preserving_containers_in_layer(
                 inner,
                 viewport,
                 container_conditions,
                 id,
+                layers,
+                current_layer.cloned(),
             ));
         }
     } else if let Some(name) = at_rule_prelude(at, "property") {
@@ -2090,23 +2302,24 @@ fn flush_at_rule(
                 // Conditional 5 deliberately does not gate them on an
                 // enclosing container query.
                 container_condition_id: ContainerConditionId::NONE,
+                layer: None,
             });
         }
-    } else if at_rule_prelude(at, "layer").is_some() {
-        // Cascade layers: `@layer name { ... }` wraps ordinary rules. We do not
-        // model layer priority (real CSS ranks unlayered above layered and
-        // later layers above earlier); just flatten the body in source order so
-        // the (specificity, source-order) cascade applies it. Tailwind/UnoCSS,
-        // Nuxt UI and similar wrap nearly all their CSS, including the `:root`
-        // design tokens and background/color utilities, in `@layer`; dropping it
-        // left whole pages unstyled (white backgrounds, collapsed layout). The
-        // `@layer a, b;` ordering-statement form has no block and is discarded
-        // by parse_stylesheet's top-level `;` handling.
-        rules.extend(parse_stylesheet_for_viewport_preserving_containers(
+    } else if let Some(prelude) = at_rule_prelude(at, "layer") {
+        let layer = if prelude.trim().is_empty() {
+            layers.register_anonymous(current_layer)
+        } else if let Some(layer) = layers.register_named(current_layer, prelude) {
+            layer
+        } else {
+            return;
+        };
+        rules.extend(parse_stylesheet_for_viewport_preserving_containers_in_layer(
             inner,
             viewport,
             container_conditions,
             container_condition_id,
+            layers,
+            Some(layer),
         ));
     }
     // Other at-rules (@font-face, @keyframes, @import, ...) carry no
@@ -2922,6 +3135,8 @@ fn denest(
     viewport: (f32, f32),
     container_conditions: &mut Vec<ContainerConditionNode>,
     container_condition_id: ContainerConditionId,
+    layers: &mut LayerRegistry,
+    current_layer: Option<&LayerOrder>,
 ) {
     let chars: Vec<char> = body.chars().collect();
     let n = chars.len();
@@ -3002,6 +3217,8 @@ fn denest(
                                 viewport,
                                 container_conditions,
                                 container_condition_id,
+                                layers,
+                                current_layer,
                             );
                         }
                     } else if let Some(prelude) = at_rule_prelude(at, "supports") {
@@ -3013,6 +3230,8 @@ fn denest(
                                 viewport,
                                 container_conditions,
                                 container_condition_id,
+                                layers,
+                                current_layer,
                             );
                         }
                     } else if let Some(prelude) = at_rule_prelude(at, "container") {
@@ -3023,22 +3242,49 @@ fn denest(
                                     parent: container_condition_id,
                                     alternatives,
                                 });
-                                denest(sel, &inner, rules, viewport, container_conditions, id);
+                                denest(
+                                    sel,
+                                    &inner,
+                                    rules,
+                                    viewport,
+                                    container_conditions,
+                                    id,
+                                    layers,
+                                    current_layer,
+                                );
                             }
                         }
-                    } else if at_rule_prelude(at, "layer").is_some() {
-                        denest(
-                            sel,
-                            &inner,
-                            rules,
-                            viewport,
-                            container_conditions,
-                            container_condition_id,
-                        );
+                    } else if let Some(prelude) = at_rule_prelude(at, "layer") {
+                        let layer = if prelude.trim().is_empty() {
+                            Some(layers.register_anonymous(current_layer))
+                        } else {
+                            layers.register_named(current_layer, prelude)
+                        };
+                        if let Some(layer) = layer {
+                            denest(
+                                sel,
+                                &inner,
+                                rules,
+                                viewport,
+                                container_conditions,
+                                container_condition_id,
+                                layers,
+                                Some(&layer),
+                            );
+                        }
                     }
                 } else if !pre.is_empty() {
                     let full = combine_selectors(sel, pre);
-                    denest(&full, &inner, rules, viewport, container_conditions, container_condition_id);
+                    denest(
+                        &full,
+                        &inner,
+                        rules,
+                        viewport,
+                        container_conditions,
+                        container_condition_id,
+                        layers,
+                        current_layer,
+                    );
                 }
                 i = j;
                 seg = i;
@@ -3047,7 +3293,11 @@ fn denest(
             ';' if paren == 0 => {
                 let d: String = chars[seg..i].iter().collect();
                 let d = d.trim();
-                if !d.is_empty() {
+                if let Some(at) = d.strip_prefix('@') {
+                    if let Some(prelude) = at_rule_prelude(at, "layer") {
+                        layers.register_statement(current_layer, prelude);
+                    }
+                } else if !d.is_empty() {
                     own.push_str(d);
                     own.push(';');
                 }
@@ -3073,6 +3323,7 @@ fn denest(
                     selector: s.to_string(),
                     declarations: own.clone(),
                     container_condition_id,
+                    layer: current_layer.cloned(),
                 });
             }
         }
@@ -3280,6 +3531,159 @@ mod tests {
             parent: ContainerConditionId::NONE,
             alternatives: Vec::new(),
         }]
+    }
+
+    fn cascade_layer_target(
+        sources: &[&str],
+        inline_css: Option<&str>,
+    ) -> (LayoutStyle, HashMap<String, String>, Option<LayoutStyle>) {
+        let tree = obscura_dom::parse_html(r#"<div id="target" class="target"></div>"#);
+        let target = tree.get_element_by_id("target").unwrap();
+        let source_strings = sources
+            .iter()
+            .map(|source| (*source).to_string())
+            .collect::<Vec<_>>();
+        let sheet = Stylesheet::parse(&tree, &source_strings);
+        let mut matcher = tree.matcher();
+        let mut style = LayoutStyle::default();
+        let effective = sheet
+            .apply(
+                &tree,
+                &mut matcher,
+                target,
+                Some("target"),
+                &["target".to_string()],
+                "div",
+                &mut style,
+                &HashMap::new(),
+                inline_css,
+            )
+            .unwrap_or_default();
+        let before = sheet
+            .pseudo_styles(&tree, &mut matcher, target, &effective, &style)
+            .0;
+        (style, effective, before)
+    }
+
+    #[test]
+    fn layer_order_statement_beats_block_source_order() {
+        let (style, _, _) = cascade_layer_target(
+            &[r#"
+                @layer reset, components, utilities;
+                @layer utilities { #target { width:320px } }
+                @layer components { #target { width:100% } }
+            "#],
+            None,
+        );
+        assert_eq!(style.width, crate::Dimension::Px(320.0));
+    }
+
+    #[test]
+    fn unlayered_normal_beats_layered_higher_specificity() {
+        let (style, _, _) = cascade_layer_target(
+            &[r#"
+                @layer utilities { #target { width:320px } }
+                .target { width:200px }
+            "#],
+            None,
+        );
+        assert_eq!(style.width, crate::Dimension::Px(200.0));
+    }
+
+    #[test]
+    fn important_layer_order_is_reversed_and_beats_unlayered() {
+        let css = r#"
+            @layer reset, overrides;
+            @layer overrides { #target { width:400px !important } }
+            @layer reset { .target { width:100px !important } }
+            #target { width:300px !important }
+        "#;
+        let (style, _, _) = cascade_layer_target(
+            &[css],
+            Some("width:500px"),
+        );
+        assert_eq!(
+            style.width,
+            crate::Dimension::Px(100.0),
+            "the earliest layered important declaration beats later layers, unlayered author rules, and normal inline style"
+        );
+        let (inline_important, _, _) =
+            cascade_layer_target(&[css], Some("width:500px !important"));
+        assert_eq!(
+            inline_important.width,
+            crate::Dimension::Px(500.0),
+            "important inline style remains strongest within the author origin"
+        );
+    }
+
+    #[test]
+    fn layer_order_applies_to_custom_properties_and_pseudos() {
+        let (style, props, before) = cascade_layer_target(
+            &[r#"
+                @layer base, theme;
+                @layer theme {
+                    #target { --normal-size:30px; --critical-size:31px !important }
+                    #target::before { content:"theme"; width:30px }
+                }
+                @layer base {
+                    #target { --normal-size:10px; --critical-size:11px !important }
+                    #target::before { content:"base" !important; width:10px }
+                }
+                #target { width:var(--normal-size); height:var(--critical-size) }
+            "#],
+            None,
+        );
+        assert_eq!(props.get("--normal-size").map(String::as_str), Some("30px"));
+        assert_eq!(props.get("--critical-size").map(String::as_str), Some("11px"));
+        assert_eq!(style.width, crate::Dimension::Px(30.0));
+        assert_eq!(style.height, crate::Dimension::Px(11.0));
+        let before = before.expect("the layered ::before content should materialize");
+        assert_eq!(before.before_content.as_deref(), Some("base"));
+        assert_eq!(before.width, crate::Dimension::Px(30.0));
+    }
+
+    #[test]
+    fn nested_and_anonymous_layers_keep_parent_direct_precedence() {
+        let (style, _, _) = cascade_layer_target(
+            &[r#"
+                @layer framework {
+                    @layer reset, components;
+                    #target { width:90px; height:90px !important }
+                    @layer components {
+                        #target { width:30px; height:30px !important }
+                    }
+                    @layer reset {
+                        #target { width:10px; height:10px !important }
+                    }
+                    @layer {
+                        #target { width:60px; height:60px !important }
+                    }
+                }
+            "#],
+            None,
+        );
+        assert_eq!(
+            style.width,
+            crate::Dimension::Px(90.0),
+            "direct normal declarations are the parent layer's implicit final sub-layer"
+        );
+        assert_eq!(
+            style.height,
+            crate::Dimension::Px(10.0),
+            "nested important order reverses, making the first named child strongest"
+        );
+    }
+
+    #[test]
+    fn layer_registry_spans_multiple_stylesheet_sources() {
+        let (style, _, _) = cascade_layer_target(
+            &[
+                "@layer base, utilities; @layer utilities { #target { width:320px } }",
+                "@layer base { #target { width:100% } }",
+            ],
+            None,
+        );
+        assert_eq!(style.width, crate::Dimension::Px(320.0));
     }
 
     #[test]
