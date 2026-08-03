@@ -7813,11 +7813,11 @@ function _cssSupportsColor(value) {
     return comma >= 0 && _cssSupportsColor(raw.slice(4 + comma + 1, -1));
   }
   if (/^rgba?\(/.test(lower) && lower.endsWith(")")) {
-    // Chromium accepts relative colors and Tailwind uses this exact syntax as
-    // a browser-family probe. Painting every relative-color expression is a
-    // separate concern from recognizing its valid conditional syntax.
+    // Keep the non-render build aligned with the renderer's capability
+    // evaluator: relative colors are valid CSS, but are not implemented by
+    // Obscura yet and therefore must not select an unsupported @supports arm.
     if (/\bfrom\b/.test(lower)) {
-      return /^rgba?\(\s*from\s+\S[\s\S]*\)$/i.test(raw);
+      return false;
     }
     const parts = lower.slice(lower.indexOf("(") + 1, -1)
       .split(/[,\s/]+/).filter(Boolean);
@@ -7918,6 +7918,21 @@ function _cssSupportsDeclaration(name, value) {
   if (name === "contain") return lower === "none";
   if (name === "content-visibility") return lower === "visible";
   if (name === "content") return _cssSupportsContent(value);
+  if (["border", "border-top", "border-right", "border-bottom", "border-left"].includes(name)) {
+    if (lower === "none") return true;
+    const parts = _cssSplitWhitespace(value);
+    if (!parts.length || parts.length > 3) return false;
+    let widths = 0, styles = 0, colors = 0;
+    for (const part of parts) {
+      const token = part.toLowerCase();
+      if (["thin", "medium", "thick"].includes(token) ||
+          (_cssSupportsDimension(part, false) && !token.includes("%"))) widths++;
+      else if (["none", "hidden", "dotted", "dashed", "solid", "double", "groove", "ridge", "inset", "outset"].includes(token)) styles++;
+      else if (_cssSupportsColor(part) || token === "currentcolor") colors++;
+      else return false;
+    }
+    return widths <= 1 && styles <= 1 && colors <= 1;
+  }
   if (["width", "height", "min-width", "min-height", "max-width", "max-height", "flex-basis"].includes(name)) {
     return _cssSupportsDimension(value, true) || (name === "width" && lower === "fit-content");
   }
