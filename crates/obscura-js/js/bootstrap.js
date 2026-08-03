@@ -24,7 +24,7 @@
     '_isSpecialScheme', '_applyDocQueryEncoding', '_anchorBase',
     '_elemHrefURL', '_setElemHrefPart', '_pad', '_daysInMonth',
     '_isoWeek1Monday', '_inputParseNumber', '_inputFormatNumber',
-    '_htmlAttrName', '_convertNodes', '_elementClassFor', '_wrap', '_wrapEl',
+    '_htmlAttrName', '_convertNodes', '_parseHTMLFragment', '_elementClassFor', '_wrap', '_wrapEl',
     '_resolveUrl', '_registerIframe', '_base64ToUint8Array',
     '_bodyToUint8Array', '_arrayBufferFromBytes',
     '_installWasmStreamingFallback', '_urlParseOp', '_urlSetOp',
@@ -1329,6 +1329,23 @@ function _isSubmitButton(el) {
   return false;
 }
 
+// Parse an HTML string into detached nodes using the actual insertion element
+// as html5ever's fragment context. This preserves table/select parsing rules,
+// comments, text-node order, and foreign-content namespaces without a wrap map.
+function _parseHTMLFragment(html, context) {
+  html = String(html == null ? '' : html);
+  const ns = context && context.nodeType === 1 ? context.namespaceURI : null;
+  const tag = context && context.nodeType === 1 ? context.localName : 'body';
+  const tmp = ns && ns !== 'http://www.w3.org/1999/xhtml'
+    ? document.createElementNS(ns, tag)
+    : document.createElement(tag);
+  tmp.innerHTML = html;
+  const out = [];
+  let child;
+  while ((child = tmp.firstChild)) out.push(tmp.removeChild(child));
+  return out;
+}
+
 class Element extends Node {
   constructor(nid) {
     super(nid);
@@ -1583,20 +1600,33 @@ class Element extends Node {
     return null;
   }
   insertAdjacentHTML(position, html) {
+    // Position is matched ASCII-case-insensitively; an unknown value throws
+    // SyntaxError (both were silent no-ops before). Sibling insertions parse
+    // against the parent's context, child insertions against this element, so
+    // table/select fragments keep the right parsing context (_parseHTMLFragment).
+    const pos = String(position).toLowerCase();
     const parent = this.parentNode;
-    switch (position) {
+    const context = (pos === 'beforebegin' || pos === 'afterend') ? parent : this;
+    switch (pos) {
       case 'beforebegin':
-        if (parent) { const tmp = document.createElement('div'); tmp.innerHTML = html; const children = tmp.childNodes; for (let i = 0; i < children.length; i++) parent.insertBefore(children[i], this); }
+        if (parent) for (const n of _parseHTMLFragment(html, context)) parent.insertBefore(n, this);
         break;
-      case 'afterbegin':
-        { const tmp = document.createElement('div'); tmp.innerHTML = html; const children = tmp.childNodes; const first = this.firstChild; for (let i = children.length - 1; i >= 0; i--) this.insertBefore(children[i], first); }
+      case 'afterbegin': {
+        const first = this.firstChild;
+        for (const n of _parseHTMLFragment(html, context)) this.insertBefore(n, first);
         break;
+      }
       case 'beforeend':
-        { const tmp = document.createElement('div'); tmp.innerHTML = html; const children = tmp.childNodes; for (let i = 0; i < children.length; i++) this.appendChild(children[i]); }
+        for (const n of _parseHTMLFragment(html, context)) this.appendChild(n);
         break;
       case 'afterend':
-        if (parent) { const tmp = document.createElement('div'); tmp.innerHTML = html; const children = tmp.childNodes; const next = this.nextSibling; for (let i = 0; i < children.length; i++) parent.insertBefore(children[i], next); }
+        if (parent) { const next = this.nextSibling; for (const n of _parseHTMLFragment(html, context)) parent.insertBefore(n, next); }
         break;
+      default:
+        throw new DOMException(
+          "Failed to execute 'insertAdjacentHTML' on 'Element': The value provided ('" + position + "') is not one of 'beforeBegin', 'afterBegin', 'beforeEnd', or 'afterEnd'.",
+          "SyntaxError"
+        );
     }
   }
   // Like insertAdjacentHTML but inserts a Text node instead of parsing markup,
