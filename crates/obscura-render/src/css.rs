@@ -15,6 +15,602 @@ use std::sync::Arc;
 
 use crate::LayoutStyle;
 
+/// The part of the tree whose selector match may change when a dependency on
+/// one element changes. Multiple bits can be present for selectors which use
+/// the same key in more than one compound.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct InvalidationReaches(u8);
+
+impl InvalidationReaches {
+    pub const SELF: Self = Self(1 << 0);
+    pub const DESCENDANTS: Self = Self(1 << 1);
+    pub const SIBLINGS: Self = Self(1 << 2);
+    /// The selector needs a correctness-first fallback which phase 2 must not
+    /// narrow to a local traversal.
+    pub const CONSERVATIVE: Self = Self(1 << 3);
+
+    pub fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+}
+
+/// One compiled rule's dependency on a selector key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InvalidationDependency {
+    /// Stylesheet source order of the compiled rule.
+    pub rule_order: usize,
+    pub reaches: InvalidationReaches,
+}
+
+/// Selector dependencies retained alongside the compiled stylesheet.
+///
+/// This follows Gecko's conservative invalidation-map shape: mutations look
+/// up the changed id/class/attribute/state and receive one or more traversal
+/// reaches. Phase 1 only builds and exposes this metadata; it deliberately does
+/// not alter mutation handling or skip any cascade work.
+#[derive(Clone, Debug, Default)]
+pub struct InvalidationMap {
+    ids: HashMap<String, Vec<InvalidationDependency>>,
+    classes: HashMap<String, Vec<InvalidationDependency>>,
+    attributes: HashMap<String, Vec<InvalidationDependency>>,
+    states: HashMap<String, Vec<InvalidationDependency>>,
+    conservative_rule_orders: Vec<usize>,
+}
+
+impl InvalidationMap {
+    pub fn id_dependencies(&self, id: &str) -> &[InvalidationDependency] {
+        self.ids.get(id).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    pub fn class_dependencies(&self, class: &str) -> &[InvalidationDependency] {
+        self.classes.get(class).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    pub fn attribute_dependencies(&self, attribute: &str) -> &[InvalidationDependency] {
+        self.attributes
+            .get(&attribute.to_ascii_lowercase())
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    pub fn state_dependencies(&self, state: &str) -> &[InvalidationDependency] {
+        self.states
+            .get(&state.to_ascii_lowercase())
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    pub fn conservative_rule_orders(&self) -> &[usize] {
+        &self.conservative_rule_orders
+    }
+
+    pub fn requires_conservative_invalidation(&self) -> bool {
+        !self.conservative_rule_orders.is_empty()
+    }
+
+    pub fn dependency_count(&self) -> usize {
+        self.ids
+            .values()
+            .chain(self.classes.values())
+            .chain(self.attributes.values())
+            .chain(self.states.values())
+            .map(Vec::len)
+            .sum()
+    }
+
+    fn push(
+        map: &mut HashMap<String, Vec<InvalidationDependency>>,
+        key: String,
+        rule_order: usize,
+        reaches: InvalidationReaches,
+    ) {
+        let dependencies = map.entry(key).or_default();
+        if let Some(existing) = dependencies
+            .iter_mut()
+            .find(|dependency| dependency.rule_order == rule_order)
+        {
+            existing.reaches = existing.reaches.union(reaches);
+        } else {
+            dependencies.push(InvalidationDependency {
+                rule_order,
+                reaches,
+            });
+        }
+    }
+
+    fn push_id(&mut self, key: String, rule_order: usize, reaches: InvalidationReaches) {
+        Self::push(&mut self.ids, key, rule_order, reaches);
+    }
+
+    fn push_class(&mut self, key: String, rule_order: usize, reaches: InvalidationReaches) {
+        Self::push(&mut self.classes, key, rule_order, reaches);
+    }
+
+    fn push_attribute(&mut self, key: String, rule_order: usize, reaches: InvalidationReaches) {
+        Self::push(
+            &mut self.attributes,
+            key.to_ascii_lowercase(),
+            rule_order,
+            reaches,
+        );
+    }
+
+    fn push_state(&mut self, key: String, rule_order: usize, reaches: InvalidationReaches) {
+        Self::push(
+            &mut self.states,
+            key.to_ascii_lowercase(),
+            rule_order,
+            reaches,
+        );
+    }
+
+    fn mark_conservative(&mut self, rule_order: usize) {
+        if self.conservative_rule_orders.last().copied() != Some(rule_order)
+            && !self.conservative_rule_orders.contains(&rule_order)
+        {
+            self.conservative_rule_orders.push(rule_order);
+        }
+    }
+}
+
+fn compose_invalidation_reach(
+    map: &mut InvalidationMap,
+    inner: InvalidationReaches,
+    outer: InvalidationReaches,
+    rule_order: usize,
+) -> InvalidationReaches {
+    if outer == InvalidationReaches::SELF {
+        inner
+    } else if inner == InvalidationReaches::SELF || inner == outer {
+        outer
+    } else {
+        // A sibling traversal nested under an ancestor traversal (or vice
+        // versa) cannot be represented by the three simple phase-1 reaches.
+        map.mark_conservative(rule_order);
+        inner
+            .union(outer)
+            .union(InvalidationReaches::CONSERVATIVE)
+    }
+}
+
+fn consume_css_identifier(chars: &[char], mut index: usize) -> (String, usize) {
+    let mut value = String::new();
+    while let Some(&ch) = chars.get(index) {
+        if ch == '\\' {
+            index += 1;
+            let Some(&escaped) = chars.get(index) else {
+                break;
+            };
+            if escaped.is_ascii_hexdigit() {
+                let start = index;
+                while index < chars.len()
+                    && index - start < 6
+                    && chars[index].is_ascii_hexdigit()
+                {
+                    index += 1;
+                }
+                let digits: String = chars[start..index].iter().collect();
+                if let Ok(codepoint) = u32::from_str_radix(&digits, 16) {
+                    value.push(char::from_u32(codepoint).unwrap_or('\u{fffd}'));
+                }
+                if chars.get(index).is_some_and(|ch| ch.is_whitespace()) {
+                    index += 1;
+                }
+                continue;
+            }
+            value.push(escaped);
+            index += 1;
+            continue;
+        }
+        if ch.is_alphanumeric() || ch == '_' || ch == '-' || !ch.is_ascii() {
+            value.push(ch);
+            index += 1;
+        } else {
+            break;
+        }
+    }
+    (value, index)
+}
+
+fn matching_delimiter(chars: &[char], open: usize, opening: char, closing: char) -> Option<usize> {
+    let mut depth = 1usize;
+    let mut quote = None;
+    let mut index = open + 1;
+    while index < chars.len() {
+        let ch = chars[index];
+        if ch == '\\' {
+            index = (index + 2).min(chars.len());
+            continue;
+        }
+        if let Some(active_quote) = quote {
+            if ch == active_quote {
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+        } else if ch == opening {
+            depth += 1;
+        } else if ch == closing {
+            depth -= 1;
+            if depth == 0 {
+                return Some(index);
+            }
+        }
+        index += 1;
+    }
+    None
+}
+
+/// Split one complex selector into compounds and the traversal generated by a
+/// dependency in each compound. Whitespace surrounding an explicit
+/// combinator is not misread as an extra descendant combinator.
+fn invalidation_compounds(selector: &str) -> (Vec<(String, InvalidationReaches)>, bool) {
+    let chars: Vec<char> = selector.chars().collect();
+    let mut compounds = Vec::new();
+    let mut start = 0usize;
+    let mut index = 0usize;
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut quote = None;
+    let mut malformed = false;
+
+    let push = |compound_start: usize,
+                end: usize,
+                reaches: InvalidationReaches,
+                compounds: &mut Vec<(String, InvalidationReaches)>| {
+        let compound: String = chars[compound_start..end].iter().collect();
+        let compound = compound.trim();
+        if !compound.is_empty() {
+            compounds.push((compound.to_string(), reaches));
+            true
+        } else {
+            false
+        }
+    };
+
+    while index < chars.len() {
+        let ch = chars[index];
+        if ch == '\\' {
+            index = (index + 2).min(chars.len());
+            continue;
+        }
+        if let Some(active_quote) = quote {
+            if ch == active_quote {
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+            index += 1;
+            continue;
+        }
+        match ch {
+            '(' => paren_depth += 1,
+            ')' => {
+                if paren_depth == 0 {
+                    malformed = true;
+                } else {
+                    paren_depth -= 1;
+                }
+            }
+            '[' => bracket_depth += 1,
+            ']' => {
+                if bracket_depth == 0 {
+                    malformed = true;
+                } else {
+                    bracket_depth -= 1;
+                }
+            }
+            '>' | '+' | '~' if paren_depth == 0 && bracket_depth == 0 => {
+                let reaches = if ch == '>' {
+                    InvalidationReaches::DESCENDANTS
+                } else {
+                    InvalidationReaches::SIBLINGS
+                };
+                if !push(start, index, reaches, &mut compounds) {
+                    malformed = true;
+                }
+                index += 1;
+                while chars.get(index).is_some_and(|ch| ch.is_whitespace()) {
+                    index += 1;
+                }
+                start = index;
+                continue;
+            }
+            ',' if paren_depth == 0 && bracket_depth == 0 => malformed = true,
+            _ if ch.is_whitespace() && paren_depth == 0 && bracket_depth == 0 => {
+                let whitespace = index;
+                while chars.get(index).is_some_and(|ch| ch.is_whitespace()) {
+                    index += 1;
+                }
+                if matches!(chars.get(index), Some('>') | Some('+') | Some('~')) {
+                    continue;
+                }
+                if index < chars.len() {
+                    if !push(
+                        start,
+                        whitespace,
+                        InvalidationReaches::DESCENDANTS,
+                        &mut compounds,
+                    ) {
+                        malformed = true;
+                    }
+                    start = index;
+                    continue;
+                }
+                break;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    if paren_depth != 0 || bracket_depth != 0 || quote.is_some() {
+        malformed = true;
+    }
+    let tail: String = chars[start..].iter().collect();
+    let tail = tail.trim();
+    if !tail.is_empty() {
+        compounds.push((tail.to_string(), InvalidationReaches::SELF));
+    } else if compounds.is_empty() {
+        malformed = true;
+    }
+    let mut descendants_to_right = false;
+    for (_, reaches) in compounds.iter_mut().rev() {
+        if reaches.contains(InvalidationReaches::DESCENDANTS) {
+            descendants_to_right = true;
+        } else if descendants_to_right && reaches.contains(InvalidationReaches::SIBLINGS) {
+            // `.foo ~ .bar .child`: a change to `.foo` can affect descendants
+            // of following siblings. A flat Siblings reach is insufficient
+            // unless phase 2 also carries the remaining descendant path.
+            *reaches = reaches.union(InvalidationReaches::CONSERVATIVE);
+        }
+    }
+    (compounds, malformed)
+}
+
+fn nth_of_selector(arguments: &str) -> Option<&str> {
+    let chars: Vec<char> = arguments.chars().collect();
+    let mut bracket_depth = 0usize;
+    let mut paren_depth = 0usize;
+    let mut quote = None;
+    let mut index = 0usize;
+    while index + 1 < chars.len() {
+        let ch = chars[index];
+        if ch == '\\' {
+            index += 2;
+            continue;
+        }
+        if let Some(active_quote) = quote {
+            if ch == active_quote {
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '(' => paren_depth += 1,
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            _ => {}
+        }
+        if bracket_depth == 0
+            && paren_depth == 0
+            && (index == 0 || chars[index - 1].is_whitespace())
+            && ch.eq_ignore_ascii_case(&'o')
+            && chars[index + 1].eq_ignore_ascii_case(&'f')
+            && chars.get(index + 2).is_none_or(|ch| ch.is_whitespace())
+        {
+            let byte_index = arguments
+                .char_indices()
+                .nth(index + 2)
+                .map_or(arguments.len(), |(byte, _)| byte);
+            return Some(arguments[byte_index..].trim());
+        }
+        index += 1;
+    }
+    None
+}
+
+fn note_compound_dependencies(
+    map: &mut InvalidationMap,
+    compound: &str,
+    reaches: InvalidationReaches,
+    rule_order: usize,
+) {
+    let chars: Vec<char> = compound.chars().collect();
+    let mut index = 0usize;
+    while index < chars.len() {
+        match chars[index] {
+            '#' => {
+                let (id, next) = consume_css_identifier(&chars, index + 1);
+                if id.is_empty() {
+                    map.mark_conservative(rule_order);
+                } else {
+                    map.push_id(id, rule_order, reaches);
+                }
+                index = next.max(index + 1);
+            }
+            '.' => {
+                let (class, next) = consume_css_identifier(&chars, index + 1);
+                if class.is_empty() {
+                    map.mark_conservative(rule_order);
+                } else {
+                    map.push_class(class, rule_order, reaches);
+                }
+                index = next.max(index + 1);
+            }
+            '[' => {
+                let Some(close) = matching_delimiter(&chars, index, '[', ']') else {
+                    map.mark_conservative(rule_order);
+                    return;
+                };
+                let mut name_index = index + 1;
+                while chars.get(name_index).is_some_and(|ch| ch.is_whitespace()) {
+                    name_index += 1;
+                }
+                if chars.get(name_index) == Some(&'*') || chars.get(name_index) == Some(&'|') {
+                    name_index += 1;
+                }
+                let (first, first_end) = consume_css_identifier(&chars, name_index);
+                let (attribute, end) = if chars.get(first_end) == Some(&'|') {
+                    consume_css_identifier(&chars, first_end + 1)
+                } else {
+                    (first, first_end)
+                };
+                if attribute.is_empty() || end > close {
+                    map.mark_conservative(rule_order);
+                } else {
+                    map.push_attribute(attribute, rule_order, reaches);
+                }
+                index = close + 1;
+            }
+            ':' => {
+                if chars.get(index + 1) == Some(&':') {
+                    let (_, next) = consume_css_identifier(&chars, index + 2);
+                    index = next.max(index + 2);
+                    continue;
+                }
+                let (name, next) = consume_css_identifier(&chars, index + 1);
+                let name = name.to_ascii_lowercase();
+                if name.is_empty() {
+                    map.mark_conservative(rule_order);
+                    index += 1;
+                    continue;
+                }
+                if chars.get(next) != Some(&'(') {
+                    map.push_state(name.clone(), rule_order, reaches);
+                    if matches!(
+                        name.as_str(),
+                        "root"
+                            | "scope"
+                            | "target"
+                            | "link"
+                            | "any-link"
+                            | "visited"
+                            | "empty"
+                            | "first-child"
+                            | "last-child"
+                            | "only-child"
+                            | "first-of-type"
+                            | "last-of-type"
+                            | "only-of-type"
+                    ) {
+                        // These change when nodes are inserted, removed, or
+                        // reordered. Phase 2 has no tree-structural mutation
+                        // lookup yet, so keep the complete cascade fallback.
+                        map.mark_conservative(rule_order);
+                    }
+                    index = next;
+                    continue;
+                }
+                let Some(close) = matching_delimiter(&chars, next, '(', ')') else {
+                    map.mark_conservative(rule_order);
+                    return;
+                };
+                let arguments: String = chars[next + 1..close].iter().collect();
+                match name.as_str() {
+                    "is" | "where" | "not" => {
+                        for alternative in split_selector_list(&arguments) {
+                            note_selector_dependencies(
+                                map,
+                                alternative.trim(),
+                                reaches,
+                                rule_order,
+                            );
+                        }
+                    }
+                    "has" => {
+                        // Relative selectors invalidate anchors upwards, which
+                        // Self/Descendants/Siblings cannot express soundly.
+                        map.mark_conservative(rule_order);
+                        for alternative in split_selector_list(&arguments) {
+                            note_selector_dependencies(
+                                map,
+                                alternative.trim(),
+                                InvalidationReaches::CONSERVATIVE,
+                                rule_order,
+                            );
+                        }
+                    }
+                    "nth-child" | "nth-last-child" | "nth-of-type" | "nth-last-of-type" => {
+                        map.push_state(name, rule_order, reaches);
+                        // Structural index changes and `of <complex-selector>`
+                        // need sibling-wide bookkeeping not present in phase 1.
+                        map.mark_conservative(rule_order);
+                        if let Some(of_selector) = nth_of_selector(&arguments) {
+                            for alternative in split_selector_list(of_selector) {
+                                note_selector_dependencies(
+                                    map,
+                                    alternative.trim(),
+                                    InvalidationReaches::CONSERVATIVE,
+                                    rule_order,
+                                );
+                            }
+                        }
+                    }
+                    _ => {
+                        // A compiled functional pseudo outside the explicitly
+                        // modeled set may hide selector or document state.
+                        map.push_state(name, rule_order, reaches);
+                        map.mark_conservative(rule_order);
+                    }
+                }
+                index = close + 1;
+            }
+            '\\' => index = (index + 2).min(chars.len()),
+            _ => index += 1,
+        }
+    }
+}
+
+fn note_selector_dependencies(
+    map: &mut InvalidationMap,
+    selector: &str,
+    outer_reaches: InvalidationReaches,
+    rule_order: usize,
+) {
+    let (compounds, malformed) = invalidation_compounds(selector);
+    if malformed {
+        map.mark_conservative(rule_order);
+    }
+    for (compound, local_reaches) in compounds {
+        if local_reaches.contains(InvalidationReaches::CONSERVATIVE) {
+            map.mark_conservative(rule_order);
+        }
+        let reaches = compose_invalidation_reach(map, local_reaches, outer_reaches, rule_order);
+        note_compound_dependencies(map, &compound, reaches, rule_order);
+    }
+}
+
+fn note_selector_for_invalidation(
+    map: &mut InvalidationMap,
+    selector: &str,
+    rule_order: usize,
+) {
+    note_selector_dependencies(map, selector, InvalidationReaches::SELF, rule_order);
+}
+
+fn selector_requires_conservative_tracking(selector: &str) -> bool {
+    let selector = selector.to_ascii_lowercase();
+    selector.contains(":has(")
+        || selector.contains(":nth-child(")
+        || selector.contains(":nth-last-child(")
+        || selector.contains(":nth-of-type(")
+        || selector.contains(":nth-last-of-type(")
+        || selector.contains(":target")
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 struct ContainerConditionId(u32);
 
@@ -754,6 +1350,7 @@ fn evaluate_container_query_expr(
 /// An indexed set of author rules ready for fast per-element matching.
 pub struct Stylesheet {
     rules: Vec<Rule>,
+    invalidation_map: InvalidationMap,
     registered_custom_properties: HashMap<String, RegisteredCustomProperty>,
     /// Index zero is the unconditional sentinel.
     container_conditions: Vec<ContainerConditionNode>,
@@ -852,6 +1449,12 @@ impl StylesheetCache {
 }
 
 impl Stylesheet {
+    /// Dependency metadata for conservative incremental-style invalidation.
+    /// Building this map does not itself enable incremental cascade skipping.
+    pub fn invalidation_map(&self) -> &InvalidationMap {
+        &self.invalidation_map
+    }
+
     /// Until Stage B supplies completed container geometry, preserved
     /// conditional rules remain inactive rather than using viewport geometry.
     fn container_condition_is_active(
@@ -926,6 +1529,7 @@ impl Stylesheet {
     ) -> Self {
         let mut sheet = Stylesheet {
             rules: Vec::new(),
+            invalidation_map: InvalidationMap::default(),
             registered_custom_properties: HashMap::new(),
             container_conditions: vec![ContainerConditionNode {
                 parent: ContainerConditionId::NONE,
@@ -1001,6 +1605,11 @@ impl Stylesheet {
                 let sel_trim = selector.trim();
                 if let Some(base) = strip_pseudo_element(sel_trim, "before") {
                     if let Some(sel) = tree.compile_rule_selector(base) {
+                        note_selector_for_invalidation(
+                            &mut sheet.invalidation_map,
+                            base,
+                            order,
+                        );
                         let (normal_decls, important_decls) =
                             crate::style::partition_declarations(&decls);
                         let normal_flags = declaration_stream_flags(&normal_decls);
@@ -1018,12 +1627,27 @@ impl Stylesheet {
                             container_condition_id,
                             layer,
                         });
+                    } else if selector_requires_conservative_tracking(base) {
+                        // Keep correctness metadata for relative/structural
+                        // syntax that the current selector matcher cannot yet
+                        // compile. Once matcher support lands, phase 2 must not
+                        // silently treat the rule as locally invalidatable.
+                        note_selector_for_invalidation(
+                            &mut sheet.invalidation_map,
+                            base,
+                            order,
+                        );
                     }
                     order += 1;
                     continue;
                 }
                 if let Some(base) = strip_pseudo_element(sel_trim, "after") {
                     if let Some(sel) = tree.compile_rule_selector(base) {
+                        note_selector_for_invalidation(
+                            &mut sheet.invalidation_map,
+                            base,
+                            order,
+                        );
                         let (normal_decls, important_decls) =
                             crate::style::partition_declarations(&decls);
                         let normal_flags = declaration_stream_flags(&normal_decls);
@@ -1041,13 +1665,32 @@ impl Stylesheet {
                             container_condition_id,
                             layer,
                         });
+                    } else if selector_requires_conservative_tracking(base) {
+                        note_selector_for_invalidation(
+                            &mut sheet.invalidation_map,
+                            base,
+                            order,
+                        );
                     }
                     order += 1;
                     continue;
                 }
                 let Some(sel) = tree.compile_rule_selector(&selector) else {
+                    if selector_requires_conservative_tracking(&selector) {
+                        note_selector_for_invalidation(
+                            &mut sheet.invalidation_map,
+                            &selector,
+                            order,
+                        );
+                        order += 1;
+                    }
                     continue;
                 };
+                note_selector_for_invalidation(
+                    &mut sheet.invalidation_map,
+                    &selector,
+                    order,
+                );
                 let (normal_decls, important_decls) = crate::style::partition_declarations(&decls);
                 let specificity = sel.specificity();
                 let normal_flags = declaration_stream_flags(&normal_decls);
@@ -4830,6 +5473,201 @@ fn split_media_query_list(query: &str) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_invalidation_map(css: &str) -> InvalidationMap {
+        let tree = obscura_dom::parse_html("<html><body></body></html>");
+        Stylesheet::parse(&tree, &[css.to_string()])
+            .invalidation_map()
+            .clone()
+    }
+
+    fn dependencies_reach(
+        dependencies: &[InvalidationDependency],
+        reaches: InvalidationReaches,
+    ) -> bool {
+        dependencies
+            .iter()
+            .any(|dependency| dependency.reaches.contains(reaches))
+    }
+
+    #[test]
+    fn invalidation_map_classifies_compound_reach_without_false_negatives() {
+        let map = test_invalidation_map(
+            r#"
+                #self { color:red }
+                #ancestor .subject { color:red }
+                #parent > .child { color:red }
+                #previous + .adjacent { color:red }
+                #earlier ~ .later { color:red }
+                .repeat .repeat { color:red }
+            "#,
+        );
+
+        assert!(dependencies_reach(
+            map.id_dependencies("self"),
+            InvalidationReaches::SELF,
+        ));
+        assert!(dependencies_reach(
+            map.id_dependencies("ancestor"),
+            InvalidationReaches::DESCENDANTS,
+        ));
+        assert!(dependencies_reach(
+            map.id_dependencies("parent"),
+            InvalidationReaches::DESCENDANTS,
+        ));
+        assert!(dependencies_reach(
+            map.id_dependencies("previous"),
+            InvalidationReaches::SIBLINGS,
+        ));
+        assert!(dependencies_reach(
+            map.id_dependencies("earlier"),
+            InvalidationReaches::SIBLINGS,
+        ));
+        let repeated = map.class_dependencies("repeat");
+        assert_eq!(repeated.len(), 1, "same-rule dependencies must merge");
+        assert!(repeated[0].reaches.contains(InvalidationReaches::SELF));
+        assert!(repeated[0]
+            .reaches
+            .contains(InvalidationReaches::DESCENDANTS));
+        assert!(!map.requires_conservative_invalidation());
+    }
+
+    #[test]
+    fn invalidation_map_indexes_attributes_states_functions_and_escaped_keys() {
+        let map = test_invalidation_map(
+            r#"
+                [data-theme] .panel:hover { color:red }
+                :is(.alpha, #beta) > button:focus-visible { color:red }
+                button:not([disabled]) { color:red }
+                .sm\:hover\:px-2[data-KIND] { color:red }
+                .group:focus-within .icon { color:red }
+            "#,
+        );
+
+        assert!(dependencies_reach(
+            map.attribute_dependencies("DATA-THEME"),
+            InvalidationReaches::DESCENDANTS,
+        ));
+        assert!(dependencies_reach(
+            map.class_dependencies("panel"),
+            InvalidationReaches::SELF,
+        ));
+        assert!(dependencies_reach(
+            map.state_dependencies("hover"),
+            InvalidationReaches::SELF,
+        ));
+        assert!(dependencies_reach(
+            map.class_dependencies("alpha"),
+            InvalidationReaches::DESCENDANTS,
+        ));
+        assert!(dependencies_reach(
+            map.id_dependencies("beta"),
+            InvalidationReaches::DESCENDANTS,
+        ));
+        assert!(dependencies_reach(
+            map.state_dependencies("focus-visible"),
+            InvalidationReaches::SELF,
+        ));
+        assert!(dependencies_reach(
+            map.attribute_dependencies("disabled"),
+            InvalidationReaches::SELF,
+        ));
+        assert!(dependencies_reach(
+            map.class_dependencies("sm:hover:px-2"),
+            InvalidationReaches::SELF,
+        ));
+        assert!(dependencies_reach(
+            map.attribute_dependencies("data-kind"),
+            InvalidationReaches::SELF,
+        ));
+        assert!(dependencies_reach(
+            map.state_dependencies("focus-within"),
+            InvalidationReaches::DESCENDANTS,
+        ));
+        assert!(!map.requires_conservative_invalidation());
+    }
+
+    #[test]
+    fn invalidation_map_marks_relative_and_nth_dependencies_conservative() {
+        let map = test_invalidation_map(
+            r#"
+                .card:has(> .badge) { color:red }
+                .row:has(+ .notice) .label { color:red }
+                .item:nth-child(2n of .eligible) { color:red }
+                .typed:nth-of-type(odd) { color:red }
+                .trigger ~ .branch .leaf { color:red }
+                :root { color:red }
+                a:link, a:visited, :target { color:red }
+            "#,
+        );
+
+        assert!(map.requires_conservative_invalidation());
+        assert!(map.conservative_rule_orders().len() >= 3);
+        assert!(dependencies_reach(
+            map.class_dependencies("badge"),
+            InvalidationReaches::CONSERVATIVE,
+        ));
+        assert!(dependencies_reach(
+            map.class_dependencies("notice"),
+            InvalidationReaches::CONSERVATIVE,
+        ));
+        assert!(dependencies_reach(
+            map.class_dependencies("eligible"),
+            InvalidationReaches::CONSERVATIVE,
+        ));
+        assert!(!map.state_dependencies("nth-child").is_empty());
+        assert!(!map.state_dependencies("nth-of-type").is_empty());
+        let trigger = map.class_dependencies("trigger");
+        assert!(dependencies_reach(
+            trigger,
+            InvalidationReaches::SIBLINGS,
+        ));
+        assert!(dependencies_reach(
+            trigger,
+            InvalidationReaches::CONSERVATIVE,
+        ));
+        assert!(dependencies_reach(
+            map.class_dependencies("branch"),
+            InvalidationReaches::DESCENDANTS,
+        ));
+        for state in ["root", "link", "visited", "target"] {
+            assert!(
+                !map.state_dependencies(state).is_empty(),
+                "missing conservative state dependency for :{state}",
+            );
+        }
+    }
+
+    #[test]
+    fn invalidation_map_includes_generated_content_host_dependencies() {
+        let map = test_invalidation_map(
+            r#"
+                .toolbar[data-open] > .button:hover::before { content:"x" }
+                #status::after { content:"ok" }
+            "#,
+        );
+
+        assert!(dependencies_reach(
+            map.class_dependencies("toolbar"),
+            InvalidationReaches::DESCENDANTS,
+        ));
+        assert!(dependencies_reach(
+            map.attribute_dependencies("data-open"),
+            InvalidationReaches::DESCENDANTS,
+        ));
+        assert!(dependencies_reach(
+            map.class_dependencies("button"),
+            InvalidationReaches::SELF,
+        ));
+        assert!(dependencies_reach(
+            map.state_dependencies("hover"),
+            InvalidationReaches::SELF,
+        ));
+        assert!(dependencies_reach(
+            map.id_dependencies("status"),
+            InvalidationReaches::SELF,
+        ));
+    }
 
     fn condition_arena_root() -> Vec<ContainerConditionNode> {
         vec![ContainerConditionNode {
