@@ -11,7 +11,10 @@ use crate::types::{CdpEvent, CdpRequest, CdpResponse};
 
 #[cfg(feature = "render")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ScreencastFormat { Png, Jpeg }
+pub(crate) enum ScreencastFormat {
+    Png,
+    Jpeg,
+}
 
 #[cfg(feature = "render")]
 #[derive(Clone, Debug)]
@@ -257,10 +260,15 @@ impl CdpContext {
         self.pages.retain(|p| p.id != id);
         #[cfg(feature = "render")]
         {
-            let removed: Vec<String> = self.sessions.iter()
+            let removed: Vec<String> = self
+                .sessions
+                .iter()
                 .filter(|(_, page_id)| page_id.as_str() == id)
-                .map(|(session_id, _)| session_id.clone()).collect();
-            for session_id in removed { self.screencasts.remove(&session_id); }
+                .map(|(session_id, _)| session_id.clone())
+                .collect();
+            for session_id in removed {
+                self.screencasts.remove(&session_id);
+            }
         }
         self.sessions.retain(|_, v| v != id);
     }
@@ -273,9 +281,7 @@ impl CdpContext {
     }
 
     pub fn get_session_page(&self, session_id: &Option<String>) -> Option<&Page> {
-        let page_id = session_id
-            .as_ref()
-            .and_then(|sid| self.sessions.get(sid))?;
+        let page_id = session_id.as_ref().and_then(|sid| self.sessions.get(sid))?;
         self.get_page(page_id)
     }
 
@@ -311,38 +317,67 @@ impl CdpContext {
 /// reads. `get_session_page_mut` triggers `suspend_js`/`resume_js` and
 /// must stay behind the lock.
 fn is_v8_free_method(method: &str) -> bool {
-    matches!(method,
-        "Target.getTargets" | "Target.setDiscoverTargets"
-        | "Target.attachToTarget" | "Target.attachToBrowserTarget"
-        | "Target.setAutoAttach"
-        | "Target.getBrowserContexts" | "Target.createBrowserContext"
-        | "Target.disposeBrowserContext" | "Target.getTargetInfo"
-        | "Target.detachFromTarget" | "Target.activateTarget"
-        | "Browser.getVersion" | "Browser.close" | "Browser.getWindowForTarget"
-        | "Browser.setDownloadBehavior" | "Browser.getWindowBounds" | "Browser.setWindowBounds"
-        | "Page.enable" | "Page.disable" | "Page.getFrameTree"
-        | "Page.setDownloadBehavior"
-        | "Page.setLifecycleEventsEnabled"
-        | "Page.addScriptToEvaluateOnNewDocument" | "Page.removeScriptToEvaluateOnNewDocument"
-        | "Page.setInterceptFileChooserDialog" | "Page.getNavigationHistory"
-        | "Page.resetNavigationHistory" | "Page.printToPDF"
-        | "Page.captureSnapshot"
-        | "Page.stopScreencast" | "Page.screencastFrameAck"
-        | "Page.createIsolatedWorld"
-        | "Runtime.enable" | "Runtime.disable"
-        | "Runtime.runIfWaitingForDebugger" | "Runtime.getExceptionDetails"
-        | "Runtime.discardConsoleEntries"
-        | "Network.enable" | "Network.disable" | "Network.setCacheDisabled"
-        | "Network.setRequestInterception" | "Network.setBlockedURLs"
-        | "Network.setExtraHTTPHeaders"
-        | "Network.setUserAgentOverride"
-        | "Network.getCookies" | "Network.getAllCookies"
-        | "Network.setCookie" | "Network.setCookies"
-        | "Network.deleteCookies" | "Network.clearBrowserCookies"
-        | "Network.getResponseBody"
-        | "Fetch.continueRequest" | "Fetch.fulfillRequest"
-        | "Fetch.failRequest" | "Fetch.getResponseBody"
-        | "Storage.getCookies" | "Storage.setCookies" | "Storage.deleteCookies"
+    matches!(
+        method,
+        "Target.getTargets"
+            | "Target.setDiscoverTargets"
+            | "Target.attachToTarget"
+            | "Target.attachToBrowserTarget"
+            | "Target.setAutoAttach"
+            | "Target.getBrowserContexts"
+            | "Target.createBrowserContext"
+            | "Target.disposeBrowserContext"
+            | "Target.getTargetInfo"
+            | "Target.detachFromTarget"
+            | "Target.activateTarget"
+            | "Browser.getVersion"
+            | "Browser.close"
+            | "Browser.getWindowForTarget"
+            | "Browser.setDownloadBehavior"
+            | "Browser.getWindowBounds"
+            | "Browser.setWindowBounds"
+            | "Page.enable"
+            | "Page.disable"
+            | "Page.getFrameTree"
+            | "Page.setDownloadBehavior"
+            | "Page.setLifecycleEventsEnabled"
+            | "Page.addScriptToEvaluateOnNewDocument"
+            | "Page.removeScriptToEvaluateOnNewDocument"
+            | "Page.setInterceptFileChooserDialog"
+            | "Page.getNavigationHistory"
+            | "Page.resetNavigationHistory"
+            | "Page.captureSnapshot"
+            | "Page.stopScreencast"
+            | "Page.screencastFrameAck"
+            | "Page.createIsolatedWorld"
+            | "Runtime.enable"
+            | "Runtime.disable"
+            | "Runtime.runIfWaitingForDebugger"
+            | "Runtime.getExceptionDetails"
+            | "Runtime.discardConsoleEntries"
+            | "Network.enable"
+            | "Network.disable"
+            | "Network.setCacheDisabled"
+            | "Network.setRequestInterception"
+            | "Network.setBlockedURLs"
+            | "Network.setExtraHTTPHeaders"
+            | "Network.setUserAgentOverride"
+            | "Network.getCookies"
+            | "Network.getAllCookies"
+            | "Network.setCookie"
+            | "Network.setCookies"
+            | "Network.deleteCookies"
+            | "Network.clearBrowserCookies"
+            | "Network.getResponseBody"
+            | "Fetch.continueRequest"
+            | "Fetch.fulfillRequest"
+            | "Fetch.failRequest"
+            | "Fetch.getResponseBody"
+            | "IO.read"
+            | "IO.close"
+            | "Storage.getCookies"
+            | "Storage.setCookies"
+            | "Storage.deleteCookies"
     )
 }
 
@@ -401,7 +436,9 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
     } else {
         ctx.get_session_page(&req.session_id)
             .and_then(|p| p.isolate_handle())
-            .map(|h| obscura_js::cdp_watchdog::arm(h, std::time::Duration::from_millis(cmd_budget_ms)))
+            .map(|h| {
+                obscura_js::cdp_watchdog::arm(h, std::time::Duration::from_millis(cmd_budget_ms))
+            })
     };
 
     let (domain, method) = match req.method.split_once('.') {
@@ -421,7 +458,9 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
         "Browser" => domains::browser::handle(method, &req.params).await,
         "Page" => domains::page::handle(method, &req.params, ctx, &req.session_id).await,
         "DOM" => domains::dom::handle(method, &req.params, ctx, &req.session_id).await,
-        "DOMSnapshot" => domains::domsnapshot::handle(method, &req.params, ctx, &req.session_id).await,
+        "DOMSnapshot" => {
+            domains::domsnapshot::handle(method, &req.params, ctx, &req.session_id).await
+        }
         "Runtime" => domains::runtime::handle(method, &req.params, ctx, &req.session_id).await,
         "Network" => domains::network::handle(method, &req.params, ctx, &req.session_id).await,
         "Fetch" => domains::fetch::handle(method, &req.params, ctx, &req.session_id).await,
@@ -430,16 +469,14 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
         "Emulation" => domains::emulation::handle(method, &req.params, ctx, &req.session_id).await,
         "Storage" => domains::storage::handle(method, &req.params, ctx, &req.session_id).await,
         "LP" => domains::lp::handle(method, &req.params, ctx, &req.session_id).await,
-        "Accessibility" => domains::accessibility::handle(method, &req.params, ctx, &req.session_id).await,
+        "Accessibility" => {
+            domains::accessibility::handle(method, &req.params, ctx, &req.session_id).await
+        }
         // Accepted but no-op. Puppeteer's FrameManager.initialize calls
         // Audits.enable on connect — refusing it breaks puppeteer.connect()
         // before any user code runs.
-        "Log" | "Performance" | "Security" | "CSS"
-        | "ServiceWorker" | "Inspector"
-        | "Debugger" | "Profiler" | "HeapProfiler" | "Overlay"
-        | "Audits" => {
-            Ok(json!({}))
-        }
+        "Log" | "Performance" | "Security" | "CSS" | "ServiceWorker" | "Inspector" | "Debugger"
+        | "Profiler" | "HeapProfiler" | "Overlay" | "Audits" => Ok(json!({})),
         _ => Err(format!("Unknown domain: {}", domain)),
     };
 
@@ -599,7 +636,11 @@ mod tests {
     async fn audits_enable_returns_empty_success() {
         let mut ctx = CdpContext::new();
         let resp = dispatch(&req("Audits.enable"), &mut ctx).await;
-        assert!(resp.error.is_none(), "Audits.enable should not error: {:?}", resp.error);
+        assert!(
+            resp.error.is_none(),
+            "Audits.enable should not error: {:?}",
+            resp.error
+        );
         assert_eq!(resp.result, Some(json!({})));
     }
 
@@ -631,7 +672,11 @@ mod tests {
         };
 
         let resp = dispatch(&outer, &mut ctx).await;
-        assert!(resp.error.is_none(), "wrapper must succeed: {:?}", resp.error);
+        assert!(
+            resp.error.is_none(),
+            "wrapper must succeed: {:?}",
+            resp.error
+        );
         assert_eq!(resp.id, 99);
         assert_eq!(resp.result, Some(json!({})));
 
@@ -647,8 +692,14 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(inner_msg).unwrap();
         assert_eq!(parsed["id"], 42);
         // Browser.getVersion returns a populated result object, not an error.
-        assert!(parsed.get("result").is_some(), "inner response carries result");
-        assert!(parsed.get("error").is_none(), "inner response is not an error");
+        assert!(
+            parsed.get("result").is_some(),
+            "inner response carries result"
+        );
+        assert!(
+            parsed.get("error").is_none(),
+            "inner response is not an error"
+        );
     }
 
     #[tokio::test]

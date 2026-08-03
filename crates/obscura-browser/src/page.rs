@@ -111,11 +111,15 @@ fn cross_scheme_to_file(from: &str, to: &str) -> bool {
 /// Real Chrome allows data: subresources by default; Instagram and most
 /// Meta properties depend on this for their inline bootstrap scripts.
 fn subresource_allowed(page_url: Option<&Url>, resource: &str) -> bool {
-    let Ok(target) = Url::parse(resource) else { return false };
+    let Ok(target) = Url::parse(resource) else {
+        return false;
+    };
     let scheme = target.scheme().to_ascii_lowercase();
     match scheme.as_str() {
         "http" | "https" | "data" => true,
-        "file" => page_url.map(|u| u.scheme().eq_ignore_ascii_case("file")).unwrap_or(false),
+        "file" => page_url
+            .map(|u| u.scheme().eq_ignore_ascii_case("file"))
+            .unwrap_or(false),
         _ => false,
     }
 }
@@ -206,6 +210,10 @@ pub struct Page {
     /// CSS viewport used by responsive page JavaScript and CDP screenshots.
     /// The physical `screen` fingerprint remains independent.
     pub viewport: (f32, f32),
+    /// Output device pixels per CSS pixel for CDP surface capture. Layout and
+    /// CSSOM stay in CSS pixels; Emulation.setDeviceMetricsOverride owns this
+    /// independent raster scale.
+    pub device_scale_factor: f32,
     /// WHATWG canonical name of the current document's character encoding
     /// (e.g. "UTF-8", "EUC-JP"), detected when the response body is decoded.
     /// Exposed to JS as `document.characterSet` and used for the URL query
@@ -280,9 +288,7 @@ fn materialize_stylesheet_graph(
             continue;
         };
         let (import_key, _) = canonical_stylesheet_url(import_url);
-        if let Some(imported) =
-            materialize_stylesheet_graph(&import_key, sheets, aliases, active)
-        {
+        if let Some(imported) = materialize_stylesheet_graph(&import_key, sheets, aliases, active) {
             output.push_str(&imported);
             output.push('\n');
         }
@@ -312,7 +318,9 @@ fn rebase_css_urls(css: &str, base: &url::Url) -> String {
             }
             continue;
         }
-        let Some(first) = rest.chars().next() else { break };
+        let Some(first) = rest.chars().next() else {
+            break;
+        };
         if first == '"' || first == '\'' {
             let quote = first;
             let mut escaped = false;
@@ -418,7 +426,9 @@ fn css_resource_urls(css: &str, base: &url::Url) -> Vec<String> {
             }
             continue;
         }
-        let Some(first) = rest.chars().next() else { break };
+        let Some(first) = rest.chars().next() else {
+            break;
+        };
         if first == '"' || first == '\'' {
             let quote = first;
             let mut escaped = false;
@@ -436,7 +446,10 @@ fn css_resource_urls(css: &str, base: &url::Url) -> Vec<String> {
             index += length;
             continue;
         }
-        if !rest.get(..4).is_some_and(|prefix| prefix.eq_ignore_ascii_case("url(")) {
+        if !rest
+            .get(..4)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("url("))
+        {
             index += first.len_utf8();
             continue;
         }
@@ -558,8 +571,13 @@ fn parse_import_url(stmt: &str) -> Option<String> {
         (rest[..end].to_string(), rest[end + 1..].trim())
     };
     if !media.is_empty() {
-        let compact: String = media.chars().filter(|c| !c.is_whitespace()).flat_map(|c| c.to_lowercase()).collect();
-        let print_only = compact.contains("print") && !compact.contains("screen") && !compact.contains("all");
+        let compact: String = media
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .flat_map(|c| c.to_lowercase())
+            .collect();
+        let print_only =
+            compact.contains("print") && !compact.contains("screen") && !compact.contains("all");
         if print_only || compact.contains("prefers-color-scheme:dark") {
             return None;
         }
@@ -690,6 +708,7 @@ impl Page {
             title: String::new(),
             referrer: String::new(),
             viewport: (1280.0, 720.0),
+            device_scale_factor: 1.0,
             encoding: "UTF-8".to_string(),
             history: Vec::new(),
             history_index: 0,
@@ -739,6 +758,26 @@ impl Page {
         self.viewport = viewport;
         if let Some(js) = &mut self.js {
             js.set_viewport(viewport.0 as f64, viewport.1 as f64);
+        }
+    }
+
+    /// Set the screenshot surface density without changing CSS layout. CDP
+    /// uses zero to disable its override, which restores the native 1x surface
+    /// in Obscura's headless-only model.
+    pub fn set_device_scale_factor(&mut self, device_scale_factor: f32) {
+        if !device_scale_factor.is_finite() || device_scale_factor < 0.0 {
+            return;
+        }
+        self.device_scale_factor = if device_scale_factor == 0.0 {
+            1.0
+        } else {
+            device_scale_factor
+        };
+        if let Some(js) = &mut self.js {
+            let _ = js.execute_script(
+                "<device-metrics>",
+                &format!("globalThis.devicePixelRatio={};", self.device_scale_factor),
+            );
         }
     }
 
@@ -839,6 +878,10 @@ impl Page {
         }
 
         rt.run_page_init();
+        let _ = rt.execute_script(
+            "<device-metrics>",
+            &format!("globalThis.devicePixelRatio={};", self.device_scale_factor),
+        );
 
         self.js = Some(rt);
     }
@@ -849,21 +892,20 @@ impl Page {
     fn resolve_base_url(&self) -> Option<url::Url> {
         let doc_url = self.url.as_ref()?;
         let base_href: Option<String> = self.js.as_ref().and_then(|js| {
-            js.with_dom(|dom| {
-                match dom.query_selector("base[href]") {
-                    Ok(Some(nid)) => {
-                        dom.get_node(nid).and_then(|n| n.get_attribute("href").map(|s| s.to_string()))
-                    }
-                    _ => None,
-                }
-            }).flatten()
+            js.with_dom(|dom| match dom.query_selector("base[href]") {
+                Ok(Some(nid)) => dom
+                    .get_node(nid)
+                    .and_then(|n| n.get_attribute("href").map(|s| s.to_string())),
+                _ => None,
+            })
+            .flatten()
         });
         match base_href {
             Some(href) => doc_url.join(&href).ok(),
             None => Some(doc_url.clone()),
         }
     }
-    
+
     async fn fetch_stylesheets(&mut self) -> Vec<(usize, String)> {
         let all_links = match &self.js {
             Some(js) => js.with_dom(linked_stylesheet_requests).unwrap_or_default(),
@@ -873,12 +915,17 @@ impl Page {
             }
         };
 
-        tracing::info!("fetch_stylesheets: found {} stylesheet links", all_links.len());
+        tracing::info!(
+            "fetch_stylesheets: found {} stylesheet links",
+            all_links.len()
+        );
 
         let Some(document_url) = self.url.clone() else {
             return Vec::new();
         };
-        let document_base = self.resolve_base_url().unwrap_or_else(|| document_url.clone());
+        let document_base = self
+            .resolve_base_url()
+            .unwrap_or_else(|| document_url.clone());
         let mut roots = Vec::new();
         let mut scheduled = std::collections::HashSet::new();
         let mut pending = Vec::new();
@@ -917,8 +964,8 @@ impl Page {
             let callbacks = self.callbacks.clone();
             let initiator = document_url.clone();
             use futures::StreamExt as _;
-            let results: Vec<_> = futures::stream::iter(batch.into_iter().map(
-                |(key, requested_url, depth)| {
+            let results: Vec<_> =
+                futures::stream::iter(batch.into_iter().map(|(key, requested_url, depth)| {
                     let client = client.clone();
                     #[cfg(feature = "stealth")]
                     let stealth_client = stealth_client.clone();
@@ -955,21 +1002,16 @@ impl Page {
                             .await;
                         (key, requested_url, depth, result)
                     }
-                },
-            ))
-            .buffered(16)
-            .collect()
-            .await;
+                }))
+                .buffered(16)
+                .collect()
+                .await;
 
             for (key, requested_url, depth, result) in results {
                 let response = match result {
                     Ok(response) => response,
                     Err(error) => {
-                        tracing::debug!(
-                            "Failed to fetch stylesheet {}: {}",
-                            requested_url,
-                            error
-                        );
+                        tracing::debug!("Failed to fetch stylesheet {}: {}", requested_url, error);
                         continue;
                     }
                 };
@@ -989,10 +1031,7 @@ impl Page {
                     aliases.insert(key, existing);
                     continue;
                 }
-                let css = obscura_net::decode_non_html(
-                    &response.body,
-                    response.content_type(),
-                );
+                let css = obscura_net::decode_non_html(&response.body, response.content_type());
                 let (imports, rules) = split_css_imports(&css);
                 let imports = if depth < MAX_STYLESHEET_IMPORT_DEPTH {
                     imports
@@ -1060,7 +1099,10 @@ impl Page {
 
     async fn execute_scripts_with_module_budget(&mut self, module_budget_override: Option<u64>) {
         let scripts_started = std::time::Instant::now();
-        tracing::info!("execute_scripts called, js runtime exists: {}", self.js.is_some());
+        tracing::info!(
+            "execute_scripts called, js runtime exists: {}",
+            self.js.is_some()
+        );
         // Soft deadline on the entire script-execution phase. Heavy SPAs
         // (GitHub, Linear, CodeSandbox) ship 50+ scripts and our serial
         // fetch + execute loop can blow past a Puppeteer/Playwright goto
@@ -1078,8 +1120,8 @@ impl Page {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(30_000);
-        let script_deadline = tokio::time::Instant::now()
-            + tokio::time::Duration::from_millis(script_deadline_ms);
+        let script_deadline =
+            tokio::time::Instant::now() + tokio::time::Duration::from_millis(script_deadline_ms);
 
         // Hard backstop over the WHOLE script-execution phase. Inline scripts
         // run back-to-back with no await between them, so neither the soft
@@ -1129,9 +1171,8 @@ impl Page {
                         if name.local.as_ref() == "base" && !found_base {
                             if let Some(href) = node.get_attribute("href") {
                                 found_base = true;
-                                if let Some(resolved) = active_base
-                                    .as_ref()
-                                    .and_then(|base| base.join(href).ok())
+                                if let Some(resolved) =
+                                    active_base.as_ref().and_then(|base| base.join(href).ok())
                                 {
                                     active_base = Some(resolved);
                                 }
@@ -1193,7 +1234,8 @@ impl Page {
                         }
                     }
                     scripts
-                }).unwrap_or_default()
+                })
+                .unwrap_or_default()
             }
             None => return,
         };
@@ -1222,7 +1264,8 @@ impl Page {
                 continue;
             }
             if let Some(src_url) = &script.src {
-                let full_url = if src_url.starts_with("http://") || src_url.starts_with("https://") {
+                let full_url = if src_url.starts_with("http://") || src_url.starts_with("https://")
+                {
                     src_url.clone()
                 } else {
                     url::Url::parse(&script.base_url)
@@ -1255,46 +1298,50 @@ impl Page {
 
         let client = self.http_client.clone();
         let page_callbacks = self.callbacks.clone();
-        let fetch_futures: Vec<_> = fetch_tasks.iter().map(|(idx, url)| {
-            let client = client.clone();
-            let cbs = page_callbacks.clone();
-            let url = url.clone();
-            let idx = *idx;
-            async move {
-                let parsed = Url::parse(&url).unwrap_or_else(|_| Url::parse("about:blank").unwrap());
-                if parsed.scheme() == "data" {
-                    // data: URIs are inline; decode locally, no network fetch.
-                    // Instagram and other Meta properties serve their bootstrap
-                    // as <script src="data:application/x-javascript;base64,...">.
-                    let body = decode_data_uri(&url).unwrap_or_default();
-                    let content_type = url
-                        .strip_prefix("data:")
-                        .and_then(|s| s.split(',').next())
-                        .unwrap_or("application/javascript")
-                        .split(';')
-                        .next()
-                        .unwrap_or("application/javascript")
-                        .to_string();
-                    let mut headers = std::collections::HashMap::new();
-                    headers.insert("content-type".to_string(), content_type);
-                    let resp = obscura_net::Response {
-                        url: parsed,
-                        status: 200,
-                        headers,
-                        body,
-                        redirected_from: Vec::new(),
-                    };
-                    return Some((idx, url, resp));
-                }
-                match client.fetch_with_callbacks(&parsed, Some(&cbs)).await {
-                    Ok(resp) => Some((idx, url, resp)),
-                    Err(e) => {
-                        tracing::warn!("Failed to fetch script {}: {}", url, e);
-                        None
+        let fetch_futures: Vec<_> = fetch_tasks
+            .iter()
+            .map(|(idx, url)| {
+                let client = client.clone();
+                let cbs = page_callbacks.clone();
+                let url = url.clone();
+                let idx = *idx;
+                async move {
+                    let parsed =
+                        Url::parse(&url).unwrap_or_else(|_| Url::parse("about:blank").unwrap());
+                    if parsed.scheme() == "data" {
+                        // data: URIs are inline; decode locally, no network fetch.
+                        // Instagram and other Meta properties serve their bootstrap
+                        // as <script src="data:application/x-javascript;base64,...">.
+                        let body = decode_data_uri(&url).unwrap_or_default();
+                        let content_type = url
+                            .strip_prefix("data:")
+                            .and_then(|s| s.split(',').next())
+                            .unwrap_or("application/javascript")
+                            .split(';')
+                            .next()
+                            .unwrap_or("application/javascript")
+                            .to_string();
+                        let mut headers = std::collections::HashMap::new();
+                        headers.insert("content-type".to_string(), content_type);
+                        let resp = obscura_net::Response {
+                            url: parsed,
+                            status: 200,
+                            headers,
+                            body,
+                            redirected_from: Vec::new(),
+                        };
+                        return Some((idx, url, resp));
+                    }
+                    match client.fetch_with_callbacks(&parsed, Some(&cbs)).await {
+                        Ok(resp) => Some((idx, url, resp)),
+                        Err(e) => {
+                            tracing::warn!("Failed to fetch script {}: {}", url, e);
+                            None
+                        }
                     }
                 }
-            }
-        }).collect();
+            })
+            .collect();
 
         // Bound concurrency: a page with 100 external scripts would
         // otherwise open 100 sockets at once, exhausting the connection
@@ -1302,12 +1349,13 @@ impl Page {
         // 16 is well above the per-host pool ceiling most browsers use
         // and matches what real Chrome does for a given origin.
         use futures::StreamExt as _;
-        let fetch_stream = futures::stream::iter(fetch_futures)
-            .buffer_unordered(16);
+        let fetch_stream = futures::stream::iter(fetch_futures).buffer_unordered(16);
         let fetch_results = match tokio::time::timeout_at(
             script_deadline,
             fetch_stream.collect::<Vec<_>>(),
-        ).await {
+        )
+        .await
+        {
             Ok(results) => results,
             Err(_) => {
                 tracing::warn!(
@@ -1317,7 +1365,8 @@ impl Page {
             }
         };
 
-        let mut fetched: std::collections::HashMap<usize, (String, String, obscura_net::Response)> = std::collections::HashMap::new();
+        let mut fetched: std::collections::HashMap<usize, (String, String, obscura_net::Response)> =
+            std::collections::HashMap::new();
         for result in fetch_results {
             if let Some((idx, url, resp)) = result {
                 if !script_response_is_executable(resp.status) {
@@ -1348,7 +1397,10 @@ impl Page {
         // Scripts that check readyState === 'loading' will register DOMContentLoaded
         // listeners instead of calling their callback immediately.
         if let Some(js) = &mut self.js {
-            let _ = js.execute_script("<ready-state>", "globalThis.__documentReadyState__ = 'loading';");
+            let _ = js.execute_script(
+                "<ready-state>",
+                "globalThis.__documentReadyState__ = 'loading';",
+            );
         }
 
         // CDP `Page.addScriptToEvaluateOnNewDocument` contract: preload
@@ -1399,14 +1451,27 @@ impl Page {
                 script_deadline_ms
             }
         };
+        // V8 can flag an overrun while a synchronous renderer host call is in
+        // progress, but it cannot preempt Rust after entering that call. Allow
+        // one bounded, finite style/layout flush without weakening the
+        // page-wide script deadline. Private test overrides keep zero grace.
+        let module_hostcall_grace_ms = if module_budget_override.is_some() {
+            0
+        } else {
+            std::env::var("OBSCURA_MODULE_HOSTCALL_GRACE_MS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(5_000)
+        };
 
         enum ScheduledScript {
             Classic(usize),
             Module {
                 prepared: obscura_js::runtime::PreparedModule,
                 url: Option<String>,
-                deadline: tokio::time::Instant,
-                started: std::time::Instant,
+                remaining_active_ms: u64,
+                graph_elapsed_ms: u64,
+                queued_at: std::time::Instant,
             },
         }
 
@@ -1415,54 +1480,73 @@ impl Page {
             if remaining.is_zero() {
                 return None;
             }
-            let millis = remaining.as_millis().saturating_add(u128::from(
-                remaining.subsec_nanos() % 1_000_000 != 0,
-            ));
+            let millis = remaining
+                .as_millis()
+                .saturating_add(u128::from(remaining.subsec_nanos() % 1_000_000 != 0));
             Some(millis.min(u128::from(u64::MAX)) as u64)
         };
+        let elapsed_ms_ceil = |elapsed: std::time::Duration| -> u64 {
+            elapsed
+                .as_micros()
+                .div_ceil(1_000)
+                .max(1)
+                .min(u128::from(u64::MAX)) as u64
+        };
+        let evaluation_budget_ms = |remaining_active_ms: u64| -> Option<u64> {
+            let remaining_page_ms = remaining_budget_ms(script_deadline)?;
+            let budget = remaining_active_ms
+                .saturating_add(module_hostcall_grace_ms)
+                .min(remaining_page_ms);
+            (budget != 0).then_some(budget)
+        };
 
-        let execute_classic = |
-            page: &mut Self,
-            script: &ScriptInfo,
-            fetched_script: Option<(String, String, obscura_net::Response)>,
-        | {
-            if script.src.is_some() {
-                if let Some((url, code, resp)) = fetched_script {
-                    tracing::info!("Executing script ({} bytes): {}", code.len(), url);
-                    let execution_url = resp.url.to_string();
-                    page.record_network_event_with_body(
-                        &url, "GET", "Script", resp.status, &resp.headers, &resp.body, false,
-                    );
+        let execute_classic =
+            |page: &mut Self,
+             script: &ScriptInfo,
+             fetched_script: Option<(String, String, obscura_net::Response)>| {
+                if script.src.is_some() {
+                    if let Some((url, code, resp)) = fetched_script {
+                        tracing::info!("Executing script ({} bytes): {}", code.len(), url);
+                        let execution_url = resp.url.to_string();
+                        page.record_network_event_with_body(
+                            &url,
+                            "GET",
+                            "Script",
+                            resp.status,
+                            &resp.headers,
+                            &resp.body,
+                            false,
+                        );
+                        if let Some(js) = &mut page.js {
+                            let _ = js.execute_script(
+                                "<current-script>",
+                                &format!("globalThis.__currentScriptNid={};", script.nid),
+                            );
+                            if let Err(error) = js.execute_script_guarded(&execution_url, &code) {
+                                tracing::warn!("Script error ({}): {}", execution_url, error);
+                            }
+                            let _ = js.execute_script(
+                                "<current-script>",
+                                "globalThis.__currentScriptNid=0;",
+                            );
+                        }
+                    }
+                } else if !script.inline.is_empty() {
                     if let Some(js) = &mut page.js {
                         let _ = js.execute_script(
                             "<current-script>",
                             &format!("globalThis.__currentScriptNid={};", script.nid),
                         );
-                        if let Err(error) = js.execute_script_guarded(&execution_url, &code) {
-                            tracing::warn!("Script error ({}): {}", execution_url, error);
+                        if let Err(error) =
+                            js.execute_script_guarded(&script.base_url, &script.inline)
+                        {
+                            tracing::warn!("Inline script error: {}", error);
                         }
-                        let _ = js.execute_script(
-                            "<current-script>",
-                            "globalThis.__currentScriptNid=0;",
-                        );
+                        let _ = js
+                            .execute_script("<current-script>", "globalThis.__currentScriptNid=0;");
                     }
                 }
-            } else if !script.inline.is_empty() {
-                if let Some(js) = &mut page.js {
-                    let _ = js.execute_script(
-                        "<current-script>",
-                        &format!("globalThis.__currentScriptNid={};", script.nid),
-                    );
-                    if let Err(error) = js.execute_script_guarded(&script.base_url, &script.inline) {
-                        tracing::warn!("Inline script error: {}", error);
-                    }
-                    let _ = js.execute_script(
-                        "<current-script>",
-                        "globalThis.__currentScriptNid=0;",
-                    );
-                }
-            }
-        };
+            };
 
         let mut post_parse = Vec::new();
 
@@ -1499,18 +1583,14 @@ impl Page {
                     }
                 }
                 ScriptKind::Module => {
-                    // This is one load+evaluation budget, not one allowance per
-                    // phase. Cap it by the page-wide script deadline as well.
-                    let module_started = std::time::Instant::now();
-                    let module_deadline = std::cmp::min(
-                        script_deadline,
-                        tokio::time::Instant::now()
-                            + tokio::time::Duration::from_millis(module_budget_ms),
-                    );
-                    let Some(prepare_budget_ms) = remaining_budget_ms(module_deadline) else {
+                    // Graph loading and evaluation share one active-work
+                    // allowance. Queue time behind other post-parse scripts is
+                    // not work performed by this module.
+                    let Some(remaining_page_ms) = remaining_budget_ms(script_deadline) else {
                         tracing::warn!("ES module budget exhausted before graph preparation");
                         continue;
                     };
+                    let prepare_budget_ms = module_budget_ms.min(remaining_page_ms);
                     let prepare_started = std::time::Instant::now();
                     let (prepared, module_url) = if let Some(src) = &script.src {
                         let full_url = if src.starts_with("http://")
@@ -1547,9 +1627,14 @@ impl Page {
                         }
                     } else {
                         let result = match &mut self.js {
-                            Some(js) => js.prepare_inline_module(
-                                &script.inline, &script.base_url, prepare_budget_ms,
-                            ).await,
+                            Some(js) => {
+                                js.prepare_inline_module(
+                                    &script.inline,
+                                    &script.base_url,
+                                    prepare_budget_ms,
+                                )
+                                .await
+                            }
                             None => continue,
                         };
                         tracing::debug!(
@@ -1568,42 +1653,62 @@ impl Page {
                             }
                         }
                     };
+                    let graph_elapsed_ms = elapsed_ms_ceil(prepare_started.elapsed());
+                    let remaining_active_ms = module_budget_ms.saturating_sub(graph_elapsed_ms);
+                    if remaining_active_ms == 0 {
+                        tracing::warn!(
+                            module = module_url.as_deref().unwrap_or("<inline>"),
+                            graph_elapsed_ms,
+                            active_budget_ms = module_budget_ms,
+                            "ES module exhausted its active budget during graph preparation",
+                        );
+                        continue;
+                    }
                     let scheduled = ScheduledScript::Module {
                         prepared,
                         url: module_url,
-                        deadline: module_deadline,
-                        started: module_started,
+                        remaining_active_ms,
+                        graph_elapsed_ms,
+                        queued_at: std::time::Instant::now(),
                     };
                     if script.is_async {
                         let ScheduledScript::Module {
                             prepared,
                             url,
-                            deadline,
-                            started,
-                        } = scheduled else {
+                            remaining_active_ms,
+                            graph_elapsed_ms,
+                            queued_at,
+                        } = scheduled
+                        else {
                             unreachable!();
                         };
-                        let Some(evaluation_budget_ms) = remaining_budget_ms(deadline) else {
+                        let Some(evaluation_budget_ms) = evaluation_budget_ms(remaining_active_ms)
+                        else {
                             tracing::warn!(
                                 module = url.as_deref().unwrap_or("<inline>"),
-                                elapsed_ms = started.elapsed().as_millis(),
-                                "ES module exhausted its shared budget before evaluation",
+                                graph_elapsed_ms,
+                                queue_wait_ms = queued_at.elapsed().as_millis(),
+                                "ES module exhausted the page budget before evaluation",
                             );
                             continue;
                         };
+                        let queue_wait_ms = queued_at.elapsed().as_millis();
                         let evaluation_started = std::time::Instant::now();
                         let result = match &mut self.js {
-                            Some(js) => js
-                                .evaluate_prepared_module(prepared, evaluation_budget_ms)
-                                .await,
+                            Some(js) => {
+                                js.evaluate_prepared_module(prepared, evaluation_budget_ms)
+                                    .await
+                            }
                             None => continue,
                         };
                         tracing::debug!(
                             phase = "module-evaluation",
                             module = url.as_deref().unwrap_or("<inline>"),
                             elapsed_ms = evaluation_started.elapsed().as_millis(),
-                            total_elapsed_ms = started.elapsed().as_millis(),
-                            budget_ms = evaluation_budget_ms,
+                            graph_elapsed_ms,
+                            queue_wait_ms,
+                            remaining_active_ms,
+                            evaluation_ceiling_ms = evaluation_budget_ms,
                             success = result.is_ok(),
                             "ES module phase complete",
                         );
@@ -1612,8 +1717,12 @@ impl Page {
                         } else if let Some(url) = url {
                             tracing::info!("ES module loaded: {}", url);
                             self.record_network_event(
-                                &url, "GET", "Script", 200,
-                                &std::collections::HashMap::new(), 0,
+                                &url,
+                                "GET",
+                                "Script",
+                                200,
+                                &std::collections::HashMap::new(),
+                                0,
                             );
                         }
                     } else {
@@ -1637,30 +1746,37 @@ impl Page {
                 ScheduledScript::Module {
                     prepared,
                     url,
-                    deadline,
-                    started,
+                    remaining_active_ms,
+                    graph_elapsed_ms,
+                    queued_at,
                 } => {
-                    let Some(evaluation_budget_ms) = remaining_budget_ms(deadline) else {
+                    let Some(evaluation_budget_ms) = evaluation_budget_ms(remaining_active_ms)
+                    else {
                         tracing::warn!(
                             module = url.as_deref().unwrap_or("<inline>"),
-                            elapsed_ms = started.elapsed().as_millis(),
-                            "ES module exhausted its shared budget before post-parse evaluation",
+                            graph_elapsed_ms,
+                            queue_wait_ms = queued_at.elapsed().as_millis(),
+                            "ES module exhausted the page budget before post-parse evaluation",
                         );
                         continue;
                     };
+                    let queue_wait_ms = queued_at.elapsed().as_millis();
                     let evaluation_started = std::time::Instant::now();
                     let result = match &mut self.js {
-                        Some(js) => js
-                            .evaluate_prepared_module(prepared, evaluation_budget_ms)
-                            .await,
+                        Some(js) => {
+                            js.evaluate_prepared_module(prepared, evaluation_budget_ms)
+                                .await
+                        }
                         None => continue,
                     };
                     tracing::debug!(
                         phase = "module-evaluation",
                         module = url.as_deref().unwrap_or("<inline>"),
                         elapsed_ms = evaluation_started.elapsed().as_millis(),
-                        total_elapsed_ms = started.elapsed().as_millis(),
-                        budget_ms = evaluation_budget_ms,
+                        graph_elapsed_ms,
+                        queue_wait_ms,
+                        remaining_active_ms,
+                        evaluation_ceiling_ms = evaluation_budget_ms,
                         success = result.is_ok(),
                         "ES module phase complete",
                     );
@@ -1669,8 +1785,12 @@ impl Page {
                     } else if let Some(url) = url {
                         tracing::info!("ES module loaded: {}", url);
                         self.record_network_event(
-                            &url, "GET", "Script", 200,
-                            &std::collections::HashMap::new(), 0,
+                            &url,
+                            "GET",
+                            "Script",
+                            200,
+                            &std::collections::HashMap::new(),
+                            0,
                         );
                     }
                 }
@@ -1710,22 +1830,23 @@ impl Page {
             // A single run_event_loop poll that pins the thread inside V8 makes
             // the per-poll tokio timeouts below useless, so guard the whole loop
             // with a watchdog that fires 250ms past the longest deadline.
-            let settle_wd = js.arm_watchdog(std::time::Duration::from_millis(dynamic_settle_ms + 250));
+            let settle_wd =
+                js.arm_watchdog(std::time::Duration::from_millis(dynamic_settle_ms + 250));
             let started = tokio::time::Instant::now();
             let deadline = started + tokio::time::Duration::from_millis(500);
             let dynamic_deadline = started + tokio::time::Duration::from_millis(dynamic_settle_ms);
             let mut idle_count = 0u32;
             loop {
                 let now = tokio::time::Instant::now();
-                if now >= deadline
-                    && (now >= dynamic_deadline || !js.has_pending_dynamic_scripts())
+                if now >= deadline && (now >= dynamic_deadline || !js.has_pending_dynamic_scripts())
                 {
                     break;
                 }
                 let result = tokio::time::timeout(
                     tokio::time::Duration::from_millis(10),
                     js.run_event_loop(),
-                ).await;
+                )
+                .await;
 
                 match result {
                     Ok(Ok(())) => {
@@ -1762,7 +1883,8 @@ impl Page {
     }
 
     pub async fn navigate(&mut self, url_str: &str) -> Result<(), PageError> {
-        self.navigate_with_wait(url_str, crate::lifecycle::WaitUntil::Load).await
+        self.navigate_with_wait(url_str, crate::lifecycle::WaitUntil::Load)
+            .await
     }
 
     pub async fn navigate_with_wait(
@@ -1770,7 +1892,8 @@ impl Page {
         url_str: &str,
         wait_until: crate::lifecycle::WaitUntil,
     ) -> Result<(), PageError> {
-        self.navigate_with_wait_post(url_str, wait_until, "GET", "").await
+        self.navigate_with_wait_post(url_str, wait_until, "GET", "")
+            .await
     }
 
     pub async fn navigate_with_wait_post(
@@ -1827,23 +1950,39 @@ impl Page {
         }
         if let Some(js) = &mut self.js {
             if std::env::var_os("OBSCURA_STRICT_SETTLE").is_some() {
-                // Paired browser measurements need the same wall-clock interval
-                // after load in both engines. The ordinary product path returns
-                // as soon as the loop is idle for speed; strict mode pumps all
-                // pending work, then retains the remaining wall-clock delay.
-                let started = tokio::time::Instant::now();
-                let _ = js.run_event_loop_bounded(max_ms).await;
-                let requested = tokio::time::Duration::from_millis(max_ms);
-                let elapsed = started.elapsed();
-                if elapsed < requested {
-                    tokio::time::sleep(requested - elapsed).await;
-                }
+                Self::settle_runtime_for_duration(js, max_ms).await;
             } else {
-                // Bounded against both async idle and synchronous microtask
-                // storms: a plain tokio timeout cannot preempt a page that pins
-                // the thread inside V8, so settle uses the watchdog path.
-                let _ = js.run_event_loop_bounded(max_ms).await;
+                // A deno_core event loop remains "busy" for any future timer,
+                // including analytics intervals and animation loops which do
+                // not make the page more ready. Require a short window without
+                // observable document/network/script activity instead. The
+                // absolute caller budget and V8 watchdog still bound both
+                // asynchronous work and synchronous microtask storms.
+                let _ = js.run_event_loop_until_quiescent(max_ms, 150).await;
             }
+        }
+    }
+
+    /// Pump the event loop and retain the full requested wall-clock delay.
+    /// The CLI uses this for an explicitly supplied `--wait`; callers asking
+    /// for a fixed capture delay should not be silently shortened by adaptive
+    /// readiness heuristics.
+    pub async fn settle_for_duration(&mut self, duration_ms: u64) {
+        if duration_ms == 0 {
+            return;
+        }
+        if let Some(js) = &mut self.js {
+            Self::settle_runtime_for_duration(js, duration_ms).await;
+        }
+    }
+
+    async fn settle_runtime_for_duration(js: &mut ObscuraJsRuntime, duration_ms: u64) {
+        let started = tokio::time::Instant::now();
+        let _ = js.run_event_loop_bounded(duration_ms).await;
+        let requested = tokio::time::Duration::from_millis(duration_ms);
+        let elapsed = started.elapsed();
+        if elapsed < requested {
+            tokio::time::sleep(requested - elapsed).await;
         }
     }
 
@@ -1851,7 +1990,9 @@ impl Page {
     /// entries past the cursor (matches real Chrome: navigating after a
     /// goBack clobbers the forward history).
     pub fn push_history(&mut self, url: String) {
-        if url.is_empty() { return; }
+        if url.is_empty() {
+            return;
+        }
         // Don't dupe consecutive entries (Page.reload would otherwise pile up).
         if self.history.get(self.history_index) == Some(&url) {
             return;
@@ -1908,7 +2049,12 @@ impl Page {
                     );
                     break;
                 }
-                tracing::info!("JS-triggered navigation chain: {} {} -> {}", current_method, current_url, next_url);
+                tracing::info!(
+                    "JS-triggered navigation chain: {} {} -> {}",
+                    current_method,
+                    current_url,
+                    next_url
+                );
                 document_referrer = self
                     .url
                     .as_ref()
@@ -2001,23 +2147,32 @@ impl Page {
         }
 
         let response = if url.scheme() == "data" {
-            let content_type = url_str.strip_prefix("data:")
+            let content_type = url_str
+                .strip_prefix("data:")
                 .and_then(|s| s.split(',').next())
                 .unwrap_or("text/html")
-                .split(';').next()
+                .split(';')
+                .next()
                 .unwrap_or("text/html")
                 .to_string();
             let body_bytes = decode_data_uri(url_str).unwrap_or_default();
             let mut headers = std::collections::HashMap::new();
             headers.insert("content-type".to_string(), content_type);
-            Ok(obscura_net::Response { url: url.clone(), status: 200, headers, body: body_bytes, redirected_from: Vec::new() })
+            Ok(obscura_net::Response {
+                url: url.clone(),
+                status: 200,
+                headers,
+                body: body_bytes,
+                redirected_from: Vec::new(),
+            })
         } else if method == "POST" {
             self.http_client
                 .post_form_with_callbacks(&url, body, Some(&self.callbacks))
                 .await
         } else {
             self.do_fetch(&url).await
-        }.map_err(|e| {
+        }
+        .map_err(|e| {
             self.lifecycle = LifecycleState::Failed;
             PageError::NetworkError(e.to_string())
         })?;
@@ -2090,6 +2245,23 @@ impl Page {
                 "(function() { var iframes = document.querySelectorAll('iframe[src]'); for (var i = 0; i < iframes.length; i++) { var src = iframes[i].getAttribute('src'); if (src && src !== 'about:blank') iframes[i]._loadIframeSrc(src); } })()");
         }
 
+        // Scripts can synchronously flush style/layout through
+        // getComputedStyle(), geometry, ResizeObserver, or IntersectionObserver.
+        // Seed their image/font dependencies concurrently through the page
+        // transport first. Otherwise the first CSSOM read falls into the
+        // renderer's synchronous resource loader and serial network latency pins
+        // V8, making framework startup take many seconds. This is deliberately
+        // bounded: navigation should not wait indefinitely for decorative
+        // resources, and screenshot/PDF capture can use its longer final wait.
+        #[cfg(feature = "render")]
+        {
+            let warmup_ms = std::env::var("OBSCURA_RENDER_RESOURCE_WARMUP_MS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(1_000);
+            let _ = self.prepare_screenshot_resources(warmup_ms).await;
+        }
+
         // Spec: DOMContentLoaded fires AFTER parser-blocking scripts run,
         // not before. Skipping execute_scripts() on the DCL path meant
         // every inline <script> in the page was silently dropped: form
@@ -2142,7 +2314,9 @@ impl Page {
                     if idle_since.is_none() {
                         idle_since = Some(now);
                     }
-                    if now.duration_since(idle_since.unwrap()) >= tokio::time::Duration::from_millis(500) {
+                    if now.duration_since(idle_since.unwrap())
+                        >= tokio::time::Duration::from_millis(500)
+                    {
                         break;
                     }
                 } else {
@@ -2150,7 +2324,10 @@ impl Page {
                 }
 
                 if now >= deadline {
-                    tracing::debug!("Network idle timeout reached with {} active requests", active);
+                    tracing::debug!(
+                        "Network idle timeout reached with {} active requests",
+                        active
+                    );
                     break;
                 }
 
@@ -2158,7 +2335,8 @@ impl Page {
                     let _ = tokio::time::timeout(
                         tokio::time::Duration::from_millis(50),
                         js.run_event_loop(),
-                    ).await;
+                    )
+                    .await;
                 } else {
                     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 }
@@ -2178,7 +2356,9 @@ impl Page {
     pub fn navigate_blank(&mut self) {
         self.js = None;
         self.url = Some(Url::parse("about:blank").unwrap());
-        self.dom = Some(parse_html("<!DOCTYPE html><html><head></head><body></body></html>"));
+        self.dom = Some(parse_html(
+            "<!DOCTYPE html><html><head></head><body></body></html>",
+        ));
         self.title = String::new();
         self.lifecycle = LifecycleState::Loaded;
     }
@@ -2210,7 +2390,9 @@ impl Page {
         let Some(document_url) = self.url.clone() else {
             return 0;
         };
-        let base_url = self.resolve_base_url().unwrap_or_else(|| document_url.clone());
+        let base_url = self
+            .resolve_base_url()
+            .unwrap_or_else(|| document_url.clone());
         let mut candidates = std::collections::BTreeMap::new();
 
         if let Some(js) = &self.js {
@@ -2220,33 +2402,37 @@ impl Page {
                     candidates.insert(url.to_string(), ResourceType::Image);
                 }
             }
-            let css_sources = js.with_dom(|dom| {
-                let mut sources = Vec::new();
-                for id in dom.descendants(dom.document()) {
-                    let Some(node) = dom.get_node(id) else { continue };
-                    if node
-                        .as_element()
-                        .is_some_and(|element| element.local.as_ref() == "style")
-                    {
-                        sources.push(dom.text_content(id));
-                    }
-                    if let Some(style) = node.get_attribute("style") {
-                        sources.push(style.to_string());
-                    }
-                    if node
-                        .as_element()
-                        .is_some_and(|element| element.local.as_ref() == "use")
-                    {
-                        if let Some(href) = node
-                            .get_attribute("href")
-                            .or_else(|| node.get_attribute("xlink:href"))
+            let css_sources = js
+                .with_dom(|dom| {
+                    let mut sources = Vec::new();
+                    for id in dom.descendants(dom.document()) {
+                        let Some(node) = dom.get_node(id) else {
+                            continue;
+                        };
+                        if node
+                            .as_element()
+                            .is_some_and(|element| element.local.as_ref() == "style")
                         {
-                            sources.push(format!("url({href})"));
+                            sources.push(dom.text_content(id));
+                        }
+                        if let Some(style) = node.get_attribute("style") {
+                            sources.push(style.to_string());
+                        }
+                        if node
+                            .as_element()
+                            .is_some_and(|element| element.local.as_ref() == "use")
+                        {
+                            if let Some(href) = node
+                                .get_attribute("href")
+                                .or_else(|| node.get_attribute("xlink:href"))
+                            {
+                                sources.push(format!("url({href})"));
+                            }
                         }
                     }
-                }
-                sources
-            }).unwrap_or_default();
+                    sources
+                })
+                .unwrap_or_default();
             for css in css_sources {
                 for raw in css_resource_urls(&css, &base_url) {
                     if let Ok(url) = url::Url::parse(&raw) {
@@ -2299,10 +2485,10 @@ impl Page {
                     .await;
                 (raw, kind, result)
             }
-        })).buffer_unordered(16);
+        }))
+        .buffer_unordered(16);
         futures::pin_mut!(requests);
-        let deadline = tokio::time::Instant::now()
-            + tokio::time::Duration::from_millis(max_ms);
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(max_ms);
         let mut outcomes = std::collections::HashMap::new();
         loop {
             match tokio::time::timeout_at(deadline, requests.next()).await {
@@ -2316,12 +2502,15 @@ impl Page {
 
         let mut loaded = 0usize;
         for (raw, kind) in requested {
-            let bytes = match outcomes.remove(&raw) {
+            let outcome = match outcomes.remove(&raw) {
                 Some((_, Ok(response))) => {
                     self.record_network_event_with_body(
                         response.url.as_str(),
                         "GET",
-                        match kind { ResourceType::Font => "Font", _ => "Image" },
+                        match kind {
+                            ResourceType::Font => "Font",
+                            _ => "Image",
+                        },
                         response.status,
                         &response.headers,
                         &response.body,
@@ -2334,10 +2523,15 @@ impl Page {
                         None
                     }
                 }
-                _ => None,
+                Some((_, Err(_))) => None,
+                // The shared deadline cancelled this request before it had a
+                // transport outcome. Keep it unknown so the final capture can
+                // retry instead of suppressing a valid slow image/font behind
+                // the renderer's negative-cache TTL.
+                None => continue,
             };
             if let Some(js) = &mut self.js {
-                js.seed_render_resource(raw, bytes);
+                js.seed_render_resource(raw, outcome);
             }
         }
         tracing::debug!(
@@ -2369,16 +2563,48 @@ impl Page {
             .as_ref()
             .map(|js| js.scroll_offset())
             .unwrap_or((0.0, 0.0));
-        self.with_dom(|dom| {
-            obscura_js::screenshot_png_scrolled(dom, viewport, base_url, scroll)
-        })
-        .flatten()
+        self.with_dom(|dom| obscura_js::screenshot_png_scrolled(dom, viewport, base_url, scroll))
+            .flatten()
+    }
+
+    /// Rasterize an immutable document-space rectangle from the page's retained
+    /// layout. Unlike [`Self::screenshot`], this may address content outside the
+    /// live viewport and scale the output without relayout or scripted scroll.
+    #[cfg(feature = "render")]
+    pub fn screenshot_region(
+        &self,
+        region: obscura_js::CaptureRegion,
+    ) -> Result<Vec<u8>, obscura_js::CaptureError> {
+        self.js
+            .as_ref()
+            .ok_or(obscura_js::CaptureError::PaintFailed)?
+            .screenshot_prepared_region(region)
+    }
+
+    /// Scrollable document dimensions from the retained render layout. Unlike
+    /// DOM properties evaluated in page JavaScript, this cannot be shadowed or
+    /// monkey-patched by the document being captured.
+    #[cfg(feature = "render")]
+    pub fn prepared_content_size(&self) -> Option<(f32, f32)> {
+        self.js.as_ref()?.prepared_content_size()
+    }
+
+    /// Renderer-owned root scroll offset for document-space capture routing.
+    #[cfg(feature = "render")]
+    pub fn screenshot_scroll_offset(&self) -> (f32, f32) {
+        self.js
+            .as_ref()
+            .map(|js| js.scroll_offset())
+            .unwrap_or((0.0, 0.0))
     }
 
     /// Absolute URLs the page pulled in via fetch()/XHR (issue #301). Empty
     /// when the page has no live JS runtime.
     pub fn fetched_urls(&self) -> Vec<String> {
-        self.js.as_ref().map(|js| js.fetched_urls()).unwrap_or_default()
+        self.js
+            .as_ref()
+            .map(|js| js.fetched_urls())
+            .unwrap_or_default()
     }
 
     /// Move network events recorded for script-initiated requests
@@ -2439,7 +2665,11 @@ impl Page {
             match js.evaluate_with_timeout(expression, timeout) {
                 Ok(val) => val,
                 Err(e) => {
-                    tracing::debug!("JS eval error/timeout for '{}': {}", truncate_on_char_boundary(expression, 80), e);
+                    tracing::debug!(
+                        "JS eval error/timeout for '{}': {}",
+                        truncate_on_char_boundary(expression, 80),
+                        e
+                    );
                     serde_json::Value::Null
                 }
             }
@@ -2453,7 +2683,11 @@ impl Page {
             match js.evaluate(expression) {
                 Ok(val) => val,
                 Err(e) => {
-                    tracing::debug!("JS eval error for '{}': {}", truncate_on_char_boundary(expression, 80), e);
+                    tracing::debug!(
+                        "JS eval error for '{}': {}",
+                        truncate_on_char_boundary(expression, 80),
+                        e
+                    );
                     serde_json::Value::Null
                 }
             }
@@ -2475,7 +2709,10 @@ impl Page {
         await_promise: bool,
     ) -> obscura_js::runtime::RemoteObjectInfo {
         if let Some(js) = &mut self.js {
-            match js.evaluate_for_cdp(expression, return_by_value, await_promise).await {
+            match js
+                .evaluate_for_cdp(expression, return_by_value, await_promise)
+                .await
+            {
                 Ok(info) => info,
                 Err(e) => {
                     tracing::debug!("evaluate_for_cdp error: {}", e);
@@ -2516,7 +2753,16 @@ impl Page {
         await_promise: bool,
     ) -> obscura_js::runtime::RemoteObjectInfo {
         if let Some(js) = &mut self.js {
-            match js.call_function_on_for_cdp(function_declaration, object_id, args, return_by_value, await_promise).await {
+            match js
+                .call_function_on_for_cdp(
+                    function_declaration,
+                    object_id,
+                    args,
+                    return_by_value,
+                    await_promise,
+                )
+                .await
+            {
                 Ok(info) => info,
                 Err(e) => {
                     tracing::debug!("callFunctionOn error: {}", e);
@@ -2564,7 +2810,14 @@ impl Page {
         response_headers: &std::collections::HashMap<String, String>,
         body_size: usize,
     ) {
-        self.record_network_event_inner(url, method, resource_type, status, response_headers, body_size);
+        self.record_network_event_inner(
+            url,
+            method,
+            resource_type,
+            status,
+            response_headers,
+            body_size,
+        );
     }
 
     fn record_network_event_with_body(
@@ -2628,7 +2881,13 @@ impl Page {
         } else {
             String::from_utf8_lossy(body).to_string()
         };
-        self.response_bodies.insert(request_id.clone(), StoredResponseBody { body, base64_encoded });
+        self.response_bodies.insert(
+            request_id.clone(),
+            StoredResponseBody {
+                body,
+                base64_encoded,
+            },
+        );
         self.response_body_order.push_back(request_id);
         while self.response_body_order.len() > max_entries {
             if let Some(oldest) = self.response_body_order.pop_front() {
@@ -2639,12 +2898,13 @@ impl Page {
 
     pub fn get_response_body(&self, request_id: &str) -> Option<StoredResponseBody> {
         self.response_bodies.get(request_id).cloned().or_else(|| {
-            self.js.as_ref()?.get_network_response_body(request_id).map(|body| {
-                StoredResponseBody {
+            self.js
+                .as_ref()?
+                .get_network_response_body(request_id)
+                .map(|body| StoredResponseBody {
                     body: body.body,
                     base64_encoded: body.base64_encoded,
-                }
-            })
+                })
         })
     }
 
@@ -2661,10 +2921,13 @@ impl Page {
             self.response_body_order.retain(|id| id != request_id);
             body
         } else {
-            self.js.as_ref()?.get_network_response_body(request_id).map(|b| StoredResponseBody {
-                body: b.body,
-                base64_encoded: b.base64_encoded,
-            })?
+            self.js
+                .as_ref()?
+                .get_network_response_body(request_id)
+                .map(|b| StoredResponseBody {
+                    body: b.body,
+                    base64_encoded: b.base64_encoded,
+                })?
         };
         if stored.base64_encoded {
             BASE64.decode(stored.body.as_bytes()).ok()
@@ -2843,9 +3106,7 @@ impl Page {
             .await
             .map_err(|_| {
                 self.lifecycle = crate::lifecycle::LifecycleState::Failed;
-                PageError::NetworkError(format!(
-                    "navigation exceeded {nav_timeout_ms}ms deadline"
-                ))
+                PageError::NetworkError(format!("navigation exceeded {nav_timeout_ms}ms deadline"))
             })?;
             result?;
             self.push_history(self.url_string());
@@ -2855,7 +3116,10 @@ impl Page {
         }
     }
 
-    pub fn set_intercept_tx(&mut self, tx: tokio::sync::mpsc::UnboundedSender<obscura_js::ops::InterceptedRequest>) {
+    pub fn set_intercept_tx(
+        &mut self,
+        tx: tokio::sync::mpsc::UnboundedSender<obscura_js::ops::InterceptedRequest>,
+    ) {
         self.intercept_tx = Some(tx.clone());
         if let Some(js) = &self.js {
             js.set_intercept_tx(tx);
@@ -2905,8 +3169,8 @@ fn url_matches_cdp_pattern(pattern: &str, url: &str) -> bool {
 mod tests {
     use super::{
         css_resource_urls, linked_stylesheet_requests, materialize_linked_stylesheet_script,
-        parse_import_url, navigation_referrer, rebase_css_urls, split_css_imports,
-        script_response_is_executable, truncate_on_char_boundary, url_matches_cdp_pattern,
+        navigation_referrer, parse_import_url, rebase_css_urls, script_response_is_executable,
+        split_css_imports, truncate_on_char_boundary, url_matches_cdp_pattern,
     };
     use base64::Engine as _;
     use obscura_dom::parse_html;
@@ -2995,8 +3259,7 @@ mod tests {
 
     #[test]
     fn default_navigation_referrer_matches_strict_origin_when_cross_origin() {
-        let source = url::Url::parse("https://user:pass@source.example/path?q=1#fragment")
-            .unwrap();
+        let source = url::Url::parse("https://user:pass@source.example/path?q=1#fragment").unwrap();
         let same_origin = url::Url::parse("https://source.example/next").unwrap();
         let cross_origin = url::Url::parse("https://target.example/next").unwrap();
         let downgrade = url::Url::parse("http://source.example/next").unwrap();
@@ -3114,7 +3377,11 @@ mod tests {
         page.navigate(&format!("{origin}/")).await.unwrap();
 
         let mut paths = (0..4)
-            .map(|_| requests.recv_timeout(std::time::Duration::from_secs(1)).unwrap())
+            .map(|_| {
+                requests
+                    .recv_timeout(std::time::Duration::from_secs(1))
+                    .unwrap()
+            })
             .collect::<Vec<_>>();
         paths.sort();
         assert_eq!(
@@ -3153,24 +3420,26 @@ mod tests {
         let shared = sheets[0].find(".shared").unwrap();
         let root = sheets[0].find(".root").unwrap();
         assert!(shared < root, "imports precede the importing sheet");
-        assert!(sheets[0].contains(&format!(
-            "url(\"{origin}/css/img/shared.png\")"
-        )));
-        assert!(sheets[0].contains(&format!(
-            "url(\"{origin}/css/img/root.png\")"
-        )));
+        assert!(sheets[0].contains(&format!("url(\"{origin}/css/img/shared.png\")")));
+        assert!(sheets[0].contains(&format!("url(\"{origin}/css/img/root.png\")")));
         let root = sheets[2].find(".root").unwrap();
         let shared = sheets[2].find(".shared").unwrap();
         let second = sheets[2].find(".second").unwrap();
-        assert!(root < shared && shared < second, "cycle is cut without reordering rules");
-        assert!(sheets[2].contains(&format!(
-            "url(\"{origin}/theme/img/second.png\")"
-        )));
+        assert!(
+            root < shared && shared < second,
+            "cycle is cut without reordering rules"
+        );
+        assert!(sheets[2].contains(&format!("url(\"{origin}/theme/img/second.png\")")));
     }
 
     fn client_replacement_page(name: &str, deferred: bool) -> super::Page {
         let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
-            name.to_string(), None, false, None, None, true,
+            name.to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
         ));
         let mut page = super::Page::new(name.to_string(), context);
         let server_content = (0..45)
@@ -3194,10 +3463,8 @@ mod tests {
             </script></body></html>"#,
         );
         let encoded = base64::engine::general_purpose::STANDARD.encode(html);
-        page.url = Some(
-            url::Url::parse(&format!("data:text/html;base64,{encoded}"))
-                .expect("data URL"),
-        );
+        page.url =
+            Some(url::Url::parse(&format!("data:text/html;base64,{encoded}")).expect("data URL"));
         page
     }
 
@@ -3248,9 +3515,11 @@ mod tests {
                 let length = stream.read(&mut request).unwrap();
                 let request = String::from_utf8_lossy(&request[..length]);
                 let path = request
-                    .lines().next()
+                    .lines()
+                    .next()
                     .and_then(|line| line.split_ascii_whitespace().nth(1))
-                    .unwrap_or("/").to_string();
+                    .unwrap_or("/")
+                    .to_string();
                 request_tx.send(path.clone()).unwrap();
                 let (status, body) = match path.as_str() {
                     "/app/before.js" => ("200 OK", "export const value = 'before-first-module';"),
@@ -3288,7 +3557,12 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn suspend_resume_preserves_document_script_start_state() {
         let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
-            "script-state-suspend".to_string(), None, false, None, None, true,
+            "script-state-suspend".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
         ));
         let mut page = super::Page::new("script-state-suspend".to_string(), context);
         page.url = Some(url::Url::parse("http://example.com/suspend.html").unwrap());
@@ -3359,7 +3633,12 @@ mod tests {
     #[test]
     fn new_document_does_not_inherit_suspended_script_ids() {
         let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
-            "script-state-navigation".to_string(), None, false, None, None, true,
+            "script-state-navigation".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
         ));
         let mut page = super::Page::new("script-state-navigation".to_string(), context);
         page.url = Some(url::Url::parse("http://example.com/old.html").unwrap());
@@ -3394,7 +3673,12 @@ mod tests {
 
     fn import_map_test_page(name: &str, base: &str, html: &str) -> super::Page {
         let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
-            name.to_string(), None, false, None, None, true,
+            name.to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
         ));
         let mut page = super::Page::new(name.to_string(), context);
         page.url = Some(url::Url::parse(&format!("{}/app/index.html", base)).unwrap());
@@ -3404,7 +3688,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn module_graph_and_evaluation_share_one_absolute_budget() {
+    async fn module_graph_and_evaluation_share_one_active_budget() {
         use std::io::{Read as _, Write as _};
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3424,7 +3708,7 @@ mod tests {
 
             // Spend part of the module's allowance loading its graph. The
             // synchronous top-level work then fits in a freshly reset budget,
-            // but cannot fit in the one absolute load+evaluation budget.
+            // but cannot fit in the shared active load+evaluation budget.
             std::thread::sleep(std::time::Duration::from_millis(100));
             let body = "export const delayed = true;";
             let response = format!(
@@ -3471,29 +3755,100 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn queued_module_does_not_spend_its_budget_waiting_for_deferred_script() {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 2048];
+                let length = stream.read(&mut request).unwrap();
+                let path = String::from_utf8_lossy(&request[..length])
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_ascii_whitespace().nth(1))
+                    .unwrap_or("/")
+                    .to_string();
+                let body = if path.ends_with("deferred.js") {
+                    "const until=Date.now()+500;while(Date.now()<until){}"
+                } else {
+                    "export const ready=true;"
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+
+        let base = format!("http://{address}");
+        let mut page = import_map_test_page(
+            "module-queue-budget",
+            &base,
+            r#"<html><head>
+                <script defer src="./deferred.js"></script>
+                <script type="module">
+                    import { ready } from "./quick.js";
+                    globalThis.__queued_module_completed = ready;
+                </script>
+            </head><body></body></html>"#,
+        );
+        page.execute_scripts_with_module_budget(Some(300)).await;
+
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("globalThis.__queued_module_completed === true")
+                .unwrap(),
+            serde_json::json!(true),
+            "queue latency must not consume a module's active-work budget",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn parser_import_map_before_first_module_controls_resolution() {
         let (base, requests) = spawn_parser_import_map_server(1);
-        let mut page = import_map_test_page("import-map-order", &base, r#"<html><head>
+        let mut page = import_map_test_page(
+            "import-map-order",
+            &base,
+            r#"<html><head>
             <script type="importmap">{"imports":{"ordered":"./before.js"}}</script>
             <script type="module">
                 import { value } from "ordered";
                 globalThis.__parser_import_map_value = value;
             </script>
             <script type="importmap">{"imports":{"ordered":"./after.js"}}</script>
-        </head><body></body></html>"#);
+        </head><body></body></html>"#,
+        );
         page.execute_scripts().await;
 
         assert_eq!(
-            page.js.as_mut().unwrap().evaluate("globalThis.__parser_import_map_value").unwrap(),
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("globalThis.__parser_import_map_value")
+                .unwrap(),
             serde_json::json!("before-first-module"),
         );
-        assert_eq!(requests.recv_timeout(std::time::Duration::from_secs(1)).unwrap(), "/app/before.js");
+        assert_eq!(
+            requests
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap(),
+            "/app/before.js"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn later_import_map_adds_unrelated_rule_without_rebinding_resolved_rule() {
         let (base, requests) = spawn_parser_import_map_server(2);
-        let mut page = import_map_test_page("multiple-import-map-order", &base, r#"<html><head>
+        let mut page = import_map_test_page(
+            "multiple-import-map-order",
+            &base,
+            r#"<html><head>
             <script type="importmap">{"imports":{"fixed":"./before.js"}}</script>
             <script type="module">
                 import { value } from "fixed";
@@ -3505,14 +3860,25 @@ mod tests {
                 import { value as later } from "later";
                 globalThis.__later_map_values = [fixed, later];
             </script>
-        </head><body></body></html>"#);
+        </head><body></body></html>"#,
+        );
         page.execute_scripts().await;
 
         let js = page.js.as_mut().unwrap();
-        assert_eq!(js.evaluate("globalThis.__first_map_value").unwrap(), serde_json::json!("before-first-module"));
-        assert_eq!(js.evaluate("globalThis.__later_map_values").unwrap(), serde_json::json!(["before-first-module", "later-map"]));
+        assert_eq!(
+            js.evaluate("globalThis.__first_map_value").unwrap(),
+            serde_json::json!("before-first-module")
+        );
+        assert_eq!(
+            js.evaluate("globalThis.__later_map_values").unwrap(),
+            serde_json::json!(["before-first-module", "later-map"])
+        );
         let paths = (0..2)
-            .map(|_| requests.recv_timeout(std::time::Duration::from_secs(1)).unwrap())
+            .map(|_| {
+                requests
+                    .recv_timeout(std::time::Duration::from_secs(1))
+                    .unwrap()
+            })
             .collect::<Vec<_>>();
         assert!(paths.contains(&"/app/before.js".to_string()), "{paths:?}");
         assert!(paths.contains(&"/app/later.js".to_string()), "{paths:?}");
@@ -3522,17 +3888,25 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn classic_dynamic_import_does_not_see_a_later_parser_import_map() {
         let (base, _requests) = spawn_parser_import_map_server(1);
-        let mut page = import_map_test_page("classic-before-import-map", &base, r#"<html><head>
+        let mut page = import_map_test_page(
+            "classic-before-import-map",
+            &base,
+            r#"<html><head>
             <script>
                 import("too-late")
                     .then(() => globalThis.__classic_before_map = "resolved")
                     .catch(() => globalThis.__classic_before_map = "rejected");
             </script>
             <script type="importmap">{"imports":{"too-late":"./later.js"}}</script>
-        </head><body></body></html>"#);
+        </head><body></body></html>"#,
+        );
         page.execute_scripts().await;
         assert_eq!(
-            page.js.as_mut().unwrap().evaluate("globalThis.__classic_before_map").unwrap(),
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("globalThis.__classic_before_map")
+                .unwrap(),
             serde_json::json!("rejected"),
         );
     }
@@ -3540,23 +3914,39 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn ready_async_classic_script_runs_before_a_later_parser_import_map() {
         let (base, requests) = spawn_parser_import_map_server(2);
-        let mut page = import_map_test_page("async-classic-before-map", &base, r#"<html><head>
+        let mut page = import_map_test_page(
+            "async-classic-before-map",
+            &base,
+            r#"<html><head>
             <script async src="./async.js"></script>
             <script type="importmap">{"imports":{"too-late":"./later.js"}}</script>
-        </head><body></body></html>"#);
+        </head><body></body></html>"#,
+        );
         page.execute_scripts().await;
         assert_eq!(
-            page.js.as_mut().unwrap().evaluate("globalThis.__async_before_map").unwrap(),
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("globalThis.__async_before_map")
+                .unwrap(),
             serde_json::json!("rejected"),
         );
-        assert_eq!(requests.recv_timeout(std::time::Duration::from_secs(1)).unwrap(), "/app/async.js");
+        assert_eq!(
+            requests
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap(),
+            "/app/async.js"
+        );
         assert!(requests.try_recv().is_err());
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn dynamically_inserted_import_map_controls_later_dynamic_import() {
         let (base, requests) = spawn_parser_import_map_server(1);
-        let mut page = import_map_test_page("dynamic-import-map", &base, r#"<html><head></head><body>
+        let mut page = import_map_test_page(
+            "dynamic-import-map",
+            &base,
+            r#"<html><head></head><body>
             <script>
                 const map = document.createElement("script");
                 map.type = "importmap";
@@ -3566,19 +3956,32 @@ mod tests {
                     .then(module => globalThis.__dynamic_map_value = module.value)
                     .catch(error => globalThis.__dynamic_map_value = error.message);
             </script>
-        </body></html>"#);
+        </body></html>"#,
+        );
         page.execute_scripts().await;
         assert_eq!(
-            page.js.as_mut().unwrap().evaluate("globalThis.__dynamic_map_value").unwrap(),
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("globalThis.__dynamic_map_value")
+                .unwrap(),
             serde_json::json!("later-map"),
         );
-        assert_eq!(requests.recv_timeout(std::time::Duration::from_secs(1)).unwrap(), "/app/later.js");
+        assert_eq!(
+            requests
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap(),
+            "/app/later.js"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn dynamic_import_map_uses_live_document_base_at_insertion() {
         let (base, requests) = spawn_parser_import_map_server(1);
-        let mut page = import_map_test_page("dynamic-import-map-base", &base, r#"<html><head><base href="/old/"></head><body>
+        let mut page = import_map_test_page(
+            "dynamic-import-map-base",
+            &base,
+            r#"<html><head><base href="/old/"></head><body>
             <script>
                 document.querySelector("base").setAttribute("href", "/app/");
                 const map = document.createElement("script");
@@ -3589,32 +3992,55 @@ mod tests {
                     .then(module => globalThis.__dynamic_map_base = module.value)
                     .catch(error => globalThis.__dynamic_map_base = error.message);
             </script>
-        </body></html>"#);
+        </body></html>"#,
+        );
         page.execute_scripts().await;
         assert_eq!(
-            page.js.as_mut().unwrap().evaluate("globalThis.__dynamic_map_base").unwrap(),
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("globalThis.__dynamic_map_base")
+                .unwrap(),
             serde_json::json!("later-map"),
         );
-        assert_eq!(requests.recv_timeout(std::time::Duration::from_secs(1)).unwrap(), "/app/later.js");
+        assert_eq!(
+            requests
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap(),
+            "/app/later.js"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn later_base_element_does_not_rebase_an_earlier_import_map() {
         let (base, requests) = spawn_parser_import_map_server(1);
-        let mut page = import_map_test_page("temporal-import-map-base", &base, r#"<html><head>
+        let mut page = import_map_test_page(
+            "temporal-import-map-base",
+            &base,
+            r#"<html><head>
             <script type="importmap">{"imports":{"fixed":"./before.js"}}</script>
             <base href="/assets/">
             <script type="module">
                 import { value } from "fixed";
                 globalThis.__temporal_base_value = value;
             </script>
-        </head><body></body></html>"#);
+        </head><body></body></html>"#,
+        );
         page.execute_scripts().await;
         assert_eq!(
-            page.js.as_mut().unwrap().evaluate("globalThis.__temporal_base_value").unwrap(),
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("globalThis.__temporal_base_value")
+                .unwrap(),
             serde_json::json!("before-first-module"),
         );
-        assert_eq!(requests.recv_timeout(std::time::Duration::from_secs(1)).unwrap(), "/app/before.js");
+        assert_eq!(
+            requests
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap(),
+            "/app/before.js"
+        );
     }
 
     #[cfg(feature = "render")]
@@ -3633,7 +4059,10 @@ mod tests {
                         let mut request = [0u8; 2048];
                         let read = stream.read(&mut request).unwrap_or(0);
                         let first = String::from_utf8_lossy(&request[..read])
-                            .lines().next().unwrap_or_default().to_string();
+                            .lines()
+                            .next()
+                            .unwrap_or_default()
+                            .to_string();
                         seen_tx.send(first).unwrap();
                         let body = br##"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"><rect width="20" height="10" fill="#f00"/></svg>"##;
                         let response = format!(
@@ -3652,7 +4081,12 @@ mod tests {
         });
 
         let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
-            "render-prefetch".to_string(), None, false, None, None, true,
+            "render-prefetch".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
         ));
         let mut page = super::Page::new("render-prefetch".to_string(), context);
         page.set_viewport((100.0, 80.0));
@@ -3676,8 +4110,66 @@ mod tests {
             .unwrap()
             .starts_with("GET /asset.svg "));
         assert!(
-            seen_rx.recv_timeout(std::time::Duration::from_millis(200)).is_err(),
+            seen_rx
+                .recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
             "capture must not open a second synchronous renderer request"
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn render_resource_deadline_does_not_negative_cache_cancelled_requests() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request);
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let body = br##"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"/>"##;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/svg+xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.write_all(body);
+        });
+
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "render-deadline".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("render-deadline".to_string(), context);
+        page.set_viewport((100.0, 80.0));
+        let page_url = format!("http://{address}/page");
+        let asset_url = format!("http://{address}/slow.svg");
+        let dom = parse_html(&format!(
+            r#"<html><body><img src="{asset_url}"></body></html>"#
+        ));
+        let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new();
+        runtime.set_dom(dom);
+        runtime.set_url(&page_url);
+        runtime.set_viewport(100.0, 80.0);
+        runtime.run_page_init();
+        page.js = Some(runtime);
+        page.url = Some(url::Url::parse(&page_url).unwrap());
+
+        assert_eq!(page.prepare_screenshot_resources(5).await, 0);
+        assert!(
+            !page
+                .js
+                .as_ref()
+                .unwrap()
+                .render_resource_is_known(&asset_url),
+            "a deadline-cancelled request must remain retryable"
         );
     }
 
@@ -3708,12 +4200,15 @@ mod tests {
             page.evaluate(
                 "return (document.getElementById('second').scrollIntoView(), window.scrollY)"
             )
-                .as_f64(),
+            .as_f64(),
             Some(80.0)
         );
         let after = page.screenshot(page.viewport).expect("scrolled screenshot");
 
-        assert_ne!(before, after, "Page screenshot must paint the scrolled viewport");
+        assert_ne!(
+            before, after,
+            "Page screenshot must paint the scrolled viewport"
+        );
         assert_eq!(
             page.js.as_ref().expect("runtime").scroll_offset(),
             (0.0, 80.0)
@@ -3734,20 +4229,41 @@ mod tests {
 
     #[test]
     fn parse_import_url_extracts_url_forms() {
-        assert_eq!(parse_import_url(" url(\"basic.css\")").as_deref(), Some("basic.css"));
-        assert_eq!(parse_import_url(" url(basic.css)").as_deref(), Some("basic.css"));
-        assert_eq!(parse_import_url(" \"basic.css\"").as_deref(), Some("basic.css"));
-        assert_eq!(parse_import_url(" 'theme.css'").as_deref(), Some("theme.css"));
+        assert_eq!(
+            parse_import_url(" url(\"basic.css\")").as_deref(),
+            Some("basic.css")
+        );
+        assert_eq!(
+            parse_import_url(" url(basic.css)").as_deref(),
+            Some("basic.css")
+        );
+        assert_eq!(
+            parse_import_url(" \"basic.css\"").as_deref(),
+            Some("basic.css")
+        );
+        assert_eq!(
+            parse_import_url(" 'theme.css'").as_deref(),
+            Some("theme.css")
+        );
         assert_eq!(parse_import_url(" URL('x.css')").as_deref(), Some("x.css"));
     }
 
     #[test]
     fn parse_import_url_skips_print_and_dark_media() {
         assert_eq!(parse_import_url("url(\"p.css\") print"), None);
-        assert_eq!(parse_import_url("url(\"d.css\") (prefers-color-scheme: dark)"), None);
+        assert_eq!(
+            parse_import_url("url(\"d.css\") (prefers-color-scheme: dark)"),
+            None
+        );
         // screen / all and light preference still apply.
-        assert_eq!(parse_import_url("url(\"s.css\") screen").as_deref(), Some("s.css"));
-        assert_eq!(parse_import_url("url(\"a.css\") print, screen").as_deref(), Some("a.css"));
+        assert_eq!(
+            parse_import_url("url(\"s.css\") screen").as_deref(),
+            Some("s.css")
+        );
+        assert_eq!(
+            parse_import_url("url(\"a.css\") print, screen").as_deref(),
+            Some("a.css")
+        );
     }
 
     #[test]
@@ -3780,12 +4296,8 @@ mod tests {
         "#;
         let rebased = rebase_css_urls(css, &base);
 
-        assert!(rebased.contains(
-            r#"url("https://example.com/css/img/hero.png")"#
-        ));
-        assert!(rebased.contains(
-            r#"url("https://example.com/css/theme/icons/mark.svg")"#
-        ));
+        assert!(rebased.contains(r#"url("https://example.com/css/img/hero.png")"#));
+        assert!(rebased.contains(r#"url("https://example.com/css/theme/icons/mark.svg")"#));
         assert!(rebased.contains(r#"url("data:image/svg+xml,<svg></svg>")"#));
         assert!(rebased.contains("url(#shape)"));
         assert!(rebased.contains(r#"content:"url(../not-an-asset.png)""#));
@@ -3859,9 +4371,7 @@ mod tests {
                     .expect("valid selector");
                 (
                     dom.get_node(link)
-                        .and_then(|node| {
-                            node.get_attribute("data-loaded").map(str::to_owned)
-                        }),
+                        .and_then(|node| node.get_attribute("data-loaded").map(str::to_owned)),
                     styles.first().map(|&nid| dom.text_content(nid)),
                 )
             })
@@ -3905,9 +4415,7 @@ mod tests {
                     .expect("print link");
                 (
                     dom.get_node(link)
-                        .and_then(|node| {
-                            node.get_attribute("data-loaded").map(str::to_owned)
-                        }),
+                        .and_then(|node| node.get_attribute("data-loaded").map(str::to_owned)),
                     dom.query_selector_all("style[data-obscura-external-stylesheets]")
                         .expect("valid selector")
                         .len(),
@@ -3920,10 +4428,7 @@ mod tests {
             Some("yes"),
             "print link still fires load"
         );
-        assert_eq!(
-            state.1, 0,
-            "print-only CSS must stay out of screen cascade"
-        );
+        assert_eq!(state.1, 0, "print-only CSS must stay out of screen cascade");
     }
 
     #[test]
@@ -3975,7 +4480,9 @@ mod tests {
         let mut page = client_replacement_page("parser-client-replacement", false);
         let target = page.url_string();
 
-        page.navigate(&target).await.expect("navigate replacement page");
+        page.navigate(&target)
+            .await
+            .expect("navigate replacement page");
 
         assert_client_replacement_survived(&mut page);
     }
@@ -3984,7 +4491,9 @@ mod tests {
     async fn timer_body_replacement_survives_settle() {
         let mut page = client_replacement_page("timer-client-replacement", true);
         let target = page.url_string();
-        page.navigate(&target).await.expect("navigate deferred replacement page");
+        page.navigate(&target)
+            .await
+            .expect("navigate deferred replacement page");
 
         let before_timer = page
             .js

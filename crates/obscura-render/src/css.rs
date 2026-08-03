@@ -9,7 +9,9 @@
 
 use obscura_dom::selector::{CompiledSelector, Matcher, SelectorKey};
 use obscura_dom::tree::{DomTree, NodeId};
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::LayoutStyle;
 
@@ -71,7 +73,11 @@ struct ContainerSizeFeature {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum ContainerQueryLength { Px(f32), Em(f32), Rem(f32) }
+enum ContainerQueryLength {
+    Px(f32),
+    Em(f32),
+    Rem(f32),
+}
 
 struct ParsedRule {
     selector: String,
@@ -82,21 +88,115 @@ struct ParsedRule {
 
 struct Rule {
     sel: CompiledSelector,
+    specificity: u32,
     normal_decls: String,
     important_decls: String,
+    normal_flags: DeclarationStreamFlags,
+    important_flags: DeclarationStreamFlags,
+    candidate_slot: u32,
     /// Source order, for breaking specificity ties (later wins).
     order: usize,
     container_condition_id: ContainerConditionId,
     layer: Option<LayerOrder>,
 }
 
+const NO_CANDIDATE_SLOT: u32 = u32::MAX;
+
+fn is_root_element(tree: &DomTree, nid: NodeId) -> bool {
+    tree.get_node(nid)
+        .and_then(|node| node.parent)
+        .and_then(|parent| tree.get_node(parent))
+        .is_some_and(|parent| parent.is_document())
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DeclarationStreamFlags {
+    has_custom_properties: bool,
+    has_var: bool,
+    has_color_scheme: bool,
+    has_animation: bool,
+}
+
+/// Cache the declaration features which otherwise require an extra stream
+/// walk or an allocated substituted copy for every matching element. This is
+/// computed once while the stylesheet is indexed; false positives would only
+/// cost work, while exact declaration-name checks keep the skip paths sound.
+fn declaration_stream_flags(css: &str) -> DeclarationStreamFlags {
+    let mut flags = DeclarationStreamFlags::default();
+    for declaration in crate::style::split_declarations(css) {
+        let Some((name, value)) = declaration.split_once(':') else {
+            continue;
+        };
+        let name = name.trim();
+        flags.has_custom_properties |= name.starts_with("--") && name.len() > 2;
+        flags.has_var |= value.contains("var(");
+        if name.eq_ignore_ascii_case("color-scheme") {
+            flags.has_color_scheme = true;
+        }
+        if name.eq_ignore_ascii_case("animation")
+            || name
+                .get(..10)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("animation-"))
+        {
+            flags.has_animation = true;
+        }
+    }
+    flags
+}
+
 struct PseudoRule {
     sel: CompiledSelector,
+    specificity: u32,
     normal_decls: String,
     important_decls: String,
+    normal_flags: DeclarationStreamFlags,
+    important_flags: DeclarationStreamFlags,
+    candidate_slot: u32,
     order: usize,
     container_condition_id: ContainerConditionId,
     layer: Option<LayerOrder>,
+}
+
+#[derive(Default)]
+struct PseudoRuleMap {
+    rules: Vec<PseudoRule>,
+    by_root: Vec<usize>,
+    by_id: HashMap<String, Vec<usize>>,
+    by_class: HashMap<String, Vec<usize>>,
+    by_attribute: HashMap<String, Vec<usize>>,
+    by_local: HashMap<String, Vec<usize>>,
+    universal: Vec<usize>,
+    candidate_slot_count: usize,
+}
+
+impl PseudoRuleMap {
+    fn push(&mut self, mut rule: PseudoRule) {
+        let index = self.rules.len();
+        if rule.sel.candidate_keys().len() > 1 {
+            rule.candidate_slot = u32::try_from(self.candidate_slot_count)
+                .expect("pseudo selector candidate slot count exceeds u32");
+            self.candidate_slot_count += 1;
+        }
+        for key in rule.sel.candidate_keys() {
+            match key {
+                SelectorKey::Root => self.by_root.push(index),
+                SelectorKey::Id(value) => self.by_id.entry(value.clone()).or_default().push(index),
+                SelectorKey::Class(value) => {
+                    self.by_class.entry(value.clone()).or_default().push(index)
+                }
+                SelectorKey::Attribute(value) => self
+                    .by_attribute
+                    .entry(value.clone())
+                    .or_default()
+                    .push(index),
+                SelectorKey::Local(value) => {
+                    self.by_local.entry(value.clone()).or_default().push(index)
+                }
+                SelectorKey::Universal => self.universal.push(index),
+            }
+        }
+        self.rules.push(rule);
+    }
 }
 
 /// A cascade layer's first-declaration position at each nesting level.
@@ -311,8 +411,7 @@ impl PartialEq for ContainerBox {
         match self.available_type {
             crate::ContainerType::Normal => true,
             crate::ContainerType::InlineSize => {
-                self.content_width == other.content_width
-                    && self.font_size == other.font_size
+                self.content_width == other.content_width && self.font_size == other.font_size
             }
             crate::ContainerType::Size => {
                 self.content_width == other.content_width
@@ -426,7 +525,8 @@ impl<'a> ContainerQueryEvaluator<'a> {
         condition: ContainerConditionId,
         kind: ContainerQuerySubjectKind,
     ) -> bool {
-        self.evaluate_condition_chain(sheet, subject, condition, kind).truth
+        self.evaluate_condition_chain(sheet, subject, condition, kind)
+            .truth
             == ContainerQueryTruth::True
     }
 
@@ -472,8 +572,7 @@ impl<'a> ContainerQueryEvaluator<'a> {
             self.cache.insert(key, decision.clone());
             return decision;
         }
-        let parent =
-            self.evaluate_condition_chain(sheet, subject, node.parent, kind);
+        let parent = self.evaluate_condition_chain(sheet, subject, node.parent, kind);
         selected_containers.extend(parent.selected_containers);
         let decision = ContainerQueryDecision {
             truth: own_truth.and(parent.truth),
@@ -505,9 +604,7 @@ impl<'a> ContainerQueryEvaluator<'a> {
             let parent = self.tree.get_node(id).and_then(|node| node.parent);
             if let Some(container) = self.snapshot.boxes.get(&id) {
                 let supports_axis = match container.container_type {
-                    crate::ContainerType::Normal => {
-                        !required_axes.inline && !required_axes.block
-                    }
+                    crate::ContainerType::Normal => !required_axes.inline && !required_axes.block,
                     crate::ContainerType::InlineSize => !required_axes.block,
                     crate::ContainerType::Size => true,
                 };
@@ -531,11 +628,11 @@ impl<'a> ContainerQueryEvaluator<'a> {
                             .condition
                             .as_ref()
                             .map_or(ContainerQueryTruth::True, |condition| {
-                            evaluate_container_query_expr(
-                                condition,
-                                container,
-                                self.snapshot.root_font_size,
-                            )
+                                evaluate_container_query_expr(
+                                    condition,
+                                    container,
+                                    self.snapshot.root_font_size,
+                                )
                             });
                     return (truth, Some(id));
                 }
@@ -571,15 +668,14 @@ fn container_query_required_axes(expr: &ContainerQueryExpr) -> ContainerQueryReq
         ContainerQueryExpr::Unknown => ContainerQueryRequiredAxes::default(),
         ContainerQueryExpr::Not(inner) => container_query_required_axes(inner),
         ContainerQueryExpr::And(items) | ContainerQueryExpr::Or(items) => {
-            items.iter().fold(
-                ContainerQueryRequiredAxes::default(),
-                |mut axes, item| {
+            items
+                .iter()
+                .fold(ContainerQueryRequiredAxes::default(), |mut axes, item| {
                     let item = container_query_required_axes(item);
                     axes.inline |= item.inline;
                     axes.block |= item.block;
                     axes
-                },
-            )
+                })
         }
     }
 }
@@ -665,15 +761,94 @@ pub struct Stylesheet {
     /// property-specific segments at the stylesheet's explicit sample time.
     keyframes: HashMap<String, Keyframes>,
     animation_sample_time: crate::AnimationSampleTime,
+    by_root: Vec<usize>,
     by_id: HashMap<String, Vec<usize>>,
     by_class: HashMap<String, Vec<usize>>,
+    by_attribute: HashMap<String, Vec<usize>>,
     by_local: HashMap<String, Vec<usize>>,
     universal: Vec<usize>,
+    candidate_slot_count: usize,
     /// `sel::before` / `sel::after` rules matched against their ordinary base
     /// selector. Keeping their full declaration cascade supports both literal
     /// generated text and positioned decorative boxes.
-    before_rules: Vec<PseudoRule>,
-    after_rules: Vec<PseudoRule>,
+    before_rules: PseudoRuleMap,
+    after_rules: PseudoRuleMap,
+}
+
+const MAX_STYLESHEET_CACHE_SOURCE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_STYLESHEET_CACHE_RULES: usize = 100_000;
+
+/// One document-local compiled author stylesheet.
+///
+/// DOM mutations still run the complete cascade and layout against the live
+/// tree. This cache retains only source parsing, selector compilation, and
+/// candidate indexing, whose inputs are the ordered CSS text and viewport.
+/// Keeping a single exact-key entry prevents cross-document growth and avoids
+/// hash-collision correctness risks. Pathological source sets above the byte
+/// bound are parsed normally but never retained.
+#[derive(Default)]
+pub struct StylesheetCache {
+    entry: Option<CachedStylesheet>,
+    hits: u64,
+    misses: u64,
+}
+
+struct CachedStylesheet {
+    sources: Vec<String>,
+    viewport_bits: (u32, u32),
+    source_bytes: usize,
+    sheet: Arc<Stylesheet>,
+}
+
+impl StylesheetCache {
+    pub(crate) fn get_or_parse(
+        &mut self,
+        tree: &DomTree,
+        sources: &[String],
+        viewport: (f32, f32),
+    ) -> (Arc<Stylesheet>, bool) {
+        let viewport_bits = (viewport.0.to_bits(), viewport.1.to_bits());
+        if let Some(entry) = self.entry.as_ref() {
+            if entry.viewport_bits == viewport_bits && entry.sources == sources {
+                self.hits = self.hits.saturating_add(1);
+                return (Arc::clone(&entry.sheet), true);
+            }
+        }
+
+        self.misses = self.misses.saturating_add(1);
+        let sheet = Arc::new(Stylesheet::parse_for_viewport(tree, sources, viewport));
+        let source_bytes = sources
+            .iter()
+            .try_fold(0usize, |total, source| total.checked_add(source.len()));
+        let compiled_rules =
+            sheet.rules.len() + sheet.before_rules.rules.len() + sheet.after_rules.rules.len();
+        if source_bytes.is_some_and(|bytes| bytes <= MAX_STYLESHEET_CACHE_SOURCE_BYTES)
+            && compiled_rules <= MAX_STYLESHEET_CACHE_RULES
+        {
+            let source_bytes = source_bytes.unwrap_or_default();
+            self.entry = Some(CachedStylesheet {
+                sources: sources.to_vec(),
+                viewport_bits,
+                source_bytes,
+                sheet: Arc::clone(&sheet),
+            });
+        } else {
+            self.entry = None;
+        }
+        (sheet, false)
+    }
+
+    pub fn hit_count(&self) -> u64 {
+        self.hits
+    }
+
+    pub fn miss_count(&self) -> u64 {
+        self.misses
+    }
+
+    pub fn retained_source_bytes(&self) -> usize {
+        self.entry.as_ref().map_or(0, |entry| entry.source_bytes)
+    }
 }
 
 impl Stylesheet {
@@ -690,9 +865,9 @@ impl Stylesheet {
         if id == ContainerConditionId::NONE {
             return true;
         }
-        evaluator.as_deref_mut().is_some_and(|evaluator| {
-            evaluator.condition_matches(self, subject, id, kind)
-        })
+        evaluator
+            .as_deref_mut()
+            .is_some_and(|evaluator| evaluator.condition_matches(self, subject, id, kind))
     }
 
     pub(crate) fn has_container_queries(&self) -> bool {
@@ -701,8 +876,9 @@ impl Stylesheet {
             .any(|rule| rule.container_condition_id != ContainerConditionId::NONE)
             || self
                 .before_rules
+                .rules
                 .iter()
-                .chain(&self.after_rules)
+                .chain(&self.after_rules.rules)
                 .any(|rule| rule.container_condition_id != ContainerConditionId::NONE)
     }
 
@@ -733,11 +909,7 @@ impl Stylesheet {
     /// same dimensions as layout and page JavaScript; filtering them against a
     /// fixed desktop width made responsive frameworks build one DOM while the
     /// renderer applied another breakpoint.
-    pub fn parse_for_viewport(
-        tree: &DomTree,
-        sources: &[String],
-        viewport: (f32, f32),
-    ) -> Self {
+    pub fn parse_for_viewport(tree: &DomTree, sources: &[String], viewport: (f32, f32)) -> Self {
         Self::parse_for_viewport_at_animation_time(
             tree,
             sources,
@@ -761,17 +933,19 @@ impl Stylesheet {
             }],
             keyframes: HashMap::new(),
             animation_sample_time,
+            by_root: Vec::new(),
             by_id: HashMap::new(),
             by_class: HashMap::new(),
+            by_attribute: HashMap::new(),
             by_local: HashMap::new(),
             universal: Vec::new(),
-            before_rules: Vec::new(),
-            after_rules: Vec::new(),
+            candidate_slot_count: 0,
+            before_rules: PseudoRuleMap::default(),
+            after_rules: PseudoRuleMap::default(),
         };
         let mut order = 0usize;
         let mut layers = LayerRegistry::default();
-        let mut keyframe_winners =
-            HashMap::<String, (Option<LayerOrder>, bool, usize)>::new();
+        let mut keyframe_winners = HashMap::<String, (Option<LayerOrder>, bool, usize)>::new();
         for src in sources {
             let parsed = parse_stylesheet_for_viewport_preserving_containers_in_layer(
                 src,
@@ -811,10 +985,7 @@ impl Stylesheet {
                     if replaces {
                         let keyframes = compile_keyframe_body(&decls);
                         sheet.keyframes.insert(name.to_string(), keyframes);
-                        keyframe_winners.insert(
-                            name.to_string(),
-                            (layer.clone(), prefixed, order),
-                        );
+                        keyframe_winners.insert(name.to_string(), (layer.clone(), prefixed, order));
                     }
                     order += 1;
                     continue;
@@ -832,10 +1003,17 @@ impl Stylesheet {
                     if let Some(sel) = tree.compile_rule_selector(base) {
                         let (normal_decls, important_decls) =
                             crate::style::partition_declarations(&decls);
+                        let normal_flags = declaration_stream_flags(&normal_decls);
+                        let important_flags = declaration_stream_flags(&important_decls);
+                        let specificity = sel.specificity();
                         sheet.before_rules.push(PseudoRule {
                             sel,
+                            specificity,
                             normal_decls,
                             important_decls,
+                            normal_flags,
+                            important_flags,
+                            candidate_slot: NO_CANDIDATE_SLOT,
                             order,
                             container_condition_id,
                             layer,
@@ -848,10 +1026,17 @@ impl Stylesheet {
                     if let Some(sel) = tree.compile_rule_selector(base) {
                         let (normal_decls, important_decls) =
                             crate::style::partition_declarations(&decls);
+                        let normal_flags = declaration_stream_flags(&normal_decls);
+                        let important_flags = declaration_stream_flags(&important_decls);
+                        let specificity = sel.specificity();
                         sheet.after_rules.push(PseudoRule {
                             sel,
+                            specificity,
                             normal_decls,
                             important_decls,
+                            normal_flags,
+                            important_flags,
+                            candidate_slot: NO_CANDIDATE_SLOT,
                             order,
                             container_condition_id,
                             layer,
@@ -860,19 +1045,46 @@ impl Stylesheet {
                     order += 1;
                     continue;
                 }
-                let Some(sel) = tree.compile_rule_selector(&selector) else { continue };
+                let Some(sel) = tree.compile_rule_selector(&selector) else {
+                    continue;
+                };
                 let (normal_decls, important_decls) = crate::style::partition_declarations(&decls);
+                let specificity = sel.specificity();
+                let normal_flags = declaration_stream_flags(&normal_decls);
+                let important_flags = declaration_stream_flags(&important_decls);
                 let idx = sheet.rules.len();
-                match sel.key() {
-                    SelectorKey::Id(v) => sheet.by_id.entry(v.clone()).or_default().push(idx),
-                    SelectorKey::Class(v) => sheet.by_class.entry(v.clone()).or_default().push(idx),
-                    SelectorKey::Local(v) => sheet.by_local.entry(v.clone()).or_default().push(idx),
-                    SelectorKey::Universal => sheet.universal.push(idx),
+                let candidate_slot = if sel.candidate_keys().len() > 1 {
+                    let slot = u32::try_from(sheet.candidate_slot_count)
+                        .expect("selector candidate slot count exceeds u32");
+                    sheet.candidate_slot_count += 1;
+                    slot
+                } else {
+                    NO_CANDIDATE_SLOT
+                };
+                for key in sel.candidate_keys() {
+                    match key {
+                        SelectorKey::Root => sheet.by_root.push(idx),
+                        SelectorKey::Id(v) => sheet.by_id.entry(v.clone()).or_default().push(idx),
+                        SelectorKey::Class(v) => {
+                            sheet.by_class.entry(v.clone()).or_default().push(idx)
+                        }
+                        SelectorKey::Attribute(v) => {
+                            sheet.by_attribute.entry(v.clone()).or_default().push(idx)
+                        }
+                        SelectorKey::Local(v) => {
+                            sheet.by_local.entry(v.clone()).or_default().push(idx)
+                        }
+                        SelectorKey::Universal => sheet.universal.push(idx),
+                    }
                 }
                 sheet.rules.push(Rule {
                     sel,
+                    specificity,
                     normal_decls,
                     important_decls,
+                    normal_flags,
+                    important_flags,
+                    candidate_slot,
                     order,
                     container_condition_id,
                     layer,
@@ -891,14 +1103,7 @@ impl Stylesheet {
         props: &HashMap<String, String>,
         host_style: &LayoutStyle,
     ) -> (Option<LayoutStyle>, Option<LayoutStyle>) {
-        self.pseudo_styles_internal(
-            tree,
-            matcher,
-            nid,
-            props,
-            host_style,
-            None,
-        )
+        self.pseudo_styles_internal(tree, matcher, nid, props, host_style, None)
     }
 
     pub(crate) fn pseudo_styles_with_container_queries(
@@ -910,14 +1115,7 @@ impl Stylesheet {
         host_style: &LayoutStyle,
         evaluator: &mut ContainerQueryEvaluator<'_>,
     ) -> (Option<LayoutStyle>, Option<LayoutStyle>) {
-        self.pseudo_styles_internal(
-            tree,
-            matcher,
-            nid,
-            props,
-            host_style,
-            Some(evaluator),
-        )
+        self.pseudo_styles_internal(tree, matcher, nid, props, host_style, Some(evaluator))
     }
 
     fn pseudo_styles_internal(
@@ -929,49 +1127,125 @@ impl Stylesheet {
         host_style: &LayoutStyle,
         mut evaluator: Option<&mut ContainerQueryEvaluator<'_>>,
     ) -> (Option<LayoutStyle>, Option<LayoutStyle>) {
-        let mut build = |rules: &[PseudoRule], matcher: &mut Matcher| {
-            let mut matched: Vec<(u32, usize, &PseudoRule)> = Vec::new();
-            for rule in rules {
-                // Container lookup is an ancestor walk. Keep it behind the
-                // selector match so unrelated pseudo rules remain cheap.
-                if matcher.matches(tree, nid, &rule.sel)
-                    && self.container_condition_is_active(
-                        rule.container_condition_id,
-                        nid,
-                        ContainerQuerySubjectKind::OriginatingPseudo,
-                        &mut evaluator,
-                    )
-                {
-                    matched.push((rule.sel.specificity(), rule.order, rule));
+        let mut build = |rules: &PseudoRuleMap, matcher: &mut Matcher| {
+            let mut normal_matched: Vec<(u32, usize, usize)> = Vec::new();
+            let mut important_matched: Vec<(u32, usize, usize)> = Vec::new();
+            if rules.candidate_slot_count != 0 {
+                matcher.begin_candidate_collection(rules.candidate_slot_count);
+            }
+            let mut consider =
+                |bucket: Option<&Vec<usize>>,
+                 normal_matched: &mut Vec<(u32, usize, usize)>,
+                 important_matched: &mut Vec<(u32, usize, usize)>| {
+                    let Some(indices) = bucket else { return };
+                    for &index in indices {
+                        let rule = &rules.rules[index];
+                        if rule.candidate_slot != NO_CANDIDATE_SLOT
+                            && !matcher.mark_candidate(rule.candidate_slot as usize)
+                        {
+                            continue;
+                        }
+                        // Candidate buckets only reject impossible originating
+                        // elements. Full selector matching remains authoritative.
+                        // Container lookup is an ancestor walk, so keep it behind
+                        // the selector match as well.
+                        if matcher.matches(tree, nid, &rule.sel)
+                            && self.container_condition_is_active(
+                                rule.container_condition_id,
+                                nid,
+                                ContainerQuerySubjectKind::OriginatingPseudo,
+                                &mut evaluator,
+                            )
+                        {
+                            let matched = (rule.specificity, rule.order, index);
+                            if !rule.normal_decls.is_empty() {
+                                normal_matched.push(matched);
+                            }
+                            if !rule.important_decls.is_empty() {
+                                important_matched.push(matched);
+                            }
+                        }
+                    }
+                };
+
+            if let Some(node) = tree.get_node(nid) {
+                if let Some(element) = node.as_element() {
+                    consider(
+                        rules.by_local.get(element.local.as_ref()),
+                        &mut normal_matched,
+                        &mut important_matched,
+                    );
+                }
+                if let Some(id) = node.get_attribute("id") {
+                    consider(
+                        rules.by_id.get(id),
+                        &mut normal_matched,
+                        &mut important_matched,
+                    );
+                }
+                if let Some(classes) = node.get_attribute("class") {
+                    for class in classes.split_whitespace() {
+                        consider(
+                            rules.by_class.get(class),
+                            &mut normal_matched,
+                            &mut important_matched,
+                        );
+                    }
+                }
+                if !rules.by_attribute.is_empty() {
+                    if let Some(attributes) = node.attrs() {
+                        for attribute in attributes {
+                            consider(
+                                rules.by_attribute.get(attribute.name.local.as_ref()),
+                                &mut normal_matched,
+                                &mut important_matched,
+                            );
+                        }
+                    }
                 }
             }
-            if matched.is_empty() {
+            if is_root_element(tree, nid) {
+                consider(
+                    (!rules.by_root.is_empty()).then_some(&rules.by_root),
+                    &mut normal_matched,
+                    &mut important_matched,
+                );
+            }
+            consider(
+                (!rules.universal.is_empty()).then_some(&rules.universal),
+                &mut normal_matched,
+                &mut important_matched,
+            );
+
+            if normal_matched.is_empty() && important_matched.is_empty() {
                 return None;
             }
-            let mut normal_matched = matched.clone();
-            normal_matched.sort_unstable_by(|a, b| {
-                compare_rule_cascade(
-                    a.2.layer.as_ref(),
-                    a.0,
-                    a.1,
-                    b.2.layer.as_ref(),
-                    b.0,
-                    b.1,
-                    false,
-                )
-            });
-            let mut important_matched = matched;
-            important_matched.sort_unstable_by(|a, b| {
-                compare_rule_cascade(
-                    a.2.layer.as_ref(),
-                    a.0,
-                    a.1,
-                    b.2.layer.as_ref(),
-                    b.0,
-                    b.1,
-                    true,
-                )
-            });
+            if normal_matched.len() > 1 {
+                normal_matched.sort_unstable_by(|a, b| {
+                    compare_rule_cascade(
+                        rules.rules[a.2].layer.as_ref(),
+                        a.0,
+                        a.1,
+                        rules.rules[b.2].layer.as_ref(),
+                        b.0,
+                        b.1,
+                        false,
+                    )
+                });
+            }
+            if important_matched.len() > 1 {
+                important_matched.sort_unstable_by(|a, b| {
+                    compare_rule_cascade(
+                        rules.rules[a.2].layer.as_ref(),
+                        a.0,
+                        a.1,
+                        rules.rules[b.2].layer.as_ref(),
+                        b.0,
+                        b.1,
+                        true,
+                    )
+                });
+            }
             // Generated ::before/::after boxes have an inline outer display
             // by default. LayoutStyle's general default is block because it
             // primarily represents ordinary DOM boxes, so set the pseudo
@@ -983,38 +1257,52 @@ impl Stylesheet {
             style.color_scheme_dark = host_style.color_scheme_dark;
             let inherited_color_scheme_dark = host_style.color_scheme_dark;
             let mut generated_content = None;
-            for &(_, _, rule) in &normal_matched {
-                let expanded = substitute_declarations(&rule.normal_decls, props);
+            for &(_, _, index) in &normal_matched {
+                let rule = &rules.rules[index];
+                if !rule.normal_flags.has_color_scheme {
+                    continue;
+                }
+                let expanded =
+                    substitute_declarations(&rule.normal_decls, props, rule.normal_flags.has_var);
                 crate::style::apply_color_scheme_declarations_from(
                     &mut style,
                     &expanded,
                     inherited_color_scheme_dark,
                 );
             }
-            for &(_, _, rule) in &important_matched {
-                let expanded = substitute_declarations(&rule.important_decls, props);
+            for &(_, _, index) in &important_matched {
+                let rule = &rules.rules[index];
+                if !rule.important_flags.has_color_scheme {
+                    continue;
+                }
+                let expanded = substitute_declarations(
+                    &rule.important_decls,
+                    props,
+                    rule.important_flags.has_var,
+                );
                 crate::style::apply_color_scheme_declarations_from(
                     &mut style,
                     &expanded,
                     inherited_color_scheme_dark,
                 );
             }
-            for &(_, _, rule) in &normal_matched {
-                let expanded = substitute_declarations(&rule.normal_decls, props);
-                crate::style::apply_declarations_with_locked_color_scheme(
-                    &mut style,
-                    &expanded,
-                );
+            for &(_, _, index) in &normal_matched {
+                let rule = &rules.rules[index];
+                let expanded =
+                    substitute_declarations(&rule.normal_decls, props, rule.normal_flags.has_var);
+                crate::style::apply_declarations_with_locked_color_scheme(&mut style, &expanded);
                 if let Some(value) = extract_content(&expanded, tree, nid) {
                     generated_content = value;
                 }
             }
-            for &(_, _, rule) in &important_matched {
-                let expanded = substitute_declarations(&rule.important_decls, props);
-                crate::style::apply_declarations_with_locked_color_scheme(
-                    &mut style,
-                    &expanded,
+            for &(_, _, index) in &important_matched {
+                let rule = &rules.rules[index];
+                let expanded = substitute_declarations(
+                    &rule.important_decls,
+                    props,
+                    rule.important_flags.has_var,
                 );
+                crate::style::apply_declarations_with_locked_color_scheme(&mut style, &expanded);
                 if let Some(value) = extract_content(&expanded, tree, nid) {
                     generated_content = value;
                 }
@@ -1040,8 +1328,15 @@ impl Stylesheet {
     }
 
     #[doc(hidden)]
-    pub fn debug_stats(&self) -> (usize, usize, usize, usize, usize) {
-        (self.rules.len(), self.by_id.len(), self.by_class.len(), self.by_local.len(), self.universal.len())
+    pub fn debug_stats(&self) -> (usize, usize, usize, usize, usize, usize) {
+        (
+            self.rules.len(),
+            self.by_id.len(),
+            self.by_class.len(),
+            self.by_attribute.len(),
+            self.by_local.len(),
+            self.universal.len(),
+        )
     }
 
     /// Apply every author rule that matches `nid` to `style`, in cascade order
@@ -1117,67 +1412,126 @@ impl Stylesheet {
         inline_css: Option<&str>,
         mut evaluator: Option<&mut ContainerQueryEvaluator<'_>>,
     ) -> Option<HashMap<String, String>> {
-        // (specificity, order, rule index) for each matching rule.
-        let mut matched: Vec<(u32, usize, usize)> = Vec::new();
-        let mut consider = |bucket: Option<&Vec<usize>>, matched: &mut Vec<(u32, usize, usize)>| {
-            if let Some(idxs) = bucket {
-                for &i in idxs {
-                    let rule = &self.rules[i];
-                    // Container lookup is an ancestor walk. Keep it behind
-                    // selector matching and cache the result per condition.
-                    if matcher.matches(tree, nid, &rule.sel)
-                        && self.container_condition_is_active(
-                            rule.container_condition_id,
-                            nid,
-                            ContainerQuerySubjectKind::Element,
-                            &mut evaluator,
-                        )
-                    {
-                        matched.push((rule.sel.specificity(), rule.order, i));
+        // Keep the two cascade priorities separate from the outset. A typical
+        // stylesheet has very few important declarations, so cloning and
+        // sorting every matching normal-only rule into an empty important pass
+        // is substantial wasted work on every element.
+        let mut normal_matched: Vec<(u32, usize, usize)> = Vec::new();
+        let mut important_matched: Vec<(u32, usize, usize)> = Vec::new();
+        if self.candidate_slot_count != 0 {
+            matcher.begin_candidate_collection(self.candidate_slot_count);
+        }
+        let mut consider =
+            |bucket: Option<&Vec<usize>>,
+             normal_matched: &mut Vec<(u32, usize, usize)>,
+             important_matched: &mut Vec<(u32, usize, usize)>| {
+                if let Some(idxs) = bucket {
+                    for &i in idxs {
+                        let rule = &self.rules[i];
+                        if rule.candidate_slot != NO_CANDIDATE_SLOT
+                            && !matcher.mark_candidate(rule.candidate_slot as usize)
+                        {
+                            continue;
+                        }
+                        // Container lookup is an ancestor walk. Keep it behind
+                        // selector matching and cache the result per condition.
+                        if matcher.matches(tree, nid, &rule.sel)
+                            && self.container_condition_is_active(
+                                rule.container_condition_id,
+                                nid,
+                                ContainerQuerySubjectKind::Element,
+                                &mut evaluator,
+                            )
+                        {
+                            let matched = (rule.specificity, rule.order, i);
+                            if !rule.normal_decls.is_empty() {
+                                normal_matched.push(matched);
+                            }
+                            if !rule.important_decls.is_empty() {
+                                important_matched.push(matched);
+                            }
+                        }
+                    }
+                }
+            };
+
+        consider(
+            self.by_local.get(local),
+            &mut normal_matched,
+            &mut important_matched,
+        );
+        if is_root_element(tree, nid) {
+            consider(
+                (!self.by_root.is_empty()).then_some(&self.by_root),
+                &mut normal_matched,
+                &mut important_matched,
+            );
+        }
+        if let Some(id) = id {
+            consider(
+                self.by_id.get(id),
+                &mut normal_matched,
+                &mut important_matched,
+            );
+        }
+        for c in classes {
+            consider(
+                self.by_class.get(c),
+                &mut normal_matched,
+                &mut important_matched,
+            );
+        }
+        if !self.by_attribute.is_empty() {
+            if let Some(node) = tree.get_node(nid) {
+                if let Some(attributes) = node.attrs() {
+                    for attribute in attributes {
+                        consider(
+                            self.by_attribute.get(attribute.name.local.as_ref()),
+                            &mut normal_matched,
+                            &mut important_matched,
+                        );
                     }
                 }
             }
-        };
-
-        consider(self.by_local.get(local), &mut matched);
-        if let Some(id) = id {
-            consider(self.by_id.get(id), &mut matched);
-        }
-        for c in classes {
-            consider(self.by_class.get(c), &mut matched);
         }
         if !self.universal.is_empty() {
-            consider(Some(&self.universal), &mut matched);
+            consider(
+                Some(&self.universal),
+                &mut normal_matched,
+                &mut important_matched,
+            );
         }
 
-        let mut normal_matched = matched.clone();
-        normal_matched.sort_unstable_by(|a, b| {
-            let left = &self.rules[a.2];
-            let right = &self.rules[b.2];
-            compare_rule_cascade(
-                left.layer.as_ref(),
-                a.0,
-                a.1,
-                right.layer.as_ref(),
-                b.0,
-                b.1,
-                false,
-            )
-        });
-        let mut important_matched = matched;
-        important_matched.sort_unstable_by(|a, b| {
-            let left = &self.rules[a.2];
-            let right = &self.rules[b.2];
-            compare_rule_cascade(
-                left.layer.as_ref(),
-                a.0,
-                a.1,
-                right.layer.as_ref(),
-                b.0,
-                b.1,
-                true,
-            )
-        });
+        if normal_matched.len() > 1 {
+            normal_matched.sort_unstable_by(|a, b| {
+                let left = &self.rules[a.2];
+                let right = &self.rules[b.2];
+                compare_rule_cascade(
+                    left.layer.as_ref(),
+                    a.0,
+                    a.1,
+                    right.layer.as_ref(),
+                    b.0,
+                    b.1,
+                    false,
+                )
+            });
+        }
+        if important_matched.len() > 1 {
+            important_matched.sort_unstable_by(|a, b| {
+                let left = &self.rules[a.2];
+                let right = &self.rules[b.2];
+                compare_rule_cascade(
+                    left.layer.as_ref(),
+                    a.0,
+                    a.1,
+                    right.layer.as_ref(),
+                    b.0,
+                    b.1,
+                    true,
+                )
+            });
+        }
 
         let (inline_normal, inline_important) = inline_css
             .map(crate::style::partition_declarations)
@@ -1186,109 +1540,143 @@ impl Stylesheet {
         // Pass 1: collect this element's own custom properties (`--x: value`),
         // in cascade order (last wins), layered over the inherited map. Custom
         // properties cascade fully before any `var()` is substituted.
-        let mut own: Vec<(String, String)> = Vec::new();
-        let mut collect_custom = |css: &str| {
-            for decl in crate::style::split_declarations(css) {
-                if let Some((name, val)) = decl.split_once(':') {
-                    let name = name.trim();
-                    if name.starts_with("--") && name.len() > 2 {
-                        own.push((name.to_string(), val.trim().to_string()));
+        let inline_normal_flags = declaration_stream_flags(&inline_normal);
+        let inline_important_flags = declaration_stream_flags(&inline_important);
+        let has_own_custom_properties = inline_normal_flags.has_custom_properties
+            || inline_important_flags.has_custom_properties
+            || normal_matched
+                .iter()
+                .any(|&(_, _, i)| self.rules[i].normal_flags.has_custom_properties)
+            || important_matched
+                .iter()
+                .any(|&(_, _, i)| self.rules[i].important_flags.has_custom_properties);
+
+        // Most elements neither declare custom properties nor participate in
+        // an `@property` registration. Reuse the inherited map directly in
+        // that case instead of parsing every declaration stream, cloning the
+        // map, and comparing the clone back to its source.
+        let effective = if !has_own_custom_properties
+            && self.registered_custom_properties.is_empty()
+        {
+            None
+        } else {
+            let mut own: Vec<(String, String)> = Vec::new();
+            let mut collect_custom = |css: &str| {
+                for decl in crate::style::split_declarations(css) {
+                    if let Some((name, val)) = decl.split_once(':') {
+                        let name = name.trim();
+                        if name.starts_with("--") && name.len() > 2 {
+                            own.push((name.to_string(), val.trim().to_string()));
+                        }
                     }
                 }
-            }
-        };
-        for &(_, _, i) in &normal_matched {
-            collect_custom(&self.rules[i].normal_decls);
-        }
-        collect_custom(&inline_normal);
-        for &(_, _, i) in &important_matched {
-            collect_custom(&self.rules[i].important_decls);
-        }
-        collect_custom(&inline_important);
-        let mut resolved_props = parent_props.clone();
-        for (name, registration) in &self.registered_custom_properties {
-            if registration.inherits && resolved_props.contains_key(name) {
-                continue;
-            }
-            if let Some(initial) = &registration.initial_value {
-                resolved_props.insert(name.clone(), initial.clone());
-            } else {
-                resolved_props.remove(name);
-            }
-        }
-        let registration_changed_props = resolved_props != *parent_props;
-        let has_own = !own.is_empty();
-        let mut own_names = std::collections::HashSet::new();
-        for (k, v) in own {
-            own_names.insert(k.clone());
-            let registration = self.registered_custom_properties.get(&k);
-            let set_initial = |props: &mut HashMap<String, String>| {
-                if let Some(initial) = registration.and_then(|entry| entry.initial_value.as_ref()) {
-                    props.insert(k.clone(), initial.clone());
-                } else {
-                    props.remove(&k);
-                }
             };
-            let inherit = |props: &mut HashMap<String, String>| {
-                if let Some(inherited) = parent_props.get(&k) {
-                    props.insert(k.clone(), inherited.clone());
-                } else if let Some(initial) =
-                    registration.and_then(|entry| entry.initial_value.as_ref())
-                {
-                    props.insert(k.clone(), initial.clone());
+            for &(_, _, i) in &normal_matched {
+                let rule = &self.rules[i];
+                if rule.normal_flags.has_custom_properties {
+                    collect_custom(&rule.normal_decls);
+                }
+            }
+            if inline_normal_flags.has_custom_properties {
+                collect_custom(&inline_normal);
+            }
+            for &(_, _, i) in &important_matched {
+                let rule = &self.rules[i];
+                if rule.important_flags.has_custom_properties {
+                    collect_custom(&rule.important_decls);
+                }
+            }
+            if inline_important_flags.has_custom_properties {
+                collect_custom(&inline_important);
+            }
+
+            let mut resolved_props = parent_props.clone();
+            for (name, registration) in &self.registered_custom_properties {
+                if registration.inherits && resolved_props.contains_key(name) {
+                    continue;
+                }
+                if let Some(initial) = &registration.initial_value {
+                    resolved_props.insert(name.clone(), initial.clone());
                 } else {
-                    props.remove(&k);
+                    resolved_props.remove(name);
                 }
-            };
-            match v.trim().to_ascii_lowercase().as_str() {
-                "initial" => set_initial(&mut resolved_props),
-                "inherit" => inherit(&mut resolved_props),
-                "unset" | "revert" | "revert-layer"
-                    if registration.is_some_and(|entry| !entry.inherits) =>
-                {
-                    set_initial(&mut resolved_props);
-                }
-                "unset" | "revert" | "revert-layer" => inherit(&mut resolved_props),
-                _ => {
-                    let valid = registration.is_none_or(|entry| {
-                        substitute_var_value(&v, &resolved_props, 0)
-                            .is_some_and(|value| registered_value_matches(entry, &value))
-                    });
-                    if valid {
-                        resolved_props.insert(k, v);
+            }
+            let registration_changed_props = resolved_props != *parent_props;
+            let has_own = !own.is_empty();
+            let mut own_names = std::collections::HashSet::new();
+            for (k, v) in own {
+                own_names.insert(k.clone());
+                let registration = self.registered_custom_properties.get(&k);
+                let set_initial = |props: &mut HashMap<String, String>| {
+                    if let Some(initial) =
+                        registration.and_then(|entry| entry.initial_value.as_ref())
+                    {
+                        props.insert(k.clone(), initial.clone());
                     } else {
+                        props.remove(&k);
+                    }
+                };
+                let inherit = |props: &mut HashMap<String, String>| {
+                    if let Some(inherited) = parent_props.get(&k) {
+                        props.insert(k.clone(), inherited.clone());
+                    } else if let Some(initial) =
+                        registration.and_then(|entry| entry.initial_value.as_ref())
+                    {
+                        props.insert(k.clone(), initial.clone());
+                    } else {
+                        props.remove(&k);
+                    }
+                };
+                match v.trim().to_ascii_lowercase().as_str() {
+                    "initial" => set_initial(&mut resolved_props),
+                    "inherit" => inherit(&mut resolved_props),
+                    "unset" | "revert" | "revert-layer"
+                        if registration.is_some_and(|entry| !entry.inherits) =>
+                    {
                         set_initial(&mut resolved_props);
                     }
+                    "unset" | "revert" | "revert-layer" => inherit(&mut resolved_props),
+                    _ => {
+                        let valid = registration.is_none_or(|entry| {
+                            substitute_var_value(&v, &resolved_props, 0)
+                                .is_some_and(|value| registered_value_matches(entry, &value))
+                        });
+                        if valid {
+                            resolved_props.insert(k, v);
+                        } else {
+                            set_initial(&mut resolved_props);
+                        }
+                    }
                 }
             }
-        }
-        // Custom properties inherit their computed value, not their original
-        // token stream. Resolve only declarations won on this element against
-        // the complete same-element environment (so forward references work),
-        // then pass those substituted values to descendants. Re-resolving an
-        // inherited `--b:var(--a)` after a child overrides `--a` is observably
-        // wrong: browsers keep the parent's already-computed `--b`.
-        let resolution_environment = resolved_props.clone();
-        for name in own_names {
-            let Some(value) = resolution_environment.get(&name) else {
-                continue;
-            };
-            if let Some(computed) = substitute_var_value(value, &resolution_environment, 0) {
-                resolved_props.insert(name, computed);
-            } else if let Some(initial) = self
-                .registered_custom_properties
-                .get(&name)
-                .and_then(|entry| entry.initial_value.clone())
-            {
-                resolved_props.insert(name, initial);
-            } else {
-                resolved_props.remove(&name);
+            // Custom properties inherit their computed value, not their original
+            // token stream. Resolve only declarations won on this element against
+            // the complete same-element environment (so forward references work),
+            // then pass those substituted values to descendants. Re-resolving an
+            // inherited `--b:var(--a)` after a child overrides `--a` is observably
+            // wrong: browsers keep the parent's already-computed `--b`.
+            let resolution_environment = resolved_props.clone();
+            for name in own_names {
+                let Some(value) = resolution_environment.get(&name) else {
+                    continue;
+                };
+                if let Some(computed) = substitute_var_value(value, &resolution_environment, 0) {
+                    resolved_props.insert(name, computed);
+                } else if let Some(initial) = self
+                    .registered_custom_properties
+                    .get(&name)
+                    .and_then(|entry| entry.initial_value.clone())
+                {
+                    resolved_props.insert(name, initial);
+                } else {
+                    resolved_props.remove(&name);
+                }
             }
-        }
-        let effective = if has_own || registration_changed_props {
-            Some(resolved_props)
-        } else {
-            None
+            if has_own || registration_changed_props {
+                Some(resolved_props)
+            } else {
+                None
+            }
         };
         let props = effective.as_ref().unwrap_or(parent_props);
 
@@ -1298,46 +1686,59 @@ impl Stylesheet {
         // across the complete author cascade before applying any color-valued
         // property. The style starts with its inherited scheme.
         for &(_, _, i) in &normal_matched {
+            let rule = &self.rules[i];
+            if !rule.normal_flags.has_color_scheme {
+                continue;
+            }
             let expanded =
-                substitute_declarations(&self.rules[i].normal_decls, props);
+                substitute_declarations(&rule.normal_decls, props, rule.normal_flags.has_var);
             crate::style::apply_color_scheme_declarations_from(
                 style,
                 &expanded,
                 inherited_color_scheme_dark,
             );
         }
-        let expanded = substitute_declarations(&inline_normal, props);
-        crate::style::apply_color_scheme_declarations_from(
-            style,
-            &expanded,
-            inherited_color_scheme_dark,
-        );
+        if inline_normal_flags.has_color_scheme {
+            let expanded =
+                substitute_declarations(&inline_normal, props, inline_normal_flags.has_var);
+            crate::style::apply_color_scheme_declarations_from(
+                style,
+                &expanded,
+                inherited_color_scheme_dark,
+            );
+        }
         for &(_, _, i) in &important_matched {
+            let rule = &self.rules[i];
+            if !rule.important_flags.has_color_scheme {
+                continue;
+            }
             let expanded =
-                substitute_declarations(&self.rules[i].important_decls, props);
+                substitute_declarations(&rule.important_decls, props, rule.important_flags.has_var);
             crate::style::apply_color_scheme_declarations_from(
                 style,
                 &expanded,
                 inherited_color_scheme_dark,
             );
         }
-        let expanded = substitute_declarations(&inline_important, props);
-        crate::style::apply_color_scheme_declarations_from(
-            style,
-            &expanded,
-            inherited_color_scheme_dark,
-        );
+        if inline_important_flags.has_color_scheme {
+            let expanded =
+                substitute_declarations(&inline_important, props, inline_important_flags.has_var);
+            crate::style::apply_color_scheme_declarations_from(
+                style,
+                &expanded,
+                inherited_color_scheme_dark,
+            );
+        }
 
         // Pass 2: apply normal declarations with `var()` substituted against
         // the resolved custom-property map.
         for &(_, _, i) in &normal_matched {
-            let expanded = substitute_declarations(&self.rules[i].normal_decls, props);
-            crate::style::apply_declarations_with_locked_color_scheme(
-                style,
-                &expanded,
-            );
+            let rule = &self.rules[i];
+            let expanded =
+                substitute_declarations(&rule.normal_decls, props, rule.normal_flags.has_var);
+            crate::style::apply_declarations_with_locked_color_scheme(style, &expanded);
         }
-        let expanded = substitute_declarations(&inline_normal, props);
+        let expanded = substitute_declarations(&inline_normal, props, inline_normal_flags.has_var);
         crate::style::apply_declarations_with_locked_color_scheme(style, &expanded);
 
         // Animation control properties from author !important participate in
@@ -1345,33 +1746,54 @@ impl Stylesheet {
         // important author origin. Resolve those controls on a temporary style
         // before sampling, then let the ordinary important pass override the
         // sampled values where appropriate.
-        let mut animation_style = style.clone();
-        for &(_, _, i) in &important_matched {
-            let expanded = substitute_declarations(&self.rules[i].important_decls, props);
-            crate::style::apply_animation_declarations(&mut animation_style, &expanded);
-        }
-        let expanded = substitute_declarations(&inline_important, props);
-        crate::style::apply_animation_declarations(&mut animation_style, &expanded);
-        if let Some(name) = animation_style.animation_name.as_deref() {
-            if let Some(keyframes) = self.keyframes.get(name) {
-                sample_animation_properties(
-                    keyframes,
-                    style,
-                    &animation_style.animation_timing,
-                    self.animation_sample_time,
+        let important_has_animation = inline_important_flags.has_animation
+            || important_matched
+                .iter()
+                .any(|&(_, _, i)| self.rules[i].important_flags.has_animation);
+        if !self.keyframes.is_empty() && (style.animation_name.is_some() || important_has_animation)
+        {
+            let mut animation_style = style.clone();
+            for &(_, _, i) in &important_matched {
+                let rule = &self.rules[i];
+                if !rule.important_flags.has_animation {
+                    continue;
+                }
+                let expanded = substitute_declarations(
+                    &rule.important_decls,
                     props,
+                    rule.important_flags.has_var,
                 );
+                crate::style::apply_animation_declarations(&mut animation_style, &expanded);
+            }
+            if inline_important_flags.has_animation {
+                let expanded = substitute_declarations(
+                    &inline_important,
+                    props,
+                    inline_important_flags.has_var,
+                );
+                crate::style::apply_animation_declarations(&mut animation_style, &expanded);
+            }
+            if let Some(name) = animation_style.animation_name.as_deref() {
+                if let Some(keyframes) = self.keyframes.get(name) {
+                    sample_animation_properties(
+                        keyframes,
+                        style,
+                        &animation_style.animation_timing,
+                        self.animation_sample_time,
+                        props,
+                    );
+                }
             }
         }
 
         for &(_, _, i) in &important_matched {
-            let expanded = substitute_declarations(&self.rules[i].important_decls, props);
-            crate::style::apply_declarations_with_locked_color_scheme(
-                style,
-                &expanded,
-            );
+            let rule = &self.rules[i];
+            let expanded =
+                substitute_declarations(&rule.important_decls, props, rule.important_flags.has_var);
+            crate::style::apply_declarations_with_locked_color_scheme(style, &expanded);
         }
-        let expanded = substitute_declarations(&inline_important, props);
+        let expanded =
+            substitute_declarations(&inline_important, props, inline_important_flags.has_var);
         crate::style::apply_declarations_with_locked_color_scheme(style, &expanded);
         effective
     }
@@ -1408,12 +1830,13 @@ fn compile_keyframe_body(css: &str) -> Keyframes {
         let (normal, _) = crate::style::partition_declarations(&stop.declarations);
         let mut declarations = HashMap::<AnimatedProperty, AnimatedDeclaration>::new();
         for raw in crate::style::split_declarations(&normal) {
-            let Some((name, value)) = raw.trim().split_once(':') else { continue };
+            let Some((name, value)) = raw.trim().split_once(':') else {
+                continue;
+            };
             let name = name.trim().to_ascii_lowercase();
             let value = value.trim();
             if value.is_empty()
-                || (!value.contains("var(")
-                    && !supports_animation_declaration(&name, value))
+                || (!value.contains("var(") && !supports_animation_declaration(&name, value))
             {
                 continue;
             }
@@ -1625,11 +2048,7 @@ fn sample_property_track(
             continue;
         }
         let mut endpoint = underlying.clone();
-        crate::style::apply_animation_property_value(
-            &mut endpoint,
-            &stop.declaration.name,
-            &value,
-        );
+        crate::style::apply_animation_property_value(&mut endpoint, &stop.declaration.name, &value);
         if let Some(value) = animation_value_from_style(property, &endpoint) {
             resolved.push((stop.offset, value));
         }
@@ -1668,10 +2087,9 @@ fn animation_value_from_style(
     match property {
         Transform => Some(AnimationValue::Transform(style.transform_ops.clone())),
         Translate => {
-            let (x, y) = style.individual_translate.unwrap_or((
-                crate::Dimension::Px(0.0),
-                crate::Dimension::Px(0.0),
-            ));
+            let (x, y) = style
+                .individual_translate
+                .unwrap_or((crate::Dimension::Px(0.0), crate::Dimension::Px(0.0)));
             Some(AnimationValue::Translate(
                 crate::TransformLength {
                     value: x,
@@ -1719,12 +2137,14 @@ fn animation_value_from_style(
         }
         Top | Right | Bottom | Left => {
             let index = physical_side_index(property);
-            Some(AnimationValue::Length(match &style.inset_expressions[index] {
-                Some(expression) => AnimatedLength::Expression(expression.clone()),
-                None => style.inset[index]
-                    .map(AnimatedLength::Dimension)
-                    .unwrap_or(AnimatedLength::Auto),
-            }))
+            Some(AnimationValue::Length(
+                match &style.inset_expressions[index] {
+                    Some(expression) => AnimatedLength::Expression(expression.clone()),
+                    None => style.inset[index]
+                        .map(AnimatedLength::Dimension)
+                        .unwrap_or(AnimatedLength::Auto),
+                },
+            ))
         }
         MarginTop | MarginRight | MarginBottom | MarginLeft => {
             let index = physical_side_index(property);
@@ -1753,9 +2173,7 @@ fn animation_value_from_style(
         Opacity => Some(AnimationValue::Number(
             style.opacity.unwrap_or(1.0).clamp(0.0, 1.0),
         )),
-        Color => Some(AnimationValue::Color(
-            style.color.unwrap_or([0, 0, 0, 255]),
-        )),
+        Color => Some(AnimationValue::Color(style.color.unwrap_or([0, 0, 0, 255]))),
         BackgroundColor => Some(AnimationValue::Color(
             style.background_color.unwrap_or([0, 0, 0, 0]),
         )),
@@ -1809,7 +2227,10 @@ fn apply_animation_value(
             style.individual_scale = Some((x, y));
             set_animation_containing_block_trigger(style, crate::CB_TRIGGER_SCALE, true);
         }
-        (Width | Height | MinWidth | MinHeight | MaxWidth | MaxHeight, AnimationValue::Length(value)) => {
+        (
+            Width | Height | MinWidth | MinHeight | MaxWidth | MaxHeight,
+            AnimationValue::Length(value),
+        ) => {
             set_size_animation_value(style, property, value);
         }
         (Top | Right | Bottom | Left, AnimationValue::Length(value)) => {
@@ -1820,7 +2241,10 @@ fn apply_animation_value(
             let index = physical_side_index(property);
             set_margin_animation_value(style, index, value);
         }
-        (PaddingTop | PaddingRight | PaddingBottom | PaddingLeft, AnimationValue::Length(value)) => {
+        (
+            PaddingTop | PaddingRight | PaddingBottom | PaddingLeft,
+            AnimationValue::Length(value),
+        ) => {
             let index = physical_side_index(property);
             set_padding_animation_value(style, index, value);
         }
@@ -1834,9 +2258,7 @@ fn apply_animation_value(
             style.opacity = Some(value.clamp(0.0, 1.0));
         }
         (Color, AnimationValue::Color(value)) => style.color = Some(value),
-        (BackgroundColor, AnimationValue::Color(value)) => {
-            style.background_color = Some(value)
-        }
+        (BackgroundColor, AnimationValue::Color(value)) => style.background_color = Some(value),
         (BorderTopColor, AnimationValue::Color(value)) => {
             style.border_model.colors.top = Some(value)
         }
@@ -1858,11 +2280,10 @@ fn apply_animation_value(
         _ => return,
     }
     let colors = style.border_model.colors;
-    style.border_color = (colors.top == colors.right
-        && colors.top == colors.bottom
-        && colors.top == colors.left)
-        .then_some(colors.top)
-        .flatten();
+    style.border_color =
+        (colors.top == colors.right && colors.top == colors.bottom && colors.top == colors.left)
+            .then_some(colors.top)
+            .flatten();
 }
 
 fn interpolate_animation_value(
@@ -1901,10 +2322,9 @@ fn interpolate_animation_value(
                 from_y + (to_y - from_y) * position,
             )
         }
-        (
-            AnimationValue::BackgroundPosition(from),
-            AnimationValue::BackgroundPosition(to),
-        ) => AnimationValue::BackgroundPosition(from.interpolate(*to, position)),
+        (AnimationValue::BackgroundPosition(from), AnimationValue::BackgroundPosition(to)) => {
+            AnimationValue::BackgroundPosition(from.interpolate(*to, position))
+        }
         (AnimationValue::Visibility(from), AnimationValue::Visibility(to)) => {
             // visibility has a special discrete interpolation: if either end
             // is visible, every interior value is visible.
@@ -2080,11 +2500,7 @@ fn set_padding_animation_value(style: &mut LayoutStyle, index: usize, value: Ani
     }
 }
 
-fn set_gap_animation_value(
-    style: &mut LayoutStyle,
-    row: bool,
-    value: AnimatedLength,
-) {
+fn set_gap_animation_value(style: &mut LayoutStyle, row: bool, value: AnimatedLength) {
     let (slot, expression) = if row {
         (&mut style.row_gap, &mut style.row_gap_expression)
     } else {
@@ -2195,11 +2611,10 @@ fn interpolate_transform_length(
         }),
         (Some(from_expression), Some(to_expression)) if from_expression == to_expression => {
             Some(crate::TransformLength {
-                value: interpolate_dimension(from.value, to.value, position)
-                    .unwrap_or(from.value),
+                value: interpolate_dimension(from.value, to.value, position).unwrap_or(from.value),
                 expression: Some(from_expression.clone()),
             })
-        },
+        }
         _ => None,
     }
 }
@@ -2238,10 +2653,9 @@ fn interpolate_transform_list(
 
 fn identity_transform_operation(operation: &crate::TransformOp) -> crate::TransformOp {
     match operation {
-        crate::TransformOp::Translate(x, y) => crate::TransformOp::Translate(
-            zero_transform_length(x),
-            zero_transform_length(y),
-        ),
+        crate::TransformOp::Translate(x, y) => {
+            crate::TransformOp::Translate(zero_transform_length(x), zero_transform_length(y))
+        }
         crate::TransformOp::Scale(_, _) => crate::TransformOp::Scale(1.0, 1.0),
         crate::TransformOp::Rotate(_) => crate::TransformOp::Rotate(0.0),
         crate::TransformOp::Skew(_, _) => crate::TransformOp::Skew(0.0, 0.0),
@@ -2273,12 +2687,13 @@ fn interpolate_transform_operation(
 ) -> Option<crate::TransformOp> {
     let lerp = |from: f32, to: f32| from + (to - from) * position;
     Some(match (from, to) {
-        (crate::TransformOp::Translate(from_x, from_y), crate::TransformOp::Translate(to_x, to_y)) => {
-            crate::TransformOp::Translate(
-                interpolate_transform_length(from_x, to_x, position)?,
-                interpolate_transform_length(from_y, to_y, position)?,
-            )
-        }
+        (
+            crate::TransformOp::Translate(from_x, from_y),
+            crate::TransformOp::Translate(to_x, to_y),
+        ) => crate::TransformOp::Translate(
+            interpolate_transform_length(from_x, to_x, position)?,
+            interpolate_transform_length(from_y, to_y, position)?,
+        ),
         (crate::TransformOp::Scale(from_x, from_y), crate::TransformOp::Scale(to_x, to_y)) => {
             crate::TransformOp::Scale(lerp(*from_x, *to_x), lerp(*from_y, *to_y))
         }
@@ -2302,11 +2717,7 @@ fn interpolate_transform_operation(
     })
 }
 
-fn set_animation_containing_block_trigger(
-    style: &mut LayoutStyle,
-    trigger: u16,
-    enabled: bool,
-) {
+fn set_animation_containing_block_trigger(style: &mut LayoutStyle, trigger: u16, enabled: bool) {
     if enabled {
         style.containing_block_triggers |= trigger;
     } else {
@@ -2366,7 +2777,11 @@ fn animation_directed_progress(
     };
 
     let overall_progress = if duration == 0.0 {
-        if phase == AnimationPhase::Before { 0.0 } else { iterations }
+        if phase == AnimationPhase::Before {
+            0.0
+        } else {
+            iterations
+        }
     } else {
         active_time / duration
     };
@@ -2378,10 +2793,7 @@ fn animation_directed_progress(
     }
     let mut current_iteration = overall_progress.floor().max(0.0);
     let mut simple_progress = overall_progress.rem_euclid(1.0);
-    if phase == AnimationPhase::After
-        && iterations > 0.0
-        && simple_progress == 0.0
-    {
+    if phase == AnimationPhase::After && iterations > 0.0 && simple_progress == 0.0 {
         simple_progress = 1.0;
         current_iteration = (current_iteration - 1.0).max(0.0);
     }
@@ -2443,7 +2855,17 @@ fn normalized_keyframe_offsets(stops: &[KeyframeStop]) -> Vec<(f32, &KeyframeSto
 /// Resolve variables one declaration at a time. An invalid variable poisons
 /// its entire declaration at computed-value time, but must not erase unrelated
 /// declarations in the same rule.
-fn substitute_declarations(css: &str, props: &HashMap<String, String>) -> String {
+fn substitute_declarations<'a>(
+    css: &'a str,
+    props: &HashMap<String, String>,
+    has_var: bool,
+) -> Cow<'a, str> {
+    // Partitioned rule streams are already normalized declaration blocks. If
+    // no value contains var(), applying them directly is both equivalent and
+    // avoids a String plus one split/serialize pass for every matched rule.
+    if !has_var {
+        return Cow::Borrowed(css);
+    }
     let mut expanded = String::new();
     for declaration in crate::style::split_declarations(css) {
         let Some((name, value)) = declaration.split_once(':') else {
@@ -2457,7 +2879,7 @@ fn substitute_declarations(css: &str, props: &HashMap<String, String>) -> String
         expanded.push_str(&value);
         expanded.push(';');
     }
-    expanded
+    Cow::Owned(expanded)
 }
 
 /// Substitute every `var(--name, fallback?)` in one property value. `None`
@@ -2553,8 +2975,7 @@ fn css_substitution_boundary_merges(left: char, right: char) -> bool {
         return false;
     }
     (name(left) && name(right))
-        || ((left.is_ascii_digit() || left == '.')
-            && (right == '.' || right == '%' || name(right)))
+        || ((left.is_ascii_digit() || left == '.') && (right == '.' || right == '%' || name(right)))
         || (matches!(left, '#' | '@') && name(right))
         || (!left.is_ascii_digit() && name(left) && right == '(')
         || (left == '+' && (right.is_ascii_digit() || right == '.'))
@@ -2593,7 +3014,9 @@ fn extract_content(
 ) -> Option<Option<Vec<crate::GeneratedContentItem>>> {
     let mut result = None;
     for raw in crate::style::split_declarations(decls) {
-        let Some((name, value)) = raw.split_once(':') else { continue };
+        let Some((name, value)) = raw.split_once(':') else {
+            continue;
+        };
         if !name.trim().eq_ignore_ascii_case("content") {
             continue;
         }
@@ -2953,16 +3376,16 @@ pub fn parse_stylesheet(css: &str) -> Vec<(String, String)> {
     parse_stylesheet_for_viewport(css, (1280.0, 720.0))
 }
 
-fn parse_stylesheet_for_viewport(
-    css: &str,
-    viewport: (f32, f32),
-) -> Vec<(String, String)> {
+fn parse_stylesheet_for_viewport(css: &str, viewport: (f32, f32)) -> Vec<(String, String)> {
     let mut conditions = vec![ContainerConditionNode {
         parent: ContainerConditionId::NONE,
         alternatives: Vec::new(),
     }];
     parse_stylesheet_for_viewport_preserving_containers(
-        css, viewport, &mut conditions, ContainerConditionId::NONE,
+        css,
+        viewport,
+        &mut conditions,
+        ContainerConditionId::NONE,
     )
     .into_iter()
     // This legacy tuple API cannot express conditional context. Keep its
@@ -3041,9 +3464,15 @@ fn parse_stylesheet_for_viewport_preserving_containers_in_layer(
                 let decls = current_decls.trim();
                 if let Some(at) = sel.strip_prefix('@') {
                     flush_at_rule(
-                        at, sel, decls, &mut rules, viewport,
-                        container_conditions, container_condition_id,
-                        layers, current_layer.as_ref(),
+                        at,
+                        sel,
+                        decls,
+                        &mut rules,
+                        viewport,
+                        container_conditions,
+                        container_condition_id,
+                        layers,
+                        current_layer.as_ref(),
                     );
                 } else {
                     // The body may contain nested rules (CSS Nesting, ubiquitous
@@ -3051,9 +3480,14 @@ fn parse_stylesheet_for_viewport_preserving_containers_in_layer(
                     // Flatten them against this selector; denest also handles the
                     // no-nesting case (just emits the rule's own declarations).
                     denest(
-                        sel, decls, &mut rules, viewport,
-                        container_conditions, container_condition_id,
-                        layers, current_layer.as_ref(),
+                        sel,
+                        decls,
+                        &mut rules,
+                        viewport,
+                        container_conditions,
+                        container_condition_id,
+                        layers,
+                        current_layer.as_ref(),
                     );
                 }
                 current_selector.clear();
@@ -3095,25 +3529,29 @@ fn flush_at_rule(
 ) {
     if let Some(prelude) = at_rule_prelude(at, "media") {
         if media_query_applies_for_viewport(prelude, viewport) {
-            rules.extend(parse_stylesheet_for_viewport_preserving_containers_in_layer(
-                inner,
-                viewport,
-                container_conditions,
-                container_condition_id,
-                layers,
-                current_layer.cloned(),
-            ));
+            rules.extend(
+                parse_stylesheet_for_viewport_preserving_containers_in_layer(
+                    inner,
+                    viewport,
+                    container_conditions,
+                    container_condition_id,
+                    layers,
+                    current_layer.cloned(),
+                ),
+            );
         }
     } else if let Some(prelude) = at_rule_prelude(at, "supports") {
         if supports_condition_applies(prelude) {
-            rules.extend(parse_stylesheet_for_viewport_preserving_containers_in_layer(
-                inner,
-                viewport,
-                container_conditions,
-                container_condition_id,
-                layers,
-                current_layer.cloned(),
-            ));
+            rules.extend(
+                parse_stylesheet_for_viewport_preserving_containers_in_layer(
+                    inner,
+                    viewport,
+                    container_conditions,
+                    container_condition_id,
+                    layers,
+                    current_layer.cloned(),
+                ),
+            );
         }
     } else if let Some(prelude) = at_rule_prelude(at, "container") {
         if let Some(alternatives) = parse_container_query_list(prelude) {
@@ -3125,14 +3563,16 @@ fn flush_at_rule(
                 parent: container_condition_id,
                 alternatives,
             });
-            rules.extend(parse_stylesheet_for_viewport_preserving_containers_in_layer(
-                inner,
-                viewport,
-                container_conditions,
-                id,
-                layers,
-                current_layer.cloned(),
-            ));
+            rules.extend(
+                parse_stylesheet_for_viewport_preserving_containers_in_layer(
+                    inner,
+                    viewport,
+                    container_conditions,
+                    id,
+                    layers,
+                    current_layer.cloned(),
+                ),
+            );
         }
     } else if let Some((name, prefixed)) = at_rule_prelude(at, "keyframes")
         .map(|name| (name, false))
@@ -3174,14 +3614,16 @@ fn flush_at_rule(
         } else {
             return;
         };
-        rules.extend(parse_stylesheet_for_viewport_preserving_containers_in_layer(
-            inner,
-            viewport,
-            container_conditions,
-            container_condition_id,
-            layers,
-            Some(layer),
-        ));
+        rules.extend(
+            parse_stylesheet_for_viewport_preserving_containers_in_layer(
+                inner,
+                viewport,
+                container_conditions,
+                container_condition_id,
+                layers,
+                Some(layer),
+            ),
+        );
     }
     // Other at-rules (@font-face, @import, ...) carry no
     // layout-relevant rules for us, so drop them.
@@ -3192,7 +3634,9 @@ fn parse_property_registration(descriptors: &str) -> Option<RegisteredCustomProp
     let mut inherits = None;
     let mut initial_value = None;
     for declaration in crate::style::split_declarations(descriptors) {
-        let Some((name, value)) = declaration.split_once(':') else { continue };
+        let Some((name, value)) = declaration.split_once(':') else {
+            continue;
+        };
         let value = value.trim();
         match name.trim().to_ascii_lowercase().as_str() {
             "syntax" => {
@@ -3255,13 +3699,17 @@ fn registered_value_matches(registration: &RegisteredCustomProperty, value: &str
         "<number>" => value.parse::<f32>().ok().is_some_and(f32::is_finite),
         "<color>" => crate::style::parse_color(value).is_some(),
         "<length>" => {
-            if value.parse::<f32>().ok().is_some_and(|number| number == 0.0) {
+            if value
+                .parse::<f32>()
+                .ok()
+                .is_some_and(|number| number == 0.0)
+            {
                 return true;
             }
             let lower = value.to_ascii_lowercase();
             [
-                "rem", "em", "ex", "vmin", "vmax", "dvw", "svw", "lvw", "dvh",
-                "svh", "lvh", "vw", "vh", "px", "pt",
+                "rem", "em", "ex", "vmin", "vmax", "dvw", "svw", "lvw", "dvh", "svh", "lvh", "vw",
+                "vh", "px", "pt",
             ]
             .iter()
             .any(|unit| {
@@ -3432,7 +3880,8 @@ fn strip_ascii_keyword<'a>(input: &'a str, keyword: &str) -> Option<&'a str> {
         return None;
     }
     let rest = &input[keyword.len()..];
-    rest.chars().next()
+    rest.chars()
+        .next()
         .filter(|character| character.is_whitespace())
         .map(|_| rest.trim_start())
 }
@@ -3453,12 +3902,24 @@ fn parse_container_size_feature(input: &str) -> Option<ContainerQueryExpr> {
             "min-height" => (ContainerQueryComparison::Min, ContainerQueryAxis::Height),
             "max-height" => (ContainerQueryComparison::Max, ContainerQueryAxis::Height),
             "height" => (ContainerQueryComparison::Equal, ContainerQueryAxis::Height),
-            "min-inline-size" => (ContainerQueryComparison::Min, ContainerQueryAxis::InlineSize),
-            "max-inline-size" => (ContainerQueryComparison::Max, ContainerQueryAxis::InlineSize),
-            "inline-size" => (ContainerQueryComparison::Equal, ContainerQueryAxis::InlineSize),
+            "min-inline-size" => (
+                ContainerQueryComparison::Min,
+                ContainerQueryAxis::InlineSize,
+            ),
+            "max-inline-size" => (
+                ContainerQueryComparison::Max,
+                ContainerQueryAxis::InlineSize,
+            ),
+            "inline-size" => (
+                ContainerQueryComparison::Equal,
+                ContainerQueryAxis::InlineSize,
+            ),
             "min-block-size" => (ContainerQueryComparison::Min, ContainerQueryAxis::BlockSize),
             "max-block-size" => (ContainerQueryComparison::Max, ContainerQueryAxis::BlockSize),
-            "block-size" => (ContainerQueryComparison::Equal, ContainerQueryAxis::BlockSize),
+            "block-size" => (
+                ContainerQueryComparison::Equal,
+                ContainerQueryAxis::BlockSize,
+            ),
             _ => return None,
         };
         return Some(ContainerQueryExpr::Feature(ContainerSizeFeature {
@@ -3499,10 +3960,10 @@ fn parse_container_size_feature(input: &str) -> Option<ContainerQueryExpr> {
             // `10px < width <= 20px` or the fully reversed equivalent.
             // Equality is valid only in a single comparison, and a mixed
             // direction such as `10px < width > 20px` is not a range.
-            let forward = matches!(*lower_operator, "<" | "<=")
-                && matches!(*upper_operator, "<" | "<=");
-            let reverse = matches!(*lower_operator, ">" | ">=")
-                && matches!(*upper_operator, ">" | ">=");
+            let forward =
+                matches!(*lower_operator, "<" | "<=") && matches!(*upper_operator, "<" | "<=");
+            let reverse =
+                matches!(*lower_operator, ">" | ">=") && matches!(*upper_operator, ">" | ">=");
             if !forward && !reverse {
                 return None;
             }
@@ -3564,9 +4025,7 @@ fn split_container_range(input: &str) -> Option<(Vec<&str>, Vec<&str>)> {
 
 fn parse_container_query_length(input: &str) -> Option<ContainerQueryLength> {
     let input = input.trim().to_ascii_lowercase();
-    let number = |value: &str| {
-        value.parse::<f32>().ok().filter(|value| value.is_finite())
-    };
+    let number = |value: &str| value.parse::<f32>().ok().filter(|value| value.is_finite());
     if let Some(value) = input.strip_suffix("rem").and_then(number) {
         return Some(ContainerQueryLength::Rem(value));
     }
@@ -3576,7 +4035,9 @@ fn parse_container_query_length(input: &str) -> Option<ContainerQueryLength> {
     if let Some(value) = input.strip_suffix("px").and_then(number) {
         return Some(ContainerQueryLength::Px(value));
     }
-    number(&input).filter(|value| *value == 0.0).map(ContainerQueryLength::Px)
+    number(&input)
+        .filter(|value| *value == 0.0)
+        .map(ContainerQueryLength::Px)
 }
 
 /// Evaluate the boolean subset of CSS Conditional Rules used by modern
@@ -3785,10 +4246,7 @@ fn split_supports_operator<'a>(condition: &'a str, operator: &str) -> Option<Vec
 /// strips whitespace before scanning: CSS gives no semantic meaning to spaces
 /// inside `(feature: value)`, so it's safe to discard them wholesale rather
 /// than special-case every formatting variant a site might use.
-pub(crate) fn media_query_applies_for_viewport(
-    query: &str,
-    viewport: (f32, f32),
-) -> bool {
+pub(crate) fn media_query_applies_for_viewport(query: &str, viewport: (f32, f32)) -> bool {
     // A media-query list is an OR, not an AND. Evaluate each top-level comma
     // arm independently (commas inside functions such as rgb() / calc() are
     // not list separators). This also keeps an inapplicable `print` arm from
@@ -3798,10 +4256,7 @@ pub(crate) fn media_query_applies_for_viewport(
         .any(|query| single_media_query_applies_for_viewport(query, viewport))
 }
 
-fn single_media_query_applies_for_viewport(
-    query: &str,
-    viewport: (f32, f32),
-) -> bool {
+fn single_media_query_applies_for_viewport(query: &str, viewport: (f32, f32)) -> bool {
     let viewport_w = viewport.0;
     let viewport_h = viewport.1;
     let query = query.trim().strip_prefix("@media").unwrap_or(query).trim();
@@ -4065,7 +4520,9 @@ fn denest(
                     }
                     j += 1;
                 }
-                let inner: String = chars[i + 1..j.saturating_sub(1).max(i + 1)].iter().collect();
+                let inner: String = chars[i + 1..j.saturating_sub(1).max(i + 1)]
+                    .iter()
+                    .collect();
                 let pre = prelude.trim();
                 if let Some(at) = pre.strip_prefix('@') {
                     // A nested at-rule keeps the enclosing selector for its body.
@@ -4255,12 +4712,7 @@ enum LengthAxis {
 /// computed font. Modern utility frameworks deliberately use those units for
 /// breakpoints, so treating only `px` as typed made every `min-width:64rem`
 /// desktop rule unconditional.
-fn extract_length(
-    s: &str,
-    prop: &str,
-    viewport: (f32, f32),
-    axis: LengthAxis,
-) -> Option<f32> {
+fn extract_length(s: &str, prop: &str, viewport: (f32, f32), axis: LengthAxis) -> Option<f32> {
     let start = s.find(prop)? + prop.len();
     let rest = &s[start..];
     if let Some(inner) = rest.strip_prefix("calc(") {
@@ -4289,11 +4741,7 @@ fn extract_length_before(
     parse_length_prefix(value, viewport, axis)
 }
 
-fn parse_length_prefix(
-    input: &str,
-    viewport: (f32, f32),
-    axis: LengthAxis,
-) -> Option<f32> {
+fn parse_length_prefix(input: &str, viewport: (f32, f32), axis: LengthAxis) -> Option<f32> {
     let numeric_len = input
         .char_indices()
         .take_while(|(_, c)| c.is_ascii_digit() || matches!(c, '.' | '+' | '-'))
@@ -4330,11 +4778,7 @@ fn parse_length_prefix(
 }
 
 /// Sum the common media-query `calc()` form (`64rem - 1px`) left to right.
-fn eval_length_sum(
-    expr: &str,
-    viewport: (f32, f32),
-    axis: LengthAxis,
-) -> Option<f32> {
+fn eval_length_sum(expr: &str, viewport: (f32, f32), axis: LengthAxis) -> Option<f32> {
     let mut total = 0.0;
     let mut sign = 1.0;
     let mut term = String::new();
@@ -4427,6 +4871,254 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "release-only cascade microbenchmark"]
+    fn benchmark_sparse_cascade_hot_path() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const RULE_COUNT: usize = 96;
+        const ITERATIONS: usize = 6_000;
+
+        let tree = obscura_dom::parse_html(r#"<div id="target" class="target"></div>"#);
+        let target = tree.get_element_by_id("target").unwrap();
+        let css = (0..RULE_COUNT)
+            .map(|index| {
+                format!(
+                    ".target {{ width:{}px; margin-left:{}px; color:rgb({}, {}, {}) }}",
+                    index + 1,
+                    index % 17,
+                    index % 255,
+                    (index * 3) % 255,
+                    (index * 7) % 255,
+                )
+            })
+            .collect::<String>();
+        let sheet = Stylesheet::parse(&tree, &[css]);
+        let mut matcher = tree.matcher();
+        let classes = vec!["target".to_string()];
+        let parent_props = (0..32)
+            .map(|index| (format!("--inherited-{index}"), format!("{}px", index + 1)))
+            .collect::<HashMap<_, _>>();
+
+        let started = Instant::now();
+        for _ in 0..ITERATIONS {
+            let mut style = LayoutStyle::default();
+            let effective = sheet.apply(
+                &tree,
+                &mut matcher,
+                target,
+                Some("target"),
+                &classes,
+                "div",
+                &mut style,
+                &parent_props,
+                None,
+            );
+            black_box((&style, effective));
+        }
+        let elapsed = started.elapsed();
+        eprintln!(
+            "sparse cascade: {ITERATIONS} iterations, {} ns/apply ({elapsed:?})",
+            elapsed.as_nanos() / ITERATIONS as u128,
+        );
+    }
+
+    #[test]
+    fn declaration_stream_flags_guard_hot_passes_and_borrow_plain_rules() {
+        let plain = "width:12px;color:red;";
+        let plain_flags = declaration_stream_flags(plain);
+        assert_eq!(plain_flags, DeclarationStreamFlags::default());
+        assert!(matches!(
+            substitute_declarations(plain, &HashMap::new(), plain_flags.has_var),
+            Cow::Borrowed(value) if value == plain
+        ));
+
+        let dynamic = "--tone:dark;color-scheme:light dark;animation-name:pulse;color:var(--tone);";
+        let flags = declaration_stream_flags(dynamic);
+        assert!(flags.has_custom_properties);
+        assert!(flags.has_var);
+        assert!(flags.has_color_scheme);
+        assert!(flags.has_animation);
+        let props = HashMap::from([("--tone".to_string(), "rebeccapurple".to_string())]);
+        let expanded = substitute_declarations(dynamic, &props, flags.has_var);
+        assert!(matches!(&expanded, Cow::Owned(_)));
+        assert!(expanded.contains("color:rebeccapurple;"));
+
+        let similarly_named = declaration_stream_flags(
+            "my-color-scheme:dark;animationish:fade;background:variety(red);",
+        );
+        assert!(!similarly_named.has_var);
+        assert!(!similarly_named.has_color_scheme);
+        assert!(!similarly_named.has_animation);
+    }
+
+    #[test]
+    fn root_rules_use_the_document_element_bucket_without_losing_is_arms() {
+        let tree = obscura_dom::parse_html(
+            r#"<html><body><div id="card" class="card"></div></body></html>"#,
+        );
+        let sheet = Stylesheet::parse(
+            &tree,
+            &[r#"
+                :root { width:321px }
+                :is(:root, .card) { height:123px }
+            "#
+            .to_string()],
+        );
+        let (_, _, class_keys, _, _, universal) = sheet.debug_stats();
+        assert_eq!(class_keys, 1);
+        assert_eq!(
+            universal, 0,
+            ":root must not remain in the universal bucket"
+        );
+
+        let root = tree.query_selector("html").unwrap().unwrap();
+        let body = tree.query_selector("body").unwrap().unwrap();
+        let card = tree.get_element_by_id("card").unwrap();
+        let mut matcher = tree.matcher();
+        let mut root_style = LayoutStyle::default();
+        sheet.apply(
+            &tree,
+            &mut matcher,
+            root,
+            None,
+            &[],
+            "html",
+            &mut root_style,
+            &HashMap::new(),
+            None,
+        );
+        assert_eq!(root_style.width, crate::Dimension::Px(321.0));
+        assert_eq!(root_style.height, crate::Dimension::Px(123.0));
+
+        let mut body_style = LayoutStyle::default();
+        sheet.apply(
+            &tree,
+            &mut matcher,
+            body,
+            None,
+            &[],
+            "body",
+            &mut body_style,
+            &HashMap::new(),
+            None,
+        );
+        assert_ne!(body_style.height, crate::Dimension::Px(123.0));
+
+        let mut card_style = LayoutStyle::default();
+        sheet.apply(
+            &tree,
+            &mut matcher,
+            card,
+            Some("card"),
+            &["card".to_string()],
+            "div",
+            &mut card_style,
+            &HashMap::new(),
+            None,
+        );
+        assert_eq!(card_style.height, crate::Dimension::Px(123.0));
+    }
+
+    #[test]
+    fn pseudo_rules_use_subject_buckets_and_dense_dedup() {
+        let tree = obscura_dom::parse_html(
+            r#"<div id="both" class="alpha" data-kind="both"></div>
+                <div id="attribute" data-kind="attribute"></div>"#,
+        );
+        let sheet = Stylesheet::parse(
+            &tree,
+            &[r#"
+                :is(.alpha, [data-kind])::before { content:"indexed" }
+                .missing::before { content:"wrong" }
+            "#
+            .to_string()],
+        );
+
+        assert_eq!(sheet.before_rules.rules.len(), 2);
+        assert_eq!(sheet.before_rules.by_class.get("alpha").unwrap(), &[0]);
+        assert_eq!(
+            sheet.before_rules.by_attribute.get("data-kind").unwrap(),
+            &[0]
+        );
+        assert_eq!(sheet.before_rules.rules[0].candidate_slot, 0);
+        assert_eq!(sheet.before_rules.candidate_slot_count, 1);
+
+        for id in ["both", "attribute"] {
+            let target = tree.get_element_by_id(id).unwrap();
+            let before = sheet
+                .pseudo_styles(
+                    &tree,
+                    &mut tree.matcher(),
+                    target,
+                    &HashMap::new(),
+                    &LayoutStyle::default(),
+                )
+                .0
+                .expect("the indexed pseudo selector should match");
+            assert_eq!(before.before_content.as_deref(), Some("indexed"));
+        }
+    }
+
+    #[test]
+    fn pseudo_candidate_bucket_does_not_replace_full_selector_matching() {
+        let tree = obscura_dom::parse_html(r#"<div id="target" class="alpha blocked"></div>"#);
+        let target = tree.get_element_by_id("target").unwrap();
+        let sheet = Stylesheet::parse(
+            &tree,
+            &[r#"
+                .alpha::before { content:"base" }
+                .alpha:not(.blocked)::before { content:"wrong" }
+            "#
+            .to_string()],
+        );
+        let before = sheet
+            .pseudo_styles(
+                &tree,
+                &mut tree.matcher(),
+                target,
+                &HashMap::new(),
+                &LayoutStyle::default(),
+            )
+            .0
+            .expect("the base pseudo selector should match");
+        assert_eq!(before.before_content.as_deref(), Some("base"));
+    }
+
+    #[test]
+    fn disjoint_functional_subjects_use_all_buckets_and_one_dense_slot() {
+        let tree = obscura_dom::parse_html(
+            r#"<div id="target" class="alpha" data-kind="both"></div><div data-kind="attribute"></div>"#,
+        );
+        let target = tree.get_element_by_id("target").unwrap();
+        let sheet = Stylesheet::parse(
+            &tree,
+            &[":is(.alpha, [data-kind]) { width:47px }".to_string()],
+        );
+
+        assert!(sheet.universal.is_empty());
+        assert_eq!(sheet.by_class.get("alpha").unwrap(), &[0]);
+        assert_eq!(sheet.by_attribute.get("data-kind").unwrap(), &[0]);
+        assert_eq!(sheet.rules[0].candidate_slot, 0);
+        assert_eq!(sheet.candidate_slot_count, 1);
+
+        let mut matcher = tree.matcher();
+        let mut style = LayoutStyle::default();
+        sheet.apply(
+            &tree,
+            &mut matcher,
+            target,
+            Some("target"),
+            &["alpha".to_string()],
+            "div",
+            &mut style,
+            &HashMap::new(),
+            None,
+        );
+        assert_eq!(style.width, crate::Dimension::Px(47.0));
+    }
+
+    #[test]
     fn layer_order_statement_beats_block_source_order() {
         let (style, _, _) = cascade_layer_target(
             &[r#"
@@ -4459,21 +5151,74 @@ mod tests {
             @layer reset { .target { width:100px !important } }
             #target { width:300px !important }
         "#;
-        let (style, _, _) = cascade_layer_target(
-            &[css],
-            Some("width:500px"),
-        );
+        let (style, _, _) = cascade_layer_target(&[css], Some("width:500px"));
         assert_eq!(
             style.width,
             crate::Dimension::Px(100.0),
             "the earliest layered important declaration beats later layers, unlayered author rules, and normal inline style"
         );
-        let (inline_important, _, _) =
-            cascade_layer_target(&[css], Some("width:500px !important"));
+        let (inline_important, _, _) = cascade_layer_target(&[css], Some("width:500px !important"));
         assert_eq!(
             inline_important.width,
             crate::Dimension::Px(500.0),
             "important inline style remains strongest within the author origin"
+        );
+    }
+
+    #[test]
+    fn sparse_priority_streams_preserve_normal_and_important_order() {
+        let (style, _, _) = cascade_layer_target(
+            &[r#"
+                @layer first, second;
+                @layer second {
+                    #target { width:20px }
+                    #target { height:40px !important }
+                }
+                @layer first {
+                    .target { width:10px }
+                    .target { height:30px !important }
+                }
+                .target { width:50px }
+            "#],
+            None,
+        );
+        assert_eq!(style.width, crate::Dimension::Px(50.0));
+        assert_eq!(style.height, crate::Dimension::Px(30.0));
+    }
+
+    #[test]
+    fn inherited_custom_property_fast_path_reuses_parent_map() {
+        let tree = obscura_dom::parse_html(r#"<div id="target" class="target"></div>"#);
+        let target = tree.get_element_by_id("target").unwrap();
+        let sheet = Stylesheet::parse(
+            &tree,
+            &[r#"
+                .target {
+                    width:var(--inherited-size);
+                    background-image:url("/asset--content-hash.png");
+                }
+            "#
+            .to_string()],
+        );
+        let parent_props = HashMap::from([("--inherited-size".to_string(), "37px".to_string())]);
+        let mut matcher = tree.matcher();
+        let mut style = LayoutStyle::default();
+        let effective = sheet.apply(
+            &tree,
+            &mut matcher,
+            target,
+            Some("target"),
+            &["target".to_string()],
+            "div",
+            &mut style,
+            &parent_props,
+            None,
+        );
+
+        assert_eq!(style.width, crate::Dimension::Px(37.0));
+        assert!(
+            effective.is_none(),
+            "an inherited var() use and `--` inside a value must not allocate a new property map"
         );
     }
 
@@ -4495,7 +5240,10 @@ mod tests {
             None,
         );
         assert_eq!(props.get("--normal-size").map(String::as_str), Some("30px"));
-        assert_eq!(props.get("--critical-size").map(String::as_str), Some("11px"));
+        assert_eq!(
+            props.get("--critical-size").map(String::as_str),
+            Some("11px")
+        );
         assert_eq!(style.width, crate::Dimension::Px(30.0));
         assert_eq!(style.height, crate::Dimension::Px(11.0));
         let before = before.expect("the layered ::before content should materialize");
@@ -4549,9 +5297,8 @@ mod tests {
 
     #[test]
     fn generated_content_resolves_host_attributes_and_resets() {
-        let tree = obscura_dom::parse_html(
-            r#"<button id="cta" data-label="Get Started"></button>"#,
-        );
+        let tree =
+            obscura_dom::parse_html(r#"<button id="cta" data-label="Get Started"></button>"#);
         let cta = tree.query_selector("#cta").unwrap().unwrap();
         assert_eq!(
             extract_content("content:attr(data-label)", &tree, cta),
@@ -4619,7 +5366,10 @@ mod tests {
         let keyframes: HashMap<_, _> = extract_keyframes(css).into_iter().collect();
         let dismiss = normalized_keyframe_offsets(&keyframes["dismiss"].stops);
         assert_eq!(
-            dismiss.iter().map(|(offset, _)| *offset).collect::<Vec<_>>(),
+            dismiss
+                .iter()
+                .map(|(offset, _)| *offset)
+                .collect::<Vec<_>>(),
             [0.0, 0.5, 1.0]
         );
         assert!(dismiss[0].1.declarations.contains("opacity: 1"));
@@ -5147,11 +5897,11 @@ mod tests {
         let narrow = parse_stylesheet_for_viewport(css, (900.0, 1000.0));
         let wide = parse_stylesheet_for_viewport(css, (1280.0, 720.0));
         assert!(narrow
-                .iter()
-                .any(|(selector, declarations)| selector == ".card"
+            .iter()
+            .any(|(selector, declarations)| selector == ".card"
                 && declarations.contains("width:100%")));
         assert!(!wide
-                .iter()
+            .iter()
             .any(|(_, declarations)| declarations.contains("width:100%")));
     }
 
@@ -5168,7 +5918,10 @@ mod tests {
         "#;
         let mut conditions = condition_arena_root();
         let parsed = parse_stylesheet_for_viewport_preserving_containers(
-            css, (1280.0, 720.0), &mut conditions, ContainerConditionId::NONE,
+            css,
+            (1280.0, 720.0),
+            &mut conditions,
+            ContainerConditionId::NONE,
         );
         assert_eq!(parsed.len(), 3);
         assert_eq!(parsed[1].container_condition_id, ContainerConditionId(1));
@@ -5262,8 +6015,7 @@ mod tests {
         let registration = parsed
             .iter()
             .find(|rule| {
-                rule.selector
-                    == format!("{PROPERTY_REGISTRATION_SELECTOR_PREFIX}--cq-token")
+                rule.selector == format!("{PROPERTY_REGISTRATION_SELECTOR_PREFIX}--cq-token")
             })
             .expect("@property initial value should be registered");
         assert_eq!(
@@ -5289,7 +6041,12 @@ mod tests {
         let element = node.as_element().unwrap();
         let classes = node
             .get_attribute("class")
-            .map(|value| value.split_whitespace().map(str::to_string).collect::<Vec<_>>())
+            .map(|value| {
+                value
+                    .split_whitespace()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default();
         let mut matcher = tree.matcher();
         let mut style = LayoutStyle::default();
@@ -5376,12 +6133,8 @@ mod tests {
         let override_id = tree.get_element_by_id("override").unwrap();
         let reset_id = tree.get_element_by_id("reset").unwrap();
         let invalid_id = tree.get_element_by_id("invalid").unwrap();
-        let (overridden, _) = apply_registered_property_test_style(
-            &sheet,
-            &tree,
-            override_id,
-            &HashMap::new(),
-        );
+        let (overridden, _) =
+            apply_registered_property_test_style(&sheet, &tree, override_id, &HashMap::new());
         assert_eq!(overridden.width, crate::Dimension::Percent(0.60));
         assert_eq!(overridden.height, crate::Dimension::Percent(0.12));
         let (reset, _) =
@@ -5712,9 +6465,7 @@ mod tests {
 
     #[test]
     fn container_evaluator_honors_tailwind_threshold_and_cache() {
-        let tree = obscura_dom::parse_html(
-            r#"<div id="container"><div id="target"></div></div>"#,
-        );
+        let tree = obscura_dom::parse_html(r#"<div id="container"><div id="target"></div></div>"#);
         let container = tree.get_element_by_id("container").unwrap();
         let target = tree.get_element_by_id("target").unwrap();
         let sheet = Stylesheet::parse(
@@ -5740,13 +6491,11 @@ mod tests {
             );
             snapshot
         };
-        let (below, _, _) =
-            evaluate_container_styles(&tree, &sheet, target, &snapshot(447.0));
+        let (below, _, _) = evaluate_container_styles(&tree, &sheet, target, &snapshot(447.0));
         assert_eq!(below.width, crate::Dimension::Px(1.0));
         assert_eq!(below.height, crate::Dimension::Px(1.0));
 
-        let (at, _, stats) =
-            evaluate_container_styles(&tree, &sheet, target, &snapshot(448.0));
+        let (at, _, stats) = evaluate_container_styles(&tree, &sheet, target, &snapshot(448.0));
         assert_eq!(at.width, crate::Dimension::Px(2.0));
         assert_eq!(at.height, crate::Dimension::Px(2.0));
         assert_eq!(stats.evaluations, 1);
@@ -5755,9 +6504,7 @@ mod tests {
 
     #[test]
     fn container_evaluator_matches_selector_before_ancestor_lookup() {
-        let tree = obscura_dom::parse_html(
-            r#"<div id="container"><div id="target"></div></div>"#,
-        );
+        let tree = obscura_dom::parse_html(r#"<div id="container"><div id="target"></div></div>"#);
         let container = tree.get_element_by_id("container").unwrap();
         let target = tree.get_element_by_id("target").unwrap();
         let sheet = Stylesheet::parse(
@@ -5777,8 +6524,7 @@ mod tests {
             container,
             container_box(crate::ContainerType::InlineSize, &[], 500.0, 16.0),
         );
-        let (_, signature, stats) =
-            evaluate_container_styles(&tree, &sheet, target, &snapshot);
+        let (_, signature, stats) = evaluate_container_styles(&tree, &sheet, target, &snapshot);
         assert_eq!(stats.evaluations, 0);
         assert_eq!(stats.ancestor_steps, 0);
         assert!(signature.decisions.is_empty());
@@ -5807,24 +6553,13 @@ mod tests {
         };
         snapshot.boxes.insert(
             outer,
-            container_box(
-                crate::ContainerType::InlineSize,
-                &["shell"],
-                600.0,
-                16.0,
-            ),
+            container_box(crate::ContainerType::InlineSize, &["shell"], 600.0, 16.0),
         );
         snapshot.boxes.insert(
             inner,
-            container_box(
-                crate::ContainerType::InlineSize,
-                &["other"],
-                300.0,
-                16.0,
-            ),
+            container_box(crate::ContainerType::InlineSize, &["other"], 300.0, 16.0),
         );
-        let (style, _, stats) =
-            evaluate_container_styles(&tree, &sheet, target, &snapshot);
+        let (style, _, stats) = evaluate_container_styles(&tree, &sheet, target, &snapshot);
         assert_eq!(style.width, crate::Dimension::Px(11.0));
         assert_eq!(style.height, crate::Dimension::Px(1.0));
         assert!(stats.ancestor_steps >= 3);
@@ -5832,9 +6567,7 @@ mod tests {
 
     #[test]
     fn container_query_em_uses_container_font_and_rem_uses_root_font() {
-        let tree = obscura_dom::parse_html(
-            r#"<div id="container"><div id="target"></div></div>"#,
-        );
+        let tree = obscura_dom::parse_html(r#"<div id="container"><div id="target"></div></div>"#);
         let container = tree.get_element_by_id("container").unwrap();
         let target = tree.get_element_by_id("target").unwrap();
         let sheet = Stylesheet::parse(
@@ -5854,16 +6587,14 @@ mod tests {
             container,
             container_box(crate::ContainerType::InlineSize, &[], 400.0, 10.0),
         );
-        let (style, _, _) =
-            evaluate_container_styles(&tree, &sheet, target, &snapshot);
+        let (style, _, _) = evaluate_container_styles(&tree, &sheet, target, &snapshot);
         assert_eq!(style.width, crate::Dimension::Px(3.0));
         assert_eq!(style.height, crate::Dimension::Px(1.0));
     }
 
     #[test]
     fn container_snapshot_compares_only_axes_exposed_by_container_type() {
-        let mut inline_a =
-            container_box(crate::ContainerType::InlineSize, &[], 400.0, 16.0);
+        let mut inline_a = container_box(crate::ContainerType::InlineSize, &[], 400.0, 16.0);
         let mut inline_b = inline_a.clone();
         inline_a.content_height = 100.0;
         inline_b.content_height = 900.0;
@@ -5903,12 +6634,7 @@ mod tests {
             };
             snapshot.boxes.insert(
                 outer,
-                container_box(
-                    crate::ContainerType::InlineSize,
-                    &["outer"],
-                    600.0,
-                    16.0,
-                ),
+                container_box(crate::ContainerType::InlineSize, &["outer"], 600.0, 16.0),
             );
             snapshot.boxes.insert(
                 inner,
@@ -5921,19 +6647,15 @@ mod tests {
             );
             snapshot
         };
-        let (matching, _, _) =
-            evaluate_container_styles(&tree, &sheet, target, &snapshot(200.0));
+        let (matching, _, _) = evaluate_container_styles(&tree, &sheet, target, &snapshot(200.0));
         assert_eq!(matching.width, crate::Dimension::Px(9.0));
-        let (failing, _, _) =
-            evaluate_container_styles(&tree, &sheet, target, &snapshot(199.0));
+        let (failing, _, _) = evaluate_container_styles(&tree, &sheet, target, &snapshot(199.0));
         assert_eq!(failing.width, crate::Dimension::Px(1.0));
     }
 
     #[test]
     fn unknown_container_alternative_does_not_mask_true_alternative() {
-        let tree = obscura_dom::parse_html(
-            r#"<div id="container"><div id="target"></div></div>"#,
-        );
+        let tree = obscura_dom::parse_html(r#"<div id="container"><div id="target"></div></div>"#);
         let container = tree.get_element_by_id("container").unwrap();
         let target = tree.get_element_by_id("target").unwrap();
         let sheet = Stylesheet::parse(
@@ -5954,15 +6676,13 @@ mod tests {
             container,
             container_box(crate::ContainerType::InlineSize, &[], 100.0, 16.0),
         );
-        let (style, _, _) =
-            evaluate_container_styles(&tree, &sheet, target, &snapshot);
+        let (style, _, _) = evaluate_container_styles(&tree, &sheet, target, &snapshot);
         assert_eq!(style.width, crate::Dimension::Px(7.0));
     }
 
     #[test]
     fn container_query_boolean_evaluation_uses_kleene_truth_tables() {
-        let container =
-            container_box(crate::ContainerType::InlineSize, &[], 200.0, 16.0);
+        let container = container_box(crate::ContainerType::InlineSize, &[], 200.0, 16.0);
         let min_width = |threshold| {
             ContainerQueryExpr::Feature(ContainerSizeFeature {
                 axis: ContainerQueryAxis::Width,
@@ -5972,10 +6692,7 @@ mod tests {
         };
         assert_eq!(
             evaluate_container_query_expr(
-                &ContainerQueryExpr::Or(vec![
-                    min_width(100.0),
-                    ContainerQueryExpr::Unknown,
-                ]),
+                &ContainerQueryExpr::Or(vec![min_width(100.0), ContainerQueryExpr::Unknown,]),
                 &container,
                 16.0,
             ),
@@ -5983,10 +6700,7 @@ mod tests {
         );
         assert_eq!(
             evaluate_container_query_expr(
-                &ContainerQueryExpr::And(vec![
-                    min_width(300.0),
-                    ContainerQueryExpr::Unknown,
-                ]),
+                &ContainerQueryExpr::And(vec![min_width(300.0), ContainerQueryExpr::Unknown,]),
                 &container,
                 16.0,
             ),
@@ -5994,10 +6708,7 @@ mod tests {
         );
         assert_eq!(
             evaluate_container_query_expr(
-                &ContainerQueryExpr::Or(vec![
-                    min_width(300.0),
-                    ContainerQueryExpr::Unknown,
-                ]),
+                &ContainerQueryExpr::Or(vec![min_width(300.0), ContainerQueryExpr::Unknown,]),
                 &container,
                 16.0,
             ),
@@ -6015,8 +6726,7 @@ mod tests {
 
     #[test]
     fn container_range_syntax_supports_strict_inclusive_and_chained_queries() {
-        let container =
-            container_box(crate::ContainerType::Size, &[], 200.0, 16.0);
+        let container = container_box(crate::ContainerType::Size, &[], 200.0, 16.0);
         for query in [
             "(width)",
             "(width > 199px)",
@@ -6026,8 +6736,7 @@ mod tests {
             "(height = 100px)",
             "(block-size >= 100px)",
         ] {
-            let expression =
-                parse_container_query_expr(query).expect("valid range query");
+            let expression = parse_container_query_expr(query).expect("valid range query");
             assert_eq!(
                 evaluate_container_query_expr(&expression, &container, 16.0),
                 ContainerQueryTruth::True,
@@ -6040,8 +6749,7 @@ mod tests {
             "(200px < width < 300px)",
             "(height > 100px)",
         ] {
-            let expression =
-                parse_container_query_expr(query).expect("valid range query");
+            let expression = parse_container_query_expr(query).expect("valid range query");
             assert_eq!(
                 evaluate_container_query_expr(&expression, &container, 16.0),
                 ContainerQueryTruth::False,
@@ -6063,9 +6771,7 @@ mod tests {
 
     #[test]
     fn block_axis_query_requires_size_container() {
-        let tree = obscura_dom::parse_html(
-            r#"<div id="container"><div id="target"></div></div>"#,
-        );
+        let tree = obscura_dom::parse_html(r#"<div id="container"><div id="target"></div></div>"#);
         let container = tree.get_element_by_id("container").unwrap();
         let target = tree.get_element_by_id("target").unwrap();
         let sheet = Stylesheet::parse(
@@ -6081,10 +6787,9 @@ mod tests {
                 root_font_size: 16.0,
                 ..Default::default()
             };
-            snapshot.boxes.insert(
-                container,
-                container_box(container_type, &[], 300.0, 16.0),
-            );
+            snapshot
+                .boxes
+                .insert(container, container_box(container_type, &[], 300.0, 16.0));
             snapshot
         };
         let (inline_only, _, _) = evaluate_container_styles(
@@ -6094,12 +6799,8 @@ mod tests {
             &snapshot(crate::ContainerType::InlineSize),
         );
         assert_eq!(inline_only.width, crate::Dimension::Px(1.0));
-        let (size, _, _) = evaluate_container_styles(
-            &tree,
-            &sheet,
-            target,
-            &snapshot(crate::ContainerType::Size),
-        );
+        let (size, _, _) =
+            evaluate_container_styles(&tree, &sheet, target, &snapshot(crate::ContainerType::Size));
         assert_eq!(size.width, crate::Dimension::Px(8.0));
     }
 
@@ -6109,7 +6810,10 @@ mod tests {
             @container (max-inline-size:50rem){.card{display:grid}}}";
         let mut conditions = condition_arena_root();
         let parsed = parse_stylesheet_for_viewport_preserving_containers(
-            css, (1280.0, 720.0), &mut conditions, ContainerConditionId::NONE,
+            css,
+            (1280.0, 720.0),
+            &mut conditions,
+            ContainerConditionId::NONE,
         );
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].container_condition_id, ContainerConditionId(2));
@@ -6121,21 +6825,32 @@ mod tests {
     fn unresolved_container_rules_do_not_enter_cascade_or_pseudos() {
         let tree = obscura_dom::parse_html(r#"<div id="target"></div>"#);
         let target = tree.query_selector("#target").unwrap().unwrap();
-        let sheet = Stylesheet::parse(&tree, &[r#"
+        let sheet = Stylesheet::parse(
+            &tree,
+            &[r#"
             #target{width:10px}
             @container (min-width:28rem){
                 #target{width:999px}
                 #target::before{content:"inactive"}
             }
             #target{height:20px}
-        "#.to_string()]);
+        "#
+            .to_string()],
+        );
         assert_eq!(sheet.rules.len(), 3, "conditional rule remains indexed");
         assert_eq!(sheet.container_conditions.len(), 2);
         let mut matcher = tree.matcher();
         let mut style = LayoutStyle::default();
         sheet.apply(
-            &tree, &mut matcher, target, Some("target"), &[], "div", &mut style,
-            &HashMap::new(), None,
+            &tree,
+            &mut matcher,
+            target,
+            Some("target"),
+            &[],
+            "div",
+            &mut style,
+            &HashMap::new(),
+            None,
         );
         assert_eq!(style.width, crate::Dimension::Px(10.0));
         assert_eq!(style.height, crate::Dimension::Px(20.0));
@@ -6161,10 +6876,15 @@ mod tests {
         );
         let mut conditions = condition_arena_root();
         let rich = parse_stylesheet_for_viewport_preserving_containers(
-            css, (1280.0, 720.0), &mut conditions, ContainerConditionId::NONE,
+            css,
+            (1280.0, 720.0),
+            &mut conditions,
+            ContainerConditionId::NONE,
         );
         assert_eq!(conditions.len(), 1);
-        assert!(rich.iter().all(|rule| rule.container_condition_id == ContainerConditionId::NONE));
+        assert!(rich
+            .iter()
+            .all(|rule| rule.container_condition_id == ContainerConditionId::NONE));
     }
 
     #[test]
@@ -6203,8 +6923,12 @@ mod tests {
 
     #[test]
     fn supports_conditions_reject_invalid_boolean_grammar() {
-        assert!(supports_condition_applies("(display:grid) and (word-break:break-all)"));
-        assert!(supports_condition_applies("(display:grid) or (unknown:value)"));
+        assert!(supports_condition_applies(
+            "(display:grid) and (word-break:break-all)"
+        ));
+        assert!(supports_condition_applies(
+            "(display:grid) or (unknown:value)"
+        ));
         assert!(!supports_condition_applies(
             "(display:grid) and (word-break:break-all) or (display:flex)"
         ));
@@ -6310,9 +7034,13 @@ mod tests {
         assert!(narrow.iter().any(|(selector, declarations)| {
             selector == "header .menu-toolkit" && declarations.contains("display: none")
         }));
-        assert!(!narrow.iter().any(|(_, declarations)| declarations.contains("display: flex")));
+        assert!(!narrow
+            .iter()
+            .any(|(_, declarations)| declarations.contains("display: flex")));
 
         let wide = parse_stylesheet_for_viewport(css, (1024.0, 768.0));
-        assert!(wide.iter().any(|(_, declarations)| declarations.contains("display: flex")));
+        assert!(wide
+            .iter()
+            .any(|(_, declarations)| declarations.contains("display: flex")));
     }
 }

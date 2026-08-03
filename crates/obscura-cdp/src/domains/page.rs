@@ -143,73 +143,61 @@ fn parse_screenshot_options(params: &Value) -> Result<ScreenshotOptions, String>
 }
 
 #[cfg(feature = "render")]
-fn screenshot_output_size(clip: ScreenshotClip) -> Result<(u32, u32), String> {
-    // Chromium converts the CSS clip size to an integer gfx::Size before
-    // applying scale to the requested output bitmap.
-    let width = (clip.width.trunc() * clip.scale).round();
-    let height = (clip.height.trunc() * clip.scale).round();
-    const MAX_DIMENSION: f64 = 128.0 * 1024.0;
-    if width <= 0.0 || height <= 0.0 {
-        return Err("Screenshot clip is too small at the requested scale.".to_string());
+fn capture_error_message(error: obscura_browser::CaptureError) -> String {
+    match error {
+        obscura_browser::CaptureError::InvalidRegion => {
+            "Page.captureScreenshot received an invalid capture region".to_string()
+        }
+        obscura_browser::CaptureError::AllocationLimitExceeded => {
+            "Page.captureScreenshot bitmap is too large".to_string()
+        }
+        obscura_browser::CaptureError::PaintFailed => {
+            "Page.captureScreenshot failed: the page has no retained DOM surface to render"
+                .to_string()
+        }
+        obscura_browser::CaptureError::EncodeFailed => {
+            "Page.captureScreenshot renderer PNG encoding failed".to_string()
+        }
     }
-    if width >= MAX_DIMENSION || height >= MAX_DIMENSION {
-        return Err("Page is too large.".to_string());
-    }
-    let pixels = width * height;
-    // Four RGBA bytes per pixel keeps this guard below a 256 MiB surface.
-    if !pixels.is_finite() || pixels > 64.0 * 1024.0 * 1024.0 {
-        return Err("Screenshot bitmap is too large.".to_string());
-    }
-    Ok((width as u32, height as u32))
 }
 
 #[cfg(feature = "render")]
-fn sample_screenshot_region(
-    source: &image::RgbaImage,
+fn chromium_clip_region(
     clip: ScreenshotClip,
-    relative_x: f64,
-    relative_y: f64,
-) -> Result<image::RgbaImage, String> {
-    let (output_width, output_height) = screenshot_output_size(clip)?;
-    let mut output = image::RgbaImage::new(output_width, output_height);
-    let source_width = source.width() as i64;
-    let source_height = source.height() as i64;
-
-    // Sampling pixel centers gives exact copies for integral, scale=1 clips
-    // while also handling fractional clip origins and non-integral scales.
-    for output_y in 0..output_height {
-        let sample_y =
-            relative_y + (f64::from(output_y) + 0.5) * clip.height / f64::from(output_height) - 0.5;
-        let y0 = sample_y.floor() as i64;
-        let y1 = y0 + 1;
-        let fy = sample_y - y0 as f64;
-        for output_x in 0..output_width {
-            let sample_x = relative_x
-                + (f64::from(output_x) + 0.5) * clip.width / f64::from(output_width)
-                - 0.5;
-            let x0 = sample_x.floor() as i64;
-            let x1 = x0 + 1;
-            let fx = sample_x - x0 as f64;
-            let pixel = |x: i64, y: i64| {
-                source.get_pixel(
-                    x.clamp(0, source_width - 1) as u32,
-                    y.clamp(0, source_height - 1) as u32,
-                )
-            };
-            let p00 = pixel(x0, y0);
-            let p10 = pixel(x1, y0);
-            let p01 = pixel(x0, y1);
-            let p11 = pixel(x1, y1);
-            let mut rgba = [0u8; 4];
-            for channel in 0..4 {
-                let top = f64::from(p00[channel]) * (1.0 - fx) + f64::from(p10[channel]) * fx;
-                let bottom = f64::from(p01[channel]) * (1.0 - fx) + f64::from(p11[channel]) * fx;
-                rgba[channel] = (top * (1.0 - fy) + bottom * fy).round().clamp(0.0, 255.0) as u8;
-            }
-            output.put_pixel(output_x, output_y, image::Rgba(rgba));
-        }
+    device_scale_factor: f64,
+) -> Result<obscura_browser::CaptureRegion, String> {
+    // Chromium first converts the CSS clip size to an integer gfx::Size, then
+    // applies the effective clip/device scale and rounds to output pixels.
+    // Keeping this calculation here avoids asking the raster layer to infer a
+    // protocol-specific size from the original fractional rectangle.
+    let width = clip.width.trunc();
+    let height = clip.height.trunc();
+    if width <= 0.0 || height <= 0.0 {
+        return Err("Screenshot clip is too small at the requested scale.".to_string());
     }
-    Ok(output)
+    let effective_scale = clip.scale * device_scale_factor;
+    let output_width = (width * effective_scale).round();
+    let output_height = (height * effective_scale).round();
+    if !effective_scale.is_finite()
+        || effective_scale <= 0.0
+        || !output_width.is_finite()
+        || !output_height.is_finite()
+        || output_width <= 0.0
+        || output_height <= 0.0
+        || output_width > f64::from(u32::MAX)
+        || output_height > f64::from(u32::MAX)
+    {
+        return Err("Page.captureScreenshot bitmap is too large".to_string());
+    }
+    Ok(obscura_browser::CaptureRegion::with_output_size(
+        clip.x as f32,
+        clip.y as f32,
+        width as f32,
+        height as f32,
+        effective_scale as f32,
+        output_width as u32,
+        output_height as u32,
+    ))
 }
 
 #[cfg(feature = "render")]
@@ -282,42 +270,64 @@ fn encode_screenshot(
 fn screencast_int32(params: &Value, name: &str) -> Result<Option<i64>, String> {
     match params.get(name) {
         None => Ok(None),
-        Some(value) => value.as_i64()
-            .filter(|value| i32::try_from(*value).is_ok()).map(Some)
+        Some(value) => value
+            .as_i64()
+            .filter(|value| i32::try_from(*value).is_ok())
+            .map(Some)
             .ok_or_else(|| format!("Invalid parameters: {name} must be an integer")),
     }
 }
 
 #[cfg(feature = "render")]
 fn parse_screencast_state(params: &Value, session_id: i64) -> Result<ScreencastState, String> {
-    if !params.is_object() { return Err("Invalid parameters: expected an object".into()); }
+    if !params.is_object() {
+        return Err("Invalid parameters: expected an object".into());
+    }
     let format = match params.get("format") {
         None => ScreencastFormat::Png,
         Some(Value::String(value)) if value == "png" => ScreencastFormat::Png,
         Some(Value::String(value)) if value == "jpeg" => ScreencastFormat::Jpeg,
-        Some(Value::String(_)) => return Err("Invalid parameters: screencast format must be png or jpeg".into()),
+        Some(Value::String(_)) => {
+            return Err("Invalid parameters: screencast format must be png or jpeg".into())
+        }
         Some(_) => return Err("Invalid parameters: format must be a string".into()),
     };
     let quality = screencast_int32(params, "quality")?.unwrap_or(DEFAULT_SCREENSHOT_QUALITY);
-    let quality = if (0..=100).contains(&quality) { quality } else { DEFAULT_SCREENSHOT_QUALITY } as u8;
+    let quality = if (0..=100).contains(&quality) {
+        quality
+    } else {
+        DEFAULT_SCREENSHOT_QUALITY
+    } as u8;
     let dimension = |name: &str| -> Result<Option<u32>, String> {
-        Ok(screencast_int32(params, name)?.filter(|value| *value > 0).map(|value| value as u32))
+        Ok(screencast_int32(params, name)?
+            .filter(|value| *value > 0)
+            .map(|value| value as u32))
     };
     let every_nth_frame = screencast_int32(params, "everyNthFrame")?.unwrap_or(1);
     if every_nth_frame <= 0 {
         return Err("Invalid parameters: everyNthFrame must be greater than zero".into());
     }
     Ok(ScreencastState {
-        format, quality,
-        max_width: dimension("maxWidth")?, max_height: dimension("maxHeight")?,
-        every_nth_frame: every_nth_frame as u32, command_frame_counter: 0,
-        session_id, frames_in_flight: 0,
+        format,
+        quality,
+        max_width: dimension("maxWidth")?,
+        max_height: dimension("maxHeight")?,
+        every_nth_frame: every_nth_frame as u32,
+        command_frame_counter: 0,
+        session_id,
+        frames_in_flight: 0,
     })
 }
 
 #[cfg(feature = "render")]
-fn encode_screencast_frame(renderer_png: Vec<u8>, state: &ScreencastState) -> Result<Vec<u8>, String> {
-    if state.format == ScreencastFormat::Png && state.max_width.is_none() && state.max_height.is_none() {
+fn encode_screencast_frame(
+    renderer_png: Vec<u8>,
+    state: &ScreencastState,
+) -> Result<Vec<u8>, String> {
+    if state.format == ScreencastFormat::Png
+        && state.max_width.is_none()
+        && state.max_height.is_none()
+    {
         return Ok(renderer_png);
     }
     let source = image::load_from_memory_with_format(&renderer_png, image::ImageFormat::Png)
@@ -334,54 +344,98 @@ fn encode_screencast_frame(renderer_png: Vec<u8>, state: &ScreencastState) -> Re
         (f64::from(source.width()) * scale).floor().max(1.0) as u32,
         (f64::from(source.height()) * scale).floor().max(1.0) as u32,
     );
-    let raster = if size == source.dimensions() { source } else {
-        image::imageops::resize(&source, size.0, size.1, image::imageops::FilterType::Triangle)
+    let raster = if size == source.dimensions() {
+        source
+    } else {
+        image::imageops::resize(
+            &source,
+            size.0,
+            size.1,
+            image::imageops::FilterType::Triangle,
+        )
     };
     let format = match state.format {
         ScreencastFormat::Png => ScreenshotFormat::Png,
         ScreencastFormat::Jpeg => ScreenshotFormat::Jpeg,
     };
-    encode_screenshot(&raster, ScreenshotOptions {
-        format, quality: state.quality, quality_supplied: true, clip: None,
-        from_surface: true, capture_beyond_viewport: false, optimize_for_speed: false,
-    })
+    encode_screenshot(
+        &raster,
+        ScreenshotOptions {
+            format,
+            quality: state.quality,
+            quality_supplied: true,
+            clip: None,
+            from_surface: true,
+            capture_beyond_viewport: false,
+            optimize_for_speed: false,
+        },
+    )
 }
 
 /// Queue a visible-viewport frame through normal CDP event transport. This is
 /// intentionally command-driven until Obscura has a compositor frame pump.
 #[cfg(feature = "render")]
 pub(crate) fn queue_screencast_frame(
-    ctx: &mut CdpContext, cdp_session_id: &Option<String>, force: bool,
+    ctx: &mut CdpContext,
+    cdp_session_id: &Option<String>,
+    force: bool,
 ) -> Result<bool, String> {
-    let cdp_session_id = cdp_session_id.as_deref()
+    let cdp_session_id = cdp_session_id
+        .as_deref()
         .ok_or("Page.startScreencast requires an attached target session")?;
     let state = {
-        let Some(state) = ctx.screencasts.get_mut(cdp_session_id) else { return Ok(false); };
-        if state.frames_in_flight >= MAX_SCREENCAST_FRAMES_IN_FLIGHT { return Ok(false); }
+        let Some(state) = ctx.screencasts.get_mut(cdp_session_id) else {
+            return Ok(false);
+        };
+        if state.frames_in_flight >= MAX_SCREENCAST_FRAMES_IN_FLIGHT {
+            return Ok(false);
+        }
         if !force {
             state.command_frame_counter = state.command_frame_counter.saturating_add(1);
-            if state.command_frame_counter % u64::from(state.every_nth_frame) != 0 { return Ok(false); }
+            if state.command_frame_counter % u64::from(state.every_nth_frame) != 0 {
+                return Ok(false);
+            }
         }
         state.clone()
     };
     let attached_session = Some(cdp_session_id.to_string());
     let (viewport, scroll, png) = {
-        let page = ctx.get_session_page_mut(&attached_session).ok_or("No page for session")?;
+        let page = ctx
+            .get_session_page_mut(&attached_session)
+            .ok_or("No page for session")?;
         let viewport = page.viewport;
-        let scroll = page.evaluate("[window.scrollX, window.scrollY]").as_array()
-            .map(|values| (
-                values.first().and_then(Value::as_f64).unwrap_or(0.0),
-                values.get(1).and_then(Value::as_f64).unwrap_or(0.0),
-            )).unwrap_or((0.0, 0.0));
-        let png = page.screenshot(viewport).ok_or_else(||
-            "Page.startScreencast failed: the page has no visible DOM surface to render".to_string())?;
+        let scroll = page
+            .evaluate("[window.scrollX, window.scrollY]")
+            .as_array()
+            .map(|values| {
+                (
+                    values.first().and_then(Value::as_f64).unwrap_or(0.0),
+                    values.get(1).and_then(Value::as_f64).unwrap_or(0.0),
+                )
+            })
+            .unwrap_or((0.0, 0.0));
+        obscura_browser::validate_capture_region(obscura_browser::CaptureRegion::new(
+            scroll.0 as f32,
+            scroll.1 as f32,
+            viewport.0,
+            viewport.1,
+            1.0,
+        ))
+        .map_err(capture_error_message)?;
+        let png = page.screenshot(viewport).ok_or_else(|| {
+            "Page.startScreencast failed: the page has no visible DOM surface to render".to_string()
+        })?;
         (viewport, scroll, png)
     };
     let encoded = encode_screencast_frame(png, &state)?;
     use base64::Engine as _;
     let data = base64::engine::general_purpose::STANDARD.encode(encoded);
-    let Some(live) = ctx.screencasts.get_mut(cdp_session_id) else { return Ok(false); };
-    if live.session_id != state.session_id { return Ok(false); }
+    let Some(live) = ctx.screencasts.get_mut(cdp_session_id) else {
+        return Ok(false);
+    };
+    if live.session_id != state.session_id {
+        return Ok(false);
+    }
     live.frames_in_flight = live.frames_in_flight.saturating_add(1);
     ctx.pending_events.push(CdpEvent {
         method: "Page.screencastFrame".into(),
@@ -402,12 +456,22 @@ pub(crate) fn queue_screencast_frame(
 
 #[cfg(feature = "render")]
 pub(crate) fn command_can_change_screencast_frame(method: &str) -> bool {
-    matches!(method,
-        "Page.navigate" | "Page.reload" | "Page.navigateToHistoryEntry"
-        | "Runtime.evaluate" | "Runtime.callFunctionOn"
-        | "Input.dispatchMouseEvent" | "Input.dispatchKeyEvent" | "Input.dispatchTouchEvent"
-        | "Emulation.setDeviceMetricsOverride" | "Emulation.clearDeviceMetricsOverride"
-        | "DOM.setAttributeValue" | "DOM.removeNode" | "DOM.focus" | "DOM.setFileInputFiles"
+    matches!(
+        method,
+        "Page.navigate"
+            | "Page.reload"
+            | "Page.navigateToHistoryEntry"
+            | "Runtime.evaluate"
+            | "Runtime.callFunctionOn"
+            | "Input.dispatchMouseEvent"
+            | "Input.dispatchKeyEvent"
+            | "Input.dispatchTouchEvent"
+            | "Emulation.setDeviceMetricsOverride"
+            | "Emulation.clearDeviceMetricsOverride"
+            | "DOM.setAttributeValue"
+            | "DOM.removeNode"
+            | "DOM.focus"
+            | "DOM.setFileInputFiles"
     )
 }
 
@@ -434,14 +498,17 @@ pub fn emit_navigation_events(
     // via `requestId === loaderId && type === "Document"` (issue #189).
     let nav_request_ids: Vec<String> = {
         let mut nav_seen = false;
-        network_events.iter().map(|ev| {
-            if !nav_seen && ev.resource_type == "Document" && ev.url == page_url {
-                nav_seen = true;
-                loader_id.to_string()
-            } else {
-                ev.request_id.clone()
-            }
-        }).collect()
+        network_events
+            .iter()
+            .map(|ev| {
+                if !nav_seen && ev.resource_type == "Document" && ev.url == page_url {
+                    nav_seen = true;
+                    loader_id.to_string()
+                } else {
+                    ev.request_id.clone()
+                }
+            })
+            .collect()
     };
     let nav_idx: Option<usize> = network_events
         .iter()
@@ -487,10 +554,26 @@ pub fn emit_navigation_events(
     // set was insert-only, so stale ids kept validating and grew unbounded.
     ctx.valid_context_ids.clear();
     let mut phase1 = vec![
-        CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "init", "timestamp": ts}), session_id: es.clone() },
-        CdpEvent { method: "Runtime.executionContextsCleared".into(), params: json!({}), session_id: es.clone() },
-        CdpEvent { method: "Page.frameNavigated".into(), params: json!({"frame": {"id": frame_id, "loaderId": loader_id, "url": page_url, "domainAndRegistry": "", "securityOrigin": page_url, "mimeType": nav_mime, "adFrameStatus": {"adFrameType": "none"}}, "type": "Navigation"}), session_id: es.clone() },
-        CdpEvent { method: "Runtime.executionContextCreated".into(), params: json!({"context": {"id": 2, "origin": page_url, "name": "", "uniqueId": format!("ctx-nav-{}", page_id), "auxData": {"isDefault": true, "type": "default", "frameId": frame_id}}}), session_id: es.clone() },
+        CdpEvent {
+            method: "Page.lifecycleEvent".into(),
+            params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "init", "timestamp": ts}),
+            session_id: es.clone(),
+        },
+        CdpEvent {
+            method: "Runtime.executionContextsCleared".into(),
+            params: json!({}),
+            session_id: es.clone(),
+        },
+        CdpEvent {
+            method: "Page.frameNavigated".into(),
+            params: json!({"frame": {"id": frame_id, "loaderId": loader_id, "url": page_url, "domainAndRegistry": "", "securityOrigin": page_url, "mimeType": nav_mime, "adFrameStatus": {"adFrameType": "none"}}, "type": "Navigation"}),
+            session_id: es.clone(),
+        },
+        CdpEvent {
+            method: "Runtime.executionContextCreated".into(),
+            params: json!({"context": {"id": 2, "origin": page_url, "name": "", "uniqueId": format!("ctx-nav-{}", page_id), "auxData": {"isDefault": true, "type": "default", "frameId": frame_id}}}),
+            session_id: es.clone(),
+        },
     ];
     // The default world is re-created as context id 2; re-register it. Isolated
     // worlds register themselves via next_isolated_context in the loop below.
@@ -555,16 +638,36 @@ pub fn emit_navigation_events(
     }
 
     let mut phase3 = vec![
-        CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "DOMContentLoaded", "timestamp": ts}), session_id: es.clone() },
-        CdpEvent { method: "Page.domContentEventFired".into(), params: json!({"timestamp": ts}), session_id: es.clone() },
-        CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "load", "timestamp": ts}), session_id: es.clone() },
-        CdpEvent { method: "Page.loadEventFired".into(), params: json!({"timestamp": ts}), session_id: es.clone() },
+        CdpEvent {
+            method: "Page.lifecycleEvent".into(),
+            params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "DOMContentLoaded", "timestamp": ts}),
+            session_id: es.clone(),
+        },
+        CdpEvent {
+            method: "Page.domContentEventFired".into(),
+            params: json!({"timestamp": ts}),
+            session_id: es.clone(),
+        },
+        CdpEvent {
+            method: "Page.lifecycleEvent".into(),
+            params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "load", "timestamp": ts}),
+            session_id: es.clone(),
+        },
+        CdpEvent {
+            method: "Page.loadEventFired".into(),
+            params: json!({"timestamp": ts}),
+            session_id: es.clone(),
+        },
     ];
     if reached_network_idle || matches!(wait_until, WaitUntil::Load | WaitUntil::DomContentLoaded) {
         let idle_ts = timestamp();
         phase3.push(CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "networkIdle", "timestamp": idle_ts}), session_id: es.clone() });
     }
-    phase3.push(CdpEvent { method: "Page.frameStoppedLoading".into(), params: json!({"frameId": frame_id}), session_id: es });
+    phase3.push(CdpEvent {
+        method: "Page.frameStoppedLoading".into(),
+        params: json!({"frameId": frame_id}),
+        session_id: es,
+    });
     ctx.pending_events.extend(phase3);
 
     // Target.targetInfoChanged: strict CDP clients (browser-use, and
@@ -655,7 +758,9 @@ async fn do_navigate(
     let preload_scripts: Vec<String> = ctx.preload_scripts.iter().map(|(_, s)| s.clone()).collect();
 
     let (frame_id, loader_id, network_events, page_url, page_id, reached_network_idle) = {
-        let page = ctx.get_session_page_mut(session_id).ok_or("No page for session")?;
+        let page = ctx
+            .get_session_page_mut(session_id)
+            .ok_or("No page for session")?;
         let frame_id = page.frame_id.clone();
         let loader_id = format!("loader-{}", uuid::Uuid::new_v4());
 
@@ -664,12 +769,19 @@ async fn do_navigate(
         // the page so navigate_single can inject them at the right point.
         page.set_preload_scripts(preload_scripts);
 
-        let nav_method = params.get("__method").and_then(|v| v.as_str()).unwrap_or("GET");
+        let nav_method = params
+            .get("__method")
+            .and_then(|v| v.as_str())
+            .unwrap_or("GET");
         let nav_body = params.get("__body").and_then(|v| v.as_str()).unwrap_or("");
         if nav_method == "POST" && !nav_body.is_empty() {
-            page.navigate_with_wait_post(url, wait_until, nav_method, nav_body).await.map_err(|e| e.to_string())?;
+            page.navigate_with_wait_post(url, wait_until, nav_method, nav_body)
+                .await
+                .map_err(|e| e.to_string())?;
         } else {
-            page.navigate_with_wait(url, wait_until).await.map_err(|e| e.to_string())?;
+            page.navigate_with_wait(url, wait_until)
+                .await
+                .map_err(|e| e.to_string())?;
         }
 
         let reached_network_idle = page.lifecycle.is_network_idle();
@@ -679,7 +791,14 @@ async fn do_navigate(
         let network_events: Vec<_> = page.network_events.drain(..).collect();
         let page_url = page.url_string();
         let page_id = page.id.clone();
-        (frame_id, loader_id, network_events, page_url, page_id, reached_network_idle)
+        (
+            frame_id,
+            loader_id,
+            network_events,
+            page_url,
+            page_id,
+            reached_network_idle,
+        )
     };
 
     emit_navigation_events(
@@ -709,12 +828,15 @@ pub async fn handle(
     match method {
         "enable" => Ok(json!({})),
         "navigate" => {
-            let url = params.get("url").and_then(|v| v.as_str())
+            let url = params
+                .get("url")
+                .and_then(|v| v.as_str())
                 .ok_or("url required")?;
             do_navigate(url, params, ctx, session_id).await
         }
         "reload" => {
-            let current_url = ctx.get_session_page(session_id)
+            let current_url = ctx
+                .get_session_page(session_id)
                 .map(|p| p.url_string())
                 .unwrap_or_else(|| "about:blank".to_string());
             let reload_params = json!({
@@ -723,7 +845,9 @@ pub async fn handle(
             do_navigate(&current_url, &reload_params, ctx, session_id).await
         }
         "getFrameTree" => {
-            let page = ctx.get_session_page(session_id).ok_or("No page for session")?;
+            let page = ctx
+                .get_session_page(session_id)
+                .ok_or("No page for session")?;
             Ok(json!({
                 "frameTree": {
                     "frame": {
@@ -741,12 +865,20 @@ pub async fn handle(
         }
         "createIsolatedWorld" => {
             let (frame_id_param, world_name, page_url, page_id) = {
-                let page = ctx.get_session_page(session_id).ok_or("No page for session")?;
+                let page = ctx
+                    .get_session_page(session_id)
+                    .ok_or("No page for session")?;
                 (
-                    params.get("frameId").and_then(|v| v.as_str())
-                        .unwrap_or(&page.frame_id).to_string(),
-                    params.get("worldName").and_then(|v| v.as_str())
-                        .unwrap_or("").to_string(),
+                    params
+                        .get("frameId")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(&page.frame_id)
+                        .to_string(),
+                    params
+                        .get("worldName")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
                     page.url_string(),
                     page.id.clone(),
                 )
@@ -792,12 +924,16 @@ pub async fn handle(
             ctx.preload_counter += 1;
             let identifier = format!("{}", ctx.preload_counter);
             if !source.is_empty() {
-                ctx.preload_scripts.push((identifier.clone(), source.to_string()));
+                ctx.preload_scripts
+                    .push((identifier.clone(), source.to_string()));
             }
             Ok(json!({ "identifier": identifier }))
         }
         "removeScriptToEvaluateOnNewDocument" => {
-            let identifier = params.get("identifier").and_then(|v| v.as_str()).unwrap_or("");
+            let identifier = params
+                .get("identifier")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             ctx.preload_scripts.retain(|(id, _)| id != identifier);
             Ok(json!({}))
         }
@@ -864,7 +1000,9 @@ pub async fn handle(
             }))
         }
         "getNavigationHistory" => {
-            let page = ctx.get_session_page(session_id).ok_or("No page for session")?;
+            let page = ctx
+                .get_session_page(session_id)
+                .ok_or("No page for session")?;
             // Synthesize an entry for the current page when history is empty
             // (initial about:blank, never-navigated targets). Puppeteer's
             // goBack reads `currentIndex` and `entries[currentIndex-1]`;
@@ -894,7 +1032,9 @@ pub async fn handle(
         "navigateToHistoryEntry" => {
             let entry_id = params.get("entryId").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
             let target_url = {
-                let page = ctx.get_session_page_mut(session_id).ok_or("No page for session")?;
+                let page = ctx
+                    .get_session_page_mut(session_id)
+                    .ok_or("No page for session")?;
                 let url = page.history.get(entry_id).cloned();
                 if url.is_some() {
                     page.set_history_index(entry_id);
@@ -905,12 +1045,18 @@ pub async fn handle(
                 // Stash + restore history so push_history doesn't clobber
                 // the cursor we just moved.
                 let stash = {
-                    let page = ctx.get_session_page_mut(session_id).ok_or("No page for session")?;
+                    let page = ctx
+                        .get_session_page_mut(session_id)
+                        .ok_or("No page for session")?;
                     (page.history.clone(), page.history_index)
                 };
                 let (frame_id, page_id, network_events, page_url, reached_idle) = {
-                    let page = ctx.get_session_page_mut(session_id).ok_or("No page for session")?;
-                    page.navigate_with_wait(&url, WaitUntil::DomContentLoaded).await.map_err(|e| e.to_string())?;
+                    let page = ctx
+                        .get_session_page_mut(session_id)
+                        .ok_or("No page for session")?;
+                    page.navigate_with_wait(&url, WaitUntil::DomContentLoaded)
+                        .await
+                        .map_err(|e| e.to_string())?;
                     page.history = stash.0;
                     page.history_index = stash.1;
                     (
@@ -923,9 +1069,15 @@ pub async fn handle(
                 };
                 let loader_id = format!("loader-{}", uuid::Uuid::new_v4());
                 emit_navigation_events(
-                    ctx, session_id,
-                    &frame_id, &loader_id, &page_url, &page_id,
-                    &network_events, WaitUntil::DomContentLoaded, reached_idle,
+                    ctx,
+                    session_id,
+                    &frame_id,
+                    &loader_id,
+                    &page_url,
+                    &page_id,
+                    &network_events,
+                    WaitUntil::DomContentLoaded,
+                    reached_idle,
                 );
             }
             Ok(json!({}))
@@ -937,46 +1089,47 @@ pub async fn handle(
             }
             Ok(json!({}))
         }
-        "printToPDF" => {
-            // Obscura has no layout/rendering engine, so PDF generation is
-            // intentionally not implemented. Returning a distinct, descriptive
-            // error (rather than the generic "Unknown Page method" fallback)
-            // tells Playwright/Puppeteer/headless_chrome clients exactly why
-            // the call failed and what to do instead.
-            Err(
-                "Page.printToPDF is not supported by Obscura: no layout engine. \
-                 Use Runtime.evaluate (e.g. page.evaluate) to extract the rendered \
-                 HTML, then render to PDF in your client (wkhtmltopdf, weasyprint, \
-                 a separate headless Chromium pipeline, etc.)."
-                    .to_string(),
-            )
-        }
+        "printToPDF" => crate::domains::pdf::print_to_pdf(params, ctx, session_id).await,
         "startScreencast" => {
             #[cfg(feature = "render")]
             {
-                let cdp_session = session_id.as_ref()
-                    .ok_or("Page.startScreencast requires an attached target session")?.clone();
+                let cdp_session = session_id
+                    .as_ref()
+                    .ok_or("Page.startScreencast requires an attached target session")?
+                    .clone();
                 let resource_deadline_ms = std::env::var("OBSCURA_RENDER_RESOURCE_DEADLINE_MS")
-                    .ok().and_then(|value| value.parse::<u64>().ok()).unwrap_or(3_000);
-                let page = ctx.get_session_page_mut(session_id).ok_or("No page for session")?;
-                let _ = page.prepare_screenshot_resources(resource_deadline_ms).await;
+                    .ok()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or(3_000);
+                let page = ctx
+                    .get_session_page_mut(session_id)
+                    .ok_or("No page for session")?;
+                let _ = page
+                    .prepare_screenshot_resources(resource_deadline_ms)
+                    .await;
                 let stream_id = ctx.next_screencast_session();
                 let state = parse_screencast_state(params, stream_id)?;
                 ctx.screencasts.insert(cdp_session.clone(), state);
                 let pending_before = ctx.pending_events.len();
                 ctx.pending_events.push(CdpEvent {
                     method: "Page.screencastVisibilityChanged".into(),
-                    params: json!({"visible": true}), session_id: session_id.clone(),
+                    params: json!({"visible": true}),
+                    session_id: session_id.clone(),
                 });
                 if let Err(error) = queue_screencast_frame(ctx, session_id, true) {
                     ctx.pending_events.truncate(pending_before);
                     ctx.screencasts.remove(&cdp_session);
                     return Err(error);
                 }
-                tracing::debug!(cdp_session, stream_id,
-                    "started command-driven screencast; autonomous compositor frames unavailable");
+                tracing::debug!(
+                    cdp_session,
+                    stream_id,
+                    "started command-driven screencast; autonomous compositor frames unavailable"
+                );
                 // Extension fields expose the MVP boundary to direct callers.
-                Ok(json!({"obscuraFrameSource": "command-driven", "obscuraAutonomousFrames": false}))
+                Ok(
+                    json!({"obscuraFrameSource": "command-driven", "obscuraAutonomousFrames": false}),
+                )
             }
             #[cfg(not(feature = "render"))]
             Err("Page.startScreencast requires a build with the render feature".into())
@@ -984,7 +1137,9 @@ pub async fn handle(
         "stopScreencast" => {
             #[cfg(feature = "render")]
             {
-                if let Some(cdp_session) = session_id.as_ref() { ctx.screencasts.remove(cdp_session); }
+                if let Some(cdp_session) = session_id.as_ref() {
+                    ctx.screencasts.remove(cdp_session);
+                }
                 Ok(json!({}))
             }
             #[cfg(not(feature = "render"))]
@@ -1018,12 +1173,6 @@ pub async fn handle(
                             .to_string(),
                     );
                 }
-                if options.capture_beyond_viewport && options.clip.is_none() {
-                    return Err(
-                        "Page.captureScreenshot full-page captureBeyondViewport=true is not supported without a clip: Obscura cannot yet record an off-viewport surface without relayout or scripted scrolling"
-                            .to_string(),
-                    );
-                }
                 if options.format == ScreenshotFormat::Webp && options.quality_supplied {
                     return Err(
                         "WebP screenshot quality is not supported by the current lossless encoder"
@@ -1035,30 +1184,81 @@ pub async fn handle(
                     .get_session_page_mut(session_id)
                     .ok_or("No page for session")?;
                 let resource_deadline_ms = std::env::var("OBSCURA_RENDER_RESOURCE_DEADLINE_MS")
-                    .ok().and_then(|value| value.parse::<u64>().ok()).unwrap_or(3_000);
-                let _ = page.prepare_screenshot_resources(resource_deadline_ms).await;
+                    .ok()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or(3_000);
+                let _ = page
+                    .prepare_screenshot_resources(resource_deadline_ms)
+                    .await;
                 let viewport = page.viewport;
-                let scroll = if options.clip.is_some() {
-                    page.evaluate("[window.scrollX, window.scrollY]")
-                        .as_array()
-                        .map(|values| {
-                            (
-                                values.first().and_then(Value::as_f64).unwrap_or(0.0),
-                                values.get(1).and_then(Value::as_f64).unwrap_or(0.0),
-                            )
-                        })
-                        .unwrap_or((0.0, 0.0))
+                let device_scale_factor = f64::from(page.device_scale_factor);
+                let trusted_scroll = page.screenshot_scroll_offset();
+                let scroll = (f64::from(trusted_scroll.0), f64::from(trusted_scroll.1));
+
+                let region = if let Some(clip) = options.clip {
+                    let relative_x = clip.x - scroll.0;
+                    let relative_y = clip.y - scroll.1;
+                    let epsilon = 1e-6;
+                    if !options.capture_beyond_viewport
+                        && (relative_x < -epsilon
+                            || relative_y < -epsilon
+                            || relative_x + clip.width > f64::from(viewport.0) + epsilon
+                            || relative_y + clip.height > f64::from(viewport.1) + epsilon)
+                    {
+                        return Err(format!(
+                            "Page.captureScreenshot clip lies outside the current viewport surface while captureBeyondViewport=false (visible page rect: x={} y={} width={} height={})",
+                            scroll.0, scroll.1, viewport.0, viewport.1
+                        ));
+                    }
+                    Some(chromium_clip_region(clip, device_scale_factor)?)
+                } else if options.capture_beyond_viewport {
+                    let content_size = page.prepared_content_size().ok_or_else(|| {
+                        "Page.captureScreenshot failed: no retained document size".to_string()
+                    })?;
+                    Some(obscura_browser::CaptureRegion::new(
+                        0.0,
+                        0.0,
+                        content_size.0.max(viewport.0),
+                        content_size.1.max(viewport.1),
+                        page.device_scale_factor,
+                    ))
+                } else if page.device_scale_factor != 1.0 {
+                    Some(obscura_browser::CaptureRegion::new(
+                        scroll.0 as f32,
+                        scroll.1 as f32,
+                        viewport.0,
+                        viewport.1,
+                        page.device_scale_factor,
+                    ))
                 } else {
-                    (0.0, 0.0)
+                    None
                 };
-                let png = page.screenshot(viewport).ok_or_else(|| {
-                    "Page.captureScreenshot failed: the page has no DOM to render".to_string()
-                })?;
+
+                let png = match region {
+                    Some(region) => page
+                        .screenshot_region(region)
+                        .map_err(capture_error_message)?,
+                    None => {
+                        obscura_browser::validate_capture_region(
+                            obscura_browser::CaptureRegion::new(
+                                scroll.0 as f32,
+                                scroll.1 as f32,
+                                viewport.0,
+                                viewport.1,
+                                1.0,
+                            ),
+                        )
+                        .map_err(capture_error_message)?;
+                        page.screenshot(viewport).ok_or_else(|| {
+                            "Page.captureScreenshot failed: the page has no DOM to render"
+                                .to_string()
+                        })?
+                    }
+                };
 
                 // Keep the common path allocation-free and byte-for-byte
                 // compatible with the renderer's native PNG encoder.
                 let encoded = if options.format == ScreenshotFormat::Png
-                    && options.clip.is_none()
                     && !options.optimize_for_speed
                 {
                     png
@@ -1068,31 +1268,7 @@ pub async fn handle(
                             format!("Page.captureScreenshot could not decode renderer PNG: {error}")
                         })?
                         .to_rgba8();
-
-                    let raster = if let Some(clip) = options.clip {
-                        let relative_x = clip.x - scroll.0;
-                        let relative_y = clip.y - scroll.1;
-                        let epsilon = 1e-6;
-                        if relative_x < -epsilon
-                            || relative_y < -epsilon
-                            || relative_x + clip.width > f64::from(source.width()) + epsilon
-                            || relative_y + clip.height > f64::from(source.height()) + epsilon
-                        {
-                            return Err(format!(
-                                "Page.captureScreenshot clip lies outside the current viewport surface; Obscura cannot yet record off-viewport pixels even with captureBeyondViewport=true (visible page rect: x={} y={} width={} height={})",
-                                scroll.0, scroll.1, viewport.0, viewport.1
-                            ));
-                        }
-                        sample_screenshot_region(
-                            &source,
-                            clip,
-                            relative_x.max(0.0),
-                            relative_y.max(0.0),
-                        )?
-                    } else {
-                        source
-                    };
-                    encode_screenshot(&raster, options)?
+                    encode_screenshot(&source, options)?
                 };
 
                 use base64::Engine as _;
@@ -1100,10 +1276,7 @@ pub async fn handle(
                 Ok(json!({ "data": data }))
             }
             #[cfg(not(feature = "render"))]
-            Err(
-                "Page.captureScreenshot requires a build with the render feature"
-                    .to_string(),
-            )
+            Err("Page.captureScreenshot requires a build with the render feature".to_string())
         }
         "captureSnapshot" => {
             // A DOM/layer-tree snapshot (not a raster image). Distinct from
@@ -1204,7 +1377,10 @@ mod tests {
         assert_eq!(metrics["visualViewport"]["pageY"].as_f64(), Some(80.0));
         assert_eq!(metrics["contentSize"]["width"].as_f64(), Some(100.0));
         assert!(
-            metrics["contentSize"]["height"].as_f64().unwrap_or_default() >= 160.0,
+            metrics["contentSize"]["height"]
+                .as_f64()
+                .unwrap_or_default()
+                >= 160.0,
             "contentSize must expose the scrollable document: {metrics}"
         );
 
@@ -1261,13 +1437,23 @@ mod tests {
     async fn screencast_initial_frame_metadata_and_encoding_match_options() {
         let (mut ctx, session) = screenshot_fixture().await;
         ctx.pending_events.clear();
-        let result = handle("startScreencast", &json!({
-            "format": "jpeg", "quality": 35, "maxWidth": 50, "maxHeight": 100,
-        }), &mut ctx, &session).await.expect("start screencast");
+        let result = handle(
+            "startScreencast",
+            &json!({
+                "format": "jpeg", "quality": 35, "maxWidth": 50, "maxHeight": 100,
+            }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("start screencast");
         assert_eq!(result["obscuraFrameSource"], "command-driven");
         assert_eq!(result["obscuraAutonomousFrames"], false);
         assert_eq!(ctx.pending_events.len(), 2);
-        assert_eq!(ctx.pending_events[0].method, "Page.screencastVisibilityChanged");
+        assert_eq!(
+            ctx.pending_events[0].method,
+            "Page.screencastVisibilityChanged"
+        );
         let frame = &ctx.pending_events[1];
         assert_eq!(frame.method, "Page.screencastFrame");
         assert_eq!(frame.session_id, session);
@@ -1277,7 +1463,12 @@ mod tests {
         assert_eq!(frame.params["metadata"]["deviceWidth"], 100.0);
         assert_eq!(frame.params["metadata"]["deviceHeight"], 80.0);
         assert_eq!(frame.params["metadata"]["scrollOffsetY"], 0.0);
-        assert!(frame.params["metadata"]["timestamp"].as_f64().unwrap_or(0.0) > 0.0);
+        assert!(
+            frame.params["metadata"]["timestamp"]
+                .as_f64()
+                .unwrap_or(0.0)
+                > 0.0
+        );
         assert_eq!(frame.params["sessionId"], 1);
     }
 
@@ -1286,30 +1477,60 @@ mod tests {
     async fn screencast_sampling_backpressure_and_stale_acks_are_bounded() {
         let (mut ctx, session) = screenshot_fixture().await;
         ctx.pending_events.clear();
-        handle("startScreencast", &json!({"everyNthFrame": 2}), &mut ctx, &session)
-            .await.expect("start sampled stream");
+        handle(
+            "startScreencast",
+            &json!({"everyNthFrame": 2}),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("start sampled stream");
         let old_id = ctx.pending_events[1].params["sessionId"].as_i64().unwrap();
         ctx.pending_events.clear();
         assert!(!queue_screencast_frame(&mut ctx, &session, false).unwrap());
         assert!(queue_screencast_frame(&mut ctx, &session, false).unwrap());
-        assert!(!queue_screencast_frame(&mut ctx, &session, false).unwrap(),
-            "two unacknowledged frames must apply backpressure before capture");
+        assert!(
+            !queue_screencast_frame(&mut ctx, &session, false).unwrap(),
+            "two unacknowledged frames must apply backpressure before capture"
+        );
         let key = session.as_ref().unwrap();
-        handle("screencastFrameAck", &json!({"sessionId": old_id + 99}), &mut ctx, &session)
-            .await.expect("stale ack");
+        handle(
+            "screencastFrameAck",
+            &json!({"sessionId": old_id + 99}),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("stale ack");
         assert_eq!(ctx.screencasts[key].frames_in_flight, 2);
-        handle("screencastFrameAck", &json!({"sessionId": old_id}), &mut ctx, &session)
-            .await.expect("current ack");
+        handle(
+            "screencastFrameAck",
+            &json!({"sessionId": old_id}),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("current ack");
         assert_eq!(ctx.screencasts[key].frames_in_flight, 1);
 
         ctx.pending_events.clear();
-        handle("startScreencast", &json!({}), &mut ctx, &session).await.expect("restart");
+        handle("startScreencast", &json!({}), &mut ctx, &session)
+            .await
+            .expect("restart");
         let new_id = ctx.pending_events[1].params["sessionId"].as_i64().unwrap();
         assert!(new_id > old_id);
-        handle("screencastFrameAck", &json!({"sessionId": old_id}), &mut ctx, &session)
-            .await.expect("old generation ack");
+        handle(
+            "screencastFrameAck",
+            &json!({"sessionId": old_id}),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("old generation ack");
         assert_eq!(ctx.screencasts[key].frames_in_flight, 1);
-        handle("stopScreencast", &json!({}), &mut ctx, &session).await.expect("stop");
+        handle("stopScreencast", &json!({}), &mut ctx, &session)
+            .await
+            .expect("stop");
         assert!(!ctx.screencasts.contains_key(key));
         assert!(!queue_screencast_frame(&mut ctx, &session, false).unwrap());
     }
@@ -1320,9 +1541,9 @@ mod tests {
         assert!(parse_screencast_state(&json!({"format": "webp"}), 1).is_err());
         assert!(parse_screencast_state(&json!({"everyNthFrame": 0}), 1).is_err());
         assert!(parse_screencast_state(&json!({"maxWidth": 20.5}), 1).is_err());
-        let state = parse_screencast_state(
-            &json!({"quality": 101, "maxWidth": 0, "maxHeight": -1}), 1,
-        ).expect("Chromium-compatible fallbacks");
+        let state =
+            parse_screencast_state(&json!({"quality": 101, "maxWidth": 0, "maxHeight": -1}), 1)
+                .expect("Chromium-compatible fallbacks");
         assert_eq!(state.quality, DEFAULT_SCREENSHOT_QUALITY as u8);
         assert_eq!(state.max_width, None);
         assert_eq!(state.max_height, None);
@@ -1368,6 +1589,40 @@ mod tests {
             "clip x/y must select the blue half of the live surface: {center:?}"
         );
 
+        // Empirical Chromium result: the fractional CSS size first becomes a
+        // 10x9 gfx::Size, then 1.1x output scaling rounds to 11x10 pixels.
+        let fractional = handle(
+            "captureScreenshot",
+            &json!({
+                "clip": {"x": 50.0, "y": 0.0, "width": 10.9, "height": 9.9, "scale": 1.1}
+            }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("fractional Chromium clip");
+        let (_, raster) = decode_capture(&fractional);
+        assert_eq!(raster.dimensions(), (11, 10));
+
+        let off_viewport = handle(
+            "captureScreenshot",
+            &json!({
+                "captureBeyondViewport": true,
+                "clip": {"x": 0.0, "y": 100.0, "width": 20.0, "height": 20.0, "scale": 1.0}
+            }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("off-viewport document-space clip");
+        let (_, raster) = decode_capture(&off_viewport);
+        assert_eq!(raster.dimensions(), (20, 20));
+        let center = raster.get_pixel(10, 10).0;
+        assert!(
+            center[1] > 80 && center[0] < 50 && center[2] < 50,
+            "captureBeyondViewport must paint off-viewport document content: {center:?}"
+        );
+
         ctx.get_session_page_mut(&session)
             .expect("page")
             .evaluate("window.scrollTo(0, 80)");
@@ -1387,6 +1642,20 @@ mod tests {
             center[1] > 80 && center[0] < 50 && center[2] < 50,
             "clip coordinates must remain page-relative after scrolling: {center:?}"
         );
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test]
+    async fn default_capture_rejects_oversized_viewport_before_raster_allocation() {
+        let (mut ctx, session) = screenshot_fixture().await;
+        ctx.get_session_page_mut(&session)
+            .expect("page")
+            .set_viewport((32_768.0, 32_768.0));
+
+        let error = handle("captureScreenshot", &json!({}), &mut ctx, &session)
+            .await
+            .expect_err("a 4 GiB RGBA surface must be rejected before allocation");
+        assert!(error.contains("bitmap is too large"), "{error}");
     }
 
     #[cfg(feature = "render")]
@@ -1468,9 +1737,11 @@ mod tests {
         assert!(parse_screenshot_options(&json!({"fromSurface": "false"}))
             .expect_err("fromSurface type")
             .contains("fromSurface must be a boolean"));
-        assert!(parse_screenshot_options(&json!({"captureBeyondViewport": 1}))
-            .expect_err("captureBeyondViewport type")
-            .contains("captureBeyondViewport must be a boolean"));
+        assert!(
+            parse_screenshot_options(&json!({"captureBeyondViewport": 1}))
+                .expect_err("captureBeyondViewport type")
+                .contains("captureBeyondViewport must be a boolean")
+        );
         assert_eq!(
             parse_screenshot_options(&json!({
                 "clip": {"x": 0, "y": 0, "width": 0, "height": 10, "scale": 1}
@@ -1487,8 +1758,12 @@ mod tests {
 
     #[cfg(feature = "render")]
     #[tokio::test]
-    async fn capture_screenshot_rejects_unrepresented_surfaces() {
+    async fn capture_screenshot_supports_full_page_but_rejects_unrepresented_surfaces() {
         let (mut ctx, session) = screenshot_fixture().await;
+        ctx.get_session_page_mut(&session).expect("page").evaluate(
+            "Object.defineProperty(globalThis,'innerWidth',{value:4096,configurable:true});\
+                 Object.defineProperty(globalThis,'innerHeight',{value:4096,configurable:true})",
+        );
         let beyond = handle(
             "captureScreenshot",
             &json!({"captureBeyondViewport": true}),
@@ -1496,8 +1771,14 @@ mod tests {
             &session,
         )
         .await
-        .expect_err("full-page recording is unsupported");
-        assert!(beyond.contains("captureBeyondViewport=true"), "{beyond}");
+        .expect("full-page document capture");
+        let (_, raster) = decode_capture(&beyond);
+        assert_eq!(raster.dimensions(), (100, 160));
+        let bottom = raster.get_pixel(50, 120).0;
+        assert!(
+            bottom[1] > 80 && bottom[0] < 50 && bottom[2] < 50,
+            "full-page capture must include below-fold content: {bottom:?}"
+        );
 
         let off_surface = handle(
             "captureScreenshot",
@@ -1525,6 +1806,54 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "render")]
+    #[tokio::test]
+    async fn capture_screenshot_combines_device_and_clip_scale_without_relayout() {
+        let (mut ctx, session) = screenshot_fixture().await;
+        crate::domains::emulation::handle(
+            "setDeviceMetricsOverride",
+            &json!({
+                "width": 100,
+                "height": 80,
+                "deviceScaleFactor": 2,
+                "mobile": false
+            }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("device metrics override");
+
+        let full_viewport = handle("captureScreenshot", &json!({}), &mut ctx, &session)
+            .await
+            .expect("2x viewport capture");
+        let (_, raster) = decode_capture(&full_viewport);
+        assert_eq!(raster.dimensions(), (200, 160));
+
+        let clip = handle(
+            "captureScreenshot",
+            &json!({
+                "clip": {"x": 50, "y": 0, "width": 20, "height": 10, "scale": 1.5}
+            }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("device-scaled clip");
+        let (_, raster) = decode_capture(&clip);
+        assert_eq!(
+            raster.dimensions(),
+            (60, 30),
+            "output scale is clip.scale times deviceScaleFactor"
+        );
+        let center = raster.get_pixel(30, 15).0;
+        assert!(center[2] > 200 && center[0] < 50, "{center:?}");
+
+        let page = ctx.get_session_page(&session).expect("page");
+        assert_eq!(page.viewport, (100.0, 80.0));
+        assert_eq!(page.device_scale_factor, 2.0);
+    }
+
     #[tokio::test]
     async fn unknown_page_method_still_errors() {
         let mut ctx = CdpContext::new();
@@ -1535,27 +1864,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn print_to_pdf_returns_descriptive_unsupported_error() {
+    async fn print_to_pdf_is_explicit_without_a_renderable_session() {
         // Regression for #53: Page.printToPDF must be handled explicitly so
         // Playwright clients receive a descriptive error rather than the
         // generic "Unknown Page method" fallback.
         let mut ctx = CdpContext::new();
         let err = handle("printToPDF", &json!({}), &mut ctx, &None)
             .await
-            .expect_err("printToPDF must error until a real renderer exists");
+            .expect_err("printToPDF without a page session must error");
         assert!(
             !err.contains("Unknown Page method"),
             "printToPDF must NOT fall through to the catch-all: {err}"
         );
+        #[cfg(feature = "render")]
+        assert!(err.contains("No page for session"), "{err}");
+        #[cfg(not(feature = "render"))]
         assert!(
-            err.contains("not supported by Obscura"),
-            "error must clearly state PDF is unsupported: {err}"
-        );
-        // Direct user to a workaround so the message is actionable.
-        assert!(
-            err.to_lowercase().contains("evaluate")
-                || err.to_lowercase().contains("html"),
-            "error must point to a workaround: {err}"
+            err.contains("requires a build with the render feature"),
+            "{err}"
         );
     }
 
@@ -1631,7 +1957,10 @@ mod tests {
         assert_eq!(info["url"], json!(exp_url));
         assert_eq!(info["title"], json!(exp_title));
         assert!(
-            info["url"].as_str().unwrap_or_default().starts_with("data:"),
+            info["url"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("data:"),
             "url should reflect the navigated page, got {}",
             info["url"]
         );

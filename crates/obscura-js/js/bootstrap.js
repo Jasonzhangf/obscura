@@ -87,8 +87,6 @@ const _DOM_MUTATION_COMMANDS = new Set([
   "set_attribute", "remove_attribute",
   "set_text_content", "set_inner_html", "set_inner_html_context",
   "set_fragment_html_executable",
-  "create_element", "create_text_node", "create_comment_node",
-  "create_document_fragment", "clone_node",
 ]);
 const _dom = (cmd, a1, a2) => {
   const result = Deno.core.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""));
@@ -622,11 +620,27 @@ globalThis.console = {
 let _tid = 0;
 const _clearedTimers = new Set();
 const _intervals = new Set();
+const _nativeTimerIds = new Map();
+const __obscuraPendingTimeoutDeadlines = new Map();
 
 const _scheduleAfter = (delay, fn) => {
   const d = Math.max(0, Number(delay) || 0);
-  if (d === 0) Promise.resolve().then(fn);
-  else Deno.core.ops.op_sleep(d).then(fn);
+  // HTML timers queue tasks even when their delay is zero. Treating a
+  // zero-delay timer as a Promise reaction turns recursive framework
+  // schedulers into an unbounded microtask checkpoint: timers and networking
+  // never regain control and V8 can burn seconds before navigation completes.
+  // deno_core's timer queue requires a Tokio reactor even to enqueue. Some
+  // low-level embedders intentionally do a synchronous geometry mutation and
+  // capture without pumping an event loop. Such a host cannot observe queued
+  // tasks, so leave them pending instead of aborting or incorrectly turning a
+  // task into a microtask. Normal browser and CDP execution always takes the
+  // task-queue path below.
+  if (!Deno.core.ops.op_async_runtime_available()) {
+    return undefined;
+  }
+  // The callback runs only when the embedder pumps the event loop, after the
+  // current microtask checkpoint.
+  return Deno.core.queueUserTimer(0, false, d, fn);
 };
 
 // Timers accept a string first arg per the HTML spec (e.g. the Aliyun WAF
@@ -652,14 +666,29 @@ globalThis.setTimeout = (fn, delay = 0, ...args) => {
   const f = _coerceTimerFn(fn);
   if (f === null) return ++_tid;
   const id = ++_tid;
-  _scheduleAfter(delay, () => {
+  const normalizedDelay = Math.max(0, Number(delay) || 0);
+  const nativeId = _scheduleAfter(normalizedDelay, () => {
+    _nativeTimerIds.delete(id);
+    __obscuraPendingTimeoutDeadlines.delete(id);
     if (_clearedTimers.has(id)) return;
     try { f(...args); } catch(e) { console.error("Timer error:", e); }
   });
+  if (nativeId !== undefined) {
+    _nativeTimerIds.set(id, nativeId);
+    __obscuraPendingTimeoutDeadlines.set(id, performance.now() + normalizedDelay);
+  }
   return id;
 };
 
-globalThis.clearTimeout = (id) => { _clearedTimers.add(id); };
+globalThis.clearTimeout = (id) => {
+  _clearedTimers.add(id);
+  __obscuraPendingTimeoutDeadlines.delete(id);
+  const nativeId = _nativeTimerIds.get(id);
+  if (nativeId !== undefined) {
+    Deno.core.cancelTimer(nativeId);
+    _nativeTimerIds.delete(id);
+  }
+};
 
 globalThis.setInterval = (fn, delay = 0, ...args) => {
   const f = _coerceTimerFn(fn);
@@ -670,13 +699,18 @@ globalThis.setInterval = (fn, delay = 0, ...args) => {
     if (!_intervals.has(id)) return;
     try { f(...args); } catch(e) { console.error("Interval error:", e); }
     if (!_intervals.has(id)) return;
-    _scheduleAfter(delay, tick);
+    const nativeId = _scheduleAfter(delay, tick);
+    if (nativeId !== undefined) _nativeTimerIds.set(id, nativeId);
   };
-  _scheduleAfter(delay, tick);
+  const nativeId = _scheduleAfter(delay, tick);
+  if (nativeId !== undefined) _nativeTimerIds.set(id, nativeId);
   return id;
 };
 
-globalThis.clearInterval = (id) => { _intervals.delete(id); _clearedTimers.add(id); };
+globalThis.clearInterval = (id) => {
+  _intervals.delete(id);
+  globalThis.clearTimeout(id);
+};
 
 // Animation callbacks are a rendering-phase batch, not zero-delay
 // microtasks.  In particular, a callback which queues itself must yield to
@@ -739,20 +773,155 @@ globalThis.cancelAnimationFrame = (id) => {
 };
 globalThis.queueMicrotask = globalThis.queueMicrotask || ((fn) => Promise.resolve().then(fn));
 
+// MessagePort is a task-backed EventTarget, not a pair of callback slots.
+// React currently uses `onmessage`, while Angular/Zone.js and worker-style
+// schedulers commonly use addEventListener + start and inspect the prototype.
+// Keep stopped-port messages queued, clone payloads synchronously, and deliver
+// one message per task so every delivery gets its own microtask checkpoint.
+const _messagePortConstructionKey = {};
+const _messagePortState = new WeakMap();
+function _messagePortStateFor(port) {
+  const state = _messagePortState.get(port);
+  if (!state) throw new TypeError("Illegal invocation");
+  return state;
+}
+function _messagePortInstallEventHandler(port, type, callback) {
+  const state = _messagePortStateFor(port);
+  const slot = type === "message" ? "onmessage" : "onmessageerror";
+  const wrapperSlot = type === "message" ? "messageHandlerWrapper" : "messageErrorHandlerWrapper";
+  const oldCallback = state[slot];
+  state[slot] = callback;
+
+  // Event-handler IDL attributes participate in the same listener list as
+  // addEventListener. Install their stable wrapper when the slot first becomes
+  // non-null so mixed registrations run in registration order. Reassigning a
+  // live handler keeps its position; clearing and setting it again appends it.
+  if (callback && !oldCallback) {
+    const wrapper = (event) => {
+      const current = _messagePortState.get(port)?.[slot];
+      if (!current) return;
+      if (typeof current === "function") current.call(port, event);
+      else current.handleEvent.call(current, event);
+    };
+    state[wrapperSlot] = wrapper;
+    _eventTargetAdd(port, type, wrapper);
+  } else if (!callback && oldCallback) {
+    _eventTargetRemove(port, type, state[wrapperSlot]);
+    state[wrapperSlot] = null;
+  }
+}
+function _messagePortScheduleDelivery(port) {
+  const state = _messagePortStateFor(port);
+  if (state.closed || !state.messageQueueEnabled || state.messageDeliveryPending || !state.messageQueue.length) return;
+  state.messageDeliveryPending = true;
+  _scheduleAfter(0, () => {
+    const current = _messagePortState.get(port);
+    if (!current) return;
+    current.messageDeliveryPending = false;
+    if (current.closed || !current.messageQueueEnabled || !current.messageQueue.length) return;
+    const data = current.messageQueue.shift();
+    const event = new MessageEvent("message", {
+      data,
+      origin: "",
+      lastEventId: "",
+      source: null,
+      ports: [],
+    });
+    _eventTargetDispatch(port, event);
+    _messagePortScheduleDelivery(port);
+  });
+}
+class MessagePort {
+  constructor(key) {
+    if (key !== _messagePortConstructionKey) throw new TypeError("Illegal constructor");
+    _messagePortState.set(this, {
+      entangled: null,
+      messageQueue: [],
+      messageQueueEnabled: false,
+      messageDeliveryPending: false,
+      closed: false,
+      onmessage: null,
+      onmessageerror: null,
+      messageHandlerWrapper: null,
+      messageErrorHandlerWrapper: null,
+    });
+  }
+  postMessage(message, options) {
+    // Structured serialization happens before inspecting the entanglement.
+    // This preserves the browser-observable DataCloneError on closed ports and
+    // prevents mutations after postMessage from changing the delivered value.
+    let cloned;
+    try {
+      cloned = globalThis.structuredClone(message, options);
+    } catch (error) {
+      throw error;
+    }
+    const state = _messagePortStateFor(this);
+    const target = state.entangled;
+    const targetState = target && _messagePortState.get(target);
+    if (state.closed || !targetState || targetState.closed) return;
+    targetState.messageQueue.push(cloned);
+    _messagePortScheduleDelivery(target);
+  }
+  start() {
+    const state = _messagePortStateFor(this);
+    if (state.messageQueueEnabled || state.closed) return;
+    state.messageQueueEnabled = true;
+    _messagePortScheduleDelivery(this);
+  }
+  close() {
+    const state = _messagePortStateFor(this);
+    if (state.closed) return;
+    state.closed = true;
+    state.messageQueue.length = 0;
+    state.messageQueueEnabled = false;
+    const peer = state.entangled;
+    state.entangled = null;
+    const peerState = peer && _messagePortState.get(peer);
+    if (peerState?.entangled === this) peerState.entangled = null;
+    // A previously scheduled task cannot be removed from the shared task
+    // source, but it observes `closed` and therefore cannot dispatch.
+  }
+  addEventListener(type, callback, options) {
+    _eventTargetAdd(this, type, callback, options);
+  }
+  removeEventListener(type, callback, options) {
+    _eventTargetRemove(this, type, callback, options);
+  }
+  dispatchEvent(event) {
+    _messagePortStateFor(this);
+    return _eventTargetDispatch(this, event);
+  }
+  get onmessage() { return _messagePortStateFor(this).onmessage; }
+  set onmessage(callback) {
+    callback = typeof callback === "function"
+      || (callback && typeof callback.handleEvent === "function")
+      ? callback : null;
+    _messagePortInstallEventHandler(this, "message", callback);
+    // Setting the event-handler IDL attribute implicitly starts the port,
+    // including when the assigned value is null.
+    this.start();
+  }
+  get onmessageerror() { return _messagePortStateFor(this).onmessageerror; }
+  set onmessageerror(callback) {
+    callback = typeof callback === "function"
+      || (callback && typeof callback.handleEvent === "function")
+      ? callback : null;
+    _messagePortInstallEventHandler(this, "messageerror", callback);
+  }
+  get [Symbol.toStringTag]() { return "MessagePort"; }
+}
+
 class MessageChannel {
   constructor() {
-    this.port1 = { onmessage: null, postMessage: () => {}, close() {}, addEventListener() {}, removeEventListener() {} };
-    this.port2 = { onmessage: null, postMessage: () => {}, close() {}, addEventListener() {}, removeEventListener() {} };
-    this.port1.postMessage = (data) => {
-      Promise.resolve().then(() => { if (this.port2.onmessage) this.port2.onmessage({ data }); });
-    };
-    this.port2.postMessage = (data) => {
-      Promise.resolve().then(() => { if (this.port1.onmessage) this.port1.onmessage({ data }); });
-    };
+    this.port1 = new MessagePort(_messagePortConstructionKey);
+    this.port2 = new MessagePort(_messagePortConstructionKey);
+    _messagePortStateFor(this.port1).entangled = this.port2;
+    _messagePortStateFor(this.port2).entangled = this.port1;
   }
 }
 globalThis.MessageChannel = MessageChannel;
-globalThis.MessagePort = class MessagePort { constructor(){} postMessage(){} close(){} addEventListener(){} removeEventListener(){} };
+globalThis.MessagePort = MessagePort;
 
 const _cssCamelToKebab = (s) => s.replace(/[A-Z]/g, (m) => "-" + m.toLowerCase());
 const _cssKebabToCamel = (s) => s.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
@@ -3529,6 +3698,26 @@ function _makeXPathResult(type, nodes) {
   };
 }
 
+// `document.domain` exposes the document's effective host.  Keep the relaxed
+// value on the live Document object so a navigation (which installs a new
+// Document in __obscura_init) naturally restores the URL host.  Detached
+// documents inherit the incumbent realm's principal for reads, which is why a
+// `new Document().domain` read reflects the live document rather than its own
+// about:blank URL.
+function _documentUrlHost() {
+  try { return new URL(_domParse("document_url") || "about:blank").hostname; }
+  catch (_) { return ""; }
+}
+function _incumbentDocumentDomain() {
+  const live = globalThis.document;
+  return live && typeof live._effectiveDomain === "string"
+    ? live._effectiveDomain
+    : _documentUrlHost();
+}
+function _throwDocumentDomainSecurityError() {
+  throw new DOMException("Failed to set the 'domain' property on 'Document'", "SecurityError");
+}
+
 class Document extends Node {
   get documentElement() { return _wrapEl(+_dom("document_element")); }
   get children() {
@@ -3569,6 +3758,28 @@ class Document extends Node {
   }
   get URL() { return _domParse("document_url") ?? ""; }
   get documentURI() { return this.URL; }
+  get domain() {
+    return this === globalThis.document
+      ? (typeof this._effectiveDomain === "string" ? this._effectiveDomain : _documentUrlHost())
+      : _incumbentDocumentDomain();
+  }
+  set domain(value) {
+    // Web IDL performs DOMString conversion before the setter algorithm checks
+    // whether the Document has a browsing context.
+    const input = String(value);
+    if (this !== globalThis.document) _throwDocumentDomainSecurityError();
+    const current = this.domain;
+    if (!current) _throwDocumentDomainSecurityError();
+    const candidate = Deno.core.ops.op_document_domain_candidate(current, input);
+    if (!candidate) _throwDocumentDomainSecurityError();
+    // This runtime currently has one top-level browsing context and no
+    // principal-backed same-origin-domain comparison.  Persisting the
+    // validated effective domain supplies the standards-shaped API without
+    // weakening iframe/fetch/storage origin checks; those must be wired to a
+    // future browsing-context principal model before domain relaxation can
+    // grant cross-document access.
+    this._effectiveDomain = candidate;
+  }
   get referrer() { return _domParse("document_referrer") ?? ""; }
   get location() { return globalThis.location; }
   set location(url) { Deno.core.ops.op_navigate(_resolveUrl(String(url)), 'GET', ''); }
@@ -6054,28 +6265,36 @@ globalThis.matchMedia = _markNative(function matchMedia(q) {
     dispatchEvent(){return true;}
   };
 });
+// getComputedStyle() returns a fresh declaration object, but those objects all
+// observe the same computed style for an element until the document mutates.
+// Share the immutable native snapshot behind them. Frameworks routinely call
+// getComputedStyle() repeatedly on the same few roots; rebuilding and parsing
+// several hundred properties for every wrapper dominated real-page startup.
+const _computedStyleSnapshotCache = new WeakMap();
 globalThis.getComputedStyle = (el) => {
   if (!el) el = document.body || {};
   const style = el?.style || el?._style || new CSSStyleDeclaration();
   // Render builds expose one immutable snapshot from the retained final
-  // cascade/layout. Fetch it once per CSSStyleDeclaration proxy: reading a
-  // dozen properties must not trigger a dozen layout/native crossings.
-  let rendered = null;
-  let renderedEpoch = -1;
-  let computedNames = [];
+  // cascade/layout. The native snapshot is shared per element and epoch while
+  // each call still returns a distinct, live CSSStyleDeclaration proxy.
+  const cacheable = (typeof el === 'object' && el !== null) || typeof el === 'function';
+  let snapshot = cacheable ? _computedStyleSnapshotCache.get(el) : null;
+  if (!snapshot) {
+    snapshot = { rendered: null, epoch: -1, names: [] };
+    if (cacheable) _computedStyleSnapshotCache.set(el, snapshot);
+  }
   const refreshRendered = () => {
-    if (renderedEpoch === _domMutationEpoch) return;
-    renderedEpoch = _domMutationEpoch;
-    rendered = null;
+    if (snapshot.epoch === _domMutationEpoch) return;
+    snapshot.epoch = _domMutationEpoch;
+    snapshot.rendered = null;
     if (typeof Deno.core.ops.op_computed_style === 'function' && el?._nid != null) {
       try {
         const raw = Deno.core.ops.op_computed_style(String(el._nid | 0));
-        rendered = raw ? JSON.parse(raw) : null;
+        snapshot.rendered = raw ? JSON.parse(raw) : null;
       } catch (e) {}
     }
-    computedNames = rendered ? Object.keys(rendered) : [];
+    snapshot.names = snapshot.rendered ? Object.keys(snapshot.rendered) : [];
   };
-  refreshRendered();
   // React virtualization libraries (react-window, tanstack-virtual,
   // react-virtuoso) all compute container dimensions via getComputedStyle.
   // The defaults table previously returned `auto` for width/height and
@@ -6139,8 +6358,8 @@ globalThis.getComputedStyle = (el) => {
     // (`-webkit-line-clamp`). Normalize the prefix once for every WebKit
     // property instead of adding per-property aliases to the native snapshot.
     if (kebab.startsWith('webkit-')) kebab = '-' + kebab;
-    if (rendered && Object.prototype.hasOwnProperty.call(rendered, kebab))
-      return rendered[kebab];
+    if (snapshot.rendered && Object.prototype.hasOwnProperty.call(snapshot.rendered, kebab))
+      return snapshot.rendered[kebab];
     // Non-render builds and properties outside the renderer snapshot retain
     // the lightweight inline CSSOM behavior.
     const inlineVal = target.getPropertyValue ? target.getPropertyValue(rawProp) : '';
@@ -6160,11 +6379,11 @@ globalThis.getComputedStyle = (el) => {
       if (prop === 'getPropertyPriority') return () => '';
       if (prop === 'item') return (i) => {
         refreshRendered();
-        return computedNames[i | 0] || '';
+        return snapshot.names[i | 0] || '';
       };
       if (prop === 'length') {
         refreshRendered();
-        return computedNames.length;
+        return snapshot.names.length;
       }
       if (prop === 'cssText') return '';
       if (prop === 'parentRule') return null;
@@ -6530,6 +6749,23 @@ globalThis.NodeFilter = {
 // target boxes through getBoundingClientRect. Element scroll-container roots
 // remain intentionally unsupported until their offsets participate in layout.
 globalThis.__intersectionObservers = [];
+let _intersectionRenderCheckpointPending = false;
+function _scheduleIntersectionRenderCheckpoint() {
+  if (_intersectionRenderCheckpointPending) return;
+  _intersectionRenderCheckpointPending = true;
+  // Intersection observation is part of the browser's rendering update, not
+  // a synchronous side effect of observe() or a DOM mutation. One queued task
+  // coalesces every observer/target and therefore performs at most one layout
+  // flush for the checkpoint.
+  _scheduleAfter(0, () => {
+    _intersectionRenderCheckpointPending = false;
+    for (const observer of globalThis.__intersectionObservers) {
+      if (observer._connected && observer._targets.size) {
+        observer._check([...observer._targets], false);
+      }
+    }
+  });
+}
 function _ioRect(x, y, width, height) {
   return {
     x, y, width, height,
@@ -6664,7 +6900,7 @@ globalThis.IntersectionObserver = class IntersectionObserver {
     }
     this._targets.add(el);
     this._previous.delete(el);
-    this._check([el], true);
+    _scheduleIntersectionRenderCheckpoint();
   }
   unobserve(el) {
     this._targets.delete(el);
@@ -6686,18 +6922,8 @@ globalThis.IntersectionObserver = class IntersectionObserver {
   get thresholds() { return this._thresholds.slice(); }
 };
 (function() {
-  let pending = false;
   const recompute = () => {
-    if (pending) return;
-    pending = true;
-    Promise.resolve().then(() => {
-      pending = false;
-      for (const observer of globalThis.__intersectionObservers) {
-        if (observer._connected && observer._targets.size) {
-          observer._check([...observer._targets], false);
-        }
-      }
-    });
+    _scheduleIntersectionRenderCheckpoint();
   };
   globalThis.__obscura_recompute_intersections = recompute;
   globalThis.addEventListener("resize", recompute);
@@ -6920,7 +7146,16 @@ globalThis.PopStateEvent = class extends Event {
   }
 };
 globalThis.HashChangeEvent = class extends Event {};
-globalThis.MessageEvent = class extends Event { constructor(t,o={}) { super(t,o);this.data=o.data; } };
+globalThis.MessageEvent = class extends Event {
+  constructor(t,o={}) {
+    super(t,o);
+    this.data = Object.prototype.hasOwnProperty.call(o, "data") ? o.data : null;
+    this.origin = o.origin == null ? "" : String(o.origin);
+    this.lastEventId = o.lastEventId == null ? "" : String(o.lastEventId);
+    this.source = o.source == null ? null : o.source;
+    this.ports = Array.isArray(o.ports) ? o.ports.slice() : [];
+  }
+};
 globalThis.ProgressEvent = class ProgressEvent extends Event {
   constructor(type, init) {
     super(type, init || {});
@@ -7315,6 +7550,8 @@ globalThis.DOMParser = class DOMParser {
       // URL about:blank, are already fully parsed, and carry no stylesheets.
       get URL() { return "about:blank"; },
       get documentURI() { return "about:blank"; },
+      get domain() { return _incumbentDocumentDomain(); },
+      set domain(value) { String(value); _throwDocumentDomainSecurityError(); },
       get referrer() { return ""; },
       get baseURI() { return "about:blank"; },
       get compatMode() { return "CSS1Compat"; },
@@ -10813,14 +11050,127 @@ if (typeof WebSocket === 'undefined') {
 }
 
 if (typeof BroadcastChannel === 'undefined') {
+  // BroadcastChannel is used by authentication/session coordinators and by
+  // modern framework dev/runtime clients. Keep the registry realm-local: one
+  // Obscura page is one origin-bound browsing context today, so every channel
+  // in this registry has the same storage key and origin by construction.
+  const channelsByName = new Map();
+  const channelState = new WeakMap();
+  const stateFor = (channel) => {
+    const state = channelState.get(channel);
+    if (!state) throw new TypeError('Illegal invocation');
+    return state;
+  };
+  const installHandler = (channel, type, callback) => {
+    const state = stateFor(channel);
+    const slot = type === 'message' ? 'onmessage' : 'onmessageerror';
+    const wrapperSlot = type === 'message' ? 'messageWrapper' : 'messageErrorWrapper';
+    const oldCallback = state[slot];
+    state[slot] = callback;
+    if (callback && !oldCallback) {
+      const wrapper = (event) => {
+        const current = channelState.get(channel)?.[slot];
+        if (!current) return;
+        if (typeof current === 'function') current.call(channel, event);
+        else current.handleEvent.call(current, event);
+      };
+      state[wrapperSlot] = wrapper;
+      _eventTargetAdd(channel, type, wrapper);
+    } else if (!callback && oldCallback) {
+      _eventTargetRemove(channel, type, state[wrapperSlot]);
+      state[wrapperSlot] = null;
+    }
+  };
+
   globalThis.BroadcastChannel = class BroadcastChannel {
     constructor(name) {
-      this.name = name; this.onmessage = null; this.onmessageerror = null;
-      _makeListenerBox(this);
+      if (arguments.length < 1) {
+        throw new TypeError("Failed to construct 'BroadcastChannel': 1 argument required.");
+      }
+      const normalizedName = String(name);
+      const state = {
+        name: normalizedName,
+        closed: false,
+        onmessage: null,
+        onmessageerror: null,
+        messageWrapper: null,
+        messageErrorWrapper: null,
+      };
+      channelState.set(this, state);
+      let channels = channelsByName.get(normalizedName);
+      if (!channels) channelsByName.set(normalizedName, channels = new Set());
+      channels.add(this);
     }
-    postMessage(msg) {}
-    close() {}
+    get name() { return stateFor(this).name; }
+    get onmessage() { return stateFor(this).onmessage; }
+    set onmessage(callback) {
+      callback = typeof callback === 'function'
+        || (callback && typeof callback.handleEvent === 'function')
+        ? callback : null;
+      installHandler(this, 'message', callback);
+    }
+    get onmessageerror() { return stateFor(this).onmessageerror; }
+    set onmessageerror(callback) {
+      callback = typeof callback === 'function'
+        || (callback && typeof callback.handleEvent === 'function')
+        ? callback : null;
+      installHandler(this, 'messageerror', callback);
+    }
+    addEventListener(type, callback, options) {
+      stateFor(this);
+      _eventTargetAdd(this, type, callback, options);
+    }
+    removeEventListener(type, callback, options) {
+      stateFor(this);
+      _eventTargetRemove(this, type, callback, options);
+    }
+    dispatchEvent(event) {
+      stateFor(this);
+      return _eventTargetDispatch(this, event);
+    }
+    postMessage(message) {
+      const state = stateFor(this);
+      if (state.closed) {
+        throw new DOMException("BroadcastChannel is closed.", "InvalidStateError");
+      }
+
+      // Serialization is synchronous and precedes recipient selection. This
+      // preserves DataCloneError even when no peer is listening and freezes
+      // the posted graph before the caller can mutate it.
+      const snapshot = globalThis.structuredClone(message);
+      const recipients = Array.from(channelsByName.get(state.name) || [])
+        .filter((channel) => channel !== this && !channelState.get(channel)?.closed);
+      const origin = globalThis.location?.origin || '';
+      for (const recipient of recipients) {
+        // Each destination gets an independent deserialization, not a shared
+        // JS object. Clone now so all serialization remains part of postMessage.
+        const data = globalThis.structuredClone(snapshot);
+        _scheduleAfter(0, () => {
+          const recipientState = channelState.get(recipient);
+          if (!recipientState || recipientState.closed) return;
+          _eventTargetDispatch(recipient, new MessageEvent('message', {
+            data,
+            origin,
+            source: null,
+            ports: [],
+          }));
+        });
+      }
+    }
+    close() {
+      const state = stateFor(this);
+      if (state.closed) return;
+      state.closed = true;
+      const channels = channelsByName.get(state.name);
+      if (!channels) return;
+      channels.delete(this);
+      if (!channels.size) channelsByName.delete(state.name);
+    }
+    get [Symbol.toStringTag]() { return 'BroadcastChannel'; }
   };
+  // EventTarget is currently Node-backed in this runtime; link the prototype
+  // without invoking Node's DOM-node constructor or exposing a fake `_nid`.
+  Object.setPrototypeOf(globalThis.BroadcastChannel.prototype, globalThis.EventTarget.prototype);
 }
 
 if (typeof MediaQueryList === 'undefined') {

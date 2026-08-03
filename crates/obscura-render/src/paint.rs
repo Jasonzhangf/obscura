@@ -5,9 +5,9 @@
 //! are later enhancements. Pure Rust (tiny-skia, CPU), deterministic, no system
 //! dependencies, so a screenshot is reproducible across hosts.
 
-use obscura_dom::tree::DomTree;
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
-use std::collections::{HashMap, VecDeque};
+use obscura_dom::tree::DomTree;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use tiny_skia::{
     Color, FillRule, FilterQuality, GradientStop, LinearGradient, Paint, PathBuilder, Pattern,
@@ -22,10 +22,14 @@ static FONT_BOLD_BYTES: &[u8] = include_bytes!("../assets/liberation-sans-bold.t
 static FONT_OBLIQUE_BYTES: &[u8] = include_bytes!("../assets/liberation-sans-oblique.ttf");
 static FONT_BOLD_OBLIQUE_BYTES: &[u8] = include_bytes!("../assets/liberation-sans-boldoblique.ttf");
 
-use crate::dom::layout_dom_with_web_fonts;
+use crate::dom::layout_dom_with_web_fonts_and_stylesheet_cache;
 
 const DEFAULT_RESOURCE_CACHE_ENTRIES: usize = 512;
 const DEFAULT_RESOURCE_CACHE_BYTES: usize = 64 * 1024 * 1024;
+/// CSS `content:url(...)` is only discoverable after cascade. Remember a
+/// bounded set of successful selections so repeated prepares can seed their
+/// intrinsic geometry before that cascade instead of always laying out twice.
+const DEFAULT_CONTENT_IMAGE_INTRINSIC_ENTRIES: usize = 256;
 const MISSING_RESOURCE_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
 /// Exact formats the renderer can decode. Do not use `image/*` or `*/*` here:
 /// either wildcard permits a content-negotiating server to choose AVIF,
@@ -74,6 +78,12 @@ enum CachedResource {
     Missing(std::time::Instant),
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct RememberedContentImageIntrinsic {
+    resolved_url: String,
+    dimensions: (f32, f32),
+}
+
 /// Page-scoped raw resource bytes shared by layout preparation and repeated
 /// paints. Entries are FIFO-bounded by both count and retained byte size.
 /// Successful bytes use `Arc` so consumers never clone an image/font body.
@@ -83,6 +93,11 @@ pub struct RenderResourceCache {
     retained_bytes: usize,
     max_entries: usize,
     max_bytes: usize,
+    content_image_intrinsics: HashMap<obscura_dom::tree::NodeId, RememberedContentImageIntrinsic>,
+    content_image_intrinsic_order: VecDeque<obscura_dom::tree::NodeId>,
+    max_content_image_intrinsics: usize,
+    #[cfg(test)]
+    content_image_layout_retries: usize,
     loader: Box<dyn RenderResourceLoader>,
 }
 
@@ -116,6 +131,11 @@ impl RenderResourceCache {
             retained_bytes: 0,
             max_entries,
             max_bytes,
+            content_image_intrinsics: HashMap::new(),
+            content_image_intrinsic_order: VecDeque::new(),
+            max_content_image_intrinsics: max_entries.min(DEFAULT_CONTENT_IMAGE_INTRINSIC_ENTRIES),
+            #[cfg(test)]
+            content_image_layout_retries: 0,
             loader: Box::new(loader),
         }
     }
@@ -184,11 +204,7 @@ impl RenderResourceCache {
     ) -> Option<Option<(String, f32, f32)>> {
         let resolved_url = resolve_resource_url(src, base_url)?;
         if resolved_url.starts_with("data:") {
-            let mut scratch = RenderResourceCache::with_loader_and_limits(
-                |_url: &str| None,
-                0,
-                0,
-            );
+            let mut scratch = RenderResourceCache::with_loader_and_limits(|_url: &str| None, 0, 0);
             return Some(
                 fetch_bytes(&resolved_url, None, &mut scratch)
                     .and_then(|bytes| image_metadata_from_bytes(&bytes))
@@ -200,9 +216,7 @@ impl RenderResourceCache {
                 image_metadata_from_bytes(bytes)
                     .map(|(width, height)| (resolved_url, width, height)),
             ),
-            Some(CachedResource::Missing(at))
-                if at.elapsed() < MISSING_RESOURCE_RETRY_AFTER =>
-            {
+            Some(CachedResource::Missing(at)) if at.elapsed() < MISSING_RESOURCE_RETRY_AFTER => {
                 Some(None)
             }
             _ => None,
@@ -256,9 +270,7 @@ impl RenderResourceCache {
         if let Some(entry) = self.entries.get(url) {
             match entry {
                 CachedResource::Bytes(bytes) => return Some(Arc::clone(bytes)),
-                CachedResource::Missing(at)
-                    if at.elapsed() < MISSING_RESOURCE_RETRY_AFTER =>
-                {
+                CachedResource::Missing(at) if at.elapsed() < MISSING_RESOURCE_RETRY_AFTER => {
                     return None;
                 }
                 CachedResource::Missing(_) => {}
@@ -323,6 +335,79 @@ impl RenderResourceCache {
             self.retained_bytes = self.retained_bytes.saturating_sub(bytes.len());
         }
     }
+
+    /// Seed a prior stable `content:url(...)` selection into the ordinary
+    /// intrinsic and selected-image maps before cascade. Node ids are scoped
+    /// to this page cache; removed/non-image ids are pruned eagerly.
+    fn seed_content_image_intrinsics(
+        &mut self,
+        tree: &DomTree,
+        intrinsic: &mut HashMap<obscura_dom::tree::NodeId, (f32, f32)>,
+        selected: &mut HashMap<obscura_dom::tree::NodeId, SelectedImage>,
+    ) -> HashSet<obscura_dom::tree::NodeId> {
+        let remembered = self
+            .content_image_intrinsics
+            .iter()
+            .map(|(&nid, value)| (nid, value.clone()))
+            .collect::<Vec<_>>();
+        let mut seeded = HashSet::with_capacity(remembered.len());
+        for (nid, value) in remembered {
+            let is_live_image = tree.get_node(nid).is_some_and(|node| {
+                node.as_element()
+                    .is_some_and(|element| element.local.as_ref() == "img")
+            });
+            if !is_live_image {
+                self.forget_content_image_intrinsic(nid);
+                continue;
+            }
+            intrinsic.insert(nid, value.dimensions);
+            selected.insert(
+                nid,
+                SelectedImage {
+                    resolved_url: value.resolved_url,
+                    density: 1.0,
+                },
+            );
+            seeded.insert(nid);
+        }
+        seeded
+    }
+
+    fn remember_content_image_intrinsic(
+        &mut self,
+        nid: obscura_dom::tree::NodeId,
+        resolved_url: String,
+        dimensions: (f32, f32),
+    ) {
+        if self.max_content_image_intrinsics == 0 {
+            return;
+        }
+        let replacing = self.content_image_intrinsics.contains_key(&nid);
+        self.content_image_intrinsic_order
+            .retain(|remembered| *remembered != nid);
+        while !replacing && self.content_image_intrinsics.len() >= self.max_content_image_intrinsics
+        {
+            let Some(oldest) = self.content_image_intrinsic_order.pop_front() else {
+                break;
+            };
+            self.content_image_intrinsics.remove(&oldest);
+        }
+        self.content_image_intrinsic_order.push_back(nid);
+        self.content_image_intrinsics.insert(
+            nid,
+            RememberedContentImageIntrinsic {
+                resolved_url,
+                dimensions,
+            },
+        );
+    }
+
+    fn forget_content_image_intrinsic(&mut self, nid: obscura_dom::tree::NodeId) {
+        if self.content_image_intrinsics.remove(&nid).is_some() {
+            self.content_image_intrinsic_order
+                .retain(|remembered| *remembered != nid);
+        }
+    }
 }
 
 /// The exact responsive image candidate chosen during preparation.
@@ -366,6 +451,7 @@ pub struct CaptureRegion {
     pub width: f32,
     pub height: f32,
     pub scale: f32,
+    output_size: Option<(u32, u32)>,
 }
 
 impl CaptureRegion {
@@ -376,6 +462,29 @@ impl CaptureRegion {
             width,
             height,
             scale,
+            output_size: None,
+        }
+    }
+
+    /// Construct a region whose transport protocol has already resolved the
+    /// exact output pixel size. The CSS-space paint extent remains independent
+    /// of that integer output surface.
+    pub fn with_output_size(
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        scale: f32,
+        output_width: u32,
+        output_height: u32,
+    ) -> Self {
+        Self {
+            x,
+            y,
+            width,
+            height,
+            scale,
+            output_size: Some((output_width, output_height)),
         }
     }
 }
@@ -383,7 +492,9 @@ impl CaptureRegion {
 /// Hard surface limits for one capture. The byte cap bounds both the native
 /// CSS-pixel raster and the scaled output before either allocation occurs.
 pub const MAX_CAPTURE_DIMENSION: u32 = 32_768;
-pub const MAX_CAPTURE_PIXELS: u64 = 64 * 1024 * 1024;
+pub const MAX_CAPTURE_PIXELS: u64 = 16 * 1024 * 1024;
+pub const MAX_CAPTURE_SCALE: f32 = 16.0;
+pub const MAX_CAPTURE_PEAK_BYTES: u64 = 128 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CaptureError {
@@ -393,9 +504,7 @@ pub enum CaptureError {
     EncodeFailed,
 }
 
-fn checked_capture_dimensions(
-    region: CaptureRegion,
-) -> Result<(u32, u32, u32, u32), CaptureError> {
+fn checked_capture_dimensions(region: CaptureRegion) -> Result<(u32, u32, u32, u32), CaptureError> {
     if !region.x.is_finite()
         || !region.y.is_finite()
         || !region.width.is_finite()
@@ -407,18 +516,30 @@ fn checked_capture_dimensions(
     {
         return Err(CaptureError::InvalidRegion);
     }
+    if region.scale > MAX_CAPTURE_SCALE {
+        return Err(CaptureError::AllocationLimitExceeded);
+    }
     let native_width = region.width.ceil();
     let native_height = region.height.ceil();
-    let output_width = (region.width * region.scale).ceil();
-    let output_height = (region.height * region.scale).ceil();
+    let (output_width, output_height) = match region.output_size {
+        Some((width, height)) => (f64::from(width), f64::from(height)),
+        None => (
+            f64::from(region.width) * f64::from(region.scale),
+            f64::from(region.height) * f64::from(region.scale),
+        ),
+    };
+    let output_width = output_width.ceil();
+    let output_height = output_height.ceil();
     if !native_width.is_finite()
         || !native_height.is_finite()
         || !output_width.is_finite()
         || !output_height.is_finite()
+        || output_width <= 0.0
+        || output_height <= 0.0
         || native_width > MAX_CAPTURE_DIMENSION as f32
         || native_height > MAX_CAPTURE_DIMENSION as f32
-        || output_width > MAX_CAPTURE_DIMENSION as f32
-        || output_height > MAX_CAPTURE_DIMENSION as f32
+        || output_width > f64::from(MAX_CAPTURE_DIMENSION)
+        || output_height > f64::from(MAX_CAPTURE_DIMENSION)
     {
         return Err(CaptureError::AllocationLimitExceeded);
     }
@@ -428,15 +549,31 @@ fn checked_capture_dimensions(
         output_width as u32,
         output_height as u32,
     );
-    for (width, height) in [
-        (dimensions.0, dimensions.1),
-        (dimensions.2, dimensions.3),
-    ] {
+    for (width, height) in [(dimensions.0, dimensions.1), (dimensions.2, dimensions.3)] {
         if u64::from(width).saturating_mul(u64::from(height)) > MAX_CAPTURE_PIXELS {
             return Err(CaptureError::AllocationLimitExceeded);
         }
     }
+    let native_pixels = u64::from(dimensions.0).saturating_mul(u64::from(dimensions.1));
+    let output_pixels = u64::from(dimensions.2).saturating_mul(u64::from(dimensions.3));
+    let peak_pixels = if dimensions.0 == dimensions.2 && dimensions.1 == dimensions.3 {
+        native_pixels
+    } else {
+        // Scaling owns the native RGBA surface and output RGBA surface at the
+        // same time. Bound their combined live bytes before either allocation.
+        native_pixels.saturating_add(output_pixels)
+    };
+    if peak_pixels.saturating_mul(4) > MAX_CAPTURE_PEAK_BYTES {
+        return Err(CaptureError::AllocationLimitExceeded);
+    }
     Ok(dimensions)
+}
+
+/// Validate every surface allocation implied by a capture before painting.
+/// Protocol adapters use this on legacy viewport captures which preserve the
+/// renderer's native PNG bytes but must obey the same limits as region capture.
+pub fn validate_capture_region(region: CaptureRegion) -> Result<(), CaptureError> {
+    checked_capture_dimensions(region).map(|_| ())
 }
 
 impl ResolvedScrollState {
@@ -455,7 +592,7 @@ impl ResolvedScrollState {
         &self,
         id: obscura_dom::tree::NodeId,
     ) -> Option<crate::dom::OverflowClip> {
-        self.inherited_clips.get(id.index()).copied().flatten()
+        self.inherited_clips.get(id.index()).cloned().flatten()
     }
 }
 
@@ -491,9 +628,7 @@ impl PreparedRender {
         self.content_size
     }
 
-    pub fn viewport_fixed_nodes(
-        &self,
-    ) -> &std::collections::HashSet<obscura_dom::tree::NodeId> {
+    pub fn viewport_fixed_nodes(&self) -> &std::collections::HashSet<obscura_dom::tree::NodeId> {
         &self.viewport_fixed
     }
 
@@ -504,10 +639,8 @@ impl PreparedRender {
     pub fn clamp_scroll(&self, requested: (f32, f32)) -> (f32, f32) {
         let clamp_axis = |requested: f32, content: f32, viewport: f32| {
             if requested.is_finite() {
-                crate::quantize_scroll_value(requested, 1.0).clamp(
-                    0.0,
-                    crate::quantized_scroll_range(content, viewport, 1.0),
-                )
+                crate::quantize_scroll_value(requested, 1.0)
+                    .clamp(0.0, crate::quantized_scroll_range(content, viewport, 1.0))
             } else {
                 0.0
             }
@@ -598,7 +731,7 @@ impl PreparedRender {
             out: &mut [Option<crate::dom::OverflowClip>],
         ) {
             if let Some(slot) = out.get_mut(id.index()) {
-                *slot = inherited;
+                *slot = inherited.clone();
             }
             let next = match (laid.styles.get(&id), laid.rects.get(&id)) {
                 (Some(style), Some(rect))
@@ -620,7 +753,7 @@ impl PreparedRender {
                 _ => inherited,
             };
             for child in crate::dom::rendered_children(tree, id) {
-                resolve_clips(tree, laid, movement, child, next, out);
+                resolve_clips(tree, laid, movement, child, next.clone(), out);
             }
         }
         if let Some(root_node) = tree
@@ -687,10 +820,7 @@ impl PreparedRender {
 
     /// Axis-aligned bounds of the transformed border box in immutable document
     /// space, excluding root-scroll and sticky movement.
-    pub fn document_rect(
-        &self,
-        id: obscura_dom::tree::NodeId,
-    ) -> Option<crate::Rect> {
+    pub fn document_rect(&self, id: obscura_dom::tree::NodeId) -> Option<crate::Rect> {
         let rect = *self.layout.rects.get(&id)?;
         Some(
             self.layout
@@ -707,10 +837,7 @@ impl PreparedRender {
     /// borders but retain padding. This deliberately ignores visual
     /// transforms: client metrics describe layout geometry, unlike
     /// `getBoundingClientRect()`.
-    pub fn client_size(
-        &self,
-        id: obscura_dom::tree::NodeId,
-    ) -> Option<(f32, f32)> {
+    pub fn client_size(&self, id: obscura_dom::tree::NodeId) -> Option<(f32, f32)> {
         let rect = self.layout.rects.get(&id)?;
         let style = self.layout.styles.get(&id)?;
         if style.ignores_used_box_sizes() {
@@ -778,7 +905,9 @@ impl PreparedRender {
         );
         out.insert(
             "z-index",
-            style.z_index.map_or_else(|| "auto".to_string(), |v| v.to_string()),
+            style
+                .z_index
+                .map_or_else(|| "auto".to_string(), |v| v.to_string()),
         );
         out.insert(
             "visibility",
@@ -861,7 +990,9 @@ impl PreparedRender {
         );
         out.insert(
             "-webkit-line-clamp",
-            style.webkit_line_clamp.map_or_else(|| "none".to_string(), |lines| lines.to_string()),
+            style
+                .webkit_line_clamp
+                .map_or_else(|| "none".to_string(), |lines| lines.to_string()),
         );
         out.insert(
             "-webkit-box-orient",
@@ -973,7 +1104,14 @@ impl PreparedRender {
             ("margin-bottom", style.margin.bottom, style.margin_auto[2]),
             ("margin-left", style.margin.left, style.margin_auto[3]),
         ] {
-            out.insert(name, if auto { "auto".to_string() } else { css_px(value) });
+            out.insert(
+                name,
+                if auto {
+                    "auto".to_string()
+                } else {
+                    css_px(value)
+                },
+            );
         }
         for (name, value) in [
             ("padding-top", style.padding.top),
@@ -1010,9 +1148,18 @@ impl PreparedRender {
         }
         for (name, radius) in [
             ("border-top-left-radius", style.border_model.radii.top_left),
-            ("border-top-right-radius", style.border_model.radii.top_right),
-            ("border-bottom-right-radius", style.border_model.radii.bottom_right),
-            ("border-bottom-left-radius", style.border_model.radii.bottom_left),
+            (
+                "border-top-right-radius",
+                style.border_model.radii.top_right,
+            ),
+            (
+                "border-bottom-right-radius",
+                style.border_model.radii.bottom_right,
+            ),
+            (
+                "border-bottom-left-radius",
+                style.border_model.radii.bottom_left,
+            ),
         ] {
             out.insert(name, corner_radius_css(radius));
         }
@@ -1067,8 +1214,16 @@ impl PreparedRender {
                 .align_content
                 .map_or_else(|| "normal".to_string(), align_content_css),
         );
-        out.insert("column-gap", style.column_gap.map_or_else(|| "normal".to_string(), css_px));
-        out.insert("row-gap", style.row_gap.map_or_else(|| "normal".to_string(), css_px));
+        out.insert(
+            "column-gap",
+            style
+                .column_gap
+                .map_or_else(|| "normal".to_string(), css_px),
+        );
+        out.insert(
+            "row-gap",
+            style.row_gap.map_or_else(|| "normal".to_string(), css_px),
+        );
         out.insert(
             "grid-auto-flow",
             match style.grid_auto_flow.unwrap_or(taffy::GridAutoFlow::Row) {
@@ -1084,8 +1239,7 @@ impl PreparedRender {
             "transform",
             transform_css(style, rect, self.root_font_size, self.viewport),
         );
-        out
-            .insert("transform-origin", transform_origin_css(style, rect));
+        out.insert("transform-origin", transform_origin_css(style, rect));
         out.insert(
             "translate",
             style.individual_translate.map_or_else(
@@ -1231,10 +1385,7 @@ impl PreparedRender {
         )
     }
 
-    pub fn selected_image(
-        &self,
-        id: obscura_dom::tree::NodeId,
-    ) -> Option<&SelectedImage> {
+    pub fn selected_image(&self, id: obscura_dom::tree::NodeId) -> Option<&SelectedImage> {
         self.selected_images.get(&id)
     }
 }
@@ -1281,17 +1432,18 @@ fn radius_value_css(value: crate::RadiusValue) -> String {
 fn corner_radius_css(radius: crate::CornerRadius) -> String {
     let x = radius_value_css(radius.x);
     let y = radius_value_css(radius.y);
-    if x == y { x } else { format!("{x} {y}") }
+    if x == y {
+        x
+    } else {
+        format!("{x} {y}")
+    }
 }
 
 fn css_color([r, g, b, a]: [u8; 4]) -> String {
     if a == 255 {
         format!("rgb({r}, {g}, {b})")
     } else {
-        format!(
-            "rgba({r}, {g}, {b}, {})",
-            css_number(a as f32 / 255.0)
-        )
+        format!("rgba({r}, {g}, {b}, {})", css_number(a as f32 / 255.0))
     }
 }
 
@@ -1341,7 +1493,12 @@ fn transform_css(
     if style.transform_ops.is_empty() {
         return "none".to_string();
     }
-    let fallback = crate::Rect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 };
+    let fallback = crate::Rect {
+        x: 0.0,
+        y: 0.0,
+        width: 0.0,
+        height: 0.0,
+    };
     let matrix = crate::dom::resolved_transform_property_matrix(
         style,
         rect.unwrap_or(&fallback),
@@ -1350,15 +1507,20 @@ fn transform_css(
     );
     format!(
         "matrix({}, {}, {}, {}, {}, {})",
-        css_number(matrix.a), css_number(matrix.b), css_number(matrix.c),
-        css_number(matrix.d), css_number(matrix.e), css_number(matrix.f),
+        css_number(matrix.a),
+        css_number(matrix.b),
+        css_number(matrix.c),
+        css_number(matrix.d),
+        css_number(matrix.e),
+        css_number(matrix.f),
     )
 }
 
 fn transform_origin_css(style: &crate::LayoutStyle, rect: Option<&crate::Rect>) -> String {
-    let (x, y) = style
-        .transform_origin
-        .unwrap_or((crate::Dimension::Percent(0.5), crate::Dimension::Percent(0.5)));
+    let (x, y) = style.transform_origin.unwrap_or((
+        crate::Dimension::Percent(0.5),
+        crate::Dimension::Percent(0.5),
+    ));
     let resolve = |value: crate::Dimension, axis: f32| match value {
         crate::Dimension::Percent(fraction) => css_px(fraction * axis),
         other => dimension_css(other, "0px"),
@@ -1412,10 +1574,29 @@ pub fn prepare_dom_with_dynamic_fonts(
     resources: &mut RenderResourceCache,
     dynamic_fonts: &[DynamicFontFace],
 ) -> Option<PreparedRender> {
-    if !viewport.0.is_finite()
-        || !viewport.1.is_finite()
-        || viewport.0 <= 0.0
-        || viewport.1 <= 0.0
+    let mut stylesheet_cache = crate::css::StylesheetCache::default();
+    prepare_dom_with_dynamic_fonts_and_stylesheet_cache(
+        tree,
+        viewport,
+        base_url,
+        resources,
+        dynamic_fonts,
+        &mut stylesheet_cache,
+    )
+}
+
+/// Prepare a DOM while retaining source parsing and selector indexing across
+/// relayouts of the same document. Cascade, computed styles, and layout are
+/// always rebuilt from the live DOM.
+pub fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache(
+    tree: &DomTree,
+    viewport: (f32, f32),
+    base_url: Option<&str>,
+    resources: &mut RenderResourceCache,
+    dynamic_fonts: &[DynamicFontFace],
+    stylesheet_cache: &mut crate::css::StylesheetCache,
+) -> Option<PreparedRender> {
+    if !viewport.0.is_finite() || !viewport.1.is_finite() || viewport.0 <= 0.0 || viewport.1 <= 0.0
     {
         return None;
     }
@@ -1425,6 +1606,26 @@ pub fn prepare_dom_with_dynamic_fonts(
     // each URL is still fetched at most once.
     let (mut intrinsic, mut selected_images) =
         collect_image_intrinsics(tree, viewport, base_url, resources);
+    // Preserve the HTML source fallback separately: a remembered CSS content
+    // image temporarily overrides it, but a changed/removed/failed content
+    // selection must restore the source before the correction layout.
+    // Only remembered nodes can need their HTML fallback restored. Avoid
+    // cloning the maps for every ordinary image on image-heavy pages.
+    let remembered_content_nodes = resources
+        .content_image_intrinsics
+        .keys()
+        .copied()
+        .collect::<Vec<_>>();
+    let source_intrinsic = remembered_content_nodes
+        .iter()
+        .filter_map(|nid| intrinsic.get(nid).copied().map(|value| (*nid, value)))
+        .collect::<HashMap<_, _>>();
+    let source_selected_images = remembered_content_nodes
+        .iter()
+        .filter_map(|nid| selected_images.get(nid).cloned().map(|value| (*nid, value)))
+        .collect::<HashMap<_, _>>();
+    let seeded_content_images =
+        resources.seed_content_image_intrinsics(tree, &mut intrinsic, &mut selected_images);
     let fonts = collect_web_fonts(tree, base_url, resources, dynamic_fonts);
     // Most framework pages use web fonts and many decorative SVG icons, but
     // only SVG text needs the page font faces. Avoid cloning/loading the page
@@ -1434,7 +1635,13 @@ pub fn prepare_dom_with_dynamic_fonts(
     } else {
         svg_font_database()
     };
-    let mut laid = layout_dom_with_web_fonts(tree, viewport, &intrinsic, &fonts);
+    let mut laid = layout_dom_with_web_fonts_and_stylesheet_cache(
+        tree,
+        viewport,
+        &intrinsic,
+        &fonts,
+        stylesheet_cache,
+    );
     // `content:url(...)` is computed by the author cascade, whereas ordinary
     // HTML image sources are available before layout. Pay for a second layout
     // only on the uncommon pages that actually use a CSS image as replaced
@@ -1446,8 +1653,21 @@ pub fn prepare_dom_with_dynamic_fonts(
         resources,
         &mut intrinsic,
         &mut selected_images,
+        &source_intrinsic,
+        &source_selected_images,
+        &seeded_content_images,
     ) {
-        laid = layout_dom_with_web_fonts(tree, viewport, &intrinsic, &fonts);
+        #[cfg(test)]
+        {
+            resources.content_image_layout_retries += 1;
+        }
+        laid = layout_dom_with_web_fonts_and_stylesheet_cache(
+            tree,
+            viewport,
+            &intrinsic,
+            &fonts,
+            stylesheet_cache,
+        );
     }
     let content_size = laid.scrolling_content_size(tree, viewport);
     let viewport_fixed = laid.viewport_fixed_nodes(tree);
@@ -1482,6 +1702,14 @@ pub fn paint_prepared(
     resources: &mut RenderResourceCache,
     scroll: (f32, f32),
 ) -> Option<Pixmap> {
+    validate_capture_region(CaptureRegion::new(
+        scroll.0,
+        scroll.1,
+        prepared.viewport.0,
+        prepared.viewport.1,
+        1.0,
+    ))
+    .ok()?;
     let (w, h) = (prepared.viewport.0 as u32, prepared.viewport.1 as u32);
     let mut pixmap = Pixmap::new(w, h)?;
     pixmap.fill(Color::WHITE);
@@ -1506,6 +1734,7 @@ pub fn paint_prepared(
         None,
         None,
         (0.0, 0.0),
+        1.0,
     )
 }
 
@@ -1517,6 +1746,14 @@ pub fn paint_prepared_with_scroll(
     resources: &mut RenderResourceCache,
     scroll: &ResolvedScrollState,
 ) -> Option<Pixmap> {
+    validate_capture_region(CaptureRegion::new(
+        scroll.root_offset().0,
+        scroll.root_offset().1,
+        prepared.viewport.0,
+        prepared.viewport.1,
+        1.0,
+    ))
+    .ok()?;
     let (w, h) = (prepared.viewport.0 as u32, prepared.viewport.1 as u32);
     let mut pixmap = Pixmap::new(w, h)?;
     pixmap.fill(Color::WHITE);
@@ -1541,6 +1778,7 @@ pub fn paint_prepared_with_scroll(
         None,
         None,
         (0.0, 0.0),
+        1.0,
     )
 }
 
@@ -1557,8 +1795,20 @@ pub fn paint_prepared_region_with_scroll(
 ) -> Result<Pixmap, CaptureError> {
     let (native_width, native_height, output_width, output_height) =
         checked_capture_dimensions(region)?;
-    let mut pixmap = Pixmap::new(native_width, native_height)
-        .ok_or(CaptureError::AllocationLimitExceeded)?;
+    let scale_matches_output =
+        (output_width as f64 - f64::from(region.width) * f64::from(region.scale)).abs() <= 1.0
+            && (output_height as f64 - f64::from(region.height) * f64::from(region.scale)).abs()
+                <= 1.0;
+    let native_scaled = (output_width != native_width || output_height != native_height)
+        && scale_matches_output
+        && native_raster_scale_supported(tree, &prepared.layout);
+    let (paint_width, paint_height, raster_scale) = if native_scaled {
+        (output_width, output_height, region.scale)
+    } else {
+        (native_width, native_height, 1.0)
+    };
+    let mut pixmap =
+        Pixmap::new(paint_width, paint_height).ok_or(CaptureError::AllocationLimitExceeded)?;
     pixmap.fill(Color::WHITE);
 
     // Resolved node movement already contains `-root_scroll` for ordinary
@@ -1589,10 +1839,11 @@ pub fn paint_prepared_region_with_scroll(
         None,
         Some((region.width, region.height)),
         surface_offset,
+        raster_scale,
     )
     .ok_or(CaptureError::PaintFailed)?;
 
-    if output_width == native_width && output_height == native_height {
+    if native_scaled || (output_width == native_width && output_height == native_height) {
         return Ok(pixmap);
     }
 
@@ -1600,7 +1851,7 @@ pub fn paint_prepared_region_with_scroll(
     // CSS-pixel space. Keep scale out of layout and scroll state, then use one
     // premultiplied-alpha high-quality surface transform. Vector primitives
     // still take the direct raster path whenever scale is 1.
-    let source = image::RgbaImage::from_raw(native_width, native_height, pixmap.data().to_vec())
+    let source = image::RgbaImage::from_raw(native_width, native_height, pixmap.take())
         .ok_or(CaptureError::PaintFailed)?;
     let scaled = image::imageops::resize(
         &source,
@@ -1611,6 +1862,48 @@ pub fn paint_prepared_region_with_scroll(
     let size = tiny_skia::IntSize::from_wh(output_width, output_height)
         .ok_or(CaptureError::AllocationLimitExceeded)?;
     Pixmap::from_vec(scaled.into_raw(), size).ok_or(CaptureError::PaintFailed)
+}
+
+/// Whether a retained display list can currently be rasterized directly at a
+/// non-1 device scale. The native path deliberately starts with the ubiquitous
+/// solid-box/text subset. Effects whose implementation creates logical-pixel
+/// intermediate surfaces retain the proven CSS-raster + resample path until
+/// those layers can carry an explicit source/device transform.
+fn native_raster_scale_supported(tree: &DomTree, laid: &crate::DomLayout) -> bool {
+    fn style_supported(style: &crate::LayoutStyle) -> bool {
+        let simple = !has_authored_transform(style)
+            && style.opacity.is_none_or(|opacity| opacity >= 1.0)
+            && style.clip_path.is_none()
+            && style.background_image.is_none()
+            && style.mask_image.is_none()
+            && style.background_gradient.is_none()
+            && style.background_radial_gradient.is_none()
+            && style.background_conic_gradient.is_none()
+            && style.background_gradient_layers.is_empty()
+            && !style.background_clip_text
+            && style.box_shadow.is_none()
+            && style.content_image.is_none()
+            && style.text_overflow == crate::TextOverflow::Clip;
+        simple
+            && style.before_pseudo.as_deref().is_none_or(style_supported)
+            && style.after_pseudo.as_deref().is_none_or(style_supported)
+    }
+
+    if laid.clip_rects.values().any(|clip| clip.is_some())
+        || laid.styles.values().any(|style| !style_supported(style))
+    {
+        return false;
+    }
+    !tree.descendants(tree.document()).into_iter().any(|id| {
+        tree.get_node(id).is_some_and(|node| {
+            node.as_element().is_some_and(|name| {
+                matches!(
+                    name.local.as_ref(),
+                    "img" | "picture" | "svg" | "canvas" | "video"
+                )
+            })
+        })
+    })
 }
 
 /// The used `z-index` for an element which participates in stacking order.
@@ -1732,6 +2025,7 @@ fn paint_laid_dom_scrolled(
     clip_scope_root: Option<obscura_dom::tree::NodeId>,
     surface_extent: Option<(f32, f32)>,
     surface_offset: (f32, f32),
+    raster_scale: f32,
 ) -> Option<Pixmap> {
     let scroll_state = match resolved_scroll {
         Some(resolved) => ScrollPaintState::from_resolved(
@@ -1766,18 +2060,19 @@ fn paint_laid_dom_scrolled(
     // their painting is owned by that raster, so they are skipped in both the
     // box/text loop below and the inline-formatting loop after it (an svg
     // `<text>` element must not also paint its glyphs on top of the raster).
-    let mut svg_subtree_skip: std::collections::HashSet<obscura_dom::tree::NodeId> = std::collections::HashSet::new();
+    let mut svg_subtree_skip: std::collections::HashSet<obscura_dom::tree::NodeId> =
+        std::collections::HashSet::new();
     // Text is painted in a second pass, after the box-order loop. Remember
     // every subtree already painted into an opacity layer so its shaped text
     // is not drawn a second time at full opacity in the outer pass.
-    let mut opacity_subtree_skip: std::collections::HashSet<
-        obscura_dom::tree::NodeId,
-    > = std::collections::HashSet::new();
+    let mut opacity_subtree_skip: std::collections::HashSet<obscura_dom::tree::NodeId> =
+        std::collections::HashSet::new();
     // External sprite symbols, keyed by "url#id", extracted from a fetched
     // sprite file so a `<use href="url#id">` resolves. One sprite backs many
     // icons (a whole logo/icon band), so cache the parsed symbol across every
     // inline svg on the page rather than re-parsing the sprite per icon.
-    let mut sprite_cache: std::collections::HashMap<String, Option<String>> = std::collections::HashMap::new();
+    let mut sprite_cache: std::collections::HashMap<String, Option<String>> =
+        std::collections::HashMap::new();
     // Whether any element carries a `transform: translate()`. When none does
     // (the overwhelmingly common case), every node's accumulated offset is
     // zero, so skip the per-node ancestor walk entirely and keep the paint
@@ -1794,7 +2089,8 @@ fn paint_laid_dom_scrolled(
     let mut neg_layers: Vec<(i32, Vec<obscura_dom::tree::NodeId>)> = Vec::new();
     let mut pos_layers: Vec<(i32, Vec<obscura_dom::tree::NodeId>)> = Vec::new();
     let mut normal: Vec<obscura_dom::tree::NodeId> = Vec::new();
-    let mut consumed: std::collections::HashSet<obscura_dom::tree::NodeId> = std::collections::HashSet::new();
+    let mut consumed: std::collections::HashSet<obscura_dom::tree::NodeId> =
+        std::collections::HashSet::new();
     let mut paint_nodes = paint_root.into_iter().collect::<Vec<_>>();
     paint_nodes.extend(tree.descendants(paint_root.unwrap_or_else(|| tree.document())));
     for nid in paint_nodes.iter().copied() {
@@ -1907,9 +2203,7 @@ fn paint_laid_dom_scrolled(
         if svg_subtree_skip.contains(&nid) {
             continue;
         }
-        if suppress_stacking_for != Some(nid)
-            && stacking_z_index(tree, laid, nid).is_some()
-        {
+        if suppress_stacking_for != Some(nid) && stacking_z_index(tree, laid, nid).is_some() {
             opacity_subtree_skip.insert(nid);
             opacity_subtree_skip.extend(tree.descendants(nid));
             // A stacking context is one structural paint item in its parent.
@@ -1939,6 +2233,7 @@ fn paint_laid_dom_scrolled(
                 clip_scope_root,
                 surface_extent,
                 surface_offset,
+                raster_scale,
             )?;
             continue;
         }
@@ -1950,13 +2245,30 @@ fn paint_laid_dom_scrolled(
         if node.is_text() {
             if let Some(items) = laid.word_ifc_items.get(&nid) {
                 let offset = scroll_state.translation_for(laid, nid);
-                let clip = scroll_state.shaped_text_clip_for(laid, nid);
+                let overflow_clip = scroll_state.shaped_text_overflow_clip_for(laid, nid);
+                let clip = overflow_clip.as_ref().map(|clip| {
+                    clip.viewport_rect(scroll_state.surface_extent.unwrap_or(viewport))
+                });
+                let clip_mask = overflow_clip.as_ref().and_then(|clip| {
+                    overflow_clip_mask(
+                        pixmap.width(),
+                        pixmap.height(),
+                        clip,
+                        scroll_state.surface_extent.unwrap_or(viewport),
+                    )
+                });
                 for &item in items {
-                    laid.text_engine
-                        .paint_item_with_clip(item, &mut pixmap, offset, clip);
+                    laid.text_engine.paint_item_with_clip_mask_scaled(
+                        item,
+                        &mut pixmap,
+                        offset,
+                        clip,
+                        clip_mask.as_ref(),
+                        raster_scale,
+                    );
                 }
             } else {
-                paint_text_node(tree, nid, laid, &scroll_state, &mut pixmap);
+                paint_text_node(tree, nid, laid, &scroll_state, &mut pixmap, raster_scale);
             }
             for generated in &generated_after_at[paint_index] {
                 paint_in_flow_generated_box(
@@ -1968,6 +2280,7 @@ fn paint_laid_dom_scrolled(
                     root_font_size,
                     base_url,
                     image_cache,
+                    raster_scale,
                 );
             }
             continue;
@@ -1990,12 +2303,8 @@ fn paint_laid_dom_scrolled(
         if suppress_transform_for != Some(nid) && has_authored_transform(style) {
             opacity_subtree_skip.insert(nid);
             opacity_subtree_skip.extend(tree.descendants(nid));
-            let transform = crate::dom::resolved_transform_matrix(
-                style,
-                &rect,
-                root_font_size,
-                viewport,
-            );
+            let transform =
+                crate::dom::resolved_transform_matrix(style, &rect, root_font_size, viewport);
             if transform.is_translation() {
                 // Translation-only transforms retain the direct offset path:
                 // no surface allocation and no resampling for carousels and
@@ -2021,6 +2330,7 @@ fn paint_laid_dom_scrolled(
                     clip_scope_root,
                     surface_extent,
                     surface_offset,
+                    raster_scale,
                 )?;
                 continue;
             }
@@ -2030,7 +2340,10 @@ fn paint_laid_dom_scrolled(
             // established inside this subtree, then map the finished surface.
             // This makes text, borders, shadows, SVG, images, and pseudos share
             // one transform exactly like Gecko's nsDisplayTransform wrapper.
-            let outside_clip = scroll_state.clip_for(laid, nid);
+            let outside_overflow_clip = scroll_state.overflow_clip_for(laid, nid);
+            let outside_clip = outside_overflow_clip
+                .as_ref()
+                .map(|clip| clip.viewport_rect(scroll_state.surface_extent.unwrap_or(viewport)));
             let movement = scroll_state.translation_for(laid, nid);
             let display_transform = crate::Affine2::translate(movement.0, movement.1)
                 .then(transform)
@@ -2053,13 +2366,10 @@ fn paint_laid_dom_scrolled(
                 continue;
             };
             let needed_source = inverse.map_rect(target);
-            let Some(source_bounds) = transform_subtree_source_bounds(
-                tree,
-                laid,
-                &scroll_state,
-                nid,
-            )
-            .and_then(|bounds| bounds.intersect(&needed_source)) else {
+            let Some(source_bounds) =
+                transform_subtree_source_bounds(tree, laid, &scroll_state, nid)
+                    .and_then(|bounds| bounds.intersect(&needed_source))
+            else {
                 continue;
             };
             let left = source_bounds.x.floor();
@@ -2094,11 +2404,10 @@ fn paint_laid_dom_scrolled(
                     surface_offset.0 + layer_delta.0,
                     surface_offset.1 + layer_delta.1,
                 ),
+                raster_scale,
             )?;
-            let transform = display_transform.then(crate::Affine2::translate(
-                -layer_delta.0,
-                -layer_delta.1,
-            ));
+            let transform =
+                display_transform.then(crate::Affine2::translate(-layer_delta.0, -layer_delta.1));
             let transform = Transform::from_row(
                 transform.a,
                 transform.b,
@@ -2107,9 +2416,14 @@ fn paint_laid_dom_scrolled(
                 transform.e,
                 transform.f,
             );
-            let clip_mask = outside_clip
-                .as_ref()
-                .and_then(|clip| box_clip_mask(pixmap.width(), pixmap.height(), clip));
+            let clip_mask = outside_overflow_clip.as_ref().and_then(|clip| {
+                overflow_clip_mask(
+                    pixmap.width(),
+                    pixmap.height(),
+                    clip,
+                    scroll_state.surface_extent.unwrap_or(viewport),
+                )
+            });
             pixmap.draw_pixmap(
                 0,
                 0,
@@ -2125,8 +2439,8 @@ fn paint_laid_dom_scrolled(
             .styles
             .get(&nid)
             .and_then(|style| style.opacity)
-        .unwrap_or(1.0)
-        .clamp(0.0, 1.0);
+            .unwrap_or(1.0)
+            .clamp(0.0, 1.0);
         if suppress_opacity_for != Some(nid) && own_opacity < 1.0 {
             opacity_subtree_skip.insert(nid);
             opacity_subtree_skip.extend(tree.descendants(nid));
@@ -2158,6 +2472,7 @@ fn paint_laid_dom_scrolled(
                 clip_scope_root,
                 surface_extent,
                 surface_offset,
+                raster_scale,
             )?;
             let group_paint = tiny_skia::PixmapPaint {
                 opacity: own_opacity,
@@ -2185,13 +2500,29 @@ fn paint_laid_dom_scrolled(
         // state, but it must not move with this descendant: that is what lets a
         // clip cull a slide the carousel track translated out of its viewport.
         let (ox, oy) = scroll_state.translation_for(laid, nid);
-        let rect = crate::Rect { x: rect.x + ox, y: rect.y + oy, width: rect.width, height: rect.height };
+        let rect = crate::Rect {
+            x: rect.x + ox,
+            y: rect.y + oy,
+            width: rect.width,
+            height: rect.height,
+        };
 
         // Ancestor `overflow: hidden` clip, if any. Skip painting entirely
         // once the box has no visible overlap with it (this is what makes the
         // ubiquitous 1x1 clipped "visually hidden" accessibility pattern
         // actually invisible instead of painting text wherever it lands).
-        let clip = scroll_state.clip_for(laid, nid);
+        let overflow_clip = scroll_state.overflow_clip_for(laid, nid);
+        let clip = overflow_clip
+            .as_ref()
+            .map(|clip| clip.viewport_rect(scroll_state.surface_extent.unwrap_or(viewport)));
+        let ancestor_clip_mask = overflow_clip.as_ref().and_then(|clip| {
+            overflow_clip_mask(
+                pixmap.width(),
+                pixmap.height(),
+                clip,
+                scroll_state.surface_extent.unwrap_or(viewport),
+            )
+        });
         let cull_rect = rect;
         let visible_rect = match clip {
             Some(c) => match cull_rect.intersect(&c) {
@@ -2243,10 +2574,12 @@ fn paint_laid_dom_scrolled(
                 &rect,
                 style,
                 clip,
+                ancestor_clip_mask.as_ref(),
                 root_font_size,
                 viewport,
                 base_url,
                 image_cache,
+                raster_scale,
             );
         }
 
@@ -2255,9 +2588,15 @@ fn paint_laid_dom_scrolled(
         // ancestor overflow clip is reapplied inside so the shadow is clipped by
         // an ancestor exactly as the box itself is.
         if !paints_inline_fragments {
-        if let Some(shadow) = style.box_shadow {
-            paint_box_shadow(&mut pixmap, &shadow, &rect, style.border_model.radii, clip);
-        }
+            if let Some(shadow) = style.box_shadow {
+                paint_box_shadow(
+                    &mut pixmap,
+                    &shadow,
+                    &rect,
+                    style.border_model.radii,
+                    ancestor_clip_mask.as_ref(),
+                );
+            }
         }
 
         // Background positioning and clipping are independent. Keep the
@@ -2268,7 +2607,9 @@ fn paint_laid_dom_scrolled(
         let has_radius = !radius.is_zero();
         let background = background_geometry(&rect, style);
         let background_path = background_clip_path(background);
-        let background_mask = background_extra_clip(&pixmap, clip, clip_path_mask.as_ref());
+        let element_clip_mask =
+            background_extra_clip(ancestor_clip_mask.as_ref(), clip_path_mask.as_ref());
+        let background_mask = element_clip_mask.clone();
         // A linear-gradient background (heavily used by modern hero sections);
         // without this it paints white. Takes precedence over a solid color.
         // `background-clip: text` clips the background to the glyphs, so it must
@@ -2283,7 +2624,7 @@ fn paint_laid_dom_scrolled(
                         path,
                         &paint,
                         FillRule::Winding,
-                        Transform::identity(),
+                        raster_transform(raster_scale),
                         background_mask.as_ref(),
                     );
                 }
@@ -2303,97 +2644,100 @@ fn paint_laid_dom_scrolled(
                     );
                 }
             } else {
-            if let Some((center, stops)) = &style.background_radial_gradient {
-                if let Some(path) = background_path.as_ref() {
-                    paint_radial_gradient(
+                if let Some((center, stops)) = &style.background_radial_gradient {
+                    if let Some(path) = background_path.as_ref() {
+                        paint_radial_gradient(
+                            &mut pixmap,
+                            path,
+                            &background.origin_rect,
+                            *center,
+                            stops,
+                            background_mask.as_ref(),
+                        );
+                    }
+                }
+                if let Some((angle, center, stops)) = &style.background_conic_gradient {
+                    paint_conic_gradient_sampled(
                         &mut pixmap,
-                        path,
+                        &background.clip_rect,
                         &background.origin_rect,
+                        background.clip_radii,
+                        *angle,
                         *center,
                         stops,
                         background_mask.as_ref(),
                     );
                 }
-            }
-            if let Some((angle, center, stops)) = &style.background_conic_gradient {
-                paint_conic_gradient_sampled(
-                    &mut pixmap,
-                    &background.clip_rect,
-                    &background.origin_rect,
-                    background.clip_radii,
-                    *angle,
-                    *center,
-                    stops,
-                    background_mask.as_ref(),
-                );
-            }
-            if let Some((angle, stops)) = &style.background_gradient {
-                if let Some(path) = background_path.as_ref() {
-                    paint_linear_gradient(
-                        &mut pixmap,
-                        path,
-                        &background.origin_rect,
-                        *angle,
-                        stops,
-                        background_mask.as_ref(),
-                    );
+                if let Some((angle, stops)) = &style.background_gradient {
+                    if let Some(path) = background_path.as_ref() {
+                        paint_linear_gradient(
+                            &mut pixmap,
+                            path,
+                            &background.origin_rect,
+                            *angle,
+                            stops,
+                            background_mask.as_ref(),
+                        );
+                    }
                 }
             }
-        }
         }
 
         if !paints_inline_fragments {
-        if let Some(mask_url) = &style.mask_image {
-            let fill = style.background_color.or(style.color).unwrap_or([0, 0, 0, 255]);
-            paint_mask(
-                mask_url,
-                base_url,
-                &visible_rect,
-                radius,
-                fill,
-                style.background_radial_gradient.as_ref(),
-                style.background_gradient.as_ref(),
-                style.background_conic_gradient.as_ref(),
-                style.mask_size,
-                style.mask_repeat,
-                clip_path_mask.as_ref(),
-                &mut pixmap,
-                image_cache,
-            );
-        } else if let Some(bg_url) = &style.background_image {
-            if let Some(img_rect) = background_image_rect(
-                bg_url,
-                base_url,
-                &background.origin_rect,
-                style.background_size,
-                style.background_size_expression.as_deref(),
-                style.background_size_fit,
-                style.background_position,
-                style.font_size.unwrap_or(16.0),
-                root_font_size,
-                viewport,
-                image_cache,
-            ) {
-                // A background layer is always clipped to its owner's border
-                // box and then to inherited overflow. Keep its full destination
-                // rect separate from that clip: intersecting first and then
-                // scaling would resize a partially clipped image.
-                if background.clip_rect.width > 0.0 && background.clip_rect.height > 0.0 {
-                    paint_image(
-                        bg_url,
-                        base_url,
-                        &img_rect,
-                        &background.clip_rect,
-                        crate::ObjectFit::Fill,
-                        &mut pixmap,
-                        image_cache,
-                        None,
-                        background.clip_radii,
-                        background_mask.as_ref(),
-                    );
+            if let Some(mask_url) = &style.mask_image {
+                let fill = style
+                    .background_color
+                    .or(style.color)
+                    .unwrap_or([0, 0, 0, 255]);
+                paint_mask(
+                    mask_url,
+                    base_url,
+                    &visible_rect,
+                    radius,
+                    fill,
+                    style.background_radial_gradient.as_ref(),
+                    style.background_gradient.as_ref(),
+                    style.background_conic_gradient.as_ref(),
+                    style.mask_size,
+                    style.mask_repeat,
+                    element_clip_mask.as_ref(),
+                    &mut pixmap,
+                    image_cache,
+                );
+            } else if let Some(bg_url) = &style.background_image {
+                if let Some(img_rect) = background_image_rect(
+                    bg_url,
+                    base_url,
+                    &background.origin_rect,
+                    style.background_size,
+                    style.background_size_expression.as_deref(),
+                    style.background_size_fit,
+                    style.background_position,
+                    style.font_size.unwrap_or(16.0),
+                    root_font_size,
+                    viewport,
+                    image_cache,
+                ) {
+                    // A background layer is always clipped to its owner's border
+                    // box and then to inherited overflow. Keep its full destination
+                    // rect separate from that clip: intersecting first and then
+                    // scaling would resize a partially clipped image.
+                    if background.clip_rect.width > 0.0 && background.clip_rect.height > 0.0 {
+                        paint_image(
+                            bg_url,
+                            base_url,
+                            &img_rect,
+                            &background.clip_rect,
+                            crate::ObjectFit::Fill,
+                            &mut pixmap,
+                            image_cache,
+                            None,
+                            background.clip_radii,
+                            background_mask.as_ref(),
+                        );
+                    }
                 }
             }
-        }
         }
         let positioned_pseudo_containing_block = {
             let mut ancestor = Some(nid);
@@ -2429,13 +2773,25 @@ fn paint_laid_dom_scrolled(
             }
             found.unwrap_or(rect)
         };
-        let positioned_pseudo_clip = scroll_state.descendant_clip_for(laid, nid);
+        let positioned_pseudo_overflow_clip = scroll_state.descendant_overflow_clip_for(laid, nid);
+        let positioned_pseudo_clip = positioned_pseudo_overflow_clip
+            .as_ref()
+            .map(|clip| clip.viewport_rect(scroll_state.surface_extent.unwrap_or(viewport)));
+        let positioned_pseudo_clip_mask =
+            positioned_pseudo_overflow_clip.as_ref().and_then(|clip| {
+                overflow_clip_mask(
+                    pixmap.width(),
+                    pixmap.height(),
+                    clip,
+                    scroll_state.surface_extent.unwrap_or(viewport),
+                )
+            });
         for pseudo in [
             style.before_pseudo.as_deref(),
             style.after_pseudo.as_deref(),
         ]
-            .into_iter()
-            .flatten()
+        .into_iter()
+        .flatten()
         {
             paint_positioned_pseudo(
                 &mut laid.text_engine,
@@ -2446,8 +2802,10 @@ fn paint_laid_dom_scrolled(
                 viewport,
                 root_font_size,
                 positioned_pseudo_clip,
+                positioned_pseudo_clip_mask.as_ref(),
                 base_url,
                 image_cache,
+                raster_scale,
             );
         }
 
@@ -2456,14 +2814,16 @@ fn paint_laid_dom_scrolled(
                 &mut pixmap,
                 &rect,
                 style,
-                clip_path_mask.as_ref(),
+                element_clip_mask.as_ref(),
+                raster_scale,
             );
         }
         paint_css_outline(
             &mut pixmap,
             &rect,
             style,
-            clip_path_mask.as_ref(),
+            element_clip_mask.as_ref(),
+            raster_scale,
         );
 
         if name.local.as_ref() == "img" {
@@ -2473,17 +2833,17 @@ fn paint_laid_dom_scrolled(
                 // half-scrolled carousel slide's image otherwise bleeds over
                 // the viewport edge).
                 let painted = paint_image(
-                        &source.resolved_url,
-                        None,
-                        &rect,
-                        &visible_rect,
-                        style.object_fit,
-                        &mut pixmap,
-                        image_cache,
-                        None,
-                        radius,
-                        clip_path_mask.as_ref(),
-                    );
+                    &source.resolved_url,
+                    None,
+                    &rect,
+                    &visible_rect,
+                    style.object_fit,
+                    &mut pixmap,
+                    image_cache,
+                    None,
+                    radius,
+                    element_clip_mask.as_ref(),
+                );
                 // Fall back when the image itself did not paint, following
                 // what browsers show for a broken image: a non-empty alt
                 // renders as text in place of the image (no placeholder box),
@@ -2506,6 +2866,8 @@ fn paint_laid_dom_scrolled(
                                 None,
                                 0.0,
                                 clip,
+                                element_clip_mask.as_ref(),
+                                raster_scale,
                             );
                         }
                         Some(_) => {}
@@ -2513,7 +2875,12 @@ fn paint_laid_dom_scrolled(
                             if visible_rect.width >= 4.0 && visible_rect.height >= 4.0 {
                                 let mut ph = Paint::default();
                                 ph.set_color(Color::from_rgba8(0xE9, 0xEA, 0xEC, 0xFF));
-                                pixmap.fill_rect(box_rect, &ph, Transform::identity(), None);
+                                pixmap.fill_rect(
+                                    box_rect,
+                                    &ph,
+                                    raster_transform(raster_scale),
+                                    None,
+                                );
                             }
                         }
                     }
@@ -2539,7 +2906,14 @@ fn paint_laid_dom_scrolled(
             // the standalone document. A document-level/external symbol may
             // itself contain `currentColor`, and therefore has to be present
             // when the root color is established.
-            inject_external_sprites(tree, nid, base_url, &mut markup, image_cache, &mut sprite_cache);
+            inject_external_sprites(
+                tree,
+                nid,
+                base_url,
+                &mut markup,
+                image_cache,
+                &mut sprite_cache,
+            );
             // resvg parses the serialized subtree as a standalone SVG
             // document, outside the page's author stylesheet. Preserve the
             // host element's computed `color` so paths using `currentColor`
@@ -2559,16 +2933,16 @@ fn paint_laid_dom_scrolled(
                 rect.height as u32,
                 &svg_fonts,
             ) {
-                let mask = if clip.is_some() || has_radius {
-                    rounded_box_clip_mask_radii(
+                let mut mask = element_clip_mask.clone();
+                if has_radius {
+                    let own = rounded_box_clip_mask_radii(
                         pixmap.width(),
                         pixmap.height(),
                         &visible_rect,
                         radius,
-                    )
-                } else {
-                    None
-                };
+                    );
+                    mask = intersect_clip_masks(mask, own.as_ref());
+                }
                 pixmap.draw_pixmap(
                     rect.x as i32,
                     rect.y as i32,
@@ -2594,6 +2968,7 @@ fn paint_laid_dom_scrolled(
                     root_font_size,
                     base_url,
                     image_cache,
+                    raster_scale,
                 );
             }
         }
@@ -2619,6 +2994,8 @@ fn paint_laid_dom_scrolled(
                     style.font_family.as_deref(),
                     style.letter_spacing.unwrap_or(0.0),
                     clip,
+                    element_clip_mask.as_ref(),
+                    raster_scale,
                 );
             }
         }
@@ -2643,6 +3020,8 @@ fn paint_laid_dom_scrolled(
                     style.font_family.as_deref(),
                     style.letter_spacing.unwrap_or(0.0),
                     clip,
+                    element_clip_mask.as_ref(),
+                    raster_scale,
                 );
             }
         }
@@ -2667,6 +3046,8 @@ fn paint_laid_dom_scrolled(
                     style.font_family.as_deref(),
                     style.letter_spacing.unwrap_or(0.0),
                     Some(visible_rect),
+                    element_clip_mask.as_ref(),
+                    raster_scale,
                 );
             }
             if rect.width >= 12.0 && rect.height >= 8.0 {
@@ -2680,15 +3061,14 @@ fn paint_laid_dom_scrolled(
                 if let Some(arrow) = arrow.finish() {
                     let mut arrow_paint = Paint::default();
                     let color = style.color.unwrap_or([0, 0, 0, 255]);
-                    arrow_paint.set_color(Color::from_rgba8(
-                        color[0], color[1], color[2], color[3],
-                    ));
+                    arrow_paint
+                        .set_color(Color::from_rgba8(color[0], color[1], color[2], color[3]));
                     pixmap.fill_path(
                         &arrow,
                         &arrow_paint,
                         FillRule::Winding,
-                        Transform::identity(),
-                        None,
+                        raster_transform(raster_scale),
+                        element_clip_mask.as_ref(),
                     );
                 }
             }
@@ -2699,7 +3079,10 @@ fn paint_laid_dom_scrolled(
         // not real content), so paint it directly from the attribute instead
         // of going through `paint_text_node`.
         if name.local.as_ref() == "input" || name.local.as_ref() == "textarea" {
-            let has_value = node.get_attribute("value").map(|v| !v.is_empty()).unwrap_or(false);
+            let has_value = node
+                .get_attribute("value")
+                .map(|v| !v.is_empty())
+                .unwrap_or(false);
             if !has_value {
                 if let Some(placeholder) = node.get_attribute("placeholder") {
                     if !placeholder.is_empty() {
@@ -2717,6 +3100,8 @@ fn paint_laid_dom_scrolled(
                             style.font_family.as_deref(),
                             style.letter_spacing.unwrap_or(0.0),
                             clip,
+                            element_clip_mask.as_ref(),
+                            raster_scale,
                         );
                     }
                 }
@@ -2732,6 +3117,7 @@ fn paint_laid_dom_scrolled(
                 root_font_size,
                 base_url,
                 image_cache,
+                raster_scale,
             );
         }
     }
@@ -2749,29 +3135,61 @@ fn paint_laid_dom_scrolled(
         if whole.is_none() && run_items.is_none() {
             continue;
         }
-        if laid.styles.get(&nid).map(|s| s.effectively_invisible).unwrap_or(false) {
+        if laid
+            .styles
+            .get(&nid)
+            .map(|s| s.effectively_invisible)
+            .unwrap_or(false)
+        {
             continue;
         }
         // Shift the shaped glyphs by the same accumulated translate as the
         // container's box so text under a transformed ancestor moves with
         // it. Computed before the mutable `paint_item` borrow.
         let off = scroll_state.translation_for(laid, nid);
-        let clip = scroll_state.shaped_text_clip_for(laid, nid);
+        let overflow_clip = scroll_state.shaped_text_overflow_clip_for(laid, nid);
+        let clip = overflow_clip
+            .as_ref()
+            .map(|clip| clip.viewport_rect(scroll_state.surface_extent.unwrap_or(viewport)));
+        let clip_mask = overflow_clip.as_ref().and_then(|clip| {
+            overflow_clip_mask(
+                pixmap.width(),
+                pixmap.height(),
+                clip,
+                scroll_state.surface_extent.unwrap_or(viewport),
+            )
+        });
         if let Some(idx) = whole {
-            laid.text_engine
-                .paint_item_with_clip(idx, &mut pixmap, off, clip);
+            laid.text_engine.paint_item_with_clip_mask_scaled(
+                idx,
+                &mut pixmap,
+                off,
+                clip,
+                clip_mask.as_ref(),
+                raster_scale,
+            );
         }
         // Anonymous inline-run leaves of a mixed block (see
         // `build_mixed_block`), pinned to their own boxes at finalize.
         if let Some(items) = run_items {
             for idx in items {
-                laid.text_engine
-                    .paint_item_with_clip(idx, &mut pixmap, off, clip);
+                laid.text_engine.paint_item_with_clip_mask_scaled(
+                    idx,
+                    &mut pixmap,
+                    off,
+                    clip,
+                    clip_mask.as_ref(),
+                    raster_scale,
+                );
             }
         }
     }
 
     Some(pixmap)
+}
+
+fn raster_transform(scale: f32) -> Transform {
+    Transform::from_scale(scale, scale)
 }
 
 /// Paint an ordinary inline's sliced border boxes instead of its multiline
@@ -2786,10 +3204,12 @@ fn paint_inline_fragment_decorations(
     union: &crate::Rect,
     style: &crate::LayoutStyle,
     clip: Option<crate::Rect>,
+    ancestor_clip_mask: Option<&tiny_skia::Mask>,
     root_font_size: f32,
     viewport: (f32, f32),
     base_url: Option<&str>,
     image_cache: &mut RenderResourceCache,
+    raster_scale: f32,
 ) {
     let union = crate::Rect {
         x: union.x,
@@ -2843,7 +3263,8 @@ fn paint_inline_fragment_decorations(
         // clip but must not move the shared background coordinate system.
         let background_origin = background_geometry(&union, style).origin_rect;
         let background_path = background_clip_path(background);
-        let background_mask = background_extra_clip(pixmap, clip, clip_path_mask.as_ref());
+        let element_clip_mask = background_extra_clip(ancestor_clip_mask, clip_path_mask.as_ref());
+        let background_mask = element_clip_mask.clone();
 
         if let Some(shadow) = fragment_style.box_shadow {
             paint_box_shadow(
@@ -2851,7 +3272,7 @@ fn paint_inline_fragment_decorations(
                 &shadow,
                 &fragment,
                 fragment_style.border_model.radii,
-                clip,
+                ancestor_clip_mask,
             );
         }
         if fragment_style.mask_image.is_none() && !fragment_style.background_clip_text {
@@ -2859,15 +3280,13 @@ fn paint_inline_fragment_decorations(
                 (fragment_style.background_color, background_path.as_ref())
             {
                 let mut paint = Paint::default();
-                paint.set_color(Color::from_rgba8(
-                    color[0], color[1], color[2], color[3],
-                ));
+                paint.set_color(Color::from_rgba8(color[0], color[1], color[2], color[3]));
                 paint.anti_alias = !background.clip_radii.is_zero();
                 pixmap.fill_path(
                     path,
                     &paint,
                     FillRule::Winding,
-                    Transform::identity(),
+                    raster_transform(raster_scale),
                     background_mask.as_ref(),
                 );
             }
@@ -2886,9 +3305,10 @@ fn paint_inline_fragment_decorations(
                     );
                 }
             } else {
-                if let (Some((center, stops)), Some(path)) =
-                    (&fragment_style.background_radial_gradient, background_path.as_ref())
-                {
+                if let (Some((center, stops)), Some(path)) = (
+                    &fragment_style.background_radial_gradient,
+                    background_path.as_ref(),
+                ) {
                     paint_radial_gradient(
                         pixmap,
                         path,
@@ -2910,9 +3330,10 @@ fn paint_inline_fragment_decorations(
                         background_mask.as_ref(),
                     );
                 }
-                if let (Some((angle, stops)), Some(path)) =
-                    (&fragment_style.background_gradient, background_path.as_ref())
-                {
+                if let (Some((angle, stops)), Some(path)) = (
+                    &fragment_style.background_gradient,
+                    background_path.as_ref(),
+                ) {
                     paint_linear_gradient(
                         pixmap,
                         path,
@@ -2941,7 +3362,7 @@ fn paint_inline_fragment_decorations(
                 fragment_style.background_conic_gradient.as_ref(),
                 fragment_style.mask_size,
                 fragment_style.mask_repeat,
-                clip_path_mask.as_ref(),
+                element_clip_mask.as_ref(),
                 pixmap,
                 image_cache,
             );
@@ -2973,7 +3394,13 @@ fn paint_inline_fragment_decorations(
                 );
             }
         }
-        paint_css_border(pixmap, &fragment, &fragment_style, clip_path_mask.as_ref());
+        paint_css_border(
+            pixmap,
+            &fragment,
+            &fragment_style,
+            element_clip_mask.as_ref(),
+            raster_scale,
+        );
     }
 }
 
@@ -3096,22 +3523,16 @@ impl<'a> ScrollPaintState<'a> {
             );
         }
         if !self.active || self.viewport_fixed.contains(&id) {
-            return (base.0 + self.surface_offset.0, base.1 + self.surface_offset.1);
+            return (
+                base.0 + self.surface_offset.0,
+                base.1 + self.surface_offset.1,
+            );
         }
         let sticky = self.sticky.get(&id).copied().unwrap_or((0.0, 0.0));
         (
             base.0 + sticky.0 - self.scroll.0 + self.surface_offset.0,
             base.1 + sticky.1 - self.scroll.1 + self.surface_offset.1,
         )
-    }
-
-    fn clip_for(
-        &self,
-        laid: &crate::DomLayout,
-        id: obscura_dom::tree::NodeId,
-    ) -> Option<crate::Rect> {
-        self.overflow_clip_for(laid, id)
-            .map(|clip| clip.viewport_rect(self.surface_extent.unwrap_or(self.viewport)))
     }
 
     fn overflow_clip_for(
@@ -3160,55 +3581,44 @@ impl<'a> ScrollPaintState<'a> {
             clip.translate(self.surface_offset.0, self.surface_offset.1);
             return Some(clip);
         }
-        let mut clip = laid.clip_rects.get(&id).copied().flatten()?;
+        let mut clip = laid.clip_rects.get(&id).cloned().flatten()?;
         if self.active && !self.viewport_fixed.contains(&id) {
-            let sticky = self
-                .sticky_clips
-                .get(&id)
-                .copied()
-                .unwrap_or((0.0, 0.0));
-            clip.translate(
-                sticky.0 - self.scroll.0,
-                sticky.1 - self.scroll.1,
-            );
+            let sticky = self.sticky_clips.get(&id).copied().unwrap_or((0.0, 0.0));
+            clip.translate(sticky.0 - self.scroll.0, sticky.1 - self.scroll.1);
         }
         clip.translate(self.surface_offset.0, self.surface_offset.1);
         Some(clip)
     }
 
-    fn descendant_clip_for(
+    fn descendant_overflow_clip_for(
         &self,
         laid: &crate::DomLayout,
         id: obscura_dom::tree::NodeId,
-    ) -> Option<crate::Rect> {
+    ) -> Option<crate::dom::OverflowClip> {
         let inherited = self.overflow_clip_for(laid, id);
-        let style = laid.styles.get(&id)?;
+        let Some(style) = laid.styles.get(&id) else {
+            return inherited;
+        };
         if !style.overflow_hidden || style.overflow_propagated_to_viewport {
-            return inherited
-                .map(|clip| clip.viewport_rect(self.surface_extent.unwrap_or(self.viewport)));
+            return inherited;
         }
-        let rect = laid.rects.get(&id)?;
+        let Some(rect) = laid.rects.get(&id) else {
+            return inherited;
+        };
         let (ox, oy) = self.translation_for(laid, id);
         let own = crate::dom::OverflowClip::for_box(rect, style, ox, oy);
-        Some(
-            match inherited {
-                Some(clip) => clip.intersect(own),
-                None => own,
-            }
-            .viewport_rect(self.surface_extent.unwrap_or(self.viewport)),
-        )
+        Some(match inherited {
+            Some(clip) => clip.intersect(own),
+            None => own,
+        })
     }
 
-    /// Capture-space clip for a shaped inline context. `clip_for` supplies the
-    /// adjusted ancestor chain; text owned by an `overflow:hidden` element
-    /// also needs that element's own padding-box clip in the same viewport
-    /// coordinates.
-    fn shaped_text_clip_for(
+    fn shaped_text_overflow_clip_for(
         &self,
         laid: &crate::DomLayout,
         id: obscura_dom::tree::NodeId,
-    ) -> Option<crate::Rect> {
-        self.descendant_clip_for(laid, id)
+    ) -> Option<crate::dom::OverflowClip> {
+        self.descendant_overflow_clip_for(laid, id)
     }
 }
 
@@ -3216,14 +3626,7 @@ impl<'a> ScrollPaintState<'a> {
 /// (visually indistinguishable from true arcs at typical UI radii). The
 /// horizontal and vertical radii are scaled together when necessary, matching
 /// CSS's overlap rule while preserving percentage ellipses.
-fn rounded_rect_path(
-    x: f32,
-    y: f32,
-    w: f32,
-    h: f32,
-    rx: f32,
-    ry: f32,
-) -> Option<tiny_skia::Path> {
+fn rounded_rect_path(x: f32, y: f32, w: f32, h: f32, rx: f32, ry: f32) -> Option<tiny_skia::Path> {
     rounded_rect_path_radii(
         x,
         y,
@@ -3305,6 +3708,7 @@ fn paint_css_border(
     rect: &crate::Rect,
     style: &crate::LayoutStyle,
     mask: Option<&tiny_skia::Mask>,
+    raster_scale: f32,
 ) {
     let widths = crate::Sides {
         top: style.border.top,
@@ -3348,6 +3752,7 @@ fn paint_css_border(
             colors.top,
             radii,
             mask,
+            raster_scale,
         );
         return;
     }
@@ -3364,7 +3769,16 @@ fn paint_css_border(
         }
         match line_style {
             crate::BorderStyle::Solid | crate::BorderStyle::Auto => {
-                fill_solid_border_side(pixmap, rect, widths, radii, side, color, mask);
+                fill_solid_border_side(
+                    pixmap,
+                    rect,
+                    widths,
+                    radii,
+                    side,
+                    color,
+                    mask,
+                    raster_scale,
+                );
             }
             crate::BorderStyle::Inset
             | crate::BorderStyle::Outset
@@ -3380,11 +3794,29 @@ fn paint_css_border(
                     _ => false,
                 };
                 let color = shade_border_color(color, if dark_side { -0.28 } else { 0.28 });
-                fill_solid_border_side(pixmap, rect, widths, radii, side, color, mask);
+                fill_solid_border_side(
+                    pixmap,
+                    rect,
+                    widths,
+                    radii,
+                    side,
+                    color,
+                    mask,
+                    raster_scale,
+                );
             }
             crate::BorderStyle::Double => {
                 if width < 3.0 {
-                    fill_solid_border_side(pixmap, rect, widths, radii, side, color, mask);
+                    fill_solid_border_side(
+                        pixmap,
+                        rect,
+                        widths,
+                        radii,
+                        side,
+                        color,
+                        mask,
+                        raster_scale,
+                    );
                 } else {
                     paint_straight_border_side(
                         pixmap,
@@ -3395,6 +3827,7 @@ fn paint_css_border(
                         color,
                         None,
                         mask,
+                        raster_scale,
                     );
                     paint_straight_border_side(
                         pixmap,
@@ -3405,6 +3838,7 @@ fn paint_css_border(
                         color,
                         None,
                         mask,
+                        raster_scale,
                     );
                 }
             }
@@ -3418,6 +3852,7 @@ fn paint_css_border(
                     color,
                     Some(line_style),
                     mask,
+                    raster_scale,
                 );
             }
             crate::BorderStyle::None | crate::BorderStyle::Hidden => {}
@@ -3430,6 +3865,7 @@ fn paint_css_outline(
     rect: &crate::Rect,
     style: &crate::LayoutStyle,
     mask: Option<&tiny_skia::Mask>,
+    raster_scale: f32,
 ) {
     let width = style.outline.used_width();
     if width <= 0.0 {
@@ -3463,6 +3899,7 @@ fn paint_css_outline(
         color,
         radii,
         mask,
+        raster_scale,
     );
 }
 
@@ -3474,6 +3911,7 @@ fn paint_uniform_border(
     color: [u8; 4],
     radii: crate::ResolvedBorderRadii,
     mask: Option<&tiny_skia::Mask>,
+    raster_scale: f32,
 ) {
     if width <= 0.0 || !line_style.is_visible() {
         return;
@@ -3496,6 +3934,7 @@ fn paint_uniform_border(
                     color,
                     radii.inset(crate::Sides::all(inset)),
                     mask,
+                    raster_scale,
                 );
             }
         }
@@ -3519,6 +3958,7 @@ fn paint_uniform_border(
         color,
         radii.inset(crate::Sides::all(center)),
         mask,
+        raster_scale,
     );
 }
 
@@ -3530,6 +3970,7 @@ fn stroke_rounded_border_path(
     color: [u8; 4],
     radii: crate::ResolvedBorderRadii,
     mask: Option<&tiny_skia::Mask>,
+    raster_scale: f32,
 ) {
     let Some(path) = rounded_rect_path_radii(
         center_rect.x,
@@ -3557,7 +3998,7 @@ fn stroke_rounded_border_path(
         }
         _ => {}
     }
-    pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), mask);
+    pixmap.stroke_path(&path, &paint, &stroke, raster_transform(raster_scale), mask);
 }
 
 fn fill_solid_border_side(
@@ -3568,6 +4009,7 @@ fn fill_solid_border_side(
     side: Side,
     color: [u8; 4],
     mask: Option<&tiny_skia::Mask>,
+    raster_scale: f32,
 ) {
     let Some(path) = solid_border_side_path(rect, widths, radii, side) else {
         return;
@@ -3575,7 +4017,13 @@ fn fill_solid_border_side(
     let mut paint = Paint::default();
     paint.set_color(Color::from_rgba8(color[0], color[1], color[2], color[3]));
     paint.anti_alias = !radii.is_zero();
-    pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), mask);
+    pixmap.fill_path(
+        &path,
+        &paint,
+        FillRule::Winding,
+        raster_transform(raster_scale),
+        mask,
+    );
 }
 
 fn arc_point(center: (f32, f32), radius: (f32, f32), degrees: f32) -> (f32, f32) {
@@ -3624,11 +4072,24 @@ fn solid_border_side_path(
     let inner_centers = [
         (ix + inner.top_left.0, iy + inner.top_left.1),
         (iright - inner.top_right.0, iy + inner.top_right.1),
-        (iright - inner.bottom_right.0, ibottom - inner.bottom_right.1),
+        (
+            iright - inner.bottom_right.0,
+            ibottom - inner.bottom_right.1,
+        ),
         (ix + inner.bottom_left.0, ibottom - inner.bottom_left.1),
     ];
-    let outer_radii = [outer.top_left, outer.top_right, outer.bottom_right, outer.bottom_left];
-    let inner_radii = [inner.top_left, inner.top_right, inner.bottom_right, inner.bottom_left];
+    let outer_radii = [
+        outer.top_left,
+        outer.top_right,
+        outer.bottom_right,
+        outer.bottom_left,
+    ];
+    let inner_radii = [
+        inner.top_left,
+        inner.top_right,
+        inner.bottom_right,
+        inner.bottom_left,
+    ];
     let (a, b, outer_a, outer_b, inner_b, inner_a) = match side {
         Side::Top => (225.0, 270.0, 0, 1, 1, 0),
         Side::Right => (315.0, 360.0, 1, 2, 2, 1),
@@ -3650,7 +4111,13 @@ fn solid_border_side_path(
     let mut path = PathBuilder::new();
     let start = arc_point(outer_centers[outer_a], outer_radii[outer_a], a);
     path.move_to(start.0, start.1);
-    append_arc(&mut path, outer_centers[outer_a], outer_radii[outer_a], a, b);
+    append_arc(
+        &mut path,
+        outer_centers[outer_a],
+        outer_radii[outer_a],
+        a,
+        b,
+    );
     append_arc(
         &mut path,
         outer_centers[outer_b],
@@ -3685,6 +4152,7 @@ fn paint_straight_border_side(
     color: [u8; 4],
     pattern: Option<crate::BorderStyle>,
     mask: Option<&tiny_skia::Mask>,
+    raster_scale: f32,
 ) {
     let mut path = PathBuilder::new();
     match side {
@@ -3713,15 +4181,12 @@ fn paint_straight_border_side(
         ..Default::default()
     };
     if pattern == Some(crate::BorderStyle::Dashed) {
-        stroke.dash = tiny_skia::StrokeDash::new(
-            vec![stroke_width * 3.0, stroke_width * 3.0],
-            0.0,
-        );
+        stroke.dash = tiny_skia::StrokeDash::new(vec![stroke_width * 3.0, stroke_width * 3.0], 0.0);
     } else if pattern == Some(crate::BorderStyle::Dotted) {
         stroke.dash = tiny_skia::StrokeDash::new(vec![0.0, stroke_width * 2.0], 0.0);
         stroke.line_cap = tiny_skia::LineCap::Round;
     }
-    pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), mask);
+    pixmap.stroke_path(&path, &paint, &stroke, raster_transform(raster_scale), mask);
 }
 
 fn shade_border_color(color: [u8; 4], amount: f32) -> [u8; 4] {
@@ -3732,7 +4197,12 @@ fn shade_border_color(color: [u8; 4], amount: f32) -> [u8; 4] {
             .round()
             .clamp(0.0, 255.0) as u8
     };
-    [channel(color[0]), channel(color[1]), channel(color[2]), color[3]]
+    [
+        channel(color[0]),
+        channel(color[1]),
+        channel(color[2]),
+        color[3],
+    ]
 }
 
 /// Paint an outset `box-shadow` layer behind the element's own box. `rect` is
@@ -3750,7 +4220,7 @@ fn paint_box_shadow(
     shadow: &crate::BoxShadow,
     rect: &crate::Rect,
     border_radius: crate::BorderRadii,
-    clip: Option<crate::Rect>,
+    ancestor_clip: Option<&tiny_skia::Mask>,
 ) {
     if shadow.inset || shadow.color[3] == 0 {
         return;
@@ -3767,20 +4237,12 @@ fn paint_box_shadow(
     let rx0 = (radius.0 + spread).max(0.0);
     let ry0 = (radius.1 + spread).max(0.0);
     let blur = shadow.blur.max(0.0);
-    // Ancestor overflow clip: build a mask once and reuse it for every layer.
-    let mask = match clip {
-        Some(c) => {
-            if c.width <= 0.0 || c.height <= 0.0 {
-                return;
-            }
-            box_clip_mask(pixmap.width(), pixmap.height(), &c)
-        }
-        None => None,
-    };
+    // Ancestor overflow clip is already the complete rect/rounded chain.
+    let mask = ancestor_clip;
     let color = shadow.color;
     if blur < 0.5 {
         // No blur: a single crisp, offset (and spread) rounded rect.
-        fill_shadow_rect(pixmap, x0, y0, w0, h0, rx0, ry0, color, mask.as_ref());
+        fill_shadow_rect(pixmap, x0, y0, w0, h0, rx0, ry0, color, mask);
         return;
     }
     let steps: u32 = (blur.ceil() as u32).clamp(2, 24);
@@ -3803,7 +4265,7 @@ fn paint_box_shadow(
             rx0 + e,
             ry0 + e,
             layer_color,
-            mask.as_ref(),
+            mask,
         );
     }
 }
@@ -3844,13 +4306,23 @@ fn fill_shadow_rect(
     let mut paint = Paint::default();
     paint.set_color(Color::from_rgba8(color[0], color[1], color[2], color[3]));
     paint.anti_alias = true;
-    pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), mask);
+    pixmap.fill_path(
+        &path,
+        &paint,
+        FillRule::Winding,
+        Transform::identity(),
+        mask,
+    );
 }
 
 /// The marker text for a list item, or `None` when markers are suppressed
 /// (`list-style: none`). `Decimal` numbers the item by its position among
 /// sibling list items so `<ol>`s count 1, 2, 3.
-fn list_marker_text(tree: &DomTree, nid: obscura_dom::tree::NodeId, style: Option<crate::ListStyle>) -> Option<String> {
+fn list_marker_text(
+    tree: &DomTree,
+    nid: obscura_dom::tree::NodeId,
+    style: Option<crate::ListStyle>,
+) -> Option<String> {
     match style {
         Some(crate::ListStyle::Disc) => Some("\u{2022}".to_string()),
         Some(crate::ListStyle::Circle) => Some("\u{25E6}".to_string()),
@@ -3859,7 +4331,12 @@ fn list_marker_text(tree: &DomTree, nid: obscura_dom::tree::NodeId, style: Optio
             let mut n = 1usize;
             let mut cur = tree.get_node(nid).and_then(|node| node.prev_sibling);
             while let Some(sib) = cur {
-                if tree.get_node(sib).and_then(|s| s.as_element().map(|e| e.local.to_string())).as_deref() == Some("li") {
+                if tree
+                    .get_node(sib)
+                    .and_then(|s| s.as_element().map(|e| e.local.to_string()))
+                    .as_deref()
+                    == Some("li")
+                {
                     n += 1;
                 }
                 cur = tree.get_node(sib).and_then(|s| s.prev_sibling);
@@ -3870,13 +4347,12 @@ fn list_marker_text(tree: &DomTree, nid: obscura_dom::tree::NodeId, style: Optio
     }
 }
 
-fn selected_option_label(
-    tree: &DomTree,
-    select: obscura_dom::tree::NodeId,
-) -> Option<String> {
+fn selected_option_label(tree: &DomTree, select: obscura_dom::tree::NodeId) -> Option<String> {
     let mut first = None;
     for option_id in tree.descendants(select) {
-        let Some(option) = tree.get_node(option_id) else { continue };
+        let Some(option) = tree.get_node(option_id) else {
+            continue;
+        };
         if option
             .as_element()
             .map_or(true, |name| name.local.as_ref() != "option")
@@ -3899,7 +4375,11 @@ fn selected_option_label(
 
 /// Render `tree` at `viewport` to PNG bytes (RGBA 8-bit). Returns None if the
 /// viewport is zero-sized. Convenience over `paint_dom` + `encode_png`.
-pub fn screenshot_png(tree: &DomTree, viewport: (f32, f32), base_url: Option<&str>) -> Option<Vec<u8>> {
+pub fn screenshot_png(
+    tree: &DomTree,
+    viewport: (f32, f32),
+    base_url: Option<&str>,
+) -> Option<Vec<u8>> {
     paint_dom(tree, viewport, base_url)?.encode_png().ok()
 }
 
@@ -3910,8 +4390,7 @@ pub fn screenshot_png_scrolled(
     base_url: Option<&str>,
     scroll: (f32, f32),
 ) -> Option<Vec<u8>> {
-    paint_dom_scrolled(tree, viewport, base_url, scroll)
-        .and_then(|pixmap| pixmap.encode_png().ok())
+    paint_dom_scrolled(tree, viewport, base_url, scroll).and_then(|pixmap| pixmap.encode_png().ok())
 }
 
 /// PNG convenience wrapper for a retained resource-aware layout.
@@ -3968,7 +4447,10 @@ fn clip_text_fill_color(style: &crate::LayoutStyle) -> Option<[u8; 4]> {
             return Some([mid[0], mid[1], mid[2], 255]);
         }
     }
-    style.background_color.filter(|c| c[3] != 0).map(|c| [c[0], c[1], c[2], 255])
+    style
+        .background_color
+        .filter(|c| c[3] != 0)
+        .map(|c| [c[0], c[1], c[2], 255])
 }
 
 /// Paint every word of a text node at its own laid-out position. A text node
@@ -3982,6 +4464,7 @@ fn paint_text_node(
     laid: &crate::DomLayout,
     scroll_state: &ScrollPaintState,
     pixmap: &mut Pixmap,
+    raster_scale: f32,
 ) -> Option<()> {
     let runs = laid.text_runs.get(&nid)?;
     let node = tree.get_node(nid)?;
@@ -3990,7 +4473,8 @@ fn paint_text_node(
     if style.effectively_invisible {
         return Some(());
     }
-    let color = clip_text_fill_color(style).unwrap_or_else(|| style.color.unwrap_or([0, 0, 0, 255]));
+    let color =
+        clip_text_fill_color(style).unwrap_or_else(|| style.color.unwrap_or([0, 0, 0, 255]));
     let fsize = style.font_size.unwrap_or(16.0);
     let is_bold = crate::style::used_font_weight(style) >= 600;
     // A text node has no transform of its own, but any transformed element
@@ -3998,7 +4482,18 @@ fn paint_text_node(
     // receives root-scroll/sticky movement without following the descendant's
     // own transform.
     let (ox, oy) = scroll_state.translation_for(laid, nid);
-    let clip = scroll_state.clip_for(laid, nid);
+    let overflow_clip = scroll_state.overflow_clip_for(laid, nid);
+    let clip = overflow_clip.as_ref().map(|clip| {
+        clip.viewport_rect(scroll_state.surface_extent.unwrap_or(scroll_state.viewport))
+    });
+    let clip_mask = overflow_clip.as_ref().and_then(|clip| {
+        overflow_clip_mask(
+            pixmap.width(),
+            pixmap.height(),
+            clip,
+            scroll_state.surface_extent.unwrap_or(scroll_state.viewport),
+        )
+    });
 
     for (rect, word) in runs {
         draw_text(
@@ -4012,13 +4507,17 @@ fn paint_text_node(
             style.font_family.as_deref(),
             style.letter_spacing.unwrap_or(0.0),
             clip,
+            clip_mask.as_ref(),
+            raster_scale,
         );
     }
     Some(())
 }
 
 fn fallback_font_bytes(family: Option<&str>) -> &'static [u8] {
-    let Some(family) = family else { return FONT_BYTES };
+    let Some(family) = family else {
+        return FONT_BYTES;
+    };
     for token in family.split(',') {
         let token = token
             .trim()
@@ -4071,10 +4570,14 @@ pub fn measure_text(text: &str, size: f32, is_bold: bool, family: Option<&str>) 
     let scaled_font = font.as_scaled(scale);
     let mut width = 0.0;
     for c in text.chars() {
-        if c.is_control() { continue; }
+        if c.is_control() {
+            continue;
+        }
         width += scaled_font.h_advance(font.glyph_id(c));
     }
-    if is_bold { width += text.chars().filter(|c| !c.is_control()).count() as f32; }
+    if is_bold {
+        width += text.chars().filter(|c| !c.is_control()).count() as f32;
+    }
     width
 }
 
@@ -4089,6 +4592,8 @@ fn draw_text(
     family: Option<&str>,
     letter_spacing: f32,
     clip: Option<crate::Rect>,
+    clip_mask: Option<&tiny_skia::Mask>,
+    raster_scale: f32,
 ) {
     // A fully clipped-away run (the common "visually hidden" accessibility
     // pattern: a 1x1 box with overflow: hidden) paints nothing at all.
@@ -4098,13 +4603,20 @@ fn draw_text(
         }
     }
     let font = FontRef::try_from_slice(fallback_font_bytes(family)).unwrap();
-    let scale = PxScale::from(size);
+    let scale = PxScale::from(size * raster_scale);
     let scaled_font = font.as_scaled(scale);
-    let mut caret = ab_glyph::point(x, y + scaled_font.ascent());
+    let mut caret = ab_glyph::point(x * raster_scale, y * raster_scale + scaled_font.ascent());
 
     let width = pixmap.width() as i32;
     let height = pixmap.height() as i32;
-    let clip_bounds = clip.map(|c| (c.x, c.y, c.x + c.width, c.y + c.height));
+    let clip_bounds = clip.map(|c| {
+        (
+            c.x * raster_scale,
+            c.y * raster_scale,
+            (c.x + c.width) * raster_scale,
+            (c.y + c.height) * raster_scale,
+        )
+    });
     let pixels = pixmap.pixels_mut();
     let (r, g, b, a_full) = (color[0], color[1], color[2], color[3]);
 
@@ -4121,7 +4633,11 @@ fn draw_text(
                 let px = (bounds.min.x + gx as f32) as i32;
                 let py = (bounds.min.y + gy as f32) as i32;
                 if let Some((cx0, cy0, cx1, cy1)) = clip_bounds {
-                    if (px as f32) < cx0 || (px as f32) >= cx1 || (py as f32) < cy0 || (py as f32) >= cy1 {
+                    if (px as f32) < cx0
+                        || (px as f32) >= cx1
+                        || (py as f32) < cy0
+                        || (py as f32) >= cy1
+                    {
                         return;
                     }
                 }
@@ -4129,28 +4645,46 @@ fn draw_text(
                     let alpha = (a_full as f32 * c) as u8;
                     if alpha > 0 {
                         let mut px_indices = vec![(py * width + px) as usize];
-                        if is_bold && px + 1 < width {
-                            px_indices.push((py * width + px + 1) as usize);
+                        if is_bold {
+                            for dx in 1..raster_scale.ceil().max(1.0) as i32 {
+                                if px + dx < width {
+                                    px_indices.push((py * width + px + dx) as usize);
+                                }
+                            }
                         }
                         for idx in px_indices {
+                            let mask_alpha = clip_mask
+                                .and_then(|mask| mask.data().get(idx))
+                                .copied()
+                                .unwrap_or(255) as u32;
+                            let alpha = alpha as u32 * mask_alpha / 255;
+                            if alpha == 0 {
+                                continue;
+                            }
                             let dst = pixels[idx];
-                            
-                            let src_a = alpha as u32;
+
+                            let src_a = alpha;
                             let src_r = (r as u32 * src_a) / 255;
                             let src_g = (g as u32 * src_a) / 255;
                             let src_b = (b as u32 * src_a) / 255;
-                            
+
                             let dst_a = dst.alpha() as u32;
                             let out_a = src_a + (dst_a * (255 - src_a) / 255);
-                            
+
                             if out_a > 0 {
                                 let out_r = src_r + (dst.red() as u32 * (255 - src_a) / 255);
                                 let out_g = src_g + (dst.green() as u32 * (255 - src_a) / 255);
                                 let out_b = src_b + (dst.blue() as u32 * (255 - src_a) / 255);
-                                
+
                                 pixels[idx] = tiny_skia::PremultipliedColorU8::from_rgba(
-                                    out_r as u8, out_g as u8, out_b as u8, out_a as u8
-                                ).unwrap_or_else(|| tiny_skia::PremultipliedColorU8::from_rgba(0,0,0,0).unwrap());
+                                    out_r as u8,
+                                    out_g as u8,
+                                    out_b as u8,
+                                    out_a as u8,
+                                )
+                                .unwrap_or_else(|| {
+                                    tiny_skia::PremultipliedColorU8::from_rgba(0, 0, 0, 0).unwrap()
+                                });
                             }
                         }
                     }
@@ -4162,12 +4696,12 @@ fn draw_text(
             // the difference shows up as a visible gap after every word once
             // each word is its own independently-positioned box.
             caret.x += scaled_font.h_advance(id)
-                + if is_bold { 1.0 } else { 0.0 }
-                + letter_spacing;
+                + if is_bold { raster_scale } else { 0.0 }
+                + letter_spacing * raster_scale;
         } else {
             caret.x += scaled_font.h_advance(id)
-                + if is_bold { 1.0 } else { 0.0 }
-                + letter_spacing;
+                + if is_bold { raster_scale } else { 0.0 }
+                + letter_spacing * raster_scale;
         }
     }
 }
@@ -4243,7 +4777,9 @@ fn collect_web_fonts(
     let mut rules = Vec::new();
 
     for nid in tree.descendants(tree.document()) {
-        let Some(node) = tree.get_node(nid) else { continue };
+        let Some(node) = tree.get_node(nid) else {
+            continue;
+        };
         if node
             .as_element()
             .map(|element| element.local.as_ref() != "style")
@@ -4293,7 +4829,9 @@ fn collect_web_fonts(
     // the matching @font-face descriptors needed for CSS family/weight lookup.
     let mut preloads = Vec::new();
     for nid in tree.descendants(tree.document()) {
-        let Some(node) = tree.get_node(nid) else { continue };
+        let Some(node) = tree.get_node(nid) else {
+            continue;
+        };
         if node
             .as_element()
             .map(|element| element.local.as_ref() != "link")
@@ -4436,17 +4974,22 @@ fn font_face_declaration<'a>(face: &'a str, name: &str) -> Option<&'a str> {
     split_css_top_level(face, ';')
         .into_iter()
         .find_map(|declaration| {
-        let (property, value) = declaration.split_once(':')?;
+            let (property, value) = declaration.split_once(':')?;
             property
                 .trim()
                 .eq_ignore_ascii_case(name)
                 .then_some(value.trim())
-    })
+        })
 }
 
 fn font_face_family(face: &str) -> Option<String> {
     font_face_declaration(face, "font-family")
-        .map(|family| family.trim().trim_matches(|ch| matches!(ch, '"' | '\'')).to_string())
+        .map(|family| {
+            family
+                .trim()
+                .trim_matches(|ch| matches!(ch, '"' | '\''))
+                .to_string()
+        })
         .filter(|family| !family.is_empty())
 }
 
@@ -4586,10 +5129,7 @@ fn http_get_bytes(url: &str) -> Option<Vec<u8>> {
     for attempt in 0..3 {
         // Advertise only formats that this build can decode. Content-negotiating
         // CDNs otherwise commonly choose AVIF and leave the image blank.
-        let res = image_agent()
-            .get(url)
-            .set("Accept", IMAGE_ACCEPT)
-            .call();
+        let res = image_agent().get(url).set("Accept", IMAGE_ACCEPT).call();
         match res {
             Ok(resp) => {
                 let mut buf = Vec::new();
@@ -4603,7 +5143,9 @@ fn http_get_bytes(url: &str) -> Option<Vec<u8>> {
             // minutes, so fast-fail to the grey placeholder instead. Real
             // fidelity for that case needs an HTTP/2 image client (multiplexing
             // like Chrome), not blocking retries.
-            Err(ureq::Error::Status(code, _)) if matches!(code, 429 | 500 | 502 | 503 | 504) && attempt < 2 => {
+            Err(ureq::Error::Status(code, _))
+                if matches!(code, 429 | 500 | 502 | 503 | 504) && attempt < 2 =>
+            {
                 std::thread::sleep(backoff);
                 backoff *= 2;
             }
@@ -4712,11 +5254,19 @@ fn paint_linear_gradient(
     let mut last = 0.0f32;
     for (i, (_, pos)) in stops.iter().enumerate() {
         let c = gradient_stop_color(stops, i);
-        let p = pos.unwrap_or(i as f32 / (n - 1) as f32).clamp(0.0, 1.0).max(last);
+        let p = pos
+            .unwrap_or(i as f32 / (n - 1) as f32)
+            .clamp(0.0, 1.0)
+            .max(last);
         last = p;
-        gs.push(GradientStop::new(p, Color::from_rgba8(c[0], c[1], c[2], c[3])));
+        gs.push(GradientStop::new(
+            p,
+            Color::from_rgba8(c[0], c[1], c[2], c[3]),
+        ));
     }
-    if let Some(shader) = LinearGradient::new(start, end, gs, SpreadMode::Pad, Transform::identity()) {
+    if let Some(shader) =
+        LinearGradient::new(start, end, gs, SpreadMode::Pad, Transform::identity())
+    {
         let mut paint = Paint::default();
         paint.shader = shader;
         paint.anti_alias = true;
@@ -4829,7 +5379,7 @@ fn paint_linear_gradient_layer(
                 ((positions[index].unwrap_or(origin) - origin) / span).clamp(0.0, 1.0)
             }
             None => positions[index].unwrap_or(0.0).clamp(0.0, 1.0),
-    }
+        }
         .max(monotonic);
         monotonic = position;
         gradient_stops.push(GradientStop::new(
@@ -4931,39 +5481,10 @@ fn background_clip_path(geometry: BackgroundGeometry) -> Option<tiny_skia::Path>
 }
 
 fn background_extra_clip(
-    pixmap: &Pixmap,
-    ancestor_clip: Option<crate::Rect>,
+    ancestor_clip: Option<&tiny_skia::Mask>,
     polygon_clip: Option<&tiny_skia::Mask>,
 ) -> Option<tiny_skia::Mask> {
-    let mut mask = polygon_clip.cloned();
-    if let Some(clip) = ancestor_clip {
-        let path = Rect::from_xywh(clip.x, clip.y, clip.width, clip.height).and_then(|rect| {
-            let mut builder = PathBuilder::new();
-            builder.push_rect(rect);
-            builder.finish()
-        });
-        if let Some(path) = path {
-            match mask.as_mut() {
-                Some(mask) => mask.intersect_path(
-                    &path,
-                    FillRule::Winding,
-                    true,
-                    Transform::identity(),
-                ),
-                None => {
-                    let mut new_mask = tiny_skia::Mask::new(pixmap.width(), pixmap.height())?;
-                    new_mask.fill_path(
-                        &path,
-                        FillRule::Winding,
-                        true,
-                        Transform::identity(),
-                    );
-                    mask = Some(new_mask);
-                }
-            }
-        }
-    }
-    mask
+    intersect_clip_masks(ancestor_clip.cloned(), polygon_clip)
 }
 
 fn paint_radial_gradient(
@@ -5028,8 +5549,7 @@ fn paint_background_gradient_layers(
 ) {
     let layers = &style.background_gradient_layers;
     let em = style.font_size.unwrap_or(16.0);
-    let tile_size =
-        background_gradient_tile_size(style, origin_rect, em, root_font_size, viewport);
+    let tile_size = background_gradient_tile_size(style, origin_rect, em, root_font_size, viewport);
     let clip_differs_from_origin = (clip_rect.x - origin_rect.x).abs() > 0.01
         || (clip_rect.y - origin_rect.y).abs() > 0.01
         || (clip_rect.width - origin_rect.width).abs() > 0.01
@@ -5300,21 +5820,10 @@ fn paint_conic_gradient_sampled(
     }
     let mut clip = extra_clip.cloned();
     if !border_radius.is_zero() {
-        let path = rounded_rect_path_radii(
-            rect.x,
-            rect.y,
-            rect.width,
-            rect.height,
-            border_radius,
-        );
+        let path = rounded_rect_path_radii(rect.x, rect.y, rect.width, rect.height, border_radius);
         match (clip.as_mut(), path) {
             (Some(mask), Some(path)) => {
-                mask.intersect_path(
-                    &path,
-                    FillRule::Winding,
-                    true,
-                    Transform::identity(),
-                );
+                mask.intersect_path(&path, FillRule::Winding, true, Transform::identity());
             }
             (None, _) => {
                 clip = rounded_box_clip_mask_radii(
@@ -5337,9 +5846,7 @@ fn paint_conic_gradient_sampled(
     );
 }
 
-fn normalized_stops(
-    stops: &[([u8; 4], Option<f32>)],
-) -> Vec<(f32, [u8; 4])> {
+fn normalized_stops(stops: &[([u8; 4], Option<f32>)]) -> Vec<(f32, [u8; 4])> {
     let count = stops.len();
     let mut normalized = Vec::with_capacity(count);
     let mut last = 0.0f32;
@@ -5361,10 +5868,7 @@ fn normalized_stops(
     normalized
 }
 
-fn gradient_stop_color(
-    stops: &[([u8; 4], Option<f32>)],
-    index: usize,
-) -> [u8; 4] {
+fn gradient_stop_color(stops: &[([u8; 4], Option<f32>)], index: usize) -> [u8; 4] {
     let color = stops[index].0;
     if color[3] != 0 {
         return color;
@@ -5372,7 +5876,12 @@ fn gradient_stop_color(
     let neighbor = stops[index + 1..]
         .iter()
         .find(|(candidate, _)| candidate[3] != 0)
-        .or_else(|| stops[..index].iter().rev().find(|(candidate, _)| candidate[3] != 0));
+        .or_else(|| {
+            stops[..index]
+                .iter()
+                .rev()
+                .find(|(candidate, _)| candidate[3] != 0)
+        });
     neighbor
         .map(|(neighbor, _)| [neighbor[0], neighbor[1], neighbor[2], 0])
         .unwrap_or(color)
@@ -5629,6 +6138,7 @@ fn paint_in_flow_generated_box(
     root_font_size: f32,
     base_url: Option<&str>,
     image_cache: &mut RenderResourceCache,
+    raster_scale: f32,
 ) {
     let Some(host_style) = laid.styles.get(&generated.host) else {
         return;
@@ -5649,7 +6159,10 @@ fn paint_in_flow_generated_box(
         width: generated.rect.width,
         height: generated.rect.height,
     };
-    let clip = scroll_state.descendant_clip_for(laid, generated.host);
+    let overflow_clip = scroll_state.descendant_overflow_clip_for(laid, generated.host);
+    let clip = overflow_clip
+        .as_ref()
+        .map(|clip| clip.viewport_rect(scroll_state.surface_extent.unwrap_or(viewport)));
     let visible = match clip {
         Some(clip) => rect.intersect(&clip),
         None => Some(rect),
@@ -5658,9 +6171,23 @@ fn paint_in_flow_generated_box(
     if visible.width <= 0.0 || visible.height <= 0.0 {
         return;
     }
+    let ancestor_clip_mask = overflow_clip.as_ref().and_then(|clip| {
+        overflow_clip_mask(
+            pixmap.width(),
+            pixmap.height(),
+            clip,
+            scroll_state.surface_extent.unwrap_or(viewport),
+        )
+    });
 
     if let Some(shadow) = style.box_shadow {
-        paint_box_shadow(pixmap, &shadow, &rect, style.border_model.radii, clip);
+        paint_box_shadow(
+            pixmap,
+            &shadow,
+            &rect,
+            style.border_model.radii,
+            ancestor_clip_mask.as_ref(),
+        );
     }
     let radius = style.border_model.radii.resolve(rect.width, rect.height);
     let clip_path_mask = style.clip_path.as_ref().and_then(|polygon| {
@@ -5676,7 +6203,9 @@ fn paint_in_flow_generated_box(
     });
     let background = background_geometry(&rect, style);
     let background_path = background_clip_path(background);
-    let background_mask = background_extra_clip(pixmap, clip, clip_path_mask.as_ref());
+    let element_clip_mask =
+        background_extra_clip(ancestor_clip_mask.as_ref(), clip_path_mask.as_ref());
+    let background_mask = element_clip_mask.clone();
     if style.mask_image.is_none() && !style.background_clip_text {
         if let (Some(color), Some(path)) = (style.background_color, background_path.as_ref()) {
             let mut paint = Paint::default();
@@ -5686,7 +6215,7 @@ fn paint_in_flow_generated_box(
                 path,
                 &paint,
                 FillRule::Winding,
-                Transform::identity(),
+                raster_transform(raster_scale),
                 background_mask.as_ref(),
             );
         }
@@ -5705,31 +6234,31 @@ fn paint_in_flow_generated_box(
                 );
             }
         } else {
-        if let Some((center, stops)) = &style.background_radial_gradient {
-            if let Some(path) = background_path.as_ref() {
-                paint_radial_gradient(
+            if let Some((center, stops)) = &style.background_radial_gradient {
+                if let Some(path) = background_path.as_ref() {
+                    paint_radial_gradient(
+                        pixmap,
+                        path,
+                        &background.origin_rect,
+                        *center,
+                        stops,
+                        background_mask.as_ref(),
+                    );
+                }
+            }
+            if let Some((angle, center, stops)) = &style.background_conic_gradient {
+                paint_conic_gradient_sampled(
                     pixmap,
-                    path,
+                    &background.clip_rect,
                     &background.origin_rect,
+                    background.clip_radii,
+                    *angle,
                     *center,
                     stops,
                     background_mask.as_ref(),
                 );
             }
-        }
-        if let Some((angle, center, stops)) = &style.background_conic_gradient {
-            paint_conic_gradient_sampled(
-                pixmap,
-                &background.clip_rect,
-                &background.origin_rect,
-                background.clip_radii,
-                *angle,
-                *center,
-                stops,
-                background_mask.as_ref(),
-            );
-        }
-        if let Some((angle, stops)) = &style.background_gradient {
+            if let Some((angle, stops)) = &style.background_gradient {
                 if let Some(path) = background_path.as_ref() {
                     paint_linear_gradient(
                         pixmap,
@@ -5759,7 +6288,7 @@ fn paint_in_flow_generated_box(
             style.background_conic_gradient.as_ref(),
             style.mask_size,
             style.mask_repeat,
-            clip_path_mask.as_ref(),
+            element_clip_mask.as_ref(),
             pixmap,
             image_cache,
         );
@@ -5792,8 +6321,20 @@ fn paint_in_flow_generated_box(
         }
     }
 
-    paint_css_border(pixmap, &rect, style, clip_path_mask.as_ref());
-    paint_css_outline(pixmap, &rect, style, clip_path_mask.as_ref());
+    paint_css_border(
+        pixmap,
+        &rect,
+        style,
+        element_clip_mask.as_ref(),
+        raster_scale,
+    );
+    paint_css_outline(
+        pixmap,
+        &rect,
+        style,
+        element_clip_mask.as_ref(),
+        raster_scale,
+    );
 }
 
 fn paint_positioned_pseudo(
@@ -5805,8 +6346,10 @@ fn paint_positioned_pseudo(
     viewport: (f32, f32),
     root_font_size: f32,
     ancestor_clip: Option<crate::Rect>,
+    ancestor_clip_mask: Option<&tiny_skia::Mask>,
     base_url: Option<&str>,
     image_cache: &mut RenderResourceCache,
+    raster_scale: f32,
 ) {
     if style.position != Some(taffy::Position::Absolute) {
         return;
@@ -5818,9 +6361,9 @@ fn paint_positioned_pseudo(
         viewport.0 / 100.0,
         viewport.1 / 100.0,
     ) {
-            crate::Dimension::Px(value) => Some(value),
-            crate::Dimension::Percent(value) => Some(value * basis),
-            _ => None,
+        crate::Dimension::Px(value) => Some(value),
+        crate::Dimension::Percent(value) => Some(value * basis),
+        _ => None,
     };
     let top = style.inset[0].and_then(|value| resolve(value, containing_block.height));
     let right = style.inset[1].and_then(|value| resolve(value, containing_block.width));
@@ -5883,8 +6426,8 @@ fn paint_positioned_pseudo(
     });
     let background = background_geometry(&rect, style);
     let background_path = background_clip_path(background);
-    let background_mask =
-        background_extra_clip(pixmap, ancestor_clip, clip_path_mask.as_ref());
+    let element_clip_mask = background_extra_clip(ancestor_clip_mask, clip_path_mask.as_ref());
+    let background_mask = element_clip_mask.clone();
     if style.mask_image.is_none() && !style.background_clip_text {
         if let (Some(color), Some(path)) = (style.background_color, background_path.as_ref()) {
             let mut paint = Paint::default();
@@ -5893,7 +6436,7 @@ fn paint_positioned_pseudo(
                 path,
                 &paint,
                 FillRule::Winding,
-                Transform::identity(),
+                raster_transform(raster_scale),
                 background_mask.as_ref(),
             );
         }
@@ -5912,31 +6455,31 @@ fn paint_positioned_pseudo(
                 );
             }
         } else {
-        if let Some((center, stops)) = &style.background_radial_gradient {
-            if let Some(path) = background_path.as_ref() {
-                paint_radial_gradient(
+            if let Some((center, stops)) = &style.background_radial_gradient {
+                if let Some(path) = background_path.as_ref() {
+                    paint_radial_gradient(
+                        pixmap,
+                        path,
+                        &background.origin_rect,
+                        *center,
+                        stops,
+                        background_mask.as_ref(),
+                    );
+                }
+            }
+            if let Some((angle, center, stops)) = &style.background_conic_gradient {
+                paint_conic_gradient_sampled(
                     pixmap,
-                    path,
+                    &background.clip_rect,
                     &background.origin_rect,
+                    background.clip_radii,
+                    *angle,
                     *center,
                     stops,
                     background_mask.as_ref(),
                 );
             }
-        }
-        if let Some((angle, center, stops)) = &style.background_conic_gradient {
-            paint_conic_gradient_sampled(
-                pixmap,
-                &background.clip_rect,
-                &background.origin_rect,
-                background.clip_radii,
-                *angle,
-                *center,
-                stops,
-                background_mask.as_ref(),
-            );
-        }
-        if let Some((angle, stops)) = &style.background_gradient {
+            if let Some((angle, stops)) = &style.background_gradient {
                 if let Some(path) = background_path.as_ref() {
                     paint_linear_gradient(
                         pixmap,
@@ -5966,7 +6509,7 @@ fn paint_positioned_pseudo(
             style.background_conic_gradient.as_ref(),
             style.mask_size,
             style.mask_repeat,
-            clip_path_mask.as_ref(),
+            element_clip_mask.as_ref(),
             pixmap,
             image_cache,
         );
@@ -5998,8 +6541,20 @@ fn paint_positioned_pseudo(
             );
         }
     }
-    paint_css_border(pixmap, &rect, style, clip_path_mask.as_ref());
-    paint_css_outline(pixmap, &rect, style, clip_path_mask.as_ref());
+    paint_css_border(
+        pixmap,
+        &rect,
+        style,
+        element_clip_mask.as_ref(),
+        raster_scale,
+    );
+    paint_css_outline(
+        pixmap,
+        &rect,
+        style,
+        element_clip_mask.as_ref(),
+        raster_scale,
+    );
     if let Some(item) = generated_item {
         let (text_width, text_height) = generated_intrinsic.unwrap_or_default();
         // `text-align` positions inline content within the pseudo's content
@@ -6010,9 +6565,7 @@ fn paint_positioned_pseudo(
         // was `right`.
         let x = if style.display == crate::Display::Flex {
             match style.justify_content {
-                Some(taffy::JustifyContent::CENTER) => {
-                    rect.x + (rect.width - text_width) / 2.0
-                }
+                Some(taffy::JustifyContent::CENTER) => rect.x + (rect.width - text_width) / 2.0,
                 Some(taffy::JustifyContent::FLEX_END | taffy::JustifyContent::END) => {
                     rect.x + rect.width - style.padding.right - text_width
                 }
@@ -6035,7 +6588,14 @@ fn paint_positioned_pseudo(
             _ => rect.y + style.padding.top,
         };
         text_engine.finalize(item, (x, y), text_width, Some(visible));
-        text_engine.paint_item(item, pixmap, (0.0, 0.0));
+        text_engine.paint_item_with_clip_mask_scaled(
+            item,
+            pixmap,
+            (0.0, 0.0),
+            Some(visible),
+            element_clip_mask.as_ref(),
+            raster_scale,
+        );
     }
 }
 
@@ -6054,11 +6614,19 @@ fn collect_image_intrinsics(
     let mut out = std::collections::HashMap::new();
     let mut selected = HashMap::new();
     for nid in tree.descendants(tree.document()) {
-        let Some(node) = tree.get_node(nid) else { continue };
-        if node.as_element().map(|e| e.local.as_ref() != "img").unwrap_or(true) {
+        let Some(node) = tree.get_node(nid) else {
+            continue;
+        };
+        if node
+            .as_element()
+            .map(|e| e.local.as_ref() != "img")
+            .unwrap_or(true)
+        {
             continue;
         }
-        let Some((url, density)) = resolve_img_url(tree, nid, viewport) else { continue };
+        let Some((url, density)) = resolve_img_url(tree, nid, viewport) else {
+            continue;
+        };
         let resolved_url = resolve_resource_url(&url, base_url).unwrap_or(url);
         selected.insert(
             nid,
@@ -6067,8 +6635,11 @@ fn collect_image_intrinsics(
                 density,
             },
         );
-        let Some(bytes) = fetch_bytes(&resolved_url, None, cache) else { continue };
-        let dimensions = image_dimensions(&bytes).map(|(width, height)| (width as f32, height as f32))
+        let Some(bytes) = fetch_bytes(&resolved_url, None, cache) else {
+            continue;
+        };
+        let dimensions = image_dimensions(&bytes)
+            .map(|(width, height)| (width as f32, height as f32))
             .or_else(|| svg_intrinsic(&bytes));
         if let Some((w, h)) = dimensions {
             if w > 0.0 && h > 0.0 {
@@ -6092,8 +6663,12 @@ fn collect_content_image_intrinsics(
     cache: &mut RenderResourceCache,
     out: &mut std::collections::HashMap<obscura_dom::tree::NodeId, (f32, f32)>,
     selected: &mut HashMap<obscura_dom::tree::NodeId, SelectedImage>,
+    source_intrinsic: &HashMap<obscura_dom::tree::NodeId, (f32, f32)>,
+    source_selected: &HashMap<obscura_dom::tree::NodeId, SelectedImage>,
+    seeded: &HashSet<obscura_dom::tree::NodeId>,
 ) -> bool {
     let mut changed = false;
+    let mut active = HashSet::new();
     for (&nid, style) in styles {
         let Some(node) = tree.get_node(nid) else {
             continue;
@@ -6107,8 +6682,12 @@ fn collect_content_image_intrinsics(
         let Some(url) = style.content_image.as_deref() else {
             continue;
         };
-        let resolved_url =
-            resolve_resource_url(url, base_url).unwrap_or_else(|| url.to_string());
+        active.insert(nid);
+        let resolved_url = resolve_resource_url(url, base_url).unwrap_or_else(|| url.to_string());
+        let remembered_url_changed = cache
+            .content_image_intrinsics
+            .get(&nid)
+            .is_some_and(|remembered| remembered.resolved_url != resolved_url);
         selected.insert(
             nid,
             SelectedImage {
@@ -6116,19 +6695,60 @@ fn collect_content_image_intrinsics(
                 density: 1.0,
             },
         );
+        // CSS content replaces the element's ordinary source. Remove the src
+        // intrinsic before inspecting content so a failed content image cannot
+        // accidentally retain src geometry.
+        let previous_dimensions = out.remove(&nid);
         let Some(bytes) = fetch_bytes(&resolved_url, None, cache) else {
+            changed |= previous_dimensions.is_some() || remembered_url_changed;
+            cache.forget_content_image_intrinsic(nid);
             continue;
         };
         let dimensions = image_dimensions(&bytes)
             .map(|(width, height)| (width as f32, height as f32))
             .or_else(|| svg_intrinsic(&bytes));
         let Some((width, height)) = dimensions else {
+            changed |= previous_dimensions.is_some() || remembered_url_changed;
+            cache.forget_content_image_intrinsic(nid);
             continue;
         };
         if width <= 0.0 || height <= 0.0 {
+            changed |= previous_dimensions.is_some() || remembered_url_changed;
+            cache.forget_content_image_intrinsic(nid);
             continue;
         }
-        changed |= out.insert(nid, (width, height)) != Some((width, height));
+        let dimensions = (width, height);
+        changed |= previous_dimensions != Some(dimensions) || remembered_url_changed;
+        out.insert(nid, dimensions);
+        cache.remember_content_image_intrinsic(nid, resolved_url, dimensions);
+    }
+
+    // A remembered selection whose computed content disappeared must stop
+    // overriding the element's ordinary source. Even equal fallback dimensions
+    // get one correction pass: the first layout consumed a stale CSS selection,
+    // and URL/selection state is part of the prepared result too.
+    for nid in seeded.iter().copied().collect::<Vec<_>>() {
+        if active.contains(&nid) {
+            continue;
+        }
+        cache.forget_content_image_intrinsic(nid);
+        match source_intrinsic.get(&nid).copied() {
+            Some(dimensions) => {
+                out.insert(nid, dimensions);
+            }
+            None => {
+                out.remove(&nid);
+            }
+        }
+        match source_selected.get(&nid).cloned() {
+            Some(source) => {
+                selected.insert(nid, source);
+            }
+            None => {
+                selected.remove(&nid);
+            }
+        }
+        changed = true;
     }
     changed
 }
@@ -6189,11 +6809,19 @@ fn picture_source_url(
         if cid == img_nid {
             break;
         }
-        let Some(child) = tree.get_node(cid) else { continue };
-        if child.as_element().map(|e| e.local.as_ref() != "source").unwrap_or(true) {
+        let Some(child) = tree.get_node(cid) else {
+            continue;
+        };
+        if child
+            .as_element()
+            .map(|e| e.local.as_ref() != "source")
+            .unwrap_or(true)
+        {
             continue;
         }
-        let Some(srcset) = child.get_attribute("srcset") else { continue };
+        let Some(srcset) = child.get_attribute("srcset") else {
+            continue;
+        };
         if srcset.trim().is_empty() {
             continue;
         }
@@ -6203,9 +6831,7 @@ fn picture_source_url(
             }
         }
         if let Some(m) = child.get_attribute("media") {
-            if !m.trim().is_empty()
-                && !crate::css::media_query_applies_for_viewport(m, viewport)
-            {
+            if !m.trim().is_empty() && !crate::css::media_query_applies_for_viewport(m, viewport) {
                 continue;
             }
         }
@@ -6263,7 +6889,11 @@ fn best_srcset_candidate(
         let density = if desc.is_empty() {
             1.0
         } else if let Some(w) = desc.strip_suffix('w').and_then(|s| s.parse::<f32>().ok()) {
-            if source_size > 0.0 { w / source_size } else { continue }
+            if source_size > 0.0 {
+                w / source_size
+            } else {
+                continue;
+            }
         } else if let Some(x) = desc.strip_suffix('x').and_then(|s| s.parse::<f32>().ok()) {
             x
         } else {
@@ -6292,7 +6922,9 @@ fn best_srcset_candidate(
 /// desktop viewport (a bare entry always holds), else the viewport width. Used
 /// only to convert `w` descriptors to densities, so a coarse value is fine.
 fn source_size_px(sizes: Option<&str>, viewport: (f32, f32)) -> f32 {
-    let Some(sizes) = sizes else { return viewport.0 };
+    let Some(sizes) = sizes else {
+        return viewport.0;
+    };
     for entry in sizes.split(',') {
         let entry = entry.trim();
         if entry.is_empty() {
@@ -6321,10 +6953,18 @@ fn split_size_entry(entry: &str) -> (Option<String>, String) {
     let mut depth = 0i32;
     for c in entry.chars() {
         match c {
-            '(' => { depth += 1; cur.push(c); }
-            ')' => { depth -= 1; cur.push(c); }
+            '(' => {
+                depth += 1;
+                cur.push(c);
+            }
+            ')' => {
+                depth -= 1;
+                cur.push(c);
+            }
             c if c.is_whitespace() && depth == 0 => {
-                if !cur.is_empty() { tokens.push(std::mem::take(&mut cur)); }
+                if !cur.is_empty() {
+                    tokens.push(std::mem::take(&mut cur));
+                }
             }
             c => cur.push(c),
         }
@@ -6333,7 +6973,11 @@ fn split_size_entry(entry: &str) -> (Option<String>, String) {
         tokens.push(cur);
     }
     let len = tokens.pop().unwrap_or_default();
-    let cond = if tokens.is_empty() { None } else { Some(tokens.join(" ")) };
+    let cond = if tokens.is_empty() {
+        None
+    } else {
+        Some(tokens.join(" "))
+    };
     (cond, len)
 }
 
@@ -6343,11 +6987,21 @@ fn split_size_entry(entry: &str) -> (Option<String>, String) {
 fn length_to_px(len: &str, viewport_width: f32) -> Option<f32> {
     let t = len.trim().to_ascii_lowercase();
     let num = |s: &str| s.trim().parse::<f32>().ok();
-    if let Some(v) = t.strip_suffix("vw").and_then(num) { return Some(v / 100.0 * viewport_width); }
-    if let Some(v) = t.strip_suffix('%').and_then(num) { return Some(v / 100.0 * viewport_width); }
-    if let Some(v) = t.strip_suffix("px").and_then(num) { return Some(v); }
-    if let Some(v) = t.strip_suffix("rem").and_then(num) { return Some(v * 16.0); }
-    if let Some(v) = t.strip_suffix("em").and_then(num) { return Some(v * 16.0); }
+    if let Some(v) = t.strip_suffix("vw").and_then(num) {
+        return Some(v / 100.0 * viewport_width);
+    }
+    if let Some(v) = t.strip_suffix('%').and_then(num) {
+        return Some(v / 100.0 * viewport_width);
+    }
+    if let Some(v) = t.strip_suffix("px").and_then(num) {
+        return Some(v);
+    }
+    if let Some(v) = t.strip_suffix("rem").and_then(num) {
+        return Some(v * 16.0);
+    }
+    if let Some(v) = t.strip_suffix("em").and_then(num) {
+        return Some(v * 16.0);
+    }
     num(&t)
 }
 
@@ -6366,7 +7020,9 @@ fn paint_image(
     if rect.width <= 0.0 || rect.height <= 0.0 {
         return false;
     }
-    let Some(bytes) = fetch_bytes(src, base_url, cache) else { return false };
+    let Some(bytes) = fetch_bytes(src, base_url, cache) else {
+        return false;
+    };
     let svg = is_svg(&bytes);
 
     // Destination sub-rect within the element box. `Fill` keeps the historical
@@ -6387,7 +7043,10 @@ fn paint_image(
         }
     };
 
-    let (dw, dh) = (dest.width.round().max(1.0) as u32, dest.height.round().max(1.0) as u32);
+    let (dw, dh) = (
+        dest.width.round().max(1.0) as u32,
+        dest.height.round().max(1.0) as u32,
+    );
     let content = if svg {
         render_svg(&bytes, dw, dh)
     } else {
@@ -6429,12 +7088,9 @@ fn paint_image(
             })
         };
         match (clip.as_mut(), path) {
-            (Some(mask), Some(path)) => mask.intersect_path(
-                &path,
-                FillRule::Winding,
-                true,
-                Transform::identity(),
-            ),
+            (Some(mask), Some(path)) => {
+                mask.intersect_path(&path, FillRule::Winding, true, Transform::identity())
+            }
             (None, _) => {
                 clip = rounded_box_clip_mask_radii(
                     pixmap.width(),
@@ -6452,14 +7108,16 @@ fn paint_image(
         content.as_ref(),
         &tiny_skia::PixmapPaint::default(),
         transform
-            .map(|transform| Transform::from_row(
-                transform.a,
-                transform.b,
-                transform.c,
-                transform.d,
-                transform.e,
-                transform.f,
-            ))
+            .map(|transform| {
+                Transform::from_row(
+                    transform.a,
+                    transform.b,
+                    transform.c,
+                    transform.d,
+                    transform.e,
+                    transform.f,
+                )
+            })
             .unwrap_or_else(Transform::identity),
         clip.as_ref(),
     );
@@ -6527,6 +7185,52 @@ fn box_clip_mask(pw: u32, ph: u32, rect: &crate::Rect) -> Option<tiny_skia::Mask
     Some(mask)
 }
 
+/// Rasterize the complete inherited overflow clip chain. Rectangular axis
+/// bounds provide the cheap culling envelope; every rounded padding-box node
+/// remains an independent path intersection so nested rounded scrollers do
+/// not collapse to one bounding rectangle and leak through either corner.
+fn overflow_clip_mask(
+    pw: u32,
+    ph: u32,
+    clip: &crate::dom::OverflowClip,
+    viewport: (f32, f32),
+) -> Option<tiny_skia::Mask> {
+    let bounds = clip.viewport_rect(viewport);
+    let mut mask = box_clip_mask(pw, ph, &bounds)?;
+    let offset = clip.rounded_offset();
+    let mut current = clip.rounded_chain().map(AsRef::as_ref);
+    while let Some(node) = current {
+        let rect = crate::Rect {
+            x: node.clip.rect.x + offset.0,
+            y: node.clip.rect.y + offset.1,
+            ..node.clip.rect
+        };
+        if let Some(path) =
+            rounded_rect_path_radii(rect.x, rect.y, rect.width, rect.height, node.clip.radii)
+        {
+            mask.intersect_path(&path, FillRule::Winding, true, Transform::identity());
+        }
+        current = node.parent.as_deref();
+    }
+    Some(mask)
+}
+
+fn intersect_clip_masks(
+    mut first: Option<tiny_skia::Mask>,
+    second: Option<&tiny_skia::Mask>,
+) -> Option<tiny_skia::Mask> {
+    match (first.as_mut(), second) {
+        (Some(first_mask), Some(second)) => {
+            for (a, b) in first_mask.data_mut().iter_mut().zip(second.data()) {
+                *a = ((*a as u16 * *b as u16 + 127) / 255) as u8;
+            }
+            first
+        }
+        (None, Some(second)) => Some(second.clone()),
+        _ => first,
+    }
+}
+
 fn rounded_box_clip_mask_radii(
     pw: u32,
     ph: u32,
@@ -6537,13 +7241,7 @@ fn rounded_box_clip_mask_radii(
         return box_clip_mask(pw, ph, rect);
     }
     let mut mask = tiny_skia::Mask::new(pw, ph)?;
-    let path = rounded_rect_path_radii(
-        rect.x,
-        rect.y,
-        rect.width,
-        rect.height,
-        radii,
-    )?;
+    let path = rounded_rect_path_radii(rect.x, rect.y, rect.width, rect.height, radii)?;
     mask.fill_path(&path, FillRule::Winding, true, Transform::identity());
     Some(mask)
 }
@@ -6562,14 +7260,14 @@ fn polygon_clip_mask(
     viewport: (f32, f32),
 ) -> Option<tiny_skia::Mask> {
     let resolve = |coordinate: crate::Dimension, basis: f32| match coordinate.resolve(
-            em,
-            rem,
-            viewport.0 / 100.0,
-            viewport.1 / 100.0,
-        ) {
-            crate::Dimension::Px(value) => Some(value),
-            crate::Dimension::Percent(value) => Some(value * basis),
-            _ => None,
+        em,
+        rem,
+        viewport.0 / 100.0,
+        viewport.1 / 100.0,
+    ) {
+        crate::Dimension::Px(value) => Some(value),
+        crate::Dimension::Percent(value) => Some(value * basis),
+        _ => None,
     };
     let mut builder = PathBuilder::new();
     for (index, &(x, y)) in polygon.points.iter().enumerate() {
@@ -6642,7 +7340,8 @@ fn render_svg_with_font_database(
         return None;
     }
     let mut svg_pixmap = Pixmap::new(width, height)?;
-    let transform = Transform::from_scale(width as f32 / size.width(), height as f32 / size.height());
+    let transform =
+        Transform::from_scale(width as f32 / size.width(), height as f32 / size.height());
     resvg::render(&tree, transform, &mut svg_pixmap.as_mut());
     Some(svg_pixmap)
 }
@@ -6775,26 +7474,26 @@ fn svg_root_attr_value_range(tag: &str, wanted: &str) -> Option<(usize, usize)> 
         }
         let (value_start, value_end) =
             if index < bytes.len() && matches!(bytes[index], b'"' | b'\'') {
-            let delimiter = bytes[index];
-            index += 1;
-            let start = index;
-            while index < bytes.len() && bytes[index] != delimiter {
+                let delimiter = bytes[index];
                 index += 1;
-            }
-            let end = index;
-            index = (index + 1).min(bytes.len());
-            (start, end)
-        } else {
-            let start = index;
-            while index < bytes.len()
-                && !bytes[index].is_ascii_whitespace()
-                && bytes[index] != b'>'
-                && bytes[index] != b'/'
-            {
-                index += 1;
-            }
-            (start, index)
-        };
+                let start = index;
+                while index < bytes.len() && bytes[index] != delimiter {
+                    index += 1;
+                }
+                let end = index;
+                index = (index + 1).min(bytes.len());
+                (start, end)
+            } else {
+                let start = index;
+                while index < bytes.len()
+                    && !bytes[index].is_ascii_whitespace()
+                    && bytes[index] != b'>'
+                    && bytes[index] != b'/'
+                {
+                    index += 1;
+                }
+                (start, index)
+            };
         if &tag[name_start..name_end] == wanted {
             return Some((value_start, value_end));
         }
@@ -6841,8 +7540,12 @@ fn serialize_svg_styled(
 }
 
 fn inject_svg_current_color(markup: &mut String, color: [u8; 4]) {
-    let Some(start) = markup.find("<svg") else { return };
-    let Some(end) = markup[start..].find('>').map(|offset| start + offset) else { return };
+    let Some(start) = markup.find("<svg") else {
+        return;
+    };
+    let Some(end) = markup[start..].find('>').map(|offset| start + offset) else {
+        return;
+    };
     let root = &markup[start..end];
     // An explicit presentation attribute already survives serialization and
     // is the correct local currentColor source.
@@ -6877,14 +7580,7 @@ fn serialize_svg_node(
         // Document/comment/PI: no tag of its own, emit only element children.
         None => {
             for child in tree.children(nid) {
-                serialize_svg_node(
-                    tree,
-                    child,
-                    false,
-                    styles,
-                    suppress_opacity_for,
-                    buf,
-                );
+                serialize_svg_node(tree, child, false, styles, suppress_opacity_for, buf);
             }
             return;
         }
@@ -7006,14 +7702,7 @@ fn serialize_svg_node(
     }
     buf.push('>');
     for child in tree.children(nid) {
-        serialize_svg_node(
-            tree,
-            child,
-            false,
-            styles,
-            suppress_opacity_for,
-            buf,
-        );
+        serialize_svg_node(tree, child, false, styles, suppress_opacity_for, buf);
     }
     buf.push_str("</");
     buf.push_str(tag);
@@ -7061,8 +7750,12 @@ fn inject_external_sprites(
     let mut refs: Vec<(String, String, String)> = Vec::new();
     let mut local_fragments = Vec::new();
     for nid in tree.descendants(root) {
-        let Some(node) = tree.get_node(nid) else { continue };
-        let Some(el) = node.as_element() else { continue };
+        let Some(node) = tree.get_node(nid) else {
+            continue;
+        };
+        let Some(el) = node.as_element() else {
+            continue;
+        };
         if el.local.as_ref() != "use" {
             continue;
         }
@@ -7098,15 +7791,21 @@ fn inject_external_sprites(
     let mut local_nodes = std::collections::HashMap::new();
     if !wanted_local.is_empty() {
         for nid in tree.descendants(tree.document()) {
-            let Some(node) = tree.get_node(nid) else { continue };
-            let Some(id) = node.get_attribute("id") else { continue };
+            let Some(node) = tree.get_node(nid) else {
+                continue;
+            };
+            let Some(id) = node.get_attribute("id") else {
+                continue;
+            };
             if wanted_local.contains(id) {
                 local_nodes.entry(id.to_string()).or_insert(nid);
             }
         }
     }
     for frag in local_fragments {
-        let Some(&symbol_id) = local_nodes.get(&frag) else { continue };
+        let Some(&symbol_id) = local_nodes.get(&frag) else {
+            continue;
+        };
         if symbol_id == root || root_descendants.contains(&symbol_id) {
             continue;
         }
@@ -7335,15 +8034,12 @@ fn paint_mask(
     if rect.width <= 0.0 || rect.height <= 0.0 {
         return false;
     }
-    let Some(bytes) = fetch_bytes(src, base_url, cache) else { return false };
+    let Some(bytes) = fetch_bytes(src, base_url, cache) else {
+        return false;
+    };
     let (box_width, box_height) = (rect.width.ceil() as u32, rect.height.ceil() as u32);
     let (tile_width, tile_height) = mask_size
-        .map(|(width, height)| {
-            (
-                width.max(1.0).ceil() as u32,
-                height.max(1.0).ceil() as u32,
-            )
-        })
+        .map(|(width, height)| (width.max(1.0).ceil() as u32, height.max(1.0).ceil() as u32))
         .unwrap_or((box_width, box_height));
     let mask = if is_svg(&bytes) {
         render_svg(&bytes, tile_width, tile_height)
@@ -7357,12 +8053,9 @@ fn paint_mask(
     } else {
         mask_repeat.unwrap_or((false, false))
     };
-    let normalized_linear =
-        linear_gradient.map(|(_, stops)| normalized_stops(stops));
-    let normalized_conic =
-        conic_gradient.map(|(_, _, stops)| normalized_stops(stops));
-    let normalized_radial =
-        radial_gradient.map(|(_, stops)| normalized_stops(stops));
+    let normalized_linear = linear_gradient.map(|(_, stops)| normalized_stops(stops));
+    let normalized_conic = conic_gradient.map(|(_, _, stops)| normalized_stops(stops));
+    let normalized_radial = radial_gradient.map(|(_, stops)| normalized_stops(stops));
     let Some(mut recolored) = Pixmap::new(box_width, box_height) else {
         return false;
     };
@@ -7376,8 +8069,7 @@ fn paint_mask(
                 continue;
             }
             let tile_x = if repeat.0 { x % tile_width } else { x };
-            let coverage =
-                mask.pixels()[(tile_y * tile_width + tile_x) as usize].alpha() as u32;
+            let coverage = mask.pixels()[(tile_y * tile_width + tile_x) as usize].alpha() as u32;
             if coverage == 0 {
                 continue;
             }
@@ -7399,26 +8091,16 @@ fn paint_mask(
                 fill
             };
             color[3] = ((color[3] as u32 * coverage) / 255) as u8;
-            recolored.pixels_mut()[(y * box_width + x) as usize] =
-                premultiplied(color);
+            recolored.pixels_mut()[(y * box_width + x) as usize] = premultiplied(color);
         }
     }
     let mut clip = extra_clip.cloned();
     if !border_radius.is_zero() {
-        let path = rounded_rect_path_radii(
-            rect.x,
-            rect.y,
-            rect.width,
-            rect.height,
-            border_radius,
-        );
+        let path = rounded_rect_path_radii(rect.x, rect.y, rect.width, rect.height, border_radius);
         match (clip.as_mut(), path) {
-            (Some(mask), Some(path)) => mask.intersect_path(
-                &path,
-                FillRule::Winding,
-                true,
-                Transform::identity(),
-            ),
+            (Some(mask), Some(path)) => {
+                mask.intersect_path(&path, FillRule::Winding, true, Transform::identity())
+            }
             (None, _) => {
                 clip = rounded_box_clip_mask_radii(
                     pixmap.width(),
@@ -7444,6 +8126,7 @@ fn paint_mask(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dom::layout_dom_with_web_fonts;
     use obscura_dom::tree_sink::parse_html;
 
     #[test]
@@ -7577,10 +8260,9 @@ mod tests {
         // enters its preload range. It is still a successfully decoded image:
         // Chromium reports complete=true and naturalWidth=1.
         const TRANSPARENT_GIF: &[u8] = &[
-            0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x70,
-            0x00, 0x00, 0x21, 0xf9, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00, 0x2c,
-            0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x02,
-            0x44, 0x01, 0x00, 0x3b,
+            0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x70, 0x00, 0x00, 0x21,
+            0xf9, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00, 0x2c, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00,
+            0x01, 0x00, 0x00, 0x02, 0x02, 0x44, 0x01, 0x00, 0x3b,
         ];
 
         // Apple's deliberately palette-less placeholder is accepted by
@@ -7589,10 +8271,9 @@ mod tests {
         assert_eq!(image_dimensions(TRANSPARENT_GIF), Some((1, 1)));
 
         const VISIBLE_GIF: &[u8] = &[
-            0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x80,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0x2c, 0x00, 0x00,
-            0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x01, 0x4c, 0x00,
-            0x3b,
+            0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x80, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0xff, 0xff, 0xff, 0x2c, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00,
+            0x00, 0x02, 0x01, 0x4c, 0x00, 0x3b,
         ];
         let decoded = raster_to_pixmap(VISIBLE_GIF, 1, 1).expect("decode GIF");
         assert_eq!(decoded.width(), 1);
@@ -7611,10 +8292,9 @@ mod tests {
                 </div>
             </body></html>"#,
         );
-        let top = paint_dom_scrolled(&tree, (100.0, 80.0), None, (0.0, 0.0))
-            .expect("top viewport");
-        let scrolled = paint_dom_scrolled(&tree, (100.0, 80.0), None, (0.0, 80.0))
-            .expect("scrolled viewport");
+        let top = paint_dom_scrolled(&tree, (100.0, 80.0), None, (0.0, 0.0)).expect("top viewport");
+        let scrolled =
+            paint_dom_scrolled(&tree, (100.0, 80.0), None, (0.0, 80.0)).expect("scrolled viewport");
 
         let top_content = top.pixel(50, 10).expect("top content");
         assert!(
@@ -7658,13 +8338,16 @@ mod tests {
         let top =
             paint_prepared(&tree, &mut prepared, &mut resources, (0.0, 0.0)).expect("top capture");
         let scrolled = paint_prepared(&tree, &mut prepared, &mut resources, (0.0, 1000.0))
-        .expect("scrolled capture");
+            .expect("scrolled capture");
         let top_repeat = paint_prepared(&tree, &mut prepared, &mut resources, (0.0, 0.0))
-        .expect("repeated top capture");
+            .expect("repeated top capture");
         let scrolled_repeat = paint_prepared(&tree, &mut prepared, &mut resources, (0.0, 1000.0))
-        .expect("repeated scrolled capture");
+            .expect("repeated scrolled capture");
 
-        assert_eq!(top, top_repeat, "returning to the top must not accumulate scroll");
+        assert_eq!(
+            top, top_repeat,
+            "returning to the top must not accumulate scroll"
+        );
         assert_eq!(
             scrolled, scrolled_repeat,
             "repeated bottom paint must reuse immutable document geometry"
@@ -7800,13 +8483,13 @@ mod tests {
         let base_clips = prepared.layout().clip_rects.clone();
 
         let near = screenshot_prepared(&tree, &mut prepared, &mut resources, (0.0, 20.0))
-        .expect("near capture");
+            .expect("near capture");
         let far = screenshot_prepared(&tree, &mut prepared, &mut resources, (0.0, 100.0))
-        .expect("far capture");
+            .expect("far capture");
         let far_repeat = screenshot_prepared(&tree, &mut prepared, &mut resources, (0.0, 100.0))
-        .expect("repeated far capture");
+            .expect("repeated far capture");
         let near_after_far = screenshot_prepared(&tree, &mut prepared, &mut resources, (0.0, 20.0))
-        .expect("repeated near capture");
+            .expect("repeated near capture");
 
         assert_ne!(
             near, far,
@@ -7857,10 +8540,8 @@ mod tests {
         let viewport = (800.0, 513.0);
         let top = paint_dom_scrolled(&tree, viewport, None, (0.0, 0.0)).unwrap();
         let stuck = paint_dom_scrolled(&tree, viewport, None, (0.0, 100.0)).unwrap();
-        let bottom_normal =
-            paint_dom_scrolled(&tree, viewport, None, (0.0, 400.0)).unwrap();
-        let boundary =
-            paint_dom_scrolled(&tree, viewport, None, (0.0, 9999.0)).unwrap();
+        let bottom_normal = paint_dom_scrolled(&tree, viewport, None, (0.0, 400.0)).unwrap();
+        let boundary = paint_dom_scrolled(&tree, viewport, None, (0.0, 9999.0)).unwrap();
 
         let is_color = |pixel: tiny_skia::PremultipliedColorU8, rgb: [u8; 3]| {
             (pixel.red() as i16 - rgb[0] as i16).abs() < 8
@@ -7886,16 +8567,37 @@ mod tests {
     fn object_fit_contain_and_cover_center_and_preserve_aspect() {
         // A 200x100 box (2:1) with a square 100x100 image, offset so centering
         // is checked against the box origin, not (0,0).
-        let box_rect = crate::Rect { x: 10.0, y: 20.0, width: 200.0, height: 100.0 };
+        let box_rect = crate::Rect {
+            x: 10.0,
+            y: 20.0,
+            width: 200.0,
+            height: 100.0,
+        };
         let (iw, ih) = (100.0f32, 100.0f32);
 
         // Contain: the largest square fitting inside 200x100 is 100x100,
         // letterboxed horizontally and centered.
         let c = object_fit_dest(&box_rect, iw, ih, crate::ObjectFit::Contain);
-        assert!((c.width - 100.0).abs() < 0.01 && (c.height - 100.0).abs() < 0.01, "contain size {:?}", c);
-        assert!((c.width / c.height - iw / ih).abs() < 1e-3, "contain preserves aspect: {:?}", c);
-        assert!((c.x - 60.0).abs() < 0.01, "contain centered x (10 + (200-100)/2): {}", c.x);
-        assert!((c.y - 20.0).abs() < 0.01, "contain centered y (20 + (100-100)/2): {}", c.y);
+        assert!(
+            (c.width - 100.0).abs() < 0.01 && (c.height - 100.0).abs() < 0.01,
+            "contain size {:?}",
+            c
+        );
+        assert!(
+            (c.width / c.height - iw / ih).abs() < 1e-3,
+            "contain preserves aspect: {:?}",
+            c
+        );
+        assert!(
+            (c.x - 60.0).abs() < 0.01,
+            "contain centered x (10 + (200-100)/2): {}",
+            c.x
+        );
+        assert!(
+            (c.y - 20.0).abs() < 0.01,
+            "contain centered y (20 + (100-100)/2): {}",
+            c.y
+        );
         // Contain always fits inside the box.
         assert!(c.x >= box_rect.x - 0.01 && c.x + c.width <= box_rect.x + box_rect.width + 0.01);
         assert!(c.y >= box_rect.y - 0.01 && c.y + c.height <= box_rect.y + box_rect.height + 0.01);
@@ -7903,32 +8605,81 @@ mod tests {
         // Cover: the smallest square covering 200x100 is 200x200, centered so
         // it overflows the box vertically (the paint path clips it).
         let v = object_fit_dest(&box_rect, iw, ih, crate::ObjectFit::Cover);
-        assert!((v.width - 200.0).abs() < 0.01 && (v.height - 200.0).abs() < 0.01, "cover size {:?}", v);
-        assert!((v.width / v.height - iw / ih).abs() < 1e-3, "cover preserves aspect: {:?}", v);
-        assert!((v.x - 10.0).abs() < 0.01, "cover centered x (10 + (200-200)/2): {}", v.x);
-        assert!((v.y + 30.0).abs() < 0.01, "cover centered y (20 + (100-200)/2 = -30): {}", v.y);
+        assert!(
+            (v.width - 200.0).abs() < 0.01 && (v.height - 200.0).abs() < 0.01,
+            "cover size {:?}",
+            v
+        );
+        assert!(
+            (v.width / v.height - iw / ih).abs() < 1e-3,
+            "cover preserves aspect: {:?}",
+            v
+        );
+        assert!(
+            (v.x - 10.0).abs() < 0.01,
+            "cover centered x (10 + (200-200)/2): {}",
+            v.x
+        );
+        assert!(
+            (v.y + 30.0).abs() < 0.01,
+            "cover centered y (20 + (100-200)/2 = -30): {}",
+            v.y
+        );
         // Cover fully covers the box on both axes.
         assert!(v.x <= box_rect.x + 0.01 && v.x + v.width >= box_rect.x + box_rect.width - 0.01);
         assert!(v.y <= box_rect.y + 0.01 && v.y + v.height >= box_rect.y + box_rect.height - 0.01);
 
         // scale-down never upscales: a 100x100 image in a 200x200 box stays
         // 100x100 (Contain would grow it to 200x200), centered.
-        let box2 = crate::Rect { x: 0.0, y: 0.0, width: 200.0, height: 200.0 };
+        let box2 = crate::Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 200.0,
+            height: 200.0,
+        };
         let sd = object_fit_dest(&box2, iw, ih, crate::ObjectFit::ScaleDown);
-        assert!((sd.width - 100.0).abs() < 0.01 && (sd.height - 100.0).abs() < 0.01, "scale-down no upscale: {:?}", sd);
-        assert!((sd.x - 50.0).abs() < 0.01 && (sd.y - 50.0).abs() < 0.01, "scale-down centered: {:?}", sd);
+        assert!(
+            (sd.width - 100.0).abs() < 0.01 && (sd.height - 100.0).abs() < 0.01,
+            "scale-down no upscale: {:?}",
+            sd
+        );
+        assert!(
+            (sd.x - 50.0).abs() < 0.01 && (sd.y - 50.0).abs() < 0.01,
+            "scale-down centered: {:?}",
+            sd
+        );
         let cn = object_fit_dest(&box2, iw, ih, crate::ObjectFit::Contain);
-        assert!((cn.width - 200.0).abs() < 0.01, "contain upscales into the box: {:?}", cn);
+        assert!(
+            (cn.width - 200.0).abs() < 0.01,
+            "contain upscales into the box: {:?}",
+            cn
+        );
 
         // None uses the intrinsic size regardless of box, centered.
         let n = object_fit_dest(&box2, iw, ih, crate::ObjectFit::None);
-        assert!((n.width - 100.0).abs() < 0.01 && (n.height - 100.0).abs() < 0.01, "none intrinsic size: {:?}", n);
-        assert!((n.x - 50.0).abs() < 0.01 && (n.y - 50.0).abs() < 0.01, "none centered: {:?}", n);
+        assert!(
+            (n.width - 100.0).abs() < 0.01 && (n.height - 100.0).abs() < 0.01,
+            "none intrinsic size: {:?}",
+            n
+        );
+        assert!(
+            (n.x - 50.0).abs() < 0.01 && (n.y - 50.0).abs() < 0.01,
+            "none centered: {:?}",
+            n
+        );
 
         // Fill stretches to exactly the box.
         let f = object_fit_dest(&box_rect, iw, ih, crate::ObjectFit::Fill);
-        assert!((f.width - box_rect.width).abs() < 0.01 && (f.height - box_rect.height).abs() < 0.01, "fill: {:?}", f);
-        assert!((f.x - box_rect.x).abs() < 0.01 && (f.y - box_rect.y).abs() < 0.01, "fill origin: {:?}", f);
+        assert!(
+            (f.width - box_rect.width).abs() < 0.01 && (f.height - box_rect.height).abs() < 0.01,
+            "fill: {:?}",
+            f
+        );
+        assert!(
+            (f.x - box_rect.x).abs() < 0.01 && (f.y - box_rect.y).abs() < 0.01,
+            "fill origin: {:?}",
+            f
+        );
     }
 
     #[test]
@@ -8007,13 +8758,132 @@ mod tests {
             pixel.blue() > 220 && pixel.red() < 40
         };
 
-        assert!(is_green(5, 30), "border-box clip paints beneath transparent border");
-        assert!(is_white(115, 30) && is_green(125, 30), "padding-box excludes border");
+        assert!(
+            is_green(5, 30),
+            "border-box clip paints beneath transparent border"
+        );
+        assert!(
+            is_white(115, 30) && is_green(125, 30),
+            "padding-box excludes border"
+        );
         assert!(is_white(225, 30) && is_white(235, 30) && is_green(245, 30));
-        assert!(is_white(351, 21) && is_green(370, 40), "content radius must inset to 20px");
-        assert!(is_red(60, 120) && is_blue(80, 120), "clip must not rebase gradient line");
-        assert!(is_red(220, 120), "ancestor clipping must not resize gradient coordinates");
-        assert!(is_white(300, 120) && !is_white(325, 110), "content origin anchors no-repeat tile");
+        assert!(
+            is_white(351, 21) && is_green(370, 40),
+            "content radius must inset to 20px"
+        );
+        assert!(
+            is_red(60, 120) && is_blue(80, 120),
+            "clip must not rebase gradient line"
+        );
+        assert!(
+            is_red(220, 120),
+            "ancestor clipping must not resize gradient coordinates"
+        );
+        assert!(
+            is_white(300, 120) && !is_white(325, 110),
+            "content origin anchors no-repeat tile"
+        );
+    }
+
+    #[test]
+    fn rounded_overflow_clips_descendants_at_the_padding_edge() {
+        let tree = parse_html(
+            r#"<html style="margin:0"><body style="margin:0;background:white">
+                <div id="outer" style="position:absolute;left:10px;top:10px;box-sizing:border-box;
+                     width:100px;height:100px;border:10px solid black;border-radius:30px;
+                     overflow:hidden">
+                  <div id="child" style="position:absolute;left:0;top:0;width:100px;height:100px;
+                       background:red;transform:translate(-10px,-10px)"></div>
+                </div>
+            </body></html>"#,
+        );
+        let child = tree.get_element_by_id("child").expect("child");
+        let mut resources = RenderResourceCache::with_loader(|_url: &str| None);
+        let mut prepared = prepare_dom(&tree, (130.0, 130.0), None, &mut resources)
+            .expect("prepared rounded overflow");
+        let child_clip = prepared
+            .layout
+            .clip_rects
+            .get(&child)
+            .and_then(Option::as_ref)
+            .expect("child clip");
+        let rounded = child_clip
+            .rounded_chain()
+            .expect("child must retain the owner's rounded clip node");
+        assert_eq!(
+            rounded.clip.rect,
+            crate::Rect {
+                x: 20.0,
+                y: 20.0,
+                width: 80.0,
+                height: 80.0
+            }
+        );
+        assert_eq!(rounded.clip.radii.top_left, (20.0, 20.0));
+        let direct_mask =
+            overflow_clip_mask(130, 130, child_clip, (130.0, 130.0)).expect("rounded mask");
+        assert_eq!(direct_mask.data()[(23 * 130 + 23) as usize], 0);
+        let pixmap = paint_prepared(&tree, &mut prepared, &mut resources, (0.0, 0.0))
+            .expect("rounded overflow paint");
+        let rgb = |x, y| {
+            let pixel = pixmap.pixel(x, y).expect("pixel");
+            (pixel.red(), pixel.green(), pixel.blue())
+        };
+
+        assert_eq!(rgb(23, 23), (0, 0, 0));
+        assert_eq!(rgb(40, 25), (255, 0, 0));
+        assert_eq!(rgb(50, 50), (255, 0, 0));
+        assert_eq!(rgb(15, 50), (0, 0, 0));
+    }
+
+    #[test]
+    fn nested_rounded_overflow_keeps_every_clip_chain_node() {
+        let tree = parse_html(
+            r#"<html style="margin:0"><body style="margin:0;background:white">
+                <div id="outer" style="position:absolute;left:10px;top:10px;width:100px;height:100px;
+                     border-radius:40px;overflow:hidden;background:blue">
+                  <div style="position:absolute;left:30px;top:0;width:80px;height:80px;
+                       border-radius:20px;overflow:hidden">
+                    <div id="child" style="width:80px;height:80px;background:lime"></div>
+                  </div>
+                </div>
+            </body></html>"#,
+        );
+        let child = tree.get_element_by_id("child").expect("child");
+        let mut resources = RenderResourceCache::with_loader(|_url: &str| None);
+        let mut prepared = prepare_dom(&tree, (140.0, 130.0), None, &mut resources)
+            .expect("prepared nested clips");
+        let mut chain = prepared
+            .layout
+            .clip_rects
+            .get(&child)
+            .and_then(Option::as_ref)
+            .and_then(crate::dom::OverflowClip::rounded_chain)
+            .map(AsRef::as_ref);
+        let mut chain_len = 0;
+        while let Some(node) = chain {
+            chain_len += 1;
+            chain = node.parent.as_deref();
+        }
+        assert_eq!(chain_len, 2, "both rounded owners must survive the chain");
+        let pixmap = paint_prepared(&tree, &mut prepared, &mut resources, (0.0, 0.0))
+            .expect("nested clip paint");
+        let rgb = |x, y| {
+            let pixel = pixmap.pixel(x, y).expect("pixel");
+            (pixel.red(), pixel.green(), pixel.blue())
+        };
+
+        assert_eq!(rgb(70, 30), (0, 255, 0), "inside both rounded clips");
+        assert_eq!(
+            rgb(43, 13),
+            (0, 0, 255),
+            "inner rounded corner must reveal the outer background"
+        );
+        assert_eq!(
+            rgb(105, 15),
+            (255, 255, 255),
+            "outer rounded corner must still constrain an inner-visible point"
+        );
     }
 
     #[test]
@@ -8058,8 +8928,8 @@ mod tests {
         let none = tree.get_element_by_id("none").expect("none");
         let decorated = tree.get_element_by_id("decorated").expect("decorated");
         let mut resources = RenderResourceCache::default();
-        let mut prepared = prepare_dom(&tree, (180.0, 180.0), None, &mut resources)
-            .expect("prepare");
+        let mut prepared =
+            prepare_dom(&tree, (180.0, 180.0), None, &mut resources).expect("prepare");
 
         let none_rect = prepared.document_rect(none).expect("none rect");
         assert_eq!((none_rect.width, none_rect.height), (100.0, 50.0));
@@ -8080,22 +8950,35 @@ mod tests {
         assert_eq!(computed["outline-style"], "dashed");
         assert_eq!(computed["outline-offset"], "3px");
 
-        let pixmap = paint_prepared(
-            &tree,
-            &mut prepared,
-            &mut resources,
-            (0.0, 0.0),
-        )
-        .expect("paint");
+        let pixmap =
+            paint_prepared(&tree, &mut prepared, &mut resources, (0.0, 0.0)).expect("paint");
         let sample = |x: u32, y: u32| pixmap.pixel(x, y).expect("pixel");
         let top = sample((rect.x + rect.width / 2.0) as u32, (rect.y + 2.0) as u32);
-        let right = sample((rect.x + rect.width - 2.0) as u32, (rect.y + rect.height / 2.0) as u32);
-        let bottom = sample((rect.x + rect.width / 2.0) as u32, (rect.y + rect.height - 2.0) as u32);
+        let right = sample(
+            (rect.x + rect.width - 2.0) as u32,
+            (rect.y + rect.height / 2.0) as u32,
+        );
+        let bottom = sample(
+            (rect.x + rect.width / 2.0) as u32,
+            (rect.y + rect.height - 2.0) as u32,
+        );
         let left = sample((rect.x + 2.0) as u32, (rect.y + rect.height / 2.0) as u32);
-        assert!(top.red() > 220 && top.green() < 40 && top.blue() < 40, "{top:?}");
-        assert!(right.green() > 90 && right.red() < 40 && right.blue() < 40, "{right:?}");
-        assert!(bottom.blue() > 220 && bottom.red() < 40 && bottom.green() < 40, "{bottom:?}");
-        assert!(left.red() > 90 && left.blue() > 90 && left.green() < 40, "{left:?}");
+        assert!(
+            top.red() > 220 && top.green() < 40 && top.blue() < 40,
+            "{top:?}"
+        );
+        assert!(
+            right.green() > 90 && right.red() < 40 && right.blue() < 40,
+            "{right:?}"
+        );
+        assert!(
+            bottom.blue() > 220 && bottom.red() < 40 && bottom.green() < 40,
+            "{bottom:?}"
+        );
+        assert!(
+            left.red() > 90 && left.blue() > 90 && left.green() < 40,
+            "{left:?}"
+        );
 
         let rounded_corner = sample((rect.x + 1.0) as u32, (rect.y + 1.0) as u32);
         assert!(
@@ -8121,7 +9004,10 @@ mod tests {
                 }
             }
         }
-        assert!(outline_pixels > 40, "dashed outline should paint outside layout: {outline_pixels}");
+        assert!(
+            outline_pixels > 40,
+            "dashed outline should paint outside layout: {outline_pixels}"
+        );
     }
 
     #[test]
@@ -8267,7 +9153,10 @@ mod tests {
         let circle_top = pixmap.pixel(20, 1).expect("circle top");
         assert!(circle_top.red() > 200 && circle_top.green() < 40 && circle_top.blue() < 40);
 
-        assert!(is_white(60, 3), "a rectangular 50% radius must use a 40x20 elliptical corner");
+        assert!(
+            is_white(60, 3),
+            "a rectangular 50% radius must use a 40x20 elliptical corner"
+        );
         let ellipse_top = pixmap.pixel(90, 1).expect("ellipse top");
         let ellipse_left = pixmap.pixel(51, 20).expect("ellipse left");
         for pixel in [ellipse_top, ellipse_left] {
@@ -8280,7 +9169,10 @@ mod tests {
             "a 20px radius must remain circular rather than resolving like 50%: {pill_corner:?}"
         );
 
-        assert!(is_white(231, 1), "a circular replaced image must clip its raster corner");
+        assert!(
+            is_white(231, 1),
+            "a circular replaced image must clip its raster corner"
+        );
         let image_center = pixmap.pixel(250, 20).expect("image center");
         assert!(image_center.red() > 80 && image_center.blue() > 80 && image_center.green() < 40);
     }
@@ -8568,7 +9460,10 @@ mod tests {
                 1 => inside.green() > 100 && inside.red() < 80 && inside.blue() < 80,
                 _ => inside.blue() > 180 && inside.red() < 80 && inside.green() < 80,
             };
-            assert!(colored, "{name} must paint inside its percentage polygon: {inside:?}");
+            assert!(
+                colored,
+                "{name} must paint inside its percentage polygon: {inside:?}"
+            );
             let outside = pixmap.pixel(left + 4, 65).expect("outside pixel");
             assert_eq!(
                 (outside.red(), outside.green(), outside.blue()),
@@ -8688,6 +9583,9 @@ mod tests {
             &mut cache,
             &mut intrinsic,
             &mut selected,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
         ));
         let laid = layout_dom_with_web_fonts(&tree, (120.0, 80.0), &intrinsic, &[]);
         let image_id = tree
@@ -8731,6 +9629,96 @@ mod tests {
         assert!(
             green.green() > 220 && green.red() < 40 && green.blue() < 40,
             "content:url image must paint through the replaced-image path: {green:?}"
+        );
+    }
+
+    #[test]
+    fn repeated_content_image_prepare_reuses_intrinsic_and_corrects_changes() {
+        const SOURCE: &str = "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='12'%20height='8'%3E%3C/svg%3E";
+        const CONTENT_A: &str = "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='30'%20height='20'%3E%3C/svg%3E";
+        const CONTENT_B: &str = "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='50'%20height='10'%3E%3C/svg%3E";
+        let make_tree = |content: Option<&str>| {
+            let content = content
+                .map(|url| format!("content:url('{url}');"))
+                .unwrap_or_default();
+            parse_html(&format!(
+                r#"<html><body style="margin:0"><img id="target" src="{SOURCE}" style="display:block;{content}"></body></html>"#
+            ))
+        };
+        let rect_for = |tree: &DomTree, prepared: &PreparedRender| {
+            let id = tree
+                .query_selector("#target")
+                .expect("selector")
+                .expect("target");
+            prepared.layout.rects[&id]
+        };
+
+        let mut resources = RenderResourceCache::default();
+        let first_tree = make_tree(Some(CONTENT_A));
+        let first =
+            prepare_dom(&first_tree, (100.0, 80.0), None, &mut resources).expect("first prepare");
+        let first_rect = rect_for(&first_tree, &first);
+        assert_eq!((first_rect.width, first_rect.height), (30.0, 20.0));
+        assert_eq!(resources.content_image_layout_retries, 1);
+
+        // Stable node + resolved URL + dimensions seed the first layout. The
+        // retry counter must not move on a repeated prepare.
+        let repeated = prepare_dom(&first_tree, (100.0, 80.0), None, &mut resources)
+            .expect("repeated prepare");
+        let repeated_rect = rect_for(&first_tree, &repeated);
+        assert_eq!((repeated_rect.width, repeated_rect.height), (30.0, 20.0));
+        assert_eq!(resources.content_image_layout_retries, 1);
+
+        // A changed computed URL initially receives the remembered geometry,
+        // then must correct it from the newly selected resource.
+        let changed_tree = make_tree(Some(CONTENT_B));
+        let changed = prepare_dom(&changed_tree, (100.0, 80.0), None, &mut resources)
+            .expect("changed prepare");
+        let changed_rect = rect_for(&changed_tree, &changed);
+        assert_eq!((changed_rect.width, changed_rect.height), (50.0, 10.0));
+        assert_eq!(resources.content_image_layout_retries, 2);
+
+        // Removing CSS content restores the ordinary src selection and its
+        // intrinsic geometry rather than leaking the remembered CSS image.
+        let removed_tree = make_tree(None);
+        let removed = prepare_dom(&removed_tree, (100.0, 80.0), None, &mut resources)
+            .expect("removed prepare");
+        let removed_id = removed_tree
+            .query_selector("#target")
+            .expect("selector")
+            .expect("target");
+        let removed_rect = removed.layout.rects[&removed_id];
+        assert_eq!((removed_rect.width, removed_rect.height), (12.0, 8.0));
+        assert_eq!(resources.content_image_layout_retries, 3);
+        assert!(resources.content_image_intrinsics.is_empty());
+        assert_eq!(
+            removed.selected_images[&removed_id].resolved_url, SOURCE,
+            "the HTML source must regain painting ownership"
+        );
+    }
+
+    #[test]
+    fn content_image_intrinsic_memory_is_bounded_and_refreshes_recency() {
+        let mut resources = RenderResourceCache::with_loader_and_limits(|_url: &str| None, 2, 1024);
+        let tree = parse_html(r#"<html><body><img id="a"><img id="b"><img id="c"></body></html>"#);
+        let ids = ["#a", "#b", "#c"].map(|selector| {
+            tree.query_selector(selector)
+                .expect("selector")
+                .expect("image")
+        });
+        resources.remember_content_image_intrinsic(ids[0], "a".into(), (1.0, 1.0));
+        resources.remember_content_image_intrinsic(ids[1], "b".into(), (2.0, 2.0));
+        // Refreshing id 1 makes id 2 the oldest entry.
+        resources.remember_content_image_intrinsic(ids[0], "a2".into(), (3.0, 3.0));
+        resources.remember_content_image_intrinsic(ids[2], "c".into(), (4.0, 4.0));
+
+        assert_eq!(resources.content_image_intrinsics.len(), 2);
+        assert!(resources.content_image_intrinsics.contains_key(&ids[0]));
+        assert!(!resources.content_image_intrinsics.contains_key(&ids[1]));
+        assert!(resources.content_image_intrinsics.contains_key(&ids[2]));
+        assert_eq!(
+            resources.content_image_intrinsics[&ids[0]].resolved_url,
+            "a2"
         );
     }
 
@@ -8783,31 +9771,43 @@ mod tests {
                 })
                 .count()
         };
-        let is_radial_color = |red, green, blue| {
-            red > 70 && blue > 100 && blue as u16 > green as u16 * 2
-        };
-        for (name, left) in [("ordinary element", 0), ("in-flow pseudo", 100), ("positioned pseudo", 200)] {
+        let is_radial_color =
+            |red, green, blue| red > 70 && blue > 100 && blue as u16 > green as u16 * 2;
+        for (name, left) in [
+            ("ordinary element", 0),
+            ("in-flow pseudo", 100),
+            ("positioned pseudo", 200),
+        ] {
             let colored = count_pixels(left, 0, is_radial_color);
             assert!(
                 colored > 20,
                 "{name} must sample the radial source through the repeated SVG mask, found {colored} colored pixels"
             );
-            let black = count_pixels(left, 0, |red, green, blue| red < 20 && green < 20 && blue < 20);
+            let black = count_pixels(left, 0, |red, green, blue| {
+                red < 20 && green < 20 && blue < 20
+            });
             assert_eq!(
                 black, 0,
                 "{name} must not fall back to the default black mask fill"
             );
         }
         assert!(
-            count_pixels(0, 80, |red, green, blue| green > 100 && red < 40 && blue < 40) > 20,
+            count_pixels(0, 80, |red, green, blue| green > 100
+                && red < 40
+                && blue < 40)
+                > 20,
             "solid mask sources must keep painting"
         );
         assert!(
-            count_pixels(100, 80, |red, green, blue| (red > 100 || blue > 100) && green < 80) > 20,
+            count_pixels(100, 80, |red, green, blue| (red > 100 || blue > 100)
+                && green < 80)
+                > 20,
             "linear-gradient mask sources must keep painting"
         );
         assert!(
-            count_pixels(200, 80, |red, green, blue| (red > 100 || blue > 100) && green < 80) > 20,
+            count_pixels(200, 80, |red, green, blue| (red > 100 || blue > 100)
+                && green < 80)
+                > 20,
             "conic-gradient mask sources must keep painting"
         );
     }
@@ -9004,7 +10004,10 @@ mod tests {
             "selected label, border, and disclosure arrow should paint"
         );
         let select = tree.get_element_by_id("theme").unwrap();
-        assert_eq!(selected_option_label(&tree, select).as_deref(), Some("Dark"));
+        assert_eq!(
+            selected_option_label(&tree, select).as_deref(),
+            Some("Dark")
+        );
     }
 
     #[test]
@@ -9279,10 +10282,7 @@ mod tests {
         let last = fragments[2];
         assert_eq!(rgb(first.x + 0.5, first.y + 1.0), (0, 0, 255));
         assert_eq!(rgb(middle.x + 0.5, middle.y + 1.0), (255, 0, 0));
-        assert_eq!(
-            rgb(last.x + last.width - 0.5, last.y + 1.0),
-            (0, 0, 255)
-        );
+        assert_eq!(rgb(last.x + last.width - 0.5, last.y + 1.0), (0, 0, 255));
         let gap_y = (first.y + first.height + middle.y) * 0.5;
         assert_eq!(
             rgb(5.0, gap_y),
@@ -9390,7 +10390,11 @@ mod tests {
         );
         let pixmap = paint_dom(&tree, (200.0, 200.0), None).expect("pixmap");
         let p = pixmap.pixel(5, 5).expect("pixel");
-        assert!(p.blue() > 200, "expected blue to paint over red, got {:?}", p);
+        assert!(
+            p.blue() > 200,
+            "expected blue to paint over red, got {:?}",
+            p
+        );
     }
 
     #[test]
@@ -9430,7 +10434,10 @@ mod tests {
         );
         // Nothing painted at the pre-transform origin: both boxes moved away.
         let origin = pixmap.pixel(5, 5).expect("pixel");
-        assert_eq!((origin.red(), origin.green(), origin.blue()), (255, 255, 255));
+        assert_eq!(
+            (origin.red(), origin.green(), origin.blue()),
+            (255, 255, 255)
+        );
     }
 
     #[test]
@@ -9501,21 +10508,42 @@ mod tests {
         let assert_rect = |actual: crate::Rect, expected: crate::Rect| {
             assert!((actual.x - expected.x).abs() < 0.02, "x: {actual:?}");
             assert!((actual.y - expected.y).abs() < 0.02, "y: {actual:?}");
-            assert!((actual.width - expected.width).abs() < 0.02, "width: {actual:?}");
-            assert!((actual.height - expected.height).abs() < 0.02, "height: {actual:?}");
+            assert!(
+                (actual.width - expected.width).abs() < 0.02,
+                "width: {actual:?}"
+            );
+            assert!(
+                (actual.height - expected.height).abs() < 0.02,
+                "height: {actual:?}"
+            );
         };
         let first = tree.get_element_by_id("translate-rotate").unwrap();
         let second = tree.get_element_by_id("rotate-translate").unwrap();
         assert_rect(
             prepared.document_rect(first).unwrap(),
-            crate::Rect { x: 140.0, y: 50.0, width: 10.0, height: 20.0 },
+            crate::Rect {
+                x: 140.0,
+                y: 50.0,
+                width: 10.0,
+                height: 20.0,
+            },
         );
         assert_rect(
             prepared.document_rect(second).unwrap(),
-            crate::Rect { x: 40.0, y: 150.0, width: 10.0, height: 20.0 },
+            crate::Rect {
+                x: 40.0,
+                y: 150.0,
+                width: 10.0,
+                height: 20.0,
+            },
         );
         let child = tree.get_element_by_id("child").unwrap();
-        let child_rect = crate::Rect { x: 30.0, y: 240.0, width: 40.0, height: 20.0 };
+        let child_rect = crate::Rect {
+            x: 30.0,
+            y: 240.0,
+            width: 40.0,
+            height: 20.0,
+        };
         assert_rect(prepared.document_rect(child).unwrap(), child_rect);
         assert_rect(
             prepared.viewport_client_rects(child, (0.0, 0.0)).unwrap()[0],
@@ -9524,12 +10552,22 @@ mod tests {
         let fixed = tree.get_element_by_id("captured-fixed").unwrap();
         assert_rect(
             prepared.document_rect(fixed).unwrap(),
-            crate::Rect { x: 50.0, y: 200.0, width: 20.0, height: 20.0 },
+            crate::Rect {
+                x: 50.0,
+                y: 200.0,
+                width: 20.0,
+                height: 20.0,
+            },
         );
         let centered = tree.get_element_by_id("center-origin").unwrap();
         assert_rect(
             prepared.document_rect(centered).unwrap(),
-            crate::Rect { x: 105.0, y: 395.0, width: 10.0, height: 20.0 },
+            crate::Rect {
+                x: 105.0,
+                y: 395.0,
+                width: 10.0,
+                height: 20.0,
+            },
         );
         let cssom = tree.get_element_by_id("cssom-transform").unwrap();
         let computed = prepared.computed_style(cssom).unwrap();
@@ -9554,7 +10592,10 @@ mod tests {
         let inside = pixmap.pixel(55, 40).expect("inside ancestor clip");
         assert!(inside.green() > 120 && inside.red() < 40);
         let outside = pixmap.pixel(65, 40).expect("outside ancestor clip");
-        assert_eq!((outside.red(), outside.green(), outside.blue()), (255, 255, 255));
+        assert_eq!(
+            (outside.red(), outside.green(), outside.blue()),
+            (255, 255, 255)
+        );
     }
 
     #[test]
@@ -9570,7 +10611,12 @@ mod tests {
         assert!(prepared.layout().transforms.is_empty());
         assert_eq!(
             prepared.document_rect(plain),
-            Some(crate::Rect { x: 10.0, y: 12.0, width: 20.0, height: 15.0 })
+            Some(crate::Rect {
+                x: 10.0,
+                y: 12.0,
+                width: 20.0,
+                height: 15.0
+            })
         );
         let pixmap = paint_dom(&tree, (80.0, 60.0), None).unwrap();
         let painted = pixmap.pixel(15, 15).unwrap();
@@ -9667,7 +10713,10 @@ mod tests {
                 }
             }
         }
-        assert!(!any_red, "translate(-10000px,0) box should be off-screen and unpainted");
+        assert!(
+            !any_red,
+            "translate(-10000px,0) box should be off-screen and unpainted"
+        );
     }
 
     #[test]
@@ -9687,10 +10736,17 @@ mod tests {
         );
         let pixmap = paint_dom(&tree, (200.0, 200.0), None).expect("pixmap");
         let center = pixmap.pixel(100, 100).expect("pixel");
-        assert!(center.red() > 200 && center.blue() < 60, "expected centered red box, got {:?}", center);
+        assert!(
+            center.red() > 200 && center.blue() < 60,
+            "expected centered red box, got {:?}",
+            center
+        );
         // Just outside the centered box stays white.
         let outside = pixmap.pixel(70, 70).expect("pixel");
-        assert_eq!((outside.red(), outside.green(), outside.blue()), (255, 255, 255));
+        assert_eq!(
+            (outside.red(), outside.green(), outside.blue()),
+            (255, 255, 255)
+        );
     }
 
     #[test]
@@ -9708,7 +10764,9 @@ mod tests {
                     break;
                 }
             }
-            if found_green { break; }
+            if found_green {
+                break;
+            }
         }
         assert!(found_green, "expected green text to be painted");
     }
@@ -9760,8 +10818,14 @@ mod tests {
             blue |= b > r.saturating_add(20) && b > g.saturating_add(5);
             normal |= b > g.saturating_add(10) && r < 80 && g < 100;
         }
-        assert!(normal, "surrounding heading text should retain its normal color");
-        assert!(green && blue, "inline accent should contain both gradient colors");
+        assert!(
+            normal,
+            "surrounding heading text should retain its normal color"
+        );
+        assert!(
+            green && blue,
+            "inline accent should contain both gradient colors"
+        );
     }
 
     #[test]
@@ -9774,11 +10838,26 @@ mod tests {
         let svg = tree.query_selector("svg").unwrap().unwrap();
         let out = serialize_svg(&tree, svg);
         assert!(out.starts_with("<svg"), "root svg tag: {out}");
-        assert!(out.contains(r#"viewBox="0 0 10 10""#), "viewBox preserved: {out}");
-        assert!(out.contains(r#"xmlns="http://www.w3.org/2000/svg""#), "xmlns injected: {out}");
-        assert!(out.contains("<use") && out.contains(r##"href="#a""##), "use + href: {out}");
-        assert!(out.contains("<symbol") && out.contains(r#"id="a""#), "symbol id: {out}");
-        assert!(out.contains("<path") && out.contains("</path>"), "path opened + closed: {out}");
+        assert!(
+            out.contains(r#"viewBox="0 0 10 10""#),
+            "viewBox preserved: {out}"
+        );
+        assert!(
+            out.contains(r#"xmlns="http://www.w3.org/2000/svg""#),
+            "xmlns injected: {out}"
+        );
+        assert!(
+            out.contains("<use") && out.contains(r##"href="#a""##),
+            "use + href: {out}"
+        );
+        assert!(
+            out.contains("<symbol") && out.contains(r#"id="a""#),
+            "symbol id: {out}"
+        );
+        assert!(
+            out.contains("<path") && out.contains("</path>"),
+            "path opened + closed: {out}"
+        );
         assert!(out.trim_end().ends_with("</svg>"), "root closed: {out}");
         // The serialized string parses as a standalone SVG document.
         let opts = usvg::Options::default();
@@ -9839,7 +10918,11 @@ mod tests {
         );
         let svg = tree.query_selector("svg").unwrap().unwrap();
         let out = serialize_svg(&tree, svg);
-        assert_eq!(out.matches("xmlns=").count(), 1, "no duplicate xmlns: {out}");
+        assert_eq!(
+            out.matches("xmlns=").count(),
+            1,
+            "no duplicate xmlns: {out}"
+        );
     }
 
     #[test]
@@ -9896,7 +10979,10 @@ mod tests {
         for pixel in pixmap.pixels() {
             found |= pixel.blue() > 120 && pixel.green() > 80 && pixel.red() < 40;
         }
-        assert!(found, "computed color should resolve currentColor in inline svg");
+        assert!(
+            found,
+            "computed color should resolve currentColor in inline svg"
+        );
     }
 
     #[test]
@@ -9907,13 +10993,22 @@ mod tests {
         );
         let copy = tree.get_element_by_id("copy").unwrap();
         let mut resources = RenderResourceCache::default();
-        let prepared = prepare_dom(&tree, (320.0, 200.0), None, &mut resources)
-            .expect("prepared render");
+        let prepared =
+            prepare_dom(&tree, (320.0, 200.0), None, &mut resources).expect("prepared render");
         let computed = prepared.computed_style(copy).expect("computed style");
 
-        assert_eq!(computed.get("overflow-wrap").map(String::as_str), Some("anywhere"));
-        assert_eq!(computed.get("word-wrap").map(String::as_str), Some("anywhere"));
-        assert_eq!(computed.get("word-break").map(String::as_str), Some("keep-all"));
+        assert_eq!(
+            computed.get("overflow-wrap").map(String::as_str),
+            Some("anywhere")
+        );
+        assert_eq!(
+            computed.get("word-wrap").map(String::as_str),
+            Some("anywhere")
+        );
+        assert_eq!(
+            computed.get("word-break").map(String::as_str),
+            Some("keep-all")
+        );
     }
 
     #[test]
@@ -9953,7 +11048,10 @@ mod tests {
                 }
             }
         }
-        assert!(found_blue, "expected <use> to instantiate the referenced <rect>");
+        assert!(
+            found_blue,
+            "expected <use> to instantiate the referenced <rect>"
+        );
     }
 
     #[test]
@@ -9962,11 +11060,23 @@ mod tests {
         // referenced <symbol> verbatim so it can be spliced into the local svg.
         let sprite = r##"<svg xmlns="http://www.w3.org/2000/svg"><defs><symbol id="a" viewBox="0 0 10 10"><path d="M0 0h10v10z"/></symbol><symbol id="b"><rect width="4" height="4"/></symbol></defs></svg>"##;
         let out = extract_svg_element_by_id(sprite, "a").expect("symbol a found");
-        assert!(out.starts_with("<symbol"), "starts at the symbol tag: {out}");
+        assert!(
+            out.starts_with("<symbol"),
+            "starts at the symbol tag: {out}"
+        );
         assert!(out.contains(r#"id="a""#), "keeps the id: {out}");
-        assert!(out.contains("<path") && out.contains("h10v10z"), "keeps children: {out}");
-        assert!(out.trim_end().ends_with("</symbol>"), "closed at matching end: {out}");
-        assert!(!out.contains(r#"id="b""#), "stops before the sibling symbol: {out}");
+        assert!(
+            out.contains("<path") && out.contains("h10v10z"),
+            "keeps children: {out}"
+        );
+        assert!(
+            out.trim_end().ends_with("</symbol>"),
+            "closed at matching end: {out}"
+        );
+        assert!(
+            !out.contains(r#"id="b""#),
+            "stops before the sibling symbol: {out}"
+        );
         assert!(!out.contains("<rect"), "no sibling content leaks in: {out}");
     }
 
@@ -9986,7 +11096,10 @@ mod tests {
         );
         // `data-id` / a missing id must not be mistaken for `id`.
         let s3 = r#"<svg><symbol data-id="a"><path/></symbol></svg>"#;
-        assert!(extract_svg_element_by_id(s3, "a").is_none(), "data-id is not id");
+        assert!(
+            extract_svg_element_by_id(s3, "a").is_none(),
+            "data-id is not id"
+        );
         assert!(extract_svg_element_by_id(s2, "nope").is_none(), "absent id");
     }
 
@@ -10083,8 +11196,7 @@ mod tests {
                 && markup.contains("stroke:#000000ff!important"),
             "serialized presentation colors must use the dark subtree scheme: {markup}"
         );
-        let pixmap =
-            render_svg(markup.as_bytes(), 10, 10).expect("resolved SVG renders");
+        let pixmap = render_svg(markup.as_bytes(), 10, 10).expect("resolved SVG renders");
         let center = pixmap.pixel(5, 5).expect("center pixel");
         assert!(
             center.red() > 60
@@ -10161,9 +11273,11 @@ mod tests {
         let loads = Arc::new(std::sync::Mutex::new(Vec::new()));
         let loader_loads = Arc::clone(&loads);
         let mut resources = RenderResourceCache::with_loader(move |url: &str| {
-            loader_loads.lock().expect("font loads").push(url.to_string());
-            (url == "https://example.test/fonts/fixture.ttf")
-                .then(|| SERIF_FONT_BYTES.to_vec())
+            loader_loads
+                .lock()
+                .expect("font loads")
+                .push(url.to_string());
+            (url == "https://example.test/fonts/fixture.ttf").then(|| SERIF_FONT_BYTES.to_vec())
         });
         let prepared = prepare_dom_with_dynamic_fonts(
             &tree,
@@ -10183,7 +11297,10 @@ mod tests {
             .document_rect(sample)
             .expect("dynamic geometry")
             .width;
-        assert_ne!(fallback, dynamic, "dynamic face must participate in shaping");
+        assert_ne!(
+            fallback, dynamic,
+            "dynamic face must participate in shaping"
+        );
         assert_eq!(
             *loads.lock().expect("dynamic font loads"),
             vec!["https://example.test/fonts/fixture.ttf".to_string()]
@@ -10208,8 +11325,8 @@ mod tests {
         let inner = tree.get_element_by_id("inner").expect("inner");
         let target = tree.get_element_by_id("target").expect("target");
         let mut resources = RenderResourceCache::with_loader(|_url: &str| None);
-        let mut prepared = prepare_dom(&tree, (360.0, 240.0), None, &mut resources)
-            .expect("prepared render");
+        let mut prepared =
+            prepare_dom(&tree, (360.0, 240.0), None, &mut resources).expect("prepared render");
         let top_state = prepared.resolve_scroll_state(&tree, (0.0, 0.0), &HashMap::new());
         let top_outer = prepared
             .viewport_rect_with_scroll(outer, &top_state)
@@ -10240,30 +11357,32 @@ mod tests {
         let scrolled_target = prepared
             .viewport_rect_with_scroll(target, &scrolled_state)
             .expect("scrolled target");
-        assert_eq!(scrolled_outer, top_outer, "scroller chrome must not move with its content");
+        assert_eq!(
+            scrolled_outer, top_outer,
+            "scroller chrome must not move with its content"
+        );
         assert_eq!(scrolled_target.x, top_target.x - 218.0);
         assert_eq!(scrolled_target.y, top_target.y - 208.0);
 
-        let scrolled = paint_prepared_with_scroll(
-            &tree,
-            &mut prepared,
-            &mut resources,
-            &scrolled_state,
-        )
-        .expect("scrolled paint");
-        let repeated = paint_prepared_with_scroll(
-            &tree,
-            &mut prepared,
-            &mut resources,
-            &scrolled_state,
-        )
-        .expect("repeated paint");
+        let scrolled =
+            paint_prepared_with_scroll(&tree, &mut prepared, &mut resources, &scrolled_state)
+                .expect("scrolled paint");
+        let repeated =
+            paint_prepared_with_scroll(&tree, &mut prepared, &mut resources, &scrolled_state)
+                .expect("repeated paint");
         assert_ne!(top.data(), scrolled.data());
-        assert_eq!(scrolled.data(), repeated.data(), "scroll deltas must not accumulate");
-        let pixel = |pixmap: &Pixmap, x: u32, y: u32| {
-            pixmap.pixels()[(y * pixmap.width() + x) as usize]
-        };
-        assert_eq!(pixel(&top, 2, 2), pixel(&scrolled, 2, 2), "outer border moved");
+        assert_eq!(
+            scrolled.data(),
+            repeated.data(),
+            "scroll deltas must not accumulate"
+        );
+        let pixel =
+            |pixmap: &Pixmap, x: u32, y: u32| pixmap.pixels()[(y * pixmap.width() + x) as usize];
+        assert_eq!(
+            pixel(&top, 2, 2),
+            pixel(&scrolled, 2, 2),
+            "outer border moved"
+        );
         assert_eq!(
             pixel(&top, 125, 50),
             pixel(&scrolled, 125, 50),
@@ -10361,6 +11480,16 @@ mod tests {
         let scaled_center = scaled.pixel(10, 10).expect("scaled center");
         assert!(scaled_center.red() > 240 && scaled_center.blue() > 240);
 
+        let protocol_sized = paint_prepared_region_with_scroll(
+            &tree,
+            &mut prepared,
+            &mut resources,
+            &scroll,
+            CaptureRegion::with_output_size(40.0, 150.0, 10.0, 9.0, 1.1, 11, 10),
+        )
+        .expect("protocol-sized region");
+        assert_eq!((protocol_sized.width(), protocol_sized.height()), (11, 10));
+
         assert_eq!(scroll.root_offset(), (0.0, 100.0));
         assert_eq!(
             prepared
@@ -10375,8 +11504,8 @@ mod tests {
     fn document_region_capture_rejects_invalid_and_oversized_surfaces_before_paint() {
         let tree = parse_html("<div style='width:10px;height:10px;background:red'></div>");
         let mut resources = RenderResourceCache::with_loader(|_url: &str| None);
-        let mut prepared = prepare_dom(&tree, (20.0, 20.0), None, &mut resources)
-            .expect("prepared render");
+        let mut prepared =
+            prepare_dom(&tree, (20.0, 20.0), None, &mut resources).expect("prepared render");
         let scroll = prepared.resolve_scroll_state(&tree, (0.0, 0.0), &HashMap::new());
 
         for invalid in [
@@ -10413,10 +11542,141 @@ mod tests {
                 &mut prepared,
                 &mut resources,
                 &scroll,
+                CaptureRegion::new(0.0, 0.0, 10.0, 10.0, MAX_CAPTURE_SCALE + 1.0),
+            )
+            .unwrap_err(),
+            CaptureError::AllocationLimitExceeded
+        );
+        assert_eq!(
+            paint_prepared_region_with_scroll(
+                &tree,
+                &mut prepared,
+                &mut resources,
+                &scroll,
+                // Each surface is below the legacy 64M-pixel per-surface
+                // bound, but their simultaneous RGBA peak exceeds 256 MiB.
+                CaptureRegion::new(0.0, 0.0, 6000.0, 6000.0, 1.2),
+            )
+            .unwrap_err(),
+            CaptureError::AllocationLimitExceeded
+        );
+        assert_eq!(
+            paint_prepared_region_with_scroll(
+                &tree,
+                &mut prepared,
+                &mut resources,
+                &scroll,
                 CaptureRegion::new(0.0, 0.0, 9000.0, 9000.0, 1.0),
             )
             .unwrap_err(),
             CaptureError::AllocationLimitExceeded
         );
+    }
+
+    #[test]
+    fn simple_region_capture_rasterizes_geometry_and_text_natively_at_two_x() {
+        let tree = parse_html(
+            r#"<html style="margin:0"><body style="margin:0">
+                <div style="width:8px;height:8px;background:#f00"></div>
+                <p style="margin:0;color:#000;font:12px sans-serif">Hi</p>
+            </body></html>"#,
+        );
+        let mut resources = RenderResourceCache::with_loader(|_url: &str| None);
+        let mut prepared =
+            prepare_dom(&tree, (40.0, 30.0), None, &mut resources).expect("prepared render");
+        assert!(
+            native_raster_scale_supported(&tree, &prepared.layout),
+            "solid boxes and shaped text should use direct device-scale paint"
+        );
+        let scroll = prepared.resolve_scroll_state(&tree, (0.0, 0.0), &HashMap::new());
+        let one_x = paint_prepared_region_with_scroll(
+            &tree,
+            &mut prepared,
+            &mut resources,
+            &scroll,
+            CaptureRegion::new(0.0, 0.0, 40.0, 30.0, 1.0),
+        )
+        .unwrap();
+        let two_x = paint_prepared_region_with_scroll(
+            &tree,
+            &mut prepared,
+            &mut resources,
+            &scroll,
+            CaptureRegion::new(0.0, 0.0, 40.0, 30.0, 2.0),
+        )
+        .unwrap();
+        assert_eq!((two_x.width(), two_x.height()), (80, 60));
+
+        let red = |x, y| {
+            let pixel = two_x.pixel(x, y).unwrap();
+            pixel.red() > 245 && pixel.green() < 10 && pixel.blue() < 10
+        };
+        assert!(red(15, 7), "the 8 CSS-px box must cover 16 device pixels");
+        assert!(
+            !red(16, 7),
+            "the adjacent CSS pixel must remain outside the box"
+        );
+
+        let source =
+            image::RgbaImage::from_raw(one_x.width(), one_x.height(), one_x.data().to_vec())
+                .unwrap();
+        let post_scaled = image::imageops::resize(
+            &source,
+            two_x.width(),
+            two_x.height(),
+            image::imageops::FilterType::Lanczos3,
+        );
+        let differing = two_x
+            .data()
+            .iter()
+            .zip(post_scaled.as_raw())
+            .filter(|(native, post)| native != post)
+            .count();
+        assert!(
+            differing > 100,
+            "2x glyph outlines and box edges must be rerasterized, not resize-equivalent ({differing} differing channels)"
+        );
+        let dark_text_pixels = (16..60)
+            .flat_map(|y| (0..50).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                let pixel = two_x.pixel(x, y).unwrap();
+                pixel.red() < 100 && pixel.green() < 100 && pixel.blue() < 100
+            })
+            .count();
+        assert!(dark_text_pixels > 10, "native 2x text must remain painted");
+    }
+
+    #[test]
+    fn effectful_region_capture_keeps_the_proven_bounded_resample_fallback() {
+        let tree = parse_html(
+            r#"<html style="margin:0"><body style="margin:0">
+                <div style="width:20px;height:20px;background:linear-gradient(red,blue)"></div>
+            </body></html>"#,
+        );
+        let mut resources = RenderResourceCache::with_loader(|_url: &str| None);
+        let mut prepared =
+            prepare_dom(&tree, (30.0, 30.0), None, &mut resources).expect("prepared render");
+        assert!(!native_raster_scale_supported(&tree, &prepared.layout));
+        let scroll = prepared.resolve_scroll_state(&tree, (0.0, 0.0), &HashMap::new());
+        let one_x = paint_prepared_region_with_scroll(
+            &tree,
+            &mut prepared,
+            &mut resources,
+            &scroll,
+            CaptureRegion::new(0.0, 0.0, 30.0, 30.0, 1.0),
+        )
+        .unwrap();
+        let two_x = paint_prepared_region_with_scroll(
+            &tree,
+            &mut prepared,
+            &mut resources,
+            &scroll,
+            CaptureRegion::new(0.0, 0.0, 30.0, 30.0, 2.0),
+        )
+        .unwrap();
+        let source = image::RgbaImage::from_raw(30, 30, one_x.data().to_vec()).unwrap();
+        let expected =
+            image::imageops::resize(&source, 60, 60, image::imageops::FilterType::Lanczos3);
+        assert_eq!(two_x.data(), expected.as_raw());
     }
 }

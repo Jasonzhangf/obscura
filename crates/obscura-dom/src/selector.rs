@@ -9,8 +9,8 @@ use selectors::matching::{
     NeedsSelectorFlags,
 };
 use selectors::parser::{self, ParseRelative, SelectorParseErrorKind};
-use selectors::{Element, OpaqueElement, SelectorList};
 use selectors::visitor::SelectorVisitor;
+use selectors::{Element, OpaqueElement, SelectorList};
 
 use crate::tree::{DomTree, NodeData, NodeId};
 
@@ -251,7 +251,13 @@ impl<'a> DomElement<'a> {
                     .map(|name| {
                         matches!(
                             name.local.as_ref(),
-                            "input" | "button" | "select" | "textarea" | "optgroup" | "option" | "fieldset"
+                            "input"
+                                | "button"
+                                | "select"
+                                | "textarea"
+                                | "optgroup"
+                                | "option"
+                                | "fieldset"
                         )
                     })
                     .unwrap_or(false)
@@ -390,20 +396,26 @@ impl<'a> Element for DomElement<'a> {
     fn has_namespace(&self, ns: &CssNamespace) -> bool {
         self.tree
             .with_node(self.node_id, |n| {
-                n.as_element()
-                    .map(|name| name.ns == ns.0)
-                    .unwrap_or(false)
+                n.as_element().map(|name| name.ns == ns.0).unwrap_or(false)
             })
             .unwrap_or(false)
     }
 
     fn is_same_type(&self, other: &Self) -> bool {
-        let self_name = self.tree.with_node(self.node_id, |n| {
-            n.as_element().map(|name| (name.local.clone(), name.ns.clone()))
-        }).flatten();
-        let other_name = self.tree.with_node(other.node_id, |n| {
-            n.as_element().map(|name| (name.local.clone(), name.ns.clone()))
-        }).flatten();
+        let self_name = self
+            .tree
+            .with_node(self.node_id, |n| {
+                n.as_element()
+                    .map(|name| (name.local.clone(), name.ns.clone()))
+            })
+            .flatten();
+        let other_name = self
+            .tree
+            .with_node(other.node_id, |n| {
+                n.as_element()
+                    .map(|name| (name.local.clone(), name.ns.clone()))
+            })
+            .flatten();
         match (self_name, other_name) {
             (Some((al, ans)), Some((bl, bns))) => al == bl && ans == bns,
             _ => false,
@@ -441,10 +453,9 @@ impl<'a> Element for DomElement<'a> {
             .with_node(self.node_id, |node| {
                 node.attrs()
                     .map(|attrs| {
-                        attrs.iter().any(|a| {
-                            a.name.ns == html5ever::ns!()
-                                && a.name.local == local_name.0
-                        })
+                        attrs
+                            .iter()
+                            .any(|a| a.name.ns == html5ever::ns!() && a.name.local == local_name.0)
                     })
                     .unwrap_or(false)
             })
@@ -469,7 +480,9 @@ impl<'a> Element for DomElement<'a> {
             // correctly are) made every such base rule silently inert.
             PseudoClass::Enabled => self.is_form_control() && !self.has_boolean_attr("disabled"),
             PseudoClass::Disabled => self.is_form_control() && self.has_boolean_attr("disabled"),
-            PseudoClass::Checked => self.has_boolean_attr("checked") || self.has_boolean_attr("selected"),
+            PseudoClass::Checked => {
+                self.has_boolean_attr("checked") || self.has_boolean_attr("selected")
+            }
             // Dynamic user-interaction pseudo-classes have no meaning against
             // a static DOM snapshot with no live user input.
             PseudoClass::Hover
@@ -640,7 +653,10 @@ fn simple_id_selector(selector: &str) -> Option<&str> {
     if !(first.is_ascii_alphabetic() || first == b'_') {
         return None;
     }
-    if id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') {
+    if id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
         Some(id)
     } else {
         None
@@ -656,7 +672,11 @@ impl DomTree {
         self.query_selector_all_from(self.document(), selector)
     }
 
-    pub fn query_selector_from(&self, root: NodeId, selector: &str) -> Result<Option<NodeId>, String> {
+    pub fn query_selector_from(
+        &self,
+        root: NodeId,
+        selector: &str,
+    ) -> Result<Option<NodeId>, String> {
         // Fast path: a bare "#id" selector resolves through the id index in O(1)
         // instead of scanning every descendant. The index holds the first element
         // in tree order per id, which is exactly what the full scan would return.
@@ -714,7 +734,11 @@ impl DomTree {
         }
     }
 
-    pub fn query_selector_all_from(&self, root: NodeId, selector: &str) -> Result<Vec<NodeId>, String> {
+    pub fn query_selector_all_from(
+        &self,
+        root: NodeId,
+        selector: &str,
+    ) -> Result<Vec<NodeId>, String> {
         let selector_list = parse_selector(selector)?;
         let mut caches = selectors::context::SelectorCaches::default();
         let mut context = MatchingContext::new(
@@ -746,7 +770,10 @@ impl DomTree {
     /// Test one element as the selector subject, including when it is
     /// detached or is a direct child of a shadow-tree compatibility root.
     pub fn matches_selector(&self, nid: NodeId, selector: &str) -> Result<bool, String> {
-        if !self.with_node(nid, |node| node.is_element()).unwrap_or(false) {
+        if !self
+            .with_node(nid, |node| node.is_element())
+            .unwrap_or(false)
+        {
             return Ok(false);
         }
         let selector_list = parse_selector(selector)?;
@@ -768,7 +795,7 @@ impl DomTree {
 
     /// Parse a single selector once for repeated single-element matching, and
     /// precompute its specificity, ancestor hashes, and "subject key" (the
-    /// rightmost id/class/tag used to bucket the rule for fast candidate
+    /// rightmost id/class/attribute/tag used to bucket the rule for fast candidate
     /// lookup). Returns `None` if the selector fails to parse.
     ///
     /// This is the primitive a stylesheet cascade builds on: compile every rule
@@ -778,9 +805,14 @@ impl DomTree {
         let list = parse_selector(selector).ok()?;
         let sel = list.slice().first()?.clone();
         let specificity = sel.specificity();
-        let key = subject_key(&sel);
+        let keys = SubjectKeys::from_vec(subject_keys(&sel));
         let hashes = parser::AncestorHashes::new(&sel, QuirksMode::NoQuirks);
-        Some(CompiledSelector { sel, specificity, key, hashes })
+        Some(CompiledSelector {
+            sel,
+            specificity,
+            keys,
+            hashes,
+        })
     }
 
     /// Does a single element match a precompiled selector? Allocates a fresh
@@ -798,6 +830,8 @@ impl DomTree {
         Matcher {
             caches: selectors::context::SelectorCaches::default(),
             ancestors: AncestorFilter::new(),
+            candidate_generation: 0,
+            candidate_seen: Vec::new(),
         }
     }
 }
@@ -809,9 +843,41 @@ impl DomTree {
 pub struct Matcher {
     caches: selectors::context::SelectorCaches,
     ancestors: AncestorFilter,
+    candidate_generation: u32,
+    candidate_seen: Vec<u32>,
 }
 
 impl Matcher {
+    /// Start one indexed-candidate collection without clearing the reusable
+    /// seen table. Stylesheet rules that live in several selector buckets use
+    /// this to avoid matching and cascading the same rule twice.
+    #[doc(hidden)]
+    pub fn begin_candidate_collection(&mut self, candidate_count: usize) {
+        self.candidate_generation = self.candidate_generation.wrapping_add(1);
+        if self.candidate_generation == 0 {
+            self.candidate_seen.fill(0);
+            self.candidate_generation = 1;
+        }
+        self.candidate_seen.resize(candidate_count, 0);
+    }
+
+    /// Return true once per candidate index in the current collection.
+    #[doc(hidden)]
+    pub fn mark_candidate(&mut self, index: usize) -> bool {
+        debug_assert!(index < self.candidate_seen.len());
+        let Some(seen) = self.candidate_seen.get_mut(index) else {
+            // Candidate collection is an optimization. If a future caller
+            // supplies inconsistent bounds, fail open to an extra match rather
+            // than silently dropping authored CSS.
+            return true;
+        };
+        if *seen == self.candidate_generation {
+            return false;
+        }
+        *seen = self.candidate_generation;
+        true
+    }
+
     /// Match `nid` (matched as if it were the subject element; the ancestor
     /// filter reflects `nid`'s ancestors, not `nid` itself) against `compiled`.
     pub fn matches(&mut self, tree: &DomTree, nid: NodeId, compiled: &CompiledSelector) -> bool {
@@ -827,7 +893,13 @@ impl Matcher {
             MatchingForInvalidation::No,
         );
         let element = DomElement::new(tree, nid);
-        selectors::matching::matches_selector(&compiled.sel, 0, Some(&compiled.hashes), &element, &mut context)
+        selectors::matching::matches_selector(
+            &compiled.sel,
+            0,
+            Some(&compiled.hashes),
+            &element,
+            &mut context,
+        )
     }
 
     /// Push `nid`'s hashes onto the ancestor filter before descending into its
@@ -854,7 +926,10 @@ struct AncestorFilter {
 
 impl AncestorFilter {
     fn new() -> Self {
-        AncestorFilter { filter: Box::default(), levels: Vec::new() }
+        AncestorFilter {
+            filter: Box::default(),
+            levels: Vec::new(),
+        }
     }
 
     fn filter(&self) -> &selectors::bloom::BloomFilter {
@@ -865,13 +940,25 @@ impl AncestorFilter {
         let mut hashes = Vec::new();
         tree.with_node(nid, |node| {
             if let Some(elem) = node.as_element() {
-                push_hash(&mut hashes, &mut self.filter, CssLocalName(elem.local.clone()).precomputed_hash());
+                push_hash(
+                    &mut hashes,
+                    &mut self.filter,
+                    CssLocalName(elem.local.clone()).precomputed_hash(),
+                );
                 if let Some(id) = node.get_attribute("id") {
-                    push_hash(&mut hashes, &mut self.filter, CssString(id.to_string()).precomputed_hash());
+                    push_hash(
+                        &mut hashes,
+                        &mut self.filter,
+                        CssString(id.to_string()).precomputed_hash(),
+                    );
                 }
                 if let Some(class) = node.get_attribute("class") {
                     for c in class.split_whitespace() {
-                        push_hash(&mut hashes, &mut self.filter, CssString(c.to_string()).precomputed_hash());
+                        push_hash(
+                            &mut hashes,
+                            &mut self.filter,
+                            CssString(c.to_string()).precomputed_hash(),
+                        );
                     }
                 }
             }
@@ -898,8 +985,13 @@ fn push_hash(hashes: &mut Vec<u32>, filter: &mut selectors::bloom::BloomFilter, 
 /// only tested against elements that carry its key.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum SelectorKey {
+    /// The document element. `:root` can match only this one subject, so it is
+    /// substantially more selective than the universal bucket despite having
+    /// no id/class/tag token.
+    Root,
     Id(String),
     Class(String),
+    Attribute(String),
     Local(String),
     Universal,
 }
@@ -908,50 +1000,358 @@ pub enum SelectorKey {
 pub struct CompiledSelector {
     sel: parser::Selector<ObscuraSelector>,
     specificity: u32,
-    key: SelectorKey,
+    keys: SubjectKeys,
     hashes: parser::AncestorHashes,
 }
 
 impl CompiledSelector {
+    /// The one bucket usable by legacy selector indexes. Selectors whose
+    /// subject has multiple disjoint alternatives deliberately report
+    /// `Universal`; use [`Self::candidate_keys`] to opt into multi-bucket
+    /// indexing.
     pub fn key(&self) -> &SelectorKey {
-        &self.key
+        match &self.keys {
+            SubjectKeys::One(key) => key,
+            // Existing single-bucket consumers must keep treating disjoint
+            // alternatives as universal until they opt into `candidate_keys`.
+            SubjectKeys::Many(_) => &SelectorKey::Universal,
+        }
+    }
+
+    /// Deduplicated buckets that together cover every element this selector
+    /// can match. A consumer must insert the rule in every returned bucket and
+    /// deduplicate rule candidates before matching, since one element can
+    /// carry keys from more than one alternative.
+    pub fn candidate_keys(&self) -> &[SelectorKey] {
+        match &self.keys {
+            SubjectKeys::One(key) => std::slice::from_ref(key),
+            SubjectKeys::Many(keys) => keys,
+        }
     }
     pub fn specificity(&self) -> u32 {
         self.specificity
     }
 }
 
-/// Pick the index key from a selector's rightmost compound: prefer id, then
-/// class, then local name; fall back to Universal for `*`, attribute-only, or
-/// pseudo-only subjects.
-fn subject_key(sel: &parser::Selector<ObscuraSelector>) -> SelectorKey {
+enum SubjectKeys {
+    One(SelectorKey),
+    Many(Box<[SelectorKey]>),
+}
+
+impl SubjectKeys {
+    fn from_vec(mut keys: Vec<SelectorKey>) -> Self {
+        if keys.len() == 1 {
+            Self::One(keys.pop().unwrap())
+        } else {
+            Self::Many(keys.into_boxed_slice())
+        }
+    }
+}
+
+fn key_rank(key: &SelectorKey) -> u8 {
+    match key {
+        SelectorKey::Universal => 0,
+        SelectorKey::Local(_) => 1,
+        SelectorKey::Attribute(_) => 2,
+        SelectorKey::Class(_) => 3,
+        SelectorKey::Id(_) => 4,
+        SelectorKey::Root => 5,
+    }
+}
+
+fn push_unique_key(keys: &mut Vec<SelectorKey>, key: SelectorKey) {
+    if !keys.contains(&key) {
+        keys.push(key);
+    }
+}
+
+/// Candidate buckets for a selector's rightmost compound. A single ordinary
+/// id/class/local selector keeps the allocation-free common path. A pure
+/// `:is()`/`:where()` subject returns the deduplicated union of its arms, but
+/// only when every arm has a concrete key; one universal/pseudo-only
+/// arm makes the whole set universal because that arm can match an element
+/// carrying none of the other keys.
+///
+/// When an outer compound key exists, disjoint functional-pseudo keys replace
+/// it only if every arm is strictly more selective. This is the same
+/// conservative contract as Gecko's `SelectorMap::find_bucket`: for
+/// `.control:is(button, #save)` keep `.control`, while
+/// `.control:is(#save, #cancel)` may use the two id buckets.
+fn subject_keys(sel: &parser::Selector<ObscuraSelector>) -> Vec<SelectorKey> {
     use parser::Component;
     let mut local: Option<String> = None;
+    let mut attribute: Option<String> = None;
     let mut class: Option<String> = None;
     let mut id: Option<String> = None;
+    let mut root = false;
+    let mut disjoint_sets: Vec<Vec<SelectorKey>> = Vec::new();
     for comp in sel.iter_raw_match_order() {
         match comp {
             Component::Combinator(_) => break,
             Component::ID(v) => id = Some(v.0.clone()),
+            Component::Root => root = true,
             Component::Class(v) => class = Some(v.0.clone()),
             Component::LocalName(l) => local = Some(l.lower_name.0.to_string()),
+            Component::AttributeInNoNamespaceExists {
+                local_name_lower, ..
+            } => attribute = Some(local_name_lower.0.to_string()),
+            Component::AttributeInNoNamespace { local_name, .. } => {
+                attribute = Some(local_name.0.to_string())
+            }
+            Component::AttributeOther(selector) => {
+                attribute = Some(selector.local_name_lower.0.to_string())
+            }
+            Component::Is(list) | Component::Where(list) => {
+                let mut keys = Vec::new();
+                let mut universal = false;
+                for alternative in list.slice() {
+                    let alternative_keys = subject_keys(alternative);
+                    if alternative_keys
+                        .iter()
+                        .any(|key| matches!(key, SelectorKey::Universal))
+                    {
+                        universal = true;
+                        break;
+                    }
+                    for key in alternative_keys {
+                        push_unique_key(&mut keys, key);
+                    }
+                }
+                if universal || keys.is_empty() {
+                    keys.clear();
+                    keys.push(SelectorKey::Universal);
+                }
+                disjoint_sets.push(keys);
+            }
             _ => {}
         }
     }
-    if let Some(i) = id {
+    let direct = if root {
+        SelectorKey::Root
+    } else if let Some(i) = id {
         SelectorKey::Id(i)
     } else if let Some(c) = class {
         SelectorKey::Class(c)
+    } else if let Some(a) = attribute {
+        SelectorKey::Attribute(a)
     } else if let Some(l) = local {
         SelectorKey::Local(l)
     } else {
         SelectorKey::Universal
+    };
+
+    let direct_rank = key_rank(&direct);
+    let mut best: Option<Vec<SelectorKey>> = None;
+    for keys in disjoint_sets {
+        if keys.iter().any(|key| key_rank(key) <= direct_rank) {
+            continue;
+        }
+        let min_rank = keys.iter().map(key_rank).min().unwrap_or(0);
+        let replaces = best.as_ref().is_none_or(|current| {
+            let current_min = current.iter().map(key_rank).min().unwrap_or(0);
+            min_rank > current_min || (min_rank == current_min && keys.len() < current.len())
+        });
+        if replaces {
+            best = Some(keys);
+        }
     }
+    best.unwrap_or_else(|| vec![direct])
 }
 
 #[cfg(test)]
 mod tests {
     use crate::tree_sink::parse_html;
+
+    use super::SelectorKey;
+
+    fn candidate_keys(tree: &crate::tree::DomTree, selector: &str) -> Vec<SelectorKey> {
+        tree.compile_rule_selector(selector)
+            .unwrap_or_else(|| panic!("failed to compile {selector}"))
+            .candidate_keys()
+            .to_vec()
+    }
+
+    fn element_has_selector_key(
+        tree: &crate::tree::DomTree,
+        node: crate::tree::NodeId,
+        key: &SelectorKey,
+    ) -> bool {
+        let node = tree.get_node(node).expect("matched node must exist");
+        match key {
+            SelectorKey::Root => node
+                .parent
+                .and_then(|parent| tree.get_node(parent))
+                .is_some_and(|parent| parent.is_document()),
+            SelectorKey::Universal => true,
+            SelectorKey::Id(id) => node.get_attribute("id") == Some(id.as_str()),
+            SelectorKey::Class(class) => node.get_attribute("class").is_some_and(|classes| {
+                classes.split_ascii_whitespace().any(|value| value == class)
+            }),
+            SelectorKey::Attribute(attribute) => node.get_attribute(attribute).is_some(),
+            SelectorKey::Local(local) => node
+                .as_element()
+                .is_some_and(|element| element.local.as_ref() == local),
+        }
+    }
+
+    #[test]
+    fn selector_candidate_keys_expand_rightmost_is_and_where() {
+        let tree = parse_html("<main></main>");
+
+        assert_eq!(
+            candidate_keys(&tree, ":is(.IssueLabel, .Label):hover"),
+            vec![
+                SelectorKey::Class("IssueLabel".into()),
+                SelectorKey::Class("Label".into()),
+            ]
+        );
+        assert_eq!(
+            candidate_keys(&tree, ":where(button, input, select)"),
+            vec![
+                SelectorKey::Local("button".into()),
+                SelectorKey::Local("input".into()),
+                SelectorKey::Local("select".into()),
+            ]
+        );
+
+        // A legacy single-bucket index stays correct until it explicitly opts
+        // into inserting all candidate keys.
+        let compiled = tree
+            .compile_rule_selector(":is(.IssueLabel, .Label):hover")
+            .unwrap();
+        assert_eq!(compiled.key(), &SelectorKey::Universal);
+    }
+
+    #[test]
+    fn selector_candidate_keys_deduplicate_equivalent_arms() {
+        let tree = parse_html("<main></main>");
+        let compiled = tree
+            .compile_rule_selector(":is(.btn, .btn:hover, :where(.btn))")
+            .unwrap();
+
+        assert_eq!(
+            compiled.candidate_keys(),
+            &[SelectorKey::Class("btn".into())]
+        );
+        assert_eq!(compiled.key(), &SelectorKey::Class("btn".into()));
+    }
+
+    #[test]
+    fn selector_candidate_keys_index_attributes_and_fall_back_for_pseudos() {
+        let tree = parse_html("<main></main>");
+        assert_eq!(
+            candidate_keys(&tree, ":is(.btn, [data-kind])"),
+            vec![
+                SelectorKey::Class("btn".into()),
+                SelectorKey::Attribute("data-kind".into()),
+            ]
+        );
+        assert_eq!(
+            candidate_keys(&tree, ":is(.btn, :first-child)"),
+            vec![SelectorKey::Universal]
+        );
+    }
+
+    #[test]
+    fn selector_candidate_keys_index_root_subjects_and_functional_arms() {
+        let tree = parse_html("<html><body><main class=app></main></body></html>");
+        assert_eq!(candidate_keys(&tree, ":root"), vec![SelectorKey::Root]);
+        assert_eq!(
+            candidate_keys(&tree, ":root[data-color-mode]"),
+            vec![SelectorKey::Root],
+        );
+        assert_eq!(
+            candidate_keys(&tree, ":is(:root, .app)"),
+            vec![SelectorKey::Root, SelectorKey::Class("app".into())],
+        );
+    }
+
+    #[test]
+    fn selector_candidate_keys_only_replace_outer_key_when_more_selective() {
+        let tree = parse_html("<main></main>");
+        assert_eq!(
+            candidate_keys(&tree, ".control:is(#save, #cancel)"),
+            vec![
+                SelectorKey::Id("save".into()),
+                SelectorKey::Id("cancel".into()),
+            ]
+        );
+        assert_eq!(
+            candidate_keys(&tree, ".control:is(button, #save)"),
+            vec![SelectorKey::Class("control".into())]
+        );
+    }
+
+    #[test]
+    fn selector_candidate_keys_use_subjects_of_complex_is_arms() {
+        let tree = parse_html("<main></main>");
+        assert_eq!(
+            candidate_keys(&tree, ".scope :is(.a > .x, .b > .y)"),
+            vec![
+                SelectorKey::Class("x".into()),
+                SelectorKey::Class("y".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn selector_candidate_keys_cover_every_actual_match() {
+        let tree = parse_html(
+            r#"<section class="scope">
+                <div class="alpha control" id="save" data-kind="x"></div>
+                <button class="beta control"></button>
+                <input class="control" id="cancel">
+                <div class="a"><span class="x"></span></div>
+                <div class="b"><span class="y"></span></div>
+            </section>"#,
+        );
+        let selectors = [
+            ":is(.alpha, .beta)",
+            ":where(button, input)",
+            ".control:is(#save, #cancel)",
+            ".control:is(button, #save)",
+            ":is(.alpha, [data-kind])",
+            ":is(:root, .control)",
+            ".scope :is(.a > .x, .b > .y)",
+        ];
+
+        for selector in selectors {
+            let keys = candidate_keys(&tree, selector);
+            let matches = tree.query_selector_all(selector).unwrap();
+            assert!(!matches.is_empty(), "fixture must exercise {selector}");
+            for matched in matches {
+                assert!(
+                    keys.iter()
+                        .any(|key| element_has_selector_key(&tree, matched, key)),
+                    "{selector} matched an element outside all candidate buckets: {keys:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn matcher_candidate_collection_deduplicates_and_reuses_indices() {
+        let tree = parse_html("<main></main>");
+        let mut matcher = tree.matcher();
+
+        matcher.begin_candidate_collection(4);
+        assert!(matcher.mark_candidate(2));
+        assert!(!matcher.mark_candidate(2));
+
+        matcher.begin_candidate_collection(4);
+        assert!(matcher.mark_candidate(2));
+        assert!(!matcher.mark_candidate(2));
+
+        matcher.begin_candidate_collection(9);
+        assert!(matcher.mark_candidate(8));
+        assert!(!matcher.mark_candidate(8));
+
+        matcher.candidate_generation = u32::MAX;
+        matcher.begin_candidate_collection(9);
+        assert_eq!(matcher.candidate_generation, 1);
+        assert!(matcher.mark_candidate(2));
+        assert!(!matcher.mark_candidate(2));
+    }
 
     #[test]
     fn test_query_selector_tag() {
@@ -964,8 +1364,7 @@ mod tests {
 
     #[test]
     fn test_query_selector_class() {
-        let tree =
-            parse_html(r#"<div class="foo bar">Content</div><div class="baz">Other</div>"#);
+        let tree = parse_html(r#"<div class="foo bar">Content</div><div class="baz">Other</div>"#);
         let result = tree.query_selector(".foo").unwrap();
         assert!(result.is_some());
         let node = tree.get_node(result.unwrap()).unwrap();
@@ -989,7 +1388,10 @@ mod tests {
     #[test]
     fn test_has_parses() {
         // Isolate parse from match: :has must parse, not error.
-        assert!(super::parse_selector("a:has(p.bt)").is_ok(), ":has failed to parse");
+        assert!(
+            super::parse_selector("a:has(p.bt)").is_ok(),
+            ":has failed to parse"
+        );
     }
 
     #[test]
@@ -1005,9 +1407,17 @@ mod tests {
     fn test_enabled_matches_form_control_without_disabled_attr() {
         let tree = parse_html(r#"<button>Click</button><button disabled>Nope</button>"#);
         let enabled = tree.query_selector_all("button:enabled").unwrap();
-        assert_eq!(enabled.len(), 1, ":enabled should match only the non-disabled button");
+        assert_eq!(
+            enabled.len(),
+            1,
+            ":enabled should match only the non-disabled button"
+        );
         let disabled = tree.query_selector_all("button:disabled").unwrap();
-        assert_eq!(disabled.len(), 1, ":disabled should match only the disabled button");
+        assert_eq!(
+            disabled.len(),
+            1,
+            ":disabled should match only the disabled button"
+        );
     }
 
     #[test]
@@ -1021,33 +1431,23 @@ mod tests {
 
     #[test]
     fn test_checked_matches_checked_attribute() {
-        let tree = parse_html(
-            r#"<input type="checkbox" checked><input type="checkbox">"#,
-        );
+        let tree = parse_html(r#"<input type="checkbox" checked><input type="checkbox">"#);
         assert_eq!(tree.query_selector_all("input:checked").unwrap().len(), 1);
     }
 
     #[test]
     fn unfocused_snapshot_matches_focus_negation_selectors() {
-        let tree = parse_html(
-            r#"<div class="visually-hidden-focusable">Skip</div>"#,
-        );
+        let tree = parse_html(r#"<div class="visually-hidden-focusable">Skip</div>"#);
         let hidden = tree
-            .query_selector_all(
-                ".visually-hidden-focusable:not(:focus):not(:focus-within)",
-            )
+            .query_selector_all(".visually-hidden-focusable:not(:focus):not(:focus-within)")
             .unwrap();
         assert_eq!(hidden.len(), 1);
-        assert_eq!(
-            tree.query_selector_all(":focus-visible").unwrap().len(),
-            0
-        );
+        assert_eq!(tree.query_selector_all(":focus-visible").unwrap().len(), 0);
     }
 
     #[test]
     fn test_query_selector_descendant() {
-        let tree =
-            parse_html(r#"<div id="outer"><div id="inner"><span>Target</span></div></div>"#);
+        let tree = parse_html(r#"<div id="outer"><div id="inner"><span>Target</span></div></div>"#);
         let result = tree.query_selector("#outer span").unwrap();
         assert!(result.is_some());
         let node = tree.get_node(result.unwrap()).unwrap();
@@ -1072,9 +1472,8 @@ mod tests {
 
     #[test]
     fn test_query_selector_attribute() {
-        let tree = parse_html(
-            r#"<input type="text" name="user"><input type="password" name="pass">"#,
-        );
+        let tree =
+            parse_html(r#"<input type="text" name="user"><input type="password" name="pass">"#);
         let result = tree.query_selector(r#"input[type="password"]"#).unwrap();
         assert!(result.is_some());
         let node = tree.get_node(result.unwrap()).unwrap();
@@ -1151,13 +1550,15 @@ mod tests {
 
     #[test]
     fn test_query_selector_from_returns_first_in_subtree_only() {
-        let tree = parse_html(
-            r#"<section id="s"><p>first</p><p>second</p></section><p>outside</p>"#,
-        );
+        let tree =
+            parse_html(r#"<section id="s"><p>first</p><p>second</p></section><p>outside</p>"#);
         let s = tree.get_element_by_id("s").expect("section#s");
 
         // Scoped to #s: skip the outside paragraph; return the first inside.
-        let first_in_s = tree.query_selector_from(s, "p").unwrap().expect("a p inside");
+        let first_in_s = tree
+            .query_selector_from(s, "p")
+            .unwrap()
+            .expect("a p inside");
         assert_eq!(tree.text_content(first_in_s), "first");
     }
 

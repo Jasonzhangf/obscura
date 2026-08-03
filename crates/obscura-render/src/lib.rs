@@ -14,7 +14,7 @@
 use taffy::prelude::*;
 
 pub mod css;
-pub use css::Stylesheet;
+pub use css::{Stylesheet, StylesheetCache};
 
 pub mod style;
 pub use style::compute_style;
@@ -37,7 +37,10 @@ pub use dom::{
 /// are ASCII case-insensitive. Keep this list aligned with the `image` crate
 /// features in `Cargo.toml` plus the SVG path in `paint.rs`.
 pub(crate) fn source_type_supported(value: &str) -> bool {
-    let essence = value.split_once(';').map_or(value, |(essence, _)| essence).trim();
+    let essence = value
+        .split_once(';')
+        .map_or(value, |(essence, _)| essence)
+        .trim();
     [
         "image/apng",
         "image/bmp",
@@ -94,11 +97,12 @@ mod paint;
 #[cfg(feature = "paint")]
 pub use paint::{
     paint_dom, paint_dom_scrolled, paint_prepared, paint_prepared_region_with_scroll,
-    paint_prepared_with_scroll, prepare_dom, prepare_dom_with_dynamic_fonts, screenshot_png,
-    screenshot_png_scrolled, screenshot_prepared, screenshot_prepared_region_with_scroll,
-    screenshot_prepared_with_scroll, CaptureError, CaptureRegion, DynamicFontFace,
-    ElementScrollMetrics, PreparedRender, RenderResourceCache, RenderResourceLoader,
-    ResolvedScrollState, SelectedImage, MAX_CAPTURE_DIMENSION, MAX_CAPTURE_PIXELS,
+    paint_prepared_with_scroll, prepare_dom, prepare_dom_with_dynamic_fonts,
+    prepare_dom_with_dynamic_fonts_and_stylesheet_cache, screenshot_png, screenshot_png_scrolled,
+    screenshot_prepared, screenshot_prepared_region_with_scroll, screenshot_prepared_with_scroll,
+    validate_capture_region, CaptureError, CaptureRegion, DynamicFontFace, ElementScrollMetrics,
+    PreparedRender, RenderResourceCache, RenderResourceLoader, ResolvedScrollState, SelectedImage,
+    MAX_CAPTURE_DIMENSION, MAX_CAPTURE_PIXELS,
 };
 
 // Real inline text layout (cosmic-text) lives behind the paint feature; the
@@ -122,7 +126,12 @@ pub mod inline {
         /// Layout-only builds have no shaper, so no container is ever treated
         /// as a cosmic-text inline formatting context: the word-split path
         /// handles text geometry for `getBoundingClientRect`.
-        pub fn try_build(&mut self, _tree: &DomTree, _id: NodeId, _styles: &HashMap<NodeId, crate::LayoutStyle>) -> Option<usize> {
+        pub fn try_build(
+            &mut self,
+            _tree: &DomTree,
+            _id: NodeId,
+            _styles: &HashMap<NodeId, crate::LayoutStyle>,
+        ) -> Option<usize> {
             None
         }
         /// See `try_build`: inline runs likewise fall back to word-split
@@ -224,16 +233,31 @@ impl Affine2 {
     }
 
     pub fn translate(x: f32, y: f32) -> Self {
-        Self { e: x, f: y, ..Self::IDENTITY }
+        Self {
+            e: x,
+            f: y,
+            ..Self::IDENTITY
+        }
     }
 
     pub fn scale(x: f32, y: f32) -> Self {
-        Self { a: x, d: y, ..Self::IDENTITY }
+        Self {
+            a: x,
+            d: y,
+            ..Self::IDENTITY
+        }
     }
 
     pub fn rotate(degrees: f32) -> Self {
         let (sin, cos) = degrees.to_radians().sin_cos();
-        Self { a: cos, b: sin, c: -sin, d: cos, e: 0.0, f: 0.0 }
+        Self {
+            a: cos,
+            b: sin,
+            c: -sin,
+            d: cos,
+            e: 0.0,
+            f: 0.0,
+        }
     }
 
     pub fn skew(x_degrees: f32, y_degrees: f32) -> Self {
@@ -254,7 +278,10 @@ impl Affine2 {
     }
 
     pub fn map_point(self, x: f32, y: f32) -> (f32, f32) {
-        (self.a * x + self.c * y + self.e, self.b * x + self.d * y + self.f)
+        (
+            self.a * x + self.c * y + self.e,
+            self.b * x + self.d * y + self.f,
+        )
     }
 
     pub fn map_rect(self, rect: Rect) -> Rect {
@@ -264,10 +291,22 @@ impl Affine2 {
             self.map_point(rect.x, rect.y + rect.height),
             self.map_point(rect.x + rect.width, rect.y + rect.height),
         ];
-        let left = points.iter().map(|point| point.0).fold(f32::INFINITY, f32::min);
-        let top = points.iter().map(|point| point.1).fold(f32::INFINITY, f32::min);
-        let right = points.iter().map(|point| point.0).fold(f32::NEG_INFINITY, f32::max);
-        let bottom = points.iter().map(|point| point.1).fold(f32::NEG_INFINITY, f32::max);
+        let left = points
+            .iter()
+            .map(|point| point.0)
+            .fold(f32::INFINITY, f32::min);
+        let top = points
+            .iter()
+            .map(|point| point.1)
+            .fold(f32::INFINITY, f32::min);
+        let right = points
+            .iter()
+            .map(|point| point.0)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let bottom = points
+            .iter()
+            .map(|point| point.1)
+            .fold(f32::NEG_INFINITY, f32::max);
         Rect {
             x: left,
             y: top,
@@ -317,7 +356,10 @@ pub struct TransformLength {
 
 impl TransformLength {
     pub fn px(value: f32) -> Self {
-        Self { value: Dimension::Px(value), expression: None }
+        Self {
+            value: Dimension::Px(value),
+            expression: None,
+        }
     }
 }
 
@@ -343,7 +385,12 @@ impl Rect {
         let x1 = (self.x + self.width).min(other.x + other.width);
         let y1 = (self.y + self.height).min(other.y + other.height);
         if x1 > x0 && y1 > y0 {
-            Some(Rect { x: x0, y: y0, width: x1 - x0, height: y1 - y0 })
+            Some(Rect {
+                x: x0,
+                y: y0,
+                width: x1 - x0,
+                height: y1 - y0,
+            })
         } else {
             None
         }
@@ -356,7 +403,12 @@ impl Rect {
         let y0 = self.y.min(other.y);
         let x1 = (self.x + self.width).max(other.x + other.width);
         let y1 = (self.y + self.height).max(other.y + other.height);
-        Rect { x: x0, y: y0, width: x1 - x0, height: y1 - y0 }
+        Rect {
+            x: x0,
+            y: y0,
+            width: x1 - x0,
+            height: y1 - y0,
+        }
     }
 }
 
@@ -380,11 +432,7 @@ pub fn quantize_scroll_value(value: f32, device_scale_factor: f32) -> f32 {
     (value * scale).round() / scale
 }
 
-pub(crate) fn quantized_scroll_range(
-    content: f32,
-    client: f32,
-    device_scale_factor: f32,
-) -> f32 {
+pub(crate) fn quantized_scroll_range(content: f32, client: f32, device_scale_factor: f32) -> f32 {
     (quantize_scroll_value(content, device_scale_factor)
         - quantize_scroll_value(client, device_scale_factor))
     .max(0.0)
@@ -532,8 +580,7 @@ impl BackgroundPositionAxis {
     pub(crate) fn interpolate(self, other: Self, position: f32) -> Self {
         Self {
             length: self.length + (other.length - self.length) * position,
-            percentage: self.percentage
-                + (other.percentage - self.percentage) * position,
+            percentage: self.percentage + (other.percentage - self.percentage) * position,
         }
     }
 }
@@ -816,8 +863,7 @@ pub struct LayoutStyle {
     /// First `radial-gradient(...)` layer: center in box-relative fractions
     /// and color stops. It is painted below the first linear layer, matching
     /// the common `linear-gradient(...), radial-gradient(...)` hero pattern.
-    pub background_radial_gradient:
-        Option<((f32, f32), Vec<([u8; 4], Option<f32>)>)>,
+    pub background_radial_gradient: Option<((f32, f32), Vec<([u8; 4], Option<f32>)>)>,
     /// `conic-gradient(...)` background. The angle is the CSS `from` angle,
     /// the center is a fraction of the border box, and stops are normalized
     /// during paint. Conic gradients commonly provide the color source for a
@@ -1536,7 +1582,11 @@ pub struct LayoutNode {
 
 impl LayoutNode {
     pub fn leaf(style: LayoutStyle) -> Self {
-        LayoutNode { style, text: None, children: Vec::new() }
+        LayoutNode {
+            style,
+            text: None,
+            children: Vec::new(),
+        }
     }
 }
 
@@ -1568,9 +1618,9 @@ fn build_node(tree: &mut TaffyTree, node: &LayoutNode) -> NodeId {
     if node.children.is_empty() {
         tree.new_leaf(style).expect("taffy new_leaf")
     } else {
-        let child_ids: Vec<NodeId> =
-            node.children.iter().map(|c| build_node(tree, c)).collect();
-        tree.new_with_children(style, &child_ids).expect("taffy new_with_children")
+        let child_ids: Vec<NodeId> = node.children.iter().map(|c| build_node(tree, c)).collect();
+        tree.new_with_children(style, &child_ids)
+            .expect("taffy new_with_children")
     }
 }
 
@@ -1609,7 +1659,10 @@ pub(crate) fn to_taffy_style(style: &LayoutStyle) -> Style {
     // `text_align` is separate from real flex/grid `align-items`, so a
     // text-align declaration never changes how flex children are sized.
     let promote_for_alignment = style.display == Display::Block
-        && matches!(style.text_align, Some(taffy::AlignItems::CENTER) | Some(taffy::AlignItems::FLEX_END));
+        && matches!(
+            style.text_align,
+            Some(taffy::AlignItems::CENTER) | Some(taffy::AlignItems::FLEX_END)
+        );
 
     s.display = match style.display {
         Display::Block if promote_for_alignment => taffy::style::Display::Flex,
@@ -1816,7 +1869,9 @@ fn dimension(v: Dimension) -> taffy::style::Dimension {
         // rather than panicking.
         Dimension::Em(v) | Dimension::Rem(v) => taffy::style::Dimension::length(v * 16.0),
         Dimension::Ex(v) => taffy::style::Dimension::length(v * 16.0 * 0.528_320_3),
-        Dimension::Vw(v) | Dimension::Vh(v) | Dimension::Vmin(v) | Dimension::Vmax(v) => taffy::style::Dimension::length(v),
+        Dimension::Vw(v) | Dimension::Vh(v) | Dimension::Vmin(v) | Dimension::Vmax(v) => {
+            taffy::style::Dimension::length(v)
+        }
     }
 }
 
@@ -1866,7 +1921,12 @@ mod tests {
     use super::*;
 
     fn make_box(display: Display, w: f32, h: f32) -> LayoutStyle {
-        LayoutStyle { display, width: Dimension::Px(w), height: Dimension::Px(h), ..Default::default() }
+        LayoutStyle {
+            display,
+            width: Dimension::Px(w),
+            height: Dimension::Px(h),
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -1909,7 +1969,10 @@ mod tests {
             display: Display::Block,
             width: Dimension::Px(200.0),
             height: Dimension::Px(40.0),
-            margin: Edges { right: 50.0, ..Default::default() },
+            margin: Edges {
+                right: 50.0,
+                ..Default::default()
+            },
             margin_auto: [false, false, false, true],
             ..Default::default()
         };
@@ -1957,7 +2020,12 @@ mod tests {
     #[test]
     fn flex_row_lays_out_horizontally() {
         let root = LayoutNode {
-            style: LayoutStyle { display: Display::Flex, width: Dimension::Px(600.0), height: Dimension::Px(100.0), ..Default::default() },
+            style: LayoutStyle {
+                display: Display::Flex,
+                width: Dimension::Px(600.0),
+                height: Dimension::Px(100.0),
+                ..Default::default()
+            },
             text: None,
             children: vec![
                 LayoutNode::leaf(make_box(Display::Block, 200.0, 100.0)),
@@ -1983,7 +2051,12 @@ mod tests {
                 display: Display::Block,
                 width: Dimension::Px(100.0),
                 height: Dimension::Px(100.0),
-                padding: Edges { top: 10.0, right: 10.0, bottom: 10.0, left: 10.0 },
+                padding: Edges {
+                    top: 10.0,
+                    right: 10.0,
+                    bottom: 10.0,
+                    left: 10.0,
+                },
                 ..Default::default()
             },
             text: None,

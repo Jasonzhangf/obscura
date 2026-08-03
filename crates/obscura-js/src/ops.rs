@@ -3,19 +3,25 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use deno_core::op2;
-use deno_core::OpState;
-use deno_core::Extension;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use deno_core::op2;
+use deno_core::Extension;
+use deno_core::OpState;
 use obscura_dom::{DomTree, NodeData, NodeId};
-use obscura_net::{CallbackRegistry, CookieJar, ObscuraHttpClient, RequestInfo, ResourceType, Response};
 #[cfg(feature = "stealth")]
 use obscura_net::StealthHttpClient;
+use obscura_net::{
+    CallbackRegistry, CookieJar, ObscuraHttpClient, RequestInfo, ResourceType, Response,
+};
 use tokio::sync::Mutex;
 
 use crate::import_map::ImportMap;
 
-pub type InterceptCallback = Arc<Mutex<Option<Box<dyn Fn(String, String, String) -> Option<(u16, String, String)> + Send + Sync>>>>;
+pub type InterceptCallback = Arc<
+    Mutex<
+        Option<Box<dyn Fn(String, String, String) -> Option<(u16, String, String)> + Send + Sync>>,
+    >,
+>;
 
 #[derive(Debug)]
 pub enum InterceptResolution {
@@ -30,7 +36,9 @@ pub enum InterceptResolution {
         headers: HashMap<String, String>,
         body: String,
     },
-    Fail { reason: String },
+    Fail {
+        reason: String,
+    },
 }
 
 pub struct InterceptedRequest {
@@ -109,6 +117,14 @@ pub struct ObscuraState {
     // drained by the Page into its network_events so the CDP layer emits
     // Network.requestWillBeSent / responseReceived for them (issue #406).
     pub js_network_events: Vec<JsNetworkEvent>,
+    /// Requests initiated by this runtime only. Browser contexts share their
+    /// transport client across pages, so the client's aggregate counter cannot
+    /// be used as a page-readiness signal.
+    pub page_in_flight: Arc<std::sync::atomic::AtomicU32>,
+    /// Monotonic generation for observable changes to the connected document.
+    /// The browser settle policy samples this to distinguish useful deferred
+    /// rendering work from unrelated long-lived timers.
+    pub activity_generation: u64,
     /// Final image/font-aware layout shared by CSSOM geometry and screenshots.
     /// DOM/style/viewport changes clear this value but retain resource bytes.
     #[cfg(feature = "render")]
@@ -117,6 +133,11 @@ pub struct ObscuraState {
     /// relayout of the same document reuses it without refetching.
     #[cfg(feature = "render")]
     pub render_resources: obscura_render::RenderResourceCache,
+    /// One exact-key compiled author stylesheet for this document. Connected
+    /// mutations still discard `prepared_render`; the next prepare reuses only
+    /// parsing/indexing when ordered CSS source and viewport remain identical.
+    #[cfg(feature = "render")]
+    pub stylesheet_cache: obscura_render::StylesheetCache,
     /// Script-created faces in this document's `FontFaceSet`. This is separate
     /// from the DOM so the bridge does not manufacture a selector-visible
     /// `<style>` element merely to feed the renderer.
@@ -171,10 +192,14 @@ impl ObscuraState {
             network_response_body_counter: 0,
             fetched_urls: Vec::new(),
             js_network_events: Vec::new(),
+            page_in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            activity_generation: 0,
             #[cfg(feature = "render")]
             prepared_render: None,
             #[cfg(feature = "render")]
             render_resources: obscura_render::RenderResourceCache::default(),
+            #[cfg(feature = "render")]
+            stylesheet_cache: obscura_render::StylesheetCache::default(),
             #[cfg(feature = "render")]
             dynamic_fonts: Vec::new(),
             #[cfg(feature = "render")]
@@ -211,7 +236,9 @@ fn script_nodes_including_template_contents(dom: &DomTree, root: NodeId) -> Vec<
         }
         let template_contents = dom
             .with_node(node_id, |node| match &node.data {
-                NodeData::Element { template_contents, .. } => *template_contents,
+                NodeData::Element {
+                    template_contents, ..
+                } => *template_contents,
                 _ => None,
             })
             .flatten();
@@ -250,19 +277,21 @@ fn propagate_script_start_state(
 
         let source_template = dom
             .with_node(source, |node| match &node.data {
-                NodeData::Element { template_contents, .. } => *template_contents,
+                NodeData::Element {
+                    template_contents, ..
+                } => *template_contents,
                 _ => None,
             })
             .flatten();
         let cloned_template = dom
             .with_node(cloned, |node| match &node.data {
-                NodeData::Element { template_contents, .. } => *template_contents,
+                NodeData::Element {
+                    template_contents, ..
+                } => *template_contents,
                 _ => None,
             })
             .flatten();
-        if let (Some(source_contents), Some(cloned_contents)) =
-            (source_template, cloned_template)
-        {
+        if let (Some(source_contents), Some(cloned_contents)) = (source_template, cloned_template) {
             pairs.push((source_contents, cloned_contents));
         }
 
@@ -291,6 +320,171 @@ fn response_body_byte_limit() -> usize {
 }
 
 pub type SharedState = Rc<RefCell<ObscuraState>>;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct RenderMutationImpact {
+    connected: bool,
+    actual_change: bool,
+}
+
+fn node_is_connected(dom: &DomTree, node: NodeId) -> bool {
+    node == dom.document() || dom.ancestors(node).contains(&dom.document())
+}
+
+/// Classify whether a DOM command can make the retained document layout
+/// stale. DOM construction is commonly performed in detached subtrees, and
+/// frameworks also assign an attribute its current value. Neither operation
+/// changes the rendered document. Chromium dirties layout when the mutation
+/// reaches a connected style/layout owner, not merely because a mutating API
+/// was entered.
+fn render_mutation_impact(
+    dom: &DomTree,
+    cmd: &str,
+    arg1: &str,
+    arg2: &str,
+) -> RenderMutationImpact {
+    let node = |value: &str| value.parse::<u32>().ok().map(NodeId::new);
+    match cmd {
+        "set_attribute" => {
+            let Some(target) = node(arg1) else {
+                return RenderMutationImpact::default();
+            };
+            let Some((name, value)) = arg2.split_once('\0') else {
+                return RenderMutationImpact::default();
+            };
+            let old = dom
+                .with_node(target, |node| node.get_attribute(name).map(str::to_owned))
+                .flatten();
+            RenderMutationImpact {
+                connected: node_is_connected(dom, target),
+                actual_change: old.as_deref() != Some(value),
+            }
+        }
+        "remove_attribute" => {
+            let Some(target) = node(arg1) else {
+                return RenderMutationImpact::default();
+            };
+            let existed = dom
+                .with_node(target, |node| node.get_attribute(arg2).is_some())
+                .unwrap_or(false);
+            RenderMutationImpact {
+                connected: node_is_connected(dom, target),
+                actual_change: existed,
+            }
+        }
+        "append_child" => {
+            let (Some(parent), Some(child)) = (node(arg1), node(arg2)) else {
+                return RenderMutationImpact::default();
+            };
+            if dom.get_node(parent).is_none() || dom.get_node(child).is_none() {
+                return RenderMutationImpact::default();
+            }
+            let old_parent = dom.get_node(child).and_then(|node| node.parent);
+            let already_last =
+                old_parent == Some(parent) && dom.children(parent).last().copied() == Some(child);
+            RenderMutationImpact {
+                // Moving a connected node into a detached subtree removes its
+                // old box, while attaching a detached node creates a new one.
+                connected: node_is_connected(dom, parent) || node_is_connected(dom, child),
+                actual_change: !already_last,
+            }
+        }
+        "remove_child" => {
+            let Some(child) = node(arg1) else {
+                return RenderMutationImpact::default();
+            };
+            RenderMutationImpact {
+                connected: node_is_connected(dom, child),
+                actual_change: dom.get_node(child).and_then(|node| node.parent).is_some(),
+            }
+        }
+        "insert_before" => {
+            let (Some(new_node), Some(reference)) = (node(arg1), node(arg2)) else {
+                return RenderMutationImpact::default();
+            };
+            if dom.get_node(new_node).is_none() {
+                return RenderMutationImpact::default();
+            }
+            let Some(reference_parent) = dom.get_node(reference).and_then(|node| node.parent)
+            else {
+                return RenderMutationImpact::default();
+            };
+            let new_was_connected = node_is_connected(dom, new_node);
+            let already_immediately_before =
+                dom.get_node(reference).and_then(|node| node.prev_sibling) == Some(new_node);
+            RenderMutationImpact {
+                connected: node_is_connected(dom, reference_parent) || new_was_connected,
+                actual_change: new_node != reference && !already_immediately_before,
+            }
+        }
+        "set_inner_html" | "set_inner_html_context" => {
+            let Some(target) = node(arg1) else {
+                return RenderMutationImpact::default();
+            };
+            RenderMutationImpact {
+                connected: node_is_connected(dom, target),
+                // Parsing normalizes source text, so a cheap string comparison
+                // cannot prove equality. Connected replacement remains dirty.
+                actual_change: dom.get_node(target).is_some(),
+            }
+        }
+        "set_text_content" => {
+            let Some(target) = node(arg1) else {
+                return RenderMutationImpact::default();
+            };
+            let changed = dom
+                .with_node(target, |node| match &node.data {
+                    NodeData::Text { contents } | NodeData::Comment { contents } => {
+                        contents.as_str() != arg2
+                    }
+                    NodeData::ProcessingInstruction { data, .. } => data.as_str() != arg2,
+                    // Element/DocumentFragment textContent replaces their
+                    // child structure, which can change style even when the
+                    // flattened text is equal (for example `<b>x</b>` -> `x`).
+                    _ => {
+                        let children = dom.children(target);
+                        match children.as_slice() {
+                            [] => !arg2.is_empty(),
+                            [child] => dom
+                                .with_node(*child, |child| match &child.data {
+                                    NodeData::Text { contents } => contents.as_str() != arg2,
+                                    _ => true,
+                                })
+                                .unwrap_or(true),
+                            _ => true,
+                        }
+                    }
+                })
+                .unwrap_or(false);
+            RenderMutationImpact {
+                connected: node_is_connected(dom, target),
+                actual_change: changed,
+            }
+        }
+        _ => RenderMutationImpact::default(),
+    }
+}
+
+#[cfg(feature = "render")]
+fn render_timing_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("OBSCURA_RENDER_TIMING").is_some())
+}
+
+#[cfg(feature = "render")]
+fn is_render_mutation_command(cmd: &str) -> bool {
+    matches!(
+        cmd,
+        "set_attribute"
+            | "remove_attribute"
+            | "append_child"
+            | "remove_child"
+            | "insert_before"
+            | "set_inner_html"
+            | "set_inner_html_context"
+            | "set_text_content"
+    )
+}
 
 #[op2(fast)]
 fn op_script_mark_started(state: &OpState, nid: u32) -> bool {
@@ -326,7 +520,12 @@ fn op_script_try_start(state: &OpState, nid: u32) -> bool {
 
 #[op2]
 #[string]
-fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[string] arg2: String) -> String {
+fn op_dom(
+    state: &OpState,
+    #[string] cmd: String,
+    #[string] arg1: String,
+    #[string] arg2: String,
+) -> String {
     // Anti-panic boundary: a panic in a DOM op would unwind through deno_core
     // into V8's FFI frame, where V8_Fatal calls abort(3) and takes the whole
     // engine (and every CDP client) down. Catch it so one malformed selector or
@@ -344,12 +543,12 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
 
 fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> String {
     let shared = state.borrow::<SharedState>().clone();
-    #[cfg(feature = "render")]
     {
         // Scroll offsets belong to a node at its current tree position.
         // Temporary box/style loss keeps that latent state, but DOM removal,
         // reparenting, and subtree replacement reset the affected identities,
         // matching Chromium's lifecycle behavior.
+        #[cfg(feature = "render")]
         let reset_nodes = {
             let state = shared.borrow();
             let mut roots = Vec::new();
@@ -395,30 +594,49 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                 HashSet::new()
             }
         };
-        // Any attribute can participate in an author selector, so even a
-        // seemingly non-geometric attribute may change computed layout.
-        // Detached-node creation and every read-only op deliberately skip this
-        // invalidation; the next geometry/scroll read rebuilds at most once.
+        // Any changed attribute on a connected node can participate in an
+        // author selector. Detached subtree construction, failed operations,
+        // and no-op value assignments cannot change live layout and preserve
+        // the prepared render. The next relevant mutation invalidates once;
+        // subsequent writes are coalesced until geometry is read again.
         let mut state = shared.borrow_mut();
+        let impact = state
+            .dom
+            .as_ref()
+            .map(|dom| render_mutation_impact(dom, &cmd, &arg1, &arg2))
+            .unwrap_or_default();
+        let invalidate = impact.connected && impact.actual_change;
+        if invalidate {
+            state.activity_generation = state.activity_generation.wrapping_add(1);
+        }
+        #[cfg(feature = "render")]
         if !reset_nodes.is_empty() {
             state
                 .element_scroll_offsets
                 .retain(|node, _| !reset_nodes.contains(node));
             state.scroll_generation = state.scroll_generation.wrapping_add(1);
         }
-        if matches!(
-            cmd.as_str(),
-            "set_attribute"
-                | "remove_attribute"
-                | "append_child"
-                | "remove_child"
-                | "insert_before"
-                | "set_inner_html"
-                | "set_inner_html_context"
-                | "set_text_content"
-        ) {
+        #[cfg(feature = "render")]
+        let had_prepared_render = state.prepared_render.is_some();
+        #[cfg(feature = "render")]
+        if invalidate {
             state.prepared_render = None;
             state.resolved_scroll = None;
+        }
+        #[cfg(feature = "render")]
+        if had_prepared_render && is_render_mutation_command(&cmd) && render_timing_enabled() {
+            static MUTATION_SEQUENCE: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let sequence = MUTATION_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            let detail = match cmd.as_str() {
+                "set_attribute" => arg2.split_once('\0').map(|(name, _)| name).unwrap_or(""),
+                "remove_attribute" => arg2.as_str(),
+                _ => "",
+            };
+            eprintln!(
+                "[timing] render-cache mutation sequence={} cmd={} node={} detail={} connected={} actual_change={} invalidated={}",
+                sequence, cmd, arg1, detail, impact.connected, impact.actual_change, invalidate
+            );
         }
     }
     let gs = shared.borrow();
@@ -453,7 +671,10 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
         "document_element" => {
             for cid in dom.children(dom.document()) {
                 if let Some(n) = dom.get_node(cid) {
-                    if n.as_element().map(|name| name.local.as_ref() == "html").unwrap_or(false) {
+                    if n.as_element()
+                        .map(|name| name.local.as_ref() == "html")
+                        .unwrap_or(false)
+                    {
                         return cid.index().to_string();
                     }
                 }
@@ -463,13 +684,19 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
         "document_doctype" => {
             for cid in dom.children(dom.document()) {
                 if let Some(n) = dom.get_node(cid) {
-                    if let obscura_dom::NodeData::Doctype { name, public_id, system_id } = &n.data {
+                    if let obscura_dom::NodeData::Doctype {
+                        name,
+                        public_id,
+                        system_id,
+                    } = &n.data
+                    {
                         return serde_json::json!({
                             "name": name,
                             "publicId": public_id,
                             "systemId": system_id,
                             "nodeId": cid.index(),
-                        }).to_string();
+                        })
+                        .to_string();
                     }
                 }
             }
@@ -486,49 +713,80 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                 Some(n) => n.index().to_string(),
                 None => {
                     // Fall back to full scan for the live document.
-                    let sel = format!("[id=\"{}\"]", arg1.replace('\\', "\\\\").replace('"', "\\\""));
-                    dom.query_selector(&sel).ok().flatten()
-                        .map(|id| id.index().to_string()).unwrap_or("-1".into())
+                    let sel = format!(
+                        "[id=\"{}\"]",
+                        arg1.replace('\\', "\\\\").replace('"', "\\\"")
+                    );
+                    dom.query_selector(&sel)
+                        .ok()
+                        .flatten()
+                        .map(|id| id.index().to_string())
+                        .unwrap_or("-1".into())
                 }
             }
         }
-        "query_selector" => {
-            dom.query_selector(&arg1).ok().flatten().map(|id| id.index().to_string()).unwrap_or("-1".into())
-        }
+        "query_selector" => dom
+            .query_selector(&arg1)
+            .ok()
+            .flatten()
+            .map(|id| id.index().to_string())
+            .unwrap_or("-1".into()),
         "query_selector_all" => {
-            let ids: Vec<i32> = dom.query_selector_all(&arg1).ok()
-                .map(|ids| ids.iter().map(|id| id.index() as i32).collect()).unwrap_or_default();
+            let ids: Vec<i32> = dom
+                .query_selector_all(&arg1)
+                .ok()
+                .map(|ids| ids.iter().map(|id| id.index() as i32).collect())
+                .unwrap_or_default();
             serde_json::to_string(&ids).unwrap_or("[]".into())
         }
         "query_selector_scoped" => {
             let root_nid = arg1.parse::<u32>().unwrap_or(0);
-            dom.query_selector_from(NodeId::new(root_nid), &arg2).ok().flatten()
-                .map(|id| id.index().to_string()).unwrap_or("-1".into())
+            dom.query_selector_from(NodeId::new(root_nid), &arg2)
+                .ok()
+                .flatten()
+                .map(|id| id.index().to_string())
+                .unwrap_or("-1".into())
         }
         "query_selector_all_scoped" => {
             let root_nid = arg1.parse::<u32>().unwrap_or(0);
-            let ids: Vec<i32> = dom.query_selector_all_from(NodeId::new(root_nid), &arg2).ok()
-                .map(|ids| ids.iter().map(|id| id.index() as i32).collect()).unwrap_or_default();
+            let ids: Vec<i32> = dom
+                .query_selector_all_from(NodeId::new(root_nid), &arg2)
+                .ok()
+                .map(|ids| ids.iter().map(|id| id.index() as i32).collect())
+                .unwrap_or_default();
             serde_json::to_string(&ids).unwrap_or("[]".into())
         }
         "matches_selector" => {
             let nid = NodeId::new(arg1.parse::<u32>().unwrap_or(0));
-            dom.matches_selector(nid, &arg2).unwrap_or(false).to_string()
+            dom.matches_selector(nid, &arg2)
+                .unwrap_or(false)
+                .to_string()
         }
         "node_type" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
             dom.with_node(NodeId::new(nid), |n| match &n.data {
-                NodeData::Document => "9", NodeData::Element { .. } => "1", NodeData::Text { .. } => "3",
-                NodeData::Comment { .. } => "8", NodeData::Doctype { .. } => "10", NodeData::ProcessingInstruction { .. } => "7",
-            }).unwrap_or("0").into()
+                NodeData::Document => "9",
+                NodeData::Element { .. } => "1",
+                NodeData::Text { .. } => "3",
+                NodeData::Comment { .. } => "8",
+                NodeData::Doctype { .. } => "10",
+                NodeData::ProcessingInstruction { .. } => "7",
+            })
+            .unwrap_or("0")
+            .into()
         }
         "node_name" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            let name: String = dom.with_node(NodeId::new(nid), |n| match &n.data {
-                NodeData::Document => "#document".to_string(), NodeData::Element { name, .. } => name.local.as_ref().to_ascii_uppercase(),
-                NodeData::Text { .. } => "#text".to_string(), NodeData::Comment { .. } => "#comment".to_string(),
-                NodeData::Doctype { name, .. } => name.clone(), NodeData::ProcessingInstruction { target, .. } => target.clone(),
-            }).unwrap_or_default();
+            let name: String = dom
+                .with_node(NodeId::new(nid), |n| match &n.data {
+                    NodeData::Document => "#document".to_string(),
+                    NodeData::Element { name, .. } => name.local.as_ref().to_ascii_uppercase(),
+                    NodeData::Text { .. } => "#text".to_string(),
+                    NodeData::Comment { .. } => "#comment".to_string(),
+                    NodeData::Doctype { name, .. } => name.clone(),
+                    NodeData::ProcessingInstruction { target, .. } => target.clone(),
+                })
+                .unwrap_or_default();
             serde_json::to_string(&name).unwrap_or("\"\"".into())
         }
         "text_content" => {
@@ -538,10 +796,16 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
         "parent_node" | "first_child" | "last_child" | "next_sibling" | "prev_sibling" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
             dom.with_node(NodeId::new(nid), |n| match cmd.as_str() {
-                "parent_node" => n.parent, "first_child" => n.first_child,
-                "last_child" => n.last_child, "next_sibling" => n.next_sibling,
-                "prev_sibling" => n.prev_sibling, _ => None,
-            }).flatten().map(|id| id.index().to_string()).unwrap_or("-1".into())
+                "parent_node" => n.parent,
+                "first_child" => n.first_child,
+                "last_child" => n.last_child,
+                "next_sibling" => n.next_sibling,
+                "prev_sibling" => n.prev_sibling,
+                _ => None,
+            })
+            .flatten()
+            .map(|id| id.index().to_string())
+            .unwrap_or("-1".into())
         }
         "next_in_subtree" => {
             let root = NodeId::new(arg1.parse::<u32>().unwrap_or(0));
@@ -570,12 +834,22 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
         }
         "child_nodes" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            let ids: Vec<i32> = dom.children(NodeId::new(nid)).iter().map(|id| id.index() as i32).collect();
+            let ids: Vec<i32> = dom
+                .children(NodeId::new(nid))
+                .iter()
+                .map(|id| id.index() as i32)
+                .collect();
             serde_json::to_string(&ids).unwrap_or("[]".into())
         }
         "tag_name" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            let name = dom.with_node(NodeId::new(nid), |n| n.as_element().map(|name| name.local.as_ref().to_ascii_uppercase())).flatten().unwrap_or_default();
+            let name = dom
+                .with_node(NodeId::new(nid), |n| {
+                    n.as_element()
+                        .map(|name| name.local.as_ref().to_ascii_uppercase())
+                })
+                .flatten()
+                .unwrap_or_default();
             serde_json::to_string(&name).unwrap_or("\"\"".into())
         }
         // The tree builder already assigns foreign content (an <svg>/<math>
@@ -583,12 +857,21 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
         // the namespace from the tag name.
         "namespace_uri" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            let ns = dom.with_node(NodeId::new(nid), |n| n.as_element().map(|name| name.ns.as_ref().to_string())).flatten().unwrap_or_default();
+            let ns = dom
+                .with_node(NodeId::new(nid), |n| {
+                    n.as_element().map(|name| name.ns.as_ref().to_string())
+                })
+                .flatten()
+                .unwrap_or_default();
             serde_json::to_string(&ns).unwrap_or("\"\"".into())
         }
         "get_attribute" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            let val = dom.with_node(NodeId::new(nid), |n| n.get_attribute(&arg2).map(|s| s.to_string())).flatten();
+            let val = dom
+                .with_node(NodeId::new(nid), |n| {
+                    n.get_attribute(&arg2).map(|s| s.to_string())
+                })
+                .flatten();
             serde_json::to_string(&val).unwrap_or("null".into())
         }
         "attribute_names" => {
@@ -607,7 +890,9 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
             let node_id = NodeId::new(nid);
             if let Some((name, value)) = arg2.split_once('\0') {
                 if name == "id" {
-                    let old_id = dom.with_node(node_id, |n| n.get_attribute("id").map(|s| s.to_string())).flatten();
+                    let old_id = dom
+                        .with_node(node_id, |n| n.get_attribute("id").map(|s| s.to_string()))
+                        .flatten();
                     dom.with_node_mut(node_id, |n| n.set_attribute(name, value.to_string()));
                     dom.update_id_index(node_id, old_id.as_deref(), Some(value));
                 } else {
@@ -628,19 +913,34 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
             // Reject if either nid failed to parse (was "undefined"/empty) — those
             // default to 0 which is the document root, and silently operating on it
             // corrupts the tree. Require both args to be valid positive integers.
-            let parent = match arg1.parse::<u32>() { Ok(n) => n, Err(_) => return "false".into() };
-            let child = match arg2.parse::<u32>() { Ok(n) => n, Err(_) => return "false".into() };
+            let parent = match arg1.parse::<u32>() {
+                Ok(n) => n,
+                Err(_) => return "false".into(),
+            };
+            let child = match arg2.parse::<u32>() {
+                Ok(n) => n,
+                Err(_) => return "false".into(),
+            };
             dom.append_child(NodeId::new(parent), NodeId::new(child));
             "true".into()
         }
         "remove_child" => {
-            let child = match arg1.parse::<u32>() { Ok(n) => n, Err(_) => return "false".into() };
+            let child = match arg1.parse::<u32>() {
+                Ok(n) => n,
+                Err(_) => return "false".into(),
+            };
             dom.remove_child(NodeId::new(child));
             "true".into()
         }
         "insert_before" => {
-            let new_node = match arg1.parse::<u32>() { Ok(n) => n, Err(_) => return "false".into() };
-            let ref_node = match arg2.parse::<u32>() { Ok(n) => n, Err(_) => return "false".into() };
+            let new_node = match arg1.parse::<u32>() {
+                Ok(n) => n,
+                Err(_) => return "false".into(),
+            };
+            let ref_node = match arg2.parse::<u32>() {
+                Ok(n) => n,
+                Err(_) => return "false".into(),
+            };
             dom.insert_before(NodeId::new(ref_node), NodeId::new(new_node));
             "true".into()
         }
@@ -720,9 +1020,7 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                 _ => return "false".into(),
             };
             let target = NodeId::new(nid);
-            let (context, html) = arg2
-                .split_once('\0')
-                .unwrap_or(("body", arg2.as_str()));
+            let (context, html) = arg2.split_once('\0').unwrap_or(("body", arg2.as_str()));
             for child in dom.children(target) {
                 dom.detach(child);
             }
@@ -750,29 +1048,35 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                 _ => return "false".into(),
             };
             let target = NodeId::new(nid);
-            let (context, html) = arg2
-                .split_once('\0')
-                .unwrap_or(("body", arg2.as_str()));
+            let (context, html) = arg2.split_once('\0').unwrap_or(("body", arg2.as_str()));
             for child in dom.children(target) {
                 dom.detach(child);
             }
             if !html.is_empty() {
-                let fragment =
-                    obscura_dom::parse_fragment_with_context(html, context);
-                let import_root = fragment.find_body_or_root();
+                let context_name = html5ever::QualName::new(
+                    None,
+                    html5ever::ns!(html),
+                    html5ever::LocalName::from(context.to_ascii_lowercase()),
+                );
+                let fragment = obscura_dom::parse_fragment_with_context(html, context_name);
+                let import_root = fragment.fragment_root();
                 dom.import_children_from(target, &fragment, import_root);
             }
             "true".into()
         }
         "set_text_content" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            dom.with_node_mut(NodeId::new(nid), |n| {
-                match &mut n.data {
-                    NodeData::Text { contents } => { *contents = arg2.clone(); }
-                    NodeData::Comment { contents } => { *contents = arg2.clone(); }
-                    NodeData::ProcessingInstruction { data, .. } => { *data = arg2.clone(); }
-                    _ => {}
+            dom.with_node_mut(NodeId::new(nid), |n| match &mut n.data {
+                NodeData::Text { contents } => {
+                    *contents = arg2.clone();
                 }
+                NodeData::Comment { contents } => {
+                    *contents = arg2.clone();
+                }
+                NodeData::ProcessingInstruction { data, .. } => {
+                    *data = arg2.clone();
+                }
+                _ => {}
             });
             "true".into()
         }
@@ -785,9 +1089,7 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                 .map(|id| id.index().to_string())
                 .unwrap_or("-1".into())
         }
-        "create_document_fragment" => {
-            dom.new_node(NodeData::Document).index().to_string()
-        }
+        "create_document_fragment" => dom.new_node(NodeData::Document).index().to_string(),
         "clone_node" => {
             let nid = match arg1.parse::<u32>() {
                 Ok(n) => n,
@@ -796,35 +1098,45 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
             let source = NodeId::new(nid);
             match dom.clone_node(source, arg2 == "true") {
                 Some(cloned) => {
-                    propagate_script_start_state(
-                        dom,
-                        source,
-                        cloned,
-                        &gs.already_started_scripts,
-                    );
+                    propagate_script_start_state(dom, source, cloned, &gs.already_started_scripts);
                     cloned.index().to_string()
                 }
                 None => "-1".into(),
             }
         }
-        "create_element" => {
-            dom.new_node(NodeData::Element {
-                name: html5ever::QualName::new(None, html5ever::ns!(html), html5ever::LocalName::from(arg1.as_str())),
-                attrs: vec![], template_contents: None, mathml_annotation_xml_integration_point: false,
-            }).index().to_string()
-        }
-        "create_text_node" => {
-            dom.new_node(NodeData::Text { contents: arg1.clone() }).index().to_string()
-        }
-        "create_comment_node" => {
-            dom.new_node(NodeData::Comment { contents: arg1.clone() }).index().to_string()
-        }
+        "create_element" => dom
+            .new_node(NodeData::Element {
+                name: html5ever::QualName::new(
+                    None,
+                    html5ever::ns!(html),
+                    html5ever::LocalName::from(arg1.as_str()),
+                ),
+                attrs: vec![],
+                template_contents: None,
+                mathml_annotation_xml_integration_point: false,
+            })
+            .index()
+            .to_string(),
+        "create_text_node" => dom
+            .new_node(NodeData::Text {
+                contents: arg1.clone(),
+            })
+            .index()
+            .to_string(),
+        "create_comment_node" => dom
+            .new_node(NodeData::Comment {
+                contents: arg1.clone(),
+            })
+            .index()
+            .to_string(),
         "create_processing_instruction" => {
             // arg1 = target, arg2 = data
             dom.new_node(NodeData::ProcessingInstruction {
                 target: arg1.clone(),
                 data: arg2.clone(),
-            }).index().to_string()
+            })
+            .index()
+            .to_string()
         }
         "create_doctype" => {
             // arg1 = name, arg2 = public_id. system_id stored only in the
@@ -834,47 +1146,65 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                 name: arg1.clone(),
                 public_id: arg2.clone(),
                 system_id: String::new(),
-            }).index().to_string()
+            })
+            .index()
+            .to_string()
         }
         "pi_target" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            let val = dom.with_node(NodeId::new(nid), |n| match &n.data {
-                NodeData::ProcessingInstruction { target, .. } => Some(target.clone()),
-                _ => None,
-            }).flatten().unwrap_or_default();
+            let val = dom
+                .with_node(NodeId::new(nid), |n| match &n.data {
+                    NodeData::ProcessingInstruction { target, .. } => Some(target.clone()),
+                    _ => None,
+                })
+                .flatten()
+                .unwrap_or_default();
             serde_json::to_string(&val).unwrap_or("\"\"".into())
         }
         "doctype_name" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            let val = dom.with_node(NodeId::new(nid), |n| match &n.data {
-                NodeData::Doctype { name, .. } => Some(name.clone()),
-                _ => None,
-            }).flatten().unwrap_or_default();
+            let val = dom
+                .with_node(NodeId::new(nid), |n| match &n.data {
+                    NodeData::Doctype { name, .. } => Some(name.clone()),
+                    _ => None,
+                })
+                .flatten()
+                .unwrap_or_default();
             serde_json::to_string(&val).unwrap_or("\"\"".into())
         }
         "doctype_public_id" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            let val = dom.with_node(NodeId::new(nid), |n| match &n.data {
-                NodeData::Doctype { public_id, .. } => Some(public_id.clone()),
-                _ => None,
-            }).flatten().unwrap_or_default();
+            let val = dom
+                .with_node(NodeId::new(nid), |n| match &n.data {
+                    NodeData::Doctype { public_id, .. } => Some(public_id.clone()),
+                    _ => None,
+                })
+                .flatten()
+                .unwrap_or_default();
             serde_json::to_string(&val).unwrap_or("\"\"".into())
         }
         "element_children" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            let ids: Vec<i32> = dom.children(NodeId::new(nid)).iter()
+            let ids: Vec<i32> = dom
+                .children(NodeId::new(nid))
+                .iter()
                 .filter(|&&id| dom.get_node(id).map(|n| n.is_element()).unwrap_or(false))
-                .map(|id| id.index() as i32).collect();
+                .map(|id| id.index() as i32)
+                .collect();
             serde_json::to_string(&ids).unwrap_or("[]".into())
         }
         "has_child_nodes" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            dom.with_node(NodeId::new(nid), |n| n.first_child.is_some()).unwrap_or(false).to_string()
+            dom.with_node(NodeId::new(nid), |n| n.first_child.is_some())
+                .unwrap_or(false)
+                .to_string()
         }
         "contains" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
             let other = arg2.parse::<u32>().unwrap_or(0);
-            dom.descendants(NodeId::new(nid)).contains(&NodeId::new(other)).to_string()
+            dom.descendants(NodeId::new(nid))
+                .contains(&NodeId::new(other))
+                .to_string()
         }
         // Index of a node among its parent's children. Walks prev siblings in
         // Rust, avoiding the per-step JS->op round trips a Range comparison
@@ -978,8 +1308,8 @@ static FETCH_CLIENT_CACHE: std::sync::OnceLock<
 /// connection pool actually warms up.
 pub fn cached_request_client(proxy_url: Option<&str>) -> Result<reqwest::Client, String> {
     let key = proxy_url.unwrap_or("").to_string();
-    let cache = FETCH_CLIENT_CACHE
-        .get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()));
+    let cache =
+        FETCH_CLIENT_CACHE.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()));
     if let Ok(read) = cache.read() {
         if let Some(client) = read.get(&key) {
             return Ok(client.clone());
@@ -1009,7 +1339,9 @@ fn build_request_client(proxy_url: Option<&str>) -> Result<reqwest::Client, Stri
         .redirect(reqwest::redirect::Policy::none())
         .timeout(fetch_timeout())
         // SSRF guard: also reject hostnames that resolve to a private/loopback IP.
-        .dns_resolver(std::sync::Arc::new(obscura_net::SsrfGuardResolver::new(false)))
+        .dns_resolver(std::sync::Arc::new(obscura_net::SsrfGuardResolver::new(
+            false,
+        )))
         // Be explicit about pool size: default is unbounded which is fine,
         // but pool_idle_timeout default (90s) is short for SPA-heavy
         // workloads where the same origin is hit dozens of times across
@@ -1096,7 +1428,11 @@ async fn op_fetch_url(
     #[string] mode: String,
     #[string] credentials: String,
 ) -> Result<String, deno_error::JsErrorBox> {
-    tracing::debug!("op_fetch_url called: {} {} (intercept check pending)", method, url);
+    tracing::debug!(
+        "op_fetch_url called: {} {} (intercept check pending)",
+        method,
+        url
+    );
 
     if let Ok(parsed_url) = url::Url::parse(&url) {
         if let Err(e) = validate_fetch_url(&parsed_url) {
@@ -1107,11 +1443,12 @@ async fn op_fetch_url(
                 "headers": {},
                 "blocked": true,
                 "error": e,
-            }).to_string());
+            })
+            .to_string());
         }
     }
 
-    let (cookie_jar, in_flight, intercept_tx, proxy_url, callbacks, http_client) = {
+    let (cookie_jar, in_flight, page_in_flight, intercept_tx, proxy_url, callbacks, http_client) = {
         let state_borrow = state.borrow();
         let gs = state_borrow.borrow::<SharedState>().clone();
         let mut gs = gs.borrow_mut();
@@ -1123,7 +1460,8 @@ async fn op_fetch_url(
                     "url": url,
                     "headers": {},
                     "blocked": true,
-                }).to_string());
+                })
+                .to_string());
             }
         }
         // Record the resource the page pulled in via fetch()/XHR so `--dump
@@ -1135,23 +1473,41 @@ async fn op_fetch_url(
         // #139: thread the configured proxy through to the per-request
         // reqwest::Client. Without this, op_fetch_url silently bypasses
         // BrowserContext.proxy_url for every JS fetch() / XHR call.
-        let proxy_url = gs.http_client.as_ref().and_then(|c| c.proxy_url().map(|s| s.to_string()));
-        tracing::debug!("op_fetch_url: intercept_enabled={}, has_tx={}", gs.intercept_enabled, gs.intercept_tx.is_some());
+        let proxy_url = gs
+            .http_client
+            .as_ref()
+            .and_then(|c| c.proxy_url().map(|s| s.to_string()));
+        tracing::debug!(
+            "op_fetch_url: intercept_enabled={}, has_tx={}",
+            gs.intercept_enabled,
+            gs.intercept_tx.is_some()
+        );
         let itx = if gs.intercept_enabled {
             gs.intercept_counter += 1;
-            gs.intercept_tx.clone().map(|tx| (tx, format!("intercept-{}", gs.intercept_counter)))
+            gs.intercept_tx
+                .clone()
+                .map(|tx| (tx, format!("intercept-{}", gs.intercept_counter)))
         } else {
             None
         };
         (
             jar,
             in_flight,
+            Arc::clone(&gs.page_in_flight),
             itx,
             proxy_url,
             gs.callbacks.clone(),
             gs.http_client.clone(),
         )
     };
+    struct PageInFlightGuard(Arc<std::sync::atomic::AtomicU32>);
+    impl Drop for PageInFlightGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    page_in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let _page_in_flight = PageInFlightGuard(page_in_flight);
 
     // Slots the interception channel can override via Continue so a consumer
     // can rewrite url/method/headers/body before the request goes out.
@@ -1161,7 +1517,8 @@ async fn op_fetch_url(
     let mut override_body: Option<String> = None;
 
     if let Some((tx, request_id)) = intercept_tx {
-        let custom_headers: HashMap<String, String> = serde_json::from_str(&headers_json).unwrap_or_default();
+        let custom_headers: HashMap<String, String> =
+            serde_json::from_str(&headers_json).unwrap_or_default();
         let (resolve_tx, resolve_rx) = tokio::sync::oneshot::channel();
         let intercepted = InterceptedRequest {
             request_id: request_id.clone(),
@@ -1173,14 +1530,19 @@ async fn op_fetch_url(
         };
         if tx.send(intercepted).is_ok() {
             match resolve_rx.await {
-                Ok(InterceptResolution::Fulfill { status, headers: h, body: b }) => {
+                Ok(InterceptResolution::Fulfill {
+                    status,
+                    headers: h,
+                    body: b,
+                }) => {
                     let resp_headers: HashMap<String, String> = h;
                     return Ok(serde_json::json!({
                         "status": status,
                         "body": b,
                         "url": url,
                         "headers": resp_headers,
-                    }).to_string());
+                    })
+                    .to_string());
                 }
                 Ok(InterceptResolution::Fail { reason }) => {
                     return Ok(serde_json::json!({
@@ -1190,21 +1552,28 @@ async fn op_fetch_url(
                         "headers": {},
                         "blocked": true,
                         "error": reason,
-                    }).to_string());
+                    })
+                    .to_string());
                 }
-                Ok(InterceptResolution::Continue { url, method, headers, body }) => {
+                Ok(InterceptResolution::Continue {
+                    url,
+                    method,
+                    headers,
+                    body,
+                }) => {
                     override_url = url;
                     override_method = method;
                     override_headers = headers;
                     override_body = body;
                     tracing::debug!(
                         "Interception: continue (overrides url={} method={} headers={} body={})",
-                        override_url.is_some(), override_method.is_some(),
-                        override_headers.is_some(), override_body.is_some()
+                        override_url.is_some(),
+                        override_method.is_some(),
+                        override_headers.is_some(),
+                        override_body.is_some()
                     );
                 }
-                Err(_) => {
-                }
+                Err(_) => {}
             }
         }
     }
@@ -1223,7 +1592,8 @@ async fn op_fetch_url(
                     "url": new_url,
                     "blocked": true,
                     "error": format!("Intercept rewrite to forbidden URL blocked: {}", reason),
-                }).to_string());
+                })
+                .to_string());
             }
         }
         new_url
@@ -1235,8 +1605,9 @@ async fn op_fetch_url(
 
     let client = match &http_client {
         Some(client) => client.request_client().await,
-        None => cached_request_client(proxy_url.as_deref())
-            .map_err(deno_error::JsErrorBox::generic)?,
+        None => {
+            cached_request_client(proxy_url.as_deref()).map_err(deno_error::JsErrorBox::generic)?
+        }
     };
 
     let initial_request_origin = request_origin(&url).unwrap_or_default();
@@ -1245,8 +1616,7 @@ async fn op_fetch_url(
     } else {
         origin.clone()
     };
-    let is_cross_origin =
-        !page_origin.is_empty() && initial_request_origin != page_origin;
+    let is_cross_origin = !page_origin.is_empty() && initial_request_origin != page_origin;
     let credentials = FetchCredentials::parse(&credentials);
 
     let req_method: reqwest::Method = method.parse().unwrap_or(reqwest::Method::GET);
@@ -1279,7 +1649,9 @@ async fn op_fetch_url(
             && req_method != reqwest::Method::POST
             || custom_headers.keys().any(|k| {
                 let kl = k.to_lowercase();
-                kl != "accept" && kl != "accept-language" && kl != "content-language"
+                kl != "accept"
+                    && kl != "accept-language"
+                    && kl != "content-language"
                     && kl != "content-type"
             }));
 
@@ -1291,11 +1663,17 @@ async fn op_fetch_url(
             .header("Access-Control-Request-Method", method.as_str())
             .header(
                 "Access-Control-Request-Headers",
-                custom_headers.keys().cloned().collect::<Vec<_>>().join(", "),
+                custom_headers
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", "),
             )
             .send()
             .await
-            .map_err(|e| deno_error::JsErrorBox::generic(format!("CORS preflight failed: {}", e)))?;
+            .map_err(|e| {
+                deno_error::JsErrorBox::generic(format!("CORS preflight failed: {}", e))
+            })?;
 
         let allowed_origin = preflight
             .headers()
@@ -1308,12 +1686,7 @@ async fn op_fetch_url(
             .get("access-control-allow-credentials")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        if !cors_response_allows(
-            credentials,
-            &page_origin,
-            allowed_origin,
-            allow_credentials,
-        ) {
+        if !cors_response_allows(credentials, &page_origin, allowed_origin, allow_credentials) {
             return Err(deno_error::JsErrorBox::generic(format!(
                 "CORS preflight: Origin '{}' not allowed by Access-Control-Allow-Origin '{}'",
                 page_origin, allowed_origin
@@ -1383,7 +1756,10 @@ async fn op_fetch_url(
         // Send a default User-Agent on fetch()/XHR requests (the navigation path
         // sets one, but this op did not, so scripted requests went out with no UA
         // and UA-gated servers rejected them). Honor an explicit override.
-        if !custom_headers.keys().any(|k| k.eq_ignore_ascii_case("user-agent")) {
+        if !custom_headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("user-agent"))
+        {
             req = req.header(
                 "User-Agent",
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
@@ -1592,7 +1968,12 @@ async fn op_fetch_url(
         request_id
     };
 
-    tracing::debug!("op_fetch_url completed: {} {} ({} bytes)", method, url, resp_body.len());
+    tracing::debug!(
+        "op_fetch_url completed: {} {} ({} bytes)",
+        method,
+        url,
+        resp_body.len()
+    );
 
     Ok(serde_json::json!({
         "status": status,
@@ -1608,7 +1989,12 @@ async fn op_fetch_url(
 /// Assemble a `Response` for the on_response interception callbacks from the
 /// parts op_fetch_url already holds. Navigation gets a Response straight from
 /// the http client, but the JS fetch path builds the pieces itself.
-fn fetch_response(url: &str, status: u16, headers: HashMap<String, String>, body: Vec<u8>) -> Response {
+fn fetch_response(
+    url: &str,
+    status: u16,
+    headers: HashMap<String, String>,
+    body: Vec<u8>,
+) -> Response {
     Response {
         url: url::Url::parse(url).unwrap_or_else(|_| url::Url::parse("http://0.0.0.0/").unwrap()),
         status,
@@ -1653,8 +2039,7 @@ async fn stealth_fetch_all(
         };
 
         let mut req_headers: HashMap<String, String> = HashMap::new();
-        let current_is_cross_origin =
-            parsed_current.origin().ascii_serialization() != page_origin;
+        let current_is_cross_origin = parsed_current.origin().ascii_serialization() != page_origin;
         if current_is_cross_origin {
             req_headers.insert("origin".to_string(), page_origin.clone());
         }
@@ -1962,9 +2347,16 @@ fn op_navigate(state: &OpState, #[string] url: &str, #[string] method: &str, #[s
     gs.pending_navigation = Some((url.to_string(), method.to_string(), body.to_string()));
 }
 
-#[op2(async)]
-async fn op_sleep(#[number] millis: u64) {
-    tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
+/// Whether async host work can be scheduled without aborting the isolate.
+///
+/// Some low-level embedders intentionally execute a synchronous expression
+/// without entering Tokio (for example, update scroll state and immediately
+/// capture). deno_core's timer queue requires a reactor even to enqueue a
+/// zero-delay timer, so the bootstrap uses this probe for its sync-only
+/// compatibility path.
+#[op2(fast)]
+fn op_async_runtime_available() -> bool {
+    tokio::runtime::Handle::try_current().is_ok()
 }
 
 // Records a binding call from page JS. The CDP layer drains this queue
@@ -1974,7 +2366,8 @@ async fn op_sleep(#[number] millis: u64) {
 fn op_binding_called(state: &OpState, #[string] name: &str, #[string] payload: &str) {
     let gs = state.borrow::<SharedState>().clone();
     let mut gs = gs.borrow_mut();
-    gs.pending_binding_calls.push((name.to_string(), payload.to_string()));
+    gs.pending_binding_calls
+        .push((name.to_string(), payload.to_string()));
 }
 
 /// Real WebCrypto `crypto.subtle.digest`. `algorithm` is the SubtleCrypto
@@ -2073,7 +2466,9 @@ fn op_subtle_aes_gcm(
             } else {
                 cipher
                     .decrypt(nonce, Payload { msg: data, aad })
-                    .map_err(|_| crypto_err("AES-GCM decryption failed: authentication tag mismatch"))?
+                    .map_err(|_| {
+                        crypto_err("AES-GCM decryption failed: authentication tag mismatch")
+                    })?
             }
         }};
     }
@@ -2162,7 +2557,11 @@ fn op_subtle_aes_ctr(
         128 => by_key!(Ctr128BE),
         64 => by_key!(Ctr64BE),
         32 => by_key!(Ctr32BE),
-        _ => return Err(crypto_err("AES-CTR supports counter lengths of 32, 64, or 128 bits")),
+        _ => {
+            return Err(crypto_err(
+                "AES-CTR supports counter lengths of 32, 64, or 128 bits",
+            ))
+        }
     }
     Ok(buf)
 }
@@ -2404,6 +2803,46 @@ fn op_url_resolve(#[string] href: &str, #[string] base: &str) -> String {
     .unwrap_or_default()
 }
 
+/// Canonicalize and validate a `document.domain` assignment.
+///
+/// Gecko's `Document::IsValidDomain` accepts the current effective host or a
+/// dot-delimited suffix no shorter than its registrable domain.  The latter
+/// check is important: a plain `ends_with` would let `foo.example.co.uk`
+/// relax all the way to `co.uk`, and would incorrectly treat private suffixes
+/// such as `github.io` as shared registrable domains.
+///
+/// An empty return value means SecurityError on the JS side.  The current host
+/// is supplied by the Document rather than read from op state because repeated
+/// assignments operate on the already-relaxed effective domain.
+#[op2]
+#[string]
+fn op_document_domain_candidate(#[string] current: &str, #[string] input: &str) -> String {
+    let canonical = match url::Host::parse(input) {
+        Ok(host) => host.to_string().to_ascii_lowercase(),
+        Err(_) => return String::new(),
+    };
+    let current = current.to_ascii_lowercase();
+
+    // Gecko permits assigning the exact current host, including IP literals
+    // and single-label hosts.  Neither can be relaxed to a parent.
+    if canonical == current {
+        return canonical;
+    }
+    if current.parse::<std::net::IpAddr>().is_ok()
+        || canonical.parse::<std::net::IpAddr>().is_ok()
+        || !current.ends_with(&format!(".{canonical}"))
+    {
+        return String::new();
+    }
+
+    // `domain_str` is the eTLD+1.  A candidate shorter than it is a public
+    // suffix and must not become an effective domain.
+    match psl::domain_str(&current) {
+        Some(registrable) if canonical.len() >= registrable.len() => canonical,
+        _ => String::new(),
+    }
+}
+
 #[op2]
 #[string]
 fn op_add_import_map(
@@ -2440,7 +2879,12 @@ fn op_encoding_for_label(#[string] label: &str) -> String {
 /// error). The UTF-8 non-fatal common case is handled in JS without this op.
 #[op2]
 #[string]
-fn op_text_decode(#[string] label: &str, #[buffer] bytes: &[u8], fatal: bool, ignore_bom: bool) -> String {
+fn op_text_decode(
+    #[string] label: &str,
+    #[buffer] bytes: &[u8],
+    fatal: bool,
+    ignore_bom: bool,
+) -> String {
     match obscura_net::decode_with_label(label, bytes, fatal, ignore_bom) {
         Some(s) => serde_json::json!({ "ok": true, "v": s }).to_string(),
         None => "{\"ok\":false}".to_string(),
@@ -2529,7 +2973,7 @@ pub fn build_extension() -> Extension {
         op_get_cookies(),
         op_set_cookie(),
         op_navigate(),
-        op_sleep(),
+        op_async_runtime_available(),
         op_binding_called(),
         op_subtle_digest(),
         op_subtle_hmac(),
@@ -2542,6 +2986,7 @@ pub fn build_extension() -> Extension {
         op_url_parse(),
         op_url_set(),
         op_url_resolve(),
+        op_document_domain_candidate(),
         op_add_import_map(),
         op_encoding_for_label(),
         op_text_decode(),
@@ -2599,12 +3044,13 @@ pub(crate) fn ensure_prepared_render(
     if stale {
         let prepared = {
             let dom = state.dom.as_ref()?;
-            obscura_render::prepare_dom_with_dynamic_fonts(
+            obscura_render::prepare_dom_with_dynamic_fonts_and_stylesheet_cache(
                 dom,
                 viewport,
                 base_url.as_deref(),
                 &mut state.render_resources,
                 &state.dynamic_fonts,
+                &mut state.stylesheet_cache,
             )?
         };
         state.prepared_render = Some(prepared);
@@ -2668,11 +3114,10 @@ fn op_image_metadata(state: &OpState, nid: u32, cached_only: bool) -> String {
     let mut gs = shared.borrow_mut();
     let node_id = NodeId::new(nid);
     let is_image = gs.dom.as_ref().is_some_and(|dom| {
-        dom.get_node(node_id)
-            .is_some_and(|node| {
-                node.as_element()
-                    .is_some_and(|element| element.local.as_ref() == "img")
-            })
+        dom.get_node(node_id).is_some_and(|node| {
+            node.as_element()
+                .is_some_and(|element| element.local.as_ref() == "img")
+        })
     });
     if !is_image {
         return serde_json::json!({ "ok": false, "currentSrc": "" }).to_string();
@@ -2705,15 +3150,8 @@ fn op_image_metadata(state: &OpState, nid: u32, cached_only: bool) -> String {
             }
         }
     } else {
-        match render_resources.image_element_metadata(
-            dom,
-            node_id,
-            viewport,
-            base_url.as_deref(),
-        ) {
-            Some((current_src, density, dimensions)) => {
-                (current_src, density, true, dimensions)
-            }
+        match render_resources.image_element_metadata(dom, node_id, viewport, base_url.as_deref()) {
+            Some((current_src, density, dimensions)) => (current_src, density, true, dimensions),
             None => {
                 return serde_json::json!({
                     "state": "error",
@@ -2742,15 +3180,13 @@ fn op_image_metadata(state: &OpState, nid: u32, cached_only: bool) -> String {
             "height": height,
         })
         .to_string(),
-        None => {
-            serde_json::json!({
-                "state": "error",
-                "ok": false,
-                "currentSrc": current_src,
-                "density": density,
-            })
-            .to_string()
-        }
+        None => serde_json::json!({
+            "state": "error",
+            "ok": false,
+            "currentSrc": current_src,
+            "density": density,
+        })
+        .to_string(),
     }
 }
 
@@ -2761,6 +3197,7 @@ pub(crate) fn clamp_scroll_offset(state: &mut ObscuraState, requested: (f32, f32
         .unwrap_or((0.0, 0.0));
     if state.scroll_offset != clamped {
         state.scroll_offset = clamped;
+        state.activity_generation = state.activity_generation.wrapping_add(1);
         state.scroll_generation = state.scroll_generation.wrapping_add(1);
         state.resolved_scroll = None;
     }
@@ -2844,9 +3281,7 @@ fn op_computed_style(state: &OpState, #[string] nid_str: String) -> String {
     let Some(snapshot) = prepared.computed_style(nid) else {
         return String::new();
     };
-    let custom = prepared
-        .computed_custom_properties(nid)
-        .unwrap_or_default();
+    let custom = prepared.computed_custom_properties(nid).unwrap_or_default();
     let mut object = serde_json::Map::with_capacity(snapshot.len() + custom.len());
     for (name, value) in snapshot {
         object.insert(name.to_string(), serde_json::Value::String(value));
@@ -2924,12 +3359,7 @@ fn op_element_scroll_metrics(state: &OpState, #[string] nid_str: String) -> Stri
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_element_scroll_to(
-    state: &OpState,
-    #[string] nid_str: String,
-    x: f64,
-    y: f64,
-) -> String {
+fn op_element_scroll_to(state: &OpState, #[string] nid_str: String, x: f64, y: f64) -> String {
     let shared = state.borrow::<SharedState>().clone();
     let nid = NodeId::new(nid_str.parse().unwrap_or(0));
     let mut gs = shared.borrow_mut();
@@ -2951,13 +3381,17 @@ fn op_element_scroll_to(
             0.0
         }
     };
-    let requested = (clamp(x, current.max_offset.0), clamp(y, current.max_offset.1));
+    let requested = (
+        clamp(x, current.max_offset.0),
+        clamp(y, current.max_offset.1),
+    );
     if requested != current.offset {
         if requested == (0.0, 0.0) {
             gs.element_scroll_offsets.remove(&nid);
         } else {
             gs.element_scroll_offsets.insert(nid, requested);
         }
+        gs.activity_generation = gs.activity_generation.wrapping_add(1);
         gs.scroll_generation = gs.scroll_generation.wrapping_add(1);
         gs.resolved_scroll = None;
         return format!("{{\"x\":{},\"y\":{}}}", requested.0, requested.1);
