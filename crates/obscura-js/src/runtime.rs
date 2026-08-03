@@ -1317,6 +1317,293 @@ mod tests {
         rt
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn string_timeout_handler_executes_in_global_scope() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.evaluate(
+            "var __timerValue='pending'; setTimeout('__timerValue=\"done\"', 0)",
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("globalThis.__timerValue").unwrap(),
+            serde_json::json!("done")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn string_interval_handler_repeats_and_can_clear_itself() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.evaluate("globalThis.__ticks=0").unwrap();
+        rt.evaluate(
+            "globalThis.__timerId=setInterval('__ticks++;if(__ticks===2)clearInterval(__timerId)',1)",
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("globalThis.__ticks").unwrap(),
+            serde_json::json!(2.0)
+        );
+    }
+
+    #[test]
+    fn performance_now_is_monotonic_under_bursty_calls() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        // Hammer performance.now() so many calls land in the same millisecond and
+        // the wall clock rolls over repeatedly; the value must never go backwards.
+        let violations = rt
+            .evaluate(
+                "(function(){var prev=-Infinity, bad=0; for(var i=0;i<500000;i++){var t=performance.now(); if(t<prev) bad++; prev=t;} return bad;})()",
+            )
+            .unwrap();
+        assert_eq!(violations.as_f64(), Some(0.0), "performance.now() went backwards");
+    }
+
+    #[test]
+    fn performance_now_does_not_outrun_elapsed_time() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let lead = rt
+            .evaluate(
+                "(function(){for(var i=0;i<500000;i++)performance.now(); return performance.now()-(Date.now()-performance.timeOrigin);})()",
+            )
+            .unwrap();
+        assert!(
+            lead.as_f64().unwrap() <= 1.0,
+            "performance.now() advanced ahead of elapsed time: {lead}"
+        );
+    }
+
+    #[test]
+    fn childnode_helpers_coerce_non_string_primitives_to_text() {
+        let mut rt = setup_runtime(r#"<html><body><div id="p"><span id="t">x</span></div></body></html>"#);
+        let before = rt
+            .evaluate("(function(){var t=document.getElementById('t'); t.before(5); return t.previousSibling ? t.previousSibling.textContent : 'NULL';})()")
+            .unwrap();
+        assert_eq!(before, serde_json::json!("5"));
+        let after = rt
+            .evaluate("(function(){var t=document.getElementById('t'); t.after(true); return t.nextSibling ? t.nextSibling.textContent : 'NULL';})()")
+            .unwrap();
+        assert_eq!(after, serde_json::json!("true"));
+        let replaced = rt
+            .evaluate("(function(){var t=document.getElementById('t'); t.replaceWith(42); return document.getElementById('p').textContent;})()")
+            .unwrap();
+        assert!(
+            replaced.as_str().unwrap().contains("42"),
+            "replaceWith(42) should leave text '42': {replaced}"
+        );
+    }
+
+    #[test]
+    fn replace_state_without_url_preserves_current_location() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let path = rt
+            .evaluate(
+                "(function(){history.pushState({}, '', '/dashboard'); history.replaceState({scroll:1}); return location.pathname;})()",
+            )
+            .unwrap();
+        assert_eq!(path, serde_json::json!("/dashboard"));
+    }
+
+    #[test]
+    fn push_state_without_url_preserves_current_location() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let path = rt
+            .evaluate(
+                "(function(){history.pushState({}, '', '/a'); history.pushState({b:1}); return location.pathname;})()",
+            )
+            .unwrap();
+        assert_eq!(path, serde_json::json!("/a"));
+    }
+
+    #[test]
+    fn style_attribute_parses_into_style_object() {
+        // Inline styles present in the parsed HTML must be visible via el.style.*
+        let mut rt = setup_runtime(
+            r#"<html><body><div id="d" style="color: red; display: none">hi</div></body></html>"#,
+        );
+        assert_eq!(
+            rt.evaluate("document.getElementById('d').style.color").unwrap(),
+            serde_json::json!("red")
+        );
+        assert_eq!(
+            rt.evaluate("document.getElementById('d').style.display").unwrap(),
+            serde_json::json!("none")
+        );
+    }
+
+    #[test]
+    fn set_style_attribute_updates_style_object() {
+        let mut rt = setup_runtime(r#"<html><body><div id="d">hi</div></body></html>"#);
+        let margin = rt
+            .evaluate(
+                "(function(){var e=document.getElementById('d'); e.setAttribute('style','margin: 5px'); return e.style.margin;})()",
+            )
+            .unwrap();
+        assert_eq!(margin, serde_json::json!("5px"));
+    }
+
+    #[test]
+    fn setting_style_property_updates_the_attribute_and_serialization() {
+        let mut rt = setup_runtime(r#"<html><body><div id="d">hi</div></body></html>"#);
+        let attr = rt
+            .evaluate(
+                "(function(){var e=document.getElementById('d'); e.style.color='blue'; return e.getAttribute('style');})()",
+            )
+            .unwrap();
+        assert_eq!(attr, serde_json::json!("color: blue;"));
+        let html = rt
+            .evaluate("document.getElementById('d').outerHTML")
+            .unwrap();
+        assert!(
+            html.as_str().unwrap().contains("color: blue"),
+            "outerHTML should carry the style set via el.style: {html}"
+        );
+    }
+
+    #[test]
+    fn style_object_reflects_external_attribute_change() {
+        // A later setAttribute('style', …) must supersede an earlier value read
+        // through el.style (the declaration re-syncs from the attribute).
+        let mut rt = setup_runtime(
+            r#"<html><body><div id="d" style="color: red">hi</div></body></html>"#,
+        );
+        let color = rt
+            .evaluate(
+                "(function(){var e=document.getElementById('d'); e.style.color; e.setAttribute('style','color: green'); return e.style.color;})()",
+            )
+            .unwrap();
+        assert_eq!(color, serde_json::json!("green"));
+    }
+
+    #[test]
+    fn clone_node_deep_preserves_context_sensitive_elements() {
+        // A <tr> is not a valid child of <div>, so cloning through a throwaway
+        // <div>.innerHTML dropped it and returned null. A structural clone keeps it.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let tag = rt
+            .evaluate("(document.createElement('tr').cloneNode(true) || {}).tagName || 'NULL'")
+            .unwrap();
+        assert_eq!(tag, serde_json::json!("TR"));
+        let td = rt
+            .evaluate("(document.createElement('td').cloneNode(true) || {}).tagName || 'NULL'")
+            .unwrap();
+        assert_eq!(td, serde_json::json!("TD"));
+    }
+
+    #[test]
+    fn clone_node_deep_copies_children_and_attributes() {
+        let mut rt = setup_runtime(r#"<html><body><ul id="l"><li class="a">one</li><li class="b">two</li></ul></body></html>"#);
+        let out = rt
+            .evaluate(
+                "(function(){var c=document.getElementById('l').cloneNode(true); return c.children.length + '|' + c.children[0].className + '|' + c.children[1].textContent;})()",
+            )
+            .unwrap();
+        assert_eq!(out, serde_json::json!("2|a|two"));
+    }
+
+    #[test]
+    fn clone_node_deep_preserves_table_rows() {
+        let mut rt = setup_runtime(
+            r#"<html><body><table id="t"><tbody><tr><td>1</td><td>2</td></tr></tbody></table></body></html>"#,
+        );
+        // Navigate the detached clone directly (querySelector does not traverse
+        // detached subtrees). tbody > tr > (td, td).
+        let out = rt
+            .evaluate(
+                "(function(){var tb=document.querySelector('#t tbody').cloneNode(true); var tr=tb.children[0]; return tr.tagName + '|' + tr.children.length + '|' + tr.children[1].textContent;})()",
+            )
+            .unwrap();
+        assert_eq!(out, serde_json::json!("TR|2|2"));
+    }
+
+    #[test]
+    fn clone_node_shallow_copies_attributes_without_children() {
+        let mut rt = setup_runtime(r#"<html><body><div id="d" data-x="7"><span>kid</span></div></body></html>"#);
+        let out = rt
+            .evaluate(
+                "(function(){var c=document.getElementById('d').cloneNode(false); return c.getAttribute('data-x') + '|' + c.childNodes.length;})()",
+            )
+            .unwrap();
+        assert_eq!(out, serde_json::json!("7|0"));
+    }
+
+    #[test]
+    fn clone_node_copies_js_assigned_inline_styles() {
+        let mut rt = setup_runtime("<html><body><div id='d'></div></body></html>");
+        let out = rt
+            .evaluate(
+                "(function(){var d=document.getElementById('d');d.style.color='red';d.style.fontSize='12px';var c=d.cloneNode(false);return c.style.color+'|'+c.style.fontSize+'|'+c.style.cssText;})()",
+            )
+            .unwrap();
+        assert_eq!(out, serde_json::json!("red|12px|color: red; font-size: 12px;"));
+    }
+
+    #[test]
+    fn clone_node_deep_copies_template_content() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let out = rt
+            .evaluate(
+                "(function(){var t=document.createElement('template');t.content.appendChild(document.createElement('option')).textContent='choice';var c=t.cloneNode(true);return c.content.childNodes.length+'|'+c.content.firstChild.tagName+'|'+c.content.firstChild.textContent;})()",
+            )
+            .unwrap();
+        assert_eq!(out, serde_json::json!("1|OPTION|choice"));
+    }
+
+    #[test]
+    fn insert_adjacent_html_parses_table_fragments() {
+        let mut rt = setup_runtime(
+            r#"<html><body><table id="t"><tbody id="tb"></tbody></table></body></html>"#,
+        );
+        let out = rt
+            .evaluate("(function(){var tb=document.getElementById('tb'); tb.insertAdjacentHTML('beforeend','<tr><td>1</td><td>2</td></tr>'); var tr=tb.firstElementChild; return tr ? (tr.tagName+':'+tr.children.length) : 'NULL';})()")
+            .unwrap();
+        assert_eq!(out, serde_json::json!("TR:2"));
+    }
+
+    #[test]
+    fn insert_adjacent_html_position_is_case_insensitive() {
+        let mut rt = setup_runtime(r#"<html><body><div id="host"><span>base</span></div></body></html>"#);
+        let out = rt
+            .evaluate("(function(){var h=document.getElementById('host'); h.insertAdjacentHTML('BeforeEnd','<b>x</b>'); return h.lastElementChild ? h.lastElementChild.tagName : 'NULL';})()")
+            .unwrap();
+        assert_eq!(out, serde_json::json!("B"));
+    }
+
+    #[test]
+    fn insert_adjacent_html_rejects_invalid_position() {
+        let mut rt = setup_runtime(r#"<html><body><div id="host"></div></body></html>"#);
+        let out = rt
+            .evaluate("(function(){var h=document.getElementById('host'); try { h.insertAdjacentHTML('nope','<b>x</b>'); return 'no-throw'; } catch(e){ return e.name; }})()")
+            .unwrap();
+        assert_eq!(out, serde_json::json!("SyntaxError"));
+    }
+
+    #[test]
+    fn insert_adjacent_html_keeps_leading_comments_in_table_contexts() {
+        let mut rt = setup_runtime(
+            r#"<html><body><table><tbody id="tb"><tr id="row"></tr></tbody></table></body></html>"#,
+        );
+        let out = rt
+            .evaluate(
+                "(function(){var tb=document.getElementById('tb');tb.insertAdjacentHTML('beforeend','<!--m--><tr><td>v</td></tr>');var row=document.getElementById('row');row.insertAdjacentHTML('beforeend','<!--n--><td>x</td>');return Array.from(tb.childNodes).map(function(n){return n.nodeName}).join('|')+';'+Array.from(row.childNodes).map(function(n){return n.nodeName}).join('|');})()",
+            )
+            .unwrap();
+        assert_eq!(out, serde_json::json!("TR|#comment|TR;#comment|TD"));
+    }
+
+    #[test]
+    fn insert_adjacent_html_uses_the_insertion_element_as_context() {
+        let mut rt = setup_runtime(
+            r#"<html><body><div id="d"></div><table id="table"><tbody id="tb"></tbody></table></body></html>"#,
+        );
+        let out = rt
+            .evaluate(
+                "(function(){var d=document.getElementById('d');d.insertAdjacentHTML('beforeend','<tr><td>v</td></tr>');var table=document.getElementById('table');table.insertAdjacentHTML('beforeend','<tr><td>x</td></tr>');var tb=document.getElementById('tb');tb.insertAdjacentHTML('beforeend','<tr><td>y</td></tr>tail');return d.firstChild.nodeName+':'+d.textContent+';'+table.lastElementChild.tagName+';'+Array.from(tb.childNodes).map(function(n){return n.nodeName+(n.data?':'+n.data:'')}).join('|');})()",
+            )
+            .unwrap();
+        assert_eq!(out, serde_json::json!("#text:v;TBODY;TR|#text:tail"));
+    }
+
     #[test]
     fn set_attribute_ns_is_retrievable_by_namespace_and_local_name() {
         let mut rt = setup_runtime("<html><body></body></html>");

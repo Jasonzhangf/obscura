@@ -421,7 +421,16 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                 dom.detach(child);
             }
             if !arg2.is_empty() {
-                let fragment = obscura_dom::parse_fragment(&arg2);
+                let context_name = dom
+                    .with_node(target, |node| match &node.data {
+                        NodeData::Element { name, .. } => Some(name.clone()),
+                        _ => None,
+                    })
+                    .flatten();
+                let fragment = match context_name {
+                    Some(name) => obscura_dom::parse_fragment_with_context(&arg2, name),
+                    None => obscura_dom::parse_fragment(&arg2),
+                };
                 let import_root = fragment.find_body_or_root();
                 dom.import_children_from(target, &fragment, import_root);
             }

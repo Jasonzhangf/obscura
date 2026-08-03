@@ -24,7 +24,7 @@
     '_isSpecialScheme', '_applyDocQueryEncoding', '_anchorBase',
     '_elemHrefURL', '_setElemHrefPart', '_pad', '_daysInMonth',
     '_isoWeek1Monday', '_inputParseNumber', '_inputFormatNumber',
-    '_htmlAttrName', '_convertNodes', '_elementClassFor', '_wrap', '_wrapEl',
+    '_htmlAttrName', '_convertNodes', '_parseHTMLFragment', '_elementClassFor', '_wrap', '_wrapEl',
     '_resolveUrl', '_registerIframe', '_base64ToUint8Array',
     '_bodyToUint8Array', '_arrayBufferFromBytes',
     '_installWasmStreamingFallback', '_urlParseOp', '_urlSetOp',
@@ -36,6 +36,18 @@
     '_rngAncestors', '_rngOrder', '_rngCmp', '_rngCheckOffset',
     '_idbRequest', '_idbObjectStore', '_idbTransaction', '_idbDatabase',
     '_makeListenerBox',
+    // WebIDL interfaces. A real browser exposes these on the global as
+    // enumerable:false; here they were assigned with `globalThis.X = X`, which
+    // defaults to enumerable:true and is detectable in one line:
+    //   Object.getOwnPropertyDescriptor(window, 'Node').enumerable
+    // Pre-declaring them non-enumerable here is enough -- per the note above,
+    // the later `globalThis.X = X` assignments only update the value.
+    'Node', 'Element', 'Document', 'DocumentFragment', 'DocumentType',
+    'Text', 'Comment', 'CDATASection', 'ProcessingInstruction', 'CharacterData',
+    'CSSStyleDeclaration', 'DOMTokenList', 'Screen', 'NetworkInformation',
+    'MessageChannel', 'MessagePort', 'CustomElementRegistry',
+    'XMLHttpRequestEventTarget', 'HTMLMediaElement', 'HTMLVideoElement',
+    'HTMLAudioElement', 'WebGL2RenderingContext',
   ];
   var _desc = { value: undefined, writable: true, enumerable: false, configurable: true };
   for (var _i = 0; _i < _names.length; _i++) {
@@ -456,12 +468,24 @@ const _scheduleAfter = (delay, fn) => {
   else Deno.core.ops.op_sleep(d).then(fn);
 };
 
+// Timers accept a string first arg per the HTML spec (e.g. the Aliyun WAF
+// `acw_sc__v2` challenge drives `setTimeout('reload(arg2)', 2)`). A string is
+// compiled and run in global scope, identical to a real browser; otherwise the
+// call silently no-ops and JS-triggered navigations (cookie → reload) never fire.
+const _coerceTimerFn = (fn) => {
+  if (typeof fn === "string") {
+    try { return new Function(fn); } catch (_) { return null; }
+  }
+  return typeof fn === "function" ? fn : null;
+};
+
 globalThis.setTimeout = (fn, delay = 0, ...args) => {
-  if (typeof fn !== "function") return ++_tid;
+  const f = _coerceTimerFn(fn);
+  if (f === null) return ++_tid;
   const id = ++_tid;
   _scheduleAfter(delay, () => {
     if (_clearedTimers.has(id)) return;
-    try { fn(...args); } catch(e) { console.error("Timer error:", e); }
+    try { f(...args); } catch(e) { console.error("Timer error:", e); }
   });
   return id;
 };
@@ -469,12 +493,13 @@ globalThis.setTimeout = (fn, delay = 0, ...args) => {
 globalThis.clearTimeout = (id) => { _clearedTimers.add(id); };
 
 globalThis.setInterval = (fn, delay = 0, ...args) => {
-  if (typeof fn !== "function") return ++_tid;
+  const f = _coerceTimerFn(fn);
+  if (f === null) return ++_tid;
   const id = ++_tid;
   _intervals.add(id);
   const tick = () => {
     if (!_intervals.has(id)) return;
-    try { fn(...args); } catch(e) { console.error("Interval error:", e); }
+    try { f(...args); } catch(e) { console.error("Interval error:", e); }
     if (!_intervals.has(id)) return;
     _scheduleAfter(delay, tick);
   };
@@ -564,35 +589,75 @@ const _CSS_PROPERTY_NAMES = [
 ];
 const _CSS_PROP_SET = new Set(_CSS_PROPERTY_NAMES);
 
+// Parse a `style` attribute string (`"color: red; margin: 5px"`) into the given
+// dashed-key store, replacing its contents in place.
+function _parseCssInto(props, text) {
+  for (const k in props) delete props[k];
+  if (text) String(text).split(";").forEach((p) => {
+    const i = p.indexOf(":");
+    if (i > 0) { const k = p.slice(0, i).trim(); const v = p.slice(i + 1).trim(); if (k && v) props[_cssCamelToKebab(k)] = v; }
+  });
+}
+function _serializeCss(props) {
+  const e = Object.entries(props);
+  return e.length ? e.map(([k, v]) => `${k}: ${v}`).join("; ") + ";" : "";
+}
+
 class CSSStyleDeclaration {
-  constructor() {
-    // Non-enumerable so it never leaks through the proxy's own-key traps.
+  constructor(owner) {
+    // Non-enumerable so they never leak through the proxy's own-key traps.
     Object.defineProperty(this, "_props", { value: {}, writable: true, enumerable: false, configurable: true });
+    // The owner Element, if any. A live declaration reflects that element's
+    // `style` content attribute in both directions; an owner-less declaration
+    // (getComputedStyle fallback, stylesheet rules) is purely in-memory.
+    Object.defineProperty(this, "_owner", { value: owner || null, writable: true, enumerable: false, configurable: true });
+    // Load the content attribute only when style is first observed. Keeping
+    // this as a primitive avoids allocating a separate sync object for every
+    // wrapped element.
+    Object.defineProperty(this, "_loaded", { value: !owner, writable: true, enumerable: false, configurable: true });
+  }
+  // Pull the initial `style` attribute once. Later attribute mutations update
+  // the declaration directly from Element.setAttribute/removeAttribute, so
+  // repeated style reads do not cross the JS/Rust op boundary.
+  _pull() {
+    if (this._loaded) return;
+    _parseCssInto(this._props, this._owner.getAttribute("style"));
+    this._loaded = true;
+  }
+  _replaceFromAttribute(text) {
+    _parseCssInto(this._props, text);
+    this._loaded = true;
+  }
+  // Serialize `_props` back onto the owner's `style` attribute after a mutation,
+  // so el.style.x = … and cssText reflect into getAttribute('style') and
+  // serialization. No-op when owner-less.
+  _push() {
+    const o = this._owner;
+    if (!o) return;
+    const text = _serializeCss(this._props);
+    if (text) o.setAttribute("style", text);
+    else o.removeAttribute("style");
   }
   // Storage is keyed by the dashed CSS name, matching CSSOM. The proxy maps the
   // camelCase IDL access (el.style.fontSize) onto the dashed key (font-size), so
   // getPropertyValue('font-size') and el.style.fontSize stay in sync.
   setProperty(name, value) {
+    this._pull();
     const k = _cssCamelToKebab(String(name));
-    if (value === "" || value == null) { delete this._props[k]; return; }
-    this._props[k] = String(value);
+    if (value === "" || value == null) delete this._props[k];
+    else this._props[k] = String(value);
+    this._push();
   }
-  removeProperty(name) { const k = _cssCamelToKebab(String(name)); const old = this._props[k]; delete this._props[k]; return old || ""; }
-  getPropertyValue(name) { return this._props[_cssCamelToKebab(String(name))] || ""; }
+  removeProperty(name) { this._pull(); const k = _cssCamelToKebab(String(name)); const old = this._props[k]; delete this._props[k]; this._push(); return old || ""; }
+  getPropertyValue(name) { this._pull(); return this._props[_cssCamelToKebab(String(name))] || ""; }
   getPropertyPriority() { return ""; }
-  get cssText() {
-    const e = Object.entries(this._props);
-    return e.length ? e.map(([k, v]) => `${k}: ${v}`).join("; ") + ";" : "";
-  }
+  get cssText() { this._pull(); return _serializeCss(this._props); }
   set cssText(v) {
-    for (const k in this._props) delete this._props[k];
-    if (v) String(v).split(";").forEach((p) => {
-      const i = p.indexOf(":");
-      if (i > 0) { const k = p.slice(0, i).trim(); const val = p.slice(i + 1).trim(); if (k && val) this._props[_cssCamelToKebab(k)] = val; }
-    });
+    _parseCssInto(this._props, v);
+    this._push();
   }
-  get length() { return Object.keys(this._props).length; }
-  item(i) { return Object.keys(this._props)[i] || ""; }
+  get length() { this._pull(); return Object.keys(this._props).length; }
+  item(i) { this._pull(); return Object.keys(this._props)[i] || ""; }
 }
 
 const _styleProxy = (decl) => new Proxy(decl, {
@@ -603,6 +668,7 @@ const _styleProxy = (decl) => new Proxy(decl, {
   },
   set(t, p, v) {
     if (typeof p === "symbol") { t[p] = v; return true; }
+    if (p === "_loaded") { t._loaded = v; return true; }
     if (p === "cssText") { t.cssText = v; return true; }
     if (/^\d+$/.test(p) || p in Object.getPrototypeOf(t)) return true;
     t.setProperty(p, v);
@@ -611,11 +677,13 @@ const _styleProxy = (decl) => new Proxy(decl, {
   has(t, p) {
     if (typeof p !== "string") return Reflect.has(t, p);
     if (p in Object.getPrototypeOf(t)) return true;
+    t._pull();
     if (_cssCamelToKebab(p) in t._props) return true;
     if (_CSS_PROP_SET.has(p) || _CSS_PROP_SET.has(_cssKebabToCamel(p))) return true;
     return /^\d+$/.test(p) && +p < t.length;
   },
   ownKeys(t) {
+    t._pull();
     const keys = [];
     const n = t.length;
     for (let i = 0; i < n; i++) keys.push(String(i));
@@ -626,6 +694,7 @@ const _styleProxy = (decl) => new Proxy(decl, {
   },
   getOwnPropertyDescriptor(t, p) {
     if (typeof p !== "string") return Reflect.getOwnPropertyDescriptor(t, p);
+    t._pull();
     if (/^\d+$/.test(p) && +p < t.length) return { value: t.item(+p), writable: false, enumerable: true, configurable: true };
     if (_cssCamelToKebab(p) in t._props || _CSS_PROP_SET.has(p) || _CSS_PROP_SET.has(_cssKebabToCamel(p))) {
       return { value: t.getPropertyValue(p), writable: true, enumerable: true, configurable: true };
@@ -633,6 +702,33 @@ const _styleProxy = (decl) => new Proxy(decl, {
     return undefined;
   },
 });
+
+// Clone a single node (no children), used by Node.cloneNode. Elements are built
+// with createElement/createElementNS and their content attributes copied, so no
+// HTML parsing context is involved and every attribute (including style) is
+// preserved. Text/Comment/DocumentFragment map to their factory; anything else
+// yields null.
+function _shallowCloneNode(node) {
+  const nt = node.nodeType;
+  if (nt === 3) return document.createTextNode(node.data != null ? node.data : (node.textContent || ""));
+  if (nt === 8) return document.createComment(node.data != null ? node.data : (node.nodeValue || ""));
+  if (nt === 11) return document.createDocumentFragment();
+  if (nt !== 1) return null;
+  const ns = node.namespaceURI;
+  const el = (ns && ns !== "http://www.w3.org/1999/xhtml")
+    ? document.createElementNS(ns, node.nodeName)
+    : document.createElement(node.localName || node.nodeName.toLowerCase());
+  const names = node.getAttributeNames ? node.getAttributeNames() : [];
+  for (const name of names) {
+    const v = node.getAttribute(name);
+    if (v !== null) el.setAttribute(name, v);
+  }
+  // CSS declarations currently live on the JS wrapper independently of the
+  // DOM attribute. Copy that state as well so styles assigned through
+  // `node.style` survive cloning even before attribute reflection runs.
+  if (node.style && node.style.cssText) el.style.cssText = node.style.cssText;
+  return el;
+}
 
 class Node {
   static ELEMENT_NODE = 1;
@@ -824,32 +920,38 @@ class Node {
   contains(o) { return o ? _dom("contains", this._nid, o._nid) === "true" : false; }
   hasChildNodes() { return _dom("has_child_nodes", this._nid) === "true"; }
   cloneNode(deep) {
-    const t = this.nodeType;
-    if (t === 1) {
-      if (deep) {
-        const wrapper = document.createElement('div');
-        wrapper.innerHTML = _domParse("outer_html", this._nid) || "";
-        const clone = wrapper.firstChild;
-        return clone;
-      }
-      const el = document.createElement(this.nodeName.toLowerCase());
-      const html = _domParse("outer_html", this._nid) || "";
-      const attrMatch = html.match(/^<[a-zA-Z][^\s>]*([\s\S]*?)>/);
-      if (attrMatch && attrMatch[1]) {
-        const attrStr = attrMatch[1].trim();
-        const re = /([a-zA-Z_:][a-zA-Z0-9_.:-]*)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|(\S+)))?/g;
-        let m;
-        while ((m = re.exec(attrStr)) !== null) {
-          const name = m[1];
-          const val = m[2] !== undefined ? m[2] : m[3] !== undefined ? m[3] : m[4] || "";
-          if (name !== this.nodeName.toLowerCase()) el.setAttribute(name, val);
+    // Clone structurally via real DOM nodes rather than round-tripping through a
+    // throwaway <div>.innerHTML: the fragment parser discards elements that are
+    // not valid children of <div> (<tr>, <td>, <option>, …), so the old path
+    // returned null for them and lost JS-set inline styles. Building each node
+    // directly with createElement(NS) + attribute copy avoids any parsing
+    // context, and an explicit stack keeps a deep subtree from overflowing the
+    // JS stack (issue #490).
+    const root = _shallowCloneNode(this);
+    if (!deep || !root) return root;
+    const stack = [[this, root]];
+    while (stack.length) {
+      const [src, dst] = stack.pop();
+      // A <template>'s children hang off its content fragment, not childNodes,
+      // so clone them into the clone's fragment. Gated on the tag name because
+      // .content means something else on other elements (e.g. <meta>).
+      if (src.localName === 'template' && dst.localName === 'template') {
+        const sc = src.content, dc = dst.content;
+        if (sc && dc && sc.childNodes) {
+          const tk = sc.childNodes;
+          for (let i = 0; i < tk.length; i++) {
+            const c = _shallowCloneNode(tk[i]);
+            if (c) { dc.appendChild(c); stack.push([tk[i], c]); }
+          }
         }
       }
-      return el;
+      const kids = src.childNodes;
+      for (let i = 0; i < kids.length; i++) {
+        const c = _shallowCloneNode(kids[i]);
+        if (c) { dst.appendChild(c); stack.push([kids[i], c]); }
+      }
     }
-    if (t === 3) return document.createTextNode(this.textContent);
-    if (t === 8) return document.createComment(this.nodeValue || "");
-    return null;
+    return root;
   }
   compareDocumentPosition(other) {
     if (!other) return 0;
@@ -1227,10 +1329,27 @@ function _isSubmitButton(el) {
   return false;
 }
 
+// Parse an HTML string into detached nodes using the actual insertion element
+// as html5ever's fragment context. This preserves table/select parsing rules,
+// comments, text-node order, and foreign-content namespaces without a wrap map.
+function _parseHTMLFragment(html, context) {
+  html = String(html == null ? '' : html);
+  const ns = context && context.nodeType === 1 ? context.namespaceURI : null;
+  const tag = context && context.nodeType === 1 ? context.localName : 'body';
+  const tmp = ns && ns !== 'http://www.w3.org/1999/xhtml'
+    ? document.createElementNS(ns, tag)
+    : document.createElement(tag);
+  tmp.innerHTML = html;
+  const out = [];
+  let child;
+  while ((child = tmp.firstChild)) out.push(tmp.removeChild(child));
+  return out;
+}
+
 class Element extends Node {
   constructor(nid) {
     super(nid);
-    this._style = _styleProxy(new CSSStyleDeclaration());
+    this._style = _styleProxy(new CSSStyleDeclaration(this));
   }
   // Element wrappers always back a nodeType-1 node (_wrap/_wrapEl only build an
   // Element for element nodes, and node ids are never freed-and-reused), so this
@@ -1398,18 +1517,27 @@ class Element extends Node {
   setAttribute(n, v) {
     n = _htmlAttrName(this, n);
     const popoverPrev = (n === "popover") ? this.popover : undefined;
-    _dom("set_attribute", this._nid, n + "\0" + String(v));
+    const value = String(v);
+    _dom("set_attribute", this._nid, n + "\0" + value);
+    if (n === "style") this._style._replaceFromAttribute(value);
     if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev);
     if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('attributes', this._nid, [], [], n);
   }
   setAttributeNS(ns, n, v) {
     ns = ns == null || ns === '' ? '' : String(ns);
     n = String(n);
+    const value = String(v);
     _ns_validateQualifiedName(ns, n);
-    _dom("set_attribute_ns", this._nid, ns + "\0" + n + "\0" + String(v));
+    _dom("set_attribute_ns", this._nid, ns + "\0" + n + "\0" + value);
+    if (ns === "" && n === "style") this._style._replaceFromAttribute(value);
   }
-  removeAttribute(n) { n = _htmlAttrName(this, n); const popoverPrev = (n === "popover") ? this.popover : undefined; _dom("remove_attribute", this._nid, n); if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev); }
-  removeAttributeNS(ns, n) { _dom("remove_attribute_ns", this._nid, String(ns == null ? "" : ns) + "\0" + String(n)); }
+  removeAttribute(n) { n = _htmlAttrName(this, n); const popoverPrev = (n === "popover") ? this.popover : undefined; _dom("remove_attribute", this._nid, n); if (n === "style") this._style._replaceFromAttribute(""); if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev); }
+  removeAttributeNS(ns, n) {
+    ns = String(ns == null ? "" : ns);
+    n = String(n);
+    _dom("remove_attribute_ns", this._nid, ns + "\0" + n);
+    if (ns === "" && n === "style") this._style._replaceFromAttribute("");
+  }
   hasAttribute(n) { return this.getAttribute(n) !== null; }
   hasAttributes() { return true; } // Simplified
   getAttributeNames() { return _domParse("attribute_names", this._nid) || []; }
@@ -1484,20 +1612,33 @@ class Element extends Node {
     return null;
   }
   insertAdjacentHTML(position, html) {
+    // Position is matched ASCII-case-insensitively; an unknown value throws
+    // SyntaxError (both were silent no-ops before). Sibling insertions parse
+    // against the parent's context, child insertions against this element, so
+    // table/select fragments keep the right parsing context (_parseHTMLFragment).
+    const pos = String(position).toLowerCase();
     const parent = this.parentNode;
-    switch (position) {
+    const context = (pos === 'beforebegin' || pos === 'afterend') ? parent : this;
+    switch (pos) {
       case 'beforebegin':
-        if (parent) { const tmp = document.createElement('div'); tmp.innerHTML = html; const children = tmp.childNodes; for (let i = 0; i < children.length; i++) parent.insertBefore(children[i], this); }
+        if (parent) for (const n of _parseHTMLFragment(html, context)) parent.insertBefore(n, this);
         break;
-      case 'afterbegin':
-        { const tmp = document.createElement('div'); tmp.innerHTML = html; const children = tmp.childNodes; const first = this.firstChild; for (let i = children.length - 1; i >= 0; i--) this.insertBefore(children[i], first); }
+      case 'afterbegin': {
+        const first = this.firstChild;
+        for (const n of _parseHTMLFragment(html, context)) this.insertBefore(n, first);
         break;
+      }
       case 'beforeend':
-        { const tmp = document.createElement('div'); tmp.innerHTML = html; const children = tmp.childNodes; for (let i = 0; i < children.length; i++) this.appendChild(children[i]); }
+        for (const n of _parseHTMLFragment(html, context)) this.appendChild(n);
         break;
       case 'afterend':
-        if (parent) { const tmp = document.createElement('div'); tmp.innerHTML = html; const children = tmp.childNodes; const next = this.nextSibling; for (let i = 0; i < children.length; i++) parent.insertBefore(children[i], next); }
+        if (parent) { const next = this.nextSibling; for (const n of _parseHTMLFragment(html, context)) parent.insertBefore(n, next); }
         break;
+      default:
+        throw new DOMException(
+          "Failed to execute 'insertAdjacentHTML' on 'Element': The value provided ('" + position + "') is not one of 'beforeBegin', 'afterBegin', 'beforeEnd', or 'afterEnd'.",
+          "SyntaxError"
+        );
     }
   }
   // Like insertAdjacentHTML but inserts a Text node instead of parsing markup,
@@ -4185,13 +4326,13 @@ if (typeof Response === 'undefined') {
 }
 
 if (!Element.prototype.replaceWith) {
+  // _convertNodes turns any non-node argument (numbers, booleans, null, …) into
+  // a Text node via String(n), matching the spec and append()/prepend(); the
+  // old `typeof n === 'string'` check corrupted insert_before for other types.
   Element.prototype.replaceWith = function(...nodes) {
     const parent = this.parentNode;
     if (!parent) return;
-    for (const n of nodes) {
-      if (typeof n === 'string') parent.insertBefore(document.createTextNode(n), this);
-      else parent.insertBefore(n, this);
-    }
+    for (const n of _convertNodes(nodes)) parent.insertBefore(n, this);
     parent.removeChild(this);
   };
   _markNative(Element.prototype.replaceWith);
@@ -4200,10 +4341,7 @@ if (!Element.prototype.before) {
   Element.prototype.before = function(...nodes) {
     const parent = this.parentNode;
     if (!parent) return;
-    for (const n of nodes) {
-      if (typeof n === 'string') parent.insertBefore(document.createTextNode(n), this);
-      else parent.insertBefore(n, this);
-    }
+    for (const n of _convertNodes(nodes)) parent.insertBefore(n, this);
   };
   _markNative(Element.prototype.before);
 }
@@ -4212,10 +4350,7 @@ if (!Element.prototype.after) {
     const parent = this.parentNode;
     if (!parent) return;
     const ref = this.nextSibling;
-    for (const n of nodes) {
-      if (typeof n === 'string') parent.insertBefore(document.createTextNode(n), ref);
-      else parent.insertBefore(n, ref);
-    }
+    for (const n of _convertNodes(nodes)) parent.insertBefore(n, ref);
   };
   _markNative(Element.prototype.after);
 }
@@ -5457,11 +5592,16 @@ globalThis.XMLSerializer = class XMLSerializer {
 };
 globalThis.performance = globalThis.performance || {
   now: (function() {
-    var _lastMs = -1, _sub = 0;
+    // Monotonically non-decreasing: return the wall-clock offset, but never a
+    // value below the last one. Equal readings are allowed, and avoiding a
+    // synthetic per-call increment keeps tight loops from advancing the clock
+    // faster than real elapsed time.
+    var _last = -Infinity;
     return function() {
       var ms = Date.now() - (globalThis.performance.timeOrigin || 0);
-      if (ms !== _lastMs) { _lastMs = ms; _sub = 0; } else { _sub += 0.1; }
-      return ms + _sub;
+      if (ms < _last) return _last;
+      _last = ms;
+      return _last;
     };
   })(),
   mark(){}, measure(){},
@@ -5710,7 +5850,10 @@ globalThis.atob = globalThis.atob || ((s) => { const c="ABCDEFGHIJKLMNOPQRSTUVWX
   const stack = [{state: null, url: undefined}]; // initial entry; url=undefined means "use document URL"
   let idx = 0;
   const resolveOrFallback = (url) => {
-    if (url === null || url === undefined) return undefined;
+    // A missing url (pushState/replaceState called with < 3 args) keeps the
+    // current document URL per the HTML spec — capture it so the entry does not
+    // reset location back to the original document URL.
+    if (url === null || url === undefined) return __currentUrl();
     try { return new URL(String(url), __currentUrl()).href; } catch (e) { return String(url); }
   };
   const applyVirtual = () => {

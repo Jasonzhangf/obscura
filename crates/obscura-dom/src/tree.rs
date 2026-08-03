@@ -207,6 +207,9 @@ pub(crate) struct DomTreeInner {
     pub(crate) free_list: Vec<u32>,
     pub(crate) document: NodeId,
     pub(crate) id_index: HashMap<String, NodeId>,
+    // Whether the document was parsed in (full) quirks mode. In quirks mode CSS
+    // class and id selectors match ASCII-case-insensitively.
+    pub(crate) quirks: bool,
 }
 
 impl DomTree {
@@ -226,12 +229,24 @@ impl DomTree {
                 free_list: Vec::new(),
                 document: NodeId(0),
                 id_index: HashMap::new(),
+                quirks: false,
             }),
         }
     }
 
     pub fn document(&self) -> NodeId {
         self.inner.borrow().document
+    }
+
+    /// Record whether the document was parsed in (full) quirks mode.
+    pub fn set_quirks(&self, quirks: bool) {
+        self.inner.borrow_mut().quirks = quirks;
+    }
+
+    /// Whether the document is in (full) quirks mode, in which CSS class and id
+    /// selectors match ASCII-case-insensitively.
+    pub fn is_quirks(&self) -> bool {
+        self.inner.borrow().quirks
     }
 
     pub(crate) fn borrow_inner(&self) -> std::cell::Ref<'_, DomTreeInner> {
@@ -533,12 +548,20 @@ impl DomTree {
             inner.id_index.remove(&id_str);
         }
 
+        // Only free slots that are currently live. Freeing an out-of-range id
+        // would panic on direct indexing, and freeing an already-freed slot
+        // would push it onto the free list a second time — later handing the
+        // same NodeId to two live nodes (aliasing).
         for desc_id in descendants {
-            inner.nodes[desc_id.index()] = None;
-            inner.free_list.push(desc_id.0);
+            if matches!(inner.nodes.get(desc_id.index()), Some(Some(_))) {
+                inner.nodes[desc_id.index()] = None;
+                inner.free_list.push(desc_id.0);
+            }
         }
-        inner.nodes[node_id.index()] = None;
-        inner.free_list.push(node_id.0);
+        if matches!(inner.nodes.get(node_id.index()), Some(Some(_))) {
+            inner.nodes[node_id.index()] = None;
+            inner.free_list.push(node_id.0);
+        }
     }
 
     pub fn children(&self, node_id: NodeId) -> Vec<NodeId> {
@@ -994,6 +1017,30 @@ mod tests {
         assert_eq!(tree.len(), 1);
         let node = tree.get_node(tree.document()).unwrap();
         assert!(node.is_document());
+    }
+
+    #[test]
+    fn remove_out_of_range_id_is_a_noop() {
+        let tree = DomTree::new();
+        // Direct indexing into `nodes` panicked out-of-bounds for an id past the
+        // end of the slot vector; it must be a no-op instead.
+        tree.remove(NodeId::new(9999));
+        assert_eq!(tree.len(), 1);
+    }
+
+    #[test]
+    fn remove_twice_does_not_alias_slots() {
+        let tree = DomTree::new();
+        let doc = tree.document();
+        let a = tree.new_node(NodeData::Text { contents: "a".into() });
+        tree.append_child(doc, a);
+        tree.remove(a);
+        // Removing the already-freed node again must not push its slot onto the
+        // free list a second time, or two later allocations alias one slot.
+        tree.remove(a);
+        let x = tree.new_node(NodeData::Text { contents: "x".into() });
+        let y = tree.new_node(NodeData::Text { contents: "y".into() });
+        assert_ne!(x, y, "double-free aliased two live nodes onto the same slot");
     }
 
     #[test]
