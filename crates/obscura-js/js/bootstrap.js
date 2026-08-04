@@ -33,7 +33,7 @@
     '_bodyToUint8Array', '_arrayBufferFromBytes',
     '_installWasmStreamingFallback', '_urlParseOp', '_urlSetOp',
     '_urlResolveOp', '_decodeBodyWithCharset', '_utf8DecodeBytes',
-    '_selectionFor', '_isConstructorCE', '_isValidCustomElementName',
+    '_selectionFor', '_isConstructorCE', '_isValidCustomElementName', '_shadowRootForHost',
     '_blobPartToBytes', '_bytesToBinaryString', '_formEncode', '_hexv',
     '_commonFonts', '_isXMLDocument', '_isValidPITarget', '_isHTMLEl',
     '_nodeList', '_rngNodeLength', '_rngNodeIndex', '_rngSame', '_rngRoot',
@@ -7310,7 +7310,82 @@ globalThis.__notifyMutation = function(type, target_nid, addedNodes, removedNode
   }
 };
 
-globalThis.ShadowRoot = class ShadowRoot extends DocumentFragment {};
+globalThis.ShadowRoot = class ShadowRoot extends DocumentFragment {
+  constructor(nid, host, options) {
+    super(nid);
+    this._host = host;
+    this._mode = options.mode;
+    this._delegatesFocus = !!options.delegatesFocus;
+    this._slotAssignment = options.slotAssignment === 'manual' ? 'manual' : 'named';
+    this._clonable = !!options.clonable;
+    this._serializable = !!options.serializable;
+  }
+  get host() { return this._host; }
+  get mode() { return this._mode; }
+  get delegatesFocus() { return this._delegatesFocus; }
+  get slotAssignment() { return this._slotAssignment; }
+  get clonable() { return this._clonable; }
+  get serializable() { return this._serializable; }
+  _assertInsertable(node, operation) {
+    const createsComposedCycle = node instanceof ShadowRoot
+      || node === this._host
+      || !!(node?.contains && node.contains(this._host));
+    if (createsComposedCycle) {
+      throw new DOMException(
+        `Failed to execute '${operation}' on 'Node': The new child would contain the parent.`,
+        'HierarchyRequestError'
+      );
+    }
+  }
+  appendChild(child) {
+    this._assertInsertable(child, 'appendChild');
+    return super.appendChild(child);
+  }
+  insertBefore(node, reference) {
+    if (reference && reference.parentNode !== this) {
+      throw new DOMException(
+        "Failed to execute 'insertBefore' on 'Node': The reference node is not a child of this node.",
+        'NotFoundError'
+      );
+    }
+    if (node === reference) return node;
+    this._assertInsertable(node, 'insertBefore');
+    return super.insertBefore(node, reference);
+  }
+  removeChild(child) {
+    if (!child || child.parentNode !== this) {
+      throw new DOMException(
+        "Failed to execute 'removeChild' on 'Node': The node to be removed is not a child of this node.",
+        'NotFoundError'
+      );
+    }
+    return super.removeChild(child);
+  }
+  replaceChild(node, oldChild) {
+    if (!oldChild || oldChild.parentNode !== this) {
+      throw new DOMException(
+        "Failed to execute 'replaceChild' on 'Node': The node to be replaced is not a child of this node.",
+        'NotFoundError'
+      );
+    }
+    if (node === oldChild) return oldChild;
+    this._assertInsertable(node, 'replaceChild');
+    return super.replaceChild(node, oldChild);
+  }
+  getRootNode(options) {
+    return options?.composed ? this._host.getRootNode(options) : this;
+  }
+  get activeElement() { return null; }
+  get styleSheets() { return []; }
+  cloneNode() {
+    throw new DOMException(
+      'Failed to execute cloneNode on Node: ShadowRoot nodes are not clonable.',
+      'NotSupportedError'
+    );
+  }
+  setHTMLUnsafe(value) { this.innerHTML = String(value == null ? '' : value); }
+  getHTML() { return this.innerHTML; }
+};
 // Constructible-stylesheet adoption, mirroring Document.adoptedStyleSheets.
 Object.defineProperty(globalThis.ShadowRoot.prototype, 'adoptedStyleSheets', {
   get() { return this._adoptedStyleSheets || []; },
@@ -7430,7 +7505,7 @@ globalThis.ElementInternals = class ElementInternals {
   get willValidate() { return true; }
   get form() { return this._el && this._el.closest ? this._el.closest('form') : null; }
   get labels() { return _nodeList([]); }
-  get shadowRoot() { return (this._el && this._el._shadowRoot) || null; }
+  get shadowRoot() { return this._el ? _shadowRootForHost(this._el, true) : null; }
   get states() { return this._states; }
 };
 // Full standard constant set (issue #439). The partial version here lacked
@@ -10544,171 +10619,40 @@ Element.prototype.attachShadow = function attachShadow(opts) {
   if (!globalThis.__obscura_shadowHostNames.has(_ln) && _ln.indexOf('-') === -1) {
     throw new DOMException('Failed to execute attachShadow on Element: this element does not support attachShadow', 'NotSupportedError');
   }
-  if (this._shadowRoot) {
+  if (Deno.core.ops.op_shadow_root_info(this._nid)) {
     throw new DOMException('Failed to execute attachShadow on Element: the element already hosts a shadow tree.', 'NotSupportedError');
   }
-  const host = this;
-  const children = [];
-  const assertInsertable = (node, operation) => {
-    const createsComposedCycle = node instanceof ShadowRoot
-      || node === host
-      || !!(node?.contains && node.contains(host));
-    if (createsComposedCycle) {
-      throw new DOMException(
-        `Failed to execute '${operation}' on 'Node': The new child would contain the parent.`,
-        "HierarchyRequestError"
-      );
-    }
-  };
-  const shadow = {
-    mode: opts.mode,
-    host: host,
-    get innerHTML() { return children.map(c => c.outerHTML || c.textContent || '').join(''); },
-    set innerHTML(v) {
-      while (children.length) shadow.removeChild(children[children.length - 1]);
-      if (v) {
-        const tmp = document.createElement('div');
-        tmp.innerHTML = v;
-        for (const child of Array.from(tmp.childNodes)) shadow.appendChild(child);
-      }
-    },
-    get childNodes() { return children; },
-    get firstChild() { return children[0] || null; },
-    get lastChild() { return children[children.length - 1] || null; },
-    get firstElementChild() { return children.find(c => c.nodeType === 1) || null; },
-    get children() { return children.filter(c => c.nodeType === 1); },
-    appendChild(c) {
-      if (!c) return c;
-      assertInsertable(c, "appendChild");
-      if (c instanceof DocumentFragment) {
-        for (const child of Array.from(c.childNodes)) shadow.appendChild(child);
-        return c;
-      }
-      if (c._shadowParent) c._shadowParent.removeChild(c);
-      else if (c.parentNode) c.parentNode.removeChild(c);
-      children.push(c);
-      c._shadowParent = shadow;
-      return c;
-    },
-    insertBefore(n, ref) {
-      if (!n) return n;
-      if (!ref) { shadow.appendChild(n); return n; }
-      if (!children.includes(ref)) {
-        throw new DOMException(
-          "Failed to execute 'insertBefore' on 'Node': The reference node is not a child of this node.",
-          "NotFoundError"
-        );
-      }
-      if (n === ref) return n;
-      assertInsertable(n, "insertBefore");
-      if (n instanceof DocumentFragment) {
-        for (const child of Array.from(n.childNodes)) shadow.insertBefore(child, ref);
-        return n;
-      }
-      if (n._shadowParent) n._shadowParent.removeChild(n);
-      else if (n.parentNode) n.parentNode.removeChild(n);
-      const idx = children.indexOf(ref);
-      children.splice(idx, 0, n);
-      n._shadowParent = shadow;
-      return n;
-    },
-    removeChild(c) {
-      const idx = children.indexOf(c);
-      if (idx < 0) {
-        throw new DOMException(
-          "Failed to execute 'removeChild' on 'Node': The node to be removed is not a child of this node.",
-          "NotFoundError"
-        );
-      }
-      children.splice(idx, 1);
-      if (c._shadowParent === shadow) c._shadowParent = null;
-      return c;
-    },
-    replaceChild(n, o) {
-      if (!children.includes(o)) {
-        throw new DOMException(
-          "Failed to execute 'replaceChild' on 'Node': The node to be replaced is not a child of this node.",
-          "NotFoundError"
-        );
-      }
-      if (n === o) return o;
-      assertInsertable(n, "replaceChild");
-      if (n instanceof DocumentFragment) {
-        for (const child of Array.from(n.childNodes)) shadow.insertBefore(child, o);
-        shadow.removeChild(o);
-        return o;
-      }
-      if (n._shadowParent) n._shadowParent.removeChild(n);
-      else if (n.parentNode) n.parentNode.removeChild(n);
-      const idx = children.indexOf(o);
-      children[idx] = n;
-      n._shadowParent = shadow;
-      if (o._shadowParent === shadow) o._shadowParent = null;
-      return o;
-    },
-    querySelector(s) {
-      for (const c of children) {
-        if (c.matches && c.matches(s)) return c;
-        if (c.querySelector) { const r = c.querySelector(s); if (r) return r; }
-      }
-      return null;
-    },
-    querySelectorAll(s) {
-      const results = [];
-      for (const c of children) {
-        if (c.matches && c.matches(s)) results.push(c);
-        if (c.querySelectorAll) results.push(...c.querySelectorAll(s));
-      }
-      return results;
-    },
-    getElementById(id) { return shadow.querySelector('#' + id); },
-    contains(n) {
-      return n === shadow || children.some(
-        child => child === n || (child.contains && child.contains(n))
-      );
-    },
-    getRootNode(options) {
-      return options?.composed ? host.getRootNode(options) : shadow;
-    },
-    get ownerDocument() { return document; },
-    get nodeType() { return 11; }, // DOCUMENT_FRAGMENT_NODE
-    get nodeName() { return '#document-fragment'; },
-    addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true; },
-    setHTMLUnsafe(v) { this.innerHTML = String(v == null ? "" : v); },
-    getHTML() { return this.innerHTML; },
-    // Own textContent: ShadowRoot now extends DocumentFragment, so without
-    // these the inherited Node accessors run against this._nid. The setter in
-    // particular would target the host document and wipe it. Operate on the
-    // shadow's own `children` store instead.
-    get textContent() {
-      return children.map(c => c.nodeType === 8 ? "" : (c.textContent || "")).join("");
-    },
-    set textContent(v) {
-      while (children.length) shadow.removeChild(children[children.length - 1]);
-      if (v != null && v !== "") shadow.appendChild(document.createTextNode(String(v)));
-    },
-    hasChildNodes() { return children.length > 0; },
-    // A detached fragment id backs any inherited nid-based method we do not
-    // override, so they stay non-destructive (operate on an empty fragment)
-    // rather than falling through to node 0 / the document.
-    _nid: +_dom("create_document_fragment"),
-    activeElement: null,
-    get styleSheets() { return []; },
-    cloneNode() { throw new DOMException('Failed to execute cloneNode on Node: ShadowRoot nodes are not clonable.', 'NotSupportedError'); },
-  };
-  Object.setPrototypeOf(shadow, ShadowRoot.prototype);
-  this._shadowRoot = shadow;
+  const rootNid = Deno.core.ops.op_shadow_attach(this._nid, _mode);
+  if (rootNid < 0) {
+    throw new DOMException('Failed to execute attachShadow on Element: this element does not support attachShadow', 'NotSupportedError');
+  }
+  const shadow = new ShadowRoot(rootNid, this, opts);
+  _cache.set(rootNid, shadow);
   return shadow;
 };
 
 _markNative(Element.prototype.attachShadow);
 
+function _shadowRootForHost(host, includeClosed) {
+  if (!host) return null;
+  const info = Deno.core.ops.op_shadow_root_info(host._nid);
+  if (!info) return null;
+  const parts = info.split('\0');
+  if (!includeClosed && parts[1] !== 'open') return null;
+  const rootNid = +parts[0];
+  let root = _cache.get(rootNid);
+  if (!(root instanceof ShadowRoot)) {
+    root = new ShadowRoot(rootNid, host, { mode: parts[1] });
+    _cache.set(rootNid, root);
+  }
+  return root;
+}
+
 Object.defineProperty(Element.prototype, 'shadowRoot', {
   configurable: true,
   enumerable: true,
   get: function () {
-    var sr = this._shadowRoot;
-    return sr && sr.mode === 'open' ? sr : null;
+    return _shadowRootForHost(this, false);
   },
 });
 

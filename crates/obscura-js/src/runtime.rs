@@ -3447,6 +3447,93 @@ mod tests {
     }
 
     #[test]
+    fn shadow_root_identity_and_children_are_native_tree_backed() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r##"
+                const host = document.createElement("native-shadow-host");
+                document.body.appendChild(host);
+                const root = host.attachShadow({ mode: "open", delegatesFocus: true });
+                root.innerHTML = "<section id='inside'><span>native</span></section>";
+                const inside = root.querySelector("#inside");
+                const records = [];
+                const observer = new MutationObserver(batch => records.push(...batch));
+                observer.observe(root, { childList: true, subtree: true });
+                const added = document.createElement("strong");
+                inside.appendChild(added);
+                records.push(...observer.takeRecords());
+
+                host._shadowRoot = { mode: "closed" };
+                let duplicateError = "none";
+                try { host.attachShadow({ mode: "open" }); }
+                catch (error) { duplicateError = error.name; }
+
+                class ClosedShadowHost extends HTMLElement {
+                    constructor() {
+                        super();
+                        this.closedRoot = this.attachShadow({ mode: "closed" });
+                        this.internals = this.attachInternals();
+                    }
+                }
+                customElements.define("closed-shadow-host", ClosedShadowHost);
+                const closedHost = document.createElement("closed-shadow-host");
+
+                return [
+                    root instanceof ShadowRoot,
+                    root.nodeType,
+                    root.nodeName,
+                    root.host === host,
+                    root.mode,
+                    root.delegatesFocus,
+                    host.shadowRoot === root,
+                    duplicateError,
+                    inside.parentNode === root,
+                    inside.getRootNode() === root,
+                    inside.getRootNode({ composed: true }) === document,
+                    root.isConnected,
+                    inside.isConnected,
+                    host.contains(inside),
+                    document.querySelector("#inside") === null,
+                    root.querySelector("#inside") === inside,
+                    records.length,
+                    records[0] && records[0].target === inside,
+                    records[0] && records[0].addedNodes[0] === added,
+                    closedHost.shadowRoot,
+                    closedHost.internals.shadowRoot === closedHost.closedRoot
+                ];
+                "##,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                true,
+                11,
+                "#document-fragment",
+                true,
+                "open",
+                true,
+                true,
+                "NotSupportedError",
+                true,
+                true,
+                true,
+                true,
+                true,
+                false,
+                true,
+                true,
+                1,
+                true,
+                true,
+                null,
+                true
+            ])
+        );
+    }
+
+    #[test]
     fn create_element_synchronously_constructs_an_existing_definition() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt

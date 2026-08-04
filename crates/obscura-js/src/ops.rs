@@ -10,6 +10,7 @@ use deno_core::Extension;
 use deno_core::JsBuffer;
 use deno_core::OpState;
 use obscura_dom::{DomTree, NodeData, NodeId};
+use obscura_dom::tree::{AttachShadowError, ShadowRootMode};
 #[cfg(feature = "render")]
 use obscura_net::{RequestCredentials, RequestMode, ResourceRequest};
 #[cfg(feature = "stealth")]
@@ -697,6 +698,51 @@ fn op_script_try_start(state: &OpState, nid: u32) -> bool {
     }
     let newly_started = state.already_started_scripts.borrow_mut().insert(node_id);
     newly_started
+}
+
+/// Attach one native shadow-tree scope without making it part of the light
+/// tree. Layout intentionally remains unaware of the detached root until
+/// scoped style, slot assignment, and composed-tree paint are implemented.
+#[op2(fast)]
+fn op_shadow_attach(state: &OpState, host_nid: u32, #[string] mode: String) -> i32 {
+    let mode = match mode.as_str() {
+        "open" => ShadowRootMode::Open,
+        "closed" => ShadowRootMode::Closed,
+        _ => return -1,
+    };
+    let shared = state.borrow::<SharedState>().clone();
+    let state = shared.borrow();
+    let Some(dom) = state.dom.as_ref() else {
+        return -1;
+    };
+    match dom.attach_shadow_root(NodeId::new(host_nid), mode) {
+        Ok(root) => root.raw() as i32,
+        Err(AttachShadowError::HostAlreadyHasShadowRoot) => -2,
+        Err(_) => -1,
+    }
+}
+
+/// Return native host-owned shadow identity as `root-id\0mode`. Closed roots
+/// are included here; the Web-facing `Element.shadowRoot` getter applies mode
+/// visibility in bootstrap.js.
+#[op2]
+#[string]
+fn op_shadow_root_info(state: &OpState, host_nid: u32) -> String {
+    let shared = state.borrow::<SharedState>().clone();
+    let state = shared.borrow();
+    let Some(dom) = state.dom.as_ref() else {
+        return String::new();
+    };
+    dom.shadow_root(NodeId::new(host_nid))
+        .and_then(|root| dom.shadow_root_info(root))
+        .map(|shadow| {
+            let mode = match shadow.mode {
+                ShadowRootMode::Open => "open",
+                ShadowRootMode::Closed => "closed",
+            };
+            format!("{}\0{mode}", shadow.id.raw())
+        })
+        .unwrap_or_default()
 }
 
 #[op2]
@@ -3327,6 +3373,8 @@ pub fn build_extension() -> Extension {
         op_dom(),
         op_script_mark_started(),
         op_script_try_start(),
+        op_shadow_attach(),
+        op_shadow_root_info(),
         op_console_msg(),
         op_fetch_url(),
         op_get_cookies(),

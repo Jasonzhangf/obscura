@@ -1,6 +1,6 @@
 use html5ever::{LocalName, Namespace, Prefix, QualName};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -25,6 +25,45 @@ impl fmt::Display for NodeId {
         write!(f, "NodeId({})", self.0)
     }
 }
+
+/// The encapsulation mode recorded by a native shadow root.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ShadowRootMode {
+    Open,
+    Closed,
+}
+
+/// Stable metadata for a shadow-root node in this tree.
+///
+/// A shadow root owns an ordinary child list, but is not an ordinary child of
+/// its host. The separate host edge keeps `parentNode`-style walks scoped to
+/// one tree while still allowing composed-tree operations to cross explicitly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ShadowRoot {
+    pub id: NodeId,
+    pub host: NodeId,
+    pub mode: ShadowRootMode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttachShadowError {
+    HostIsNotElement,
+    HostAlreadyHasShadowRoot,
+    InvalidShadowRoot,
+}
+
+impl fmt::Display for AttachShadowError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::HostIsNotElement => "shadow host is not an element",
+            Self::HostAlreadyHasShadowRoot => "shadow host already has a shadow root",
+            Self::InvalidShadowRoot => "shadow root is not a detached fragment node",
+        };
+        f.write_str(message)
+    }
+}
+
+impl std::error::Error for AttachShadowError {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Attribute {
@@ -211,6 +250,11 @@ pub(crate) struct DomTreeInner {
     pub(crate) free_list: Vec<u32>,
     pub(crate) document: NodeId,
     pub(crate) id_index: HashMap<String, NodeId>,
+    /// Shadow roots are arena nodes with their own child list. They are kept
+    /// outside the ordinary parent links so light-tree traversal never crosses
+    /// into a shadow tree by accident.
+    shadow_roots: HashMap<NodeId, ShadowRoot>,
+    shadow_roots_by_host: HashMap<NodeId, NodeId>,
     // Whether the document was parsed in (full) quirks mode. In quirks mode CSS
     // class and id selectors match ASCII-case-insensitively.
     pub(crate) quirks: bool,
@@ -233,6 +277,8 @@ impl DomTree {
                 free_list: Vec::new(),
                 document: NodeId(0),
                 id_index: HashMap::new(),
+                shadow_roots: HashMap::new(),
+                shadow_roots_by_host: HashMap::new(),
                 quirks: false,
             }),
         }
@@ -255,6 +301,188 @@ impl DomTree {
 
     pub(crate) fn borrow_inner(&self) -> std::cell::Ref<'_, DomTreeInner> {
         self.inner.borrow()
+    }
+
+    /// Create and attach a dormant native shadow-root node to `host`.
+    ///
+    /// This only creates the tree-scope relationship. Parser attachment,
+    /// selector scoping, slot assignment, style, layout, and paint remain
+    /// separate opt-in layers.
+    pub fn attach_shadow_root(
+        &self,
+        host: NodeId,
+        mode: ShadowRootMode,
+    ) -> Result<NodeId, AttachShadowError> {
+        {
+            let inner = self.inner.borrow();
+            let host_is_element = inner
+                .nodes
+                .get(host.index())
+                .and_then(|node| node.as_ref())
+                .is_some_and(Node::is_element);
+            if !host_is_element {
+                return Err(AttachShadowError::HostIsNotElement);
+            }
+            if inner.shadow_roots_by_host.contains_key(&host) {
+                return Err(AttachShadowError::HostAlreadyHasShadowRoot);
+            }
+        }
+
+        let root = self.new_node(NodeData::Document);
+        // A freshly allocated document-fragment backing node satisfies every
+        // invariant below. If this ever fails, remove it so the arena does not
+        // retain an unreachable allocation.
+        if let Err(error) = self.attach_shadow_root_node(host, root, mode) {
+            self.remove(root);
+            return Err(error);
+        }
+        Ok(root)
+    }
+
+    /// Attach an existing detached fragment node as a shadow root. html5ever's
+    /// declarative-shadow hook supplies the template-contents fragment through
+    /// this path, but the hook remains disabled until style/layout integration
+    /// is ready.
+    pub(crate) fn attach_shadow_root_node(
+        &self,
+        host: NodeId,
+        root: NodeId,
+        mode: ShadowRootMode,
+    ) -> Result<(), AttachShadowError> {
+        let mut inner = self.inner.borrow_mut();
+        let host_is_element = inner
+            .nodes
+            .get(host.index())
+            .and_then(|node| node.as_ref())
+            .is_some_and(Node::is_element);
+        if !host_is_element {
+            return Err(AttachShadowError::HostIsNotElement);
+        }
+        if inner.shadow_roots_by_host.contains_key(&host) {
+            return Err(AttachShadowError::HostAlreadyHasShadowRoot);
+        }
+
+        let valid_root = root != inner.document
+            && !inner.shadow_roots.contains_key(&root)
+            && inner
+                .nodes
+                .get(root.index())
+                .and_then(|node| node.as_ref())
+                .is_some_and(|node| {
+                    matches!(node.data, NodeData::Document)
+                        && node.parent.is_none()
+                        && node.prev_sibling.is_none()
+                        && node.next_sibling.is_none()
+                });
+        if !valid_root {
+            return Err(AttachShadowError::InvalidShadowRoot);
+        }
+
+        let info = ShadowRoot {
+            id: root,
+            host,
+            mode,
+        };
+        inner.shadow_roots.insert(root, info);
+        inner.shadow_roots_by_host.insert(host, root);
+        Ok(())
+    }
+
+    /// Return the native root hosted by `host`, including closed roots. Web API
+    /// visibility is intentionally left to the caller.
+    pub fn shadow_root(&self, host: NodeId) -> Option<NodeId> {
+        self.inner.borrow().shadow_roots_by_host.get(&host).copied()
+    }
+
+    pub fn shadow_root_info(&self, root: NodeId) -> Option<ShadowRoot> {
+        self.inner.borrow().shadow_roots.get(&root).copied()
+    }
+
+    pub fn is_shadow_root(&self, node: NodeId) -> bool {
+        self.inner.borrow().shadow_roots.contains_key(&node)
+    }
+
+    /// Return the root of `node`'s local tree scope. This follows ordinary
+    /// parent links only, so a shadow descendant resolves to its ShadowRoot and
+    /// a light descendant resolves to its document or detached subtree root.
+    pub fn tree_scope_root(&self, node: NodeId) -> Option<NodeId> {
+        let inner = self.inner.borrow();
+        let mut current = node;
+        for _ in 0..=inner.nodes.len() {
+            let current_node = inner.nodes.get(current.index())?.as_ref()?;
+            match current_node.parent {
+                Some(parent) => current = parent,
+                None => return Some(current),
+            }
+        }
+        None
+    }
+
+    pub fn containing_shadow_root(&self, node: NodeId) -> Option<NodeId> {
+        let root = self.tree_scope_root(node)?;
+        self.is_shadow_root(root).then_some(root)
+    }
+
+    /// Return the topmost root after crossing ShadowRoot-to-host edges. This is
+    /// the native counterpart of `getRootNode({ composed: true })`.
+    pub fn shadow_including_root(&self, node: NodeId) -> Option<NodeId> {
+        let inner = self.inner.borrow();
+        let mut current = node;
+        for _ in 0..=inner.nodes.len() {
+            let current_node = inner.nodes.get(current.index())?.as_ref()?;
+            if let Some(parent) = current_node.parent {
+                current = parent;
+            } else if let Some(root) = inner.shadow_roots.get(&current) {
+                current = root.host;
+            } else {
+                return Some(current);
+            }
+        }
+        None
+    }
+
+    fn host_including_parent(inner: &DomTreeInner, node: NodeId) -> Option<NodeId> {
+        inner
+            .nodes
+            .get(node.index())
+            .and_then(|entry| entry.as_ref())
+            .and_then(|entry| entry.parent)
+            .or_else(|| inner.shadow_roots.get(&node).map(|root| root.host))
+    }
+
+    /// DOM insertion rejects a node when it is a host-including inclusive
+    /// ancestor of the destination parent. Ordinary parent links are not enough
+    /// for this check because a ShadowRoot's parent is intentionally null.
+    fn would_create_host_including_cycle(
+        inner: &DomTreeInner,
+        parent: NodeId,
+        child: NodeId,
+    ) -> bool {
+        let child_can_be_ancestor = inner
+            .nodes
+            .get(child.index())
+            .and_then(|entry| entry.as_ref())
+            .is_some_and(|entry| entry.first_child.is_some())
+            || inner.shadow_roots_by_host.contains_key(&child);
+        if !child_can_be_ancestor {
+            return false;
+        }
+
+        let mut current = Some(parent);
+        for _ in 0..=inner.nodes.len() {
+            let node = match current {
+                Some(node) => node,
+                None => return false,
+            };
+            if node == child {
+                return true;
+            }
+            current = Self::host_including_parent(inner, node);
+        }
+
+        // A valid host-including chain cannot be longer than the arena. Refuse
+        // mutation if pre-existing corruption ever violates that invariant.
+        true
     }
 
     pub fn new_node(&self, data: NodeData) -> NodeId {
@@ -317,38 +545,25 @@ impl DomTree {
         if parent_id == child_id {
             return;
         }
-        // Appending an ancestor of the parent under that parent makes the
-        // parent/child graph cyclic, and every later descendants()/children()/
-        // textContent walk (none carry a visited set) would loop forever, pinning
-        // the thread in native Rust where neither tokio nor the V8 watchdog can
-        // interrupt it. Per the DOM spec this is a HierarchyRequestError; treat it
-        // as a no-op, like the self-append guard above. Only a node that already
-        // has children can be an ancestor, so a fresh/leaf child (the common
-        // append) skips the walk: O(1) hot path, O(depth) only when relocating a
-        // populated subtree.
+        // A ShadowRoot is never itself an ordinary child, and moving a host
+        // below its own root would create a cycle even though the root's parent
+        // pointer is null. Follow both ordinary parents and root-to-host edges.
         {
             let inner = self.inner.borrow();
-            let child_has_children = inner.nodes.get(child_id.index())
-                .and_then(|n| n.as_ref())
-                .map(|n| n.first_child.is_some())
-                .unwrap_or(false);
-            if child_has_children {
-                let mut cur = inner.nodes.get(parent_id.index())
-                    .and_then(|n| n.as_ref())
-                    .and_then(|n| n.parent);
-                let mut steps = 0usize;
-                while let Some(p) = cur {
-                    if p == child_id {
-                        return;
-                    }
-                    steps += 1;
-                    if steps > inner.nodes.len() {
-                        return; // pre-existing corruption: refuse rather than risk a cycle
-                    }
-                    cur = inner.nodes.get(p.index())
-                        .and_then(|n| n.as_ref())
-                        .and_then(|n| n.parent);
-                }
+            let parent_exists = inner
+                .nodes
+                .get(parent_id.index())
+                .is_some_and(Option::is_some);
+            let child_exists = inner
+                .nodes
+                .get(child_id.index())
+                .is_some_and(Option::is_some);
+            if !parent_exists
+                || !child_exists
+                || inner.shadow_roots.contains_key(&child_id)
+                || Self::would_create_host_including_cycle(&inner, parent_id, child_id)
+            {
+                return;
             }
         }
         self.detach(child_id);
@@ -397,32 +612,20 @@ impl DomTree {
             }
         };
 
-        // Inserting the parent itself, or any ancestor of the parent, as a child
-        // of that parent would create a cycle (same non-terminating-walk hang as
-        // append_child). Reject it, matching the self-insert guard above. Gate on
-        // the inserted node actually having children, so the common case (insert a
-        // fresh node) stays O(1).
+        // Apply the same host-including cycle and root-node constraints as
+        // append_child. A leaf host still needs this check because its hosted
+        // root is not present in the ordinary child list.
         {
             let inner = self.inner.borrow();
-            let new_has_children = inner.nodes.get(new_sibling_id.index())
-                .and_then(|n| n.as_ref())
-                .map(|n| n.first_child.is_some())
-                .unwrap_or(false);
-            if new_has_children {
-                let mut cur = Some(parent_id);
-                let mut steps = 0usize;
-                while let Some(p) = cur {
-                    if p == new_sibling_id {
-                        return;
-                    }
-                    steps += 1;
-                    if steps > inner.nodes.len() {
-                        return;
-                    }
-                    cur = inner.nodes.get(p.index())
-                        .and_then(|n| n.as_ref())
-                        .and_then(|n| n.parent);
-                }
+            let new_exists = inner
+                .nodes
+                .get(new_sibling_id.index())
+                .is_some_and(Option::is_some);
+            if !new_exists
+                || inner.shadow_roots.contains_key(&new_sibling_id)
+                || Self::would_create_host_including_cycle(&inner, parent_id, new_sibling_id)
+            {
+                return;
             }
         }
 
@@ -530,21 +733,19 @@ impl DomTree {
     }
 
     pub fn remove(&self, node_id: NodeId) {
+        let nodes_to_remove = self.inclusive_owned_subtrees(node_id);
+        if nodes_to_remove.is_empty() {
+            return;
+        }
         self.detach(node_id);
-        let descendants = self.descendants(node_id);
         let mut inner = self.inner.borrow_mut();
 
         let mut ids_to_remove = Vec::new();
-        for &desc_id in &descendants {
-            if let Some(Some(node)) = inner.nodes.get(desc_id.index()) {
+        for &id in &nodes_to_remove {
+            if let Some(Some(node)) = inner.nodes.get(id.index()) {
                 if let Some(id_val) = node.get_attribute("id") {
                     ids_to_remove.push(id_val.to_string());
                 }
-            }
-        }
-        if let Some(Some(node)) = inner.nodes.get(node_id.index()) {
-            if let Some(id_val) = node.get_attribute("id") {
-                ids_to_remove.push(id_val.to_string());
             }
         }
 
@@ -552,20 +753,80 @@ impl DomTree {
             inner.id_index.remove(&id_str);
         }
 
+        // Remove both directions before freeing any arena slot. Otherwise a
+        // reused NodeId could inherit an old host/root relationship.
+        for &id in &nodes_to_remove {
+            if let Some(root) = inner.shadow_roots.remove(&id) {
+                if inner.shadow_roots_by_host.get(&root.host) == Some(&id) {
+                    inner.shadow_roots_by_host.remove(&root.host);
+                }
+            }
+            if let Some(root_id) = inner.shadow_roots_by_host.remove(&id) {
+                inner.shadow_roots.remove(&root_id);
+            }
+        }
+
         // Only free slots that are currently live. Freeing an out-of-range id
         // would panic on direct indexing, and freeing an already-freed slot
         // would push it onto the free list a second time — later handing the
         // same NodeId to two live nodes (aliasing).
-        for desc_id in descendants {
-            if matches!(inner.nodes.get(desc_id.index()), Some(Some(_))) {
-                inner.nodes[desc_id.index()] = None;
-                inner.free_list.push(desc_id.0);
+        for id in nodes_to_remove {
+            if matches!(inner.nodes.get(id.index()), Some(Some(_))) {
+                inner.nodes[id.index()] = None;
+                inner.free_list.push(id.0);
             }
         }
-        if matches!(inner.nodes.get(node_id.index()), Some(Some(_))) {
-            inner.nodes[node_id.index()] = None;
-            inner.free_list.push(node_id.0);
+    }
+
+    /// Collect an ordinary subtree plus every shadow tree owned by a host in
+    /// that subtree. This is used only by the arena-freeing path; normal DOM
+    /// traversal must remain tree-scoped and therefore never follows host edges.
+    fn inclusive_owned_subtrees(&self, node_id: NodeId) -> Vec<NodeId> {
+        let inner = self.inner.borrow();
+        if !inner
+            .nodes
+            .get(node_id.index())
+            .is_some_and(Option::is_some)
+        {
+            return Vec::new();
         }
+
+        let mut result = Vec::new();
+        let mut seen = HashSet::new();
+        let mut stack = vec![node_id];
+        while let Some(current) = stack.pop() {
+            if !seen.insert(current) {
+                continue;
+            }
+            let Some(node) = inner
+                .nodes
+                .get(current.index())
+                .and_then(|entry| entry.as_ref())
+            else {
+                continue;
+            };
+            result.push(current);
+
+            if let Some(root) = inner.shadow_roots_by_host.get(&current) {
+                stack.push(*root);
+            }
+
+            let mut children = Vec::new();
+            let mut child = node.first_child;
+            while let Some(child_id) = child {
+                children.push(child_id);
+                if children.len() > inner.nodes.len() {
+                    break;
+                }
+                child = inner
+                    .nodes
+                    .get(child_id.index())
+                    .and_then(|entry| entry.as_ref())
+                    .and_then(|entry| entry.next_sibling);
+            }
+            stack.extend(children.into_iter().rev());
+        }
+        result
     }
 
     pub fn children(&self, node_id: NodeId) -> Vec<NodeId> {
@@ -581,6 +842,13 @@ impl DomTree {
                 .and_then(|n| n.next_sibling);
         }
         result
+    }
+
+    /// Snapshot the direct children of `host`'s shadow root. Ordinary
+    /// `children(host)` continues to return only light children.
+    pub fn shadow_children(&self, host: NodeId) -> Option<Vec<NodeId>> {
+        let root = self.shadow_root(host)?;
+        Some(self.children(root))
     }
 
     pub fn descendants(&self, node_id: NodeId) -> Vec<NodeId> {
@@ -642,6 +910,13 @@ impl DomTree {
         }
 
         result
+    }
+
+    /// Snapshot the descendants of `host`'s shadow tree without including the
+    /// ShadowRoot node itself.
+    pub fn shadow_descendants(&self, host: NodeId) -> Option<Vec<NodeId>> {
+        let root = self.shadow_root(host)?;
+        Some(self.descendants(root))
     }
 
     /// Returns the node after `current` in document order, without leaving the
@@ -780,7 +1055,20 @@ impl DomTree {
     }
 
     pub fn get_element_by_id(&self, id: &str) -> Option<NodeId> {
-        self.inner.borrow().id_index.get(id).copied()
+        let indexed = self.inner.borrow().id_index.get(id).copied();
+        if indexed.is_some_and(|node| self.containing_shadow_root(node).is_none()) {
+            return indexed;
+        }
+
+        // Creation happens before insertion, so the O(1) best-effort index can
+        // point at a shadow descendant. Never expose that node through
+        // document.getElementById; recover the first matching light-tree
+        // element in document order instead. Detached and template-content
+        // nodes retain the legacy best-effort lookup behavior used internally.
+        self.descendants(self.document()).into_iter().find(|node_id| {
+            self.with_node(*node_id, |node| node.get_attribute("id") == Some(id))
+                .unwrap_or(false)
+        })
     }
 
     pub fn text_content(&self, node_id: NodeId) -> String {
@@ -881,6 +1169,12 @@ impl DomTree {
     /// element type and namespace. Template contents are stored in a separate
     /// document node and therefore need their own remapped clone.
     pub fn clone_node(&self, source_node_id: NodeId, deep: bool) -> Option<NodeId> {
+        // DOM cloneNode is not defined for ShadowRoot nodes. A host clone keeps
+        // its light subtree only; the separate registry means the shadow root
+        // is naturally omitted from that traversal.
+        if self.is_shadow_root(source_node_id) {
+            return None;
+        }
         let source_data = self.get_node(source_node_id)?.data;
         let cloned_root = self.new_node(source_data);
         let mut stack = Vec::new();
@@ -1080,6 +1374,27 @@ impl Default for DomTree {
 mod tests {
     use super::*;
 
+    fn element(tree: &DomTree, local: &str) -> NodeId {
+        tree.new_node(NodeData::Element {
+            name: QualName::new(None, ns!(html), LocalName::from(local)),
+            attrs: vec![],
+            template_contents: None,
+            mathml_annotation_xml_integration_point: false,
+        })
+    }
+
+    fn element_with_id(tree: &DomTree, local: &str, id: &str) -> NodeId {
+        tree.new_node(NodeData::Element {
+            name: QualName::new(None, ns!(html), LocalName::from(local)),
+            attrs: vec![Attribute {
+                name: QualName::new(None, Namespace::default(), LocalName::from("id")),
+                value: id.into(),
+            }],
+            template_contents: None,
+            mathml_annotation_xml_integration_point: false,
+        })
+    }
+
     #[test]
     fn test_new_tree_has_document() {
         let tree = DomTree::new();
@@ -1110,6 +1425,152 @@ mod tests {
         let x = tree.new_node(NodeData::Text { contents: "x".into() });
         let y = tree.new_node(NodeData::Text { contents: "y".into() });
         assert_ne!(x, y, "double-free aliased two live nodes onto the same slot");
+    }
+
+    #[test]
+    fn native_shadow_root_keeps_light_and_shadow_tree_scopes_separate() {
+        let tree = DomTree::new();
+        let document = tree.document();
+        let host = element(&tree, "x-card");
+        let light = element(&tree, "span");
+        tree.append_child(document, host);
+        tree.append_child(host, light);
+
+        let root = tree
+            .attach_shadow_root(host, ShadowRootMode::Closed)
+            .expect("element can host one shadow root");
+        let shadow = element(&tree, "button");
+        tree.append_child(root, shadow);
+
+        assert_eq!(
+            tree.shadow_root_info(root),
+            Some(ShadowRoot {
+                id: root,
+                host,
+                mode: ShadowRootMode::Closed,
+            })
+        );
+        assert!(tree.is_shadow_root(root));
+        assert_eq!(tree.shadow_root(host), Some(root));
+        assert_eq!(tree.get_node(root).unwrap().parent, None);
+        assert_eq!(tree.children(host), vec![light]);
+        assert_eq!(tree.shadow_children(host), Some(vec![shadow]));
+        assert_eq!(tree.shadow_descendants(host), Some(vec![shadow]));
+
+        let document_nodes = tree.descendants(document);
+        assert!(!document_nodes.contains(&root));
+        assert!(!document_nodes.contains(&shadow));
+        assert_eq!(tree.tree_scope_root(light), Some(document));
+        assert_eq!(tree.tree_scope_root(root), Some(root));
+        assert_eq!(tree.tree_scope_root(shadow), Some(root));
+        assert_eq!(tree.containing_shadow_root(light), None);
+        assert_eq!(tree.containing_shadow_root(shadow), Some(root));
+        assert_eq!(tree.shadow_including_root(shadow), Some(document));
+        assert_eq!(
+            tree.attach_shadow_root(host, ShadowRootMode::Open),
+            Err(AttachShadowError::HostAlreadyHasShadowRoot)
+        );
+    }
+
+    #[test]
+    fn document_id_lookup_never_exposes_a_shadow_descendant() {
+        let tree = DomTree::new();
+        let document = tree.document();
+        let host = element(&tree, "x-card");
+        tree.append_child(document, host);
+        let root = tree
+            .attach_shadow_root(host, ShadowRootMode::Open)
+            .unwrap();
+
+        // The shadow element is created first, so it owns the best-effort
+        // global id-index entry. Public document lookup still has to recover
+        // the light-tree match rather than leak across the tree scope.
+        let shadow_match = element_with_id(&tree, "span", "shared");
+        tree.append_child(root, shadow_match);
+        let light_match = element_with_id(&tree, "span", "shared");
+        tree.append_child(host, light_match);
+
+        assert_eq!(tree.get_element_by_id("shared"), Some(light_match));
+        assert_eq!(
+            tree.query_selector_from(document, "#shared").unwrap(),
+            Some(light_match)
+        );
+        assert_eq!(
+            tree.query_selector_from(root, "#shared").unwrap(),
+            Some(shadow_match)
+        );
+    }
+
+    #[test]
+    fn shadow_host_edges_participate_in_cycle_rejection() {
+        let tree = DomTree::new();
+        let document = tree.document();
+        let host = element(&tree, "x-card");
+        tree.append_child(document, host);
+        let root = tree
+            .attach_shadow_root(host, ShadowRootMode::Open)
+            .unwrap();
+        let shadow_child = element(&tree, "span");
+        tree.append_child(root, shadow_child);
+
+        // Root nodes cannot become ordinary children.
+        tree.append_child(host, root);
+        assert_eq!(tree.get_node(root).unwrap().parent, None);
+        assert!(tree.children(host).is_empty());
+
+        // A host is a host-including ancestor of every node in its shadow
+        // tree, even when it has no light children.
+        tree.append_child(root, host);
+        tree.insert_before(shadow_child, host);
+        assert_eq!(tree.get_node(host).unwrap().parent, Some(document));
+        assert_eq!(tree.children(root), vec![shadow_child]);
+    }
+
+    #[test]
+    fn freeing_a_host_reclaims_shadow_nodes_and_registry_entries() {
+        let tree = DomTree::new();
+        let host = element(&tree, "x-card");
+        tree.append_child(tree.document(), host);
+        let root = tree
+            .attach_shadow_root(host, ShadowRootMode::Open)
+            .unwrap();
+        let shadow_host = element(&tree, "nested-card");
+        tree.append_child(root, shadow_host);
+        let nested_root = tree
+            .attach_shadow_root(shadow_host, ShadowRootMode::Closed)
+            .unwrap();
+        let nested_child = element(&tree, "span");
+        tree.append_child(nested_root, nested_child);
+
+        assert_eq!(tree.len(), 6);
+        tree.remove(host);
+        assert_eq!(tree.len(), 1);
+        for removed in [host, root, shadow_host, nested_root, nested_child] {
+            assert!(tree.get_node(removed).is_none());
+            assert!(!tree.is_shadow_root(removed));
+        }
+
+        // Reusing freed slots must not resurrect either registry direction.
+        let replacement = element(&tree, "div");
+        assert_eq!(tree.shadow_root(replacement), None);
+        assert_eq!(tree.shadow_root_info(replacement), None);
+    }
+
+    #[test]
+    fn cloning_a_host_omits_its_shadow_tree_and_a_root_is_not_clonable() {
+        let tree = DomTree::new();
+        let host = element(&tree, "x-card");
+        let light = element(&tree, "span");
+        tree.append_child(host, light);
+        let root = tree
+            .attach_shadow_root(host, ShadowRootMode::Open)
+            .unwrap();
+        tree.append_child(root, element(&tree, "button"));
+
+        assert_eq!(tree.clone_node(root, true), None);
+        let clone = tree.clone_node(host, true).expect("host itself is clonable");
+        assert_eq!(tree.shadow_root(clone), None);
+        assert_eq!(tree.children(clone).len(), 1);
     }
 
     #[test]

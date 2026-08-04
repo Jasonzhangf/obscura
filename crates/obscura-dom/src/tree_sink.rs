@@ -6,7 +6,7 @@ use html5ever::tendril::StrTendril;
 use html5ever::tree_builder::{ElemName, ElementFlags, NodeOrText, QuirksMode, TreeSink};
 use html5ever::{Attribute as HtmlAttribute, LocalName, Namespace, QualName};
 
-use crate::tree::{Attribute, DomTree, NodeData, NodeId};
+use crate::tree::{Attribute, DomTree, NodeData, NodeId, ShadowRootMode};
 
 pub struct ObscuraElemName<'a> {
     _ref: Ref<'a, ()>,
@@ -232,11 +232,49 @@ impl TreeSink for DomTree {
         // then appends its contents directly to the host. That leaks shadow
         // styles and markup into the light DOM.
         //
-        // Keep declarative shadow roots as ordinary inert templates until
-        // DomTree has a real shadow-root node, tree-scoped selectors, and a
-        // scoped stylesheet cascade. Returning false makes html5ever take its
-        // fully implemented ordinary-template path.
+        // DomTree now has dormant native host/root identity, but selector,
+        // style, layout, and paint integration are not enabled as one partial
+        // feature. Returning false keeps html5ever on its fully implemented
+        // ordinary-template path in the meantime.
         false
+    }
+
+    fn attach_declarative_shadow(
+        &self,
+        location: &NodeId,
+        template: &NodeId,
+        attrs: &[HtmlAttribute],
+    ) -> bool {
+        // This hook is intentionally dormant while
+        // allow_declarative_shadow_roots returns false. Keep the implementation
+        // ready for that future switch: html5ever creates an unattached
+        // <template> and routes subsequent tokens into its contents fragment,
+        // so that existing fragment is the native ShadowRoot identity.
+        let mode = attrs.iter().find_map(|attr| {
+            if attr.name.local.as_ref() != "shadowrootmode" {
+                return None;
+            }
+            match attr.value.as_ref() {
+                "open" => Some(ShadowRootMode::Open),
+                "closed" => Some(ShadowRootMode::Closed),
+                _ => None,
+            }
+        });
+        let Some(mode) = mode else {
+            return false;
+        };
+        let root = self
+            .with_node(*template, |node| match &node.data {
+                NodeData::Element {
+                    template_contents, ..
+                } => *template_contents,
+                _ => None,
+            })
+            .flatten();
+        let Some(root) = root else {
+            return false;
+        };
+        self.attach_shadow_root_node(*location, root, mode).is_ok()
     }
 
     fn is_mathml_annotation_xml_integration_point(&self, target: &NodeId) -> bool {
@@ -395,6 +433,11 @@ mod tests {
             vec![template, light_content],
             "shadow markup must not be spliced into the host's light children"
         );
+        assert_eq!(
+            tree.shadow_root(host),
+            None,
+            "the parser gate must remain disabled until scoped style/layout is ready"
+        );
         assert!(
             tree.children(template).is_empty(),
             "template nodes keep their markup in the separate contents document"
@@ -436,5 +479,45 @@ mod tests {
         assert!(tree.children(template).is_empty());
         assert_eq!(element_children(contents), vec![inside]);
         assert_eq!(tree.get_node(inside).unwrap().parent, Some(contents));
+    }
+
+    #[test]
+    fn dormant_tree_sink_hook_reuses_the_template_contents_identity() {
+        let tree = DomTree::new();
+        let host = tree.new_node(NodeData::Element {
+            name: QualName::new(None, ns!(html), LocalName::from("x-card")),
+            attrs: vec![],
+            template_contents: None,
+            mathml_annotation_xml_integration_point: false,
+        });
+        tree.append_child(tree.document(), host);
+        let contents = tree.new_node(NodeData::Document);
+        let template = tree.new_node(NodeData::Element {
+            name: QualName::new(None, ns!(html), local_name!("template")),
+            attrs: vec![],
+            template_contents: Some(contents),
+            mathml_annotation_xml_integration_point: false,
+        });
+        let attrs = vec![HtmlAttribute {
+            name: QualName::new(
+                None,
+                Namespace::default(),
+                LocalName::from("shadowrootmode"),
+            ),
+            value: StrTendril::from("closed"),
+        }];
+
+        assert!(!TreeSink::allow_declarative_shadow_roots(&tree, &host));
+        assert!(TreeSink::attach_declarative_shadow(
+            &tree,
+            &host,
+            &template,
+            &attrs,
+        ));
+        assert_eq!(tree.shadow_root(host), Some(contents));
+        assert_eq!(
+            tree.shadow_root_info(contents).unwrap().mode,
+            ShadowRootMode::Closed
+        );
     }
 }
