@@ -230,6 +230,150 @@ class ControlledScrollTests(unittest.TestCase):
         self.assertEqual(paired_corpus.parse_scroll_y("-20"), -20)
 
 
+class StateComparabilityTests(unittest.TestCase):
+    @staticmethod
+    def state(element_count, body_text_utf16, probe_counts, **extra):
+        state = {
+            "url": "https://fixture.test/delayed-route",
+            "document": {
+                "ready_state": "complete",
+                "element_count": element_count,
+                "body_text_utf16": body_text_utf16,
+                # Deliberately unrelated: hashes must not drive classification.
+                "outer_html_fnv1a32": extra.pop("outer_hash", "aaaaaaaa"),
+                "body_text_fnv1a32": extra.pop("text_hash", "bbbbbbbb"),
+            },
+            "geometry_probes": [
+                {
+                    "selector": f".probe-{index}",
+                    "valid": True,
+                    "count": count,
+                    "rects": [],
+                }
+                for index, count in enumerate(probe_counts)
+            ],
+            "state_and_screenshot_share_capture_boundary": True,
+        }
+        state.update(extra)
+        return state
+
+    def test_delayed_route_at_zero_settle_is_different_live_state_and_not_fidelity(self):
+        pending_route = self.state(
+            41,
+            921,
+            [0, 1, 0, 0, 0, 0, 0],
+        )
+        loaded_route = self.state(
+            397,
+            3924,
+            [2, 1, 7, 4, 18, 3, 2],
+            outer_hash="cccccccc",
+            text_hash="dddddddd",
+        )
+
+        comparison = paired_corpus.classify_state_comparability(
+            pending_route,
+            loaded_route,
+            {"stable": True},
+        )
+        fidelity = paired_corpus.classify_fidelity_metric(
+            "cold-load-latency",
+            comparison["state_comparable"],
+            metrics_present=True,
+        )
+
+        self.assertFalse(comparison["state_comparable"])
+        self.assertEqual(comparison["classification"], "different-live-state")
+        self.assertGreaterEqual(len(comparison["gross_provenance_signals"]), 2)
+        self.assertFalse(fidelity["fidelity_metric_valid"])
+        self.assertIn("cold-load-latency-mode", fidelity["exclusion_reasons"])
+
+    def test_delayed_route_after_settle_is_comparable_despite_hashes(self):
+        obscura = self.state(
+            399,
+            3910,
+            [2, 1, 7, 4, 18, 3, 2],
+            outer_hash="11111111",
+            text_hash="22222222",
+        )
+        chromium = self.state(
+            397,
+            3924,
+            [2, 1, 7, 4, 18, 3, 2],
+            outer_hash="ffffffff",
+            text_hash="eeeeeeee",
+        )
+
+        comparison = paired_corpus.classify_state_comparability(
+            obscura,
+            chromium,
+            {"stable": True},
+        )
+        fidelity = paired_corpus.classify_fidelity_metric(
+            "representative-fidelity",
+            comparison["state_comparable"],
+            metrics_present=True,
+        )
+
+        self.assertTrue(comparison["state_comparable"])
+        self.assertEqual(comparison["classification"], "comparable")
+        self.assertFalse(comparison["hashes_used_for_classification"])
+        self.assertTrue(fidelity["fidelity_metric_valid"])
+
+    def test_live_and_deterministic_modes_with_same_dom_provenance_are_comparable(self):
+        live = self.state(
+            210,
+            1700,
+            [4, 2, 12, 3],
+            animation_sampling={"mode": "live-wall-clock"},
+        )
+        deterministic = self.state(
+            211,
+            1692,
+            [4, 2, 12, 3],
+            animation_sampling={
+                "mode": "deterministic-active-web-animations",
+                "sample_ms": 0,
+            },
+        )
+
+        comparison = paired_corpus.classify_state_comparability(
+            live,
+            deterministic,
+            {"stable": True},
+        )
+
+        self.assertTrue(comparison["state_comparable"])
+        self.assertEqual(comparison["gross_provenance_signals"], [])
+
+    def test_capture_boundary_instability_excludes_otherwise_matching_state(self):
+        obscura = self.state(100, 800, [2, 4, 1])
+        chromium = self.state(100, 800, [2, 4, 1])
+
+        comparison = paired_corpus.classify_state_comparability(
+            obscura,
+            chromium,
+            {"stable": False},
+        )
+
+        self.assertFalse(comparison["state_comparable"])
+        self.assertEqual(
+            comparison["classification"], "capture-boundary-unstable"
+        )
+
+    def test_one_moderate_provenance_difference_does_not_overreject(self):
+        obscura = self.state(70, 800, [2, 4, 1])
+        chromium = self.state(100, 800, [2, 4, 1])
+
+        comparison = paired_corpus.classify_state_comparability(
+            obscura,
+            chromium,
+            {"stable": True},
+        )
+
+        self.assertTrue(comparison["state_comparable"])
+
+
 class GeometryProbeTests(unittest.TestCase):
     @staticmethod
     def chromium_state():

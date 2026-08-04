@@ -1418,6 +1418,227 @@ def compare_page_states(obscura, chromium):
     }
 
 
+def classify_state_comparability(
+    obscura, chromium, chromium_capture_boundary=None
+):
+    """Classify whether two screenshots represent comparable live page states.
+
+    Exact DOM/text hashes are intentionally not inputs. Different engines can
+    serialize equivalent live DOMs differently. Instead, this uses bounded,
+    coarse provenance signals that identify gross incomplete-route/load states
+    without turning small DOM differences into rendering exclusions.
+    """
+    obscura = obscura or {}
+    chromium = chromium or {}
+    obscura_document = obscura.get("document") or {}
+    chromium_document = chromium.get("document") or {}
+
+    def count_signal(left, right, minimum_max, minimum_delta, ratio_limit):
+        if not (
+            isinstance(left, (int, float))
+            and not isinstance(left, bool)
+            and isinstance(right, (int, float))
+            and not isinstance(right, bool)
+        ):
+            return {
+                "available": False,
+                "obscura": left,
+                "chromium": right,
+                "gross_difference": False,
+                "catastrophic_difference": False,
+            }
+        maximum = max(left, right)
+        minimum = min(left, right)
+        difference = abs(left - right)
+        ratio = minimum / maximum if maximum else 1.0
+        return {
+            "available": True,
+            "obscura": left,
+            "chromium": right,
+            "absolute_difference": difference,
+            "smaller_to_larger_ratio": round(ratio, 6),
+            "gross_difference": (
+                maximum >= minimum_max
+                and difference >= minimum_delta
+                and ratio < ratio_limit
+            ),
+            "catastrophic_difference": (
+                maximum >= minimum_max * 2
+                and difference >= minimum_delta * 2
+                and ratio < 0.2
+            ),
+        }
+
+    element_signal = count_signal(
+        obscura_document.get("element_count"),
+        chromium_document.get("element_count"),
+        minimum_max=20,
+        minimum_delta=15,
+        ratio_limit=0.6,
+    )
+    text_signal = count_signal(
+        obscura_document.get("body_text_utf16"),
+        chromium_document.get("body_text_utf16"),
+        minimum_max=256,
+        minimum_delta=256,
+        ratio_limit=0.6,
+    )
+
+    obscura_probes = obscura.get("geometry_probes") or []
+    chromium_probes = chromium.get("geometry_probes") or []
+    probe_pairs = []
+    for index in range(min(len(obscura_probes), len(chromium_probes))):
+        left_probe = obscura_probes[index] or {}
+        right_probe = chromium_probes[index] or {}
+        left = left_probe.get("count")
+        right = right_probe.get("count")
+        if (
+            left_probe.get("valid") is not False
+            and right_probe.get("valid") is not False
+            and isinstance(left, int)
+            and not isinstance(left, bool)
+            and isinstance(right, int)
+            and not isinstance(right, bool)
+        ):
+            maximum = max(left, right)
+            minimum = min(left, right)
+            ratio = minimum / maximum if maximum else 1.0
+            probe_pairs.append(
+                {
+                    "index": index,
+                    "selector": left_probe.get("selector")
+                    or right_probe.get("selector"),
+                    "obscura": left,
+                    "chromium": right,
+                    "absolute_difference": abs(left - right),
+                    "smaller_to_larger_ratio": round(ratio, 6),
+                }
+            )
+    obscura_probe_total = sum(pair["obscura"] for pair in probe_pairs)
+    chromium_probe_total = sum(pair["chromium"] for pair in probe_pairs)
+    maximum_probe_total = max(obscura_probe_total, chromium_probe_total)
+    probe_absolute_difference = sum(
+        pair["absolute_difference"] for pair in probe_pairs
+    )
+    gross_probe_pairs = sum(
+        1
+        for pair in probe_pairs
+        if max(pair["obscura"], pair["chromium"]) >= 3
+        and pair["smaller_to_larger_ratio"] < 0.5
+    )
+    structural_signal = {
+        "available": bool(probe_pairs),
+        "pairs_compared": len(probe_pairs),
+        "obscura_total": obscura_probe_total,
+        "chromium_total": chromium_probe_total,
+        "summed_absolute_difference": probe_absolute_difference,
+        "gross_pair_count": gross_probe_pairs,
+        "gross_difference": bool(probe_pairs)
+        and (
+            gross_probe_pairs >= 2
+            or (
+                maximum_probe_total >= 6
+                and probe_absolute_difference
+                >= max(4, int(maximum_probe_total * 0.35 + 0.999999))
+            )
+        ),
+    }
+
+    obscura_boundary_stable = obscura.get(
+        "state_and_screenshot_share_capture_boundary"
+    )
+    chromium_boundary_stable = (chromium_capture_boundary or {}).get("stable")
+    boundary_instability = (
+        obscura_boundary_stable is False or chromium_boundary_stable is False
+    )
+    url_mismatch = (
+        bool(obscura.get("url"))
+        and bool(chromium.get("url"))
+        and obscura.get("url") != chromium.get("url")
+    )
+    gross_signals = [
+        name
+        for name, signal in (
+            ("element-count", element_signal),
+            ("body-text-length", text_signal),
+            ("structural-probe-counts", structural_signal),
+        )
+        if signal["gross_difference"]
+    ]
+    catastrophic_signals = [
+        name
+        for name, signal in (
+            ("element-count", element_signal),
+            ("body-text-length", text_signal),
+        )
+        if signal.get("catastrophic_difference")
+    ]
+    available_provenance = sum(
+        bool(signal["available"])
+        for signal in (element_signal, text_signal, structural_signal)
+    )
+
+    reasons = []
+    if boundary_instability:
+        reasons.append("capture-boundary-instability")
+    if url_mismatch:
+        reasons.append("final-url-mismatch")
+    if catastrophic_signals:
+        reasons.append(
+            "catastrophic-provenance-difference:"
+            + ",".join(catastrophic_signals)
+        )
+    elif len(gross_signals) >= 2:
+        reasons.append(
+            "multiple-gross-provenance-differences:"
+            + ",".join(gross_signals)
+        )
+    if available_provenance == 0:
+        reasons.append("insufficient-state-provenance")
+
+    comparable = not reasons
+    if comparable:
+        classification = "comparable"
+    elif boundary_instability:
+        classification = "capture-boundary-unstable"
+    elif available_provenance == 0:
+        classification = "insufficient-provenance"
+    else:
+        classification = "different-live-state"
+    return {
+        "state_comparable": comparable,
+        "classification": classification,
+        "reasons": reasons,
+        "gross_provenance_signals": gross_signals,
+        "evidence": {
+            "capture_boundary": {
+                "obscura_shared": obscura_boundary_stable,
+                "chromium_stable": chromium_boundary_stable,
+            },
+            "url_mismatch": url_mismatch,
+            "element_count": element_signal,
+            "body_text_utf16": text_signal,
+            "structural_probe_counts": structural_signal,
+        },
+        "hashes_used_for_classification": False,
+    }
+
+
+def classify_fidelity_metric(capture_purpose, state_comparable, metrics_present):
+    """Return whether raw image metrics are valid representative evidence."""
+    reasons = []
+    if capture_purpose != "representative-fidelity":
+        reasons.append("cold-load-latency-mode")
+    if state_comparable is not True:
+        reasons.append("page-state-not-comparable")
+    if not metrics_present:
+        reasons.append("image-metrics-unavailable")
+    return {
+        "fidelity_metric_valid": not reasons,
+        "exclusion_reasons": reasons,
+    }
+
+
 def compare_geometry_probes(obscura, chromium):
     """Report raw per-selector deltas without reducing them to a verdict."""
     obscura_probes = (obscura or {}).get("geometry_probes") or []
@@ -1679,6 +1900,16 @@ def main():
     parser.add_argument("--height", type=int, default=1400)
     parser.add_argument("--settle-ms", type=int, default=3000)
     parser.add_argument(
+        "--capture-purpose",
+        choices=["representative-fidelity", "cold-load-latency"],
+        default="representative-fidelity",
+        help=(
+            "representative-fidelity requires a non-zero settle; "
+            "cold-load-latency requires --settle-ms=0 and excludes pixel "
+            "metrics from fidelity interpretation"
+        ),
+    )
+    parser.add_argument(
         "--animation-time-ms",
         type=int,
         choices=[0],
@@ -1714,6 +1945,15 @@ def main():
             "--settle-ms must be a whole number of seconds because Obscura's "
             "fetch --wait interface accepts integer seconds"
         )
+    if args.settle_ms < 0:
+        parser.error("--settle-ms must be non-negative")
+    if args.settle_ms == 0 and args.capture_purpose != "cold-load-latency":
+        parser.error(
+            "--settle-ms=0 is cold-load latency mode; pass "
+            "--capture-purpose=cold-load-latency explicitly"
+        )
+    if args.capture_purpose == "cold-load-latency" and args.settle_ms != 0:
+        parser.error("cold-load-latency requires --settle-ms=0")
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=False)
@@ -1731,6 +1971,18 @@ def main():
     manifest = {
         "started_utc": datetime.now(timezone.utc).isoformat(),
         "viewport": {"width": args.width, "height": args.height, "dpr": 1},
+        "capture_purpose": args.capture_purpose,
+        "fidelity_metrics_enabled": (
+            args.capture_purpose == "representative-fidelity"
+        ),
+        "capture_purpose_semantics": (
+            "settled representative capture; raw image metrics are eligible "
+            "for fidelity interpretation only when page-state provenance is "
+            "also comparable"
+            if args.capture_purpose == "representative-fidelity"
+            else "zero-settle cold-load latency diagnostic; raw screenshots "
+            "and metrics are retained, but are never fidelity evidence"
+        ),
         "settle_ms_after_load": args.settle_ms,
         "settle_ms_after_controlled_scroll": (
             args.settle_ms if controlled_scroll is not None else 0
@@ -1808,7 +2060,9 @@ def main():
         "methodology_limits": {
             "pixel_metrics": (
                 "raw full-canvas diagnostics only; they are a tripwire, not a "
-                "fidelity verdict"
+                "fidelity verdict. They remain recorded for every successful "
+                "pair, but fidelity_metric_valid excludes cold-load mode and "
+                "different or unstable live-page states from interpretation"
             ),
             "controlled_scroll": (
                 "The settled pre-reassert offset is diagnostic evidence, not "
@@ -1956,7 +2210,12 @@ def main():
                 ours_path = out / f"{name}.obscura.png"
                 chrome_path = out / f"{name}.chrome.png"
                 baseline_path = out / f"{name}.baseline.png"
-                page_result = {"url": url, "name": name}
+                page_result = {
+                    "url": url,
+                    "name": name,
+                    "state_comparable": None,
+                    "fidelity_metric_valid": False,
+                }
                 context = browser.new_context(
                     viewport={"width": args.width, "height": args.height},
                     device_scale_factor=1,
@@ -2117,6 +2376,15 @@ def main():
                         page_result["obscura"].get("state"),
                         chromium_state,
                     )
+                    state_comparability = classify_state_comparability(
+                        page_result["obscura"].get("state"),
+                        chromium_state,
+                        chromium_capture_boundary,
+                    )
+                    page_result["state_comparability"] = state_comparability
+                    page_result["state_comparable"] = state_comparability[
+                        "state_comparable"
+                    ]
                     page_result["feature_probe_comparison"] = (
                         compare_feature_probes(
                             page_result["obscura"].get("state"),
@@ -2140,6 +2408,17 @@ def main():
                             page_result["baseline"].get("state"),
                             chromium_state,
                         )
+                    )
+                    baseline_state_comparability = classify_state_comparability(
+                        page_result["baseline"].get("state"),
+                        chromium_state,
+                        chromium_capture_boundary,
+                    )
+                    page_result["baseline_state_comparability"] = (
+                        baseline_state_comparability
+                    )
+                    page_result["baseline_state_comparable"] = (
+                        baseline_state_comparability["state_comparable"]
                     )
                     page_result["baseline_feature_probe_comparison"] = (
                         compare_feature_probes(
@@ -2238,9 +2517,40 @@ def main():
                             if key in current_metrics and key in baseline_metrics:
                                 if current_metrics[key] is None or baseline_metrics[key] is None:
                                     continue
-                                page_result.setdefault("delta_vs_baseline", {})[key] = round(
+                                page_result.setdefault("raw_delta_vs_baseline", {})[key] = round(
                                     current_metrics[key] - baseline_metrics[key], 6
                                 )
+                fidelity_classification = classify_fidelity_metric(
+                    args.capture_purpose,
+                    page_result.get("state_comparable"),
+                    bool(page_result.get("metrics")),
+                )
+                page_result["fidelity_metric_valid"] = fidelity_classification[
+                    "fidelity_metric_valid"
+                ]
+                page_result["fidelity_metric_exclusion_reasons"] = (
+                    fidelity_classification["exclusion_reasons"]
+                )
+                if baseline_future:
+                    baseline_fidelity_classification = classify_fidelity_metric(
+                        args.capture_purpose,
+                        page_result.get("baseline_state_comparable"),
+                        bool(page_result.get("baseline_metrics")),
+                    )
+                    page_result["baseline_fidelity_metric_valid"] = (
+                        baseline_fidelity_classification["fidelity_metric_valid"]
+                    )
+                    page_result["baseline_fidelity_metric_exclusion_reasons"] = (
+                        baseline_fidelity_classification["exclusion_reasons"]
+                    )
+                    if (
+                        page_result["fidelity_metric_valid"]
+                        and page_result["baseline_fidelity_metric_valid"]
+                        and page_result.get("raw_delta_vs_baseline")
+                    ):
+                        page_result["delta_vs_baseline"] = dict(
+                            page_result["raw_delta_vs_baseline"]
+                        )
                 manifest["pages"].append(page_result)
                 write_results(results_path, manifest)
                 metric = page_result.get("metrics", {}).get("pixels_gt_50")
@@ -2258,7 +2568,10 @@ def main():
                 )
                 print(
                     f"{name:84} "
-                    f"p>50={metric if metric is not None else 'capture-fail'} "
+                    f"mode={args.capture_purpose} "
+                    f"state={page_result.get('state_comparability', {}).get('classification', 'unavailable')} "
+                    f"fidelity={'valid' if page_result['fidelity_metric_valid'] else 'excluded'} "
+                    f"p>50_raw={metric if metric is not None else 'capture-fail'} "
                     f"edge_bbox={edge_bbox if edge_bbox is not None else '-'} "
                     f"edge_row={edge_row if edge_row is not None else '-'} "
                     f"edge_col={edge_col if edge_col is not None else '-'} "
@@ -2270,6 +2583,23 @@ def main():
         browser.close()
 
     manifest["finished_utc"] = datetime.now(timezone.utc).isoformat()
+    manifest["fidelity_eligibility"] = {
+        "valid_pages": sum(
+            1 for page in manifest["pages"] if page["fidelity_metric_valid"]
+        ),
+        "excluded_pages": sum(
+            1 for page in manifest["pages"] if not page["fidelity_metric_valid"]
+        ),
+        "excluded_page_names": [
+            page["name"]
+            for page in manifest["pages"]
+            if not page["fidelity_metric_valid"]
+        ],
+        "semantics": (
+            "eligibility counts only; excluded pages retain raw screenshots "
+            "and metrics but do not contribute fidelity evidence"
+        ),
+    }
     write_results(results_path, manifest)
     failed = [
         page["name"]

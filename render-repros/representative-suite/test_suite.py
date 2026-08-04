@@ -83,6 +83,8 @@ class RepresentativeSuiteTests(unittest.TestCase):
         )
         self.assertIn("--animation-time-ms", arguments)
         self.assertEqual(arguments[arguments.index("--animation-time-ms") + 1], "0")
+        purpose_index = arguments.index("--capture-purpose")
+        self.assertEqual(arguments[purpose_index + 1], "representative-fidelity")
         self.assertEqual(arguments.count("--geometry-selector"), 7)
         self.assertNotIn("--scroll-y", arguments)
 
@@ -131,11 +133,29 @@ class RepresentativeSuiteTests(unittest.TestCase):
 
     def test_zero_settle_latency_mode_is_forwarded(self):
         result, arguments, _, _ = self.run_wrapper(
-            extra_environment={"SETTLE_MS": "0"},
+            extra_environment={"SUITE_MODE": "latency", "SETTLE_MS": "0"},
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         settle_index = arguments.index("--settle-ms")
         self.assertEqual(arguments[settle_index + 1], "0")
+        purpose_index = arguments.index("--capture-purpose")
+        self.assertEqual(arguments[purpose_index + 1], "cold-load-latency")
+
+    def test_zero_settle_without_explicit_latency_mode_is_rejected(self):
+        result, arguments, _, _ = self.run_wrapper(
+            extra_environment={"SETTLE_MS": "0"},
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(arguments, [])
+        self.assertIn("requires explicit SUITE_MODE=latency", result.stderr)
+
+    def test_latency_mode_requires_zero_settle(self):
+        result, arguments, _, _ = self.run_wrapper(
+            extra_environment={"SUITE_MODE": "latency"},
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(arguments, [])
+        self.assertIn("requires SETTLE_MS=0", result.stderr)
 
     def test_fractional_settle_is_rejected_before_capture(self):
         result, arguments, _, _ = self.run_wrapper(
