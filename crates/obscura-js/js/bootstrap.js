@@ -5480,7 +5480,7 @@ const _checkXmlWellFormed = (html) => {
     const fullTag = match[0];
     const tagName = match[1];
     const isClosing = fullTag.startsWith('</');
-    const isSelfClosing = match[2] === '/' || fullTag.endsWith('/>');
+    const isSelfClosing = match[2] === '/';
 
     if (isClosing) {
       if (stack.length === 0) {
@@ -5524,18 +5524,14 @@ globalThis.DOMParser = class DOMParser {
     const html = String(source ?? "");
     const isXml = typeof mimeType === "string" && /xml/i.test(mimeType);
     const root = document.createElement("html");
-    let _xmlError = null;
 
     // For XML mime types, check well-formedness first (conservative: only
     // clear errors like tag mismatch / extra root are flagged).  If the
     // check fires, build a <parsererror> root so callers doing
     // doc.querySelector('parsererror') get the same signal as in Chrome.
-    if (isXml) {
-      const wf = _checkXmlWellFormed(html);
-      if (!wf.wellFormed) _xmlError = wf.error;
-    }
-    if (_xmlError) {
-      root.innerHTML = '<parsererror>' + _xmlError + '</parsererror>';
+    const xmlError = isXml ? _checkXmlWellFormed(html) : null;
+    if (xmlError && !xmlError.wellFormed) {
+      root.innerHTML = '<parsererror>' + xmlError.error + '</parsererror>';
       // Make sure querySelector('parsererror') finds the root element.
       root._parserError = true;
     } else {
@@ -5568,7 +5564,7 @@ globalThis.DOMParser = class DOMParser {
       get documentElement() {
         // For XML parsererror docs, return the <parsererror> child, not the
         // <html> wrapper — matches Chrome's behavior.
-        if (root._parserError) return root.firstElementChild || root;
+        if (root._parserError) return root.firstElementChild;
         return root;
       },
       get body() { return findByTagName("BODY"); },
@@ -5599,7 +5595,7 @@ globalThis.DOMParser = class DOMParser {
       querySelector(s) {
         // For XML parsererror docs, check the root element as well —
         // the <parsererror> is the documentElement, not a descendant.
-        return root.querySelector(s) || (root._parserError && root.matches && root.matches(s) ? root : null);
+        return root.querySelector(s) || (root._parserError && root.matches(s) ? root : null);
       },
       querySelectorAll(s) { return root.querySelectorAll(s); },
       getElementById(id) {
