@@ -2789,7 +2789,15 @@ class Element extends Node {
   // Element for element nodes, and node ids are never freed-and-reused), so this
   // is constant. Overrides Node's dynamic getter to drop one op per nodeType read.
   get nodeType() { return 1; }
-  get tagName() { return _domParse("tag_name", this._nid) || ""; }
+  get tagName() {
+    // An element's qualified name is immutable for its lifetime. React reads
+    // nodeName/tagName repeatedly while hydrating; crossing the native bridge
+    // for every comparison adds thousands of calls on modern component trees.
+    if (this._tagName !== undefined) return this._tagName;
+    this._tagName = _domParse("tag_name", this._nid) || "";
+    return this._tagName;
+  }
+  get nodeName() { return this.tagName; }
   get localName() {
     // tagName is an op call and the tag never changes, so cache the lowercased
     // localName. This keeps the new <a>/<area> href getters (which read
@@ -2956,12 +2964,16 @@ class Element extends Node {
   get style() { return this._style; }
   set style(v) { if (typeof v === "string") this._style.cssText = v; }
   getAttribute(n) {
-    // Fast path: HTML attributes are stored lowercase, so a direct hit needs no
-    // case folding. Only on a miss do we lowercase (gated) and retry, so the hot
-    // case (reading an existing lowercase attribute) pays zero scan.
-    let v = _domParse("get_attribute", this._nid, n);
-    if (v === null) { const ln = _htmlAttrName(this, n); if (ln !== n) v = _domParse("get_attribute", this._nid, ln); }
-    return v;
+    n = _htmlAttrName(this, n);
+    // Script-created elements start with a provably empty attribute set. Keep
+    // that small null-namespace map coherent through the ordinary mutation
+    // APIs so React's write-then-read reflection does not cross the bridge.
+    if (this._nullNamespaceAttrs instanceof Map) {
+      return this._nullNamespaceAttrs.has(n)
+        ? this._nullNamespaceAttrs.get(n)
+        : null;
+    }
+    return _domParse("get_attribute", this._nid, n);
   }
   setAttribute(n, v) {
     n = _htmlAttrName(this, n);
@@ -2971,6 +2983,9 @@ class Element extends Node {
       : null;
     const value = String(v);
     _dom("set_attribute", this._nid, n + "\0" + value);
+    if (this._nullNamespaceAttrs instanceof Map) {
+      this._nullNamespaceAttrs.set(n, value);
+    }
     if (n === "id" || (n === "name" && _windowNameEligibleElement(this))) {
       if (this.getRootNode() === globalThis.document) {
         _ensureWindowNamedProperty(value);
@@ -2999,6 +3014,10 @@ class Element extends Node {
     const value = String(v);
     _ns_validateQualifiedName(ns, n);
     _dom("set_attribute_ns", this._nid, ns + "\0" + n + "\0" + value);
+    // Namespace-aware writes can replace an attribute by namespace/local name
+    // while changing its qualified name. Fall back to native reads afterwards
+    // instead of maintaining a second, subtly different key space here.
+    this._nullNamespaceAttrs = null;
     if (ns === "" && n === "style") this._style._replaceFromAttribute(value);
   }
   removeAttribute(n) {
@@ -3008,6 +3027,9 @@ class Element extends Node {
       ? this.getAttribute(n)
       : null;
     _dom("remove_attribute", this._nid, n);
+    if (this._nullNamespaceAttrs instanceof Map) {
+      this._nullNamespaceAttrs.delete(n);
+    }
     if (previousWindowName
         && (n === "id" || (n === "name" && _windowNameEligibleElement(this)))) {
       _reconcileWindowNamedProperty(previousWindowName);
@@ -3029,6 +3051,7 @@ class Element extends Node {
     ns = String(ns == null ? "" : ns);
     n = String(n);
     _dom("remove_attribute_ns", this._nid, ns + "\0" + n);
+    this._nullNamespaceAttrs = null;
     if (ns === "" && n === "style") this._style._replaceFromAttribute("");
   }
   hasAttribute(n) { return this.getAttribute(n) !== null; }
@@ -4638,7 +4661,20 @@ class Document extends Node {
   }
   createElement(t) {
     const localName = String(t).toLowerCase();
-    const el = _wrapEl(+_dom("create_element", localName));
+    const nid = +_dom("create_element", localName);
+    const C = _elementClassForKnownName(
+      "http://www.w3.org/1999/xhtml",
+      localName,
+    );
+    const el = new C(nid);
+    // This node was just created from values already known to JS. Seed its
+    // immutable metadata instead of rediscovering it through native calls in
+    // hydration's tag/local-name checks.
+    el._tagName = localName.toUpperCase();
+    el._lname = localName;
+    el._ns = "http://www.w3.org/1999/xhtml";
+    el._nullNamespaceAttrs = new Map();
+    _cache.set(nid, el);
     if (el && localName === 'template') {
       el._templateContent = this.createDocumentFragment();
       el._templateContent._fragmentContext = 'template';
@@ -4649,16 +4685,36 @@ class Document extends Node {
   }
   createElementNS(ns, t) {
     const namespace = ns == null ? null : String(ns);
+    const qualified = String(t);
+    _ns_validateQualifiedName(namespace == null ? "" : namespace, qualified);
     if (namespace === "http://www.w3.org/1999/xhtml") {
-      const el = this.createElement(t);
+      const el = this.createElement(qualified);
       if (el) el._ns = namespace;
       return el;
     }
-    const el = _wrapEl(+_dom("create_element", String(t).toLowerCase()));
-    if (el) el._ns = ns;
+    const nid = +_dom(
+      "create_element_ns",
+      (namespace == null ? "" : namespace) + "\0" + qualified,
+    );
+    const effectiveNamespace = namespace == null ? "" : namespace;
+    const C = _elementClassForKnownName(effectiveNamespace, qualified);
+    const el = new C(nid);
+    const localName = qualified.includes(":")
+      ? qualified.slice(qualified.indexOf(":") + 1)
+      : qualified;
+    el._tagName = qualified;
+    el._lname = localName;
+    el._ns = effectiveNamespace;
+    el._nullNamespaceAttrs = new Map();
+    _cache.set(nid, el);
     return el;
   }
-  createTextNode(t) { return _wrap(+_dom("create_text_node", String(t))); }
+  createTextNode(t) {
+    const nid = +_dom("create_text_node", String(t));
+    const n = new Text(nid);
+    _cache.set(nid, n);
+    return n;
+  }
   createComment(t) {
     const nid = +_dom("create_comment_node", String(t ?? ""));
     const n = new Comment(nid);
@@ -5666,6 +5722,26 @@ function _elementClassFor(nid) {
   if (tag === "AUDIO") return HTMLAudioElement;
   if (tag === "VIDEO") return HTMLVideoElement;
   if (tag === "TRACK") return HTMLTrackElement;
+  return Element;
+}
+function _elementClassForKnownName(namespace, qualifiedName) {
+  const localName = qualifiedName.includes(":")
+    ? qualifiedName.slice(qualifiedName.indexOf(":") + 1)
+    : qualifiedName;
+  if (namespace === "http://www.w3.org/2000/svg") {
+    if (localName === "path" && globalThis.SVGPathElement) return globalThis.SVGPathElement;
+    if (localName === "svg" && globalThis.SVGSVGElement) return globalThis.SVGSVGElement;
+    if (globalThis.SVGElement) return globalThis.SVGElement;
+  }
+  if (namespace === "http://www.w3.org/1999/xhtml") {
+    const tag = localName.toUpperCase();
+    if (tag === "FORM" && globalThis.HTMLFormElement) return globalThis.HTMLFormElement;
+    if (tag === "IMG") return HTMLImageElement;
+    if (tag === "CANVAS" && globalThis.HTMLCanvasElement) return globalThis.HTMLCanvasElement;
+    if (tag === "AUDIO") return HTMLAudioElement;
+    if (tag === "VIDEO") return HTMLVideoElement;
+    if (tag === "TRACK") return HTMLTrackElement;
+  }
   return Element;
 }
 function _wrap(nid) {

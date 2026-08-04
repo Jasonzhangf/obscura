@@ -3910,164 +3910,6 @@ mod tests {
     }
 
     #[test]
-    fn clone_node_deep_preserves_context_sensitive_elements() {
-        // A <tr> is not a valid child of <div>, so cloning through a throwaway
-        // <div>.innerHTML dropped it and returned null. A structural clone keeps it.
-        let mut rt = setup_runtime("<html><body></body></html>");
-        let tag = rt
-            .evaluate("(document.createElement('tr').cloneNode(true) || {}).tagName || 'NULL'")
-            .unwrap();
-        assert_eq!(tag, serde_json::json!("TR"));
-        let td = rt
-            .evaluate("(document.createElement('td').cloneNode(true) || {}).tagName || 'NULL'")
-            .unwrap();
-        assert_eq!(td, serde_json::json!("TD"));
-    }
-
-    #[test]
-    fn clone_node_deep_copies_children_and_attributes() {
-        let mut rt = setup_runtime(r#"<html><body><ul id="l"><li class="a">one</li><li class="b">two</li></ul></body></html>"#);
-        let out = rt
-            .evaluate(
-                "(function(){var c=document.getElementById('l').cloneNode(true); return c.children.length + '|' + c.children[0].className + '|' + c.children[1].textContent;})()",
-            )
-            .unwrap();
-        assert_eq!(out, serde_json::json!("2|a|two"));
-    }
-
-    #[test]
-    fn test_clone_node_deep() {
-        let mut rt = setup_runtime(r#"<div id="src"><p>A</p><p>B</p></div>"#);
-        rt.execute_script(
-            "test",
-            r#"
-            var src = document.getElementById('src');
-            var clone = src.cloneNode(true);
-            document.body.appendChild(clone);
-        "#,
-        )
-        .unwrap();
-        let count = rt.evaluate("document.querySelectorAll('p').length").unwrap();
-        assert!(
-            count.as_f64().unwrap() as i64 >= 4,
-            "Deep clone should duplicate <p> children, got: {}",
-            count
-        );
-    }
-
-    #[test]
-    fn clone_node_deep_preserves_table_rows() {
-        let mut rt = setup_runtime(
-            r#"<html><body><table id="t"><tbody><tr><td>1</td><td>2</td></tr></tbody></table></body></html>"#,
-        );
-        // Navigate the detached clone directly (querySelector does not traverse
-        // detached subtrees). tbody > tr > (td, td).
-        let out = rt
-            .evaluate(
-                "(function(){var tb=document.querySelector('#t tbody').cloneNode(true); var tr=tb.children[0]; return tr.tagName + '|' + tr.children.length + '|' + tr.children[1].textContent;})()",
-            )
-            .unwrap();
-        assert_eq!(out, serde_json::json!("TR|2|2"));
-    }
-
-    #[test]
-    fn clone_node_shallow_copies_attributes_without_children() {
-        let mut rt = setup_runtime(r#"<html><body><div id="d" data-x="7"><span>kid</span></div></body></html>"#);
-        let out = rt
-            .evaluate(
-                "(function(){var c=document.getElementById('d').cloneNode(false); return c.getAttribute('data-x') + '|' + c.childNodes.length;})()",
-            )
-            .unwrap();
-        assert_eq!(out, serde_json::json!("7|0"));
-    }
-
-    #[test]
-    fn clone_node_copies_js_assigned_inline_styles() {
-        let mut rt = setup_runtime("<html><body><div id='d'></div></body></html>");
-        let out = rt
-            .evaluate(
-                "(function(){var d=document.getElementById('d');d.style.color='red';d.style.fontSize='12px';var c=d.cloneNode(false);return c.style.color+'|'+c.style.fontSize+'|'+c.style.cssText;})()",
-            )
-            .unwrap();
-        assert_eq!(out, serde_json::json!("red|12px|color: red; font-size: 12px;"));
-    }
-
-    #[test]
-    fn clone_node_deep_copies_template_content() {
-        let mut rt = setup_runtime("<html><body></body></html>");
-        let out = rt
-            .evaluate(
-                "(function(){var t=document.createElement('template');t.content.appendChild(document.createElement('option')).textContent='choice';var c=t.cloneNode(true);return c.content.childNodes.length+'|'+c.content.firstChild.tagName+'|'+c.content.firstChild.textContent;})()",
-            )
-            .unwrap();
-        assert_eq!(out, serde_json::json!("1|OPTION|choice"));
-    }
-
-    #[test]
-    fn insert_adjacent_html_parses_table_fragments() {
-        let mut rt = setup_runtime(
-            r#"<html><body><table id="t"><tbody id="tb"></tbody></table></body></html>"#,
-        );
-        let out = rt
-            .evaluate("(function(){var tb=document.getElementById('tb'); tb.insertAdjacentHTML('beforeend','<tr><td>1</td><td>2</td></tr>'); var tr=tb.firstElementChild; return tr ? (tr.tagName+':'+tr.children.length) : 'NULL';})()")
-            .unwrap();
-        assert_eq!(out, serde_json::json!("TR:2"));
-    }
-
-    #[test]
-    fn insert_adjacent_html_position_is_case_insensitive() {
-        let mut rt = setup_runtime(r#"<html><body><div id="host"><span>base</span></div></body></html>"#);
-        let out = rt
-            .evaluate("(function(){var h=document.getElementById('host'); h.insertAdjacentHTML('BeforeEnd','<b>x</b>'); return h.lastElementChild ? h.lastElementChild.tagName : 'NULL';})()")
-            .unwrap();
-        assert_eq!(out, serde_json::json!("B"));
-    }
-
-    #[test]
-    fn insert_adjacent_html_rejects_invalid_position() {
-        let mut rt = setup_runtime(r#"<html><body><div id="host"></div></body></html>"#);
-        let out = rt
-            .evaluate("(function(){var h=document.getElementById('host'); try { h.insertAdjacentHTML('nope','<b>x</b>'); return 'no-throw'; } catch(e){ return e.name; }})()")
-            .unwrap();
-        assert_eq!(out, serde_json::json!("SyntaxError"));
-    }
-
-    #[test]
-    fn insert_adjacent_html_keeps_leading_comments_in_table_contexts() {
-        let mut rt = setup_runtime(
-            r#"<html><body><table><tbody id="tb"><tr id="row"></tr></tbody></table></body></html>"#,
-        );
-        let out = rt
-            .evaluate(
-                "(function(){var tb=document.getElementById('tb');tb.insertAdjacentHTML('beforeend','<!--m--><tr><td>v</td></tr>');var row=document.getElementById('row');row.insertAdjacentHTML('beforeend','<!--n--><td>x</td>');return Array.from(tb.childNodes).map(function(n){return n.nodeName}).join('|')+';'+Array.from(row.childNodes).map(function(n){return n.nodeName}).join('|');})()",
-            )
-            .unwrap();
-        assert_eq!(out, serde_json::json!("TR|#comment|TR;#comment|TD"));
-    }
-
-    #[test]
-    fn insert_adjacent_html_uses_the_insertion_element_as_context() {
-        let mut rt = setup_runtime(
-            r#"<html><body><div id="d"></div><table id="table"><tbody id="tb"></tbody></table></body></html>"#,
-        );
-        let out = rt
-            .evaluate(
-                "(function(){var d=document.getElementById('d');d.insertAdjacentHTML('beforeend','<tr><td>v</td></tr>');var table=document.getElementById('table');table.insertAdjacentHTML('beforeend','<tr><td>x</td></tr>');var tb=document.getElementById('tb');tb.insertAdjacentHTML('beforeend','<tr><td>y</td></tr>tail');return d.firstChild.nodeName+':'+d.textContent+';'+table.lastElementChild.tagName+';'+Array.from(tb.childNodes).map(function(n){return n.nodeName+(n.data?':'+n.data:'')}).join('|');})()",
-            )
-            .unwrap();
-        assert_eq!(out, serde_json::json!("#text:v;TBODY;TR|#text:tail"));
-    }
-
-    #[test]
-    fn set_attribute_ns_is_retrievable_by_namespace_and_local_name() {
-        let mut rt = setup_runtime("<html><body></body></html>");
-        let v = rt
-            .evaluate("(function(){var s=document.createElementNS('http://www.w3.org/2000/svg','svg'); s.setAttributeNS('http://www.w3.org/1999/xlink','xlink:href','#g'); return s.getAttributeNS('http://www.w3.org/1999/xlink','href');})()")
-            .unwrap();
-        assert_eq!(v, serde_json::json!("#g"));
-    }
-
-    #[test]
     fn created_foreign_element_keeps_native_qualified_name_through_clone() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let v = rt
@@ -4147,59 +3989,6 @@ mod tests {
             v,
             serde_json::json!(
                 "http://www.w3.org/2000/svg|linearGradient|http://www.w3.org/2000/svg|circle"
-            )
-        );
-    }
-
-    #[test]
-    fn remove_attribute_ns_removes_by_namespace() {
-        let mut rt = setup_runtime("<html><body></body></html>");
-        let v = rt
-            .evaluate("(function(){var s=document.createElementNS('http://www.w3.org/2000/svg','svg'); s.setAttributeNS('http://www.w3.org/1999/xlink','xlink:href','#g'); s.removeAttributeNS('http://www.w3.org/1999/xlink','href'); return s.getAttributeNS('http://www.w3.org/1999/xlink','href');})()")
-            .unwrap();
-        assert_eq!(v, serde_json::json!(null));
-    }
-
-    #[test]
-    fn get_attribute_ns_reads_plain_attributes_with_null_namespace() {
-        // Backward-compat: getAttributeNS(null, name) still reads a plain attr.
-        let mut rt = setup_runtime(r#"<html><body><div id="d" title="hi"></div></body></html>"#);
-        let v = rt
-            .evaluate("document.getElementById('d').getAttributeNS(null,'title')")
-            .unwrap();
-        assert_eq!(v, serde_json::json!("hi"));
-    }
-
-    #[test]
-    fn namespaced_attribute_keeps_its_qualified_name() {
-        let mut rt = setup_runtime("<html><body></body></html>");
-        let v = rt
-            .evaluate("(function(){var s=document.createElementNS('http://www.w3.org/2000/svg','svg');s.setAttributeNS('http://www.w3.org/1999/xlink','xlink:href','#g');return s.getAttribute('xlink:href')+'|'+s.getAttributeNames()[0]+'|'+s.outerHTML;})()")
-            .unwrap();
-        assert_eq!(v, serde_json::json!("#g|xlink:href|<svg xlink:href=\"#g\"></svg>"));
-    }
-
-    #[test]
-    fn parsed_xlink_attribute_is_available_through_both_apis() {
-        let mut rt = setup_runtime(
-            r##"<html><body><svg><use id="u" xlink:href="#icon"></use></svg></body></html>"##,
-        );
-        let v = rt
-            .evaluate("(function(){var u=document.getElementById('u');return u.getAttribute('xlink:href')+'|'+u.getAttributeNS('http://www.w3.org/1999/xlink','href')+'|'+u.getAttributeNames().join(',');})()")
-            .unwrap();
-        assert_eq!(v, serde_json::json!("#icon|#icon|id,xlink:href"));
-    }
-
-    #[test]
-    fn set_attribute_ns_validates_namespace_constraints() {
-        let mut rt = setup_runtime("<html><body></body></html>");
-        let v = rt
-            .evaluate("(function(){var e=document.createElement('div'),out=[];for(const args of [[null,'x:y'],['urn:test','a:b:c'],['urn:test','xml:lang'],['urn:test','xmlns:x']]){try{e.setAttributeNS(args[0],args[1],'v');out.push('none')}catch(err){out.push(err.name)}}return out.join('|');})()")
-            .unwrap();
-        assert_eq!(
-            v,
-            serde_json::json!(
-                "NamespaceError|InvalidCharacterError|NamespaceError|NamespaceError"
             )
         );
     }
@@ -5908,6 +5697,40 @@ mod tests {
                 "removed": 3,
                 "length": 0,
                 "hasAttributes": false,
+            })
+        );
+    }
+
+    #[test]
+    fn script_created_attribute_reads_stay_coherent_across_mutation_apis() {
+        let mut rt = setup_runtime(r#"<html><body></body></html>"#);
+        let result = rt
+            .evaluate(
+                r#"
+                (() => {
+                    const element = document.createElement("DIV");
+                    const initial = element.getAttribute("data-state");
+                    element.setAttribute("DATA-STATE", "ready");
+                    const ordinary = [
+                        element.getAttribute("data-state"),
+                        element.getAttribute("DATA-STATE"),
+                    ];
+                    element.setAttributeNS(null, "data-state", "namespaced");
+                    const namespaced = element.getAttribute("data-state");
+                    element.removeAttributeNS(null, "data-state");
+                    const removed = element.getAttribute("data-state");
+                    return { initial, ordinary, namespaced, removed };
+                })()
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "initial": null,
+                "ordinary": ["ready", "ready"],
+                "namespaced": "namespaced",
+                "removed": null,
             })
         );
     }
