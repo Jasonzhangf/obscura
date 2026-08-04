@@ -1725,24 +1725,73 @@ impl ObscuraJsRuntime {
     }
 
     /// Drive the event loop for at most `budget_ms`, bounded against BOTH async
-    /// idle (tokio timeout) and synchronous hangs (V8 watchdog). A microtask
-    /// storm that pins the thread is terminated ~500ms past the budget; a
-    /// well-behaved page returns as soon as the loop goes idle.
+    /// idle (Tokio deadline) and synchronous hangs (V8 watchdog). The deadline
+    /// is observed between browser tasks; a task already running there gets a
+    /// five-second completion allowance plus a 500ms scheduling margin before
+    /// the watchdog terminates it. A well-behaved page returns as soon as the
+    /// loop goes idle.
     pub async fn run_event_loop_bounded(&mut self, budget_ms: u64) -> Result<(), String> {
         if budget_ms == 0 {
             return self.run_event_loop().await;
         }
         let budget = std::time::Duration::from_millis(budget_ms);
-        let token = self.arm_watchdog(budget + std::time::Duration::from_millis(500));
-        let result = tokio::time::timeout(budget, self.run_event_loop()).await;
-        self.disarm_watchdog(token);
+        let deadline = tokio::time::Instant::now() + budget;
+        // A capture/readiness deadline is observed only between browser tasks.
+        // Chromium does not terminate the JavaScript task which happens to be
+        // active when a screenshot delay expires; the capture waits for that
+        // task boundary. Keep a separate long-task floor so short compositor
+        // slices and explicit waits do not kill legitimate framework work,
+        // while an actually unyielding task remains bounded.
+        const SYNCHRONOUS_TASK_FLOOR_MS: u64 = 5_000;
+        // One watchdog for the complete pump avoids spawning a native thread
+        // per cooperative task. Adding the floor after the observation budget
+        // guarantees that even a task beginning just before `deadline` gets
+        // the same bounded completion allowance.
+        let synchronous_budget = budget
+            .saturating_add(std::time::Duration::from_millis(SYNCHRONOUS_TASK_FLOOR_MS));
+        let token =
+            self.arm_watchdog(synchronous_budget + std::time::Duration::from_millis(500));
+        let result = loop {
+            if tokio::time::Instant::now() >= deadline {
+                break Ok(());
+            }
+
+            match tokio::time::timeout_at(deadline, self.run_cooperative_event_loop_tick()).await {
+                Ok(Ok(true)) => break Ok(()),
+                Ok(Ok(false)) => {
+                    // End-of-task microtasks belong to this turn, but work
+                    // queued from them belongs to a subsequent cooperative
+                    // turn. Yield so the wall deadline remains observable even
+                    // when every turn immediately schedules another one.
+                    self.runtime.v8_isolate().perform_microtask_checkpoint();
+                    tokio::task::yield_now().await;
+                }
+                Ok(Err(error)) => break Err(error),
+                Err(_) => break Ok(()),
+            }
+        };
+        let fired = self.disarm_watchdog(token);
         match result {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) if e.contains("execution terminated") => Ok(()),
-            Ok(Err(e)) => Err(e),
-            // tokio idle-timeout is the normal "settled" exit, not an error.
-            Err(_) => Ok(()),
+            Err(error) if fired || error.contains("execution terminated") => Ok(()),
+            other => other,
         }
+    }
+
+    /// Drive page tasks for a fixed observation interval without asking
+    /// deno_core's run-to-idle future to own that entire interval.
+    ///
+    /// Modern schedulers commonly keep the event loop continuously ready with
+    /// animation frames, zero-delay tasks, or streaming work. A single
+    /// `run_event_loop()` poll then never yields to Tokio, so the fixed-delay
+    /// deadline can only be enforced by terminating otherwise valid page JS.
+    /// Cooperative turns preserve the requested wall interval while returning
+    /// to the embedder between task-queue wakes. The watchdog remains solely as
+    /// a backstop for one genuinely synchronous, unyielding turn.
+    pub async fn run_event_loop_for_duration(&mut self, budget_ms: u64) -> Result<(), String> {
+        if budget_ms == 0 {
+            return Ok(());
+        }
+        self.run_event_loop_bounded(budget_ms).await
     }
 
     /// Drive one deno_core event-loop tick at a time. When the first tick
@@ -4692,6 +4741,72 @@ mod tests {
         assert!(
             started.elapsed() < std::time::Duration::from_millis(400),
             "a future analytics interval must not consume the full settle budget"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fixed_duration_event_loop_yields_from_continuously_ready_tasks() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "fixed-duration-continuously-ready",
+            "globalThis.__fixedTicks = 0;\
+             setInterval(() => { __fixedTicks++; }, 0);",
+        )
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        rt.run_event_loop_bounded(40).await.unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_millis(300),
+            "a continuously-ready queue must return between tasks instead of waiting for the watchdog: {elapsed:?}",
+        );
+        assert!(
+            rt.evaluate("globalThis.__fixedTicks > 0")
+                .unwrap()
+                .as_bool()
+                .unwrap_or(false),
+            "the cooperative fixed wait must still execute queued tasks",
+        );
+        assert_eq!(
+            rt.evaluate(
+                "(document.body.setAttribute('data-after-fixed-wait', 'usable'), \
+                 document.body.getAttribute('data-after-fixed-wait'))",
+            )
+            .unwrap(),
+            serde_json::json!("usable"),
+            "the isolate must remain usable after the fixed wait",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn short_observation_deadline_does_not_terminate_the_active_task() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "task-crossing-observation-deadline",
+            "globalThis.__longTaskCompleted = false;\
+             setTimeout(() => {\
+               const end = performance.now() + 600;\
+               while (performance.now() < end) {}\
+               __longTaskCompleted = true;\
+             }, 0);",
+        )
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        rt.run_event_loop_bounded(20).await.unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= std::time::Duration::from_millis(500)
+                && elapsed < std::time::Duration::from_millis(1_500),
+            "capture must wait for the active task boundary without becoming unbounded: {elapsed:?}",
+        );
+        assert_eq!(
+            rt.evaluate("globalThis.__longTaskCompleted").unwrap(),
+            serde_json::json!(true),
+            "a screenshot/readiness deadline must not terminate valid page work",
         );
     }
 
