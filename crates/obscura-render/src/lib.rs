@@ -861,6 +861,12 @@ pub struct LayoutStyle {
     /// SVG can expose only one dimension or a `viewBox` ratio, distinctions
     /// that the stable public `intrinsic_size` tuple cannot represent.
     pub(crate) replaced_intrinsic: Option<ReplacedIntrinsic>,
+    /// Definite content-box width available to an auto/auto ratio-only
+    /// replaced element in ordinary block flow. Taffy's flex-row stand-in for
+    /// an inline formatting context asks atomic children for max-content first,
+    /// so its measure callback otherwise never sees the definite line width
+    /// that CSS replaced sizing uses for this special case.
+    pub(crate) ratio_only_available_width: Option<f32>,
     /// The current ratio came from HTML width/height presentation hints
     /// (`<img>` or its selected `<picture><source>`), rather than authored
     /// CSS. A decoded image's natural ratio replaces this provisional ratio.

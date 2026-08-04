@@ -5317,6 +5317,33 @@ fn layout_dom_once(
         // subtree (nextjs.org's nav stretched to a full 688px, burying the
         // hero), so it is gone.
 
+        // Capture the definite containing width for ratio-only auto/auto
+        // replaced boxes before installing their metadata. The inline layout
+        // stand-in asks atomic items for max-content before its own percentage
+        // width becomes definite; Gecko instead resolves this case directly
+        // from the containing block's content width.
+        let ratio_only_available_widths: HashMap<NodeId, f32> = intrinsic
+            .iter()
+            .filter_map(|(&nid, metadata)| {
+                let style = styles.get(&nid)?;
+                (metadata.width.is_none()
+                    && metadata.height.is_none()
+                    && metadata.ratio.is_some()
+                    && style.width == crate::Dimension::Auto
+                    && style.height == crate::Dimension::Auto)
+                    .then(|| {
+                        reliable_ratio_only_available_width(
+                            tree,
+                            nid,
+                            &styles,
+                            initial_cb_width,
+                        )
+                        .map(|width| (nid, width))
+                    })
+                    .flatten()
+            })
+            .collect();
+
         // Apply fetched intrinsic image sizes. A replaced element with no
         // explicit dimensions must size from its intrinsic pixels (else it is
         // 0x0 and never paints); with one dimension given, the aspect ratio
@@ -5329,6 +5356,7 @@ fn layout_dom_once(
             if let Some(s) = styles.get_mut(&nid) {
                 s.intrinsic_size = metadata.natural_size();
                 s.replaced_intrinsic = Some(metadata);
+                s.ratio_only_available_width = ratio_only_available_widths.get(&nid).copied();
                 if (s.aspect_ratio.is_none() || s.aspect_ratio_is_mapped)
                     && metadata.ratio.is_some()
                 {
@@ -8620,6 +8648,7 @@ fn is_flattenable_inline(
     };
     style.display == crate::Display::Inline
         && !style.is_inline_block
+        && !style.is_replaced_box
         && style.before_pseudo.is_none()
         && style.after_pseudo.is_none()
         && style.background_color.is_none()
@@ -9217,6 +9246,152 @@ fn reliable_normal_flow_content_width(
         content_width = content_width.min(maximum);
     }
     Some(content_width.max(0.0))
+}
+
+/// Resolve an authored definite width even when the box's placement is owned
+/// by float or positioned layout. A pixel width is independent of placement;
+/// a percentage is definite only when the containing block can itself be
+/// resolved without layout. Auto widths and functional size expressions stay
+/// on the ordinary Taffy path.
+fn reliable_declared_content_width(
+    tree: &DomTree,
+    id: NodeId,
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+    initial_cb_width: f32,
+    depth: usize,
+) -> Option<f32> {
+    if depth > 4096 {
+        return None;
+    }
+    let style = styles.get(&id)?;
+    if style.width_fit_content
+        || style.size_expressions[0].is_some()
+        || style.size_expressions[2].is_some()
+        || style.size_expressions[4].is_some()
+    {
+        return None;
+    }
+
+    let needs_containing_width = matches!(
+        style.width,
+        crate::Dimension::Percent(_)
+    ) || matches!(style.min_width, crate::Dimension::Percent(_))
+        || matches!(style.max_width, crate::Dimension::Percent(_));
+    let containing_width = needs_containing_width.then(|| {
+        let mut parent = tree.get_node(id).and_then(|node| node.parent);
+        while parent.is_some_and(|parent_id| {
+            styles
+                .get(&parent_id)
+                .is_some_and(|parent_style| parent_style.display_contents)
+        }) {
+            parent = parent
+                .and_then(|parent_id| tree.get_node(parent_id).and_then(|node| node.parent));
+        }
+        if let Some(parent_id) = parent {
+            reliable_normal_flow_content_width(
+                tree,
+                parent_id,
+                styles,
+                initial_cb_width,
+                depth + 1,
+            )
+            .or_else(|| {
+                reliable_declared_content_width(
+                    tree,
+                    parent_id,
+                    styles,
+                    initial_cb_width,
+                    depth + 1,
+                )
+            })
+        } else {
+            Some(initial_cb_width)
+        }
+    });
+    let containing_width = match containing_width {
+        Some(Some(width)) => Some(width),
+        Some(None) => return None,
+        None => None,
+    };
+
+    let horizontal_edges =
+        style.padding.left + style.padding.right + style.border.left + style.border.right;
+    let declared_content = |dimension: crate::Dimension| match dimension {
+        crate::Dimension::Px(value) => Some(if style.box_sizing == crate::BoxSizing::ContentBox {
+            value
+        } else {
+            (value - horizontal_edges).max(0.0)
+        }),
+        crate::Dimension::Percent(percent) => {
+            let value = containing_width? * percent;
+            Some(if style.box_sizing == crate::BoxSizing::ContentBox {
+                value
+            } else {
+                (value - horizontal_edges).max(0.0)
+            })
+        }
+        _ => None,
+    };
+    let mut content_width = declared_content(style.width)?;
+    if let Some(minimum) = declared_content(style.min_width) {
+        content_width = content_width.max(minimum);
+    }
+    if let Some(maximum) = declared_content(style.max_width) {
+        content_width = content_width.min(maximum);
+    }
+    Some(content_width.max(0.0))
+}
+
+/// Resolve the containing-block content width used by CSS's ratio-only
+/// auto/auto replaced sizing branch. Decoration-free inline ancestors do not
+/// establish containing blocks, so skip them (and display:contents) before
+/// using the existing conservative ordinary-flow width resolver. A definite
+/// authored width is also safe for floated or positioned containing boxes;
+/// their auto-sized allocations still return `None` and remain layout-owned.
+fn reliable_ratio_only_available_width(
+    tree: &DomTree,
+    id: NodeId,
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+    initial_cb_width: f32,
+) -> Option<f32> {
+    let image = styles.get(&id)?;
+    let mut parent = tree.get_node(id).and_then(|node| node.parent);
+    while let Some(parent_id) = parent {
+        let Some(parent_style) = styles.get(&parent_id) else {
+            parent = tree
+                .get_node(parent_id)
+                .and_then(|node| node.parent);
+            continue;
+        };
+        if parent_style.display_contents
+            || (parent_style.display == crate::Display::Inline
+                && !parent_style.is_inline_block)
+        {
+            parent = tree
+                .get_node(parent_id)
+                .and_then(|node| node.parent);
+            continue;
+        }
+        break;
+    }
+
+    let containing_width = if let Some(parent_id) = parent {
+        reliable_normal_flow_content_width(tree, parent_id, styles, initial_cb_width, 0)
+            .or_else(|| {
+                reliable_declared_content_width(tree, parent_id, styles, initial_cb_width, 0)
+            })?
+    } else {
+        initial_cb_width
+    };
+    let horizontal_edges =
+        image.padding.left + image.padding.right + image.border.left + image.border.right;
+    Some(
+        (containing_width
+            - image.margin.left
+            - image.margin.right
+            - horizontal_edges)
+            .max(0.0),
+    )
 }
 
 fn reliable_table_available_width(

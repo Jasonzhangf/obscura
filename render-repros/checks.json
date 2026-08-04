@@ -279,6 +279,13 @@
     {"name": "text alignment leaves the block frame at available width", "color": "#1971c2", "x": 450, "y": 0, "width": 450, "height": 304},
     {"name": "auto block wrapper contains its percentage image", "color": "#c2255c", "x": 498, "y": 48, "width": 354, "height": 208}
   ],
+  "ratio-only-inline-images": [
+    {"name": "native image stretch-fits its definite line width", "color": "#087f5b", "x": 0, "y": 0, "width": 280, "height": 280},
+    {"name": "inline anchor preserves ratio-only replaced sizing", "color": "#1971c2", "x": 300, "y": 0, "width": 280, "height": 280},
+    {"name": "authored inline image remains an atomic replaced box", "color": "#862e9c", "x": 600, "y": 0, "width": 280, "height": 280},
+    {"name": "authored block image uses the same ratio-only branch", "color": "#e8590c", "x": 0, "y": 300, "width": 280, "height": 280},
+    {"name": "authored inline-block image keeps replaced sizing", "color": "#c2255c", "x": 300, "y": 300, "width": 280, "height": 280}
+  ],
   "right-float-navigation": [
     {"name": "first inline item stays at band start", "color": "#087f5b", "x": 0, "y": 0, "width": 60, "height": 30},
     {"name": "second inline item keeps source order", "color": "#1971c2", "x": 64, "y": 0, "width": 80, "height": 30},

@@ -1146,6 +1146,7 @@ impl PreparedRender {
                 (crate::Display::Block, true) => "inline-block",
                 (crate::Display::Flex, false) => "flex",
                 (crate::Display::Grid, false) => "grid",
+                (crate::Display::Inline, true) => "inline-block",
                 (crate::Display::Inline, false) => "inline",
                 _ => "block",
             }
@@ -9699,6 +9700,83 @@ mod tests {
         assert_eq!((ratio.width, ratio.height), (360.0, 180.0));
         let explicit = rect("#explicit");
         assert_eq!((explicit.width, explicit.height), (120.0, 80.0));
+    }
+
+    #[test]
+    fn ratio_only_inline_images_stretch_fit_the_definite_line_width() {
+        let source = "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%20576%20576'%3E%3Crect%20width='576'%20height='576'%20fill='%23ff80ab'/%3E%3C/svg%3E";
+        let raster = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAADCAYAAAC56t6BAAAAFklEQVR4nGP8z8Dwn4GBgYGJAQrgDAAxOwIE7x6DkQAAAABJRU5ErkJggg==";
+        let tree = parse_html(&format!(
+            r#"<html><head><style>
+                html,body {{ margin:0 }}
+                .case {{ width:370px; line-height:0 }}
+                #authored-inline {{ display:inline }}
+                #authored-block {{ display:block }}
+                #authored-inline-block {{ display:inline-block }}
+                #positioned {{ position:absolute; left:0; top:1900px; width:340px;
+                    min-width:360px; max-width:380px; box-sizing:border-box;
+                    padding:10px; border:10px solid transparent }}
+                #float-row {{ width:500px }}
+                #float-column {{ float:left; width:40%; box-sizing:border-box;
+                    padding-left:10px; padding-right:10px }}
+            </style></head><body>
+                <div class="case"><img id="direct" src="{source}"></div>
+                <div class="case"><a><img id="anchored" src="{source}"></a></div>
+                <div class="case"><img id="authored-inline" src="{source}"></div>
+                <div class="case"><img id="authored-block" src="{source}"></div>
+                <div class="case"><img id="authored-inline-block" src="{source}"></div>
+                <div class="case"><img id="intrinsic-raster" src="{raster}"></div>
+                <div id="positioned"><img id="positioned-image" src="{source}"></div>
+                <div id="float-row"><div id="float-column"><img id="float-image" src="{source}"></div></div>
+            </body></html>"#
+        ));
+        let mut resources = RenderResourceCache::default();
+        let prepared =
+            prepare_dom(&tree, (500.0, 2400.0), None, &mut resources).expect("image matrix");
+        let node = |selector| tree.query_selector(selector).unwrap().unwrap();
+        let rect = |selector| prepared.layout.rects[&node(selector)];
+
+        for selector in [
+            "#direct",
+            "#anchored",
+            "#authored-inline",
+            "#authored-block",
+            "#authored-inline-block",
+        ] {
+            let image = rect(selector);
+            assert_eq!(
+                (image.width, image.height),
+                (370.0, 370.0),
+                "ratio-only auto/auto sizing for {selector}: {image:?}"
+            );
+        }
+        assert_eq!(
+            (rect("#intrinsic-raster").width, rect("#intrinsic-raster").height),
+            (2.0, 3.0),
+            "a decoded image with real intrinsic axes must not stretch-fit"
+        );
+        assert_eq!(
+            (rect("#positioned-image").width, rect("#positioned-image").height),
+            (320.0, 320.0),
+            "a definite positioned border-box honors edges and min/max widths"
+        );
+        assert_eq!(
+            (rect("#float-image").width, rect("#float-image").height),
+            (180.0, 180.0),
+            "a floated percentage column resolves against its reliable containing width"
+        );
+
+        let display = |selector| {
+            prepared
+                .computed_style(node(selector))
+                .unwrap()["display"]
+                .clone()
+        };
+        assert_eq!(display("#direct"), "inline");
+        assert_eq!(display("#anchored"), "inline");
+        assert_eq!(display("#authored-inline"), "inline");
+        assert_eq!(display("#authored-block"), "block");
+        assert_eq!(display("#authored-inline-block"), "inline-block");
     }
 
     #[test]

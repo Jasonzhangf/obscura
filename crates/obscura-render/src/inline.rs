@@ -745,6 +745,10 @@ struct ReplacedItem {
     /// CSS replaced sizing stretch-fits this case to a definite available
     /// inline size instead of using the 300x150 default-object contribution.
     ratio_only: bool,
+    /// Definite normal-flow containing width captured before Taffy's intrinsic
+    /// flex-item contribution pass. Only populated for ratio-only auto/auto
+    /// replaced boxes; decoded raster dimensions never use it.
+    ratio_only_available_width: Option<f32>,
     /// CSS Sizing's cyclic-percentage rule makes a proper replaced element's
     /// inline min-content contribution zero when its preferred or maximum
     /// inline size contains a percentage. The natural size still participates
@@ -801,6 +805,7 @@ impl ReplacedItem {
             ratio_only: intrinsic.width.is_none()
                 && intrinsic.height.is_none()
                 && explicit_ratio.is_some(),
+            ratio_only_available_width: style.ratio_only_available_width,
             zero_inline_min_content: matches!(style.width, Dimension::Percent(_))
                 || matches!(style.max_width, Dimension::Percent(_))
                 || expression_has_percentage(0)
@@ -1541,9 +1546,11 @@ impl TextEngine {
                 && replaced.preferred_width.is_none()
                 && replaced.preferred_height.is_none()
                 && known.width.is_none())
-            .then(|| match available.width {
-                taffy::AvailableSpace::Definite(width) => Some(width.max(0.0)),
-                _ => None,
+            .then(|| {
+                match available.width {
+                    taffy::AvailableSpace::Definite(width) => Some(width.max(0.0)),
+                    _ => replaced.ratio_only_available_width,
+                }
             })
             .flatten();
             let mut size = replaced.size(taffy::Size {

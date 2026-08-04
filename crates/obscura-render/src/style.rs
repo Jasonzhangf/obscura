@@ -287,15 +287,14 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
             style.font_weight = Some("bold".to_string());
         }
     } else if tag == "img" {
-        // Images are inline-level replaced elements by default. Model the
-        // atomic inner box with the same inline-block marker used by native
-        // controls, so an icon between text fragments participates in their
-        // line instead of splitting the parent into block runs. Chromium's UA
-        // sheet does not impose a responsive max-width: author/reset CSS must
-        // opt into that. A synthetic `max-width:100%` here distorts deliberately
-        // oversized art whose height and intrinsic ratio establish its width.
+        // Images are inline-level replaced elements by default. Replacement
+        // already makes the box atomic; `is_inline_block` is reserved for an
+        // authored inline-block outer display and native controls. Chromium's
+        // UA sheet does not impose a responsive max-width: author/reset CSS
+        // must opt into that. A synthetic `max-width:100%` here distorts
+        // deliberately oversized art whose height and intrinsic ratio
+        // establish its width.
         style.display = Display::Inline;
-        style.is_inline_block = true;
     }
     style
 }
@@ -8934,7 +8933,7 @@ mod tests {
 
         let native_image = compute_style("img", None);
         assert_eq!(native_image.display, Display::Inline);
-        assert!(native_image.is_inline_block);
+        assert!(!native_image.is_inline_block);
 
         let block_image = compute_style("img", Some("display:block"));
         assert_eq!(block_image.display, Display::Block);
@@ -8990,7 +8989,7 @@ mod tests {
     fn image_ua_style_does_not_invent_a_responsive_size_cap() {
         let image = ua_style("img");
         assert_eq!(image.display, crate::Display::Inline);
-        assert!(image.is_inline_block);
+        assert!(!image.is_inline_block);
         assert_eq!(image.max_width, crate::Dimension::Auto);
 
         let authored = compute_style("img", Some("max-width:100%"));
