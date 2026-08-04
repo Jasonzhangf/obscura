@@ -2255,7 +2255,26 @@ fn cascade_walk(
             .get_attribute("class")
             .map(|c| c.split_whitespace().map(|s| s.to_string()).collect())
             .unwrap_or_default();
-        let effective_props = if let Some(evaluator) = container_evaluator.as_deref_mut() {
+        let shadow_host_sheet = tree
+            .shadow_root(id)
+            .and_then(|root| shadow_sheets.get(&root));
+        let effective_props = if let Some(shadow_host_sheet) = shadow_host_sheet {
+            sheet.apply_with_shadow_host_at_animation_time(
+                shadow_host_sheet,
+                tree,
+                matcher,
+                id,
+                node_id,
+                &classes,
+                elem.local.as_ref(),
+                &mut style,
+                parent_props,
+                node.get_attribute("style"),
+                container_evaluator.as_deref_mut(),
+                animation_sample,
+                animation_timeline,
+            )
+        } else if let Some(evaluator) = container_evaluator.as_deref_mut() {
             sheet.apply_with_container_queries_at_animation_time(
                 tree,
                 matcher,
@@ -13950,7 +13969,7 @@ mod tests {
         assert_eq!(light_style.width, crate::Dimension::Px(123.0));
         assert_eq!(light_style.height, crate::Dimension::Px(9.0));
         assert_eq!(light_style.padding.left, 13.0);
-        assert_eq!(light_style.margin.left, 0.0);
+        assert_eq!(light_style.margin.left, 99.0);
         assert_eq!(first_style.width, crate::Dimension::Px(41.0));
         assert_eq!(first_style.height, crate::Dimension::Px(23.0));
         assert_eq!(first_style.padding.left, 0.0);
@@ -13959,6 +13978,81 @@ mod tests {
         assert_eq!(second_style.width, crate::Dimension::Px(67.0));
         assert_eq!(second_style.height, crate::Dimension::Px(31.0));
         assert_eq!(second_style.margin.left, 0.0);
+    }
+
+    #[test]
+    fn shadow_host_rules_match_in_scope_and_follow_encapsulation_cascade_order() {
+        let tree = parse_html(
+            r#"<style>
+                 x-one { width:110px; --normal-size:66px; height:var(--normal-size) }
+                 x-one { margin-left:8px !important; padding-left:9px !important; --critical:7px !important }
+               </style>
+               <x-one id="host-one" class="active" style="margin-left:11px !important"></x-one>
+               <x-two id="host-two"></x-two>
+               <div id="source-one">
+                 <style>
+                   :host { display:block; width:40px; --normal-size:22px }
+                   :host(.active) { margin-left:31px !important; padding-left:var(--critical) !important; --critical:17px !important }
+                   :host([hidden]) { border-left-width:19px }
+                   .active { border-right-width:23px }
+                 </style>
+                 <div style="height:5px"></div>
+               </div>
+               <div id="source-two">
+                 <style>:host { display:block; width:55px }</style>
+                 <div style="height:7px"></div>
+               </div>"#,
+        );
+        let host_one = tree.get_element_by_id("host-one").unwrap();
+        let host_two = tree.get_element_by_id("host-two").unwrap();
+        let source_one = tree.get_element_by_id("source-one").unwrap();
+        let source_two = tree.get_element_by_id("source-two").unwrap();
+        attach_programmatic_shadow(&tree, host_one, source_one);
+        attach_programmatic_shadow(&tree, host_two, source_two);
+
+        let laid = layout_dom(&tree, (400.0, 300.0));
+        let first = &laid.styles[&host_one];
+        let second = &laid.styles[&host_two];
+
+        assert_eq!(
+            first.display,
+            crate::Display::Block,
+            ":host supplies geometry"
+        );
+        assert_eq!(
+            first.width,
+            crate::Dimension::Px(110.0),
+            "outer normal wins"
+        );
+        assert_eq!(
+            first.height,
+            crate::Dimension::Px(66.0),
+            "outer custom property wins"
+        );
+        assert_eq!(
+            first.margin.left, 31.0,
+            "inner important beats inline important"
+        );
+        assert_eq!(
+            first.padding.left, 17.0,
+            "inner important custom property wins"
+        );
+        assert_eq!(
+            first.border.left, 0.0,
+            "non-matching :host argument is isolated"
+        );
+        assert_eq!(
+            first.border.right, 0.0,
+            "ordinary shadow selector cannot style host"
+        );
+        assert_eq!(
+            laid.rects[&host_one].width, 127.0,
+            "content width plus host padding"
+        );
+
+        assert_eq!(second.width, crate::Dimension::Px(55.0));
+        assert_eq!(second.height, crate::Dimension::Auto);
+        assert_eq!(second.margin.left, 0.0, "first shadow root cannot leak");
     }
 
     #[test]

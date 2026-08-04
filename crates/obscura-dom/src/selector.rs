@@ -206,6 +206,13 @@ impl<'i> parser::Parser<'i> for ObscuraSelectorParser {
         true
     }
 
+    // `:host` is parsed by the selectors crate itself. Ordinary document
+    // matching still cannot match it because those contexts deliberately have
+    // no `current_host`.
+    fn parse_host(&self) -> bool {
+        true
+    }
+
     fn parse_non_ts_pseudo_class(
         &self,
         _location: cssparser::SourceLocation,
@@ -909,6 +916,38 @@ impl Matcher {
         )
     }
 
+    /// Match a selector from `host`'s shadow-tree scope against the host.
+    /// Supplying the scope explicitly prevents `:host` from leaking into
+    /// document stylesheets or a different shadow root.
+    pub fn matches_shadow_host(
+        &mut self,
+        tree: &DomTree,
+        nid: NodeId,
+        compiled: &CompiledSelector,
+        host: NodeId,
+    ) -> bool {
+        if nid != host || !tree.with_node(nid, |n| n.is_element()).unwrap_or(false) {
+            return false;
+        }
+        let mut context = MatchingContext::new(
+            MatchingMode::Normal,
+            Some(self.ancestors.filter()),
+            &mut self.caches,
+            QuirksMode::NoQuirks,
+            NeedsSelectorFlags::No,
+            MatchingForInvalidation::No,
+        );
+        let element = DomElement::new(tree, nid);
+        context.current_host = Some(element.opaque());
+        selectors::matching::matches_selector(
+            &compiled.sel,
+            0,
+            Some(&compiled.hashes),
+            &element,
+            &mut context,
+        )
+    }
+
     /// Push `nid`'s hashes onto the ancestor filter before descending into its
     /// children. Must be paired with a matching [`Matcher::pop_ancestor`].
     pub fn push_ancestor(&mut self, tree: &DomTree, nid: NodeId) {
@@ -1012,6 +1051,15 @@ pub struct CompiledSelector {
 }
 
 impl CompiledSelector {
+    /// Whether this selector is eligible to match a featureless shadow host.
+    /// Shadow-tree stylesheets use this to retain only `:host` selectors when
+    /// matching against the host in their own tree scope.
+    pub fn matches_featureless_host(&self) -> bool {
+        self.sel
+            .matches_featureless_host_selector_or_pseudo_element()
+            .contains(parser::FeaturelessHostMatches::FOR_HOST)
+    }
+
     /// The one bucket usable by legacy selector indexes. Selectors whose
     /// subject has multiple disjoint alternatives deliberately report
     /// `Universal`; use [`Self::candidate_keys`] to opt into multi-bucket
@@ -1669,5 +1717,31 @@ mod tests {
                 .map(|element| element.node_id),
             Some(host)
         );
+    }
+
+    #[test]
+    fn host_selectors_require_and_respect_explicit_shadow_scope() {
+        let tree = parse_html(
+            r#"<!doctype html><x-card id="host" class="active"></x-card><x-card id="other"></x-card>"#,
+        );
+        let host = tree.get_element_by_id("host").unwrap();
+        let other = tree.get_element_by_id("other").unwrap();
+        tree.attach_shadow_root(host, ShadowRootMode::Open).unwrap();
+
+        let plain = tree.compile_rule_selector(":host").unwrap();
+        let qualified = tree.compile_rule_selector(":host(.active)").unwrap();
+        let rejected = tree.compile_rule_selector(":host([hidden])").unwrap();
+        assert!(plain.matches_featureless_host());
+        assert!(qualified.matches_featureless_host());
+
+        let mut matcher = tree.matcher();
+        assert!(matcher.matches_shadow_host(&tree, host, &plain, host));
+        assert!(matcher.matches_shadow_host(&tree, host, &qualified, host));
+        assert!(!matcher.matches_shadow_host(&tree, host, &rejected, host));
+        assert!(!matcher.matches_shadow_host(&tree, other, &plain, host));
+
+        // Parsing support must not make `:host` observable in document scope.
+        assert!(!tree.matches_selector(host, ":host").unwrap());
+        assert!(tree.query_selector_all(":host").unwrap().is_empty());
     }
 }

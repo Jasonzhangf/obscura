@@ -1568,6 +1568,22 @@ struct Rule {
     layer: Option<LayerOrder>,
 }
 
+#[derive(Default)]
+struct ShadowHostDeclarations {
+    normal: String,
+    important: String,
+}
+
+fn append_declaration_stream(target: &mut String, declarations: &str) {
+    if declarations.trim().is_empty() {
+        return;
+    }
+    if !target.is_empty() && !target.ends_with(';') {
+        target.push(';');
+    }
+    target.push_str(declarations);
+}
+
 const NO_CANDIDATE_SLOT: u32 = u32::MAX;
 
 fn is_root_element(tree: &DomTree, nid: NodeId) -> bool {
@@ -2302,6 +2318,11 @@ fn evaluate_container_query_expr(
 /// An indexed set of author rules ready for fast per-element matching.
 pub struct Stylesheet {
     rules: Vec<Rule>,
+    /// Rules whose subject can match this stylesheet's featureless shadow
+    /// host. Kept separate because a host is outside the shadow tree's normal
+    /// selector index and must only be matched with that tree's explicit host
+    /// scope.
+    host_rules: Vec<usize>,
     invalidation_map: InvalidationMap,
     registered_custom_properties: HashMap<String, RegisteredCustomProperty>,
     /// Index zero is the unconditional sentinel.
@@ -2627,6 +2648,7 @@ impl Stylesheet {
     ) -> Self {
         let mut sheet = Stylesheet {
             rules: Vec::new(),
+            host_rules: Vec::new(),
             invalidation_map: InvalidationMap::default(),
             registered_custom_properties: HashMap::new(),
             container_conditions: vec![ContainerConditionNode {
@@ -2850,6 +2872,9 @@ impl Stylesheet {
                 let normal_flags = declaration_stream_flags(&normal_decls);
                 let important_flags = declaration_stream_flags(&important_decls);
                 let idx = sheet.rules.len();
+                if sel.matches_featureless_host() {
+                    sheet.host_rules.push(idx);
+                }
                 let candidate_slot = if sel.candidate_keys().len() > 1 {
                     let slot = u32::try_from(sheet.candidate_slot_count)
                         .expect("selector candidate slot count exceeds u32");
@@ -3169,6 +3194,70 @@ impl Stylesheet {
         )
     }
 
+    fn shadow_host_declarations(
+        &self,
+        tree: &DomTree,
+        matcher: &mut Matcher,
+        host: NodeId,
+        mut evaluator: Option<&mut ContainerQueryEvaluator<'_>>,
+    ) -> ShadowHostDeclarations {
+        let mut normal = Vec::new();
+        let mut important = Vec::new();
+        for &index in &self.host_rules {
+            let rule = &self.rules[index];
+            if matcher.matches_shadow_host(tree, host, &rule.sel, host)
+                && self.container_condition_is_active(
+                    rule.container_condition_id,
+                    host,
+                    ContainerQuerySubjectKind::Element,
+                    &mut evaluator,
+                )
+            {
+                let matched = (rule.specificity, rule.order, index);
+                if !rule.normal_decls.is_empty() {
+                    normal.push(matched);
+                }
+                if !rule.important_decls.is_empty() {
+                    important.push(matched);
+                }
+            }
+        }
+        normal.sort_unstable_by(|a, b| {
+            compare_rule_cascade(
+                self.rules[a.2].layer.as_ref(),
+                a.0,
+                a.1,
+                self.rules[b.2].layer.as_ref(),
+                b.0,
+                b.1,
+                false,
+            )
+        });
+        important.sort_unstable_by(|a, b| {
+            compare_rule_cascade(
+                self.rules[a.2].layer.as_ref(),
+                a.0,
+                a.1,
+                self.rules[b.2].layer.as_ref(),
+                b.0,
+                b.1,
+                true,
+            )
+        });
+
+        let mut declarations = ShadowHostDeclarations::default();
+        for &(_, _, index) in &normal {
+            append_declaration_stream(&mut declarations.normal, &self.rules[index].normal_decls);
+        }
+        for &(_, _, index) in &important {
+            append_declaration_stream(
+                &mut declarations.important,
+                &self.rules[index].important_decls,
+            );
+        }
+        declarations
+    }
+
     /// Apply every author rule that matches `nid` to `style`, in cascade order
     /// (ascending specificity, then source order, so the winner is applied last).
     /// `id`, `classes`, and `local` are the element's precomputed keys.
@@ -3231,6 +3320,7 @@ impl Stylesheet {
             style,
             parent_props,
             inline_css,
+            None,
             None,
             animation_sample,
             animation_timeline,
@@ -3296,7 +3386,46 @@ impl Stylesheet {
             style,
             parent_props,
             inline_css,
+            None,
             Some(evaluator),
+            animation_sample,
+            animation_timeline,
+        )
+    }
+
+    /// Apply document author rules together with the `:host` rules from the
+    /// host's own shadow tree. Encapsulation context precedes specificity and
+    /// layer order: shadow normal declarations are weaker than document/inline
+    /// normal declarations, while shadow `!important` is stronger than every
+    /// document/inline author-important declaration.
+    pub(crate) fn apply_with_shadow_host_at_animation_time(
+        &self,
+        shadow_host_sheet: &Stylesheet,
+        tree: &DomTree,
+        matcher: &mut Matcher,
+        nid: NodeId,
+        id: Option<&str>,
+        classes: &[String],
+        local: &str,
+        style: &mut LayoutStyle,
+        parent_props: &HashMap<String, String>,
+        inline_css: Option<&str>,
+        evaluator: Option<&mut ContainerQueryEvaluator<'_>>,
+        animation_sample: crate::AnimationSample,
+        animation_timeline: &mut crate::AnimationTimelineState,
+    ) -> Option<HashMap<String, String>> {
+        self.apply_internal(
+            tree,
+            matcher,
+            nid,
+            id,
+            classes,
+            local,
+            style,
+            parent_props,
+            inline_css,
+            Some(shadow_host_sheet),
+            evaluator,
             animation_sample,
             animation_timeline,
         )
@@ -3313,10 +3442,16 @@ impl Stylesheet {
         style: &mut LayoutStyle,
         parent_props: &HashMap<String, String>,
         inline_css: Option<&str>,
+        shadow_host_sheet: Option<&Stylesheet>,
         mut evaluator: Option<&mut ContainerQueryEvaluator<'_>>,
         animation_sample: crate::AnimationSample,
         animation_timeline: &mut crate::AnimationTimelineState,
     ) -> Option<HashMap<String, String>> {
+        let shadow_host_declarations = shadow_host_sheet
+            .map(|sheet| {
+                sheet.shadow_host_declarations(tree, matcher, nid, evaluator.as_deref_mut())
+            })
+            .unwrap_or_default();
         // Keep the two cascade priorities separate from the outset. A typical
         // stylesheet has very few important declarations, so cloning and
         // sorting every matching normal-only rule into an empty important pass
@@ -3447,7 +3582,11 @@ impl Stylesheet {
         // properties cascade fully before any `var()` is substituted.
         let inline_normal_flags = declaration_stream_flags(&inline_normal);
         let inline_important_flags = declaration_stream_flags(&inline_important);
-        let has_own_custom_properties = inline_normal_flags.has_custom_properties
+        let shadow_normal_flags = declaration_stream_flags(&shadow_host_declarations.normal);
+        let shadow_important_flags = declaration_stream_flags(&shadow_host_declarations.important);
+        let has_own_custom_properties = shadow_normal_flags.has_custom_properties
+            || shadow_important_flags.has_custom_properties
+            || inline_normal_flags.has_custom_properties
             || inline_important_flags.has_custom_properties
             || normal_matched
                 .iter()
@@ -3488,6 +3627,9 @@ impl Stylesheet {
                     }
                 }
             };
+            if shadow_normal_flags.has_custom_properties {
+                collect_custom(&shadow_host_declarations.normal);
+            }
             for &(_, _, i) in &normal_matched {
                 let rule = &self.rules[i];
                 if rule.normal_flags.has_custom_properties {
@@ -3505,6 +3647,9 @@ impl Stylesheet {
             }
             if inline_important_flags.has_custom_properties {
                 collect_custom(&inline_important);
+            }
+            if shadow_important_flags.has_custom_properties {
+                collect_custom(&shadow_host_declarations.important);
             }
 
             let mut resolved_props = parent_props.clone();
@@ -3602,6 +3747,18 @@ impl Stylesheet {
         // scheme, not the declaration order. Determine the scheme winner
         // across the complete author cascade before applying any color-valued
         // property. The style starts with its inherited scheme.
+        if shadow_normal_flags.has_color_scheme {
+            let expanded = substitute_declarations(
+                &shadow_host_declarations.normal,
+                props,
+                shadow_normal_flags.has_var,
+            );
+            crate::style::apply_color_scheme_declarations_from(
+                style,
+                &expanded,
+                inherited_color_scheme_dark,
+            );
+        }
         for &(_, _, i) in &normal_matched {
             let rule = &self.rules[i];
             if !rule.normal_flags.has_color_scheme {
@@ -3646,9 +3803,27 @@ impl Stylesheet {
                 inherited_color_scheme_dark,
             );
         }
+        if shadow_important_flags.has_color_scheme {
+            let expanded = substitute_declarations(
+                &shadow_host_declarations.important,
+                props,
+                shadow_important_flags.has_var,
+            );
+            crate::style::apply_color_scheme_declarations_from(
+                style,
+                &expanded,
+                inherited_color_scheme_dark,
+            );
+        }
 
         // Pass 2: apply normal declarations with `var()` substituted against
         // the resolved custom-property map.
+        let expanded = substitute_declarations(
+            &shadow_host_declarations.normal,
+            props,
+            shadow_normal_flags.has_var,
+        );
+        crate::style::apply_declarations_with_locked_color_scheme(style, &expanded);
         for &(_, _, i) in &normal_matched {
             let rule = &self.rules[i];
             let expanded =
@@ -3663,7 +3838,8 @@ impl Stylesheet {
         // important author origin. Resolve those controls on a temporary style
         // before sampling, then let the ordinary important pass override the
         // sampled values where appropriate.
-        let important_has_animation = inline_important_flags.has_animation
+        let important_has_animation = shadow_important_flags.has_animation
+            || inline_important_flags.has_animation
             || important_matched
                 .iter()
                 .any(|&(_, _, i)| self.rules[i].important_flags.has_animation);
@@ -3688,6 +3864,14 @@ impl Stylesheet {
                     &inline_important,
                     props,
                     inline_important_flags.has_var,
+                );
+                crate::style::apply_animation_declarations(&mut animation_style, &expanded);
+            }
+            if shadow_important_flags.has_animation {
+                let expanded = substitute_declarations(
+                    &shadow_host_declarations.important,
+                    props,
+                    shadow_important_flags.has_var,
                 );
                 crate::style::apply_animation_declarations(&mut animation_style, &expanded);
             }
@@ -3735,6 +3919,12 @@ impl Stylesheet {
         }
         let expanded =
             substitute_declarations(&inline_important, props, inline_important_flags.has_var);
+        crate::style::apply_declarations_with_locked_color_scheme(style, &expanded);
+        let expanded = substitute_declarations(
+            &shadow_host_declarations.important,
+            props,
+            shadow_important_flags.has_var,
+        );
         crate::style::apply_declarations_with_locked_color_scheme(style, &expanded);
         effective
     }
