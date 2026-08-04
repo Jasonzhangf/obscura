@@ -320,6 +320,25 @@ class StateComparabilityTests(unittest.TestCase):
         self.assertFalse(comparison["hashes_used_for_classification"])
         self.assertTrue(fidelity["fidelity_metric_valid"])
 
+    def test_matching_contentless_canvases_are_not_fidelity_evidence(self):
+        metrics = {
+            "pixels_gt_50": 0.0,
+            "ours_luminance_stddev": 0.0,
+            "chromium_luminance_stddev": 0.0,
+            "ours_structural_edge_pixels": 0,
+            "chromium_structural_edge_pixels": 0,
+        }
+
+        fidelity = paired_corpus.classify_fidelity_metric(
+            "representative-fidelity",
+            True,
+            metrics_present=True,
+            metrics=metrics,
+        )
+
+        self.assertFalse(fidelity["fidelity_metric_valid"])
+        self.assertIn("contentless-image-pair", fidelity["exclusion_reasons"])
+
     def test_live_and_deterministic_modes_with_same_dom_provenance_are_comparable(self):
         live = self.state(
             210,

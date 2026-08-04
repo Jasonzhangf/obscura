@@ -130,6 +130,16 @@ def pair_metrics(ours, chromium):
     # low-amplitude texture, and font antialiasing differences.
     ours_edges = structural_edges(ours)
     chromium_edges = structural_edges(chromium)
+    ours_luminance = (
+        ours[:, :, 0].astype(np.float32) * 0.2126
+        + ours[:, :, 1].astype(np.float32) * 0.7152
+        + ours[:, :, 2].astype(np.float32) * 0.0722
+    )
+    chromium_luminance = (
+        chromium[:, :, 0].astype(np.float32) * 0.2126
+        + chromium[:, :, 1].astype(np.float32) * 0.7152
+        + chromium[:, :, 2].astype(np.float32) * 0.0722
+    )
     ours_edge_bbox = bbox(ours_edges)
     chromium_edge_bbox = bbox(chromium_edges)
     edge_bbox_delta = None
@@ -162,6 +172,13 @@ def pair_metrics(ours, chromium):
         "edge_bbox_max_delta": edge_bbox_delta,
         "edge_row_projection_delta": round(edge_row_projection, 6),
         "edge_column_projection_delta": round(edge_col_projection, 6),
+        # A matching solid canvas is not evidence of rendering fidelity. Keep
+        # enough per-engine signal for the paired harness to exclude blank or
+        # otherwise contentless captures without discarding their raw deltas.
+        "ours_luminance_stddev": round(float(ours_luminance.std()), 6),
+        "chromium_luminance_stddev": round(float(chromium_luminance.std()), 6),
+        "ours_structural_edge_pixels": int(ours_edges.sum()),
+        "chromium_structural_edge_pixels": int(chromium_edges.sum()),
     }
     metrics.update(edge_distance)
     return metrics

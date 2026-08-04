@@ -1645,7 +1645,9 @@ def classify_state_comparability(
     }
 
 
-def classify_fidelity_metric(capture_purpose, state_comparable, metrics_present):
+def classify_fidelity_metric(
+    capture_purpose, state_comparable, metrics_present, metrics=None
+):
     """Return whether raw image metrics are valid representative evidence."""
     reasons = []
     if capture_purpose != "representative-fidelity":
@@ -1654,6 +1656,17 @@ def classify_fidelity_metric(capture_purpose, state_comparable, metrics_present)
         reasons.append("page-state-not-comparable")
     if not metrics_present:
         reasons.append("image-metrics-unavailable")
+    metrics = metrics or {}
+    contentless_pair = (
+        metrics.get("ours_structural_edge_pixels") == 0
+        and metrics.get("chromium_structural_edge_pixels") == 0
+        and isinstance(metrics.get("ours_luminance_stddev"), (int, float))
+        and isinstance(metrics.get("chromium_luminance_stddev"), (int, float))
+        and metrics["ours_luminance_stddev"] <= 0.5
+        and metrics["chromium_luminance_stddev"] <= 0.5
+    )
+    if contentless_pair:
+        reasons.append("contentless-image-pair")
     return {
         "fidelity_metric_valid": not reasons,
         "exclusion_reasons": reasons,
@@ -2734,6 +2747,7 @@ def main():
                     args.capture_purpose,
                     page_result.get("state_comparable"),
                     bool(page_result.get("metrics")),
+                    page_result.get("metrics"),
                 )
                 page_result["fidelity_metric_valid"] = fidelity_classification[
                     "fidelity_metric_valid"
@@ -2746,6 +2760,7 @@ def main():
                         args.capture_purpose,
                         page_result.get("baseline_state_comparable"),
                         bool(page_result.get("baseline_metrics")),
+                        page_result.get("baseline_metrics"),
                     )
                     page_result["baseline_fidelity_metric_valid"] = (
                         baseline_fidelity_classification["fidelity_metric_valid"]

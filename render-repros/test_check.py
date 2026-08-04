@@ -31,6 +31,16 @@ class PairMetricsTests(unittest.TestCase):
         self.assertEqual(metrics["edge_bidirectional_mean_distance_px"], 0.0)
         self.assertEqual(metrics["edge_bidirectional_p95_distance_px"], 0.0)
 
+    def test_solid_pair_records_no_visual_signal(self):
+        image = np.zeros((80, 80, 3), dtype=np.uint8)
+
+        metrics = pair_metrics(image, image)
+
+        self.assertEqual(metrics["ours_luminance_stddev"], 0.0)
+        self.assertEqual(metrics["chromium_luminance_stddev"], 0.0)
+        self.assertEqual(metrics["ours_structural_edge_pixels"], 0)
+        self.assertEqual(metrics["chromium_structural_edge_pixels"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()
