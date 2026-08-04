@@ -2521,8 +2521,17 @@ pub fn layout_dom_with_resources(
             italic: None,
         })
         .collect();
-    layout_dom_with_web_fonts(tree, viewport, intrinsic, &fonts)
+    let intrinsic = intrinsic
+        .iter()
+        .filter_map(|(&nid, &(width, height))| {
+            (width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0)
+                .then(|| (nid, crate::ReplacedIntrinsic::from_dimensions(width, height)))
+        })
+        .collect();
+    layout_dom_with_web_fonts(tree, viewport, &intrinsic, &fonts)
 }
+
+type ReplacedIntrinsicMap = HashMap<NodeId, crate::ReplacedIntrinsic>;
 
 const CONTAINER_LAYOUT_SAFETY_LIMIT: usize = 512;
 
@@ -3326,7 +3335,7 @@ fn retained_style_plan(
 pub(crate) fn layout_dom_with_web_fonts(
     tree: &DomTree,
     viewport: (f32, f32),
-    intrinsic: &HashMap<NodeId, (f32, f32)>,
+    intrinsic: &ReplacedIntrinsicMap,
     fonts: &[crate::inline::WebFont],
 ) -> DomLayout {
     layout_dom_with_web_fonts_measured(tree, viewport, intrinsic, fonts).0
@@ -3336,7 +3345,7 @@ pub(crate) fn layout_dom_with_web_fonts(
 pub(crate) fn layout_dom_with_web_fonts_and_stylesheet_cache(
     tree: &DomTree,
     viewport: (f32, f32),
-    intrinsic: &HashMap<NodeId, (f32, f32)>,
+    intrinsic: &ReplacedIntrinsicMap,
     fonts: &[crate::inline::WebFont],
     stylesheet_cache: &mut crate::css::StylesheetCache,
 ) -> DomLayout {
@@ -3353,7 +3362,7 @@ pub(crate) fn layout_dom_with_web_fonts_and_stylesheet_cache(
 pub(crate) fn layout_dom_with_web_fonts_and_stylesheet_cache_at_animation_time(
     tree: &DomTree,
     viewport: (f32, f32),
-    intrinsic: &HashMap<NodeId, (f32, f32)>,
+    intrinsic: &ReplacedIntrinsicMap,
     fonts: &[crate::inline::WebFont],
     stylesheet_cache: &mut crate::css::StylesheetCache,
     animation_sample_time: crate::AnimationSampleTime,
@@ -3376,7 +3385,7 @@ pub(crate) fn layout_dom_with_web_fonts_and_stylesheet_cache_at_animation_time(
 pub(crate) fn layout_dom_with_web_fonts_and_stylesheet_cache_with_animation_state(
     tree: &DomTree,
     viewport: (f32, f32),
-    intrinsic: &HashMap<NodeId, (f32, f32)>,
+    intrinsic: &ReplacedIntrinsicMap,
     fonts: &[crate::inline::WebFont],
     stylesheet_cache: &mut crate::css::StylesheetCache,
     animation_sample: crate::AnimationSample,
@@ -3401,7 +3410,7 @@ pub(crate) fn layout_dom_with_web_fonts_and_stylesheet_cache_with_animation_stat
 pub(crate) fn layout_dom_with_web_fonts_and_retained_styles(
     tree: &DomTree,
     viewport: (f32, f32),
-    intrinsic: &HashMap<NodeId, (f32, f32)>,
+    intrinsic: &ReplacedIntrinsicMap,
     fonts: &[crate::inline::WebFont],
     stylesheet_cache: &mut crate::css::StylesheetCache,
     retained: RetainedStyleMaps,
@@ -3422,7 +3431,7 @@ pub(crate) fn layout_dom_with_web_fonts_and_retained_styles(
 pub(crate) fn layout_dom_with_web_fonts_and_retained_styles_at_animation_time(
     tree: &DomTree,
     viewport: (f32, f32),
-    intrinsic: &HashMap<NodeId, (f32, f32)>,
+    intrinsic: &ReplacedIntrinsicMap,
     fonts: &[crate::inline::WebFont],
     stylesheet_cache: &mut crate::css::StylesheetCache,
     retained: RetainedStyleMaps,
@@ -3449,7 +3458,7 @@ pub(crate) fn layout_dom_with_web_fonts_and_retained_styles_at_animation_time(
 pub(crate) fn layout_dom_with_web_fonts_and_retained_styles_with_animation_state(
     tree: &DomTree,
     viewport: (f32, f32),
-    intrinsic: &HashMap<NodeId, (f32, f32)>,
+    intrinsic: &ReplacedIntrinsicMap,
     fonts: &[crate::inline::WebFont],
     stylesheet_cache: &mut crate::css::StylesheetCache,
     retained: RetainedStyleMaps,
@@ -3475,7 +3484,7 @@ pub(crate) fn layout_dom_with_web_fonts_and_retained_styles_with_animation_state
 fn layout_dom_with_web_fonts_measured(
     tree: &DomTree,
     viewport: (f32, f32),
-    intrinsic: &HashMap<NodeId, (f32, f32)>,
+    intrinsic: &ReplacedIntrinsicMap,
     fonts: &[crate::inline::WebFont],
 ) -> (DomLayout, ContainerLayoutTelemetry) {
     layout_dom_with_web_fonts_pass_limit(tree, viewport, intrinsic, fonts, None, None, None, &[])
@@ -3484,7 +3493,7 @@ fn layout_dom_with_web_fonts_measured(
 fn layout_dom_with_web_fonts_pass_limit(
     tree: &DomTree,
     viewport: (f32, f32),
-    intrinsic: &HashMap<NodeId, (f32, f32)>,
+    intrinsic: &ReplacedIntrinsicMap,
     fonts: &[crate::inline::WebFont],
     pass_limit: Option<usize>,
     stylesheet_cache: Option<&mut crate::css::StylesheetCache>,
@@ -3509,7 +3518,7 @@ fn layout_dom_with_web_fonts_pass_limit(
 fn layout_dom_with_web_fonts_pass_limit_at_animation_time(
     tree: &DomTree,
     viewport: (f32, f32),
-    intrinsic: &HashMap<NodeId, (f32, f32)>,
+    intrinsic: &ReplacedIntrinsicMap,
     fonts: &[crate::inline::WebFont],
     pass_limit: Option<usize>,
     stylesheet_cache: Option<&mut crate::css::StylesheetCache>,
@@ -3782,7 +3791,7 @@ fn layout_dom_with_web_fonts_pass_limit_at_animation_time(
 fn layout_dom_once(
     tree: &DomTree,
     viewport: (f32, f32),
-    intrinsic: &HashMap<NodeId, (f32, f32)>,
+    intrinsic: &ReplacedIntrinsicMap,
     fonts: &[crate::inline::WebFont],
     sheet: &crate::css::Stylesheet,
     snapshot: Option<&crate::css::ContainerSnapshot>,
@@ -3890,6 +3899,7 @@ fn layout_dom_once(
             is_inline_block: bool,
             flow_root: bool,
             is_table_box: bool,
+            is_table_cell_box: bool,
             color: Option<[u8; 4]>,
             font_size: Option<f32>,
             font_weight: u16,
@@ -3940,6 +3950,7 @@ fn layout_dom_once(
                     is_inline_block: false,
                     flow_root: false,
                     is_table_box: false,
+                    is_table_cell_box: false,
                     color: None,
                     font_size: None,
                     font_weight: 400,
@@ -4039,6 +4050,7 @@ fn layout_dom_once(
                     inh.is_inline_block = style.is_inline_block;
                     inh.flow_root = style.flow_root;
                     inh.is_table_box = style.is_table_box;
+                    inh.is_table_cell_box = style.is_table_cell_box;
                     inh.color = style.color.or(inh.color);
                     inh.font_size = style.font_size.or(inh.font_size);
                     inh.font_weight = crate::style::used_font_weight(style);
@@ -4205,9 +4217,14 @@ fn layout_dom_once(
                     style.is_inline_block = inh.is_inline_block;
                     style.flow_root = inh.flow_root;
                     style.is_table_box = inh.is_table_box;
-                    // `internal_flex_container` describes an engine-only UA
-                    // approximation, not the computed CSS display value.
-                    style.internal_flex_container = false;
+                    style.is_table_cell_box = inh.is_table_cell_box;
+                    // Reconstruct the internal cell-content wrapper only when
+                    // the inherited computed display is table-cell.
+                    style.internal_flex_container = style.is_table_cell_box;
+                    if style.is_table_cell_box {
+                        style.flex_direction = Some(taffy::FlexDirection::Column);
+                        style.align_items = Some(taffy::AlignItems::FLEX_START);
+                    }
                     style.display_inherit = false;
                 }
                 inh.display = style.display;
@@ -4215,6 +4232,7 @@ fn layout_dom_once(
                 inh.is_inline_block = style.is_inline_block;
                 inh.flow_root = style.flow_root;
                 inh.is_table_box = style.is_table_box;
+                inh.is_table_cell_box = style.is_table_cell_box;
                 match style.color {
                     Some(c) => inh.color = Some(c),
                     None => style.color = inh.color,
@@ -4647,6 +4665,7 @@ fn layout_dom_once(
                 let host_is_inline_block = style.is_inline_block;
                 let host_flow_root = style.flow_root;
                 let host_is_table_box = style.is_table_box;
+                let host_is_table_cell_box = style.is_table_cell_box;
                 let host_grid_auto_columns = style.grid_auto_columns.clone();
                 let host_grid_auto_rows = style.grid_auto_rows.clone();
                 let host_grid_auto_column_calcs = style.grid_calc_expressions[2].clone();
@@ -4682,7 +4701,12 @@ fn layout_dom_once(
                         pseudo.is_inline_block = host_is_inline_block;
                         pseudo.flow_root = host_flow_root;
                         pseudo.is_table_box = host_is_table_box;
-                        pseudo.internal_flex_container = false;
+                        pseudo.is_table_cell_box = host_is_table_cell_box;
+                        pseudo.internal_flex_container = pseudo.is_table_cell_box;
+                        if pseudo.is_table_cell_box {
+                            pseudo.flex_direction = Some(taffy::FlexDirection::Column);
+                            pseudo.align_items = Some(taffy::AlignItems::FLEX_START);
+                        }
                         pseudo.display_inherit = false;
                     }
                     if pseudo.overflow_inherit_x {
@@ -5261,14 +5285,17 @@ fn layout_dom_once(
         // 0x0 and never paints); with one dimension given, the aspect ratio
         // fills the other. An authored `max-width:100%` still caps it to the
         // container, and the aspect ratio keeps it proportional.
-        for (&nid, &(iw, ih)) in intrinsic {
-            if iw <= 0.0 || ih <= 0.0 {
+        for (&nid, &metadata) in intrinsic {
+            if metadata.natural_size().is_none() {
                 continue;
             }
             if let Some(s) = styles.get_mut(&nid) {
-                s.intrinsic_size = Some((iw, ih));
-                if s.aspect_ratio.is_none() || s.aspect_ratio_is_mapped {
-                    s.aspect_ratio = Some(iw / ih);
+                s.intrinsic_size = metadata.natural_size();
+                s.replaced_intrinsic = Some(metadata);
+                if (s.aspect_ratio.is_none() || s.aspect_ratio_is_mapped)
+                    && metadata.ratio.is_some()
+                {
+                    s.aspect_ratio = metadata.ratio;
                     s.aspect_ratio_is_mapped = false;
                     s.aspect_ratio_is_intrinsic = true;
                 }
@@ -5352,12 +5379,8 @@ fn layout_dom_once(
                 // preferring the author's specified width when there is one.
                 let mut tables: Vec<(taffy::NodeId, NodeId, usize)> = id_map
                     .iter()
-                    .filter(|(_, dom)| {
-                        tree.get_node(**dom)
-                            .and_then(|n| n.as_element().map(|e| e.local.as_ref() == "table"))
-                            .unwrap_or(false)
-                    })
-                    .map(|(t, d)| (*t, *d, table_ancestor_depth(tree, *d)))
+                    .filter(|(taffy, _)| ifc_items.table_rows.contains_key(taffy))
+                    .map(|(t, d)| (*t, *d, table_ancestor_depth(tree, *d, &styles)))
                     .collect();
                 // Outer tables consume their nested tables' intrinsic sizes.
                 // Only after an outer depth is fixed can a root layout expose
@@ -5610,87 +5633,35 @@ fn layout_dom_once(
                             // contribution, not a min-content floor. Preserve the
                             // content minimum and raise only the preferred width so
                             // a constrained table can interpolate below the hint.
-                            // Percentage tracks retain the existing definite-table
-                            // behavior here; broader percent balancing is separate.
                             let specified_columns = ifc_items.table_cols.get(&tnode);
-                            if let Some((spec_px, spec_pct)) = specified_columns {
-                                for j in 0..ncols {
-                                    let fixed = spec_px.get(j).copied().flatten();
-                                    if let Some(w) = fixed {
-                                        let w = w.max(col_min[j]);
-                                        col_max[j] = w;
-                                    } else if let Some(w) = spec_pct
-                                        .get(j)
+                            let fixed: Vec<Option<f32>> = (0..ncols)
+                                .map(|index| {
+                                    specified_columns
+                                        .and_then(|(px, _)| px.get(index))
                                         .copied()
                                         .flatten()
-                                        .map(|percent| percent * target)
-                                    {
-                                        let w = w.max(col_min[j]);
-                                        col_min[j] = w;
-                                        col_max[j] = w;
-                                    }
+                                })
+                                .collect();
+                            let percentages: Vec<Option<f32>> = (0..ncols)
+                                .map(|index| {
+                                    specified_columns
+                                        .and_then(|(_, pct)| pct.get(index))
+                                        .copied()
+                                        .flatten()
+                                })
+                                .collect();
+                            for j in 0..ncols {
+                                if let Some(width) = fixed[j] {
+                                    col_max[j] = width.max(col_min[j]);
                                 }
                             }
-                            let sum_min: f32 = col_min.iter().sum();
-                            let sum_max: f32 = col_max.iter().sum();
-                            let widths: Vec<f32> = if target <= sum_min {
-                                col_min.clone()
-                            } else if target >= sum_max {
-                                // Surplus follows the table-layout priority: auto
-                                // columns absorb it before fixed and percentage
-                                // columns. This is important even when every
-                                // column has min==max (a one-word auto cell still
-                                // fills the remainder of a definite-width table).
-                                let mut result = col_max.clone();
-                                let extra = target - sum_max;
-                                let is_px = |j: usize| {
-                                    specified_columns
-                                        .and_then(|(px, _)| px.get(j))
-                                        .copied()
-                                        .flatten()
-                                        .is_some()
-                                };
-                                let is_pct = |j: usize| {
-                                    specified_columns
-                                        .and_then(|(_, pct)| pct.get(j))
-                                        .copied()
-                                        .flatten()
-                                        .is_some()
-                                };
-                                let mut candidates: Vec<usize> = (0..ncols)
-                                    .filter(|&j| !is_px(j) && !is_pct(j) && col_max[j] > 0.0)
-                                    .collect();
-                                if candidates.is_empty() {
-                                    candidates =
-                                        (0..ncols).filter(|&j| !is_px(j) && !is_pct(j)).collect();
-                                }
-                                if candidates.is_empty() {
-                                    candidates = (0..ncols).filter(|&j| is_px(j)).collect();
-                                }
-                                if candidates.is_empty() {
-                                    candidates = (0..ncols).filter(|&j| is_pct(j)).collect();
-                                }
-                                if candidates.is_empty() {
-                                    candidates = (0..ncols).collect();
-                                }
-                                let weight_sum: f32 = candidates.iter().map(|&j| col_max[j]).sum();
-                                for &j in &candidates {
-                                    let share = if weight_sum > 0.0 {
-                                        extra * col_max[j] / weight_sum
-                                    } else {
-                                        extra / candidates.len() as f32
-                                    };
-                                    result[j] += share;
-                                }
-                                result
-                            } else {
-                                let scale = (target - sum_min) / (sum_max - sum_min);
-                                col_min
-                                    .iter()
-                                    .zip(&col_max)
-                                    .map(|(mn, mx)| mn + (mx - mn) * scale)
-                                    .collect()
-                            };
+                            let widths = distribute_auto_table_columns(
+                                target,
+                                &col_min,
+                                &col_max,
+                                &fixed,
+                                &percentages,
+                            );
                             if let Ok(cur) = taffy_tree.style(tnode) {
                                 let mut s = cur.clone();
                                 s.size.width = length(used_declaration);
@@ -9010,14 +8981,15 @@ fn synthesize_row_rects(tree: &DomTree, rects: &mut HashMap<NodeId, Rect>) {
 /// Number of ancestor tables containing `id`. Table sizing runs outer-first:
 /// an outer table consumes an inner table's intrinsic contributions, then a
 /// root layout establishes the inner table's real cell containing block.
-fn table_ancestor_depth(tree: &DomTree, id: NodeId) -> usize {
+fn table_ancestor_depth(
+    tree: &DomTree,
+    id: NodeId,
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+) -> usize {
     let mut depth = 0usize;
     let mut cur = id;
     while let Some(p) = tree.get_node(cur).and_then(|n| n.parent) {
-        if tree.get_node(p).is_some_and(|node| {
-            node.as_element()
-                .is_some_and(|element| element.local.as_ref() == "table")
-        }) {
+        if styles.get(&p).is_some_and(|style| style.is_table_box) {
             depth += 1;
         }
         cur = p;
@@ -9378,6 +9350,163 @@ fn table_inline_outer_edges(style: &crate::LayoutStyle) -> f32 {
         + spacing * 2.0
 }
 
+/// Resolve auto-table column constraints into final track widths.
+///
+/// Gecko's auto-table strategy uses four monotonic guesses: all columns at
+/// min-content; percentage columns raised toward their percentage; fixed
+/// columns raised toward their preferred lengths; then auto columns raised to
+/// max-content. The used width interpolates only the category between the two
+/// surrounding guesses. This matters for Bootstrap input groups: a 100% input
+/// column must shrink by the intrinsic widths of adjacent `width:1%; nowrap`
+/// addon/button columns instead of making the table overflow.
+fn distribute_auto_table_columns(
+    target: f32,
+    minimums: &[f32],
+    preferreds: &[f32],
+    fixed: &[Option<f32>],
+    percentages: &[Option<f32>],
+) -> Vec<f32> {
+    let count = minimums.len();
+    if count == 0
+        || preferreds.len() != count
+        || fixed.len() != count
+        || percentages.len() != count
+    {
+        return minimums.to_vec();
+    }
+    let target = target.max(0.0);
+    let mins: Vec<f32> = minimums.iter().map(|value| value.max(0.0)).collect();
+    let prefs: Vec<f32> = preferreds
+        .iter()
+        .zip(&mins)
+        .map(|(preferred, minimum)| preferred.max(*minimum))
+        .collect();
+
+    // Percentage column constraints are cumulatively clamped to 100% in
+    // source order. Keep zero-valued entries as percentage columns: their
+    // intrinsic minimum still participates in the percentage guess.
+    let mut remaining = 1.0f32;
+    let effective_percentages: Vec<Option<f32>> = percentages
+        .iter()
+        .map(|percentage| {
+            percentage.map(|value| {
+                let used = value.max(0.0).min(remaining);
+                remaining = (remaining - used).max(0.0);
+                used
+            })
+        })
+        .collect();
+
+    let guess_min = mins.clone();
+    let guess_min_pct: Vec<f32> = (0..count)
+        .map(|index| {
+            effective_percentages[index]
+                .map(|percentage| (percentage * target).max(mins[index]))
+                .unwrap_or(mins[index])
+        })
+        .collect();
+    let guess_min_spec: Vec<f32> = (0..count)
+        .map(|index| {
+            if effective_percentages[index].is_some() {
+                guess_min_pct[index]
+            } else if fixed[index].is_some() {
+                prefs[index]
+            } else {
+                mins[index]
+            }
+        })
+        .collect();
+    let guess_pref: Vec<f32> = (0..count)
+        .map(|index| {
+            if effective_percentages[index].is_some() {
+                guess_min_pct[index]
+            } else {
+                prefs[index]
+            }
+        })
+        .collect();
+    let total = |values: &[f32]| values.iter().sum::<f32>();
+    let min_total = total(&guess_min);
+    let min_pct_total = total(&guess_min_pct);
+    let min_spec_total = total(&guess_min_spec);
+    let pref_total = total(&guess_pref);
+
+    let interpolate = |lower: &[f32], upper: &[f32], wanted: f32| {
+        let lower_total = total(lower);
+        let delta_total = (total(upper) - lower_total).max(0.0);
+        if delta_total <= f32::EPSILON {
+            return lower.to_vec();
+        }
+        let scale = ((wanted - lower_total) / delta_total).clamp(0.0, 1.0);
+        lower
+            .iter()
+            .zip(upper)
+            .map(|(low, high)| low + (high - low).max(0.0) * scale)
+            .collect()
+    };
+
+    if target <= min_total {
+        return guess_min;
+    }
+    if target < min_pct_total {
+        return interpolate(&guess_min, &guess_min_pct, target);
+    }
+    if target < min_spec_total {
+        return interpolate(&guess_min_pct, &guess_min_spec, target);
+    }
+    if target < pref_total {
+        return interpolate(&guess_min_spec, &guess_pref, target);
+    }
+
+    let mut result = guess_pref;
+    let extra = target - pref_total;
+    if extra <= f32::EPSILON {
+        return result;
+    }
+    let mut candidates: Vec<(usize, f32)> = (0..count)
+        .filter(|index| effective_percentages[*index].is_none() && fixed[*index].is_none())
+        .filter_map(|index| (prefs[index] > 0.0).then_some((index, prefs[index])))
+        .collect();
+    if candidates.is_empty() {
+        candidates = (0..count)
+            .filter(|index| {
+                effective_percentages[*index].is_none() && fixed[*index].is_none()
+            })
+            .map(|index| (index, 1.0))
+            .collect();
+    }
+    if candidates.is_empty() {
+        candidates = (0..count)
+            .filter(|index| effective_percentages[*index].is_none() && fixed[*index].is_some())
+            .map(|index| (index, prefs[index].max(0.0)))
+            .collect();
+    }
+    if candidates.is_empty() {
+        candidates = effective_percentages
+            .iter()
+            .enumerate()
+            .filter_map(|(index, percentage)| {
+                (*percentage)
+                    .filter(|value| *value > 0.0)
+                    .map(|value| (index, value))
+            })
+            .collect();
+    }
+    if candidates.is_empty() {
+        candidates = (0..count).map(|index| (index, 1.0)).collect();
+    }
+    let weight: f32 = candidates.iter().map(|(_, value)| *value).sum();
+    let candidate_count = candidates.len() as f32;
+    for (index, value) in candidates {
+        result[index] += if weight > 0.0 {
+            extra * value / weight
+        } else {
+            extra / candidate_count
+        };
+    }
+    result
+}
+
 /// Build a `<table>` as a CSS grid. Modeling the table as a grid is what makes
 /// columns negotiate a shared width across every row (min-content/max-content
 /// track sizing), which the old flex-row-per-`<tr>` stack could not do: each
@@ -9400,10 +9529,50 @@ fn build_table(
     styles: &HashMap<NodeId, crate::LayoutStyle>,
 ) -> Option<taffy::NodeId> {
     let style = styles.get(&id)?;
+    let native_html_table = tree.get_node(id).is_some_and(|node| {
+        node.as_element()
+            .is_some_and(|element| element.local.as_ref() == "table")
+    });
+    let authored_row_children = if native_html_table {
+        None
+    } else {
+        let children = rendered_children(tree, id);
+        let mut flattened = Vec::new();
+        flatten_contents_children(tree, &children, styles, &mut flattened);
+        // Full anonymous-table fixup is not represented yet. Falling back to
+        // ordinary box construction preserves every child; partially taking
+        // the dedicated path would silently discard direct text/non-cell
+        // boxes once one real table cell made the build succeed.
+        let all_rendered_children_are_cells = flattened.iter().all(|child| {
+            let hidden = styles
+                .get(child)
+                .is_some_and(|child_style| child_style.display == crate::Display::None);
+            let ignorable_whitespace = tree.get_node(*child).is_some_and(|node| {
+                !node.is_element() && tree.text_content(*child).trim().is_empty()
+            });
+            hidden
+                || ignorable_whitespace
+                || styles
+                    .get(child)
+                    .is_some_and(|child_style| child_style.is_table_cell_box)
+        });
+        if !all_rendered_children_are_cells {
+            return None;
+        }
+        Some(flattened)
+    };
     let mut rows: Vec<(NodeId, usize)> = Vec::new();
-    collect_table_rows(tree, id, &mut rows);
-    if rows.is_empty() {
-        return None;
+    if native_html_table {
+        collect_table_rows(tree, id, &mut rows);
+        if rows.is_empty() {
+            return None;
+        }
+    } else {
+        // CSS table fixup inserts an anonymous row around table-cell children
+        // that are direct children of a table. The grid representation does
+        // not need a material row node, but retaining one logical row gives
+        // those cells the same shared-track negotiation as native cells.
+        rows.push((id, 1));
     }
     // Bounds so a crafted table cannot exhaust memory or time: `colspan`/
     // `rowspan` and the column count are page-controlled, and the occupancy
@@ -9434,11 +9603,23 @@ fn build_table(
     let mut ncols = 0usize;
     for (r, &(tr, group_end)) in rows.iter().enumerate() {
         let mut c = 0usize;
-        for cid in tree.children(tr) {
+        let row_children = if native_html_table {
+            tree.children(tr)
+        } else {
+            authored_row_children.clone().unwrap_or_default()
+        };
+        for cid in row_children {
             let local = tree
                 .get_node(cid)
                 .and_then(|n| n.as_element().map(|e| e.local.to_string()));
-            if !matches!(local.as_deref(), Some("td") | Some("th")) {
+            let is_cell = if native_html_table {
+                matches!(local.as_deref(), Some("td") | Some("th"))
+            } else {
+                styles
+                    .get(&cid)
+                    .is_some_and(|cell| cell.is_table_cell_box)
+            };
+            if !is_cell {
                 continue;
             }
             // A hidden cell is removed from the table model entirely (it must
@@ -9456,10 +9637,18 @@ fn build_table(
             if c >= MAX_COLS {
                 break;
             }
-            let cs = span_attr(cid, "colspan").clamp(1, MAX_SPAN);
+            let cs = if native_html_table {
+                span_attr(cid, "colspan").clamp(1, MAX_SPAN)
+            } else {
+                1
+            };
             // rowspan=0 means "span to the end of this row group". Explicit
             // spans are clipped at the same boundary by the effective cell map.
-            let rs_raw = span_attr(cid, "rowspan");
+            let rs_raw = if native_html_table {
+                span_attr(cid, "rowspan")
+            } else {
+                1
+            };
             let rows_left_in_group = group_end.min(nrows).saturating_sub(r).max(1);
             let rs = if rs_raw == 0 {
                 rows_left_in_group
@@ -9507,6 +9696,18 @@ fn build_table(
             // grid area. Left in place, a `width:50%` cell would shrink to
             // half of its own already-halved track.
             cstyle.size.width = Dimension::auto();
+            // Taffy's grid-item automatic minimum is an engine artifact here:
+            // the table track has already collected the cell's min-content
+            // contribution and owns final column sizing. Remove only the
+            // initial `auto` minimum at translation time; an authored
+            // min-width remains a real constraint and computed style stays
+            // declaration-order independent.
+            if styles
+                .get(cid)
+                .is_some_and(|cell_style| cell_style.min_width == crate::Dimension::Auto)
+            {
+                cstyle.min_size.width = taffy::Dimension::length(0.0);
+            }
             let _ = taffy_tree.set_style(cell_node, cstyle);
         }
         children.push(cell_node);
@@ -9618,10 +9819,12 @@ fn build_table(
     // Row sizing: a `height` on the row or a rowspan-1 cell is a MINIMUM
     // (content can always grow a row), matching how tables treat heights.
     let mut row_min: Vec<Option<f32>> = vec![None; nrows];
-    for (r, &(tr, _)) in rows.iter().enumerate() {
-        if let Some(crate::Dimension::Px(h)) = styles.get(&tr).map(|s| s.height) {
-            if h > 0.0 {
-                row_min[r] = Some(h);
+    if native_html_table {
+        for (r, &(tr, _)) in rows.iter().enumerate() {
+            if let Some(crate::Dimension::Px(h)) = styles.get(&tr).map(|s| s.height) {
+                if h > 0.0 {
+                    row_min[r] = Some(h);
+                }
             }
         }
     }
@@ -10218,11 +10421,11 @@ fn build(
         return None;
     }
 
-    // Real table layout: a <table> becomes a CSS grid so columns negotiate
+    // Real table layout: every computed table box becomes a CSS grid so columns negotiate
     // across rows (the flex approximation could not) and colspan/rowspan map to
     // grid spans. Falls through to the generic path only if the table has no
     // usable rows/cells.
-    if _name.local.as_ref() == "table" {
+    if style.is_table_box {
         if let Some(node) = build_table(
             tree, id, taffy_tree, id_map, words, engine, ifc_items, styles,
         ) {
@@ -10387,13 +10590,13 @@ fn build(
     // max-content measurement; once the percentage axis becomes definite, the
     // measure callback derives the other axis through the intrinsic ratio.
     if _name.local.as_ref() == "img" {
-        if let Some((width, height)) = style.intrinsic_size {
-            let intrinsic_ratio =
-                if width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0 {
-                    width / height
-                } else {
-                    1.0
-                };
+        if let Some(intrinsic) = style.replaced_intrinsic.or_else(|| {
+            style
+                .intrinsic_size
+                .map(|(width, height)| crate::ReplacedIntrinsic::from_dimensions(width, height))
+        }) {
+            let (width, height) = intrinsic.natural_size().unwrap_or((300.0, 150.0));
+            let intrinsic_ratio = intrinsic.ratio.unwrap_or(2.0);
             let preferred_ratio = style
                 .aspect_ratio
                 .filter(|ratio| ratio.is_finite() && *ratio > 0.0)
@@ -10455,9 +10658,13 @@ fn build(
                     .iter()
                     .flatten()
                     .any(|expression| expression.contains('%'));
+            let ratio_only = intrinsic.width.is_none()
+                && intrinsic.height.is_none()
+                && intrinsic.ratio.is_some();
             if matches!(style.width, crate::Dimension::Auto)
                 && matches!(style.height, crate::Dimension::Auto)
                 && !has_percentage_constraint
+                && !ratio_only
                 && !is_in_flow_grid_item(tree, id, style, styles)
             {
                 let constrained =
@@ -10494,7 +10701,7 @@ fn build(
             if measured_axis_constraint {
                 taffy_style.aspect_ratio = None;
             }
-            let context = engine.register_replaced(width, height, style);
+            let context = engine.register_replaced_intrinsic(intrinsic, style);
             let leaf = taffy_tree
                 .new_leaf_with_context(taffy_style, context)
                 .ok()?;
@@ -10657,9 +10864,7 @@ fn build(
     let has_in_flow_block_child = dom_children
         .iter()
         .any(|cid| styles.get(cid).map_or(false, is_in_flow_block_level));
-    let is_native_table_cell = node.as_element().map_or(false, |element| {
-        matches!(element.local.as_ref(), "td" | "th") && style.internal_flex_container
-    });
+    let is_internal_table_cell = style.is_table_cell_box && style.internal_flex_container;
 
     // `text-align` affects inline content, never the used width or placement
     // of an in-flow block child. `to_taffy_style` promotes a centered/right
@@ -10685,7 +10890,8 @@ fn build(
     // block children (e.g. a `position:relative` hero wrapper whose only
     // child is out-of-flow) to width 0 and let text and blocks share lines.
     // Floats still take the legacy zone path below.
-    if (style.display == crate::Display::Block || (is_native_table_cell && has_in_flow_block_child))
+    if (style.display == crate::Display::Block
+        || (is_internal_table_cell && has_in_flow_block_child))
         && has_inline_ish_content
         && !has_float_child
     {
@@ -11683,22 +11889,25 @@ fn max_definite_table_content_width(
 ) -> Option<f32> {
     let mut best: Option<f32> = None;
     for descendant in tree.descendants(id) {
-        let structural = tree.get_node(descendant).is_some_and(|node| {
-            node.as_element().is_some_and(|element| {
-                matches!(
-                    element.local.as_ref(),
-                    "caption"
-                        | "col"
-                        | "colgroup"
-                        | "thead"
-                        | "tbody"
-                        | "tfoot"
-                        | "tr"
-                        | "td"
-                        | "th"
-                )
-            })
-        });
+        let structural = styles
+            .get(&descendant)
+            .is_some_and(|style| style.is_table_cell_box)
+            || tree.get_node(descendant).is_some_and(|node| {
+                node.as_element().is_some_and(|element| {
+                    matches!(
+                        element.local.as_ref(),
+                        "caption"
+                            | "col"
+                            | "colgroup"
+                            | "thead"
+                            | "tbody"
+                            | "tfoot"
+                            | "tr"
+                            | "td"
+                            | "th"
+                    )
+                })
+            });
         if structural {
             continue;
         }
@@ -12438,6 +12647,14 @@ fn build_children_with_float_zone(
             flex_direction: taffy::FlexDirection::Row,
             flex_wrap: taffy::FlexWrap::Wrap,
             align_items: Some(taffy::AlignItems::FLEX_START),
+            // This anonymous row represents the float band's available
+            // inline size. Make that size definite before flex line
+            // collection: leaving it auto lets intrinsic sizing wrap a set
+            // of percentage floats before the parent later stretches the row.
+            size: taffy::Size {
+                width: taffy::Dimension::percent(1.0),
+                height: taffy::Dimension::auto(),
+            },
             ..Default::default()
         };
         if let Ok(row) = taffy_tree.new_with_children(row_style, &run_children) {
@@ -13378,6 +13595,42 @@ mod tests {
         assert!(
             (container.height - 40.0).abs() < 0.01,
             "query container must contain its descendant float: {container:?}"
+        );
+    }
+
+    #[test]
+    fn consecutive_percentage_floats_collect_against_the_full_band_width() {
+        let tree = parse_html(
+            r#"<style>
+                html,body{margin:0}
+                #container{box-sizing:border-box;width:780px}
+                .cell{float:left;box-sizing:border-box;width:25%;padding:0 15px}
+                #a{height:87px} #b{height:85px} #c{height:150px} #d{height:76px}
+            </style>
+            <div id="container">
+              <div id="a" class="cell"></div>
+              <div id="b" class="cell"></div>
+              <div id="c" class="cell"></div>
+              <div id="d" class="cell"></div>
+            </div>"#,
+        );
+        let laid = layout_dom(&tree, (900.0, 300.0));
+        for (index, id) in ["a", "b", "c", "d"].into_iter().enumerate() {
+            let rect = laid.rects[&tree.get_element_by_id(id).unwrap()];
+            assert!((rect.width - 195.0).abs() < 0.01, "{id}: {rect:?}");
+            assert!(
+                rect.y.abs() < 0.01,
+                "four 25% floats must share the 780px band; {id} wrapped: {rect:?}"
+            );
+            assert!(
+                (rect.x - index as f32 * 195.0).abs() < 0.01,
+                "{id}: {rect:?}"
+            );
+        }
+        let container = laid.rects[&tree.get_element_by_id("container").unwrap()];
+        assert!(
+            (container.height - 150.0).abs() < 0.01,
+            "one float band must be as tall as its tallest float: {container:?}"
         );
     }
 
@@ -15780,6 +16033,86 @@ mod tests {
         };
         assert_eq!(width("content-cell"), 124.0);
         assert_eq!(width("border-cell"), 100.0);
+    }
+
+    #[test]
+    fn authored_table_with_mixed_direct_content_preserves_non_cell_child() {
+        let tree = parse_html(
+            r#"<style>
+                html,body { margin:0 }
+                #group { display:table; width:300px }
+                #cell { display:table-cell; width:100px; height:20px }
+                #ordinary { display:block; width:80px; height:30px }
+            </style>
+            <div id="group">
+                <div id="cell"></div>
+                direct text
+                <div id="ordinary"></div>
+            </div>"#,
+        );
+        let laid = layout_dom(&tree, (500.0, 200.0));
+        let id = |name: &str| tree.get_element_by_id(name).unwrap();
+
+        assert!(laid.rects.contains_key(&id("group")));
+        assert!(laid.rects.contains_key(&id("cell")));
+        let ordinary = laid.rects[&id("ordinary")];
+        assert!((ordinary.width - 80.0).abs() < 0.1, "{ordinary:?}");
+        assert!((ordinary.height - 30.0).abs() < 0.1, "{ordinary:?}");
+        // Before the preflight check, finding `cell` was enough to take the
+        // dedicated table path, which filtered `ordinary` (and the text) out.
+        // Its geometry proves the mixed subtree instead used ordinary box
+        // construction and kept the non-cell sibling.
+    }
+
+    #[cfg(feature = "paint")]
+    #[test]
+    fn authored_table_cells_allocate_bootstrap_input_group_columns() {
+        let tree = parse_html(
+            r#"<style>
+                * { box-sizing:border-box }
+                html,body { margin:0 }
+                #group { display:table; width:600px; border-collapse:separate }
+                #field,#addon,#button { display:table-cell; height:34px }
+                #field { width:100% }
+                #addon,#button {
+                    width:1%; white-space:nowrap; padding:0 12px;
+                    font:16px/normal "Liberation Sans";
+                }
+            </style>
+            <div id="group"><div id="field"></div><div id="addon">Addon label</div><div id="button">Button</div></div>"#,
+        );
+        let laid = layout_dom(&tree, (800.0, 200.0));
+        let rect = |id: &str| laid.rects[&tree.get_element_by_id(id).unwrap()];
+        let group = rect("group");
+        let field = rect("field");
+        let addon = rect("addon");
+        let button = rect("button");
+
+        assert!((group.width - 600.0).abs() < 0.1, "{group:?}");
+        assert!((field.x - group.x).abs() < 0.1, "{field:?} {group:?}");
+        assert!((addon.x - (field.x + field.width)).abs() < 0.1);
+        assert!((button.x - (addon.x + addon.width)).abs() < 0.1);
+        assert!(((button.x + button.width) - (group.x + group.width)).abs() < 0.1);
+        assert!(addon.width > 80.0, "nowrap addon must keep its intrinsic width: {addon:?}");
+        assert!(button.width > 50.0, "nowrap button must keep its intrinsic width: {button:?}");
+        assert!(field.width > addon.width + button.width, "{field:?} {addon:?} {button:?}");
+        for cell in [field, addon, button] {
+            assert!((cell.height - 34.0).abs() < 0.1, "{cell:?}");
+        }
+    }
+
+    #[test]
+    fn auto_table_percent_guess_reserves_intrinsic_neighbor_columns() {
+        let widths = distribute_auto_table_columns(
+            600.0,
+            &[0.0, 100.0, 70.0],
+            &[0.0, 100.0, 70.0],
+            &[None, None, None],
+            &[Some(1.0), Some(0.01), Some(0.01)],
+        );
+        assert!((widths[0] - 430.0).abs() < 0.01, "{widths:?}");
+        assert!((widths[1] - 100.0).abs() < 0.01, "{widths:?}");
+        assert!((widths[2] - 70.0).abs() < 0.01, "{widths:?}");
     }
 
     #[test]

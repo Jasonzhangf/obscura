@@ -248,6 +248,7 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
                                                               // grows to fit unshrinkable content, needs real table layout.)
         style.min_width = crate::Dimension::Px(0.0);
         if tag == "table" {
+            style.is_table_box = true;
             // Chromium's HTML UA sheet makes the table grid border-box and
             // supplies the traditional two-pixel separate-border spacing.
             // Author declarations and the legacy `cellspacing` hint cascade
@@ -272,6 +273,7 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
     } else if tag == "td" || tag == "th" {
         style.display = Display::Flex;
         style.internal_flex_container = true;
+        style.is_table_cell_box = true;
         style.flex_direction = Some(taffy::FlexDirection::Column);
         style.align_items = Some(taffy::AlignItems::FLEX_START);
         style.padding = Edges {
@@ -713,6 +715,7 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                     | "flow-root"
                     | "table"
                     | "inline-table"
+                    | "table-cell"
                     | "-webkit-box"
                     | "-webkit-inline-box"
                     | "contents"
@@ -726,6 +729,7 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                 // internal enum happens to equal the newly specified value.
                 style.internal_flex_container = false;
                 style.is_table_box = false;
+                style.is_table_cell_box = false;
                 style.is_inline_block = false;
                 style.flow_root = false;
                 style.display_contents = false;
@@ -768,6 +772,17 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                     style.is_inline_block = true;
                     style.flow_root = true;
                     style.is_table_box = true;
+                }
+                "table-cell" => {
+                    // A table cell establishes an internal flow container. A
+                    // column flexbox is our cell-content wrapper stand-in; it
+                    // is marked internal so descendants do not become CSS flex
+                    // items and the table grid owns the cell's inline size.
+                    style.display = crate::Display::Flex;
+                    style.internal_flex_container = true;
+                    style.flex_direction = Some(taffy::FlexDirection::Column);
+                    style.align_items = Some(taffy::AlignItems::FLEX_START);
+                    style.is_table_cell_box = true;
                 }
                 "-webkit-box" => {
                     // The unclamped legacy display is an old flexbox. When it
@@ -7684,9 +7699,24 @@ mod tests {
         assert!(inline_table.flow_root);
         assert!(inline_table.is_table_box);
 
+        let table_cell = compute_style("div", Some("display:block; display:table-cell"));
+        assert_eq!(table_cell.display, Display::Flex);
+        assert!(table_cell.internal_flex_container);
+        assert!(table_cell.is_table_cell_box);
+
+        let min_before = compute_style("div", Some("min-width:50px;display:table-cell"));
+        let min_after = compute_style("div", Some("display:table-cell;min-width:50px"));
+        assert_eq!(min_before.min_width, crate::Dimension::Px(50.0));
+        assert_eq!(min_after.min_width, crate::Dimension::Px(50.0));
+
         let reset_table = compute_style("div", Some("display:table; display:grid"));
         assert_eq!(reset_table.display, Display::Grid);
         assert!(!reset_table.is_table_box);
+
+        let reset_cell = compute_style("div", Some("display:table-cell; display:block"));
+        assert_eq!(reset_cell.display, Display::Block);
+        assert!(!reset_cell.internal_flex_container);
+        assert!(!reset_cell.is_table_cell_box);
     }
 
     #[test]

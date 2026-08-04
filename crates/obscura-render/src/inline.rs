@@ -732,7 +732,8 @@ const REPLACED_CONTEXT_BIT: usize = 1usize << (usize::BITS - 1);
 
 #[derive(Clone, Copy)]
 struct ReplacedItem {
-    intrinsic_width: f32,
+    intrinsic_width: Option<f32>,
+    intrinsic_height: Option<f32>,
     preferred_width: Option<f32>,
     preferred_height: Option<f32>,
     preferred_ratio: f32,
@@ -740,6 +741,10 @@ struct ReplacedItem {
     min_height: Option<f32>,
     max_width: Option<f32>,
     max_height: Option<f32>,
+    /// Both intrinsic axes are absent but a real preferred ratio exists.
+    /// CSS replaced sizing stretch-fits this case to a definite available
+    /// inline size instead of using the 300x150 default-object contribution.
+    ratio_only: bool,
     /// CSS Sizing's cyclic-percentage rule makes a proper replaced element's
     /// inline min-content contribution zero when its preferred or maximum
     /// inline size contains a percentage. The natural size still participates
@@ -749,6 +754,10 @@ struct ReplacedItem {
 
 impl ReplacedItem {
     fn from_style(width: f32, height: f32, style: &LayoutStyle) -> Self {
+        Self::from_intrinsic(crate::ReplacedIntrinsic::from_dimensions(width, height), style)
+    }
+
+    fn from_intrinsic(intrinsic: crate::ReplacedIntrinsic, style: &LayoutStyle) -> Self {
         let px = |dimension| match dimension {
             Dimension::Px(value) => Some(value.max(0.0)),
             _ => None,
@@ -758,24 +767,40 @@ impl ReplacedItem {
                 .as_deref()
                 .map_or(false, |expression| expression.contains('%'))
         };
-        let intrinsic_ratio =
-            if width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0 {
-                width / height
-            } else {
-                1.0
-            };
+        let explicit_ratio = style
+            .aspect_ratio
+            .filter(|ratio| ratio.is_finite() && *ratio > 0.0)
+            .or_else(|| {
+                intrinsic
+                    .ratio
+                    .filter(|ratio| ratio.is_finite() && *ratio > 0.0)
+            });
+        let intrinsic_ratio = intrinsic
+            .ratio
+            .filter(|ratio| ratio.is_finite() && *ratio > 0.0)
+            .or_else(|| {
+                let (width, height) = intrinsic.natural_size()?;
+                (width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0)
+                    .then_some(width / height)
+            })
+            .unwrap_or(2.0);
         ReplacedItem {
-            intrinsic_width: width,
+            intrinsic_width: intrinsic
+                .width
+                .filter(|width| width.is_finite() && *width > 0.0),
+            intrinsic_height: intrinsic
+                .height
+                .filter(|height| height.is_finite() && *height > 0.0),
             preferred_width: px(style.width),
             preferred_height: px(style.height),
-            preferred_ratio: style
-                .aspect_ratio
-                .filter(|ratio| ratio.is_finite() && *ratio > 0.0)
-                .unwrap_or(intrinsic_ratio),
+            preferred_ratio: explicit_ratio.unwrap_or(intrinsic_ratio),
             min_width: px(style.min_width),
             min_height: px(style.min_height),
             max_width: px(style.max_width),
             max_height: px(style.max_height),
+            ratio_only: intrinsic.width.is_none()
+                && intrinsic.height.is_none()
+                && explicit_ratio.is_some(),
             zero_inline_min_content: matches!(style.width, Dimension::Percent(_))
                 || matches!(style.max_width, Dimension::Percent(_))
                 || expression_has_percentage(0)
@@ -846,10 +871,22 @@ impl ReplacedItem {
                 (Some(width), Some(height)) => (width, height),
                 (Some(width), None) => (width, width / self.preferred_ratio),
                 (None, Some(height)) => (height * self.preferred_ratio, height),
-                (None, None) => (
-                    self.intrinsic_width,
-                    self.intrinsic_width / self.preferred_ratio,
-                ),
+                (None, None) => match (self.intrinsic_width, self.intrinsic_height) {
+                    (Some(width), Some(height)) => (width, height),
+                    (Some(width), None) => (width, width / self.preferred_ratio),
+                    (None, Some(height)) => (height * self.preferred_ratio, height),
+                    // Contain the intrinsic ratio inside CSS Images' 300x150
+                    // default object size. A definite authored/known axis is
+                    // handled above and transfers through the same ratio.
+                    (None, None) => {
+                        let width = if self.preferred_ratio >= 2.0 {
+                            300.0
+                        } else {
+                            150.0 * self.preferred_ratio
+                        };
+                        (width, width / self.preferred_ratio)
+                    }
+                },
             },
         };
         let tentative = taffy::Size { width, height };
@@ -1472,9 +1509,20 @@ impl TextEngine {
     /// context. Percentage-sized image leaves still need their intrinsic
     /// max-content contribution while an auto-sized ancestor is measured.
     pub fn register_replaced(&mut self, width: f32, height: f32, style: &LayoutStyle) -> usize {
+        self.register_replaced_intrinsic(
+            crate::ReplacedIntrinsic::from_dimensions(width, height),
+            style,
+        )
+    }
+
+    pub(crate) fn register_replaced_intrinsic(
+        &mut self,
+        intrinsic: crate::ReplacedIntrinsic,
+        style: &LayoutStyle,
+    ) -> usize {
         let index = self.replaced.len();
         self.replaced
-            .push(ReplacedItem::from_style(width, height, style));
+            .push(ReplacedItem::from_intrinsic(intrinsic, style));
         REPLACED_CONTEXT_BIT | index
     }
 
@@ -1489,7 +1537,19 @@ impl TextEngine {
     ) -> taffy::Size<f32> {
         if idx & REPLACED_CONTEXT_BIT != 0 {
             let replaced = self.replaced[idx & !REPLACED_CONTEXT_BIT];
-            let mut size = replaced.size(known);
+            let stretch_width = (replaced.ratio_only
+                && replaced.preferred_width.is_none()
+                && replaced.preferred_height.is_none()
+                && known.width.is_none())
+            .then(|| match available.width {
+                taffy::AvailableSpace::Definite(width) => Some(width.max(0.0)),
+                _ => None,
+            })
+            .flatten();
+            let mut size = replaced.size(taffy::Size {
+                width: known.width.or(stretch_width),
+                height: known.height,
+            });
             if replaced.zero_inline_min_content
                 && known.width.is_none()
                 && matches!(available.width, taffy::AvailableSpace::MinContent)
@@ -3715,13 +3775,45 @@ mod tests {
     }
 
     #[test]
+    fn partial_replaced_intrinsics_use_the_default_object_axis() {
+        let unknown = taffy::Size {
+            width: None,
+            height: None,
+        };
+        let style = LayoutStyle::default();
+        let width_only = ReplacedItem::from_intrinsic(
+            crate::ReplacedIntrinsic {
+                width: Some(100.0),
+                height: None,
+                ratio: None,
+            },
+            &style,
+        )
+        .size(unknown);
+        assert_eq!((width_only.width, width_only.height), (100.0, 150.0));
+
+        let height_only = ReplacedItem::from_intrinsic(
+            crate::ReplacedIntrinsic {
+                width: None,
+                height: Some(100.0),
+                ratio: None,
+            },
+            &style,
+        )
+        .size(unknown);
+        assert_eq!((height_only.width, height_only.height), (300.0, 100.0));
+    }
+
+    #[test]
     fn both_auto_replaced_constraints_transfer_through_preferred_ratio() {
         let unknown = taffy::Size {
             width: None,
             height: None,
         };
         let measure =
-            |style: &LayoutStyle| ReplacedItem::from_style(512.0, 323.0, style).size(unknown);
+            |style: &LayoutStyle| {
+                ReplacedItem::from_style(512.0, 323.0, style).size(unknown)
+            };
 
         let max_height = LayoutStyle {
             max_height: Dimension::Px(128.0),

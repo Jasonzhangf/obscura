@@ -127,7 +127,7 @@ fn network_resource_url(url: &str) -> String {
 #[derive(Clone, Debug, PartialEq)]
 struct RememberedContentImageIntrinsic {
     resolved_url: String,
-    dimensions: (f32, f32),
+    intrinsic: crate::ReplacedIntrinsic,
 }
 
 /// Page-scoped raw resource bytes shared by layout preparation and repeated
@@ -488,7 +488,7 @@ impl RenderResourceCache {
     fn seed_content_image_intrinsics(
         &mut self,
         tree: &DomTree,
-        intrinsic: &mut HashMap<obscura_dom::tree::NodeId, (f32, f32)>,
+        intrinsic: &mut HashMap<obscura_dom::tree::NodeId, crate::ReplacedIntrinsic>,
         selected: &mut HashMap<obscura_dom::tree::NodeId, SelectedImage>,
     ) -> HashSet<obscura_dom::tree::NodeId> {
         let remembered = self
@@ -506,7 +506,7 @@ impl RenderResourceCache {
                 self.forget_content_image_intrinsic(nid);
                 continue;
             }
-            intrinsic.insert(nid, value.dimensions);
+            intrinsic.insert(nid, value.intrinsic);
             selected.insert(
                 nid,
                 SelectedImage {
@@ -524,7 +524,7 @@ impl RenderResourceCache {
         &mut self,
         nid: obscura_dom::tree::NodeId,
         resolved_url: String,
-        dimensions: (f32, f32),
+        intrinsic: crate::ReplacedIntrinsic,
     ) {
         if self.max_content_image_intrinsics == 0 {
             return;
@@ -544,7 +544,7 @@ impl RenderResourceCache {
             nid,
             RememberedContentImageIntrinsic {
                 resolved_url,
-                dimensions,
+                intrinsic,
             },
         );
     }
@@ -6920,13 +6920,20 @@ fn image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
 }
 
 fn image_metadata_from_bytes(bytes: &[u8]) -> Option<(f32, f32)> {
-    let (width, height) = image_dimensions(bytes)
-        .map(|(width, height)| (width as f32, height as f32))
-        .or_else(|| svg_intrinsic(bytes))?;
+    image_intrinsic_metadata(bytes)?.natural_size()
+}
+
+fn image_intrinsic_metadata(bytes: &[u8]) -> Option<crate::ReplacedIntrinsic> {
+    let metadata = image_dimensions(bytes)
+        .map(|(width, height)| {
+            crate::ReplacedIntrinsic::from_dimensions(width as f32, height as f32)
+        })
+        .or_else(|| svg_image_intrinsic_metadata(bytes))?;
+    let (width, height) = metadata.natural_size()?;
     if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
         return None;
     }
-    Some((width, height))
+    Some(metadata)
 }
 
 fn background_image_rect(
@@ -7546,7 +7553,7 @@ fn collect_image_intrinsics(
     base_url: Option<&str>,
     cache: &mut RenderResourceCache,
 ) -> (
-    HashMap<obscura_dom::tree::NodeId, (f32, f32)>,
+    HashMap<obscura_dom::tree::NodeId, crate::ReplacedIntrinsic>,
     HashMap<obscura_dom::tree::NodeId, SelectedImage>,
 ) {
     let mut out = std::collections::HashMap::new();
@@ -7578,16 +7585,12 @@ fn collect_image_intrinsics(
         let Some(bytes) = fetch_profiled_image_bytes(&resolved_url, None, cache, profile) else {
             continue;
         };
-        let dimensions = image_dimensions(&bytes)
-            .map(|(width, height)| (width as f32, height as f32))
-            .or_else(|| svg_intrinsic(&bytes));
-        if let Some((w, h)) = dimensions {
-            if w > 0.0 && h > 0.0 {
-                // A 2x (or w-descriptor) candidate's raw pixels are density
-                // times its CSS size; divide so layout sees CSS px, or every
-                // responsive image occupies twice its design size.
-                out.insert(nid, (w / density, h / density));
-            }
+        if let Some(mut intrinsic) = image_intrinsic_metadata(&bytes) {
+            // A 2x (or w-descriptor) candidate's raw pixels are density times
+            // its CSS size. A ratio is dimensionless and remains unchanged.
+            intrinsic.width = intrinsic.width.map(|width| width / density);
+            intrinsic.height = intrinsic.height.map(|height| height / density);
+            out.insert(nid, intrinsic);
         }
     }
     (out, selected)
@@ -7601,9 +7604,9 @@ fn collect_content_image_intrinsics(
     styles: &std::collections::HashMap<obscura_dom::tree::NodeId, crate::LayoutStyle>,
     base_url: Option<&str>,
     cache: &mut RenderResourceCache,
-    out: &mut std::collections::HashMap<obscura_dom::tree::NodeId, (f32, f32)>,
+    out: &mut std::collections::HashMap<obscura_dom::tree::NodeId, crate::ReplacedIntrinsic>,
     selected: &mut HashMap<obscura_dom::tree::NodeId, SelectedImage>,
-    source_intrinsic: &HashMap<obscura_dom::tree::NodeId, (f32, f32)>,
+    source_intrinsic: &HashMap<obscura_dom::tree::NodeId, crate::ReplacedIntrinsic>,
     source_selected: &HashMap<obscura_dom::tree::NodeId, SelectedImage>,
     seeded: &HashSet<obscura_dom::tree::NodeId>,
 ) -> bool {
@@ -7645,23 +7648,14 @@ fn collect_content_image_intrinsics(
             cache.forget_content_image_intrinsic(nid);
             continue;
         };
-        let dimensions = image_dimensions(&bytes)
-            .map(|(width, height)| (width as f32, height as f32))
-            .or_else(|| svg_intrinsic(&bytes));
-        let Some((width, height)) = dimensions else {
+        let Some(intrinsic) = image_intrinsic_metadata(&bytes) else {
             changed |= previous_dimensions.is_some() || remembered_url_changed;
             cache.forget_content_image_intrinsic(nid);
             continue;
         };
-        if width <= 0.0 || height <= 0.0 {
-            changed |= previous_dimensions.is_some() || remembered_url_changed;
-            cache.forget_content_image_intrinsic(nid);
-            continue;
-        }
-        let dimensions = (width, height);
-        changed |= previous_dimensions != Some(dimensions) || remembered_url_changed;
-        out.insert(nid, dimensions);
-        cache.remember_content_image_intrinsic(nid, resolved_url, dimensions);
+        changed |= previous_dimensions != Some(intrinsic) || remembered_url_changed;
+        out.insert(nid, intrinsic);
+        cache.remember_content_image_intrinsic(nid, resolved_url, intrinsic);
     }
 
     // A remembered selection whose computed content disappeared must stop
@@ -8123,6 +8117,173 @@ fn svg_intrinsic(bytes: &[u8]) -> Option<(f32, f32)> {
     } else {
         None
     }
+}
+
+/// Read intrinsic SVG dimensions without treating `viewBox` user-space
+/// coordinates as CSS-pixel dimensions. `usvg::Tree::size()` necessarily
+/// resolves percentage/missing root dimensions to its rendering viewport, so
+/// it cannot preserve the distinction required by CSS replaced sizing.
+fn svg_image_intrinsic_metadata(bytes: &[u8]) -> Option<crate::ReplacedIntrinsic> {
+    // The lightweight attribute pass below preserves missing/percentage axes,
+    // which `Tree::size()` necessarily resolves. It must not, however, turn a
+    // malformed XML prefix that merely resembles an SVG root into successful
+    // image metadata. Use the same parser as paint as the validity gate first.
+    let _validated = usvg::Tree::from_data(bytes, &usvg::Options::default()).ok()?;
+    let source = std::str::from_utf8(bytes).ok()?;
+    let mut remaining = source.trim_start_matches('\u{feff}').trim_start();
+    let tail = loop {
+        if let Some(after) = remaining.strip_prefix("<!--") {
+            let end = after.find("-->")?;
+            remaining = after[end + 3..].trim_start();
+            continue;
+        }
+        if let Some(after) = remaining.strip_prefix("<?") {
+            let end = after.find("?>")?;
+            remaining = after[end + 2..].trim_start();
+            continue;
+        }
+        if remaining.starts_with("<!") {
+            // Skip a validated DOCTYPE/declaration, including an internal
+            // subset whose quoted declarations may themselves contain `>`.
+            let mut quote = None;
+            let mut subset_depth = 0usize;
+            let end = remaining.char_indices().find_map(|(index, ch)| match quote {
+                Some(open) if ch == open => {
+                    quote = None;
+                    None
+                }
+                Some(_) => None,
+                None if ch == '\'' || ch == '"' => {
+                    quote = Some(ch);
+                    None
+                }
+                None if ch == '[' => {
+                    subset_depth += 1;
+                    None
+                }
+                None if ch == ']' => {
+                    subset_depth = subset_depth.saturating_sub(1);
+                    None
+                }
+                None if ch == '>' && subset_depth == 0 => Some(index),
+                None => None,
+            })?;
+            remaining = remaining[end + 1..].trim_start();
+            continue;
+        }
+        let after_open = remaining.strip_prefix('<')?;
+        let name_end = after_open
+            .find(|ch: char| ch.is_ascii_whitespace() || matches!(ch, '/' | '>'))
+            .unwrap_or(after_open.len());
+        let root_name = &after_open[..name_end];
+        if root_name.rsplit(':').next()? != "svg" {
+            return None;
+        }
+        break &after_open[name_end..];
+    };
+    let mut quote = None;
+    let end = tail.char_indices().find_map(|(index, ch)| match quote {
+        Some(open) if ch == open => {
+            quote = None;
+            None
+        }
+        Some(_) => None,
+        None if ch == '\'' || ch == '"' => {
+            quote = Some(ch);
+            None
+        }
+        None if ch == '>' => Some(index),
+        None => None,
+    })?;
+    let attributes = &tail[..end];
+    let attribute = |name: &str| -> Option<&str> {
+        let bytes = attributes.as_bytes();
+        let mut cursor = 0;
+        while cursor < bytes.len() {
+            while cursor < bytes.len()
+                && (bytes[cursor].is_ascii_whitespace() || bytes[cursor] == b'/')
+            {
+                cursor += 1;
+            }
+            let name_start = cursor;
+            while cursor < bytes.len()
+                && !bytes[cursor].is_ascii_whitespace()
+                && bytes[cursor] != b'='
+            {
+                cursor += 1;
+            }
+            let found = &attributes[name_start..cursor];
+            while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+            if cursor >= bytes.len() || bytes[cursor] != b'=' {
+                continue;
+            }
+            cursor += 1;
+            while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+            if cursor >= bytes.len() || !matches!(bytes[cursor], b'\'' | b'"') {
+                continue;
+            }
+            let quote = bytes[cursor];
+            cursor += 1;
+            let value_start = cursor;
+            while cursor < bytes.len() && bytes[cursor] != quote {
+                cursor += 1;
+            }
+            let value = &attributes[value_start..cursor];
+            cursor = cursor.saturating_add(1);
+            if found == name {
+                return Some(value);
+            }
+        }
+        None
+    };
+    let length = |value: &str| -> Option<f32> {
+        let value = value.trim();
+        if value.is_empty() || value.ends_with('%') || value.eq_ignore_ascii_case("auto") {
+            return None;
+        }
+        let split = value
+            .find(|ch: char| !(ch.is_ascii_digit() || matches!(ch, '+' | '-' | '.' | 'e' | 'E')))
+            .unwrap_or(value.len());
+        let number = value[..split].parse::<f32>().ok()?;
+        let factor = match value[split..].trim().to_ascii_lowercase().as_str() {
+            "" | "px" => 1.0,
+            "in" => 96.0,
+            "cm" => 96.0 / 2.54,
+            "mm" => 96.0 / 25.4,
+            "q" => 96.0 / 101.6,
+            "pt" => 96.0 / 72.0,
+            "pc" => 16.0,
+            _ => return None,
+        };
+        let result = number * factor;
+        (result.is_finite() && result > 0.0).then_some(result)
+    };
+    let width = attribute("width").and_then(length);
+    let height = attribute("height").and_then(length);
+    let view_box_ratio = attribute("viewBox").and_then(|value| {
+        let values = value
+            .split(|ch: char| ch.is_ascii_whitespace() || ch == ',')
+            .filter(|value| !value.is_empty())
+            .map(str::parse::<f32>)
+            .collect::<Result<Vec<_>, _>>()
+            .ok()?;
+        (values.len() == 4 && values[2].is_finite() && values[3].is_finite()
+            && values[2] > 0.0 && values[3] > 0.0)
+            .then_some(values[2] / values[3])
+    });
+    let ratio = match (width, height) {
+        (Some(width), Some(height)) => Some(width / height),
+        _ => view_box_ratio,
+    };
+    Some(crate::ReplacedIntrinsic {
+        width,
+        height,
+        ratio,
+    })
 }
 
 /// A full-pixmap clip mask admitting only the pixels inside `rect`, used to
@@ -9151,6 +9312,72 @@ mod tests {
     use super::*;
     use crate::dom::layout_dom_with_web_fonts;
     use obscura_dom::tree_sink::parse_html;
+
+    #[test]
+    fn svg_image_metadata_keeps_view_box_as_ratio_only() {
+        let ratio_only = svg_image_intrinsic_metadata(
+            br#"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 576 576'/>"#,
+        )
+        .expect("ratio-only SVG metadata");
+        assert_eq!(ratio_only.width, None);
+        assert_eq!(ratio_only.height, None);
+        assert_eq!(ratio_only.ratio, Some(1.0));
+        assert_eq!(ratio_only.natural_size(), Some((150.0, 150.0)));
+
+        let explicit = svg_image_intrinsic_metadata(
+            br#"<svg xmlns='http://www.w3.org/2000/svg' width='120' height='80' viewBox='0 0 200 100'/>"#,
+        )
+        .expect("explicit SVG metadata");
+        assert_eq!(explicit.width, Some(120.0));
+        assert_eq!(explicit.height, Some(80.0));
+        assert_eq!(explicit.ratio, Some(1.5));
+        assert_eq!(explicit.natural_size(), Some((120.0, 80.0)));
+
+        let commented = svg_image_intrinsic_metadata(
+            br#"<!-- <svg width='999' height='999'/> --><svg xmlns='http://www.w3.org/2000/svg' width='12' height='8'/>"#,
+        )
+        .expect("the real root after a comment");
+        assert_eq!(commented.natural_size(), Some((12.0, 8.0)));
+
+        assert!(svg_image_intrinsic_metadata(
+            br#"<svg xmlns='http://www.w3.org/2000/svg' width='10' height='20'><g>"#,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn view_box_only_svg_transfers_definite_css_width_without_using_view_box_units() {
+        let square = br#"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'/>"#;
+        assert_eq!(
+            image_metadata_from_bytes(square),
+            Some((150.0, 150.0)),
+            "natural dimensions contain the ratio in the 300x150 default object"
+        );
+        let tree = parse_html(
+            r#"<html><head><style>
+                html,body { margin:0 }
+                #host { width:360px }
+                img { display:block }
+                #ratio { width:100%; height:auto }
+            </style></head><body><div id="host">
+                <img id="auto" src="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%20100%20100'/%3E">
+                <img id="ratio" src="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%20200%20100'/%3E">
+                <img id="explicit" src="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='120'%20height='80'%20viewBox='0%200%20200%20100'/%3E">
+            </div></body></html>"#,
+        );
+        let mut resources = RenderResourceCache::default();
+        let prepared = prepare_dom(&tree, (500.0, 400.0), None, &mut resources).expect("layout");
+        let rect = |selector| {
+            let id = tree.query_selector(selector).unwrap().unwrap();
+            prepared.layout.rects[&id]
+        };
+        let auto = rect("#auto");
+        assert_eq!((auto.width, auto.height), (360.0, 360.0));
+        let ratio = rect("#ratio");
+        assert_eq!((ratio.width, ratio.height), (360.0, 180.0));
+        let explicit = rect("#explicit");
+        assert_eq!((explicit.width, explicit.height), (120.0, 80.0));
+    }
 
     #[test]
     fn native_placeholders_honor_default_author_color_opacity_and_value_state() {
@@ -10883,11 +11110,27 @@ mod tests {
                 .expect("selector")
                 .expect("image")
         });
-        resources.remember_content_image_intrinsic(ids[0], "a".into(), (1.0, 1.0));
-        resources.remember_content_image_intrinsic(ids[1], "b".into(), (2.0, 2.0));
+        resources.remember_content_image_intrinsic(
+            ids[0],
+            "a".into(),
+            crate::ReplacedIntrinsic::from_dimensions(1.0, 1.0),
+        );
+        resources.remember_content_image_intrinsic(
+            ids[1],
+            "b".into(),
+            crate::ReplacedIntrinsic::from_dimensions(2.0, 2.0),
+        );
         // Refreshing id 1 makes id 2 the oldest entry.
-        resources.remember_content_image_intrinsic(ids[0], "a2".into(), (3.0, 3.0));
-        resources.remember_content_image_intrinsic(ids[2], "c".into(), (4.0, 4.0));
+        resources.remember_content_image_intrinsic(
+            ids[0],
+            "a2".into(),
+            crate::ReplacedIntrinsic::from_dimensions(3.0, 3.0),
+        );
+        resources.remember_content_image_intrinsic(
+            ids[2],
+            "c".into(),
+            crate::ReplacedIntrinsic::from_dimensions(4.0, 4.0),
+        );
 
         assert_eq!(resources.content_image_intrinsics.len(), 2);
         assert!(resources.content_image_intrinsics.contains_key(&ids[0]));

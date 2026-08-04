@@ -763,6 +763,12 @@ pub struct LayoutStyle {
     /// features such as container-query axis availability that depend on the
     /// computed display rather than our internal layout approximation.
     pub(crate) is_table_box: bool,
+    /// The computed inner display is `table-cell`.
+    ///
+    /// Authored internal table boxes need the same cell sizing path as native
+    /// `<td>`/`<th>` elements even though Taffy represents their cell-content
+    /// wrapper as an internal column flexbox.
+    pub(crate) is_table_cell_box: bool,
     /// The HTML UA sheet's vendor `text-align` behavior for `<center>`.
     /// Unlike ordinary `text-align:center`, it also centers fixed-width block
     /// descendants while leaving auto-width blocks fill-available.
@@ -807,6 +813,10 @@ pub struct LayoutStyle {
     /// size when percentage dimensions are resolved through an auto-sized
     /// wrapper (`img { width:100%; height:auto }`).
     pub intrinsic_size: Option<(f32, f32)>,
+    /// Per-axis decoded intrinsic metadata used by the replaced sizing path.
+    /// SVG can expose only one dimension or a `viewBox` ratio, distinctions
+    /// that the stable public `intrinsic_size` tuple cannot represent.
+    pub(crate) replaced_intrinsic: Option<ReplacedIntrinsic>,
     /// The current ratio came from HTML width/height presentation hints
     /// (`<img>` or its selected `<picture><source>`), rather than authored
     /// CSS. A decoded image's natural ratio replaces this provisional ratio.
@@ -1318,6 +1328,50 @@ pub struct LayoutStyle {
     /// modern web rely on it for depth, and without it those elements paint
     /// flat. See [`BoxShadow`] and `paint::paint_box_shadow`.
     pub box_shadow: Option<BoxShadow>,
+}
+
+/// Intrinsic metadata exposed by a decoded replaced resource.
+///
+/// Presence of this value means metadata is available; each dimension may
+/// still be absent independently. This is required for SVG, whose root can
+/// declare one dimension, both dimensions, or only a `viewBox` ratio.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct ReplacedIntrinsic {
+    pub(crate) width: Option<f32>,
+    pub(crate) height: Option<f32>,
+    pub(crate) ratio: Option<f32>,
+}
+
+impl ReplacedIntrinsic {
+    pub fn from_dimensions(width: f32, height: f32) -> Self {
+        Self {
+            width: Some(width),
+            height: Some(height),
+            ratio: (width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0)
+                .then_some(width / height),
+        }
+    }
+
+    /// Resolve the concrete natural size from CSS Images' 300x150 default
+    /// object size. A definite authored layout axis still overrides this
+    /// fallback and transfers through the intrinsic ratio.
+    pub fn natural_size(self) -> Option<(f32, f32)> {
+        let width = self.width.filter(|value| value.is_finite() && *value > 0.0);
+        let height = self
+            .height
+            .filter(|value| value.is_finite() && *value > 0.0);
+        let ratio = self.ratio.filter(|value| value.is_finite() && *value > 0.0);
+        match (width, height, ratio) {
+            (Some(width), Some(height), _) => Some((width, height)),
+            (Some(width), None, Some(ratio)) => Some((width, width / ratio)),
+            (None, Some(height), Some(ratio)) => Some((height * ratio, height)),
+            (Some(width), None, None) => Some((width, 150.0)),
+            (None, Some(height), None) => Some((300.0, height)),
+            (None, None, Some(ratio)) if ratio >= 2.0 => Some((300.0, 300.0 / ratio)),
+            (None, None, Some(ratio)) => Some((150.0 * ratio, 150.0)),
+            (None, None, None) => Some((300.0, 150.0)),
+        }
+    }
 }
 
 /// Whether this box has an inline outer display and participates in an inline

@@ -3854,7 +3854,8 @@ fn display_inherit_transitively_preserves_contents_and_block_display() {
         </div>
         <section id="block-parent"><span id="block-child"></span></section>
         <table><tr><td id="native-cell">
-          <div id="native-inherit" style="display:inherit"></div>
+          <div id="native-inherit" style="min-width:50px;display:inherit"></div>
+          <div id="native-inherit-reversed" style="display:inherit;min-width:50px"></div>
         </td></tr></table>
         "#,
     );
@@ -3880,11 +3881,18 @@ fn display_inherit_transitively_preserves_contents_and_block_display() {
 
     let native_cell = &layout.styles[&id("native-cell")];
     let native_inherit = &layout.styles[&id("native-inherit")];
+    let native_inherit_reversed = &layout.styles[&id("native-inherit-reversed")];
     assert!(native_cell.internal_flex_container);
     assert_eq!(native_inherit.display, obscura_render::Display::Flex);
     assert!(
-        !native_inherit.internal_flex_container,
-        "display inheritance must not copy the engine's UA-only table approximation"
+        native_inherit.internal_flex_container,
+        "inherited table-cell display must reconstruct its internal cell-content wrapper"
+    );
+    assert_eq!(native_inherit.min_width, obscura_render::Dimension::Px(50.0));
+    assert!(native_inherit_reversed.internal_flex_container);
+    assert_eq!(
+        native_inherit_reversed.min_width,
+        obscura_render::Dimension::Px(50.0)
     );
 }
 
