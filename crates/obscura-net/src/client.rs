@@ -1,7 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use std::net::{IpAddr, SocketAddr};
 
@@ -9,7 +9,7 @@ use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, USER_AGENT};
 use reqwest::redirect::Policy;
 use reqwest::{Client, Method};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, watch};
 use url::Url;
 
 use crate::cookies::CookieJar;
@@ -124,7 +124,7 @@ pub struct RequestInfo {
     pub resource_type: ResourceType,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub enum ResourceType {
     Document,
     Script,
@@ -139,7 +139,7 @@ pub enum ResourceType {
 /// Fetch metadata for a browser-owned request. Navigation keeps its existing
 /// profile; render resources use this type so they do not masquerade as HTML
 /// documents when they move onto the page's asynchronous transport.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub enum RequestMode {
     Navigate,
     NoCors,
@@ -147,7 +147,7 @@ pub enum RequestMode {
     SameOrigin,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub enum RequestCredentials {
     Omit,
     SameOrigin,
@@ -813,10 +813,146 @@ pub struct ObscuraHttpClient {
     pub timeout: Duration,
     pub in_flight: Arc<std::sync::atomic::AtomicU32>,
     pub block_trackers: bool,
+    resource_loader: std::sync::Mutex<ResourceLoaderState>,
     /// When true, `validate_url` lets localhost / RFC1918 / link-local addresses
     /// through in addition to the `OBSCURA_ALLOW_PRIVATE_NETWORK` env var.
     /// Set via `--allow-private-network` on the CLI (issue #33).
     pub allow_private_network: bool,
+}
+
+const RESOURCE_CACHE_MAX_ENTRIES: usize = 256;
+const RESOURCE_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct ResourceCacheKey {
+    url: String,
+    resource_type: ResourceType,
+    mode: RequestMode,
+    credentials: RequestCredentials,
+    initiator: Option<String>,
+    user_agent: String,
+    extra_headers: Vec<(String, String)>,
+    max_response_bytes: usize,
+}
+
+#[derive(Clone)]
+struct ResourceCacheEntry {
+    response: Response,
+    expires_at: Instant,
+}
+
+#[derive(Default)]
+struct ResourceCache {
+    entries: HashMap<ResourceCacheKey, ResourceCacheEntry>,
+    insertion_order: VecDeque<ResourceCacheKey>,
+    body_bytes: usize,
+}
+
+#[derive(Default)]
+struct ResourceLoaderState {
+    cache: ResourceCache,
+    shared_fetches: HashMap<ResourceCacheKey, SharedFetchSender>,
+}
+
+#[derive(Clone)]
+enum SharedFetchOutcome {
+    Cacheable(Response),
+    RetryUncoalesced,
+}
+
+type SharedFetchSender = watch::Sender<Option<SharedFetchOutcome>>;
+
+struct SharedFetchLeader<'a> {
+    loader: &'a std::sync::Mutex<ResourceLoaderState>,
+    key: ResourceCacheKey,
+    sender: SharedFetchSender,
+    finished: bool,
+}
+
+impl SharedFetchLeader<'_> {
+    fn finish(mut self, outcome: SharedFetchOutcome) {
+        self.loader.lock().unwrap().shared_fetches.remove(&self.key);
+        let _ = self.sender.send(Some(outcome));
+        self.finished = true;
+    }
+}
+
+impl Drop for SharedFetchLeader<'_> {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.loader.lock().unwrap().shared_fetches.remove(&self.key);
+        let _ = self.sender.send(Some(SharedFetchOutcome::RetryUncoalesced));
+    }
+}
+
+impl ResourceCache {
+    fn get(&mut self, key: &ResourceCacheKey) -> Option<Response> {
+        let entry = self.entries.get(key)?;
+        if entry.expires_at <= Instant::now() {
+            let expired = self.entries.remove(key)?;
+            self.body_bytes = self.body_bytes.saturating_sub(expired.response.body.len());
+            return None;
+        }
+        Some(entry.response.clone())
+    }
+
+    fn insert(&mut self, key: ResourceCacheKey, response: Response, lifetime: Duration) {
+        let response_bytes = response.body.len();
+        if response_bytes > RESOURCE_CACHE_MAX_BYTES {
+            return;
+        }
+        if let Some(previous) = self.entries.remove(&key) {
+            self.body_bytes = self.body_bytes.saturating_sub(previous.response.body.len());
+            self.insertion_order.retain(|queued| queued != &key);
+        }
+        while self.entries.len() >= RESOURCE_CACHE_MAX_ENTRIES
+            || self.body_bytes.saturating_add(response_bytes) > RESOURCE_CACHE_MAX_BYTES
+        {
+            let Some(oldest) = self.insertion_order.pop_front() else {
+                break;
+            };
+            if let Some(entry) = self.entries.remove(&oldest) {
+                self.body_bytes = self.body_bytes.saturating_sub(entry.response.body.len());
+            }
+        }
+        self.body_bytes = self.body_bytes.saturating_add(response_bytes);
+        self.insertion_order.push_back(key.clone());
+        self.entries.insert(
+            key,
+            ResourceCacheEntry {
+                response,
+                expires_at: Instant::now() + lifetime,
+            },
+        );
+    }
+}
+
+fn response_cache_lifetime(response: &Response) -> Option<Duration> {
+    if !(200..300).contains(&response.status)
+        || !response.redirected_from.is_empty()
+        || response.header("set-cookie").is_some()
+        || response
+            .header("vary")
+            .is_some_and(|vary| vary.split(',').any(|name| name.trim() == "*"))
+    {
+        return None;
+    }
+    let cache_control = response.header("cache-control")?;
+    let mut max_age = None;
+    for directive in cache_control.split(',').map(str::trim) {
+        let lower = directive.to_ascii_lowercase();
+        if lower == "no-store" || lower == "no-cache" {
+            return None;
+        }
+        if let Some(value) = lower.strip_prefix("max-age=") {
+            max_age = value.trim_matches('"').parse::<u64>().ok();
+        }
+    }
+    max_age
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
 }
 
 /// Derive the sec-ch-ua and sec-ch-ua-platform client-hint header values from a
@@ -889,6 +1025,7 @@ impl ObscuraHttpClient {
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             timeout: Duration::from_secs(30),
             block_trackers: false,
+            resource_loader: std::sync::Mutex::new(ResourceLoaderState::default()),
             allow_private_network,
         }
     }
@@ -999,7 +1136,198 @@ impl ObscuraHttpClient {
             .await
     }
 
+    async fn resource_cache_key(
+        &self,
+        method: &Method,
+        url: &Url,
+        body: &Option<Vec<u8>>,
+        request: &ResourceRequest,
+    ) -> Option<ResourceCacheKey> {
+        if *method != Method::GET
+            || body.is_some()
+            || request.resource_type == ResourceType::Document
+            || !matches!(url.scheme(), "http" | "https")
+            || self.interceptor.read().await.is_some()
+        {
+            return None;
+        }
+        let mut extra_headers = self
+            .extra_headers
+            .read()
+            .await
+            .iter()
+            .map(|(name, value)| (name.to_ascii_lowercase(), value.clone()))
+            .collect::<Vec<_>>();
+        extra_headers.sort();
+        if extra_headers.iter().any(|(name, value)| {
+            name == "authorization"
+                || name == "cookie"
+                || (name == "cache-control"
+                    && (value.to_ascii_lowercase().contains("no-cache")
+                        || value.to_ascii_lowercase().contains("no-store")))
+        }) {
+            return None;
+        }
+        if request.sends_credentials_to(url) && !self.cookie_jar.get_cookie_header(url).is_empty() {
+            return None;
+        }
+        Some(ResourceCacheKey {
+            url: url.to_string(),
+            resource_type: request.resource_type,
+            mode: request.mode,
+            credentials: request.credentials,
+            initiator: request.initiator.as_ref().map(ToString::to_string),
+            user_agent: self.user_agent.read().await.clone(),
+            extra_headers,
+            max_response_bytes: request.max_response_bytes,
+        })
+    }
+
     async fn fetch_with_profile(
+        &self,
+        initial_method: Method,
+        url: &Url,
+        initial_body: Option<Vec<u8>>,
+        callbacks: Option<&CallbackRegistry>,
+        request: ResourceRequest,
+    ) -> Result<Response, ObscuraNetError> {
+        let Some(cache_key) = self
+            .resource_cache_key(&initial_method, url, &initial_body, &request)
+            .await
+        else {
+            return self
+                .fetch_with_profile_uncached(initial_method, url, initial_body, callbacks, request)
+                .await;
+        };
+
+        enum Acquisition {
+            Cached(Response),
+            Follower(watch::Receiver<Option<SharedFetchOutcome>>),
+            Leader(SharedFetchSender),
+        }
+
+        // Cache lookup and leader election are one critical section.  Without
+        // that atomicity a request can miss the cache, pause, and install a
+        // second leader after the first request has already populated it.
+        let acquisition = {
+            let mut loader = self.resource_loader.lock().unwrap();
+            if let Some(response) = loader.cache.get(&cache_key) {
+                Acquisition::Cached(response)
+            } else if let Some(sender) = loader.shared_fetches.get(&cache_key) {
+                Acquisition::Follower(sender.subscribe())
+            } else {
+                let (sender, _receiver) = watch::channel(None);
+                loader
+                    .shared_fetches
+                    .insert(cache_key.clone(), sender.clone());
+                Acquisition::Leader(sender)
+            }
+        };
+
+        match acquisition {
+            Acquisition::Cached(response) => {
+                self.fire_logical_resource_callbacks(callbacks, url, &request, &response)
+                    .await;
+                Ok(response)
+            }
+            Acquisition::Follower(mut receiver) => loop {
+                let outcome = { receiver.borrow().clone() };
+                if let Some(outcome) = outcome {
+                    break match outcome {
+                        SharedFetchOutcome::Cacheable(response) => {
+                            self.fire_logical_resource_callbacks(
+                                callbacks, url, &request, &response,
+                            )
+                            .await;
+                            Ok(response)
+                        }
+                        SharedFetchOutcome::RetryUncoalesced => {
+                            self.fetch_with_profile_uncached(
+                                initial_method,
+                                url,
+                                initial_body,
+                                callbacks,
+                                request,
+                            )
+                            .await
+                        }
+                    };
+                }
+                if receiver.changed().await.is_err() {
+                    break self
+                        .fetch_with_profile_uncached(
+                            initial_method,
+                            url,
+                            initial_body,
+                            callbacks,
+                            request,
+                        )
+                        .await;
+                }
+            },
+            Acquisition::Leader(sender) => {
+                // If this future is cancelled or panics while awaiting I/O,
+                // the guard removes the stale leader and wakes followers so
+                // they can retry instead of waiting forever.
+                let leader = SharedFetchLeader {
+                    loader: &self.resource_loader,
+                    key: cache_key.clone(),
+                    sender,
+                    finished: false,
+                };
+                let result = self
+                    .fetch_with_profile_uncached(
+                        initial_method,
+                        url,
+                        initial_body,
+                        callbacks,
+                        request,
+                    )
+                    .await;
+                let shared_outcome = match &result {
+                    Ok(response) => match response_cache_lifetime(response) {
+                        Some(lifetime) => {
+                            self.resource_loader.lock().unwrap().cache.insert(
+                                cache_key,
+                                response.clone(),
+                                lifetime,
+                            );
+                            SharedFetchOutcome::Cacheable(response.clone())
+                        }
+                        None => SharedFetchOutcome::RetryUncoalesced,
+                    },
+                    Err(_) => SharedFetchOutcome::RetryUncoalesced,
+                };
+                leader.finish(shared_outcome);
+                result
+            }
+        }
+    }
+
+    /// A cache hit or shared transport still represents an independent page
+    /// request.  Keep passive request/response observers at logical-resource
+    /// granularity even when only one HTTP transaction reaches the server.
+    async fn fire_logical_resource_callbacks(
+        &self,
+        callbacks: Option<&CallbackRegistry>,
+        url: &Url,
+        request: &ResourceRequest,
+        response: &Response,
+    ) {
+        let Some(callbacks) = callbacks else {
+            return;
+        };
+        let request_info = RequestInfo {
+            url: url.clone(),
+            method: Method::GET.to_string(),
+            headers: self.extra_headers.read().await.clone(),
+            resource_type: request.resource_type,
+        };
+        callbacks.fire_request(&request_info).await;
+        callbacks.fire_response(&request_info, response).await;
+    }
+
+    async fn fetch_with_profile_uncached(
         &self,
         initial_method: Method,
         url: &Url,
@@ -1316,10 +1644,12 @@ mod ssrf_tests {
     };
     use crate::cookies::CookieJar;
     use reqwest::dns::{Name, Resolve};
+    use std::collections::HashMap;
     use std::net::IpAddr;
     use std::str::FromStr;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
     use url::Url;
 
     fn ip(s: &str) -> IpAddr {
@@ -1612,6 +1942,52 @@ mod ssrf_tests {
         )
     }
 
+    async fn cancelled_shared_fetch_fixture(
+    ) -> (Url, tokio::sync::oneshot::Receiver<()>, Arc<AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed = requests.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let mut first_stream = None;
+            let mut started_tx = Some(started_tx);
+            for index in 0..3 {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut request = [0u8; 2048];
+                let _ = stream.read(&mut request).await;
+                observed.fetch_add(1, Ordering::SeqCst);
+                if index == 0 {
+                    if let Some(started_tx) = started_tx.take() {
+                        let _ = started_tx.send(());
+                    }
+                    // Hold the transport open until the leader task is
+                    // cancelled. The next two connections prove both the
+                    // waiting follower retry and a fresh cache leader work.
+                    first_stream = Some(stream);
+                    continue;
+                }
+                let body = "shared";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nCache-Control: public, max-age=3600\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+            drop(first_stream);
+        });
+        (
+            Url::parse(&format!("http://{address}/shared.js")).unwrap(),
+            started_rx,
+            requests,
+        )
+    }
+
     #[tokio::test]
     async fn cancellation_returns_active_requests_to_zero() {
         let (target, started) = hanging_fixture().await;
@@ -1629,6 +2005,81 @@ mod ssrf_tests {
         task.abort();
         let _ = task.await;
         assert_eq!(client.active_requests(), 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_shared_subresource_leader_wakes_follower_and_clears_slot() {
+        let (target, started, network_requests) = cancelled_shared_fetch_fixture().await;
+        let initiator = target.join("/page.html").unwrap();
+        let request = ResourceRequest::subresource(ResourceType::Script, &initiator);
+        let client = Arc::new(ObscuraHttpClient::with_full_options(
+            Arc::new(CookieJar::new()),
+            None,
+            true,
+        ));
+
+        let leader = tokio::spawn({
+            let client = client.clone();
+            let target = target.clone();
+            let request = request.clone();
+            async move {
+                client
+                    .fetch_resource_with_callbacks(&target, request, None)
+                    .await
+            }
+        });
+        started.await.unwrap();
+
+        let follower = tokio::spawn({
+            let client = client.clone();
+            let target = target.clone();
+            let request = request.clone();
+            async move {
+                client
+                    .fetch_resource_with_callbacks(&target, request, None)
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let follower_is_waiting = client
+                    .resource_loader
+                    .lock()
+                    .unwrap()
+                    .shared_fetches
+                    .values()
+                    .next()
+                    .is_some_and(|sender| sender.receiver_count() > 0);
+                if follower_is_waiting {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("follower did not join the shared fetch");
+
+        leader.abort();
+        let _ = leader.await;
+        let response = tokio::time::timeout(Duration::from_secs(2), follower)
+            .await
+            .expect("follower remained blocked after leader cancellation")
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.body, b"shared");
+
+        // The follower intentionally retried without populating the cache.
+        // A subsequent request must be able to install a fresh leader, and
+        // its successful response is then reusable.
+        client
+            .fetch_resource_with_callbacks(&target, request.clone(), None)
+            .await
+            .unwrap();
+        client
+            .fetch_resource_with_callbacks(&target, request, None)
+            .await
+            .unwrap();
+        assert_eq!(network_requests.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]
@@ -1673,6 +2124,184 @@ mod ssrf_tests {
             .unwrap();
         assert_eq!(requests.load(Ordering::SeqCst), 1);
         assert_eq!(responses.load(Ordering::SeqCst), 1);
+    }
+
+    async fn cacheable_resource_fixture(
+        status: u16,
+        headers: &'static str,
+    ) -> (Url, Arc<AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed = requests.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let observed = observed.clone();
+                tokio::spawn(async move {
+                    let mut request = [0u8; 2048];
+                    let _ = stream.read(&mut request).await;
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(80)).await;
+                    let body = "globalThis.__sharedRuns=(globalThis.__sharedRuns||0)+1;";
+                    let response = format!(
+                        "HTTP/1.1 {status} Test\r\nContent-Type: application/javascript\r\nContent-Length: {}\r\n{headers}Connection: close\r\n\r\n{body}",
+                        body.len(),
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        (
+            Url::parse(&format!("http://{address}/shared.js")).unwrap(),
+            requests,
+        )
+    }
+
+    #[tokio::test]
+    async fn cacheable_identical_subresources_share_one_in_flight_request() {
+        let (url, network_requests) = cacheable_resource_fixture(
+            200,
+            "Cache-Control: public, max-age=3600\r\nVary: Accept-Language\r\n",
+        )
+        .await;
+        let initiator = url.join("/page.html").unwrap();
+        let client = Arc::new(ObscuraHttpClient::with_full_options(
+            Arc::new(CookieJar::new()),
+            None,
+            true,
+        ));
+        let callbacks = Arc::new(CallbackRegistry::new());
+        let callback_requests = Arc::new(AtomicUsize::new(0));
+        let callback_responses = Arc::new(AtomicUsize::new(0));
+        let observed_requests = callback_requests.clone();
+        callbacks.add_request(Arc::new(move |_| {
+            observed_requests.fetch_add(1, Ordering::SeqCst);
+        }));
+        let observed_responses = callback_responses.clone();
+        callbacks.add_response(Arc::new(move |_, _| {
+            observed_responses.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        let mut fetches = tokio::task::JoinSet::new();
+        for _ in 0..32 {
+            let client = client.clone();
+            let callbacks = callbacks.clone();
+            let url = url.clone();
+            let request = ResourceRequest::subresource(ResourceType::Script, &initiator);
+            fetches.spawn(async move {
+                client
+                    .fetch_resource_with_callbacks(&url, request, Some(&callbacks))
+                    .await
+                    .unwrap()
+            });
+        }
+        let mut responses = Vec::new();
+        while let Some(response) = fetches.join_next().await {
+            responses.push(response.unwrap());
+        }
+
+        assert_eq!(responses.len(), 32);
+        assert!(responses.iter().all(|response| response.status == 200));
+        assert_eq!(network_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(callback_requests.load(Ordering::SeqCst), 32);
+        assert_eq!(callback_responses.load(Ordering::SeqCst), 32);
+    }
+
+    #[tokio::test]
+    async fn distinct_subresource_urls_do_not_coalesce() {
+        let (url, network_requests) =
+            cacheable_resource_fixture(200, "Cache-Control: public, max-age=3600\r\n").await;
+        let initiator = url.join("/page.html").unwrap();
+        let client = Arc::new(ObscuraHttpClient::with_full_options(
+            Arc::new(CookieJar::new()),
+            None,
+            true,
+        ));
+
+        let mut fetches = tokio::task::JoinSet::new();
+        for index in 0..24 {
+            let client = client.clone();
+            let url = url.join(&format!("/distinct/{index}.js")).unwrap();
+            let request = ResourceRequest::subresource(ResourceType::Script, &initiator);
+            fetches.spawn(async move {
+                client
+                    .fetch_resource_with_callbacks(&url, request, None)
+                    .await
+                    .unwrap()
+            });
+        }
+        let mut responses = Vec::new();
+        while let Some(response) = fetches.join_next().await {
+            responses.push(response.unwrap());
+        }
+
+        assert_eq!(responses.len(), 24);
+        assert_eq!(network_requests.load(Ordering::SeqCst), 24);
+    }
+
+    #[tokio::test]
+    async fn no_store_vary_star_and_error_responses_are_not_reused() {
+        for (status, headers) in [
+            (200, "Cache-Control: no-store\r\n"),
+            (200, "Cache-Control: public, max-age=3600\r\nVary: *\r\n"),
+            (500, "Cache-Control: public, max-age=3600\r\n"),
+        ] {
+            let (url, network_requests) = cacheable_resource_fixture(status, headers).await;
+            let initiator = url.join("/page.html").unwrap();
+            let client =
+                ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
+            let request = ResourceRequest::subresource(ResourceType::Script, &initiator);
+            client
+                .fetch_resource_with_callbacks(&url, request.clone(), None)
+                .await
+                .unwrap();
+            client
+                .fetch_resource_with_callbacks(&url, request, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                network_requests.load(Ordering::SeqCst),
+                2,
+                "status={status} headers={headers:?}",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn authorization_and_cookie_bearing_requests_bypass_resource_cache() {
+        for header in [
+            ("Authorization", "Bearer secret"),
+            ("Cookie", "session=secret"),
+        ] {
+            let (url, network_requests) =
+                cacheable_resource_fixture(200, "Cache-Control: public, max-age=3600\r\n").await;
+            let initiator = url.join("/page.html").unwrap();
+            let client =
+                ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
+            client
+                .set_extra_headers(HashMap::from([(
+                    header.0.to_string(),
+                    header.1.to_string(),
+                )]))
+                .await;
+            let request = ResourceRequest::subresource(ResourceType::Script, &initiator);
+            client
+                .fetch_resource_with_callbacks(&url, request.clone(), None)
+                .await
+                .unwrap();
+            client
+                .fetch_resource_with_callbacks(&url, request, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                network_requests.load(Ordering::SeqCst),
+                2,
+                "header={header:?}"
+            );
+        }
     }
 
     #[tokio::test]

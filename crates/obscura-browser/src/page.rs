@@ -1355,11 +1355,16 @@ impl Page {
 
         let client = self.http_client.clone();
         let page_callbacks = self.callbacks.clone();
+        let script_initiator = self
+            .url
+            .clone()
+            .unwrap_or_else(|| Url::parse("about:blank").unwrap());
         let fetch_futures: Vec<_> = fetch_tasks
             .iter()
             .map(|(idx, url)| {
                 let client = client.clone();
                 let cbs = page_callbacks.clone();
+                let initiator = script_initiator.clone();
                 let url = url.clone();
                 let idx = *idx;
                 async move {
@@ -1389,7 +1394,11 @@ impl Page {
                         };
                         return Some((idx, url, resp));
                     }
-                    match client.fetch_with_callbacks(&parsed, Some(&cbs)).await {
+                    let request = ResourceRequest::subresource(ResourceType::Script, &initiator);
+                    match client
+                        .fetch_resource_with_callbacks(&parsed, request, Some(&cbs))
+                        .await
+                    {
                         Ok(resp) => Some((idx, url, resp)),
                         Err(e) => {
                             tracing::warn!("Failed to fetch script {}: {}", url, e);
@@ -3762,6 +3771,137 @@ mod tests {
             stream.write_all(response.as_bytes()).unwrap();
         });
         (format!("http://{address}"), request_rx)
+    }
+
+    fn spawn_script_resource_cache_server(
+        distinct: bool,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read as _, Write as _};
+        use std::sync::atomic::Ordering;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let script_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_requests = script_requests.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else {
+                    continue;
+                };
+                let observed_requests = observed_requests.clone();
+                std::thread::spawn(move || {
+                    let mut request = [0u8; 2048];
+                    let length = stream.read(&mut request).unwrap_or(0);
+                    let request_text = String::from_utf8_lossy(&request[..length]);
+                    let path = request_text
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_ascii_whitespace().nth(1))
+                        .unwrap_or("/");
+                    let (content_type, cache_control, body) = if path == "/duplicate.html" {
+                        let tags = (0..32)
+                            .map(|_| "<script src='/shared.js'></script>")
+                            .collect::<String>();
+                        (
+                            "text/html",
+                            "no-store",
+                            format!(
+                                "<!doctype html><html><body><script>globalThis.__runs=0</script>{tags}</body></html>"
+                            ),
+                        )
+                    } else if path == "/distinct.html" {
+                        let tags = (0..24)
+                            .map(|index| format!("<script src='/distinct/{index}.js'></script>"))
+                            .collect::<String>();
+                        (
+                            "text/html",
+                            "no-store",
+                            format!(
+                                "<!doctype html><html><body><script>globalThis.__runs=0</script>{tags}</body></html>"
+                            ),
+                        )
+                    } else if path == "/shared.js" || path.starts_with("/distinct/") {
+                        observed_requests.fetch_add(1, Ordering::SeqCst);
+                        std::thread::sleep(std::time::Duration::from_millis(80));
+                        (
+                            "application/javascript",
+                            "public, max-age=3600",
+                            "globalThis.__runs=(globalThis.__runs||0)+1;".to_string(),
+                        )
+                    } else {
+                        ("text/plain", "no-store", "not found".to_string())
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nCache-Control: {cache_control}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len(),
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                });
+            }
+        });
+        let page = if distinct {
+            "distinct.html"
+        } else {
+            "duplicate.html"
+        };
+        (format!("http://{address}/{page}"), script_requests)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn duplicate_cacheable_scripts_fetch_once_but_execute_for_each_element() {
+        use std::sync::atomic::Ordering;
+
+        let (url, script_requests) = spawn_script_resource_cache_server(false);
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "duplicate-script-cache".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("duplicate-script-cache".to_string(), context);
+
+        page.navigate(&url).await.unwrap();
+
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("globalThis.__runs")
+                .unwrap(),
+            serde_json::json!(32.0),
+            "a cached response must still execute for every script element",
+        );
+        assert_eq!(script_requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn distinct_cacheable_scripts_keep_distinct_network_requests() {
+        use std::sync::atomic::Ordering;
+
+        let (url, script_requests) = spawn_script_resource_cache_server(true);
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "distinct-script-cache".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("distinct-script-cache".to_string(), context);
+
+        page.navigate(&url).await.unwrap();
+
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("globalThis.__runs")
+                .unwrap(),
+            serde_json::json!(24.0),
+        );
+        assert_eq!(script_requests.load(Ordering::SeqCst), 24);
     }
 
     #[test]
