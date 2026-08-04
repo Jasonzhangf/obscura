@@ -1284,10 +1284,48 @@ const _CSS_PROP_SET = new Set(_CSS_PROPERTY_NAMES);
 // dashed-key store, replacing its contents in place.
 function _parseCssInto(props, text) {
   for (const k in props) delete props[k];
-  if (text) String(text).split(";").forEach((p) => {
+  if (text) _splitCssDeclarations(text).forEach((p) => {
     const i = p.indexOf(":");
     if (i > 0) { const k = p.slice(0, i).trim(); const v = p.slice(i + 1).trim(); if (k && v) props[_cssCamelToKebab(k)] = v; }
   });
+}
+// Declaration values routinely contain semicolons in quoted `content`, data
+// URLs, gradients, and custom-property token streams. Split only at the
+// declaration-list level so reflecting a CSSStyleRule through CSSOM does not
+// corrupt otherwise valid CSS before the renderer sees it.
+function _splitCssDeclarations(value) {
+  const text = String(value || "");
+  const declarations = [];
+  let start = 0, quote = "", escaped = false, comment = false;
+  let parens = 0, brackets = 0, braces = 0;
+  const push = (end) => {
+    const declaration = text.slice(start, end).trim();
+    if (declaration) declarations.push(declaration);
+  };
+  for (let index = 0; index < text.length; index++) {
+    const ch = text[index], next = text[index + 1];
+    if (comment) {
+      if (ch === "*" && next === "/") { comment = false; index++; }
+      continue;
+    }
+    if (escaped) { escaped = false; continue; }
+    if (ch === "\\") { escaped = true; continue; }
+    if (quote) { if (ch === quote) quote = ""; continue; }
+    if (ch === "/" && next === "*") { comment = true; index++; continue; }
+    if (ch === '"' || ch === "'") { quote = ch; continue; }
+    if (ch === "(") { parens++; continue; }
+    if (ch === ")") { parens = Math.max(0, parens - 1); continue; }
+    if (ch === "[") { brackets++; continue; }
+    if (ch === "]") { brackets = Math.max(0, brackets - 1); continue; }
+    if (ch === "{") { braces++; continue; }
+    if (ch === "}") { braces = Math.max(0, braces - 1); continue; }
+    if (ch === ";" && !parens && !brackets && !braces) {
+      push(index);
+      start = index + 1;
+    }
+  }
+  push(text.length);
+  return declarations;
 }
 function _serializeCss(props) {
   const e = Object.entries(props);
@@ -1295,13 +1333,14 @@ function _serializeCss(props) {
 }
 
 class CSSStyleDeclaration {
-  constructor(owner) {
+  constructor(owner, onChange) {
     // Non-enumerable so they never leak through the proxy's own-key traps.
     Object.defineProperty(this, "_props", { value: {}, writable: true, enumerable: false, configurable: true });
     // The owner Element, if any. A live declaration reflects that element's
     // `style` content attribute in both directions; an owner-less declaration
     // (getComputedStyle fallback, stylesheet rules) is purely in-memory.
     Object.defineProperty(this, "_owner", { value: owner || null, writable: true, enumerable: false, configurable: true });
+    Object.defineProperty(this, "_onChange", { value: onChange || null, writable: true, enumerable: false, configurable: true });
     // Load the content attribute only when style is first observed. Keeping
     // this as a primitive avoids allocating a separate sync object for every
     // wrapped element.
@@ -1324,10 +1363,13 @@ class CSSStyleDeclaration {
   // serialization. No-op when owner-less.
   _push() {
     const o = this._owner;
-    if (!o) return;
-    const text = _serializeCss(this._props);
-    if (text) o.setAttribute("style", text);
-    else o.removeAttribute("style");
+    if (o) {
+      const text = _serializeCss(this._props);
+      if (text) o.setAttribute("style", text);
+      else o.removeAttribute("style");
+    } else if (this._onChange) {
+      this._onChange();
+    }
   }
   // Storage is keyed by the dashed CSS name, matching CSSOM. The proxy maps the
   // camelCase IDL access (el.style.fontSize) onto the dashed key (font-size), so
@@ -1696,7 +1738,11 @@ class Node {
   get textContent() { return _domParse("text_content", this._nid) ?? ""; }
   set textContent(v) {
     const oldChildren = _domParse("child_nodes", this._nid) || [];
-    for (const c of oldChildren) _dom("remove_child", c);
+    for (const c of oldChildren) {
+      const child = _wrap(c);
+      if (child) _detachStyleSheetsInSubtree(child);
+      _dom("remove_child", c);
+    }
     let added = [];
     if (v != null && v !== "") {
       const tn = +_dom("create_text_node", String(v));
@@ -1753,6 +1799,7 @@ class Node {
       return c;
     }
     if (c._shadowParent) c._shadowParent.removeChild(c);
+    else if (c.parentNode) _detachStyleSheetsInSubtree(c);
     _dom("append_child", this._nid, c._nid);
     _registerWindowNamedTree(c);
     if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('childList', this._nid, [c._nid], []);
@@ -1773,6 +1820,7 @@ class Node {
       _linkedStylesheetNodes.delete(c);
     }
     _dom("remove_child", c._nid);
+    _detachStyleSheetsInSubtree(c);
     _reconcileWindowNamedProperties(removedWindowNames);
     if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('childList', this._nid, [], [c._nid]);
     return c;
@@ -1786,9 +1834,11 @@ class Node {
       return oldChild;
     }
     if (newChild._shadowParent) newChild._shadowParent.removeChild(newChild);
+    else if (newChild.parentNode) _detachStyleSheetsInSubtree(newChild);
     const removedWindowNames = _windowNamedNamesInTree(oldChild);
     _dom("insert_before", newChild._nid, oldChild._nid);
     _dom("remove_child", oldChild._nid);
+    _detachStyleSheetsInSubtree(oldChild);
     _registerWindowNamedTree(newChild);
     _reconcileWindowNamedProperties(removedWindowNames);
     __prepareInsertedSubtree(newChild);
@@ -1803,6 +1853,7 @@ class Node {
       return n;
     }
     if (n._shadowParent) n._shadowParent.removeChild(n);
+    else if (n.parentNode) _detachStyleSheetsInSubtree(n);
     _dom("insert_before", n._nid, ref._nid);
     _registerWindowNamedTree(n);
     __prepareInsertedSubtree(n);
@@ -2682,6 +2733,10 @@ class Element extends Node {
     // every MutationObserver subscriber and downstream hydration / polling
     // logic stalls.
     const previousWindowNames = _windowNamedNamesInTree(this);
+    // Native fragment replacement bypasses Node.removeChild. Disassociate
+    // descendant style sheets before the backing nodes leave the document so
+    // retained CSSStyleSheet wrappers cannot keep stale owner/source nodes.
+    for (const style of this.querySelectorAll("style")) _detachStyleSheet(style);
     let oldChildren = [];
     let newChildren = [];
     if (globalThis.__mutationObservers?.length) {
@@ -4850,7 +4905,10 @@ class Document extends Node {
       hasFeature() { return true; },
     };
   }
-  get styleSheets() { return []; }
+  get styleSheets() {
+    if (!this._styleSheetList) this._styleSheetList = new StyleSheetList(this);
+    return this._styleSheetList;
+  }
   get forms() { return this.querySelectorAll("form"); }
   get images() { return this.querySelectorAll("img"); }
   get links() { return this.querySelectorAll("a[href], area[href]"); }
@@ -7422,41 +7480,339 @@ globalThis.getSelection = _markNative(function getSelection() {
   return _selectionFor(globalThis.document);
 });
 
-globalThis.CSSStyleSheet = class CSSStyleSheet {
-  constructor(options) {
-    this.cssRules = [];
+class CSSRule {
+  static STYLE_RULE = 1;
+  static CHARSET_RULE = 2;
+  static IMPORT_RULE = 3;
+  static MEDIA_RULE = 4;
+  static FONT_FACE_RULE = 5;
+  static PAGE_RULE = 6;
+  static KEYFRAMES_RULE = 7;
+  static KEYFRAME_RULE = 8;
+  static NAMESPACE_RULE = 10;
+  static COUNTER_STYLE_RULE = 11;
+  static SUPPORTS_RULE = 12;
+
+  constructor(cssText, type = 0) {
+    this._cssText = String(cssText || "").trim();
+    this._type = type;
+    this._parentStyleSheet = null;
+    this._parentRule = null;
+  }
+  get type() { return this._type; }
+  get cssText() { return this._cssText; }
+  set cssText(_value) {}
+  get parentStyleSheet() { return this._parentStyleSheet; }
+  get parentRule() { return this._parentRule; }
+}
+for (const name of [
+  "STYLE_RULE", "CHARSET_RULE", "IMPORT_RULE", "MEDIA_RULE", "FONT_FACE_RULE",
+  "PAGE_RULE", "KEYFRAMES_RULE", "KEYFRAME_RULE", "NAMESPACE_RULE",
+  "COUNTER_STYLE_RULE", "SUPPORTS_RULE",
+]) {
+  Object.defineProperty(CSSRule.prototype, name, { value: CSSRule[name] });
+}
+
+class CSSStyleRule extends CSSRule {
+  constructor(selectorText, declarations) {
+    super("", CSSRule.STYLE_RULE);
+    this._selectorText = String(selectorText || "").trim();
+    const declaration = new CSSStyleDeclaration(null, () => this._changed());
+    _parseCssInto(declaration._props, declarations);
+    declaration._loaded = true;
+    this._style = _styleProxy(declaration);
+  }
+  get selectorText() { return this._selectorText; }
+  set selectorText(value) {
+    const selector = String(value || "").trim();
+    if (!selector || /[{}]/.test(selector)) return;
+    this._selectorText = selector;
+    this._changed();
+  }
+  get style() { return this._style; }
+  get cssText() {
+    const declarations = this._style.cssText;
+    return `${this._selectorText} {${declarations ? " " + declarations : ""} }`;
+  }
+  set cssText(_value) {}
+  _changed() {
+    if (this._parentStyleSheet) this._parentStyleSheet._ruleChanged();
+  }
+}
+
+// Split only the stylesheet's top-level rules. The renderer remains the CSS
+// parser of record; this scanner exists to expose the live CSSOM rule list and
+// deliberately preserves unfamiliar at-rules as opaque CSSRule objects.
+function _splitTopLevelCssRules(value) {
+  const css = String(value || "");
+  const rules = [];
+  let position = 0;
+  const skipTrivia = () => {
+    for (;;) {
+      while (position < css.length && /\s/.test(css[position])) position++;
+      if (css.startsWith("/*", position)) {
+        const end = css.indexOf("*/", position + 2);
+        if (end < 0) { position = css.length; return false; }
+        position = end + 2;
+        continue;
+      }
+      return true;
+    }
+  };
+  let valid = skipTrivia();
+  while (valid && position < css.length) {
+    const start = position;
+    let quote = "", comment = false, escaped = false;
+    let parens = 0, braces = 0, complete = false;
+    for (; position < css.length; position++) {
+      const ch = css[position], next = css[position + 1];
+      if (comment) {
+        if (ch === "*" && next === "/") { comment = false; position++; }
+        continue;
+      }
+      if (escaped) { escaped = false; continue; }
+      if (ch === "\\") { escaped = true; continue; }
+      if (quote) { if (ch === quote) quote = ""; continue; }
+      if (ch === "/" && next === "*") { comment = true; position++; continue; }
+      if (ch === '"' || ch === "'") { quote = ch; continue; }
+      if (ch === "(") { parens++; continue; }
+      if (ch === ")") { parens = Math.max(0, parens - 1); continue; }
+      if (parens) continue;
+      if (ch === "{") { braces++; continue; }
+      if (ch === "}") {
+        if (!braces) break;
+        braces--;
+        if (!braces) { position++; complete = true; break; }
+        continue;
+      }
+      if (ch === ";" && !braces) { position++; complete = true; break; }
+    }
+    if (!complete || quote || comment || braces || parens) {
+      valid = false;
+      break;
+    }
+    const text = css.slice(start, position).trim();
+    if (text) rules.push(text);
+    valid = skipTrivia();
+  }
+  return { rules, valid: valid && position >= css.length };
+}
+
+function _cssRuleFromText(text) {
+  const trimmed = String(text || "").trim();
+  if (!trimmed) return null;
+  if (trimmed[0] === "@") return new CSSRule(trimmed, 0);
+  const open = trimmed.indexOf("{");
+  if (open <= 0 || !trimmed.endsWith("}")) return null;
+  const selector = trimmed.slice(0, open).trim();
+  if (!selector) return null;
+  return new CSSStyleRule(selector, trimmed.slice(open + 1, -1));
+}
+
+class CSSRuleList {
+  constructor(sheet) {
+    this._sheet = sheet;
+    return new Proxy(this, {
+      get(target, property, receiver) {
+        if (typeof property === "string" && /^(?:0|[1-9]\d*)$/.test(property)) {
+          return target.item(+property) || undefined;
+        }
+        return Reflect.get(target, property, receiver);
+      },
+      has(target, property) {
+        if (typeof property === "string" && /^(?:0|[1-9]\d*)$/.test(property)) {
+          return +property < target.length;
+        }
+        return Reflect.has(target, property);
+      },
+      getOwnPropertyDescriptor(target, property) {
+        if (typeof property === "string" && /^(?:0|[1-9]\d*)$/.test(property)) {
+          const value = target.item(+property);
+          return value ? { value, writable: false, enumerable: true, configurable: true } : undefined;
+        }
+        return Reflect.getOwnPropertyDescriptor(target, property);
+      },
+    });
+  }
+  get length() { this._sheet._refreshFromOwner(); return this._sheet._rules.length; }
+  item(index) {
+    this._sheet._refreshFromOwner();
+    return this._sheet._rules[index >>> 0] || null;
+  }
+  forEach(callback, thisArg) {
+    for (let i = 0; i < this.length; i++) callback.call(thisArg, this.item(i), i, this);
+  }
+  *[Symbol.iterator]() { for (let i = 0; i < this.length; i++) yield this.item(i); }
+}
+
+class CSSStyleSheet {
+  constructor(_options) {
     this.ownerRule = null;
     this.disabled = false;
+    this._ownerNode = null;
+    this._sourceNode = null;
+    this._sourceText = "";
     this._rules = [];
+    this._cssRules = new CSSRuleList(this);
   }
-  insertRule(rule, index) {
-    const idx = index ?? this._rules.length;
-    this._rules.splice(idx, 0, { cssText: rule, type: 1 });
-    this.cssRules = this._rules;
+  get type() { return "text/css"; }
+  get ownerNode() { return this._ownerNode; }
+  get parentStyleSheet() { return null; }
+  get href() { return null; }
+  get title() { return this._ownerNode?.getAttribute?.("title") || ""; }
+  get cssRules() { this._refreshFromOwner(); return this._cssRules; }
+  get rules() { return this.cssRules; }
+  _bindOwner(ownerNode, sourceNode = ownerNode) {
+    this._ownerNode = ownerNode;
+    this._sourceNode = sourceNode;
+    this._sourceText = null;
+    this._refreshFromOwner();
+  }
+  _refreshFromOwner() {
+    if (!this._sourceNode) return;
+    const text = this._sourceNode.textContent || "";
+    if (text === this._sourceText) return;
+    const parsed = _splitTopLevelCssRules(text);
+    const rules = parsed.rules.map(_cssRuleFromText).filter(Boolean);
+    this._setRules(rules);
+    this._sourceText = text;
+  }
+  _setRules(rules) {
+    for (const rule of this._rules) rule._parentStyleSheet = null;
+    this._rules.splice(0, this._rules.length, ...rules);
+    for (const rule of this._rules) rule._parentStyleSheet = this;
+  }
+  _serializeText() { return this._rules.map(rule => rule.cssText).join("\n"); }
+  _ruleChanged() {
+    const text = this._serializeText();
+    this._sourceText = text;
+    // DOM text is the renderer bridge for this bounded CSSOM implementation:
+    // its ordinary style-element mutation path invalidates cascade/layout.
+    // Avoiding the observable text rewrite requires a future native effective-
+    // source channel shared by CSSOM and the renderer.
+    if (this._sourceNode && this._sourceNode.textContent !== text) this._sourceNode.textContent = text;
     _syncAdoptedStyleSheet(this);
+  }
+  insertRule(rule, index = 0) {
+    if (arguments.length < 1) throw new TypeError("CSSStyleSheet.insertRule requires a rule");
+    this._refreshFromOwner();
+    const idx = Number(index) >>> 0;
+    if (idx > this._rules.length) throw new DOMException("Rule index is out of range", "IndexSizeError");
+    const parsed = _splitTopLevelCssRules(String(rule));
+    if (!parsed.valid || parsed.rules.length !== 1) {
+      throw new DOMException("The rule could not be parsed", "SyntaxError");
+    }
+    const cssRule = _cssRuleFromText(parsed.rules[0]);
+    if (!cssRule) throw new DOMException("The rule could not be parsed", "SyntaxError");
+    cssRule._parentStyleSheet = this;
+    this._rules.splice(idx, 0, cssRule);
+    this._ruleChanged();
     return idx;
   }
   deleteRule(index) {
-    this._rules.splice(index, 1);
-    this.cssRules = this._rules;
-    _syncAdoptedStyleSheet(this);
+    if (arguments.length < 1) throw new TypeError("CSSStyleSheet.deleteRule requires an index");
+    this._refreshFromOwner();
+    const idx = Number(index) >>> 0;
+    if (idx >= this._rules.length) throw new DOMException("Rule index is out of range", "IndexSizeError");
+    const [removed] = this._rules.splice(idx, 1);
+    if (removed) removed._parentStyleSheet = null;
+    this._ruleChanged();
   }
   addRule(selector, style, index) {
-    return this.insertRule(selector + '{' + style + '}', index);
+    this.insertRule(String(selector) + "{" + String(style) + "}", index ?? this._rules.length);
+    return -1;
   }
-  removeRule(index) { this.deleteRule(index); }
-  replace(text) {
-    this._rules = [{ cssText: text, type: 1 }];
-    this.cssRules = this._rules;
-    _syncAdoptedStyleSheet(this);
-    return Promise.resolve(this);
-  }
+  removeRule(index = 0) { this.deleteRule(index); }
+  replace(text) { this.replaceSync(text); return Promise.resolve(this); }
   replaceSync(text) {
-    this._rules = [{ cssText: text, type: 1 }];
-    this.cssRules = this._rules;
-    _syncAdoptedStyleSheet(this);
+    const parsed = _splitTopLevelCssRules(String(text));
+    this._setRules(parsed.rules.map(_cssRuleFromText).filter(Boolean));
+    this._ruleChanged();
   }
-};
+}
+
+const _styleElementSheets = new WeakMap();
+function _styleElementHasCssSheet(style) {
+  if (!style || style.localName !== "style" || !style.isConnected) return false;
+  const type = (style.getAttribute("type") || "").trim().toLowerCase();
+  return !type || type === "text/css";
+}
+function _sheetForStyleElement(style) {
+  if (!_styleElementHasCssSheet(style)) {
+    _detachStyleSheet(style);
+    return null;
+  }
+  let sheet = _styleElementSheets.get(style);
+  if (!sheet) {
+    sheet = new CSSStyleSheet();
+    sheet._bindOwner(style);
+    _styleElementSheets.set(style, sheet);
+  }
+  return sheet;
+}
+function _detachStyleSheet(style) {
+  const sheet = _styleElementSheets.get(style);
+  if (!sheet) return;
+  sheet._ownerNode = null;
+  sheet._sourceNode = null;
+  _styleElementSheets.delete(style);
+}
+function _detachStyleSheetsInSubtree(root) {
+  if (!root) return;
+  if (root.nodeType === 1 && root.localName === "style") _detachStyleSheet(root);
+  if (!root.querySelectorAll) return;
+  for (const style of root.querySelectorAll("style")) _detachStyleSheet(style);
+}
+
+class StyleSheetList {
+  constructor(root) {
+    this._root = root;
+    return new Proxy(this, {
+      get(target, property, receiver) {
+        if (typeof property === "string" && /^(?:0|[1-9]\d*)$/.test(property)) {
+          return target.item(+property) || undefined;
+        }
+        return Reflect.get(target, property, receiver);
+      },
+      has(target, property) {
+        if (typeof property === "string" && /^(?:0|[1-9]\d*)$/.test(property)) {
+          return +property < target.length;
+        }
+        return Reflect.has(target, property);
+      },
+    });
+  }
+  _sheets() {
+    const styles = this._root.querySelectorAll ? this._root.querySelectorAll("style") : [];
+    const out = [];
+    for (const style of styles) {
+      if (style.hasAttribute("data-obscura-adopted")
+          || style.hasAttribute("data-obscura-linked")
+          || style.hasAttribute("data-obscura-external-stylesheets")
+          || style.hasAttribute("data-obscura-inline-import")) continue;
+      const sheet = _sheetForStyleElement(style);
+      if (sheet) out.push(sheet);
+    }
+    return out;
+  }
+  get length() { return this._sheets().length; }
+  item(index) { return this._sheets()[index >>> 0] || null; }
+  forEach(callback, thisArg) {
+    const sheets = this._sheets();
+    sheets.forEach((sheet, index) => callback.call(thisArg, sheet, index, this));
+  }
+  *[Symbol.iterator]() { yield* this._sheets(); }
+}
+
+Object.defineProperty(Element.prototype, "sheet", {
+  get() { return this.localName === "style" ? _sheetForStyleElement(this) : null; },
+  configurable: true,
+});
+globalThis.CSSRule = CSSRule;
+globalThis.CSSStyleRule = CSSStyleRule;
+globalThis.CSSRuleList = CSSRuleList;
+globalThis.CSSStyleSheet = CSSStyleSheet;
+globalThis.StyleSheetList = StyleSheetList;
 
 function _syncAdoptedStyleSheet(sheet) {
   const doc = globalThis.document;

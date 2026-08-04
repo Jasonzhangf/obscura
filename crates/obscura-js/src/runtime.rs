@@ -9870,6 +9870,198 @@ mod tests {
     }
 
     #[test]
+    fn inline_stylesheet_cssom_lists_and_rules_are_live_same_objects() {
+        let mut rt = setup_runtime(
+            r#"<html><head>
+                <style id="first">.one { color:red } .two { width:20px }</style>
+                <style id="second">.three { display:block }</style>
+            </head><body></body></html>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+                (() => {
+                    const list = document.styleSheets;
+                    const style = document.getElementById('first');
+                    const sheet = style.sheet;
+                    const rules = sheet.cssRules;
+                    const firstRule = rules[0];
+                    const initial = [
+                        list === document.styleSheets,
+                        list.length,
+                        list[0] === sheet,
+                        list.item(0) === sheet,
+                        list.item(9),
+                        sheet.ownerNode === style,
+                        rules === sheet.cssRules,
+                        rules.length,
+                        rules.item(0) === firstRule,
+                        firstRule instanceof CSSRule,
+                        firstRule instanceof CSSStyleRule,
+                        firstRule.type,
+                        firstRule.selectorText,
+                        firstRule.style.color,
+                        firstRule.parentStyleSheet === sheet,
+                    ];
+
+                    sheet.insertRule('.middle { height: 30px; }', 1);
+                    const inserted = [
+                        rules.length,
+                        rules[0] === firstRule,
+                        rules[1].selectorText,
+                        style.textContent.includes('.middle'),
+                    ];
+                    sheet.deleteRule(1);
+
+                    const extra = document.createElement('style');
+                    document.head.appendChild(extra);
+                    const afterAppend = list.length;
+                    const emptySheet = extra.sheet;
+                    const emptyIdentity = emptySheet === list[2]
+                        && emptySheet.cssRules.length === 0;
+                    extra.textContent = '.extra { opacity:.5 }';
+                    const emptyBecameLive = emptySheet.cssRules.length === 1;
+                    extra.remove();
+                    const afterRemove = list.length;
+
+                    style.textContent = '.replacement { padding: 4px; }';
+                    const reparsed = [
+                        style.sheet === sheet,
+                        sheet.cssRules === rules,
+                        rules.length,
+                        rules[0].selectorText,
+                        rules[0].style.padding,
+                    ];
+                    style.remove();
+                    const disconnected = style.sheet === null
+                        && sheet.ownerNode === null
+                        && list.length === 1;
+                    document.head.appendChild(style);
+                    const reconnected = style.sheet !== sheet
+                        && style.sheet.ownerNode === style
+                        && list.length === 2;
+
+                    const left = document.createElement('div');
+                    const right = document.createElement('div');
+                    document.body.append(left, right);
+                    const moving = document.createElement('style');
+                    moving.textContent = '.moving { color: red }';
+                    left.appendChild(moving);
+                    const beforeMove = moving.sheet;
+                    right.appendChild(moving);
+                    const reparented = beforeMove.ownerNode === null
+                        && moving.sheet !== beforeMove
+                        && moving.sheet.ownerNode === moving;
+                    right.remove();
+                    left.remove();
+
+                    const bulk = document.createElement('div');
+                    document.body.appendChild(bulk);
+                    bulk.innerHTML = '<style>.bulk { color: blue }</style><span></span>';
+                    const bulkSheet = bulk.querySelector('style').sheet;
+                    bulk.innerHTML = '';
+                    const innerHTMLDetached = bulkSheet.ownerNode === null;
+                    bulk.innerHTML = '<section><style>.text { color: green }</style></section>';
+                    const textSheet = bulk.querySelector('style').sheet;
+                    bulk.textContent = '';
+                    const textContentDetached = textSheet.ownerNode === null;
+                    bulk.remove();
+                    return {
+                        initial, inserted, afterAppend, emptyIdentity, emptyBecameLive,
+                        afterRemove, reparsed, disconnected, reconnected, reparented,
+                        innerHTMLDetached, textContentDetached,
+                    };
+                })()
+                "#,
+            )
+            .unwrap();
+
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "initial": [true, 2, true, true, null, true, true, 2, true,
+                    true, true, 1, ".one", "red", true],
+                "inserted": [3, true, ".middle", true],
+                "afterAppend": 3,
+                "emptyIdentity": true,
+                "emptyBecameLive": true,
+                "afterRemove": 2,
+                "reparsed": [true, true, 1, ".replacement", "4px"],
+                "disconnected": true,
+                "reconnected": true,
+                "reparented": true,
+                "innerHTMLDetached": true,
+                "textContentDetached": true,
+            })
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn stylesheet_cssom_mutations_update_the_live_cascade() {
+        let mut rt = setup_runtime(
+            r#"<html style="margin:0"><head>
+                <style>#box { width:11px; height:10px }</style>
+                </head><body style="margin:0"><div id="box"></div></body></html>"#,
+        );
+        rt.set_viewport(200.0, 100.0);
+        let result = rt
+            .evaluate(
+                r#"
+                (() => {
+                    const style = document.createElement('style');
+                    style.type = 'text/css';
+                    style.setAttribute('data-framer-css', 'true');
+                    document.head.appendChild(style);
+                    const sheet = style.sheet;
+                    const rules = sheet.cssRules;
+                    const termius = [
+                        !!sheet,
+                        rules.length,
+                        document.styleSheets[1] === sheet,
+                        sheet.ownerNode === style,
+                    ];
+                    sheet.insertRule('#box { width:73px; height:10px; }', rules.length);
+                    termius.push(rules.length);
+                    sheet.insertRule('.other { color: blue; }', rules.length);
+                    termius.push(rules.length);
+                    sheet.insertRule('.semicolon { content: "a;b"; background-image: url("data:image/svg+xml;utf8,<svg/>"); }', rules.length);
+                    const semicolonValues = [
+                        rules[2].style.content,
+                        rules[2].style.backgroundImage,
+                    ];
+                    let multiRuleSyntaxError = false;
+                    try {
+                        sheet.insertRule('.invalid-a {} .invalid-b {}', rules.length);
+                    } catch (error) {
+                        multiRuleSyntaxError = error?.name === 'SyntaxError';
+                    }
+                    const inserted = document.getElementById('box').getBoundingClientRect().width;
+                    rules[0].style.setProperty('width', '91px');
+                    const edited = document.getElementById('box').getBoundingClientRect().width;
+                    const computed = getComputedStyle(document.getElementById('box')).width;
+                    sheet.deleteRule(0);
+                    const deleted = document.getElementById('box').getBoundingClientRect().width;
+                    sheet.replaceSync('#box { width:64px } .other { color: blue }');
+                    const replaced = document.getElementById('box').getBoundingClientRect().width;
+                    return [termius, semicolonValues, multiRuleSyntaxError, inserted, edited, computed, deleted,
+                            replaced, rules.length, rules[0].selectorText,
+                            style.textContent.includes('.other')];
+                })()
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                [true, 0, true, true, 1, 2],
+                ["\"a;b\"", "url(\"data:image/svg+xml;utf8,<svg/>\")"], true,
+                73, 91, "91px", 11, 64, 2, "#box", true
+            ])
+        );
+    }
+
+    #[test]
     fn adopted_stylesheets_materialize_into_the_document() {
         let mut rt =
             setup_runtime("<html><head></head><body><div class=\"card\"></div></body></html>");
@@ -9882,18 +10074,33 @@ mod tests {
                     sheet.insertRule('.card { display: flex; color: red; }', 0);
                     const node = document.querySelector('style[data-obscura-adopted]');
                     const inserted = node.textContent;
+                    sheet.replaceSync('.card { content: "a;b"; background-image: url("data:image/svg+xml;utf8,<svg/>"); }');
+                    const preserved = [
+                        sheet.cssRules[0].style.content,
+                        sheet.cssRules[0].style.backgroundImage,
+                        node.textContent.includes('a;b'),
+                        node.textContent.includes('svg+xml;utf8'),
+                    ];
                     sheet.deleteRule(0);
                     return [
                         document.adoptedStyleSheets.length,
                         document.querySelectorAll('style[data-obscura-adopted]').length,
                         inserted.includes('display: flex'),
+                        preserved,
                         node.textContent,
                     ];
                 })()
                 "#,
             )
             .unwrap();
-        assert_eq!(result, serde_json::json!([1, 1, true, ""]));
+        assert_eq!(
+            result,
+            serde_json::json!([
+                1, 1, true,
+                ["\"a;b\"", "url(\"data:image/svg+xml;utf8,<svg/>\")", true, true],
+                ""
+            ])
+        );
     }
 
     #[test]
