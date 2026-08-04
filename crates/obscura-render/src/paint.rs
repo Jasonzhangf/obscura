@@ -607,6 +607,45 @@ pub struct SelectedImage {
     pub profile: ImageRequestProfile,
 }
 
+/// A short-lived view of one JavaScript canvas backing store. The renderer
+/// deliberately borrows raw RGBA only for a synchronous paint; retained
+/// layout never owns VM-specific resources or pixel copies.
+#[derive(Clone, Copy, Debug)]
+pub struct CanvasSurface<'a> {
+    width: u32,
+    height: u32,
+    rgba: &'a [u8],
+}
+
+impl<'a> CanvasSurface<'a> {
+    pub fn from_rgba8(width: u32, height: u32, rgba: &'a [u8]) -> Option<Self> {
+        let expected = (width as usize)
+            .checked_mul(height as usize)?
+            .checked_mul(4)?;
+        (expected == rgba.len()).then_some(Self {
+            width,
+            height,
+            rgba,
+        })
+    }
+}
+
+/// Paint-time lookup for dynamic canvas pixels. Implementations may retain a
+/// VM backing store, but the returned slice cannot escape the capture call.
+pub trait CanvasSurfaceSource {
+    fn surface(&self, node: obscura_dom::tree::NodeId) -> Option<CanvasSurface<'_>>;
+}
+
+struct EmptyCanvasSurfaceSource;
+
+impl CanvasSurfaceSource for EmptyCanvasSurfaceSource {
+    fn surface(&self, _node: obscura_dom::tree::NodeId) -> Option<CanvasSurface<'_>> {
+        None
+    }
+}
+
+static EMPTY_CANVAS_SURFACES: EmptyCanvasSurfaceSource = EmptyCanvasSurfaceSource;
+
 /// CSSOM scrolling metrics for one element box. Non-scroll containers expose
 /// their padding-box size on both surfaces and retain a zero offset.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2393,6 +2432,7 @@ fn paint_prepared_with_surface_color(
         pixmap,
         resources,
         &prepared.selected_images,
+        &EMPTY_CANVAS_SURFACES,
         &prepared.svg_fonts,
         prepared.content_size,
         &prepared.viewport_fixed,
@@ -2435,6 +2475,24 @@ pub fn paint_prepared_with_scroll_and_surface_color(
     scroll: &ResolvedScrollState,
     surface_color: [u8; 4],
 ) -> Option<Pixmap> {
+    paint_prepared_with_scroll_and_surface_color_and_canvas_surfaces(
+        tree,
+        prepared,
+        resources,
+        scroll,
+        surface_color,
+        &EMPTY_CANVAS_SURFACES,
+    )
+}
+
+pub fn paint_prepared_with_scroll_and_surface_color_and_canvas_surfaces(
+    tree: &DomTree,
+    prepared: &mut PreparedRender,
+    resources: &mut RenderResourceCache,
+    scroll: &ResolvedScrollState,
+    surface_color: [u8; 4],
+    canvas_surfaces: &dyn CanvasSurfaceSource,
+) -> Option<Pixmap> {
     validate_capture_region(CaptureRegion::new(
         scroll.root_offset().0,
         scroll.root_offset().1,
@@ -2461,6 +2519,7 @@ pub fn paint_prepared_with_scroll_and_surface_color(
         pixmap,
         resources,
         &prepared.selected_images,
+        canvas_surfaces,
         &prepared.svg_fonts,
         prepared.content_size,
         &prepared.viewport_fixed,
@@ -2508,6 +2567,26 @@ pub fn paint_prepared_region_with_scroll_and_surface_color(
     region: CaptureRegion,
     surface_color: [u8; 4],
 ) -> Result<Pixmap, CaptureError> {
+    paint_prepared_region_with_scroll_and_surface_color_and_canvas_surfaces(
+        tree,
+        prepared,
+        resources,
+        scroll,
+        region,
+        surface_color,
+        &EMPTY_CANVAS_SURFACES,
+    )
+}
+
+pub fn paint_prepared_region_with_scroll_and_surface_color_and_canvas_surfaces(
+    tree: &DomTree,
+    prepared: &mut PreparedRender,
+    resources: &mut RenderResourceCache,
+    scroll: &ResolvedScrollState,
+    region: CaptureRegion,
+    surface_color: [u8; 4],
+    canvas_surfaces: &dyn CanvasSurfaceSource,
+) -> Result<Pixmap, CaptureError> {
     paint_prepared_region_with_scroll_policy(
         tree,
         prepared,
@@ -2516,6 +2595,7 @@ pub fn paint_prepared_region_with_scroll_and_surface_color(
         region,
         false,
         surface_color,
+        canvas_surfaces,
     )
 }
 
@@ -2525,6 +2605,7 @@ fn paint_prepared_region_with_scroll_with_print_economy(
     resources: &mut RenderResourceCache,
     scroll: &ResolvedScrollState,
     region: CaptureRegion,
+    canvas_surfaces: &dyn CanvasSurfaceSource,
 ) -> Result<Pixmap, CaptureError> {
     paint_prepared_region_with_scroll_policy(
         tree,
@@ -2534,6 +2615,7 @@ fn paint_prepared_region_with_scroll_with_print_economy(
         region,
         true,
         [255, 255, 255, 255],
+        canvas_surfaces,
     )
 }
 
@@ -2545,6 +2627,7 @@ fn paint_prepared_region_with_scroll_policy(
     region: CaptureRegion,
     print_economy: bool,
     surface_color: [u8; 4],
+    canvas_surfaces: &dyn CanvasSurfaceSource,
 ) -> Result<Pixmap, CaptureError> {
     let (native_width, native_height, output_width, output_height) =
         checked_capture_dimensions(region)?;
@@ -2586,6 +2669,7 @@ fn paint_prepared_region_with_scroll_policy(
         pixmap,
         resources,
         &prepared.selected_images,
+        canvas_surfaces,
         &prepared.svg_fonts,
         prepared.content_size,
         &prepared.viewport_fixed,
@@ -2998,6 +3082,7 @@ fn paint_laid_dom_scrolled(
     mut pixmap: Pixmap,
     image_cache: &mut RenderResourceCache,
     selected_images: &HashMap<obscura_dom::tree::NodeId, SelectedImage>,
+    canvas_surfaces: &dyn CanvasSurfaceSource,
     svg_fonts: &Arc<usvg::fontdb::Database>,
     content_size: (f32, f32),
     viewport_fixed: &std::collections::HashSet<obscura_dom::tree::NodeId>,
@@ -3260,6 +3345,7 @@ fn paint_laid_dom_scrolled(
                 pixmap,
                 image_cache,
                 selected_images,
+                canvas_surfaces,
                 svg_fonts,
                 content_size,
                 viewport_fixed,
@@ -3294,6 +3380,7 @@ fn paint_laid_dom_scrolled(
                 pixmap,
                 image_cache,
                 selected_images,
+                canvas_surfaces,
                 svg_fonts,
                 content_size,
                 viewport_fixed,
@@ -3395,6 +3482,7 @@ fn paint_laid_dom_scrolled(
                     pixmap,
                     image_cache,
                     selected_images,
+                    canvas_surfaces,
                     svg_fonts,
                     content_size,
                     viewport_fixed,
@@ -3468,6 +3556,7 @@ fn paint_laid_dom_scrolled(
                 layer,
                 image_cache,
                 selected_images,
+                canvas_surfaces,
                 svg_fonts,
                 content_size,
                 viewport_fixed,
@@ -3542,6 +3631,7 @@ fn paint_laid_dom_scrolled(
                 layer,
                 image_cache,
                 selected_images,
+                canvas_surfaces,
                 svg_fonts,
                 content_size,
                 viewport_fixed,
@@ -3938,6 +4028,38 @@ fn paint_laid_dom_scrolled(
                     base_url,
                     image_cache,
                     raster_scale,
+                );
+            }
+        }
+
+        if box_on_surface && name.local.as_ref() == "canvas" {
+            if let Some(surface) = canvas_surfaces.surface(nid) {
+                // A canvas bitmap is replaced content: CSS sizing and
+                // object-fit operate on the content box, never the padding or
+                // border box. Keep padding available for the element's own
+                // background and inset the rounded clip to the same edge.
+                let content_insets = crate::Sides {
+                    top: style.border.top + style.padding.top,
+                    right: style.border.right + style.padding.right,
+                    bottom: style.border.bottom + style.padding.bottom,
+                    left: style.border.left + style.padding.left,
+                };
+                let content_rect = crate::Rect {
+                    x: rect.x + content_insets.left,
+                    y: rect.y + content_insets.top,
+                    width: (rect.width - content_insets.left - content_insets.right).max(0.0),
+                    height: (rect.height - content_insets.top - content_insets.bottom).max(0.0),
+                };
+                let content_visible = content_rect.intersect(&visible_rect).unwrap_or_default();
+                paint_canvas_surface(
+                    surface,
+                    &content_rect,
+                    &content_visible,
+                    style.object_fit,
+                    style.object_position,
+                    &mut pixmap,
+                    radius.inset(content_insets),
+                    element_clip_mask,
                 );
             }
         }
@@ -5734,6 +5856,26 @@ pub fn screenshot_prepared_with_scroll_and_surface_color(
     .ok()
 }
 
+pub fn screenshot_prepared_with_scroll_and_surface_color_and_canvas_surfaces(
+    tree: &DomTree,
+    prepared: &mut PreparedRender,
+    resources: &mut RenderResourceCache,
+    scroll: &ResolvedScrollState,
+    surface_color: [u8; 4],
+    canvas_surfaces: &dyn CanvasSurfaceSource,
+) -> Option<Vec<u8>> {
+    paint_prepared_with_scroll_and_surface_color_and_canvas_surfaces(
+        tree,
+        prepared,
+        resources,
+        scroll,
+        surface_color,
+        canvas_surfaces,
+    )?
+    .encode_png()
+    .ok()
+}
+
 /// PNG convenience wrapper for [`paint_prepared_region_with_scroll`].
 pub fn screenshot_prepared_region_with_scroll(
     tree: &DomTree,
@@ -5767,6 +5909,28 @@ pub fn screenshot_prepared_region_with_scroll_and_surface_color(
     .map_err(|_| CaptureError::EncodeFailed)
 }
 
+pub fn screenshot_prepared_region_with_scroll_and_surface_color_and_canvas_surfaces(
+    tree: &DomTree,
+    prepared: &mut PreparedRender,
+    resources: &mut RenderResourceCache,
+    scroll: &ResolvedScrollState,
+    region: CaptureRegion,
+    surface_color: [u8; 4],
+    canvas_surfaces: &dyn CanvasSurfaceSource,
+) -> Result<Vec<u8>, CaptureError> {
+    paint_prepared_region_with_scroll_and_surface_color_and_canvas_surfaces(
+        tree,
+        prepared,
+        resources,
+        scroll,
+        region,
+        surface_color,
+        canvas_surfaces,
+    )?
+    .encode_png()
+    .map_err(|_| CaptureError::EncodeFailed)
+}
+
 /// Capture a retained region using the PDF print-background policy. Ordinary
 /// screenshots pass `true`. When false, authored fills are replaced with the
 /// browser print-economy white fill and light text is darkened for legibility;
@@ -5779,8 +5943,38 @@ pub fn screenshot_prepared_region_with_scroll_and_backgrounds(
     region: CaptureRegion,
     paint_backgrounds: bool,
 ) -> Result<Vec<u8>, CaptureError> {
+    screenshot_prepared_region_with_scroll_and_backgrounds_and_canvas_surfaces(
+        tree,
+        prepared,
+        resources,
+        scroll,
+        region,
+        paint_backgrounds,
+        &EMPTY_CANVAS_SURFACES,
+    )
+}
+
+pub fn screenshot_prepared_region_with_scroll_and_backgrounds_and_canvas_surfaces(
+    tree: &DomTree,
+    prepared: &mut PreparedRender,
+    resources: &mut RenderResourceCache,
+    scroll: &ResolvedScrollState,
+    region: CaptureRegion,
+    paint_backgrounds: bool,
+    canvas_surfaces: &dyn CanvasSurfaceSource,
+) -> Result<Vec<u8>, CaptureError> {
     if paint_backgrounds {
-        return screenshot_prepared_region_with_scroll(tree, prepared, resources, scroll, region);
+        return paint_prepared_region_with_scroll_and_surface_color_and_canvas_surfaces(
+            tree,
+            prepared,
+            resources,
+            scroll,
+            region,
+            [255, 255, 255, 255],
+            canvas_surfaces,
+        )?
+        .encode_png()
+        .map_err(|_| CaptureError::EncodeFailed);
     }
 
     let snapshots = prepared
@@ -5790,7 +5984,12 @@ pub fn screenshot_prepared_region_with_scroll_and_backgrounds(
         .map(|(&node, style)| (node, PrintEconomyStyleSnapshot::apply(style)))
         .collect::<Vec<_>>();
     let result = paint_prepared_region_with_scroll_with_print_economy(
-        tree, prepared, resources, scroll, region,
+        tree,
+        prepared,
+        resources,
+        scroll,
+        region,
+        canvas_surfaces,
     )
     .and_then(|pixmap| pixmap.encode_png().map_err(|_| CaptureError::EncodeFailed));
     for (node, snapshot) in snapshots {
@@ -8687,6 +8886,122 @@ fn length_to_px(len: &str, viewport_width: f32) -> Option<f32> {
         return Some(v * 16.0);
     }
     num(&t)
+}
+
+fn paint_canvas_surface(
+    surface: CanvasSurface<'_>,
+    rect: &crate::Rect,
+    visible_rect: &crate::Rect,
+    object_fit: crate::ObjectFit,
+    object_position: crate::ObjectPosition,
+    pixmap: &mut Pixmap,
+    clip_radius: crate::ResolvedBorderRadii,
+    extra_clip: Option<&tiny_skia::Mask>,
+) -> bool {
+    if surface.width == 0
+        || surface.height == 0
+        || rect.width <= 0.0
+        || rect.height <= 0.0
+        || !rect_intersects_paint_surface(visible_rect, pixmap, 1.0)
+    {
+        return false;
+    }
+
+    // Canvas ImageData is straight-alpha RGBA; tiny-skia consumes
+    // premultiplied RGBA. Convert once per actual canvas paint while borrowing
+    // the live V8 backing directly—there is no JS-to-Rust surface copy on each
+    // Canvas2D operation.
+    let mut premultiplied = surface.rgba.to_vec();
+    for pixel in premultiplied.chunks_exact_mut(4) {
+        let alpha = pixel[3] as u32;
+        pixel[0] = ((pixel[0] as u32 * alpha + 127) / 255) as u8;
+        pixel[1] = ((pixel[1] as u32 * alpha + 127) / 255) as u8;
+        pixel[2] = ((pixel[2] as u32 * alpha + 127) / 255) as u8;
+    }
+    let Some(content) = tiny_skia::PixmapRef::from_bytes(
+        &premultiplied,
+        surface.width,
+        surface.height,
+    ) else {
+        return false;
+    };
+
+    let dest = object_fit_dest_positioned(
+        rect,
+        surface.width as f32,
+        surface.height as f32,
+        object_fit,
+        object_position,
+    );
+    if dest.width <= 0.0 || dest.height <= 0.0 {
+        return false;
+    }
+
+    let has_radius = !clip_radius.is_zero();
+    let needs_box_clip = has_radius
+        || dest.width > visible_rect.width + 0.5
+        || dest.height > visible_rect.height + 0.5
+        || dest.x < visible_rect.x - 0.5
+        || dest.y < visible_rect.y - 0.5;
+    let mut clip = extra_clip.cloned();
+    if needs_box_clip {
+        let path = if has_radius {
+            rounded_rect_path_radii(
+                visible_rect.x,
+                visible_rect.y,
+                visible_rect.width,
+                visible_rect.height,
+                clip_radius,
+            )
+        } else {
+            Rect::from_xywh(
+                visible_rect.x,
+                visible_rect.y,
+                visible_rect.width,
+                visible_rect.height,
+            )
+            .and_then(|rect| {
+                let mut builder = PathBuilder::new();
+                builder.push_rect(rect);
+                builder.finish()
+            })
+        };
+        match (clip.as_mut(), path) {
+            (Some(mask), Some(path)) => {
+                mask.intersect_path(&path, FillRule::Winding, true, Transform::identity())
+            }
+            (None, _) => {
+                clip = rounded_box_clip_mask_radii(
+                    pixmap.width(),
+                    pixmap.height(),
+                    visible_rect,
+                    clip_radius,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    let transform = Transform::from_row(
+        dest.width / surface.width as f32,
+        0.0,
+        0.0,
+        dest.height / surface.height as f32,
+        dest.x,
+        dest.y,
+    );
+    pixmap.draw_pixmap(
+        0,
+        0,
+        content,
+        &tiny_skia::PixmapPaint {
+            quality: FilterQuality::Bilinear,
+            ..tiny_skia::PixmapPaint::default()
+        },
+        transform,
+        clip.as_ref(),
+    );
+    true
 }
 
 fn paint_image(

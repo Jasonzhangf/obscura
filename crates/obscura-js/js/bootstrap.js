@@ -5254,6 +5254,7 @@ function _elementClassFor(nid) {
   const tag = _domParse("tag_name", nid);
   if (tag === "FORM" && globalThis.HTMLFormElement) return globalThis.HTMLFormElement;
   if (tag === "IMG") return HTMLImageElement;
+  if (tag === "CANVAS" && globalThis.HTMLCanvasElement) return globalThis.HTMLCanvasElement;
   if (tag === "AUDIO") return HTMLAudioElement;
   if (tag === "VIDEO") return HTMLVideoElement;
   if (tag === "TRACK") return HTMLTrackElement;
@@ -10141,15 +10142,15 @@ class _IframeWindow {
 // per session (from _fpNoise) and valid, so it does not match the known
 // headless stub.
 function _encodePNG(w, h, rgba) {
-  // RGB scanlines: filter byte (0) + 3 bytes per pixel
-  var rowLen = 1 + w * 3;
+  // RGBA scanlines: filter byte (0) + 4 bytes per pixel.
+  var rowLen = 1 + w * 4;
   var raw = new Uint8Array(h * rowLen);
   for (var y = 0; y < h; y++) {
     var base = y * rowLen;
     raw[base] = 0;
     for (var x = 0; x < w; x++) {
-      var s = (y * w + x) << 2, d = base + 1 + x * 3;
-      raw[d] = rgba[s]; raw[d+1] = rgba[s+1]; raw[d+2] = rgba[s+2];
+      var s = (y * w + x) << 2, d = base + 1 + x * 4;
+      raw[d] = rgba[s]; raw[d+1] = rgba[s+1]; raw[d+2] = rgba[s+2]; raw[d+3] = rgba[s+3];
     }
   }
   // Adler32 of raw
@@ -10189,7 +10190,7 @@ function _encodePNG(w, h, rgba) {
   var ihd = new Uint8Array(13);
   ihd[0]=(w>>24)&0xff; ihd[1]=(w>>16)&0xff; ihd[2]=(w>>8)&0xff; ihd[3]=w&0xff;
   ihd[4]=(h>>24)&0xff; ihd[5]=(h>>16)&0xff; ihd[6]=(h>>8)&0xff; ihd[7]=h&0xff;
-  ihd[8]=8; ihd[9]=2; // 8-bit RGB
+  ihd[8]=8; ihd[9]=6; // 8-bit RGBA
   var png = new Uint8Array(8 + 25 + (12+dlen) + 12);
   png.set([0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A]);
   var p = 8;
@@ -10208,18 +10209,21 @@ function _encodePNG(w, h, rgba) {
 
 globalThis.__ariaQuerySelector = function(root, selector) { return null; };
 globalThis.__ariaQuerySelectorAll = async function*(root, selector) { /* yields nothing */ };
+const _MAX_CANVAS_DIMENSION = 32767;
+const _MAX_CANVAS_PIXELS = 67108864;
 class _Canvas2D {
   constructor(canvas) {
     this.canvas = canvas;
-    this._w = parseInt(canvas.getAttribute('width')) || 300;
-    this._h = parseInt(canvas.getAttribute('height')) || 150;
-    this._buf = new Uint8ClampedArray(this._w * this._h * 4);
-    for (let i = 0; i < this._w * this._h; i++) {
-      this._buf[i*4+0] = 255 + Math.floor(_fpNoise(i % this._w, Math.floor(i / this._w), 0));
-      this._buf[i*4+1] = 255 + Math.floor(_fpNoise(i % this._w, Math.floor(i / this._w), 1));
-      this._buf[i*4+2] = 255 + Math.floor(_fpNoise(i % this._w, Math.floor(i / this._w), 2));
-      this._buf[i*4+3] = 255;
-    }
+    this._damageQueued = false;
+    this._resizeFromCanvas();
+  }
+  _canvasDimension(name, fallback) {
+    const raw = this.canvas.getAttribute(name);
+    if (raw === null || raw === '') return fallback;
+    const parsed = Number.parseInt(raw, 10);
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+  }
+  _resetDrawingState() {
     this.fillStyle = '#000000';
     this.strokeStyle = '#000000';
     this.lineWidth = 1;
@@ -10229,6 +10233,39 @@ class _Canvas2D {
     this.globalAlpha = 1;
     this.globalCompositeOperation = 'source-over';
     this._stateStack = [];
+  }
+  _resizeFromCanvas() {
+    const requestedWidth = this._canvasDimension('width', 300);
+    const requestedHeight = this._canvasDimension('height', 150);
+    const valid = requestedWidth <= _MAX_CANVAS_DIMENSION
+      && requestedHeight <= _MAX_CANVAS_DIMENSION
+      && requestedWidth * requestedHeight <= _MAX_CANVAS_PIXELS;
+    this._w = valid ? requestedWidth : 0;
+    this._h = valid ? requestedHeight : 0;
+    this._buf = new Uint8ClampedArray(this._w * this._h * 4);
+    this._resetDrawingState();
+    const register = Deno.core.ops.op_canvas_register_surface;
+    if (typeof register === 'function') {
+      // op2 accepts Uint8Array, while Canvas exposes Uint8ClampedArray. This
+      // second view shares the exact backing store; no pixel copy is made.
+      const bytes = new Uint8Array(
+        this._buf.buffer,
+        this._buf.byteOffset,
+        this._buf.byteLength,
+      );
+      if (!register(this.canvas._nid, this._w, this._h, bytes)) {
+        throw new RangeError('Canvas backing store allocation failed');
+      }
+    }
+  }
+  _markPaintDamage() {
+    if (this._damageQueued) return;
+    this._damageQueued = true;
+    queueMicrotask(() => {
+      this._damageQueued = false;
+      const damage = Deno.core.ops.op_canvas_paint_damage;
+      if (typeof damage === 'function') damage(this.canvas._nid);
+    });
   }
   _parseColor(css) {
     if (!css || typeof css !== 'string' || css === 'none') return [0,0,0,0];
@@ -10268,6 +10305,7 @@ class _Canvas2D {
         this._setPixel(px, py, r, g, b, a);
       }
     }
+    this._markPaintDamage();
   }
   clearRect(x, y, w, h) {
     x=Math.round(x); y=Math.round(y); w=Math.round(w); h=Math.round(h);
@@ -10277,6 +10315,7 @@ class _Canvas2D {
         this._buf[idx] = this._buf[idx+1] = this._buf[idx+2] = this._buf[idx+3] = 0;
       }
     }
+    this._markPaintDamage();
   }
   strokeRect(x, y, w, h) {
     const [r,g,b,a] = this._parseColor(this.strokeStyle);
@@ -10287,6 +10326,7 @@ class _Canvas2D {
     for (let py = Math.round(y); py < Math.round(y+h); py++) {
       for (let l = 0; l < lw; l++) { this._setPixel(Math.round(x)+l, py, r,g,b,a); this._setPixel(Math.round(x+w)-1-l, py, r,g,b,a); }
     }
+    this._markPaintDamage();
   }
   fillText(text, x, y) {
     const [r,g,b,a] = this._parseColor(this.fillStyle);
@@ -10312,6 +10352,7 @@ class _Canvas2D {
       }
       cx += 6 * scale;
     }
+    this._markPaintDamage();
   }
   strokeText(text, x, y) { this.fillText(text, x, y); }
   measureText(t) {
@@ -10353,6 +10394,7 @@ class _Canvas2D {
         }
       }
     }
+    this._markPaintDamage();
   }
   createImageData(w, h) { return { data: new Uint8ClampedArray(w*h*4), width: w, height: h }; }
   drawImage(img, sx, sy, sw, sh, dx, dy, dw, dh) {
@@ -10370,6 +10412,7 @@ class _Canvas2D {
         }
       }
     }
+    this._markPaintDamage();
   }
   beginPath() { this._path = []; }
   closePath() {}
@@ -10394,6 +10437,7 @@ class _Canvas2D {
       }
     }
     this._path = [];
+    this._markPaintDamage();
   }
   stroke() {}
   clip() {}
@@ -10417,10 +10461,41 @@ class _Canvas2D {
   getContextAttributes() { return { alpha: true, desynchronized: false, colorSpace: "srgb", willReadFrequently: false }; }
 }
 
-Element.prototype.getContext = function getContext(type) {
+class HTMLCanvasElement extends Element {
+  get width() {
+    const raw = this.getAttribute('width');
+    const parsed = raw === null ? 300 : Number.parseInt(raw, 10);
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : 300;
+  }
+  set width(value) { this.setAttribute('width', Math.max(0, Number(value) || 0)); }
+  get height() {
+    const raw = this.getAttribute('height');
+    const parsed = raw === null ? 150 : Number.parseInt(raw, 10);
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : 150;
+  }
+  set height(value) { this.setAttribute('height', Math.max(0, Number(value) || 0)); }
+  setAttribute(name, value) {
+    super.setAttribute(name, value);
+    const normalized = String(name).toLowerCase();
+    if (this._ctx && (normalized === 'width' || normalized === 'height')) {
+      this._ctx._resizeFromCanvas();
+    }
+  }
+  removeAttribute(name) {
+    super.removeAttribute(name);
+    const normalized = String(name).toLowerCase();
+    if (this._ctx && (normalized === 'width' || normalized === 'height')) {
+      this._ctx._resizeFromCanvas();
+    }
+  }
+}
+globalThis.HTMLCanvasElement = HTMLCanvasElement;
+
+HTMLCanvasElement.prototype.getContext = function getContext(type) {
   if (type === '2d') {
     if (!this._ctx) {
-      this._ctx = new _Canvas2D(this);
+      try { this._ctx = new _Canvas2D(this); }
+      catch (_error) { return null; }
     }
     return this._ctx;
   }
@@ -10434,22 +10509,31 @@ Element.prototype.getContext = function getContext(type) {
   }
   return null;
 };
-Element.prototype.toDataURL = function(type) {
-  if (this._ctx && this._ctx._buf) {
-    const ctx = this._ctx;
+HTMLCanvasElement.prototype.toDataURL = function(type) {
+  const ctx = this._ctx || this.getContext('2d');
+  if (ctx && ctx._buf) {
+    if (ctx._w === 0 || ctx._h === 0) return 'data:,';
     return _encodePNG(ctx._w, ctx._h, ctx._buf);
   }
-  return _fp('canvasFingerprint');
+  return 'data:,';
 };
-Element.prototype.toBlob = function(cb, type, q) { cb(new Blob([''])); };
+HTMLCanvasElement.prototype.toBlob = function(cb, type, q) {
+  const url = this.toDataURL(type, q);
+  const comma = url.indexOf(',');
+  if (comma < 0 || !url.startsWith('data:image/')) { cb(null); return; }
+  const binary = atob(url.slice(comma + 1));
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  cb(new Blob([bytes], {type: String(type || 'image/png')}));
+};
 Element.prototype.getBBox = function() { return { x: 0, y: 0, width: 0, height: 0 }; };
 Element.prototype.getComputedTextLength = function() { return 0; };
 Element.prototype.getExtentOfChar = function(ch) { return { x: 0, y: 0, width: 0, height: 0 }; };
 Element.prototype.getSubStringLength = function(ch, len) { return 0; };
 
-_markNative(Element.prototype.getContext);
-_markNative(Element.prototype.toDataURL);
-_markNative(Element.prototype.toBlob);
+_markNative(HTMLCanvasElement.prototype.getContext);
+_markNative(HTMLCanvasElement.prototype.toDataURL);
+_markNative(HTMLCanvasElement.prototype.toBlob);
 
 Element.prototype.attachShadow = function attachShadow(opts) {
   var _mode = opts == null ? undefined : opts.mode;

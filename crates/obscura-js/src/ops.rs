@@ -6,6 +6,8 @@ use std::sync::Arc;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use deno_core::op2;
 use deno_core::Extension;
+#[cfg(feature = "render")]
+use deno_core::JsBuffer;
 use deno_core::OpState;
 use obscura_dom::{DomTree, NodeData, NodeId};
 #[cfg(feature = "render")]
@@ -81,6 +83,17 @@ pub struct JsNetworkEvent {
 
 #[cfg(feature = "render")]
 pub use obscura_render::ImageRequestProfile;
+
+/// A live Canvas2D backing store retained from V8. `JsBuffer` owns a shared
+/// reference to the ArrayBuffer backing store, so the pixels stay valid while
+/// the canvas wrapper and native page state share it. Paint only borrows these
+/// bytes synchronously while JavaScript is not executing.
+#[cfg(feature = "render")]
+pub(crate) struct CanvasBackingSurface {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: JsBuffer,
+}
 
 pub struct ObscuraState {
     pub dom: Option<DomTree>,
@@ -185,6 +198,10 @@ pub struct ObscuraState {
     /// `<style>` element merely to feed the renderer.
     #[cfg(feature = "render")]
     pub dynamic_fonts: Vec<obscura_render::DynamicFontFace>,
+    /// Live Canvas2D backing stores keyed by stable DOM identity. Pixel damage
+    /// updates this resource independently of retained style/layout geometry.
+    #[cfg(feature = "render")]
+    pub(crate) canvas_surfaces: HashMap<NodeId, CanvasBackingSurface>,
     #[cfg(feature = "render")]
     pub viewport: (f32, f32),
     /// Root scrolling offset in CSS pixels. With render enabled this is
@@ -261,6 +278,8 @@ impl ObscuraState {
             stylesheet_cache: obscura_render::StylesheetCache::default(),
             #[cfg(feature = "render")]
             dynamic_fonts: Vec::new(),
+            #[cfg(feature = "render")]
+            canvas_surfaces: HashMap::new(),
             #[cfg(feature = "render")]
             viewport: (1280.0, 720.0),
             #[cfg(feature = "render")]
@@ -3217,6 +3236,92 @@ fn op_set_dynamic_fonts(state: &OpState, #[string] registrations: &str) -> bool 
     true
 }
 
+/// Retain the JavaScript-owned Canvas2D pixel buffer without copying it. A
+/// canvas resize supplies a new fixed backing store and atomically replaces
+/// the previous surface for the same DOM node.
+#[cfg(feature = "render")]
+#[op2]
+fn op_canvas_register_surface(
+    state: &OpState,
+    nid: u32,
+    width: u32,
+    height: u32,
+    #[buffer] pixels: JsBuffer,
+) -> bool {
+    const MAX_CANVAS_DIMENSION: u32 = 32_767;
+    const MAX_CANVAS_PIXELS: usize = 67_108_864;
+    const MAX_CANVAS_SURFACE_BYTES: usize = 256 * 1024 * 1024;
+    let Some(expected) = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|pixels| pixels.checked_mul(4))
+    else {
+        return false;
+    };
+    if width > MAX_CANVAS_DIMENSION
+        || height > MAX_CANVAS_DIMENSION
+        || expected / 4 > MAX_CANVAS_PIXELS
+        || pixels.len() != expected
+    {
+        return false;
+    }
+
+    let shared = state.borrow::<SharedState>().clone();
+    let mut state = shared.borrow_mut();
+    let node = NodeId::new(nid);
+    let is_canvas = state
+        .dom
+        .as_ref()
+        .and_then(|dom| dom.get_node(node))
+        .is_some_and(|node| {
+            node.as_element()
+                .is_some_and(|name| name.local.as_ref() == "canvas")
+        });
+    if !is_canvas {
+        return false;
+    }
+    let replacing = state.canvas_surfaces.get(&node).map(|surface| surface.pixels.len());
+    let retained_bytes = state
+        .canvas_surfaces
+        .values()
+        .try_fold(0usize, |total, surface| total.checked_add(surface.pixels.len()))
+        .and_then(|total| total.checked_sub(replacing.unwrap_or(0)))
+        .and_then(|total| total.checked_add(expected));
+    if retained_bytes.is_none_or(|bytes| bytes > MAX_CANVAS_SURFACE_BYTES) {
+        return false;
+    }
+    state.canvas_surfaces.insert(
+        node,
+        CanvasBackingSurface {
+            width,
+            height,
+            pixels,
+        },
+    );
+    true
+}
+
+/// Report one coalesced Canvas2D paint at the JavaScript task boundary. Pixel
+/// bytes are already live through the retained backing store, so damage wakes
+/// screencast/readiness without throwing away otherwise-valid layout.
+#[cfg(feature = "render")]
+#[op2(fast)]
+fn op_canvas_paint_damage(state: &OpState, nid: u32) -> bool {
+    let shared = state.borrow::<SharedState>().clone();
+    let mut state = shared.borrow_mut();
+    let node = NodeId::new(nid);
+    if !state.canvas_surfaces.contains_key(&node) {
+        return false;
+    }
+    let connected = state
+        .dom
+        .as_ref()
+        .is_some_and(|dom| node_is_connected(dom, node));
+    if connected {
+        state.activity_generation = state.activity_generation.wrapping_add(1);
+    }
+    connected
+}
+
 pub fn build_extension() -> Extension {
     let mut ops = vec![
         op_dom(),
@@ -3252,6 +3357,8 @@ pub fn build_extension() -> Extension {
     {
         ops.push(op_begin_render_task());
         ops.push(op_set_dynamic_fonts());
+        ops.push(op_canvas_register_surface());
+        ops.push(op_canvas_paint_damage());
         ops.push(op_image_metadata());
         ops.push(op_load_image_metadata());
         ops.push(op_layout_geometry());

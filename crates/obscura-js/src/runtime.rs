@@ -19,6 +19,23 @@ use crate::ops::{
     begin_animation_task, clamp_scroll_offset, document_base_url, ensure_resolved_scroll,
 };
 
+#[cfg(feature = "render")]
+struct RuntimeCanvasSurfaceSource<'a>(
+    &'a HashMap<NodeId, crate::ops::CanvasBackingSurface>,
+);
+
+#[cfg(feature = "render")]
+impl obscura_render::CanvasSurfaceSource for RuntimeCanvasSurfaceSource<'_> {
+    fn surface(&self, node: NodeId) -> Option<obscura_render::CanvasSurface<'_>> {
+        let surface = self.0.get(&node)?;
+        obscura_render::CanvasSurface::from_rgba8(
+            surface.width,
+            surface.height,
+            surface.pixels.as_ref(),
+        )
+    }
+}
+
 static SNAPSHOT: &[u8] = include_bytes!(env!("OBSCURA_SNAPSHOT_PATH"));
 
 /// Serializes V8 isolate construction across OS threads. The thread-per-
@@ -292,6 +309,7 @@ impl ObscuraJsRuntime {
             gs.render_image_in_flight.clear();
             gs.stylesheet_cache = obscura_render::StylesheetCache::default();
             gs.dynamic_fonts.clear();
+            gs.canvas_surfaces.clear();
             gs.scroll_offset = (0.0, 0.0);
             gs.element_scroll_offsets.clear();
             gs.scroll_generation = 0;
@@ -583,15 +601,18 @@ impl ObscuraJsRuntime {
                 prepared_render,
                 render_resources,
                 resolved_scroll,
+                canvas_surfaces,
                 ..
             } = state;
             let (_, scroll) = resolved_scroll.as_ref()?;
-            obscura_render::screenshot_prepared_with_scroll_and_surface_color(
+            let canvas_surfaces = RuntimeCanvasSurfaceSource(canvas_surfaces);
+            obscura_render::screenshot_prepared_with_scroll_and_surface_color_and_canvas_surfaces(
                 dom.as_ref()?,
                 prepared_render.as_mut()?,
                 render_resources,
                 scroll,
                 surface_color,
+                &canvas_surfaces,
             )
         })
     }
@@ -621,12 +642,14 @@ impl ObscuraJsRuntime {
                 prepared_render,
                 render_resources,
                 resolved_scroll,
+                canvas_surfaces,
                 ..
             } = state;
             let (_, scroll) = resolved_scroll
                 .as_ref()
                 .ok_or(obscura_render::CaptureError::PaintFailed)?;
-            obscura_render::screenshot_prepared_region_with_scroll_and_surface_color(
+            let canvas_surfaces = RuntimeCanvasSurfaceSource(canvas_surfaces);
+            obscura_render::screenshot_prepared_region_with_scroll_and_surface_color_and_canvas_surfaces(
                 dom.as_ref()
                     .ok_or(obscura_render::CaptureError::PaintFailed)?,
                 prepared_render
@@ -636,6 +659,7 @@ impl ObscuraJsRuntime {
                 scroll,
                 region,
                 surface_color,
+                &canvas_surfaces,
             )
         })
     }
@@ -656,12 +680,14 @@ impl ObscuraJsRuntime {
                 prepared_render,
                 render_resources,
                 resolved_scroll,
+                canvas_surfaces,
                 ..
             } = state;
             let (_, scroll) = resolved_scroll
                 .as_ref()
                 .ok_or(obscura_render::CaptureError::PaintFailed)?;
-            obscura_render::screenshot_prepared_region_with_scroll_and_backgrounds(
+            let canvas_surfaces = RuntimeCanvasSurfaceSource(canvas_surfaces);
+            obscura_render::screenshot_prepared_region_with_scroll_and_backgrounds_and_canvas_surfaces(
                 dom.as_ref()
                     .ok_or(obscura_render::CaptureError::PaintFailed)?,
                 prepared_render
@@ -671,6 +697,7 @@ impl ObscuraJsRuntime {
                 scroll,
                 region,
                 paint_backgrounds,
+                &canvas_surfaces,
             )
         })
     }
@@ -694,6 +721,7 @@ impl ObscuraJsRuntime {
                 prepared_render,
                 render_resources,
                 element_scroll_offsets,
+                canvas_surfaces,
                 ..
             } = state;
             let dom = dom
@@ -708,7 +736,8 @@ impl ObscuraJsRuntime {
                     element_scroll_offsets,
                     (region.width, region.height),
                 );
-            obscura_render::screenshot_prepared_region_with_scroll_and_backgrounds(
+            let canvas_surfaces = RuntimeCanvasSurfaceSource(canvas_surfaces);
+            obscura_render::screenshot_prepared_region_with_scroll_and_backgrounds_and_canvas_surfaces(
                 dom,
                 prepared_render
                     .as_mut()
@@ -717,6 +746,7 @@ impl ObscuraJsRuntime {
                 &scroll,
                 region,
                 paint_backgrounds,
+                &canvas_surfaces,
             )
         })
     }
@@ -8897,6 +8927,166 @@ mod tests {
             result,
             serde_json::json!([null, null, null, true, "static fallback"])
         );
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn canvas_2d_live_backing_paints_immediately_with_scaling_clips_and_effects() {
+        let dom = parse_html(
+            r#"<html style="margin:0"><body style="margin:0;width:64px;height:40px;background:#0000ff">
+                <div style="position:absolute;left:4px;top:4px;width:18px;height:14px;overflow:hidden">
+                  <canvas id="paint" width="2" height="1"
+                    style="display:block;width:20px;height:10px;border:2px solid #ffff00;opacity:.5"></canvas>
+                </div>
+                <canvas id="blank" width="4" height="4"
+                  style="position:absolute;left:30px;top:4px;width:10px;height:10px"></canvas>
+                <canvas id="padding" width="2" height="1"
+                  style="position:absolute;left:30px;top:20px;width:10px;height:4px;padding:2px 2px 2px 4px;border:1px solid #ffff00;background:#00ffff"></canvas>
+                <div style="position:absolute;z-index:2;left:10px;top:7px;width:4px;height:4px;background:#ff00ff"></div>
+            </body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_url("http://example.test/canvas");
+        rt.set_viewport(64.0, 40.0);
+        rt.run_page_init();
+
+        let blank_api = rt
+            .evaluate(
+                r#"(() => {
+                    const blank = document.getElementById('blank');
+                    const encoded = blank.toDataURL();
+                    const blankContext = blank.getContext('2d');
+                    const pixels = blankContext.getImageData(0, 0, 4, 4).data;
+                    blankContext.fillStyle = '#ff0000'; blankContext.fillRect(0, 0, 1, 1);
+                    blank.width = 6;
+                    const resetPixel = blankContext.getImageData(0, 0, 1, 1).data;
+                    const untouched = document.createElement('canvas');
+                    const defaultEncoded = untouched.toDataURL();
+                    const defaultPixels = untouched.getContext('2d').getImageData(0, 0, 1, 1).data;
+                    return [
+                      blank instanceof HTMLCanvasElement,
+                      typeof document.createElement('div').getContext,
+                      blank.width, blank.height, blank.getContext('2d') === blankContext,
+                      encoded.startsWith('data:image/png;base64,'),
+                      atob(encoded.split(',')[1]).charCodeAt(25) === 6,
+                      Array.from(pixels).every((value, index) => index % 4 !== 3 || value === 0),
+                      untouched.width, untouched.height,
+                      defaultEncoded.startsWith('data:image/png;base64,'),
+                      Array.from(defaultPixels),
+                      Array.from(resetPixel),
+                    ];
+                })()"#,
+            )
+            .expect("transparent default canvas API");
+        assert_eq!(
+            blank_api,
+            serde_json::json!([
+                true,
+                "undefined",
+                6,
+                4,
+                true,
+                true,
+                true,
+                true,
+                300,
+                150,
+                true,
+                [0, 0, 0, 0],
+                [0, 0, 0, 0]
+            ])
+        );
+
+        // Prepare layout before drawing so the assertions below prove canvas
+        // damage retains layout, while the following capture proves pixels
+        // are read from the live backing immediately after the script task.
+        {
+            let mut state = rt.state.borrow_mut();
+            ensure_resolved_scroll(&mut state).expect("initial resolved canvas scroll");
+        }
+        let prepared_address = {
+            let state = rt.state.borrow();
+            state.prepared_render.as_ref().unwrap() as *const _ as usize
+        };
+        let activity_before = rt.activity_generation();
+        rt.execute_script(
+            "canvas-fill",
+            r#"const canvas = document.getElementById('paint');
+               const ctx = canvas.getContext('2d');
+               ctx.fillStyle = '#ff0000'; ctx.fillRect(0, 0, 1, 1);
+               ctx.fillStyle = '#00ff00'; ctx.fillRect(1, 0, 1, 1);
+               const padding = document.getElementById('padding').getContext('2d');
+               padding.fillStyle = '#ff0000'; padding.fillRect(0, 0, 1, 1);
+               padding.fillStyle = '#00ff00'; padding.fillRect(1, 0, 1, 1);"#,
+        )
+        .expect("fill live canvas backing");
+        assert!(rt.activity_generation() > activity_before);
+        assert_eq!(
+            rt.state.borrow().prepared_render.as_ref().unwrap() as *const _ as usize,
+            prepared_address,
+            "canvas damage must not invalidate retained layout"
+        );
+
+        let pixmap = {
+            let mut state = rt.state.borrow_mut();
+            ensure_resolved_scroll(&mut state).expect("resolved canvas scroll");
+            let ObscuraState {
+                dom,
+                prepared_render,
+                render_resources,
+                resolved_scroll,
+                canvas_surfaces,
+                ..
+            } = &mut *state;
+            let (_, scroll) = resolved_scroll.as_ref().expect("scroll snapshot");
+            let canvas_surfaces = RuntimeCanvasSurfaceSource(canvas_surfaces);
+            obscura_render::paint_prepared_with_scroll_and_surface_color_and_canvas_surfaces(
+                dom.as_ref().expect("canvas DOM"),
+                prepared_render.as_mut().expect("prepared canvas layout"),
+                render_resources,
+                scroll,
+                [255, 255, 255, 255],
+                &canvas_surfaces,
+            )
+            .expect("canvas pixmap")
+        };
+
+        let red_half = pixmap.pixel(7, 8).expect("scaled red canvas pixel");
+        assert!(red_half.red() > 100 && red_half.blue() > 100 && red_half.green() < 20);
+        // Bilinear filtering blends at the exact source-pixel transition
+        // (x=16), so sample several CSS pixels into the green half.
+        let green_half = pixmap.pixel(19, 8).expect("scaled green canvas pixel");
+        assert!(
+            green_half.green() > 45 && green_half.blue() > 100 && green_half.red() < 20,
+            "pixel at (19, 8) was rgba({}, {}, {}, {})",
+            green_half.red(),
+            green_half.green(),
+            green_half.blue(),
+            green_half.alpha()
+        );
+        let clipped = pixmap.pixel(23, 8).expect("outside overflow clip");
+        assert_eq!((clipped.red(), clipped.green(), clipped.blue()), (0, 0, 255));
+        let blank = pixmap.pixel(34, 8).expect("transparent blank canvas");
+        assert_eq!((blank.red(), blank.green(), blank.blue()), (0, 0, 255));
+        let overlay = pixmap.pixel(11, 8).expect("higher z-index overlay");
+        assert!(overlay.red() > 240 && overlay.blue() > 240 && overlay.green() < 20);
+        let border = pixmap.pixel(4, 8).expect("canvas border above content");
+        assert!(border.red() > 100 && border.green() > 100 && border.blue() > 100);
+        let padding = pixmap.pixel(33, 23).expect("canvas padding pixel");
+        assert_eq!(
+            (padding.red(), padding.green(), padding.blue()),
+            (0, 255, 255),
+            "canvas pixels must not cover authored padding"
+        );
+        let padded_content = pixmap.pixel(36, 23).expect("padded canvas content pixel");
+        assert!(
+            padded_content.red() > 220
+                && padded_content.green() < 40
+                && padded_content.blue() < 40,
+            "canvas bitmap must start at the CSS content-box origin"
+        );
+
     }
 
     #[test]
