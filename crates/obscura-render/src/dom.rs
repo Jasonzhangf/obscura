@@ -12536,7 +12536,6 @@ fn can_use_native_float_band(
         || parent_style.internal_flex_container
         || parent_style.is_inline_block
         || parent_style.is_table_box
-        || parent_style.float.is_some()
         || matches!(parent_style.position, Some(taffy::Position::Absolute))
         || !matches!(
             parent_style.width,
@@ -12741,7 +12740,12 @@ fn build_children_with_float_zone(
     ifc_items: &mut IfcRegistry,
     styles: &HashMap<NodeId, crate::LayoutStyle>,
 ) -> Vec<taffy::NodeId> {
-    let is_float = |cid: NodeId| styles.get(&cid).map(|s| s.float.is_some()).unwrap_or(false);
+    let is_float = |cid: NodeId| {
+        styles
+            .get(&cid)
+            .map(|style| style.display != crate::Display::None && style.float.is_some())
+            .unwrap_or(false)
+    };
 
     // A definite-height block whose only substantive contents are either one
     // full-width float or one percentage float followed by one percentage
@@ -12785,7 +12789,13 @@ fn build_children_with_float_zone(
             .copied()
             .filter(|cid| {
                 tree.get_node(*cid).is_some_and(|node| {
-                    node.is_element() || !tree.text_content(*cid).trim().is_empty()
+                    if node.is_element() {
+                        styles
+                            .get(cid)
+                            .is_some_and(|style| style.display != crate::Display::None)
+                    } else {
+                        !tree.text_content(*cid).trim().is_empty()
+                    }
                 })
             })
             .collect();
@@ -13050,6 +13060,9 @@ fn build_children_with_float_zone(
             return tree.text_content(cid).trim().is_empty();
         }
         let style = styles.get(&cid);
+        if style.is_some_and(|style| style.display == crate::Display::None) {
+            return true;
+        }
         let no_size = style
             .map(|style| {
                 matches!(style.width, crate::Dimension::Auto)
@@ -13075,7 +13088,8 @@ fn build_children_with_float_zone(
     let opposite_side = dom_children
         .get(opposite_idx)
         .and_then(|cid| styles.get(cid))
-        .and_then(|style| style.float);
+        .and_then(|style| (style.display != crate::Display::None).then_some(style.float))
+        .flatten();
     if opposite_side.is_some() && opposite_side != float_side {
         let first = build(
             tree,
@@ -13134,7 +13148,7 @@ fn build_children_with_float_zone(
     let mut float_count = 1usize;
     while run_end < dom_children.len() {
         let cid = dom_children[run_end];
-        if styles.get(&cid).and_then(|s| s.float) == float_side {
+        if is_float(cid) && styles.get(&cid).and_then(|style| style.float) == float_side {
             float_count += 1;
             run_end += 1;
         } else if tree.get_node(cid).map_or(false, |n| !n.is_element())
@@ -13170,7 +13184,10 @@ fn build_children_with_float_zone(
             && dom_children
                 .get(run_end)
                 .and_then(|cid| styles.get(cid))
-                .and_then(|style| style.float)
+                .and_then(|style| {
+                    (style.display != crate::Display::None).then_some(style.float)
+                })
+                .flatten()
                 == Some(crate::Float::Right))
         .then(|| dom_children[run_end]);
         if let Some(right_dom) = trailing_right {
@@ -13260,7 +13277,11 @@ fn build_children_with_float_zone(
     // `clear` on a sibling ends the zone: the cleared element moves below the
     // float (the clearfix idiom), so it must not join the flow column beside it.
     let clears_this_float = |cid: NodeId| {
-        let Some(c) = styles.get(&cid).and_then(|s| s.clear) else {
+        let Some(c) = styles.get(&cid).and_then(|style| {
+            (style.display != crate::Display::None)
+                .then_some(style.clear)
+                .flatten()
+        }) else {
             return false;
         };
         match (float_side, c) {
@@ -13308,7 +13329,10 @@ fn build_children_with_float_zone(
             .get(&float_dom)
             .map(|s| matches!(s.width, crate::Dimension::Auto))
             .unwrap_or(true);
-        if float_auto {
+        let float_is_table = styles
+            .get(&float_dom)
+            .is_some_and(|style| style.is_table_box);
+        if float_auto && float_is_table {
             if let Some(w) = max_definite_descendant_width(tree, float_dom, styles) {
                 if let Ok(cur) = taffy_tree.style(float_id) {
                     let mut st = cur.clone();
@@ -14257,6 +14281,100 @@ mod tests {
             (bfc.x, bfc.y, bfc.width, bfc.height),
             (250.0, 50.0, 530.0, 30.0),
             "a float-avoiding BFC moves and shrinks as one box"
+        );
+    }
+
+    #[test]
+    fn display_none_floats_do_not_hide_a_later_visible_float_from_the_band() {
+        // Bootstrap keeps its responsive toggle/cart floated even when a
+        // desktop media query makes them display:none. Non-generated boxes
+        // with display:none must not enter float selection or split the
+        // visible brand out of its float band.
+        let tree = parse_html(
+            r#"<style>
+                *{box-sizing:border-box} html,body{margin:0}
+                #container{width:780px}
+                #header{float:left;width:780px;height:100px}
+                #header::before,#header::after{display:table;content:" "}
+                #header::after{clear:both}
+                .hidden-float{display:none;float:right}
+                #brand{float:left;width:208px;height:100px;margin-right:33px}
+                #flow{height:50px}
+                #line{display:inline-block;width:400px;height:20px}
+            </style>
+            <div id="container">
+              <div id="header">
+                <button class="hidden-float">menu</button>
+                <a id="brand"></a>
+                <div id="flow"><span id="line"></span></div>
+                <span class="hidden-float">cart</span>
+              </div>
+            </div>"#,
+        );
+        let laid = layout_dom(&tree, (900.0, 300.0));
+        let rect = |id: &str| laid.rects[&tree.get_element_by_id(id).unwrap()];
+        let header = rect("header");
+        let brand = rect("brand");
+        let flow = rect("flow");
+        let line = rect("line");
+
+        assert_eq!(
+            (brand.x, brand.y, brand.width, brand.height),
+            (0.0, 0.0, 208.0, 100.0)
+        );
+        assert_eq!(
+            (flow.x, flow.y, flow.width, flow.height),
+            (0.0, 0.0, 780.0, 50.0),
+            "an ordinary flow block keeps its full border-box width beneath a float"
+        );
+        assert_eq!(
+            (line.x, line.y, line.width, line.height),
+            (241.0, 0.0, 400.0, 20.0),
+            "display:none floats must not suppress the later visible float's line band"
+        );
+        assert_eq!((header.width, header.height), (780.0, 100.0));
+    }
+
+    #[test]
+    fn auto_width_float_uses_its_own_bfc_for_nested_float_max_content() {
+        // A float establishes a BFC. Its auto inline size must therefore be
+        // measured from its nested float's max-content line, not through the
+        // cyclic width:100% synthetic row used for non-native float zones.
+        let tree = parse_html(
+            r#"<style>
+                *{box-sizing:border-box} html,body{margin:0}
+                #container{width:780px}
+                #container::before,#container::after,
+                #header::before,#header::after{display:table;content:" "}
+                #container::after,#header::after{clear:both}
+                #header{float:left;height:100px}
+                #brand{float:left;height:100px;padding:15px;margin-right:33px}
+                #logo{width:70px;height:70px}
+                #label{font-size:34.5px;line-height:20px}
+                #toggle{display:none;float:right;padding:14px;border:1px solid}
+                .icon{display:block;width:22px;height:2px}
+                #flow{height:50px}
+            </style>
+            <div id="container"><div id="header"><button id="toggle"><span class="icon"></span><span class="icon"></span><span class="icon"></span></button><a id="brand"><img id="logo"><span id="label">porkbun</span></a></div><div id="flow"></div></div>"#,
+        );
+        let laid = layout_dom(&tree, (900.0, 300.0));
+        let rect = |id: &str| laid.rects[&tree.get_element_by_id(id).unwrap()];
+        let header = rect("header");
+        let brand = rect("brand");
+        let logo = rect("logo");
+
+        assert_eq!((logo.width, logo.height), (70.0, 70.0));
+        assert!(
+            brand.width > 220.0,
+            "the nested float must aggregate the image and label on its max-content line: {brand:?}"
+        );
+        assert!(
+            header.width > 255.0 && header.width < 259.0,
+            "the hidden 22px toggle icon must not cap the outer shrink-to-fit width: {header:?}"
+        );
+        assert!(
+            (header.width - brand.width - 33.0).abs() < 0.01,
+            "the outer auto-width float must include the nested float's margin box: header={header:?}, brand={brand:?}"
         );
     }
 
