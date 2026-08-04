@@ -274,7 +274,15 @@ impl TreeSink for DomTree {
         let Some(root) = root else {
             return false;
         };
-        self.attach_shadow_root_node(*location, root, mode).is_ok()
+        if self.attach_shadow_root_node(*location, root, mode).is_err() {
+            return false;
+        }
+        // html5ever inserts the temporary template at the adjusted insertion
+        // location before invoking this hook. On successful attachment the
+        // template itself is not part of the host's light tree; only its
+        // contents fragment survives as the ShadowRoot backing node.
+        self.detach(*template);
+        true
     }
 
     fn is_mathml_annotation_xml_integration_point(&self, target: &NodeId) -> bool {
@@ -498,6 +506,7 @@ mod tests {
             template_contents: Some(contents),
             mathml_annotation_xml_integration_point: false,
         });
+        tree.append_child(host, template);
         let attrs = vec![HtmlAttribute {
             name: QualName::new(
                 None,
@@ -515,6 +524,8 @@ mod tests {
             &attrs,
         ));
         assert_eq!(tree.shadow_root(host), Some(contents));
+        assert!(tree.children(host).is_empty());
+        assert_eq!(tree.get_node(template).unwrap().parent, None);
         assert_eq!(
             tree.shadow_root_info(contents).unwrap().mode,
             ShadowRootMode::Closed
