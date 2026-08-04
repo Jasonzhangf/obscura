@@ -24,6 +24,31 @@ fn resolve_flex_normal(alignment: AlignSelf) -> AlignSelf {
     if alignment.keyword == AlignItemsKeyword::Normal { AlignSelf::STRETCH } else { alignment }
 }
 
+/// Transfer a definite border-box size through a preferred aspect ratio while
+/// applying the ratio to the box selected by CSS `box-sizing` and intrinsic
+/// ratio provenance.
+#[inline]
+fn maybe_apply_preferred_aspect_ratio(
+    size: Size<Option<f32>>,
+    aspect_ratio: Option<f32>,
+    adjustment: Size<f32>,
+) -> Size<Option<f32>> {
+    match aspect_ratio {
+        Some(ratio) if ratio.is_finite() && ratio > 0.0 => match (size.width, size.height) {
+            (Some(width), None) => Size {
+                width: Some(width),
+                height: Some((width - adjustment.width).max(0.0) / ratio + adjustment.height),
+            },
+            (None, Some(height)) => Size {
+                width: Some((height - adjustment.height).max(0.0) * ratio + adjustment.width),
+                height: Some(height),
+            },
+            _ => size,
+        },
+        _ => size,
+    }
+}
+
 /// The intermediate results of a flexbox calculation for a single item
 struct FlexItem {
     /// The identifier for the associated node
@@ -38,6 +63,13 @@ struct FlexItem {
     min_size: Size<Option<f32>>,
     /// The maximum allowable size of this item
     max_size: Size<Option<f32>>,
+    /// The item's preferred aspect ratio.
+    aspect_ratio: Option<f32>,
+    /// Insets excluded while transferring sizes through the preferred aspect ratio.
+    aspect_ratio_adjustment: Size<f32>,
+    /// Whether the authored cross-size is auto. The resolved `size` above may
+    /// contain a provisional transfer from the pre-flex main size.
+    cross_size_is_auto: bool,
     /// The cross-alignment of this item
     align_self: AlignSelf,
 
@@ -533,6 +565,7 @@ fn generate_anonymous_flex_items(
         .filter(|(_, _, style)| style.box_generation_mode() != BoxGenerationMode::None)
         .map(|(index, child, child_style)| {
             let aspect_ratio = child_style.aspect_ratio();
+            let raw_size = child_style.size();
             let padding = child_style
                 .padding()
                 .resolve_or_zero(constants.node_inner_size.width, |val, basis| tree.calc(val, basis));
@@ -542,24 +575,40 @@ fn generate_anonymous_flex_items(
             let pb_sum = (padding + border).sum_axes();
             let box_sizing_adjustment =
                 if child_style.box_sizing() == BoxSizing::ContentBox { pb_sum } else { Size::ZERO };
+            let aspect_ratio_adjustment =
+                if child_style.aspect_ratio_uses_content_box() { pb_sum } else { box_sizing_adjustment };
+            let size = maybe_apply_preferred_aspect_ratio(
+                raw_size
+                    .maybe_resolve(constants.node_inner_size, |val, basis| tree.calc(val, basis))
+                    .maybe_add(box_sizing_adjustment),
+                aspect_ratio,
+                aspect_ratio_adjustment,
+            );
+            let min_size = maybe_apply_preferred_aspect_ratio(
+                child_style
+                    .min_size()
+                    .maybe_resolve(constants.node_inner_size, |val, basis| tree.calc(val, basis))
+                    .maybe_add(box_sizing_adjustment),
+                aspect_ratio,
+                aspect_ratio_adjustment,
+            );
+            let max_size = maybe_apply_preferred_aspect_ratio(
+                child_style
+                    .max_size()
+                    .maybe_resolve(constants.node_inner_size, |val, basis| tree.calc(val, basis))
+                    .maybe_add(box_sizing_adjustment),
+                aspect_ratio,
+                aspect_ratio_adjustment,
+            );
             FlexItem {
                 node: child,
                 order: index as u32,
-                size: child_style
-                    .size()
-                    .maybe_resolve(constants.node_inner_size, |val, basis| tree.calc(val, basis))
-                    .maybe_apply_aspect_ratio(aspect_ratio)
-                    .maybe_add(box_sizing_adjustment),
-                min_size: child_style
-                    .min_size()
-                    .maybe_resolve(constants.node_inner_size, |val, basis| tree.calc(val, basis))
-                    .maybe_apply_aspect_ratio(aspect_ratio)
-                    .maybe_add(box_sizing_adjustment),
-                max_size: child_style
-                    .max_size()
-                    .maybe_resolve(constants.node_inner_size, |val, basis| tree.calc(val, basis))
-                    .maybe_apply_aspect_ratio(aspect_ratio)
-                    .maybe_add(box_sizing_adjustment),
+                size,
+                min_size,
+                max_size,
+                aspect_ratio,
+                aspect_ratio_adjustment,
+                cross_size_is_auto: raw_size.cross(constants.dir).is_auto(),
 
                 inset: child_style
                     .inset()
@@ -1399,9 +1448,31 @@ fn determine_hypothetical_cross_size(
 
         let child_known_main = constants.container_size.main(constants.dir).into();
 
-        let child_cross = child
-            .size
-            .cross(constants.dir)
+        // A preferred aspect ratio can provisionally fill an auto cross-size
+        // from the authored main size while flex items are generated. That
+        // value is stale after flexible-length resolution changes the main
+        // size. Transfer the final target main size through the ratio instead,
+        // matching Flexbox 9.4's requirement to lay the item out with its used
+        // main size. Keep intrinsic ratios in the content box and authored
+        // ratios in the box selected by `box-sizing`.
+        let ratio_cross = if child.cross_size_is_auto {
+            child.aspect_ratio.and_then(|ratio| {
+                if ratio.is_finite() && ratio > 0.0 {
+                    let ratio_main = (child.target_size.main(constants.dir)
+                        - child.aspect_ratio_adjustment.main(constants.dir))
+                    .max(0.0);
+                    let ratio_cross = if constants.is_row { ratio_main / ratio } else { ratio_main * ratio };
+                    Some(ratio_cross + child.aspect_ratio_adjustment.cross(constants.dir))
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        };
+
+        let child_cross = ratio_cross
+            .or(child.size.cross(constants.dir))
             .maybe_clamp(child.min_size.cross(constants.dir), child.max_size.cross(constants.dir))
             .maybe_max(padding_border_sum);
 

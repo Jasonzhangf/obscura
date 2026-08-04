@@ -310,6 +310,123 @@ fn percentage_padding_uses_final_flex_containing_block_width() {
 }
 
 #[test]
+fn final_flex_main_size_drives_auto_cross_size_through_aspect_ratio() {
+    let tree = parse_html(include_str!("../../../render-repros/flex-post-ratio-cross-size.html"));
+    let layout = layout_dom(&tree, (1080.0, 1000.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+
+    let row = rect("row");
+    let media = rect("media");
+    let visual = rect("visual");
+    let copy = rect("copy");
+    let after = rect("after");
+
+    assert!((media.width - 520.0).abs() < 0.01, "flexed media width: {media:?}");
+    assert!(
+        (media.height - 520.0 / 1.72).abs() < 0.51,
+        "auto cross-size must use the final 520px main size: {media:?}"
+    );
+    assert!(
+        (visual.width - 520.0).abs() < 0.01 && (visual.height - 520.0 / 1.75571).abs() < 0.51,
+        "absolute visual must use the ratio-sized containing block: {visual:?}"
+    );
+    assert!(
+        (copy.x - 560.0).abs() < 0.01 && (copy.width - 520.0).abs() < 0.01,
+        "the sibling must receive the other flexible share: {copy:?}"
+    );
+    assert!(
+        (row.height - media.height).abs() < 0.01 && (after.y - (row.height + 150.0)).abs() < 0.01,
+        "the ratio-sized item must contribute to its line and following flow: row={row:?} after={after:?}"
+    );
+}
+
+#[test]
+fn post_flex_aspect_transfer_respects_content_and_border_boxes() {
+    let tree = parse_html(
+        r#"
+        <style>
+          html,body{margin:0}
+          #row{display:flex;align-items:flex-start;width:400px}
+          .item{flex:1 0 0;width:1px;height:auto;aspect-ratio:2;padding:10px;border:5px solid}
+          #content{box-sizing:content-box}
+          #border{box-sizing:border-box}
+          .single{display:flex;align-items:flex-start;width:200px}
+          .plain{flex:1 0 0;width:1px;aspect-ratio:2}
+          #minimum{height:auto;min-width:0;min-height:130px}
+          #maximum{height:auto;max-width:1000px;max-height:70px}
+          #explicit{height:80px}
+        </style>
+        <div id="row"><div id="content" class="item"></div><div id="border" class="item"></div></div>
+        <div class="single"><div id="minimum" class="plain"></div></div>
+        <div class="single"><div id="maximum" class="plain"></div></div>
+        <div class="single"><div id="explicit" class="plain"></div></div>
+        "#,
+    );
+    let layout = layout_dom(&tree, (500.0, 300.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    let content = rect("content");
+    let border = rect("border");
+    let row = rect("row");
+    let minimum = rect("minimum");
+    let maximum = rect("maximum");
+    let explicit = rect("explicit");
+
+    assert!(
+        (content.width - 200.0).abs() < 0.01 && (content.height - 115.0).abs() < 0.01,
+        "content-box ratio must exclude then restore 30px of padding and border: {content:?}"
+    );
+    assert!(
+        (border.width - 200.0).abs() < 0.01 && (border.height - 100.0).abs() < 0.01,
+        "authored border-box ratio must apply to the outer box: {border:?}"
+    );
+    assert!((row.height - 115.0).abs() < 0.01, "the tallest transferred cross-size sets the line: {row:?}");
+    assert!(
+        (minimum.width - 200.0).abs() < 0.01 && (minimum.height - 130.0).abs() < 0.01,
+        "the transferred cross-size must obey min-height: {minimum:?}"
+    );
+    assert!(
+        (maximum.width - 200.0).abs() < 0.01 && (maximum.height - 70.0).abs() < 0.01,
+        "the transferred cross-size must obey max-height: {maximum:?}"
+    );
+    assert!(
+        (explicit.width - 200.0).abs() < 0.01 && (explicit.height - 80.0).abs() < 0.01,
+        "an explicit cross-size must not be replaced by the preferred ratio: {explicit:?}"
+    );
+}
+
+#[cfg(feature = "paint")]
+#[test]
+fn scrolled_ratio_sized_flex_clip_keeps_absolute_visual_visible() {
+    let tree = parse_html(
+        r#"
+        <style>
+          html,body{margin:0;background:#030712}
+          #spacer{height:8300px}
+          #row{display:flex;align-items:flex-start;gap:40px;width:1080px;overflow:hidden}
+          #media{flex:1 0 0;width:1px;height:auto;aspect-ratio:1.72;position:relative;overflow:hidden;background:#7048e8}
+          #visual{position:absolute;top:0;left:0;width:100%;height:auto;aspect-ratio:1.75571;background:#2f9e44}
+          #copy{flex:1 0 0;width:1px;height:150px;background:#1971c2}
+          #tail{height:500px}
+        </style>
+        <div id="spacer"></div><div id="row"><div id="media"><div id="visual"></div></div><div id="copy"></div></div><div id="tail"></div>
+        "#,
+    );
+    let pixmap = obscura_render::paint_dom_scrolled(&tree, (1080.0, 400.0), None, (0.0, 8300.0))
+        .expect("scrolled ratio fixture paints");
+    let visual = pixmap.pixel(260, 100).expect("visual center pixel");
+    let clip_tail = pixmap.pixel(260, 299).expect("clip tail pixel");
+
+    assert!(
+        visual.red() == 47 && visual.green() == 158 && visual.blue() == 68,
+        "the absolute visual must survive its overflow clip: {visual:?}"
+    );
+    assert!(
+        clip_tail.red() == 112 && clip_tail.green() == 72 && clip_tail.blue() == 232,
+        "the ratio-sized clip owner must extend below the visual: {clip_tail:?}"
+    );
+}
+
+#[test]
 fn mixed_percentage_padding_shorthand_preserves_fixed_sides_and_content_origin() {
     let tree = parse_html(
         r#"
