@@ -1116,6 +1116,44 @@ impl Page {
         self.execute_scripts_with_module_budget(None).await;
     }
 
+    /// Drive only dynamic script elements which participate in the current
+    /// document's load-event delay set. Browser script runners keep this set
+    /// separate from arbitrary post-load imports, timers, and enhancement
+    /// scripts; navigation readiness must not turn those into an implicit
+    /// multi-second settle.
+    async fn drive_load_delaying_scripts(
+        js: &mut ObscuraJsRuntime,
+        deadline: tokio::time::Instant,
+    ) -> bool {
+        while js.has_pending_load_delaying_scripts() {
+            let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now())
+            else {
+                return false;
+            };
+            if remaining.is_zero() {
+                return false;
+            }
+            let poll_budget = remaining.min(tokio::time::Duration::from_millis(25));
+            match tokio::time::timeout(poll_budget, js.run_event_loop()).await {
+                Ok(Ok(())) => {
+                    if js.has_pending_load_delaying_scripts() {
+                        tokio::task::yield_now().await;
+                    }
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!("load-delaying dynamic script event loop failed: {error}");
+                    return false;
+                }
+                Err(_) => {
+                    // The poll budget is a scheduling quantum, not a script
+                    // timeout. Keep polling until the shared navigation/script
+                    // deadline; the phase watchdog handles a native V8 pin.
+                }
+            }
+        }
+        true
+    }
+
     async fn execute_scripts_with_module_budget(&mut self, module_budget_override: Option<u64>) {
         let scripts_started = std::time::Instant::now();
         tracing::info!(
@@ -1751,6 +1789,16 @@ impl Page {
             }
         }
 
+        // Parsing has finished before defer scripts and non-async modules run.
+        // They still gate DOMContentLoaded, but observe the browser's
+        // `interactive` readyState while they execute.
+        if let Some(js) = &mut self.js {
+            let _ = js.execute_script(
+                "<ready-state-interactive>",
+                "globalThis.__documentReadyState__ = 'interactive';",
+            );
+        }
+
         for scheduled in post_parse {
             if tokio::time::Instant::now() >= script_deadline {
                 tracing::warn!("execute_scripts: deadline reached during post-parse scripts");
@@ -1817,81 +1865,33 @@ impl Page {
         }
 
         if let Some(js) = &mut self.js {
-            // Spec order: readyState -> interactive, fire DOMContentLoaded on both
-            // document and window, then readyState -> complete, fire load.
-            let _ = js.execute_script("<load-events>",
-                "globalThis.__documentReadyState__ = 'interactive';\n\
-                 try { document.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false})); } catch(e) {}\n\
-                 try { window.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false})); } catch(e) {}\n\
-                 if (typeof window.onload === 'function') { try { window.onload(); } catch(e) {} }\n\
-                 globalThis.__documentReadyState__ = 'complete';\n\
-                 try { window.dispatchEvent(new Event('load', {bubbles:false,cancelable:false})); } catch(e) {}");
-        }
+            // DOMContentLoaded follows parser/defer/module work, but async
+            // dynamic script elements do not gate it. They do remain in the
+            // document's load-event delay set, including scripts inserted by
+            // a DOMContentLoaded listener.
+            let _ = js.execute_script(
+                "<dom-content-loaded>",
+                "try { document.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false})); } catch(e) {}\n\
+                 try { window.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false})); } catch(e) {}",
+            );
 
-        if let Some(js) = &mut self.js {
-            let dynamic_settle_ms = std::env::var("OBSCURA_DYNAMIC_SCRIPT_SETTLE_MS")
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(3_000)
-                .max(500);
-            // Bound the post-script settle loop by wall clock, not just by the
-            // 10ms-tick branch. The old code only consulted `deadline` inside
-            // the `Err(_)` arm (when the inner tick timed out), so a steady
-            // stream of inflight XHR/fetch (active_requests() > 0) kept the
-            // loop running indefinitely because it took the `Ok(Ok(()))` arm
-            // and slept 1ms each iteration without ever checking the clock.
-            // On busy sites this could keep the V8 lock held for tens of
-            // seconds, wedging the entire CDP dispatcher (see triage for
-            // issue series around the 40-site compat sweep).
-            // A dynamic external script may still be in flight at 500ms. Keep
-            // pumping only while that queue is pending, up to a separate bounded
-            // budget, so normal pages and unrelated fetches retain the fast path.
-            // A single run_event_loop poll that pins the thread inside V8 makes
-            // the per-poll tokio timeouts below useless, so guard the whole loop
-            // with a watchdog that fires 250ms past the longest deadline.
-            let settle_wd =
-                js.arm_watchdog(std::time::Duration::from_millis(dynamic_settle_ms + 250));
-            let started = tokio::time::Instant::now();
-            let deadline = started + tokio::time::Duration::from_millis(500);
-            let dynamic_deadline = started + tokio::time::Duration::from_millis(dynamic_settle_ms);
-            let mut idle_count = 0u32;
-            loop {
-                let now = tokio::time::Instant::now();
-                // `has_pending_dynamic_scripts` includes both inserted script
-                // elements and loader-owned ES-module graph activity. A lazy
-                // import may be the work which removes an SSR loading shell;
-                // do not take the 500ms fast exit while that graph is fetching.
-                // Unrelated fetch/XHR activity remains on the fast path.
-                if now >= deadline && (now >= dynamic_deadline || !js.has_pending_dynamic_scripts())
-                {
-                    break;
-                }
-                let result = tokio::time::timeout(
-                    tokio::time::Duration::from_millis(10),
-                    js.run_event_loop(),
-                )
-                .await;
-
-                match result {
-                    Ok(Ok(())) => {
-                        if self.http_client.active_requests() == 0 {
-                            idle_count += 1;
-                            if idle_count >= 2 {
-                                break;
-                            }
-                            tokio::task::yield_now().await;
-                        } else {
-                            idle_count = 0;
-                            tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
-                        }
-                    }
-                    Ok(Err(_)) => break,
-                    Err(_) => {
-                        idle_count = 0;
-                    }
-                }
+            let load_blockers_finished =
+                Self::drive_load_delaying_scripts(js, script_deadline).await;
+            if !load_blockers_finished {
+                tracing::warn!(
+                    "script deadline reached with load-delaying dynamic scripts still pending"
+                );
             }
-            js.disarm_watchdog(settle_wd);
+
+            // readyState becomes complete before the load event. A script
+            // inserted by an onload handler is therefore post-load work and
+            // remains pending until an explicit caller settle/wait.
+            let _ = js.execute_script(
+                "<load-event>",
+                "globalThis.__documentReadyState__ = 'complete';\n\
+                 if (typeof window.onload === 'function') { try { window.onload(); } catch(e) {} }\n\
+                 try { window.dispatchEvent(new Event('load', {bubbles:false,cancelable:false})); } catch(e) {}",
+            );
         }
         if let Some(token) = exec_wd {
             if let Some(js) = self.js.as_mut() {
@@ -3734,6 +3734,36 @@ mod tests {
         (format!("http://{}", address), request_rx)
     }
 
+    fn spawn_delayed_classic_script_server(
+        delay: std::time::Duration,
+        body: &'static str,
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 2048];
+            let length = stream.read(&mut request).unwrap();
+            let path = String::from_utf8_lossy(&request[..length])
+                .lines()
+                .next()
+                .and_then(|line| line.split_ascii_whitespace().nth(1))
+                .unwrap_or("/")
+                .to_string();
+            request_tx.send(path).unwrap();
+            std::thread::sleep(delay);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        (format!("http://{address}"), request_rx)
+    }
+
     #[test]
     fn external_scripts_require_a_successful_http_status() {
         assert!(script_response_is_executable(200));
@@ -4093,6 +4123,7 @@ mod tests {
         </head><body></body></html>"#,
         );
         page.execute_scripts().await;
+        page.settle_for_duration(500).await;
         assert_eq!(
             page.js
                 .as_mut()
@@ -4115,6 +4146,7 @@ mod tests {
         </head><body></body></html>"#,
         );
         page.execute_scripts().await;
+        page.settle_for_duration(500).await;
         assert_eq!(
             page.js
                 .as_mut()
@@ -4151,6 +4183,7 @@ mod tests {
         </body></html>"#,
         );
         page.execute_scripts().await;
+        page.settle_for_duration(500).await;
         assert_eq!(
             page.js
                 .as_mut()
@@ -4168,7 +4201,168 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn lazy_module_graph_keeps_post_script_settle_alive() {
+    async fn preload_dynamic_script_delays_load_but_not_dom_content_loaded() {
+        let (base, requests) = spawn_delayed_classic_script_server(
+            std::time::Duration::from_millis(150),
+            "globalThis.__lifecycleOrder.push('dynamic-exec');",
+        );
+        let html = format!(
+            r#"<html><head></head><body><script>
+                globalThis.__lifecycleOrder = [];
+                document.addEventListener('DOMContentLoaded', () =>
+                    globalThis.__lifecycleOrder.push('dom-content-loaded'));
+                window.onload = () =>
+                    globalThis.__lifecycleOrder.push('window-onload');
+                window.addEventListener('load', () =>
+                    globalThis.__lifecycleOrder.push('window-load'));
+                const script = document.createElement('script');
+                script.src = '{base}/preload-dynamic.js';
+                script.onload = () => globalThis.__lifecycleOrder.push('script-load');
+                document.head.appendChild(script);
+            </script></body></html>"#,
+        );
+        let mut page = import_map_test_page("preload-dynamic-lifecycle", &base, &html);
+
+        page.execute_scripts().await;
+
+        assert_eq!(
+            requests
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap(),
+            "/preload-dynamic.js",
+        );
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("globalThis.__lifecycleOrder")
+                .unwrap(),
+            serde_json::json!([
+                "dom-content-loaded",
+                "dynamic-exec",
+                "script-load",
+                "window-onload",
+                "window-load"
+            ]),
+            "dynamic async scripts gate load, not DOMContentLoaded",
+        );
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate(
+                    "globalThis.__lifecycleOrder.filter(value => value === 'window-onload').length",
+                )
+                .unwrap(),
+            serde_json::json!(1.0),
+            "window.onload must fire exactly once",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn post_load_dynamic_script_waits_only_when_caller_requests_settle() {
+        let (base, requests) = spawn_delayed_classic_script_server(
+            std::time::Duration::from_millis(400),
+            "globalThis.__postLoadDynamicRan = true;",
+        );
+        let html = format!(
+            r#"<html><body><script>
+                window.addEventListener('load', () => {{
+                    const script = document.createElement('script');
+                    script.src = '{base}/post-load.js';
+                    document.head.appendChild(script);
+                }});
+            </script></body></html>"#,
+        );
+        let mut page = import_map_test_page("post-load-dynamic-lifecycle", &base, &html);
+        let started = std::time::Instant::now();
+
+        page.execute_scripts().await;
+
+        let navigation_elapsed = started.elapsed();
+        assert!(
+            navigation_elapsed < std::time::Duration::from_millis(300),
+            "post-load enhancement must not extend navigation; elapsed={navigation_elapsed:?}",
+        );
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate(
+                    "[document.readyState, globalThis.__postLoadDynamicRan === true, \
+                     globalThis.__obscura_hasPendingDynamicScripts(), \
+                     globalThis.__obscura_hasPendingLoadDelayingScripts()]",
+                )
+                .unwrap(),
+            serde_json::json!(["complete", false, true, false]),
+            "a script prepared by load is pending enhancement work, not a load blocker",
+        );
+
+        page.settle_for_duration(700).await;
+
+        assert_eq!(
+            requests
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap(),
+            "/post-load.js",
+        );
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("globalThis.__postLoadDynamicRan === true")
+                .unwrap(),
+            serde_json::json!(true),
+            "an explicit caller settle must drive post-load script completion",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn timer_hydration_runs_during_explicit_adaptive_settle_not_navigation_load() {
+        let mut page = import_map_test_page(
+            "timer-hydration-lifecycle",
+            "http://example.com",
+            r#"<html><body><main id="app">Server shell</main><script>
+                window.addEventListener('load', () => {
+                    setTimeout(() => {
+                        document.getElementById('app').textContent = 'Hydrated app';
+                        document.body.setAttribute('data-hydrated', 'true');
+                    }, 80);
+                });
+            </script></body></html>"#,
+        );
+
+        page.execute_scripts().await;
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate(
+                    "[document.readyState, document.body.getAttribute('data-hydrated'), \
+                     document.getElementById('app').textContent]",
+                )
+                .unwrap(),
+            serde_json::json!(["complete", null, "Server shell"]),
+            "navigation load observes load semantics without inventing a timer settle",
+        );
+
+        page.settle(500).await;
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate(
+                    "[document.body.getAttribute('data-hydrated'), \
+                     document.getElementById('app').textContent]",
+                )
+                .unwrap(),
+            serde_json::json!(["true", "Hydrated app"]),
+            "the automation caller's adaptive settle must retain timer hydration",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn lazy_module_graph_is_post_load_work_until_caller_settles() {
         use std::io::{Read as _, Write as _};
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -4215,7 +4409,23 @@ mod tests {
                 });
             </script></body></html>"#,
         );
+        let started = std::time::Instant::now();
         page.execute_scripts().await;
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "dynamic import() must not become an implicit navigation settle",
+        );
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("document.body.getAttribute('data-lazy-state')")
+                .unwrap(),
+            serde_json::Value::Null,
+        );
+
+        page.settle_for_duration(1_000).await;
 
         assert_eq!(
             page.js
@@ -4224,7 +4434,7 @@ mod tests {
                 .evaluate("document.body.getAttribute('data-lazy-state')")
                 .unwrap(),
             serde_json::json!("lazy-ready"),
-            "post-script readiness must include an in-flight lazy module graph",
+            "an explicit caller settle must drive the lazy module graph",
         );
     }
 
@@ -4309,6 +4519,7 @@ mod tests {
         </body></html>"#,
         );
         page.execute_scripts().await;
+        page.settle_for_duration(500).await;
         assert_eq!(
             page.js
                 .as_mut()

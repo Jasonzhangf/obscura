@@ -342,8 +342,9 @@ impl Page {
                 let y = page_index as f32 * plan.css_page_height;
                 let slice_height = (content_height - y).min(plan.css_page_height);
                 let png = js
-                    .screenshot_prepared_region_with_backgrounds(
+                    .screenshot_prepared_region_at_scroll_with_backgrounds(
                         CaptureRegion::new(0.0, y, content_width, slice_height, 1.0),
+                        (0.0, y),
                         options.print_background,
                     )
                     .map_err(|error| RasterPdfError::CaptureFailed(format!("{error:?}")))?;
@@ -533,6 +534,57 @@ impl io::Write for PdfWriter {
 mod tests {
     use super::*;
 
+    fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
+    }
+
+    /// Decode the actual JPEG XObjects emitted into the PDF, rather than
+    /// trusting pagination options or writer-internal page counters.
+    fn pdf_page_rasters(pdf: &[u8]) -> Vec<image::RgbImage> {
+        let mut pages = Vec::new();
+        let mut cursor = 0usize;
+        while let Some(relative) = find_bytes(&pdf[cursor..], b"/Subtype /Image") {
+            let image_object = cursor + relative;
+            let length_key = image_object
+                + find_bytes(&pdf[image_object..], b"/Length ").expect("image /Length");
+            let mut digits_start = length_key + b"/Length ".len();
+            while pdf[digits_start].is_ascii_whitespace() {
+                digits_start += 1;
+            }
+            let mut digits_end = digits_start;
+            while pdf[digits_end].is_ascii_digit() {
+                digits_end += 1;
+            }
+            let length = std::str::from_utf8(&pdf[digits_start..digits_end])
+                .expect("ASCII image length")
+                .parse::<usize>()
+                .expect("numeric image length");
+            let stream_start = digits_end
+                + find_bytes(&pdf[digits_end..], b"stream\n").expect("image stream")
+                + b"stream\n".len();
+            let stream_end = stream_start.checked_add(length).expect("bounded stream end");
+            let raster = image::load_from_memory_with_format(
+                &pdf[stream_start..stream_end],
+                image::ImageFormat::Jpeg,
+            )
+            .expect("decodable page JPEG")
+            .into_rgb8();
+            pages.push(raster);
+            cursor = stream_end;
+        }
+        pages
+    }
+
+    fn channel_near(actual: image::Rgb<u8>, expected: [u8; 3]) -> bool {
+        actual
+            .0
+            .into_iter()
+            .zip(expected)
+            .all(|(actual, expected)| (i16::from(actual) - i16::from(expected)).abs() <= 20)
+    }
+
     #[test]
     fn options_reject_impossible_media_boxes() {
         let mut options = RasterPdfOptions::default();
@@ -709,6 +761,88 @@ mod tests {
             ),
             Err(RasterPdfError::EmptyPageRange)
         );
+    }
+
+    #[test]
+    fn raster_pdf_repeats_fixed_content_and_advances_flow_on_every_selected_page() {
+        let context = std::sync::Arc::new(crate::BrowserContext::new("pdf-fixed".to_string()));
+        let mut page = crate::Page::new("pdf-fixed-page".to_string(), context);
+        page.set_viewport((100.0, 80.0));
+        let dom = obscura_dom::parse_html(
+            r#"<html style="margin:0"><body style="margin:0;width:100px;height:200px">
+                <div style="position:fixed;z-index:5;left:0;top:0;width:20px;height:10px;background:#111"></div>
+                <div style="height:80px;background:#e02020"></div>
+                <div style="height:80px;background:#20c040"></div>
+                <div style="height:40px;background:#2050e0"></div>
+            </body></html>"#,
+        );
+        let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new();
+        runtime.set_dom(dom);
+        runtime.set_url("https://example.test/pdf-fixed");
+        runtime.set_viewport(100.0, 80.0);
+        runtime.run_page_init();
+        page.js = Some(runtime);
+
+        let options = RasterPdfOptions {
+            print_background: true,
+            paper_width_in: 100.0 / POINTS_PER_INCH,
+            paper_height_in: 80.0 / POINTS_PER_INCH,
+            margin_top_in: 0.0,
+            margin_bottom_in: 0.0,
+            margin_left_in: 0.0,
+            margin_right_in: 0.0,
+            ..RasterPdfOptions::default()
+        };
+        let pdf = page.raster_pdf(options.clone()).expect("three-page PDF");
+        assert!(String::from_utf8_lossy(&pdf).contains("/MediaBox [0 0 100.000 80.000]"));
+        let rasters = pdf_page_rasters(&pdf);
+        assert_eq!(rasters.len(), 3);
+        assert_eq!(rasters[0].dimensions(), (100, 80));
+        assert_eq!(rasters[1].dimensions(), (100, 80));
+        assert_eq!(
+            rasters[2].dimensions(),
+            (100, 40),
+            "the final partial page must use its own virtual viewport height"
+        );
+        for (index, raster) in rasters.iter().enumerate() {
+            assert!(
+                channel_near(*raster.get_pixel(5, 5), [17, 17, 17]),
+                "fixed header missing from decoded page {}: {:?}",
+                index + 1,
+                raster.get_pixel(5, 5)
+            );
+        }
+        for (index, expected) in [[224, 32, 32], [32, 192, 64], [32, 80, 224]]
+            .into_iter()
+            .enumerate()
+        {
+            let raster = &rasters[index];
+            assert!(
+                channel_near(
+                    *raster.get_pixel(raster.width() / 2, raster.height() / 2),
+                    expected,
+                ),
+                "ordinary flow did not advance on page {}",
+                index + 1,
+            );
+        }
+        assert_eq!(
+            page.js.as_ref().expect("runtime").scroll_offset(),
+            (0.0, 0.0),
+            "virtual PDF page scrolling must not mutate the live page"
+        );
+
+        let mut ranged = options;
+        ranged.page_ranges = vec![RasterPdfPageRange {
+            start: Some(2),
+            end: Some(3),
+        }];
+        let selected = pdf_page_rasters(&page.raster_pdf(ranged).expect("selected pages"));
+        assert_eq!(selected.len(), 2);
+        assert!(channel_near(*selected[0].get_pixel(5, 5), [17, 17, 17]));
+        assert!(channel_near(*selected[1].get_pixel(5, 5), [17, 17, 17]));
+        assert!(channel_near(*selected[0].get_pixel(50, 40), [32, 192, 64]));
+        assert!(channel_near(*selected[1].get_pixel(50, 20), [32, 80, 224]));
     }
 
     #[test]

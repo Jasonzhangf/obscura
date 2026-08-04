@@ -16,7 +16,10 @@
     '__obscura_objects', '__obscura_oid', '__obscura_ua',
     '__obscura_platform', '__obscura_ua_platform', '__obscura_ua_platform_version',
     '__obscura_stealth', '__obscura_markTrusted',
-    '__obscura_hw', '__obscura_mem', '__markParserScripts',
+    '__markParserScripts', '__obscura_hasPendingDynamicScripts',
+    '__obscura_hasPendingLoadDelayingScripts',
+    '__obscura_nextPendingTimeoutDelay',
+    '__obscura_hw', '__obscura_mem',
     '__documentReadyState__', '__currentUrl',
     // internal helpers (var-declared throughout the file)
     '__processDynScriptQueue', '_decodeDataScriptUrl', '_markNative', '_fpRand', '_fpNoise',
@@ -199,10 +202,22 @@ let _fpSeed = 0;
 let __dynScriptQueue = [];
 let __dynScriptBusy = false;
 let __dynClassicPending = 0;
+let __dynLoadDelayingPending = 0;
 Object.defineProperty(globalThis, '__obscura_hasPendingDynamicScripts', {
   value: function() {
     return __dynClassicPending > 0 || __dynScriptBusy || __dynScriptQueue.length > 0;
   },
+  writable: false,
+  enumerable: false,
+  configurable: false,
+});
+// HTML tracks scripts which delay the document load event separately from
+// arbitrary asynchronous script work. A connected external script prepared
+// before `load` joins that set until its load/error processing finishes;
+// dynamic import() and scripts created by a load handler are post-load work.
+// Keep this bridge hidden for the same reason as the general queue status.
+Object.defineProperty(globalThis, '__obscura_hasPendingLoadDelayingScripts', {
+  value: function() { return __dynLoadDelayingPending > 0; },
   writable: false,
   enumerable: false,
   configurable: false,
@@ -305,6 +320,11 @@ async function __runDynScriptTask(task) {
   } catch(e) {
     console.error('Dynamic script fetch error:', e.message);
     try { task.dispatchEvent(new Event('error')); } catch(ex) {}
+  } finally {
+    if (task.delaysLoad) {
+      task.delaysLoad = false;
+      __dynLoadDelayingPending = Math.max(0, __dynLoadDelayingPending - 1);
+    }
   }
 }
 async function __runAsyncClassicScript(task) {
@@ -658,6 +678,19 @@ const _clearedTimers = new Set();
 const _intervals = new Set();
 const _nativeTimerIds = new Map();
 const __obscuraPendingTimeoutDeadlines = new Map();
+Object.defineProperty(globalThis, '__obscura_nextPendingTimeoutDelay', {
+  value: function() {
+    const now = performance.now();
+    let nearest = Infinity;
+    for (const deadline of __obscuraPendingTimeoutDeadlines.values()) {
+      nearest = Math.min(nearest, Math.max(0, deadline - now));
+    }
+    return Number.isFinite(nearest) ? nearest : -1;
+  },
+  writable: false,
+  enumerable: false,
+  configurable: false,
+});
 
 const _scheduleAfter = (delay, fn) => {
   const d = Math.max(0, Number(delay) || 0);
@@ -1327,6 +1360,12 @@ function __prepareInsertedScript(script) {
       pageOrigin,
       dispatchEvent: (ev) => { try { script.dispatchEvent(ev); } catch(e) {} },
     };
+    // Non-parser-inserted external scripts are async by default, but scripts
+    // prepared while the document is still loading still delay window.load.
+    // Snapshot the flag at preparation time: changing readyState later must
+    // not turn already-prepared work into a post-load enhancement.
+    task.delaysLoad = globalThis.document?.readyState !== 'complete';
+    if (task.delaysLoad) __dynLoadDelayingPending++;
     // A non-parser-inserted classic script is force-async unless script code
     // explicitly assigned `.async = false`. Keep that opt-out in insertion
     // order; default/async=true scripts fetch concurrently and execute as soon
@@ -1342,14 +1381,17 @@ function __prepareInsertedScript(script) {
     }
   } else if (isModule) {
     const dataUrl = 'data:text/javascript;base64,' + btoa(unescape(encodeURIComponent(code)));
-    __dynScriptQueue.push({
+    const task = {
       url: dataUrl,
       isModule: true,
       nid: script._nid,
       prevNid,
       pageOrigin: "",
       dispatchEvent: (ev) => { try { script.dispatchEvent(ev); } catch(e) {} },
-    });
+      delaysLoad: globalThis.document?.readyState !== 'complete',
+    };
+    if (task.delaysLoad) __dynLoadDelayingPending++;
+    __dynScriptQueue.push(task);
     __processDynScriptQueue();
   } else {
     globalThis.__currentScriptNid = script._nid;

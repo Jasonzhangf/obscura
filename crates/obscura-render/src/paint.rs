@@ -838,6 +838,14 @@ impl PreparedRender {
     }
 
     pub fn clamp_scroll(&self, requested: (f32, f32)) -> (f32, f32) {
+        self.clamp_scroll_for_viewport(requested, self.viewport)
+    }
+
+    fn clamp_scroll_for_viewport(
+        &self,
+        requested: (f32, f32),
+        viewport: (f32, f32),
+    ) -> (f32, f32) {
         let clamp_axis = |requested: f32, content: f32, viewport: f32| {
             if requested.is_finite() {
                 crate::quantize_scroll_value(requested, 1.0)
@@ -847,8 +855,8 @@ impl PreparedRender {
             }
         };
         (
-            clamp_axis(requested.0, self.content_size.0, self.viewport.0),
-            clamp_axis(requested.1, self.content_size.1, self.viewport.1),
+            clamp_axis(requested.0, self.content_size.0, viewport.0),
+            clamp_axis(requested.1, self.content_size.1, viewport.1),
         )
     }
 
@@ -870,7 +878,26 @@ impl PreparedRender {
         requested_root: (f32, f32),
         requested_elements: &HashMap<obscura_dom::tree::NodeId, (f32, f32)>,
     ) -> ResolvedScrollState {
-        let root = self.clamp_scroll(requested_root);
+        self.resolve_scroll_state_for_viewport(
+            tree,
+            requested_root,
+            requested_elements,
+            self.viewport,
+        )
+    }
+
+    /// Resolve scroll-time movement for a virtual capture viewport without
+    /// mutating the live page scroll. Paginated raster consumers use each page
+    /// slice as its viewport so fixed/sticky content is positioned at that
+    /// page's origin, including a final slice shorter than the live viewport.
+    pub fn resolve_scroll_state_for_viewport(
+        &self,
+        tree: &DomTree,
+        requested_root: (f32, f32),
+        requested_elements: &HashMap<obscura_dom::tree::NodeId, (f32, f32)>,
+        viewport: (f32, f32),
+    ) -> ResolvedScrollState {
+        let root = self.clamp_scroll_for_viewport(requested_root, viewport);
         let mut offsets = vec![(0.0, 0.0); self.scroll_tree.containers.len()];
         offsets[0] = root;
         for (index, container) in self.scroll_tree.containers.iter().enumerate().skip(1) {
@@ -915,7 +942,7 @@ impl PreparedRender {
         // Stage 1 keeps the established root sticky behavior. Nested sticky is
         // intentionally absent from ScrollTree until its constraints are made
         // scroll-container-relative in Stage 2.
-        for (id, sticky) in self.sticky.translations(self.viewport, root) {
+        for (id, sticky) in self.sticky.translations(viewport, root) {
             if let Some(movement) = node_movement.get_mut(id.index()) {
                 movement.0 += sticky.0;
                 movement.1 += sticky.1;

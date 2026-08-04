@@ -104,13 +104,15 @@ async fn js_fetch_emits_network_request_and_response() {
     let session_id = "session-1";
     ctx.sessions.insert(session_id.to_string(), page_id.clone());
 
-    // Navigate with waitUntil:load so the after-load fetch() runs and settles
-    // before the navigation emits its Network events.
+    // An ordinary fetch() is not load-delaying in Chromium: `load` may fire
+    // while its response is still pending. Ask for networkidle0 explicitly so
+    // this output-level assertion observes the completed request without
+    // turning every load navigation into an implicit global settle.
     cdp(
         &mut ctx,
         1,
         "Page.navigate",
-        json!({"url": base, "waitUntil": "load"}),
+        json!({"url": base, "waitUntil": "networkidle0"}),
         session_id,
     )
     .await;

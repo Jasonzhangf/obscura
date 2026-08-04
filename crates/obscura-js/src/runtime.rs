@@ -605,6 +605,52 @@ impl ObscuraJsRuntime {
         })
     }
 
+    /// Capture one immutable document slice as if its origin were the root
+    /// scroll position of a virtual viewport. This leaves the live page scroll
+    /// untouched while giving fixed and sticky descendants page-local paint
+    /// geometry, which paginated raster PDF export requires.
+    #[cfg(feature = "render")]
+    pub fn screenshot_prepared_region_at_scroll_with_backgrounds(
+        &self,
+        region: obscura_render::CaptureRegion,
+        root_scroll: (f32, f32),
+        paint_backgrounds: bool,
+    ) -> Result<Vec<u8>, obscura_render::CaptureError> {
+        let mut state = self.state.borrow_mut();
+        with_sync_render_loading_disabled(&mut state, |state| {
+            ensure_resolved_scroll(state).ok_or(obscura_render::CaptureError::PaintFailed)?;
+            let ObscuraState {
+                dom,
+                prepared_render,
+                render_resources,
+                element_scroll_offsets,
+                ..
+            } = state;
+            let dom = dom
+                .as_ref()
+                .ok_or(obscura_render::CaptureError::PaintFailed)?;
+            let scroll = prepared_render
+                .as_ref()
+                .ok_or(obscura_render::CaptureError::PaintFailed)?
+                .resolve_scroll_state_for_viewport(
+                    dom,
+                    root_scroll,
+                    element_scroll_offsets,
+                    (region.width, region.height),
+                );
+            obscura_render::screenshot_prepared_region_with_scroll_and_backgrounds(
+                dom,
+                prepared_render
+                    .as_mut()
+                    .ok_or(obscura_render::CaptureError::PaintFailed)?,
+                render_resources,
+                &scroll,
+                region,
+                paint_backgrounds,
+            )
+        })
+    }
+
     /// Return the retained layout's scrollable document size without changing
     /// the live viewport or scroll position. PDF/full-document consumers use
     /// this to paginate document-space captures from the same geometry.
@@ -1490,6 +1536,19 @@ impl ObscuraJsRuntime {
             || self
                 .module_load_activity
                 .is_pending_or_recent(std::time::Duration::from_millis(100))
+    }
+
+    /// Whether a connected dynamic script prepared before the document load
+    /// event still has fetch/evaluation/load-or-error work outstanding.
+    ///
+    /// This intentionally excludes `import()` and scripts created by a load
+    /// handler. Those are ordinary post-load enhancement work and should only
+    /// be driven when an automation caller explicitly asks the page to settle.
+    pub fn has_pending_load_delaying_scripts(&mut self) -> bool {
+        self.evaluate("globalThis.__obscura_hasPendingLoadDelayingScripts?.() === true")
+            .ok()
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
     }
 
     /// Generation of observable connected-document mutations. This excludes
@@ -8379,6 +8438,8 @@ mod tests {
     fn dynamic_script_status_bridge_is_hidden_and_idle() {
         let mut rt = setup_runtime("<html><body></body></html>");
         assert!(!rt.has_pending_dynamic_scripts());
+        assert!(!rt.has_pending_load_delaying_scripts());
+        assert_eq!(rt.next_pending_timeout_delay_ms(), None);
         assert_eq!(
             rt.evaluate("typeof __dynScriptBusy").unwrap(),
             serde_json::json!("undefined")
@@ -8393,6 +8454,27 @@ mod tests {
         assert_eq!(
             rt.evaluate(
                 "Reflect.ownKeys(globalThis).includes('__obscura_hasPendingDynamicScripts')"
+            )
+            .unwrap(),
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            rt.evaluate(
+                "Reflect.ownKeys(globalThis).includes('__obscura_hasPendingLoadDelayingScripts')"
+            )
+            .unwrap(),
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            rt.evaluate(
+                "Object.getOwnPropertyNames(globalThis).includes('__obscura_nextPendingTimeoutDelay')"
+            )
+            .unwrap(),
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            rt.evaluate(
+                "Reflect.ownKeys(globalThis).includes('__obscura_nextPendingTimeoutDelay')"
             )
             .unwrap(),
             serde_json::json!(false)

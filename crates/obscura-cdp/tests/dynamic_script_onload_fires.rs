@@ -1,5 +1,5 @@
 // Regression for issue #474: external scripts inserted after a timer must be
-// fetched and execute before the post-navigation event-loop settle completes.
+// fetched and execute before an explicit post-navigation settle completes.
 
 use obscura_cdp::dispatch::{dispatch, CdpContext};
 use obscura_cdp::types::CdpRequest;
@@ -100,7 +100,7 @@ async fn dynamic_external_scripts_execute_and_fire_load() {
     )
     .await;
 
-    let result = cdp(
+    let at_load = cdp(
         &mut ctx,
         2,
         "Runtime.evaluate",
@@ -112,9 +112,31 @@ async fn dynamic_external_scripts_execute_and_fire_load() {
     )
     .await;
     assert_eq!(
-        result["result"]["value"],
+        at_load["result"]["value"],
+        r#"{"directExecuted":false,"directLoaded":false,"nestedExecuted":false,"nestedLoaded":false}"#,
+        "waitUntil=load must not invent a post-load timer settle"
+    );
+
+    // The automation caller opts into post-load work. This must drive the
+    // timer, both concurrently fetched scripts, their bodies, and their load
+    // handlers without relying on navigation to exceed browser load semantics.
+    ctx.pages[0].settle(1_500).await;
+
+    let settled = cdp(
+        &mut ctx,
+        3,
+        "Runtime.evaluate",
+        json!({
+            "expression": "JSON.stringify({directExecuted: !!window.__directExecuted, directLoaded: !!window.__directLoaded, nestedExecuted: !!window.__nestedExecuted, nestedLoaded: !!window.__nestedLoaded})",
+            "returnByValue": true,
+        }),
+        session_id,
+    )
+    .await;
+    assert_eq!(
+        settled["result"]["value"],
         r#"{"directExecuted":true,"directLoaded":true,"nestedExecuted":true,"nestedLoaded":true}"#,
-        "dynamic scripts must execute and fire load before navigation settles"
+        "dynamic scripts must execute and fire load before explicit settle completes"
     );
 }
 
