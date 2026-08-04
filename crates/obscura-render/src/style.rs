@@ -2596,7 +2596,7 @@ fn supports_conservative_known_value(name: &str, value: &str) -> bool {
         "background-image" | "mask-image" | "-webkit-mask-image" => {
             lower == "none"
                 || parse_url(value).is_some()
-                || !parse_background_gradient_layers(value, false).is_empty()
+                || !parse_background_gradient_layers(value, false).0.is_empty()
         }
         "background-repeat" | "mask-repeat" | "-webkit-mask-repeat" => {
             parse_image_repeat(value).is_some()
@@ -6728,7 +6728,8 @@ fn token(value: &str) -> Option<&str> {
 }
 
 fn set_background_gradients(style: &mut LayoutStyle, value: &str) {
-    let layers = parse_background_gradient_layers(value, style.color_scheme_dark);
+    let (layers, radial_geometries) =
+        parse_background_gradient_layers(value, style.color_scheme_dark);
     style.background_gradient = layers.iter().find_map(|layer| match layer {
         crate::BackgroundGradientLayer::Linear { angle, stops, .. } => {
             Some((*angle, stops.clone()))
@@ -6739,6 +6740,15 @@ fn set_background_gradients(style: &mut LayoutStyle, value: &str) {
         crate::BackgroundGradientLayer::Radial { center, stops } => Some((*center, stops.clone())),
         _ => None,
     });
+    style.background_radial_gradient_geometry =
+        layers
+            .iter()
+            .zip(&radial_geometries)
+            .find_map(|(layer, geometry)| {
+                matches!(layer, crate::BackgroundGradientLayer::Radial { .. })
+                    .then_some(*geometry)
+                    .flatten()
+            });
     style.background_conic_gradient = layers.iter().find_map(|layer| match layer {
         crate::BackgroundGradientLayer::Conic {
             angle,
@@ -6748,13 +6758,18 @@ fn set_background_gradients(style: &mut LayoutStyle, value: &str) {
         _ => None,
     });
     style.background_gradient_layers = layers;
+    style.background_gradient_layer_radial_geometries = radial_geometries;
 }
 
 fn parse_background_gradient_layers(
     value: &str,
     dark_scheme: bool,
-) -> Vec<crate::BackgroundGradientLayer> {
+) -> (
+    Vec<crate::BackgroundGradientLayer>,
+    Vec<Option<crate::RadialGradientGeometry>>,
+) {
     let mut layers = Vec::new();
+    let mut radial_geometries = Vec::new();
     for authored_layer in split_top_level(value, ',') {
         if let Some(linear) = parse_linear_gradient(authored_layer, dark_scheme) {
             layers.push(crate::BackgroundGradientLayer::Linear {
@@ -6763,8 +6778,13 @@ fn parse_background_gradient_layers(
                 stop_positions: linear.stop_positions,
                 repeating: linear.repeating,
             });
-        } else if let Some((center, stops)) = parse_radial_gradient(authored_layer, dark_scheme) {
-            layers.push(crate::BackgroundGradientLayer::Radial { center, stops });
+            radial_geometries.push(None);
+        } else if let Some(radial) = parse_radial_gradient(authored_layer, dark_scheme) {
+            layers.push(crate::BackgroundGradientLayer::Radial {
+                center: radial.center,
+                stops: radial.stops,
+            });
+            radial_geometries.push(Some(radial.geometry));
         } else if let Some((angle, center, stops)) =
             parse_conic_gradient(authored_layer, dark_scheme)
         {
@@ -6773,9 +6793,10 @@ fn parse_background_gradient_layers(
                 center,
                 stops,
             });
+            radial_geometries.push(None);
         }
     }
-    layers
+    (layers, radial_geometries)
 }
 
 struct ParsedLinearGradient {
@@ -6938,10 +6959,13 @@ fn gradient_position_is_valid(value: &str) -> bool {
     })
 }
 
-fn parse_radial_gradient(
-    value: &str,
-    dark_scheme: bool,
-) -> Option<((f32, f32), Vec<([u8; 4], Option<f32>)>)> {
+struct ParsedRadialGradient {
+    center: (f32, f32),
+    stops: Vec<([u8; 4], Option<f32>)>,
+    geometry: crate::RadialGradientGeometry,
+}
+
+fn parse_radial_gradient(value: &str, dark_scheme: bool) -> Option<ParsedRadialGradient> {
     let lower = value.to_ascii_lowercase();
     let start = lower.find("radial-gradient(")?;
     let open = start + "radial-gradient(".len();
@@ -6951,17 +6975,19 @@ fn parse_radial_gradient(
         return None;
     }
     let mut center = (0.5, 0.5);
+    let mut geometry = crate::RadialGradientGeometry::default();
     let mut stop_start = 0;
     let prelude = parts[0].trim().to_ascii_lowercase();
     if prelude.contains(" at ") || prelude.starts_with("at ") {
-        let coords = prelude
+        let (shape, coords) = prelude
             .split_once(" at ")
-            .map(|(_, coords)| coords)
-            .or_else(|| prelude.strip_prefix("at "))
-            .unwrap_or_default();
+            .map(|(shape, coords)| (shape, coords))
+            .or_else(|| prelude.strip_prefix("at ").map(|coords| ("", coords)))?;
+        geometry = parse_radial_gradient_geometry(shape)?;
         center = parse_gradient_center(coords);
         stop_start = 1;
-    } else if parse_color_for_scheme(parts[0].trim(), dark_scheme).is_none() {
+    } else if parse_color_for_scheme(split_color_stop(parts[0].trim()).0, dark_scheme).is_none() {
+        geometry = parse_radial_gradient_geometry(&prelude)?;
         stop_start = 1;
     }
     let mut stops = Vec::new();
@@ -6971,7 +6997,131 @@ fn parse_radial_gradient(
             stops.push((color, position));
         }
     }
-    (stops.len() >= 2).then_some((center, stops))
+    (stops.len() >= 2).then_some(ParsedRadialGradient {
+        center,
+        stops,
+        geometry,
+    })
+}
+
+fn parse_radial_gradient_geometry(value: &str) -> Option<crate::RadialGradientGeometry> {
+    use crate::{
+        RadialGradientGeometry as Geometry, RadialGradientShape as Shape,
+        RadialGradientSize as Size,
+    };
+
+    let tokens = value
+        .split_whitespace()
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    if tokens.is_empty() {
+        return Some(Geometry::default());
+    }
+
+    let explicit_shape = tokens.iter().find_map(|token| match *token {
+        "circle" => Some(Shape::Circle),
+        "ellipse" => Some(Shape::Ellipse),
+        _ => None,
+    });
+    if tokens
+        .iter()
+        .filter(|token| matches!(**token, "circle" | "ellipse"))
+        .count()
+        > 1
+    {
+        return None;
+    }
+
+    let extent = tokens.iter().find_map(|token| match *token {
+        "closest-side" | "contain" => Some(Size::ClosestSide),
+        "closest-corner" => Some(Size::ClosestCorner),
+        "farthest-side" => Some(Size::FarthestSide),
+        "farthest-corner" | "cover" => Some(Size::FarthestCorner),
+        _ => None,
+    });
+    if tokens
+        .iter()
+        .filter(|token| {
+            matches!(
+                **token,
+                "closest-side"
+                    | "closest-corner"
+                    | "farthest-side"
+                    | "farthest-corner"
+                    | "contain"
+                    | "cover"
+            )
+        })
+        .count()
+        > 1
+    {
+        return None;
+    }
+
+    let dimensions = tokens
+        .iter()
+        .filter(|token| {
+            !matches!(
+                **token,
+                "circle"
+                    | "ellipse"
+                    | "closest-side"
+                    | "closest-corner"
+                    | "farthest-side"
+                    | "farthest-corner"
+                    | "contain"
+                    | "cover"
+            )
+        })
+        .map(|token| dimension_value(token))
+        .collect::<Vec<_>>();
+    if dimensions
+        .iter()
+        .any(|dimension| !radial_radius_is_non_negative(*dimension))
+    {
+        return None;
+    }
+    if extent.is_some() && !dimensions.is_empty() {
+        return None;
+    }
+
+    match dimensions.as_slice() {
+        [] => Some(Geometry {
+            shape: explicit_shape.unwrap_or(Shape::Ellipse),
+            size: extent.unwrap_or(Size::FarthestCorner),
+        }),
+        [radius] if explicit_shape != Some(Shape::Ellipse) => {
+            // Circle radii are lengths, never percentages.
+            if matches!(radius, crate::Dimension::Percent(_)) {
+                return None;
+            }
+            Some(Geometry {
+                shape: Shape::Circle,
+                size: Size::Explicit(*radius, *radius),
+            })
+        }
+        [x, y] if explicit_shape != Some(Shape::Circle) => Some(Geometry {
+            shape: Shape::Ellipse,
+            size: Size::Explicit(*x, *y),
+        }),
+        _ => None,
+    }
+}
+
+fn radial_radius_is_non_negative(value: crate::Dimension) -> bool {
+    match value {
+        crate::Dimension::Auto => false,
+        crate::Dimension::Px(value)
+        | crate::Dimension::Percent(value)
+        | crate::Dimension::Em(value)
+        | crate::Dimension::Ex(value)
+        | crate::Dimension::Rem(value)
+        | crate::Dimension::Vw(value)
+        | crate::Dimension::Vh(value)
+        | crate::Dimension::Vmin(value)
+        | crate::Dimension::Vmax(value) => value.is_finite() && value >= 0.0,
+    }
 }
 
 fn parse_gradient_center(value: &str) -> (f32, f32) {
@@ -9319,6 +9469,77 @@ mod tests {
             centers,
             vec![(0.0, 0.0), (1.0, 0.0), (1.0, 0.5), (0.0, 0.5)]
         );
+    }
+
+    #[test]
+    fn radial_gradients_retain_explicit_ellipse_radii_and_extent_shape() {
+        let explicit = compute_style(
+            "div",
+            Some(
+                "background:radial-gradient(141.53% 114.68% at 87.46% 55.27%,\
+                 #9a7cff 36.75%,#0e0aa200 100%)",
+            ),
+        );
+        assert_eq!(
+            explicit.background_radial_gradient_geometry,
+            Some(crate::RadialGradientGeometry {
+                shape: crate::RadialGradientShape::Ellipse,
+                size: crate::RadialGradientSize::Explicit(
+                    crate::Dimension::Percent(1.4153),
+                    crate::Dimension::Percent(1.1468),
+                ),
+            })
+        );
+        assert_eq!(
+            explicit
+                .background_radial_gradient
+                .as_ref()
+                .map(|value| value.0),
+            Some((0.8746, 0.5527))
+        );
+
+        let keyword = compute_style(
+            "div",
+            Some("background-image:radial-gradient(circle closest-side at 25% 75%,red,blue)"),
+        );
+        assert_eq!(
+            keyword.background_radial_gradient_geometry,
+            Some(crate::RadialGradientGeometry {
+                shape: crate::RadialGradientShape::Circle,
+                size: crate::RadialGradientSize::ClosestSide,
+            })
+        );
+
+        let lengths = compute_style(
+            "div",
+            Some("background-image:radial-gradient(80px 2em at center,#fff 0%,#000 100%)"),
+        );
+        assert_eq!(
+            lengths.background_radial_gradient_geometry,
+            Some(crate::RadialGradientGeometry {
+                shape: crate::RadialGradientShape::Ellipse,
+                size: crate::RadialGradientSize::Explicit(
+                    crate::Dimension::Px(80.0),
+                    crate::Dimension::Em(2.0),
+                ),
+            })
+        );
+    }
+
+    #[test]
+    fn radial_gradient_rejects_invalid_shape_radius_combinations() {
+        for value in [
+            "radial-gradient(circle 50%,red,blue)",
+            "radial-gradient(ellipse 10px,red,blue)",
+            "radial-gradient(circle 10px 20px,red,blue)",
+            "radial-gradient(-10px 20px,red,blue)",
+        ] {
+            let style = compute_style("div", Some(&format!("background-image:{value}")));
+            assert!(
+                style.background_gradient_layers.is_empty(),
+                "invalid radial geometry must not become a painted layer: {value}"
+            );
+        }
     }
 
     #[test]

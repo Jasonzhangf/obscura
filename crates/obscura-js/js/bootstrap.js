@@ -189,13 +189,20 @@ if (_origStackDesc && _origStackDesc.get) {
 }
 
 let _fpSeed = 0;
-// Dynamic script import queue — serializes concurrent import() calls
-// to prevent re-entrant RefCell panic in deno_core's futures_unordered_driver
-// when SPAs dynamically insert multiple <script module> tags at once.
+// Dynamic module/in-order script queue. Module evaluation remains serialized
+// to prevent a re-entrant RefCell panic in deno_core's
+// futures_unordered_driver when SPAs insert multiple <script type=module>
+// elements at once. Ordinary dynamically inserted classic scripts are async
+// by default, so their fetches run independently and execute when ready just
+// like browser ScriptRunner tasks; serializing those fetches made unrelated
+// analytics/widgets form one long load-blocking waterfall.
 let __dynScriptQueue = [];
 let __dynScriptBusy = false;
+let __dynClassicPending = 0;
 Object.defineProperty(globalThis, '__obscura_hasPendingDynamicScripts', {
-  value: function() { return __dynScriptBusy || __dynScriptQueue.length > 0; },
+  value: function() {
+    return __dynClassicPending > 0 || __dynScriptBusy || __dynScriptQueue.length > 0;
+  },
   writable: false,
   enumerable: false,
   configurable: false,
@@ -251,50 +258,72 @@ function _decodeDataScriptUrl(url) {
 globalThis.__markParserScripts = function(nids) {
   for (const nid of nids || []) Deno.core.ops.op_script_mark_started(+nid);
 };
+async function __runDynScriptTask(task) {
+  try {
+    if (task.isModule) {
+      await import(task.url);
+    } else {
+      let body;
+      if (task.url.startsWith('data:')) {
+        body = _decodeDataScriptUrl(task.url);
+      } else {
+        const raw = await Deno.core.ops.op_fetch_url(
+          task.url, "GET", "{}", "", task.pageOrigin, "no-cors", "same-origin"
+        );
+        const parsed = JSON.parse(raw);
+        // The HTML script-fetch algorithm treats an unsuccessful HTTP
+        // response as a network error. Evaluating its response body is both
+        // observably unlike browsers and dangerous: JSON error payloads and
+        // diagnostic HTML must never become script source.
+        if (!(parsed.status >= 200 && parsed.status <= 299)) {
+          throw new Error('HTTP ' + (parsed.status || 0));
+        }
+        body = parsed.body;
+      }
+      if (body) {
+        // A fetched async script is executed by a ScriptRunner task, not by
+        // the fetch promise's microtask continuation. Besides matching event
+        // loop ordering, this prevents a batch of concurrently completed
+        // third-party scripts from being charged to (and pinning) whichever
+        // parser script happened to trigger the microtask checkpoint.
+        await new Promise(resolve => {
+          const execute = () => {
+            globalThis.__currentScriptNid = task.nid;
+            try { (0, eval)(body); }
+            catch(e) { console.error('Dynamic script error (' + task.url + '):', e.message); }
+            finally { globalThis.__currentScriptNid = task.prevNid || 0; }
+            resolve();
+          };
+          if (_scheduleAfter(0, execute) === undefined) execute();
+        });
+      }
+    }
+    // Fire load via dispatchEvent only: it invokes the element's onload
+    // property handler and any addEventListener('load') listeners, read live
+    // off the element. Calling onload separately would double-fire it.
+    try { task.dispatchEvent(new Event('load')); } catch(e) {}
+  } catch(e) {
+    console.error('Dynamic script fetch error:', e.message);
+    try { task.dispatchEvent(new Event('error')); } catch(ex) {}
+  }
+}
+async function __runAsyncClassicScript(task) {
+  __dynClassicPending++;
+  try {
+    await __runDynScriptTask(task);
+  } finally {
+    __dynClassicPending--;
+  }
+}
 async function __processDynScriptQueue() {
   if (__dynScriptBusy) return;
   __dynScriptBusy = true;
   // try/finally so the busy flag is always cleared even if a task throws
   // outside its own guard; otherwise the queue would wedge and silently
-  // block every later dynamic script on the page.
+  // block every later module or explicitly in-order script on the page.
   try {
     while (__dynScriptQueue.length > 0) {
-      const task = __dynScriptQueue.shift();
-      try {
-        if (task.isModule) {
-          await import(task.url);
-        } else {
-          let body;
-          if (task.url.startsWith('data:')) {
-            body = _decodeDataScriptUrl(task.url);
-          } else {
-            const raw = await Deno.core.ops.op_fetch_url(task.url, "GET", "{}", "", task.pageOrigin, "no-cors", "same-origin");
-            const parsed = JSON.parse(raw);
-            // The HTML script-fetch algorithm treats an unsuccessful HTTP
-            // response as a network error. Evaluating its response body is both
-            // observably unlike browsers and dangerous: JSON error payloads
-            // become JavaScript source, while servers can return diagnostic
-            // HTML that mutates global state before throwing.
-            if (!(parsed.status >= 200 && parsed.status <= 299)) {
-              throw new Error('HTTP ' + (parsed.status || 0));
-            }
-            body = parsed.body;
-          }
-          if (body) {
-            globalThis.__currentScriptNid = task.nid;
-            try { (0, eval)(body); }
-            catch(e) { console.error('Dynamic script error (' + task.url + '):', e.message); }
-            finally { globalThis.__currentScriptNid = task.prevNid || 0; }
-          }
-        }
-        // Fire load via dispatchEvent only: it invokes the element's onload
-        // property handler and any addEventListener('load') listeners, read
-        // live off the element. Calling onload separately would double-fire it.
-        try { task.dispatchEvent(new Event('load')); } catch(e) {}
-      } catch(e) {
-        console.error('Dynamic script fetch error:', e.message);
-        try { task.dispatchEvent(new Event('error')); } catch(ex) {}
-      }
+      await __runDynScriptTask(__dynScriptQueue.shift());
     }
   } finally {
     __dynScriptBusy = false;
@@ -1290,15 +1319,27 @@ function __prepareInsertedScript(script) {
       fullUrl = src;
     }
     const pageOrigin = (function() { try { return new URL(baseUrl).origin; } catch(e) { return ""; } })();
-    __dynScriptQueue.push({
+    const task = {
       url: fullUrl,
       isModule,
       nid: script._nid,
       prevNid,
       pageOrigin,
       dispatchEvent: (ev) => { try { script.dispatchEvent(ev); } catch(e) {} },
-    });
-    __processDynScriptQueue();
+    };
+    // A non-parser-inserted classic script is force-async unless script code
+    // explicitly assigned `.async = false`. Keep that opt-out in insertion
+    // order; default/async=true scripts fetch concurrently and execute as soon
+    // as each response is ready.
+    const explicitlyInOrder = !isModule
+      && Object.prototype.hasOwnProperty.call(script, 'async')
+      && script.async === false;
+    if (!isModule && !explicitlyInOrder) {
+      __runAsyncClassicScript(task);
+    } else {
+      __dynScriptQueue.push(task);
+      __processDynScriptQueue();
+    }
   } else if (isModule) {
     const dataUrl = 'data:text/javascript;base64,' + btoa(unescape(encodeURIComponent(code)));
     __dynScriptQueue.push({

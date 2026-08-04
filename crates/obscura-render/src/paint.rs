@@ -2486,6 +2486,43 @@ fn stacking_z_index(
     None
 }
 
+/// Whether this box participates in the float painting band of its current
+/// stacking context. A retained `float` declaration has no effect on an
+/// absolutely positioned box or on a flex/grid item, matching layout's
+/// blockification rules.
+fn is_effective_float(
+    tree: &DomTree,
+    laid: &crate::DomLayout,
+    id: obscura_dom::tree::NodeId,
+) -> bool {
+    let Some(style) = laid.styles.get(&id) else {
+        return false;
+    };
+    if style.float.is_none()
+        || style.display == crate::Display::None
+        || style.display_contents
+        || matches!(style.position, Some(taffy::Position::Absolute))
+    {
+        return false;
+    }
+
+    let mut parent = tree.get_node(id).and_then(|node| node.parent);
+    while let Some(parent_id) = parent {
+        let Some(parent_style) = laid.styles.get(&parent_id) else {
+            parent = tree.get_node(parent_id).and_then(|node| node.parent);
+            continue;
+        };
+        if parent_style.display_contents {
+            parent = tree.get_node(parent_id).and_then(|node| node.parent);
+            continue;
+        }
+        return parent_style.display != crate::Display::Grid
+            && !(parent_style.display == crate::Display::Flex
+                && !parent_style.internal_flex_container);
+    }
+    true
+}
+
 fn has_authored_transform(style: &crate::LayoutStyle) -> bool {
     !style.transform_ops.is_empty()
         || style.individual_translate.is_some()
@@ -2618,8 +2655,13 @@ fn paint_laid_dom_scrolled(
     // zero, so skip the per-node ancestor walk entirely and keep the paint
     // path free of any added cost.
 
-    // Paint order: tree order for the normal flow (later elements paint over
-    // earlier ones), except that a positioned element or a flex/grid item
+    // Paint order follows CSS2's stacking bands: in-flow block backgrounds
+    // and borders first, then non-positioned floats, then inline/text content
+    // (painted by the later text pass). A float is an atomic paint unit in
+    // this band, so its background, replaced content, and descendants cannot
+    // be covered by a later full-width normal block background.
+    //
+    // A positioned element or a flex/grid item
     // with a non-auto z-index lifts its whole subtree into an atomic stacking
     // unit: negative layers paint under the normal flow, non-negative ones
     // above it, each sorted by z-index ascending (stable, so equal z keeps
@@ -2628,6 +2670,7 @@ fn paint_laid_dom_scrolled(
     // leaking into different global paint phases.
     let mut neg_layers: Vec<(i32, Vec<obscura_dom::tree::NodeId>)> = Vec::new();
     let mut pos_layers: Vec<(i32, Vec<obscura_dom::tree::NodeId>)> = Vec::new();
+    let mut float_layers: Vec<obscura_dom::tree::NodeId> = Vec::new();
     let mut normal: Vec<obscura_dom::tree::NodeId> = Vec::new();
     let mut consumed: std::collections::HashSet<obscura_dom::tree::NodeId> =
         std::collections::HashSet::new();
@@ -2648,6 +2691,7 @@ fn paint_laid_dom_scrolled(
         let z = (suppress_stacking_for != Some(nid))
             .then(|| stacking_z_index(tree, laid, nid))
             .flatten();
+        let is_float_root = paint_root != Some(nid) && is_effective_float(tree, laid, nid);
         if is_opacity_root || is_transform_root {
             let mut sub = vec![nid];
             sub.extend(tree.descendants(nid));
@@ -2659,6 +2703,7 @@ fn paint_laid_dom_scrolled(
             match z {
                 Some(z) if z < 0 => neg_layers.push((z, vec![nid])),
                 Some(z) => pos_layers.push((z, vec![nid])),
+                None if is_float_root => float_layers.push(nid),
                 None => normal.push(nid),
             }
         } else if let Some(z) = z {
@@ -2672,6 +2717,10 @@ fn paint_laid_dom_scrolled(
             } else {
                 pos_layers.push((z, vec![nid]));
             }
+        } else if is_float_root {
+            consumed.insert(nid);
+            consumed.extend(tree.descendants(nid));
+            float_layers.push(nid);
         } else {
             normal.push(nid);
         }
@@ -2682,6 +2731,7 @@ fn paint_laid_dom_scrolled(
         .into_iter()
         .flat_map(|(_, sub)| sub)
         .chain(normal)
+        .chain(float_layers)
         .chain(pos_layers.into_iter().flat_map(|(_, sub)| sub))
         .collect();
 
@@ -2769,6 +2819,39 @@ fn paint_laid_dom_scrolled(
                 Some(nid),
                 suppress_opacity_for,
                 Some(nid),
+                suppress_transform_for,
+                clip_scope_root,
+                surface_extent,
+                surface_offset,
+                raster_scale,
+                print_economy,
+            )?;
+            continue;
+        }
+        if paint_root != Some(nid) && is_effective_float(tree, laid, nid) {
+            opacity_subtree_skip.insert(nid);
+            opacity_subtree_skip.extend(tree.descendants(nid));
+            // CSS paints each float as an atomic unit in the float band. The
+            // recursive display-list build preserves the float's own stacking,
+            // opacity, transforms, generated boxes, replaced content, and
+            // inline text while keeping outer in-flow inline content above it.
+            pixmap = paint_laid_dom_scrolled(
+                tree,
+                viewport,
+                base_url,
+                scroll,
+                resolved_scroll,
+                pixmap,
+                image_cache,
+                selected_images,
+                svg_fonts,
+                content_size,
+                viewport_fixed,
+                sticky,
+                laid,
+                Some(nid),
+                suppress_opacity_for,
+                suppress_stacking_for,
                 suppress_transform_for,
                 clip_scope_root,
                 surface_extent,
@@ -3238,6 +3321,10 @@ fn paint_laid_dom_scrolled(
                             &background.origin_rect,
                             *center,
                             stops,
+                            style.background_radial_gradient_geometry,
+                            style.font_size.unwrap_or(16.0),
+                            root_font_size,
+                            viewport,
                             background_mask,
                             raster_scale,
                         );
@@ -3284,6 +3371,10 @@ fn paint_laid_dom_scrolled(
                     radius,
                     fill,
                     style.background_radial_gradient.as_ref(),
+                    style.background_radial_gradient_geometry,
+                    style.font_size.unwrap_or(16.0),
+                    root_font_size,
+                    viewport,
                     style.background_gradient.as_ref(),
                     style.background_conic_gradient.as_ref(),
                     style.mask_size,
@@ -3990,6 +4081,10 @@ fn paint_inline_fragment_decorations(
                         &background_origin,
                         *center,
                         stops,
+                        fragment_style.background_radial_gradient_geometry,
+                        fragment_style.font_size.unwrap_or(16.0),
+                        root_font_size,
+                        viewport,
                         background_mask.as_ref(),
                         raster_scale,
                     );
@@ -4035,6 +4130,10 @@ fn paint_inline_fragment_decorations(
                 radius,
                 fill,
                 fragment_style.background_radial_gradient.as_ref(),
+                fragment_style.background_radial_gradient_geometry,
+                fragment_style.font_size.unwrap_or(16.0),
+                root_font_size,
+                viewport,
                 fragment_style.background_gradient.as_ref(),
                 fragment_style.background_conic_gradient.as_ref(),
                 fragment_style.mask_size,
@@ -6383,6 +6482,10 @@ fn paint_radial_gradient(
     rect: &crate::Rect,
     center: (f32, f32),
     stops: &[([u8; 4], Option<f32>)],
+    geometry: Option<crate::RadialGradientGeometry>,
+    em: f32,
+    root_font_size: f32,
+    viewport: (f32, f32),
     clip: Option<&tiny_skia::Mask>,
     raster_scale: f32,
 ) {
@@ -6393,14 +6496,11 @@ fn paint_radial_gradient(
         rect.x + rect.width * center.0,
         rect.y + rect.height * center.1,
     );
-    let radius = [
-        (rect.x - center.x).hypot(rect.y - center.y),
-        (rect.x + rect.width - center.x).hypot(rect.y - center.y),
-        (rect.x - center.x).hypot(rect.y + rect.height - center.y),
-        (rect.x + rect.width - center.x).hypot(rect.y + rect.height - center.y),
-    ]
-    .into_iter()
-    .fold(0.0, f32::max);
+    let Some((radius_x, radius_y)) =
+        resolve_radial_gradient_radii(rect, center, geometry, em, root_font_size, viewport)
+    else {
+        return;
+    };
     let normalized = normalized_stops(stops);
     let gradient_stops = normalized
         .into_iter()
@@ -6411,14 +6511,26 @@ fn paint_radial_gradient(
             )
         })
         .collect();
+    // tiny-skia's native radial shader is circular. Keep the established CSS
+    // coordinate-space shader and transform that circle around its center into
+    // the authored ellipse. The paint transform later handles device scale.
+    let ellipse_scale = radius_y / radius_x;
+    let gradient_transform = Transform::from_row(
+        1.0,
+        0.0,
+        0.0,
+        ellipse_scale,
+        0.0,
+        center.y * (1.0 - ellipse_scale),
+    );
     if let Some(shader) = RadialGradient::new(
         center,
         0.0,
         center,
-        radius,
+        radius_x,
         gradient_stops,
         SpreadMode::Pad,
-        Transform::identity(),
+        gradient_transform,
     ) {
         let mut paint = Paint::default();
         paint.shader = shader;
@@ -6431,6 +6543,81 @@ fn paint_radial_gradient(
             clip,
         );
     }
+}
+
+fn resolve_radial_gradient_radii(
+    rect: &crate::Rect,
+    center: Point,
+    geometry: Option<crate::RadialGradientGeometry>,
+    em: f32,
+    root_font_size: f32,
+    viewport: (f32, f32),
+) -> Option<(f32, f32)> {
+    use crate::{RadialGradientShape as Shape, RadialGradientSize as Size};
+
+    let left = (center.x - rect.x).abs();
+    let right = (rect.x + rect.width - center.x).abs();
+    let top = (center.y - rect.y).abs();
+    let bottom = (rect.y + rect.height - center.y).abs();
+
+    // Programmatically constructed legacy `BackgroundGradientLayer::Radial`
+    // values have no sidecar geometry. Preserve their former circular
+    // farthest-corner behavior exactly.
+    let Some(geometry) = geometry else {
+        let radius = [
+            left.hypot(top),
+            right.hypot(top),
+            left.hypot(bottom),
+            right.hypot(bottom),
+        ]
+        .into_iter()
+        .fold(0.0, f32::max);
+        return (radius > f32::EPSILON).then_some((radius, radius));
+    };
+
+    let (mut radius_x, mut radius_y) = match geometry.size {
+        Size::ClosestSide => (left.min(right), top.min(bottom)),
+        Size::FarthestSide => (left.max(right), top.max(bottom)),
+        Size::ClosestCorner => {
+            let sqrt_two = 2.0f32.sqrt();
+            (left.min(right) * sqrt_two, top.min(bottom) * sqrt_two)
+        }
+        Size::FarthestCorner => {
+            let sqrt_two = 2.0f32.sqrt();
+            (left.max(right) * sqrt_two, top.max(bottom) * sqrt_two)
+        }
+        Size::Explicit(x, y) => (
+            resolve_radial_radius(x, rect.width, em, root_font_size, viewport)?,
+            resolve_radial_radius(y, rect.height, em, root_font_size, viewport)?,
+        ),
+    };
+    if geometry.shape == Shape::Circle && !matches!(geometry.size, Size::Explicit(..)) {
+        let radius = match geometry.size {
+            Size::ClosestSide => radius_x.min(radius_y),
+            Size::FarthestSide => radius_x.max(radius_y),
+            Size::ClosestCorner => left.min(right).hypot(top.min(bottom)),
+            Size::FarthestCorner => left.max(right).hypot(top.max(bottom)),
+            Size::Explicit(..) => unreachable!(),
+        };
+        radius_x = radius;
+        radius_y = radius;
+    }
+    (radius_x > f32::EPSILON && radius_y > f32::EPSILON).then_some((radius_x, radius_y))
+}
+
+fn resolve_radial_radius(
+    radius: crate::Dimension,
+    percentage_basis: f32,
+    em: f32,
+    root_font_size: f32,
+    viewport: (f32, f32),
+) -> Option<f32> {
+    match radius.resolve(em, root_font_size, viewport.0 / 100.0, viewport.1 / 100.0) {
+        crate::Dimension::Px(value) => Some(value),
+        crate::Dimension::Percent(value) => Some(value * percentage_basis),
+        _ => None,
+    }
+    .filter(|value| value.is_finite() && *value >= 0.0)
 }
 
 fn paint_background_gradient_layers(
@@ -6484,6 +6671,7 @@ fn paint_background_gradient_layers(
                     &tile_rect,
                     crate::ResolvedBorderRadii::default(),
                     layers,
+                    &style.background_gradient_layer_radial_geometries,
                     em,
                     root_font_size,
                     viewport,
@@ -6578,6 +6766,7 @@ fn paint_background_gradient_layers(
         clip_rect,
         clip_radii,
         layers,
+        &style.background_gradient_layer_radial_geometries,
         em,
         root_font_size,
         viewport,
@@ -6593,6 +6782,7 @@ fn paint_gradient_layer_stack(
     clip_rect: &crate::Rect,
     clip_radii: crate::ResolvedBorderRadii,
     layers: &[crate::BackgroundGradientLayer],
+    radial_geometries: &[Option<crate::RadialGradientGeometry>],
     em: f32,
     root_font_size: f32,
     viewport: (f32, f32),
@@ -6601,7 +6791,7 @@ fn paint_gradient_layer_stack(
 ) {
     // CSS lists the topmost background first. Paint back-to-front so every
     // translucent layer composites over the layers authored after it.
-    for layer in layers.iter().rev() {
+    for (index, layer) in layers.iter().enumerate().rev() {
         match layer {
             crate::BackgroundGradientLayer::Linear {
                 angle,
@@ -6631,6 +6821,10 @@ fn paint_gradient_layer_stack(
                     sampling_rect,
                     *center,
                     stops,
+                    radial_geometries.get(index).copied().flatten(),
+                    em,
+                    root_font_size,
+                    viewport,
                     clip,
                     raster_scale,
                 );
@@ -6876,24 +7070,26 @@ fn radial_color_at(
     rect: &crate::Rect,
     center: (f32, f32),
     stops: &[(f32, [u8; 4])],
+    geometry: Option<crate::RadialGradientGeometry>,
+    em: f32,
+    root_font_size: f32,
+    viewport: (f32, f32),
     x: f32,
     y: f32,
 ) -> [u8; 4] {
     let center_x = rect.x + rect.width * center.0;
     let center_y = rect.y + rect.height * center.1;
-    let radius = [
-        (rect.x - center_x).hypot(rect.y - center_y),
-        (rect.x + rect.width - center_x).hypot(rect.y - center_y),
-        (rect.x - center_x).hypot(rect.y + rect.height - center_y),
-        (rect.x + rect.width - center_x).hypot(rect.y + rect.height - center_y),
-    ]
-    .into_iter()
-    .fold(0.0, f32::max);
-    let position = if radius <= f32::EPSILON {
-        0.0
-    } else {
-        (x - center_x).hypot(y - center_y) / radius
-    };
+    let radii = resolve_radial_gradient_radii(
+        rect,
+        Point::from_xy(center_x, center_y),
+        geometry,
+        em,
+        root_font_size,
+        viewport,
+    );
+    let position = radii.map_or(0.0, |(radius_x, radius_y)| {
+        (((x - center_x) / radius_x).powi(2) + ((y - center_y) / radius_y).powi(2)).sqrt()
+    });
     sample_normalized_stops(stops, position)
 }
 
@@ -7171,6 +7367,10 @@ fn paint_in_flow_generated_box(
                         &background.origin_rect,
                         *center,
                         stops,
+                        style.background_radial_gradient_geometry,
+                        style.font_size.unwrap_or(16.0),
+                        root_font_size,
+                        viewport,
                         background_mask.as_ref(),
                         raster_scale,
                     );
@@ -7215,6 +7415,10 @@ fn paint_in_flow_generated_box(
             radius,
             fill,
             style.background_radial_gradient.as_ref(),
+            style.background_radial_gradient_geometry,
+            style.font_size.unwrap_or(16.0),
+            root_font_size,
+            viewport,
             style.background_gradient.as_ref(),
             style.background_conic_gradient.as_ref(),
             style.mask_size,
@@ -7405,6 +7609,10 @@ fn paint_positioned_pseudo(
                         &background.origin_rect,
                         *center,
                         stops,
+                        style.background_radial_gradient_geometry,
+                        em,
+                        root_font_size,
+                        viewport,
                         background_mask.as_ref(),
                         raster_scale,
                     );
@@ -7449,6 +7657,10 @@ fn paint_positioned_pseudo(
             radius,
             fill,
             style.background_radial_gradient.as_ref(),
+            style.background_radial_gradient_geometry,
+            em,
+            root_font_size,
+            viewport,
             style.background_gradient.as_ref(),
             style.background_conic_gradient.as_ref(),
             style.mask_size,
@@ -9202,6 +9414,10 @@ fn paint_mask(
     border_radius: crate::ResolvedBorderRadii,
     fill: [u8; 4],
     radial_gradient: Option<&((f32, f32), Vec<([u8; 4], Option<f32>)>)>,
+    radial_geometry: Option<crate::RadialGradientGeometry>,
+    em: f32,
+    root_font_size: f32,
+    viewport: (f32, f32),
     linear_gradient: Option<&(f32, Vec<([u8; 4], Option<f32>)>)>,
     conic_gradient: Option<&(f32, (f32, f32), Vec<([u8; 4], Option<f32>)>)>,
     mask_size: Option<(f32, f32)>,
@@ -9270,7 +9486,17 @@ fn paint_mask(
             } else if let (Some((center, _)), Some(stops)) =
                 (radial_gradient, normalized_radial.as_deref())
             {
-                radial_color_at(rect, *center, stops, sample_x, sample_y)
+                radial_color_at(
+                    rect,
+                    *center,
+                    stops,
+                    radial_geometry,
+                    em,
+                    root_font_size,
+                    viewport,
+                    sample_x,
+                    sample_y,
+                )
             } else {
                 fill
             };
@@ -10103,6 +10329,54 @@ mod tests {
         assert_eq!(outside.red(), 255);
         assert_eq!(outside.green(), 255);
         assert_eq!(outside.blue(), 255);
+    }
+
+    #[test]
+    fn float_paints_above_normal_block_backgrounds_and_below_later_flow() {
+        // Chromium 145: ordinary block border boxes remain full-width beneath
+        // the float, but their backgrounds are in the lower block-background
+        // paint band. The right float therefore stays visible through its
+        // 80px height; the following block becomes visible across the full
+        // width once it starts below the float.
+        let tree = parse_html(
+            r#"<style>
+                html,body{margin:0}
+                #bfc{display:flow-root;width:200px}
+                #float{float:right;width:50px;height:80px;background:#1971c2}
+                #lead{height:50px;background:#087f5b}
+                #heading{height:10px;background:#e8590c}
+                #beside{height:20px;background:#7048e8}
+                #after{height:20px;background:#a61e4d}
+            </style>
+            <main id="bfc">
+              <aside id="float"></aside>
+              <div id="lead"></div>
+              <div id="heading"></div>
+              <div id="beside"></div>
+              <div id="after"></div>
+            </main>"#,
+        );
+        let pixmap = paint_dom(&tree, (200.0, 120.0), None).expect("float paint");
+        let rgb = |x, y| {
+            let pixel = pixmap.pixel(x, y).expect("sample pixel");
+            (pixel.red(), pixel.green(), pixel.blue())
+        };
+
+        assert_eq!(rgb(25, 25), (8, 127, 91), "left side keeps lead background");
+        assert_eq!(rgb(25, 55), (232, 89, 12), "left side keeps heading background");
+        assert_eq!(rgb(25, 70), (112, 72, 232), "left side keeps beside background");
+        for y in [25, 55, 70] {
+            assert_eq!(
+                rgb(175, y),
+                (25, 113, 194),
+                "float must overlay the full-width block background at y={y}"
+            );
+        }
+        assert_eq!(
+            rgb(175, 90),
+            (166, 30, 77),
+            "normal flow below the float paints across the full width"
+        );
     }
 
     /// Chromium 150 oracle for CSS Backgrounds box geometry. Transparent
@@ -13203,6 +13477,60 @@ mod tests {
         assert!(
             differing > 200,
             "2x vector gradient samples must be rerasterized, not resize-equivalent ({differing} differing channels)"
+        );
+    }
+
+    #[test]
+    fn explicit_radial_ellipse_matches_chromium_axis_samples() {
+        let tree = parse_html(
+            r#"<html style="margin:0"><body style="margin:0">
+                <div style="width:200px;height:100px;
+                    background:radial-gradient(50% 25% at 50% 50%,#fff 0%,#000 100%)">
+                </div>
+            </body></html>"#,
+        );
+        let pixmap = paint_dom(&tree, (200.0, 100.0), None).expect("pixmap");
+        // Chromium 144 at DPR 1 yields R values 249, 126, 2, 127, and 5 at
+        // these pixel centers. Allow a small raster-backend interpolation
+        // tolerance while requiring both authored radii to control geometry.
+        for ((x, y), chromium) in [
+            ((100, 50), 249i16),
+            ((150, 50), 126),
+            ((199, 50), 2),
+            ((100, 62), 127),
+            ((100, 74), 5),
+        ] {
+            let pixel = pixmap.pixel(x, y).expect("sample pixel");
+            let actual = pixel.red() as i16;
+            assert!(
+                (actual - chromium).abs() <= 5,
+                "ellipse sample ({x},{y}) was {actual}, Chromium was {chromium}: {pixel:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn radial_extent_keywords_keep_circle_and_ellipse_geometry_distinct() {
+        let tree = parse_html(
+            r#"<html style="margin:0"><body style="margin:0;display:flex">
+                <div style="width:200px;height:100px;
+                    background:radial-gradient(circle farthest-side at 25% 50%,#fff,#000)">
+                </div>
+                <div style="width:200px;height:100px;
+                    background:radial-gradient(ellipse farthest-side at 25% 50%,#fff,#000)">
+                </div>
+            </body></html>"#,
+        );
+        let pixmap = paint_dom(&tree, (400.0, 100.0), None).expect("pixmap");
+        let circle_bottom = pixmap.pixel(50, 99).expect("circle sample").red();
+        let ellipse_bottom = pixmap.pixel(250, 99).expect("ellipse sample").red();
+        assert!(
+            circle_bottom > 150,
+            "farthest-side circle radius is 150px, so its bottom remains light: {circle_bottom}"
+        );
+        assert!(
+            ellipse_bottom < 10,
+            "farthest-side ellipse vertical radius is 50px: {ellipse_bottom}"
         );
     }
 

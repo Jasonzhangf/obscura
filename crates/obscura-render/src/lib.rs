@@ -689,6 +689,43 @@ pub enum BackgroundGradientLayer {
     },
 }
 
+/// Parsed ending-shape geometry for one CSS radial gradient.
+///
+/// This is kept alongside `BackgroundGradientLayer` rather than adding fields
+/// to its public `Radial` variant, preserving the existing construction API for
+/// embedders while allowing authored circle/ellipse sizing to survive to paint.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct RadialGradientGeometry {
+    pub shape: RadialGradientShape,
+    pub size: RadialGradientSize,
+}
+
+impl Default for RadialGradientGeometry {
+    fn default() -> Self {
+        Self {
+            shape: RadialGradientShape::Ellipse,
+            size: RadialGradientSize::FarthestCorner,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RadialGradientShape {
+    Circle,
+    Ellipse,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum RadialGradientSize {
+    ClosestSide,
+    ClosestCorner,
+    FarthestSide,
+    FarthestCorner,
+    /// Horizontal and vertical radii. Percentages resolve against the
+    /// corresponding axis of the gradient box, per CSS Images.
+    Explicit(Dimension, Dimension),
+}
+
 /// One computed CSS counter operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CounterDirective {
@@ -887,6 +924,9 @@ pub struct LayoutStyle {
     /// and color stops. It is painted below the first linear layer, matching
     /// the common `linear-gradient(...), radial-gradient(...)` hero pattern.
     pub background_radial_gradient: Option<((f32, f32), Vec<([u8; 4], Option<f32>)>)>,
+    /// Geometry paired with `background_radial_gradient`. The legacy public
+    /// tuple above remains unchanged for API compatibility.
+    pub(crate) background_radial_gradient_geometry: Option<RadialGradientGeometry>,
     /// `conic-gradient(...)` background. The angle is the CSS `from` angle,
     /// the center is a fraction of the border box, and stops are normalized
     /// during paint. Conic gradients commonly provide the color source for a
@@ -895,6 +935,9 @@ pub struct LayoutStyle {
     /// Every parsed gradient in authored background-layer order. The legacy
     /// single-kind fields above remain populated for mask/text fast paths.
     pub background_gradient_layers: Vec<BackgroundGradientLayer>,
+    /// One entry per `background_gradient_layers` item. Radial entries carry
+    /// their authored ending shape; non-radial entries are `None`.
+    pub(crate) background_gradient_layer_radial_geometries: Vec<Option<RadialGradientGeometry>>,
     /// The first `url(...)` reference from `background`/`background-image`
     /// (gradients and repeat keywords in the same shorthand are ignored: we
     /// paint the referenced image, not the gradient layer).

@@ -939,6 +939,11 @@ fn float_flow_zone_preserves_blocks_inline_runs_and_clearance() {
 
 #[test]
 fn float_exclusion_continues_through_non_bfc_block_wrappers() {
+    // Chromium keeps each ordinary block's outer box at the containing
+    // block's full width. Only line boxes inside those blocks query the
+    // float-reduced available band; backgrounds and borders extend beneath
+    // the float. This is deliberately distinct from a new BFC, which avoids
+    // the float as one box.
     let tree = parse_html(include_str!(
         "../../../render-repros/float-bfc-continuation.html"
     ));
@@ -959,21 +964,21 @@ fn float_exclusion_continues_through_non_bfc_block_wrappers() {
     assert!(
         (lead.x - 0.0).abs() < 0.01
             && (lead.y - 0.0).abs() < 0.01
-            && (lead.width - 650.0).abs() < 0.01
+            && (lead.width - 900.0).abs() < 0.01
             && (lead.height - 250.0).abs() < 0.01,
         "lead: {lead:?}"
     );
     assert!(
         (heading.x - 0.0).abs() < 0.01
             && (heading.y - 250.0).abs() < 0.01
-            && (heading.width - 650.0).abs() < 0.01
+            && (heading.width - 900.0).abs() < 0.01
             && (heading.height - 50.0).abs() < 0.01,
         "heading: {heading:?}"
     );
     assert!(
         (beside.x - 0.0).abs() < 0.01
             && (beside.y - 300.0).abs() < 0.01
-            && (beside.width - 650.0).abs() < 0.01
+            && (beside.width - 900.0).abs() < 0.01
             && (beside.height - 100.0).abs() < 0.01,
         "beside: {beside:?}"
     );

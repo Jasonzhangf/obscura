@@ -10731,6 +10731,64 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn dynamic_classic_scripts_are_async_by_default_but_honor_async_false_order() {
+        let mut rt = setup_runtime("<html><head></head><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const originalFetchOp = Deno.core.ops.op_fetch_url;
+                    const runPair = async (explicitlyInOrder) => {
+                        globalThis.__dynamicOrder = [];
+                        Deno.core.ops.op_fetch_url = (url) => new Promise(resolve => {
+                            const slow = url.includes("slow");
+                            setTimeout(() => resolve(JSON.stringify({
+                                status: 200,
+                                headers: {"content-type": "text/javascript"},
+                                body: `globalThis.__dynamicOrder.push("${slow ? "slow" : "fast"}")`,
+                                url,
+                            })), slow ? 30 : 1);
+                        });
+                        const load = name => new Promise(resolve => {
+                            const script = document.createElement("script");
+                            if (explicitlyInOrder) script.async = false;
+                            script.src = `/${name}.js`;
+                            script.onload = resolve;
+                            document.head.appendChild(script);
+                        });
+                        await Promise.all([load("slow"), load("fast")]);
+                        return globalThis.__dynamicOrder.slice();
+                    };
+                    try {
+                        const asyncOrder = await runPair(false);
+                        const inOrder = await runPair(true);
+                        return {
+                            asyncOrder,
+                            inOrder,
+                            pending: globalThis.__obscura_hasPendingDynamicScripts(),
+                        };
+                    } finally {
+                        Deno.core.ops.op_fetch_url = originalFetchOp;
+                    }
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({
+                "asyncOrder": ["fast", "slow"],
+                "inOrder": ["slow", "fast"],
+                "pending": false,
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn test_response_array_buffer_preserves_typed_array_view() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt

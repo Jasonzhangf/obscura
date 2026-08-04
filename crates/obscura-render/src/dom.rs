@@ -1654,6 +1654,12 @@ struct IfcRegistry {
     /// nodes real geometry; `apply_float_continuations` uses it to narrow the
     /// later intersecting bands before the final layout.
     float_continuations: Vec<FloatContinuation>,
+    /// Ordinary blocks participating in a native float band must keep a
+    /// distinct inner line box. Collapsing the block and all of its text into
+    /// one measured leaf gives Taffy no descendant at which the shared BFC
+    /// float context can shorten the line while retaining the block's full
+    /// border-box width.
+    float_aware_blocks: HashSet<NodeId>,
     /// CSS multi-column containers built as a row of anonymous block
     /// fragmentainers. All in-flow boxes start in the first fragmentainer so
     /// the preliminary layout measures them at the final column width; the
@@ -5490,28 +5496,26 @@ fn layout_dom_once(
                             crate::Dimension::Px(w) => w,
                             _ => max_c,
                         };
-                        let used_outer = match width_style {
+                        let available_outer = available_widths
+                            .get(&tnode)
+                            .copied()
+                            .or_else(|| {
+                                reliable_table_available_width(
+                                    tree,
+                                    dom,
+                                    &styles,
+                                    initial_cb_width,
+                                )
+                            })
+                            .unwrap_or(initial_cb_width);
+                        let mut used_outer = match width_style {
                             // A definite table width is not clamped to its
                             // containing block. Like other fixed boxes it may
                             // overflow, while min-content can still make it wider.
                             crate::Dimension::Px(_) => preferred_outer.max(min_c),
-                            _ => {
-                                let available_outer = available_widths
-                                    .get(&tnode)
-                                    .copied()
-                                    .or_else(|| {
-                                        reliable_table_available_width(
-                                            tree,
-                                            dom,
-                                            &styles,
-                                            initial_cb_width,
-                                        )
-                                    })
-                                    .unwrap_or(initial_cb_width);
-                                preferred_outer.max(min_c).min(available_outer.max(min_c))
-                            }
+                            _ => preferred_outer.max(min_c).min(available_outer.max(min_c)),
                         };
-                        let used_declaration =
+                        let mut used_declaration =
                             if table_style.box_sizing == crate::BoxSizing::ContentBox {
                                 (used_outer - inline_outer_edges).max(0.0)
                             } else {
@@ -5627,8 +5631,6 @@ fn layout_dom_once(
                             let (horizontal_spacing, _) = table_spacing(table_style);
                             let interior_spacing =
                                 horizontal_spacing * ncols.saturating_sub(1) as f32;
-                            let target =
-                                (used_outer - inline_outer_edges - interior_spacing).max(0.0);
                             // A specified length on a cell/column is a preferred
                             // contribution, not a min-content floor. Preserve the
                             // content minimum and raise only the preferred width so
@@ -5655,6 +5657,23 @@ fn layout_dom_once(
                                     col_max[j] = width.max(col_min[j]);
                                 }
                             }
+                            if !matches!(width_style, crate::Dimension::Px(_)) {
+                                let percentage_floor =
+                                    auto_table_percentage_intrinsic_floor(&col_min, &percentages);
+                                let percentage_outer =
+                                    percentage_floor + inline_outer_edges + interior_spacing;
+                                used_outer = used_outer
+                                    .max(percentage_outer)
+                                    .min(available_outer.max(min_c));
+                                used_declaration =
+                                    if table_style.box_sizing == crate::BoxSizing::ContentBox {
+                                        (used_outer - inline_outer_edges).max(0.0)
+                                    } else {
+                                        used_outer
+                                    };
+                            }
+                            let target =
+                                (used_outer - inline_outer_edges - interior_spacing).max(0.0);
                             let widths = distribute_auto_table_columns(
                                 target,
                                 &col_min,
@@ -8802,7 +8821,11 @@ fn build_in_flow_pseudo(
     }
 
     let children = content
-        .filter(|text| !text.is_empty())
+        // CSS table fixup discards whitespace-only text between table
+        // structures. Clearfixes conventionally use `content:" "`, so
+        // retaining that text as a measured leaf gives the otherwise-empty
+        // generated table a spurious space glyph of intrinsic width.
+        .filter(|text| !text.is_empty() && !(pseudo.is_table_box && text.trim().is_empty()))
         .map(|text| build_pseudo_content(host, text, pseudo, taffy_tree, words))
         .unwrap_or_default();
     let mut taffy_style = to_taffy_style(pseudo);
@@ -9348,6 +9371,48 @@ fn table_inline_outer_edges(style: &crate::LayoutStyle) -> f32 {
         + style.padding.left
         + style.padding.right
         + spacing * 2.0
+}
+
+/// Minimum track width implied by percentage columns in an auto-width table.
+///
+/// Percentage table-cell widths participate in the table's intrinsic width.
+/// For example, if a 50% column has a 100px minimum next to 100px of auto
+/// columns, the table needs 200px before both constraints can hold. When the
+/// constraints cannot all fit (a 100% cell plus any non-empty neighbour), the
+/// intrinsic requirement is unbounded and the used width is capped by the
+/// available containing-block width. This is the behavior Bootstrap input
+/// groups rely on to make an otherwise auto-width `display:table` fill their
+/// form while reserving intrinsic space for narrow addon/button cells.
+fn auto_table_percentage_intrinsic_floor(minimums: &[f32], percentages: &[Option<f32>]) -> f32 {
+    if minimums.len() != percentages.len() || minimums.is_empty() {
+        return 0.0;
+    }
+
+    let mut remaining = 1.0f32;
+    let mut auto_minimum = 0.0f32;
+    let mut required = 0.0f32;
+    for (minimum, percentage) in minimums.iter().zip(percentages) {
+        let minimum = minimum.max(0.0);
+        let Some(percentage) = percentage else {
+            auto_minimum += minimum;
+            continue;
+        };
+        let effective = percentage.max(0.0).min(remaining);
+        remaining = (remaining - effective).max(0.0);
+        if minimum > 0.0 {
+            if effective <= f32::EPSILON {
+                return f32::INFINITY;
+            }
+            required = required.max(minimum / effective);
+        }
+    }
+    if auto_minimum > 0.0 {
+        if remaining <= f32::EPSILON {
+            return f32::INFINITY;
+        }
+        required = required.max(auto_minimum / remaining);
+    }
+    required
 }
 
 /// Resolve auto-table column constraints into final track widths.
@@ -10719,7 +10784,7 @@ fn build(
     let is_closed_html_details = _name.ns.as_ref() == "http://www.w3.org/1999/xhtml"
         && _name.local.as_ref() == "details"
         && node.get_attribute("open").is_none();
-    if !is_closed_html_details {
+    if !is_closed_html_details && !ifc_items.float_aware_blocks.contains(&id) {
         if let Some(item) = engine.try_build(tree, id, styles) {
             if style.display == crate::Display::Block && style.width == crate::Dimension::Auto {
                 // A pure-text block is still a fill-available block. Its shaped
@@ -11976,10 +12041,10 @@ fn is_structural_native_float_pseudo(style: &crate::LayoutStyle) -> bool {
 }
 
 /// Native taffy floats are currently sound for a deliberately small structural
-/// subset: a flat block band made only of definite-width direct floats plus
-/// empty generated/direct clearance boxes. Text flow, transparent wrappers,
-/// shrink-to-fit floats, independent formatting contexts, and tables retain
-/// the synthetic float-zone path.
+/// subset: a flat block band made from boxed direct floats, boxed block flow,
+/// and empty generated/direct clearance boxes. Text nodes directly in the
+/// parent, transparent wrappers, independent formatting contexts, and tables
+/// retain the synthetic float-zone path.
 fn can_use_native_float_band(
     tree: &DomTree,
     parent_style: &crate::LayoutStyle,
@@ -12005,6 +12070,7 @@ fn can_use_native_float_band(
     let mut has_right = false;
     let mut saw_float = false;
     let mut saw_clear_after_floats = false;
+    let mut saw_flow_after_floats = false;
 
     if let Some(before) = parent_style.before_pseudo.as_deref() {
         if !is_structural_native_float_pseudo(before) {
@@ -12031,12 +12097,13 @@ fn can_use_native_float_band(
 
         if let Some(side) = style.float {
             if saw_clear_after_floats
+                || saw_flow_after_floats
                 || style.display_contents
                 || style.is_table_box
                 || matches!(style.position, Some(taffy::Position::Absolute))
                 || !matches!(
                     style.width,
-                    crate::Dimension::Px(_) | crate::Dimension::Percent(_)
+                    crate::Dimension::Auto | crate::Dimension::Px(_) | crate::Dimension::Percent(_)
                 )
                 || style.size_expressions[0].is_some()
                 || has_deferred_or_auto_margin(style)
@@ -12055,6 +12122,22 @@ fn can_use_native_float_band(
                 has_left,
                 has_right,
             );
+        } else if saw_float
+            && style.display == crate::Display::Block
+            && !style.display_contents
+            && !style.is_inline_block
+            && !style.is_table_box
+            && !style.internal_flex_container
+            && !matches!(style.position, Some(taffy::Position::Absolute))
+        {
+            // Gecko keeps an ordinary block's border box at the BFC's full
+            // inline size and narrows only its descendant line boxes. A block
+            // that establishes its own BFC (overflow/flow-root) instead moves
+            // as one float-avoiding box. Taffy's native block float context
+            // implements both branches; the old synthetic flex row could
+            // represent neither distinction because it shrank every sibling's
+            // outer box beside the float.
+            saw_flow_after_floats = true;
         } else {
             return false;
         }
@@ -12075,7 +12158,7 @@ fn can_use_native_float_band(
     // distinct taffy-side representation, so they are not an escape signal.
     let parent_is_native_bfc =
         parent_style.overflow_scroll_container && !parent_style.overflow_propagated_to_viewport;
-    saw_float && (saw_clear_after_floats || parent_is_native_bfc)
+    saw_float && (saw_flow_after_floats || saw_clear_after_floats || parent_is_native_bfc)
 }
 
 fn set_native_float_clear(
@@ -12138,6 +12221,12 @@ fn build_children_with_native_float_band(
                 let Some(style) = styles.get(&id) else {
                     continue;
                 };
+                if style.float.is_none()
+                    && style.display == crate::Display::Block
+                    && !establishes_block_formatting_context(style)
+                {
+                    ifc_items.float_aware_blocks.insert(id);
+                }
                 for node in build_any(
                     tree, id, taffy_tree, id_map, words, engine, ifc_items, styles,
                 ) {
@@ -13631,6 +13720,62 @@ mod tests {
         assert!(
             (container.height - 150.0).abs() < 0.01,
             "one float band must be as tall as its tallest float: {container:?}"
+        );
+    }
+
+    #[test]
+    fn single_float_keeps_normal_block_outer_width_and_shortens_its_line_band() {
+        // Chromium 145 geometry for a Bootstrap-style single header float,
+        // an ordinary full-width collapse block, and an overflow BFC below it.
+        let tree = parse_html(
+            r#"<style>
+                *{box-sizing:border-box} html,body{margin:0}
+                #parent{width:780px}
+                #parent::before,#parent::after{display:table;content:" "}
+                #parent::after{clear:both}
+                #float{float:left;height:100px}
+                #float::after{display:table;clear:both;content:" "}
+                #brand{float:left;width:250px;height:100px}
+                #flow{height:50px}
+                #line{display:inline-block;width:400px;height:20px}
+                #bfc{overflow:hidden;height:30px}
+            </style>
+            <div id="parent">
+              <div id="float"><div id="brand"></div></div>
+              <div id="flow"><span id="line"></span></div>
+              <div id="bfc"></div>
+            </div>"#,
+        );
+        let laid = layout_dom(&tree, (900.0, 300.0));
+        let rect = |id: &str| laid.rects[&tree.get_element_by_id(id).unwrap()];
+        let parent = rect("parent");
+        let float = rect("float");
+        let flow = rect("flow");
+        let line = rect("line");
+        let bfc = rect("bfc");
+
+        assert_eq!(
+            (parent.x, parent.y, parent.width, parent.height),
+            (0.0, 0.0, 780.0, 100.0)
+        );
+        assert_eq!(
+            (float.x, float.y, float.width, float.height),
+            (0.0, 0.0, 250.0, 100.0)
+        );
+        assert_eq!(
+            (flow.x, flow.y, flow.width, flow.height),
+            (0.0, 0.0, 780.0, 50.0),
+            "a normal block border box spans beneath the float"
+        );
+        assert_eq!(
+            (line.x, line.y, line.width, line.height),
+            (250.0, 0.0, 400.0, 20.0),
+            "inline content starts at the float band's available edge"
+        );
+        assert_eq!(
+            (bfc.x, bfc.y, bfc.width, bfc.height),
+            (250.0, 50.0, 530.0, 30.0),
+            "a float-avoiding BFC moves and shrinks as one box"
         );
     }
 
@@ -16102,6 +16247,36 @@ mod tests {
     }
 
     #[test]
+    fn auto_width_authored_table_honors_percentage_cell_intrinsic_constraints() {
+        let tree = parse_html(
+            r#"<style>
+                * { box-sizing:border-box }
+                html,body { margin:0 }
+                #host { width:600px }
+                #group { display:table }
+                #field,#button { display:table-cell; height:34px }
+                #field { width:100% }
+                #button { width:1%; min-width:100px }
+            </style>
+            <div id="host"><div id="group"><div id="field"></div><div id="button"></div></div></div>"#,
+        );
+        let laid = layout_dom(&tree, (800.0, 200.0));
+        let rect = |id: &str| laid.rects[&tree.get_element_by_id(id).unwrap()];
+        let group = rect("group");
+        let field = rect("field");
+        let button = rect("button");
+
+        // Chromium 145: group=600, field=500, button=100. An auto-width
+        // table cannot shrink-wrap to 100px here: the 100% field and the
+        // non-empty 1% neighbor make their percentage constraints fill the
+        // definite available width.
+        assert!((group.width - 600.0).abs() < 0.1, "{group:?}");
+        assert!((field.width - 500.0).abs() < 0.1, "{field:?}");
+        assert!((button.width - 100.0).abs() < 0.1, "{button:?}");
+        assert!((button.x - (field.x + field.width)).abs() < 0.1);
+    }
+
+    #[test]
     fn auto_table_percent_guess_reserves_intrinsic_neighbor_columns() {
         let widths = distribute_auto_table_columns(
             600.0,
@@ -16113,6 +16288,23 @@ mod tests {
         assert!((widths[0] - 430.0).abs() < 0.01, "{widths:?}");
         assert!((widths[1] - 100.0).abs() < 0.01, "{widths:?}");
         assert!((widths[2] - 70.0).abs() < 0.01, "{widths:?}");
+    }
+
+    #[test]
+    fn auto_table_percentage_intrinsic_floor_matches_chromium_cases() {
+        let percentages = [Some(0.1), None];
+        assert!(
+            (auto_table_percentage_intrinsic_floor(&[16.0, 144.0], &percentages) - 160.0).abs()
+                < 0.01
+        );
+        let percentages = [Some(0.5), None];
+        assert!(
+            (auto_table_percentage_intrinsic_floor(&[16.0, 106.71875], &percentages) - 213.4375)
+                .abs()
+                < 0.01
+        );
+        let percentages = [Some(0.9), None];
+        assert!(auto_table_percentage_intrinsic_floor(&[16.0, 106.71875], &percentages) > 1000.0);
     }
 
     #[test]
