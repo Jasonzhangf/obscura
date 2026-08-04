@@ -667,6 +667,10 @@ async fn settle_page(page: &mut Page, wait_secs: u64, fixed: bool) {
     }
 }
 
+fn configure_fetch_navigation_timeout(page: &mut Page, timeout_secs: u64) {
+    page.set_navigation_timeout(Duration::from_secs(timeout_secs));
+}
+
 async fn run_fetch(
     url_str: &str,
     dump: Option<DumpFormat>,
@@ -710,6 +714,10 @@ async fn run_fetch(
         allow_private_network,
     ));
     let mut page = Page::new("fetch-page".to_string(), context.clone());
+    // Keep the browser's end-to-end navigation ceiling aligned with the CLI
+    // request deadline. Previously Page retained its independent 30s default,
+    // so `fetch --timeout 50` could still fail after 30 seconds.
+    configure_fetch_navigation_timeout(&mut page, timeout_secs);
     // A screenshot viewport is also the navigation viewport: responsive
     // frameworks must build the DOM for the same dimensions we later paint.
     // Previously page JS saw a randomized screen-sized innerWidth while the
@@ -1868,10 +1876,10 @@ fn dump_assets(page: &Page) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        effective_v8_flags, extract_assets, extract_readable_text, fetch_original_bytes,
-        is_quiet_command, link_kind_from_rel, merge_proxy, normalize_v8_flags, read_urls_from_file,
-        resolve_asset_url, select_log_filter, write_or_print, write_or_print_bytes, Args, Command,
-        DumpFormat, DEFAULT_V8_FLAGS,
+        configure_fetch_navigation_timeout, effective_v8_flags, extract_assets,
+        extract_readable_text, fetch_original_bytes, is_quiet_command, link_kind_from_rel,
+        merge_proxy, normalize_v8_flags, read_urls_from_file, resolve_asset_url, select_log_filter,
+        write_or_print, write_or_print_bytes, Args, Command, DumpFormat, DEFAULT_V8_FLAGS,
     };
     use clap::Parser;
     use obscura_dom::parse_html;
@@ -2224,6 +2232,51 @@ mod tests {
             Some(Command::Fetch { wait, .. }) => assert_eq!(wait, Some(0)),
             _ => panic!("expected Fetch command"),
         }
+    }
+
+    fn configured_fetch_timeout(args: Args) -> std::time::Duration {
+        let timeout = match args.command {
+            Some(Command::Fetch { timeout, .. }) => timeout,
+            _ => panic!("expected Fetch command"),
+        };
+        let context = std::sync::Arc::new(
+            obscura_browser::BrowserContext::with_storage_and_network(
+                "cli-timeout-test".to_string(),
+                None,
+                false,
+                None,
+                None,
+                true,
+            ),
+        );
+        let mut page = obscura_browser::Page::new("cli-timeout-test".to_string(), context);
+        configure_fetch_navigation_timeout(&mut page, timeout);
+        page.navigation_timeout()
+    }
+
+    #[test]
+    fn fetch_timeout_sets_the_page_navigation_budget() {
+        let args = Args::try_parse_from([
+            "obscura",
+            "fetch",
+            "https://example.com",
+            "--timeout",
+            "50",
+        ])
+        .unwrap();
+        assert_eq!(
+            configured_fetch_timeout(args),
+            std::time::Duration::from_secs(50)
+        );
+    }
+
+    #[test]
+    fn fetch_default_navigation_budget_remains_thirty_seconds() {
+        let args = Args::try_parse_from(["obscura", "fetch", "https://example.com"]).unwrap();
+        assert_eq!(
+            configured_fetch_timeout(args),
+            std::time::Duration::from_secs(30)
+        );
     }
 
     #[test]

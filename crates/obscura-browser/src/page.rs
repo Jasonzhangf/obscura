@@ -240,6 +240,11 @@ pub struct Page {
     /// It is reset once author styles are installed, so stylesheet download
     /// latency does not incorrectly advance newly-created animations.
     document_timeline_origin: std::time::Instant,
+    /// Optional page-scoped ceiling for an end-to-end navigation. Automation
+    /// frontends set this from their request timeout so a caller asking for a
+    /// 50-second navigation is not silently cut off by the process default.
+    /// Pages without an override retain the environment-configurable default.
+    navigation_timeout: Option<std::time::Duration>,
     /// Navigation history for Page.getNavigationHistory / navigateToHistoryEntry.
     /// Entries are URLs in visit order; `history_index` is the current position.
     /// Pushed on every successful navigation; truncated on goBack -> new nav.
@@ -272,6 +277,22 @@ pub struct Page {
 
 const MAX_STYLESHEET_IMPORT_DEPTH: u8 = 4;
 const MAX_STYLESHEET_RESOURCES: usize = 128;
+const DEFAULT_NAVIGATION_TIMEOUT_MS: u64 = 30_000;
+
+fn default_navigation_timeout() -> std::time::Duration {
+    navigation_timeout_from_env_value(std::env::var("OBSCURA_NAV_TIMEOUT_MS").ok().as_deref())
+}
+
+fn navigation_timeout_from_env_value(value: Option<&str>) -> std::time::Duration {
+    let milliseconds = value
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_NAVIGATION_TIMEOUT_MS);
+    std::time::Duration::from_millis(milliseconds)
+}
+
+fn duration_millis_u64(duration: std::time::Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
 
 #[derive(Clone)]
 struct LoadedStylesheet {
@@ -863,6 +884,7 @@ impl Page {
             default_background_color_override: None,
             encoding: "UTF-8".to_string(),
             document_timeline_origin: std::time::Instant::now(),
+            navigation_timeout: None,
             history: Vec::new(),
             history_index: 0,
             network_events: Vec::new(),
@@ -879,6 +901,19 @@ impl Page {
             #[cfg(feature = "stealth")]
             stealth_client,
         }
+    }
+
+    /// Set the end-to-end navigation deadline for this page. This page-scoped
+    /// value takes precedence over `OBSCURA_NAV_TIMEOUT_MS`; callers that do
+    /// not set it retain the existing environment-configurable 30s default.
+    pub fn set_navigation_timeout(&mut self, timeout: std::time::Duration) {
+        self.navigation_timeout = Some(timeout);
+    }
+
+    /// Return the effective end-to-end navigation deadline for this page.
+    pub fn navigation_timeout(&self) -> std::time::Duration {
+        self.navigation_timeout
+            .unwrap_or_else(default_navigation_timeout)
     }
 
     fn should_block_url(&self, url: &str) -> bool {
@@ -2125,12 +2160,10 @@ impl Page {
         // dispatcher holds the lock across the entire handler. 30 seconds
         // matches reqwest's default per-request timeout — the worst case is
         // one slow primary GET plus one slow JS-redirect chain step. Override
-        // with `OBSCURA_NAV_TIMEOUT_MS=NN`.
-        let nav_timeout_ms: u64 = std::env::var("OBSCURA_NAV_TIMEOUT_MS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(30_000);
-        let nav_timeout = tokio::time::Duration::from_millis(nav_timeout_ms);
+        // with `OBSCURA_NAV_TIMEOUT_MS=NN`, or set a page-scoped deadline when
+        // the automation request already has an explicit timeout.
+        let nav_timeout = self.navigation_timeout();
+        let nav_timeout_ms = duration_millis_u64(nav_timeout);
 
         let result = match tokio::time::timeout(
             nav_timeout,
@@ -3482,12 +3515,10 @@ impl Page {
                         .map(|target| navigation_referrer(source, &target))
                 })
                 .unwrap_or_default();
-            let nav_timeout_ms: u64 = std::env::var("OBSCURA_NAV_TIMEOUT_MS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(30_000);
+            let nav_timeout = self.navigation_timeout();
+            let nav_timeout_ms = duration_millis_u64(nav_timeout);
             let result = tokio::time::timeout(
-                tokio::time::Duration::from_millis(nav_timeout_ms),
+                nav_timeout,
                 self.navigate_with_wait_post_inner(
                     &url,
                     crate::lifecycle::WaitUntil::Load,
@@ -3562,14 +3593,34 @@ fn url_matches_cdp_pattern(pattern: &str, url: &str) -> bool {
 mod tests {
     use super::{
         css_resource_urls, linked_stylesheet_requests, materialize_linked_stylesheet_script,
-        materialize_stylesheet_graph, navigation_referrer, parse_import_url, rebase_css_urls,
-        script_response_is_executable, split_css_imports, truncate_on_char_boundary,
-        url_matches_cdp_pattern, LoadedStylesheet, StylesheetImport,
+        materialize_stylesheet_graph, navigation_referrer, navigation_timeout_from_env_value,
+        parse_import_url, rebase_css_urls, script_response_is_executable, split_css_imports,
+        truncate_on_char_boundary, url_matches_cdp_pattern, LoadedStylesheet, StylesheetImport,
     };
     #[cfg(feature = "render")]
     use super::remaining_settle_resource_warmup_ms;
     use base64::Engine as _;
     use obscura_dom::parse_html;
+
+    #[test]
+    fn navigation_timeout_environment_default_remains_thirty_seconds() {
+        assert_eq!(
+            navigation_timeout_from_env_value(None),
+            std::time::Duration::from_secs(30)
+        );
+        assert_eq!(
+            navigation_timeout_from_env_value(Some("not-a-timeout")),
+            std::time::Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn navigation_timeout_environment_override_remains_available() {
+        assert_eq!(
+            navigation_timeout_from_env_value(Some("42000")),
+            std::time::Duration::from_secs(42)
+        );
+    }
 
     #[test]
     fn css_resource_discovery_ignores_strings_comments_data_and_fragments() {
