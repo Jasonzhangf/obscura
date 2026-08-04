@@ -12,6 +12,10 @@ use crate::dispatch::{ScreencastFormat, ScreencastState};
 const DEFAULT_SCREENSHOT_QUALITY: i64 = 80;
 #[cfg(feature = "render")]
 const MAX_SCREENCAST_FRAMES_IN_FLIGHT: u8 = 2;
+#[cfg(feature = "render")]
+const MAX_LONG_PNG_PIXELS: u64 = 32 * 1024 * 1024;
+#[cfg(feature = "render")]
+const MAX_LONG_PNG_DIMENSION: u32 = 128 * 1024 - 1;
 
 #[cfg(feature = "render")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -264,6 +268,151 @@ fn encode_screenshot(
         }
     }
     Ok(output)
+}
+
+/// Encode a full-page PNG a bounded horizontal strip at a time. The ordinary
+/// single-surface path stays faster for captures within the renderer's limits;
+/// this fallback exists for tall pages whose complete RGBA surface would exceed
+/// that bound. Each strip is independently validated by the renderer and only
+/// one decoded strip is live while the PNG encoder consumes its scanlines.
+#[cfg(feature = "render")]
+fn encode_long_full_page_png(
+    page: &obscura_browser::Page,
+    content_size: (f32, f32),
+    scale: f32,
+    animation_sample: obscura_js::AnimationSample,
+    optimize_for_speed: bool,
+) -> Result<Vec<u8>, String> {
+    use std::io::Write as _;
+
+    let (width, height) = content_size;
+    if !width.is_finite()
+        || !height.is_finite()
+        || !scale.is_finite()
+        || width <= 0.0
+        || height <= 0.0
+        || scale <= 0.0
+    {
+        return Err("Page.captureScreenshot received an invalid full-page region".to_string());
+    }
+
+    let native_width = width.ceil() as u64;
+    let native_height = height.ceil() as u64;
+    let output_width_value = (f64::from(width) * f64::from(scale)).round();
+    let output_height_value = (f64::from(height) * f64::from(scale)).round();
+    if native_width == 0
+        || native_height == 0
+        || native_width > u64::from(obscura_js::MAX_CAPTURE_DIMENSION)
+        || !output_width_value.is_finite()
+        || !output_height_value.is_finite()
+        || output_width_value <= 0.0
+        || output_height_value <= 0.0
+        || output_width_value > f64::from(obscura_js::MAX_CAPTURE_DIMENSION)
+        || output_height_value > f64::from(MAX_LONG_PNG_DIMENSION)
+    {
+        return Err("Page.captureScreenshot long PNG dimensions are too large".to_string());
+    }
+    let output_width = output_width_value as u32;
+    let output_height = output_height_value as u32;
+    let native_pixels = native_width
+        .checked_mul(native_height)
+        .ok_or_else(|| "Page.captureScreenshot long PNG size overflow".to_string())?;
+    let output_pixels = u64::from(output_width)
+        .checked_mul(u64::from(output_height))
+        .ok_or_else(|| "Page.captureScreenshot long PNG size overflow".to_string())?;
+    if native_pixels > MAX_LONG_PNG_PIXELS || output_pixels > MAX_LONG_PNG_PIXELS {
+        return Err(format!(
+            "Page.captureScreenshot long PNG exceeds the {}-pixel safety limit",
+            MAX_LONG_PNG_PIXELS
+        ));
+    }
+
+    let max_native_rows = (obscura_js::MAX_CAPTURE_PIXELS / native_width)
+        .min(u64::from(obscura_js::MAX_CAPTURE_DIMENSION));
+    let max_output_rows = (obscura_js::MAX_CAPTURE_PIXELS / u64::from(output_width))
+        .min(u64::from(obscura_js::MAX_CAPTURE_DIMENSION));
+    let native_bounded_output_rows =
+        (max_native_rows.saturating_sub(1) as f64 * f64::from(scale)).floor() as u64;
+    if max_native_rows == 0 || max_output_rows == 0 || native_bounded_output_rows == 0 {
+        return Err("Page.captureScreenshot bitmap is too large".to_string());
+    }
+    // Keep each decoded strip materially below the renderer's absolute limit.
+    // This leaves headroom for the encoder's scanlines and compressed output.
+    let target_output_rows = max_output_rows
+        .min(native_bounded_output_rows)
+        .min(4096)
+        .max(1) as u32;
+
+    let mut encoded = Vec::new();
+    let mut encoder = png::Encoder::new(&mut encoded, output_width, output_height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    if optimize_for_speed {
+        encoder.set_compression(png::Compression::Fast);
+        encoder.set_filter(png::Filter::NoFilter);
+    }
+    let mut writer = encoder
+        .write_header()
+        .map_err(|error| format!("Page.captureScreenshot striped PNG header failed: {error}"))?;
+    {
+        let mut stream = writer
+            .stream_writer_with_size(64 * 1024)
+            .map_err(|error| format!("Page.captureScreenshot striped PNG stream failed: {error}"))?;
+        let mut output_y = 0u32;
+        while output_y < output_height {
+            let next_output_y = output_y
+                .saturating_add(target_output_rows)
+                .min(output_height);
+            // Derive document-space boundaries from global output rows. The
+            // neighboring strips therefore share the exact same rounded edge,
+            // rather than accumulating independent per-strip rounding error.
+            let css_y = output_y as f64 / f64::from(scale);
+            let css_end = if next_output_y == output_height {
+                f64::from(height)
+            } else {
+                next_output_y as f64 / f64::from(scale)
+            };
+            let css_height = css_end - css_y;
+            if css_height <= 0.0 || css_height.ceil() as u64 > max_native_rows {
+                return Err("Page.captureScreenshot could not form a bounded PNG strip".to_string());
+            }
+            let strip_height = next_output_y - output_y;
+            let region = obscura_browser::CaptureRegion::with_output_size(
+                0.0,
+                css_y as f32,
+                width,
+                css_height as f32,
+                scale,
+                output_width,
+                strip_height,
+            );
+            let strip_png = page
+                .screenshot_region_with_animation_sample(region, animation_sample)
+                .map_err(capture_error_message)?;
+            let strip = image::load_from_memory_with_format(&strip_png, image::ImageFormat::Png)
+                .map_err(|error| {
+                    format!("Page.captureScreenshot could not decode a PNG strip: {error}")
+                })?
+                .to_rgba8();
+            if strip.dimensions() != (output_width, strip_height) {
+                return Err(format!(
+                    "Page.captureScreenshot PNG strip has dimensions {:?}, expected ({output_width}, {strip_height})",
+                    strip.dimensions()
+                ));
+            }
+            stream
+                .write_all(strip.as_raw())
+                .map_err(|error| format!("Page.captureScreenshot striped PNG write failed: {error}"))?;
+            output_y = next_output_y;
+        }
+        stream
+            .finish()
+            .map_err(|error| format!("Page.captureScreenshot striped PNG finish failed: {error}"))?;
+    }
+    writer
+        .finish()
+        .map_err(|error| format!("Page.captureScreenshot striped PNG finish failed: {error}"))?;
+    Ok(encoded)
 }
 
 /// Keep capture itself an observation of the retained page state. Chromium's
@@ -1264,6 +1413,19 @@ pub async fn handle(
                 let device_scale_factor = f64::from(page.device_scale_factor);
                 let trusted_scroll = page.screenshot_scroll_offset();
                 let scroll = (f64::from(trusted_scroll.0), f64::from(trusted_scroll.1));
+                let full_page_size = if options.capture_beyond_viewport && options.clip.is_none() {
+                    let content_size = page
+                        .prepared_content_size_with_animation_sample(animation_sample)
+                        .ok_or_else(|| {
+                            "Page.captureScreenshot failed: no retained document size".to_string()
+                        })?;
+                    Some((
+                        content_size.0.max(viewport.0),
+                        content_size.1.max(viewport.1),
+                    ))
+                } else {
+                    None
+                };
 
                 let region = if let Some(clip) = options.clip {
                     let relative_x = clip.x - scroll.0;
@@ -1281,17 +1443,12 @@ pub async fn handle(
                         ));
                     }
                     Some(chromium_clip_region(clip, device_scale_factor)?)
-                } else if options.capture_beyond_viewport {
-                    let content_size = page
-                        .prepared_content_size_with_animation_sample(animation_sample)
-                        .ok_or_else(|| {
-                            "Page.captureScreenshot failed: no retained document size".to_string()
-                        })?;
+                } else if let Some(content_size) = full_page_size {
                     Some(obscura_browser::CaptureRegion::new(
                         0.0,
                         0.0,
-                        content_size.0.max(viewport.0),
-                        content_size.1.max(viewport.1),
+                        content_size.0,
+                        content_size.1,
                         page.device_scale_factor,
                     ))
                 } else if page.device_scale_factor != 1.0 {
@@ -1306,10 +1463,30 @@ pub async fn handle(
                     None
                 };
 
-                let png = match region {
-                    Some(region) => page
+                let (png, png_is_final_encoding) = match region {
+                    Some(region) => match page
                         .screenshot_region_with_animation_sample(region, animation_sample)
-                        .map_err(capture_error_message)?,
+                    {
+                        Ok(png) => (png, false),
+                        Err(obscura_browser::CaptureError::AllocationLimitExceeded)
+                            if options.format == ScreenshotFormat::Png
+                                && options.clip.is_none()
+                                && options.capture_beyond_viewport =>
+                        {
+                            (
+                                encode_long_full_page_png(
+                                    page,
+                                    full_page_size
+                                        .expect("full-page route has retained dimensions"),
+                                    page.device_scale_factor,
+                                    animation_sample,
+                                    options.optimize_for_speed,
+                                )?,
+                                true,
+                            )
+                        }
+                        Err(error) => return Err(capture_error_message(error)),
+                    },
                     None => {
                         obscura_browser::validate_capture_region(
                             obscura_browser::CaptureRegion::new(
@@ -1321,18 +1498,18 @@ pub async fn handle(
                             ),
                         )
                         .map_err(capture_error_message)?;
-                        page.screenshot_with_animation_sample(viewport, animation_sample)
+                        (page.screenshot_with_animation_sample(viewport, animation_sample)
                             .ok_or_else(|| {
                                 "Page.captureScreenshot failed: the page has no DOM to render"
                                     .to_string()
-                            })?
+                            })?, false)
                     }
                 };
 
                 // Keep the common path allocation-free and byte-for-byte
                 // compatible with the renderer's native PNG encoder.
                 let encoded = if options.format == ScreenshotFormat::Png
-                    && !options.optimize_for_speed
+                    && (!options.optimize_for_speed || png_is_final_encoding)
                 {
                     png
                 } else {
@@ -1929,6 +2106,174 @@ mod tests {
             .await
             .expect_err("a 4 GiB RGBA surface must be rejected before allocation");
         assert!(error.contains("bitmap is too large"), "{error}");
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test]
+    async fn long_full_page_png_is_contiguous_and_preserves_live_scroll_and_fixed_geometry() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = format!("{page_id}-session");
+        ctx.sessions.insert(session_id.clone(), page_id);
+        let session = Some(session_id);
+        ctx.get_session_page_mut(&session)
+            .expect("page")
+            .set_viewport((1000.0, 700.0));
+        handle(
+            "navigate",
+            &json!({
+                "url": "data:text/html,<html style='margin:0'><body style='margin:0;width:1000px;height:17000px;background:rgb(180,20,30)'><div style='position:absolute;left:0;top:8490px;width:1000px;height:30px;background:rgb(20,160,40)'></div><div style='position:absolute;left:0;top:16950px;width:1000px;height:50px;background:rgb(20,40,200)'></div><div style='position:fixed;z-index:2;left:0;top:10px;width:20px;height:20px;background:rgb(240,220,10)'></div></body></html>",
+                "waitUntil": "load",
+            }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("navigate long screenshot fixture");
+        ctx.get_session_page_mut(&session)
+            .expect("page")
+            .evaluate("window.scrollTo(0, 8000)");
+        assert_eq!(
+            ctx.get_session_page(&session)
+                .expect("page")
+                .screenshot_scroll_offset(),
+            (0.0, 8000.0)
+        );
+
+        let capture = handle(
+            "captureScreenshot",
+            &json!({"format": "png", "captureBeyondViewport": true}),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("striped full-page capture");
+        let (format, raster) = decode_capture(&capture);
+        assert_eq!(format, image::ImageFormat::Png);
+        assert_eq!(raster.dimensions(), (1000, 17_000));
+        assert_eq!(raster.get_pixel(500, 100).0, [180, 20, 30, 255]);
+        assert_eq!(raster.get_pixel(500, 8500).0, [20, 160, 40, 255]);
+        assert_eq!(raster.get_pixel(500, 16_975).0, [20, 40, 200, 255]);
+        assert_eq!(
+            raster.get_pixel(10, 8015).0,
+            [240, 220, 10, 255],
+            "fixed content must retain its one live-scroll document position"
+        );
+        assert_eq!(
+            raster.get_pixel(10, 15).0,
+            [180, 20, 30, 255],
+            "fixed content must not be repeated at the full-page origin"
+        );
+        for boundary in [4096, 8192, 12_288, 16_384] {
+            for y in (boundary - 1)..=(boundary + 1) {
+                assert_eq!(
+                    raster.get_pixel(900, y).0,
+                    [180, 20, 30, 255],
+                    "visible seam around globally rounded strip row {boundary}"
+                );
+            }
+        }
+        assert_eq!(
+            ctx.get_session_page(&session)
+                .expect("page")
+                .screenshot_scroll_offset(),
+            (0.0, 8000.0),
+            "full-page capture must not mutate the live scroll position"
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test]
+    async fn long_full_page_png_uses_global_device_pixel_boundaries_at_dpr_two() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = format!("{page_id}-session");
+        ctx.sessions.insert(session_id.clone(), page_id);
+        let session = Some(session_id);
+        ctx.get_session_page_mut(&session)
+            .expect("page")
+            .set_viewport((1000.0, 500.0));
+        handle(
+            "navigate",
+            &json!({
+                "url": "data:text/html,<html style='margin:0'><body style='margin:0;width:1000px;height:4250px;background:rgb(70,40,190)'></body></html>",
+                "waitUntil": "load",
+            }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("navigate DPR fixture");
+        crate::domains::emulation::handle(
+            "setDeviceMetricsOverride",
+            &json!({
+                "width": 1000,
+                "height": 500,
+                "deviceScaleFactor": 2,
+                "mobile": false
+            }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("set DPR two");
+
+        let capture = handle(
+            "captureScreenshot",
+            &json!({"captureBeyondViewport": true}),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("DPR two striped capture");
+        let (_, raster) = decode_capture(&capture);
+        assert_eq!(raster.dimensions(), (2000, 8500));
+        for boundary in [4096, 8192] {
+            for y in (boundary - 1)..=(boundary + 1) {
+                assert_eq!(
+                    raster.get_pixel(1500, y).0,
+                    [70, 40, 190, 255],
+                    "DPR two seam around global output row {boundary}"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test]
+    async fn long_full_page_png_rejects_more_than_thirty_two_megapixels_before_striping() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = format!("{page_id}-session");
+        ctx.sessions.insert(session_id.clone(), page_id);
+        let session = Some(session_id);
+        ctx.get_session_page_mut(&session)
+            .expect("page")
+            .set_viewport((1000.0, 700.0));
+        handle(
+            "navigate",
+            &json!({
+                "url": "data:text/html,<html style='margin:0'><body style='margin:0;width:1000px;height:34000px;background:red'></body></html>",
+                "waitUntil": "load",
+            }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("navigate over-cap fixture");
+
+        let error = handle(
+            "captureScreenshot",
+            &json!({"captureBeyondViewport": true}),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect_err("34 megapixels must fail before striped raster allocation");
+        assert!(
+            error.contains("33554432-pixel safety limit"),
+            "unexpected over-cap error: {error}"
+        );
     }
 
     #[cfg(feature = "render")]
