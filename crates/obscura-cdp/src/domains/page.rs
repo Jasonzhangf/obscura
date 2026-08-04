@@ -702,6 +702,7 @@ pub(crate) fn command_can_change_screencast_frame(method: &str) -> bool {
             | "Input.dispatchTouchEvent"
             | "Emulation.setDeviceMetricsOverride"
             | "Emulation.clearDeviceMetricsOverride"
+            | "Emulation.setDefaultBackgroundColorOverride"
             | "DOM.setAttributeValue"
             | "DOM.removeNode"
             | "DOM.focus"
@@ -1428,20 +1429,6 @@ pub async fn handle(
                 };
 
                 let region = if let Some(clip) = options.clip {
-                    let relative_x = clip.x - scroll.0;
-                    let relative_y = clip.y - scroll.1;
-                    let epsilon = 1e-6;
-                    if !options.capture_beyond_viewport
-                        && (relative_x < -epsilon
-                            || relative_y < -epsilon
-                            || relative_x + clip.width > f64::from(viewport.0) + epsilon
-                            || relative_y + clip.height > f64::from(viewport.1) + epsilon)
-                    {
-                        return Err(format!(
-                            "Page.captureScreenshot clip lies outside the current viewport surface while captureBeyondViewport=false (visible page rect: x={} y={} width={} height={})",
-                            scroll.0, scroll.1, viewport.0, viewport.1
-                        ));
-                    }
                     Some(chromium_clip_region(clip, device_scale_factor)?)
                 } else if let Some(content_size) = full_page_size {
                     Some(obscura_browser::CaptureRegion::new(
@@ -1680,6 +1667,273 @@ mod tests {
         .await
         .expect("navigate screenshot fixture");
         (ctx, session)
+    }
+
+    #[cfg(feature = "render")]
+    async fn transparent_surface_fixture(
+        height: u32,
+    ) -> (CdpContext, Option<String>) {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = format!("{page_id}-session");
+        ctx.sessions.insert(session_id.clone(), page_id);
+        let session = Some(session_id);
+        ctx.get_session_page_mut(&session)
+            .expect("page")
+            .set_viewport((100.0, 80.0));
+        handle(
+            "navigate",
+            &json!({
+                "url": format!("data:text/html,<html style='margin:0;background:transparent'><body style='margin:0;height:{height}px;background:transparent'></body></html>"),
+                "waitUntil": "load",
+            }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("navigate transparent surface fixture");
+        (ctx, session)
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test]
+    async fn default_background_override_matches_chromium_across_capture_state() {
+        let (mut ctx, session) = transparent_surface_fixture(160).await;
+
+        let (_, default_raster) = decode_capture(
+            &handle("captureScreenshot", &json!({}), &mut ctx, &session)
+                .await
+                .expect("default white capture"),
+        );
+        assert_eq!(default_raster.get_pixel(50, 40).0, [255, 255, 255, 255]);
+
+        crate::domains::emulation::handle(
+            "setDefaultBackgroundColorOverride",
+            &json!({"color": {"r": 0, "g": 0, "b": 255, "a": 1}}),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("opaque blue override");
+        let (_, blue) = decode_capture(
+            &handle("captureScreenshot", &json!({}), &mut ctx, &session)
+                .await
+                .expect("blue capture"),
+        );
+        assert!(blue.pixels().all(|pixel| pixel.0 == [0, 0, 255, 255]));
+
+        crate::domains::emulation::handle(
+            "setDefaultBackgroundColorOverride",
+            &json!({"color": {"r": 0, "g": 0, "b": 0, "a": 0}}),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("transparent override");
+        let (_, transparent) = decode_capture(
+            &handle("captureScreenshot", &json!({}), &mut ctx, &session)
+                .await
+                .expect("transparent capture"),
+        );
+        assert!(transparent.pixels().all(|pixel| pixel.0 == [0, 0, 0, 0]));
+
+        crate::domains::emulation::handle(
+            "setDefaultBackgroundColorOverride",
+            &json!({"color": {"r": 255, "g": 0, "b": 0, "a": 16.0 / 255.0}}),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("semi-transparent override");
+        crate::domains::emulation::handle(
+            "setDeviceMetricsOverride",
+            &json!({"width": 40, "height": 30, "deviceScaleFactor": 2}),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("metrics override");
+        let (_, semi) = decode_capture(
+            &handle("captureScreenshot", &json!({}), &mut ctx, &session)
+                .await
+                .expect("semi-transparent metrics capture"),
+        );
+        assert_eq!(semi.dimensions(), (80, 60));
+        assert!(semi.pixels().all(|pixel| pixel.0 == [255, 0, 0, 16]));
+
+        handle(
+            "navigate",
+            &json!({
+                "url": "data:text/html,<html style='margin:0;background:transparent'><body style='margin:0;background:transparent'></body></html>",
+                "waitUntil": "load",
+            }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("navigate with live override");
+        let (_, after_navigation) = decode_capture(
+            &handle("captureScreenshot", &json!({}), &mut ctx, &session)
+                .await
+                .expect("capture after navigation"),
+        );
+        assert_eq!(after_navigation.get_pixel(20, 15).0, [255, 0, 0, 16]);
+
+        crate::domains::emulation::handle(
+            "setDefaultBackgroundColorOverride",
+            &json!({}),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("clear override");
+        let (_, cleared) = decode_capture(
+            &handle("captureScreenshot", &json!({}), &mut ctx, &session)
+                .await
+                .expect("capture after clear"),
+        );
+        assert_eq!(cleared.get_pixel(20, 15).0, [255, 255, 255, 255]);
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test]
+    async fn default_background_override_is_target_isolated() {
+        let (mut ctx, first_session) = transparent_surface_fixture(80).await;
+        let second_page_id = ctx.create_page();
+        let second_session_id = format!("{second_page_id}-session");
+        ctx.sessions
+            .insert(second_session_id.clone(), second_page_id);
+        let second_session = Some(second_session_id);
+        ctx.get_session_page_mut(&second_session)
+            .expect("second page")
+            .set_viewport((100.0, 80.0));
+        handle(
+            "navigate",
+            &json!({
+                "url": "data:text/html,<html style='margin:0;background:transparent'><body style='margin:0;background:transparent'></body></html>",
+                "waitUntil": "load",
+            }),
+            &mut ctx,
+            &second_session,
+        )
+        .await
+        .expect("navigate second page");
+        crate::domains::emulation::handle(
+            "setDefaultBackgroundColorOverride",
+            &json!({"color": {"r": 20, "g": 40, "b": 60}}),
+            &mut ctx,
+            &first_session,
+        )
+        .await
+        .expect("first-page override");
+
+        let (_, first) = decode_capture(
+            &handle("captureScreenshot", &json!({}), &mut ctx, &first_session)
+                .await
+                .expect("first-page capture"),
+        );
+        let (_, second) = decode_capture(
+            &handle("captureScreenshot", &json!({}), &mut ctx, &second_session)
+                .await
+                .expect("second-page capture"),
+        );
+        assert_eq!(first.get_pixel(50, 40).0, [20, 40, 60, 255]);
+        assert_eq!(second.get_pixel(50, 40).0, [255, 255, 255, 255]);
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test]
+    async fn default_background_override_covers_clips_full_page_and_screencast_damage() {
+        let (mut ctx, session) = transparent_surface_fixture(160).await;
+        crate::domains::emulation::handle(
+            "setDefaultBackgroundColorOverride",
+            &json!({"color": {"r": 7, "g": 19, "b": 31, "a": 1}}),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("surface override");
+
+        for clip in [
+            json!({"x": 90, "y": 0, "width": 20, "height": 20, "scale": 1}),
+            json!({"x": 0, "y": 120, "width": 20, "height": 20, "scale": 1}),
+        ] {
+            let (_, raster) = decode_capture(
+                &handle(
+                    "captureScreenshot",
+                    &json!({"captureBeyondViewport": false, "clip": clip}),
+                    &mut ctx,
+                    &session,
+                )
+                .await
+                .expect("off-viewport clip with default false"),
+            );
+            assert_eq!(raster.dimensions(), (20, 20));
+            assert!(raster
+                .pixels()
+                .all(|pixel| pixel.0 == [7, 19, 31, 255]));
+        }
+
+        ctx.get_session_page_mut(&session)
+            .expect("page")
+            .evaluate("window.scrollTo(0, 80)");
+        let (_, above_scroll) = decode_capture(
+            &handle(
+                "captureScreenshot",
+                &json!({
+                    "clip": {"x": 0, "y": 0, "width": 20, "height": 20, "scale": 1}
+                }),
+                &mut ctx,
+                &session,
+            )
+            .await
+            .expect("document clip above live scroll"),
+        );
+        assert_eq!(above_scroll.get_pixel(10, 10).0, [7, 19, 31, 255]);
+        assert_eq!(
+            ctx.get_session_page(&session)
+                .expect("page")
+                .screenshot_scroll_offset(),
+            (0.0, 80.0),
+            "clip capture must not mutate live scroll"
+        );
+
+        let (_, full_page) = decode_capture(
+            &handle(
+                "captureScreenshot",
+                &json!({"captureBeyondViewport": true}),
+                &mut ctx,
+                &session,
+            )
+            .await
+            .expect("full-page override capture"),
+        );
+        assert_eq!(full_page.dimensions(), (100, 160));
+        assert_eq!(full_page.get_pixel(50, 140).0, [7, 19, 31, 255]);
+
+        ctx.pending_events.clear();
+        handle("startScreencast", &json!({}), &mut ctx, &session)
+            .await
+            .expect("start screencast");
+        ctx.pending_events.clear();
+        let response = crate::dispatch::dispatch(
+            &crate::types::CdpRequest {
+                id: 99,
+                method: "Emulation.setDefaultBackgroundColorOverride".to_string(),
+                params: json!({"color": {"r": 90, "g": 80, "b": 70, "a": 1}}),
+                session_id: session.clone(),
+            },
+            &mut ctx,
+        )
+        .await;
+        assert!(response.error.is_none(), "override response: {response:?}");
+        let event = ctx
+            .pending_events
+            .iter()
+            .find(|event| event.method == "Page.screencastFrame")
+            .expect("background override must damage active screencast");
+        let (_, frame) = decode_capture(&event.params);
+        assert_eq!(frame.get_pixel(50, 40).0, [90, 80, 70, 255]);
     }
 
     #[cfg(feature = "render")]
@@ -2122,7 +2376,7 @@ mod tests {
         handle(
             "navigate",
             &json!({
-                "url": "data:text/html,<html style='margin:0'><body style='margin:0;width:1000px;height:17000px;background:rgb(180,20,30)'><div style='position:absolute;left:0;top:8490px;width:1000px;height:30px;background:rgb(20,160,40)'></div><div style='position:absolute;left:0;top:16950px;width:1000px;height:50px;background:rgb(20,40,200)'></div><div style='position:fixed;z-index:2;left:0;top:10px;width:20px;height:20px;background:rgb(240,220,10)'></div></body></html>",
+                "url": "data:text/html,<html style='margin:0;background:transparent'><body style='margin:0;width:1000px;height:17000px;background:transparent'><div style='position:absolute;left:0;top:8490px;width:1000px;height:30px;background:rgb(20,160,40)'></div><div style='position:absolute;left:0;top:16950px;width:1000px;height:50px;background:rgb(20,40,200)'></div><div style='position:fixed;z-index:2;left:0;top:10px;width:20px;height:20px;background:rgb(240,220,10)'></div></body></html>",
                 "waitUntil": "load",
             }),
             &mut ctx,
@@ -2130,6 +2384,14 @@ mod tests {
         )
         .await
         .expect("navigate long screenshot fixture");
+        crate::domains::emulation::handle(
+            "setDefaultBackgroundColorOverride",
+            &json!({"color": {"r": 180, "g": 20, "b": 30, "a": 1}}),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("long-page surface override");
         ctx.get_session_page_mut(&session)
             .expect("page")
             .evaluate("window.scrollTo(0, 8000)");
@@ -2376,7 +2638,7 @@ mod tests {
 
     #[cfg(feature = "render")]
     #[tokio::test]
-    async fn capture_screenshot_supports_full_page_but_rejects_unrepresented_surfaces() {
+    async fn capture_screenshot_supports_full_page_and_off_viewport_clips() {
         let (mut ctx, session) = screenshot_fixture().await;
         ctx.get_session_page_mut(&session).expect("page").evaluate(
             "Object.defineProperty(globalThis,'innerWidth',{value:4096,configurable:true});\
@@ -2417,11 +2679,13 @@ mod tests {
             &session,
         )
         .await
-        .expect_err("partial off-viewport clip is unsupported");
-        assert!(
-            off_viewport.contains("outside the current viewport surface"),
-            "{off_viewport}"
-        );
+        .expect("Chromium accepts a partial off-viewport surface clip");
+        let (_, raster) = decode_capture(&off_viewport);
+        assert_eq!(raster.dimensions(), (20, 20));
+        assert_eq!(raster.get_pixel(5, 10).0, [0, 0, 255, 255]);
+        // TODO(canvas-background-transfer): Chromium propagates the body's red
+        // canvas background into the half beyond the 100px document box. This
+        // regression covers acceptance and the represented clip content.
     }
 
     #[cfg(feature = "render")]

@@ -18,6 +18,40 @@ fn metric_dimension(params: &Value, name: &str) -> Result<u32, String> {
     Ok(value as u32)
 }
 
+fn default_background_color(params: &Value) -> Result<Option<[u8; 4]>, String> {
+    let Some(color) = params.get("color") else {
+        return Ok(None);
+    };
+    let color = color.as_object().ok_or(
+        "Emulation.setDefaultBackgroundColorOverride color must be an RGBA object",
+    )?;
+    let channel = |name: &str| -> Result<u8, String> {
+        let value = color.get(name).and_then(Value::as_i64).ok_or_else(|| {
+            format!(
+                "Emulation.setDefaultBackgroundColorOverride requires integer color.{name}"
+            )
+        })?;
+        Ok(value.clamp(0, 255) as u8)
+    };
+    let alpha = match color.get("a") {
+        Some(value) => value.as_f64().ok_or(
+            "Emulation.setDefaultBackgroundColorOverride color.a must be a number",
+        )?,
+        None => 1.0,
+    };
+    if !alpha.is_finite() {
+        return Err(
+            "Emulation.setDefaultBackgroundColorOverride color.a must be finite".to_string(),
+        );
+    }
+    Ok(Some([
+        channel("r")?,
+        channel("g")?,
+        channel("b")?,
+        ((alpha as f32).clamp(0.0, 1.0) * 255.0).round() as u8,
+    ]))
+}
+
 pub async fn handle(
     method: &str,
     params: &Value,
@@ -62,6 +96,14 @@ pub async fn handle(
                 .ok_or("No page for session")?;
             page.set_viewport(DEFAULT_VIEWPORT);
             page.set_device_scale_factor(1.0);
+            Ok(json!({}))
+        }
+        "setDefaultBackgroundColorOverride" => {
+            let color = default_background_color(params)?;
+            let page = ctx
+                .get_session_page_mut(session_id)
+                .ok_or("No page for session")?;
+            page.set_default_background_color_override(color);
             Ok(json!({}))
         }
         // Touch emulation does not affect layout yet, but acknowledging it is
@@ -193,5 +235,47 @@ mod tests {
         let page = ctx.get_session_page(&session_id).unwrap();
         assert_eq!(page.viewport, (1280.0, 720.0));
         assert_eq!(page.device_scale_factor, 1.0);
+    }
+
+    #[test]
+    fn default_background_color_matches_blink_defaults_rounding_and_clamping() {
+        assert_eq!(default_background_color(&json!({})), Ok(None));
+        assert_eq!(
+            default_background_color(&json!({"color": {"r": 1, "g": 2, "b": 3}})),
+            Ok(Some([1, 2, 3, 255]))
+        );
+        assert_eq!(
+            default_background_color(&json!({
+                "color": {"r": -20, "g": 400, "b": 30, "a": 16.0 / 255.0}
+            })),
+            Ok(Some([0, 255, 30, 16]))
+        );
+        assert_eq!(
+            default_background_color(&json!({
+                "color": {"r": 1, "g": 2, "b": 3, "a": 2}
+            })),
+            Ok(Some([1, 2, 3, 255]))
+        );
+        assert_eq!(
+            default_background_color(&json!({
+                "color": {"r": 1, "g": 2, "b": 3, "a": -1}
+            })),
+            Ok(Some([1, 2, 3, 0]))
+        );
+    }
+
+    #[test]
+    fn default_background_color_rejects_malformed_rgba() {
+        for params in [
+            json!({"color": null}),
+            json!({"color": {"g": 2, "b": 3}}),
+            json!({"color": {"r": 1.5, "g": 2, "b": 3}}),
+            json!({"color": {"r": 1, "g": 2, "b": 3, "a": "opaque"}}),
+        ] {
+            assert!(
+                default_background_color(&params).is_err(),
+                "must reject {params}"
+            );
+        }
     }
 }

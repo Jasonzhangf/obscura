@@ -228,6 +228,9 @@ pub struct Page {
     /// CSSOM stay in CSS pixels; Emulation.setDeviceMetricsOverride owns this
     /// independent raster scale.
     pub device_scale_factor: f32,
+    /// DevTools override for the compositor's base surface. It is page-owned,
+    /// so it survives document navigation without leaking to other targets.
+    default_background_color_override: Option<[u8; 4]>,
     /// WHATWG canonical name of the current document's character encoding
     /// (e.g. "UTF-8", "EUC-JP"), detected when the response body is decoded.
     /// Exposed to JS as `document.characterSet` and used for the URL query
@@ -727,6 +730,7 @@ impl Page {
             referrer: String::new(),
             viewport: (1280.0, 720.0),
             device_scale_factor: 1.0,
+            default_background_color_override: None,
             encoding: "UTF-8".to_string(),
             document_timeline_origin: std::time::Instant::now(),
             history: Vec::new(),
@@ -798,6 +802,16 @@ impl Page {
                 &format!("globalThis.devicePixelRatio={};", self.device_scale_factor),
             );
         }
+    }
+
+    pub fn set_default_background_color_override(&mut self, color: Option<[u8; 4]>) {
+        self.default_background_color_override = color;
+    }
+
+    #[cfg(feature = "render")]
+    fn capture_surface_color(&self) -> [u8; 4] {
+        self.default_background_color_override
+            .unwrap_or([255, 255, 255, 255])
     }
 
     async fn do_fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
@@ -2672,7 +2686,11 @@ impl Page {
             if !js.set_animation_sample(animation_sample) {
                 return None;
             }
-            if let Some(png) = js.screenshot_prepared(viewport, base_url) {
+            if let Some(png) = js.screenshot_prepared_with_surface_color(
+                viewport,
+                base_url,
+                self.capture_surface_color(),
+            ) {
                 return Some(png);
             }
         }
@@ -2684,12 +2702,13 @@ impl Page {
             .map(|js| js.scroll_offset())
             .unwrap_or((0.0, 0.0));
         self.with_dom(|dom| {
-            obscura_js::screenshot_png_scrolled_at_animation_time(
+            obscura_js::screenshot_png_scrolled_at_animation_time_with_surface_color(
                 dom,
                 viewport,
                 base_url,
                 scroll,
                 animation_sample.time,
+                self.capture_surface_color(),
             )
         })
             .flatten()
@@ -2734,7 +2753,7 @@ impl Page {
         if !js.set_animation_sample(animation_sample) {
             return Err(obscura_js::CaptureError::PaintFailed);
         }
-        js.screenshot_prepared_region(region)
+        js.screenshot_prepared_region_with_surface_color(region, self.capture_surface_color())
     }
 
     /// Scrollable document dimensions from the retained render layout. Unlike

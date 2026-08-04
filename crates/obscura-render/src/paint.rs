@@ -1827,6 +1827,24 @@ pub fn paint_dom_scrolled_at_animation_time(
     scroll: (f32, f32),
     animation_sample_time: crate::AnimationSampleTime,
 ) -> Option<Pixmap> {
+    paint_dom_scrolled_at_animation_time_with_surface_color(
+        tree,
+        viewport,
+        base_url,
+        scroll,
+        animation_sample_time,
+        [255, 255, 255, 255],
+    )
+}
+
+pub fn paint_dom_scrolled_at_animation_time_with_surface_color(
+    tree: &DomTree,
+    viewport: (f32, f32),
+    base_url: Option<&str>,
+    scroll: (f32, f32),
+    animation_sample_time: crate::AnimationSampleTime,
+    surface_color: [u8; 4],
+) -> Option<Pixmap> {
     let mut resources = RenderResourceCache::default();
     let mut prepared = prepare_dom_at_animation_time(
         tree,
@@ -1835,7 +1853,7 @@ pub fn paint_dom_scrolled_at_animation_time(
         &mut resources,
         animation_sample_time,
     )?;
-    paint_prepared(tree, &mut prepared, &mut resources, scroll)
+    paint_prepared_with_surface_color(tree, &mut prepared, &mut resources, scroll, surface_color)
 }
 
 /// Resolve image candidates and web fonts, then create the single final layout
@@ -2247,6 +2265,16 @@ pub fn paint_prepared(
     resources: &mut RenderResourceCache,
     scroll: (f32, f32),
 ) -> Option<Pixmap> {
+    paint_prepared_with_surface_color(tree, prepared, resources, scroll, [255, 255, 255, 255])
+}
+
+fn paint_prepared_with_surface_color(
+    tree: &DomTree,
+    prepared: &mut PreparedRender,
+    resources: &mut RenderResourceCache,
+    scroll: (f32, f32),
+    surface_color: [u8; 4],
+) -> Option<Pixmap> {
     validate_capture_region(CaptureRegion::new(
         scroll.0,
         scroll.1,
@@ -2257,7 +2285,12 @@ pub fn paint_prepared(
     .ok()?;
     let (w, h) = (prepared.viewport.0 as u32, prepared.viewport.1 as u32);
     let mut pixmap = Pixmap::new(w, h)?;
-    pixmap.fill(Color::WHITE);
+    pixmap.fill(Color::from_rgba8(
+        surface_color[0],
+        surface_color[1],
+        surface_color[2],
+        surface_color[3],
+    ));
     paint_laid_dom_scrolled(
         tree,
         prepared.viewport,
@@ -2292,6 +2325,22 @@ pub fn paint_prepared_with_scroll(
     resources: &mut RenderResourceCache,
     scroll: &ResolvedScrollState,
 ) -> Option<Pixmap> {
+    paint_prepared_with_scroll_and_surface_color(
+        tree,
+        prepared,
+        resources,
+        scroll,
+        [255, 255, 255, 255],
+    )
+}
+
+pub fn paint_prepared_with_scroll_and_surface_color(
+    tree: &DomTree,
+    prepared: &mut PreparedRender,
+    resources: &mut RenderResourceCache,
+    scroll: &ResolvedScrollState,
+    surface_color: [u8; 4],
+) -> Option<Pixmap> {
     validate_capture_region(CaptureRegion::new(
         scroll.root_offset().0,
         scroll.root_offset().1,
@@ -2302,7 +2351,12 @@ pub fn paint_prepared_with_scroll(
     .ok()?;
     let (w, h) = (prepared.viewport.0 as u32, prepared.viewport.1 as u32);
     let mut pixmap = Pixmap::new(w, h)?;
-    pixmap.fill(Color::WHITE);
+    pixmap.fill(Color::from_rgba8(
+        surface_color[0],
+        surface_color[1],
+        surface_color[2],
+        surface_color[3],
+    ));
     paint_laid_dom_scrolled(
         tree,
         prepared.viewport,
@@ -2340,7 +2394,33 @@ pub fn paint_prepared_region_with_scroll(
     scroll: &ResolvedScrollState,
     region: CaptureRegion,
 ) -> Result<Pixmap, CaptureError> {
-    paint_prepared_region_with_scroll_policy(tree, prepared, resources, scroll, region, false)
+    paint_prepared_region_with_scroll_and_surface_color(
+        tree,
+        prepared,
+        resources,
+        scroll,
+        region,
+        [255, 255, 255, 255],
+    )
+}
+
+pub fn paint_prepared_region_with_scroll_and_surface_color(
+    tree: &DomTree,
+    prepared: &mut PreparedRender,
+    resources: &mut RenderResourceCache,
+    scroll: &ResolvedScrollState,
+    region: CaptureRegion,
+    surface_color: [u8; 4],
+) -> Result<Pixmap, CaptureError> {
+    paint_prepared_region_with_scroll_policy(
+        tree,
+        prepared,
+        resources,
+        scroll,
+        region,
+        false,
+        surface_color,
+    )
 }
 
 fn paint_prepared_region_with_scroll_with_print_economy(
@@ -2350,7 +2430,15 @@ fn paint_prepared_region_with_scroll_with_print_economy(
     scroll: &ResolvedScrollState,
     region: CaptureRegion,
 ) -> Result<Pixmap, CaptureError> {
-    paint_prepared_region_with_scroll_policy(tree, prepared, resources, scroll, region, true)
+    paint_prepared_region_with_scroll_policy(
+        tree,
+        prepared,
+        resources,
+        scroll,
+        region,
+        true,
+        [255, 255, 255, 255],
+    )
 }
 
 fn paint_prepared_region_with_scroll_policy(
@@ -2360,6 +2448,7 @@ fn paint_prepared_region_with_scroll_policy(
     scroll: &ResolvedScrollState,
     region: CaptureRegion,
     print_economy: bool,
+    surface_color: [u8; 4],
 ) -> Result<Pixmap, CaptureError> {
     let (native_width, native_height, output_width, output_height) =
         checked_capture_dimensions(region)?;
@@ -2377,7 +2466,12 @@ fn paint_prepared_region_with_scroll_policy(
     };
     let mut pixmap =
         Pixmap::new(paint_width, paint_height).ok_or(CaptureError::AllocationLimitExceeded)?;
-    pixmap.fill(Color::WHITE);
+    pixmap.fill(Color::from_rgba8(
+        surface_color[0],
+        surface_color[1],
+        surface_color[2],
+        surface_color[3],
+    ));
 
     // Resolved node movement already contains `-root_scroll` for ordinary
     // document content and zero root movement for fixed content. Adding the
@@ -5278,6 +5372,25 @@ pub fn screenshot_png_scrolled_at_animation_time(
     .and_then(|pixmap| pixmap.encode_png().ok())
 }
 
+pub fn screenshot_png_scrolled_at_animation_time_with_surface_color(
+    tree: &DomTree,
+    viewport: (f32, f32),
+    base_url: Option<&str>,
+    scroll: (f32, f32),
+    animation_sample_time: crate::AnimationSampleTime,
+    surface_color: [u8; 4],
+) -> Option<Vec<u8>> {
+    paint_dom_scrolled_at_animation_time_with_surface_color(
+        tree,
+        viewport,
+        base_url,
+        scroll,
+        animation_sample_time,
+        surface_color,
+    )
+    .and_then(|pixmap| pixmap.encode_png().ok())
+}
+
 /// PNG convenience wrapper for a retained resource-aware layout.
 pub fn screenshot_prepared(
     tree: &DomTree,
@@ -5301,6 +5414,24 @@ pub fn screenshot_prepared_with_scroll(
         .ok()
 }
 
+pub fn screenshot_prepared_with_scroll_and_surface_color(
+    tree: &DomTree,
+    prepared: &mut PreparedRender,
+    resources: &mut RenderResourceCache,
+    scroll: &ResolvedScrollState,
+    surface_color: [u8; 4],
+) -> Option<Vec<u8>> {
+    paint_prepared_with_scroll_and_surface_color(
+        tree,
+        prepared,
+        resources,
+        scroll,
+        surface_color,
+    )?
+    .encode_png()
+    .ok()
+}
+
 /// PNG convenience wrapper for [`paint_prepared_region_with_scroll`].
 pub fn screenshot_prepared_region_with_scroll(
     tree: &DomTree,
@@ -5312,6 +5443,26 @@ pub fn screenshot_prepared_region_with_scroll(
     paint_prepared_region_with_scroll(tree, prepared, resources, scroll, region)?
         .encode_png()
         .map_err(|_| CaptureError::EncodeFailed)
+}
+
+pub fn screenshot_prepared_region_with_scroll_and_surface_color(
+    tree: &DomTree,
+    prepared: &mut PreparedRender,
+    resources: &mut RenderResourceCache,
+    scroll: &ResolvedScrollState,
+    region: CaptureRegion,
+    surface_color: [u8; 4],
+) -> Result<Vec<u8>, CaptureError> {
+    paint_prepared_region_with_scroll_and_surface_color(
+        tree,
+        prepared,
+        resources,
+        scroll,
+        region,
+        surface_color,
+    )?
+    .encode_png()
+    .map_err(|_| CaptureError::EncodeFailed)
 }
 
 /// Capture a retained region using the PDF print-background policy. Ordinary

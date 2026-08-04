@@ -535,6 +535,20 @@ impl ObscuraJsRuntime {
         viewport: (f32, f32),
         base_url: Option<&str>,
     ) -> Option<Vec<u8>> {
+        self.screenshot_prepared_with_surface_color(
+            viewport,
+            base_url,
+            [255, 255, 255, 255],
+        )
+    }
+
+    #[cfg(feature = "render")]
+    pub fn screenshot_prepared_with_surface_color(
+        &self,
+        viewport: (f32, f32),
+        base_url: Option<&str>,
+        surface_color: [u8; 4],
+    ) -> Option<Vec<u8>> {
         let mut state = self.state.borrow_mut();
         let effective_base = document_base_url(&state);
         if viewport != state.viewport || base_url != effective_base.as_deref() {
@@ -550,11 +564,12 @@ impl ObscuraJsRuntime {
                 ..
             } = state;
             let (_, scroll) = resolved_scroll.as_ref()?;
-            obscura_render::screenshot_prepared_with_scroll(
+            obscura_render::screenshot_prepared_with_scroll_and_surface_color(
                 dom.as_ref()?,
                 prepared_render.as_mut()?,
                 render_resources,
                 scroll,
+                surface_color,
             )
         })
     }
@@ -567,7 +582,40 @@ impl ObscuraJsRuntime {
         &self,
         region: obscura_render::CaptureRegion,
     ) -> Result<Vec<u8>, obscura_render::CaptureError> {
-        self.screenshot_prepared_region_with_backgrounds(region, true)
+        self.screenshot_prepared_region_with_surface_color(region, [255, 255, 255, 255])
+    }
+
+    #[cfg(feature = "render")]
+    pub fn screenshot_prepared_region_with_surface_color(
+        &self,
+        region: obscura_render::CaptureRegion,
+        surface_color: [u8; 4],
+    ) -> Result<Vec<u8>, obscura_render::CaptureError> {
+        let mut state = self.state.borrow_mut();
+        with_sync_render_loading_disabled(&mut state, |state| {
+            ensure_resolved_scroll(state).ok_or(obscura_render::CaptureError::PaintFailed)?;
+            let ObscuraState {
+                dom,
+                prepared_render,
+                render_resources,
+                resolved_scroll,
+                ..
+            } = state;
+            let (_, scroll) = resolved_scroll
+                .as_ref()
+                .ok_or(obscura_render::CaptureError::PaintFailed)?;
+            obscura_render::screenshot_prepared_region_with_scroll_and_surface_color(
+                dom.as_ref()
+                    .ok_or(obscura_render::CaptureError::PaintFailed)?,
+                prepared_render
+                    .as_mut()
+                    .ok_or(obscura_render::CaptureError::PaintFailed)?,
+                render_resources,
+                scroll,
+                region,
+                surface_color,
+            )
+        })
     }
 
     /// Capture a document-space rectangle with the PDF print-background
