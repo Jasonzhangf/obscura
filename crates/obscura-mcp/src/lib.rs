@@ -1298,15 +1298,17 @@ fn tool_fill_form(args: &Value, state: &mut BrowserState) -> Result<String, Stri
             "check" => format!(r#"(function(){{
                 var el = document.querySelector({sel});
                 if (!el) return "error:not found";
-                el.checked = true;
-                el.dispatchEvent(new Event('change', {{bubbles:true}}));
+                globalThis.__obscura_setFieldValue(el, 'checked', true);
+                el.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {{bubbles:true}})));
+                el.dispatchEvent(globalThis.__obscura_markTrusted(new Event('change', {{bubbles:true}})));
                 return "ok";
             }})()"#, sel = serde_json::to_string(&selector).unwrap()),
             "uncheck" => format!(r#"(function(){{
                 var el = document.querySelector({sel});
                 if (!el) return "error:not found";
-                el.checked = false;
-                el.dispatchEvent(new Event('change', {{bubbles:true}}));
+                globalThis.__obscura_setFieldValue(el, 'checked', false);
+                el.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {{bubbles:true}})));
+                el.dispatchEvent(globalThis.__obscura_markTrusted(new Event('change', {{bubbles:true}})));
                 return "ok";
             }})()"#, sel = serde_json::to_string(&selector).unwrap()),
             "select" => format!(r#"(function(){{
@@ -1323,7 +1325,8 @@ fn tool_fill_form(args: &Value, state: &mut BrowserState) -> Result<String, Stri
                     }}
                 }}
                 if (!matched) return "error:no matching option";
-                el.dispatchEvent(new Event('change', {{bubbles:true}}));
+                el.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {{bubbles:true}})));
+                el.dispatchEvent(globalThis.__obscura_markTrusted(new Event('change', {{bubbles:true}})));
                 return "ok";
             }})()"#, sel = serde_json::to_string(&selector).unwrap(), val = serde_json::to_string(value).unwrap()),
             _ => format!(r#"(function(){{
@@ -1844,6 +1847,78 @@ mod tests {
         assert_eq!(
             actual,
             json!(r#"{"domValue":"form-filled","controlledState":"form-filled","controlledUpdates":3,"lastInputTarget":"field","lastInputTrusted":true}"#),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fill_form_check_and_select_use_native_setter_and_trusted_events() {
+        let mut state = BrowserState::new(None, None, false);
+        state
+            .page_mut()
+            .navigate(
+                "data:text/html,<div id=root><input id=box type=checkbox>\
+                 <select id=sel><option value=a>a</option><option value=b>b</option></select></div>",
+            )
+            .await
+            .expect("test page should navigate");
+
+        // Install a React-style tracker on the checkbox's `checked`, redefined on
+        // the instance. A direct `el.checked = true` runs this wrapper in lockstep,
+        // so a change handler comparing target.checked to the tracked value sees no
+        // change and never commits. Writing through the prototype setter (what
+        // __obscura_setFieldValue does) leaves the tracker stale so the edit
+        // registers. Also record whether the dispatched change is trusted.
+        state.page_mut().evaluate(
+            r#"(function () {
+                var box = document.getElementById('box');
+                var root = document.getElementById('root');
+                var d = Object.getOwnPropertyDescriptor(box.constructor.prototype, 'checked');
+                var tracked = box.checked;
+                Object.defineProperty(box, 'checked', {
+                    configurable: true,
+                    get: function () { return d.get.call(this); },
+                    set: function (v) { tracked = !!v; d.set.call(this, v); }
+                });
+                window.__checkedCommitted = false;
+                window.__checkTrusted = false;
+                window.__selectTrusted = false;
+                root.addEventListener('change', function (event) {
+                    if (event.target.id === 'box') {
+                        window.__checkTrusted = event.isTrusted;
+                        if (event.target.checked !== tracked) {
+                            tracked = event.target.checked;
+                            window.__checkedCommitted = true;
+                        }
+                    } else if (event.target.id === 'sel') {
+                        window.__selectTrusted = event.isTrusted;
+                    }
+                });
+            })()"#,
+        );
+
+        tool_fill_form(
+            &json!({
+                "fields": [
+                    { "selector": "#box", "type": "check" },
+                    { "selector": "#sel", "type": "select", "value": "b" }
+                ]
+            }),
+            &mut state,
+        )
+        .expect("browser_fill_form should succeed");
+
+        let actual = state.page_mut().evaluate(
+            r#"JSON.stringify({
+                domChecked: document.getElementById('box').checked,
+                checkedCommitted: window.__checkedCommitted,
+                checkTrusted: window.__checkTrusted,
+                selValue: document.getElementById('sel').value,
+                selectTrusted: window.__selectTrusted
+            })"#,
+        );
+        assert_eq!(
+            actual,
+            json!(r#"{"domChecked":true,"checkedCommitted":true,"checkTrusted":true,"selValue":"b","selectTrusted":true}"#),
         );
     }
 }
