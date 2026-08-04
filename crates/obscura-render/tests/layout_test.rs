@@ -1661,6 +1661,31 @@ fn ratio_only_inline_svg_sizes_inside_an_auto_grid_row() {
     );
 }
 
+/// A percentage-sized absolutely positioned SVG resolves against its
+/// containing block like any other replaced element. The special intrinsic
+/// sizing used for a ratio-only SVG in an auto grid track must not turn this
+/// authored percentage into grid-style self-stretch (or the 300px default
+/// object size wins instead).
+#[test]
+fn absolute_inline_svg_keeps_percentage_width_and_view_box_ratio() {
+    let tree = parse_html(
+        r#"<html><head><style>
+             html,body{margin:0}
+             #container{position:relative;width:800px;height:300px}
+             #art{display:block;position:absolute;right:0;top:0;width:20%;height:auto}
+           </style></head><body>
+             <div id="container">
+               <svg id="art" width="162" height="162" viewBox="0 0 162 162"></svg>
+             </div>
+           </body></html>"#,
+    );
+    let layout = layout_dom(&tree, (1000.0, 600.0));
+    let art = layout.rects[&tree.get_element_by_id("art").unwrap()];
+    assert!((art.x - 640.0).abs() < 0.01, "percentage width must anchor from the right: {art:?}");
+    assert!((art.width - 160.0).abs() < 0.01, "percentage width: {art:?}");
+    assert!((art.height - 160.0).abs() < 0.01, "viewBox ratio: {art:?}");
+}
+
 /// Chromium 150 includes collapsed descendant margins in a grid item's
 /// intrinsic block-size. The nested 64px margin reaches through `section`,
 /// making the first item 200px tall; the second row therefore begins after
@@ -3382,6 +3407,65 @@ fn cyclic_descendant_percentages_do_not_inflate_a_flex_items_intrinsic_minimum()
             (216.0..=217.0).contains(&child.width),
             "the final reflow must resolve calc() against the 697px flex item: {child:?}"
         );
+    }
+}
+
+/// Chromium resolves both spellings to the same 163px content width: the
+/// percentage is cyclic while the link's flex-item width is being measured,
+/// then resolves against that link's final width. Carbon Ads uses the bare
+/// spelling; treating its 500px image as a permanent intrinsic floor widened
+/// Bootstrap's 195px sidebar card to 532px.
+#[test]
+fn bare_and_functional_cyclic_image_percentages_use_the_final_flex_width() {
+    let tree = parse_html(
+        r#"
+        <style>
+          * { box-sizing:border-box }
+          html, body { margin:0 }
+          .stack { display:flex; flex-flow:column wrap; width:195px }
+          .wrap { display:flex; flex-wrap:wrap; padding:16px }
+          .link { display:block; position:relative; flex:1 0 100%; overflow:hidden }
+          .image { display:block; height:auto }
+          #bare-image { width:100% }
+          #functional-image { width:calc(100%) }
+        </style>
+        <div class="stack"><div id="bare-wrap" class="wrap">
+          <a id="bare-link" class="link">
+            <img id="bare-image" class="image" width="100" height="100">
+          </a>
+        </div></div>
+        <div class="stack"><div id="functional-wrap" class="wrap">
+          <a id="functional-link" class="link">
+            <img id="functional-image" class="image" width="100" height="100">
+          </a>
+        </div></div>
+        "#,
+    );
+    let bare_image = tree.get_element_by_id("bare-image").unwrap();
+    let functional_image = tree.get_element_by_id("functional-image").unwrap();
+    let intrinsic = HashMap::from([
+        (bare_image, (500.0, 500.0)),
+        (functional_image, (500.0, 500.0)),
+    ]);
+    let layout = layout_dom_with_images(&tree, (1280.0, 720.0), &intrinsic);
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+
+    for (prefix, wrap_id, link_id, image_id) in [
+        ("bare", "bare-wrap", "bare-link", "bare-image"),
+        (
+            "functional",
+            "functional-wrap",
+            "functional-link",
+            "functional-image",
+        ),
+    ] {
+        let wrap = rect(wrap_id);
+        let link = rect(link_id);
+        let image = rect(image_id);
+        assert_eq!(wrap.width, 195.0, "{prefix} percentage wrapper: {wrap:?}");
+        assert_eq!(link.width, 163.0, "{prefix} percentage link: {link:?}");
+        assert_eq!(image.width, 163.0, "{prefix} percentage image: {image:?}");
+        assert_eq!(image.height, 163.0, "{prefix} image ratio: {image:?}");
     }
 }
 

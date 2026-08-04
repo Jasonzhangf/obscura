@@ -10693,11 +10693,18 @@ fn apply_container_size_containment(
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct DeferredCyclicInlineSize {
     node: NodeId,
     flex_item: NodeId,
     slot: usize,
+    source: DeferredCyclicInlineSource,
+}
+
+#[derive(Clone)]
+enum DeferredCyclicInlineSource {
+    Expression(String),
+    Percent(f32),
 }
 
 /// During a flex item's intrinsic-size calculation, percentages in descendant
@@ -10717,22 +10724,36 @@ fn defer_cyclic_flex_inline_sizes(
     vw: f32,
     vh: f32,
 ) -> Vec<DeferredCyclicInlineSize> {
-    let candidates: Vec<(NodeId, usize, String)> = styles
+    let candidates: Vec<(NodeId, usize, DeferredCyclicInlineSource)> = styles
         .iter()
         .filter(|(_, style)| !style.ignores_used_box_sizes())
         .flat_map(|(&id, style)| {
             [0usize, 2, 4].into_iter().filter_map(move |slot| {
-                style.size_expressions[slot]
+                let functional = style.size_expressions[slot]
                     .as_ref()
                     .filter(|expression| expression.contains('%'))
                     .cloned()
-                    .map(|expression| (id, slot, expression))
+                    .map(DeferredCyclicInlineSource::Expression);
+                let dimension = match slot {
+                    0 => style.width,
+                    2 => style.min_width,
+                    4 => style.max_width,
+                    _ => unreachable!(),
+                };
+                functional
+                    .or_else(|| match dimension {
+                        crate::Dimension::Percent(percent) => {
+                            Some(DeferredCyclicInlineSource::Percent(percent))
+                        }
+                        _ => None,
+                    })
+                    .map(|source| (id, slot, source))
             })
         })
         .collect();
     let mut deferred = Vec::new();
 
-    for (id, slot, expression) in candidates {
+    for (id, slot, source) in candidates {
         // Start at the expression's containing-box chain, not the sized
         // node itself. A percentage-sized direct child of a nested flex
         // container makes that container's contribution cyclic when the
@@ -10781,8 +10802,13 @@ fn defer_cyclic_flex_inline_sizes(
             .get(&id)
             .and_then(|style| style.font_size)
             .unwrap_or(root_fs);
-        let Some(intrinsic) =
-            crate::style::resolve_contextual_length(&expression, em, root_fs, vw, vh, 0.0)
+        let intrinsic = match &source {
+            DeferredCyclicInlineSource::Expression(expression) => {
+                crate::style::resolve_contextual_length(expression, em, root_fs, vw, vh, 0.0)
+            }
+            DeferredCyclicInlineSource::Percent(_) => Some(0.0),
+        };
+        let Some(intrinsic) = intrinsic
         else {
             continue;
         };
@@ -10802,6 +10828,7 @@ fn defer_cyclic_flex_inline_sizes(
             node: id,
             flex_item,
             slot,
+            source,
         });
     }
 
@@ -10852,12 +10879,6 @@ fn resolve_deferred_flex_inline_sizes(
     }
 
     for entry in deferred {
-        let Some(expression) = styles
-            .get(&entry.node)
-            .and_then(|style| style.size_expressions[entry.slot].clone())
-        else {
-            continue;
-        };
         let mut containing = tree.get_node(entry.node).and_then(|node| node.parent);
         let basis = loop {
             let Some(parent) = containing else {
@@ -10887,8 +10908,20 @@ fn resolve_deferred_flex_inline_sizes(
             .get(&entry.node)
             .and_then(|style| style.font_size)
             .unwrap_or(root_fs);
-        let Some(value) =
-            crate::style::resolve_contextual_length(&expression, em, root_fs, vw, vh, basis)
+        let value = match &entry.source {
+            DeferredCyclicInlineSource::Expression(expression) => {
+                crate::style::resolve_contextual_length(
+                    expression,
+                    em,
+                    root_fs,
+                    vw,
+                    vh,
+                    basis,
+                )
+            }
+            DeferredCyclicInlineSource::Percent(percent) => Some(basis * percent),
+        };
+        let Some(value) = value
         else {
             continue;
         };
@@ -11080,14 +11113,18 @@ fn build(
             .aspect_ratio
             .filter(|ratio| ratio.is_finite() && *ratio > 0.0)
         {
-            // A percentage inline size inside an auto grid track is cyclic
+            // A 100% inline size inside an auto grid track is cyclic
             // during intrinsic sizing: it behaves as auto for the contribution
             // pass, then fills the final track. Taffy 0.12 keeps the intrinsic
             // fallback width instead of revisiting that percentage. Express
             // the final fill as grid self-stretch so the known content width
-            // reaches the replaced-item measure callback.
-            if matches!(style.width, crate::Dimension::Percent(_))
+            // reaches the replaced-item measure callback. This substitution is
+            // only equivalent for an in-flow grid item at exactly 100%; an
+            // abs-pos SVG or a smaller percentage must keep its containing-
+            // block-relative authored size.
+            if matches!(style.width, crate::Dimension::Percent(percent) if percent == 1.0)
                 && matches!(style.height, crate::Dimension::Auto)
+                && is_in_flow_grid_item(tree, id, style, styles)
             {
                 taffy_style.size.width = taffy::Dimension::auto();
                 taffy_style.min_size.width = taffy::Dimension::length(0.0);
