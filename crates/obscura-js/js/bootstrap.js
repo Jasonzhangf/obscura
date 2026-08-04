@@ -53,6 +53,8 @@
     'MessageChannel', 'MessagePort', 'BroadcastChannel', 'CustomElementRegistry',
     'XMLHttpRequestEventTarget', 'HTMLMediaElement', 'HTMLVideoElement',
     'HTMLAudioElement', 'WebGL2RenderingContext',
+    'SVGElement', 'SVGGraphicsElement', 'SVGGeometryElement', 'SVGPathElement',
+    'SVGSVGElement',
   ];
   var _desc = { value: undefined, writable: true, enumerable: false, configurable: true };
   for (var _i = 0; _i < _names.length; _i++) {
@@ -1551,6 +1553,7 @@ class Node {
     }
     if (c._shadowParent) c._shadowParent.removeChild(c);
     _dom("append_child", this._nid, c._nid);
+    _registerWindowNamedTree(c);
     if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('childList', this._nid, [c._nid], []);
     __prepareInsertedSubtree(c);
     if (c instanceof Element && c.tagName === 'LINK') {
@@ -1560,6 +1563,7 @@ class Node {
   }
   removeChild(c) {
     if (!c) return c;
+    const removedWindowNames = _windowNamedNamesInTree(c);
     const linkedStyle = c instanceof Element
       ? _linkedStylesheetNodes.get(c)
       : null;
@@ -1568,6 +1572,7 @@ class Node {
       _linkedStylesheetNodes.delete(c);
     }
     _dom("remove_child", c._nid);
+    _reconcileWindowNamedProperties(removedWindowNames);
     if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('childList', this._nid, [], [c._nid]);
     return c;
   }
@@ -1580,8 +1585,11 @@ class Node {
       return oldChild;
     }
     if (newChild._shadowParent) newChild._shadowParent.removeChild(newChild);
+    const removedWindowNames = _windowNamedNamesInTree(oldChild);
     _dom("insert_before", newChild._nid, oldChild._nid);
     _dom("remove_child", oldChild._nid);
+    _registerWindowNamedTree(newChild);
+    _reconcileWindowNamedProperties(removedWindowNames);
     __prepareInsertedSubtree(newChild);
     return oldChild;
   }
@@ -1595,6 +1603,7 @@ class Node {
     }
     if (n._shadowParent) n._shadowParent.removeChild(n);
     _dom("insert_before", n._nid, ref._nid);
+    _registerWindowNamedTree(n);
     __prepareInsertedSubtree(n);
     return n;
   }
@@ -2471,12 +2480,18 @@ class Element extends Node {
     // `dangerouslySetInnerHTML`, vue-style content swaps) silently bypass
     // every MutationObserver subscriber and downstream hydration / polling
     // logic stalls.
+    const previousWindowNames = _windowNamedNamesInTree(this);
     let oldChildren = [];
     let newChildren = [];
     if (globalThis.__mutationObservers?.length) {
       oldChildren = _domParse("child_nodes", this._nid) || [];
     }
     _dom("set_inner_html", this._nid, String(v ?? ""));
+    // HTML fragment parsing can introduce IDs without calling the JS
+    // setAttribute path. Register those elements for Window named access
+    // before script can synchronously read `window.someId`.
+    _registerWindowNamedTree(this);
+    _reconcileWindowNamedProperties(previousWindowNames);
     if (globalThis.__mutationObservers?.length) {
       newChildren = _domParse("child_nodes", this._nid) || [];
       globalThis.__notifyMutation('childList', this._nid, newChildren, oldChildren);
@@ -2584,8 +2599,19 @@ class Element extends Node {
   setAttribute(n, v) {
     n = _htmlAttrName(this, n);
     const popoverPrev = (n === "popover") ? this.popover : undefined;
+    const previousWindowName = (n === "id" || n === "name")
+      ? this.getAttribute(n)
+      : null;
     const value = String(v);
     _dom("set_attribute", this._nid, n + "\0" + value);
+    if (n === "id" || (n === "name" && _windowNameEligibleElement(this))) {
+      if (this.getRootNode() === globalThis.document) {
+        _ensureWindowNamedProperty(value);
+      }
+      if (previousWindowName && previousWindowName !== value) {
+        _reconcileWindowNamedProperty(previousWindowName);
+      }
+    }
     if (n === "style") this._style._replaceFromAttribute(value);
     if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev);
     if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('attributes', this._nid, [], [], n);
@@ -2611,7 +2637,14 @@ class Element extends Node {
   removeAttribute(n) {
     n = _htmlAttrName(this, n);
     const popoverPrev = (n === "popover") ? this.popover : undefined;
+    const previousWindowName = (n === "id" || n === "name")
+      ? this.getAttribute(n)
+      : null;
     _dom("remove_attribute", this._nid, n);
+    if (previousWindowName
+        && (n === "id" || (n === "name" && _windowNameEligibleElement(this)))) {
+      _reconcileWindowNamedProperty(previousWindowName);
+    }
     if (n === "style") this._style._replaceFromAttribute("");
     if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev);
     if (this.localName === "source"
@@ -5252,6 +5285,15 @@ globalThis.VTTCue = VTTCue;
 
 function _elementClassFor(nid) {
   const tag = _domParse("tag_name", nid);
+  // HTML tagName values are ASCII-uppercase. Foreign SVG names retain their
+  // case, so keep the common HTML path fast and only inspect the native
+  // namespace for possible SVG wrappers.
+  if (tag && tag !== tag.toUpperCase()
+      && _domParse("namespace_uri", nid) === "http://www.w3.org/2000/svg") {
+    if (tag === "path" && globalThis.SVGPathElement) return globalThis.SVGPathElement;
+    if (tag === "svg" && globalThis.SVGSVGElement) return globalThis.SVGSVGElement;
+    if (globalThis.SVGElement) return globalThis.SVGElement;
+  }
   if (tag === "FORM" && globalThis.HTMLFormElement) return globalThis.HTMLFormElement;
   if (tag === "IMG") return HTMLImageElement;
   if (tag === "CANVAS" && globalThis.HTMLCanvasElement) return globalThis.HTMLCanvasElement;
@@ -9597,8 +9639,16 @@ Object.defineProperty(SVGAnimatedString.prototype, 'animVal', {
 Object.defineProperty(SVGAnimatedString.prototype, Symbol.toStringTag, { value: 'SVGAnimatedString', configurable: true });
 _markNative(SVGAnimatedString);
 
-globalThis.SVGElement = Element;
-globalThis.SVGSVGElement = Element;
+class SVGElement extends Element {}
+class SVGGraphicsElement extends SVGElement {}
+class SVGGeometryElement extends SVGGraphicsElement {}
+class SVGPathElement extends SVGGeometryElement {}
+class SVGSVGElement extends SVGGraphicsElement {}
+globalThis.SVGElement = SVGElement;
+globalThis.SVGGraphicsElement = SVGGraphicsElement;
+globalThis.SVGGeometryElement = SVGGeometryElement;
+globalThis.SVGPathElement = SVGPathElement;
+globalThis.SVGSVGElement = SVGSVGElement;
 globalThis.CharacterData = CharacterData;
 globalThis.Text = Text;
 globalThis.Comment = Comment;
@@ -9714,6 +9764,131 @@ function _nodeList(els) {
   nl.length = els.length;
   return nl;
 }
+
+// Window named access. HTML exposes every element id, plus the name of a
+// small legacy set of HTML elements, as properties of the WindowProxy. V8's
+// global object cannot be replaced with a WindowProxy after snapshot startup,
+// so install lazy accessors for the supported names present in this document.
+// The accessor resolves against the live tree: one match returns that element
+// (or an iframe's Window), while duplicates return a live-shaped
+// HTMLCollection in tree order.
+const _windowNamedPropertyNames = new Set();
+const _windowNamedNameTags = new Set(["embed", "form", "iframe", "img", "object"]);
+
+function _windowNameEligibleElement(element) {
+  return !!element
+    && element.namespaceURI === "http://www.w3.org/1999/xhtml"
+    && _windowNamedNameTags.has(element.localName);
+}
+
+function _windowNamedSupportedNames(element) {
+  const names = [];
+  if (!element || element.nodeType !== 1) return names;
+  const id = element.getAttribute("id");
+  if (id) names.push(id);
+  if (_windowNameEligibleElement(element)) {
+    const name = element.getAttribute("name");
+    if (name && name !== id) names.push(name);
+  }
+  return names;
+}
+
+function _windowNamedCandidates(name) {
+  const doc = globalThis.document;
+  if (!doc || !name) return [];
+  const elements = doc.querySelectorAll(
+    "[id],embed[name],form[name],iframe[name],img[name],object[name]"
+  );
+  const matches = [];
+  for (let i = 0; i < elements.length; i++) {
+    const element = elements[i];
+    if (element.getAttribute("id") === name
+        || (_windowNameEligibleElement(element)
+          && element.getAttribute("name") === name)) {
+      matches.push(element);
+    }
+  }
+  return matches;
+}
+
+function _windowNamedValue(name) {
+  const matches = _windowNamedCandidates(name);
+  if (matches.length === 0) return undefined;
+  if (matches.length > 1) return HTMLCollection._from(matches);
+  const element = matches[0];
+  return element.localName === "iframe" && element.contentWindow
+    ? element.contentWindow
+    : element;
+}
+
+function _ensureWindowNamedProperty(name) {
+  name = String(name || "");
+  if (!name || _windowNamedPropertyNames.has(name)) return;
+  // Existing own Window properties win over named elements.
+  if (Object.prototype.hasOwnProperty.call(globalThis, name)) return;
+  try {
+    Object.defineProperty(globalThis, name, {
+      get() { return _windowNamedValue(name); },
+      configurable: true,
+      enumerable: true,
+    });
+    _windowNamedPropertyNames.add(name);
+  } catch (_error) {}
+}
+
+function _reconcileWindowNamedProperty(name) {
+  if (!_windowNamedPropertyNames.has(name)) return;
+  if (_windowNamedCandidates(name).length !== 0) return;
+  try { delete globalThis[name]; } catch (_error) {}
+  _windowNamedPropertyNames.delete(name);
+}
+
+function _windowNamedNamesInTree(root) {
+  const names = new Set();
+  if (!root) return names;
+  if (root.nodeType === 1) {
+    for (const name of _windowNamedSupportedNames(root)) names.add(name);
+  }
+  if (typeof root.querySelectorAll === "function") {
+    const elements = root.querySelectorAll(
+      "[id],embed[name],form[name],iframe[name],img[name],object[name]"
+    );
+    for (let i = 0; i < elements.length; i++) {
+      for (const name of _windowNamedSupportedNames(elements[i])) names.add(name);
+    }
+  }
+  return names;
+}
+
+function _registerWindowNamedTree(root) {
+  // Window named access only considers the document tree. Detached nodes and
+  // attached shadow trees must not manufacture own Window properties.
+  if (!root || root.getRootNode() !== globalThis.document) return;
+  const names = _windowNamedNamesInTree(root);
+  for (const name of names) _ensureWindowNamedProperty(name);
+}
+
+function _reconcileWindowNamedProperties(names) {
+  if (!names || names.size === 0) return;
+  const doc = globalThis.document;
+  if (!doc) return;
+  const present = new Set();
+  const elements = doc.querySelectorAll(
+    "[id],embed[name],form[name],iframe[name],img[name],object[name]"
+  );
+  for (let i = 0; i < elements.length; i++) {
+    for (const name of _windowNamedSupportedNames(elements[i])) {
+      if (names.has(name)) present.add(name);
+    }
+  }
+  for (const name of names) {
+    if (_windowNamedPropertyNames.has(name) && !present.has(name)) {
+      try { delete globalThis[name]; } catch (_error) {}
+      _windowNamedPropertyNames.delete(name);
+    }
+  }
+}
+
 globalThis.DOMTokenList = DOMTokenList;
 // NodeList is its own type, not an Array subclass: in a real browser
 // Array.isArray(nodeList) is false and Object.prototype.toString reports
@@ -12551,6 +12726,9 @@ globalThis.__obscura_init = function() {
   // canonical so getRootNode(), isConnected, and identity comparisons return
   // the same Document object exposed as globalThis.document.
   _cache.set(documentNid, globalThis.document);
+  const previousWindowNames = new Set(_windowNamedPropertyNames);
+  _registerWindowNamedTree(globalThis.document.documentElement);
+  _reconcileWindowNamedProperties(previousWindowNames);
 
   const scr = _fp('screen');
   const sw = scr[0], sh = scr[1];
