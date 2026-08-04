@@ -1708,12 +1708,173 @@ def canonical_geometry_dom_structure(dom):
     return None
 
 
+GENERATED_ID_NAMESPACE_PATTERN = re.compile(
+    r"(?:^|[-_:])(ng|ngb|cdk|mat|ember|react|radix|headlessui|mui)(?:[-_:]|$)",
+    re.IGNORECASE,
+)
+
+
+def split_generated_id_variance(obscura_id, chromium_id):
+    """Describe one structured ID mismatch without deciding it is volatile."""
+    if not obscura_id or not chromium_id or obscura_id == chromium_id:
+        return None
+
+    prefix_length = 0
+    prefix_limit = min(len(obscura_id), len(chromium_id))
+    while (
+        prefix_length < prefix_limit
+        and obscura_id[prefix_length] == chromium_id[prefix_length]
+    ):
+        prefix_length += 1
+
+    suffix_length = 0
+    suffix_limit = min(
+        len(obscura_id) - prefix_length,
+        len(chromium_id) - prefix_length,
+    )
+    while (
+        suffix_length < suffix_limit
+        and obscura_id[-1 - suffix_length] == chromium_id[-1 - suffix_length]
+    ):
+        suffix_length += 1
+
+    # Do not let a coincidentally shared salt character become part of the
+    # stable suffix (`...-7-panel` versus `...-17-panel`). Stable structured
+    # suffixes begin at an ID separator; otherwise the whole tail remains salt.
+    if suffix_length:
+        raw_suffix = obscura_id[len(obscura_id) - suffix_length :]
+        if raw_suffix[0] not in "-_:":
+            separator_offsets = [
+                raw_suffix.find(separator)
+                for separator in ("-", "_", ":")
+                if raw_suffix.find(separator) >= 0
+            ]
+            suffix_length = (
+                len(raw_suffix) - min(separator_offsets) if separator_offsets else 0
+            )
+
+    suffix_start_obscura = len(obscura_id) - suffix_length
+    suffix_start_chromium = len(chromium_id) - suffix_length
+    prefix = obscura_id[:prefix_length]
+    suffix = obscura_id[suffix_start_obscura:] if suffix_length else ""
+    obscura_salt = obscura_id[prefix_length:suffix_start_obscura]
+    chromium_salt = chromium_id[prefix_length:suffix_start_chromium]
+    if not obscura_salt or not chromium_salt:
+        return None
+
+    stable_fingerprint = prefix + "<volatile-id-salt>" + suffix
+    generated_namespace = GENERATED_ID_NAMESPACE_PATTERN.search(prefix + suffix)
+    salt_is_generated = (
+        generated_namespace is not None
+        and any(character.isdigit() for character in obscura_salt)
+        and any(character.isdigit() for character in chromium_salt)
+        and len(obscura_salt) <= 32
+        and len(chromium_salt) <= 32
+    )
+    return {
+        "prefix": prefix,
+        "suffix": suffix,
+        "obscura_salt": obscura_salt,
+        "chromium_salt": chromium_salt,
+        "normalized_fingerprint": stable_fingerprint,
+        "generated_namespace": (
+            generated_namespace.group(1).lower() if generated_namespace else None
+        ),
+        "generated_salt_candidate": salt_is_generated,
+    }
+
+
+def compare_geometry_dom_ids(obscura_nodes, chromium_nodes):
+    """Compare IDs, allowing only repeated framework-generated salt changes."""
+    if len(obscura_nodes) != len(chromium_nodes):
+        return {
+            "comparable": False,
+            "mismatches": [],
+            "normalized_mismatch_count": 0,
+            "semantic_mismatch_count": 0,
+        }
+
+    mismatches = []
+    mapping_fingerprints = {}
+    for index, (obscura_node, chromium_node) in enumerate(
+        zip(obscura_nodes, chromium_nodes)
+    ):
+        obscura_id = (obscura_node or {}).get("id") or ""
+        chromium_id = (chromium_node or {}).get("id") or ""
+        if obscura_id == chromium_id:
+            continue
+        variance = split_generated_id_variance(obscura_id, chromium_id)
+        mismatch = {
+            "node_index": index,
+            "obscura_id": obscura_id,
+            "chromium_id": chromium_id,
+            "normalized_as_volatile": False,
+            "variance": variance,
+        }
+        mismatches.append(mismatch)
+        if variance and variance["generated_salt_candidate"]:
+            mapping = (variance["obscura_salt"], variance["chromium_salt"])
+            mapping_fingerprints.setdefault(mapping, set()).add(
+                variance["normalized_fingerprint"]
+            )
+
+    # A generated-looking numeric difference is not enough by itself. The same
+    # salt substitution must recur in at least two distinct structured IDs,
+    # such as `ngb-nav-7` and `ngb-nav-7-panel`. This keeps one-off semantic
+    # identifiers authoritative while tolerating framework instance counters.
+    for mismatch in mismatches:
+        variance = mismatch["variance"]
+        if not variance or not variance["generated_salt_candidate"]:
+            continue
+        mapping = (variance["obscura_salt"], variance["chromium_salt"])
+        mismatch["normalized_as_volatile"] = (
+            len(mapping_fingerprints.get(mapping, ())) >= 2
+        )
+
+    normalized_count = sum(
+        mismatch["normalized_as_volatile"] for mismatch in mismatches
+    )
+    semantic_count = len(mismatches) - normalized_count
+    return {
+        "comparable": semantic_count == 0,
+        "mismatches": mismatches,
+        "normalized_mismatch_count": normalized_count,
+        "semantic_mismatch_count": semantic_count,
+    }
+
+
+def geometry_dom_topology(structure):
+    """Return the canonical descriptor with raw diagnostic IDs removed."""
+    if not isinstance(structure, dict):
+        return None
+    return {
+        "source": structure.get("source"),
+        "subtree_element_count": structure.get("subtree_element_count"),
+        "subtree_truncated": structure.get("subtree_truncated"),
+        "nodes": [
+            {key: value for key, value in (node or {}).items() if key != "id"}
+            for node in structure.get("nodes", [])
+        ],
+    }
+
+
 def compare_geometry_dom_structures(obscura_dom, chromium_dom):
     """Classify whether two geometry rects address the same DOM structure."""
     obscura_structure = canonical_geometry_dom_structure(obscura_dom)
     chromium_structure = canonical_geometry_dom_structure(chromium_dom)
     available = obscura_structure is not None and chromium_structure is not None
-    structures_equal = available and obscura_structure == chromium_structure
+    topology_equal = available and geometry_dom_topology(
+        obscura_structure
+    ) == geometry_dom_topology(chromium_structure)
+    id_comparison = (
+        compare_geometry_dom_ids(
+            obscura_structure.get("nodes", []),
+            chromium_structure.get("nodes", []),
+        )
+        if available and topology_equal
+        else None
+    )
+    structures_equal = topology_equal and id_comparison["comparable"]
     truncated = available and (
         obscura_structure.get("subtree_truncated") is True
         or chromium_structure.get("subtree_truncated") is True
@@ -1737,6 +1898,8 @@ def compare_geometry_dom_structures(obscura_dom, chromium_dom):
             else "different-target-structure"
         ),
         "reasons": reasons,
+        "topology_equal": topology_equal,
+        "id_comparison": id_comparison,
         "obscura": obscura_structure,
         "chromium": chromium_structure,
     }

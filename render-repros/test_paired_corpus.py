@@ -809,6 +809,156 @@ class GeometryProbeTests(unittest.TestCase):
         self.assertTrue(comparison[0]["rect_deltas"][0]["geometry_delta_valid"])
         self.assertEqual(paired_corpus.geometry_verdict_exclusions(comparison), [])
 
+    def test_geometry_target_accepts_repeated_angular_id_salt_variants(self):
+        def descriptor(salt):
+            return {
+                "subtree_element_count": 3,
+                "subtree_truncated": False,
+                "subtree": [
+                    {
+                        "index": 0,
+                        "parent_index": None,
+                        "tag": "div",
+                        "id": f"ng-tab-{salt}",
+                        "class_name": "nav nav-tabs",
+                        "child_element_count": 2,
+                    },
+                    {
+                        "index": 1,
+                        "parent_index": 0,
+                        "tag": "button",
+                        "id": f"ng-tab-{salt}-label",
+                        "class_name": "nav-link active",
+                        "child_element_count": 0,
+                    },
+                    {
+                        "index": 2,
+                        "parent_index": 0,
+                        "tag": "div",
+                        "id": f"ng-tab-{salt}-panel",
+                        "class_name": "tab-pane active",
+                        "child_element_count": 0,
+                    },
+                ],
+            }
+
+        def state(salt, x):
+            return {
+                "geometry_probes": [
+                    {
+                        "selector": ".nav-tabs",
+                        "valid": True,
+                        "count": 1,
+                        "rect_limit": 200,
+                        "rects": [
+                            {
+                                "x": x,
+                                "y": 10,
+                                "width": 300,
+                                "height": 80,
+                                "dom": descriptor(salt),
+                            }
+                        ],
+                    }
+                ]
+            }
+
+        probe = paired_corpus.compare_geometry_probes(
+            state("7", 12), state("19", 10)
+        )[0]
+        self.assertTrue(probe["geometry_verdict_valid"])
+        self.assertEqual(probe["geometry_verdict_exclusion_reasons"], [])
+        self.assertTrue(probe["rect_deltas"][0]["geometry_delta_valid"])
+        self.assertEqual(probe["rect_deltas"][0]["delta"]["x"], 2)
+        comparison = probe["rect_deltas"][0]["target_subtree_comparability"]
+        self.assertTrue(comparison["comparable"])
+        self.assertTrue(comparison["topology_equal"])
+        self.assertEqual(
+            comparison["id_comparison"]["normalized_mismatch_count"], 3
+        )
+        self.assertEqual(comparison["id_comparison"]["semantic_mismatch_count"], 0)
+        self.assertTrue(
+            all(
+                mismatch["normalized_as_volatile"]
+                for mismatch in comparison["id_comparison"]["mismatches"]
+            )
+        )
+        self.assertEqual(comparison["obscura"]["nodes"][0]["id"], "ng-tab-7")
+        self.assertEqual(
+            comparison["chromium"]["nodes"][0]["id"], "ng-tab-19"
+        )
+        self.assertEqual(
+            comparison["id_comparison"]["mismatches"][2]["variance"][
+                "normalized_fingerprint"
+            ],
+            "ng-tab-<volatile-id-salt>-panel",
+        )
+
+    def test_geometry_target_rejects_one_off_generated_id_salt(self):
+        def descriptor(salt):
+            return {
+                "subtree_element_count": 1,
+                "subtree_truncated": False,
+                "subtree": [
+                    {
+                        "index": 0,
+                        "parent_index": None,
+                        "tag": "div",
+                        "id": f"ng-tab-{salt}",
+                        "class_name": "nav-tabs",
+                        "child_element_count": 0,
+                    }
+                ],
+            }
+
+        comparison = paired_corpus.compare_geometry_dom_structures(
+            descriptor("7"), descriptor("19")
+        )
+        self.assertFalse(comparison["comparable"])
+        self.assertEqual(
+            comparison["id_comparison"]["normalized_mismatch_count"], 0
+        )
+        self.assertEqual(comparison["id_comparison"]["semantic_mismatch_count"], 1)
+
+    def test_geometry_target_rejects_repeated_semantic_id_changes(self):
+        def descriptor(section):
+            return {
+                "subtree_element_count": 2,
+                "subtree_truncated": False,
+                "subtree": [
+                    {
+                        "index": 0,
+                        "parent_index": None,
+                        "tag": "section",
+                        "id": f"{section}-settings",
+                        "class_name": "settings",
+                        "child_element_count": 1,
+                    },
+                    {
+                        "index": 1,
+                        "parent_index": 0,
+                        "tag": "button",
+                        "id": f"{section}-save",
+                        "class_name": "button primary",
+                        "child_element_count": 0,
+                    },
+                ],
+            }
+
+        comparison = paired_corpus.compare_geometry_dom_structures(
+            descriptor("account"), descriptor("billing")
+        )
+        self.assertFalse(comparison["comparable"])
+        self.assertTrue(comparison["topology_equal"])
+        self.assertEqual(
+            comparison["classification"], "different-target-structure"
+        )
+        self.assertIn("target-subtree-structure-mismatch", comparison["reasons"])
+        self.assertEqual(
+            comparison["id_comparison"]["normalized_mismatch_count"], 0
+        )
+        self.assertEqual(comparison["id_comparison"]["semantic_mismatch_count"], 2)
+
     def test_geometry_verdict_excludes_different_dynamic_subtree_only(self):
         def state(child_class):
             return {
