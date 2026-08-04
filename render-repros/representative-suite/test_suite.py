@@ -179,7 +179,7 @@ class RepresentativeSuiteTests(unittest.TestCase):
             for line in SITES.read_text().splitlines()
             if line.strip() and not line.lstrip().startswith("#")
         ]
-        self.assertEqual(len(urls), 13)
+        self.assertEqual(len(urls), 15)
         self.assertEqual(len(urls), len(set(urls)))
         self.assertTrue(all(url.startswith("https://") for url in urls))
 
