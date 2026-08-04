@@ -3987,6 +3987,7 @@ fn paint_laid_dom_scrolled(
                     tree,
                     nid,
                     &laid.styles,
+                    &laid.custom_properties,
                     (suppress_opacity_for == Some(nid)).then_some(nid),
                 );
                 // Resolve referenced symbols before carrying the host color into
@@ -9402,7 +9403,7 @@ fn svg_root_attr_value_range(tag: &str, wanted: &str) -> Option<(usize, usize)> 
 #[cfg(test)]
 fn serialize_svg(tree: &DomTree, root: obscura_dom::tree::NodeId) -> String {
     let mut buf = String::new();
-    serialize_svg_node(tree, root, true, None, None, &mut buf);
+    serialize_svg_node(tree, root, true, None, None, None, &mut buf);
     buf
 }
 
@@ -9414,6 +9415,10 @@ fn serialize_svg_styled(
     tree: &DomTree,
     root: obscura_dom::tree::NodeId,
     styles: &std::collections::HashMap<obscura_dom::tree::NodeId, crate::LayoutStyle>,
+    custom_properties: &std::collections::HashMap<
+        obscura_dom::tree::NodeId,
+        std::rc::Rc<std::collections::HashMap<String, String>>,
+    >,
     suppress_opacity_for: Option<obscura_dom::tree::NodeId>,
 ) -> String {
     let mut buf = String::new();
@@ -9422,6 +9427,7 @@ fn serialize_svg_styled(
         root,
         true,
         Some(styles),
+        Some(custom_properties),
         suppress_opacity_for,
         &mut buf,
     );
@@ -9453,6 +9459,12 @@ fn serialize_svg_node(
     nid: obscura_dom::tree::NodeId,
     is_root: bool,
     styles: Option<&std::collections::HashMap<obscura_dom::tree::NodeId, crate::LayoutStyle>>,
+    custom_properties: Option<
+        &std::collections::HashMap<
+            obscura_dom::tree::NodeId,
+            std::rc::Rc<std::collections::HashMap<String, String>>,
+        >,
+    >,
     suppress_opacity_for: Option<obscura_dom::tree::NodeId>,
     buf: &mut String,
 ) {
@@ -9469,7 +9481,15 @@ fn serialize_svg_node(
         // Document/comment/PI: no tag of its own, emit only element children.
         None => {
             for child in tree.children(nid) {
-                serialize_svg_node(tree, child, false, styles, suppress_opacity_for, buf);
+                serialize_svg_node(
+                    tree,
+                    child,
+                    false,
+                    styles,
+                    custom_properties,
+                    suppress_opacity_for,
+                    buf,
+                );
             }
             return;
         }
@@ -9501,10 +9521,35 @@ fn serialize_svg_node(
                 source_style = Some(attr.value.to_string());
                 continue;
             }
+            let value = if styles.is_some()
+                && svg_css_presentation_attribute(aname)
+                && attr.value.contains("var(")
+            {
+                let empty = std::collections::HashMap::new();
+                let properties = custom_properties
+                    .and_then(|all| all.get(&nid))
+                    .map_or(&empty, std::rc::Rc::as_ref);
+                let Some(resolved) = crate::css::substitute_var_value(&attr.value, properties, 0)
+                else {
+                    // A var() failure makes the declaration invalid at computed
+                    // value time. Omitting this low-specificity presentation
+                    // attribute lets usvg apply the property's inherited or
+                    // initial value, matching the browser cascade.
+                    continue;
+                };
+                if resolved.trim().is_empty()
+                    || svg_presentation_substitution_is_guaranteed_invalid(aname, &resolved)
+                {
+                    continue;
+                }
+                std::borrow::Cow::Owned(resolved)
+            } else {
+                std::borrow::Cow::Borrowed(attr.value.as_ref())
+            };
             buf.push(' ');
             buf.push_str(aname);
             buf.push_str("=\"");
-            svg_escape_attr(&attr.value, buf);
+            svg_escape_attr(&value, buf);
             buf.push('"');
         }
     }
@@ -9591,11 +9636,154 @@ fn serialize_svg_node(
     }
     buf.push('>');
     for child in tree.children(nid) {
-        serialize_svg_node(tree, child, false, styles, suppress_opacity_for, buf);
+        serialize_svg_node(
+            tree,
+            child,
+            false,
+            styles,
+            custom_properties,
+            suppress_opacity_for,
+            buf,
+        );
     }
     buf.push_str("</");
     buf.push_str(tag);
     buf.push('>');
+}
+
+/// SVG attributes which participate in the CSS cascade. Blink exposes the
+/// first group through `SVGElement::CssPropertyIdForSVGAttributeName`; the
+/// final geometry group is backed by per-element SVG animated properties with
+/// CSS property IDs. XML-only attributes such as `d`, `viewBox`, and `id` must
+/// remain literal even when their text happens to contain `var()`.
+fn svg_css_presentation_attribute(name: &str) -> bool {
+    matches!(
+        name,
+        "alignment-baseline"
+            | "baseline-shift"
+            | "buffered-rendering"
+            | "clip"
+            | "clip-path"
+            | "clip-rule"
+            | "color"
+            | "color-interpolation"
+            | "color-interpolation-filters"
+            | "color-rendering"
+            | "cursor"
+            | "direction"
+            | "display"
+            | "dominant-baseline"
+            | "fill"
+            | "fill-opacity"
+            | "fill-rule"
+            | "filter"
+            | "flood-color"
+            | "flood-opacity"
+            | "font-family"
+            | "font-size"
+            | "font-stretch"
+            | "font-style"
+            | "font-variant"
+            | "font-weight"
+            | "image-rendering"
+            | "letter-spacing"
+            | "lighting-color"
+            | "marker-end"
+            | "marker-mid"
+            | "marker-start"
+            | "mask"
+            | "mask-type"
+            | "opacity"
+            | "overflow"
+            | "paint-order"
+            | "pointer-events"
+            | "shape-rendering"
+            | "stop-color"
+            | "stop-opacity"
+            | "stroke"
+            | "stroke-dasharray"
+            | "stroke-dashoffset"
+            | "stroke-linecap"
+            | "stroke-linejoin"
+            | "stroke-miterlimit"
+            | "stroke-opacity"
+            | "stroke-width"
+            | "text-anchor"
+            | "text-decoration"
+            | "text-rendering"
+            | "transform-origin"
+            | "unicode-bidi"
+            | "vector-effect"
+            | "visibility"
+            | "word-spacing"
+            | "writing-mode"
+            | "x"
+            | "y"
+            | "cx"
+            | "cy"
+            | "r"
+            | "rx"
+            | "ry"
+            | "width"
+            | "height"
+    )
+}
+
+/// Detect only values whose post-substitution grammar is unambiguously
+/// invalid. Functional and escaped values are left to usvg because its SVG
+/// paint grammar is broader than our HTML color parser. An unknown bare
+/// identifier, however, cannot be a color/paint and must compute to
+/// inherit/initial instead of triggering usvg's black error fallback.
+fn svg_presentation_substitution_is_guaranteed_invalid(name: &str, value: &str) -> bool {
+    if !matches!(
+        name,
+        "color" | "fill" | "flood-color" | "lighting-color" | "stop-color" | "stroke"
+    ) {
+        return false;
+    }
+    let value = value.trim();
+    if value.is_empty()
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        || crate::style::parse_color(value).is_some()
+    {
+        return false;
+    }
+    let lower = value.to_ascii_lowercase();
+    if matches!(name, "fill" | "stroke")
+        && matches!(lower.as_str(), "none" | "context-fill" | "context-stroke")
+    {
+        return false;
+    }
+    !matches!(
+        lower.as_str(),
+        "currentcolor"
+            | "inherit"
+            | "initial"
+            | "unset"
+            | "revert"
+            | "revert-layer"
+            | "accentcolor"
+            | "accentcolortext"
+            | "activetext"
+            | "buttonborder"
+            | "buttonface"
+            | "buttontext"
+            | "canvas"
+            | "canvastext"
+            | "field"
+            | "fieldtext"
+            | "graytext"
+            | "highlight"
+            | "highlighttext"
+            | "linktext"
+            | "mark"
+            | "marktext"
+            | "selecteditem"
+            | "selecteditemtext"
+            | "visitedtext"
+    )
 }
 
 fn svg_escape_text(s: &str, buf: &mut String) {
@@ -9698,7 +9886,7 @@ fn inject_external_sprites(
         if symbol_id == root || root_descendants.contains(&symbol_id) {
             continue;
         }
-        serialize_svg_node(tree, symbol_id, false, None, None, &mut defs);
+        serialize_svg_node(tree, symbol_id, false, None, None, None, &mut defs);
     }
     for (href, url, frag) in &refs {
         let key = format!("{url}#{frag}");
@@ -13288,7 +13476,13 @@ mod tests {
         );
         let svg = tree.query_selector("svg").unwrap().unwrap();
         let layout = crate::dom::layout_dom(&tree, (160.0, 80.0));
-        let markup = serialize_svg_styled(&tree, svg, &layout.styles, None);
+        let markup = serialize_svg_styled(
+            &tree,
+            svg,
+            &layout.styles,
+            &layout.custom_properties,
+            None,
+        );
         assert!(
             markup.contains("fill:#00cc55!important"),
             "computed author fill must cross the standalone boundary: {markup}"
@@ -13380,6 +13574,120 @@ mod tests {
         assert!(
             found,
             "computed color should resolve currentColor in inline svg"
+        );
+    }
+
+    #[test]
+    fn inline_svg_resolves_custom_property_presentation_attributes_like_chromium() {
+        assert!(svg_css_presentation_attribute("transform-origin"));
+        assert!(!svg_css_presentation_attribute("transform"));
+        assert!(!svg_css_presentation_attribute("d"));
+        assert!(!svg_css_presentation_attribute("viewBox"));
+        assert!(!svg_css_presentation_attribute("id"));
+        let tree = parse_html(
+            r##"<html><head><style>#winner{fill:#a030c0}</style></head>
+            <body style="margin:0">
+              <svg id="icon" width="70" height="10" viewBox="0 0 70 10"
+                   fill="#176b75"
+                   style="display:block;--direct:#dc1e28;--nested:#c02020;
+                          --paint:currentColor;--x:10;--w:10;--stroke-width:2;
+                          --cycle-a:var(--cycle-b);--cycle-b:var(--cycle-a);
+                          color:#e09020">
+                <defs>
+                  <linearGradient id="gradient">
+                    <stop id="stop" offset="0" stop-color="var(--nested)"/>
+                  </linearGradient>
+                  <path id="probe" d="var(--path)" fill="none"
+                        stroke="var(--direct)"
+                        stroke-width="var(--stroke-width,4)"/>
+                </defs>
+                <rect id="direct" x="0" width="10" height="10"
+                      fill="var(--direct,rgb(255,255,255))"/>
+                <rect id="nested" x="var(--x)" width="var(--w,5)" height="10"
+                      style="--nested:#20c060"
+                      fill="var(--missing,var(--nested,#ffffff))"/>
+                <rect id="cycle" x="20" width="10" height="10"
+                      fill="var(--cycle-a,#3040e0)"/>
+                <rect id="current" x="30" width="10" height="10"
+                      fill="var(--paint,#000000)"/>
+                <rect id="winner" x="40" width="10" height="10"
+                      fill="var(--direct,#ffffff)"/>
+                <rect id="invalid" x="50" width="10" height="10"
+                      fill="var(--missing)"/>
+                <rect id="invalid-fallback" x="60" width="10" height="10"
+                      fill="var(--missing,definitely-not-a-paint)"/>
+              </svg>
+            </body></html>"##,
+        );
+        let svg = tree.query_selector("#icon").unwrap().unwrap();
+        let laid = crate::dom::layout_dom(&tree, (70.0, 10.0));
+        let markup = serialize_svg_styled(
+            &tree,
+            svg,
+            &laid.styles,
+            &laid.custom_properties,
+            None,
+        );
+
+        assert!(
+            markup.contains(r##"fill="#dc1e28""##)
+                && markup.contains(r##"stop-color="#c02020""##)
+                && markup.contains(r##"stroke="#dc1e28""##)
+                && markup.contains(r#"stroke-width="2""#)
+                && markup.contains(r#"x="10""#)
+                && markup.contains(r#"width="10""#),
+            "computed custom properties must cross the resvg boundary: {markup}"
+        );
+        assert!(
+            markup.contains(r#"d="var(--path)""#),
+            "non-CSS XML attributes must remain literal: {markup}"
+        );
+        assert!(
+            !markup.contains("fill=\"var(")
+                && !markup.contains("stroke=\"var(")
+                && !markup.contains("stop-color=\"var("),
+            "supported presentation attributes must not reach usvg unresolved: {markup}"
+        );
+        let invalid = markup
+            .split("<rect id=\"invalid\"")
+            .nth(1)
+            .and_then(|tail| tail.split_once('>'))
+            .map(|(tag, _)| tag)
+            .expect("serialized invalid rect");
+        assert!(
+            !invalid.contains("fill="),
+            "guaranteed-invalid var() must become inherited/initial, not usvg black: {invalid}"
+        );
+        let invalid_fallback = markup
+            .split("<rect id=\"invalid-fallback\"")
+            .nth(1)
+            .and_then(|tail| tail.split_once('>'))
+            .map(|(tag, _)| tag)
+            .expect("serialized invalid-fallback rect");
+        assert!(
+            !invalid_fallback.contains("fill="),
+            "invalid fallback grammar must inherit instead of becoming usvg black: {invalid_fallback}"
+        );
+        assert!(
+            markup.contains("fill:#a030c0!important"),
+            "author CSS must keep precedence over the presentation attribute: {markup}"
+        );
+
+        let pixmap = paint_dom(&tree, (70.0, 10.0), None).expect("paint custom-property svg");
+        let rgb = |x| {
+            let pixel = pixmap.pixel(x, 5).expect("SVG sample");
+            (pixel.red(), pixel.green(), pixel.blue())
+        };
+        assert_eq!(rgb(5), (0xdc, 0x1e, 0x28), "defined token");
+        assert_eq!(rgb(15), (0x20, 0xc0, 0x60), "nested fallback");
+        assert_eq!(rgb(25), (0x30, 0x40, 0xe0), "cycle fallback");
+        assert_eq!(rgb(35), (0xe0, 0x90, 0x20), "currentColor token");
+        assert_eq!(rgb(45), (0xa0, 0x30, 0xc0), "author CSS winner");
+        assert_eq!(rgb(55), (0x17, 0x6b, 0x75), "invalid var inherits fill");
+        assert_eq!(
+            rgb(65),
+            (0x17, 0x6b, 0x75),
+            "invalid fallback inherits fill"
         );
     }
 
@@ -13584,7 +13892,13 @@ mod tests {
         );
         let laid = crate::dom::layout_dom(&tree, (100.0, 100.0));
         let svg = tree.query_selector("#icon").unwrap().unwrap();
-        let markup = serialize_svg_styled(&tree, svg, &laid.styles, None);
+        let markup = serialize_svg_styled(
+            &tree,
+            svg,
+            &laid.styles,
+            &laid.custom_properties,
+            None,
+        );
         assert!(
             !markup.to_ascii_lowercase().contains("light-dark("),
             "unsupported CSS Color 5 syntax must not reach usvg: {markup}"
