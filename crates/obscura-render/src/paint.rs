@@ -3997,6 +3997,8 @@ fn paint_laid_dom_scrolled(
                 inject_external_sprites(
                     tree,
                     nid,
+                    Some(&laid.styles),
+                    Some(&laid.custom_properties),
                     base_url,
                     &mut markup,
                     image_cache,
@@ -9521,28 +9523,24 @@ fn serialize_svg_node(
                 source_style = Some(attr.value.to_string());
                 continue;
             }
-            let value = if styles.is_some()
-                && svg_css_presentation_attribute(aname)
-                && attr.value.contains("var(")
-            {
+            let value = if styles.is_some() && svg_css_presentation_attribute(aname) {
                 let empty = std::collections::HashMap::new();
                 let properties = custom_properties
                     .and_then(|all| all.get(&nid))
                     .map_or(&empty, std::rc::Rc::as_ref);
-                let Some(resolved) = crate::css::substitute_var_value(&attr.value, properties, 0)
-                else {
-                    // A var() failure makes the declaration invalid at computed
-                    // value time. Omitting this low-specificity presentation
-                    // attribute lets usvg apply the property's inherited or
-                    // initial value, matching the browser cascade.
+                let Some(resolved) = resolve_svg_presentation_value(
+                    aname,
+                    attr.value.as_ref(),
+                    properties,
+                ) else {
+                    // A var() failure makes the declaration invalid at
+                    // computed value time. Omitting this low-specificity
+                    // presentation attribute lets usvg apply the property's
+                    // inherited or initial value, matching the browser
+                    // cascade.
                     continue;
                 };
-                if resolved.trim().is_empty()
-                    || svg_presentation_substitution_is_guaranteed_invalid(aname, &resolved)
-                {
-                    continue;
-                }
-                std::borrow::Cow::Owned(resolved)
+                resolved
             } else {
                 std::borrow::Cow::Borrowed(attr.value.as_ref())
             };
@@ -9571,28 +9569,40 @@ fn serialize_svg_node(
             declarations.push_str("!important;");
         };
         if let Some(computed) = styles.and_then(|all| all.get(&nid)) {
+            let empty = std::collections::HashMap::new();
+            let properties = custom_properties
+                .and_then(|all| all.get(&nid))
+                .map_or(&empty, std::rc::Rc::as_ref);
             if let Some(value) = computed.svg_fill.as_deref() {
-                append(
-                    "fill",
-                    if value.eq_ignore_ascii_case("currentcolor") {
-                        "currentColor"
-                    } else {
-                        value
-                    },
-                );
+                if let Some(value) = resolve_svg_presentation_value("fill", value, properties) {
+                    append(
+                        "fill",
+                        if value.eq_ignore_ascii_case("currentcolor") {
+                            "currentColor"
+                        } else {
+                            value.as_ref()
+                        },
+                    );
+                }
             }
             if let Some(value) = computed.svg_stroke.as_deref() {
-                append(
-                    "stroke",
-                    if value.eq_ignore_ascii_case("currentcolor") {
-                        "currentColor"
-                    } else {
-                        value
-                    },
-                );
+                if let Some(value) = resolve_svg_presentation_value("stroke", value, properties) {
+                    append(
+                        "stroke",
+                        if value.eq_ignore_ascii_case("currentcolor") {
+                            "currentColor"
+                        } else {
+                            value.as_ref()
+                        },
+                    );
+                }
             }
             if let Some(value) = computed.svg_stroke_width.as_deref() {
-                append("stroke-width", value);
+                if let Some(value) =
+                    resolve_svg_presentation_value("stroke-width", value, properties)
+                {
+                    append("stroke-width", value.as_ref());
+                }
             }
             if matches!(tag, "svg" | "text" | "textPath" | "textpath" | "tspan") {
                 if let Some(value) = computed.font_size {
@@ -9729,6 +9739,23 @@ fn svg_css_presentation_attribute(name: &str) -> bool {
     )
 }
 
+fn resolve_svg_presentation_value<'a>(
+    name: &str,
+    value: &'a str,
+    properties: &std::collections::HashMap<String, String>,
+) -> Option<std::borrow::Cow<'a, str>> {
+    if !value.contains("var(") {
+        return Some(std::borrow::Cow::Borrowed(value));
+    }
+    let resolved = crate::css::substitute_var_value(value, properties, 0)?;
+    if resolved.trim().is_empty()
+        || svg_presentation_substitution_is_guaranteed_invalid(name, &resolved)
+    {
+        return None;
+    }
+    Some(std::borrow::Cow::Owned(resolved))
+}
+
 /// Detect only values whose post-substitution grammar is unambiguously
 /// invalid. Functional and escaped values are left to usvg because its SVG
 /// paint grammar is broader than our HTML color parser. An unknown bare
@@ -9815,6 +9842,13 @@ fn svg_escape_attr(s: &str, buf: &mut String) {
 fn inject_external_sprites(
     tree: &DomTree,
     root: obscura_dom::tree::NodeId,
+    styles: Option<&std::collections::HashMap<obscura_dom::tree::NodeId, crate::LayoutStyle>>,
+    custom_properties: Option<
+        &std::collections::HashMap<
+            obscura_dom::tree::NodeId,
+            std::rc::Rc<std::collections::HashMap<String, String>>,
+        >,
+    >,
     base_url: Option<&str>,
     markup: &mut String,
     cache: &mut RenderResourceCache,
@@ -9886,7 +9920,15 @@ fn inject_external_sprites(
         if symbol_id == root || root_descendants.contains(&symbol_id) {
             continue;
         }
-        serialize_svg_node(tree, symbol_id, false, None, None, None, &mut defs);
+        serialize_svg_node(
+            tree,
+            symbol_id,
+            false,
+            styles,
+            custom_properties,
+            None,
+            &mut defs,
+        );
     }
     for (href, url, frag) in &refs {
         let key = format!("{url}#{frag}");
@@ -9903,7 +9945,14 @@ fn inject_external_sprites(
             })
             .clone();
         let Some(symbol) = symbol else { continue };
-        defs.push_str(&symbol);
+        let empty = std::collections::HashMap::new();
+        let properties = custom_properties
+            .and_then(|all| all.get(&root))
+            .map_or(&empty, std::rc::Rc::as_ref);
+        defs.push_str(&resolve_svg_markup_presentation_vars(
+            &symbol,
+            properties,
+        ));
         rewrites.push((href.clone(), format!("#{frag}")));
     }
     if defs.is_empty() {
@@ -9922,6 +9971,145 @@ fn inject_external_sprites(
         let to = format!("href=\"{}\"", svg_escape_attr_str(&local));
         *markup = markup.replace(&from, &to);
     }
+}
+
+/// External sprite fragments are not part of the page DOM, so they have no
+/// `LayoutStyle` entry to carry into the standalone resvg document. Resolve
+/// CSS-variable presentation attributes against the referencing SVG's
+/// inherited custom properties (or their authored fallbacks) while preserving
+/// XML-only attributes byte-for-byte.
+fn resolve_svg_markup_presentation_vars(
+    markup: &str,
+    properties: &std::collections::HashMap<String, String>,
+) -> String {
+    if !markup.contains("var(") {
+        return markup.to_string();
+    }
+    let mut output = String::with_capacity(markup.len());
+    let mut cursor = 0;
+    while let Some(relative_start) = markup[cursor..].find('<') {
+        let start = cursor + relative_start;
+        output.push_str(&markup[cursor..start]);
+        let Some(end) = svg_markup_tag_end(markup, start) else {
+            output.push_str(&markup[start..]);
+            return output;
+        };
+        output.push_str(&resolve_svg_tag_presentation_vars(
+            &markup[start..=end],
+            properties,
+        ));
+        cursor = end + 1;
+    }
+    output.push_str(&markup[cursor..]);
+    output
+}
+
+fn svg_markup_tag_end(markup: &str, start: usize) -> Option<usize> {
+    let bytes = markup.as_bytes();
+    let mut quote = None;
+    let mut cursor = start + 1;
+    while cursor < bytes.len() {
+        let byte = bytes[cursor];
+        if let Some(active) = quote {
+            if byte == active {
+                quote = None;
+            }
+        } else if matches!(byte, b'\'' | b'"') {
+            quote = Some(byte);
+        } else if byte == b'>' {
+            return Some(cursor);
+        }
+        cursor += 1;
+    }
+    None
+}
+
+fn resolve_svg_tag_presentation_vars(
+    tag: &str,
+    properties: &std::collections::HashMap<String, String>,
+) -> String {
+    let bytes = tag.as_bytes();
+    if bytes.len() < 3
+        || bytes[0] != b'<'
+        || matches!(bytes[1], b'/' | b'!' | b'?')
+    {
+        return tag.to_string();
+    }
+    let mut cursor = 1;
+    while cursor < bytes.len()
+        && !bytes[cursor].is_ascii_whitespace()
+        && !matches!(bytes[cursor], b'/' | b'>')
+    {
+        cursor += 1;
+    }
+    let mut replacements: Vec<(usize, usize, String)> = Vec::new();
+    while cursor < bytes.len() {
+        let attribute_start = cursor;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor >= bytes.len() || matches!(bytes[cursor], b'/' | b'>') {
+            break;
+        }
+        let name_start = cursor;
+        while cursor < bytes.len()
+            && !bytes[cursor].is_ascii_whitespace()
+            && !matches!(bytes[cursor], b'=' | b'/' | b'>')
+        {
+            cursor += 1;
+        }
+        let name_end = cursor;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor >= bytes.len() || bytes[cursor] != b'=' {
+            continue;
+        }
+        cursor += 1;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor >= bytes.len() {
+            break;
+        }
+        let quote = matches!(bytes[cursor], b'\'' | b'"').then_some(bytes[cursor]);
+        if quote.is_some() {
+            cursor += 1;
+        }
+        let value_start = cursor;
+        while cursor < bytes.len()
+            && if let Some(quote) = quote {
+                bytes[cursor] != quote
+            } else {
+                !bytes[cursor].is_ascii_whitespace() && !matches!(bytes[cursor], b'/' | b'>')
+            }
+        {
+            cursor += 1;
+        }
+        let value_end = cursor;
+        if quote.is_some() && cursor < bytes.len() {
+            cursor += 1;
+        }
+        let name = &tag[name_start..name_end];
+        let value = &tag[value_start..value_end];
+        if svg_css_presentation_attribute(name) && value.contains("var(") {
+            match resolve_svg_presentation_value(name, value, properties) {
+                Some(std::borrow::Cow::Owned(resolved)) => {
+                    replacements.push((value_start, value_end, resolved));
+                }
+                Some(std::borrow::Cow::Borrowed(_)) => {}
+                None => replacements.push((attribute_start, cursor, String::new())),
+            }
+        }
+    }
+    if replacements.is_empty() {
+        return tag.to_string();
+    }
+    let mut resolved = tag.to_string();
+    for (start, end, replacement) in replacements.into_iter().rev() {
+        resolved.replace_range(start..end, &replacement);
+    }
+    resolved
 }
 
 /// Escape a string for use as an SVG attribute value (`&`, `<`, `"`), returning
@@ -13821,7 +14009,16 @@ mod tests {
         let before = markup.clone();
         let mut cache = RenderResourceCache::default();
         let mut sprite_cache = std::collections::HashMap::new();
-        inject_external_sprites(&tree, svg, None, &mut markup, &mut cache, &mut sprite_cache);
+        inject_external_sprites(
+            &tree,
+            svg,
+            None,
+            None,
+            None,
+            &mut markup,
+            &mut cache,
+            &mut sprite_cache,
+        );
         assert_eq!(markup, before, "same-document use must be untouched");
     }
 
@@ -13839,7 +14036,16 @@ mod tests {
         let mut markup = serialize_svg(&tree, svg);
         let mut cache = RenderResourceCache::default();
         let mut sprite_cache = std::collections::HashMap::new();
-        inject_external_sprites(&tree, svg, None, &mut markup, &mut cache, &mut sprite_cache);
+        inject_external_sprites(
+            &tree,
+            svg,
+            None,
+            None,
+            None,
+            &mut markup,
+            &mut cache,
+            &mut sprite_cache,
+        );
         assert!(
             markup.contains(r#"<defs><symbol id="arrow""#),
             "document-level symbol must be copied into target SVG: {markup}"
@@ -13847,6 +14053,101 @@ mod tests {
         assert!(
             markup.contains(r##"<use href="#arrow""##),
             "local use reference must remain intact: {markup}"
+        );
+    }
+
+    #[test]
+    fn injected_document_symbol_carries_resolved_presentation_style() {
+        let tree = parse_html(
+            r##"<html><head><style>
+                body { --icon-fill: #20c997; }
+                #sprite rect { stroke: var(--icon-stroke, #114433); }
+            </style></head><body>
+                <svg id="sprite" style="display:none"><symbol id="badge" viewBox="0 0 10 10"><rect width="10" height="10" fill="var(--icon-fill, #ff0000)"/></symbol></svg>
+                <svg id="icon" width="10" height="10" viewBox="0 0 10 10"><use href="#badge"/></svg>
+            </body></html>"##,
+        );
+        let laid = crate::dom::layout_dom(&tree, (100.0, 100.0));
+        let svg = tree.query_selector("#icon").unwrap().unwrap();
+        let mut markup = serialize_svg_styled(
+            &tree,
+            svg,
+            &laid.styles,
+            &laid.custom_properties,
+            None,
+        );
+        let mut cache = RenderResourceCache::default();
+        let mut sprite_cache = std::collections::HashMap::new();
+        inject_external_sprites(
+            &tree,
+            svg,
+            Some(&laid.styles),
+            Some(&laid.custom_properties),
+            None,
+            &mut markup,
+            &mut cache,
+            &mut sprite_cache,
+        );
+        assert!(
+            !markup.contains("var("),
+            "injected local symbol must not lose computed custom properties: {markup}"
+        );
+        assert!(
+            markup.contains("#20c997") && markup.contains("#114433"),
+            "injected local symbol must carry attribute and author-CSS colors: {markup}"
+        );
+        let pixmap = render_svg(markup.as_bytes(), 10, 10).expect("injected svg renders");
+        let center = pixmap.pixel(5, 5).expect("center pixel");
+        assert!(
+            center.green() > 150 && center.red() < 80 && center.blue() > 90,
+            "resolved injected-symbol fill must paint instead of usvg black: {center:?}"
+        );
+    }
+
+    #[test]
+    fn injected_external_symbol_resolves_host_custom_properties_and_fallbacks() {
+        let tree = parse_html(
+            r##"<html><body><svg id="icon" style="--icon-fill:#e83e8c" width="10" height="10" viewBox="0 0 10 10"><use href="icons.svg#badge"/></svg></body></html>"##,
+        );
+        let laid = crate::dom::layout_dom(&tree, (100.0, 100.0));
+        let svg = tree.query_selector("#icon").unwrap().unwrap();
+        let mut markup = serialize_svg_styled(
+            &tree,
+            svg,
+            &laid.styles,
+            &laid.custom_properties,
+            None,
+        );
+        let mut cache = RenderResourceCache::default();
+        let mut sprite_cache = std::collections::HashMap::from([(
+            "icons.svg#badge".to_string(),
+            Some(
+                r##"<symbol id="badge" viewBox="0 0 10 10"><rect width="10" height="10" fill="var(--icon-fill, #ff0000)" stroke="var(--missing, #224466)"/><path d="var(--xml-only)"/></symbol>"##
+                    .to_string(),
+            ),
+        )]);
+        inject_external_sprites(
+            &tree,
+            svg,
+            Some(&laid.styles),
+            Some(&laid.custom_properties),
+            None,
+            &mut markup,
+            &mut cache,
+            &mut sprite_cache,
+        );
+        assert!(
+            markup.contains(r##"href="#badge""##),
+            "external use reference must be localized: {markup}"
+        );
+        assert!(
+            markup.contains(r##"fill="#e83e8c""##)
+                && markup.contains(r##"stroke="#224466""##),
+            "external symbol presentation values must use host properties and fallbacks: {markup}"
+        );
+        assert!(
+            markup.contains(r##"d="var(--xml-only)""##),
+            "XML-only attributes must remain literal: {markup}"
         );
     }
 
@@ -13862,7 +14163,16 @@ mod tests {
         let mut markup = serialize_svg(&tree, svg);
         let mut cache = RenderResourceCache::default();
         let mut sprite_cache = std::collections::HashMap::new();
-        inject_external_sprites(&tree, svg, None, &mut markup, &mut cache, &mut sprite_cache);
+        inject_external_sprites(
+            &tree,
+            svg,
+            None,
+            None,
+            None,
+            &mut markup,
+            &mut cache,
+            &mut sprite_cache,
+        );
         inject_svg_current_color(&mut markup, [220, 20, 60, 255]);
         let pixmap = render_svg(markup.as_bytes(), 20, 20).expect("injected svg renders");
         assert!(
