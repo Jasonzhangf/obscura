@@ -3,7 +3,6 @@ use serde_json::{json, Value};
 use crate::dispatch::CdpContext;
 
 const MAX_DEVICE_METRIC_DIMENSION: i64 = 10_000_000;
-const DEFAULT_VIEWPORT: (f32, f32) = (1280.0, 720.0);
 
 fn metric_dimension(params: &Value, name: &str) -> Result<u32, String> {
     let value = params
@@ -16,6 +15,13 @@ fn metric_dimension(params: &Value, name: &str) -> Result<u32, String> {
         ));
     }
     Ok(value as u32)
+}
+
+fn optional_metric_dimension(params: &Value, name: &str) -> Result<Option<u32>, String> {
+    params
+        .get(name)
+        .map(|_| metric_dimension(params, name))
+        .transpose()
 }
 
 fn default_background_color(params: &Value) -> Result<Option<[u8; 4]>, String> {
@@ -72,30 +78,39 @@ pub async fn handle(
                         .to_string(),
                 );
             }
+            let mobile = params
+                .get("mobile")
+                .and_then(Value::as_bool)
+                .ok_or("Emulation.setDeviceMetricsOverride requires boolean mobile")?;
+            // Parse optional dimensions independently. Even an incomplete
+            // screen-size pair must reject a malformed or out-of-range member.
+            let screen_width = optional_metric_dimension(params, "screenWidth")?;
+            let screen_height = optional_metric_dimension(params, "screenHeight")?;
+            let screen_size = match (screen_width, screen_height) {
+                (Some(screen_width), Some(screen_height))
+                    if screen_width > 0 && screen_height > 0 =>
+                {
+                    Some((screen_width as f32, screen_height as f32))
+                }
+                _ => None,
+            };
             let page = ctx
                 .get_session_page_mut(session_id)
                 .ok_or("No page for session")?;
-            page.set_viewport((
-                if width == 0 {
-                    DEFAULT_VIEWPORT.0
-                } else {
-                    width as f32
-                },
-                if height == 0 {
-                    DEFAULT_VIEWPORT.1
-                } else {
-                    height as f32
-                },
-            ));
-            page.set_device_scale_factor(device_scale_factor as f32);
+            page.apply_device_metrics_override(
+                (width > 0).then_some(width as f32),
+                (height > 0).then_some(height as f32),
+                (device_scale_factor > 0.0).then_some(device_scale_factor as f32),
+                screen_size,
+                mobile,
+            );
             Ok(json!({}))
         }
         "clearDeviceMetricsOverride" => {
             let page = ctx
                 .get_session_page_mut(session_id)
                 .ok_or("No page for session")?;
-            page.set_viewport(DEFAULT_VIEWPORT);
-            page.set_device_scale_factor(1.0);
+            page.clear_device_metrics_override();
             Ok(json!({}))
         }
         "setDefaultBackgroundColorOverride" => {
@@ -126,7 +141,14 @@ mod tests {
 
         handle(
             "setDeviceMetricsOverride",
-            &json!({"width": 1024, "height": 768, "deviceScaleFactor": 2}),
+            &json!({
+                "width": 1024,
+                "height": 768,
+                "deviceScaleFactor": 2,
+                "mobile": false,
+                "screenWidth": 1440,
+                "screenHeight": 900
+            }),
             &mut ctx,
             &session_id,
         )
@@ -141,9 +163,49 @@ mod tests {
         assert_eq!(
             page.evaluate(
                 "return [innerWidth, innerHeight, visualViewport.width,\
-                         visualViewport.height, devicePixelRatio];"
+                         visualViewport.height, screen.width, screen.height,\
+                         screen.availWidth, screen.availHeight, devicePixelRatio];"
             ),
-            json!([1024, 768, 1024, 768, 2])
+            json!([1024, 768, 1024, 768, 1440, 900, 1440, 900, 2])
+        );
+    }
+
+    #[tokio::test]
+    async fn omitted_screen_metrics_clear_only_the_screen_override() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = Some("screen-session".to_string());
+        ctx.sessions.insert(session_id.clone().unwrap(), page_id);
+
+        for params in [
+            json!({
+                "width": 1024,
+                "height": 768,
+                "deviceScaleFactor": 1,
+                "mobile": false,
+                "screenWidth": 1111,
+                "screenHeight": 777
+            }),
+            json!({
+                "width": 800,
+                "height": 600,
+                "deviceScaleFactor": 1,
+                "mobile": false
+            }),
+        ] {
+            handle("setDeviceMetricsOverride", &params, &mut ctx, &session_id)
+                .await
+                .unwrap();
+        }
+
+        let page = ctx.get_session_page_mut(&session_id).unwrap();
+        assert_eq!(page.viewport, (800.0, 600.0));
+        assert_eq!(
+            page.evaluate(
+                "return [innerWidth, innerHeight, screen.width !== 1111,\
+                         screen.height !== 777];"
+            ),
+            json!([800, 600, true, true])
         );
     }
 
@@ -154,9 +216,9 @@ mod tests {
         let session_id = Some("viewport-session".to_string());
         ctx.sessions.insert(session_id.clone().unwrap(), page_id);
         for params in [
-            json!({"width": 0.5, "height": 768, "deviceScaleFactor": 1}),
-            json!({"width": 10_000_001, "height": 768, "deviceScaleFactor": 1}),
-            json!({"width": -1, "height": 768, "deviceScaleFactor": 1}),
+            json!({"width": 0.5, "height": 768, "deviceScaleFactor": 1, "mobile": false}),
+            json!({"width": 10_000_001, "height": 768, "deviceScaleFactor": 1, "mobile": false}),
+            json!({"width": -1, "height": 768, "deviceScaleFactor": 1, "mobile": false}),
         ] {
             assert!(
                 handle("setDeviceMetricsOverride", &params, &mut ctx, &session_id)
@@ -173,9 +235,18 @@ mod tests {
         let page_id = ctx.create_page();
         let session_id = Some("zero-size-session".to_string());
         ctx.sessions.insert(session_id.clone().unwrap(), page_id);
+        let page = ctx.get_session_page_mut(&session_id).unwrap();
+        page.set_viewport((1111.0, 777.0));
+        page.set_device_scale_factor(1.5);
+
         handle(
             "setDeviceMetricsOverride",
-            &json!({"width": 0, "height": 0, "deviceScaleFactor": 0}),
+            &json!({
+                "width": 0,
+                "height": 0,
+                "deviceScaleFactor": 0,
+                "mobile": false
+            }),
             &mut ctx,
             &session_id,
         )
@@ -183,20 +254,33 @@ mod tests {
         .expect("zero disables the overrides");
 
         let page = ctx.get_session_page_mut(&session_id).unwrap();
-        assert_eq!(page.viewport, DEFAULT_VIEWPORT);
-        assert_eq!(page.device_scale_factor, 1.0);
+        assert_eq!(page.viewport, (1111.0, 777.0));
+        assert_eq!(page.device_scale_factor, 1.5);
     }
 
     #[tokio::test]
-    async fn device_scale_factor_zero_disables_override_and_clear_restores_defaults() {
+    async fn repeated_overrides_keep_baseline_and_clear_restores_it() {
         let mut ctx = CdpContext::new();
         let page_id = ctx.create_page();
         let session_id = Some("scale-session".to_string());
         ctx.sessions.insert(session_id.clone().unwrap(), page_id);
+        let page = ctx.get_session_page_mut(&session_id).unwrap();
+        page.set_viewport((1111.0, 777.0));
+        page.set_device_scale_factor(1.5);
+        let baseline_screen = page.evaluate(
+            "return [screen.width, screen.height, screen.availWidth, screen.availHeight];",
+        );
 
         handle(
             "setDeviceMetricsOverride",
-            &json!({"width": 640, "height": 480, "deviceScaleFactor": 3}),
+            &json!({
+                "width": 640,
+                "height": 480,
+                "deviceScaleFactor": 3,
+                "mobile": false,
+                "screenWidth": 900,
+                "screenHeight": 700
+            }),
             &mut ctx,
             &session_id,
         )
@@ -211,18 +295,20 @@ mod tests {
 
         handle(
             "setDeviceMetricsOverride",
-            &json!({"width": 640, "height": 480, "deviceScaleFactor": 0}),
+            &json!({
+                "width": 0,
+                "height": 333,
+                "deviceScaleFactor": 0,
+                "mobile": false
+            }),
             &mut ctx,
             &session_id,
         )
         .await
-        .expect("zero disables the scale override");
-        assert_eq!(
-            ctx.get_session_page(&session_id)
-                .unwrap()
-                .device_scale_factor,
-            1.0
-        );
+        .expect("zero restores the corresponding baseline metric");
+        let page = ctx.get_session_page(&session_id).unwrap();
+        assert_eq!(page.viewport, (1111.0, 333.0));
+        assert_eq!(page.device_scale_factor, 1.5);
 
         handle(
             "clearDeviceMetricsOverride",
@@ -232,9 +318,98 @@ mod tests {
         )
         .await
         .unwrap();
+        let page = ctx.get_session_page_mut(&session_id).unwrap();
+        assert_eq!(page.viewport, (1111.0, 777.0));
+        assert_eq!(page.device_scale_factor, 1.5);
+        assert_eq!(
+            page.evaluate(
+                "return [screen.width, screen.height, screen.availWidth, screen.availHeight];"
+            ),
+            baseline_screen
+        );
+    }
+
+    #[tokio::test]
+    async fn inactive_clear_is_a_no_op() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = Some("inactive-clear-session".to_string());
+        ctx.sessions.insert(session_id.clone().unwrap(), page_id);
+        let page = ctx.get_session_page_mut(&session_id).unwrap();
+        page.set_viewport((901.0, 607.0));
+        page.set_device_scale_factor(1.25);
+
+        handle(
+            "clearDeviceMetricsOverride",
+            &json!({}),
+            &mut ctx,
+            &session_id,
+        )
+        .await
+        .unwrap();
+
         let page = ctx.get_session_page(&session_id).unwrap();
-        assert_eq!(page.viewport, (1280.0, 720.0));
-        assert_eq!(page.device_scale_factor, 1.0);
+        assert_eq!(page.viewport, (901.0, 607.0));
+        assert_eq!(page.device_scale_factor, 1.25);
+    }
+
+    #[tokio::test]
+    async fn mobile_without_complete_screen_size_uses_effective_viewport() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = Some("mobile-screen-session".to_string());
+        ctx.sessions.insert(session_id.clone().unwrap(), page_id);
+
+        for params in [
+            json!({
+                "width": 800,
+                "height": 600,
+                "deviceScaleFactor": 1,
+                "mobile": true
+            }),
+            json!({
+                "width": 700,
+                "height": 500,
+                "deviceScaleFactor": 1,
+                "mobile": true,
+                "screenWidth": 1000
+            }),
+        ] {
+            handle("setDeviceMetricsOverride", &params, &mut ctx, &session_id)
+                .await
+                .unwrap();
+        }
+
+        let page = ctx.get_session_page_mut(&session_id).unwrap();
+        assert_eq!(
+            page.evaluate(
+                "return [screen.width, screen.height, screen.availWidth, screen.availHeight];"
+            ),
+            json!([700, 500, 700, 500])
+        );
+    }
+
+    #[tokio::test]
+    async fn validates_mobile_and_each_optional_screen_dimension() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = Some("validation-session".to_string());
+        ctx.sessions.insert(session_id.clone().unwrap(), page_id);
+
+        for params in [
+            json!({"width": 800, "height": 600, "deviceScaleFactor": 1}),
+            json!({"width": 800, "height": 600, "deviceScaleFactor": 1, "mobile": "false"}),
+            json!({"width": 800, "height": 600, "deviceScaleFactor": 1, "mobile": false, "screenWidth": -1}),
+            json!({"width": 800, "height": 600, "deviceScaleFactor": 1, "mobile": false, "screenHeight": 0.5}),
+            json!({"width": 800, "height": 600, "deviceScaleFactor": 1, "mobile": false, "screenWidth": 10_000_001}),
+        ] {
+            assert!(
+                handle("setDeviceMetricsOverride", &params, &mut ctx, &session_id)
+                    .await
+                    .is_err(),
+                "must reject {params}"
+            );
+        }
     }
 
     #[test]

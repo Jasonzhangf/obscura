@@ -105,6 +105,12 @@ const _dom = (cmd, a1, a2) => {
     if (typeof globalThis.__obscura_recompute_resizes === "function") {
       globalThis.__obscura_recompute_resizes();
     }
+    // Intersection geometry is invalidated synchronously as well. Deferring
+    // this solely through MutationObserver misses the IO phase of the current
+    // rendering opportunity when an rAF callback changes layout.
+    if (typeof globalThis.__obscura_recompute_intersections === "function") {
+      globalThis.__obscura_recompute_intersections();
+    }
   }
   return result;
 };
@@ -850,37 +856,76 @@ let _rafPending = new Map();
 let _rafCurrentBatch = null;
 let _rafFrameScheduled = false;
 let _rafRunningFrame = false;
+let _renderOpportunityScheduled = false;
+let _renderOpportunityRunning = false;
+
+function _renderOpportunityHasWork() {
+  return _rafFrameScheduled || _resizeRenderCheckpointPending
+    || _intersectionRenderCheckpointPending;
+}
+
+// Gecko and the HTML rendering algorithm use one refresh opportunity for
+// every rendering phase. Keeping rAF, ResizeObserver, and
+// IntersectionObserver on independent 16ms timers triples host wakeups and
+// lets registration order change which geometry a callback sees. Run the
+// phases once, in browser order, from one task instead:
+//
+//   animation frame callbacks -> layout/ResizeObserver -> intersections
+//
+// A phase which queues more work while this task is running belongs to the
+// next opportunity unless a later phase in this opportunity can consume it.
+function _scheduleRenderingOpportunity() {
+  if (_renderOpportunityScheduled || _renderOpportunityRunning
+      || !_renderOpportunityHasWork()) return;
+  _renderOpportunityScheduled = true;
+  _scheduleAfter(_RAF_FRAME_DELAY_MS, _runRenderingOpportunity);
+}
+
+function _runRenderingOpportunity() {
+  _renderOpportunityScheduled = false;
+  _renderOpportunityRunning = true;
+  try {
+    if (_rafFrameScheduled) _runAnimationFrameBatch();
+    if (_resizeRenderCheckpointPending) _runResizeRenderCheckpoint();
+    if (_intersectionRenderCheckpointPending) _runIntersectionRenderCheckpoint();
+  } finally {
+    _renderOpportunityRunning = false;
+    _scheduleRenderingOpportunity();
+  }
+}
 
 function _scheduleAnimationFrame() {
   if (_rafFrameScheduled || _rafRunningFrame || _rafPending.size === 0) return;
   _rafFrameScheduled = true;
-  _scheduleAfter(_RAF_FRAME_DELAY_MS, () => {
-    _rafFrameScheduled = false;
-    if (_rafPending.size === 0) return;
+  _scheduleRenderingOpportunity();
+}
 
-    // Swap before invoking anything. A callback requested while this batch is
-    // running therefore belongs to the next frame. Every callback in this
-    // batch receives the same rendering timestamp.
-    const batch = _rafPending;
-    _rafPending = new Map();
-    _rafCurrentBatch = batch;
-    _rafRunningFrame = true;
-    const timestamp = performance.now();
-    try {
-      for (const [id, callback] of batch) {
-        // cancelAnimationFrame() may remove a later callback while an earlier
-        // callback in the same frame is running.
-        if (!batch.has(id)) continue;
-        batch.delete(id);
-        try { callback(timestamp); }
-        catch (e) { console.error("Animation frame error:", e); }
-      }
-    } finally {
-      _rafRunningFrame = false;
-      _rafCurrentBatch = null;
-      _scheduleAnimationFrame();
+function _runAnimationFrameBatch() {
+  _rafFrameScheduled = false;
+  if (_rafPending.size === 0) return;
+
+  // Swap before invoking anything. A callback requested while this batch is
+  // running therefore belongs to the next frame. Every callback in this
+  // batch receives the same rendering timestamp.
+  const batch = _rafPending;
+  _rafPending = new Map();
+  _rafCurrentBatch = batch;
+  _rafRunningFrame = true;
+  const timestamp = performance.now();
+  try {
+    for (const [id, callback] of batch) {
+      // cancelAnimationFrame() may remove a later callback while an earlier
+      // callback in the same frame is running.
+      if (!batch.has(id)) continue;
+      batch.delete(id);
+      try { callback(timestamp); }
+      catch (e) { console.error("Animation frame error:", e); }
     }
-  });
+  } finally {
+    _rafRunningFrame = false;
+    _rafCurrentBatch = null;
+    _scheduleAnimationFrame();
+  }
 }
 
 globalThis.requestAnimationFrame = (fn) => {
@@ -6099,15 +6144,17 @@ globalThis.WebGLRenderingContext = class WebGLRenderingContext {};
 globalThis.WebGL2RenderingContext = class WebGL2RenderingContext {};
 
 class Screen {
-  constructor(w, h) {
+  constructor(w, h, availW, availH) {
     this._w = w; this._h = h;
+    this._availW = availW === undefined ? w : availW;
+    this._availH = availH === undefined ? h - 40 : availH;
     this.colorDepth = 24; this.pixelDepth = 24; this.availTop = 0; this.availLeft = 0;
     this.orientation = {type:'landscape-primary',angle:0,addEventListener(){},removeEventListener(){},dispatchEvent(){return true;}};
   }
   get width() { return this._w; }
   get height() { return this._h; }
-  get availWidth() { return this._w; }
-  get availHeight() { return this._h - 40; }
+  get availWidth() { return this._availW; }
+  get availHeight() { return this._availH; }
 }
 ['width','height','availWidth','availHeight'].forEach(function(k) {
   var d = Object.getOwnPropertyDescriptor(Screen.prototype, k);
@@ -6115,6 +6162,29 @@ class Screen {
 });
 globalThis.Screen = Screen;
 globalThis.screen = new Screen(1920, 1080);
+function _applyScreenSize(w, h, emulated) {
+  if (globalThis.screen instanceof Screen) {
+    globalThis.screen._w = w;
+    globalThis.screen._h = h;
+    globalThis.screen._availW = w;
+    globalThis.screen._availH = emulated ? h : h - 40;
+  } else {
+    globalThis.screen = new Screen(w, h, w, emulated ? h : h - 40);
+  }
+}
+globalThis.__obscura_set_screen_override = function(w, h, emulated) {
+  globalThis.__obscura_screen_emulated = !!emulated;
+  if (Number.isFinite(w) && Number.isFinite(h) && w > 0 && h > 0) {
+    globalThis.__obscura_screen_w = w;
+    globalThis.__obscura_screen_h = h;
+    _applyScreenSize(w, h, !!emulated);
+    return;
+  }
+  delete globalThis.__obscura_screen_w;
+  delete globalThis.__obscura_screen_h;
+  const fallback = _fp('screen');
+  _applyScreenSize(fallback[0], fallback[1], !!emulated);
+};
 globalThis.visualViewport = { width:1920, height:1000, offsetLeft:0, offsetTop:0, scale:1, addEventListener(){}, removeEventListener(){} };
 globalThis.devicePixelRatio = 1;
 globalThis.innerWidth = 1920; globalThis.innerHeight = 1000;
@@ -6821,61 +6891,57 @@ function _scheduleResizeRenderCheckpoint() {
   }
   if (_resizeRenderCheckpointPending) return;
   _resizeRenderCheckpointPending = true;
-  // Resize observations are gathered at a rendering opportunity, not once
-  // for every zero-delay task which happens to mutate the DOM. A frame-sized
-  // one-shot coalesces framework microtasks/timers without installing a
-  // perpetual frame pump; the callback still runs promptly when the embedder
-  // explicitly drives the event loop.
-  _scheduleAfter(_RAF_FRAME_DELAY_MS, () => {
-    _resizeRenderCheckpointPending = false;
-    _resizeRenderCheckpointRunning = true;
-    let depth = 0;
-    let skipped = false;
-    // Depth strictly increases after each broadcast, so this is naturally
-    // bounded by tree depth. Keep a hard ceiling for adversarial callbacks
-    // that manufacture an ever-deeper subtree during one delivery cycle.
-    for (let iteration = 0; iteration < 64; iteration++) {
-      _resizeRenderCheckpointRerun = false;
-      const observers = [...globalThis.__resizeObservers];
-      const targets = [];
-      const seenTargets = new Set();
-      for (const observer of observers) {
-        for (const target of observer._targets.keys()) {
-          if (seenTargets.has(target)) continue;
-          seenTargets.add(target);
-          targets.push(target);
-        }
-      }
-      const measurements = _roMeasurements(targets);
-      let shallowest = Infinity;
-      let active = false;
-      skipped = false;
-      // Gather every observer before invoking any callback. A callback from an
-      // earlier observer must not change the geometry gathered for a later one.
-      for (const observer of observers) {
-        const gathered = observer._gather(measurements, depth);
-        active = active || gathered.active;
-        skipped = skipped || gathered.skipped;
-        shallowest = Math.min(shallowest, gathered.shallowest);
-      }
-      if (!active) break;
-      for (const observer of observers) observer._broadcast();
-      depth = shallowest;
-      if (!_resizeRenderCheckpointRerun) break;
-      if (iteration === 63) skipped = true;
-    }
-    _resizeRenderCheckpointRunning = false;
+  _scheduleRenderingOpportunity();
+}
+function _runResizeRenderCheckpoint() {
+  _resizeRenderCheckpointPending = false;
+  _resizeRenderCheckpointRunning = true;
+  let depth = 0;
+  let skipped = false;
+  // Depth strictly increases after each broadcast, so this is naturally
+  // bounded by tree depth. Keep a hard ceiling for adversarial callbacks
+  // that manufacture an ever-deeper subtree during one delivery cycle.
+  for (let iteration = 0; iteration < 64; iteration++) {
     _resizeRenderCheckpointRerun = false;
-    if (skipped) {
-      // Match the standardized loop-limit signal without queuing another
-      // internal task that could keep a pathological page permanently busy.
-      try {
-        globalThis.dispatchEvent(new ErrorEvent("error", {
-          message: "ResizeObserver loop completed with undelivered notifications."
-        }));
-      } catch (_error) {}
+    const observers = [...globalThis.__resizeObservers];
+    const targets = [];
+    const seenTargets = new Set();
+    for (const observer of observers) {
+      for (const target of observer._targets.keys()) {
+        if (seenTargets.has(target)) continue;
+        seenTargets.add(target);
+        targets.push(target);
+      }
     }
-  });
+    const measurements = _roMeasurements(targets);
+    let shallowest = Infinity;
+    let active = false;
+    skipped = false;
+    // Gather every observer before invoking any callback. A callback from an
+    // earlier observer must not change the geometry gathered for a later one.
+    for (const observer of observers) {
+      const gathered = observer._gather(measurements, depth);
+      active = active || gathered.active;
+      skipped = skipped || gathered.skipped;
+      shallowest = Math.min(shallowest, gathered.shallowest);
+    }
+    if (!active) break;
+    for (const observer of observers) observer._broadcast();
+    depth = shallowest;
+    if (!_resizeRenderCheckpointRerun) break;
+    if (iteration === 63) skipped = true;
+  }
+  _resizeRenderCheckpointRunning = false;
+  _resizeRenderCheckpointRerun = false;
+  if (skipped) {
+    // Match the standardized loop-limit signal without queuing another
+    // internal task that could keep a pathological page permanently busy.
+    try {
+      globalThis.dispatchEvent(new ErrorEvent("error", {
+        message: "ResizeObserver loop completed with undelivered notifications."
+      }));
+    } catch (_error) {}
+  }
 }
 globalThis.__obscura_recompute_resizes = _scheduleResizeRenderCheckpoint;
 function _roNumber(value) {
@@ -8365,48 +8431,48 @@ globalThis.NodeFilter = {
 globalThis.__intersectionObservers = [];
 let _intersectionRenderCheckpointPending = false;
 function _scheduleIntersectionRenderCheckpoint() {
+  if (!globalThis.__intersectionObservers.some(
+    observer => observer._connected && observer._targets.size,
+  )) return;
   if (_intersectionRenderCheckpointPending) return;
   _intersectionRenderCheckpointPending = true;
-  // Intersection observation is part of the browser's rendering update, not
-  // a synchronous side effect of observe() or a DOM mutation. One queued task
-  // coalesces every observer/target and therefore performs one bulk layout
-  // read for the checkpoint without installing a perpetual frame pump.
-  _scheduleAfter(_RAF_FRAME_DELAY_MS, () => {
-    _intersectionRenderCheckpointPending = false;
-    const observers = globalThis.__intersectionObservers.filter(
-      observer => observer._connected && observer._targets.size,
-    );
-    const elements = [];
-    const seen = new Set();
-    const addElement = element => {
-      if (!(element instanceof Element) || seen.has(element)) return;
-      seen.add(element);
-      elements.push(element);
-    };
+  _scheduleRenderingOpportunity();
+}
+function _runIntersectionRenderCheckpoint() {
+  _intersectionRenderCheckpointPending = false;
+  const observers = globalThis.__intersectionObservers.filter(
+    observer => observer._connected && observer._targets.size,
+  );
+  const elements = [];
+  const seen = new Set();
+  const addElement = element => {
+    if (!(element instanceof Element) || seen.has(element)) return;
+    seen.add(element);
+    elements.push(element);
+  };
 
-    // Gather the complete clip graph before entering native code. DOM/shadow
-    // ancestry stays in JS, while every geometry/style value comes from the
-    // same animation sample and PreparedRender snapshot.
-    for (const observer of observers) {
-      for (const target of observer._targets) addElement(target);
-    }
-    for (const observer of observers) {
-      if (observer._root instanceof Element) addElement(observer._root);
-      for (const target of observer._targets) {
-        let ancestor = target.parentNode || target.host || null;
-        while (ancestor && ancestor !== observer._root && ancestor.nodeType !== 9) {
-          addElement(ancestor);
-          ancestor = ancestor.parentNode || ancestor.host || null;
-        }
+  // Gather the complete clip graph before entering native code. DOM/shadow
+  // ancestry stays in JS, while every geometry/style value comes from the
+  // same animation sample and PreparedRender snapshot.
+  for (const observer of observers) {
+    for (const target of observer._targets) addElement(target);
+  }
+  for (const observer of observers) {
+    if (observer._root instanceof Element) addElement(observer._root);
+    for (const target of observer._targets) {
+      let ancestor = target.parentNode || target.host || null;
+      while (ancestor && ancestor !== observer._root && ancestor.nodeType !== 9) {
+        addElement(ancestor);
+        ancestor = ancestor.parentNode || ancestor.host || null;
       }
     }
-    const measurements = _ioMeasurements(elements);
-    for (const observer of observers) {
-      if (observer._connected && observer._targets.size) {
-        observer._check([...observer._targets], false, measurements);
-      }
+  }
+  const measurements = _ioMeasurements(elements);
+  for (const observer of observers) {
+    if (observer._connected && observer._targets.size) {
+      observer._check([...observer._targets], false, measurements);
     }
-  });
+  }
 }
 function _ioRect(x, y, width, height) {
   return {
@@ -8628,12 +8694,15 @@ globalThis.IntersectionObserver = class IntersectionObserver {
     }
     if (!this._records.length || this._deliveryPending) return;
     this._deliveryPending = true;
-    Promise.resolve().then(() => {
+    // The IntersectionObserver task source delivers after the rendering
+    // update and its microtask checkpoint. A Promise reaction delivers too
+    // early and changes takeRecords(), timer, and framework effect ordering.
+    _browserPostedTaskEnqueue(() => {
       this._deliveryPending = false;
       if (!this._connected || !this._records.length) return;
       const records = this.takeRecords();
       try { this._callback(records, this); } catch (e) {}
-    });
+    }, _schedulerPriorityRank["user-visible"] * 2);
   }
   observe(el) {
     if (!el || this._targets.has(el)) return;
@@ -13593,7 +13662,10 @@ globalThis.__obscura_init = function() {
   _reconcileWindowNamedProperties(previousWindowNames);
 
   const scr = _fp('screen');
-  const sw = scr[0], sh = scr[1];
+  const sw = Number.isFinite(globalThis.__obscura_screen_w) && globalThis.__obscura_screen_w > 0
+    ? globalThis.__obscura_screen_w : scr[0];
+  const sh = Number.isFinite(globalThis.__obscura_screen_h) && globalThis.__obscura_screen_h > 0
+    ? globalThis.__obscura_screen_h : scr[1];
   // The OS screen and the page viewport are different browser concepts.
   // Keep the fingerprinted screen, but let the embedding browser provide the
   // actual CSS viewport so responsive JavaScript, layout, and screenshots all
@@ -13602,7 +13674,7 @@ globalThis.__obscura_init = function() {
     ? globalThis.__obscura_viewport_w : sw;
   const vh = Number.isFinite(globalThis.__obscura_viewport_h) && globalThis.__obscura_viewport_h > 0
     ? globalThis.__obscura_viewport_h : sh - 80;
-  globalThis.screen = new Screen(sw, sh);
+  _applyScreenSize(sw, sh, !!globalThis.__obscura_screen_emulated);
   globalThis.visualViewport = { width:vw, height:vh, offsetLeft:0, offsetTop:0, scale:1, addEventListener(){}, removeEventListener(){} };
   // Screen dimensions do not determine the output device scale. The embedding
   // browser applies an explicit device metric after page initialization; the

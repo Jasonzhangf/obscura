@@ -470,6 +470,29 @@ impl ObscuraJsRuntime {
         );
     }
 
+    /// Override the physical screen metrics exposed to page JavaScript.
+    /// Unlike the CSS viewport, CDP only changes these when both optional
+    /// screen dimensions are supplied. Passing `None` restores the native
+    /// screen surface while keeping the viewport override intact.
+    pub fn set_screen_size_override(&mut self, size: Option<(f64, f64)>, emulated: bool) {
+        let script = match size {
+            Some((width, height))
+                if width.is_finite()
+                    && height.is_finite()
+                    && width > 0.0
+                    && height > 0.0 =>
+            {
+                format!(
+                    "globalThis.__obscura_set_screen_override({width},{height},{emulated});"
+                )
+            }
+            _ => format!(
+                "globalThis.__obscura_set_screen_override(null,null,{emulated});"
+            ),
+        };
+        let _ = self.runtime.execute_script("<set-screen-size>", script);
+    }
+
     /// Current clamped root scroll offset shared by CSSOM geometry and paint.
     #[cfg(feature = "render")]
     pub fn scroll_offset(&self) -> (f32, f32) {
@@ -4455,6 +4478,38 @@ mod tests {
     }
 
     #[test]
+    fn screen_override_is_independent_live_and_preserves_screen_identity() {
+        let dom = parse_html("<html><body></body></html>");
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_viewport(1024.0, 768.0);
+        rt.run_page_init();
+        rt.execute_script("remember-screen", "globalThis.__screenBefore = screen;")
+            .unwrap();
+
+        rt.set_screen_size_override(Some((1440.0, 900.0)), true);
+        assert_eq!(
+            rt.evaluate(
+                "[innerWidth, innerHeight, screen.width, screen.height,\
+                  screen.availWidth, screen.availHeight, screen === __screenBefore]"
+            )
+            .unwrap(),
+            serde_json::json!([1024, 768, 1440, 900, 1440, 900, true])
+        );
+
+        rt.set_screen_size_override(None, false);
+        assert_eq!(
+            rt.evaluate(
+                "[innerWidth, innerHeight, screen.width !== 1440,\
+                  screen.height !== 900, screen.availHeight === screen.height - 40,\
+                  screen === __screenBefore]"
+            )
+            .unwrap(),
+            serde_json::json!([1024, 768, true, true, true, true])
+        );
+    }
+
+    #[test]
     fn match_media_evaluates_query_lists_conjunctions_ranges_and_orientation() {
         let dom = parse_html("<html><body></body></html>");
         let mut rt = ObscuraJsRuntime::new();
@@ -5597,6 +5652,79 @@ mod tests {
                 true,
                 true
             ])
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rendering_opportunity_orders_raf_resize_and_intersection_phases() {
+        let mut rt = setup_runtime(
+            "<html><body><div id='target' style='width:20px;height:20px'></div></body></html>",
+        );
+        rt.execute_script(
+            "rendering-opportunity-order",
+            r#"
+                globalThis.__renderPhaseOrder = [];
+                const target = document.getElementById("target");
+                new ResizeObserver(() => __renderPhaseOrder.push("resize")).observe(target);
+                new IntersectionObserver(() => __renderPhaseOrder.push("intersection")).observe(target);
+                requestAnimationFrame(() => {
+                    __renderPhaseOrder.push("raf");
+                    target.style.width = "40px";
+                });
+            "#,
+        )
+        .unwrap();
+
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__renderPhaseOrder.slice(0, 3)").unwrap(),
+            serde_json::json!(["raf", "resize", "intersection"]),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn raf_geometry_mutation_reaches_settled_intersection_before_next_frame() {
+        let mut rt = setup_runtime(
+            "<html><body style='margin:0'><div id='spacer' style='height:150px'></div><div id='target' style='height:20px'></div></body></html>",
+        );
+        rt.set_viewport(200.0, 100.0);
+        rt.execute_script(
+            "settle-intersection",
+            r#"
+                globalThis.__sameFrameOrder = [];
+                globalThis.__sameFrameInitial = false;
+                const target = document.getElementById("target");
+                globalThis.__sameFrameObserver = new IntersectionObserver(entries => {
+                    if (!__sameFrameInitial) {
+                        __sameFrameInitial = true;
+                        return;
+                    }
+                    if (entries.some(entry => entry.isIntersecting)) {
+                        __sameFrameOrder.push("intersection");
+                    }
+                });
+                __sameFrameObserver.observe(target);
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(50).await.unwrap();
+
+        rt.execute_script(
+            "mutate-in-animation-frame",
+            r#"
+                requestAnimationFrame(() => {
+                    __sameFrameOrder.push("raf");
+                    document.getElementById("spacer").style.height = "0px";
+                    requestAnimationFrame(() => __sameFrameOrder.push("next-raf"));
+                });
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(80).await.unwrap();
+
+        assert_eq!(
+            rt.evaluate("__sameFrameOrder").unwrap(),
+            serde_json::json!(["raf", "intersection", "next-raf"]),
         );
     }
 

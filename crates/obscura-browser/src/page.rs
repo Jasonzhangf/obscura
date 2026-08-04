@@ -207,6 +207,12 @@ pub struct StoredResponseBody {
     pub base64_encoded: bool,
 }
 
+#[derive(Clone, Copy)]
+struct DeviceMetricsBaseline {
+    viewport: (f32, f32),
+    device_scale_factor: f32,
+}
+
 pub struct Page {
     pub id: String,
     pub frame_id: String,
@@ -224,6 +230,14 @@ pub struct Page {
     /// CSS viewport used by responsive page JavaScript and CDP screenshots.
     /// The physical `screen` fingerprint remains independent.
     pub viewport: (f32, f32),
+    /// Optional CDP physical-screen override. This is separate from the CSS
+    /// viewport and survives navigation, matching device-metrics emulation.
+    screen_size_override: Option<(f32, f32)>,
+    screen_metrics_emulated: bool,
+    /// Metrics captured when CDP device emulation is first enabled. Chromium
+    /// keeps this baseline across subsequent override calls and restores it
+    /// only when the override is cleared.
+    device_metrics_baseline: Option<DeviceMetricsBaseline>,
     /// Output device pixels per CSS pixel for CDP surface capture. Layout and
     /// CSSOM stay in CSS pixels; Emulation.setDeviceMetricsOverride owns this
     /// independent raster scale.
@@ -881,6 +895,9 @@ impl Page {
             title: String::new(),
             referrer: String::new(),
             viewport: (1280.0, 720.0),
+            screen_size_override: None,
+            screen_metrics_emulated: false,
+            device_metrics_baseline: None,
             device_scale_factor: 1.0,
             default_background_color_override: None,
             encoding: "UTF-8".to_string(),
@@ -948,6 +965,62 @@ impl Page {
         if let Some(js) = &mut self.js {
             js.set_viewport(viewport.0 as f64, viewport.1 as f64);
         }
+    }
+
+    /// Set or clear the CDP physical-screen override independently of layout.
+    pub fn set_screen_size_override(&mut self, size: Option<(f32, f32)>, emulated: bool) {
+        self.screen_size_override = size.filter(|(width, height)| {
+            width.is_finite() && height.is_finite() && *width > 0.0 && *height > 0.0
+        });
+        self.screen_metrics_emulated = emulated;
+        if let Some(js) = &mut self.js {
+            js.set_screen_size_override(
+                self.screen_size_override
+                    .map(|(width, height)| (width as f64, height as f64)),
+                self.screen_metrics_emulated,
+            );
+        }
+    }
+
+    /// Apply CDP device metrics relative to the metrics that were active when
+    /// emulation was first enabled. A zero protocol dimension/scale is passed
+    /// as `None` and therefore restores that axis from the retained baseline.
+    pub fn apply_device_metrics_override(
+        &mut self,
+        width: Option<f32>,
+        height: Option<f32>,
+        device_scale_factor: Option<f32>,
+        screen_size: Option<(f32, f32)>,
+        mobile: bool,
+    ) {
+        let baseline = *self
+            .device_metrics_baseline
+            .get_or_insert(DeviceMetricsBaseline {
+                viewport: self.viewport,
+                device_scale_factor: self.device_scale_factor,
+            });
+        let viewport = (
+            width.unwrap_or(baseline.viewport.0),
+            height.unwrap_or(baseline.viewport.1),
+        );
+        self.set_viewport(viewport);
+
+        // Blink uses the effective widget size as the screen size for mobile
+        // emulation when no complete explicit screen size was supplied.
+        let effective_screen_size = screen_size.or_else(|| mobile.then_some(viewport));
+        self.set_screen_size_override(effective_screen_size, true);
+        self.set_device_scale_factor(device_scale_factor.unwrap_or(baseline.device_scale_factor));
+    }
+
+    /// Disable CDP device metrics and restore the state captured by the first
+    /// override. Clearing while emulation is inactive is intentionally a no-op.
+    pub fn clear_device_metrics_override(&mut self) {
+        let Some(baseline) = self.device_metrics_baseline.take() else {
+            return;
+        };
+        self.set_viewport(baseline.viewport);
+        self.set_screen_size_override(None, false);
+        self.set_device_scale_factor(baseline.device_scale_factor);
     }
 
     /// Set the screenshot surface density without changing CSS layout. CDP
@@ -1053,6 +1126,11 @@ impl Page {
             rt.set_geolocation(lat, lon);
         }
         rt.set_viewport(self.viewport.0 as f64, self.viewport.1 as f64);
+        rt.set_screen_size_override(
+            self.screen_size_override
+                .map(|(width, height)| (width as f64, height as f64)),
+            self.screen_metrics_emulated,
+        );
 
         rt.set_cookie_jar(self.context.cookie_jar.clone());
         rt.set_http_client(self.http_client.clone());
