@@ -371,6 +371,40 @@ impl RenderResourceCache {
         }
     }
 
+    /// Cache-only poster selection for one live `<video>`. Poster images use
+    /// the element's media CORS settings and the same page-owned image cache as
+    /// ordinary replaced images; they do not imply that any video frame has
+    /// loaded or decoded.
+    pub fn cached_video_poster_metadata(
+        &self,
+        tree: &DomTree,
+        id: obscura_dom::tree::NodeId,
+        base_url: Option<&str>,
+    ) -> Option<(String, ImageRequestProfile, bool, Option<(f32, f32)>)> {
+        let node = tree.get_node(id)?;
+        if node
+            .as_element()
+            .is_none_or(|element| element.local.as_ref() != "video")
+        {
+            return None;
+        }
+        let poster = node.get_attribute("poster")?.trim();
+        if poster.is_empty() {
+            return None;
+        }
+        let resolved_url = resolve_resource_url(poster, base_url)?;
+        let profile = image_request_profile(tree, id);
+        match self.cached_profiled_image_metadata(&resolved_url, None, profile) {
+            None => Some((resolved_url, profile, false, None)),
+            Some(dimensions) => Some((
+                resolved_url,
+                profile,
+                true,
+                dimensions.map(|(_, width, height)| (width, height)),
+            )),
+        }
+    }
+
     fn get_or_load(&mut self, url: &str) -> Option<Arc<[u8]>> {
         let url = network_resource_url(url);
         if let Some(entry) = self.entries.get(&url) {
@@ -3437,6 +3471,7 @@ fn paint_laid_dom_scrolled(
                             &img_rect,
                             &background.clip_rect,
                             crate::ObjectFit::Fill,
+                            crate::ObjectPosition::default(),
                             &mut pixmap,
                             image_cache,
                             None,
@@ -3530,7 +3565,7 @@ fn paint_laid_dom_scrolled(
             raster_scale,
         );
 
-        if box_on_surface && name.local.as_ref() == "img" {
+        if box_on_surface && matches!(name.local.as_ref(), "img" | "video") {
             if let Some(source) = selected_images.get(&nid) {
                 // `visible_rect` is the border box already intersected with the
                 // ancestor overflow clip: the raster must not paint past it (a
@@ -3542,6 +3577,7 @@ fn paint_laid_dom_scrolled(
                     &rect,
                     &visible_rect,
                     style.object_fit,
+                    style.object_position,
                     &mut pixmap,
                     image_cache,
                     Some(source.profile),
@@ -3557,7 +3593,7 @@ fn paint_laid_dom_scrolled(
                 // grey placeholder. box_rect/visible_rect are already
                 // clip-intersected, so none of this paints outside an
                 // overflow:hidden clip.
-                if !painted {
+                if !painted && name.local.as_ref() == "img" {
                     match node.get_attribute("alt") {
                         Some(alt) if !alt.trim().is_empty() => {
                             draw_text(
@@ -4191,6 +4227,7 @@ fn paint_inline_fragment_decorations(
                     &image_rect,
                     &background.clip_rect,
                     crate::ObjectFit::Fill,
+                    crate::ObjectPosition::default(),
                     pixmap,
                     image_cache,
                     None,
@@ -7476,6 +7513,7 @@ fn paint_in_flow_generated_box(
                 &image_rect,
                 &background.clip_rect,
                 crate::ObjectFit::Fill,
+                crate::ObjectPosition::default(),
                 pixmap,
                 image_cache,
                 None,
@@ -7718,6 +7756,7 @@ fn paint_positioned_pseudo(
                 &image_rect,
                 &background.clip_rect,
                 crate::ObjectFit::Fill,
+                crate::ObjectPosition::default(),
                 pixmap,
                 image_cache,
                 None,
@@ -7787,7 +7826,10 @@ fn paint_positioned_pseudo(
 
 /// Fetch every `<img>` once (seeding `cache` for the paint pass) and record its
 /// intrinsic (width, height) so layout can size replaced elements that have no
-/// explicit dimensions. Keyed by the `<img>`'s NodeId.
+/// explicit dimensions. Video posters are image resources too: before a
+/// decoded frame exists, their intrinsic dimensions and pixels are the
+/// replaced content Chromium paints for `<video>`. Keyed by the element's
+/// NodeId.
 fn collect_image_intrinsics(
     tree: &DomTree,
     viewport: (f32, f32),
@@ -7803,15 +7845,27 @@ fn collect_image_intrinsics(
         let Some(node) = tree.get_node(nid) else {
             continue;
         };
-        if node
-            .as_element()
-            .map(|e| e.local.as_ref() != "img")
-            .unwrap_or(true)
-        {
+        let Some(element) = node.as_element() else {
             continue;
-        }
-        let Some((url, density)) = resolve_img_url(tree, nid, viewport) else {
-            continue;
+        };
+        let (url, density) = match element.local.as_ref() {
+            "img" => {
+                let Some(candidate) = resolve_img_url(tree, nid, viewport) else {
+                    continue;
+                };
+                candidate
+            }
+            "video" => {
+                let Some(poster) = node.get_attribute("poster") else {
+                    continue;
+                };
+                let poster = poster.trim();
+                if poster.is_empty() {
+                    continue;
+                }
+                (poster.to_string(), 1.0)
+            }
+            _ => continue,
         };
         let resolved_url = resolve_resource_url(&url, base_url).unwrap_or(url);
         let profile = image_request_profile(tree, nid);
@@ -8187,6 +8241,7 @@ fn paint_image(
     rect: &crate::Rect,
     visible_rect: &crate::Rect,
     object_fit: crate::ObjectFit,
+    object_position: crate::ObjectPosition,
     pixmap: &mut Pixmap,
     cache: &mut RenderResourceCache,
     profile: Option<ImageRequestProfile>,
@@ -8225,7 +8280,9 @@ fn paint_image(
             image_dimensions(&bytes).map(|(w, h)| (w as f32, h as f32))
         };
         match intrinsic {
-            Some((iw, ih)) => object_fit_dest(rect, iw, ih, object_fit),
+            Some((iw, ih)) => {
+                object_fit_dest_positioned(rect, iw, ih, object_fit, object_position)
+            }
             None => *rect,
         }
     };
@@ -8311,11 +8368,21 @@ fn paint_image(
     true
 }
 
-/// The destination sub-rect for a replaced element's image within its box,
-/// given the image's intrinsic `(iw, ih)` size and `object-fit`. Centered in
-/// the box; for `Cover`/`None` it can extend past the box edges (the caller
-/// clips it). Aspect ratio is preserved for every mode except `Fill`.
+/// The destination sub-rect for replaced image content within its box. The
+/// position resolves against the leftover space after `object-fit`; for
+/// `Cover`/`None` that space can be negative and the caller clips the result.
+#[cfg(test)]
 fn object_fit_dest(box_rect: &crate::Rect, iw: f32, ih: f32, fit: crate::ObjectFit) -> crate::Rect {
+    object_fit_dest_positioned(box_rect, iw, ih, fit, crate::ObjectPosition::default())
+}
+
+fn object_fit_dest_positioned(
+    box_rect: &crate::Rect,
+    iw: f32,
+    ih: f32,
+    fit: crate::ObjectFit,
+    position: crate::ObjectPosition,
+) -> crate::Rect {
     let (bw, bh) = (box_rect.width, box_rect.height);
     if iw <= 0.0 || ih <= 0.0 {
         return *box_rect;
@@ -8339,8 +8406,8 @@ fn object_fit_dest(box_rect: &crate::Rect, iw: f32, ih: f32, fit: crate::ObjectF
         }
     };
     crate::Rect {
-        x: box_rect.x + (bw - dw) / 2.0,
-        y: box_rect.y + (bh - dh) / 2.0,
+        x: box_rect.x + position.x.resolve(bw - dw),
+        y: box_rect.y + position.y.resolve(bh - dh),
         width: dw,
         height: dh,
     }
@@ -12383,6 +12450,49 @@ mod tests {
     }
 
     #[test]
+    fn video_poster_supplies_intrinsic_size_and_paints_as_replaced_content() {
+        const POSTER: &str = "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='300'%20height='100'%3E%3Crect%20width='100'%20height='100'%20fill='%23ff0000'/%3E%3Crect%20x='100'%20width='100'%20height='100'%20fill='%2300ff00'/%3E%3Crect%20x='200'%20width='100'%20height='100'%20fill='%230000ff'/%3E%3C/svg%3E";
+        let tree = parse_html(&format!(
+            r#"<html><body style="margin:0;background:white">
+                <video id="poster" style="position:absolute;left:0;top:0" poster="{POSTER}"></video>
+                <video id="positioned" style="position:absolute;left:0;top:110px;width:100px;height:100px;object-fit:cover;object-position:right center;border-radius:20px;opacity:.5" poster="{POSTER}"></video>
+            </body></html>"#
+        ));
+        let mut resources = RenderResourceCache::default();
+        let mut prepared = prepare_dom(&tree, (360.0, 220.0), None, &mut resources)
+            .expect("poster-aware layout");
+        let video = tree.get_element_by_id("poster").expect("video");
+        let rect = prepared.document_rect(video).expect("video rect");
+        assert_eq!((rect.width, rect.height), (300.0, 100.0));
+
+        let pixmap = paint_prepared(&tree, &mut prepared, &mut resources, (0.0, 0.0))
+            .expect("poster paint");
+        let red = pixmap.pixel(50, 50).expect("red stripe");
+        let green = pixmap.pixel(150, 50).expect("green stripe");
+        let blue = pixmap.pixel(250, 50).expect("blue stripe");
+        assert!(red.red() > 240 && red.green() < 20 && red.blue() < 20);
+        assert!(green.green() > 240 && green.red() < 20 && green.blue() < 20);
+        assert!(blue.blue() > 240 && blue.red() < 20 && blue.green() < 20);
+
+        let rounded_corner = pixmap.pixel(0, 110).expect("rounded corner");
+        assert!(
+            rounded_corner.red() > 245
+                && rounded_corner.green() > 245
+                && rounded_corner.blue() > 245,
+            "poster must be clipped by the video radius: {rounded_corner:?}"
+        );
+        let positioned = pixmap.pixel(50, 160).expect("positioned poster center");
+        assert!(
+            positioned.red() > 100
+                && positioned.red() < 160
+                && positioned.green() > 100
+                && positioned.green() < 160
+                && positioned.blue() > 240,
+            "right object-position must select the blue stripe and opacity must composite it: {positioned:?}"
+        );
+    }
+
+    #[test]
     fn projected_image_transform_enters_overflow_clip() {
         // Chromium reduction: without the projected rotate/scale, this image is
         // wholly left of the clip. Its transformed right edge reaches x=53.14.
@@ -13729,6 +13839,7 @@ mod tests {
             &rect,
             &rect,
             crate::ObjectFit::Fill,
+            crate::ObjectPosition::default(),
             &mut pixmap,
             &mut resources,
             None,

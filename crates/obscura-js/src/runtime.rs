@@ -667,9 +667,9 @@ impl ObscuraJsRuntime {
     }
 
     /// Return the exact responsive candidates selected for live `<img>`
-    /// elements without loading them.  The browser layer can then fetch them
-    /// concurrently through the page-owned transport before synchronous layout
-    /// or paint observes the cache.
+    /// elements and `<video poster>` resources without loading them. The
+    /// browser layer can then fetch them concurrently through the page-owned
+    /// transport before synchronous layout or paint observes the cache.
     #[cfg(feature = "render")]
     pub fn pending_render_image_urls(&self) -> Vec<(String, crate::ops::ImageRequestProfile)> {
         let state = self.state.borrow();
@@ -682,30 +682,37 @@ impl ObscuraJsRuntime {
             let Some(node) = dom.get_node(id) else {
                 continue;
             };
-            if node
-                .as_element()
-                .is_none_or(|element| element.local.as_ref() != "img")
-            {
+            let Some(element) = node.as_element() else {
                 continue;
-            }
-            let Some((url, _, known, _)) = state.render_resources.cached_image_element_metadata(
-                dom,
-                id,
-                state.viewport,
-                base_url.as_deref(),
-            ) else {
+            };
+            let candidate = match element.local.as_ref() {
+                "img" => state
+                    .render_resources
+                    .cached_image_element_metadata(dom, id, state.viewport, base_url.as_deref())
+                    .map(|(url, _, known, _)| {
+                        let profile = match node
+                            .get_attribute("crossorigin")
+                            .map(|value| value.trim().to_ascii_lowercase())
+                            .as_deref()
+                        {
+                            Some("use-credentials") => {
+                                crate::ops::ImageRequestProfile::CorsInclude
+                            }
+                            Some(_) => crate::ops::ImageRequestProfile::CorsSameOrigin,
+                            None => crate::ops::ImageRequestProfile::NoCorsInclude,
+                        };
+                        (url, profile, known)
+                    }),
+                "video" => state
+                    .render_resources
+                    .cached_video_poster_metadata(dom, id, base_url.as_deref())
+                    .map(|(url, profile, known, _)| (url, profile, known)),
+                _ => None,
+            };
+            let Some((url, profile, known)) = candidate else {
                 continue;
             };
             if !known && !url.starts_with("data:") {
-                let profile = match node
-                    .get_attribute("crossorigin")
-                    .map(|value| value.trim().to_ascii_lowercase())
-                    .as_deref()
-                {
-                    Some("use-credentials") => crate::ops::ImageRequestProfile::CorsInclude,
-                    Some(_) => crate::ops::ImageRequestProfile::CorsSameOrigin,
-                    None => crate::ops::ImageRequestProfile::NoCorsInclude,
-                };
                 urls.push((url, profile));
             }
         }
@@ -12605,6 +12612,46 @@ mod tests {
         assert_eq!(
             result,
             serde_json::json!([true, true, true, 1, 1, 3, "Hello", -2, 80, 1, true, "metadata"])
+        );
+    }
+
+    #[test]
+    fn unsupported_media_capabilities_and_readiness_are_honest() {
+        let mut rt = setup_runtime(
+            r#"<video id="media" src="https://example.test/movie.mp4"
+                poster="https://example.test/poster.png"></video>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+                const media = document.getElementById("media");
+                return [
+                    media.canPlayType("video/mp4"),
+                    media.canPlayType('video/webm; codecs="vp9"'),
+                    media.readyState,
+                    media.currentTime,
+                    media.videoWidth,
+                    media.videoHeight,
+                    media.paused,
+                    media.currentSrc,
+                    media.poster,
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                "",
+                "",
+                0,
+                0,
+                0,
+                0,
+                true,
+                "",
+                "https://example.test/poster.png"
+            ])
         );
     }
 

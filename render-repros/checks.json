@@ -60,6 +60,13 @@
     {"name": "display contents overrides hidden responsive wrapper", "color": "#087f5b", "x": 0, "y": 0, "width": 200, "height": 80},
     {"name": "flattened sibling remains in parent flex flow", "color": "#1971c2", "x": 200, "y": 0, "width": 200, "height": 80}
   ],
+  "direction-rtl": [
+    {"name": "inherited RTL places first flex item at inline start", "color": "#e03131", "x": 850, "y": 0, "width": 50, "height": 40},
+    {"name": "inherited RTL reverses the flex row", "color": "#1971c2", "x": 800, "y": 0, "width": 50, "height": 40},
+    {"name": "inherited RTL places first grid track at inline start", "color": "#2f9e44", "x": 850, "y": 60, "width": 50, "height": 40},
+    {"name": "inherited RTL reverses explicit grid track placement", "color": "#1971c2", "x": 800, "y": 60, "width": 50, "height": 40},
+    {"name": "inherited RTL resolves block under-constraint from right", "color": "#862e9c", "x": 850, "y": 120, "width": 50, "height": 40}
+  ],
   "eventtarget-lifecycle": [
     {"name": "framework lifecycle EventTarget completes", "color": "#18723a", "x": 0, "y": 0, "width": 420, "height": 120}
   ],
@@ -192,6 +199,12 @@
   ],
   "media-text-track": [
     {"name": "media text track exposes parsed cues", "color": "#18723a", "x": 0, "y": 0, "width": 420, "height": 120}
+  ],
+  "video-poster": [
+    {"name": "poster intrinsic width and first stripe", "color": "#ff0000", "x": 20, "y": 20, "width": 100, "height": 100},
+    {"name": "poster intrinsic geometry retains middle stripe", "color": "#00ff00", "x": 120, "y": 20, "width": 100, "height": 100},
+    {"name": "poster intrinsic geometry retains final stripe", "color": "#0000ff", "x": 220, "y": 20, "width": 100, "height": 100},
+    {"name": "right object-position selects the final stripe", "color": "#0000ff", "x": 150, "y": 150, "width": 100, "height": 100}
   ],
   "mixed-content-block": [
     {"name": "full-width block child", "color": "#ccddff", "width": 400}

@@ -5116,25 +5116,42 @@ globalThis.HTMLImageElement = HTMLImageElement;
 _markNative(HTMLImageElement);
 _markNative(HTMLImageElement.prototype.decode);
 
-// Media elements need canPlayType for codec detection fingerprinting.
-// Values match Chrome 145 on Linux x86_64 without proprietary codecs.
+// Report only capabilities backed by a real decoder. Poster rendering is an
+// image operation and does not make any audio/video container playable.
 class HTMLMediaElement extends Element {
-  canPlayType(type) {
-    if (!type || typeof type !== 'string') return '';
-    const mime = type.split(';')[0].trim().toLowerCase();
-    if (mime === 'video/mp4' || mime === 'video/webm' || mime === 'video/ogg') return 'probably';
-    if (mime === 'video/x-matroska') return 'maybe';
-    if (mime === 'audio/ogg' || mime === 'audio/webm' || mime === 'audio/wav' ||
-        mime === 'audio/mpeg') return 'probably';
-    if (mime === 'audio/mp4' || mime === 'audio/x-m4a' || mime === 'audio/aac') return 'maybe';
-    return '';
-  }
+  static NETWORK_EMPTY = 0;
+  static NETWORK_IDLE = 1;
+  static NETWORK_LOADING = 2;
+  static NETWORK_NO_SOURCE = 3;
+  static HAVE_NOTHING = 0;
+  static HAVE_METADATA = 1;
+  static HAVE_CURRENT_DATA = 2;
+  static HAVE_FUTURE_DATA = 3;
+  static HAVE_ENOUGH_DATA = 4;
+  canPlayType(_type) { return ''; }
   load() {}
-  play() { return Promise.resolve(); }
+  play() {
+    return Promise.reject(new DOMException(
+      "The element has no supported sources.",
+      "NotSupportedError",
+    ));
+  }
   pause() {}
+  get NETWORK_EMPTY() { return HTMLMediaElement.NETWORK_EMPTY; }
+  get NETWORK_IDLE() { return HTMLMediaElement.NETWORK_IDLE; }
+  get NETWORK_LOADING() { return HTMLMediaElement.NETWORK_LOADING; }
+  get NETWORK_NO_SOURCE() { return HTMLMediaElement.NETWORK_NO_SOURCE; }
+  get HAVE_NOTHING() { return HTMLMediaElement.HAVE_NOTHING; }
+  get HAVE_METADATA() { return HTMLMediaElement.HAVE_METADATA; }
+  get HAVE_CURRENT_DATA() { return HTMLMediaElement.HAVE_CURRENT_DATA; }
+  get HAVE_FUTURE_DATA() { return HTMLMediaElement.HAVE_FUTURE_DATA; }
+  get HAVE_ENOUGH_DATA() { return HTMLMediaElement.HAVE_ENOUGH_DATA; }
   get paused() { return true; }
   get ended() { return false; }
-  get readyState() { return 0; }
+  get networkState() { return HTMLMediaElement.NETWORK_EMPTY; }
+  get readyState() { return HTMLMediaElement.HAVE_NOTHING; }
+  get error() { return null; }
+  get seeking() { return false; }
   get currentTime() { return 0; }
   set currentTime(v) {}
   get duration() { return NaN; }
@@ -5142,8 +5159,14 @@ class HTMLMediaElement extends Element {
   set volume(v) {}
   get muted() { return false; }
   set muted(v) {}
-  get src() { return this.getAttribute('src') || ''; }
+  get src() {
+    const raw = this.getAttribute("src");
+    if (!raw) return "";
+    try { return new URL(raw, this.baseURI || globalThis.location?.href || "about:blank").href; }
+    catch (_error) { return raw; }
+  }
   set src(v) { this.setAttribute('src', v); }
+  get currentSrc() { return ""; }
   get textTracks() {
     return TextTrackList.from(
       Array.from(this.querySelectorAll("track")).map((element) => element.track)
@@ -5157,7 +5180,17 @@ _markNative(HTMLMediaElement.prototype.canPlayType);
 _markNative(HTMLMediaElement.prototype.play);
 _markNative(HTMLMediaElement.prototype.load);
 _markNative(HTMLMediaElement.prototype.pause);
-class HTMLVideoElement extends HTMLMediaElement {}
+class HTMLVideoElement extends HTMLMediaElement {
+  get poster() {
+    const raw = this.getAttribute("poster");
+    if (!raw) return "";
+    try { return new URL(raw, this.baseURI || globalThis.location?.href || "about:blank").href; }
+    catch (_error) { return raw; }
+  }
+  set poster(value) { this.setAttribute("poster", value); }
+  get videoWidth() { return 0; }
+  get videoHeight() { return 0; }
+}
 class HTMLAudioElement extends HTMLMediaElement {}
 class HTMLTrackElement extends Element {
   static NONE = 0;

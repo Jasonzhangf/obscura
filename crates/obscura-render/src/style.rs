@@ -700,6 +700,14 @@ fn unitless_math_tokens<'i, 't>(
 
 fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
     match name {
+        "direction" => match value.trim().to_ascii_lowercase().as_str() {
+            "ltr" | "initial" | "revert" | "revert-layer" => {
+                style.direction = Some(taffy::Direction::Ltr);
+            }
+            "rtl" => style.direction = Some(taffy::Direction::Rtl),
+            "inherit" | "unset" => style.direction = None,
+            _ => {}
+        },
         "display" => {
             let value = value.trim().to_ascii_lowercase();
             if matches!(
@@ -1318,6 +1326,10 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
             "none" => style.object_fit = crate::ObjectFit::None,
             _ => {}
         },
+        "object-position" => {
+            let position = parse_background_position(value);
+            style.object_position = crate::ObjectPosition::new(position.x, position.y);
+        }
         "top" => set_inset_side(style, 0, value),
         "right" => set_inset_side(style, 1, value),
         "bottom" => set_inset_side(style, 2, value),
@@ -1865,6 +1877,7 @@ pub fn supports_declaration(name: &str, value: &str) -> bool {
     let known = matches!(
         name.as_str(),
         "display"
+            | "direction"
             | "width"
             | "inline-size"
             | "height"
@@ -2004,6 +2017,7 @@ pub fn supports_declaration(name: &str, value: &str) -> bool {
             | "counter-increment"
             | "counter-set"
             | "object-fit"
+            | "object-position"
             | "top"
             | "right"
             | "bottom"
@@ -2121,6 +2135,7 @@ pub fn supports_declaration(name: &str, value: &str) -> bool {
                 | "-webkit-inline-box"
                 | "contents"
         ),
+        "direction" => matches!(value.to_ascii_lowercase().as_str(), "ltr" | "rtl"),
         "position" => matches!(
             value.to_ascii_lowercase().as_str(),
             "static" | "relative" | "absolute" | "fixed" | "sticky"
@@ -2188,6 +2203,19 @@ pub fn supports_declaration(name: &str, value: &str) -> bool {
             value.to_ascii_lowercase().as_str(),
             "fill" | "contain" | "cover" | "none" | "scale-down"
         ),
+        "object-position" => {
+            let tokens = split_ws_paren(value);
+            !tokens.is_empty()
+                && tokens.len() <= 4
+                && tokens.iter().all(|token| {
+                    matches!(*token, "left" | "right" | "top" | "bottom" | "center")
+                        || token
+                            .strip_suffix('%')
+                            .and_then(|number| number.parse::<f32>().ok())
+                            .is_some_and(f32::is_finite)
+                        || px_value(token).is_some_and(f32::is_finite)
+                })
+        }
         "visibility" => matches!(
             value.to_ascii_lowercase().as_str(),
             "visible" | "hidden" | "collapse"
@@ -8055,6 +8083,25 @@ fn split_ws_paren(s: &str) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direction_parses_inherited_state_and_supports_only_real_values() {
+        assert_eq!(
+            compute_style("div", Some("direction:rtl")).direction,
+            Some(taffy::Direction::Rtl)
+        );
+        assert_eq!(
+            compute_style("div", Some("direction:rtl;direction:initial")).direction,
+            Some(taffy::Direction::Ltr)
+        );
+        assert_eq!(
+            compute_style("div", Some("direction:rtl;direction:inherit")).direction,
+            None
+        );
+        assert!(supports_declaration("direction", "rtl"));
+        assert!(supports_declaration("direction", "ltr"));
+        assert!(!supports_declaration("direction", "auto"));
+    }
 
     #[test]
     fn table_layout_parses_resets_and_reports_only_supported_values() {

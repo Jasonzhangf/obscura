@@ -764,6 +764,9 @@ pub enum GeneratedContentItem {
 #[derive(Debug, Clone, Default)]
 pub struct LayoutStyle {
     pub display: Display,
+    /// Computed inline base direction. `None` is the inherited specified
+    /// state before the DOM top-down pass resolves it.
+    pub direction: Option<taffy::Direction>,
     /// The specified `display` value was the CSS-wide `inherit` keyword.
     ///
     /// `display` is normally non-inherited, so the cascade cannot resolve this
@@ -1348,6 +1351,10 @@ pub struct LayoutStyle {
     /// `Fill` (default) stretches to the box, the rest preserve aspect ratio.
     /// Only consulted in the image paint path.
     pub object_fit: ObjectFit,
+    /// `object-position` for replaced image content. Percentages resolve
+    /// against the leftover space after `object-fit`; the CSS initial value
+    /// is centered on both axes.
+    pub object_position: ObjectPosition,
     /// Ordered operations in the non-inherited `transform` property. Length
     /// percentages remain unresolved until the final border box is known.
     pub transform_ops: Vec<TransformOp>,
@@ -1526,6 +1533,30 @@ pub enum ObjectFit {
     Cover,
     ScaleDown,
     None,
+}
+
+/// `object-position` for replaced image content. It shares the same
+/// length-percentage positioning model as backgrounds, but has a centered
+/// initial value instead of `background-position`'s start-edge default.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ObjectPosition {
+    pub x: BackgroundPositionAxis,
+    pub y: BackgroundPositionAxis,
+}
+
+impl ObjectPosition {
+    pub const fn new(x: BackgroundPositionAxis, y: BackgroundPositionAxis) -> Self {
+        Self { x, y }
+    }
+}
+
+impl Default for ObjectPosition {
+    fn default() -> Self {
+        Self {
+            x: BackgroundPositionAxis::percentage(0.5),
+            y: BackgroundPositionAxis::percentage(0.5),
+        }
+    }
 }
 
 /// `vertical-align` positions for table-cell content. `baseline` (and the
@@ -2096,6 +2127,7 @@ fn read_node(tree: &TaffyTree, id: NodeId) -> NodeRect {
 
 pub(crate) fn to_taffy_style(style: &LayoutStyle) -> Style {
     let mut s = Style::DEFAULT;
+    s.direction = style.direction.unwrap_or(taffy::Direction::Ltr);
     s.item_is_replaced = style.has_replaced_sizing;
     s.item_aspect_ratio_is_intrinsic = style.aspect_ratio_is_intrinsic;
     s.box_sizing = match style.box_sizing {

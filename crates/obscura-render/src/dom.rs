@@ -1916,6 +1916,13 @@ pub(crate) fn resolve_translate(d: crate::Dimension, basis: f32) -> f32 {
 /// Apply HTML presentational attributes at their cascade origin: above the UA
 /// defaults, but below every author stylesheet and style attribute.
 fn apply_presentational_hints(node: &obscura_dom::tree::Node, style: &mut crate::LayoutStyle) {
+    if let Some(direction) = node.get_attribute("dir") {
+        style.direction = match direction.trim().to_ascii_lowercase().as_str() {
+            "ltr" => Some(taffy::Direction::Ltr),
+            "rtl" => Some(taffy::Direction::Rtl),
+            _ => style.direction,
+        };
+    }
     if let Some(color) = node.get_attribute("color") {
         crate::style::apply_inline(style, &format!("color: {}", color));
     }
@@ -3912,6 +3919,7 @@ fn layout_dom_once(
         #[derive(Clone)]
         struct Inherited {
             display: crate::Display,
+            direction: taffy::Direction,
             display_contents: bool,
             is_inline_block: bool,
             flow_root: bool,
@@ -3963,6 +3971,7 @@ fn layout_dom_once(
                     // CSS Display's initial outer/inner value is inline flow.
                     // The root is blockified after computed values settle.
                     display: crate::Display::Inline,
+                    direction: taffy::Direction::Ltr,
                     display_contents: false,
                     is_inline_block: false,
                     flow_root: false,
@@ -4063,6 +4072,7 @@ fn layout_dom_once(
                         vh,
                     );
                     inh.display = style.display;
+                    inh.direction = style.direction.unwrap_or(inh.direction);
                     inh.display_contents = style.display_contents;
                     inh.is_inline_block = style.is_inline_block;
                     inh.flow_root = style.flow_root;
@@ -4245,6 +4255,10 @@ fn layout_dom_once(
                     style.display_inherit = false;
                 }
                 inh.display = style.display;
+                match style.direction {
+                    Some(direction) => inh.direction = direction,
+                    None => style.direction = Some(inh.direction),
+                }
                 inh.display_contents = style.display_contents;
                 inh.is_inline_block = style.is_inline_block;
                 inh.flow_root = style.flow_root;
@@ -4678,6 +4692,7 @@ fn layout_dom_once(
                 let host_text_indent = style.text_indent;
                 let host_invisible = style.effectively_invisible;
                 let host_display = style.display;
+                let host_direction = style.direction.unwrap_or(taffy::Direction::Ltr);
                 let host_display_contents = style.display_contents;
                 let host_is_inline_block = style.is_inline_block;
                 let host_flow_root = style.flow_root;
@@ -4702,6 +4717,9 @@ fn layout_dom_once(
                     0
                 };
                 let settle_pseudo = |pseudo: &mut crate::LayoutStyle| {
+                    if pseudo.direction.is_none() {
+                        pseudo.direction = Some(host_direction);
+                    }
                     if pseudo.grid_auto_columns_inherit {
                         pseudo.grid_auto_columns = host_grid_auto_columns.clone();
                         pseudo.grid_calc_expressions[2] = host_grid_auto_column_calcs.clone();
@@ -6986,10 +7004,9 @@ fn fixed_grid_tracks(widths: &[f32]) -> Vec<taffy::GridTemplateComponent<String>
 /// growth limit fits, `justify-content:normal` stretches all auto tracks by an
 /// equal share; narrower/cyclic cases decline this fast path.
 ///
-/// The current style model does not expose orthogonal writing modes and emits
-/// Taffy's default LTR direction for every grid; this physical-column reduction
-/// therefore cannot accidentally enter an RTL/orthogonal layout path that the
-/// surrounding renderer does not implement yet. Percentage-width parents are
+/// The current style model does not expose orthogonal writing modes. RTL grids
+/// are deliberately excluded because this physical-column reduction has not
+/// yet been mirrored into logical track coordinates. Percentage-width parents are
 /// accepted only after the preliminary layout produced finite, explicit used
 /// track sizes; that resolved track sum is the definite basis for pass two.
 fn apply_full_span_column_subgrids<F>(
@@ -7008,6 +7025,7 @@ where
 
     for (&dom, style) in styles {
         if style.display != crate::Display::Grid
+            || style.direction == Some(taffy::Direction::Rtl)
             || style.grid_template_columns_subgrid
             || !matches!(
                 style.width,
@@ -8452,6 +8470,10 @@ fn build_any(
         }
     }
     let outer_style = taffy::Style {
+        direction: styles
+            .get(&id)
+            .and_then(|style| style.direction)
+            .unwrap_or(taffy::Direction::Ltr),
         display: taffy::style::Display::Flex,
         flex_direction: taffy::FlexDirection::Row,
         flex_wrap: taffy::FlexWrap::Wrap,
@@ -10869,28 +10891,33 @@ fn build(
         }
     }
 
-    if let Some((width, height)) = crate::inline::default_replaced_intrinsic_size(
-        _name.local.as_ref(),
-        style.font_size.unwrap_or(16.0),
-        node.get_attribute("controls").is_some(),
-        _name.local.as_ref() != "embed"
-            || node
-                .get_attribute("src")
-                .is_some_and(|value| !value.trim().is_empty()),
-    ) {
-        let context = engine.register_replaced(width, height, style);
-        let leaf = taffy_tree
-            .new_leaf_with_context(taffy_style, context)
-            .ok()?;
-        id_map.insert(leaf, id);
-        return Some(leaf);
+    // A loaded poster supplies `<video>`'s replaced-content dimensions before
+    // decoded video metadata exists. Only use HTML's 300x150 fallback when no
+    // poster intrinsic is available.
+    if !(_name.local.as_ref() == "video" && style.replaced_intrinsic.is_some()) {
+        if let Some((width, height)) = crate::inline::default_replaced_intrinsic_size(
+            _name.local.as_ref(),
+            style.font_size.unwrap_or(16.0),
+            node.get_attribute("controls").is_some(),
+            _name.local.as_ref() != "embed"
+                || node
+                    .get_attribute("src")
+                    .is_some_and(|value| !value.trim().is_empty()),
+        ) {
+            let context = engine.register_replaced(width, height, style);
+            let leaf = taffy_tree
+                .new_leaf_with_context(taffy_style, context)
+                .ok()?;
+            id_map.insert(leaf, id);
+            return Some(leaf);
+        }
     }
 
     // A replaced image is a measured leaf, even when CSS gives it a percentage
     // width. Its intrinsic dimensions participate in an auto-sized ancestor's
     // max-content measurement; once the percentage axis becomes definite, the
     // measure callback derives the other axis through the intrinsic ratio.
-    if _name.local.as_ref() == "img" {
+    if matches!(_name.local.as_ref(), "img" | "video") {
         if let Some(intrinsic) = style.replaced_intrinsic.or_else(|| {
             style
                 .intrinsic_size
@@ -11955,6 +11982,7 @@ fn run_wrapper_style(parent: &crate::LayoutStyle, has_text_strut: bool) -> taffy
         0.0
     };
     taffy::Style {
+        direction: parent.direction.unwrap_or(taffy::Direction::Ltr),
         display: taffy::style::Display::Flex,
         flex_direction: taffy::FlexDirection::Row,
         flex_wrap: taffy::FlexWrap::Wrap,
@@ -16586,6 +16614,46 @@ mod tests {
             ),
             &[150.0, 150.0],
         );
+    }
+
+    #[test]
+    fn inherited_rtl_direction_controls_flex_grid_and_block_start_edges() {
+        let tree = parse_html(
+            r#"<style>
+                html,body { margin:0; direction:rtl }
+                .case { width:300px; height:40px; margin-bottom:20px }
+                .flex { display:flex }
+                .grid { display:grid; grid-template-columns:50px 50px }
+                .item { width:50px; height:40px }
+                .block > div { width:50px; height:40px }
+            </style>
+            <div id="flex" class="case flex"><div id="flex-one" class="item"></div><div id="flex-two" class="item"></div></div>
+            <div id="grid" class="case grid"><div id="grid-one" class="item"></div><div id="grid-two" class="item"></div></div>
+            <div class="case block"><div id="block"></div></div>"#,
+        );
+        let laid = layout_dom(&tree, (900.0, 300.0));
+        let x = |id: &str| laid.rects[&tree.get_element_by_id(id).unwrap()].x;
+        assert!((x("flex-one") - 850.0).abs() < 0.1, "{}", x("flex-one"));
+        assert!((x("flex-two") - 800.0).abs() < 0.1, "{}", x("flex-two"));
+        assert!((x("grid-one") - 850.0).abs() < 0.1, "{}", x("grid-one"));
+        assert!((x("grid-two") - 800.0).abs() < 0.1, "{}", x("grid-two"));
+        assert!((x("block") - 850.0).abs() < 0.1, "{}", x("block"));
+        for id in ["flex", "grid"] {
+            let node = tree.get_element_by_id(id).unwrap();
+            assert_eq!(laid.styles[&node].direction, Some(taffy::Direction::Rtl));
+        }
+    }
+
+    #[test]
+    fn html_dir_hint_is_overridden_by_author_css_and_inherits() {
+        let tree = parse_html(
+            r#"<style>#override { direction:ltr }</style>
+            <div dir="rtl"><div id="inherited"></div><div id="override"></div></div>"#,
+        );
+        let laid = layout_dom(&tree, (900.0, 300.0));
+        let style = |id: &str| &laid.styles[&tree.get_element_by_id(id).unwrap()];
+        assert_eq!(style("inherited").direction, Some(taffy::Direction::Rtl));
+        assert_eq!(style("override").direction, Some(taffy::Direction::Ltr));
     }
 
     #[test]
