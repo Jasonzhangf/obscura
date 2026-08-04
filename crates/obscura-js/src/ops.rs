@@ -1288,16 +1288,20 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                 Ok(n) => n,
                 Err(_) => return "false".into(),
             };
-            dom.append_child(NodeId::new(parent), NodeId::new(child));
-            "true".into()
+            let parent = NodeId::new(parent);
+            let child = NodeId::new(child);
+            dom.append_child(parent, child);
+            (dom.get_node(child).and_then(|node| node.parent) == Some(parent)).to_string()
         }
         "remove_child" => {
             let child = match arg1.parse::<u32>() {
                 Ok(n) => n,
                 Err(_) => return "false".into(),
             };
-            dom.remove_child(NodeId::new(child));
-            "true".into()
+            let child = NodeId::new(child);
+            let had_parent = dom.get_node(child).is_some_and(|node| node.parent.is_some());
+            dom.remove_child(child);
+            (had_parent && dom.get_node(child).is_some_and(|node| node.parent.is_none())).to_string()
         }
         "insert_before" => {
             let new_node = match arg1.parse::<u32>() {
@@ -1308,8 +1312,13 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                 Ok(n) => n,
                 Err(_) => return "false".into(),
             };
-            dom.insert_before(NodeId::new(ref_node), NodeId::new(new_node));
-            "true".into()
+            let ref_node = NodeId::new(ref_node);
+            let new_node = NodeId::new(new_node);
+            let expected_parent = dom.get_node(ref_node).and_then(|node| node.parent);
+            dom.insert_before(ref_node, new_node);
+            (expected_parent.is_some()
+                && dom.get_node(new_node).and_then(|node| node.parent) == expected_parent)
+                .to_string()
         }
         "remove_attribute" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
@@ -3795,6 +3804,8 @@ struct WaapiCreateInput {
     duration: f32,
     delay: f32,
     iterations: f32,
+    #[serde(default)]
+    iterations_infinite: bool,
     fill: String,
     direction: String,
     easing_bezier: Option<[f32; 4]>,
@@ -3855,6 +3866,11 @@ fn op_waapi_create(state: &OpState, #[string] input: &str) -> bool {
         "alternate-reverse" => obscura_render::AnimationDirection::AlternateReverse,
         _ => obscura_render::AnimationDirection::Normal,
     };
+    let iterations = if input.iterations_infinite {
+        f32::INFINITY
+    } else {
+        input.iterations
+    };
     state.animation_timeline.register_waapi(obscura_render::WaapiAnimation {
         id: input.id,
         node,
@@ -3866,7 +3882,7 @@ fn op_waapi_create(state: &OpState, #[string] input: &str) -> bool {
         timing: obscura_render::AnimationTiming {
             duration_ms: input.duration,
             delay_ms: input.delay,
-            iteration_count: input.iterations,
+            iteration_count: iterations,
             direction,
             fill_mode,
             play_state: obscura_render::AnimationPlayState::Running,

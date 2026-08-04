@@ -90,11 +90,16 @@ globalThis.dispatchEvent = function(event) {
 };
 
 let _domMutationEpoch = 0;
+let _treeMutationEpoch = 0;
 const _DOM_MUTATION_COMMANDS = new Set([
   "append_child", "insert_before", "remove_child",
   "set_attribute", "remove_attribute",
   "set_text_content", "set_inner_html", "set_inner_html_context",
   "set_fragment_html_executable",
+]);
+const _DOM_TREE_MUTATION_COMMANDS = new Set([
+  "append_child", "insert_before", "remove_child",
+  "set_inner_html", "set_inner_html_context", "set_fragment_html_executable",
 ]);
 const _dom = (cmd, a1, a2) => {
   const result = Deno.core.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""));
@@ -111,6 +116,12 @@ const _dom = (cmd, a1, a2) => {
     if (typeof globalThis.__obscura_recompute_intersections === "function") {
       globalThis.__obscura_recompute_intersections();
     }
+  }
+  // Native mutation ops report their verified postcondition. Only a real tree
+  // change invalidates ancestry caches; rejected cycles and invalid roots must
+  // not make JS believe a move happened.
+  if (result === "true" && _DOM_TREE_MUTATION_COMMANDS.has(cmd)) {
+    _treeMutationEpoch++;
   }
   return result;
 };
@@ -1798,6 +1809,27 @@ function __prepareInsertedSubtree(root) {
   for (const script of scripts) __prepareInsertedScript(script);
 }
 
+function _seedDetachedTreeState(node) {
+  node._treeDetachedExact = true;
+  node._treeParent = null;
+  node._treeParentEpoch = _treeMutationEpoch;
+  node._treeConnected = false;
+  node._treeConnectedEpoch = _treeMutationEpoch;
+}
+
+function _seedInsertedTreeState(node, parent, connected) {
+  node._treeDetachedExact = false;
+  node._treeParent = parent;
+  node._treeParentEpoch = _treeMutationEpoch;
+  node._treeConnected = !!connected;
+  node._treeConnectedEpoch = _treeMutationEpoch;
+}
+
+function _seedUnchangedConnection(node, connected) {
+  node._treeConnected = !!connected;
+  node._treeConnectedEpoch = _treeMutationEpoch;
+}
+
 class Node {
   static ELEMENT_NODE = 1;
   static ATTRIBUTE_NODE = 2;
@@ -1870,7 +1902,13 @@ class Node {
     if (t === 3 || t === 8) _dom("set_text_content", this._nid, String(v ?? ""));
   }
   get parentNode() {
-    return this._shadowParent || _wrap(+_dom("parent_node", this._nid));
+    if (this._shadowParent) return this._shadowParent;
+    if (this._treeDetachedExact) return null;
+    if (this._treeParentEpoch === _treeMutationEpoch) return this._treeParent;
+    const parent = _wrap(+_dom("parent_node", this._nid));
+    this._treeParent = parent;
+    this._treeParentEpoch = _treeMutationEpoch;
+    return parent;
   }
   get parentElement() { const p = this.parentNode; return p && p.nodeType === 1 ? p : null; }
   get childNodes() {
@@ -1904,7 +1942,16 @@ class Node {
     }
     if (c._shadowParent) c._shadowParent.removeChild(c);
     else if (c.parentNode) _detachStyleSheetsInSubtree(c);
-    _dom("append_child", this._nid, c._nid);
+    const parentConnected = this.isConnected;
+    const inserted = _dom("append_child", this._nid, c._nid) === "true";
+    if (!inserted) {
+      throw new DOMException(
+        "Failed to execute 'appendChild' on 'Node': The new child would create an invalid tree.",
+        "HierarchyRequestError",
+      );
+    }
+    _seedUnchangedConnection(this, parentConnected);
+    _seedInsertedTreeState(c, this, parentConnected);
     _registerWindowNamedTree(c);
     if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('childList', this._nid, [c._nid], []);
     __prepareInsertedSubtree(c);
@@ -1928,7 +1975,16 @@ class Node {
       _dom("remove_child", linkedStyle._nid);
       _linkedStylesheetNodes.delete(c);
     }
-    _dom("remove_child", c._nid);
+    const parentConnected = this.isConnected;
+    const removed = _dom("remove_child", c._nid) === "true";
+    if (!removed) {
+      throw new DOMException(
+        "Failed to execute 'removeChild' on 'Node': The node is not a child of this node.",
+        "NotFoundError",
+      );
+    }
+    _seedUnchangedConnection(this, parentConnected);
+    _seedDetachedTreeState(c);
     _detachStyleSheetsInSubtree(c);
     _reconcileWindowNamedProperties(removedWindowNames);
     if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('childList', this._nid, [], [c._nid]);
@@ -1936,6 +1992,13 @@ class Node {
   }
   replaceChild(newChild, oldChild) {
     if (!oldChild || !newChild) return oldChild;
+    if (oldChild.parentNode !== this) {
+      throw new DOMException(
+        "Failed to execute 'replaceChild' on 'Node': The node to be replaced is not a child of this node.",
+        "NotFoundError",
+      );
+    }
+    if (newChild === oldChild) return oldChild;
     if (newChild instanceof DocumentFragment) {
       const children = Array.from(newChild.childNodes);
       for (const child of children) this.insertBefore(child, oldChild);
@@ -1944,9 +2007,20 @@ class Node {
     }
     if (newChild._shadowParent) newChild._shadowParent.removeChild(newChild);
     else if (newChild.parentNode) _detachStyleSheetsInSubtree(newChild);
+    const parentConnected = this.isConnected;
     const removedWindowNames = _windowNamedNamesInTree(oldChild);
-    _dom("insert_before", newChild._nid, oldChild._nid);
-    _dom("remove_child", oldChild._nid);
+    const inserted = _dom("insert_before", newChild._nid, oldChild._nid) === "true";
+    if (!inserted) {
+      throw new DOMException(
+        "Failed to execute 'replaceChild' on 'Node': The new child would create an invalid tree.",
+        "HierarchyRequestError",
+      );
+    }
+    const removed = _dom("remove_child", oldChild._nid) === "true";
+    if (!removed) throw new DOMException("The node could not be replaced.", "NotFoundError");
+    _seedUnchangedConnection(this, parentConnected);
+    _seedInsertedTreeState(newChild, this, parentConnected);
+    _seedDetachedTreeState(oldChild);
     _detachStyleSheetsInSubtree(oldChild);
     _registerWindowNamedTree(newChild);
     _reconcileWindowNamedProperties(removedWindowNames);
@@ -1956,6 +2030,13 @@ class Node {
   insertBefore(n, ref) {
     if (!n) return n;
     if (!ref) { this.appendChild(n); return n; }
+    if (ref.parentNode !== this) {
+      throw new DOMException(
+        "Failed to execute 'insertBefore' on 'Node': The reference node is not a child of this node.",
+        "NotFoundError",
+      );
+    }
+    if (n === ref) return n;
     if (n instanceof DocumentFragment) {
       const children = Array.from(n.childNodes);
       for (const child of children) this.insertBefore(child, ref);
@@ -1963,7 +2044,16 @@ class Node {
     }
     if (n._shadowParent) n._shadowParent.removeChild(n);
     else if (n.parentNode) _detachStyleSheetsInSubtree(n);
-    _dom("insert_before", n._nid, ref._nid);
+    const parentConnected = this.isConnected;
+    const inserted = _dom("insert_before", n._nid, ref._nid) === "true";
+    if (!inserted) {
+      throw new DOMException(
+        "Failed to execute 'insertBefore' on 'Node': The new child would create an invalid tree.",
+        "HierarchyRequestError",
+      );
+    }
+    _seedUnchangedConnection(this, parentConnected);
+    _seedInsertedTreeState(n, this, parentConnected);
     _registerWindowNamedTree(n);
     __prepareInsertedSubtree(n);
     return n;
@@ -2030,7 +2120,12 @@ class Node {
     return root;
   }
   get isConnected() {
-    return _dom("is_connected", this._nid) === "true";
+    if (this._treeDetachedExact) return false;
+    if (this._treeConnectedEpoch === _treeMutationEpoch) return this._treeConnected;
+    const connected = _dom("is_connected", this._nid) === "true";
+    this._treeConnected = connected;
+    this._treeConnectedEpoch = _treeMutationEpoch;
+    return connected;
   }
   normalize() {
     // Merge adjacent exclusive Text nodes, drop empty ones, recurse. Detached
@@ -2556,7 +2651,7 @@ function _normalizeWaapiTiming(options) {
   const delay = options.delay == null ? 0 : Number(options.delay);
   const iterations = options.iterations == null ? 1 : Number(options.iterations);
   if (!Number.isFinite(duration) || duration < 0 || !Number.isFinite(delay)
-      || !Number.isFinite(iterations) || iterations < 0) {
+      || (!Number.isFinite(iterations) && iterations !== Infinity) || iterations < 0) {
     throw new TypeError('Invalid animation timing');
   }
   const easing = options.easing == null ? 'linear' : String(options.easing).trim();
@@ -2659,6 +2754,12 @@ class Animation {
       node: this.effect.target._nid,
       keyframes: this.effect._keyframes,
       ...this.effect._timing,
+      // JSON has no Infinity literal and would silently turn it into null.
+      // Preserve the Web Animations unrestricted-double value explicitly.
+      iterations: this.effect._timing.iterations === Infinity
+        ? 0
+        : this.effect._timing.iterations,
+      iterationsInfinite: this.effect._timing.iterations === Infinity,
     };
     try { this._registered = !!Deno.core.ops.op_waapi_create?.(JSON.stringify(input)); }
     catch (_) { this._registered = false; }
@@ -2672,6 +2773,10 @@ class Animation {
     if (this._finishTimer != null) clearTimeout(this._finishTimer);
     if (this._playState !== 'running' || !this.effect) return;
     const timing = this.effect._timing;
+    if (timing.iterations === Infinity) {
+      this._finishTimer = null;
+      return;
+    }
     const end = Math.max(0, timing.delay + timing.duration * timing.iterations);
     const remaining = Math.max(0, end - this.currentTime);
     this._finishTimer = setTimeout(() => this.finish(), remaining);
@@ -4674,6 +4779,7 @@ class Document extends Node {
     el._lname = localName;
     el._ns = "http://www.w3.org/1999/xhtml";
     el._nullNamespaceAttrs = new Map();
+    _seedDetachedTreeState(el);
     _cache.set(nid, el);
     if (el && localName === 'template') {
       el._templateContent = this.createDocumentFragment();
@@ -4706,18 +4812,21 @@ class Document extends Node {
     el._lname = localName;
     el._ns = effectiveNamespace;
     el._nullNamespaceAttrs = new Map();
+    _seedDetachedTreeState(el);
     _cache.set(nid, el);
     return el;
   }
   createTextNode(t) {
     const nid = +_dom("create_text_node", String(t));
     const n = new Text(nid);
+    _seedDetachedTreeState(n);
     _cache.set(nid, n);
     return n;
   }
   createComment(t) {
     const nid = +_dom("create_comment_node", String(t ?? ""));
     const n = new Comment(nid);
+    _seedDetachedTreeState(n);
     _cache.set(nid, n);
     return n;
   }
@@ -4733,6 +4842,7 @@ class Document extends Node {
     }
     const nid = +_dom("create_text_node", str);
     const n = new CDATASection(nid);
+    _seedDetachedTreeState(n);
     _cache.set(nid, n);
     return n;
   }
@@ -4749,12 +4859,14 @@ class Document extends Node {
     }
     const nid = +_dom("create_text_node", str);
     const n = new ProcessingInstruction(nid, tgt);
+    _seedDetachedTreeState(n);
     _cache.set(nid, n);
     return n;
   }
   createDocumentFragment() {
     const nid = +_dom("create_document_fragment");
     const frag = new DocumentFragment(nid);
+    _seedDetachedTreeState(frag);
     _cache.set(nid, frag);
     return frag;
   }
@@ -5112,7 +5224,9 @@ class Document extends Node {
 
 class DocumentFragment extends Node {
   constructor(nid) {
-    super(nid !== undefined ? nid : +_dom("create_document_fragment"));
+    const created = nid === undefined;
+    super(created ? +_dom("create_document_fragment") : nid);
+    if (created) _seedDetachedTreeState(this);
   }
   get nodeType() { return 11; }
   get nodeName() { return "#document-fragment"; }
@@ -11807,6 +11921,12 @@ Element.prototype.attachShadow = function attachShadow(opts) {
     throw new DOMException('Failed to execute attachShadow on Element: this element does not support attachShadow', 'NotSupportedError');
   }
   const shadow = new ShadowRoot(rootNid, this, opts);
+  _treeMutationEpoch++;
+  shadow._treeDetachedExact = false;
+  shadow._treeParent = null;
+  shadow._treeParentEpoch = _treeMutationEpoch;
+  shadow._treeConnected = this.isConnected;
+  shadow._treeConnectedEpoch = _treeMutationEpoch;
   _cache.set(rootNid, shadow);
   return shadow;
 };

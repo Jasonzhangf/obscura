@@ -5736,6 +5736,77 @@ mod tests {
     }
 
     #[test]
+    fn structural_cache_tracks_detach_reparent_and_rejected_mutations() {
+        let mut rt = setup_runtime(r#"<html><body></body></html>"#);
+        let result = rt
+            .evaluate(
+                r#"
+                (() => {
+                    const host = document.createElement("div");
+                    const child = document.createElement("span");
+                    const text = document.createTextNode("hello");
+                    const fresh = [host.parentNode, host.isConnected, text.parentNode, text.isConnected];
+
+                    host.appendChild(child);
+                    const detachedTree = [child.parentNode === host, host.isConnected, child.isConnected];
+                    document.body.appendChild(host);
+                    const connectedTree = [host.isConnected, child.isConnected, child.parentNode === host];
+
+                    const other = document.createElement("section");
+                    document.body.appendChild(other);
+                    const afterUnrelatedMutation = [host.parentNode === document.body, child.isConnected];
+
+                    other.appendChild(child);
+                    const reparented = [child.parentNode === other, child.isConnected, host.firstChild === null];
+
+                    let wrongReference = "";
+                    try { other.insertBefore(document.createElement("b"), host); }
+                    catch (error) { wrongReference = error.name; }
+                    let wrongReplacement = "";
+                    try { other.replaceChild(document.createElement("i"), host); }
+                    catch (error) { wrongReplacement = error.name; }
+                    let cycle = "";
+                    try { child.appendChild(other); }
+                    catch (error) { cycle = error.name; }
+
+                    document.body.removeChild(other);
+                    const removedTree = [other.parentNode, other.isConnected, child.isConnected, child.parentNode === other];
+                    document.body.appendChild(other);
+                    const reattachedTree = [other.isConnected, child.isConnected];
+                    return {
+                        fresh,
+                        detachedTree,
+                        connectedTree,
+                        afterUnrelatedMutation,
+                        reparented,
+                        wrongReference,
+                        wrongReplacement,
+                        cycle,
+                        removedTree,
+                        reattachedTree,
+                    };
+                })()
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "fresh": [null, false, null, false],
+                "detachedTree": [true, false, false],
+                "connectedTree": [true, true, true],
+                "afterUnrelatedMutation": [true, true],
+                "reparented": [true, true, true],
+                "wrongReference": "NotFoundError",
+                "wrongReplacement": "NotFoundError",
+                "cycle": "HierarchyRequestError",
+                "removedTree": [null, false, false, true],
+                "reattachedTree": [true, true],
+            })
+        );
+    }
+
+    #[test]
     fn element_scroll_methods_update_scroll_offsets() {
         let mut rt = setup_runtime(
             r#"<div id="scroller" style="width:100px;height:100px;overflow:auto">
@@ -7745,6 +7816,35 @@ mod tests {
         assert_eq!(rt.evaluate("__finishEvent").unwrap(), serde_json::json!(true));
         assert_eq!(rt.evaluate("__animation.playState").unwrap(), serde_json::json!("finished"));
         assert_eq!(rt.evaluate("getComputedStyle(box).opacity").unwrap(), serde_json::json!("1"));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn waapi_positive_infinite_iterations_remain_active() {
+        let mut rt = setup_runtime(r#"<div id="box" style="opacity:.1"></div>"#);
+        rt.execute_script(
+            "waapi-infinite",
+            r#"
+                globalThis.__infiniteFinished = false;
+                globalThis.__infiniteAnimation = document.getElementById('box').animate(
+                    [{opacity:.1}, {opacity:1}],
+                    {duration:1, iterations:Infinity, fill:'both', easing:'linear'}
+                );
+                __infiniteAnimation.finished.then(() => { __infiniteFinished = true; });
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(20).await.unwrap();
+        assert_eq!(
+            rt.evaluate(
+                "[__infiniteAnimation.playState, __infiniteAnimation.effect.getTiming().iterations === Infinity, __infiniteFinished]",
+            )
+            .unwrap(),
+            serde_json::json!(["running", true, false]),
+        );
+        rt.evaluate("getComputedStyle(document.getElementById('box')).opacity")
+            .unwrap();
+        assert!(rt.prepared_has_active_css_animations());
     }
 
     #[cfg(feature = "render")]
