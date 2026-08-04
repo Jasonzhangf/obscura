@@ -800,6 +800,10 @@ pub struct LayoutStyle {
     /// features such as container-query axis availability that depend on the
     /// computed display rather than our internal layout approximation.
     pub(crate) is_table_box: bool,
+    /// The computed `table-layout: fixed` value. The fixed algorithm is only
+    /// activated when the table also has a definite inline size; otherwise
+    /// CSS requires the automatic table layout algorithm.
+    pub(crate) table_layout_fixed: bool,
     /// The computed inner display is `table-cell`.
     ///
     /// Authored internal table boxes need the same cell sizing path as native

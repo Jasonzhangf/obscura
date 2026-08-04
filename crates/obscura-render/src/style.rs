@@ -1710,6 +1710,13 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                 _ => style.border_collapse,
             };
         }
+        "table-layout" => match value.trim().to_ascii_lowercase().as_str() {
+            "fixed" => style.table_layout_fixed = true,
+            "auto" | "initial" | "unset" | "revert" | "revert-layer" => {
+                style.table_layout_fixed = false;
+            }
+            _ => {}
+        },
         "grid-template-columns" => {
             let (tracks, names, calc_expressions) = parse_track_list_named(value);
             style.grid_template_columns_subgrid = is_subgrid_track_list(value);
@@ -2042,6 +2049,7 @@ pub fn supports_declaration(name: &str, value: &str) -> bool {
             | "-webkit-column-break-inside"
             | "border-spacing"
             | "border-collapse"
+            | "table-layout"
             | "grid-template-columns"
             | "grid-template-rows"
             | "grid-auto-columns"
@@ -2121,6 +2129,7 @@ pub fn supports_declaration(name: &str, value: &str) -> bool {
             value.to_ascii_lowercase().as_str(),
             "content-box" | "border-box"
         ),
+        "table-layout" => matches!(value.to_ascii_lowercase().as_str(), "auto" | "fixed"),
         "container-type" => parse_container_type(value).is_some(),
         "container-name" => parse_container_names(value).is_some(),
         "container" => parse_container_shorthand(value).is_some(),
@@ -8046,6 +8055,21 @@ fn split_ws_paren(s: &str) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn table_layout_parses_resets_and_reports_only_supported_values() {
+        let fixed = compute_style("table", Some("table-layout:fixed"));
+        assert!(fixed.table_layout_fixed);
+
+        let reset = compute_style(
+            "table",
+            Some("table-layout:fixed;table-layout:auto;table-layout:banana"),
+        );
+        assert!(!reset.table_layout_fixed);
+        assert!(supports_declaration("table-layout", "fixed"));
+        assert!(supports_declaration("table-layout", "auto"));
+        assert!(!supports_declaration("table-layout", "fixed-ish"));
+    }
 
     #[test]
     fn supports_reports_only_implemented_value_subsets() {

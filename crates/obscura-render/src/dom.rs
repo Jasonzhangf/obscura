@@ -1644,6 +1644,10 @@ struct IfcRegistry {
     /// table column-balancing pass in `layout_dom_with_images`, which pins
     /// specified columns instead of sizing them purely from content.
     table_cols: HashMap<taffy::NodeId, (Vec<Option<f32>>, Vec<Option<f32>>)>,
+    /// Column constraints for the fixed table-layout algorithm. Unlike
+    /// `table_cols`, these are sourced only from columns and the first row and
+    /// deliberately exclude later-row intrinsic content.
+    fixed_table_cols: HashMap<taffy::NodeId, Vec<FixedTableColumn>>,
     /// Minimum row heights per table grid node, one entry per source row.
     /// The post-width row-sizing pass combines these with each cell's final
     /// content height and pins the tracks before vertical alignment.
@@ -1666,6 +1670,13 @@ struct IfcRegistry {
     /// post-pass then balances those already-built boxes without rebuilding
     /// or reshaping their subtrees.
     multicol: Vec<MulticolBuild>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct FixedTableColumn {
+    length: f32,
+    percentage: f32,
+    specified: bool,
 }
 
 struct MulticolBuild {
@@ -5403,7 +5414,7 @@ fn layout_dom_once(
                     let mut available_widths: HashMap<taffy::NodeId, f32> = HashMap::new();
                     let needs_layout_snapshot = group.iter().any(|(_, dom, _)| {
                         styles.get(dom).is_some_and(|style| {
-                            style.width == crate::Dimension::Auto
+                            (style.width == crate::Dimension::Auto
                                 && (depth > 0
                                     || reliable_table_available_width(
                                         tree,
@@ -5411,7 +5422,9 @@ fn layout_dom_once(
                                         &styles,
                                         initial_cb_width,
                                     )
-                                    .is_none())
+                                    .is_none()))
+                                || (style.table_layout_fixed
+                                    && matches!(style.width, crate::Dimension::Percent(_)))
                         })
                     });
                     if needs_layout_snapshot {
@@ -5427,7 +5440,14 @@ fn layout_dom_once(
                         for &(tnode, dom, _) in group {
                             if styles
                                 .get(&dom)
-                                .is_some_and(|style| style.width == crate::Dimension::Auto)
+                                .is_some_and(|style| {
+                                    style.width == crate::Dimension::Auto
+                                        || (style.table_layout_fixed
+                                            && matches!(
+                                                style.width,
+                                                crate::Dimension::Percent(_)
+                                            ))
+                                })
                             {
                                 if let Ok(layout) = taffy_tree.layout(tnode) {
                                     available_widths.insert(tnode, layout.size.width.max(0.0));
@@ -5439,6 +5459,66 @@ fn layout_dom_once(
                         let Some(table_style) = styles.get(&dom) else {
                             continue;
                         };
+                        if let Some(columns) = ifc_items.fixed_table_cols.get(&tnode) {
+                            let ncols = columns.len();
+                            if ncols == 0 {
+                                continue;
+                            }
+                            let inline_outer_edges = table_inline_outer_edges(table_style);
+                            let mut used_outer = match table_style.width {
+                                crate::Dimension::Px(width)
+                                    if table_style.box_sizing
+                                        == crate::BoxSizing::ContentBox =>
+                                {
+                                    width.max(0.0) + inline_outer_edges
+                                }
+                                crate::Dimension::Px(width) => width.max(0.0),
+                                crate::Dimension::Percent(_) => available_widths
+                                    .get(&tnode)
+                                    .copied()
+                                    .unwrap_or_else(|| {
+                                        reliable_table_available_width(
+                                            tree,
+                                            dom,
+                                            &styles,
+                                            initial_cb_width,
+                                        )
+                                        .unwrap_or(initial_cb_width)
+                                    }),
+                                _ => continue,
+                            };
+                            let (horizontal_spacing, _) = table_spacing(table_style);
+                            let interior_spacing =
+                                horizontal_spacing * ncols.saturating_sub(1) as f32;
+                            let target =
+                                (used_outer - inline_outer_edges - interior_spacing).max(0.0);
+                            let widths = distribute_fixed_table_columns(target, columns);
+                            let required_outer = widths.iter().sum::<f32>()
+                                + inline_outer_edges
+                                + interior_spacing;
+                            used_outer = used_outer.max(required_outer);
+                            let used_declaration =
+                                if table_style.box_sizing == crate::BoxSizing::ContentBox {
+                                    (used_outer - inline_outer_edges).max(0.0)
+                                } else {
+                                    used_outer
+                                };
+                            if let Ok(cur) = taffy_tree.style(tnode) {
+                                let mut fixed_style = cur.clone();
+                                fixed_style.size.width = length(used_declaration);
+                                fixed_style.grid_template_columns = widths
+                                    .iter()
+                                    .map(|width| {
+                                        taffy::GridTemplateComponent::Single(taffy::MinMax {
+                                            min: taffy::MinTrackSizingFunction::length(*width),
+                                            max: taffy::MaxTrackSizingFunction::length(*width),
+                                        })
+                                    })
+                                    .collect();
+                                let _ = taffy_tree.set_style(tnode, fixed_style);
+                            }
+                            continue;
+                        }
                         // A percentage-width table resolves against its container, so
                         // leave taffy's percentage handling in place.
                         let width_style = table_style.width;
@@ -9572,6 +9652,87 @@ fn distribute_auto_table_columns(
     result
 }
 
+/// Resolve CSS 2 fixed-layout column constraints into exact track widths.
+///
+/// Columns and first-row cells establish the initial widths. Unspecified
+/// tracks share the remaining space; when every track is specified, surplus
+/// follows Gecko's fixed-length, percentage, then equal fallback order. A
+/// fixed-length over-constraint grows the table, while percentage constraints
+/// may shrink proportionally to keep the specified table width.
+fn distribute_fixed_table_columns(target: f32, columns: &[FixedTableColumn]) -> Vec<f32> {
+    if columns.is_empty() {
+        return Vec::new();
+    }
+    let target = target.max(0.0);
+    let mut widths: Vec<f32> = columns
+        .iter()
+        .map(|column| {
+            if column.specified {
+                column.length.max(0.0) + column.percentage.max(0.0) * target
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    let mut total: f32 = widths.iter().sum();
+
+    // Percentage columns are the flexible part of an over-constrained fixed
+    // table. Never shrink the absolute component: if lengths alone do not fit,
+    // the table's used width grows to contain them.
+    if total > target {
+        let percentage_total: f32 = columns
+            .iter()
+            .map(|column| column.percentage.max(0.0) * target)
+            .sum();
+        let shrink = (total - target).min(percentage_total);
+        if shrink > 0.0 && percentage_total > 0.0 {
+            for (width, column) in widths.iter_mut().zip(columns) {
+                let contribution = column.percentage.max(0.0) * target;
+                *width = (*width - shrink * contribution / percentage_total).max(0.0);
+            }
+            total -= shrink;
+        }
+    }
+
+    let remaining = (target - total).max(0.0);
+    if remaining <= f32::EPSILON {
+        return widths;
+    }
+    let unresolved: Vec<usize> = columns
+        .iter()
+        .enumerate()
+        .filter_map(|(index, column)| (!column.specified).then_some(index))
+        .collect();
+    if !unresolved.is_empty() {
+        let share = remaining / unresolved.len() as f32;
+        for index in unresolved {
+            widths[index] = share;
+        }
+        return widths;
+    }
+
+    let mut weights: Vec<f32> = columns
+        .iter()
+        .map(|column| column.length.max(0.0))
+        .collect();
+    let mut weight: f32 = weights.iter().sum();
+    if weight <= f32::EPSILON {
+        weights = columns
+            .iter()
+            .map(|column| column.percentage.max(0.0))
+            .collect();
+        weight = weights.iter().sum();
+    }
+    if weight <= f32::EPSILON {
+        weights.fill(1.0);
+        weight = columns.len() as f32;
+    }
+    for (width, column_weight) in widths.iter_mut().zip(weights) {
+        *width += remaining * column_weight / weight;
+    }
+    widths
+}
+
 /// Build a `<table>` as a CSS grid. Modeling the table as a grid is what makes
 /// columns negotiate a shared width across every row (min-content/max-content
 /// track sizing), which the old flex-row-per-`<tr>` stack could not do: each
@@ -9791,6 +9952,9 @@ fn build_table(
     // leaving a dead strip of bare table background.
     let mut col_px: Vec<Option<f32>> = vec![None; ncols];
     let mut col_pct: Vec<Option<f32>> = vec![None; ncols];
+    let fixed_layout = style.table_layout_fixed
+        && matches!(style.width, crate::Dimension::Px(_) | crate::Dimension::Percent(_));
+    let mut fixed_columns = vec![FixedTableColumn::default(); ncols];
     let attr_width = |cid: NodeId| -> (Option<f32>, Option<f32>) {
         let Some(v) = tree
             .get_node(cid)
@@ -9811,6 +9975,13 @@ fn build_table(
         match styles.get(&cid).map(|s| s.width) {
             Some(crate::Dimension::Px(w)) if w > 0.0 => (Some(w), None),
             Some(crate::Dimension::Percent(p)) if p > 0.0 => (None, Some(p)),
+            _ => attr_width(cid),
+        }
+    };
+    let fixed_style_width = |cid: NodeId| -> (Option<f32>, Option<f32>) {
+        match styles.get(&cid).map(|s| s.width) {
+            Some(crate::Dimension::Px(w)) if w >= 0.0 => (Some(w), None),
+            Some(crate::Dimension::Percent(p)) if p >= 0.0 => (None, Some(p)),
             _ => attr_width(cid),
         }
     };
@@ -9838,22 +10009,30 @@ fn build_table(
             _ => {}
         }
     }
-    for col_el in col_elems {
+    for col_el in &col_elems {
         let span = tree
-            .get_node(col_el)
+            .get_node(*col_el)
             .and_then(|n| {
                 n.get_attribute("span")
                     .and_then(|v| v.trim().parse::<usize>().ok())
             })
             .unwrap_or(1)
             .clamp(1, MAX_SPAN);
-        let (px, pct) = style_width(col_el);
+        let (px, pct) = style_width(*col_el);
+        let (fixed_px, fixed_pct) = fixed_style_width(*col_el);
         for _ in 0..span {
             if next_col >= ncols {
                 break;
             }
             col_px[next_col] = px;
             col_pct[next_col] = pct;
+            if fixed_layout && (fixed_px.is_some() || fixed_pct.is_some()) {
+                fixed_columns[next_col] = FixedTableColumn {
+                    length: fixed_px.unwrap_or(0.0),
+                    percentage: fixed_pct.unwrap_or(0.0),
+                    specified: true,
+                };
+            }
             next_col += 1;
         }
     }
@@ -9881,6 +10060,48 @@ fn build_table(
         }
     }
 
+    // Under fixed table layout only the first row contributes cell widths,
+    // and an explicit `<col>` constraint wins for every covered column. A
+    // spanning cell's outer width is split with the inter-column spacing
+    // removed, matching Gecko's `((width + spacing) / span) - spacing` rule.
+    if fixed_layout {
+        let (horizontal_spacing, _) = table_spacing(style);
+        for (cid, row, start, _rowspan, colspan) in &placed {
+            if *row != 0 || *start >= ncols {
+                continue;
+            }
+            let (px, pct) = fixed_style_width(*cid);
+            if px.is_none() && pct.is_none() {
+                continue;
+            }
+            let span = (*colspan).min(ncols - *start).max(1);
+            let cell_style = styles.get(cid);
+            let edges = cell_style
+                .filter(|cell| cell.box_sizing == crate::BoxSizing::ContentBox)
+                .map(|cell| {
+                    cell.padding.left
+                        + cell.padding.right
+                        + cell.border.left
+                        + cell.border.right
+                })
+                .unwrap_or(0.0);
+            let outer_length = px.unwrap_or(0.0) + edges;
+            let per_column_length =
+                ((outer_length + horizontal_spacing) / span as f32 - horizontal_spacing)
+                    .max(0.0);
+            let per_column_percentage = pct.unwrap_or(0.0).max(0.0) / span as f32;
+            for column in &mut fixed_columns[*start..*start + span] {
+                if !column.specified {
+                    *column = FixedTableColumn {
+                        length: per_column_length,
+                        percentage: per_column_percentage,
+                        specified: true,
+                    };
+                }
+            }
+        }
+    }
+
     // Row sizing: a `height` on the row or a rowspan-1 cell is a MINIMUM
     // (content can always grow a row), matching how tables treat heights.
     let mut row_min: Vec<Option<f32>> = vec![None; nrows];
@@ -9905,6 +10126,12 @@ fn build_table(
     }
 
     let col = |i: usize| {
+        if fixed_layout {
+            return taffy::GridTemplateComponent::Single(taffy::MinMax {
+                min: taffy::MinTrackSizingFunction::length(0.0),
+                max: taffy::MaxTrackSizingFunction::length(0.0),
+            });
+        }
         let max = if let Some(p) = col_pct[i] {
             taffy::MaxTrackSizingFunction::percent(p)
         } else if let Some(px) = col_px[i] {
@@ -9954,6 +10181,9 @@ fn build_table(
     let table_node = taffy_tree.new_with_children(tstyle, &children).ok()?;
     id_map.insert(table_node, id);
     ifc_items.table_rows.insert(table_node, row_min);
+    if fixed_layout {
+        ifc_items.fixed_table_cols.insert(table_node, fixed_columns);
+    }
     if col_px.iter().any(Option::is_some) || col_pct.iter().any(Option::is_some) {
         ifc_items.table_cols.insert(table_node, (col_px, col_pct));
     }
@@ -16178,6 +16408,160 @@ mod tests {
         };
         assert_eq!(width("content-cell"), 124.0);
         assert_eq!(width("border-cell"), 100.0);
+    }
+
+    #[test]
+    fn fixed_table_layout_uses_only_first_row_for_column_geometry() {
+        let tree = parse_html(
+            r#"<style>
+                html,body { margin:0 }
+                table { table-layout:fixed; width:300px; border-collapse:collapse }
+                td { height:30px; padding:0; border:0 }
+                #first { width:50px }
+                #later { width:250px; white-space:nowrap }
+            </style>
+            <table><tr><td id="first"></td><td id="second"></td></tr>
+            <tr><td id="later">XXXXXXXXXXXXXXXXXXXXXXXX</td><td id="last"></td></tr></table>"#,
+        );
+        let laid = layout_dom(&tree, (800.0, 300.0));
+        let rect = |id: &str| laid.rects[&tree.get_element_by_id(id).unwrap()];
+        for id in ["first", "later"] {
+            assert!((rect(id).width - 50.0).abs() < 0.1, "{}: {:?}", id, rect(id));
+        }
+        for id in ["second", "last"] {
+            assert!((rect(id).width - 250.0).abs() < 0.1, "{}: {:?}", id, rect(id));
+        }
+    }
+
+    #[test]
+    fn fixed_table_layout_accounts_for_separate_border_spacing() {
+        let tree = parse_html(
+            r#"<style>
+                html,body { margin:0 }
+                table { table-layout:fixed; width:300px; border:4px solid black; border-spacing:10px 0 }
+                td { height:30px; padding:0; border:0 }
+                #first { width:50px }
+            </style>
+            <table id="table"><tr><td id="first"></td><td id="second"></td></tr></table>"#,
+        );
+        let laid = layout_dom(&tree, (800.0, 300.0));
+        let rect = |id: &str| laid.rects[&tree.get_element_by_id(id).unwrap()];
+        assert!((rect("table").width - 300.0).abs() < 0.1, "{:?}", rect("table"));
+        assert!((rect("first").x - 14.0).abs() < 0.1, "{:?}", rect("first"));
+        assert!((rect("first").width - 50.0).abs() < 0.1, "{:?}", rect("first"));
+        assert!((rect("second").x - 74.0).abs() < 0.1, "{:?}", rect("second"));
+        assert!((rect("second").width - 212.0).abs() < 0.1, "{:?}", rect("second"));
+    }
+
+    #[test]
+    fn fixed_percentage_table_resolves_tracks_against_final_used_width() {
+        let tree = parse_html(
+            r#"<style>
+                html,body { margin:0 }
+                table { table-layout:fixed; width:50%; border-spacing:10px 0 }
+                td { height:30px; padding:0; border:0 }
+                #first { width:25% }
+            </style>
+            <table id="table"><tr><td id="first"></td><td id="second"></td></tr></table>"#,
+        );
+        let laid = layout_dom(&tree, (800.0, 300.0));
+        let rect = |id: &str| laid.rects[&tree.get_element_by_id(id).unwrap()];
+        assert!((rect("table").width - 400.0).abs() < 0.1, "{:?}", rect("table"));
+        // Final paint geometry is snapped to device pixels around the 92.5 /
+        // 277.5 CSS-pixel track boundary.
+        assert!((rect("first").width - 92.5).abs() <= 0.5, "{:?}", rect("first"));
+        assert!((rect("second").width - 277.5).abs() <= 0.5, "{:?}", rect("second"));
+    }
+
+    #[test]
+    fn fixed_columns_win_over_first_row_spanning_cell_widths() {
+        let tree = parse_html(
+            r#"<style>
+                html,body { margin:0 }
+                table { table-layout:fixed; width:300px; border-spacing:10px 0 }
+                td { height:30px; padding:0; border:0 }
+            </style>
+            <table><col style="width:40px"><col><col>
+              <tr><td id="span" colspan="2" style="width:200px"></td><td id="top-last"></td></tr>
+              <tr><td id="one"></td><td id="two"></td><td id="three"></td></tr>
+            </table>"#,
+        );
+        let laid = layout_dom(&tree, (800.0, 300.0));
+        let width = |id: &str| laid.rects[&tree.get_element_by_id(id).unwrap()].width;
+        assert!((width("span") - 145.0).abs() < 0.1, "{}", width("span"));
+        assert!((width("one") - 40.0).abs() < 0.1, "{}", width("one"));
+        assert!((width("two") - 95.0).abs() < 0.1, "{}", width("two"));
+        assert!((width("three") - 125.0).abs() < 0.1, "{}", width("three"));
+    }
+
+    #[test]
+    fn fixed_table_layout_with_auto_width_falls_back_to_auto_algorithm() {
+        let tree = parse_html(
+            r#"<style>
+                html,body { margin:0 }
+                table { table-layout:fixed; border-collapse:collapse }
+                td { padding:0; border:0 }
+                #first { width:50px }
+                #later { width:250px }
+            </style>
+            <table><tr><td id="first"></td><td></td></tr>
+            <tr><td id="later"></td><td></td></tr></table>"#,
+        );
+        let laid = layout_dom(&tree, (800.0, 300.0));
+        let first = laid.rects[&tree.get_element_by_id("first").unwrap()];
+        let later = laid.rects[&tree.get_element_by_id("later").unwrap()];
+        assert!(first.width >= 249.9, "{first:?}");
+        assert!((first.width - later.width).abs() < 0.1, "{first:?} {later:?}");
+    }
+
+    #[test]
+    fn fixed_table_column_distribution_matches_css_fixed_rules() {
+        let column = |length, percentage, specified| FixedTableColumn {
+            length,
+            percentage,
+            specified,
+        };
+        let assert_widths = |actual: Vec<f32>, expected: &[f32]| {
+            assert_eq!(actual.len(), expected.len());
+            for (actual, expected) in actual.iter().zip(expected) {
+                assert!((actual - expected).abs() < 0.01, "{actual:?} != {expected:?}");
+            }
+        };
+        assert_widths(
+            distribute_fixed_table_columns(
+                300.0,
+                &[column(50.0, 0.0, true), column(0.0, 0.0, false)],
+            ),
+            &[50.0, 250.0],
+        );
+        assert_widths(
+            distribute_fixed_table_columns(
+                300.0,
+                &[column(50.0, 0.0, true), column(100.0, 0.0, true)],
+            ),
+            &[100.0, 200.0],
+        );
+        assert_widths(
+            distribute_fixed_table_columns(
+                300.0,
+                &[column(50.0, 0.0, true), column(0.0, 0.5, true)],
+            ),
+            &[150.0, 150.0],
+        );
+        assert_widths(
+            distribute_fixed_table_columns(
+                300.0,
+                &[column(250.0, 0.0, true), column(100.0, 0.0, true)],
+            ),
+            &[250.0, 100.0],
+        );
+        assert_widths(
+            distribute_fixed_table_columns(
+                300.0,
+                &[column(0.0, 0.75, true), column(0.0, 0.75, true)],
+            ),
+            &[150.0, 150.0],
+        );
     }
 
     #[test]

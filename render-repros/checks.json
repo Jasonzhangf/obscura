@@ -268,6 +268,16 @@
   "tables": [
     {"name": "content-box fixed cell column", "color": "#ffcc99", "width": 208}
   ],
+  "fixed-table-layout": [
+    {"name": "first-row length fixes collapsed first track", "color": "#e03131", "x": 0, "y": 0, "width": 50, "height": 30},
+    {"name": "unresolved collapsed track receives remainder", "color": "#1971c2", "x": 50, "y": 0, "width": 250, "height": 30},
+    {"name": "later content cannot resize fixed first track", "color": "#2f9e44", "x": 0, "y": 30, "width": 50, "height": 30},
+    {"name": "later collapsed row preserves shared tracks", "color": "#f08c00", "x": 50, "y": 30, "width": 250, "height": 30},
+    {"name": "separate model charges outer spacing before first track", "color": "#862e9c", "x": 14, "y": 104, "width": 50, "height": 30},
+    {"name": "separate model removes border and all spacing from track space", "color": "#15aabf", "x": 74, "y": 104, "width": 212, "height": 30},
+    {"name": "later separate row cannot resize first track", "color": "#c2255c", "x": 14, "y": 134, "width": 50, "height": 30},
+    {"name": "later separate row preserves remaining track", "color": "#fab005", "x": 74, "y": 134, "width": 212, "height": 30}
+  ],
   "table-row-geometry": [
     {"name": "cell height remains a minimum below block content", "color": "#1971c2", "x": 0, "y": 0, "width": 40, "height": 30},
     {"name": "sibling cell stretches to the content-sized row", "color": "#f783ac", "x": 40, "y": 0, "width": 50, "height": 30},
