@@ -407,7 +407,7 @@ struct RenderMutationImpact {
 }
 
 fn node_is_connected(dom: &DomTree, node: NodeId) -> bool {
-    dom.shadow_including_root(node) == Some(dom.document())
+    dom.is_connected(node)
 }
 
 #[cfg(feature = "render")]
@@ -674,6 +674,45 @@ fn retained_style_mutation(
 }
 
 #[cfg(feature = "render")]
+const MAX_PENDING_STYLE_MUTATIONS: usize = 256;
+
+/// Queue one retained-style invalidation without letting animation frameworks
+/// evict the whole prepared render merely because they rewrite the same inline
+/// style more than once before the next rendering opportunity.
+///
+/// A `style` mutation does not carry selector values: the retained planner
+/// dirties that element/subtree and reads the final inline declaration from the
+/// live DOM. Repeating the same dirty marker for one node is therefore
+/// idempotent. Other attributes retain their complete transition sequence;
+/// selector invalidation needs their old and new values.
+#[cfg(feature = "render")]
+fn queue_retained_style_mutation(
+    pending: &mut Vec<obscura_render::RetainedStyleMutation>,
+    mutation: obscura_render::RetainedStyleMutation,
+) -> bool {
+    if let obscura_render::RetainedStyleMutation::Attribute(next) = &mutation {
+        if next.name.eq_ignore_ascii_case("style")
+            && pending.iter().any(|queued| {
+                matches!(
+                    queued,
+                    obscura_render::RetainedStyleMutation::Attribute(current)
+                        if current.node == next.node
+                            && current.name.eq_ignore_ascii_case("style")
+                )
+            })
+        {
+            return true;
+        }
+    }
+
+    if pending.len() >= MAX_PENDING_STYLE_MUTATIONS {
+        return false;
+    }
+    pending.push(mutation);
+    true
+}
+
+#[cfg(feature = "render")]
 fn render_timing_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("OBSCURA_RENDER_TIMING").is_some())
@@ -936,11 +975,12 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                     .note_subtree_start_candidate(root, mutation_time_ms);
             }
             if let Some(mutation) = retained_style_mutation {
-                if state.prepared_render.is_some()
-                    && state.pending_style_mutations.len() < 256
-                {
-                    state.pending_style_mutations.push(mutation);
-                } else {
+                let retained = state.prepared_render.is_some()
+                    && queue_retained_style_mutation(
+                        &mut state.pending_style_mutations,
+                        mutation,
+                    );
+                if !retained {
                     state.prepared_render = None;
                     state.pending_style_mutations.clear();
                 }
@@ -1532,6 +1572,13 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
             dom.descendants(NodeId::new(nid))
                 .contains(&NodeId::new(other))
                 .to_string()
+        }
+        // Connectivity is maintained incrementally by DomTree. Exposing the
+        // cached bit avoids an ancestor op crossing for every level when JS
+        // builds a deep detached subtree.
+        "is_connected" => {
+            let nid = arg1.parse::<u32>().unwrap_or(0);
+            dom.is_connected(NodeId::new(nid)).to_string()
         }
         // Index of a node among its parent's children. Walks prev siblings in
         // Rust, avoiding the per-step JS->op round trips a Range comparison
@@ -2519,14 +2566,17 @@ fn glob_match(pattern: &str, url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{cors_response_allows, glob_match, validate_fetch_url, FetchCredentials};
+    use crate::runtime::ObscuraJsRuntime;
+    use obscura_dom::parse_html;
 
     #[cfg(feature = "render")]
     use super::{
         ensure_prepared_geometry, ensure_prepared_render, node_is_connected,
-        retained_style_mutation, shadow_including_connected_nodes, ObscuraState,
+        queue_retained_style_mutation, retained_style_mutation,
+        shadow_including_connected_nodes, ObscuraState,
     };
     #[cfg(feature = "render")]
-    use obscura_dom::{parse_html, ShadowRootMode};
+    use obscura_dom::ShadowRootMode;
 
     #[test]
     fn glob_match_handles_cdp_blocked_url_patterns() {
@@ -2606,6 +2656,134 @@ mod tests {
         assert!(validate_fetch_url(&loopback, true).is_ok());
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn posted_task_chains_complete_without_zero_delay_timer_floor() {
+        let mut runtime = ObscuraJsRuntime::new();
+        runtime.set_dom(parse_html("<html><body></body></html>"));
+        runtime.set_url("http://example.com/posted-task-test");
+        runtime.run_page_init();
+        runtime
+            .execute_script(
+                "posted-task-throughput",
+                r#"
+                    globalThis.__postedTaskBench = {
+                        message: 0,
+                        postTask: 0,
+                        yields: 0,
+                        started: performance.now(),
+                        finished: 0,
+                    };
+                    const markFinished = () => {
+                        if (__postedTaskBench.message === 100 &&
+                            __postedTaskBench.postTask === 100 &&
+                            __postedTaskBench.yields === 100) {
+                            __postedTaskBench.finished = performance.now();
+                        }
+                    };
+
+                    const channel = new MessageChannel();
+                    channel.port2.onmessage = () => {
+                        __postedTaskBench.message++;
+                        if (__postedTaskBench.message < 100) channel.port1.postMessage(null);
+                        else markFinished();
+                    };
+                    channel.port1.postMessage(null);
+
+                    const postNext = () => scheduler.postTask(() => {
+                        __postedTaskBench.postTask++;
+                        if (__postedTaskBench.postTask < 100) postNext();
+                        else markFinished();
+                    });
+                    postNext();
+
+                    scheduler.postTask(async () => {
+                        while (__postedTaskBench.yields < 100) {
+                            await scheduler.yield();
+                            __postedTaskBench.yields++;
+                        }
+                        markFinished();
+                    });
+                "#,
+            )
+            .unwrap();
+
+        runtime.run_event_loop_bounded(100).await.unwrap();
+        let result = runtime
+            .evaluate(
+                r#"[
+                    __postedTaskBench.message,
+                    __postedTaskBench.postTask,
+                    __postedTaskBench.yields,
+                    __postedTaskBench.finished - __postedTaskBench.started,
+                ]"#,
+            )
+            .unwrap();
+        let values = result.as_array().unwrap();
+        assert!(
+            values[..3].iter().all(|value| value.as_f64() == Some(100.0)),
+            "posted-task chains did not finish inside the 100ms pump: {result}",
+        );
+        assert!(
+            values[3].as_f64().is_some_and(|elapsed| elapsed >= 0.0 && elapsed < 75.0),
+            "300 chained posted-task deliveries retained timer-wheel latency: {result}",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shared_posted_task_queue_preserves_priority_fifo_and_microtasks() {
+        let mut runtime = ObscuraJsRuntime::new();
+        runtime.set_dom(parse_html("<html><body></body></html>"));
+        runtime.set_url("http://example.com/posted-task-order");
+        runtime.run_page_init();
+        runtime
+            .execute_script(
+                "shared-posted-task-order",
+                r#"
+                    globalThis.__sharedPostedOrder = ["sync"];
+                    const channel = new MessageChannel();
+                    channel.port2.onmessage = event => {
+                        __sharedPostedOrder.push("message-" + event.data);
+                        Promise.resolve().then(() => {
+                            __sharedPostedOrder.push("message-" + event.data + "-microtask");
+                        });
+                    };
+                    channel.port1.postMessage(1);
+                    scheduler.postTask(() => {
+                        __sharedPostedOrder.push("visible");
+                        Promise.resolve().then(() => __sharedPostedOrder.push("visible-microtask"));
+                    });
+                    channel.port1.postMessage(2);
+                    scheduler.postTask(() => {
+                        __sharedPostedOrder.push("background");
+                    }, { priority: "background" });
+                    scheduler.postTask(() => {
+                        __sharedPostedOrder.push("blocking");
+                        Promise.resolve().then(() => __sharedPostedOrder.push("blocking-microtask"));
+                    }, { priority: "user-blocking" });
+                    Promise.resolve().then(() => __sharedPostedOrder.push("initial-microtask"));
+                "#,
+            )
+            .unwrap();
+
+        runtime.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            runtime.evaluate("__sharedPostedOrder").unwrap(),
+            serde_json::json!([
+                "sync",
+                "initial-microtask",
+                "blocking",
+                "blocking-microtask",
+                "message-1",
+                "message-1-microtask",
+                "visible",
+                "visible-microtask",
+                "message-2",
+                "message-2-microtask",
+                "background",
+            ]),
+        );
+    }
+
     #[cfg(feature = "render")]
     #[test]
     fn connected_shadow_nodes_invalidate_without_entering_light_tree_retention() {
@@ -2633,6 +2811,56 @@ mod tests {
         dom.remove(source);
         assert!(!node_is_connected(&dom, child));
         assert!(!shadow_including_connected_nodes(&dom).contains(&child));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn repeated_inline_style_writes_share_one_retained_dirty_marker_per_node() {
+        let mut pending = Vec::new();
+        let style_mutation = |raw| {
+            obscura_render::RetainedStyleMutation::Attribute(
+                obscura_render::AttributeStyleMutation {
+                    node: obscura_dom::tree::NodeId::new(raw),
+                    name: "style".to_string(),
+                    old_value: None,
+                    new_value: None,
+                },
+            )
+        };
+
+        // Motion/React commonly writes a connected element's serialized style
+        // twice in one commit. The old queue reached its 256-record ceiling at
+        // only 128 elements and discarded the complete PreparedRender.
+        for raw in 1..=200 {
+            assert!(queue_retained_style_mutation(
+                &mut pending,
+                style_mutation(raw),
+            ));
+            assert!(queue_retained_style_mutation(
+                &mut pending,
+                style_mutation(raw),
+            ));
+        }
+        assert_eq!(pending.len(), 200);
+
+        // The memory bound remains real: unique dirty nodes still consume one
+        // slot, while an already-recorded node remains safe at the ceiling.
+        for raw in 201..=256 {
+            assert!(queue_retained_style_mutation(
+                &mut pending,
+                style_mutation(raw),
+            ));
+        }
+        assert_eq!(pending.len(), 256);
+        assert!(queue_retained_style_mutation(
+            &mut pending,
+            style_mutation(1),
+        ));
+        assert!(!queue_retained_style_mutation(
+            &mut pending,
+            style_mutation(257),
+        ));
+        assert_eq!(pending.len(), 256);
     }
 
     #[cfg(feature = "render")]
@@ -2792,6 +3020,16 @@ fn op_navigate(state: &OpState, #[string] url: &str, #[string] method: &str, #[s
 #[op2(fast)]
 fn op_async_runtime_available() -> bool {
     tokio::runtime::Handle::try_current().is_ok()
+}
+
+/// Wake one browser posted task without routing through Tokio's timer wheel.
+/// `yield_now` guarantees the op cannot settle in the initiating JavaScript
+/// turn, while avoiding the roughly one-millisecond floor of a zero-duration
+/// timer. The bootstrap owns task priority, FIFO order, and one-at-a-time
+/// delivery; this op supplies only the event-loop wake boundary.
+#[op2(async)]
+async fn op_posted_task() {
+    tokio::task::yield_now().await;
 }
 
 // Records a binding call from page JS. The CDP layer drains this queue
@@ -3498,6 +3736,7 @@ pub fn build_extension() -> Extension {
         op_set_cookie(),
         op_navigate(),
         op_async_runtime_available(),
+        op_posted_task(),
         op_binding_called(),
         op_subtle_digest(),
         op_subtle_hmac(),

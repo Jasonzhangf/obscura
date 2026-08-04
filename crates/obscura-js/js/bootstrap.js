@@ -16,6 +16,7 @@
     '__obscura_objects', '__obscura_oid', '__obscura_ua',
     '__obscura_platform', '__obscura_ua_platform', '__obscura_ua_platform_version',
     '__obscura_stealth', '__obscura_markTrusted',
+    '__obscura_registerLinkedStylesheet',
     '__markParserScripts', '__obscura_hasPendingDynamicScripts',
     '__obscura_hasPendingLoadDelayingScripts',
     '__obscura_nextPendingTimeoutDelay',
@@ -390,6 +391,38 @@ function _resolveResourceUrl(src) {
 }
 
 const _linkedStylesheetNodes = new WeakMap();
+const _linkElementSheets = new WeakMap();
+
+function _linkedStylesheetHref(link, explicitHref) {
+  const raw = explicitHref || link?.getAttribute?.("href") || link?.href || "";
+  return raw ? _resolveResourceUrl(String(raw)) : "";
+}
+
+function _linkedStylesheetIsOriginClean(href) {
+  try {
+    const documentUrl = new URL(globalThis.document?.URL || globalThis.location?.href || "about:blank");
+    const stylesheetUrl = new URL(href, documentUrl.href);
+    return stylesheetUrl.origin === documentUrl.origin;
+  } catch(e) {
+    // An unresolved relative URL in an about:blank-style synthetic document
+    // has no distinct remote origin and is safe to expose.
+    return !/^[a-z][a-z0-9+.-]*:/i.test(String(href || ""));
+  }
+}
+
+function _registerLinkedStylesheet(link, sourceNode, explicitHref) {
+  if (!link || !sourceNode) return null;
+  const href = _linkedStylesheetHref(link, explicitHref);
+  _linkedStylesheetNodes.set(link, sourceNode);
+  let sheet = _linkElementSheets.get(link);
+  if (!sheet) {
+    sheet = new CSSStyleSheet();
+    _linkElementSheets.set(link, sheet);
+  }
+  sheet._bindLinkedOwner(link, sourceNode, href, _linkedStylesheetIsOriginClean(href));
+  return sheet;
+}
+globalThis.__obscura_registerLinkedStylesheet = _registerLinkedStylesheet;
 
 // A fetched sheet becomes an inline <style>, so relative url() references
 // must keep resolving against the stylesheet URL rather than document.URL.
@@ -527,12 +560,12 @@ async function _loadLinkedStylesheet(c) {
     const previous = _linkedStylesheetNodes.get(c);
     if (previous?.parentNode) previous.parentNode.removeChild(previous);
     const media = c.getAttribute("media") || "";
+    const style = document.createElement("style");
+    style.setAttribute("data-obscura-linked", fullUrl);
+    style.textContent = css;
+    _registerLinkedStylesheet(c, style, fullUrl);
     if (c.parentNode && !c.disabled && _cssImportApplies(media)) {
-      const style = document.createElement("style");
-      style.setAttribute("data-obscura-linked", fullUrl);
-      style.textContent = css;
       c.parentNode.insertBefore(style, c.nextSibling);
-      _linkedStylesheetNodes.set(c, style);
     }
     try { c.dispatchEvent(new Event('load', { bubbles: true })); } catch(e) {}
   } catch(e) {
@@ -868,6 +901,57 @@ globalThis.cancelAnimationFrame = (id) => {
 };
 globalThis.queueMicrotask = globalThis.queueMicrotask || ((fn) => Promise.resolve().then(fn));
 
+// Browser posted tasks need an event-loop boundary but no clock delay. Tokio's
+// timer wheel imposes roughly a one-millisecond floor even for delay zero,
+// which turns MessageChannel and scheduler chains into artificial latency.
+// Keep one shared priority/FIFO queue in JavaScript and use a yield-only async
+// op solely to wake one delivery. Scheduling the next wake after the callback
+// gives V8 a microtask checkpoint between every pair of posted tasks.
+const _browserPostedTaskQueues = Array.from({ length: 6 }, () => []);
+let _browserPostedTaskWakePending = false;
+
+function _browserPostedTaskScheduleWake() {
+  if (_browserPostedTaskWakePending) return;
+  if (!Deno.core.ops.op_async_runtime_available()) return;
+  _browserPostedTaskWakePending = true;
+  Deno.core.ops.op_posted_task().then(
+    _browserPostedTaskRunOne,
+    () => {
+      _browserPostedTaskWakePending = false;
+      if (_browserPostedTaskQueues.some(queue => queue.length)) {
+        _scheduleAfter(0, _browserPostedTaskRunOne);
+      }
+    },
+  );
+}
+
+function _browserPostedTaskEnqueue(callback, priority) {
+  _browserPostedTaskQueues[priority].push(callback);
+  _browserPostedTaskScheduleWake();
+}
+
+function _browserPostedTaskRunOne() {
+  _browserPostedTaskWakePending = false;
+  let callback = null;
+  for (let priority = _browserPostedTaskQueues.length - 1; priority >= 0; priority--) {
+    const queue = _browserPostedTaskQueues[priority];
+    if (queue.length) {
+      callback = queue.shift();
+      break;
+    }
+  }
+  if (!callback) return;
+
+  Deno.core.ops.op_begin_render_task?.();
+  try { callback(); }
+  catch (error) { console.error("Posted task error:", error); }
+  finally {
+    if (_browserPostedTaskQueues.some(queue => queue.length)) {
+      _browserPostedTaskScheduleWake();
+    }
+  }
+}
+
 // Prioritized Task Scheduling. A scheduler task is a real event-loop task,
 // ordered strictly by effective priority and FIFO within one priority. Yield
 // continuations rank immediately above ordinary tasks of the same priority.
@@ -880,8 +964,6 @@ const _schedulerPriorityRank = {
   "user-visible": 1,
   "user-blocking": 2,
 };
-const _schedulerTaskQueues = Array.from({ length: 6 }, () => []);
-let _schedulerPumpScheduled = false;
 let _schedulerCurrentState = null;
 
 function _schedulerRemoveAbort(task) {
@@ -891,35 +973,15 @@ function _schedulerRemoveAbort(task) {
   }
 }
 
-function _schedulerSchedulePump() {
-  if (_schedulerPumpScheduled) return;
-  _schedulerPumpScheduled = true;
-  _scheduleAfter(0, _schedulerRunOneTask);
-}
-
 function _schedulerEnqueue(task, continuation) {
   if (task.canceled) return;
   const effectivePriority = _schedulerPriorityRank[task.priority] * 2
     + (continuation ? 1 : 0);
-  _schedulerTaskQueues[effectivePriority].push(task);
-  _schedulerSchedulePump();
+  _browserPostedTaskEnqueue(() => _schedulerRunTask(task), effectivePriority);
 }
 
-function _schedulerRunOneTask() {
-  _schedulerPumpScheduled = false;
-  let task = null;
-  for (let priority = _schedulerTaskQueues.length - 1; priority >= 0; priority--) {
-    const queue = _schedulerTaskQueues[priority];
-    while (queue.length) {
-      const candidate = queue.shift();
-      if (!candidate.canceled) {
-        task = candidate;
-        break;
-      }
-    }
-    if (task) break;
-  }
-  if (!task) return;
+function _schedulerRunTask(task) {
+  if (task.canceled) return;
 
   task.started = true;
   const previousState = _schedulerCurrentState;
@@ -938,11 +1000,6 @@ function _schedulerRunOneTask() {
     task.completed = true;
     _schedulerRemoveAbort(task);
   }
-
-  // Queue only one native task at a time. This preserves a microtask
-  // checkpoint between scheduler callbacks and lets newly posted high-priority
-  // work overtake lower-priority work which is still waiting.
-  if (_schedulerTaskQueues.some(queue => queue.length)) _schedulerSchedulePump();
 }
 
 function _schedulerNormalizeOptions(options) {
@@ -1109,7 +1166,9 @@ function _messagePortScheduleDelivery(port) {
   const state = _messagePortStateFor(port);
   if (state.closed || !state.messageQueueEnabled || state.messageDeliveryPending || !state.messageQueue.length) return;
   state.messageDeliveryPending = true;
-  _scheduleAfter(0, () => {
+  // User-visible ordinary rank. Scheduler continuations at the same priority
+  // remain immediately above this task; FIFO holds across all ordinary tasks.
+  _browserPostedTaskEnqueue(() => {
     const current = _messagePortState.get(port);
     if (!current) return;
     current.messageDeliveryPending = false;
@@ -1124,7 +1183,7 @@ function _messagePortScheduleDelivery(port) {
     });
     _eventTargetDispatch(port, event);
     _messagePortScheduleDelivery(port);
-  });
+  }, _schedulerPriorityRank["user-visible"] * 2);
 }
 class MessagePort {
   constructor(key) {
@@ -1810,7 +1869,12 @@ class Node {
     return c;
   }
   removeChild(c) {
-    if (!c) return c;
+    if (!c || c.parentNode !== this) {
+      throw new DOMException(
+        "Failed to execute 'removeChild' on 'Node': The node to be removed is not a child of this node.",
+        'NotFoundError'
+      );
+    }
     const removedWindowNames = _windowNamedNamesInTree(c);
     const linkedStyle = c instanceof Element
       ? _linkedStylesheetNodes.get(c)
@@ -1914,12 +1978,14 @@ class Node {
     return (+_dom("compare_order", this._nid, other._nid) < 0) ? 4 : 2;
   }
   getRootNode(options) {
-    let root = this;
-    while (root.parentNode) root = root.parentNode;
+    const root = _wrap(+_dom("node_root", this._nid));
     if (options?.composed && root instanceof ShadowRoot) {
       return root.host.getRootNode(options);
     }
     return root;
+  }
+  get isConnected() {
+    return _dom("is_connected", this._nid) === "true";
   }
   normalize() {
     // Merge adjacent exclusive Text nodes, drop empty ones, recurse. Detached
@@ -4158,10 +4224,6 @@ class Element extends Node {
     return animation;
   }
   getAnimations() { return _animationsForTarget(this); }
-  get isConnected() {
-    const root = this.getRootNode({ composed: true });
-    return !!root && root.nodeType === 9;
-  }
   remove() { if (this.parentNode) this.parentNode.removeChild(this); }
   append(...nodes) { for (const n of _convertNodes(nodes)) this.appendChild(n); }
   prepend(...nodes) {
@@ -7652,6 +7714,8 @@ class CSSStyleSheet {
     this._ownerNode = null;
     this._sourceNode = null;
     this._sourceText = "";
+    this._href = null;
+    this._originClean = true;
     this._rules = [];
     this._cssRules = new CSSRuleList(this);
     this._adopters = new Set();
@@ -7659,9 +7723,13 @@ class CSSStyleSheet {
   get type() { return "text/css"; }
   get ownerNode() { return this._ownerNode; }
   get parentStyleSheet() { return null; }
-  get href() { return null; }
+  get href() { return this._href; }
   get title() { return this._ownerNode?.getAttribute?.("title") || ""; }
-  get cssRules() { this._refreshFromOwner(); return this._cssRules; }
+  get cssRules() {
+    this._assertOriginClean();
+    this._refreshFromOwner();
+    return this._cssRules;
+  }
   get rules() { return this.cssRules; }
   _bindOwner(ownerNode, sourceNode = ownerNode) {
     this._ownerNode = ownerNode;
@@ -7669,8 +7737,25 @@ class CSSStyleSheet {
     this._sourceText = null;
     this._refreshFromOwner();
   }
+  _bindLinkedOwner(ownerNode, sourceNode, href, originClean) {
+    this._ownerNode = ownerNode;
+    this._sourceNode = sourceNode;
+    this._sourceText = null;
+    this._href = href || null;
+    this._originClean = originClean !== false;
+    if (this._originClean) this._refreshFromOwner();
+    else {
+      this._setRules([]);
+      this._sourceText = sourceNode?.textContent || "";
+    }
+  }
+  _assertOriginClean() {
+    if (!this._originClean) {
+      throw new DOMException("Cannot access rules in a cross-origin stylesheet", "SecurityError");
+    }
+  }
   _refreshFromOwner() {
-    if (!this._sourceNode) return;
+    if (!this._sourceNode || !this._originClean) return;
     const text = this._sourceNode.textContent || "";
     if (text === this._sourceText) return;
     const parsed = _splitTopLevelCssRules(text);
@@ -7696,6 +7781,7 @@ class CSSStyleSheet {
   }
   insertRule(rule, index = 0) {
     if (arguments.length < 1) throw new TypeError("CSSStyleSheet.insertRule requires a rule");
+    this._assertOriginClean();
     this._refreshFromOwner();
     const idx = Number(index) >>> 0;
     if (idx > this._rules.length) throw new DOMException("Rule index is out of range", "IndexSizeError");
@@ -7712,6 +7798,7 @@ class CSSStyleSheet {
   }
   deleteRule(index) {
     if (arguments.length < 1) throw new TypeError("CSSStyleSheet.deleteRule requires an index");
+    this._assertOriginClean();
     this._refreshFromOwner();
     const idx = Number(index) >>> 0;
     if (idx >= this._rules.length) throw new DOMException("Rule index is out of range", "IndexSizeError");
@@ -7726,6 +7813,7 @@ class CSSStyleSheet {
   removeRule(index = 0) { this.deleteRule(index); }
   replace(text) { this.replaceSync(text); return Promise.resolve(this); }
   replaceSync(text) {
+    this._assertOriginClean();
     const parsed = _splitTopLevelCssRules(String(text));
     this._setRules(parsed.rules.map(_cssRuleFromText).filter(Boolean));
     this._ruleChanged();
@@ -7733,8 +7821,18 @@ class CSSStyleSheet {
 }
 
 const _styleElementSheets = new WeakMap();
+function _styleElementIsCssomBridge(style) {
+  return style.hasAttribute("data-obscura-adopted")
+    || style.hasAttribute("data-obscura-linked")
+    || style.hasAttribute("data-obscura-external-stylesheets")
+    || style.hasAttribute("data-obscura-inline-import");
+}
 function _styleElementHasCssSheet(style) {
   if (!style || style.localName !== "style" || !style.isConnected) return false;
+  // These nodes carry renderer input for another stylesheet owner. Exposing a
+  // second style-owned sheet would duplicate entries and, for remote links,
+  // bypass the link sheet's origin-clean cssRules check.
+  if (_styleElementIsCssomBridge(style)) return false;
   const type = (style.getAttribute("type") || "").trim().toLowerCase();
   return !type || type === "text/css";
 }
@@ -7758,11 +7856,40 @@ function _detachStyleSheet(style) {
   sheet._sourceNode = null;
   _styleElementSheets.delete(style);
 }
+function _linkElementHasCssSheet(link) {
+  if (!link || link.localName !== "link" || !link.isConnected) return false;
+  const rel = (link.getAttribute("rel") || link.rel || "").toLowerCase().split(/\s+/);
+  const type = (link.getAttribute("type") || "").trim().toLowerCase();
+  return rel.includes("stylesheet") && (!type || type === "text/css")
+    && _linkedStylesheetNodes.has(link);
+}
+function _sheetForLinkElement(link) {
+  if (!_linkElementHasCssSheet(link)) {
+    _detachLinkedStyleSheet(link);
+    return null;
+  }
+  let sheet = _linkElementSheets.get(link);
+  if (!sheet) {
+    sheet = _registerLinkedStylesheet(link, _linkedStylesheetNodes.get(link));
+  }
+  return sheet;
+}
+function _detachLinkedStyleSheet(link) {
+  const sheet = _linkElementSheets.get(link);
+  if (!sheet) return;
+  sheet._ownerNode = null;
+  sheet._sourceNode = null;
+  _linkElementSheets.delete(link);
+}
 function _detachStyleSheetsInSubtree(root) {
   if (!root) return;
   if (root.nodeType === 1 && root.localName === "style") _detachStyleSheet(root);
+  if (root.nodeType === 1 && root.localName === "link") _detachLinkedStyleSheet(root);
   if (!root.querySelectorAll) return;
   for (const style of root.querySelectorAll("style")) _detachStyleSheet(style);
+  for (const link of root.querySelectorAll('link[rel~="stylesheet"]')) {
+    _detachLinkedStyleSheet(link);
+  }
 }
 
 class StyleSheetList {
@@ -7784,13 +7911,17 @@ class StyleSheetList {
     });
   }
   _sheets() {
-    const styles = this._root.querySelectorAll ? this._root.querySelectorAll("style") : [];
+    const nodes = this._root.querySelectorAll
+      ? this._root.querySelectorAll('style, link[rel~="stylesheet"]')
+      : [];
     const out = [];
-    for (const style of styles) {
-      if (style.hasAttribute("data-obscura-adopted")
-          || style.hasAttribute("data-obscura-linked")
-          || style.hasAttribute("data-obscura-external-stylesheets")
-          || style.hasAttribute("data-obscura-inline-import")) continue;
+    for (const style of nodes) {
+      if (style.localName === "link") {
+        const sheet = _sheetForLinkElement(style);
+        if (sheet) out.push(sheet);
+        continue;
+      }
+      if (_styleElementIsCssomBridge(style)) continue;
       const sheet = _sheetForStyleElement(style);
       if (sheet) out.push(sheet);
     }
@@ -7806,7 +7937,11 @@ class StyleSheetList {
 }
 
 Object.defineProperty(Element.prototype, "sheet", {
-  get() { return this.localName === "style" ? _sheetForStyleElement(this) : null; },
+  get() {
+    if (this.localName === "style") return _sheetForStyleElement(this);
+    if (this.localName === "link") return _sheetForLinkElement(this);
+    return null;
+  },
   configurable: true,
 });
 globalThis.CSSRule = CSSRule;
@@ -10585,8 +10720,10 @@ function _windowNamedNamesInTree(root) {
 
 function _registerWindowNamedTree(root) {
   // Window named access only considers the document tree. Detached nodes and
-  // attached shadow trees must not manufacture own Window properties.
-  if (!root || root.getRootNode() !== globalThis.document) return;
+  // attached shadow trees must not manufacture own Window properties. Check
+  // connectivity first: getRootNode() walks every ancestor, which made the
+  // common framework pattern of building a deep detached subtree quadratic.
+  if (!root || !root.isConnected || root.getRootNode() !== globalThis.document) return;
   const names = _windowNamedNamesInTree(root);
   for (const name of names) _ensureWindowNamedProperty(name);
 }

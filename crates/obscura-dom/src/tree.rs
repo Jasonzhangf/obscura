@@ -121,6 +121,9 @@ pub enum NodeData {
 #[derive(Clone, Debug)]
 pub struct Node {
     pub id: NodeId,
+    /// Shadow-including document connectivity, maintained incrementally on
+    /// insertion/removal so hot DOM mutation paths do not walk every ancestor.
+    pub connected: bool,
     pub parent: Option<NodeId>,
     pub first_child: Option<NodeId>,
     pub last_child: Option<NodeId>,
@@ -267,6 +270,7 @@ impl DomTree {
     pub fn new() -> Self {
         let doc_node = Node {
             id: NodeId(0),
+            connected: true,
             parent: None,
             first_child: None,
             last_child: None,
@@ -393,6 +397,12 @@ impl DomTree {
         };
         inner.shadow_roots.insert(root, info);
         inner.shadow_roots_by_host.insert(host, root);
+        let connected = inner
+            .nodes
+            .get(host.index())
+            .and_then(|node| node.as_ref())
+            .is_some_and(|node| node.connected);
+        Self::set_subtree_connected(&mut inner, root, connected);
         Ok(())
     }
 
@@ -447,6 +457,67 @@ impl DomTree {
             }
         }
         None
+    }
+
+    /// Constant-time shadow-including connectivity. The bit is propagated over
+    /// ordinary children and hosted shadow roots whenever a subtree moves.
+    pub fn is_connected(&self, node: NodeId) -> bool {
+        self.inner
+            .borrow()
+            .nodes
+            .get(node.index())
+            .and_then(|entry| entry.as_ref())
+            .is_some_and(|node| node.connected)
+    }
+
+    fn set_subtree_connected(inner: &mut DomTreeInner, root: NodeId, connected: bool) {
+        // Fresh parser/framework insertions are overwhelmingly leaves. Avoid
+        // allocating traversal state for the one-node case.
+        let is_leaf = inner
+            .nodes
+            .get(root.index())
+            .and_then(|entry| entry.as_ref())
+            .is_some_and(|node| node.first_child.is_none())
+            && !inner.shadow_roots_by_host.contains_key(&root);
+        if is_leaf {
+            if let Some(Some(node)) = inner.nodes.get_mut(root.index()) {
+                node.connected = connected;
+            }
+            return;
+        }
+
+        let mut stack = vec![root];
+        let mut seen = HashSet::new();
+        while let Some(node_id) = stack.pop() {
+            if !seen.insert(node_id) {
+                continue;
+            }
+            let (mut child, shadow_root) = match inner
+                .nodes
+                .get_mut(node_id.index())
+                .and_then(|entry| entry.as_mut())
+            {
+                Some(node) => {
+                    node.connected = connected;
+                    (node.first_child, inner.shadow_roots_by_host.get(&node_id).copied())
+                }
+                None => continue,
+            };
+            if let Some(root) = shadow_root {
+                stack.push(root);
+            }
+            // Valid trees terminate naturally. The bound is defense in depth
+            // against a corrupt sibling cycle, which must not spin here.
+            for _ in 0..=inner.nodes.len() {
+                let Some(child_id) = child else { break };
+                stack.push(child_id);
+                child = inner
+                    .nodes
+                    .get(child_id.index())
+                    .and_then(|entry| entry.as_ref())
+                    .and_then(|node| node.next_sibling);
+            }
+        }
     }
 
     fn host_including_parent(inner: &DomTreeInner, node: NodeId) -> Option<NodeId> {
@@ -514,6 +585,7 @@ impl DomTree {
 
         inner.nodes[id.index()] = Some(Node {
             id,
+            connected: false,
             parent: None,
             first_child: None,
             last_child: None,
@@ -556,7 +628,7 @@ impl DomTree {
         // A ShadowRoot is never itself an ordinary child, and moving a host
         // below its own root would create a cycle even though the root's parent
         // pointer is null. Follow both ordinary parents and root-to-host edges.
-        {
+        let (parent_connected, child_connected) = {
             let inner = self.inner.borrow();
             let parent_exists = inner
                 .nodes
@@ -566,15 +638,39 @@ impl DomTree {
                 .nodes
                 .get(child_id.index())
                 .is_some_and(Option::is_some);
+            // A leaf which is not a shadow host cannot be an inclusive
+            // ancestor of the destination parent. Detached framework tree
+            // construction appends thousands of freshly-created leaves; doing
+            // a complete parent walk for each one makes a deep chain O(n²).
+            // Non-leaves and shadow hosts retain the full host-including cycle
+            // check, where reparenting really can create a cycle.
+            let child_can_be_ancestor = inner
+                .nodes
+                .get(child_id.index())
+                .and_then(|entry| entry.as_ref())
+                .is_some_and(|child| child.first_child.is_some())
+                || inner.shadow_roots_by_host.contains_key(&child_id);
             if !parent_exists
                 || !child_exists
                 || inner.shadow_roots.contains_key(&child_id)
-                || Self::would_create_host_including_cycle(&inner, parent_id, child_id)
+                || (child_can_be_ancestor
+                    && Self::would_create_host_including_cycle(&inner, parent_id, child_id))
             {
                 return;
             }
-        }
-        self.detach(child_id);
+            let parent_connected = inner
+                .nodes
+                .get(parent_id.index())
+                .and_then(|entry| entry.as_ref())
+                .is_some_and(|parent| parent.connected);
+            let child_connected = inner
+                .nodes
+                .get(child_id.index())
+                .and_then(|entry| entry.as_ref())
+                .is_some_and(|child| child.connected);
+            (parent_connected, child_connected)
+        };
+        self.detach_for_reparent(child_id, child_connected && !parent_connected);
 
         let mut inner = self.inner.borrow_mut();
 
@@ -600,6 +696,9 @@ impl DomTree {
             }
             parent.last_child = Some(child_id);
         }
+        if parent_connected && !child_connected {
+            Self::set_subtree_connected(&mut inner, child_id, true);
+        }
     }
 
     pub fn insert_before(&self, existing_id: NodeId, new_sibling_id: NodeId) {
@@ -612,10 +711,17 @@ impl DomTree {
         if existing_id == new_sibling_id {
             return;
         }
-        let parent_id = {
+        let (parent_id, parent_connected) = {
             let inner = self.inner.borrow();
             match inner.nodes.get(existing_id.index()).and_then(|n| n.as_ref()).and_then(|n| n.parent) {
-                Some(p) => p,
+                Some(parent) => {
+                    let connected = inner
+                        .nodes
+                        .get(parent.index())
+                        .and_then(|entry| entry.as_ref())
+                        .is_some_and(|node| node.connected);
+                    (parent, connected)
+                }
                 None => return,
             }
         };
@@ -637,7 +743,11 @@ impl DomTree {
             }
         }
 
-        self.detach(new_sibling_id);
+        let child_connected = self.is_connected(new_sibling_id);
+        self.detach_for_reparent(
+            new_sibling_id,
+            child_connected && !parent_connected,
+        );
 
         // Read existing's prev AFTER detaching new. If new was existing's
         // immediate previous sibling, detach moved that pointer; using the
@@ -669,15 +779,36 @@ impl DomTree {
         } else if let Some(Some(parent)) = inner.nodes.get_mut(parent_id.index()) {
             parent.first_child = Some(new_sibling_id);
         }
+        if parent_connected && !child_connected {
+            Self::set_subtree_connected(&mut inner, new_sibling_id, true);
+        }
     }
 
     pub fn detach(&self, node_id: NodeId) {
+        self.detach_for_reparent(node_id, true);
+    }
+
+    fn detach_for_reparent(&self, node_id: NodeId, disconnect: bool) {
         let mut inner = self.inner.borrow_mut();
+
+        // The document and registered ShadowRoots have no ordinary parent and
+        // cannot be detached through light-tree mutation APIs.
+        if node_id == inner.document || inner.shadow_roots.contains_key(&node_id) {
+            return;
+        }
 
         let (parent_id, prev_id, next_id) = match inner.nodes.get(node_id.index()).and_then(|n| n.as_ref()) {
             Some(node) => (node.parent, node.prev_sibling, node.next_sibling),
             None => return,
         };
+        if disconnect && inner
+            .nodes
+            .get(node_id.index())
+            .and_then(|entry| entry.as_ref())
+            .is_some_and(|node| node.connected)
+        {
+            Self::set_subtree_connected(&mut inner, node_id, false);
+        }
 
         if let Some(prev) = prev_id {
             if let Some(Some(node)) = inner.nodes.get_mut(prev.index()) {
@@ -1676,6 +1807,66 @@ mod tests {
     }
 
     #[test]
+    fn connectivity_propagates_across_light_and_shadow_subtrees() {
+        let tree = DomTree::new();
+        let host = element(&tree, "x-card");
+        let light = element(&tree, "span");
+        tree.append_child(host, light);
+        let root = tree
+            .attach_shadow_root(host, ShadowRootMode::Open)
+            .unwrap();
+        let shadow = element(&tree, "button");
+        tree.append_child(root, shadow);
+        for node in [host, light, root, shadow] {
+            assert!(!tree.is_connected(node));
+        }
+
+        tree.append_child(tree.document(), host);
+        for node in [host, light, root, shadow] {
+            assert!(tree.is_connected(node));
+        }
+
+        tree.detach(host);
+        for node in [host, light, root, shadow] {
+            assert!(!tree.is_connected(node));
+        }
+    }
+
+    #[test]
+    fn connectivity_survives_connected_moves_and_root_detach_attempts() {
+        let tree = DomTree::new();
+        let document = tree.document();
+        let left = element(&tree, "section");
+        let right = element(&tree, "section");
+        let host = element(&tree, "x-card");
+        let light = element(&tree, "span");
+        tree.append_child(document, left);
+        tree.append_child(document, right);
+        tree.append_child(host, light);
+        let root = tree
+            .attach_shadow_root(host, ShadowRootMode::Open)
+            .unwrap();
+        let shadow = element(&tree, "button");
+        tree.append_child(root, shadow);
+        tree.append_child(left, host);
+
+        tree.append_child(right, host);
+        assert!(tree.children(left).is_empty());
+        assert_eq!(tree.children(right), vec![host]);
+        for node in [document, left, right, host, light, root, shadow] {
+            assert!(tree.is_connected(node));
+        }
+
+        // Neither root participates in the ordinary child list, so a generic
+        // detach must not corrupt the cached connectivity invariant.
+        tree.detach(document);
+        tree.detach(root);
+        for node in [document, left, right, host, light, root, shadow] {
+            assert!(tree.is_connected(node));
+        }
+    }
+
+    #[test]
     fn freeing_a_host_reclaims_shadow_nodes_and_registry_entries() {
         let tree = DomTree::new();
         let host = element(&tree, "x-card");
@@ -1729,6 +1920,7 @@ mod tests {
             contents: "hello".into(),
         });
         let doc = tree.document();
+        assert!(!tree.is_connected(child));
         tree.append_child(doc, child);
 
         assert_eq!(tree.len(), 2);
@@ -1738,6 +1930,7 @@ mod tests {
 
         let child_node = tree.get_node(child).unwrap();
         assert_eq!(child_node.parent, Some(doc));
+        assert!(tree.is_connected(child));
     }
 
     #[test]
@@ -1765,6 +1958,8 @@ mod tests {
 
         tree.detach(c1);
         assert_eq!(tree.children(doc), vec![c2]);
+        assert!(!tree.is_connected(c1));
+        assert!(tree.is_connected(c2));
     }
 
     #[test]

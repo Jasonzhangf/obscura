@@ -646,8 +646,6 @@ pub(crate) fn queue_screencast_frame(
 /// acknowledgement window, ensuring neither mechanism loses the latest frame.
 #[cfg(feature = "render")]
 pub(crate) async fn pump_screencast_frames(ctx: &mut CdpContext) {
-    const EVENT_LOOP_SLICE_MS: u64 = 4;
-
     let sessions: Vec<String> = ctx.screencasts.keys().cloned().collect();
     for cdp_session_id in sessions {
         if !ctx.screencasts.contains_key(&cdp_session_id) {
@@ -658,12 +656,9 @@ pub(crate) async fn pump_screencast_frames(ctx: &mut CdpContext) {
             let Some(page) = ctx.get_session_page_mut(&attached_session) else {
                 continue;
             };
-            let Some(js) = page.js.as_mut() else {
+            let Some(js) = page.js.as_ref() else {
                 continue;
             };
-            // A V8 watchdog bounds synchronous callbacks as well as the async
-            // timeout, so a hostile timer cannot freeze the CDP connection.
-            let _ = js.run_event_loop_bounded(EVENT_LOOP_SLICE_MS).await;
             let generation = js.activity_generation();
             let css_animation_active = page.prepared_has_active_css_animations();
             (generation, css_animation_active)
@@ -725,6 +720,8 @@ pub fn emit_navigation_events(
     wait_until: WaitUntil,
     reached_network_idle: bool,
 ) {
+    ctx.current_loader_ids
+        .insert(page_id.to_string(), loader_id.to_string());
     let es = session_id.clone();
     let ts = timestamp();
 
@@ -928,6 +925,79 @@ pub fn emit_navigation_events(
             }
         }),
     ));
+}
+
+/// Emit completed script-initiated requests after the document lifecycle has
+/// already finished. These requests belong to the current document loader and
+/// must not replay frame navigation or load lifecycle events.
+pub(crate) fn emit_runtime_network_events(
+    ctx: &mut CdpContext,
+    session_id: &Option<String>,
+    frame_id: &str,
+    page_url: &str,
+    page_id: &str,
+    network_events: &[obscura_browser::NetworkEvent],
+) {
+    if network_events.is_empty() {
+        return;
+    }
+    let loader_id = ctx
+        .current_loader_ids
+        .get(page_id)
+        .cloned()
+        .unwrap_or_else(|| format!("loader-blank-{page_id}"));
+    for network_event in network_events {
+        let request_id = &network_event.request_id;
+        ctx.pending_events.push(CdpEvent {
+            method: "Network.requestWillBeSent".into(),
+            params: json!({
+                "requestId": request_id,
+                "loaderId": loader_id,
+                "documentURL": page_url,
+                "request": {
+                    "url": network_event.url,
+                    "method": network_event.method,
+                    "headers": network_event.headers,
+                },
+                "timestamp": network_event.timestamp,
+                "wallTime": network_event.timestamp,
+                "initiator": {"type": "script"},
+                "type": network_event.resource_type,
+                "frameId": frame_id,
+            }),
+            session_id: session_id.clone(),
+        });
+        ctx.pending_events.push(CdpEvent {
+            method: "Network.responseReceived".into(),
+            params: json!({
+                "requestId": request_id,
+                "loaderId": loader_id,
+                "timestamp": network_event.timestamp,
+                "type": network_event.resource_type,
+                "response": {
+                    "url": network_event.url,
+                    "status": network_event.status,
+                    "statusText": "",
+                    "headers": &*network_event.response_headers,
+                    "mimeType": network_event.response_headers
+                        .get("content-type")
+                        .cloned()
+                        .unwrap_or_default(),
+                },
+                "frameId": frame_id,
+            }),
+            session_id: session_id.clone(),
+        });
+        ctx.pending_events.push(CdpEvent {
+            method: "Network.loadingFinished".into(),
+            params: json!({
+                "requestId": request_id,
+                "timestamp": network_event.timestamp,
+                "encodedDataLength": network_event.body_size,
+            }),
+            session_id: session_id.clone(),
+        });
+    }
 }
 
 /// Parse the `waitUntil` argument that Puppeteer/Playwright pass on
@@ -1539,6 +1609,53 @@ fn timestamp() -> f64 {
 mod tests {
     use super::*;
     use crate::dispatch::CdpContext;
+
+    #[test]
+    fn runtime_network_events_reuse_the_document_loader_without_lifecycle_replay() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = Some(format!("{page_id}-session"));
+        ctx.sessions
+            .insert(session_id.clone().unwrap(), page_id.clone());
+        ctx.current_loader_ids
+            .insert(page_id.clone(), "loader-current".into());
+        let event = obscura_browser::NetworkEvent {
+            request_id: "fetch-7".into(),
+            url: "https://example.test/data.json".into(),
+            method: "GET".into(),
+            resource_type: "Fetch".into(),
+            status: 200,
+            headers: std::collections::HashMap::new(),
+            response_headers: std::sync::Arc::new(std::collections::HashMap::from([(
+                "content-type".into(),
+                "application/json".into(),
+            )])),
+            body_size: 12,
+            timestamp: 42.0,
+        };
+
+        emit_runtime_network_events(
+            &mut ctx,
+            &session_id,
+            "frame-1",
+            "https://example.test/",
+            &page_id,
+            &[event],
+        );
+
+        assert_eq!(ctx.pending_events.len(), 3);
+        assert_eq!(ctx.pending_events[0].method, "Network.requestWillBeSent");
+        assert_eq!(ctx.pending_events[0].params["loaderId"], "loader-current");
+        assert_eq!(ctx.pending_events[1].method, "Network.responseReceived");
+        assert_eq!(ctx.pending_events[1].params["loaderId"], "loader-current");
+        assert_eq!(ctx.pending_events[2].method, "Network.loadingFinished");
+        assert!(ctx.pending_events.iter().all(|event| {
+            !matches!(
+                event.method.as_str(),
+                "Page.frameNavigated" | "Page.lifecycleEvent"
+            )
+        }));
+    }
 
     #[tokio::test]
     async fn get_layout_metrics_returns_chrome_default_viewport() {

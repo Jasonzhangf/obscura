@@ -11970,7 +11970,15 @@ fn build(
     {
         taffy_style.display = taffy::style::Display::Flex;
         taffy_style.flex_direction = taffy::FlexDirection::Row;
-        taffy_style.flex_wrap = taffy::FlexWrap::Wrap;
+        // The row-flex stand-in is our inline formatting context. A nowrap
+        // table cell (Bootstrap input groups, segmented controls, toolbars)
+        // must keep adjacent atomic inline children on one line; wrapping
+        // them here doubles the table row and stretches every sibling cell.
+        taffy_style.flex_wrap = if style.white_space == Some(crate::WhiteSpace::NoWrap) {
+            taffy::FlexWrap::NoWrap
+        } else {
+            taffy::FlexWrap::Wrap
+        };
 
         // The promoted container's main axis is horizontal, so text alignment
         // belongs on `justify_content`. Real `justify-content` from actual CSS
@@ -18246,6 +18254,39 @@ mod tests {
         for cell in [field, addon, button] {
             assert!((cell.height - 34.0).abs() < 0.1, "{cell:?}");
         }
+    }
+
+    #[cfg(feature = "paint")]
+    #[test]
+    fn nowrap_table_cell_keeps_bootstrap_controls_on_one_row() {
+        let tree = parse_html(
+            r#"<style>
+                * { box-sizing:border-box }
+                html,body { margin:0 }
+                #group { display:table; width:750px; border-collapse:separate }
+                #field,#actions { display:table-cell; height:55px }
+                #field { float:left; width:100% }
+                #actions { width:1%; white-space:nowrap }
+                #bulk,#submit { display:inline-block; height:55px }
+                #bulk { width:60px }
+                #submit { width:42px }
+            </style>
+            <div id="group"><input id="field"><span id="actions"><a id="bulk"></a><button id="submit"></button></span></div>"#,
+        );
+        let laid = layout_dom(&tree, (900.0, 250.0));
+        let rect = |id: &str| laid.rects[&tree.get_element_by_id(id).unwrap()];
+        let group = rect("group");
+        let field = rect("field");
+        let actions = rect("actions");
+        let bulk = rect("bulk");
+        let submit = rect("submit");
+
+        assert!((group.height - 55.0).abs() < 0.1, "{group:?}");
+        assert!((field.height - 55.0).abs() < 0.1, "{field:?}");
+        assert!((actions.height - 55.0).abs() < 0.1, "{actions:?}");
+        assert!((submit.x - (bulk.x + bulk.width)).abs() < 0.1);
+        assert!((bulk.y - submit.y).abs() < 0.1);
+        assert!(((submit.x + submit.width) - (group.x + group.width)).abs() < 0.1);
     }
 
     #[test]

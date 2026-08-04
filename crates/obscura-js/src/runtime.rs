@@ -50,6 +50,8 @@ static SNAPSHOT: &[u8] = include_bytes!(env!("OBSCURA_SNAPSHOT_PATH"));
 /// parallel, each isolate on its own thread with no shared lock.
 static ISOLATE_CREATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+const DEFAULT_CDP_AWAIT_TIMEOUT_MS: u64 = 30_000;
+
 #[cfg(feature = "render")]
 fn with_sync_render_loading_disabled<R>(
     state: &mut ObscuraState,
@@ -919,6 +921,22 @@ impl ObscuraJsRuntime {
         return_by_value: bool,
         await_promise: bool,
     ) -> Result<RemoteObjectInfo, String> {
+        self.evaluate_for_cdp_with_timeout(
+            expression,
+            return_by_value,
+            await_promise,
+            DEFAULT_CDP_AWAIT_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    pub async fn evaluate_for_cdp_with_timeout(
+        &mut self,
+        expression: &str,
+        return_by_value: bool,
+        await_promise: bool,
+        await_timeout_ms: u64,
+    ) -> Result<RemoteObjectInfo, String> {
         if !await_promise && return_by_value {
             let val = self.evaluate(expression)?;
             return Ok(Self::info_from_json(&val));
@@ -984,18 +1002,24 @@ impl ObscuraJsRuntime {
         let meta_str = if await_promise {
             let __t0 = std::time::Instant::now();
             let sentinel = format!("globalThis.__obscura_done_{done_counter} === true");
-            self.resolve_promises_until(
-                |rt| {
-                    rt.runtime
-                        .execute_script("<done?>", sentinel.clone())
-                        .ok()
-                        .and_then(|v| rt.v8_to_json(v).ok())
-                        .and_then(|j| j.as_bool())
-                        .unwrap_or(false)
-                },
-                5000,
-            )
-            .await;
+            let settled = self
+                .resolve_promises_until(
+                    |rt| {
+                        rt.runtime
+                            .execute_script("<done?>", sentinel.clone())
+                            .ok()
+                            .and_then(|v| rt.v8_to_json(v).ok())
+                            .and_then(|j| j.as_bool())
+                            .unwrap_or(false)
+                    },
+                    await_timeout_ms,
+                )
+                .await;
+            if !settled {
+                return Err(format!(
+                    "Runtime.evaluate promise did not settle within {await_timeout_ms}ms"
+                ));
+            }
             let __dt = __t0.elapsed();
             if __dt > std::time::Duration::from_secs(1) {
                 let preview: String = expression
@@ -1064,6 +1088,26 @@ impl ObscuraJsRuntime {
         return_by_value: bool,
         await_promise: bool,
     ) -> Result<RemoteObjectInfo, String> {
+        self.call_function_on_for_cdp_with_timeout(
+            function_declaration,
+            object_id,
+            arguments,
+            return_by_value,
+            await_promise,
+            DEFAULT_CDP_AWAIT_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    pub async fn call_function_on_for_cdp_with_timeout(
+        &mut self,
+        function_declaration: &str,
+        object_id: Option<&str>,
+        arguments: &[serde_json::Value],
+        return_by_value: bool,
+        await_promise: bool,
+        await_timeout_ms: u64,
+    ) -> Result<RemoteObjectInfo, String> {
         self.begin_javascript_task();
         let this_expr = self.resolve_this(object_id);
         let (setup, args_list) = self.build_args(arguments);
@@ -1108,18 +1152,24 @@ impl ObscuraJsRuntime {
 
             let __t0 = std::time::Instant::now();
             let sentinel = format!("globalThis.__obscura_done_{done_counter} === true");
-            self.resolve_promises_until(
-                |rt| {
-                    rt.runtime
-                        .execute_script("<done?>", sentinel.clone())
-                        .ok()
-                        .and_then(|v| rt.v8_to_json(v).ok())
-                        .and_then(|j| j.as_bool())
-                        .unwrap_or(false)
-                },
-                5000,
-            )
-            .await;
+            let settled = self
+                .resolve_promises_until(
+                    |rt| {
+                        rt.runtime
+                            .execute_script("<done?>", sentinel.clone())
+                            .ok()
+                            .and_then(|v| rt.v8_to_json(v).ok())
+                            .and_then(|j| j.as_bool())
+                            .unwrap_or(false)
+                    },
+                    await_timeout_ms,
+                )
+                .await;
+            if !settled {
+                return Err(format!(
+                    "Runtime.callFunctionOn promise did not settle within {await_timeout_ms}ms"
+                ));
+            }
             let __dt = __t0.elapsed();
             if __dt > std::time::Duration::from_secs(1) {
                 let preview: String = function_declaration
@@ -1836,6 +1886,68 @@ impl ObscuraJsRuntime {
         .await
     }
 
+    /// Drive one browser task while allowing the future to remain parked on
+    /// deno_core's real timer/network waker. This is the long-lived browser
+    /// server counterpart to bounded screenshot settling: the owner selects
+    /// this future alongside incoming protocol commands, so a page continues
+    /// to make progress while the automation client is idle without polling at
+    /// a fixed frequency.
+    ///
+    /// The shared CDP watchdog is armed only around synchronous V8 entry. It is
+    /// deliberately disarmed while `Poll::Pending`; a legitimate distant timer
+    /// must not look like a hung JavaScript task merely because the runtime is
+    /// asleep waiting for it.
+    #[doc(hidden)]
+    pub async fn run_autonomous_event_loop_turn(&mut self) -> Result<bool, String> {
+        const AUTONOMOUS_TASK_WATCHDOG_MS: u64 =
+            SYNCHRONOUS_TASK_FLOOR_MS + WATCHDOG_SCHEDULING_MARGIN_MS;
+
+        self.begin_javascript_task();
+
+        let checkpoint_watchdog = crate::cdp_watchdog::arm(
+            self.isolate_handle(),
+            std::time::Duration::from_millis(AUTONOMOUS_TASK_WATCHDOG_MS),
+        );
+        self.runtime.v8_isolate().perform_microtask_checkpoint();
+        if crate::cdp_watchdog::disarm(checkpoint_watchdog) {
+            self.cancel_termination();
+            return Err("autonomous microtask checkpoint exceeded its task budget".into());
+        }
+
+        let isolate_handle = self.isolate_handle();
+        let mut waiting_for_wake = false;
+        std::future::poll_fn(|cx| {
+            let watchdog = crate::cdp_watchdog::arm(
+                isolate_handle.clone(),
+                std::time::Duration::from_millis(AUTONOMOUS_TASK_WATCHDOG_MS),
+            );
+            let tick = self
+                .runtime
+                .poll_event_loop(cx, deno_core::PollEventLoopOptions::default());
+            let watchdog_fired = crate::cdp_watchdog::disarm(watchdog);
+            if watchdog_fired {
+                self.runtime.v8_isolate().cancel_terminate_execution();
+                return std::task::Poll::Ready(Err(
+                    "autonomous browser task exceeded its task budget".into(),
+                ));
+            }
+            match tick {
+                std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(true)),
+                std::task::Poll::Ready(Err(error)) => std::task::Poll::Ready(Err(format!(
+                    "Event loop error: {error}"
+                ))),
+                std::task::Poll::Pending if waiting_for_wake => {
+                    std::task::Poll::Ready(Ok(false))
+                }
+                std::task::Poll::Pending => {
+                    waiting_for_wake = true;
+                    std::task::Poll::Pending
+                }
+            }
+        })
+        .await
+    }
+
     /// Drive one cooperative event-loop turn for browser lifecycle code that
     /// must re-check an external readiness predicate after every wake. The
     /// boolean is true only when deno_core reached full idle.
@@ -2011,7 +2123,8 @@ impl ObscuraJsRuntime {
     }
 
     /// Pump the event loop until `done_check` returns true (e.g. an IIFE
-    /// has written its result sentinel), or `max_total_ms` elapses.
+    /// has written its result sentinel), or `max_total_ms` elapses. Returns
+    /// whether the predicate completed before the deadline.
     ///
     /// Why this exists: `run_event_loop(default)` only returns when there is
     /// no pending work. Page JS routinely schedules long setTimeouts
@@ -2021,7 +2134,11 @@ impl ObscuraJsRuntime {
     /// added ~7s per click because Puppeteer's `isIntersectingViewport`
     /// disconnects its observer in the callback, but our scheduled
     /// re-fires keep the event loop "busy" until they all fire.
-    pub async fn resolve_promises_until<F>(&mut self, mut done_check: F, max_total_ms: u64)
+    pub async fn resolve_promises_until<F>(
+        &mut self,
+        mut done_check: F,
+        max_total_ms: u64,
+    ) -> bool
     where
         F: FnMut(&mut Self) -> bool,
     {
@@ -2031,10 +2148,10 @@ impl ObscuraJsRuntime {
         loop {
             self.begin_javascript_task();
             if done_check(self) {
-                return;
+                return true;
             }
             if tokio::time::Instant::now() >= deadline {
-                return;
+                return false;
             }
             // Pump for a short slice. If the loop returns idle in <tick_ms,
             // run_event_loop returns Ok and we check the predicate again.
@@ -12048,6 +12165,46 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn test_evaluate_for_cdp_can_await_beyond_legacy_five_second_cap() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let started = std::time::Instant::now();
+        let result = rt
+            .evaluate_for_cdp_with_timeout(
+                "new Promise(resolve => setTimeout(() => resolve('after-five'), 5100))",
+                true,
+                true,
+                6000,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.value.unwrap().as_str(), Some("after-five"));
+        assert!(
+            started.elapsed() >= std::time::Duration::from_secs(5),
+            "long promise resolved before its timer deadline"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_call_function_on_for_cdp_reports_unsettled_promise_timeout() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let error = rt
+            .call_function_on_for_cdp_with_timeout(
+                "() => new Promise(() => {})",
+                None,
+                &[],
+                true,
+                true,
+                25,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("did not settle within 25ms"),
+            "unexpected timeout error: {error}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn test_evaluate_for_cdp_awaits_async_function() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt
@@ -12786,6 +12943,16 @@ mod tests {
                         const style = document.querySelector("style[data-obscura-linked]");
                         const css = style.textContent;
                         const afterLink = link.nextSibling === style;
+                        const list = document.styleSheets;
+                        const sheet = link.sheet;
+                        const rules = sheet.cssRules;
+                        const cssom = {
+                            listed: list.length === 1 && list[0] === sheet,
+                            stable: link.sheet === sheet && sheet.cssRules === rules,
+                            owner: sheet.ownerNode === link,
+                            href: sheet.href,
+                            selectors: Array.from(rules, rule => rule.selectorText),
+                        };
                         link.remove();
                         return {
                             afterLink,
@@ -12797,6 +12964,10 @@ mod tests {
                                 css.includes("http://example.com/img/card.png"),
                             removedWithLink:
                                 !document.querySelector("style[data-obscura-linked]"),
+                            cssom,
+                            detachedCssom: sheet.ownerNode === null
+                                && link.sheet === null
+                                && list.length === 0,
                         };
                     } finally {
                         Deno.core.ops.op_fetch_url = originalFetchOp;
@@ -12818,6 +12989,14 @@ mod tests {
                 "importedUrl": true,
                 "routeUrl": true,
                 "removedWithLink": true,
+                "cssom": {
+                    "listed": true,
+                    "stable": true,
+                    "owner": true,
+                    "href": "http://example.com/assets/route.css",
+                    "selectors": [".card", ".card"],
+                },
+                "detachedCssom": true,
             })
         );
     }

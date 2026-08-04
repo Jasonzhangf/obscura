@@ -40,6 +40,10 @@ pub(crate) struct ScreencastState {
 pub struct CdpContext {
     pub pages: Vec<Page>,
     pub sessions: HashMap<String, String>, // session_id -> page_id
+    /// Current document loader per page. Navigation events and later
+    /// script-initiated Network events must share this id; inventing a loader
+    /// for each fetch breaks DevTools request grouping.
+    pub current_loader_ids: HashMap<String, String>,
     pub pending_events: Vec<CdpEvent>,
     #[cfg(feature = "render")]
     pub(crate) screencasts: HashMap<String, ScreencastState>,
@@ -149,6 +153,7 @@ impl CdpContext {
         CdpContext {
             pages: Vec::new(),
             sessions: HashMap::new(),
+            current_loader_ids: HashMap::new(),
             pending_events: Vec::new(),
             #[cfg(feature = "render")]
             screencasts: HashMap::new(),
@@ -217,6 +222,8 @@ impl CdpContext {
         let mut page = Page::new(page_id.clone(), context);
         page.navigate_blank();
         self.pages.push(page);
+        self.current_loader_ids
+            .insert(page_id.clone(), format!("loader-blank-{page_id}"));
         Ok(page_id)
     }
 
@@ -266,6 +273,7 @@ impl CdpContext {
 
     pub fn remove_page(&mut self, id: &str) {
         self.pages.retain(|p| p.id != id);
+        self.current_loader_ids.remove(id);
         #[cfg(feature = "render")]
         {
             let removed: Vec<String> = self
@@ -531,7 +539,7 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
 // connected client. Called after every dispatch — binding calls only land
 // in the queue while V8 is running inside a CDP handler, so there is no
 // window in which they could pile up without a draining opportunity.
-fn drain_binding_calls(ctx: &mut CdpContext) {
+pub(crate) fn drain_binding_calls(ctx: &mut CdpContext) {
     // page_id -> session_id (any one session that holds this page).
     let page_to_session: HashMap<String, String> = ctx
         .sessions

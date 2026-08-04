@@ -730,17 +730,18 @@ fn materialize_linked_stylesheet_script(link_index: usize, css: &str) -> String 
                 return link.getAttribute('media') || '';
             }}
             function syncSheet() {{
+                if (!style) {{
+                    style = document.createElement('style');
+                    style.setAttribute('data-obscura-external-stylesheets', '');
+                    style.textContent = `{escaped_css}`;
+                    globalThis.__obscura_registerLinkedStylesheet(link, style);
+                }}
                 var enabled = link.parentNode
                     && !link.disabled
                     && !link.hasAttribute('disabled');
                 if (!enabled) {{
                     if (style && style.parentNode) style.parentNode.removeChild(style);
                     return;
-                }}
-                if (!style) {{
-                    style = document.createElement('style');
-                    style.setAttribute('data-obscura-external-stylesheets', '');
-                    style.textContent = `{escaped_css}`;
                 }}
                 var media = effectiveMedia().trim();
                 if (media) style.setAttribute('media', media);
@@ -2244,6 +2245,18 @@ impl Page {
         }
     }
 
+    /// Advance one wake-driven browser task for a continuously owned page.
+    /// `true` means deno_core reached full idle; `false` means one wake/task was
+    /// delivered and the owner should offer another turn after servicing any
+    /// higher-priority automation commands.
+    #[doc(hidden)]
+    pub async fn run_autonomous_event_loop_turn(&mut self) -> Result<bool, String> {
+        match self.js.as_mut() {
+            Some(js) => js.run_autonomous_event_loop_turn().await,
+            None => Ok(true),
+        }
+    }
+
     async fn settle_runtime_for_duration(js: &mut ObscuraJsRuntime, duration_ms: u64) {
         let started = tokio::time::Instant::now();
         let _ = js.run_event_loop_for_duration(duration_ms).await;
@@ -2516,6 +2529,7 @@ impl Page {
             }
         }
         self.document_timeline_origin = std::time::Instant::now();
+        #[cfg(feature = "render")]
         if let Some(js) = &self.js {
             js.reset_animation_timeline();
         }
@@ -3170,6 +3184,39 @@ impl Page {
         }
     }
 
+    pub async fn evaluate_for_cdp_with_timeout(
+        &mut self,
+        expression: &str,
+        return_by_value: bool,
+        await_promise: bool,
+        await_timeout_ms: u64,
+    ) -> Result<obscura_js::runtime::RemoteObjectInfo, String> {
+        if let Some(js) = &mut self.js {
+            js.evaluate_for_cdp_with_timeout(
+                expression,
+                return_by_value,
+                await_promise,
+                await_timeout_ms,
+            )
+            .await
+        } else {
+            let value = self.evaluate(expression);
+            Ok(obscura_js::runtime::RemoteObjectInfo {
+                js_type: match &value {
+                    serde_json::Value::String(_) => "string".into(),
+                    serde_json::Value::Number(_) => "number".into(),
+                    serde_json::Value::Bool(_) => "boolean".into(),
+                    _ => "undefined".into(),
+                },
+                subtype: None,
+                class_name: String::new(),
+                description: String::new(),
+                object_id: None,
+                value: Some(value),
+            })
+        }
+    }
+
     pub async fn call_function_on_for_cdp(
         &mut self,
         function_declaration: &str,
@@ -3212,6 +3259,27 @@ impl Page {
                 value: None,
             }
         }
+    }
+
+    pub async fn call_function_on_for_cdp_with_timeout(
+        &mut self,
+        function_declaration: &str,
+        object_id: Option<&str>,
+        args: &[serde_json::Value],
+        return_by_value: bool,
+        await_promise: bool,
+        await_timeout_ms: u64,
+    ) -> Result<obscura_js::runtime::RemoteObjectInfo, String> {
+        let js = self.js.as_mut().ok_or("JavaScript runtime unavailable")?;
+        js.call_function_on_for_cdp_with_timeout(
+            function_declaration,
+            object_id,
+            args,
+            return_by_value,
+            await_promise,
+            await_timeout_ms,
+        )
+        .await
     }
 
     pub fn set_blocked_urls(&mut self, patterns: Vec<String>) {
@@ -5758,6 +5826,106 @@ mod tests {
             state.1.as_deref(),
             Some("print"),
             "the fetched sheet must remain available for PDF print selection"
+        );
+    }
+
+    #[test]
+    fn materialized_linked_stylesheets_expose_link_owned_cssom_with_origin_security() {
+        let dom = parse_html(
+            r#"<html><head>
+                <link id="same" rel="stylesheet" href="/assets/app.css" title="app">
+                <style id="inline">.inline { color: green }</style>
+                <link id="cross" rel="stylesheet" href="https://cdn.example.test/theme.css">
+            </head><body></body></html>"#,
+        );
+        let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new();
+        runtime.set_dom(dom);
+        runtime.set_url("https://example.test/products/widget");
+        runtime.run_page_init();
+        runtime
+            .execute_script(
+                "<same-origin-sheet>",
+                &materialize_linked_stylesheet_script(
+                    0,
+                    ".app { color: red } .wide { width: 20px }",
+                ),
+            )
+            .expect("materialize same-origin linked sheet");
+        runtime
+            .execute_script(
+                "<cross-origin-sheet>",
+                &materialize_linked_stylesheet_script(1, ".secret { color: purple }"),
+            )
+            .expect("materialize cross-origin linked sheet");
+
+        let result = runtime
+            .evaluate(
+                r#"
+                (() => {
+                    const list = document.styleSheets;
+                    const same = document.getElementById('same');
+                    const inline = document.getElementById('inline');
+                    const cross = document.getElementById('cross');
+                    const sameSheet = same.sheet;
+                    const sameRules = sameSheet.cssRules;
+                    const crossSheet = cross.sheet;
+                    const security = [];
+                    for (const operation of [
+                        () => crossSheet.cssRules,
+                        () => crossSheet.rules,
+                        () => crossSheet.insertRule('.leak {}', 0),
+                        () => crossSheet.deleteRule(0),
+                        () => crossSheet.replaceSync('.leak {}'),
+                    ]) {
+                        try { operation(); security.push('missing'); }
+                        catch (error) { security.push(error && error.name); }
+                    }
+                    sameSheet.insertRule('.added { height: 9px }', sameRules.length);
+                    const source = document.querySelector(
+                        'style[data-obscura-external-stylesheets]'
+                    );
+                    return {
+                        stableList: list === document.styleSheets,
+                        length: list.length,
+                        order: [list[0] === sameSheet, list[1] === inline.sheet,
+                                list[2] === crossSheet],
+                        sameIdentity: same.sheet === sameSheet,
+                        owner: sameSheet.ownerNode === same,
+                        href: sameSheet.href,
+                        title: sameSheet.title,
+                        rulesIdentity: sameSheet.cssRules === sameRules,
+                        rules: Array.from(sameRules, rule => rule.selectorText),
+                        sourceUpdated: source.textContent.includes('.added'),
+                        crossOwner: crossSheet.ownerNode === cross,
+                        crossHref: crossSheet.href,
+                        bridgeSheetsHidden: same.nextSibling.sheet === null
+                            && cross.nextSibling.sheet === null,
+                        security,
+                    };
+                })()
+                "#,
+            )
+            .expect("inspect linked stylesheet CSSOM");
+
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "stableList": true,
+                "length": 3,
+                "order": [true, true, true],
+                "sameIdentity": true,
+                "owner": true,
+                "href": "https://example.test/assets/app.css",
+                "title": "app",
+                "rulesIdentity": true,
+                "rules": [".app", ".wide", ".added"],
+                "sourceUpdated": true,
+                "crossOwner": true,
+                "crossHref": "https://cdn.example.test/theme.css",
+                "bridgeSheetsHidden": true,
+                "security": ["SecurityError", "SecurityError", "SecurityError",
+                             "SecurityError", "SecurityError"],
+            })
         );
     }
 
