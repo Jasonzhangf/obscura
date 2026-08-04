@@ -1312,8 +1312,13 @@ impl Page {
                 return false;
             }
             let poll_budget = remaining.min(tokio::time::Duration::from_millis(25));
-            match tokio::time::timeout(poll_budget, js.run_event_loop()).await {
-                Ok(Ok(())) => {
+            match tokio::time::timeout(
+                poll_budget,
+                js.run_load_delaying_event_loop_tick(),
+            )
+            .await
+            {
+                Ok(Ok(_idle)) => {
                     if js.has_pending_load_delaying_scripts() {
                         tokio::task::yield_now().await;
                     }
@@ -1323,9 +1328,8 @@ impl Page {
                     return false;
                 }
                 Err(_) => {
-                    // The poll budget is a scheduling quantum, not a script
-                    // timeout. Keep polling until the shared navigation/script
-                    // deadline; the phase watchdog handles a native V8 pin.
+                    // This timeout only cancels a parked event-loop poll. The
+                    // shared absolute deadline above remains authoritative.
                 }
             }
         }
@@ -4707,7 +4711,11 @@ mod tests {
                 document.head.appendChild(script);
             </script></body></html>"#,
         );
-        let mut page = import_map_test_page("preload-dynamic-lifecycle", &base, &html);
+        let mut page = import_map_test_page(
+            "preload-dynamic-lifecycle",
+            "http://127.0.0.1:9",
+            &html,
+        );
 
         page.execute_scripts().await;
 
@@ -4742,6 +4750,114 @@ mod tests {
                 .unwrap(),
             serde_json::json!(1.0),
             "window.onload must fire exactly once",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn load_delaying_script_progresses_through_continuously_ready_timer_work() {
+        let (base, requests) = spawn_delayed_classic_script_server(
+            std::time::Duration::from_millis(75),
+            "globalThis.__fairDynamicRan = true;",
+        );
+        let html = format!(
+            r#"<html><head></head><body><script>
+                globalThis.__schedulerTicks = 0;
+                setInterval(() => globalThis.__schedulerTicks++, 0);
+                const script = document.createElement('script');
+                script.src = '{base}/fair-dynamic.js';
+                script.onload = () => globalThis.__fairDynamicLoaded = true;
+                document.head.appendChild(script);
+            </script></body></html>"#,
+        );
+        let mut page = import_map_test_page(
+            "load-delayer-scheduler-fairness",
+            "http://127.0.0.1:9",
+            &html,
+        );
+        let started = std::time::Instant::now();
+
+        page.execute_scripts().await;
+
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(1500),
+            "continuous ready work must not starve a load-delaying fetch; elapsed={elapsed:?}",
+        );
+        assert_eq!(
+            requests
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap(),
+            "/fair-dynamic.js",
+        );
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate(
+                    "[globalThis.__fairDynamicRan === true, \
+                     globalThis.__fairDynamicLoaded === true, \
+                     globalThis.__schedulerTicks > 0]",
+                )
+                .unwrap(),
+            serde_json::json!([true, true, true]),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn load_delaying_script_driver_respects_absolute_deadline() {
+        let (base, requests) = spawn_delayed_classic_script_server(
+            std::time::Duration::from_secs(1),
+            "globalThis.__lateDynamicRan = true;",
+        );
+        let mut page = import_map_test_page(
+            "load-delayer-deadline",
+            "http://127.0.0.1:9",
+            "<html><head></head><body></body></html>",
+        );
+        page.js
+            .as_mut()
+            .unwrap()
+            .execute_script(
+                "install-load-delayer",
+                &format!(
+                    "globalThis.__documentReadyState__ = 'loading'; \
+                     const script = document.createElement('script'); \
+                     script.src = '{base}/slow-dynamic.js'; \
+                     document.head.appendChild(script);",
+                ),
+            )
+            .unwrap();
+        assert!(page
+            .js
+            .as_mut()
+            .unwrap()
+            .has_pending_load_delaying_scripts());
+        let started = std::time::Instant::now();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(125);
+
+        let completed = super::Page::drive_load_delaying_scripts(
+            page.js.as_mut().unwrap(),
+            deadline,
+        )
+        .await;
+
+        let elapsed = started.elapsed();
+        assert!(!completed, "the delayed resource must exceed the deadline");
+        assert!(
+            elapsed >= std::time::Duration::from_millis(100)
+                && elapsed < std::time::Duration::from_millis(500),
+            "the driver must honor its absolute wall-clock bound; elapsed={elapsed:?}",
+        );
+        assert!(page
+            .js
+            .as_mut()
+            .unwrap()
+            .has_pending_load_delaying_scripts());
+        assert_eq!(
+            requests
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap(),
+            "/slow-dynamic.js",
         );
     }
 

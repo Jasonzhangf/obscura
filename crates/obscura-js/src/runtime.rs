@@ -1781,6 +1781,14 @@ impl ObscuraJsRuntime {
         .await
     }
 
+    /// Drive one cooperative event-loop turn for browser lifecycle code that
+    /// must re-check an external readiness predicate after every wake. The
+    /// boolean is true only when deno_core reached full idle.
+    #[doc(hidden)]
+    pub async fn run_load_delaying_event_loop_tick(&mut self) -> Result<bool, String> {
+        self.run_cooperative_event_loop_tick().await
+    }
+
     /// Pump deferred work until deno_core reports true idle, or until the page
     /// has had no connected-document mutation, relevant request/dynamic-script
     /// work, or near-term one-shot timeout for `quiet_ms`. Network and script
