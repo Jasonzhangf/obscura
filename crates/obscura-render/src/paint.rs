@@ -2291,6 +2291,7 @@ fn paint_prepared_with_surface_color(
         surface_color[2],
         surface_color[3],
     ));
+    let canvas_background = canvas_background_source(tree, &prepared.layout);
     paint_laid_dom_scrolled(
         tree,
         prepared.viewport,
@@ -2314,6 +2315,7 @@ fn paint_prepared_with_surface_color(
         (0.0, 0.0),
         1.0,
         false,
+        canvas_background,
     )
 }
 
@@ -2357,6 +2359,7 @@ pub fn paint_prepared_with_scroll_and_surface_color(
         surface_color[2],
         surface_color[3],
     ));
+    let canvas_background = canvas_background_source(tree, &prepared.layout);
     paint_laid_dom_scrolled(
         tree,
         prepared.viewport,
@@ -2380,6 +2383,7 @@ pub fn paint_prepared_with_scroll_and_surface_color(
         (0.0, 0.0),
         1.0,
         false,
+        canvas_background,
     )
 }
 
@@ -2480,6 +2484,7 @@ fn paint_prepared_region_with_scroll_policy(
     // their live viewport's document-space position.
     let root = scroll.root_offset();
     let surface_offset = (root.0 - region.x, root.1 - region.y);
+    let canvas_background = canvas_background_source(tree, &prepared.layout);
     let pixmap = paint_laid_dom_scrolled(
         tree,
         prepared.viewport,
@@ -2503,6 +2508,7 @@ fn paint_prepared_region_with_scroll_policy(
         surface_offset,
         raster_scale,
         print_economy,
+        canvas_background,
     )
     .ok_or(CaptureError::PaintFailed)?;
 
@@ -2733,6 +2739,164 @@ fn transform_subtree_source_bounds(
 /// Paint an already prepared layout without changing its document-space
 /// geometry. Root scrolling and sticky positioning are per-shot visual state,
 /// so alternating captures can safely reuse the same layout.
+#[derive(Clone, Copy)]
+struct CanvasBackground {
+    root: obscura_dom::tree::NodeId,
+    source: obscura_dom::tree::NodeId,
+}
+
+fn style_has_canvas_background(style: &crate::LayoutStyle) -> bool {
+    style.background_color.is_some_and(|color| color[3] != 0)
+        || style.background_image.is_some()
+        || style.background_gradient.is_some()
+        || style.background_radial_gradient.is_some()
+        || style.background_conic_gradient.is_some()
+        || !style.background_gradient_layers.is_empty()
+}
+
+fn canvas_background_source(tree: &DomTree, laid: &crate::DomLayout) -> Option<CanvasBackground> {
+    let root = tree.query_selector("html").ok().flatten()?;
+    let root_style = laid.styles.get(&root)?;
+    let root_is_contained = root_style.containing_block_triggers & crate::CB_TRIGGER_CONTAIN != 0;
+    if root_is_contained || style_has_canvas_background(root_style) {
+        return Some(CanvasBackground { root, source: root });
+    }
+    let body = tree.query_selector("body").ok().flatten();
+    let source = body
+        .filter(|body| {
+            laid.styles.get(body).is_some_and(|style| {
+                style.containing_block_triggers & crate::CB_TRIGGER_CONTAIN == 0
+            })
+        })
+        .unwrap_or(root);
+    Some(CanvasBackground { root, source })
+}
+
+fn paint_canvas_background(
+    pixmap: &mut Pixmap,
+    style: &crate::LayoutStyle,
+    origin_rect: &crate::Rect,
+    surface_rect: &crate::Rect,
+    root_font_size: f32,
+    viewport: (f32, f32),
+    base_url: Option<&str>,
+    image_cache: &mut RenderResourceCache,
+    raster_scale: f32,
+) {
+    let Some(surface) = Rect::from_xywh(
+        surface_rect.x,
+        surface_rect.y,
+        surface_rect.width,
+        surface_rect.height,
+    ) else {
+        return;
+    };
+    let mut builder = PathBuilder::new();
+    builder.push_rect(surface);
+    let Some(path) = builder.finish() else {
+        return;
+    };
+
+    if let Some(color) = style.background_color {
+        let mut paint = Paint::default();
+        paint.set_color(Color::from_rgba8(
+            color[0], color[1], color[2], color[3],
+        ));
+        pixmap.fill_path(
+            &path,
+            &paint,
+            FillRule::Winding,
+            raster_transform(raster_scale),
+            None,
+        );
+    }
+
+    if !style.background_gradient_layers.is_empty() {
+        paint_background_gradient_layers(
+            pixmap,
+            &path,
+            origin_rect,
+            surface_rect,
+            crate::ResolvedBorderRadii::default(),
+            style,
+            root_font_size,
+            viewport,
+            None,
+            raster_scale,
+        );
+    } else {
+        if let Some((center, stops)) = &style.background_radial_gradient {
+            paint_radial_gradient(
+                pixmap,
+                &path,
+                origin_rect,
+                *center,
+                stops,
+                style.background_radial_gradient_geometry,
+                style.font_size.unwrap_or(16.0),
+                root_font_size,
+                viewport,
+                None,
+                raster_scale,
+            );
+        }
+        if let Some((angle, center, stops)) = &style.background_conic_gradient {
+            paint_conic_gradient_sampled(
+                pixmap,
+                surface_rect,
+                origin_rect,
+                crate::ResolvedBorderRadii::default(),
+                *angle,
+                *center,
+                stops,
+                None,
+            );
+        }
+        if let Some((angle, stops)) = &style.background_gradient {
+            paint_linear_gradient(
+                pixmap,
+                &path,
+                origin_rect,
+                *angle,
+                stops,
+                None,
+                raster_scale,
+            );
+        }
+    }
+
+    if let Some(url) = &style.background_image {
+        if let Some(image_rect) = background_image_rect(
+            url,
+            base_url,
+            origin_rect,
+            style.background_size,
+            style.background_size_expression.as_deref(),
+            style.background_size_fit,
+            style.background_position,
+            style.font_size.unwrap_or(16.0),
+            root_font_size,
+            viewport,
+            image_cache,
+        ) {
+            paint_image(
+                url,
+                base_url,
+                &image_rect,
+                surface_rect,
+                crate::ObjectFit::Fill,
+                crate::ObjectPosition::default(),
+                pixmap,
+                image_cache,
+                None,
+                None,
+                crate::ResolvedBorderRadii::default(),
+                None,
+            );
+        }
+    }
+}
+
 fn paint_laid_dom_scrolled(
     tree: &DomTree,
     viewport: (f32, f32),
@@ -2756,6 +2920,7 @@ fn paint_laid_dom_scrolled(
     surface_offset: (f32, f32),
     raster_scale: f32,
     print_economy: bool,
+    canvas_background: Option<CanvasBackground>,
 ) -> Option<Pixmap> {
     let scroll_state = match resolved_scroll {
         Some(resolved) => ScrollPaintState::from_resolved(
@@ -2786,6 +2951,40 @@ fn paint_laid_dom_scrolled(
         .and_then(|root| laid.styles.get(&root))
         .and_then(|style| style.font_size)
         .unwrap_or(16.0);
+    if paint_root.is_none() {
+        if let Some(canvas) = canvas_background {
+            let root_visible = laid
+                .styles
+                .get(&canvas.root)
+                .is_some_and(|style| !style.effectively_invisible);
+            if root_visible {
+                if let (Some(style), Some(source_rect)) = (
+                    laid.styles.get(&canvas.source),
+                    laid.rects.get(&canvas.source).copied(),
+                ) {
+                    let (x, y) = scroll_state.translation_for(laid, canvas.source);
+                    let origin_rect = crate::Rect {
+                        x: source_rect.x + x,
+                        y: source_rect.y + y,
+                        width: source_rect.width,
+                        height: source_rect.height,
+                    };
+                    let surface_rect = paint_surface_rect(&pixmap, raster_scale);
+                    paint_canvas_background(
+                        &mut pixmap,
+                        style,
+                        &origin_rect,
+                        &surface_rect,
+                        root_font_size,
+                        viewport,
+                        base_url,
+                        image_cache,
+                        raster_scale,
+                    );
+                }
+            }
+        }
+    }
     // Nodes that live inside an inline `<svg>` we rasterized as one document;
     // their painting is owned by that raster, so they are skipped in both the
     // box/text loop below and the inline-formatting loop after it (an svg
@@ -2983,6 +3182,7 @@ fn paint_laid_dom_scrolled(
                 surface_offset,
                 raster_scale,
                 print_economy,
+                canvas_background,
             )?;
             continue;
         }
@@ -3016,6 +3216,7 @@ fn paint_laid_dom_scrolled(
                 surface_offset,
                 raster_scale,
                 print_economy,
+                canvas_background,
             )?;
             continue;
         }
@@ -3116,6 +3317,7 @@ fn paint_laid_dom_scrolled(
                     surface_offset,
                     raster_scale,
                     print_economy,
+                    canvas_background,
                 )?;
                 continue;
             }
@@ -3191,6 +3393,7 @@ fn paint_laid_dom_scrolled(
                 ),
                 raster_scale,
                 print_economy,
+                canvas_background,
             )?;
             let transform =
                 display_transform.then(crate::Affine2::translate(-layer_delta.0, -layer_delta.1));
@@ -3261,6 +3464,7 @@ fn paint_laid_dom_scrolled(
                 surface_offset,
                 raster_scale,
                 print_economy,
+                canvas_background,
             )?;
             let group_paint = tiny_skia::PixmapPaint {
                 opacity: own_opacity,
@@ -3280,6 +3484,8 @@ fn paint_laid_dom_scrolled(
         if style.effectively_invisible {
             continue;
         }
+        let background_transfers_to_canvas = canvas_background
+            .is_some_and(|canvas| nid == canvas.root || nid == canvas.source);
 
         // A `transform: translate()` on this element or any ancestor offsets
         // this element's whole painted box (and, applied per node, its whole
@@ -3438,6 +3644,7 @@ fn paint_laid_dom_scrolled(
         // not paint as a box here; the text paint path fills the glyphs instead.
         if box_on_surface
             && !paints_inline_fragments
+            && !background_transfers_to_canvas
             && style.mask_image.is_none()
             && !style.background_clip_text
         {
@@ -3516,7 +3723,7 @@ fn paint_laid_dom_scrolled(
             }
         }
 
-        if box_on_surface && !paints_inline_fragments {
+        if box_on_surface && !paints_inline_fragments && !background_transfers_to_canvas {
             if let Some(mask_url) = &style.mask_image {
                 let fill = style
                     .background_color
@@ -10654,6 +10861,92 @@ mod tests {
         assert_eq!(outside.red(), 255);
         assert_eq!(outside.green(), 255);
         assert_eq!(outside.blue(), 255);
+    }
+
+    #[test]
+    fn body_background_transfers_to_canvas_once_over_base_surface() {
+        let tree = parse_html(
+            r#"<html style="margin:0;background:transparent">
+               <body style="margin:0;width:20px;height:20px;background:rgba(255,0,0,.5)"></body>
+               </html>"#,
+        );
+        let pixmap = paint_dom_scrolled_at_animation_time_with_surface_color(
+            &tree,
+            (100.0, 80.0),
+            None,
+            (0.0, 0.0),
+            crate::AnimationSampleTime::default(),
+            [0, 0, 255, 255],
+        )
+        .expect("canvas paint");
+        let inside = pixmap.pixel(10, 10).expect("inside body box");
+        let outside = pixmap.pixel(90, 70).expect("outside body box");
+        assert_eq!(inside, outside, "transferred body background must not paint twice");
+        assert!((127..=128).contains(&inside.red()), "red blend: {inside:?}");
+        assert_eq!(inside.green(), 0);
+        assert!((127..=128).contains(&inside.blue()), "blue blend: {inside:?}");
+        assert_eq!(inside.alpha(), 255);
+    }
+
+    #[test]
+    fn authored_html_background_owns_canvas_and_body_keeps_its_box_background() {
+        let tree = parse_html(
+            r#"<html style="margin:0;background:rgb(10,20,30)">
+               <body style="margin:0;width:20px;height:20px;background:rgb(200,100,50)"></body>
+               </html>"#,
+        );
+        let pixmap = paint_dom(&tree, (100.0, 80.0), None).expect("canvas paint");
+        let inside = pixmap.pixel(10, 10).expect("body pixel");
+        let outside = pixmap.pixel(90, 70).expect("canvas pixel");
+        assert_eq!(
+            (inside.red(), inside.green(), inside.blue()),
+            (200, 100, 50)
+        );
+        assert_eq!(
+            (outside.red(), outside.green(), outside.blue()),
+            (10, 20, 30)
+        );
+    }
+
+    #[test]
+    fn transparent_html_and_body_leave_base_surface_unchanged() {
+        let tree = parse_html(
+            r#"<html style="margin:0;background:transparent">
+               <body style="margin:0;background:transparent"></body></html>"#,
+        );
+        let pixmap = paint_dom_scrolled_at_animation_time_with_surface_color(
+            &tree,
+            (40.0, 30.0),
+            None,
+            (0.0, 0.0),
+            crate::AnimationSampleTime::default(),
+            [4, 8, 12, 255],
+        )
+        .expect("transparent canvas paint");
+        for pixel in pixmap.pixels() {
+            assert_eq!(
+                (pixel.red(), pixel.green(), pixel.blue(), pixel.alpha()),
+                (4, 8, 12, 255)
+            );
+        }
+    }
+
+    #[test]
+    fn transferred_canvas_background_paints_below_negative_z_content() {
+        let tree = parse_html(
+            r#"<html style="margin:0;background:transparent">
+               <body style="margin:0;background:red">
+                 <div style="position:absolute;z-index:-1;left:0;top:0;width:20px;height:20px;background:blue"></div>
+               </body></html>"#,
+        );
+        let pixmap = paint_dom(&tree, (60.0, 40.0), None).expect("canvas paint");
+        let negative = pixmap.pixel(10, 10).expect("negative layer pixel");
+        let canvas = pixmap.pixel(40, 30).expect("canvas pixel");
+        assert_eq!(
+            (negative.red(), negative.green(), negative.blue()),
+            (0, 0, 255)
+        );
+        assert_eq!((canvas.red(), canvas.green(), canvas.blue()), (255, 0, 0));
     }
 
     #[test]

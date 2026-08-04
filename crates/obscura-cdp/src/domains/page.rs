@@ -2683,9 +2683,11 @@ mod tests {
         let (_, raster) = decode_capture(&off_viewport);
         assert_eq!(raster.dimensions(), (20, 20));
         assert_eq!(raster.get_pixel(5, 10).0, [0, 0, 255, 255]);
-        // TODO(canvas-background-transfer): Chromium propagates the body's red
-        // canvas background into the half beyond the 100px document box. This
-        // regression covers acceptance and the represented clip content.
+        assert_eq!(
+            raster.get_pixel(15, 10).0,
+            [255, 0, 0, 255],
+            "Chromium 145 propagates the body canvas background beyond its box"
+        );
     }
 
     #[cfg(feature = "render")]
