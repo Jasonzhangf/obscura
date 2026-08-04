@@ -8,6 +8,73 @@ use html5ever::{Attribute as HtmlAttribute, LocalName, Namespace, QualName};
 
 use crate::tree::{Attribute, DomTree, NodeData, NodeId, ShadowRootMode};
 
+/// DOM's valid-shadow-host-name predicate. Gecko's
+/// `nsContentUtils::IsValidShadowHostName` uses this same HTML allowlist plus
+/// valid custom-element names; keeping the check at the parser boundary makes
+/// an invalid declarative template fall back to an ordinary inert template.
+fn is_valid_shadow_host(tree: &DomTree, id: NodeId) -> bool {
+    let Some(node) = tree.get_node(id) else {
+        return false;
+    };
+    let Some(name) = node.as_element() else {
+        return false;
+    };
+    if name.ns != ns!(html) {
+        return false;
+    }
+    let local = name.local.as_ref();
+    if matches!(
+        local,
+        "article"
+            | "aside"
+            | "blockquote"
+            | "body"
+            | "div"
+            | "footer"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+            | "header"
+            | "main"
+            | "nav"
+            | "p"
+            | "section"
+            | "span"
+    ) {
+        return true;
+    }
+
+    let mut chars = local.chars();
+    if !chars.next().is_some_and(|first| first.is_ascii_lowercase())
+        || !local.contains('-')
+        || local.chars().any(|ch| {
+            ch.is_ascii_uppercase()
+                || ch == '\0'
+                || matches!(
+                    ch,
+                    '\u{0009}' | '\u{000A}' | '\u{000C}' | '\u{000D}' | '\u{0020}'
+                )
+                || matches!(ch, '/' | '>')
+        })
+    {
+        return false;
+    }
+    !matches!(
+        local,
+        "annotation-xml"
+            | "color-profile"
+            | "font-face"
+            | "font-face-src"
+            | "font-face-uri"
+            | "font-face-format"
+            | "font-face-name"
+            | "missing-glyph"
+    )
+}
+
 pub struct ObscuraElemName<'a> {
     _ref: Ref<'a, ()>,
     name: *const QualName,
@@ -224,19 +291,10 @@ impl TreeSink for DomTree {
         self.set_quirks(mode == QuirksMode::Quirks);
     }
 
-    fn allow_declarative_shadow_roots(&self, _intended_parent: &NodeId) -> bool {
-        // html5ever defaults this hook to `true`, but its default
-        // `attach_declarative_shadow` implementation returns an error. In
-        // that combination the tree builder consumes
-        // `<template shadowrootmode=...>` without inserting a template and
-        // then appends its contents directly to the host. That leaks shadow
-        // styles and markup into the light DOM.
-        //
-        // DomTree now has dormant native host/root identity, but selector,
-        // style, layout, and paint integration are not enabled as one partial
-        // feature. Returning false keeps html5ever on its fully implemented
-        // ordinary-template path in the meantime.
-        false
+    fn allow_declarative_shadow_roots(&self, intended_parent: &NodeId) -> bool {
+        self.allows_declarative_shadow_roots()
+            && is_valid_shadow_host(self, *intended_parent)
+            && self.shadow_root(*intended_parent).is_none()
     }
 
     fn attach_declarative_shadow(
@@ -245,11 +303,6 @@ impl TreeSink for DomTree {
         template: &NodeId,
         attrs: &[HtmlAttribute],
     ) -> bool {
-        // This hook is intentionally dormant while
-        // allow_declarative_shadow_roots returns false. Keep the implementation
-        // ready for that future switch: html5ever creates an unattached
-        // <template> and routes subsequent tokens into its contents fragment,
-        // so that existing fragment is the native ShadowRoot identity.
         let mode = attrs.iter().find_map(|attr| {
             if attr.name.local.as_ref() != "shadowrootmode" {
                 return None;
@@ -277,11 +330,12 @@ impl TreeSink for DomTree {
         if self.attach_shadow_root_node(*location, root, mode).is_err() {
             return false;
         }
-        // html5ever inserts the temporary template at the adjusted insertion
-        // location before invoking this hook. On successful attachment the
-        // template itself is not part of the host's light tree; only its
-        // contents fragment survives as the ShadowRoot backing node.
-        self.detach(*template);
+        // The temporary template was never inserted on the successful path,
+        // but create_element registered any `id` before attachment. Use the
+        // DOM removal path so that stale template ids cannot escape through
+        // document.getElementById; template contents are a separate fragment
+        // and remain alive as the native root.
+        self.remove_child(*template);
         true
     }
 
@@ -301,6 +355,7 @@ pub fn parse_html(html: &str) -> DomTree {
     use html5ever::{parse_document, ParseOpts};
 
     let tree = DomTree::new();
+    tree.set_allow_declarative_shadow_roots(true);
     parse_document(tree, ParseOpts::default())
         .from_utf8()
         .one(html.as_bytes())
@@ -409,57 +464,166 @@ mod tests {
         assert_eq!(tree.text_content(row), "cell");
     }
 
+    fn element_children(tree: &DomTree, parent: NodeId) -> Vec<NodeId> {
+        tree.children(parent)
+            .into_iter()
+            .filter(|child| tree.get_node(*child).is_some_and(|node| node.is_element()))
+            .collect()
+    }
+
     #[test]
-    fn declarative_shadow_markup_remains_an_inert_template() {
+    fn full_document_consumes_open_and_closed_declarative_shadow_templates() {
+        let tree = parse_html(
+            r#"<x-open id="open-host">
+                 <template id="open-template" shadowrootmode="open">
+                   <span id="open-content">open shadow</span>
+                 </template>
+                 <b id="open-light">open light</b>
+               </x-open>
+               <x-closed id="closed-host">
+                 <template id="closed-template" shadowrootmode="closed">
+                   <span id="closed-content">closed shadow</span>
+                 </template>
+                 <b id="closed-light">closed light</b>
+               </x-closed>"#,
+        );
+
+        let open_host = tree.get_element_by_id("open-host").unwrap();
+        let closed_host = tree.get_element_by_id("closed-host").unwrap();
+        let open_light = tree.get_element_by_id("open-light").unwrap();
+        let closed_light = tree.get_element_by_id("closed-light").unwrap();
+        let open_root = tree.shadow_root(open_host).expect("open root attached");
+        let closed_root = tree.shadow_root(closed_host).expect("closed root attached");
+
+        assert_eq!(
+            tree.shadow_root_info(open_root).unwrap().mode,
+            ShadowRootMode::Open
+        );
+        assert_eq!(
+            tree.shadow_root_info(closed_root).unwrap().mode,
+            ShadowRootMode::Closed
+        );
+        assert_eq!(element_children(&tree, open_host), vec![open_light]);
+        assert_eq!(element_children(&tree, closed_host), vec![closed_light]);
+        assert!(tree.get_element_by_id("open-template").is_none());
+        assert!(tree.get_element_by_id("closed-template").is_none());
+        assert!(
+            tree.query_selector_from(open_root, "#open-content")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            tree.query_selector_from(closed_root, "#closed-content")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            tree.get_element_by_id("open-content").is_none()
+                && tree.get_element_by_id("closed-content").is_none(),
+            "document id lookup must not pierce either shadow mode"
+        );
+    }
+
+    #[test]
+    fn invalid_declarative_shadow_mode_remains_an_ordinary_template() {
+        let tree = parse_html(
+            r#"<x-card id="host"><template id="invalid" shadowrootmode="Open"><span id="inside"></span></template></x-card>
+               <button id="invalid-host"><template id="invalid-host-template" shadowrootmode="open"><i id="invalid-host-content"></i></template></button>"#,
+        );
+        let host = tree.get_element_by_id("host").unwrap();
+        let template = tree.get_element_by_id("invalid").unwrap();
+        let contents = tree.template_contents(template).unwrap();
+        let inside = tree.get_element_by_id("inside").unwrap();
+
+        assert_eq!(tree.shadow_root(host), None);
+        assert_eq!(element_children(&tree, host), vec![template]);
+        assert_eq!(element_children(&tree, contents), vec![inside]);
+
+        let invalid_host = tree.get_element_by_id("invalid-host").unwrap();
+        let invalid_host_template = tree.get_element_by_id("invalid-host-template").unwrap();
+        assert_eq!(tree.shadow_root(invalid_host), None);
+        assert_eq!(
+            element_children(&tree, invalid_host),
+            vec![invalid_host_template],
+            "an HTML element outside the valid-shadow-host allowlist stays inert"
+        );
+    }
+
+    #[test]
+    fn duplicate_declarative_shadow_root_falls_back_to_an_inert_template() {
         let tree = parse_html(
             r#"<x-card id="host">
-                 <template id="shadow" shadowrootmode="open">
-                   <style id="shadow-style">.button { width:100% }</style>
-                   <span id="shadow-content">shadow</span>
-                 </template>
-                 <span id="light-content">light</span>
+                 <template shadowrootmode="open"><span id="first"></span></template>
+                 <template id="duplicate" shadowrootmode="closed"><span id="second"></span></template>
+                 <b id="light"></b>
                </x-card>"#,
         );
-
         let host = tree.get_element_by_id("host").unwrap();
-        let template = tree.get_element_by_id("shadow").unwrap();
-        let contents = tree
-            .template_contents(template)
-            .expect("parsed template has a contents document");
-        let style = tree.get_element_by_id("shadow-style").unwrap();
-        let shadow_content = tree.get_element_by_id("shadow-content").unwrap();
-        let light_content = tree.get_element_by_id("light-content").unwrap();
-        let element_children = |parent| {
-            tree.children(parent)
-                .into_iter()
-                .filter(|child| tree.get_node(*child).is_some_and(|node| node.is_element()))
-                .collect::<Vec<_>>()
-        };
+        let light = tree.get_element_by_id("light").unwrap();
+        let duplicate = tree.get_element_by_id("duplicate").unwrap();
+        let duplicate_contents = tree.template_contents(duplicate).unwrap();
+        let second = tree.get_element_by_id("second").unwrap();
+        let root = tree.shadow_root(host).unwrap();
 
-        assert_eq!(
-            element_children(host),
-            vec![template, light_content],
-            "shadow markup must not be spliced into the host's light children"
+        assert_eq!(tree.shadow_root_info(root).unwrap().mode, ShadowRootMode::Open);
+        assert!(tree.query_selector_from(root, "#first").unwrap().is_some());
+        assert_eq!(element_children(&tree, host), vec![duplicate, light]);
+        assert_eq!(element_children(&tree, duplicate_contents), vec![second]);
+    }
+
+    #[test]
+    fn nested_declarative_shadow_roots_keep_distinct_tree_scopes() {
+        let tree = parse_html(
+            r#"<x-outer id="outer-host">
+                 <template shadowrootmode="open">
+                   <x-inner id="inner-host">
+                     <template shadowrootmode="closed"><i id="inner-shadow"></i></template>
+                     <b id="inner-light"></b>
+                   </x-inner>
+                 </template>
+               </x-outer>"#,
         );
-        assert_eq!(
-            tree.shadow_root(host),
-            None,
-            "the parser gate must remain disabled until scoped style/layout is ready"
+        let outer_host = tree.get_element_by_id("outer-host").unwrap();
+        let outer_root = tree.shadow_root(outer_host).unwrap();
+        let inner_host = tree
+            .query_selector_from(outer_root, "#inner-host")
+            .unwrap()
+            .unwrap();
+        let inner_root = tree.shadow_root(inner_host).unwrap();
+
+        assert_eq!(tree.containing_shadow_root(inner_host), Some(outer_root));
+        assert_eq!(tree.shadow_root_info(inner_root).unwrap().mode, ShadowRootMode::Closed);
+        assert!(
+            tree.query_selector_from(outer_root, "#inner-shadow")
+                .unwrap()
+                .is_none(),
+            "an outer-tree query must not pierce a nested root"
         );
         assert!(
-            tree.children(template).is_empty(),
-            "template nodes keep their markup in the separate contents document"
-        );
-        assert_eq!(element_children(contents), vec![style, shadow_content]);
-        assert_eq!(tree.get_node(style).unwrap().parent, Some(contents));
-        assert_eq!(
-            tree.get_node(shadow_content).unwrap().parent,
-            Some(contents)
+            tree.query_selector_from(inner_root, "#inner-shadow")
+                .unwrap()
+                .is_some()
         );
         assert!(
-            !tree.descendants(tree.document()).contains(&style),
-            "inert shadow styles must not enter the document tree"
+            tree.query_selector_from(outer_root, "#inner-light")
+                .unwrap()
+                .is_some()
         );
+    }
+
+    #[test]
+    fn fragment_parsing_keeps_declarative_shadow_templates_inert() {
+        let tree = parse_fragment_with_context(
+            r#"<template id="shadow" shadowrootmode="open"><span id="inside"></span></template>"#,
+            QualName::new(None, ns!(html), LocalName::from("x-card")),
+        );
+        let template = tree.get_element_by_id("shadow").unwrap();
+        let contents = tree.template_contents(template).unwrap();
+        let inside = tree.get_element_by_id("inside").unwrap();
+
+        assert!(!tree.allows_declarative_shadow_roots());
+        assert_eq!(element_children(&tree, contents), vec![inside]);
+        assert!(tree.containing_shadow_root(inside).is_none());
     }
 
     #[test]

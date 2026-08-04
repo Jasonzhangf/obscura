@@ -255,6 +255,9 @@ pub(crate) struct DomTreeInner {
     /// into a shadow tree by accident.
     shadow_roots: HashMap<NodeId, ShadowRoot>,
     shadow_roots_by_host: HashMap<NodeId, NodeId>,
+    /// Full-document HTML parsing enables declarative shadow roots. Fragment
+    /// parsing (including innerHTML) deliberately leaves this false.
+    pub(crate) allow_declarative_shadow_roots: bool,
     // Whether the document was parsed in (full) quirks mode. In quirks mode CSS
     // class and id selectors match ASCII-case-insensitively.
     pub(crate) quirks: bool,
@@ -279,6 +282,7 @@ impl DomTree {
                 id_index: HashMap::new(),
                 shadow_roots: HashMap::new(),
                 shadow_roots_by_host: HashMap::new(),
+                allow_declarative_shadow_roots: false,
                 quirks: false,
             }),
         }
@@ -299,15 +303,19 @@ impl DomTree {
         self.inner.borrow().quirks
     }
 
+    pub(crate) fn set_allow_declarative_shadow_roots(&self, allow: bool) {
+        self.inner.borrow_mut().allow_declarative_shadow_roots = allow;
+    }
+
+    pub(crate) fn allows_declarative_shadow_roots(&self) -> bool {
+        self.inner.borrow().allow_declarative_shadow_roots
+    }
+
     pub(crate) fn borrow_inner(&self) -> std::cell::Ref<'_, DomTreeInner> {
         self.inner.borrow()
     }
 
-    /// Create and attach a dormant native shadow-root node to `host`.
-    ///
-    /// This only creates the tree-scope relationship. Parser attachment,
-    /// selector scoping, slot assignment, style, layout, and paint remain
-    /// separate opt-in layers.
+    /// Create and attach a native shadow-root node to `host`.
     pub fn attach_shadow_root(
         &self,
         host: NodeId,
