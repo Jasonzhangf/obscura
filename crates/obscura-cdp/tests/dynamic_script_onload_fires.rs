@@ -109,7 +109,7 @@ async fn serve_dynamic_order_fixture(explicitly_in_order: bool) -> (String, Arc<
                         "window.__dynamicOrder.push('slow');".to_string(),
                     )
                 } else if request.starts_with("GET /fast.js") {
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     (
                         "application/javascript",
                         "window.__dynamicOrder.push('fast');".to_string(),
@@ -199,12 +199,12 @@ async fn dynamic_classic_fetch_concurrency_matches_force_async_state() {
         navigate_dynamic_order_fixture(true).await;
     assert_eq!(ordered_order, ["slow", "fast"]);
     assert_eq!(
-        ordered_peak, 1,
-        "explicit async=false scripts must retain their insertion-order queue"
+        ordered_peak, 2,
+        "explicit async=false scripts must overlap fetches while retaining their execution-order queue"
     );
     assert!(
-        async_elapsed_ms + 50 < ordered_elapsed_ms,
-        "concurrent fetches should avoid the ordered waterfall: async={async_elapsed_ms}ms ordered={ordered_elapsed_ms}ms"
+        ordered_elapsed_ms < async_elapsed_ms + 300,
+        "execution ordering must not serialize network fetches: async={async_elapsed_ms}ms ordered={ordered_elapsed_ms}ms"
     );
 }
 

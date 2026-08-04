@@ -274,28 +274,44 @@ function _decodeDataScriptUrl(url) {
 globalThis.__markParserScripts = function(nids) {
   for (const nid of nids || []) Deno.core.ops.op_script_mark_started(+nid);
 };
+async function __fetchDynClassicScript(task) {
+  let body;
+  if (task.url.startsWith('data:')) {
+    body = _decodeDataScriptUrl(task.url);
+  } else {
+    const raw = await Deno.core.ops.op_fetch_url(
+      task.url, "GET", "{}", "", task.pageOrigin, "no-cors", "same-origin"
+    );
+    const parsed = JSON.parse(raw);
+    // The HTML script-fetch algorithm treats an unsuccessful HTTP response
+    // as a network error. Evaluating its response body is both observably
+    // unlike browsers and dangerous: JSON error payloads and diagnostic HTML
+    // must never become script source.
+    if (!(parsed.status >= 200 && parsed.status <= 299)) {
+      throw new Error('HTTP ' + (parsed.status || 0));
+    }
+    body = parsed.body;
+  }
+  return body;
+}
+function __startDynClassicFetch(task) {
+  // Attach both reactions immediately. An in-order script may finish fetching
+  // before an earlier queue member; retaining a settled value avoids an
+  // unhandled-rejection report while its execution turn is still blocked.
+  task.fetchResult = __fetchDynClassicScript(task).then(
+    body => ({ body }),
+    error => ({ error }),
+  );
+}
 async function __runDynScriptTask(task) {
   try {
     if (task.isModule) {
       await import(task.url);
     } else {
-      let body;
-      if (task.url.startsWith('data:')) {
-        body = _decodeDataScriptUrl(task.url);
-      } else {
-        const raw = await Deno.core.ops.op_fetch_url(
-          task.url, "GET", "{}", "", task.pageOrigin, "no-cors", "same-origin"
-        );
-        const parsed = JSON.parse(raw);
-        // The HTML script-fetch algorithm treats an unsuccessful HTTP
-        // response as a network error. Evaluating its response body is both
-        // observably unlike browsers and dangerous: JSON error payloads and
-        // diagnostic HTML must never become script source.
-        if (!(parsed.status >= 200 && parsed.status <= 299)) {
-          throw new Error('HTTP ' + (parsed.status || 0));
-        }
-        body = parsed.body;
-      }
+      if (!task.fetchResult) __startDynClassicFetch(task);
+      const fetched = await task.fetchResult;
+      if (fetched.error) throw fetched.error;
+      const body = fetched.body;
       if (body) {
         // A fetched async script is executed by a ScriptRunner task, not by
         // the fetch promise's microtask continuation. Besides matching event
@@ -1374,8 +1390,17 @@ function __prepareInsertedScript(script) {
     const explicitlyInOrder = !isModule
       && Object.prototype.hasOwnProperty.call(script, 'async')
       && script.async === false;
-    if (!isModule && !explicitlyInOrder) {
-      __runAsyncClassicScript(task);
+    if (!isModule) {
+      // Fetch all dynamically inserted classics immediately. `async=false`
+      // changes only execution order: browsers still overlap their network
+      // requests, then hold a ready body behind earlier ordered scripts.
+      __startDynClassicFetch(task);
+      if (explicitlyInOrder) {
+        __dynScriptQueue.push(task);
+        __processDynScriptQueue();
+      } else {
+        __runAsyncClassicScript(task);
+      }
     } else {
       __dynScriptQueue.push(task);
       __processDynScriptQueue();
