@@ -5491,11 +5491,17 @@ const _checkXmlWellFormed = (html) => {
         return { wellFormed: false, error: 'error on line 1: opening and ending tag mismatch: ' + open + ' and ' + tagName };
       }
       if (stack.length === 0) rootFound = true;
-    } else if (!isSelfClosing) {
+    } else {
+      // Opening or self-closing tag. Check for extra content after root.
       if (stack.length === 0 && rootFound) {
         return { wellFormed: false, error: 'error on line 1: extra content after root element' };
       }
-      stack.push(tagName);
+      if (isSelfClosing) {
+        // Self-closing: complete element, mark rootFound if at root level.
+        if (stack.length === 0) rootFound = true;
+      } else {
+        stack.push(tagName);
+      }
     }
   }
 
