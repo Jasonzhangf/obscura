@@ -231,13 +231,14 @@ pub async fn print_to_pdf(
             .raster_pdf_with_animation_sample(options.raster, animation_sample)
             .map_err(|error| error.to_string())?;
         let mut response = json!({
-            "obscuraPrintMode": "screen-raster",
+            "obscuraPrintMode": "print-media-raster",
             "obscuraPrintBackground": options.requested_print_background,
             "obscuraRequestedPrintBackground": options.requested_print_background,
             "obscuraTaggedPDF": false,
             "obscuraRequestedTaggedPDF": options.requested_tagged_pdf,
             "obscuraCapabilities": {
                 "cssPagedMedia": false,
+                "honorsPrintMedia": true,
                 "honorsPrintBackground": true,
                 "honorsScale": true,
                 "pageRanges": true,
@@ -423,7 +424,7 @@ mod tests {
         )
         .await
         .expect("raster PDF");
-        assert_eq!(response["obscuraPrintMode"], "screen-raster");
+        assert_eq!(response["obscuraPrintMode"], "print-media-raster");
         assert_eq!(response["obscuraPrintBackground"], true);
         use base64::Engine as _;
         let bytes = base64::engine::general_purpose::STANDARD
@@ -472,6 +473,7 @@ mod tests {
             true
         );
         assert_eq!(streamed["obscuraCapabilities"]["honorsScale"], true);
+        assert_eq!(streamed["obscuraCapabilities"]["honorsPrintMedia"], true);
         assert_eq!(streamed["obscuraCapabilities"]["pageRanges"], true);
         assert_eq!(streamed["obscuraTaggedPDF"], false);
         assert_eq!(streamed["obscuraRequestedTaggedPDF"], true);

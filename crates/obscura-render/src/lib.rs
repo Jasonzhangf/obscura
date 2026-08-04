@@ -14,7 +14,7 @@
 use taffy::prelude::*;
 
 pub mod css;
-pub use css::{Stylesheet, StylesheetCache};
+pub use css::{CssMediaType, Stylesheet, StylesheetCache};
 
 pub mod style;
 pub use style::compute_style;
@@ -106,6 +106,7 @@ pub use paint::{
     prepare_dom_with_dynamic_fonts, prepare_dom_with_dynamic_fonts_at_animation_time,
     prepare_dom_with_dynamic_fonts_and_stylesheet_cache,
     prepare_dom_with_dynamic_fonts_and_stylesheet_cache_at_animation_time,
+    prepare_dom_with_dynamic_fonts_and_stylesheet_cache_for_media_with_animation_state,
     prepare_dom_with_dynamic_fonts_and_stylesheet_cache_with_animation_state,
     screenshot_png, screenshot_png_scrolled, screenshot_png_scrolled_at_animation_time,
     screenshot_png_scrolled_at_animation_time_with_surface_color,

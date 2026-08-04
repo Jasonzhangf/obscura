@@ -493,6 +493,24 @@ impl ObscuraJsRuntime {
         true
     }
 
+    /// Select the CSS media type for the next synchronous render flush.
+    /// Changing media invalidates geometry and the compiled stylesheet key but
+    /// leaves the live DOM, scroll offsets, and resource bytes untouched.
+    #[cfg(feature = "render")]
+    pub fn set_render_media(
+        &self,
+        media: obscura_render::CssMediaType,
+    ) -> obscura_render::CssMediaType {
+        let mut state = self.state.borrow_mut();
+        let previous = state.render_media;
+        if previous != media {
+            state.render_media = media;
+            state.prepared_render = None;
+            state.resolved_scroll = None;
+        }
+        previous
+    }
+
     #[cfg(feature = "render")]
     pub fn animation_sample_time(&self) -> obscura_render::AnimationSampleTime {
         self.state.borrow().animation_sample.time

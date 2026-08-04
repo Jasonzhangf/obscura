@@ -3436,6 +3436,28 @@ pub(crate) fn layout_dom_with_web_fonts_and_stylesheet_cache_with_animation_stat
     animation_sample: crate::AnimationSample,
     animation_timeline: &mut crate::AnimationTimelineState,
 ) -> DomLayout {
+    layout_dom_with_web_fonts_and_stylesheet_cache_for_media_with_animation_state(
+        tree,
+        viewport,
+        intrinsic,
+        fonts,
+        stylesheet_cache,
+        crate::CssMediaType::Screen,
+        animation_sample,
+        animation_timeline,
+    )
+}
+
+pub(crate) fn layout_dom_with_web_fonts_and_stylesheet_cache_for_media_with_animation_state(
+    tree: &DomTree,
+    viewport: (f32, f32),
+    intrinsic: &ReplacedIntrinsicMap,
+    fonts: &[crate::inline::WebFont],
+    stylesheet_cache: &mut crate::css::StylesheetCache,
+    media_type: crate::CssMediaType,
+    animation_sample: crate::AnimationSample,
+    animation_timeline: &mut crate::AnimationTimelineState,
+) -> DomLayout {
     layout_dom_with_web_fonts_pass_limit_at_animation_time(
         tree,
         viewport,
@@ -3445,6 +3467,7 @@ pub(crate) fn layout_dom_with_web_fonts_and_stylesheet_cache_with_animation_stat
         Some(stylesheet_cache),
         None,
         &[],
+        media_type,
         animation_sample,
         animation_timeline,
     )
@@ -3520,6 +3543,7 @@ pub(crate) fn layout_dom_with_web_fonts_and_retained_styles_with_animation_state
         Some(stylesheet_cache),
         Some(retained),
         mutations,
+        crate::CssMediaType::Screen,
         animation_sample,
         animation_timeline,
     )
@@ -3555,6 +3579,7 @@ fn layout_dom_with_web_fonts_pass_limit(
         stylesheet_cache,
         retained,
         mutations,
+        crate::CssMediaType::Screen,
         crate::AnimationSample::default(),
         &mut animation_timeline,
     )
@@ -3569,6 +3594,7 @@ fn layout_dom_with_web_fonts_pass_limit_at_animation_time(
     stylesheet_cache: Option<&mut crate::css::StylesheetCache>,
     retained: Option<RetainedStyleMaps>,
     mutations: &[RetainedStyleMutation],
+    media_type: crate::CssMediaType,
     animation_sample: crate::AnimationSample,
     animation_timeline: &mut crate::AnimationTimelineState,
 ) -> (DomLayout, ContainerLayoutTelemetry) {
@@ -3579,7 +3605,16 @@ fn layout_dom_with_web_fonts_pass_limit_at_animation_time(
     for nid in tree.descendants(tree.document()) {
         if let Some(node) = tree.get_node(nid) {
             if let Some(elem) = node.as_element() {
-                if elem.local.as_ref() == "style" {
+                if elem.local.as_ref() == "style"
+                    && node.get_attribute("media").is_none_or(|media| {
+                        media.trim().is_empty()
+                            || crate::css::media_query_applies_for_viewport_and_type(
+                                media,
+                                viewport,
+                                media_type,
+                            )
+                    })
+                {
                     css_sources.push(tree.text_content(nid));
                 }
             }
@@ -3588,12 +3623,13 @@ fn layout_dom_with_web_fonts_pass_limit_at_animation_time(
 
     let t0 = std::time::Instant::now();
     let (sheet, stylesheet_cache_hit) = match stylesheet_cache {
-        Some(cache) => cache.get_or_parse(tree, &css_sources, viewport),
+        Some(cache) => cache.get_or_parse(tree, &css_sources, viewport, media_type),
         None => (
-            std::sync::Arc::new(crate::css::Stylesheet::parse_for_viewport(
+            std::sync::Arc::new(crate::css::Stylesheet::parse_for_viewport_and_media(
                 tree,
                 &css_sources,
                 viewport,
+                media_type,
             )),
             false,
         ),
@@ -14866,6 +14902,7 @@ mod tests {
             Some(&mut cache),
             None,
             &[],
+            crate::CssMediaType::Screen,
             crate::AnimationSample::document(0.0),
             &mut timeline,
         );
@@ -14883,6 +14920,7 @@ mod tests {
                 Some(&mut cache),
                 Some(retained),
                 &[RetainedStyleMutation::Animation { node: animated }],
+                crate::CssMediaType::Screen,
                 crate::AnimationSample::document(500.0),
                 &mut timeline,
             );
@@ -14896,6 +14934,7 @@ mod tests {
             Some(&mut cache),
             None,
             &[],
+            crate::CssMediaType::Screen,
             crate::AnimationSample::document(500.0),
             &mut full_timeline,
         );

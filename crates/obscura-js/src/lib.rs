@@ -16,6 +16,6 @@ pub use obscura_render::{
     screenshot_png, screenshot_png_scrolled, screenshot_png_scrolled_at_animation_time,
     screenshot_png_scrolled_at_animation_time_with_surface_color,
     validate_capture_region, AnimationSample, AnimationSampleMode, AnimationSampleTime,
-    CaptureError, CaptureRegion, ImageRequestProfile,
+    CaptureError, CaptureRegion, CssMediaType, ImageRequestProfile,
     MAX_CAPTURE_DIMENSION, MAX_CAPTURE_PIXELS,
 };

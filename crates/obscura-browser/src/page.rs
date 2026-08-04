@@ -276,8 +276,20 @@ const MAX_STYLESHEET_RESOURCES: usize = 128;
 #[derive(Clone)]
 struct LoadedStylesheet {
     response_url: Url,
-    imports: Vec<String>,
+    imports: Vec<StylesheetImport>,
     rules: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StylesheetImport {
+    url: String,
+    media: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+enum AuthorStylesheetTarget {
+    Linked(usize),
+    InlineImport(usize),
 }
 
 fn canonical_stylesheet_url(mut url: Url) -> (String, Url) {
@@ -305,13 +317,21 @@ fn materialize_stylesheet_graph(
 
     let mut output = String::new();
     for import in &sheet.imports {
-        let Ok(import_url) = sheet.response_url.join(import) else {
+        let Ok(import_url) = sheet.response_url.join(&import.url) else {
             continue;
         };
         let (import_key, _) = canonical_stylesheet_url(import_url);
         if let Some(imported) = materialize_stylesheet_graph(&import_key, sheets, aliases, active) {
-            output.push_str(&imported);
-            output.push('\n');
+            if let Some(media) = import.media.as_deref() {
+                output.push_str("@media ");
+                output.push_str(media);
+                output.push_str(" {\n");
+                output.push_str(&imported);
+                output.push_str("\n}\n");
+            } else {
+                output.push_str(&imported);
+                output.push('\n');
+            }
         }
     }
     output.push_str(&rebase_css_urls(&sheet.rules, &sheet.response_url));
@@ -537,12 +557,13 @@ fn render_resource_type(url: &url::Url) -> ResourceType {
 }
 
 /// Pull leading `@import` rules out of a stylesheet. Returns each import target
-/// URL (skipping print-only and `prefers-color-scheme: dark` conditional
-/// imports, which must not apply in our light desktop context) plus the CSS
-/// with those `@import` statements removed. Handles `@import "x.css";`,
+/// URL with its optional media condition plus the CSS with those `@import`
+/// statements removed. Browsers fetch media-gated imports even when they do
+/// not match the current screen; preserving the condition lets the same bytes
+/// participate in a later PDF print cascade. Handles `@import "x.css";`,
 /// `@import url("x.css");`, `@import url(x.css);` and an optional trailing
 /// media query.
-fn split_css_imports(css: &str) -> (Vec<String>, String) {
+fn split_css_imports(css: &str) -> (Vec<StylesheetImport>, String) {
     let mut urls = Vec::new();
     let mut stripped = String::with_capacity(css.len());
     let mut rest = css;
@@ -574,10 +595,9 @@ fn split_css_imports(css: &str) -> (Vec<String>, String) {
     (urls, stripped)
 }
 
-/// Extract the URL from an `@import` statement body (the text between `@import`
-/// and `;`), or `None` when the import is media-gated to print / dark and must
-/// be skipped.
-fn parse_import_url(stmt: &str) -> Option<String> {
+/// Extract the URL and optional trailing media query from an `@import`
+/// statement body (the text between `@import` and `;`).
+fn parse_import_url(stmt: &str) -> Option<StylesheetImport> {
     let s = stmt.trim();
     let is_url_fn = s.len() >= 4 && s[..4].eq_ignore_ascii_case("url(");
     let (url, media) = if is_url_fn {
@@ -591,22 +611,13 @@ fn parse_import_url(stmt: &str) -> Option<String> {
         let end = rest.find(quote)?;
         (rest[..end].to_string(), rest[end + 1..].trim())
     };
-    if !media.is_empty() {
-        let compact: String = media
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .flat_map(|c| c.to_lowercase())
-            .collect();
-        let print_only =
-            compact.contains("print") && !compact.contains("screen") && !compact.contains("all");
-        if print_only || compact.contains("prefers-color-scheme:dark") {
-            return None;
-        }
-    }
     if url.is_empty() {
         return None;
     }
-    Some(url)
+    Some(StylesheetImport {
+        url,
+        media: (!media.is_empty()).then(|| media.to_string()),
+    })
 }
 
 /// Materialize a fetched linked sheet immediately after its source `<link>`.
@@ -615,6 +626,8 @@ fn parse_import_url(stmt: &str) -> Option<String> {
 /// author sheets are interleaved. Appending one aggregate `<style>` to `<head>`
 /// makes every external rule later than every inline rule, which changes the
 /// CSS cascade even when the external fetches themselves complete in order.
+/// The synthetic style retains the link's effective media query so the same
+/// fetched bytes can enter print layout without leaking into screen layout.
 fn materialize_linked_stylesheet_script(link_index: usize, css: &str) -> String {
     let escaped_css = escape_for_js_template_literal(css);
     format!(
@@ -632,17 +645,10 @@ fn materialize_linked_stylesheet_script(link_index: usize, css: &str) -> String 
                 }}
                 return link.getAttribute('media') || '';
             }}
-            function applies() {{
-                var media = effectiveMedia().trim();
-                if (!media) return true;
-                try {{ return window.matchMedia(media).matches; }}
-                catch (_) {{ return false; }}
-            }}
             function syncSheet() {{
                 var enabled = link.parentNode
                     && !link.disabled
-                    && !link.hasAttribute('disabled')
-                    && applies();
+                    && !link.hasAttribute('disabled');
                 if (!enabled) {{
                     if (style && style.parentNode) style.parentNode.removeChild(style);
                     return;
@@ -652,6 +658,9 @@ fn materialize_linked_stylesheet_script(link_index: usize, css: &str) -> String 
                     style.setAttribute('data-obscura-external-stylesheets', '');
                     style.textContent = `{escaped_css}`;
                 }}
+                var media = effectiveMedia().trim();
+                if (media) style.setAttribute('media', media);
+                else style.removeAttribute('media');
                 if (!style.parentNode) {{
                     link.parentNode.insertBefore(style, link.nextSibling);
                 }}
@@ -663,6 +672,35 @@ fn materialize_linked_stylesheet_script(link_index: usize, css: &str) -> String 
             syncSheet();
             try {{ link.dispatchEvent(new Event('load')); }}
             finally {{ syncSheet(); }}
+        }})()"#
+    )
+}
+
+/// Materialize one fetched `@import` immediately before its source inline
+/// `<style>`. Imported rules precede the importing sheet in the author cascade,
+/// and inherit the source sheet's own media condition in addition to the
+/// import rule's media wrapper.
+fn materialize_inline_import_script(style_index: usize, css: &str) -> String {
+    let escaped_css = escape_for_js_template_literal(css);
+    format!(
+        r#"(function() {{
+            var styles = document.querySelectorAll('style');
+            var source = null;
+            var authorIndex = -1;
+            for (var i = 0; i < styles.length; i++) {{
+                var candidate = styles[i];
+                if (candidate.hasAttribute('data-obscura-external-stylesheets')
+                    || candidate.hasAttribute('data-obscura-inline-import')) continue;
+                authorIndex++;
+                if (authorIndex === {style_index}) {{ source = candidate; break; }}
+            }}
+            if (!source || !source.parentNode) return;
+            var imported = document.createElement('style');
+            imported.setAttribute('data-obscura-inline-import', '');
+            var media = source.getAttribute('media') || '';
+            if (media.trim()) imported.setAttribute('media', media);
+            imported.textContent = `{escaped_css}`;
+            source.parentNode.insertBefore(imported, source);
         }})()"#
     )
 }
@@ -690,6 +728,35 @@ fn linked_stylesheet_requests(dom: &DomTree) -> Vec<(usize, String)> {
         }
     }
     links
+}
+
+/// Discover fetchable `@import` rules in inline author sheets. The source
+/// index excludes Obscura's own materialized sheets so it remains stable while
+/// imports are inserted before their source nodes.
+fn inline_stylesheet_import_requests(dom: &DomTree) -> Vec<(usize, StylesheetImport)> {
+    let style_ids = dom.query_selector_all("style").unwrap_or_default();
+    let mut imports = Vec::new();
+    let mut author_index = 0usize;
+    for style_id in style_ids {
+        let Some(node) = dom.get_node(style_id) else {
+            continue;
+        };
+        if node
+            .get_attribute("data-obscura-external-stylesheets")
+            .is_some()
+            || node.get_attribute("data-obscura-inline-import").is_some()
+        {
+            continue;
+        }
+        let (style_imports, _) = split_css_imports(&dom.text_content(style_id));
+        imports.extend(
+            style_imports
+                .into_iter()
+                .map(|import| (author_index, import)),
+        );
+        author_index += 1;
+    }
+    imports
 }
 
 impl Page {
@@ -939,9 +1006,16 @@ impl Page {
         }
     }
 
-    async fn fetch_stylesheets(&mut self) -> Vec<(usize, String)> {
-        let all_links = match &self.js {
-            Some(js) => js.with_dom(linked_stylesheet_requests).unwrap_or_default(),
+    async fn fetch_stylesheets(&mut self) -> Vec<(AuthorStylesheetTarget, String)> {
+        let (all_links, inline_imports) = match &self.js {
+            Some(js) => js
+                .with_dom(|dom| {
+                    (
+                        linked_stylesheet_requests(dom),
+                        inline_stylesheet_import_requests(dom),
+                    )
+                })
+                .unwrap_or_default(),
             None => {
                 tracing::info!("fetch_stylesheets: no js runtime");
                 return Vec::new();
@@ -949,8 +1023,9 @@ impl Page {
         };
 
         tracing::info!(
-            "fetch_stylesheets: found {} stylesheet links",
-            all_links.len()
+            "fetch_stylesheets: found {} stylesheet links and {} inline imports",
+            all_links.len(),
+            inline_imports.len()
         );
 
         let Some(document_url) = self.url.clone() else {
@@ -979,11 +1054,31 @@ impl Page {
                 tracing::info!("Blocked stylesheet by interception: {}", resolved);
                 continue;
             }
-            roots.push((link_index, key.clone()));
+            roots.push((AuthorStylesheetTarget::Linked(link_index), key.clone(), None));
             if scheduled.insert(key.clone()) {
                 if scheduled.len() <= MAX_STYLESHEET_RESOURCES {
                     pending.push((key, resolved, 0u8));
                 }
+            }
+        }
+        for (style_index, import) in inline_imports {
+            let Ok(resolved) = document_base.join(&import.url) else {
+                continue;
+            };
+            let (key, resolved) = canonical_stylesheet_url(resolved);
+            if !subresource_allowed(Some(&document_url), resolved.as_str())
+                || self.should_block_url(resolved.as_str())
+            {
+                tracing::info!("Blocked inline stylesheet import: {}", resolved);
+                continue;
+            }
+            roots.push((
+                AuthorStylesheetTarget::InlineImport(style_index),
+                key.clone(),
+                import.media,
+            ));
+            if scheduled.insert(key.clone()) && scheduled.len() <= MAX_STYLESHEET_RESOURCES {
+                pending.push((key, resolved, 1u8));
             }
         }
 
@@ -1086,7 +1181,7 @@ impl Page {
                     continue;
                 }
                 for import in imports {
-                    let Ok(import_url) = response_url.join(&import) else {
+                    let Ok(import_url) = response_url.join(&import.url) else {
                         continue;
                     };
                     let (import_key, import_url) = canonical_stylesheet_url(import_url);
@@ -1114,14 +1209,20 @@ impl Page {
 
         roots
             .into_iter()
-            .filter_map(|(link_index, key)| {
+            .filter_map(|(target, key, media)| {
                 materialize_stylesheet_graph(
                     &key,
                     &sheets,
                     &aliases,
                     &mut std::collections::HashSet::new(),
                 )
-                .map(|css| (link_index, css))
+                .map(|css| {
+                    let css = match media {
+                        Some(media) => format!("@media {media} {{\n{css}\n}}\n"),
+                        None => css,
+                    };
+                    (target, css)
+                })
             })
             .collect()
     }
@@ -2280,14 +2381,14 @@ impl Page {
 
         self.dom = Some(dom);
         self.init_js();
-        let linked_stylesheets = self.fetch_stylesheets().await;
+        let author_stylesheets = self.fetch_stylesheets().await;
 
         // Inject CSS as a global so getComputedStyle and any CSS-aware shim
         // can read it. Has to happen before scripts run, regardless of
         // waitUntil, so handlers that read window.__obscura_css see it.
-        if !linked_stylesheets.is_empty() {
+        if !author_stylesheets.is_empty() {
             if let Some(js) = &mut self.js {
-                let combined_css = linked_stylesheets
+                let combined_css = author_stylesheets
                     .iter()
                     .map(|(_, css)| css.as_str())
                     .collect::<Vec<_>>()
@@ -2301,8 +2402,15 @@ impl Page {
                 let escaped = escape_for_js_template_literal(&combined_css);
                 let code = format!("globalThis.__obscura_css = `{}`;", escaped);
                 let _ = js.execute_script("<css>", &code);
-                for (link_index, css) in &linked_stylesheets {
-                    let code = materialize_linked_stylesheet_script(*link_index, css);
+                for (target, css) in &author_stylesheets {
+                    let code = match target {
+                        AuthorStylesheetTarget::Linked(link_index) => {
+                            materialize_linked_stylesheet_script(*link_index, css)
+                        }
+                        AuthorStylesheetTarget::InlineImport(style_index) => {
+                            materialize_inline_import_script(*style_index, css)
+                        }
+                    };
                     let _ = js.execute_script("<fetch_stylesheets>", &code);
                 }
             }
@@ -3387,8 +3495,9 @@ fn url_matches_cdp_pattern(pattern: &str, url: &str) -> bool {
 mod tests {
     use super::{
         css_resource_urls, linked_stylesheet_requests, materialize_linked_stylesheet_script,
-        navigation_referrer, parse_import_url, rebase_css_urls, script_response_is_executable,
-        split_css_imports, truncate_on_char_boundary, url_matches_cdp_pattern,
+        materialize_stylesheet_graph, navigation_referrer, parse_import_url, rebase_css_urls,
+        script_response_is_executable, split_css_imports, truncate_on_char_boundary,
+        url_matches_cdp_pattern, LoadedStylesheet, StylesheetImport,
     };
     #[cfg(feature = "render")]
     use super::remaining_settle_resource_warmup_ms;
@@ -3469,6 +3578,49 @@ mod tests {
                 };
                 let response = format!(
                     "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\nX-Origin: {response_origin}\r\n\r\n{body}",
+                    body.len(),
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        (origin, request_rx)
+    }
+
+    fn spawn_inline_import_server() -> (String, std::sync::mpsc::Receiver<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let origin = format!("http://{address}");
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 4096];
+                let length = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..length]);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_ascii_whitespace().nth(1))
+                    .unwrap_or("/")
+                    .to_string();
+                request_tx.send(path.clone()).unwrap();
+                let (content_type, body) = match path.as_str() {
+                    "/" => (
+                        "text/html",
+                        r#"<!doctype html><style media="screen, print">
+                            @import url('/a.css') print;
+                            @import '/b.css' print;
+                            .local { color: white }
+                        </style><div class="local imported-a imported-b">marker</div>"#,
+                    ),
+                    "/a.css" => ("text/css", ".imported-a{background:#9020d0}"),
+                    "/b.css" => ("text/css", ".imported-b{border-color:#f0d020}"),
+                    _ => ("text/plain", "unexpected"),
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len(),
                 );
                 stream.write_all(response.as_bytes()).unwrap();
@@ -3650,6 +3802,74 @@ mod tests {
             "cycle is cut without reordering rules"
         );
         assert!(sheets[2].contains(&format!("url(\"{origin}/theme/img/second.png\")")));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn inline_imports_fetch_in_order_and_materialize_before_source_style() {
+        let (origin, requests) = spawn_inline_import_server();
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "inline-imports".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("inline-imports".to_string(), context);
+        page.set_viewport((100.0, 80.0));
+        page.navigate(&format!("{origin}/")).await.unwrap();
+
+        let mut paths = (0..3)
+            .map(|_| {
+                requests
+                    .recv_timeout(std::time::Duration::from_secs(1))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        paths.sort();
+        assert_eq!(paths, vec!["/", "/a.css", "/b.css"]);
+
+        let styles = page
+            .js
+            .as_ref()
+            .unwrap()
+            .with_dom(|dom| {
+                dom.query_selector_all("style")
+                    .unwrap()
+                    .into_iter()
+                    .map(|nid| {
+                        let node = dom.get_node(nid).unwrap();
+                        (
+                            node.get_attribute("data-obscura-inline-import").is_some(),
+                            node.get_attribute("media").map(str::to_string),
+                            dom.text_content(nid),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap();
+        assert_eq!(styles.len(), 3);
+        assert!(styles[0].0 && styles[0].2.contains(".imported-a"));
+        assert!(styles[1].0 && styles[1].2.contains(".imported-b"));
+        assert!(!styles[2].0 && styles[2].2.contains(".local"));
+        assert_eq!(styles[0].1.as_deref(), Some("screen, print"));
+        assert_eq!(styles[1].1.as_deref(), Some("screen, print"));
+        assert!(styles[0].2.starts_with("@media print {\n"));
+        assert!(styles[1].2.starts_with("@media print {\n"));
+
+        let pdf = page
+            .raster_pdf(crate::RasterPdfOptions {
+                print_background: true,
+                paper_width_in: 100.0 / 72.0,
+                paper_height_in: 80.0 / 72.0,
+                margin_top_in: 0.0,
+                margin_bottom_in: 0.0,
+                margin_left_in: 0.0,
+                margin_right_in: 0.0,
+                ..crate::RasterPdfOptions::default()
+            })
+            .expect("inline-import print PDF");
+        assert!(pdf.starts_with(b"%PDF-1.4"));
     }
 
     fn client_replacement_page(name: &str, deferred: bool) -> super::Page {
@@ -5004,40 +5224,45 @@ mod tests {
 
     #[test]
     fn parse_import_url_extracts_url_forms() {
-        assert_eq!(
-            parse_import_url(" url(\"basic.css\")").as_deref(),
-            Some("basic.css")
-        );
-        assert_eq!(
-            parse_import_url(" url(basic.css)").as_deref(),
-            Some("basic.css")
-        );
-        assert_eq!(
-            parse_import_url(" \"basic.css\"").as_deref(),
-            Some("basic.css")
-        );
-        assert_eq!(
-            parse_import_url(" 'theme.css'").as_deref(),
-            Some("theme.css")
-        );
-        assert_eq!(parse_import_url(" URL('x.css')").as_deref(), Some("x.css"));
+        for (source, expected_url) in [
+            (" url(\"basic.css\")", "basic.css"),
+            (" url(basic.css)", "basic.css"),
+            (" \"basic.css\"", "basic.css"),
+            (" 'theme.css'", "theme.css"),
+            (" URL('x.css')", "x.css"),
+        ] {
+            assert_eq!(
+                parse_import_url(source),
+                Some(StylesheetImport {
+                    url: expected_url.to_string(),
+                    media: None,
+                })
+            );
+        }
     }
 
     #[test]
-    fn parse_import_url_skips_print_and_dark_media() {
-        assert_eq!(parse_import_url("url(\"p.css\") print"), None);
+    fn parse_import_url_preserves_print_and_color_scheme_media() {
+        assert_eq!(
+            parse_import_url("url(\"p.css\") print"),
+            Some(StylesheetImport {
+                url: "p.css".to_string(),
+                media: Some("print".to_string()),
+            })
+        );
         assert_eq!(
             parse_import_url("url(\"d.css\") (prefers-color-scheme: dark)"),
-            None
-        );
-        // screen / all and light preference still apply.
-        assert_eq!(
-            parse_import_url("url(\"s.css\") screen").as_deref(),
-            Some("s.css")
+            Some(StylesheetImport {
+                url: "d.css".to_string(),
+                media: Some("(prefers-color-scheme: dark)".to_string()),
+            })
         );
         assert_eq!(
-            parse_import_url("url(\"a.css\") print, screen").as_deref(),
-            Some("a.css")
+            parse_import_url("url(\"a.css\") print, screen"),
+            Some(StylesheetImport {
+                url: "a.css".to_string(),
+                media: Some("print, screen".to_string()),
+            })
         );
     }
 
@@ -5045,7 +5270,13 @@ mod tests {
     fn split_css_imports_pulls_imports_and_strips_them() {
         let css = "@import url(\"basic.css\");\nbody { color: red; }";
         let (imports, stripped) = split_css_imports(css);
-        assert_eq!(imports, vec!["basic.css".to_string()]);
+        assert_eq!(
+            imports,
+            vec![StylesheetImport {
+                url: "basic.css".to_string(),
+                media: None,
+            }]
+        );
         assert!(!stripped.contains("@import"));
         assert!(stripped.contains("body { color: red; }"));
     }
@@ -5056,6 +5287,49 @@ mod tests {
         let (imports, stripped) = split_css_imports(css);
         assert!(imports.is_empty());
         assert_eq!(stripped, css);
+    }
+
+    #[test]
+    fn materialized_import_graph_retains_print_condition_and_import_base() {
+        let root_url = url::Url::parse("https://example.test/css/root.css").unwrap();
+        let print_url = root_url.join("print/print.css").unwrap();
+        let mut sheets = std::collections::HashMap::new();
+        sheets.insert(
+            root_url.to_string(),
+            LoadedStylesheet {
+                response_url: root_url.clone(),
+                imports: vec![StylesheetImport {
+                    url: "print/print.css".to_string(),
+                    media: Some("print".to_string()),
+                }],
+                rules: ".root{color:red}".to_string(),
+            },
+        );
+        sheets.insert(
+            print_url.to_string(),
+            LoadedStylesheet {
+                response_url: print_url.clone(),
+                imports: Vec::new(),
+                rules: ".print{background:url(../mark.svg)}".to_string(),
+            },
+        );
+        let aliases = std::collections::HashMap::from([
+            (root_url.to_string(), root_url.to_string()),
+            (print_url.to_string(), print_url.to_string()),
+        ]);
+        let materialized = materialize_stylesheet_graph(
+            root_url.as_str(),
+            &sheets,
+            &aliases,
+            &mut std::collections::HashSet::new(),
+        )
+        .expect("materialized graph");
+
+        assert!(materialized.starts_with("@media print {\n"));
+        assert!(materialized.contains(
+            r#".print{background:url("https://example.test/css/mark.svg")}"#
+        ));
+        assert!(materialized.ends_with(".root{color:red}"));
     }
 
     #[test]
@@ -5165,7 +5439,7 @@ mod tests {
     }
 
     #[test]
-    fn true_print_stylesheet_loads_without_entering_screen_cascade() {
+    fn true_print_stylesheet_loads_and_remains_media_gated() {
         let dom = parse_html(
             r#"<html><head>
                 <link id="print" rel="stylesheet" href="print.css" media="print"
@@ -5191,9 +5465,12 @@ mod tests {
                 (
                     dom.get_node(link)
                         .and_then(|node| node.get_attribute("data-loaded").map(str::to_owned)),
-                    dom.query_selector_all("style[data-obscura-external-stylesheets]")
+                    dom.query_selector("style[data-obscura-external-stylesheets]")
                         .expect("valid selector")
-                        .len(),
+                        .and_then(|style| {
+                            dom.get_node(style)
+                                .and_then(|node| node.get_attribute("media").map(str::to_owned))
+                        }),
                 )
             })
             .expect("live DOM");
@@ -5203,7 +5480,11 @@ mod tests {
             Some("yes"),
             "print link still fires load"
         );
-        assert_eq!(state.1, 0, "print-only CSS must stay out of screen cascade");
+        assert_eq!(
+            state.1.as_deref(),
+            Some("print"),
+            "the fetched sheet must remain available for PDF print selection"
+        );
     }
 
     #[test]

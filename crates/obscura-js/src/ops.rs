@@ -141,6 +141,11 @@ pub struct ObscuraState {
     /// DOM/style/viewport changes clear this value but retain resource bytes.
     #[cfg(feature = "render")]
     pub prepared_render: Option<obscura_render::PreparedRender>,
+    /// CSS media type selected for the next retained layout. Live pages use
+    /// screen; PDF export switches to print for one synchronous capture and
+    /// restores screen before returning.
+    #[cfg(feature = "render")]
+    pub render_media: obscura_render::CssMediaType,
     /// Explicit document-timeline sample used by the next style/layout flush.
     /// Captures set this to either deterministic T=0 or live document time.
     #[cfg(feature = "render")]
@@ -234,6 +239,8 @@ impl ObscuraState {
             document_generation: 0,
             #[cfg(feature = "render")]
             prepared_render: None,
+            #[cfg(feature = "render")]
+            render_media: obscura_render::CssMediaType::Screen,
             #[cfg(feature = "render")]
             animation_sample: obscura_render::AnimationSample::default(),
             #[cfg(feature = "render")]
@@ -3426,6 +3433,7 @@ pub(crate) fn ensure_prepared_render(
 ) -> Option<&obscura_render::PreparedRender> {
     let base_url = document_base_url(state);
     let viewport = state.viewport;
+    let render_media = state.render_media;
     let animation_sample = state.animation_sample;
     let incompatible = state.prepared_render.as_ref().is_some_and(|prepared| {
         prepared.viewport() != viewport
@@ -3440,7 +3448,7 @@ pub(crate) fn ensure_prepared_render(
                 .animation_timeline
                 .materialize_start_candidates(dom);
         }
-        let previous = (!incompatible)
+        let previous = (!incompatible && render_media == obscura_render::CssMediaType::Screen)
             .then(|| state.prepared_render.take())
             .flatten();
         let mutations = std::mem::take(&mut state.pending_style_mutations);
@@ -3471,16 +3479,29 @@ pub(crate) fn ensure_prepared_render(
                         &mut state.animation_timeline,
                     )
                 })?,
-                None => obscura_render::prepare_dom_with_dynamic_fonts_and_stylesheet_cache_with_animation_state(
-                    dom,
-                    viewport,
-                    base_url.as_deref(),
-                    &mut state.render_resources,
-                    &state.dynamic_fonts,
-                    &mut state.stylesheet_cache,
-                    animation_sample,
-                    &mut state.animation_timeline,
-                )?,
+                None => match render_media {
+                    obscura_render::CssMediaType::Screen => obscura_render::prepare_dom_with_dynamic_fonts_and_stylesheet_cache_with_animation_state(
+                        dom,
+                        viewport,
+                        base_url.as_deref(),
+                        &mut state.render_resources,
+                        &state.dynamic_fonts,
+                        &mut state.stylesheet_cache,
+                        animation_sample,
+                        &mut state.animation_timeline,
+                    )?,
+                    obscura_render::CssMediaType::Print => obscura_render::prepare_dom_with_dynamic_fonts_and_stylesheet_cache_for_media_with_animation_state(
+                        dom,
+                        viewport,
+                        base_url.as_deref(),
+                        &mut state.render_resources,
+                        &state.dynamic_fonts,
+                        &mut state.stylesheet_cache,
+                        render_media,
+                        animation_sample,
+                        &mut state.animation_timeline,
+                    )?,
+                },
             }
         };
         if animation_sample.mode == obscura_render::AnimationSampleMode::DocumentTime {

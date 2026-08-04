@@ -1,8 +1,8 @@
 //! Bounded raster-backed PDF export over the retained document-space painter.
 //!
 //! This deliberately does not claim CSS paged-media support. It preserves the
-//! screen layout, fits the full document width into the printable area, and
-//! slices that immutable layout vertically across PDF pages.
+//! print-media layout, fits the full document width into the printable area,
+//! and slices that immutable layout vertically across PDF pages.
 
 use std::io;
 
@@ -272,11 +272,12 @@ fn selected_page_indices(
 }
 
 impl Page {
-    /// Export the current screen layout as a paginated raster PDF.
+    /// Export the current print-media layout as a paginated raster PDF.
     ///
     /// The full document width is scaled uniformly into the printable width;
-    /// vertical slices become pages. This does not reflow into `@media print`
-    /// or implement CSS paged media, headers, or footers.
+    /// vertical slices become pages. Print media rules participate in normal
+    /// cascade and layout, but CSS paged media, headers, and footers remain
+    /// outside this raster-backed exporter.
     pub fn raster_pdf(&self, options: RasterPdfOptions) -> Result<Vec<u8>, RasterPdfError> {
         self.raster_pdf_with_animation_sample(options, self.live_animation_sample())
     }
@@ -309,62 +310,68 @@ impl Page {
         if !js.set_animation_sample(animation_sample) {
             return Err(RasterPdfError::NoRenderableDocument);
         }
-        let (content_width, content_height) = js
-            .prepared_content_size()
-            .ok_or(RasterPdfError::NoRenderableDocument)?;
-        if !content_width.is_finite()
-            || !content_height.is_finite()
-            || content_width <= 0.0
-            || content_height <= 0.0
-        {
-            return Err(RasterPdfError::NoRenderableDocument);
-        }
+        let previous_media = js.set_render_media(obscura_js::CssMediaType::Print);
+        let result = (|| {
+            let (content_width, content_height) = js
+                .prepared_content_size()
+                .ok_or(RasterPdfError::NoRenderableDocument)?;
+            if !content_width.is_finite()
+                || !content_height.is_finite()
+                || content_width <= 0.0
+                || content_height <= 0.0
+            {
+                return Err(RasterPdfError::NoRenderableDocument);
+            }
 
-        let plan = pagination_plan(
-            content_width,
-            content_height,
-            printable_width,
-            printable_height,
-            options.scale,
-        )?;
-        let selected_pages = selected_page_indices(plan.page_count, &options.page_ranges)?;
-        validate_selected_raster_work(content_width, content_height, plan, &selected_pages)?;
+            let plan = pagination_plan(
+                content_width,
+                content_height,
+                printable_width,
+                printable_height,
+                options.scale,
+            )?;
+            let selected_pages = selected_page_indices(plan.page_count, &options.page_ranges)?;
+            validate_selected_raster_work(content_width, content_height, plan, &selected_pages)?;
 
-        encode_pdf_pages(
-            selected_pages.len(),
-            page_width,
-            page_height,
-            left,
-            bottom,
-            printable_height,
-            |output_page_index| {
-                let page_index = selected_pages[output_page_index];
-                let y = page_index as f32 * plan.css_page_height;
-                let slice_height = (content_height - y).min(plan.css_page_height);
-                let png = js
-                    .screenshot_prepared_region_at_scroll_with_backgrounds(
-                        CaptureRegion::new(0.0, y, content_width, slice_height, 1.0),
-                        (0.0, y),
-                        options.print_background,
-                    )
-                    .map_err(|error| RasterPdfError::CaptureFailed(format!("{error:?}")))?;
-                let decoded = image::load_from_memory_with_format(&png, image::ImageFormat::Png)
-                    .map_err(|error| RasterPdfError::ImageDecode(error.to_string()))?;
-                // The document capture is already a complete PNG allocation. Drop
-                // it before converting the decoded pixels and, below, encoding the
-                // JPEG directly into the final PDF buffer. At no point do we retain
-                // PNGs or JPEGs for earlier pages.
-                drop(png);
-                let rgb = decoded.into_rgb8();
-                Ok(RasterPage {
-                    rgb,
-                    draw_width_pt: content_width * plan.points_per_css_pixel,
-                    draw_height_pt: slice_height * plan.points_per_css_pixel,
-                    #[cfg(test)]
-                    _lifetime_probe: None,
-                })
-            },
-        )
+            encode_pdf_pages(
+                selected_pages.len(),
+                page_width,
+                page_height,
+                left,
+                bottom,
+                printable_height,
+                |output_page_index| {
+                    let page_index = selected_pages[output_page_index];
+                    let y = page_index as f32 * plan.css_page_height;
+                    let slice_height = (content_height - y).min(plan.css_page_height);
+                    let png = js
+                        .screenshot_prepared_region_at_scroll_with_backgrounds(
+                            CaptureRegion::new(0.0, y, content_width, slice_height, 1.0),
+                            (0.0, y),
+                            options.print_background,
+                        )
+                        .map_err(|error| RasterPdfError::CaptureFailed(format!("{error:?}")))?;
+                    let decoded =
+                        image::load_from_memory_with_format(&png, image::ImageFormat::Png)
+                            .map_err(|error| RasterPdfError::ImageDecode(error.to_string()))?;
+                    // The document capture is already a complete PNG allocation. Drop
+                    // it before converting the decoded pixels and, below, encoding the
+                    // JPEG directly into the final PDF buffer. At no point do we retain
+                    // PNGs or JPEGs for earlier pages.
+                    drop(png);
+                    let rgb = decoded.into_rgb8();
+                    Ok(RasterPage {
+                        rgb,
+                        draw_width_pt: content_width * plan.points_per_css_pixel,
+                        draw_height_pt: slice_height * plan.points_per_css_pixel,
+                        #[cfg(test)]
+                        _lifetime_probe: None,
+                    })
+                },
+            )
+        })();
+        js.set_render_media(previous_media);
+        result
     }
 }
 
@@ -843,6 +850,89 @@ mod tests {
         assert!(channel_near(*selected[1].get_pixel(5, 5), [17, 17, 17]));
         assert!(channel_near(*selected[0].get_pixel(50, 40), [32, 192, 64]));
         assert!(channel_near(*selected[1].get_pixel(50, 20), [32, 80, 224]));
+    }
+
+    #[test]
+    fn raster_pdf_selects_print_media_and_restores_screen_render_state() {
+        let context = std::sync::Arc::new(crate::BrowserContext::new("pdf-media".to_string()));
+        let mut page = crate::Page::new("pdf-media-page".to_string(), context);
+        page.set_viewport((100.0, 80.0));
+        let dom = obscura_dom::parse_html(
+            r#"<!doctype html><html><head>
+                <style>
+                    html,body{margin:0;width:100px;height:80px;background:#101010}
+                    #print-marker,#screen-marker{display:none}
+                    @media print {
+                        body{background:#2050e0}
+                    }
+                    @media screen {
+                        body{background:#e02020}
+                    }
+                </style>
+                <style media="print">
+                    #print-marker{display:block;position:absolute;left:60px;top:10px;
+                                  width:30px;height:30px;background:#f0d020}
+                </style>
+                <style media="screen">
+                    #screen-marker{display:block;position:absolute;left:5px;top:5px;
+                                   width:10px;height:10px;background:#20c040}
+                </style>
+            </head><body><div id="print-marker"></div><div id="screen-marker"></div></body></html>"#,
+        );
+        let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new();
+        runtime.set_dom(dom);
+        runtime.set_url("https://example.test/pdf-media");
+        runtime.set_viewport(100.0, 80.0);
+        runtime.run_page_init();
+        page.js = Some(runtime);
+
+        let screen_before = page.screenshot((100.0, 80.0)).expect("screen before PDF");
+        let screen_before_pixels =
+            image::load_from_memory_with_format(&screen_before, image::ImageFormat::Png)
+                .expect("screen PNG")
+                .into_rgb8();
+        assert_eq!(screen_before_pixels.get_pixel(50, 60).0, [224, 32, 32]);
+        assert_eq!(screen_before_pixels.get_pixel(8, 8).0, [32, 192, 64]);
+        assert_eq!(
+            screen_before_pixels.get_pixel(70, 20).0,
+            [224, 32, 32],
+            "media=print marker must stay out of the screen cascade"
+        );
+
+        let options = RasterPdfOptions {
+            print_background: true,
+            paper_width_in: 100.0 / POINTS_PER_INCH,
+            paper_height_in: 80.0 / POINTS_PER_INCH,
+            margin_top_in: 0.0,
+            margin_bottom_in: 0.0,
+            margin_left_in: 0.0,
+            margin_right_in: 0.0,
+            ..RasterPdfOptions::default()
+        };
+        let pages = pdf_page_rasters(&page.raster_pdf(options).expect("print-media PDF"));
+        assert_eq!(pages.len(), 1);
+        let printed = &pages[0];
+        assert!(
+            channel_near(*printed.get_pixel(50, 60), [32, 80, 224]),
+            "@media print body color missing: {:?}",
+            printed.get_pixel(50, 60)
+        );
+        assert!(
+            channel_near(*printed.get_pixel(70, 20), [240, 208, 32]),
+            "media=print stylesheet marker missing: {:?}",
+            printed.get_pixel(70, 20)
+        );
+        assert!(
+            channel_near(*printed.get_pixel(8, 8), [32, 80, 224]),
+            "media=screen marker leaked into print: {:?}",
+            printed.get_pixel(8, 8)
+        );
+
+        let screen_after = page.screenshot((100.0, 80.0)).expect("screen after PDF");
+        assert_eq!(
+            screen_after, screen_before,
+            "temporary print cascade must not poison retained screen geometry or stylesheet cache"
+        );
     }
 
     #[test]

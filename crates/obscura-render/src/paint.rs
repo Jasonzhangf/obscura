@@ -24,7 +24,8 @@ static FONT_BOLD_OBLIQUE_BYTES: &[u8] = include_bytes!("../assets/liberation-san
 
 use crate::dom::{
     layout_dom_with_web_fonts_and_retained_styles_with_animation_state,
-    layout_dom_with_web_fonts_and_stylesheet_cache_with_animation_state, RetainedStyleMaps,
+    layout_dom_with_web_fonts_and_stylesheet_cache_for_media_with_animation_state,
+    RetainedStyleMaps,
 };
 
 const DEFAULT_RESOURCE_CACHE_ENTRIES: usize = 512;
@@ -2007,6 +2008,30 @@ pub fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_with_animation_state(
     animation_sample: crate::AnimationSample,
     animation_timeline: &mut crate::AnimationTimelineState,
 ) -> Option<PreparedRender> {
+    prepare_dom_with_dynamic_fonts_and_stylesheet_cache_for_media_with_animation_state(
+        tree,
+        viewport,
+        base_url,
+        resources,
+        dynamic_fonts,
+        stylesheet_cache,
+        crate::CssMediaType::Screen,
+        animation_sample,
+        animation_timeline,
+    )
+}
+
+pub fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_for_media_with_animation_state(
+    tree: &DomTree,
+    viewport: (f32, f32),
+    base_url: Option<&str>,
+    resources: &mut RenderResourceCache,
+    dynamic_fonts: &[DynamicFontFace],
+    stylesheet_cache: &mut crate::css::StylesheetCache,
+    media_type: crate::CssMediaType,
+    animation_sample: crate::AnimationSample,
+    animation_timeline: &mut crate::AnimationTimelineState,
+) -> Option<PreparedRender> {
     prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
         tree,
         viewport,
@@ -2015,6 +2040,7 @@ pub fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_with_animation_state(
         dynamic_fonts,
         stylesheet_cache,
         None,
+        media_type,
         animation_sample,
         animation_timeline,
     )
@@ -2166,6 +2192,7 @@ pub fn prepare_dom_with_retained_styles_with_animation_state(
         dynamic_fonts,
         stylesheet_cache,
         Some((retained, mutations)),
+        crate::CssMediaType::Screen,
         animation_sample,
         animation_timeline,
     )
@@ -2199,6 +2226,7 @@ fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
     dynamic_fonts: &[DynamicFontFace],
     stylesheet_cache: &mut crate::css::StylesheetCache,
     retained: Option<(RetainedStyleMaps, &[crate::dom::RetainedStyleMutation])>,
+    media_type: crate::CssMediaType,
     animation_sample: crate::AnimationSample,
     animation_timeline: &mut crate::AnimationTimelineState,
 ) -> Option<PreparedRender> {
@@ -2253,12 +2281,13 @@ fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
             animation_sample,
             animation_timeline,
         ),
-        None => layout_dom_with_web_fonts_and_stylesheet_cache_with_animation_state(
+        None => layout_dom_with_web_fonts_and_stylesheet_cache_for_media_with_animation_state(
             tree,
             viewport,
             &intrinsic,
             &fonts,
             stylesheet_cache,
+            media_type,
             animation_sample,
             animation_timeline,
         ),
@@ -2282,12 +2311,13 @@ fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
         {
             resources.content_image_layout_retries += 1;
         }
-        laid = layout_dom_with_web_fonts_and_stylesheet_cache_with_animation_state(
+        laid = layout_dom_with_web_fonts_and_stylesheet_cache_for_media_with_animation_state(
             tree,
             viewport,
             &intrinsic,
             &fonts,
             stylesheet_cache,
+            media_type,
             animation_sample,
             animation_timeline,
         );

@@ -15,6 +15,18 @@ use std::sync::Arc;
 
 use crate::LayoutStyle;
 
+/// CSS media type used while selecting conditional author rules.
+///
+/// Screen is the normal live-page mode. PDF export temporarily selects Print
+/// so `@media print` and media-gated stylesheet blocks can participate without
+/// mutating the document or changing JavaScript's live screen environment.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CssMediaType {
+    #[default]
+    Screen,
+    Print,
+}
+
 /// The part of the tree whose selector match may change when a dependency on
 /// one element changes. Multiple bits can be present for selectors which use
 /// the same key in more than one compound.
@@ -2320,7 +2332,8 @@ const MAX_STYLESHEET_CACHE_RULES: usize = 100_000;
 ///
 /// DOM mutations still run the complete cascade and layout against the live
 /// tree. This cache retains only source parsing, selector compilation, and
-/// candidate indexing, whose inputs are the ordered CSS text and viewport.
+/// candidate indexing, whose inputs are the ordered CSS text, viewport, and
+/// selected CSS media type.
 /// Keeping a single exact-key entry prevents cross-document growth and avoids
 /// hash-collision correctness risks. Pathological source sets above the byte
 /// bound are parsed normally but never retained.
@@ -2334,6 +2347,7 @@ pub struct StylesheetCache {
 struct CachedStylesheet {
     sources: Vec<String>,
     viewport_bits: (u32, u32),
+    media_type: CssMediaType,
     source_bytes: usize,
     sheet: Arc<Stylesheet>,
 }
@@ -2344,17 +2358,26 @@ impl StylesheetCache {
         tree: &DomTree,
         sources: &[String],
         viewport: (f32, f32),
+        media_type: CssMediaType,
     ) -> (Arc<Stylesheet>, bool) {
         let viewport_bits = (viewport.0.to_bits(), viewport.1.to_bits());
         if let Some(entry) = self.entry.as_ref() {
-            if entry.viewport_bits == viewport_bits && entry.sources == sources {
+            if entry.viewport_bits == viewport_bits
+                && entry.media_type == media_type
+                && entry.sources == sources
+            {
                 self.hits = self.hits.saturating_add(1);
                 return (Arc::clone(&entry.sheet), true);
             }
         }
 
         self.misses = self.misses.saturating_add(1);
-        let sheet = Arc::new(Stylesheet::parse_for_viewport(tree, sources, viewport));
+        let sheet = Arc::new(Stylesheet::parse_for_viewport_and_media(
+            tree,
+            sources,
+            viewport,
+            media_type,
+        ));
         let source_bytes = sources
             .iter()
             .try_fold(0usize, |total, source| total.checked_add(source.len()));
@@ -2369,6 +2392,7 @@ impl StylesheetCache {
             self.entry = Some(CachedStylesheet {
                 sources: sources.to_vec(),
                 viewport_bits,
+                media_type,
                 source_bytes,
                 sheet: Arc::clone(&sheet),
             });
@@ -2556,10 +2580,25 @@ impl Stylesheet {
     /// fixed desktop width made responsive frameworks build one DOM while the
     /// renderer applied another breakpoint.
     pub fn parse_for_viewport(tree: &DomTree, sources: &[String], viewport: (f32, f32)) -> Self {
-        Self::parse_for_viewport_at_animation_time(
+        Self::parse_for_viewport_and_media(
             tree,
             sources,
             viewport,
+            CssMediaType::Screen,
+        )
+    }
+
+    pub fn parse_for_viewport_and_media(
+        tree: &DomTree,
+        sources: &[String],
+        viewport: (f32, f32),
+        media_type: CssMediaType,
+    ) -> Self {
+        Self::parse_for_viewport_and_media_at_animation_time(
+            tree,
+            sources,
+            viewport,
+            media_type,
             crate::AnimationSampleTime::default(),
         )
     }
@@ -2568,6 +2607,22 @@ impl Stylesheet {
         tree: &DomTree,
         sources: &[String],
         viewport: (f32, f32),
+        animation_sample_time: crate::AnimationSampleTime,
+    ) -> Self {
+        Self::parse_for_viewport_and_media_at_animation_time(
+            tree,
+            sources,
+            viewport,
+            CssMediaType::Screen,
+            animation_sample_time,
+        )
+    }
+
+    pub fn parse_for_viewport_and_media_at_animation_time(
+        tree: &DomTree,
+        sources: &[String],
+        viewport: (f32, f32),
+        media_type: CssMediaType,
         animation_sample_time: crate::AnimationSampleTime,
     ) -> Self {
         let mut sheet = Stylesheet {
@@ -2598,6 +2653,7 @@ impl Stylesheet {
             let parsed = parse_stylesheet_for_viewport_preserving_containers_in_layer(
                 src,
                 viewport,
+                media_type,
                 &mut sheet.container_conditions,
                 ContainerConditionId::NONE,
                 &mut layers,
@@ -3919,6 +3975,7 @@ fn extract_keyframes(css: &str) -> Vec<(String, Keyframes)> {
     let parsed = parse_stylesheet_for_viewport_preserving_containers(
         css,
         (1280.0, 720.0),
+        CssMediaType::Screen,
         &mut conditions,
         ContainerConditionId::NONE,
     );
@@ -5413,6 +5470,7 @@ fn parse_stylesheet_for_viewport(css: &str, viewport: (f32, f32)) -> Vec<(String
     parse_stylesheet_for_viewport_preserving_containers(
         css,
         viewport,
+        CssMediaType::Screen,
         &mut conditions,
         ContainerConditionId::NONE,
     )
@@ -5432,6 +5490,7 @@ fn parse_stylesheet_for_viewport(css: &str, viewport: (f32, f32)) -> Vec<(String
 fn parse_stylesheet_for_viewport_preserving_containers(
     css: &str,
     viewport: (f32, f32),
+    media_type: CssMediaType,
     container_conditions: &mut Vec<ContainerConditionNode>,
     container_condition_id: ContainerConditionId,
 ) -> Vec<ParsedRule> {
@@ -5439,6 +5498,7 @@ fn parse_stylesheet_for_viewport_preserving_containers(
     parse_stylesheet_for_viewport_preserving_containers_in_layer(
         css,
         viewport,
+        media_type,
         container_conditions,
         container_condition_id,
         &mut layers,
@@ -5449,6 +5509,7 @@ fn parse_stylesheet_for_viewport_preserving_containers(
 fn parse_stylesheet_for_viewport_preserving_containers_in_layer(
     css: &str,
     viewport: (f32, f32),
+    media_type: CssMediaType,
     container_conditions: &mut Vec<ContainerConditionNode>,
     container_condition_id: ContainerConditionId,
     layers: &mut LayerRegistry,
@@ -5498,6 +5559,7 @@ fn parse_stylesheet_for_viewport_preserving_containers_in_layer(
                         decls,
                         &mut rules,
                         viewport,
+                        media_type,
                         container_conditions,
                         container_condition_id,
                         layers,
@@ -5513,6 +5575,7 @@ fn parse_stylesheet_for_viewport_preserving_containers_in_layer(
                         decls,
                         &mut rules,
                         viewport,
+                        media_type,
                         container_conditions,
                         container_condition_id,
                         layers,
@@ -5551,17 +5614,19 @@ fn flush_at_rule(
     inner: &str,
     rules: &mut Vec<ParsedRule>,
     viewport: (f32, f32),
+    media_type: CssMediaType,
     container_conditions: &mut Vec<ContainerConditionNode>,
     container_condition_id: ContainerConditionId,
     layers: &mut LayerRegistry,
     current_layer: Option<&LayerOrder>,
 ) {
     if let Some(prelude) = at_rule_prelude(at, "media") {
-        if media_query_applies_for_viewport(prelude, viewport) {
+        if media_query_applies_for_viewport_and_type(prelude, viewport, media_type) {
             rules.extend(
                 parse_stylesheet_for_viewport_preserving_containers_in_layer(
                     inner,
                     viewport,
+                    media_type,
                     container_conditions,
                     container_condition_id,
                     layers,
@@ -5575,6 +5640,7 @@ fn flush_at_rule(
                 parse_stylesheet_for_viewport_preserving_containers_in_layer(
                     inner,
                     viewport,
+                    media_type,
                     container_conditions,
                     container_condition_id,
                     layers,
@@ -5596,6 +5662,7 @@ fn flush_at_rule(
                 parse_stylesheet_for_viewport_preserving_containers_in_layer(
                     inner,
                     viewport,
+                    media_type,
                     container_conditions,
                     id,
                     layers,
@@ -5647,6 +5714,7 @@ fn flush_at_rule(
             parse_stylesheet_for_viewport_preserving_containers_in_layer(
                 inner,
                 viewport,
+                media_type,
                 container_conditions,
                 container_condition_id,
                 layers,
@@ -6276,16 +6344,28 @@ fn split_supports_operator<'a>(condition: &'a str, operator: &str) -> Option<Vec
 /// inside `(feature: value)`, so it's safe to discard them wholesale rather
 /// than special-case every formatting variant a site might use.
 pub(crate) fn media_query_applies_for_viewport(query: &str, viewport: (f32, f32)) -> bool {
+    media_query_applies_for_viewport_and_type(query, viewport, CssMediaType::Screen)
+}
+
+pub(crate) fn media_query_applies_for_viewport_and_type(
+    query: &str,
+    viewport: (f32, f32),
+    media_type: CssMediaType,
+) -> bool {
     // A media-query list is an OR, not an AND. Evaluate each top-level comma
     // arm independently (commas inside functions such as rgb() / calc() are
     // not list separators). This also keeps an inapplicable `print` arm from
     // suppressing a later screen/feature arm.
     split_media_query_list(query)
         .into_iter()
-        .any(|query| single_media_query_applies_for_viewport(query, viewport))
+        .any(|query| single_media_query_applies_for_viewport(query, viewport, media_type))
 }
 
-fn single_media_query_applies_for_viewport(query: &str, viewport: (f32, f32)) -> bool {
+fn single_media_query_applies_for_viewport(
+    query: &str,
+    viewport: (f32, f32),
+    media_type: CssMediaType,
+) -> bool {
     let viewport_w = viewport.0;
     let viewport_h = viewport.1;
     let query = query.trim().strip_prefix("@media").unwrap_or(query).trim();
@@ -6295,19 +6375,26 @@ fn single_media_query_applies_for_viewport(query: &str, viewport: (f32, f32)) ->
         .flat_map(|c| c.to_lowercase())
         .collect();
 
-    // Tailwind expresses every `max-*` breakpoint as the negation of a
-    // min-width query (`not all and (min-width:40rem)`). Evaluate the inner
-    // condition and invert it; treating all `not all` queries as permanently
-    // false makes mutually exclusive responsive utilities apply together at
-    // desktop widths. Unknown browser-targeting features still conservatively
-    // evaluate true inside and therefore false after negation.
-    if let Some(inner) = compact.strip_prefix("notalland") {
-        return !single_media_query_applies_for_viewport(inner, viewport);
+    // A leading `not` negates the complete media query. This covers both
+    // Tailwind's `not all and (...)` breakpoints and ordinary `not print` /
+    // `not screen` selection without treating a word inside a feature as a
+    // media type.
+    if let Some(inner) = compact.strip_prefix("not") {
+        return !single_media_query_applies_for_viewport(inner, viewport, media_type);
     }
-    if compact == "notall" {
-        return false;
-    }
-    if compact.contains("print") {
+    let compact = compact.strip_prefix("only").unwrap_or(&compact);
+
+    let medium = compact.split_once("and").map_or(compact, |(medium, _)| medium);
+    let medium_matches = match medium {
+        "all" => true,
+        "screen" => media_type == CssMediaType::Screen,
+        "print" => media_type == CssMediaType::Print,
+        medium if medium.starts_with('(') => true,
+        // Unknown named media such as `speech` do not match either visual
+        // rendering mode.
+        _ => false,
+    };
+    if !medium_matches {
         return false;
     }
 
@@ -6478,6 +6565,7 @@ fn denest(
     body: &str,
     rules: &mut Vec<ParsedRule>,
     viewport: (f32, f32),
+    media_type: CssMediaType,
     container_conditions: &mut Vec<ContainerConditionNode>,
     container_condition_id: ContainerConditionId,
     layers: &mut LayerRegistry,
@@ -6556,12 +6644,17 @@ fn denest(
                 if let Some(at) = pre.strip_prefix('@') {
                     // A nested at-rule keeps the enclosing selector for its body.
                     if let Some(prelude) = at_rule_prelude(at, "media") {
-                        if media_query_applies_for_viewport(prelude, viewport) {
+                        if media_query_applies_for_viewport_and_type(
+                            prelude,
+                            viewport,
+                            media_type,
+                        ) {
                             denest(
                                 sel,
                                 &inner,
                                 rules,
                                 viewport,
+                                media_type,
                                 container_conditions,
                                 container_condition_id,
                                 layers,
@@ -6575,6 +6668,7 @@ fn denest(
                                 &inner,
                                 rules,
                                 viewport,
+                                media_type,
                                 container_conditions,
                                 container_condition_id,
                                 layers,
@@ -6594,6 +6688,7 @@ fn denest(
                                     &inner,
                                     rules,
                                     viewport,
+                                    media_type,
                                     container_conditions,
                                     id,
                                     layers,
@@ -6613,6 +6708,7 @@ fn denest(
                                 &inner,
                                 rules,
                                 viewport,
+                                media_type,
                                 container_conditions,
                                 container_condition_id,
                                 layers,
@@ -6627,6 +6723,7 @@ fn denest(
                         &inner,
                         rules,
                         viewport,
+                        media_type,
                         container_conditions,
                         container_condition_id,
                         layers,
@@ -8365,6 +8462,7 @@ mod tests {
         let parsed = parse_stylesheet_for_viewport_preserving_containers(
             css,
             (1280.0, 720.0),
+            CssMediaType::Screen,
             &mut conditions,
             ContainerConditionId::NONE,
         );
@@ -8420,6 +8518,7 @@ mod tests {
         let parsed = parse_stylesheet_for_viewport_preserving_containers(
             css,
             (1280.0, 720.0),
+            CssMediaType::Screen,
             &mut conditions,
             ContainerConditionId::NONE,
         );
@@ -8453,6 +8552,7 @@ mod tests {
         let parsed = parse_stylesheet_for_viewport_preserving_containers(
             css,
             (1280.0, 720.0),
+            CssMediaType::Screen,
             &mut conditions,
             ContainerConditionId::NONE,
         );
@@ -8894,6 +8994,7 @@ mod tests {
         let parsed = parse_stylesheet_for_viewport_preserving_containers(
             "@container (future(foo)), main (min-width:1px) {.card{display:grid}}",
             (1280.0, 720.0),
+            CssMediaType::Screen,
             &mut conditions,
             ContainerConditionId::NONE,
         );
@@ -9320,6 +9421,7 @@ mod tests {
         let parsed = parse_stylesheet_for_viewport_preserving_containers(
             css,
             (1280.0, 720.0),
+            CssMediaType::Screen,
             &mut conditions,
             ContainerConditionId::NONE,
         );
@@ -9386,6 +9488,7 @@ mod tests {
         let rich = parse_stylesheet_for_viewport_preserving_containers(
             css,
             (1280.0, 720.0),
+            CssMediaType::Screen,
             &mut conditions,
             ContainerConditionId::NONE,
         );
@@ -9515,6 +9618,37 @@ mod tests {
         assert!(media_query_applies_for_viewport(
             left_height_calc,
             (1280.0, 705.0)
+        ));
+    }
+
+    #[test]
+    fn media_type_selects_screen_print_negation_and_query_lists() {
+        let viewport = (800.0, 600.0);
+        let applies = |query, media| {
+            media_query_applies_for_viewport_and_type(query, viewport, media)
+        };
+
+        assert!(applies("screen", CssMediaType::Screen));
+        assert!(!applies("screen", CssMediaType::Print));
+        assert!(applies("print", CssMediaType::Print));
+        assert!(!applies("print", CssMediaType::Screen));
+        assert!(applies("not print", CssMediaType::Screen));
+        assert!(!applies("not print", CssMediaType::Print));
+        assert!(applies("not screen", CssMediaType::Print));
+        assert!(!applies("not screen", CssMediaType::Screen));
+        assert!(applies("speech, print", CssMediaType::Print));
+        assert!(!applies("speech, print", CssMediaType::Screen));
+        assert!(applies(
+            "print and (min-width: 700px)",
+            CssMediaType::Print
+        ));
+        assert!(!applies(
+            "print and (min-width: 900px)",
+            CssMediaType::Print
+        ));
+        assert!(applies(
+            "not all and (min-width: 900px)",
+            CssMediaType::Screen
         ));
     }
 
