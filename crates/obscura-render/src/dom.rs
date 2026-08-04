@@ -5465,12 +5465,19 @@ fn layout_dom_once(
                                 continue;
                             }
                             let inline_outer_edges = table_inline_outer_edges(table_style);
+                            let (horizontal_spacing, _) = table_spacing(table_style);
                             let mut used_outer = match table_style.width {
                                 crate::Dimension::Px(width)
                                     if table_style.box_sizing
                                         == crate::BoxSizing::ContentBox =>
                                 {
-                                    width.max(0.0) + inline_outer_edges
+                                    // Border spacing lives inside a CSS table's
+                                    // content box. It is artificial Taffy
+                                    // padding in our grid model, but must not
+                                    // enlarge an authored content-box width.
+                                    width.max(0.0)
+                                        + (inline_outer_edges - horizontal_spacing * 2.0)
+                                            .max(0.0)
                                 }
                                 crate::Dimension::Px(width) => width.max(0.0),
                                 crate::Dimension::Percent(_) => available_widths
@@ -5487,7 +5494,6 @@ fn layout_dom_once(
                                     }),
                                 _ => continue,
                             };
-                            let (horizontal_spacing, _) = table_spacing(table_style);
                             let interior_spacing =
                                 horizontal_spacing * ncols.saturating_sub(1) as f32;
                             let target =
@@ -16451,6 +16457,24 @@ mod tests {
         assert!((rect("first").width - 50.0).abs() < 0.1, "{:?}", rect("first"));
         assert!((rect("second").x - 74.0).abs() < 0.1, "{:?}", rect("second"));
         assert!((rect("second").width - 212.0).abs() < 0.1, "{:?}", rect("second"));
+    }
+
+    #[test]
+    fn fixed_content_box_table_keeps_border_spacing_inside_declared_width() {
+        let tree = parse_html(
+            r#"<style>
+                html,body { margin:0 }
+                table { box-sizing:content-box; table-layout:fixed; width:300px; border:4px solid black; border-spacing:10px 0 }
+                td { height:30px; padding:0; border:0 }
+                #first { width:50px }
+            </style>
+            <table id="table"><tr><td id="first"></td><td id="second"></td></tr></table>"#,
+        );
+        let laid = layout_dom(&tree, (800.0, 300.0));
+        let rect = |id: &str| laid.rects[&tree.get_element_by_id(id).unwrap()];
+        assert!((rect("table").width - 308.0).abs() < 0.1, "{:?}", rect("table"));
+        assert!((rect("first").width - 50.0).abs() < 0.1, "{:?}", rect("first"));
+        assert!((rect("second").width - 220.0).abs() < 0.1, "{:?}", rect("second"));
     }
 
     #[test]
