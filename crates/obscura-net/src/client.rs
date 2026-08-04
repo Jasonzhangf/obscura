@@ -60,6 +60,23 @@ fn configured_root_certificates() -> &'static [reqwest::Certificate] {
     })
 }
 
+/// Whether SSL_CERT_FILE / SSL_CERT_DIR request a custom TLS trust store. A
+/// variable that is set but empty (e.g. `SSL_CERT_FILE=""`, a common shell
+/// accident) is treated as unset, matching the `!is_empty()` filter in
+/// `configured_root_paths` above. The stealth client (wreq) relies on this:
+/// supplying a store to `tls_cert_store` REPLACES the bundled webpki roots, so
+/// an empty value would otherwise build a near-empty store and break all HTTPS.
+///
+/// The only non-test caller is the stealth (wreq) client, so a plain build
+/// without the `stealth` feature sees it as unused.
+#[cfg_attr(not(feature = "stealth"), allow(dead_code))]
+pub(crate) fn custom_cert_store_requested(
+    cert_file: Option<&std::ffi::OsStr>,
+    cert_dir: Option<&std::ffi::OsStr>,
+) -> bool {
+    cert_file.is_some_and(|v| !v.is_empty()) || cert_dir.is_some_and(|v| !v.is_empty())
+}
+
 #[derive(Debug, Clone)]
 pub struct Response {
     pub url: Url,
@@ -1012,5 +1029,35 @@ mod ssrf_tests {
             ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
         let url = Url::parse(&format!("https://127.0.0.1:{port}/")).unwrap();
         assert!(client.fetch(&url).await.is_err(), "unknown CA must be rejected");
+    }
+}
+
+#[cfg(test)]
+mod cert_env_tests {
+    use super::custom_cert_store_requested;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn empty_ssl_cert_env_is_treated_as_unset() {
+        // Set-but-empty must NOT request a custom store: for the stealth client
+        // that would replace the webpki roots with a near-empty default-paths
+        // store and break all HTTPS.
+        assert!(!custom_cert_store_requested(Some(OsStr::new("")), None));
+        assert!(!custom_cert_store_requested(None, Some(OsStr::new(""))));
+        assert!(!custom_cert_store_requested(
+            Some(OsStr::new("")),
+            Some(OsStr::new(""))
+        ));
+        // Genuinely unset: no custom store.
+        assert!(!custom_cert_store_requested(None, None));
+        // Set and non-empty: build the custom store (behavior unchanged).
+        assert!(custom_cert_store_requested(
+            Some(OsStr::new("/etc/corp/ca.pem")),
+            None
+        ));
+        assert!(custom_cert_store_requested(
+            None,
+            Some(OsStr::new("/etc/ssl/certs"))
+        ));
     }
 }

@@ -77,9 +77,10 @@ impl StealthHttpClient {
         //    `tls/conn/ext.rs`), it does not add to them. Applying it unconditionally would break
         //    every ordinary site whenever the bundle is incomplete. With neither variable set,
         //    behaviour is byte-for-byte what it was before.
-        if std::env::var_os("SSL_CERT_FILE").is_some()
-            || std::env::var_os("SSL_CERT_DIR").is_some()
-        {
+        if crate::client::custom_cert_store_requested(
+            std::env::var_os("SSL_CERT_FILE").as_deref(),
+            std::env::var_os("SSL_CERT_DIR").as_deref(),
+        ) {
             match wreq::tls::trust::CertStore::builder().set_default_paths().build() {
                 Ok(store) => builder = builder.tls_cert_store(store),
                 Err(error) => tracing::warn!(
