@@ -915,6 +915,12 @@ pub struct LayoutStyle {
     /// consumed by layout; it is zero on `none`/`hidden` sides while this
     /// model retains their specified widths for later cascade declarations.
     pub border_model: BorderModel,
+    /// Border state before the first cascaded physical/logical border
+    /// declaration. Logical sides cannot be mapped until inherited direction
+    /// is known, so the top-down pass replays `border_cascade_ops` over this
+    /// snapshot in exact cascade order.
+    pub(crate) border_cascade_base: Option<BorderModel>,
+    pub(crate) border_cascade_ops: Vec<BorderCascadeOp>,
     /// Outline paint state. It deliberately has no counterpart in Taffy:
     /// outlines never contribute to box geometry.
     pub outline: OutlineModel,
@@ -1382,6 +1388,31 @@ pub struct LayoutStyle {
     /// modern web rely on it for depth, and without it those elements paint
     /// flat. See [`BoxShadow`] and `paint::paint_box_shadow`.
     pub box_shadow: Option<BoxShadow>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BorderCascadeSide {
+    Top,
+    Right,
+    Bottom,
+    Left,
+    Inline,
+    InlineStart,
+    InlineEnd,
+    Block,
+    BlockStart,
+    BlockEnd,
+    All,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BorderCascadeOp {
+    pub side: BorderCascadeSide,
+    pub width: Option<f32>,
+    pub style: Option<BorderStyle>,
+    /// Outer `None` means this operation leaves color unchanged; inner `None`
+    /// is the valid computed `currentcolor` value.
+    pub color: Option<Option<[u8; 4]>>,
 }
 
 /// Intrinsic metadata exposed by a decoded replaced resource.

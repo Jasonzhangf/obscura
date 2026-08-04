@@ -700,14 +700,17 @@ fn unitless_math_tokens<'i, 't>(
 
 fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
     match name {
-        "direction" => match value.trim().to_ascii_lowercase().as_str() {
-            "ltr" | "initial" | "revert" | "revert-layer" => {
-                style.direction = Some(taffy::Direction::Ltr);
+        "direction" => {
+            match value.trim().to_ascii_lowercase().as_str() {
+                "ltr" | "initial" | "revert" | "revert-layer" => {
+                    style.direction = Some(taffy::Direction::Ltr);
+                }
+                "rtl" => style.direction = Some(taffy::Direction::Rtl),
+                "inherit" | "unset" => style.direction = None,
+                _ => return,
             }
-            "rtl" => style.direction = Some(taffy::Direction::Rtl),
-            "inherit" | "unset" => style.direction = None,
-            _ => {}
-        },
+            resolve_logical_borders(style);
+        }
         "display" => {
             let value = value.trim().to_ascii_lowercase();
             if matches!(
@@ -999,6 +1002,30 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         "border-right-color" => set_border_color(style, Side::Right, value),
         "border-bottom-color" => set_border_color(style, Side::Bottom, value),
         "border-left-color" => set_border_color(style, Side::Left, value),
+        "border-inline"
+        | "border-block"
+        | "border-inline-start"
+        | "border-inline-end"
+        | "border-block-start"
+        | "border-block-end"
+        | "border-inline-width"
+        | "border-inline-style"
+        | "border-inline-color"
+        | "border-block-width"
+        | "border-block-style"
+        | "border-block-color"
+        | "border-inline-start-width"
+        | "border-inline-start-style"
+        | "border-inline-start-color"
+        | "border-inline-end-width"
+        | "border-inline-end-style"
+        | "border-inline-end-color"
+        | "border-block-start-width"
+        | "border-block-start-style"
+        | "border-block-start-color"
+        | "border-block-end-width"
+        | "border-block-end-style"
+        | "border-block-end-color" => apply_logical_border(style, name, value),
         "outline" => apply_outline_shorthand(style, value),
         "outline-width" => set_outline_width(style, value),
         "outline-style" => set_outline_style(style, value),
@@ -1943,6 +1970,30 @@ pub fn supports_declaration(name: &str, value: &str) -> bool {
             | "border-right"
             | "border-bottom"
             | "border-left"
+            | "border-inline"
+            | "border-block"
+            | "border-inline-start"
+            | "border-inline-end"
+            | "border-block-start"
+            | "border-block-end"
+            | "border-inline-width"
+            | "border-inline-style"
+            | "border-inline-color"
+            | "border-block-width"
+            | "border-block-style"
+            | "border-block-color"
+            | "border-inline-start-width"
+            | "border-inline-start-style"
+            | "border-inline-start-color"
+            | "border-inline-end-width"
+            | "border-inline-end-style"
+            | "border-inline-end-color"
+            | "border-block-start-width"
+            | "border-block-start-style"
+            | "border-block-start-color"
+            | "border-block-end-width"
+            | "border-block-end-style"
+            | "border-block-end-color"
             | "background"
             | "background-color"
             | "background-image"
@@ -2242,6 +2293,30 @@ pub fn supports_declaration(name: &str, value: &str) -> bool {
         "border" | "border-top" | "border-right" | "border-bottom" | "border-left" => {
             parse_border_shorthand(value, false).is_some()
         }
+        "border-inline"
+        | "border-block"
+        | "border-inline-start"
+        | "border-inline-end"
+        | "border-block-start"
+        | "border-block-end"
+        | "border-inline-width"
+        | "border-inline-style"
+        | "border-inline-color"
+        | "border-block-width"
+        | "border-block-style"
+        | "border-block-color"
+        | "border-inline-start-width"
+        | "border-inline-start-style"
+        | "border-inline-start-color"
+        | "border-inline-end-width"
+        | "border-inline-end-style"
+        | "border-inline-end-color"
+        | "border-block-start-width"
+        | "border-block-start-style"
+        | "border-block-start-color"
+        | "border-block-end-width"
+        | "border-block-end-style"
+        | "border-block-end-color" => supports_logical_border_declaration(&name, value),
         "border-width" => {
             let values = split_ws_paren(value)
                 .iter()
@@ -5422,24 +5497,166 @@ fn side_colors_mut(model: &mut crate::BorderModel, side: Side) -> &mut Option<[u
     }
 }
 
+fn for_each_border_cascade_side(
+    side: crate::BorderCascadeSide,
+    direction: taffy::Direction,
+    mut apply: impl FnMut(Side),
+) {
+    use crate::BorderCascadeSide as Logical;
+    match side {
+        Logical::Top => apply(Side::Top),
+        Logical::Right => apply(Side::Right),
+        Logical::Bottom => apply(Side::Bottom),
+        Logical::Left => apply(Side::Left),
+        Logical::InlineStart => apply(if direction == taffy::Direction::Rtl {
+            Side::Right
+        } else {
+            Side::Left
+        }),
+        Logical::InlineEnd => apply(if direction == taffy::Direction::Rtl {
+            Side::Left
+        } else {
+            Side::Right
+        }),
+        Logical::BlockStart => apply(Side::Top),
+        Logical::BlockEnd => apply(Side::Bottom),
+        Logical::Inline => {
+            apply(Side::Left);
+            apply(Side::Right);
+        }
+        Logical::Block => {
+            apply(Side::Top);
+            apply(Side::Bottom);
+        }
+        Logical::All => {
+            apply(Side::Top);
+            apply(Side::Right);
+            apply(Side::Bottom);
+            apply(Side::Left);
+        }
+    }
+}
+
+fn record_border_cascade_op(style: &mut LayoutStyle, op: crate::BorderCascadeOp) {
+    style.border_cascade_ops.push(op);
+}
+
+fn record_physical_border_component(
+    style: &mut LayoutStyle,
+    side: crate::BorderCascadeSide,
+    width: Option<f32>,
+    line_style: Option<crate::BorderStyle>,
+    color: Option<Option<[u8; 4]>>,
+) {
+    // The existing physical model is already final until a logical property
+    // appears. Avoid per-element logs on the overwhelmingly common
+    // physical-only path; once logical replay is active, later physical
+    // aliases must join the ordered stream.
+    if style.border_cascade_base.is_none() {
+        return;
+    }
+    record_border_cascade_op(
+        style,
+        crate::BorderCascadeOp {
+            side,
+            width,
+            style: line_style,
+            color,
+        },
+    );
+}
+
+fn record_logical_border_component(
+    style: &mut LayoutStyle,
+    side: crate::BorderCascadeSide,
+    width: Option<f32>,
+    line_style: Option<crate::BorderStyle>,
+    color: Option<Option<[u8; 4]>>,
+) {
+    if style.border_cascade_base.is_none() {
+        style.border_cascade_base = Some(style.border_model);
+    }
+    record_border_cascade_op(
+        style,
+        crate::BorderCascadeOp {
+            side,
+            width,
+            style: line_style,
+            color,
+        },
+    );
+}
+
+fn physical_border_cascade_side(side: Side) -> crate::BorderCascadeSide {
+    match side {
+        Side::Top => crate::BorderCascadeSide::Top,
+        Side::Right => crate::BorderCascadeSide::Right,
+        Side::Bottom => crate::BorderCascadeSide::Bottom,
+        Side::Left => crate::BorderCascadeSide::Left,
+    }
+}
+
+/// Replay physical and logical border declarations after inherited direction
+/// is final. Keeping the original cascade sequence makes a later physical
+/// declaration beat an earlier logical alias (and vice versa), independent of
+/// whether `direction` appeared before or after either declaration.
+pub(crate) fn resolve_logical_borders(style: &mut LayoutStyle) {
+    let Some(mut model) = style.border_cascade_base else {
+        return;
+    };
+    // Border radius is an independent family and may have cascaded after the
+    // base snapshot was taken.
+    model.radii = style.border_model.radii;
+    let direction = style.direction.unwrap_or(taffy::Direction::Ltr);
+    for op in &style.border_cascade_ops {
+        for_each_border_cascade_side(op.side, direction, |side| {
+            if let Some(width) = op.width {
+                *side_widths_mut(&mut model, side) = width;
+            }
+            if let Some(line_style) = op.style {
+                *side_styles_mut(&mut model, side) = line_style;
+            }
+            if let Some(color) = op.color {
+                *side_colors_mut(&mut model, side) = color;
+            }
+        });
+    }
+    style.border_model = model;
+    let colors = model.colors;
+    style.border_color = (colors.top == colors.right
+        && colors.right == colors.bottom
+        && colors.bottom == colors.left)
+        .then_some(colors.top)
+        .flatten();
+    sync_used_border(style);
+}
+
 fn apply_border_widths(style: &mut LayoutStyle, value: &str) {
-    if matches!(
+    let values = if matches!(
         value.trim().to_ascii_lowercase().as_str(),
         "initial" | "unset" | "revert" | "revert-layer"
     ) {
-        style.border_model.specified_widths = crate::Sides::all(crate::border::MEDIUM_BORDER_WIDTH);
-        sync_used_border(style);
-        return;
-    }
-    let tokens = split_ws_paren(value);
-    let Some(values) = tokens
-        .iter()
-        .map(|token| border_width(token))
-        .collect::<Option<Vec<_>>>()
-        .and_then(|values| crate::border::expand_sides(&values))
-    else {
-        return;
+        crate::Sides::all(crate::border::MEDIUM_BORDER_WIDTH)
+    } else {
+        let tokens = split_ws_paren(value);
+        let Some(values) = tokens
+            .iter()
+            .map(|token| border_width(token))
+            .collect::<Option<Vec<_>>>()
+            .and_then(|values| crate::border::expand_sides(&values))
+        else {
+            return;
+        };
+        values
     };
+    for (side, width) in [
+        (crate::BorderCascadeSide::Top, values.top),
+        (crate::BorderCascadeSide::Right, values.right),
+        (crate::BorderCascadeSide::Bottom, values.bottom),
+        (crate::BorderCascadeSide::Left, values.left),
+    ] {
+        record_physical_border_component(style, side, Some(width), None, None);
+    }
     style.border_model.specified_widths = values;
     sync_used_border(style);
 }
@@ -5454,29 +5671,44 @@ fn set_border_width(style: &mut LayoutStyle, side: Side, value: &str) {
         border_width(value)
     };
     if let Some(width) = width {
+        record_physical_border_component(
+            style,
+            physical_border_cascade_side(side),
+            Some(width),
+            None,
+            None,
+        );
         *side_widths_mut(&mut style.border_model, side) = width;
         sync_used_border(style);
     }
 }
 
 fn apply_border_styles(style: &mut LayoutStyle, value: &str) {
-    if matches!(
+    let values = if matches!(
         value.trim().to_ascii_lowercase().as_str(),
         "initial" | "unset" | "revert" | "revert-layer"
     ) {
-        style.border_model.styles = crate::Sides::all(crate::BorderStyle::None);
-        sync_used_border(style);
-        return;
-    }
-    let tokens = split_ws_paren(value);
-    let Some(values) = tokens
-        .iter()
-        .map(|token| border_style(token))
-        .collect::<Option<Vec<_>>>()
-        .and_then(|values| crate::border::expand_sides(&values))
-    else {
-        return;
+        crate::Sides::all(crate::BorderStyle::None)
+    } else {
+        let tokens = split_ws_paren(value);
+        let Some(values) = tokens
+            .iter()
+            .map(|token| border_style(token))
+            .collect::<Option<Vec<_>>>()
+            .and_then(|values| crate::border::expand_sides(&values))
+        else {
+            return;
+        };
+        values
     };
+    for (side, line_style) in [
+        (crate::BorderCascadeSide::Top, values.top),
+        (crate::BorderCascadeSide::Right, values.right),
+        (crate::BorderCascadeSide::Bottom, values.bottom),
+        (crate::BorderCascadeSide::Left, values.left),
+    ] {
+        record_physical_border_component(style, side, None, Some(line_style), None);
+    }
     style.border_model.styles = values;
     sync_used_border(style);
 }
@@ -5491,6 +5723,13 @@ fn set_border_style(style: &mut LayoutStyle, side: Side, value: &str) {
         border_style(value)
     };
     if let Some(line_style) = line_style {
+        record_physical_border_component(
+            style,
+            physical_border_cascade_side(side),
+            None,
+            Some(line_style),
+            None,
+        );
         *side_styles_mut(&mut style.border_model, side) = line_style;
         sync_used_border(style);
     }
@@ -5506,20 +5745,30 @@ fn parse_border_colors(value: &str, dark_scheme: bool) -> Option<crate::Sides<Op
 }
 
 fn apply_border_colors(style: &mut LayoutStyle, value: &str) {
-    if matches!(
+    let colors = if matches!(
         value.trim().to_ascii_lowercase().as_str(),
         "initial" | "unset" | "revert" | "revert-layer"
     ) {
-        style.border_model.colors = crate::Sides::all(None);
-        style.border_color = None;
+        crate::Sides::all(None)
     } else if let Some(colors) = parse_border_colors(value, style.color_scheme_dark) {
-        style.border_model.colors = colors;
-        style.border_color = (colors.top == colors.right
-            && colors.right == colors.bottom
-            && colors.bottom == colors.left)
-            .then_some(colors.top)
-            .flatten();
+        colors
+    } else {
+        return;
+    };
+    for (side, color) in [
+        (crate::BorderCascadeSide::Top, colors.top),
+        (crate::BorderCascadeSide::Right, colors.right),
+        (crate::BorderCascadeSide::Bottom, colors.bottom),
+        (crate::BorderCascadeSide::Left, colors.left),
+    ] {
+        record_physical_border_component(style, side, None, None, Some(color));
     }
+    style.border_model.colors = colors;
+    style.border_color = (colors.top == colors.right
+        && colors.right == colors.bottom
+        && colors.bottom == colors.left)
+        .then_some(colors.top)
+        .flatten();
 }
 
 fn set_border_color(style: &mut LayoutStyle, side: Side, value: &str) {
@@ -5532,6 +5781,13 @@ fn set_border_color(style: &mut LayoutStyle, side: Side, value: &str) {
         border_color(value, style.color_scheme_dark)
     };
     if let Some(color) = color {
+        record_physical_border_component(
+            style,
+            physical_border_cascade_side(side),
+            None,
+            None,
+            Some(color),
+        );
         *side_colors_mut(&mut style.border_model, side) = color;
         let colors = style.border_model.colors;
         style.border_color = (colors.top == colors.right
@@ -5597,10 +5853,213 @@ fn parse_border_shorthand(value: &str, dark_scheme: bool) -> Option<BorderShorth
     })
 }
 
+fn logical_border_pair<T: Copy>(
+    value: &str,
+    initial: T,
+    parse: impl Fn(&str) -> Option<T>,
+) -> Option<(T, T)> {
+    if matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "initial" | "unset" | "revert" | "revert-layer"
+    ) {
+        return Some((initial, initial));
+    }
+    let tokens = split_ws_paren(value);
+    match tokens.as_slice() {
+        [one] => parse(one).map(|value| (value, value)),
+        [start, end] => Some((parse(start)?, parse(end)?)),
+        _ => None,
+    }
+}
+
+fn logical_border_single<T: Copy>(
+    value: &str,
+    initial: T,
+    parse: impl Fn(&str) -> Option<T>,
+) -> Option<T> {
+    if matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "initial" | "unset" | "revert" | "revert-layer"
+    ) {
+        return Some(initial);
+    }
+    let tokens = split_ws_paren(value);
+    matches!(tokens.as_slice(), [one] if parse(one).is_some()).then(|| parse(tokens[0]).unwrap())
+}
+
+fn logical_border_sides(name: &str) -> Option<(crate::BorderCascadeSide, crate::BorderCascadeSide)> {
+    match name {
+        "border-inline-width" | "border-inline-style" | "border-inline-color" => Some((
+            crate::BorderCascadeSide::InlineStart,
+            crate::BorderCascadeSide::InlineEnd,
+        )),
+        "border-block-width" | "border-block-style" | "border-block-color" => Some((
+            crate::BorderCascadeSide::BlockStart,
+            crate::BorderCascadeSide::BlockEnd,
+        )),
+        _ => None,
+    }
+}
+
+fn logical_border_single_side(name: &str) -> Option<crate::BorderCascadeSide> {
+    if name.starts_with("border-inline-start") {
+        Some(crate::BorderCascadeSide::InlineStart)
+    } else if name.starts_with("border-inline-end") {
+        Some(crate::BorderCascadeSide::InlineEnd)
+    } else if name.starts_with("border-block-start") {
+        Some(crate::BorderCascadeSide::BlockStart)
+    } else if name.starts_with("border-block-end") {
+        Some(crate::BorderCascadeSide::BlockEnd)
+    } else {
+        None
+    }
+}
+
+fn apply_logical_border(style: &mut LayoutStyle, name: &str, value: &str) {
+    let shorthand_side = match name {
+        "border-inline" => Some(crate::BorderCascadeSide::Inline),
+        "border-block" => Some(crate::BorderCascadeSide::Block),
+        "border-inline-start" | "border-inline-end" | "border-block-start"
+        | "border-block-end" => logical_border_single_side(name),
+        _ => None,
+    };
+    if let Some(side) = shorthand_side {
+        let Some(parsed) = parse_border_shorthand(value, style.color_scheme_dark) else {
+            return;
+        };
+        record_logical_border_component(
+            style,
+            side,
+            Some(parsed.width),
+            Some(parsed.style),
+            Some(parsed.color),
+        );
+        resolve_logical_borders(style);
+        return;
+    }
+
+    let pair_sides = logical_border_sides(name);
+    let single_side = logical_border_single_side(name);
+    if name.ends_with("-width") {
+        let (start, end) = if pair_sides.is_some() {
+            let Some(values) =
+                logical_border_pair(value, crate::border::MEDIUM_BORDER_WIDTH, border_width)
+            else {
+                return;
+            };
+            values
+        } else {
+            let Some(value) =
+                logical_border_single(value, crate::border::MEDIUM_BORDER_WIDTH, border_width)
+            else {
+                return;
+            };
+            (value, value)
+        };
+        if let Some((start_side, end_side)) = pair_sides {
+            record_logical_border_component(style, start_side, Some(start), None, None);
+            record_logical_border_component(style, end_side, Some(end), None, None);
+        } else if let Some(side) = single_side {
+            record_logical_border_component(style, side, Some(start), None, None);
+        }
+    } else if name.ends_with("-style") {
+        let (start, end) = if pair_sides.is_some() {
+            let Some(values) = logical_border_pair(value, crate::BorderStyle::None, border_style)
+            else {
+                return;
+            };
+            values
+        } else {
+            let Some(value) = logical_border_single(value, crate::BorderStyle::None, border_style)
+            else {
+                return;
+            };
+            (value, value)
+        };
+        if let Some((start_side, end_side)) = pair_sides {
+            record_logical_border_component(style, start_side, None, Some(start), None);
+            record_logical_border_component(style, end_side, None, Some(end), None);
+        } else if let Some(side) = single_side {
+            record_logical_border_component(style, side, None, Some(start), None);
+        }
+    } else if name.ends_with("-color") {
+        let dark_scheme = style.color_scheme_dark;
+        let (start, end) = if pair_sides.is_some() {
+            let Some(values) =
+                logical_border_pair(value, None, |token| border_color(token, dark_scheme))
+            else {
+                return;
+            };
+            values
+        } else {
+            let Some(value) =
+                logical_border_single(value, None, |token| border_color(token, dark_scheme))
+            else {
+                return;
+            };
+            (value, value)
+        };
+        if let Some((start_side, end_side)) = pair_sides {
+            record_logical_border_component(style, start_side, None, None, Some(start));
+            record_logical_border_component(style, end_side, None, None, Some(end));
+        } else if let Some(side) = single_side {
+            record_logical_border_component(style, side, None, None, Some(start));
+        }
+    } else {
+        return;
+    }
+    resolve_logical_borders(style);
+}
+
+fn supports_logical_border_declaration(name: &str, value: &str) -> bool {
+    if matches!(
+        name,
+        "border-inline"
+            | "border-block"
+            | "border-inline-start"
+            | "border-inline-end"
+            | "border-block-start"
+            | "border-block-end"
+    ) {
+        return parse_border_shorthand(value, false).is_some();
+    }
+    let is_pair = matches!(
+        name,
+        "border-inline-width"
+            | "border-inline-style"
+            | "border-inline-color"
+            | "border-block-width"
+            | "border-block-style"
+            | "border-block-color"
+    );
+    let tokens = split_ws_paren(value);
+    if tokens.is_empty() || tokens.len() > if is_pair { 2 } else { 1 } {
+        return false;
+    }
+    if name.ends_with("-width") {
+        tokens.iter().all(|token| border_width(token).is_some())
+    } else if name.ends_with("-style") {
+        tokens.iter().all(|token| border_style(token).is_some())
+    } else if name.ends_with("-color") {
+        tokens
+            .iter()
+            .all(|token| border_color(token, false).is_some())
+    } else {
+        false
+    }
+}
+
 fn apply_border_shorthand(style: &mut LayoutStyle, side: Option<Side>, value: &str) {
     let Some(parsed) = parse_border_shorthand(value, style.color_scheme_dark) else {
         return;
     };
+    record_physical_border_component(
+        style,
+        side.map_or(crate::BorderCascadeSide::All, physical_border_cascade_side),
+        Some(parsed.width),
+        Some(parsed.style),
+        Some(parsed.color),
+    );
     if let Some(side) = side {
         *side_widths_mut(&mut style.border_model, side) = parsed.width;
         *side_styles_mut(&mut style.border_model, side) = parsed.style;
@@ -8101,6 +8560,67 @@ mod tests {
         assert!(supports_declaration("direction", "rtl"));
         assert!(supports_declaration("direction", "ltr"));
         assert!(!supports_declaration("direction", "auto"));
+    }
+
+    #[test]
+    fn logical_borders_resolve_final_direction_and_cascade_with_physical_sides() {
+        let later_logical = compute_style(
+            "div",
+            Some(
+                "direction:rtl;border-right:4px solid #2f9e44;\
+                 border-inline-start:12px solid #862e9c",
+            ),
+        );
+        assert_eq!(later_logical.border.right, 12.0);
+        assert_eq!(later_logical.border_model.colors.right, Some([0x86, 0x2e, 0x9c, 255]));
+
+        let later_physical = compute_style(
+            "div",
+            Some(
+                "direction:rtl;border-inline-start:12px solid #c2255c;\
+                 border-right:4px solid #0b7285",
+            ),
+        );
+        assert_eq!(later_physical.border.right, 4.0);
+        assert_eq!(later_physical.border_model.colors.right, Some([0x0b, 0x72, 0x85, 255]));
+
+        let late_direction = compute_style(
+            "div",
+            Some("border-inline-start:10px solid red;direction:rtl"),
+        );
+        assert_eq!(late_direction.border.left, 0.0);
+        assert_eq!(late_direction.border.right, 10.0);
+    }
+
+    #[test]
+    fn logical_border_pairs_expand_start_end_components_and_supports_grammar() {
+        let style = compute_style(
+            "div",
+            Some(
+                "border-inline:8px solid #f08c00;\
+                 border-inline-width:5px 9px;\
+                 border-block:3px dashed #1971c2;\
+                 border-block-color:#e03131 #2f9e44",
+            ),
+        );
+        assert_eq!((style.border.left, style.border.right), (5.0, 9.0));
+        assert_eq!((style.border.top, style.border.bottom), (3.0, 3.0));
+        assert_eq!(style.border_model.styles.left, crate::BorderStyle::Solid);
+        assert_eq!(style.border_model.styles.top, crate::BorderStyle::Dashed);
+        assert_eq!(style.border_model.colors.top, Some([0xe0, 0x31, 0x31, 255]));
+        assert_eq!(style.border_model.colors.bottom, Some([0x2f, 0x9e, 0x44, 255]));
+
+        for (property, value) in [
+            ("border-inline", "1px solid red"),
+            ("border-block-width", "1px 2px"),
+            ("border-inline-start-style", "dashed"),
+            ("border-block-end-color", "currentcolor"),
+        ] {
+            assert!(supports_declaration(property, value), "{property}:{value}");
+        }
+        assert!(!supports_declaration("border-inline-start-width", "1px 2px"));
+        assert!(!supports_declaration("border-block-color", "red blue green"));
+        assert!(!supports_declaration("border-inline-style", "solid banana"));
     }
 
     #[test]

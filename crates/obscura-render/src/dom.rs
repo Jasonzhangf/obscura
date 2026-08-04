@@ -4259,6 +4259,7 @@ fn layout_dom_once(
                     Some(direction) => inh.direction = direction,
                     None => style.direction = Some(inh.direction),
                 }
+                crate::style::resolve_logical_borders(style);
                 inh.display_contents = style.display_contents;
                 inh.is_inline_block = style.is_inline_block;
                 inh.flow_root = style.flow_root;
@@ -4720,6 +4721,7 @@ fn layout_dom_once(
                     if pseudo.direction.is_none() {
                         pseudo.direction = Some(host_direction);
                     }
+                    crate::style::resolve_logical_borders(pseudo);
                     if pseudo.grid_auto_columns_inherit {
                         pseudo.grid_auto_columns = host_grid_auto_columns.clone();
                         pseudo.grid_calc_expressions[2] = host_grid_auto_column_calcs.clone();
@@ -16654,6 +16656,33 @@ mod tests {
         let style = |id: &str| &laid.styles[&tree.get_element_by_id(id).unwrap()];
         assert_eq!(style("inherited").direction, Some(taffy::Direction::Rtl));
         assert_eq!(style("override").direction, Some(taffy::Direction::Ltr));
+    }
+
+    #[test]
+    fn inherited_direction_resolves_logical_border_cascade_after_stylesheets() {
+        let tree = parse_html(
+            r#"<style>
+                body { direction:rtl; margin:0 }
+                .box { width:200px; height:80px; box-sizing:border-box }
+                .physical-low { border-right:4px solid green }
+                #logical-last { border-inline-start:12px solid purple }
+                .physical { border-inline-start:12px solid red }
+                #physical-last { border-right:4px solid teal }
+            </style>
+            <div id="logical-last" class="box physical-low"></div>
+            <div id="physical-last" class="box physical"></div>"#,
+        );
+        let laid = layout_dom(&tree, (900.0, 300.0));
+        let style = |id: &str| &laid.styles[&tree.get_element_by_id(id).unwrap()];
+        assert_eq!(style("logical-last").border.right, 12.0);
+        // ID specificity wins regardless of source order: the physical alias
+        // and logical property compete for the same final RTL side.
+        assert_eq!(
+            style("logical-last").border_model.colors.right,
+            Some([128, 0, 128, 255])
+        );
+        assert_eq!(style("physical-last").border.right, 4.0);
+        assert_eq!(style("physical-last").border_model.colors.right, Some([0, 128, 128, 255]));
     }
 
     #[test]
