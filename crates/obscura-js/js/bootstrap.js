@@ -8620,6 +8620,31 @@ globalThis.NodeFilter = {
 // element-root, and overflow-ancestor boxes from one prepared layout snapshot.
 globalThis.__intersectionObservers = [];
 let _intersectionRenderCheckpointPending = false;
+const _intersectionDeliveryObservers = new Set();
+let _intersectionDeliveryTaskPending = false;
+
+function _scheduleIntersectionObserverDelivery(observer) {
+  if (!observer._connected || !observer._records.length) return;
+  _intersectionDeliveryObservers.add(observer);
+  if (_intersectionDeliveryTaskPending) return;
+  _intersectionDeliveryTaskPending = true;
+
+  // IntersectionObserver has one task source per document. Deliver every
+  // observer which became pending during the rendering update from that task;
+  // posting one task per observer lets unrelated scheduler work split a single
+  // document notification into seconds of staggered framework updates.
+  _browserPostedTaskEnqueue(() => {
+    _intersectionDeliveryTaskPending = false;
+    const pending = [..._intersectionDeliveryObservers];
+    _intersectionDeliveryObservers.clear();
+    for (const current of pending) {
+      if (!current._connected || !current._records.length) continue;
+      const records = current.takeRecords();
+      try { current._callback(records, current); } catch (e) {}
+    }
+  }, _schedulerPriorityRank["user-visible"] * 2);
+}
+
 function _scheduleIntersectionRenderCheckpoint() {
   if (!globalThis.__intersectionObservers.some(
     observer => observer._connected && observer._targets.size,
@@ -8762,7 +8787,6 @@ globalThis.IntersectionObserver = class IntersectionObserver {
     this._previous = new Map();
     this._records = [];
     this._connected = true;
-    this._deliveryPending = false;
     globalThis.__intersectionObservers.push(this);
   }
   _rootBounds(measurements) {
@@ -8882,17 +8906,9 @@ globalThis.IntersectionObserver = class IntersectionObserver {
         this._queueChanged(target, !!forceInitial, root, measurements);
       }
     }
-    if (!this._records.length || this._deliveryPending) return;
-    this._deliveryPending = true;
-    // The IntersectionObserver task source delivers after the rendering
-    // update and its microtask checkpoint. A Promise reaction delivers too
-    // early and changes takeRecords(), timer, and framework effect ordering.
-    _browserPostedTaskEnqueue(() => {
-      this._deliveryPending = false;
-      if (!this._connected || !this._records.length) return;
-      const records = this.takeRecords();
-      try { this._callback(records, this); } catch (e) {}
-    }, _schedulerPriorityRank["user-visible"] * 2);
+    // Delivery remains a task after the rendering update and its microtask
+    // checkpoint. The document-level queue batches all pending observers.
+    _scheduleIntersectionObserverDelivery(this);
   }
   observe(el) {
     if (!el || this._targets.has(el)) return;
@@ -8919,6 +8935,7 @@ globalThis.IntersectionObserver = class IntersectionObserver {
     this._targets.clear();
     this._previous.clear();
     this._records.length = 0;
+    _intersectionDeliveryObservers.delete(this);
     const index = globalThis.__intersectionObservers.indexOf(this);
     if (index >= 0) globalThis.__intersectionObservers.splice(index, 1);
   }

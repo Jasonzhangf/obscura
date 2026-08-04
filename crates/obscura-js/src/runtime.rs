@@ -9266,6 +9266,45 @@ mod tests {
 
     #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
+    async fn intersection_observer_delivers_document_batch_before_callback_posted_tasks() {
+        let dom = parse_html(
+            r#"<html><body><div id="first"></div><div id="second"></div></body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.run_page_init();
+        rt.execute_script(
+            "intersection-document-delivery-batch",
+            r#"
+                globalThis.__intersectionDeliveryOrder = [];
+                const first = new IntersectionObserver(() => {
+                    __intersectionDeliveryOrder.push("first-observer");
+                    scheduler.postTask(() => {
+                        __intersectionDeliveryOrder.push("callback-posted-task");
+                    }, { priority: "user-blocking" });
+                });
+                const second = new IntersectionObserver(() => {
+                    __intersectionDeliveryOrder.push("second-observer");
+                });
+                first.observe(document.getElementById("first"));
+                second.observe(document.getElementById("second"));
+            "#,
+        )
+        .unwrap();
+
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__intersectionDeliveryOrder").unwrap(),
+            serde_json::json!([
+                "first-observer",
+                "second-observer",
+                "callback-posted-task",
+            ])
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
     async fn intersection_observer_element_root_uses_live_padding_box_and_scroll() {
         let dom = parse_html(
             r#"<html style="margin:0"><body style="margin:0">
@@ -9650,6 +9689,43 @@ mod tests {
         assert_eq!(
             rt.evaluate("__ioRecords").unwrap(),
             serde_json::json!([[false, 150], [true, 120]])
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn intersection_observer_recomputes_after_root_scroll() {
+        let dom = parse_html(
+            r#"<html style="margin:0"><body style="margin:0">
+                <div style="height:150px"></div>
+                <div id="target" style="height:20px"></div>
+                <div style="height:300px"></div>
+            </body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_viewport(200.0, 100.0);
+        rt.run_page_init();
+        rt.execute_script(
+            "intersection-root-scroll",
+            r#"
+                globalThis.__rootScrollIoRecords = [];
+                globalThis.__rootScrollIo = new IntersectionObserver(entries => {
+                    __rootScrollIoRecords.push(...entries.map(entry => [
+                        entry.isIntersecting,
+                        Math.round(entry.boundingClientRect.top),
+                    ]));
+                });
+                __rootScrollIo.observe(document.getElementById("target"));
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(40).await.unwrap();
+        rt.evaluate("window.scrollTo(0, 100)").unwrap();
+        rt.run_event_loop_bounded(40).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__rootScrollIoRecords").unwrap(),
+            serde_json::json!([[false, 150], [true, 50]])
         );
     }
 
