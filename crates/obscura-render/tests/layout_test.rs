@@ -3366,6 +3366,38 @@ fn percentage_max_replaced_items_shrink_in_a_flex_row() {
     );
 }
 
+/// The compressible-percentage exception is specific to proper replaced
+/// sizing. A non-replaced descendant with `max-width:100%` keeps its ordinary
+/// min-content contribution while its flex item is intrinsically sized; its
+/// fixed child must therefore continue to impose a 400px automatic minimum.
+#[test]
+fn percentage_max_non_replaced_descendant_keeps_its_intrinsic_minimum() {
+    let tree = parse_html(
+        r#"
+        <style>
+          html, body { margin:0 }
+          #row { display:flex; width:300px; overflow:hidden }
+          #column { display:flex; flex-direction:column }
+          #bounded { max-width:100% }
+          #floor { width:400px; height:10px }
+          #side { flex:0 0 100px; height:10px }
+        </style>
+        <div id="row">
+          <div id="column"><div id="bounded"><div id="floor"></div></div></div>
+          <div id="side"></div>
+        </div>
+        "#,
+    );
+    let layout = layout_dom(&tree, (800.0, 400.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+
+    assert_eq!(rect("row").width, 300.0);
+    assert_eq!(rect("column").width, 400.0);
+    assert_eq!(rect("bounded").width, 400.0);
+    assert_eq!(rect("floor").width, 400.0);
+    assert_eq!(rect("side").width, 100.0);
+}
+
 #[test]
 fn cyclic_descendant_percentages_do_not_inflate_a_flex_items_intrinsic_minimum() {
     let tree = parse_html(

@@ -10778,7 +10778,9 @@ fn defer_cyclic_flex_inline_sizes(
                 };
                 functional
                     .or_else(|| match dimension {
-                        crate::Dimension::Percent(percent) => {
+                        crate::Dimension::Percent(percent)
+                            if slot != 4 || !style.has_replaced_sizing =>
+                        {
                             Some(DeferredCyclicInlineSource::Percent(percent))
                         }
                         _ => None,
