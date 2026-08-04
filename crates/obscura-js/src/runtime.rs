@@ -854,18 +854,17 @@ impl ObscuraJsRuntime {
     }
 
     /// Insert one page-transport resource outcome into the retained renderer
-    /// cache. A new successful byte body can change intrinsic geometry, so any
-    /// previously prepared layout is invalidated. A negative outcome cannot
-    /// change geometry and therefore preserves the retained layout/scroll.
+    /// cache. Successful image/font bytes queue one resource-dependent layout
+    /// refresh while preserving computed styles and any DOM damage already
+    /// queued. A negative outcome cannot change geometry and preserves the
+    /// retained layout/scroll.
     #[cfg(feature = "render")]
     pub fn seed_render_resource(&mut self, url: String, bytes: Option<Vec<u8>>) {
         let mut state = self.state.borrow_mut();
         match bytes {
             Some(bytes) => {
                 state.render_resources.seed(url, bytes);
-                state.prepared_render = None;
-                state.pending_style_mutations.clear();
-                state.resolved_scroll = None;
+                crate::ops::invalidate_render_resource_geometry(&mut state);
             }
             None => state.render_resources.seed_missing(url),
         }
@@ -882,9 +881,7 @@ impl ObscuraJsRuntime {
         match bytes {
             Some(bytes) if obscura_render::image_intrinsic_dimensions(&bytes).is_some() => {
                 state.render_resources.seed_image(url, profile, bytes);
-                state.prepared_render = None;
-                state.pending_style_mutations.clear();
-                state.resolved_scroll = None;
+                crate::ops::invalidate_render_resource_geometry(&mut state);
             }
             _ => state.render_resources.seed_image_missing(url, profile),
         }
@@ -4274,8 +4271,12 @@ mod tests {
         rt.set_dom(dom);
         rt.set_viewport(1024.0, 768.0);
         rt.run_page_init();
-        rt.execute_script("remember-screen", "globalThis.__screenBefore = screen;")
-            .unwrap();
+        rt.execute_script(
+            "remember-screen",
+            "globalThis.__screenBefore = screen;\
+             globalThis.__screenSizeBefore = [screen.width, screen.height];",
+        )
+        .unwrap();
 
         rt.set_screen_size_override(Some((1440.0, 900.0)), true);
         assert_eq!(
@@ -4290,8 +4291,9 @@ mod tests {
         rt.set_screen_size_override(None, false);
         assert_eq!(
             rt.evaluate(
-                "[innerWidth, innerHeight, screen.width !== 1440,\
-                  screen.height !== 900, screen.availHeight === screen.height - 40,\
+                "[innerWidth, innerHeight, screen.width === __screenSizeBefore[0],\
+                  screen.height === __screenSizeBefore[1],\
+                  screen.availHeight === screen.height - 40,\
                   screen === __screenBefore]"
             )
             .unwrap(),
@@ -7418,14 +7420,97 @@ mod tests {
             Some(br#"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"/>"#.to_vec()),
         );
         let state = rt.state.borrow();
-        assert!(
-            state.prepared_render.is_none(),
-            "successful bytes can change geometry"
+        let prepared = state.prepared_render.as_ref().expect("retained style graph");
+        assert_eq!(
+            prepared as *const obscura_render::PreparedRender as usize,
+            prepared_address,
+            "resource arrival waits for the next geometry flush"
+        );
+        assert_eq!(
+            state.pending_style_mutations,
+            vec![obscura_render::RetainedStyleMutation::Resource],
+            "successful bytes queue one resource-dependent rebuild"
         );
         assert!(
             state.resolved_scroll.is_none(),
             "successful bytes invalidate scroll geometry"
         );
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn image_resource_arrival_retains_styles_and_rebuilds_intrinsic_geometry() {
+        let dom = parse_html(
+            r#"<html style="margin:0"><body style="margin:0">
+                <img id="hero" src="http://example.test/late.png" style="display:block">
+                <div id="after" style="height:10px"></div>
+            </body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_url("http://example.test/page");
+        rt.set_viewport(80.0, 60.0);
+        rt.state.borrow_mut().render_resources =
+            obscura_render::RenderResourceCache::with_loader(|_: &str| None);
+        rt.run_page_init();
+
+        let before = rt
+            .evaluate("[hero.getBoundingClientRect().height, after.getBoundingClientRect().top]")
+            .expect("geometry before image arrival");
+        assert_eq!(before, serde_json::json!([0, 0]));
+        let prepared_address = {
+            let state = rt.state.borrow();
+            state
+                .prepared_render
+                .as_ref()
+                .expect("initial prepared render") as *const obscura_render::PreparedRender
+                as usize
+        };
+
+        // Preserve already queued framework damage and coalesce repeated
+        // notification of the same shared resource into one refresh marker.
+        rt.evaluate("after.setAttribute('data-ready', 'true')")
+            .expect("queued DOM mutation");
+        let png = two_by_three_png();
+        rt.seed_render_image_resource(
+            "http://example.test/late.png".to_string(),
+            crate::ops::ImageRequestProfile::NoCorsInclude,
+            Some(png.clone()),
+        );
+        rt.seed_render_image_resource(
+            "http://example.test/late.png".to_string(),
+            crate::ops::ImageRequestProfile::NoCorsInclude,
+            Some(png),
+        );
+        {
+            let state = rt.state.borrow();
+            assert_eq!(
+                state
+                    .prepared_render
+                    .as_ref()
+                    .expect("style graph remains available")
+                    as *const obscura_render::PreparedRender as usize,
+                prepared_address,
+            );
+            assert_eq!(
+                state
+                    .pending_style_mutations
+                    .iter()
+                    .filter(|mutation| matches!(mutation, obscura_render::RetainedStyleMutation::Resource))
+                    .count(),
+                1,
+            );
+            assert!(state.pending_style_mutations.iter().any(|mutation| matches!(
+                mutation,
+                obscura_render::RetainedStyleMutation::Attribute(_)
+            )));
+        }
+
+        let after = rt
+            .evaluate("[hero.getBoundingClientRect().height, after.getBoundingClientRect().top]")
+            .expect("geometry after image arrival");
+        assert_eq!(after, serde_json::json!([3, 3]));
+        assert!(rt.state.borrow().pending_style_mutations.is_empty());
     }
 
     #[cfg(feature = "render")]
@@ -7584,9 +7669,11 @@ mod tests {
         {
             let state = rt.state.borrow();
             assert_eq!(state.dynamic_fonts.len(), 1);
-            assert!(
-                state.prepared_render.is_none(),
-                "changing the document font registry must invalidate prepared text geometry"
+            assert!(state.prepared_render.is_some());
+            assert_eq!(
+                state.pending_style_mutations,
+                vec![obscura_render::RetainedStyleMutation::Resource],
+                "font registry changes need reshaping and layout, not a fresh cascade"
             );
         }
 
@@ -11666,7 +11753,14 @@ mod tests {
             serde_json::json!([true, 2, 3, ["load"]])
         );
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert!(rt.state.borrow().prepared_render.is_none());
+        {
+            let state = rt.state.borrow();
+            assert!(state.prepared_render.is_some());
+            assert_eq!(
+                state.pending_style_mutations,
+                vec![obscura_render::RetainedStyleMutation::Resource]
+            );
+        }
 
         // Once the successful dimensions are retained, another loading-form
         // metadata probe is only a cache hit and must preserve fresh layout.

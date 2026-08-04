@@ -1926,8 +1926,9 @@ impl AnimationTimelineState {
         self.waapi.values().map(|animation| animation.node).collect()
     }
 
-    /// New animation instance epochs must observe a complete cascade. They
-    /// can be created by DOM mutations which have not yet reached style flush.
+    /// New animation instance epochs must reach a style flush. Retained
+    /// mutation planning cascades the affected nodes while clean branches keep
+    /// their existing instances.
     pub fn has_pending_start_candidates(&self) -> bool {
         !self.start_candidates.is_empty() || !self.subtree_start_candidates.is_empty()
     }

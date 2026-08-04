@@ -534,7 +534,7 @@ pub enum TreeStyleMutation {
     },
 }
 
-/// Mutation input for a retained-style rebuild. Attribute invalidation uses
+/// Damage input for a retained-style rebuild. Attribute invalidation uses
 /// selector-key dependencies; tree invalidation uses parent/sibling scopes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RetainedStyleMutation {
@@ -544,6 +544,11 @@ pub enum RetainedStyleMutation {
     /// stable. Re-cascade this animation owner and its inheritance-dependent
     /// subtree while retaining unrelated branches.
     Animation { node: NodeId },
+    /// Cached image or font bytes became available. Resource selection,
+    /// intrinsic sizes, shaping, layout, and paint must be rebuilt, but the
+    /// DOM, stylesheet, and computed declarations are unchanged, so no style
+    /// node is dirty.
+    Resource,
 }
 
 impl From<AttributeStyleMutation> for RetainedStyleMutation {
@@ -3245,6 +3250,7 @@ fn empty_state_may_have_changed(
         .filter(|mutation| match mutation {
             RetainedStyleMutation::Attribute(_) => false,
             RetainedStyleMutation::Animation { .. } => false,
+            RetainedStyleMutation::Resource => false,
             RetainedStyleMutation::Tree(TreeStyleMutation::Insert {
                 old_parent,
                 new_parent,
@@ -3310,6 +3316,9 @@ fn retained_style_plan(
     let mut dirty = HashSet::new();
     let mut has_animation_damage = false;
     for mutation in mutations {
+        if matches!(mutation, RetainedStyleMutation::Resource) {
+            continue;
+        }
         if let RetainedStyleMutation::Animation { node } = mutation {
             // Animated color and visibility inherit, keyframe endpoints can
             // consume inherited custom properties, and generated pseudos are
@@ -3809,10 +3818,15 @@ fn layout_dom_with_web_fonts_pass_limit_at_animation_time(
     let retained = retained.and_then(|mut retained| {
         // The document cache key intentionally contains only document-scope
         // sources. Until shadow sheets have their own retained cache keys and
-        // invalidation maps, reusing any computed styles in a document with a
-        // native root could preserve stale shadow rules or inherited host
-        // custom properties after a mutation. Prefer a full correct cascade.
-        if !shadow_sheets.is_empty() {
+        // invalidation maps, reusing computed styles after DOM/style damage in
+        // a document with a native root could preserve stale shadow rules or
+        // inherited host custom properties. Resource-only damage cannot
+        // change either cascade, so its zero-dirty reuse remains sound.
+        let resource_only = !mutations.is_empty()
+            && mutations
+                .iter()
+                .all(|mutation| matches!(mutation, RetainedStyleMutation::Resource));
+        if !shadow_sheets.is_empty() && !resource_only {
             return None;
         }
         if !stylesheet_cache_hit {

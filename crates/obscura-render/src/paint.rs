@@ -2195,9 +2195,7 @@ pub fn prepare_dom_with_retained_styles_with_animation_state(
         && previous.animation_sample.mode == crate::AnimationSampleMode::DocumentTime
         && animation_sample.mode == crate::AnimationSampleMode::DocumentTime
         && animation_sample.time.milliseconds >= previous.animation_sample.time.milliseconds;
-    if sample_changed
-        && (!forward_document_sample || animation_timeline.has_pending_start_candidates())
-    {
+    if sample_changed && !forward_document_sample {
         drop(previous);
         return prepare_dom_with_dynamic_fonts_and_stylesheet_cache_with_animation_state(
             tree,

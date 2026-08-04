@@ -674,22 +674,32 @@ fn retained_style_mutation(
 }
 
 #[cfg(feature = "render")]
-const MAX_PENDING_STYLE_MUTATIONS: usize = 256;
+// Modern hydration can touch thousands of distinct connected nodes before the
+// first rendering opportunity. Keep a bounded safety valve for adversarial
+// churn, but do not force a whole-document cascade at the scale of an ordinary
+// React/Framer commit.
+const MAX_PENDING_STYLE_MUTATIONS: usize = 4_096;
 
 /// Queue one retained-style invalidation without letting animation frameworks
 /// evict the whole prepared render merely because they rewrite the same inline
 /// style more than once before the next rendering opportunity.
 ///
-/// A `style` mutation does not carry selector values: the retained planner
-/// dirties that element/subtree and reads the final inline declaration from the
-/// live DOM. Repeating the same dirty marker for one node is therefore
-/// idempotent. Other attributes retain their complete transition sequence;
-/// selector invalidation needs their old and new values.
+/// Rendering observes the attribute state at flush boundaries. Repeated writes
+/// to the same node/name therefore retain the first old value and final new
+/// value; intermediate values were never rendered and cannot affect selector
+/// matching. Inline style uses the same rule without storing serialized values.
 #[cfg(feature = "render")]
-fn queue_retained_style_mutation(
+pub(crate) fn queue_retained_style_mutation(
     pending: &mut Vec<obscura_render::RetainedStyleMutation>,
     mutation: obscura_render::RetainedStyleMutation,
 ) -> bool {
+    let is_resource = matches!(mutation, obscura_render::RetainedStyleMutation::Resource);
+    let has_resource = pending
+        .iter()
+        .any(|queued| matches!(queued, obscura_render::RetainedStyleMutation::Resource));
+    if is_resource && has_resource {
+        return true;
+    }
     if let obscura_render::RetainedStyleMutation::Animation { node } = &mutation {
         if pending.iter().any(|queued| {
             matches!(
@@ -702,25 +712,49 @@ fn queue_retained_style_mutation(
         }
     }
     if let obscura_render::RetainedStyleMutation::Attribute(next) = &mutation {
-        if next.name.eq_ignore_ascii_case("style")
-            && pending.iter().any(|queued| {
+        if let Some(obscura_render::RetainedStyleMutation::Attribute(current)) =
+            pending.iter_mut().find(|queued| {
                 matches!(
                     queued,
                     obscura_render::RetainedStyleMutation::Attribute(current)
                         if current.node == next.node
-                            && current.name.eq_ignore_ascii_case("style")
+                            && current.name.eq_ignore_ascii_case(&next.name)
                 )
             })
         {
+            current.new_value.clone_from(&next.new_value);
             return true;
         }
     }
 
-    if pending.len() >= MAX_PENDING_STYLE_MUTATIONS {
+    // Resource refresh is a singleton trigger, not style damage. Keep the
+    // bounded safety limit on actual selector/tree/animation invalidations
+    // without making a late image discard an exactly-full retained batch.
+    let style_damage_len = pending.len() - usize::from(has_resource);
+    if !is_resource && style_damage_len >= MAX_PENDING_STYLE_MUTATIONS {
         return false;
     }
     pending.push(mutation);
     true
+}
+
+/// Rebuild resource-dependent geometry while retaining the previous computed
+/// style graph. Image intrinsic sizes and font metrics can reflow the whole
+/// document, but neither changes selector matching or computed declarations.
+/// Coalescing this marker also makes one shared image response invalidate once
+/// rather than once for every HTMLImageElement waiter.
+#[cfg(feature = "render")]
+pub(crate) fn invalidate_render_resource_geometry(state: &mut ObscuraState) {
+    if state.prepared_render.is_some()
+        && !queue_retained_style_mutation(
+            &mut state.pending_style_mutations,
+            obscura_render::RetainedStyleMutation::Resource,
+        )
+    {
+        state.prepared_render = None;
+        state.pending_style_mutations.clear();
+    }
+    state.resolved_scroll = None;
 }
 
 #[cfg(feature = "render")]
@@ -2593,7 +2627,7 @@ mod tests {
     use super::{
         ensure_prepared_geometry, ensure_prepared_render, node_is_connected,
         queue_retained_style_mutation, retained_style_mutation,
-        shadow_including_connected_nodes, ObscuraState,
+        shadow_including_connected_nodes, ObscuraState, MAX_PENDING_STYLE_MUTATIONS,
     };
     #[cfg(feature = "render")]
     use obscura_dom::ShadowRootMode;
@@ -2865,22 +2899,58 @@ mod tests {
 
         // The memory bound remains real: unique dirty nodes still consume one
         // slot, while an already-recorded node remains safe at the ceiling.
-        for raw in 201..=256 {
+        for raw in 201..=MAX_PENDING_STYLE_MUTATIONS as u32 {
             assert!(queue_retained_style_mutation(
                 &mut pending,
                 style_mutation(raw),
             ));
         }
-        assert_eq!(pending.len(), 256);
+        assert_eq!(pending.len(), MAX_PENDING_STYLE_MUTATIONS);
         assert!(queue_retained_style_mutation(
             &mut pending,
             style_mutation(1),
         ));
         assert!(!queue_retained_style_mutation(
             &mut pending,
-            style_mutation(257),
+            style_mutation(MAX_PENDING_STYLE_MUTATIONS as u32 + 1),
         ));
-        assert_eq!(pending.len(), 256);
+        assert_eq!(pending.len(), MAX_PENDING_STYLE_MUTATIONS);
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn repeated_selector_attribute_writes_keep_only_the_rendered_transition() {
+        let node = obscura_dom::tree::NodeId::new(7);
+        let mutation = |old: &str, new: &str| {
+            obscura_render::RetainedStyleMutation::Attribute(
+                obscura_render::AttributeStyleMutation {
+                    node,
+                    name: "class".to_string(),
+                    old_value: Some(old.to_string()),
+                    new_value: Some(new.to_string()),
+                },
+            )
+        };
+        let mut pending = Vec::new();
+        assert!(queue_retained_style_mutation(
+            &mut pending,
+            mutation("before", "intermediate"),
+        ));
+        assert!(queue_retained_style_mutation(
+            &mut pending,
+            mutation("intermediate", "after"),
+        ));
+        assert_eq!(
+            pending,
+            vec![obscura_render::RetainedStyleMutation::Attribute(
+                obscura_render::AttributeStyleMutation {
+                    node,
+                    name: "class".to_string(),
+                    old_value: Some("before".to_string()),
+                    new_value: Some("after".to_string()),
+                }
+            )]
+        );
     }
 
     #[cfg(feature = "render")]
@@ -2906,6 +2976,46 @@ mod tests {
                 obscura_render::RetainedStyleMutation::Animation { node: second },
             ]
         );
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn repeated_resource_changes_share_one_retained_refresh_marker() {
+        let mut pending = vec![obscura_render::RetainedStyleMutation::Animation {
+            node: obscura_dom::tree::NodeId::new(1),
+        }];
+        for _ in 0..300 {
+            assert!(queue_retained_style_mutation(
+                &mut pending,
+                obscura_render::RetainedStyleMutation::Resource,
+            ));
+        }
+        assert_eq!(
+            pending,
+            vec![
+                obscura_render::RetainedStyleMutation::Animation {
+                    node: obscura_dom::tree::NodeId::new(1),
+                },
+                obscura_render::RetainedStyleMutation::Resource,
+            ]
+        );
+
+        let mut full_style_batch = (1..=MAX_PENDING_STYLE_MUTATIONS)
+            .map(|raw| obscura_render::RetainedStyleMutation::Animation {
+                node: obscura_dom::tree::NodeId::new(raw as u32),
+            })
+            .collect::<Vec<_>>();
+        assert!(queue_retained_style_mutation(
+            &mut full_style_batch,
+            obscura_render::RetainedStyleMutation::Resource,
+        ));
+        assert_eq!(full_style_batch.len(), MAX_PENDING_STYLE_MUTATIONS + 1);
+        assert!(!queue_retained_style_mutation(
+            &mut full_style_batch,
+            obscura_render::RetainedStyleMutation::Animation {
+                node: obscura_dom::tree::NodeId::new(5_000),
+            },
+        ));
     }
 
     #[cfg(feature = "render")]
@@ -3675,9 +3785,7 @@ fn op_set_dynamic_fonts(state: &OpState, #[string] registrations: &str) -> bool 
     let mut state = shared.borrow_mut();
     if state.dynamic_fonts != fonts {
         state.dynamic_fonts = fonts;
-        state.prepared_render = None;
-        state.pending_style_mutations.clear();
-        state.resolved_scroll = None;
+        invalidate_render_resource_geometry(&mut state);
     }
     true
 }
@@ -4358,9 +4466,7 @@ fn load_image_metadata_without_page_transport(gs: &mut ObscuraState, node_id: No
         .to_string();
     };
     if dimensions.is_some() && dimensions != previous_dimensions {
-        gs.prepared_render = None;
-        gs.pending_style_mutations.clear();
-        gs.resolved_scroll = None;
+        invalidate_render_resource_geometry(gs);
     }
     image_metadata_json(current_src, density, true, dimensions)
 }
@@ -4373,7 +4479,7 @@ fn finish_async_image_metadata(
     expected_url: &str,
     request_profile: ImageRequestProfile,
 ) -> String {
-    let mut gs = shared.borrow_mut();
+    let gs = shared.borrow();
     if gs.document_generation != document_generation {
         return serde_json::json!({ "state": "stale", "currentSrc": expected_url })
             .to_string();
@@ -4394,14 +4500,6 @@ fn finish_async_image_metadata(
     };
     if current_src != expected_url {
         return serde_json::json!({ "state": "stale", "currentSrc": current_src }).to_string();
-    }
-    if known && dimensions.is_some() {
-        // This request began only because the selected resource was unknown.
-        // Newly available intrinsic dimensions can dirty ancestor geometry,
-        // exactly like Gecko's SIZE_AVAILABLE reflow notification.
-        gs.prepared_render = None;
-        gs.pending_style_mutations.clear();
-        gs.resolved_scroll = None;
     }
     image_metadata_json(current_src, density, known, dimensions)
 }
@@ -4582,6 +4680,10 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
                             request_profile,
                             bytes,
                         );
+                        // The leader owns the unknown-to-known cache
+                        // transition. Followers only observe this result and
+                        // must not invalidate the retained render again.
+                        invalidate_render_resource_geometry(&mut gs);
                     } else {
                         gs.render_resources
                             .seed_image_missing(selected_url.clone(), request_profile);
