@@ -611,6 +611,11 @@ class GeometryProbeTests(unittest.TestCase):
         expression, args = page.calls[0]
         self.assertEqual(args, (selectors,))
         self.assertIn("querySelectorAll(selector)", expression)
+        self.assertIn("sampleGeometryDom(element)", expression)
+        self.assertIn("subtree_element_count", expression)
+        self.assertIn("parent_index", expression)
+        self.assertIn("nodes.length<80", expression)
+        self.assertNotIn("Array.from(element.querySelectorAll('*'))", expression)
         self.assertIn("catch(error)", expression)
         self.assertIn("font_family:style.fontFamily", expression)
         self.assertIn("line_height:style.lineHeight", expression)
@@ -703,6 +708,11 @@ class GeometryProbeTests(unittest.TestCase):
 
         comparison = paired_corpus.compare_geometry_probes(obscura, chromium)
         self.assertEqual(comparison[0]["counts"]["delta"], 1)
+        self.assertFalse(comparison[0]["geometry_verdict_valid"])
+        self.assertIn(
+            "target-count-mismatch",
+            comparison[0]["geometry_verdict_exclusion_reasons"],
+        )
         self.assertEqual(
             comparison[0]["rect_deltas"][0]["delta"],
             {"x": 1, "y": -2, "width": 2, "height": 0},
@@ -722,8 +732,209 @@ class GeometryProbeTests(unittest.TestCase):
             },
         )
         self.assertEqual(comparison[1]["valid"], {"obscura": False, "chromium": False})
+        self.assertFalse(comparison[1]["geometry_verdict_valid"])
         self.assertIsNone(comparison[1]["counts"]["delta"])
         self.assertEqual(comparison[1]["rects_compared"], 0)
+
+    def test_geometry_verdict_accepts_matching_bounded_subtrees(self):
+        def descriptor(root_classes):
+            return {
+                "subtree_element_count": 2,
+                "subtree_truncated": False,
+                "subtree": [
+                    {
+                        "index": 0,
+                        "parent_index": None,
+                        "tag": "div",
+                        "id": "card",
+                        "class_name": root_classes,
+                        "child_element_count": 1,
+                    },
+                    {
+                        "index": 1,
+                        "parent_index": 0,
+                        "tag": "img",
+                        "id": "",
+                        "class_name": "hero",
+                        "child_element_count": 0,
+                    },
+                ],
+            }
+
+        def state(classes, x):
+            return {
+                "geometry_probes": [
+                    {
+                        "selector": "#card",
+                        "valid": True,
+                        "count": 1,
+                        "rect_limit": 200,
+                        "rects": [
+                            {
+                                "x": x,
+                                "y": 20,
+                                "width": 100,
+                                "height": 40,
+                                "dom": descriptor(classes),
+                            }
+                        ],
+                    }
+                ]
+            }
+
+        comparison = paired_corpus.compare_geometry_probes(
+            state("featured card", 11), state("card featured", 10)
+        )
+        self.assertTrue(comparison[0]["geometry_verdict_valid"])
+        self.assertEqual(comparison[0]["geometry_verdict_exclusion_reasons"], [])
+        self.assertTrue(comparison[0]["rect_deltas"][0]["geometry_delta_valid"])
+        self.assertEqual(paired_corpus.geometry_verdict_exclusions(comparison), [])
+
+    def test_geometry_verdict_excludes_different_dynamic_subtree_only(self):
+        def state(child_class):
+            return {
+                "geometry_probes": [
+                    {
+                        "selector": "#ad",
+                        "valid": True,
+                        "count": 1,
+                        "rect_limit": 200,
+                        "rects": [
+                            {
+                                "x": 1,
+                                "y": 2,
+                                "width": 300,
+                                "height": 200,
+                                "dom": {
+                                    "subtree_element_count": 2,
+                                    "subtree_truncated": False,
+                                    "subtree": [
+                                        {
+                                            "index": 0,
+                                            "parent_index": None,
+                                            "tag": "div",
+                                            "id": "ad",
+                                            "class_name": "",
+                                            "child_element_count": 1,
+                                        },
+                                        {
+                                            "index": 1,
+                                            "parent_index": 0,
+                                            "tag": "a",
+                                            "id": "",
+                                            "class_name": child_class,
+                                            "child_element_count": 0,
+                                        },
+                                    ],
+                                },
+                            }
+                        ],
+                    }
+                ]
+            }
+
+        comparison = paired_corpus.compare_geometry_probes(
+            state("ad-image-large"), state("ad-image-small")
+        )
+        probe = comparison[0]
+        self.assertFalse(probe["geometry_verdict_valid"])
+        self.assertIn(
+            "target-subtree-structure-mismatch",
+            probe["geometry_verdict_exclusion_reasons"],
+        )
+        self.assertFalse(probe["rect_deltas"][0]["geometry_delta_valid"])
+        self.assertEqual(
+            paired_corpus.geometry_verdict_exclusions(comparison)[0]["selector"],
+            "#ad",
+        )
+        summary = paired_corpus.summarize_geometry_verdicts(comparison)
+        self.assertEqual(summary["valid_selectors"], 0)
+        self.assertEqual(summary["excluded_selectors"], 1)
+        self.assertFalse(summary["all_selectors_valid"])
+        # Selector-scoped target mismatch does not poison unrelated page pixels.
+        fidelity = paired_corpus.classify_fidelity_metric(
+            "representative-fidelity", True, metrics_present=True
+        )
+        self.assertTrue(fidelity["fidelity_metric_valid"])
+
+    def test_legacy_geometry_report_is_insufficient_for_verdict(self):
+        legacy_dom = {
+            "tag": "div",
+            "id": "card",
+            "class_name": "card",
+            "child_element_count": 0,
+            "children": [],
+        }
+        state = {
+            "geometry_probes": [
+                {
+                    "selector": "#card",
+                    "valid": True,
+                    "count": 1,
+                    "rects": [
+                        {
+                            "x": 0,
+                            "y": 0,
+                            "width": 20,
+                            "height": 20,
+                            "dom": legacy_dom,
+                        }
+                    ],
+                }
+            ]
+        }
+        comparison = paired_corpus.compare_geometry_probes(state, state)
+        self.assertFalse(comparison[0]["geometry_verdict_valid"])
+        self.assertIn(
+            "target-subtree-descriptor-unavailable",
+            comparison[0]["geometry_verdict_exclusion_reasons"],
+        )
+
+    def test_truncated_equal_subtrees_are_insufficient_for_verdict(self):
+        dom = {
+            "subtree_element_count": 100,
+            "subtree_truncated": True,
+            "subtree": [
+                {
+                    "index": 0,
+                    "parent_index": None,
+                    "tag": "div",
+                    "id": "target",
+                    "class_name": "same-prefix",
+                    "child_element_count": 99,
+                }
+            ],
+        }
+        state = {
+            "geometry_probes": [
+                {
+                    "selector": "#target",
+                    "valid": True,
+                    "count": 1,
+                    "rects": [
+                        {
+                            "x": 0,
+                            "y": 0,
+                            "width": 20,
+                            "height": 20,
+                            "dom": dom,
+                        }
+                    ],
+                }
+            ]
+        }
+        comparison = paired_corpus.compare_geometry_probes(state, state)
+        rect_state = comparison[0]["rect_deltas"][0][
+            "target_subtree_comparability"
+        ]
+        self.assertFalse(comparison[0]["geometry_verdict_valid"])
+        self.assertEqual(
+            rect_state["classification"], "insufficient-target-structure"
+        )
+        self.assertIn(
+            "target-subtree-descriptor-truncated",
+            comparison[0]["geometry_verdict_exclusion_reasons"],
+        )
 
     def test_feature_comparison_reports_presence_computed_geometry_and_quad_capability(self):
         obscura = {

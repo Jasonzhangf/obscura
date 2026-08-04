@@ -63,6 +63,7 @@ BRAND_PERMUTATIONS = [
     [2, 1, 0],
 ]
 GEOMETRY_PROBE_RECT_LIMIT = 200
+GEOMETRY_PROBE_SUBTREE_LIMIT = 80
 FEATURE_PROBE_SCAN_LIMIT = 2000
 FEATURE_PROBE_CANDIDATE_LIMIT = 40
 CAPTURE_BOUNDARY_PHASE = "capture-boundary-before-screenshot"
@@ -72,6 +73,31 @@ RESOURCE_WARMUP_PHASE = "before-final-scroll-reassert-and-state-sample"
 def geometry_probe_javascript(selectors_expression):
     """Return bounded, per-selector geometry sampling JavaScript."""
     return (
+        "const geometryClassName=element=>String("
+        "element.getAttribute&&element.getAttribute('class')||'');"
+        "const sampleGeometryDom=element=>{"
+        "const descendants=element.querySelectorAll('*');const nodes=[element];"
+        "for(let geometryIndex=0;geometryIndex<descendants.length&&nodes.length<"
+        f"{GEOMETRY_PROBE_SUBTREE_LIMIT}"
+        ";geometryIndex++)nodes.push(descendants[geometryIndex]);"
+        "const nodeIndices=new Map(nodes.map((node,index)=>[node,index]));"
+        "const describe=(node,index)=>({"
+        "index:index,parent_index:index===0?null:"
+        "(nodeIndices.has(node.parentElement)?nodeIndices.get(node.parentElement):null),"
+        "tag:String(node.tagName||'').toLowerCase(),id:node.id||'',"
+        "class_name:geometryClassName(node),"
+        "child_element_count:node.children.length});"
+        "return {tag:String(element.tagName||'').toLowerCase(),"
+        "id:element.id||'',class_name:geometryClassName(element),"
+        "child_node_count:element.childNodes.length,"
+        "child_element_count:element.children.length,"
+        "children:Array.from(element.children).slice(0,20).map(child=>({"
+        "tag:String(child.tagName||'').toLowerCase(),id:child.id||'',"
+        "class_name:geometryClassName(child)})),"
+        "subtree_element_count:descendants.length+1,"
+        f"subtree_limit:{GEOMETRY_PROBE_SUBTREE_LIMIT},"
+        f"subtree_truncated:descendants.length+1>{GEOMETRY_PROBE_SUBTREE_LIMIT},"
+        "subtree:nodes.map(describe)};};"
         "const sampleGeometrySelector=selector=>{try{"
         "const elements=Array.from(document.querySelectorAll(selector));"
         "const rects=elements.slice(0,"
@@ -83,13 +109,7 @@ def geometry_probe_javascript(selectors_expression):
         "const clientRectCount=element.getClientRects().length;"
         "return {index:index,x:rect.left,y:rect.top,"
         "width:rect.width,height:rect.height,"
-        "dom:{tag:String(element.tagName||'').toLowerCase(),"
-        "id:element.id||'',class_name:typeof element.className==='string'"
-        "?element.className:'',child_node_count:element.childNodes.length,"
-        "child_element_count:element.children.length,"
-        "children:Array.from(element.children).slice(0,20).map(child=>({"
-        "tag:String(child.tagName||'').toLowerCase(),id:child.id||'',"
-        "class_name:typeof child.className==='string'?child.className:''}))},"
+        "dom:sampleGeometryDom(element),"
         "computed:{display:style.display,float:style.cssFloat,"
         "clear:style.clear,position:style.position,"
         "visibility:style.visibility,opacity:style.opacity,"
@@ -1162,6 +1182,7 @@ def chromium_capture_signature(state):
                             "height",
                             "visible",
                             "client_rect_count",
+                            "dom",
                         )
                     }
                     for rect in probe.get("rects") or []
@@ -1639,8 +1660,107 @@ def classify_fidelity_metric(capture_purpose, state_comparable, metrics_present)
     }
 
 
+def canonical_geometry_dom_structure(dom):
+    """Return a stable, style-independent form of a bounded DOM descriptor."""
+    if not isinstance(dom, dict):
+        return None
+
+    def class_tokens(value):
+        if not isinstance(value, str):
+            return []
+        return sorted(set(value.split()))
+
+    def canonical_node(node):
+        if not isinstance(node, dict):
+            return None
+        return {
+            "parent_index": node.get("parent_index"),
+            "tag": node.get("tag"),
+            "id": node.get("id") or "",
+            "class_tokens": class_tokens(node.get("class_name")),
+            "child_element_count": node.get("child_element_count"),
+        }
+
+    subtree = dom.get("subtree")
+    if isinstance(subtree, list):
+        return {
+            "source": "bounded-subtree",
+            "subtree_element_count": dom.get("subtree_element_count"),
+            "subtree_truncated": bool(dom.get("subtree_truncated")),
+            "nodes": [canonical_node(node) for node in subtree],
+        }
+
+    # Pre-gate reports only sampled direct children. They are useful raw
+    # provenance but cannot establish that deeper target subtrees are equal.
+    return None
+
+
+def compare_geometry_dom_structures(obscura_dom, chromium_dom):
+    """Classify whether two geometry rects address the same DOM structure."""
+    obscura_structure = canonical_geometry_dom_structure(obscura_dom)
+    chromium_structure = canonical_geometry_dom_structure(chromium_dom)
+    available = obscura_structure is not None and chromium_structure is not None
+    structures_equal = available and obscura_structure == chromium_structure
+    truncated = available and (
+        obscura_structure.get("subtree_truncated") is True
+        or chromium_structure.get("subtree_truncated") is True
+    )
+    comparable = structures_equal and not truncated
+    reasons = []
+    if not available:
+        reasons.append("target-subtree-descriptor-unavailable")
+    elif not structures_equal:
+        reasons.append("target-subtree-structure-mismatch")
+    elif truncated:
+        reasons.append("target-subtree-descriptor-truncated")
+    return {
+        "available": available,
+        "comparable": comparable,
+        "classification": (
+            "comparable"
+            if comparable
+            else "insufficient-target-structure"
+            if not available or truncated
+            else "different-target-structure"
+        ),
+        "reasons": reasons,
+        "obscura": obscura_structure,
+        "chromium": chromium_structure,
+    }
+
+
+def geometry_verdict_exclusions(comparisons):
+    """Return selector-scoped exclusions without changing full-page fidelity."""
+    return [
+        {
+            "index": comparison.get("index"),
+            "selector": comparison.get("selector"),
+            "reasons": comparison.get("geometry_verdict_exclusion_reasons") or [],
+        }
+        for comparison in comparisons or []
+        if comparison.get("geometry_verdict_valid") is not True
+    ]
+
+
+def summarize_geometry_verdicts(comparisons):
+    """Summarize selector-level eligibility without folding it into pixels."""
+    comparisons = comparisons or []
+    valid = [
+        comparison
+        for comparison in comparisons
+        if comparison.get("geometry_verdict_valid") is True
+    ]
+    exclusions = geometry_verdict_exclusions(comparisons)
+    return {
+        "valid_selectors": len(valid),
+        "excluded_selectors": len(exclusions),
+        "all_selectors_valid": bool(comparisons) and not exclusions,
+        "excluded": exclusions,
+    }
+
+
 def compare_geometry_probes(obscura, chromium):
-    """Report raw per-selector deltas without reducing them to a verdict."""
+    """Report raw deltas and gate geometry verdicts on target structure."""
     obscura_probes = (obscura or {}).get("geometry_probes") or []
     chromium_probes = (chromium or {}).get("geometry_probes") or []
     comparisons = []
@@ -1654,9 +1774,14 @@ def compare_geometry_probes(obscura, chromium):
         obscura_rects = (obscura_probe or {}).get("rects") or []
         chromium_rects = (chromium_probe or {}).get("rects") or []
         rect_deltas = []
+        subtree_comparisons = []
         for rect_index in range(min(len(obscura_rects), len(chromium_rects))):
             obscura_rect = obscura_rects[rect_index]
             chromium_rect = chromium_rects[rect_index]
+            subtree_comparison = compare_geometry_dom_structures(
+                obscura_rect.get("dom"), chromium_rect.get("dom")
+            )
+            subtree_comparisons.append(subtree_comparison)
             deltas = {}
             for field in ("x", "y", "width", "height"):
                 left = obscura_rect.get(field)
@@ -1687,12 +1812,53 @@ def compare_geometry_probes(obscura, chromium):
                         "obscura": obscura_rect.get("visible"),
                         "chromium": chromium_rect.get("visible"),
                     },
+                    "target_subtree_comparability": subtree_comparison,
+                    "geometry_delta_valid": subtree_comparison["comparable"],
                     "computed_difference_count": len(computed_differences),
                     "computed_differences": computed_differences,
                 }
             )
         obscura_count = (obscura_probe or {}).get("count")
         chromium_count = (chromium_probe or {}).get("count")
+        selector_left = (obscura_probe or {}).get("selector")
+        selector_right = (chromium_probe or {}).get("selector")
+        query_valid = (
+            (obscura_probe or {}).get("valid") is True
+            and (chromium_probe or {}).get("valid") is True
+        )
+        counts_equal = (
+            isinstance(obscura_count, int)
+            and not isinstance(obscura_count, bool)
+            and isinstance(chromium_count, int)
+            and not isinstance(chromium_count, bool)
+            and obscura_count == chromium_count
+        )
+        verdict_exclusions = []
+        if not query_valid:
+            verdict_exclusions.append("selector-query-invalid")
+        if selector_left != selector_right:
+            verdict_exclusions.append("selector-mismatch")
+        if not counts_equal:
+            verdict_exclusions.append("target-count-mismatch")
+        elif obscura_count == 0:
+            verdict_exclusions.append("no-matched-targets")
+        if counts_equal and isinstance(obscura_count, int) and obscura_count > 0:
+            expected_rects = min(
+                obscura_count,
+                (obscura_probe or {}).get("rect_limit")
+                or GEOMETRY_PROBE_RECT_LIMIT,
+            )
+            if len(subtree_comparisons) != expected_rects:
+                verdict_exclusions.append("paired-target-descriptors-incomplete")
+        subtree_reasons = {
+            reason
+            for comparison in subtree_comparisons
+            for reason in comparison["reasons"]
+        }
+        verdict_exclusions.extend(sorted(subtree_reasons))
+        # Preserve reason order while avoiding duplicates.
+        verdict_exclusions = list(dict.fromkeys(verdict_exclusions))
+        geometry_verdict_valid = not verdict_exclusions
         comparisons.append(
             {
                 "index": index,
@@ -1704,6 +1870,20 @@ def compare_geometry_probes(obscura, chromium):
                 "valid": {
                     "obscura": (obscura_probe or {}).get("valid"),
                     "chromium": (chromium_probe or {}).get("valid"),
+                },
+                "geometry_verdict_valid": geometry_verdict_valid,
+                "geometry_verdict_exclusion_reasons": verdict_exclusions,
+                "target_subtree_comparability": {
+                    "pairs_compared": len(subtree_comparisons),
+                    "all_comparable": bool(subtree_comparisons)
+                    and all(
+                        comparison["comparable"]
+                        for comparison in subtree_comparisons
+                    ),
+                    "bounded_descriptor": (
+                        "tag/id/class tokens, child counts, and parent-indexed "
+                        "descendant structure"
+                    ),
                 },
                 "errors": {
                     "obscura": (obscura_probe or {}).get("error"),
@@ -2082,6 +2262,14 @@ def main():
                 "stylesheet mirror nodes, because Chromium's CSSOM does not "
                 "serialize fetched stylesheet text into outerHTML."
             ),
+            "selector_target_state": (
+                "Each geometry target carries a bounded, parent-indexed DOM "
+                "subtree descriptor. Selector geometry remains raw diagnostic "
+                "data when match counts or target structures differ, but it is "
+                "explicitly excluded from a geometry verdict. A selector-scoped "
+                "exclusion does not by itself invalidate unrelated full-page "
+                "fidelity metrics."
+            ),
             "resource_readiness": (
                 "Both engines take and discard one screenshot before sampling "
                 "resource readiness, then yield one bounded task turn. This "
@@ -2125,6 +2313,7 @@ def main():
             "selectors": args.geometry_selector,
             "coordinate_space": "viewport-css-px",
             "rect_limit_per_selector": GEOMETRY_PROBE_RECT_LIMIT,
+            "subtree_element_limit_per_rect": GEOMETRY_PROBE_SUBTREE_LIMIT,
             "visibility": (
                 "practical rendered-box heuristic: client rect exists, positive "
                 "bounding size, display/visibility permit paint, and opacity > 0"
@@ -2132,8 +2321,11 @@ def main():
             "comparison_semantics": (
                 "raw per-selector counts, rect deltas in document order, "
                 "visibility observations, and exact differences between the "
-                "computed values that won each engine's cascade; no aggregate "
-                "parity verdict"
+                "computed values that won each engine's cascade. Geometry "
+                "verdict validity additionally requires equal selector counts "
+                "and matching bounded tag/id/class/child structure for every "
+                "paired target; selector exclusions do not invalidate the "
+                "full-page fidelity metric"
             ),
         }
     manifest["automatic_feature_probes"] = {
@@ -2392,11 +2584,18 @@ def main():
                         )
                     )
                     if args.geometry_selector:
+                        geometry_comparison = compare_geometry_probes(
+                            page_result["obscura"].get("state"),
+                            chromium_state,
+                        )
                         page_result["geometry_probe_comparison"] = (
-                            compare_geometry_probes(
-                                page_result["obscura"].get("state"),
-                                chromium_state,
-                            )
+                            geometry_comparison
+                        )
+                        page_result["geometry_verdict_exclusions"] = (
+                            geometry_verdict_exclusions(geometry_comparison)
+                        )
+                        page_result["geometry_verdict_eligibility"] = (
+                            summarize_geometry_verdicts(geometry_comparison)
                         )
                 if (
                     chrome_ok
@@ -2427,10 +2626,21 @@ def main():
                         )
                     )
                     if args.geometry_selector:
+                        baseline_geometry_comparison = compare_geometry_probes(
+                            page_result["baseline"].get("state"),
+                            chromium_state,
+                        )
                         page_result["baseline_geometry_probe_comparison"] = (
-                            compare_geometry_probes(
-                                page_result["baseline"].get("state"),
-                                chromium_state,
+                            baseline_geometry_comparison
+                        )
+                        page_result["baseline_geometry_verdict_exclusions"] = (
+                            geometry_verdict_exclusions(
+                                baseline_geometry_comparison
+                            )
+                        )
+                        page_result["baseline_geometry_verdict_eligibility"] = (
+                            summarize_geometry_verdicts(
+                                baseline_geometry_comparison
                             )
                         )
 
@@ -2566,11 +2776,23 @@ def main():
                 edge_2d_delta = page_result.get("delta_vs_baseline", {}).get(
                     "edge_bidirectional_mean_distance_px"
                 )
+                geometry_eligibility = page_result.get(
+                    "geometry_verdict_eligibility"
+                )
+                geometry_summary = (
+                    "-"
+                    if geometry_eligibility is None
+                    else (
+                        f"{geometry_eligibility['valid_selectors']}-valid/"
+                        f"{geometry_eligibility['excluded_selectors']}-excluded"
+                    )
+                )
                 print(
                     f"{name:84} "
                     f"mode={args.capture_purpose} "
                     f"state={page_result.get('state_comparability', {}).get('classification', 'unavailable')} "
                     f"fidelity={'valid' if page_result['fidelity_metric_valid'] else 'excluded'} "
+                    f"geometry={geometry_summary} "
                     f"p>50_raw={metric if metric is not None else 'capture-fail'} "
                     f"edge_bbox={edge_bbox if edge_bbox is not None else '-'} "
                     f"edge_row={edge_row if edge_row is not None else '-'} "
@@ -2598,6 +2820,24 @@ def main():
         "semantics": (
             "eligibility counts only; excluded pages retain raw screenshots "
             "and metrics but do not contribute fidelity evidence"
+        ),
+    }
+    manifest["geometry_verdict_eligibility"] = {
+        "valid_selectors": sum(
+            (page.get("geometry_verdict_eligibility") or {}).get(
+                "valid_selectors", 0
+            )
+            for page in manifest["pages"]
+        ),
+        "excluded_selectors": sum(
+            (page.get("geometry_verdict_eligibility") or {}).get(
+                "excluded_selectors", 0
+            )
+            for page in manifest["pages"]
+        ),
+        "semantics": (
+            "selector-level eligibility only; exclusions retain raw geometry "
+            "diagnostics and do not by themselves invalidate full-page fidelity"
         ),
     }
     write_results(results_path, manifest)
