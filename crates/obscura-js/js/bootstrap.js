@@ -481,7 +481,15 @@ const _scheduleAfter = (delay, fn) => {
 // call silently no-ops and JS-triggered navigations (cookie → reload) never fire.
 const _coerceTimerFn = (fn) => {
   if (typeof fn === "string") {
-    try { return new Function(fn); } catch (_) { return null; }
+    // Per HTML, a string handler is compiled and run as a classic script in
+    // global scope *at fire time*. Indirect eval ((0, eval)) runs in the true
+    // global scope, so top-level var/function declarations become globals (a
+    // `new Function(fn)` wrapper kept them local); deferring to fire time also
+    // surfaces a SyntaxError when the timer elapses, matching a real browser,
+    // instead of swallowing it eagerly at scheduling. The dynamic-script path
+    // uses the same indirect eval for the same reason.
+    const src = fn;
+    return () => { (0, eval)(src); };
   }
   return typeof fn === "function" ? fn : null;
 };
