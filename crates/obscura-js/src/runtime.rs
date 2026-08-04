@@ -6725,6 +6725,68 @@ mod tests {
 
     #[cfg(feature = "render")]
     #[test]
+    fn waapi_pause_seek_and_cancel_preserve_authored_inline_style() {
+        let mut rt = setup_runtime(
+            r#"<html><body><div id="box" style="opacity:.2;width:20px;height:20px"></div></body></html>"#,
+        );
+        rt.execute_script(
+            "waapi",
+            r#"
+                globalThis.box = document.getElementById('box');
+                globalThis.__animation = box.animate(
+                    [{opacity:.2, transform:'translateX(0px)'}, {opacity:1, transform:'translateX(100px)'}],
+                    {duration:100, fill:'both', easing:'linear'}
+                );
+                __animation.pause();
+                __animation.currentTime = 50;
+            "#,
+        ).unwrap();
+        assert_eq!(rt.evaluate("box.style.opacity").unwrap(), serde_json::json!(".2"));
+        assert_eq!(rt.evaluate("box.getAnimations()[0] === __animation").unwrap(), serde_json::json!(true));
+        assert_eq!(rt.evaluate("document.getAnimations()[0] === __animation").unwrap(), serde_json::json!(true));
+        assert_eq!(rt.evaluate("__animation.playState").unwrap(), serde_json::json!("paused"));
+        assert_eq!(
+            rt.evaluate("!('easingBezier' in __animation.effect.getTiming()) && !('linearEasing' in __animation.effect.getComputedTiming())").unwrap(),
+            serde_json::json!(true),
+        );
+        let opacity = rt.evaluate("getComputedStyle(box).opacity").unwrap();
+        let opacity = opacity.as_str().unwrap().parse::<f32>().unwrap();
+        assert!((opacity - 0.6).abs() < 0.001, "midpoint opacity was {opacity}");
+
+        rt.execute_script("cancel", "__animation.cancel()").unwrap();
+        assert_eq!(rt.evaluate("box.style.opacity").unwrap(), serde_json::json!(".2"));
+        assert_eq!(rt.evaluate("getComputedStyle(box).opacity").unwrap(), serde_json::json!("0.2"));
+        assert_eq!(rt.evaluate("box.getAnimations().length").unwrap(), serde_json::json!(0.0));
+        assert_eq!(rt.evaluate("document.getAnimations().length").unwrap(), serde_json::json!(0.0));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn waapi_zero_duration_finishes_asynchronously_and_fires_lifecycle() {
+        let mut rt = setup_runtime(r#"<div id="box" style="opacity:.1"></div>"#);
+        rt.execute_script(
+            "waapi-lifecycle",
+            r#"
+                globalThis.box = document.getElementById('box');
+                globalThis.__ready = false;
+                globalThis.__finished = false;
+                globalThis.__finishEvent = false;
+                globalThis.__animation = box.animate([{opacity:.1}, {opacity:1}], {duration:0, fill:'both'});
+                __animation.onfinish = () => { __finishEvent = true; };
+                __animation.ready.then(() => { __ready = true; });
+                __animation.finished.then(() => { __finished = true; });
+            "#,
+        ).unwrap();
+        rt.run_event_loop_bounded(20).await.unwrap();
+        assert_eq!(rt.evaluate("__ready").unwrap(), serde_json::json!(true));
+        assert_eq!(rt.evaluate("__finished").unwrap(), serde_json::json!(true));
+        assert_eq!(rt.evaluate("__finishEvent").unwrap(), serde_json::json!(true));
+        assert_eq!(rt.evaluate("__animation.playState").unwrap(), serde_json::json!("finished"));
+        assert_eq!(rt.evaluate("getComputedStyle(box).opacity").unwrap(), serde_json::json!("1"));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
     fn forward_animation_samples_retain_static_prepared_render() {
         let mut rt = ObscuraJsRuntime::new();
         rt.set_dom(parse_html(

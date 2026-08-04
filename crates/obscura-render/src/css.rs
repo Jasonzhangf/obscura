@@ -3664,6 +3664,13 @@ impl Stylesheet {
             animation_timeline.clear_animation(nid, animation_sample);
         }
 
+        // Web Animations contribute at the animation cascade origin: above
+        // every normal author declaration (including inline style), but below
+        // author !important. Keep the renderer-side effect separate from the
+        // authored declaration block so cancel() reveals the exact underlying
+        // value and CSSOM never observes a synthetic inline rewrite.
+        sample_waapi_properties(animation_timeline, nid, style, animation_sample);
+
         for &(_, _, i) in &important_matched {
             let rule = &self.rules[i];
             let expanded =
@@ -3675,6 +3682,151 @@ impl Stylesheet {
         crate::style::apply_declarations_with_locked_color_scheme(style, &expanded);
         effective
     }
+}
+
+fn sample_waapi_properties(
+    timeline: &crate::AnimationTimelineState,
+    node: NodeId,
+    style: &mut LayoutStyle,
+    sample: crate::AnimationSample,
+) {
+    for (animation, local_time) in timeline.waapi_for_node(node, sample.time) {
+        let Some(mut progress) = animation_directed_progress(&animation.timing, local_time) else {
+            continue;
+        };
+        if let Some(samples) = animation.linear_easing.as_deref() {
+            progress = sample_linear_easing(samples, progress);
+        } else if let Some(points) = animation.easing {
+            progress = sample_cubic_bezier(points, progress);
+        }
+        let underlying = style.clone();
+
+        let opacity_track = animation
+            .keyframes
+            .iter()
+            .filter_map(|frame| frame.opacity.map(|value| (frame.offset, value)))
+            .collect::<Vec<_>>();
+        if let Some(value) = sample_numeric_waapi_track(
+            &opacity_track,
+            underlying.opacity.unwrap_or(1.0),
+            progress,
+        ) {
+            style.opacity = Some(value.clamp(0.0, 1.0));
+        }
+
+        let transform_track = animation
+            .keyframes
+            .iter()
+            .filter_map(|frame| {
+                let value = frame.transform.as_ref()?;
+                if !crate::style::supports_declaration("transform", value) {
+                    return None;
+                }
+                let mut endpoint = underlying.clone();
+                crate::style::apply_animation_property_value(&mut endpoint, "transform", value);
+                Some((frame.offset, endpoint.transform_ops))
+            })
+            .collect::<Vec<_>>();
+        if let Some(value) = sample_transform_waapi_track(
+            &transform_track,
+            underlying.transform_ops.clone(),
+            progress,
+        ) {
+            apply_animation_value(
+                style,
+                AnimatedProperty::Transform,
+                AnimationValue::Transform(value),
+            );
+        }
+    }
+}
+
+fn sample_linear_easing(samples: &[f32], progress: f32) -> f32 {
+    if samples.len() < 2 {
+        return progress;
+    }
+    let scaled = progress.clamp(0.0, 1.0) * (samples.len() - 1) as f32;
+    let index = (scaled.floor() as usize).min(samples.len() - 2);
+    let local = scaled - index as f32;
+    samples[index] + (samples[index + 1] - samples[index]) * local
+}
+
+fn sample_cubic_bezier(points: [f32; 4], progress: f32) -> f32 {
+    let [x1, y1, x2, y2] = points;
+    let target = progress.clamp(0.0, 1.0);
+    let component = |t: f32, first: f32, second: f32| {
+        let inverse = 1.0 - t;
+        3.0 * inverse * inverse * t * first + 3.0 * inverse * t * t * second + t * t * t
+    };
+    // x control points are constrained to [0,1], so bisection is stable even
+    // for flat derivatives at the ends.
+    let (mut low, mut high) = (0.0, 1.0);
+    for _ in 0..14 {
+        let middle = (low + high) * 0.5;
+        if component(middle, x1, x2) < target {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    component((low + high) * 0.5, y1, y2).clamp(0.0, 1.0)
+}
+
+fn sample_numeric_waapi_track(
+    track: &[(f32, f32)],
+    underlying: f32,
+    progress: f32,
+) -> Option<f32> {
+    sample_waapi_track(track, underlying, progress, |from, to, position| {
+        from + (to - from) * position
+    })
+}
+
+fn sample_transform_waapi_track(
+    track: &[(f32, Vec<crate::TransformOp>)],
+    underlying: Vec<crate::TransformOp>,
+    progress: f32,
+) -> Option<Vec<crate::TransformOp>> {
+    sample_waapi_track(track, underlying, progress, |from, to, position| {
+        interpolate_transform_list(from, to, position)
+    })
+}
+
+fn sample_waapi_track<T: Clone>(
+    track: &[(f32, T)],
+    underlying: T,
+    progress: f32,
+    interpolate: impl Fn(&T, &T, f32) -> T,
+) -> Option<T> {
+    if track.is_empty() {
+        return None;
+    }
+    let mut resolved = track.to_vec();
+    resolved.sort_by(|left, right| left.0.total_cmp(&right.0));
+    if resolved[0].0 > 0.0 {
+        resolved.insert(0, (0.0, underlying.clone()));
+    }
+    if resolved.last().is_some_and(|stop| stop.0 < 1.0) {
+        resolved.push((1.0, underlying));
+    }
+    if progress <= resolved[0].0 {
+        return Some(resolved[0].1.clone());
+    }
+    for pair in resolved.windows(2) {
+        let (from_offset, from) = (&pair[0].0, &pair[0].1);
+        let (to_offset, to) = (&pair[1].0, &pair[1].1);
+        if progress <= *to_offset {
+            if progress == *to_offset || from_offset == to_offset {
+                return Some(to.clone());
+            }
+            return Some(interpolate(
+                from,
+                to,
+                (progress - *from_offset) / (*to_offset - *from_offset),
+            ));
+        }
+    }
+    resolved.last().map(|stop| stop.1.clone())
 }
 
 /// Compile a keyframes body into sparse per-property tracks. Values remain in
@@ -7796,6 +7948,79 @@ mod tests {
         let style = sampled_animation_style(css, 0.0, "target");
         assert_eq!(style.width, crate::Dimension::Px(80.0));
         assert_eq!(style.background_color, Some([0, 0, 255, 255]));
+    }
+
+    #[test]
+    fn waapi_samples_opacity_and_transform_without_rewriting_inline_cascade() {
+        let tree = obscura_dom::parse_html(r#"<div id="target" style="opacity:.2"></div>"#);
+        let target = tree.get_element_by_id("target").unwrap();
+        let sheet = Stylesheet::parse_for_viewport(&tree, &[], (800.0, 600.0));
+        let mut timeline = crate::AnimationTimelineState::default();
+        timeline.register_waapi(crate::WaapiAnimation {
+            id: 1,
+            node: target,
+            keyframes: vec![
+                crate::WaapiKeyframe { offset: 0.0, opacity: Some(0.2), transform: Some("translateX(0px)".into()) },
+                crate::WaapiKeyframe { offset: 1.0, opacity: Some(1.0), transform: Some("translateX(100px)".into()) },
+            ],
+            timing: crate::AnimationTiming {
+                duration_ms: 100.0,
+                fill_mode: crate::AnimationFillMode::Both,
+                ..Default::default()
+            },
+            easing: None,
+            linear_easing: None,
+            start_time_ms: 0.0,
+            hold_time_ms: Some(50.0),
+            play_state: crate::WaapiPlayState::Paused,
+        });
+        let node = tree.get_node(target).unwrap();
+        let element = node.as_element().unwrap();
+        let mut matcher = tree.matcher();
+        let mut style = LayoutStyle::default();
+        sheet.apply_at_animation_time(
+            &tree,
+            &mut matcher,
+            target,
+            node.get_attribute("id"),
+            &[],
+            element.local.as_ref(),
+            &mut style,
+            &HashMap::new(),
+            node.get_attribute("style"),
+            crate::AnimationSample::document(50.0),
+            &mut timeline,
+        );
+        assert_opacity(style.opacity.unwrap(), 0.6);
+        assert!(matches!(style.transform_ops.as_slice(),
+            [crate::TransformOp::Translate(x, _)] if x.value == crate::Dimension::Px(50.0)));
+
+        let important_tree = obscura_dom::parse_html(
+            r#"<div id="target" style="opacity:.2 !important"></div>"#,
+        );
+        let target = important_tree.get_element_by_id("target").unwrap();
+        let sheet = Stylesheet::parse_for_viewport(&important_tree, &[], (800.0, 600.0));
+        let mut timeline = crate::AnimationTimelineState::default();
+        timeline.register_waapi(crate::WaapiAnimation {
+            id: 2,
+            node: target,
+            keyframes: vec![crate::WaapiKeyframe { offset: 1.0, opacity: Some(1.0), transform: None }],
+            timing: crate::AnimationTiming { duration_ms: 100.0, fill_mode: crate::AnimationFillMode::Both, ..Default::default() },
+            easing: None,
+            linear_easing: None,
+            start_time_ms: 0.0,
+            hold_time_ms: Some(100.0),
+            play_state: crate::WaapiPlayState::Finished,
+        });
+        let node = important_tree.get_node(target).unwrap();
+        let mut matcher = important_tree.matcher();
+        let mut style = LayoutStyle::default();
+        sheet.apply_at_animation_time(
+            &important_tree, &mut matcher, target, node.get_attribute("id"), &[], "div",
+            &mut style, &HashMap::new(), node.get_attribute("style"),
+            crate::AnimationSample::document(100.0), &mut timeline,
+        );
+        assert_opacity(style.opacity.unwrap(), 0.2);
     }
 
     #[test]

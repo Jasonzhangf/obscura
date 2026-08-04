@@ -1711,6 +1711,41 @@ struct AnimationInstance {
     was_paused: bool,
 }
 
+/// A normalized property keyframe supplied through the Web Animations API.
+/// Values stay in specified form until cascade time because transforms may
+/// contain relative units whose meaning depends on the animated element.
+#[derive(Debug, Clone)]
+pub struct WaapiKeyframe {
+    pub offset: f32,
+    pub opacity: Option<f32>,
+    pub transform: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaapiPlayState {
+    Running,
+    Paused,
+    Finished,
+}
+
+/// Renderer-owned WAAPI effect. JavaScript keeps the wrapper object identity,
+/// while this document-scoped record is the source of truth for cascade and
+/// paint. It deliberately does not rewrite the element's inline style.
+#[derive(Debug, Clone)]
+pub struct WaapiAnimation {
+    pub id: u64,
+    pub node: obscura_dom::tree::NodeId,
+    pub keyframes: Vec<WaapiKeyframe>,
+    pub timing: AnimationTiming,
+    /// Cubic Bezier timing function control points. `None` is linear.
+    pub easing: Option<[f32; 4]>,
+    /// CSS `linear()` output samples at evenly distributed input positions.
+    pub linear_easing: Option<Vec<f32>>,
+    pub start_time_ms: f32,
+    pub hold_time_ms: Option<f32>,
+    pub play_state: WaapiPlayState,
+}
+
 /// Page-owned CSS animation instance history retained across layout rebuilds.
 /// Node ids are document-scoped, so navigation must replace this value.
 #[derive(Debug, Default)]
@@ -1718,6 +1753,7 @@ pub struct AnimationTimelineState {
     instances: std::collections::HashMap<obscura_dom::tree::NodeId, AnimationInstance>,
     start_candidates: std::collections::HashMap<obscura_dom::tree::NodeId, f32>,
     subtree_start_candidates: std::collections::HashMap<obscura_dom::tree::NodeId, f32>,
+    waapi: std::collections::BTreeMap<u64, WaapiAnimation>,
 }
 
 impl AnimationTimelineState {
@@ -1765,7 +1801,89 @@ impl AnimationTimelineState {
             self.instances.remove(node);
             self.start_candidates.remove(node);
             self.subtree_start_candidates.remove(node);
+            self.waapi.retain(|_, animation| animation.node != *node);
         }
+    }
+
+    pub fn register_waapi(&mut self, animation: WaapiAnimation) {
+        self.waapi.insert(animation.id, animation);
+    }
+
+    pub fn cancel_waapi(&mut self, id: u64) -> bool {
+        self.waapi.remove(&id).is_some()
+    }
+
+    pub fn set_waapi_current_time(&mut self, id: u64, document_time_ms: f32, local_time_ms: f32) -> bool {
+        let Some(animation) = self.waapi.get_mut(&id) else { return false; };
+        let local = local_time_ms.max(0.0);
+        animation.hold_time_ms = Some(local);
+        animation.start_time_ms = document_time_ms - local;
+        true
+    }
+
+    pub fn set_waapi_play_state(
+        &mut self,
+        id: u64,
+        state: WaapiPlayState,
+        document_time_ms: f32,
+    ) -> bool {
+        let Some(animation) = self.waapi.get_mut(&id) else { return false; };
+        let current = animation
+            .hold_time_ms
+            .unwrap_or_else(|| (document_time_ms - animation.start_time_ms).max(0.0));
+        match state {
+            WaapiPlayState::Running => {
+                animation.start_time_ms = document_time_ms - current;
+                animation.hold_time_ms = None;
+            }
+            WaapiPlayState::Paused | WaapiPlayState::Finished => {
+                animation.hold_time_ms = Some(current);
+            }
+        }
+        animation.play_state = state;
+        true
+    }
+
+    pub fn finish_waapi(&mut self, id: u64) -> bool {
+        let Some(animation) = self.waapi.get_mut(&id) else { return false; };
+        let end = animation.timing.delay_ms
+            + animation.timing.duration_ms * animation.timing.iteration_count.max(0.0);
+        animation.hold_time_ms = Some(end.max(0.0));
+        animation.play_state = WaapiPlayState::Finished;
+        true
+    }
+
+    pub(crate) fn waapi_for_node(
+        &self,
+        node: obscura_dom::tree::NodeId,
+        document_time: AnimationSampleTime,
+    ) -> impl Iterator<Item = (&WaapiAnimation, AnimationSampleTime)> {
+        self.waapi.values().filter_map(move |animation| {
+            if animation.node != node {
+                return None;
+            }
+            let local = animation.hold_time_ms.unwrap_or_else(|| {
+                (document_time.milliseconds - animation.start_time_ms).max(0.0)
+            });
+            Some((animation, AnimationSampleTime { milliseconds: local }))
+        })
+    }
+
+    pub(crate) fn has_active_waapi(&self, document_time: AnimationSampleTime) -> bool {
+        self.waapi.values().any(|animation| {
+            if animation.play_state != WaapiPlayState::Running
+                || animation.timing.duration_ms <= 0.0
+                || animation.timing.iteration_count <= 0.0
+            {
+                return false;
+            }
+            let local = animation.hold_time_ms.unwrap_or_else(|| {
+                (document_time.milliseconds - animation.start_time_ms).max(0.0)
+            });
+            let end = animation.timing.delay_ms
+                + animation.timing.duration_ms * animation.timing.iteration_count;
+            local < end.max(0.0)
+        })
     }
 
     pub(crate) fn sample_for(
@@ -1832,6 +1950,7 @@ impl AnimationTimelineState {
         self.instances.retain(|node, _| keep(*node));
         self.start_candidates.retain(|node, _| keep(*node));
         self.subtree_start_candidates.retain(|node, _| keep(*node));
+        self.waapi.retain(|_, animation| keep(animation.node));
     }
 
     pub fn clear_start_candidates(&mut self) {

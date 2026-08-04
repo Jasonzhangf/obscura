@@ -17,6 +17,9 @@ use obscura_net::{
 };
 use tokio::sync::Mutex;
 
+#[cfg(feature = "render")]
+use serde::Deserialize;
+
 use crate::import_map::ImportMap;
 
 pub type InterceptCallback = Arc<
@@ -3252,12 +3255,151 @@ pub fn build_extension() -> Extension {
         ops.push(op_element_scroll_to());
         ops.push(op_scroll_offset());
         ops.push(op_scroll_to());
+        ops.push(op_waapi_create());
+        ops.push(op_waapi_control());
     }
     Extension {
         name: "obscura_dom",
         ops: std::borrow::Cow::Owned(ops),
         ..Default::default()
     }
+}
+
+#[cfg(feature = "render")]
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WaapiCreateInput {
+    id: u64,
+    node: u32,
+    keyframes: Vec<WaapiKeyframeInput>,
+    duration: f32,
+    delay: f32,
+    iterations: f32,
+    fill: String,
+    direction: String,
+    easing_bezier: Option<[f32; 4]>,
+    linear_easing: Option<Vec<f32>>,
+}
+
+#[cfg(feature = "render")]
+#[derive(Deserialize)]
+struct WaapiKeyframeInput {
+    offset: f32,
+    opacity: Option<f32>,
+    transform: Option<String>,
+}
+
+#[cfg(feature = "render")]
+fn waapi_document_time_ms(state: &ObscuraState) -> f32 {
+    state.animation_timeline_origin.elapsed().as_secs_f32() * 1000.0
+}
+
+#[cfg(feature = "render")]
+fn invalidate_waapi_render(state: &mut ObscuraState) {
+    state.prepared_render = None;
+    state.resolved_scroll = None;
+    state.activity_generation = state.activity_generation.wrapping_add(1);
+}
+
+#[cfg(feature = "render")]
+#[op2(fast)]
+fn op_waapi_create(state: &OpState, #[string] input: &str) -> bool {
+    let Ok(input) = serde_json::from_str::<WaapiCreateInput>(input) else {
+        return false;
+    };
+    if !input.duration.is_finite()
+        || input.duration < 0.0
+        || !input.delay.is_finite()
+        || !input.iterations.is_finite()
+        || input.iterations < 0.0
+        || input.keyframes.is_empty()
+    {
+        return false;
+    }
+    let shared = state.borrow::<SharedState>().clone();
+    let mut state = shared.borrow_mut();
+    let node = NodeId::new(input.node);
+    if state.dom.as_ref().and_then(|dom| dom.get_node(node)).is_none() {
+        return false;
+    }
+    let start_time_ms = waapi_document_time_ms(&state);
+    let fill_mode = match input.fill.as_str() {
+        "forwards" => obscura_render::AnimationFillMode::Forwards,
+        "backwards" => obscura_render::AnimationFillMode::Backwards,
+        "both" => obscura_render::AnimationFillMode::Both,
+        _ => obscura_render::AnimationFillMode::None,
+    };
+    let direction = match input.direction.as_str() {
+        "reverse" => obscura_render::AnimationDirection::Reverse,
+        "alternate" => obscura_render::AnimationDirection::Alternate,
+        "alternate-reverse" => obscura_render::AnimationDirection::AlternateReverse,
+        _ => obscura_render::AnimationDirection::Normal,
+    };
+    state.animation_timeline.register_waapi(obscura_render::WaapiAnimation {
+        id: input.id,
+        node,
+        keyframes: input.keyframes.into_iter().map(|frame| obscura_render::WaapiKeyframe {
+            offset: frame.offset.clamp(0.0, 1.0),
+            opacity: frame.opacity.map(|value| value.clamp(0.0, 1.0)),
+            transform: frame.transform,
+        }).collect(),
+        timing: obscura_render::AnimationTiming {
+            duration_ms: input.duration,
+            delay_ms: input.delay,
+            iteration_count: input.iterations,
+            direction,
+            fill_mode,
+            play_state: obscura_render::AnimationPlayState::Running,
+        },
+        easing: input.easing_bezier,
+        linear_easing: input.linear_easing,
+        start_time_ms,
+        hold_time_ms: None,
+        play_state: obscura_render::WaapiPlayState::Running,
+    });
+    invalidate_waapi_render(&mut state);
+    true
+}
+
+#[cfg(feature = "render")]
+#[op2(fast)]
+fn op_waapi_control(
+    state: &OpState,
+    id: f64,
+    #[string] action: &str,
+    value: f64,
+) -> bool {
+    if !id.is_finite() || id < 0.0 {
+        return false;
+    }
+    let shared = state.borrow::<SharedState>().clone();
+    let mut state = shared.borrow_mut();
+    let id = id as u64;
+    let document_time = waapi_document_time_ms(&state);
+    let changed = match action {
+        "cancel" => state.animation_timeline.cancel_waapi(id),
+        "finish" => state.animation_timeline.finish_waapi(id),
+        "pause" => state.animation_timeline.set_waapi_play_state(
+            id,
+            obscura_render::WaapiPlayState::Paused,
+            document_time,
+        ),
+        "play" => state.animation_timeline.set_waapi_play_state(
+            id,
+            obscura_render::WaapiPlayState::Running,
+            document_time,
+        ),
+        "currentTime" if value.is_finite() => state.animation_timeline.set_waapi_current_time(
+            id,
+            document_time,
+            value as f32,
+        ),
+        _ => false,
+    };
+    if changed {
+        invalidate_waapi_render(&mut state);
+    }
+    changed
 }
 
 #[cfg(feature = "render")]

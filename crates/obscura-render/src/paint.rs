@@ -756,6 +756,7 @@ impl ResolvedScrollState {
 pub struct PreparedRender {
     viewport: (f32, f32),
     animation_sample: crate::AnimationSample,
+    has_active_waapi_animations: bool,
     root_font_size: f32,
     base_url: Option<String>,
     content_size: (f32, f32),
@@ -784,7 +785,7 @@ impl PreparedRender {
     /// animation. Finite animations stop producing compositor damage after
     /// their active interval; paused and zero-duration animations never do.
     pub fn has_active_css_animations(&self) -> bool {
-        self.layout.styles.values().any(|style| {
+        self.has_active_waapi_animations || self.layout.styles.values().any(|style| {
             if style.animation_name.is_none()
                 || !style.animation_has_render_effect
                 || style.animation_timing.play_state == crate::AnimationPlayState::Paused
@@ -2190,6 +2191,7 @@ fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
     Some(PreparedRender {
         viewport,
         animation_sample,
+        has_active_waapi_animations: animation_timeline.has_active_waapi(animation_sample.time),
         root_font_size,
         base_url: base_url.map(str::to_string),
         content_size,
