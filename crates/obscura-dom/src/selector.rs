@@ -213,6 +213,13 @@ impl<'i> parser::Parser<'i> for ObscuraSelectorParser {
         true
     }
 
+    // The selectors crate implements the `::slotted()` grammar and matching
+    // combinator. DomElement's slot hooks below provide the tree-specific
+    // assignment boundary.
+    fn parse_slotted(&self) -> bool {
+        true
+    }
+
     fn parse_non_ts_pseudo_class(
         &self,
         _location: cssparser::SourceLocation,
@@ -529,11 +536,13 @@ impl<'a> Element for DomElement<'a> {
     }
 
     fn is_html_slot_element(&self) -> bool {
-        false
+        self.tree.is_html_slot_element(self.node_id)
     }
 
     fn assigned_slot(&self) -> Option<Self> {
-        None
+        self.tree
+            .assigned_slot(self.node_id)
+            .map(|node_id| DomElement::new(self.tree, node_id))
     }
 
     fn has_id(&self, id: &CssString, case_sensitivity: CaseSensitivity) -> bool {
@@ -926,19 +935,41 @@ impl Matcher {
         compiled: &CompiledSelector,
         host: NodeId,
     ) -> bool {
-        if nid != host || !tree.with_node(nid, |n| n.is_element()).unwrap_or(false) {
+        if nid != host {
+            return false;
+        }
+        self.matches_in_shadow_scope(tree, nid, compiled, host)
+    }
+
+    /// Match `compiled` in the shadow tree hosted by `host`. This supplies the
+    /// scope used by `::slotted()`'s slot-assignment combinator without making
+    /// shadow-only selectors observable to document matching.
+    pub fn matches_in_shadow_scope(
+        &mut self,
+        tree: &DomTree,
+        nid: NodeId,
+        compiled: &CompiledSelector,
+        host: NodeId,
+    ) -> bool {
+        if !tree.with_node(nid, |n| n.is_element()).unwrap_or(false) {
             return false;
         }
         let mut context = MatchingContext::new(
             MatchingMode::Normal,
-            Some(self.ancestors.filter()),
+            // The caller's reusable bloom tracks the subject's DOM ancestors.
+            // A slotted selector crosses to the assigned slot and then walks
+            // that slot's shadow-tree ancestors, so the DOM bloom would cause
+            // false negatives for `.wrapper slot::slotted(...)`. Scoped rules
+            // are already narrowed to a small per-shadow index; match them
+            // without an incompatible ancestor filter.
+            None,
             &mut self.caches,
             QuirksMode::NoQuirks,
             NeedsSelectorFlags::No,
             MatchingForInvalidation::No,
         );
         let element = DomElement::new(tree, nid);
-        context.current_host = Some(element.opaque());
+        context.current_host = Some(DomElement::new(tree, host).opaque());
         selectors::matching::matches_selector(
             &compiled.sel,
             0,
@@ -1058,6 +1089,12 @@ impl CompiledSelector {
         self.sel
             .matches_featureless_host_selector_or_pseudo_element()
             .contains(parser::FeaturelessHostMatches::FOR_HOST)
+    }
+
+    /// Whether this selector contains the `::slotted()` pseudo-element and
+    /// must be collected at a slot-assignment boundary.
+    pub fn is_slotted(&self) -> bool {
+        self.sel.is_slotted()
     }
 
     /// The one bucket usable by legacy selector indexes. Selectors whose
@@ -1743,5 +1780,45 @@ mod tests {
         // Parsing support must not make `:host` observable in document scope.
         assert!(!tree.matches_selector(host, ":host").unwrap());
         assert!(tree.query_selector_all(":host").unwrap().is_empty());
+    }
+
+    #[test]
+    fn slotted_selectors_match_only_assigned_elements_in_their_shadow_scope() {
+        let tree = parse_html(
+            r#"<!doctype html><x-card id="host"><span id="item" class="item" slot="title"></span><span id="unslotted" class="item" slot="missing"></span></x-card>"#,
+        );
+        let host = tree.get_element_by_id("host").unwrap();
+        let item = tree.get_element_by_id("item").unwrap();
+        let unslotted = tree.get_element_by_id("unslotted").unwrap();
+        let root = tree.attach_shadow_root(host, ShadowRootMode::Open).unwrap();
+        let slot = shadow_element(
+            &tree,
+            "slot",
+            &[("name", "title"), ("class", "outlet")],
+        );
+        let wrapper = shadow_element(&tree, "div", &[("class", "wrapper")]);
+        tree.append_child(root, wrapper);
+        tree.append_child(wrapper, slot);
+
+        let plain = tree.compile_rule_selector("::slotted(.item)").unwrap();
+        let qualified = tree
+            .compile_rule_selector("slot.outlet::slotted(.item)")
+            .unwrap();
+        let descendant = tree
+            .compile_rule_selector(".wrapper slot.outlet::slotted(.item)")
+            .unwrap();
+        let rejected = tree.compile_rule_selector("::slotted(.other)").unwrap();
+        assert!(plain.is_slotted());
+
+        let mut matcher = tree.matcher();
+        assert!(matcher.matches_in_shadow_scope(&tree, item, &plain, host));
+        assert!(matcher.matches_in_shadow_scope(&tree, item, &qualified, host));
+        assert!(matcher.matches_in_shadow_scope(&tree, item, &descendant, host));
+        assert!(!matcher.matches_in_shadow_scope(&tree, item, &rejected, host));
+        assert!(!matcher.matches_in_shadow_scope(&tree, unslotted, &plain, host));
+        assert!(!matcher.matches_in_shadow_scope(&tree, item, &plain, item));
+
+        // Document matching parses the selector but has no shadow scope.
+        assert!(!tree.matches_selector(item, "::slotted(.item)").unwrap());
     }
 }

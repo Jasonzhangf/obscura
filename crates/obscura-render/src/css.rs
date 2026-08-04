@@ -1569,9 +1569,14 @@ struct Rule {
 }
 
 #[derive(Default)]
-struct ShadowHostDeclarations {
+struct ShadowScopeDeclarations {
     normal: String,
     important: String,
+}
+
+pub(crate) struct ShadowSlottedScope<'a> {
+    pub sheet: &'a Stylesheet,
+    pub host: NodeId,
 }
 
 fn append_declaration_stream(target: &mut String, declarations: &str) {
@@ -2323,6 +2328,9 @@ pub struct Stylesheet {
     /// selector index and must only be matched with that tree's explicit host
     /// scope.
     host_rules: Vec<usize>,
+    /// `::slotted()` rules are matched against assigned light children with
+    /// this stylesheet's host supplied as the selector tree scope.
+    slotted_rules: Vec<usize>,
     invalidation_map: InvalidationMap,
     registered_custom_properties: HashMap<String, RegisteredCustomProperty>,
     /// Index zero is the unconditional sentinel.
@@ -2649,6 +2657,7 @@ impl Stylesheet {
         let mut sheet = Stylesheet {
             rules: Vec::new(),
             host_rules: Vec::new(),
+            slotted_rules: Vec::new(),
             invalidation_map: InvalidationMap::default(),
             registered_custom_properties: HashMap::new(),
             container_conditions: vec![ContainerConditionNode {
@@ -2874,6 +2883,9 @@ impl Stylesheet {
                 let idx = sheet.rules.len();
                 if sel.matches_featureless_host() {
                     sheet.host_rules.push(idx);
+                }
+                if sel.is_slotted() {
+                    sheet.slotted_rules.push(idx);
                 }
                 let candidate_slot = if sel.candidate_keys().len() > 1 {
                     let slot = u32::try_from(sheet.candidate_slot_count)
@@ -3200,7 +3212,7 @@ impl Stylesheet {
         matcher: &mut Matcher,
         host: NodeId,
         mut evaluator: Option<&mut ContainerQueryEvaluator<'_>>,
-    ) -> ShadowHostDeclarations {
+    ) -> ShadowScopeDeclarations {
         let mut normal = Vec::new();
         let mut important = Vec::new();
         for &index in &self.host_rules {
@@ -3245,7 +3257,72 @@ impl Stylesheet {
             )
         });
 
-        let mut declarations = ShadowHostDeclarations::default();
+        let mut declarations = ShadowScopeDeclarations::default();
+        for &(_, _, index) in &normal {
+            append_declaration_stream(&mut declarations.normal, &self.rules[index].normal_decls);
+        }
+        for &(_, _, index) in &important {
+            append_declaration_stream(
+                &mut declarations.important,
+                &self.rules[index].important_decls,
+            );
+        }
+        declarations
+    }
+
+    fn shadow_slotted_declarations(
+        &self,
+        tree: &DomTree,
+        matcher: &mut Matcher,
+        subject: NodeId,
+        host: NodeId,
+        mut evaluator: Option<&mut ContainerQueryEvaluator<'_>>,
+    ) -> ShadowScopeDeclarations {
+        let mut normal = Vec::new();
+        let mut important = Vec::new();
+        for &index in &self.slotted_rules {
+            let rule = &self.rules[index];
+            if matcher.matches_in_shadow_scope(tree, subject, &rule.sel, host)
+                && self.container_condition_is_active(
+                    rule.container_condition_id,
+                    subject,
+                    ContainerQuerySubjectKind::Element,
+                    &mut evaluator,
+                )
+            {
+                let matched = (rule.specificity, rule.order, index);
+                if !rule.normal_decls.is_empty() {
+                    normal.push(matched);
+                }
+                if !rule.important_decls.is_empty() {
+                    important.push(matched);
+                }
+            }
+        }
+        normal.sort_unstable_by(|a, b| {
+            compare_rule_cascade(
+                self.rules[a.2].layer.as_ref(),
+                a.0,
+                a.1,
+                self.rules[b.2].layer.as_ref(),
+                b.0,
+                b.1,
+                false,
+            )
+        });
+        important.sort_unstable_by(|a, b| {
+            compare_rule_cascade(
+                self.rules[a.2].layer.as_ref(),
+                a.0,
+                a.1,
+                self.rules[b.2].layer.as_ref(),
+                b.0,
+                b.1,
+                true,
+            )
+        });
+
+        let mut declarations = ShadowScopeDeclarations::default();
         for &(_, _, index) in &normal {
             append_declaration_stream(&mut declarations.normal, &self.rules[index].normal_decls);
         }
@@ -3321,6 +3398,7 @@ impl Stylesheet {
             parent_props,
             inline_css,
             None,
+            &[],
             None,
             animation_sample,
             animation_timeline,
@@ -3387,20 +3465,22 @@ impl Stylesheet {
             parent_props,
             inline_css,
             None,
+            &[],
             Some(evaluator),
             animation_sample,
             animation_timeline,
         )
     }
 
-    /// Apply document author rules together with the `:host` rules from the
-    /// host's own shadow tree. Encapsulation context precedes specificity and
-    /// layer order: shadow normal declarations are weaker than document/inline
-    /// normal declarations, while shadow `!important` is stronger than every
-    /// document/inline author-important declaration.
-    pub(crate) fn apply_with_shadow_host_at_animation_time(
+    /// Apply document author rules together with `:host` and `::slotted()`
+    /// rules from the element's applicable shadow scopes. Encapsulation
+    /// context precedes specificity and layer order: shadow normal declarations
+    /// are weaker than document/inline normal declarations, while shadow
+    /// `!important` is stronger than document/inline author-important.
+    pub(crate) fn apply_with_shadow_scopes_at_animation_time(
         &self,
-        shadow_host_sheet: &Stylesheet,
+        shadow_host_sheet: Option<&Stylesheet>,
+        slotted_scopes: &[ShadowSlottedScope<'_>],
         tree: &DomTree,
         matcher: &mut Matcher,
         nid: NodeId,
@@ -3424,7 +3504,8 @@ impl Stylesheet {
             style,
             parent_props,
             inline_css,
-            Some(shadow_host_sheet),
+            shadow_host_sheet,
+            slotted_scopes,
             evaluator,
             animation_sample,
             animation_timeline,
@@ -3443,6 +3524,7 @@ impl Stylesheet {
         parent_props: &HashMap<String, String>,
         inline_css: Option<&str>,
         shadow_host_sheet: Option<&Stylesheet>,
+        slotted_scopes: &[ShadowSlottedScope<'_>],
         mut evaluator: Option<&mut ContainerQueryEvaluator<'_>>,
         animation_sample: crate::AnimationSample,
         animation_timeline: &mut crate::AnimationTimelineState,
@@ -3452,6 +3534,40 @@ impl Stylesheet {
                 sheet.shadow_host_declarations(tree, matcher, nid, evaluator.as_deref_mut())
             })
             .unwrap_or_default();
+        let mut shadow_scope_declarations = ShadowScopeDeclarations::default();
+        append_declaration_stream(
+            &mut shadow_scope_declarations.normal,
+            &shadow_host_declarations.normal,
+        );
+        let mut slotted_declarations = Vec::with_capacity(slotted_scopes.len());
+        for scope in slotted_scopes {
+            slotted_declarations.push(scope.sheet.shadow_slotted_declarations(
+                tree,
+                matcher,
+                nid,
+                scope.host,
+                evaluator.as_deref_mut(),
+            ));
+        }
+        // Match Gecko's ShadowCascadeOrder: normal declarations progress from
+        // the host's own (innermost) tree through outer slot scopes toward the
+        // document. Important declarations reverse that order.
+        for declarations in slotted_declarations.iter().rev() {
+            append_declaration_stream(
+                &mut shadow_scope_declarations.normal,
+                &declarations.normal,
+            );
+        }
+        for declarations in &slotted_declarations {
+            append_declaration_stream(
+                &mut shadow_scope_declarations.important,
+                &declarations.important,
+            );
+        }
+        append_declaration_stream(
+            &mut shadow_scope_declarations.important,
+            &shadow_host_declarations.important,
+        );
         // Keep the two cascade priorities separate from the outset. A typical
         // stylesheet has very few important declarations, so cloning and
         // sorting every matching normal-only rule into an empty important pass
@@ -3582,8 +3698,8 @@ impl Stylesheet {
         // properties cascade fully before any `var()` is substituted.
         let inline_normal_flags = declaration_stream_flags(&inline_normal);
         let inline_important_flags = declaration_stream_flags(&inline_important);
-        let shadow_normal_flags = declaration_stream_flags(&shadow_host_declarations.normal);
-        let shadow_important_flags = declaration_stream_flags(&shadow_host_declarations.important);
+        let shadow_normal_flags = declaration_stream_flags(&shadow_scope_declarations.normal);
+        let shadow_important_flags = declaration_stream_flags(&shadow_scope_declarations.important);
         let has_own_custom_properties = shadow_normal_flags.has_custom_properties
             || shadow_important_flags.has_custom_properties
             || inline_normal_flags.has_custom_properties
@@ -3628,7 +3744,7 @@ impl Stylesheet {
                 }
             };
             if shadow_normal_flags.has_custom_properties {
-                collect_custom(&shadow_host_declarations.normal);
+                collect_custom(&shadow_scope_declarations.normal);
             }
             for &(_, _, i) in &normal_matched {
                 let rule = &self.rules[i];
@@ -3649,7 +3765,7 @@ impl Stylesheet {
                 collect_custom(&inline_important);
             }
             if shadow_important_flags.has_custom_properties {
-                collect_custom(&shadow_host_declarations.important);
+                collect_custom(&shadow_scope_declarations.important);
             }
 
             let mut resolved_props = parent_props.clone();
@@ -3749,7 +3865,7 @@ impl Stylesheet {
         // property. The style starts with its inherited scheme.
         if shadow_normal_flags.has_color_scheme {
             let expanded = substitute_declarations(
-                &shadow_host_declarations.normal,
+                &shadow_scope_declarations.normal,
                 props,
                 shadow_normal_flags.has_var,
             );
@@ -3805,7 +3921,7 @@ impl Stylesheet {
         }
         if shadow_important_flags.has_color_scheme {
             let expanded = substitute_declarations(
-                &shadow_host_declarations.important,
+                &shadow_scope_declarations.important,
                 props,
                 shadow_important_flags.has_var,
             );
@@ -3819,7 +3935,7 @@ impl Stylesheet {
         // Pass 2: apply normal declarations with `var()` substituted against
         // the resolved custom-property map.
         let expanded = substitute_declarations(
-            &shadow_host_declarations.normal,
+            &shadow_scope_declarations.normal,
             props,
             shadow_normal_flags.has_var,
         );
@@ -3869,7 +3985,7 @@ impl Stylesheet {
             }
             if shadow_important_flags.has_animation {
                 let expanded = substitute_declarations(
-                    &shadow_host_declarations.important,
+                    &shadow_scope_declarations.important,
                     props,
                     shadow_important_flags.has_var,
                 );
@@ -3921,7 +4037,7 @@ impl Stylesheet {
             substitute_declarations(&inline_important, props, inline_important_flags.has_var);
         crate::style::apply_declarations_with_locked_color_scheme(style, &expanded);
         let expanded = substitute_declarations(
-            &shadow_host_declarations.important,
+            &shadow_scope_declarations.important,
             props,
             shadow_important_flags.has_var,
         );

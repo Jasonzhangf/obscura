@@ -2258,9 +2258,28 @@ fn cascade_walk(
         let shadow_host_sheet = tree
             .shadow_root(id)
             .and_then(|root| shadow_sheets.get(&root));
-        let effective_props = if let Some(shadow_host_sheet) = shadow_host_sheet {
-            sheet.apply_with_shadow_host_at_animation_time(
-                shadow_host_sheet,
+        let mut slotted_scopes = Vec::new();
+        let mut assigned_slot = tree.assigned_slot(id);
+        for _ in 0..tree.len() {
+            let Some(slot) = assigned_slot else { break };
+            let Some(root) = tree.containing_shadow_root(slot) else {
+                break;
+            };
+            let Some(host) = tree.shadow_root_info(root).map(|root| root.host) else {
+                break;
+            };
+            if let Some(shadow_sheet) = shadow_sheets.get(&root) {
+                slotted_scopes.push(crate::css::ShadowSlottedScope {
+                    sheet: shadow_sheet,
+                    host,
+                });
+            }
+            assigned_slot = tree.assigned_slot(slot);
+        }
+        let effective_props = if shadow_host_sheet.is_some() || !slotted_scopes.is_empty() {
+            sheet.apply_with_shadow_scopes_at_animation_time(
+                shadow_host_sheet.map(|sheet| &**sheet),
+                &slotted_scopes,
                 tree,
                 matcher,
                 id,
@@ -8430,14 +8449,6 @@ fn resolve_static_positions_and_reparent(
     }
 }
 
-fn is_html_slot(tree: &DomTree, id: NodeId) -> bool {
-    tree.get_node(id).is_some_and(|node| {
-        node.as_element().is_some_and(|name| {
-            name.ns.as_ref() == "http://www.w3.org/1999/xhtml" && name.local.as_ref() == "slot"
-        })
-    })
-}
-
 /// Children which need computed-value resolution below `id`.
 ///
 /// CSSOM still exposes and styles unslotted light DOM, so this differs from
@@ -8458,58 +8469,6 @@ fn style_children(tree: &DomTree, id: NodeId) -> Vec<NodeId> {
 /// host's matching slottables. Text and element light children are slottable;
 /// comments and other node kinds are not. When no node is assigned, the slot's
 /// ordinary children remain its fallback content.
-fn assigned_nodes_for_slot(tree: &DomTree, slot: NodeId) -> Option<Vec<NodeId>> {
-    if !is_html_slot(tree, slot) {
-        return None;
-    }
-    let root = tree.containing_shadow_root(slot)?;
-    let host = tree.shadow_root_info(root)?.host;
-    let name = tree
-        .get_node(slot)
-        .and_then(|node| node.get_attribute("name").map(str::to_owned))
-        .unwrap_or_default();
-
-    let is_same_name_slot = |candidate: NodeId| {
-        is_html_slot(tree, candidate)
-            && tree
-                .get_node(candidate)
-                .and_then(|node| node.get_attribute("name").map(str::to_owned))
-                .unwrap_or_default()
-                == name
-    };
-    if tree
-        .descendants(root)
-        .into_iter()
-        .take_while(|candidate| *candidate != slot)
-        .any(is_same_name_slot)
-    {
-        return Some(tree.children(slot));
-    }
-
-    let assigned = tree
-        .children(host)
-        .into_iter()
-        .filter(|candidate| {
-            let Some(node) = tree.get_node(*candidate) else {
-                return false;
-            };
-            let candidate_name = if node.is_element() {
-                node.get_attribute("slot").unwrap_or("")
-            } else if node.text_content_of_text_node().is_some() {
-                ""
-            } else {
-                return false;
-            };
-            candidate_name == name
-        })
-        .collect::<Vec<_>>();
-    Some(if assigned.is_empty() {
-        tree.children(slot)
-    } else {
-        assigned
-    })
-}
-
 /// Return the flattened-tree children that generate boxes for `id`.
 pub(crate) fn rendered_children(tree: &DomTree, id: NodeId) -> Vec<NodeId> {
     if let Some(shadow_children) = tree.shadow_children(id) {
@@ -8518,7 +8477,7 @@ pub(crate) fn rendered_children(tree: &DomTree, id: NodeId) -> Vec<NodeId> {
         // slot insertion points below; unslotted children generate no boxes.
         return shadow_children;
     }
-    if let Some(assigned_or_fallback) = assigned_nodes_for_slot(tree, id) {
+    if let Some(assigned_or_fallback) = tree.slot_rendered_children(id) {
         return assigned_or_fallback;
     }
 
@@ -8565,25 +8524,10 @@ pub(crate) fn rendered_parent(tree: &DomTree, id: NodeId) -> Option<NodeId> {
     if let Some(root) = tree.shadow_root_info(parent) {
         return Some(root.host);
     }
-    let Some(shadow_root) = tree.shadow_root(parent) else {
+    if tree.shadow_root(parent).is_none() {
         return Some(parent);
-    };
-    let node = tree.get_node(id)?;
-    let name = if node.is_element() {
-        node.get_attribute("slot").unwrap_or("")
-    } else if node.text_content_of_text_node().is_some() {
-        ""
-    } else {
-        return None;
-    };
-    tree.descendants(shadow_root).into_iter().find(|candidate| {
-        is_html_slot(tree, *candidate)
-            && tree
-                .get_node(*candidate)
-                .and_then(|slot| slot.get_attribute("name").map(str::to_owned))
-                .unwrap_or_default()
-                == name
-    })
+    }
+    tree.assigned_slot(id)
 }
 
 /// Flattened-tree descendants in preorder, excluding `root`.
@@ -14053,6 +13997,63 @@ mod tests {
         assert_eq!(second.width, crate::Dimension::Px(55.0));
         assert_eq!(second.height, crate::Dimension::Auto);
         assert_eq!(second.margin.left, 0.0, "first shadow root cannot leak");
+    }
+
+    #[test]
+    fn slotted_rules_style_only_assigned_light_children_with_shadow_cascade_order() {
+        let tree = parse_html(
+            r#"<style>
+                 .item { width:120px; height:var(--normal-size); --normal-size:33px }
+                 .item { margin-left:5px !important; padding-left:var(--critical) !important; --critical:7px !important }
+               </style>
+               <x-one id="host-one">
+                 <span id="assigned-one" class="item" slot="title" style="margin-left:9px !important"></span>
+                 <span id="unslotted" class="item" slot="missing"></span>
+               </x-one>
+               <x-two id="host-two"><span id="assigned-two" class="item"></span></x-two>
+               <div id="source-one">
+                 <style>
+                   ::slotted(.item) { display:block; width:40px; --normal-size:11px; border-left:3px solid }
+                   .wrapper slot.named::slotted(.item) { margin-left:21px !important; padding-left:var(--critical) !important; --critical:17px !important }
+                   ::slotted([hidden]) { border-top:19px solid }
+                   .item { border-right:23px solid }
+                 </style>
+                 <div class="wrapper"><slot class="named" name="title"></slot></div>
+               </div>
+               <div id="source-two">
+                 <style>::slotted(.item) { display:block; border-bottom:4px solid }</style>
+                 <slot></slot>
+               </div>"#,
+        );
+        let host_one = tree.get_element_by_id("host-one").unwrap();
+        let host_two = tree.get_element_by_id("host-two").unwrap();
+        let source_one = tree.get_element_by_id("source-one").unwrap();
+        let source_two = tree.get_element_by_id("source-two").unwrap();
+        let assigned_one = tree.get_element_by_id("assigned-one").unwrap();
+        let assigned_two = tree.get_element_by_id("assigned-two").unwrap();
+        let unslotted = tree.get_element_by_id("unslotted").unwrap();
+        attach_programmatic_shadow(&tree, host_one, source_one);
+        attach_programmatic_shadow(&tree, host_two, source_two);
+
+        let laid = layout_dom(&tree, (400.0, 300.0));
+        let first = &laid.styles[&assigned_one];
+        let second = &laid.styles[&assigned_two];
+        let hidden = &laid.styles[&unslotted];
+
+        assert_eq!(first.display, crate::Display::Block);
+        assert_eq!(first.width, crate::Dimension::Px(120.0), "document normal wins");
+        assert_eq!(first.height, crate::Dimension::Px(33.0), "document custom property wins");
+        assert_eq!(first.margin.left, 21.0, "shadow important beats inline important");
+        assert_eq!(first.padding.left, 17.0, "shadow important custom property wins");
+        assert_eq!(first.border.left, 3.0, "slot-qualified selector matches");
+        assert_eq!(first.border.right, 0.0, "ordinary shadow selector stays isolated");
+        assert_eq!(first.border.top, 0.0, "slotted argument must match");
+        assert_eq!(laid.rects[&assigned_one].width, 140.0);
+
+        assert_eq!(second.border.bottom, 4.0);
+        assert_eq!(second.border.left, 0.0, "first shadow root cannot leak");
+        assert_eq!(hidden.border.left, 0.0, "unassigned light child is not slotted");
+        assert!(!laid.rects.contains_key(&unslotted));
     }
 
     #[test]

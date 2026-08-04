@@ -927,6 +927,99 @@ impl DomTree {
         Some(self.descendants(root))
     }
 
+    /// Whether `node` is an HTML `<slot>` element. Slot assignment is defined
+    /// only for HTML slots; same-local-name elements in other namespaces do
+    /// not participate in the flattened tree.
+    pub fn is_html_slot_element(&self, node: NodeId) -> bool {
+        self.get_node(node).is_some_and(|node| {
+            node.as_element().is_some_and(|name| {
+                name.ns.as_ref() == "http://www.w3.org/1999/xhtml"
+                    && name.local.as_ref() == "slot"
+            })
+        })
+    }
+
+    /// Return the first slot to which `node` is assigned.
+    ///
+    /// The node must be a direct light child of a shadow host. Element slot
+    /// names and slot `name` values compare as exact strings; text nodes use
+    /// the empty/default name. The first same-name slot in shadow-tree order
+    /// wins, matching the HTML slot assignment algorithm.
+    pub fn assigned_slot(&self, node: NodeId) -> Option<NodeId> {
+        let node_ref = self.get_node(node)?;
+        let parent = node_ref.parent?;
+        let name = if node_ref.is_element() {
+            node_ref.get_attribute("slot").unwrap_or("").to_owned()
+        } else if node_ref.text_content_of_text_node().is_some() {
+            String::new()
+        } else {
+            return None;
+        };
+        drop(node_ref);
+
+        let root = self.shadow_root(parent)?;
+        self.descendants(root).into_iter().find(|candidate| {
+            self.is_html_slot_element(*candidate)
+                && self
+                    .get_node(*candidate)
+                    .and_then(|slot| slot.get_attribute("name").map(str::to_owned))
+                    .unwrap_or_default()
+                    == name
+        })
+    }
+
+    /// Flattened children for an HTML slot. Assigned nodes replace fallback
+    /// children; an unassigned slot exposes its ordinary child list.
+    pub fn slot_rendered_children(&self, slot: NodeId) -> Option<Vec<NodeId>> {
+        if !self.is_html_slot_element(slot) {
+            return None;
+        }
+        let root = self.containing_shadow_root(slot)?;
+        let host = self.shadow_root_info(root)?.host;
+        let name = self
+            .get_node(slot)
+            .and_then(|slot| slot.get_attribute("name").map(str::to_owned))
+            .unwrap_or_default();
+        let is_same_name_slot = |candidate: NodeId| {
+            self.is_html_slot_element(candidate)
+                && self
+                    .get_node(candidate)
+                    .and_then(|slot| slot.get_attribute("name").map(str::to_owned))
+                    .unwrap_or_default()
+                    == name
+        };
+        if self
+            .descendants(root)
+            .into_iter()
+            .take_while(|candidate| *candidate != slot)
+            .any(is_same_name_slot)
+        {
+            return Some(self.children(slot));
+        }
+        let assigned = self
+            .children(host)
+            .into_iter()
+            .filter(|candidate| {
+                let Some(node) = self.get_node(*candidate) else {
+                    return false;
+                };
+                let candidate_name = if node.is_element() {
+                    node.get_attribute("slot").unwrap_or("")
+                } else if node.text_content_of_text_node().is_some() {
+                    ""
+                } else {
+                    return false;
+                };
+                candidate_name == name
+            })
+            .collect::<Vec<_>>();
+        Some(if assigned.is_empty() {
+            self.children(slot)
+        } else {
+            assigned
+        })
+    }
+
     /// Returns the node after `current` in document order, without leaving the
     /// subtree rooted at `root`.
     ///
@@ -1477,6 +1570,46 @@ mod tests {
         assert_eq!(
             tree.attach_shadow_root(host, ShadowRootMode::Open),
             Err(AttachShadowError::HostAlreadyHasShadowRoot)
+        );
+    }
+
+    #[test]
+    fn slot_assignment_uses_exact_names_first_slot_and_fallback_children() {
+        let tree = DomTree::new();
+        let host = element(&tree, "x-card");
+        tree.append_child(tree.document(), host);
+        let named = element(&tree, "span");
+        tree.with_node_mut(named, |node| node.set_attribute("slot", "title".into()));
+        let default_text = tree.new_node(NodeData::Text {
+            contents: "default".into(),
+        });
+        tree.append_child(host, named);
+        tree.append_child(host, default_text);
+
+        let root = tree
+            .attach_shadow_root(host, ShadowRootMode::Open)
+            .unwrap();
+        let first_named = element(&tree, "slot");
+        tree.with_node_mut(first_named, |node| node.set_attribute("name", "title".into()));
+        let duplicate_named = element(&tree, "slot");
+        tree.with_node_mut(duplicate_named, |node| node.set_attribute("name", "title".into()));
+        let fallback = element(&tree, "b");
+        tree.append_child(duplicate_named, fallback);
+        let default_slot = element(&tree, "slot");
+        tree.append_child(root, first_named);
+        tree.append_child(root, duplicate_named);
+        tree.append_child(root, default_slot);
+
+        assert_eq!(tree.assigned_slot(named), Some(first_named));
+        assert_eq!(tree.assigned_slot(default_text), Some(default_slot));
+        assert_eq!(tree.slot_rendered_children(first_named), Some(vec![named]));
+        assert_eq!(
+            tree.slot_rendered_children(duplicate_named),
+            Some(vec![fallback])
+        );
+        assert_eq!(
+            tree.slot_rendered_children(default_slot),
+            Some(vec![default_text])
         );
     }
 
