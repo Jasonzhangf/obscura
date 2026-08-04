@@ -183,6 +183,12 @@ impl WatchdogToken {
     }
 }
 
+// Observation deadlines are checked between browser tasks. A task which has
+// already started receives this bounded completion allowance, matching the
+// fixed-wait path while retaining an absolute backstop for infinite script.
+const SYNCHRONOUS_TASK_FLOOR_MS: u64 = 5_000;
+const WATCHDOG_SCHEDULING_MARGIN_MS: u64 = 500;
+
 impl ObscuraJsRuntime {
     /// Freeze the document timeline for one JavaScript task. Browser timelines
     /// update at task/rendering boundaries, not on each forced style or layout
@@ -1742,7 +1748,6 @@ impl ObscuraJsRuntime {
         // task boundary. Keep a separate long-task floor so short compositor
         // slices and explicit waits do not kill legitimate framework work,
         // while an actually unyielding task remains bounded.
-        const SYNCHRONOUS_TASK_FLOOR_MS: u64 = 5_000;
         // One watchdog for the complete pump avoids spawning a native thread
         // per cooperative task. Adding the floor after the observation budget
         // guarantees that even a task beginning just before `deadline` gets
@@ -1750,7 +1755,8 @@ impl ObscuraJsRuntime {
         let synchronous_budget = budget
             .saturating_add(std::time::Duration::from_millis(SYNCHRONOUS_TASK_FLOOR_MS));
         let token =
-            self.arm_watchdog(synchronous_budget + std::time::Duration::from_millis(500));
+            self.arm_watchdog(synchronous_budget
+                + std::time::Duration::from_millis(WATCHDOG_SCHEDULING_MARGIN_MS));
         let result = loop {
             if tokio::time::Instant::now() >= deadline {
                 break Ok(());
@@ -1872,7 +1878,11 @@ impl ObscuraJsRuntime {
         let external_work_deadline = started + external_work_grace;
         let activity_tail = std::time::Duration::from_millis(OBSERVABLE_ACTIVITY_TAIL_MS);
         let mut activity_deadline = deadline.min(started + activity_tail);
-        let token = self.arm_watchdog(budget + std::time::Duration::from_millis(500));
+        let token = self.arm_watchdog(
+            budget
+                .saturating_add(std::time::Duration::from_millis(SYNCHRONOUS_TASK_FLOOR_MS))
+                + std::time::Duration::from_millis(WATCHDOG_SCHEDULING_MARGIN_MS),
+        );
         let mut generation = self.activity_generation();
         let mut quiet_since: Option<tokio::time::Instant> = None;
         let result = loop {
@@ -1927,14 +1937,14 @@ impl ObscuraJsRuntime {
             // iteration may synchronously drain an arbitrarily long chain of
             // nextTick/macrotask/microtask callbacks before returning. Tokio's
             // deadline cannot preempt that native V8 call. Bound the individual
-            // turn to the readiness horizon plus the same 500ms synchronous
-            // safety margin used by fixed waits. Reaching this bound means the
-            // adaptive observation window is exhausted; clear V8 termination
-            // and capture the current stable frame instead of starting another
-            // unbounded turn.
+            // turn beyond the readiness horizon by the same bounded task
+            // allowance as fixed waits. The observation window may expire
+            // while valid framework/layout work is running; browser capture
+            // waits for that task boundary instead of terminating it midway.
             let tick_watchdog = self.arm_watchdog(
                 policy_deadline.saturating_duration_since(now)
-                    + std::time::Duration::from_millis(500),
+                    + std::time::Duration::from_millis(SYNCHRONOUS_TASK_FLOOR_MS)
+                    + std::time::Duration::from_millis(WATCHDOG_SCHEDULING_MARGIN_MS),
             );
             let tick = tokio::time::timeout_at(
                 policy_deadline,
@@ -2576,6 +2586,134 @@ mod tests {
         assert_eq!(
             rt.evaluate("__taskOrder").unwrap(),
             serde_json::json!(["sync", "microtask", "timer"])
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn scheduler_post_task_observes_priority_fifo_and_task_boundaries() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "scheduler-priority-order",
+            r#"
+                globalThis.__schedulerOrder = ["sync"];
+                const schedule = (name, priority) => scheduler.postTask(() => {
+                    __schedulerOrder.push(name);
+                    Promise.resolve().then(() => __schedulerOrder.push(name + "-microtask"));
+                    return name + "-result";
+                }, { priority });
+                globalThis.__schedulerResults = Promise.all([
+                    schedule("background-1", "background"),
+                    schedule("background-2", "background"),
+                    schedule("visible", "user-visible"),
+                    schedule("blocking-1", "user-blocking"),
+                    schedule("blocking-2", "user-blocking"),
+                ]).then(values => { globalThis.__schedulerValues = values; });
+                Promise.resolve().then(() => __schedulerOrder.push("initial-microtask"));
+            "#,
+        )
+        .unwrap();
+
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__schedulerOrder").unwrap(),
+            serde_json::json!([
+                "sync",
+                "initial-microtask",
+                "blocking-1",
+                "blocking-1-microtask",
+                "blocking-2",
+                "blocking-2-microtask",
+                "visible",
+                "visible-microtask",
+                "background-1",
+                "background-1-microtask",
+                "background-2",
+                "background-2-microtask",
+            ])
+        );
+        assert_eq!(
+            rt.evaluate("__schedulerValues").unwrap(),
+            serde_json::json!([
+                "background-1-result",
+                "background-2-result",
+                "visible-result",
+                "blocking-1-result",
+                "blocking-2-result",
+            ])
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn scheduler_abort_delay_and_yield_follow_task_state() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "scheduler-abort-delay-yield",
+            r#"
+                globalThis.__schedulerState = {
+                    order: [],
+                    canceledCallbackRan: false,
+                    exactAbortReason: false,
+                    selfAbortCallbackRan: false,
+                    exactSelfAbortReason: false,
+                };
+                const abortReason = { reason: "stop" };
+                const canceled = new AbortController();
+                scheduler.postTask(() => {
+                    __schedulerState.canceledCallbackRan = true;
+                }, { signal: canceled.signal, delay: 20 }).catch(error => {
+                    __schedulerState.exactAbortReason = error === abortReason;
+                });
+                canceled.abort(abortReason);
+
+                const selfAbortReason = { reason: "inside callback" };
+                const selfCanceled = new AbortController();
+                scheduler.postTask(() => {
+                    __schedulerState.selfAbortCallbackRan = true;
+                    selfCanceled.abort(selfAbortReason);
+                    return "ignored result";
+                }, { signal: selfCanceled.signal }).catch(error => {
+                    __schedulerState.exactSelfAbortReason = error === selfAbortReason;
+                });
+
+                scheduler.postTask(async () => {
+                    __schedulerState.order.push("blocking-start");
+                    await scheduler.yield();
+                    __schedulerState.order.push("blocking-continuation");
+                }, { priority: "user-blocking" });
+                scheduler.postTask(() => {
+                    __schedulerState.order.push("background");
+                }, { priority: "background" });
+            "#,
+        )
+        .unwrap();
+
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate(
+                r#"[
+                    __schedulerState.order,
+                    __schedulerState.canceledCallbackRan,
+                    __schedulerState.exactAbortReason,
+                    __schedulerState.selfAbortCallbackRan,
+                    __schedulerState.exactSelfAbortReason,
+                    scheduler instanceof Scheduler,
+                    Object.prototype.toString.call(scheduler),
+                    Scheduler.prototype.postTask.length,
+                    Scheduler.prototype.yield.length,
+                ]"#,
+            )
+            .unwrap(),
+            serde_json::json!([
+                ["blocking-start", "blocking-continuation", "background"],
+                false,
+                true,
+                true,
+                true,
+                true,
+                "[object Scheduler]",
+                1,
+                0,
+            ])
         );
     }
 
@@ -4811,6 +4949,37 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn adaptive_observation_deadline_does_not_terminate_the_active_task() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "adaptive-task-crossing-observation-deadline",
+            "globalThis.__adaptiveLongTaskCompleted = false;\
+             setTimeout(() => {\
+               const end = performance.now() + 600;\
+               while (performance.now() < end) {}\
+               __adaptiveLongTaskCompleted = true;\
+             }, 0);",
+        )
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        rt.run_event_loop_until_quiescent(20, 10).await.unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= std::time::Duration::from_millis(500)
+                && elapsed < std::time::Duration::from_millis(1_500),
+            "adaptive settle must wait for the active task boundary: {elapsed:?}",
+        );
+        assert_eq!(
+            rt.evaluate("globalThis.__adaptiveLongTaskCompleted")
+                .unwrap(),
+            serde_json::json!(true),
+            "adaptive readiness must not terminate valid page work",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn quiescent_event_loop_yields_from_continuously_ready_non_visual_work() {
         let mut rt = setup_runtime("<html><body></body></html>");
         rt.execute_script(
@@ -4856,8 +5025,12 @@ mod tests {
         let elapsed = started.elapsed();
 
         assert!(
-            elapsed < std::time::Duration::from_millis(1_200),
-            "one synchronous callback drain consumed the adaptive budget: {elapsed:?}"
+            elapsed >= std::time::Duration::from_millis(SYNCHRONOUS_TASK_FLOOR_MS)
+                && elapsed
+                    < std::time::Duration::from_millis(
+                        SYNCHRONOUS_TASK_FLOOR_MS + 1_500,
+                    ),
+            "one synchronous callback drain escaped the bounded task allowance: {elapsed:?}"
         );
         assert_eq!(
             rt.evaluate(
@@ -8457,6 +8630,107 @@ mod tests {
 
     #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
+    async fn resize_observer_batches_unique_targets_into_one_native_layout_read() {
+        let dom = parse_html(
+            r#"<html style="margin:0"><body style="margin:0">
+                <div id="a" style="box-sizing:border-box;width:100px;height:30px;padding:2px 3px;border:1px solid"></div>
+                <div id="b" style="box-sizing:border-box;width:110px;height:30px;padding:2px 3px;border:1px solid"></div>
+                <div id="c" style="box-sizing:border-box;width:120px;height:30px;padding:2px 3px;border:1px solid"></div>
+                <div id="d" style="box-sizing:border-box;width:130px;height:30px;padding:2px 3px;border:1px solid"></div>
+                <div id="vertical" style="box-sizing:border-box;width:140px;height:30px;padding:2px 3px;border:1px solid;writing-mode:vertical-rl"></div>
+                <div id="hidden" style="display:none;width:50px;height:20px"></div>
+            </body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_viewport(400.0, 300.0);
+        rt.run_page_init();
+        rt.execute_script(
+            "batch-resize-observer-targets",
+            r#"
+                globalThis.__resizeBulkCalls = 0;
+                globalThis.__resizeBulkSizes = [];
+                globalThis.__resizeLegacyGeometryCalls = 0;
+                globalThis.__resizeComputedStyleCalls = 0;
+                const nativeBulk = Deno.core.ops.op_resize_observer_measurements;
+                const nativeGeometry = Deno.core.ops.op_layout_geometry;
+                const nativeComputedStyle = Deno.core.ops.op_computed_style;
+                Deno.core.ops.op_resize_observer_measurements = input => {
+                    __resizeBulkCalls++;
+                    __resizeBulkSizes.push(JSON.parse(input).length);
+                    return nativeBulk(input);
+                };
+                Deno.core.ops.op_layout_geometry = (...args) => {
+                    __resizeLegacyGeometryCalls++;
+                    return nativeGeometry(...args);
+                };
+                Deno.core.ops.op_computed_style = (...args) => {
+                    __resizeComputedStyleCalls++;
+                    return nativeComputedStyle(...args);
+                };
+
+                globalThis.__resizeBatchRecords = [];
+                const detached = document.createElement("div");
+                detached.id = "detached";
+                detached.style.cssText = "width:60px;height:20px";
+                const targets = ["a", "b", "c", "d", "vertical", "hidden"]
+                    .map(id => document.getElementById(id));
+                targets.push(detached);
+                const observer = new ResizeObserver(entries => {
+                    __resizeBatchRecords.push(entries.map(entry => [
+                        entry.target.id,
+                        entry.contentBoxSize[0].inlineSize,
+                        entry.contentBoxSize[0].blockSize,
+                        entry.borderBoxSize[0].inlineSize,
+                        entry.borderBoxSize[0].blockSize,
+                    ]));
+                });
+                for (const target of targets) observer.observe(target);
+                // A second observer of an existing target must share the same
+                // native measurement rather than adding it to the batch twice.
+                globalThis.__duplicateResizeRecords = 0;
+                const duplicate = new ResizeObserver(entries => {
+                    __duplicateResizeRecords += entries.length;
+                });
+                duplicate.observe(targets[2], { box: "border-box" });
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+
+        assert_eq!(
+            rt.evaluate(
+                r#"[
+                    __resizeBulkCalls,
+                    __resizeBulkSizes,
+                    __resizeLegacyGeometryCalls,
+                    __resizeComputedStyleCalls,
+                    __duplicateResizeRecords,
+                    __resizeBatchRecords,
+                ]"#,
+            )
+            .unwrap(),
+            serde_json::json!([
+                1,
+                [7],
+                0,
+                0,
+                1,
+                [[
+                    ["a", 92, 24, 100, 30],
+                    ["b", 102, 24, 110, 30],
+                    ["c", 112, 24, 120, 30],
+                    ["d", 122, 24, 130, 30],
+                    ["vertical", 24, 132, 30, 140],
+                    ["hidden", 0, 0, 0, 0],
+                    ["detached", 0, 0, 0, 0],
+                ]],
+            ])
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
     async fn resize_observer_selected_box_and_viewport_lifecycle_match_chromium() {
         let dom = parse_html(
             r#"<html style="margin:0"><body style="margin:0">
@@ -8704,9 +8978,9 @@ mod tests {
                         }
                     }, { threshold: [0, 0.5, 1] });
                     observer.observe(target);
-                    setTimeout(() => window.scrollTo(0, 100), 5);
-                    setTimeout(() => window.scrollTo(0, 260), 15);
-                    setTimeout(() => resolve(records), 30);
+                    setTimeout(() => window.scrollTo(0, 100), 25);
+                    setTimeout(() => window.scrollTo(0, 260), 50);
+                    setTimeout(() => resolve(records), 80);
                 })
                 "#,
                 true,
@@ -8717,6 +8991,108 @@ mod tests {
         assert_eq!(
             result.value.unwrap(),
             serde_json::json!([[false, 0, 150, 0], [true, 0.5, 50, 50], [false, 0, -110, 0],])
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn intersection_observer_batches_unique_clip_graph_into_one_native_layout_read() {
+        let dom = parse_html(
+            r#"<html style="margin:0"><body style="margin:0">
+                <div id="root" style="width:200px;height:100px;overflow:hidden">
+                    <div id="clip" style="width:150px;height:80px;overflow:auto">
+                        <div id="a" style="width:30px;height:20px"></div>
+                        <div id="b" style="width:40px;height:20px"></div>
+                        <div id="hidden" style="display:none"></div>
+                    </div>
+                </div>
+            </body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_viewport(300.0, 200.0);
+        rt.run_page_init();
+        rt.execute_script(
+            "batch-intersection-observer-clip-graph",
+            r#"
+                globalThis.__intersectionBulkCalls = 0;
+                globalThis.__intersectionBulkSizes = [];
+                globalThis.__intersectionLegacyGeometryCalls = 0;
+                globalThis.__intersectionComputedStyleCalls = 0;
+                const nativeBulk = Deno.core.ops.op_intersection_observer_measurements;
+                const nativeGeometry = Deno.core.ops.op_layout_geometry;
+                const nativeComputedStyle = Deno.core.ops.op_computed_style;
+                Deno.core.ops.op_intersection_observer_measurements = input => {
+                    __intersectionBulkCalls++;
+                    __intersectionBulkSizes.push(JSON.parse(input).length);
+                    return nativeBulk(input);
+                };
+                Deno.core.ops.op_layout_geometry = (...args) => {
+                    __intersectionLegacyGeometryCalls++;
+                    return nativeGeometry(...args);
+                };
+                Deno.core.ops.op_computed_style = (...args) => {
+                    __intersectionComputedStyleCalls++;
+                    return nativeComputedStyle(...args);
+                };
+
+                const root = document.getElementById("root");
+                const a = document.getElementById("a");
+                const b = document.getElementById("b");
+                const hidden = document.getElementById("hidden");
+                const detached = document.createElement("div");
+                detached.id = "detached";
+                globalThis.__intersectionBatchRecords = [];
+                const first = new IntersectionObserver(entries => {
+                    __intersectionBatchRecords.push(entries.map(entry => [
+                        entry.target.id,
+                        entry.isIntersecting,
+                    ]));
+                }, { root });
+                const second = new IntersectionObserver(entries => {
+                    __intersectionBatchRecords.push(entries.map(entry => [
+                        entry.target.id,
+                        entry.isIntersecting,
+                    ]));
+                }, { root });
+                first.observe(a);
+                first.observe(b);
+                first.observe(hidden);
+                first.observe(detached);
+                // The second observer shares its target, root, and clip ancestor
+                // with the first and must not duplicate any native measurements.
+                second.observe(b);
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+
+        assert_eq!(
+            rt.evaluate(
+                r#"[
+                    __intersectionBulkCalls,
+                    __intersectionBulkSizes,
+                    __intersectionLegacyGeometryCalls,
+                    __intersectionComputedStyleCalls,
+                    __intersectionBatchRecords,
+                ]"#,
+            )
+            .unwrap(),
+            serde_json::json!([
+                1,
+                [6],
+                0,
+                0,
+                [
+                    [
+                        ["a", true],
+                        ["b", true],
+                        ["hidden", false],
+                        ["detached", false],
+                    ],
+                    [["b", true]],
+                ],
+            ])
         );
     }
 
@@ -8758,8 +9134,8 @@ mod tests {
                         })));
                     }, { root, threshold: [0, 1] });
                     observer.observe(document.getElementById("target"));
-                    setTimeout(() => { root.scrollTop = 999; }, 5);
-                    setTimeout(() => resolve(records), 30);
+                    setTimeout(() => { root.scrollTop = 999; }, 25);
+                    setTimeout(() => resolve(records), 60);
                 })
                 "#,
                 true,
@@ -8827,8 +9203,8 @@ mod tests {
                         threshold: [0, 1],
                     });
                     observer.observe(document.getElementById("target"));
-                    setTimeout(() => { clip.scrollTop = 999; }, 5);
-                    setTimeout(() => resolve(records), 30);
+                    setTimeout(() => { clip.scrollTop = 999; }, 25);
+                    setTimeout(() => resolve(records), 60);
                 })
                 "#,
                 true,
@@ -8883,9 +9259,16 @@ mod tests {
             serde_json::json!([["sync", "after-observe-0", "microtask"], 0])
         );
         rt.run_event_loop_bounded(100).await.unwrap();
+        #[cfg(feature = "render")]
+        let expected_geometry_reads = 0;
+        #[cfg(not(feature = "render"))]
+        let expected_geometry_reads = 2;
         assert_eq!(
             rt.evaluate("[__ioOrder, __ioReads]").unwrap(),
-            serde_json::json!([["sync", "after-observe-0", "microtask", "observer"], 2])
+            serde_json::json!([
+                ["sync", "after-observe-0", "microtask", "observer"],
+                expected_geometry_reads,
+            ])
         );
     }
 
@@ -9084,18 +9467,18 @@ mod tests {
             "#,
         )
         .unwrap();
-        rt.run_event_loop_bounded(10).await.unwrap();
+        rt.run_event_loop_bounded(40).await.unwrap();
 
         rt.evaluate(r#"document.getElementById("spacer").setAttribute("style", "height:120px")"#)
             .unwrap();
-        rt.run_event_loop_bounded(10).await.unwrap();
+        rt.run_event_loop_bounded(40).await.unwrap();
         assert_eq!(
             rt.evaluate("__ioRecords").unwrap(),
             serde_json::json!([[false, 150]])
         );
 
         rt.set_viewport(200.0, 160.0);
-        rt.run_event_loop_bounded(20).await.unwrap();
+        rt.run_event_loop_bounded(40).await.unwrap();
         assert_eq!(
             rt.evaluate("__ioRecords").unwrap(),
             serde_json::json!([[false, 150], [true, 120]])

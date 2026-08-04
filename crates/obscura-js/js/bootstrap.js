@@ -51,6 +51,7 @@
     'Text', 'Comment', 'CDATASection', 'ProcessingInstruction', 'CharacterData',
     'CSSStyleDeclaration', 'DOMTokenList', 'NamedNodeMap', 'Screen', 'NetworkInformation',
     'MessageChannel', 'MessagePort', 'BroadcastChannel', 'CustomElementRegistry',
+    'Scheduler',
     'XMLHttpRequestEventTarget', 'HTMLMediaElement', 'HTMLVideoElement',
     'HTMLAudioElement', 'WebGL2RenderingContext',
     'SVGElement', 'SVGGraphicsElement', 'SVGGeometryElement', 'SVGPathElement',
@@ -866,6 +867,206 @@ globalThis.cancelAnimationFrame = (id) => {
   if (_rafCurrentBatch) _rafCurrentBatch.delete(id);
 };
 globalThis.queueMicrotask = globalThis.queueMicrotask || ((fn) => Promise.resolve().then(fn));
+
+// Prioritized Task Scheduling. A scheduler task is a real event-loop task,
+// ordered strictly by effective priority and FIFO within one priority. Yield
+// continuations rank immediately above ordinary tasks of the same priority.
+// This keeps background prefetch work behind visible hydration while still
+// giving every callback its own microtask checkpoint.
+const _schedulerConstructionKey = {};
+const _schedulerInstances = new WeakSet();
+const _schedulerPriorityRank = {
+  "background": 0,
+  "user-visible": 1,
+  "user-blocking": 2,
+};
+const _schedulerTaskQueues = Array.from({ length: 6 }, () => []);
+let _schedulerPumpScheduled = false;
+let _schedulerCurrentState = null;
+
+function _schedulerRemoveAbort(task) {
+  if (task.signal && task.abortHandler) {
+    task.signal.removeEventListener("abort", task.abortHandler);
+    task.abortHandler = null;
+  }
+}
+
+function _schedulerSchedulePump() {
+  if (_schedulerPumpScheduled) return;
+  _schedulerPumpScheduled = true;
+  _scheduleAfter(0, _schedulerRunOneTask);
+}
+
+function _schedulerEnqueue(task, continuation) {
+  if (task.canceled) return;
+  const effectivePriority = _schedulerPriorityRank[task.priority] * 2
+    + (continuation ? 1 : 0);
+  _schedulerTaskQueues[effectivePriority].push(task);
+  _schedulerSchedulePump();
+}
+
+function _schedulerRunOneTask() {
+  _schedulerPumpScheduled = false;
+  let task = null;
+  for (let priority = _schedulerTaskQueues.length - 1; priority >= 0; priority--) {
+    const queue = _schedulerTaskQueues[priority];
+    while (queue.length) {
+      const candidate = queue.shift();
+      if (!candidate.canceled) {
+        task = candidate;
+        break;
+      }
+    }
+    if (task) break;
+  }
+  if (!task) return;
+
+  task.started = true;
+  const previousState = _schedulerCurrentState;
+  _schedulerCurrentState = task.state;
+  try {
+    if (task.callback === null) {
+      task.resolve(undefined);
+    } else {
+      const callback = task.callback;
+      task.resolve(callback());
+    }
+  } catch (error) {
+    task.reject(error);
+  } finally {
+    _schedulerCurrentState = previousState;
+    task.completed = true;
+    _schedulerRemoveAbort(task);
+  }
+
+  // Queue only one native task at a time. This preserves a microtask
+  // checkpoint between scheduler callbacks and lets newly posted high-priority
+  // work overtake lower-priority work which is still waiting.
+  if (_schedulerTaskQueues.some(queue => queue.length)) _schedulerSchedulePump();
+}
+
+function _schedulerNormalizeOptions(options) {
+  const dictionary = options == null ? {} : Object(options);
+
+  let delay = 0;
+  const rawDelay = dictionary.delay;
+  if (rawDelay !== undefined) {
+    if (typeof rawDelay === "bigint") {
+      throw new TypeError("Failed to read the 'delay' property from 'SchedulerPostTaskOptions': Value is not of type 'unsigned long long'.");
+    }
+    delay = Number(rawDelay);
+    if (!Number.isFinite(delay) || delay < 0 || delay >= 18446744073709551616) {
+      throw new TypeError("Failed to read the 'delay' property from 'SchedulerPostTaskOptions': Value is outside the 'unsigned long long' value range.");
+    }
+    delay = Math.trunc(delay);
+  }
+
+  let priority = "user-visible";
+  const rawPriority = dictionary.priority;
+  if (rawPriority !== undefined) {
+    priority = String(rawPriority);
+    if (!Object.prototype.hasOwnProperty.call(_schedulerPriorityRank, priority)) {
+      throw new TypeError("The provided value '" + priority + "' is not a valid enum value of type TaskPriority.");
+    }
+  }
+
+  const signal = dictionary.signal;
+  if (signal !== undefined && !(signal instanceof globalThis.AbortSignal)) {
+    throw new TypeError("Failed to read the 'signal' property from 'SchedulerPostTaskOptions': Failed to convert value to 'AbortSignal'.");
+  }
+  return { delay, priority, signal: signal === undefined ? null : signal };
+}
+
+function _schedulerCreateTask(callback, state, resolve, reject) {
+  const task = {
+    callback, state, resolve, reject,
+    priority: state.priority,
+    signal: state.signal,
+    abortHandler: null,
+    delayTimerId: null,
+    canceled: false,
+    started: false,
+    completed: false,
+  };
+  if (task.signal) {
+    task.abortHandler = () => {
+      if (task.completed || task.canceled) return;
+      task.canceled = true;
+      if (task.delayTimerId !== null) clearTimeout(task.delayTimerId);
+      _schedulerRemoveAbort(task);
+      reject(task.signal.reason);
+    };
+    task.signal.addEventListener("abort", task.abortHandler);
+  }
+  return task;
+}
+
+globalThis.Scheduler = class Scheduler {
+  constructor(key) {
+    if (key !== _schedulerConstructionKey) {
+      throw new TypeError("Failed to construct 'Scheduler': Illegal constructor");
+    }
+    _schedulerInstances.add(this);
+  }
+
+  postTask(callback, options = {}) {
+    return new Promise((resolve, reject) => {
+      if (!_schedulerInstances.has(this)) throw new TypeError("Illegal invocation");
+      if (typeof callback !== "function") {
+        throw new TypeError("Failed to execute 'postTask' on 'Scheduler': parameter 1 is not of type 'Function'.");
+      }
+      const normalized = _schedulerNormalizeOptions(options);
+      if (normalized.signal && normalized.signal.aborted) {
+        reject(normalized.signal.reason);
+        return;
+      }
+      const state = { priority: normalized.priority, signal: normalized.signal };
+      const task = _schedulerCreateTask(callback, state, resolve, reject);
+      if (normalized.delay > 0) {
+        task.delayTimerId = setTimeout(() => {
+          task.delayTimerId = null;
+          _schedulerEnqueue(task, false);
+        }, normalized.delay);
+      } else {
+        _schedulerEnqueue(task, false);
+      }
+    });
+  }
+
+  yield() {
+    return new Promise((resolve, reject) => {
+      if (!_schedulerInstances.has(this)) throw new TypeError("Illegal invocation");
+      const inherited = _schedulerCurrentState;
+      const state = inherited
+        ? { priority: inherited.priority, signal: inherited.signal }
+        : { priority: "user-visible", signal: null };
+      if (state.signal && state.signal.aborted) {
+        reject(state.signal.reason);
+        return;
+      }
+      _schedulerEnqueue(_schedulerCreateTask(null, state, resolve, reject), true);
+    });
+  }
+};
+Object.defineProperty(globalThis.Scheduler.prototype, Symbol.toStringTag, {
+  value: "Scheduler",
+  configurable: true,
+});
+_markNative(globalThis.Scheduler);
+_markNative(globalThis.Scheduler.prototype.postTask);
+_markNative(globalThis.Scheduler.prototype.yield);
+
+const _defaultScheduler = new globalThis.Scheduler(_schedulerConstructionKey);
+Object.defineProperty(globalThis, "scheduler", {
+  get() { return _defaultScheduler; },
+  set(value) {
+    Object.defineProperty(globalThis, "scheduler", {
+      value, writable: true, enumerable: true, configurable: true,
+    });
+  },
+  enumerable: true,
+  configurable: true,
+});
 
 // MessagePort is a task-backed EventTarget, not a pair of callback slots.
 // React currently uses `onmessage`, while Angular/Zone.js and worker-style
@@ -6500,7 +6701,12 @@ function _scheduleResizeRenderCheckpoint() {
   }
   if (_resizeRenderCheckpointPending) return;
   _resizeRenderCheckpointPending = true;
-  _scheduleAfter(0, () => {
+  // Resize observations are gathered at a rendering opportunity, not once
+  // for every zero-delay task which happens to mutate the DOM. A frame-sized
+  // one-shot coalesces framework microtasks/timers without installing a
+  // perpetual frame pump; the callback still runs promptly when the embedder
+  // explicitly drives the event loop.
+  _scheduleAfter(_RAF_FRAME_DELAY_MS, () => {
     _resizeRenderCheckpointPending = false;
     _resizeRenderCheckpointRunning = true;
     let depth = 0;
@@ -6510,11 +6716,20 @@ function _scheduleResizeRenderCheckpoint() {
     // that manufacture an ever-deeper subtree during one delivery cycle.
     for (let iteration = 0; iteration < 64; iteration++) {
       _resizeRenderCheckpointRerun = false;
-      const measurements = new Map();
+      const observers = [...globalThis.__resizeObservers];
+      const targets = [];
+      const seenTargets = new Set();
+      for (const observer of observers) {
+        for (const target of observer._targets.keys()) {
+          if (seenTargets.has(target)) continue;
+          seenTargets.add(target);
+          targets.push(target);
+        }
+      }
+      const measurements = _roMeasurements(targets);
       let shallowest = Infinity;
       let active = false;
       skipped = false;
-      const observers = [...globalThis.__resizeObservers];
       // Gather every observer before invoking any callback. A callback from an
       // earlier observer must not change the geometry gathered for a later one.
       for (const observer of observers) {
@@ -6558,10 +6773,10 @@ function _roNodeDepth(target) {
   while (node && (node = node.parentNode || node.host || null)) depth++;
   return depth;
 }
-function _roMeasurement(target) {
-  let geometry = null;
+function _roMeasurement(target, suppliedGeometry, suppliedByBatch = false) {
+  let geometry = suppliedGeometry ?? null;
   const hasRenderer = typeof Deno.core.ops.op_layout_geometry === "function";
-  if (hasRenderer && target?._nid != null) {
+  if (!suppliedByBatch && hasRenderer && target?._nid != null) {
     try {
       const raw = Deno.core.ops.op_layout_geometry(String(target._nid | 0));
       geometry = raw ? JSON.parse(raw) : null;
@@ -6571,7 +6786,7 @@ function _roMeasurement(target) {
   // Preserve deterministic geometry in non-render builds. This path has no
   // native layout cache, but lifecycle behavior (initial delivery and
   // change-only rechecks) should remain useful to automation consumers.
-  if (!hasRenderer && target?.getBoundingClientRect) {
+  if (!suppliedByBatch && !hasRenderer && target?.getBoundingClientRect) {
     const rect = target.getBoundingClientRect();
     geometry = {
       x: rect.x, y: rect.y,
@@ -6592,7 +6807,18 @@ function _roMeasurement(target) {
     };
   }
 
-  const style = getComputedStyle(target);
+  // The bulk native measurement includes this small style subset from the
+  // same PreparedRender as geometry. Non-render builds retain the CSSOM
+  // fallback, and a missing/invalid bulk result falls back above.
+  const style = suppliedByBatch
+    ? {
+        ...geometry,
+        // `writing-mode` is not yet part of the renderer's compact computed
+        // snapshot. Preserve the existing CSSOM fallback for an authored
+        // inline value so batching does not silently swap inline/block axes.
+        writingMode: geometry.writingMode || target?.style?.writingMode || "",
+      }
+    : getComputedStyle(target);
   const paddingTop = _roNumber(style.paddingTop);
   const paddingRight = _roNumber(style.paddingRight);
   const paddingBottom = _roNumber(style.paddingBottom);
@@ -6645,6 +6871,32 @@ function _roMeasurement(target) {
       "device-pixel-content-box": [deviceSize.inlineSize, deviceSize.blockSize],
     },
   };
+}
+
+function _roMeasurements(targets) {
+  const measurements = new Map();
+  if (!targets.length) return measurements;
+  const bulk = Deno.core.ops.op_resize_observer_measurements;
+  if (typeof bulk === "function"
+      && targets.every(target => target?._nid != null)) {
+    try {
+      const raw = bulk(JSON.stringify(targets.map(target => target._nid | 0)));
+      const geometries = raw ? JSON.parse(raw) : null;
+      if (Array.isArray(geometries) && geometries.length === targets.length) {
+        for (let index = 0; index < targets.length; index++) {
+          measurements.set(
+            targets[index],
+            _roMeasurement(targets[index], geometries[index], true),
+          );
+        }
+        return measurements;
+      }
+    } catch (_error) {}
+  }
+  for (const target of targets) {
+    measurements.set(target, _roMeasurement(target));
+  }
+  return measurements;
 }
 
 const _roConstructionKey = {};
@@ -7575,9 +7827,8 @@ globalThis.NodeFilter = {
 // ResizeObserver is defined earlier with real per-target firing; the stub
 // that previously lived here was a no-op that clobbered the real class.
 //
-// Viewport IntersectionObserver. Render builds provide real, scroll-relative
-// target boxes through getBoundingClientRect. Element scroll-container roots
-// remain intentionally unsupported until their offsets participate in layout.
+// IntersectionObserver. Render builds provide real, scroll-relative target,
+// element-root, and overflow-ancestor boxes from one prepared layout snapshot.
 globalThis.__intersectionObservers = [];
 let _intersectionRenderCheckpointPending = false;
 function _scheduleIntersectionRenderCheckpoint() {
@@ -7585,13 +7836,41 @@ function _scheduleIntersectionRenderCheckpoint() {
   _intersectionRenderCheckpointPending = true;
   // Intersection observation is part of the browser's rendering update, not
   // a synchronous side effect of observe() or a DOM mutation. One queued task
-  // coalesces every observer/target and therefore performs at most one layout
-  // flush for the checkpoint.
-  _scheduleAfter(0, () => {
+  // coalesces every observer/target and therefore performs one bulk layout
+  // read for the checkpoint without installing a perpetual frame pump.
+  _scheduleAfter(_RAF_FRAME_DELAY_MS, () => {
     _intersectionRenderCheckpointPending = false;
-    for (const observer of globalThis.__intersectionObservers) {
+    const observers = globalThis.__intersectionObservers.filter(
+      observer => observer._connected && observer._targets.size,
+    );
+    const elements = [];
+    const seen = new Set();
+    const addElement = element => {
+      if (!(element instanceof Element) || seen.has(element)) return;
+      seen.add(element);
+      elements.push(element);
+    };
+
+    // Gather the complete clip graph before entering native code. DOM/shadow
+    // ancestry stays in JS, while every geometry/style value comes from the
+    // same animation sample and PreparedRender snapshot.
+    for (const observer of observers) {
+      for (const target of observer._targets) addElement(target);
+    }
+    for (const observer of observers) {
+      if (observer._root instanceof Element) addElement(observer._root);
+      for (const target of observer._targets) {
+        let ancestor = target.parentNode || target.host || null;
+        while (ancestor && ancestor !== observer._root && ancestor.nodeType !== 9) {
+          addElement(ancestor);
+          ancestor = ancestor.parentNode || ancestor.host || null;
+        }
+      }
+    }
+    const measurements = _ioMeasurements(elements);
+    for (const observer of observers) {
       if (observer._connected && observer._targets.size) {
-        observer._check([...observer._targets], false);
+        observer._check([...observer._targets], false, measurements);
       }
     }
   });
@@ -7619,15 +7898,53 @@ function _ioMargins(value) {
 function _ioClipsOverflow(value) {
   return /^(?:auto|clip|hidden|overlay|scroll)$/.test(String(value || ""));
 }
-function _ioElementPaddingBox(element, style) {
-  const geometry = element._renderBoxGeometry();
-  const rect = geometry
-    ? element._rectFromRenderGeometry(geometry)
-    : element.getBoundingClientRect();
+function _ioMeasurements(elements) {
+  const measurements = new Map();
+  if (!elements.length) return measurements;
+  const bulk = Deno.core.ops.op_intersection_observer_measurements;
+  const nativeElements = elements.filter(element => element?._nid != null);
+  if (typeof bulk !== "function" || !nativeElements.length) return measurements;
+  try {
+    const raw = bulk(JSON.stringify(nativeElements.map(element => element._nid | 0)));
+    const geometries = raw ? JSON.parse(raw) : null;
+    if (Array.isArray(geometries) && geometries.length === nativeElements.length) {
+      for (let index = 0; index < nativeElements.length; index++) {
+        measurements.set(nativeElements[index], geometries[index]);
+      }
+    }
+  } catch (_error) {}
+  return measurements;
+}
+function _ioElementRect(element, measurements) {
+  if (measurements.has(element)) {
+    const geometry = measurements.get(element);
+    return geometry
+      ? _ioRect(
+          _roNumber(geometry.x), _roNumber(geometry.y),
+          _roNumber(geometry.width), _roNumber(geometry.height),
+        )
+      : _ioRect(0, 0, 0, 0);
+  }
+  const rect = element.getBoundingClientRect();
+  return _ioRect(rect.x, rect.y, rect.width, rect.height);
+}
+function _ioElementStyle(element, measurements) {
+  return measurements.has(element)
+    ? (measurements.get(element) || {})
+    : getComputedStyle(element);
+}
+function _ioElementPaddingBox(element, style, measurements) {
+  const hasMeasurement = measurements.has(element);
+  const geometry = measurements.get(element);
+  const rect = _ioElementRect(element, measurements);
   const borderLeft = _roNumber(style.borderLeftWidth);
   const borderTop = _roNumber(style.borderTopWidth);
-  const width = geometry ? geometry.clientWidth : element.clientWidth;
-  const height = geometry ? geometry.clientHeight : element.clientHeight;
+  const width = hasMeasurement
+    ? (geometry ? _roNumber(geometry.clientWidth) : 0)
+    : element.clientWidth;
+  const height = hasMeasurement
+    ? (geometry ? _roNumber(geometry.clientHeight) : 0)
+    : element.clientHeight;
   return _ioRect(rect.left + borderLeft, rect.top + borderTop, width, height);
 }
 globalThis.IntersectionObserver = class IntersectionObserver {
@@ -7659,16 +7976,16 @@ globalThis.IntersectionObserver = class IntersectionObserver {
     this._deliveryPending = false;
     globalThis.__intersectionObservers.push(this);
   }
-  _rootBounds() {
+  _rootBounds(measurements) {
     let x = 0, y = 0;
     let width = globalThis.innerWidth || 1280;
     let height = globalThis.innerHeight || 720;
     if (this._root instanceof Element) {
-      const style = getComputedStyle(this._root);
+      const style = _ioElementStyle(this._root, measurements);
       const clips = _ioClipsOverflow(style.overflowX) ||
         _ioClipsOverflow(style.overflowY);
       if (clips) {
-        const paddingBox = _ioElementPaddingBox(this._root, style);
+        const paddingBox = _ioElementPaddingBox(this._root, style, measurements);
         x = paddingBox.left;
         y = paddingBox.top;
         // The intersection root for a content-clipping element is its padding
@@ -7676,7 +7993,7 @@ globalThis.IntersectionObserver = class IntersectionObserver {
         width = paddingBox.width;
         height = paddingBox.height;
       } else {
-        const rect = this._root.getBoundingClientRect();
+        const rect = _ioElementRect(this._root, measurements);
         x = rect.left;
         y = rect.top;
         width = rect.width;
@@ -7693,9 +8010,15 @@ globalThis.IntersectionObserver = class IntersectionObserver {
     const left = resolve(this._margins[3], width);
     return _ioRect(x - left, y - top, width + left + right, height + top + bottom);
   }
-  _entry(target, root) {
-    const rect = target.getBoundingClientRect();
-    let inRootTree = !(this._root instanceof Element) || this._root.contains(target);
+  _entry(target, root, measurements) {
+    const rect = _ioElementRect(target, measurements);
+    // A connected zero-area box may intersect when its edges touch the root,
+    // but a detached or non-generated box must never become intersecting just
+    // because its synthetic zero rectangle happens to sit at the origin.
+    const hasGeneratedBox = !measurements.has(target) ||
+      measurements.get(target) !== null;
+    let inRootTree = hasGeneratedBox && target.isConnected &&
+      (!(this._root instanceof Element) || this._root.contains(target));
     let left = Math.max(rect.left, root.left);
     let top = Math.max(rect.top, root.top);
     let right = Math.min(rect.right, root.right);
@@ -7709,11 +8032,11 @@ globalThis.IntersectionObserver = class IntersectionObserver {
     let ancestor = target.parentNode || target.host || null;
     while (inRootTree && ancestor && ancestor !== this._root && ancestor.nodeType !== 9) {
       if (ancestor instanceof Element) {
-        const style = getComputedStyle(ancestor);
+        const style = _ioElementStyle(ancestor, measurements);
         const clipX = _ioClipsOverflow(style.overflowX);
         const clipY = _ioClipsOverflow(style.overflowY);
         if (clipX || clipY) {
-          const clip = _ioElementPaddingBox(ancestor, style);
+          const clip = _ioElementPaddingBox(ancestor, style, measurements);
           if (clipX) {
             left = Math.max(left, clip.left);
             right = Math.min(right, clip.right);
@@ -7749,8 +8072,8 @@ globalThis.IntersectionObserver = class IntersectionObserver {
     while (index < this._thresholds.length && this._thresholds[index] <= ratio) index++;
     return index;
   }
-  _queueChanged(target, forceInitial, root) {
-    const entry = this._entry(target, root);
+  _queueChanged(target, forceInitial, root, measurements) {
+    const entry = this._entry(target, root, measurements);
     const previous = this._previous.get(target);
     const changed = forceInitial || !previous ||
       previous.isIntersecting !== entry.isIntersecting ||
@@ -7762,11 +8085,13 @@ globalThis.IntersectionObserver = class IntersectionObserver {
     });
     if (changed) this._records.push(entry);
   }
-  _check(targets, forceInitial) {
+  _check(targets, forceInitial, measurements = new Map()) {
     if (!this._connected) return;
-    const root = this._rootBounds();
+    const root = this._rootBounds(measurements);
     for (const target of targets) {
-      if (this._targets.has(target)) this._queueChanged(target, !!forceInitial, root);
+      if (this._targets.has(target)) {
+        this._queueChanged(target, !!forceInitial, root, measurements);
+      }
     }
     if (!this._records.length || this._deliveryPending) return;
     this._deliveryPending = true;
@@ -11190,6 +11515,8 @@ globalThis.Worker = class Worker {
       setInterval: globalThis.setInterval,
       clearTimeout: globalThis.clearTimeout,
       clearInterval: globalThis.clearInterval,
+      scheduler: globalThis.scheduler,
+      Scheduler: globalThis.Scheduler,
       fetch: globalThis.fetch,
       console: globalThis.console,
       performance: globalThis.performance,

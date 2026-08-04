@@ -3470,6 +3470,8 @@ pub fn build_extension() -> Extension {
         ops.push(op_image_metadata());
         ops.push(op_load_image_metadata());
         ops.push(op_layout_geometry());
+        ops.push(op_resize_observer_measurements());
+        ops.push(op_intersection_observer_measurements());
         ops.push(op_computed_style());
         ops.push(op_css_supports());
         ops.push(op_layout_metrics());
@@ -4275,6 +4277,137 @@ fn op_layout_geometry(state: &OpState, #[string] nid_str: String) -> String {
         .to_string();
     }
     String::new()
+}
+
+/// Measure every target in one ResizeObserver rendering opportunity.
+///
+/// ResizeObserver gathers all observations before it invokes any callback.
+/// Crossing the JS/native boundary once per target defeated that batching:
+/// each read sampled the document timeline and could rebuild the retained
+/// cascade/layout independently.  Accept the complete target list, freeze the
+/// animation sample once, prepare/resolve layout once, and return the small
+/// computed-style subset needed to derive content/border/device-pixel boxes.
+/// The result is index-aligned with the input and contains `null` for targets
+/// which currently generate no box (detached, `display:none`, and stale ids).
+#[cfg(feature = "render")]
+#[op2]
+#[string]
+fn op_resize_observer_measurements(state: &OpState, #[string] nids_json: String) -> String {
+    let nids = serde_json::from_str::<Vec<u32>>(&nids_json).unwrap_or_default();
+    if nids.is_empty() {
+        return "[]".to_string();
+    }
+
+    let shared = state.borrow::<SharedState>().clone();
+    let mut gs = shared.borrow_mut();
+    sample_live_document_animations(&mut gs);
+    if ensure_resolved_scroll(&mut gs).is_none() {
+        return serde_json::to_string(&vec![serde_json::Value::Null; nids.len()])
+            .unwrap_or_else(|_| "[]".to_string());
+    }
+    let Some((_, scroll)) = gs.resolved_scroll.as_ref() else {
+        return serde_json::to_string(&vec![serde_json::Value::Null; nids.len()])
+            .unwrap_or_else(|_| "[]".to_string());
+    };
+    let Some(prepared) = gs.prepared_render.as_ref() else {
+        return serde_json::to_string(&vec![serde_json::Value::Null; nids.len()])
+            .unwrap_or_else(|_| "[]".to_string());
+    };
+
+    let style_value =
+        |snapshot: &std::collections::HashMap<&'static str, String>, name: &'static str| {
+            snapshot.get(name).cloned().unwrap_or_default()
+        };
+    let measurements = nids
+        .into_iter()
+        .map(|nid| {
+            let nid = obscura_dom::tree::NodeId::new(nid);
+            let rect = prepared.viewport_rect_with_scroll(nid, scroll)?;
+            let (client_width, client_height) = prepared.client_size(nid)?;
+            let snapshot = prepared.computed_style(nid)?;
+            Some(serde_json::json!({
+                "x": rect.x,
+                "y": rect.y,
+                "clientWidth": client_width,
+                "clientHeight": client_height,
+                "paddingTop": style_value(&snapshot, "padding-top"),
+                "paddingRight": style_value(&snapshot, "padding-right"),
+                "paddingBottom": style_value(&snapshot, "padding-bottom"),
+                "paddingLeft": style_value(&snapshot, "padding-left"),
+                "borderTopWidth": style_value(&snapshot, "border-top-width"),
+                "borderRightWidth": style_value(&snapshot, "border-right-width"),
+                "borderBottomWidth": style_value(&snapshot, "border-bottom-width"),
+                "borderLeftWidth": style_value(&snapshot, "border-left-width"),
+                "writingMode": style_value(&snapshot, "writing-mode"),
+                "display": style_value(&snapshot, "display"),
+            }))
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string(&measurements).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// Measure the complete IntersectionObserver clip graph in one rendering
+/// opportunity. The JS side supplies the unique observed targets, element
+/// roots, and intervening element ancestors. Sampling animations and preparing
+/// layout once here avoids turning each target/ancestor box and style read into
+/// a separate retained-layout rebuild.
+///
+/// Results are index-aligned with the input. A `null` entry means that the node
+/// currently generates no layout box (for example, it is detached or hidden).
+#[cfg(feature = "render")]
+#[op2]
+#[string]
+fn op_intersection_observer_measurements(
+    state: &OpState,
+    #[string] nids_json: String,
+) -> String {
+    let nids = serde_json::from_str::<Vec<u32>>(&nids_json).unwrap_or_default();
+    if nids.is_empty() {
+        return "[]".to_string();
+    }
+
+    let shared = state.borrow::<SharedState>().clone();
+    let mut gs = shared.borrow_mut();
+    sample_live_document_animations(&mut gs);
+    if ensure_resolved_scroll(&mut gs).is_none() {
+        return serde_json::to_string(&vec![serde_json::Value::Null; nids.len()])
+            .unwrap_or_else(|_| "[]".to_string());
+    }
+    let Some((_, scroll)) = gs.resolved_scroll.as_ref() else {
+        return serde_json::to_string(&vec![serde_json::Value::Null; nids.len()])
+            .unwrap_or_else(|_| "[]".to_string());
+    };
+    let Some(prepared) = gs.prepared_render.as_ref() else {
+        return serde_json::to_string(&vec![serde_json::Value::Null; nids.len()])
+            .unwrap_or_else(|_| "[]".to_string());
+    };
+
+    let style_value =
+        |snapshot: &std::collections::HashMap<&'static str, String>, name: &'static str| {
+            snapshot.get(name).cloned().unwrap_or_default()
+        };
+    let measurements = nids
+        .into_iter()
+        .map(|nid| {
+            let nid = obscura_dom::tree::NodeId::new(nid);
+            let rect = prepared.viewport_rect_with_scroll(nid, scroll)?;
+            let (client_width, client_height) = prepared.client_size(nid)?;
+            let snapshot = prepared.computed_style(nid)?;
+            Some(serde_json::json!({
+                "x": rect.x,
+                "y": rect.y,
+                "width": rect.width,
+                "height": rect.height,
+                "clientWidth": client_width,
+                "clientHeight": client_height,
+                "borderTopWidth": style_value(&snapshot, "border-top-width"),
+                "borderLeftWidth": style_value(&snapshot, "border-left-width"),
+                "overflowX": style_value(&snapshot, "overflow-x"),
+                "overflowY": style_value(&snapshot, "overflow-y"),
+            }))
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string(&measurements).unwrap_or_else(|_| "[]".to_string())
 }
 
 /// One renderer-computed CSS snapshot for `getComputedStyle()`. Returning all
