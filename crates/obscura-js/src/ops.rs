@@ -8,6 +8,8 @@ use deno_core::op2;
 use deno_core::Extension;
 use deno_core::OpState;
 use obscura_dom::{DomTree, NodeData, NodeId};
+#[cfg(feature = "render")]
+use obscura_net::{RequestCredentials, RequestMode, ResourceRequest};
 #[cfg(feature = "stealth")]
 use obscura_net::StealthHttpClient;
 use obscura_net::{
@@ -74,6 +76,9 @@ pub struct JsNetworkEvent {
     pub timestamp: f64,
 }
 
+#[cfg(feature = "render")]
+pub use obscura_render::ImageRequestProfile;
+
 pub struct ObscuraState {
     pub dom: Option<DomTree>,
     pub url: String,
@@ -125,10 +130,28 @@ pub struct ObscuraState {
     /// The browser settle policy samples this to distinguish useful deferred
     /// rendering work from unrelated long-lived timers.
     pub activity_generation: u64,
+    /// Monotonic identity of the currently installed document. Async resource
+    /// completions use this to discard bytes and lifecycle results belonging
+    /// to a navigation that has already been replaced.
+    pub document_generation: u64,
     /// Final image/font-aware layout shared by CSSOM geometry and screenshots.
     /// DOM/style/viewport changes clear this value but retain resource bytes.
     #[cfg(feature = "render")]
     pub prepared_render: Option<obscura_render::PreparedRender>,
+    /// Explicit document-timeline sample used by the next style/layout flush.
+    /// Captures set this to either deterministic T=0 or live document time.
+    #[cfg(feature = "render")]
+    pub animation_sample: obscura_render::AnimationSample,
+    #[cfg(feature = "render")]
+    pub animation_timeline: obscura_render::AnimationTimelineState,
+    #[cfg(feature = "render")]
+    pub animation_timeline_origin: std::time::Instant,
+    /// Host/HTML task epoch for document-timeline sampling. Geometry and
+    /// computed-style reads within one task share one frozen animation frame.
+    #[cfg(feature = "render")]
+    pub animation_task_generation: u64,
+    #[cfg(feature = "render")]
+    pub animation_sampled_task_generation: u64,
     /// Connected mutations awaiting dependency-indexed retained style refresh.
     /// Tree changes carry stable node/parent ids so a later geometry read can
     /// coalesce framework DOM churn into one conservative local cascade.
@@ -138,6 +161,12 @@ pub struct ObscuraState {
     /// relayout of the same document reuses it without refetching.
     #[cfg(feature = "render")]
     pub render_resources: obscura_render::RenderResourceCache,
+    /// Waiters sharing an asynchronous HTMLImageElement request. The key keeps
+    /// navigation identity and request credentials separate so neither stale
+    /// pages nor incompatible CORS profiles share a completion.
+    #[cfg(feature = "render")]
+    pub render_image_in_flight:
+        HashMap<(u64, String, ImageRequestProfile), Vec<tokio::sync::oneshot::Sender<()>>>,
     /// One exact-key compiled author stylesheet for this document. Connected
     /// mutations still discard `prepared_render`; the next prepare reuses only
     /// parsing/indexing when ordered CSS source and viewport remain identical.
@@ -199,12 +228,25 @@ impl ObscuraState {
             js_network_events: Vec::new(),
             page_in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             activity_generation: 0,
+            document_generation: 0,
             #[cfg(feature = "render")]
             prepared_render: None,
+            #[cfg(feature = "render")]
+            animation_sample: obscura_render::AnimationSample::default(),
+            #[cfg(feature = "render")]
+            animation_timeline: obscura_render::AnimationTimelineState::default(),
+            #[cfg(feature = "render")]
+            animation_timeline_origin: std::time::Instant::now(),
+            #[cfg(feature = "render")]
+            animation_task_generation: 0,
+            #[cfg(feature = "render")]
+            animation_sampled_task_generation: 0,
             #[cfg(feature = "render")]
             pending_style_mutations: Vec::new(),
             #[cfg(feature = "render")]
             render_resources: obscura_render::RenderResourceCache::default(),
+            #[cfg(feature = "render")]
+            render_image_in_flight: HashMap::new(),
             #[cfg(feature = "render")]
             stylesheet_cache: obscura_render::StylesheetCache::default(),
             #[cfg(feature = "render")]
@@ -480,18 +522,12 @@ fn retained_style_mutation(
     arg2: &str,
 ) -> Option<obscura_render::RetainedStyleMutation> {
     let node = NodeId::new(arg1.parse::<u32>().ok()?);
-    let can_retain = |name: &str| {
-        let name = name.to_ascii_lowercase();
-        name == "class"
-            || name == "id"
-            || name == "style"
-            || name.starts_with("data-")
-            || name.starts_with("aria-")
-    };
     match cmd {
         "set_attribute" => {
             let (name, value) = arg2.split_once('\0')?;
-            if !can_retain(name) {
+            if obscura_render::dom::retained_attribute_mutation_kind(dom, node, name)
+                == obscura_render::dom::RetainedAttributeMutationKind::Full
+            {
                 return None;
             }
             let keeps_selector_value = !name.eq_ignore_ascii_case("style");
@@ -510,9 +546,14 @@ fn retained_style_mutation(
             }
             .into())
         }
-        "remove_attribute" => can_retain(arg2).then(|| {
+        "remove_attribute" => {
+            if obscura_render::dom::retained_attribute_mutation_kind(dom, node, arg2)
+                == obscura_render::dom::RetainedAttributeMutationKind::Full
+            {
+                return None;
+            }
             let keeps_selector_value = !arg2.eq_ignore_ascii_case("style");
-            obscura_render::AttributeStyleMutation {
+            Some(obscura_render::AttributeStyleMutation {
                 node,
                 name: arg2.to_string(),
                 old_value: keeps_selector_value
@@ -525,8 +566,8 @@ fn retained_style_mutation(
                     .flatten(),
                 new_value: None,
             }
-            .into()
-        }),
+            .into())
+        }
         "append_child" => {
             let child = NodeId::new(arg2.parse::<u32>().ok()?);
             dom.get_node(node)?;
@@ -559,13 +600,19 @@ fn retained_style_mutation(
                 .into(),
             )
         }
-        "set_text_content" => Some(
-            obscura_render::TreeStyleMutation::Text {
-                node,
-                parent: dom.get_node(node)?.parent,
-            }
-            .into(),
-        ),
+        "set_text_content" => match &dom.get_node(node)?.data {
+            NodeData::Text { .. } => Some(
+                obscura_render::TreeStyleMutation::Text {
+                    node,
+                    parent: dom.get_node(node)?.parent,
+                }
+                .into(),
+            ),
+            // Element/fragment textContent replaces a child list. That can
+            // flip :empty and structural/relational selectors, so the local
+            // text fast path cannot describe the mutation safely.
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -725,11 +772,68 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                 .element_scroll_offsets
                 .retain(|node, _| !reset_nodes.contains(node));
             state.scroll_generation = state.scroll_generation.wrapping_add(1);
+            if invalidate {
+                state.animation_timeline.remove_subtree(reset_nodes.iter());
+            }
         }
         #[cfg(feature = "render")]
         let had_prepared_render = state.prepared_render.is_some();
         #[cfg(feature = "render")]
         if invalidate {
+            let mutation_time_ms = (state.animation_timeline_origin.elapsed().as_secs_f64()
+                * 1_000.0)
+                .min(f64::from(f32::MAX)) as f32;
+            // Keep animation birth epochs local to the changed subtree. A
+            // single document-global timestamp made a later unrelated write
+            // restart every not-yet-sampled animation at the same instant.
+            let direct_root = match cmd.as_str() {
+                "append_child" => arg2.parse::<u32>().ok(),
+                "insert_before"
+                | "set_attribute"
+                | "remove_attribute"
+                | "set_attribute_ns"
+                | "remove_attribute_ns" => arg1.parse::<u32>().ok(),
+                _ => None,
+            }
+            .map(NodeId::new);
+            let direct_nodes = direct_root
+                .and_then(|root| {
+                    state.dom.as_ref().map(|dom| {
+                        std::iter::once(root)
+                            .chain(dom.descendants(root))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .unwrap_or_default();
+            for node in direct_nodes {
+                state
+                    .animation_timeline
+                    .note_start_candidate(node, mutation_time_ms);
+            }
+            let scope_root = match cmd.as_str() {
+                "append_child" => arg1.parse::<u32>().ok().map(NodeId::new),
+                "insert_before" => arg2
+                    .parse::<u32>()
+                    .ok()
+                    .map(NodeId::new)
+                    .and_then(|reference| {
+                        state.dom.as_ref()?.get_node(reference)?.parent
+                    }),
+                "remove_child" => arg1
+                    .parse::<u32>()
+                    .ok()
+                    .map(NodeId::new)
+                    .and_then(|child| state.dom.as_ref()?.get_node(child)?.parent),
+                "set_inner_html" | "set_inner_html_context" | "set_text_content" => {
+                    arg1.parse::<u32>().ok().map(NodeId::new)
+                }
+                _ => None,
+            };
+            if let Some(root) = scope_root {
+                state
+                    .animation_timeline
+                    .note_subtree_start_candidate(root, mutation_time_ms);
+            }
             if let Some(mutation) = retained_style_mutation {
                 if state.prepared_render.is_some()
                     && state.pending_style_mutations.len() < 256
@@ -1556,20 +1660,6 @@ async fn op_fetch_url(
         url
     );
 
-    if let Ok(parsed_url) = url::Url::parse(&url) {
-        if let Err(e) = validate_fetch_url(&parsed_url) {
-            return Ok(serde_json::json!({
-                "status": 0,
-                "body": "",
-                "url": url,
-                "headers": {},
-                "blocked": true,
-                "error": e,
-            })
-            .to_string());
-        }
-    }
-
     let (cookie_jar, in_flight, page_in_flight, intercept_tx, proxy_url, callbacks, http_client) = {
         let state_borrow = state.borrow();
         let gs = state_borrow.borrow::<SharedState>().clone();
@@ -1622,6 +1712,26 @@ async fn op_fetch_url(
             gs.http_client.clone(),
         )
     };
+    // The private-network opt-in is a BrowserContext policy, not only a
+    // process-wide environment setting.  Navigation already honours the
+    // context's configured HTTP client; scripted fetch/XHR must use the same
+    // policy for its initial URL and every URL it can reach below.
+    let allow_private_network = http_client
+        .as_ref()
+        .is_some_and(|client| client.allow_private_network);
+    if let Ok(parsed_url) = url::Url::parse(&url) {
+        if let Err(e) = validate_fetch_url(&parsed_url, allow_private_network) {
+            return Ok(serde_json::json!({
+                "status": 0,
+                "body": "",
+                "url": url,
+                "headers": {},
+                "blocked": true,
+                "error": e,
+            })
+            .to_string());
+        }
+    }
     struct PageInFlightGuard(Arc<std::sync::atomic::AtomicU32>);
     impl Drop for PageInFlightGuard {
         fn drop(&mut self) {
@@ -1707,7 +1817,7 @@ async fn op_fetch_url(
     // bypass validate_fetch_url entirely.
     let url = if let Some(new_url) = override_url {
         if let Ok(parsed) = url::Url::parse(&new_url) {
-            if let Err(reason) = validate_fetch_url(&parsed) {
+            if let Err(reason) = validate_fetch_url(&parsed, allow_private_network) {
                 return Ok(serde_json::json!({
                     "status": 0,
                     "body": "",
@@ -1838,6 +1948,7 @@ async fn op_fetch_url(
                 mode.clone(),
                 credentials,
                 callbacks.clone(),
+                allow_private_network,
             )
             .await;
         }
@@ -1947,7 +2058,7 @@ async fn op_fetch_url(
         };
 
         // Re-validate every redirect target against the SSRF policy.
-        if let Err(reason) = validate_fetch_url(&next_url) {
+        if let Err(reason) = validate_fetch_url(&next_url, allow_private_network) {
             return Ok(serde_json::json!({
                 "status": 0,
                 "body": "",
@@ -2143,6 +2254,7 @@ async fn stealth_fetch_all(
     mode: String,
     credentials: FetchCredentials,
     callbacks: Option<Arc<CallbackRegistry>>,
+    allow_private_network: bool,
 ) -> Result<String, deno_error::JsErrorBox> {
     let mut current_url = url.clone();
     let mut current_method = method;
@@ -2194,7 +2306,7 @@ async fn stealth_fetch_all(
         };
         // Re-validate every redirect target against the SSRF policy, matching
         // op_fetch_url (GHSA-8v6v-g4rh-jmcm).
-        if let Err(reason) = validate_fetch_url(&next_url) {
+        if let Err(reason) = validate_fetch_url(&next_url, allow_private_network) {
             return Ok(serde_json::json!({
                 "status": 0, "body": "", "url": next_url.to_string(), "headers": {},
                 "blocked": true,
@@ -2305,7 +2417,7 @@ fn glob_match(pattern: &str, url: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{cors_response_allows, glob_match, FetchCredentials};
+    use super::{cors_response_allows, glob_match, validate_fetch_url, FetchCredentials};
 
     #[test]
     fn glob_match_handles_cdp_blocked_url_patterns() {
@@ -2378,9 +2490,15 @@ mod tests {
             "true",
         ));
     }
+
+    #[test]
+    fn fetch_url_validation_honors_per_context_private_network_opt_in() {
+        let loopback = url::Url::parse("http://127.0.0.1:8080/resource").unwrap();
+        assert!(validate_fetch_url(&loopback, true).is_ok());
+    }
 }
 
-fn validate_fetch_url(url: &url::Url) -> Result<(), String> {
+fn validate_fetch_url(url: &url::Url, allow_private_network: bool) -> Result<(), String> {
     let scheme = url.scheme();
     if scheme != "http" && scheme != "https" && scheme != "file" {
         return Err(format!(
@@ -2389,7 +2507,10 @@ fn validate_fetch_url(url: &url::Url) -> Result<(), String> {
         ));
     }
 
-    if scheme == "file" || obscura_net::env_allows_private_network() {
+    if scheme == "file"
+        || allow_private_network
+        || obscura_net::env_allows_private_network()
+    {
         return Ok(());
     }
 
@@ -3119,8 +3240,10 @@ pub fn build_extension() -> Extension {
     // probes with typeof before calling, so the op's absence is a clean fallback.
     #[cfg(feature = "render")]
     {
+        ops.push(op_begin_render_task());
         ops.push(op_set_dynamic_fonts());
         ops.push(op_image_metadata());
+        ops.push(op_load_image_metadata());
         ops.push(op_layout_geometry());
         ops.push(op_computed_style());
         ops.push(op_css_supports());
@@ -3161,16 +3284,24 @@ pub(crate) fn ensure_prepared_render(
 ) -> Option<&obscura_render::PreparedRender> {
     let base_url = document_base_url(state);
     let viewport = state.viewport;
+    let animation_sample = state.animation_sample;
     let stale = state.prepared_render.as_ref().map_or(true, |prepared| {
-        prepared.viewport() != viewport || prepared.base_url() != base_url.as_deref()
+        prepared.viewport() != viewport
+            || prepared.base_url() != base_url.as_deref()
+            || prepared.animation_sample() != animation_sample
     });
     if stale || !state.pending_style_mutations.is_empty() {
+        if let Some(dom) = state.dom.as_ref() {
+            state
+                .animation_timeline
+                .materialize_start_candidates(dom);
+        }
         let previous = (!stale).then(|| state.prepared_render.take()).flatten();
         let mutations = std::mem::take(&mut state.pending_style_mutations);
         let prepared = {
             let dom = state.dom.as_ref()?;
             match previous {
-                Some(previous) => obscura_render::prepare_dom_with_retained_styles(
+                Some(previous) => obscura_render::prepare_dom_with_retained_styles_with_animation_state(
                     dom,
                     viewport,
                     base_url.as_deref(),
@@ -3179,31 +3310,90 @@ pub(crate) fn ensure_prepared_render(
                     &mut state.stylesheet_cache,
                     previous,
                     &mutations,
+                    animation_sample,
+                    &mut state.animation_timeline,
                 )
                 .or_else(|| {
-                    obscura_render::prepare_dom_with_dynamic_fonts_and_stylesheet_cache(
+                    obscura_render::prepare_dom_with_dynamic_fonts_and_stylesheet_cache_with_animation_state(
                         dom,
                         viewport,
                         base_url.as_deref(),
                         &mut state.render_resources,
                         &state.dynamic_fonts,
                         &mut state.stylesheet_cache,
+                        animation_sample,
+                        &mut state.animation_timeline,
                     )
                 })?,
-                None => obscura_render::prepare_dom_with_dynamic_fonts_and_stylesheet_cache(
+                None => obscura_render::prepare_dom_with_dynamic_fonts_and_stylesheet_cache_with_animation_state(
                     dom,
                     viewport,
                     base_url.as_deref(),
                     &mut state.render_resources,
                     &state.dynamic_fonts,
                     &mut state.stylesheet_cache,
+                    animation_sample,
+                    &mut state.animation_timeline,
                 )?,
             }
         };
+        if animation_sample.mode == obscura_render::AnimationSampleMode::DocumentTime {
+            state.animation_timeline.clear_start_candidates();
+        }
+        let connected = state.dom.as_ref().map(|dom| {
+            std::iter::once(dom.document())
+                .chain(dom.descendants(dom.document()))
+                .collect::<HashSet<_>>()
+        });
+        if let Some(connected) = connected {
+            state
+                .animation_timeline
+                .retain_nodes(|node| connected.contains(&node));
+        }
         state.prepared_render = Some(prepared);
         state.resolved_scroll = None;
     }
     state.prepared_render.as_ref()
+}
+
+#[cfg(feature = "render")]
+pub(crate) fn sample_live_document_animations(state: &mut ObscuraState) {
+    if state.animation_sampled_task_generation == state.animation_task_generation {
+        return;
+    }
+    state.animation_sampled_task_generation = state.animation_task_generation;
+    let sample = obscura_render::AnimationSample::document(
+        (state.animation_timeline_origin.elapsed().as_secs_f64() * 1_000.0)
+            .min(f64::from(f32::MAX)) as f32,
+    );
+    if state.animation_sample == sample {
+        return;
+    }
+    if sample.time.milliseconds > state.animation_sample.time.milliseconds
+        && state.animation_sample.mode == obscura_render::AnimationSampleMode::DocumentTime
+        && state.prepared_render.as_mut().is_some_and(|prepared| {
+            prepared.advance_inactive_animation_sample_time(sample.time)
+        })
+    {
+        state.animation_sample = sample;
+        return;
+    }
+    state.animation_sample = sample;
+    state.prepared_render = None;
+    state.pending_style_mutations.clear();
+    state.resolved_scroll = None;
+}
+
+#[cfg(feature = "render")]
+pub(crate) fn begin_animation_task(state: &mut ObscuraState) {
+    state.animation_task_generation = state.animation_task_generation.wrapping_add(1);
+}
+
+#[cfg(feature = "render")]
+#[op2(fast)]
+fn op_begin_render_task(state: &OpState) {
+    let shared = state.borrow::<SharedState>().clone();
+    begin_animation_task(&mut shared.borrow_mut());
 }
 
 #[cfg(feature = "render")]
@@ -3248,81 +3438,13 @@ pub(crate) fn ensure_resolved_scroll(state: &mut ObscuraState) -> Option<()> {
     Some(())
 }
 
-/// Probe one ordinary `<img src>` through the renderer's page-scoped resource
-/// cache. This is deliberately a synchronous render-only op: the current
-/// renderer loader is synchronous too, and sharing it is what guarantees that
-/// HTMLImageElement lifecycle state and the subsequent paint see the same
-/// success/failure and retained bytes.
 #[cfg(feature = "render")]
-#[op2]
-#[string]
-fn op_image_metadata(state: &OpState, nid: u32, cached_only: bool) -> String {
-    let shared = state.borrow::<SharedState>().clone();
-    let mut gs = shared.borrow_mut();
-    let node_id = NodeId::new(nid);
-    let is_image = gs.dom.as_ref().is_some_and(|dom| {
-        dom.get_node(node_id).is_some_and(|node| {
-            node.as_element()
-                .is_some_and(|element| element.local.as_ref() == "img")
-        })
-    });
-    if !is_image {
-        return serde_json::json!({ "ok": false, "currentSrc": "" }).to_string();
-    }
-    let base_url = document_base_url(&gs);
-    let viewport = gs.viewport;
-    let previous_dimensions = (!cached_only)
-        .then(|| {
-            gs.dom.as_ref().and_then(|dom| {
-                gs.render_resources
-                    .cached_image_element_metadata(
-                        dom,
-                        node_id,
-                        viewport,
-                        base_url.as_deref(),
-                    )
-                    .and_then(|(_, _, known, dimensions)| known.then_some(dimensions).flatten())
-            })
-        })
-        .flatten();
-    let ObscuraState {
-        dom,
-        render_resources,
-        ..
-    } = &mut *gs;
-    let Some(dom) = dom.as_ref() else {
-        return serde_json::json!({ "ok": false, "currentSrc": "" }).to_string();
-    };
-    let (current_src, density, known, dimensions) = if cached_only {
-        match render_resources.cached_image_element_metadata(
-            dom,
-            node_id,
-            viewport,
-            base_url.as_deref(),
-        ) {
-            Some(metadata) => metadata,
-            None => {
-                return serde_json::json!({
-                    "state": "error",
-                    "ok": false,
-                    "currentSrc": "",
-                })
-                .to_string();
-            }
-        }
-    } else {
-        match render_resources.image_element_metadata(dom, node_id, viewport, base_url.as_deref()) {
-            Some((current_src, density, dimensions)) => (current_src, density, true, dimensions),
-            None => {
-                return serde_json::json!({
-                    "state": "error",
-                    "ok": false,
-                    "currentSrc": "",
-                })
-                .to_string();
-            }
-        }
-    };
+fn image_metadata_json(
+    current_src: String,
+    density: f32,
+    known: bool,
+    dimensions: Option<(f32, f32)>,
+) -> String {
     if !known {
         return serde_json::json!({
             "state": "pending",
@@ -3330,15 +3452,6 @@ fn op_image_metadata(state: &OpState, nid: u32, cached_only: bool) -> String {
             "density": density,
         })
         .to_string();
-    }
-    // The page transport invalidates prepared layout when it seeds successful
-    // bytes. Cover the synchronous compatibility-loader path too, but only
-    // when this call actually discovers a new decodable intrinsic size. A
-    // cache hit or retained decode failure cannot change used geometry.
-    if !cached_only && dimensions.is_some() && dimensions != previous_dimensions {
-        gs.prepared_render = None;
-        gs.pending_style_mutations.clear();
-        gs.resolved_scroll = None;
     }
     match dimensions {
         Some((width, height)) => serde_json::json!({
@@ -3358,6 +3471,348 @@ fn op_image_metadata(state: &OpState, nid: u32, cached_only: bool) -> String {
         })
         .to_string(),
     }
+}
+
+#[cfg(feature = "render")]
+fn image_request_profile(dom: &DomTree, node_id: NodeId) -> ImageRequestProfile {
+    match dom
+        .get_node(node_id)
+        .and_then(|node| node.get_attribute("crossorigin").map(str::to_owned))
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("use-credentials") => ImageRequestProfile::CorsInclude,
+        Some(_) => ImageRequestProfile::CorsSameOrigin,
+        None => ImageRequestProfile::NoCorsInclude,
+    }
+}
+
+#[cfg(feature = "render")]
+fn profiled_cached_image_metadata(
+    gs: &ObscuraState,
+    node_id: NodeId,
+) -> Option<(String, f32, bool, Option<(f32, f32)>)> {
+    let dom = gs.dom.as_ref()?;
+    let base_url = document_base_url(gs);
+    gs.render_resources.cached_image_element_metadata(
+        dom,
+        node_id,
+        gs.viewport,
+        base_url.as_deref(),
+    )
+}
+
+#[cfg(feature = "render")]
+fn cached_image_metadata_for_node(gs: &ObscuraState, node_id: NodeId) -> String {
+    match profiled_cached_image_metadata(gs, node_id) {
+        Some((current_src, density, known, dimensions)) => {
+            image_metadata_json(current_src, density, known, dimensions)
+        }
+        None => serde_json::json!({ "ok": false, "currentSrc": "" }).to_string(),
+    }
+}
+
+/// Probe one ordinary `<img>` through the renderer's page-scoped resource
+/// cache. This op is intentionally cache-only. Lifecycle getters call it
+/// synchronously and must never open a socket or wait on network I/O.
+#[cfg(feature = "render")]
+#[op2]
+#[string]
+fn op_image_metadata(state: &OpState, nid: u32, _cached_only: bool) -> String {
+    let shared = state.borrow::<SharedState>().clone();
+    let gs = shared.borrow();
+    let node_id = NodeId::new(nid);
+    let is_image = gs.dom.as_ref().is_some_and(|dom| {
+        dom.get_node(node_id).is_some_and(|node| {
+            node.as_element()
+                .is_some_and(|element| element.local.as_ref() == "img")
+        })
+    });
+    if !is_image {
+        return serde_json::json!({ "ok": false, "currentSrc": "" }).to_string();
+    }
+    cached_image_metadata_for_node(&gs, node_id)
+}
+
+/// Compatibility path for standalone render runtimes which deliberately
+/// install an in-memory `RenderResourceLoader` but have no owning page
+/// transport. Browser pages always install `ObscuraHttpClient` before page
+/// script runs and never enter this synchronous loader.
+#[cfg(feature = "render")]
+fn load_image_metadata_without_page_transport(gs: &mut ObscuraState, node_id: NodeId) -> String {
+    let base_url = document_base_url(&gs);
+    let viewport = gs.viewport;
+    let previous_dimensions = gs.dom.as_ref().and_then(|dom| {
+        gs.render_resources
+            .cached_image_element_metadata(dom, node_id, viewport, base_url.as_deref())
+            .and_then(|(_, _, known, dimensions)| known.then_some(dimensions).flatten())
+    });
+    let Some(dom) = gs.dom.as_ref() else {
+        return serde_json::json!({ "ok": false, "currentSrc": "" }).to_string();
+    };
+    let Some((current_src, density, dimensions)) = gs.render_resources.image_element_metadata(
+        dom,
+        node_id,
+        viewport,
+        base_url.as_deref(),
+    ) else {
+        return serde_json::json!({
+            "state": "error",
+            "ok": false,
+            "currentSrc": "",
+        })
+        .to_string();
+    };
+    if dimensions.is_some() && dimensions != previous_dimensions {
+        gs.prepared_render = None;
+        gs.pending_style_mutations.clear();
+        gs.resolved_scroll = None;
+    }
+    image_metadata_json(current_src, density, true, dimensions)
+}
+
+#[cfg(feature = "render")]
+fn finish_async_image_metadata(
+    shared: &SharedState,
+    node_id: NodeId,
+    document_generation: u64,
+    expected_url: &str,
+    request_profile: ImageRequestProfile,
+) -> String {
+    let mut gs = shared.borrow_mut();
+    if gs.document_generation != document_generation {
+        return serde_json::json!({ "state": "stale", "currentSrc": expected_url })
+            .to_string();
+    }
+    let Some(dom) = gs.dom.as_ref() else {
+        return serde_json::json!({ "state": "stale", "currentSrc": expected_url })
+            .to_string();
+    };
+    if image_request_profile(dom, node_id) != request_profile {
+        return serde_json::json!({ "state": "stale", "currentSrc": expected_url })
+            .to_string();
+    }
+    let Some((current_src, density, known, dimensions)) =
+        profiled_cached_image_metadata(&gs, node_id)
+    else {
+        return serde_json::json!({ "state": "stale", "currentSrc": expected_url })
+            .to_string();
+    };
+    if current_src != expected_url {
+        return serde_json::json!({ "state": "stale", "currentSrc": current_src }).to_string();
+    }
+    if known && dimensions.is_some() {
+        // This request began only because the selected resource was unknown.
+        // Newly available intrinsic dimensions can dirty ancestor geometry,
+        // exactly like Gecko's SIZE_AVAILABLE reflow notification.
+        gs.prepared_render = None;
+        gs.pending_style_mutations.clear();
+        gs.resolved_scroll = None;
+    }
+    image_metadata_json(current_src, density, known, dimensions)
+}
+
+/// Load HTMLImageElement bytes through the owning page's async transport.
+/// Network runs after every RefCell borrow is released, requests for the same
+/// navigation/URL/profile share one fetch, and completion revalidates both the
+/// document identity and responsive candidate before exposing lifecycle state.
+#[cfg(feature = "render")]
+#[op2(async)]
+#[string]
+async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String {
+    let shared = {
+        let state = state.borrow();
+        state.borrow::<SharedState>().clone()
+    };
+    let node_id = NodeId::new(nid);
+    let (
+        document_generation,
+        selected_url,
+        request_profile,
+        resource_request,
+        http_client,
+        callbacks,
+        page_in_flight,
+        blocked,
+    ) = {
+        let gs = shared.borrow();
+        let Some(dom) = gs.dom.as_ref() else {
+            return serde_json::json!({ "state": "stale", "currentSrc": "" }).to_string();
+        };
+        let is_image = dom.get_node(node_id).is_some_and(|node| {
+            node.as_element()
+                .is_some_and(|element| element.local.as_ref() == "img")
+        });
+        if !is_image {
+            return serde_json::json!({ "state": "stale", "currentSrc": "" }).to_string();
+        }
+        let profile = image_request_profile(dom, node_id);
+        let Some((selected_url, _, known, _)) =
+            profiled_cached_image_metadata(&gs, node_id)
+        else {
+            return serde_json::json!({ "state": "error", "ok": false, "currentSrc": "" })
+                .to_string();
+        };
+        if known {
+            return cached_image_metadata_for_node(&gs, node_id);
+        }
+        let initiator = url::Url::parse(&gs.url)
+            .or_else(|_| url::Url::parse(&selected_url))
+            .unwrap_or_else(|_| url::Url::parse("about:blank").unwrap());
+        let mut request = ResourceRequest::subresource(ResourceType::Image, &initiator);
+        match profile {
+            ImageRequestProfile::CorsInclude => {
+                request.mode = RequestMode::Cors;
+                request.credentials = RequestCredentials::Include;
+            }
+            ImageRequestProfile::CorsSameOrigin => {
+                request.mode = RequestMode::Cors;
+                request.credentials = RequestCredentials::SameOrigin;
+            }
+            ImageRequestProfile::NoCorsInclude => {}
+        }
+        let blocked = gs.blocked_urls.iter().any(|pattern| {
+            pattern == "*" || selected_url.contains(pattern) || glob_match(pattern, &selected_url)
+        });
+        (
+            gs.document_generation,
+            selected_url,
+            profile,
+            request,
+            gs.http_client.clone(),
+            gs.callbacks.clone(),
+            Arc::clone(&gs.page_in_flight),
+            blocked,
+        )
+    };
+
+    #[cfg(feature = "stealth")]
+    let stealth_client = shared.borrow().stealth_client.clone();
+    #[cfg(feature = "stealth")]
+    let has_page_transport = http_client.is_some() || stealth_client.is_some();
+    #[cfg(not(feature = "stealth"))]
+    let has_page_transport = http_client.is_some();
+    if !has_page_transport {
+        return load_image_metadata_without_page_transport(&mut shared.borrow_mut(), node_id);
+    }
+
+    // Different CORS/credential profiles do not share an in-flight response.
+    let request_key = (document_generation, selected_url.clone(), request_profile);
+    let follower = {
+        let mut gs = shared.borrow_mut();
+        if let Some(waiters) = gs.render_image_in_flight.get_mut(&request_key) {
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            waiters.push(sender);
+            Some(receiver)
+        } else {
+            gs.render_image_in_flight.insert(request_key.clone(), Vec::new());
+            None
+        }
+    };
+    if let Some(receiver) = follower {
+        let _ = receiver.await;
+        return finish_async_image_metadata(
+            &shared,
+            node_id,
+            document_generation,
+            &selected_url,
+            request_profile,
+        );
+    }
+
+    struct PageImageInFlightGuard(Arc<std::sync::atomic::AtomicU32>);
+    impl Drop for PageImageInFlightGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    page_in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let _page_in_flight = PageImageInFlightGuard(page_in_flight);
+
+    let parsed_url = url::Url::parse(&selected_url).ok();
+    let response = if blocked || parsed_url.is_none() {
+        None
+    } else {
+        let parsed_url = parsed_url.as_ref().unwrap();
+        #[cfg(feature = "stealth")]
+        {
+            if let Some(client) = stealth_client {
+                client
+                    .fetch_resource_with_callbacks(
+                        parsed_url,
+                        resource_request.clone(),
+                        callbacks.as_deref(),
+                    )
+                    .await
+                    .ok()
+            } else {
+                http_client
+                    .as_ref()
+                    .unwrap()
+                    .fetch_resource_with_callbacks(
+                        parsed_url,
+                        resource_request,
+                        callbacks.as_deref(),
+                    )
+                    .await
+                    .ok()
+            }
+        }
+        #[cfg(not(feature = "stealth"))]
+        {
+            http_client
+                .as_ref()
+                .unwrap()
+                .fetch_resource_with_callbacks(
+                    parsed_url,
+                    resource_request,
+                    callbacks.as_deref(),
+                )
+                .await
+                .ok()
+        }
+    };
+    let bytes = response.and_then(|response| {
+        (200..300)
+            .contains(&response.status)
+            .then_some(response.body)
+    });
+    let waiters = {
+        let mut gs = shared.borrow_mut();
+        if gs.document_generation == document_generation {
+            match bytes {
+                Some(bytes) => {
+                    if obscura_render::image_intrinsic_dimensions(&bytes).is_some() {
+                        gs.render_resources.seed_image(
+                            selected_url.clone(),
+                            request_profile,
+                            bytes,
+                        );
+                    } else {
+                        gs.render_resources
+                            .seed_image_missing(selected_url.clone(), request_profile);
+                    }
+                }
+                None => {
+                    gs.render_resources
+                        .seed_image_missing(selected_url.clone(), request_profile);
+                }
+            }
+        }
+        gs.render_image_in_flight
+            .remove(&request_key)
+            .unwrap_or_default()
+    };
+    for waiter in waiters {
+        let _ = waiter.send(());
+    }
+    finish_async_image_metadata(
+        &shared,
+        node_id,
+        document_generation,
+        &selected_url,
+        request_profile,
+    )
 }
 
 #[cfg(feature = "render")]
@@ -3391,6 +3846,7 @@ fn op_layout_geometry(state: &OpState, #[string] nid_str: String) -> String {
     let nid: u32 = nid_str.parse().unwrap_or(0);
     let nid = obscura_dom::tree::NodeId::new(nid);
     let mut gs = shared.borrow_mut();
+    sample_live_document_animations(&mut gs);
     if ensure_resolved_scroll(&mut gs).is_some() {
         let Some((_, scroll)) = gs.resolved_scroll.as_ref() else {
             return String::new();
@@ -3445,6 +3901,7 @@ fn op_computed_style(state: &OpState, #[string] nid_str: String) -> String {
     let nid: u32 = nid_str.parse().unwrap_or(0);
     let nid = obscura_dom::tree::NodeId::new(nid);
     let mut gs = shared.borrow_mut();
+    sample_live_document_animations(&mut gs);
     let Some(prepared) = ensure_prepared_render(&mut gs) else {
         return String::new();
     };
@@ -3480,6 +3937,7 @@ fn op_css_supports(#[string] name: &str, #[string] value: &str) -> bool {
 fn op_layout_metrics(state: &OpState) -> String {
     let shared = state.borrow::<SharedState>().clone();
     let mut gs = shared.borrow_mut();
+    sample_live_document_animations(&mut gs);
     let viewport = gs.viewport;
     let content = ensure_prepared_render(&mut gs)
         .map(|prepared| prepared.content_size())
@@ -3497,6 +3955,7 @@ fn op_element_scroll_metrics(state: &OpState, #[string] nid_str: String) -> Stri
     let shared = state.borrow::<SharedState>().clone();
     let nid = NodeId::new(nid_str.parse().unwrap_or(0));
     let mut gs = shared.borrow_mut();
+    sample_live_document_animations(&mut gs);
     if ensure_resolved_scroll(&mut gs).is_none() {
         return String::new();
     }
@@ -3533,6 +3992,7 @@ fn op_element_scroll_to(state: &OpState, #[string] nid_str: String, x: f64, y: f
     let shared = state.borrow::<SharedState>().clone();
     let nid = NodeId::new(nid_str.parse().unwrap_or(0));
     let mut gs = shared.borrow_mut();
+    sample_live_document_animations(&mut gs);
     if ensure_resolved_scroll(&mut gs).is_none() {
         return String::new();
     }
@@ -3575,6 +4035,7 @@ fn op_element_scroll_to(state: &OpState, #[string] nid_str: String, x: f64, y: f
 fn op_scroll_offset(state: &OpState) -> String {
     let shared = state.borrow::<SharedState>().clone();
     let mut gs = shared.borrow_mut();
+    sample_live_document_animations(&mut gs);
     let requested = gs.scroll_offset;
     let (x, y) = clamp_scroll_offset(&mut gs, requested);
     format!("{{\"x\":{},\"y\":{}}}", x, y)
@@ -3586,6 +4047,7 @@ fn op_scroll_offset(state: &OpState) -> String {
 fn op_scroll_to(state: &OpState, x: f64, y: f64) -> String {
     let shared = state.borrow::<SharedState>().clone();
     let mut gs = shared.borrow_mut();
+    sample_live_document_animations(&mut gs);
     let (x, y) = clamp_scroll_offset(&mut gs, (x as f32, y as f32));
     format!("{{\"x\":{},\"y\":{}}}", x, y)
 }

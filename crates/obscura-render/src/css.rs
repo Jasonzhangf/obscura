@@ -1290,6 +1290,19 @@ fn note_compound_dependencies(
                             }
                         }
                     }
+                    "dir" | "lang" => {
+                        // The corresponding HTML attributes inherit through
+                        // descendants, while the functional selector may
+                        // observe language/direction resolved above the
+                        // mutated node. Keep the dependency keyed, but require
+                        // the retained planner's sound full fallback.
+                        map.push_state(
+                            name,
+                            rule_order,
+                            InvalidationReaches::CONSERVATIVE,
+                        );
+                        map.mark_conservative(rule_order);
+                    }
                     _ => {
                         // A compiled functional pseudo outside the explicitly
                         // modeled set may hide selector or document state.
@@ -1449,6 +1462,8 @@ fn note_declaration_attribute_dependencies(
 fn selector_requires_conservative_tracking(selector: &str) -> bool {
     let selector = selector.to_ascii_lowercase();
     selector.contains(":has(")
+        || selector.contains(":dir(")
+        || selector.contains(":lang(")
         || selector.contains(":nth-child(")
         || selector.contains(":nth-last-child(")
         || selector.contains(":nth-of-type(")
@@ -1637,6 +1652,86 @@ impl PseudoRuleMap {
             }
         }
         self.rules.push(rule);
+    }
+
+    fn bucket_matches_container_query_rule(
+        &self,
+        bucket: Option<&Vec<usize>>,
+        tree: &DomTree,
+        matcher: &mut Matcher,
+        nid: NodeId,
+    ) -> bool {
+        bucket.is_some_and(|indices| {
+            indices.iter().copied().any(|index| {
+                let rule = &self.rules[index];
+                rule.container_condition_id != ContainerConditionId::NONE
+                    && (rule.candidate_slot == NO_CANDIDATE_SLOT
+                        || matcher.mark_candidate(rule.candidate_slot as usize))
+                    && matcher.matches(tree, nid, &rule.sel)
+            })
+        })
+    }
+
+    fn node_matches_container_query_rule(
+        &self,
+        tree: &DomTree,
+        matcher: &mut Matcher,
+        nid: NodeId,
+    ) -> bool {
+        if self.candidate_slot_count != 0 {
+            matcher.begin_candidate_collection(self.candidate_slot_count);
+        }
+        let Some(node) = tree.get_node(nid) else {
+            return false;
+        };
+        node.as_element().is_some_and(|element| {
+            self.bucket_matches_container_query_rule(
+                self.by_local.get(element.local.as_ref()),
+                tree,
+                matcher,
+                nid,
+            ) || (is_root_element(tree, nid)
+                && self.bucket_matches_container_query_rule(
+                    (!self.by_root.is_empty()).then_some(&self.by_root),
+                    tree,
+                    matcher,
+                    nid,
+                ))
+                || node.get_attribute("id").is_some_and(|id| {
+                    self.bucket_matches_container_query_rule(
+                        self.by_id.get(id),
+                        tree,
+                        matcher,
+                        nid,
+                    )
+                })
+                || node.get_attribute("class").is_some_and(|classes| {
+                    classes.split_whitespace().any(|class| {
+                        self.bucket_matches_container_query_rule(
+                            self.by_class.get(class),
+                            tree,
+                            matcher,
+                            nid,
+                        )
+                    })
+                })
+                || node.attrs().is_some_and(|attributes| {
+                    attributes.iter().any(|attribute| {
+                        self.bucket_matches_container_query_rule(
+                            self.by_attribute.get(attribute.name.local.as_ref()),
+                            tree,
+                            matcher,
+                            nid,
+                        )
+                    })
+                })
+                || self.bucket_matches_container_query_rule(
+                    (!self.universal.is_empty()).then_some(&self.universal),
+                    tree,
+                    matcher,
+                    nid,
+                )
+        })
     }
 }
 
@@ -2330,6 +2425,98 @@ impl Stylesheet {
                 .any(|rule| rule.container_condition_id != ContainerConditionId::NONE)
     }
 
+    /// Whether `nid` can receive a declaration from any container-conditional
+    /// rule in the current DOM state. Retained style uses this to reset only
+    /// conditional subjects (and their inherited subtrees) for its query-free
+    /// seed pass instead of discarding every clean computed style merely
+    /// because the document owns a query container.
+    fn bucket_matches_container_query_rule(
+        &self,
+        bucket: Option<&Vec<usize>>,
+        tree: &DomTree,
+        matcher: &mut Matcher,
+        nid: NodeId,
+    ) -> bool {
+        bucket.is_some_and(|indices| {
+            indices.iter().copied().any(|index| {
+                let rule = &self.rules[index];
+                rule.container_condition_id != ContainerConditionId::NONE
+                    && (rule.candidate_slot == NO_CANDIDATE_SLOT
+                        || matcher.mark_candidate(rule.candidate_slot as usize))
+                    && matcher.matches(tree, nid, &rule.sel)
+            })
+        })
+    }
+
+    pub(crate) fn node_matches_container_query_rule(
+        &self,
+        tree: &DomTree,
+        matcher: &mut Matcher,
+        nid: NodeId,
+    ) -> bool {
+        if self.candidate_slot_count != 0 {
+            matcher.begin_candidate_collection(self.candidate_slot_count);
+        }
+        let Some(node) = tree.get_node(nid) else {
+            return false;
+        };
+        let normal_match = node.as_element().is_some_and(|element| {
+            self.bucket_matches_container_query_rule(
+                self.by_local.get(element.local.as_ref()),
+                tree,
+                matcher,
+                nid,
+            ) || (is_root_element(tree, nid)
+                && self.bucket_matches_container_query_rule(
+                    (!self.by_root.is_empty()).then_some(&self.by_root),
+                    tree,
+                    matcher,
+                    nid,
+                ))
+                || node.get_attribute("id").is_some_and(|id| {
+                    self.bucket_matches_container_query_rule(
+                        self.by_id.get(id),
+                        tree,
+                        matcher,
+                        nid,
+                    )
+                })
+                || node.get_attribute("class").is_some_and(|classes| {
+                    classes.split_whitespace().any(|class| {
+                        self.bucket_matches_container_query_rule(
+                            self.by_class.get(class),
+                            tree,
+                            matcher,
+                            nid,
+                        )
+                    })
+                })
+                || node.attrs().is_some_and(|attributes| {
+                    attributes.iter().any(|attribute| {
+                        self.bucket_matches_container_query_rule(
+                            self.by_attribute.get(attribute.name.local.as_ref()),
+                            tree,
+                            matcher,
+                            nid,
+                        )
+                    })
+                })
+                || self.bucket_matches_container_query_rule(
+                    (!self.universal.is_empty()).then_some(&self.universal),
+                    tree,
+                    matcher,
+                    nid,
+                )
+        });
+        normal_match
+            || self
+                .before_rules
+                .node_matches_container_query_rule(tree, matcher, nid)
+            || self
+                .after_rules
+                .node_matches_container_query_rule(tree, matcher, nid)
+    }
+
     pub(crate) fn container_condition_depth(&self) -> usize {
         self.container_conditions
             .iter()
@@ -2861,6 +3048,39 @@ impl Stylesheet {
         parent_props: &HashMap<String, String>,
         inline_css: Option<&str>,
     ) -> Option<HashMap<String, String>> {
+        let mut animation_timeline = crate::AnimationTimelineState::default();
+        self.apply_at_animation_time(
+            tree,
+            matcher,
+            nid,
+            id,
+            classes,
+            local,
+            style,
+            parent_props,
+            inline_css,
+            crate::AnimationSample {
+                time: self.animation_sample_time,
+                mode: crate::AnimationSampleMode::DocumentTime,
+            },
+            &mut animation_timeline,
+        )
+    }
+
+    pub(crate) fn apply_at_animation_time(
+        &self,
+        tree: &DomTree,
+        matcher: &mut Matcher,
+        nid: NodeId,
+        id: Option<&str>,
+        classes: &[String],
+        local: &str,
+        style: &mut LayoutStyle,
+        parent_props: &HashMap<String, String>,
+        inline_css: Option<&str>,
+        animation_sample: crate::AnimationSample,
+        animation_timeline: &mut crate::AnimationTimelineState,
+    ) -> Option<HashMap<String, String>> {
         self.apply_internal(
             tree,
             matcher,
@@ -2872,9 +3092,12 @@ impl Stylesheet {
             parent_props,
             inline_css,
             None,
+            animation_sample,
+            animation_timeline,
         )
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn apply_with_container_queries(
         &self,
         tree: &DomTree,
@@ -2888,6 +3111,41 @@ impl Stylesheet {
         inline_css: Option<&str>,
         evaluator: &mut ContainerQueryEvaluator<'_>,
     ) -> Option<HashMap<String, String>> {
+        let mut animation_timeline = crate::AnimationTimelineState::default();
+        self.apply_with_container_queries_at_animation_time(
+            tree,
+            matcher,
+            nid,
+            id,
+            classes,
+            local,
+            style,
+            parent_props,
+            inline_css,
+            evaluator,
+            crate::AnimationSample {
+                time: self.animation_sample_time,
+                mode: crate::AnimationSampleMode::DocumentTime,
+            },
+            &mut animation_timeline,
+        )
+    }
+
+    pub(crate) fn apply_with_container_queries_at_animation_time(
+        &self,
+        tree: &DomTree,
+        matcher: &mut Matcher,
+        nid: NodeId,
+        id: Option<&str>,
+        classes: &[String],
+        local: &str,
+        style: &mut LayoutStyle,
+        parent_props: &HashMap<String, String>,
+        inline_css: Option<&str>,
+        evaluator: &mut ContainerQueryEvaluator<'_>,
+        animation_sample: crate::AnimationSample,
+        animation_timeline: &mut crate::AnimationTimelineState,
+    ) -> Option<HashMap<String, String>> {
         self.apply_internal(
             tree,
             matcher,
@@ -2899,6 +3157,8 @@ impl Stylesheet {
             parent_props,
             inline_css,
             Some(evaluator),
+            animation_sample,
+            animation_timeline,
         )
     }
 
@@ -2914,6 +3174,8 @@ impl Stylesheet {
         parent_props: &HashMap<String, String>,
         inline_css: Option<&str>,
         mut evaluator: Option<&mut ContainerQueryEvaluator<'_>>,
+        animation_sample: crate::AnimationSample,
+        animation_timeline: &mut crate::AnimationTimelineState,
     ) -> Option<HashMap<String, String>> {
         // Keep the two cascade priorities separate from the outset. A typical
         // stylesheet has very few important declarations, so cloning and
@@ -3265,6 +3527,7 @@ impl Stylesheet {
             || important_matched
                 .iter()
                 .any(|&(_, _, i)| self.rules[i].important_flags.has_animation);
+        style.animation_has_render_effect = false;
         if !self.keyframes.is_empty() && (style.animation_name.is_some() || important_has_animation)
         {
             let mut animation_style = style.clone();
@@ -3290,15 +3553,31 @@ impl Stylesheet {
             }
             if let Some(name) = animation_style.animation_name.as_deref() {
                 if let Some(keyframes) = self.keyframes.get(name) {
+                    style.animation_has_render_effect = !keyframes.tracks.is_empty();
+                    let local_sample = animation_timeline.sample_for(
+                        nid,
+                        crate::AnimationInstanceKey {
+                            name: name.to_string(),
+                        },
+                        animation_style.animation_timing.play_state,
+                        animation_sample,
+                    );
+                    style.animation_local_time_ms = local_sample.milliseconds;
                     sample_animation_properties(
                         keyframes,
                         style,
                         &animation_style.animation_timing,
-                        self.animation_sample_time,
+                        local_sample,
                         props,
                     );
+                } else {
+                    animation_timeline.clear_animation(nid, animation_sample);
                 }
+            } else {
+                animation_timeline.clear_animation(nid, animation_sample);
             }
+        } else {
+            animation_timeline.clear_animation(nid, animation_sample);
         }
 
         for &(_, _, i) in &important_matched {
@@ -4251,11 +4530,10 @@ fn animation_directed_progress(
     } else {
         duration * iterations
     };
-    let local_time = if timing.play_state == crate::AnimationPlayState::Paused {
-        0.0
-    } else {
-        sample_time.milliseconds
-    };
+    // The timeline owns pause/resume hold time. Keeping that state outside the
+    // sampler lets a running animation freeze at its current progress and
+    // later resume without manufacturing a new instance.
+    let local_time = sample_time.milliseconds;
     if !local_time.is_finite() {
         return None;
     }

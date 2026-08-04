@@ -902,6 +902,29 @@ async fn run_fetch(
             // OBSCURA_SHOT_W / OBSCURA_SHOT_H override it (e.g. a tall viewport to
             // capture below-the-fold content in one shot).
             let viewport = screenshot_viewport.unwrap_or((1280.0, 720.0));
+            // Ordinary screenshots sample the live document timeline. The
+            // comparison harness can request an exact instant (normally T=0)
+            // so both engines paint the same animation frame.
+            let requested_animation_sample = std::env::var("OBSCURA_SHOT_ANIMATION_TIME_MS")
+                .ok()
+                .map(|raw| {
+                    let milliseconds = raw.parse::<f32>().map_err(|_| {
+                        anyhow::anyhow!(
+                            "OBSCURA_SHOT_ANIMATION_TIME_MS must be a finite non-negative number"
+                        )
+                    })?;
+                    if !milliseconds.is_finite() || milliseconds < 0.0 {
+                        anyhow::bail!(
+                            "OBSCURA_SHOT_ANIMATION_TIME_MS must be a finite non-negative number"
+                        );
+                    }
+                    Ok(obscura_browser::AnimationSampleTime { milliseconds })
+                })
+                .transpose()?;
+            let capture_screenshot = |page: &Page| match requested_animation_sample {
+                Some(sample) => page.screenshot_at_animation_time(viewport, sample),
+                None => page.screenshot(viewport),
+            };
             // The parity harness performs one throwaway paint in both engines
             // before observing image/font readiness. Obscura resolves retained
             // render resources during prepare/paint, so sampling first would
@@ -910,7 +933,7 @@ async fn run_fetch(
             let warmup_capture =
                 std::env::var("OBSCURA_SHOT_RESOURCE_WARMUP").is_ok_and(|value| value == "1");
             if warmup_capture {
-                if page.screenshot(viewport).is_none() {
+                if capture_screenshot(&page).is_none() {
                     anyhow::bail!("resource warm-up screenshot failed: page has no DOM to render");
                 }
                 // Give completion callbacks one bounded task turn before the
@@ -962,7 +985,7 @@ async fn run_fetch(
                      }))()",
                 )
             });
-            match page.screenshot(viewport) {
+            match capture_screenshot(&page) {
                 Some(bytes) => std::fs::write(path, &bytes)?,
                 None => anyhow::bail!("screenshot failed: page has no DOM to render"),
             }

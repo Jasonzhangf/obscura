@@ -226,8 +226,9 @@ pub async fn print_to_pdf(
             .get_session_page_mut(session_id)
             .ok_or("No page for session")?;
         crate::domains::page::prepare_capture_resources_if_requested(page).await;
+        let animation_sample = page.live_animation_sample();
         let pdf = page
-            .raster_pdf(options.raster)
+            .raster_pdf_with_animation_sample(options.raster, animation_sample)
             .map_err(|error| error.to_string())?;
         let mut response = json!({
             "obscuraPrintMode": "screen-raster",

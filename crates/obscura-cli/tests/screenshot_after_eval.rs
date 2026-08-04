@@ -73,6 +73,57 @@ fn screenshot_is_captured_after_eval_scrolls_the_live_page() {
 }
 
 #[test]
+fn screenshots_use_live_animation_time_unless_harness_pins_a_sample() {
+    let directory = output_directory();
+    std::fs::create_dir_all(&directory).expect("temporary output directory");
+    let live = directory.join("live.png");
+    let initial = directory.join("initial.png");
+    let url = concat!(
+        "data:text/html,<html style=\"margin:0\"><head><style>",
+        "@keyframes hide{from{opacity:1}to{opacity:0}}",
+        "#cover{width:80px;height:60px;background:red;",
+        "animation:hide 50ms linear forwards}",
+        "</style></head><body style=\"margin:0;background:lime\">",
+        "<div id=\"cover\"></div></body></html>"
+    );
+
+    let run = |path: &std::path::Path, animation_time: Option<&str>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_obscura"));
+        command
+            .args(["fetch", url, "--screenshot"])
+            .arg(path)
+            .args(["--wait", "1", "--timeout", "5", "--quiet"])
+            .env("OBSCURA_SHOT_W", "80")
+            .env("OBSCURA_SHOT_H", "60")
+            .env_remove("OBSCURA_SHOT_ANIMATION_TIME_MS");
+        if let Some(milliseconds) = animation_time {
+            command.env("OBSCURA_SHOT_ANIMATION_TIME_MS", milliseconds);
+        }
+        command.output().expect("run obscura fetch")
+    };
+
+    let live_output = run(&live, None);
+    assert!(
+        live_output.status.success(),
+        "live capture failed: {}",
+        String::from_utf8_lossy(&live_output.stderr)
+    );
+    let initial_output = run(&initial, Some("0"));
+    assert!(
+        initial_output.status.success(),
+        "explicit capture failed: {}",
+        String::from_utf8_lossy(&initial_output.stderr)
+    );
+    assert_ne!(
+        std::fs::read(live).expect("live PNG"),
+        std::fs::read(initial).expect("initial PNG"),
+        "live capture must advance past a finite overlay while explicit T=0 preserves it"
+    );
+
+    std::fs::remove_dir_all(directory).expect("remove temporary output directory");
+}
+
+#[test]
 fn paired_capture_reasserts_scroll_after_the_post_eval_settle() {
     let directory = output_directory();
     std::fs::create_dir_all(&directory).expect("temporary output directory");

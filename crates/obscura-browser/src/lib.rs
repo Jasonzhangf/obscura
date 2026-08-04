@@ -9,7 +9,10 @@ pub use context::BrowserContext;
 pub use lifecycle::{LifecycleState, WaitUntil};
 pub use obscura_js::HTML_TO_MARKDOWN_JS;
 #[cfg(feature = "render")]
-pub use obscura_js::{validate_capture_region, CaptureError, CaptureRegion};
+pub use obscura_js::{
+    validate_capture_region, AnimationSample, AnimationSampleMode, AnimationSampleTime,
+    CaptureError, CaptureRegion,
+};
 pub use page::{NetworkEvent, Page, PageError};
 #[cfg(feature = "render")]
 pub use pdf::{RasterPdfError, RasterPdfOptions, RasterPdfPageRange};

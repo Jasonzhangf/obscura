@@ -425,6 +425,7 @@ pub(crate) fn queue_screencast_frame(
         let page = ctx
             .get_session_page_mut(&attached_session)
             .ok_or("No page for session")?;
+        let animation_sample = page.live_animation_sample();
         let viewport = page.viewport;
         let scroll = page
             .evaluate("[window.scrollX, window.scrollY]")
@@ -444,9 +445,12 @@ pub(crate) fn queue_screencast_frame(
             1.0,
         ))
         .map_err(capture_error_message)?;
-        let png = page.screenshot(viewport).ok_or_else(|| {
-            "Page.startScreencast failed: the page has no visible DOM surface to render".to_string()
-        })?;
+        let png = page
+            .screenshot_with_animation_sample(viewport, animation_sample)
+            .ok_or_else(|| {
+                "Page.startScreencast failed: the page has no visible DOM surface to render"
+                    .to_string()
+            })?;
         let activity_generation = page
             .js
             .as_ref()
@@ -501,7 +505,7 @@ pub(crate) async fn pump_screencast_frames(ctx: &mut CdpContext) {
             continue;
         }
         let attached_session = Some(cdp_session_id.clone());
-        let activity_generation = {
+        let (activity_generation, css_animation_active) = {
             let Some(page) = ctx.get_session_page_mut(&attached_session) else {
                 continue;
             };
@@ -511,14 +515,16 @@ pub(crate) async fn pump_screencast_frames(ctx: &mut CdpContext) {
             // A V8 watchdog bounds synchronous callbacks as well as the async
             // timeout, so a hostile timer cannot freeze the CDP connection.
             let _ = js.run_event_loop_bounded(EVENT_LOOP_SLICE_MS).await;
-            js.activity_generation()
+            let generation = js.activity_generation();
+            let css_animation_active = page.prepared_has_active_css_animations();
+            (generation, css_animation_active)
         };
 
         let should_attempt = {
             let Some(state) = ctx.screencasts.get_mut(&cdp_session_id) else {
                 continue;
             };
-            if state.observed_activity_generation != activity_generation {
+            if state.observed_activity_generation != activity_generation || css_animation_active {
                 state.observed_activity_generation = activity_generation;
                 state.autonomous_frame_pending = true;
             }
@@ -1253,6 +1259,7 @@ pub async fn handle(
                     .get_session_page_mut(session_id)
                     .ok_or("No page for session")?;
                 prepare_capture_resources_if_requested(page).await;
+                let animation_sample = page.live_animation_sample();
                 let viewport = page.viewport;
                 let device_scale_factor = f64::from(page.device_scale_factor);
                 let trusted_scroll = page.screenshot_scroll_offset();
@@ -1275,9 +1282,11 @@ pub async fn handle(
                     }
                     Some(chromium_clip_region(clip, device_scale_factor)?)
                 } else if options.capture_beyond_viewport {
-                    let content_size = page.prepared_content_size().ok_or_else(|| {
-                        "Page.captureScreenshot failed: no retained document size".to_string()
-                    })?;
+                    let content_size = page
+                        .prepared_content_size_with_animation_sample(animation_sample)
+                        .ok_or_else(|| {
+                            "Page.captureScreenshot failed: no retained document size".to_string()
+                        })?;
                     Some(obscura_browser::CaptureRegion::new(
                         0.0,
                         0.0,
@@ -1299,7 +1308,7 @@ pub async fn handle(
 
                 let png = match region {
                     Some(region) => page
-                        .screenshot_region(region)
+                        .screenshot_region_with_animation_sample(region, animation_sample)
                         .map_err(capture_error_message)?,
                     None => {
                         obscura_browser::validate_capture_region(
@@ -1312,10 +1321,11 @@ pub async fn handle(
                             ),
                         )
                         .map_err(capture_error_message)?;
-                        page.screenshot(viewport).ok_or_else(|| {
-                            "Page.captureScreenshot failed: the page has no DOM to render"
-                                .to_string()
-                        })?
+                        page.screenshot_with_animation_sample(viewport, animation_sample)
+                            .ok_or_else(|| {
+                                "Page.captureScreenshot failed: the page has no DOM to render"
+                                    .to_string()
+                            })?
                     }
                 };
 
@@ -1533,6 +1543,116 @@ mod tests {
                 > 0.0
         );
         assert_eq!(frame.params["sessionId"], 1);
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test]
+    async fn css_animation_drives_autonomous_screencast_frames_until_completion() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = format!("{page_id}-session");
+        ctx.sessions.insert(session_id.clone(), page_id);
+        let session = Some(session_id);
+        ctx.get_session_page_mut(&session)
+            .expect("page")
+            .set_viewport((80.0, 60.0));
+        handle(
+            "navigate",
+            &json!({
+                "url": "data:text/html,<html style='margin:0'><head><style>@keyframes hide{from{opacity:1}to{opacity:0}}#cover{width:80px;height:60px;background:red;animation:hide 100ms linear forwards}</style></head><body style='margin:0;background:lime'><div id=cover></div></body></html>",
+                "waitUntil": "load",
+            }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("navigate animation fixture");
+
+        ctx.pending_events.clear();
+        handle("startScreencast", &json!({}), &mut ctx, &session)
+            .await
+            .expect("start screencast");
+        let initial = ctx
+            .pending_events
+            .iter()
+            .find(|event| event.method == "Page.screencastFrame")
+            .expect("initial frame")
+            .params["data"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let generation = ctx
+            .get_session_page_mut(&session)
+            .unwrap()
+            .js
+            .as_ref()
+            .unwrap()
+            .activity_generation();
+
+        ctx.pending_events.clear();
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        pump_screencast_frames(&mut ctx).await;
+        let (animated, frame_session_id) = {
+            let event = ctx
+                .pending_events
+                .iter()
+                .find(|event| event.method == "Page.screencastFrame")
+                .expect("CSS-only animation frame");
+            (
+                event.params["data"].as_str().unwrap().to_string(),
+                event.params["sessionId"].as_u64().unwrap(),
+            )
+        };
+        assert_ne!(animated, initial);
+        assert_eq!(
+            ctx.get_session_page_mut(&session)
+                .unwrap()
+                .js
+                .as_ref()
+                .unwrap()
+                .activity_generation(),
+            generation,
+            "CSS timeline damage must not depend on DOM or task activity"
+        );
+
+        for _ in 0..2 {
+            handle(
+                "screencastFrameAck",
+                &json!({"sessionId": frame_session_id}),
+                &mut ctx,
+                &session,
+            )
+            .await
+            .expect("ack frame");
+        }
+        ctx.pending_events.clear();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        pump_screencast_frames(&mut ctx).await;
+        assert!(
+            ctx.pending_events
+                .iter()
+                .any(|event| event.method == "Page.screencastFrame"),
+            "the stream must emit the finite animation's final frame"
+        );
+        assert!(!ctx
+            .get_session_page_mut(&session)
+            .unwrap()
+            .prepared_has_active_css_animations());
+
+        handle(
+            "screencastFrameAck",
+            &json!({"sessionId": frame_session_id}),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("ack final frame");
+        ctx.pending_events.clear();
+        pump_screencast_frames(&mut ctx).await;
+        assert!(
+            ctx.pending_events.is_empty(),
+            "a completed finite animation must not keep rasterizing idle frames"
+        );
     }
 
     #[cfg(feature = "render")]

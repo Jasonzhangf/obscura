@@ -355,15 +355,162 @@ pub struct DomLayout {
 }
 
 /// One connected element attribute mutation eligible for conservative
-/// retained-style invalidation. Attributes with independent HTML rendering
-/// semantics (image sources, form state, inline style, and similar) still use
-/// the ordinary full-layout path.
+/// retained-style invalidation. The planner distinguishes ordinary selector
+/// attributes from mapped presentation hints and attributes which can change
+/// global stylesheets or loaded resources.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AttributeStyleMutation {
     pub node: NodeId,
     pub name: String,
     pub old_value: Option<String>,
     pub new_value: Option<String>,
+}
+
+/// How an attribute mutation participates in retained style.
+///
+/// This classification is public so DOM bindings can decide whether to keep a
+/// prepared render without maintaining a second, inevitably divergent HTML
+/// attribute allowlist.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetainedAttributeMutationKind {
+    /// Only selector matching or declaration `attr()` can observe the value.
+    Selector,
+    /// The renderer maps the attribute into computed style or a native box.
+    Subtree,
+    /// The attribute can replace global CSS/resources or has document-wide
+    /// semantics which cannot be represented by a bounded style dirty set.
+    Full,
+}
+
+/// Classify an element attribute for conservative retained-style planning.
+///
+/// Unknown attributes are deliberately selector-only. Custom elements and
+/// frameworks routinely toggle attributes such as `autocomplete`, `part`,
+/// and `itemprop`; forcing a document cascade for an unreferenced attribute is
+/// both unnecessary and particularly costly during hydration. Known HTML
+/// resource/global attributes remain an explicit full fallback.
+pub fn retained_attribute_mutation_kind(
+    tree: &DomTree,
+    node: NodeId,
+    name: &str,
+) -> RetainedAttributeMutationKind {
+    use RetainedAttributeMutationKind::{Full, Selector, Subtree};
+
+    let name = name.to_ascii_lowercase();
+    if name == "style" {
+        return Subtree;
+    }
+    let Some(local) = tree.get_node(node).and_then(|node| {
+        node.as_element()
+            .map(|element| element.local.as_ref().to_ascii_lowercase())
+    }) else {
+        return Full;
+    };
+
+    // These nodes feed document-global stylesheet, URL, metadata, or script
+    // state. A selector dirty set cannot describe the external side effect.
+    if (local == "base" && matches!(name.as_str(), "href" | "target"))
+        || (local == "meta"
+            && matches!(name.as_str(), "charset" | "content" | "http-equiv" | "name"))
+        || (local == "style" && matches!(name.as_str(), "media" | "type" | "title"))
+        || (local == "link"
+            && matches!(
+                name.as_str(),
+                "as" | "crossorigin"
+                    | "disabled"
+                    | "fetchpriority"
+                    | "href"
+                    | "hreflang"
+                    | "imagesizes"
+                    | "imagesrcset"
+                    | "integrity"
+                    | "media"
+                    | "referrerpolicy"
+                    | "rel"
+                    | "sizes"
+                    | "type"
+            ))
+        || (local == "script"
+            && matches!(
+                name.as_str(),
+                "async"
+                    | "crossorigin"
+                    | "defer"
+                    | "fetchpriority"
+                    | "integrity"
+                    | "nomodule"
+                    | "referrerpolicy"
+                    | "src"
+                    | "type"
+            ))
+    {
+        return Full;
+    }
+
+    // Resource selection changes require the embedding runtime to rebuild its
+    // decoded-resource/intrinsic-size inputs, not merely recompute CSS.
+    if (local == "img"
+        && matches!(
+            name.as_str(),
+            "crossorigin"
+                | "decoding"
+                | "fetchpriority"
+                | "referrerpolicy"
+                | "sizes"
+                | "src"
+                | "srcset"
+        ))
+        || (local == "source"
+            && matches!(
+                name.as_str(),
+                "height" | "media" | "sizes" | "src" | "srcset" | "type" | "width"
+            ))
+        || (matches!(local.as_str(), "audio" | "video" | "track")
+            && matches!(
+                name.as_str(),
+                "crossorigin"
+                    | "kind"
+                    | "label"
+                    | "media"
+                    | "poster"
+                    | "preload"
+                    | "src"
+                    | "srclang"
+                    | "type"
+            ))
+        || (matches!(local.as_str(), "embed" | "iframe")
+            && matches!(name.as_str(), "src" | "srcdoc" | "type"))
+        || (local == "object" && matches!(name.as_str(), "data" | "type"))
+        || (matches!(local.as_str(), "image" | "use")
+            && matches!(name.as_str(), "href" | "xlink:href"))
+    {
+        return Full;
+    }
+
+    // These values enter the UA/presentational cascade or are folded into a
+    // native control's final used style. Refreshing the complete subtree also
+    // covers inheritance and generated content while retaining clean peers.
+    if matches!(
+        name.as_str(),
+        "align"
+            | "bgcolor"
+            | "cellpadding"
+            | "cellspacing"
+            | "color"
+            | "height"
+            | "hidden"
+            | "valign"
+            | "viewbox"
+            | "width"
+    ) || (local == "input" && matches!(name.as_str(), "size" | "type" | "value"))
+        || (local == "select" && name == "size")
+        || (local == "textarea" && matches!(name.as_str(), "cols" | "rows" | "wrap"))
+        || matches!(name.as_str(), "dir" | "lang" | "xml:lang")
+    {
+        return Subtree;
+    }
+
+    Selector
 }
 
 /// A connected tree change which can reuse computed styles from the previous
@@ -1931,6 +2078,8 @@ fn cascade_walk(
     container_evaluator: &mut Option<&mut crate::css::ContainerQueryEvaluator<'_>>,
     quirks_mode: bool,
     viewport: (f32, f32),
+    animation_sample: crate::AnimationSample,
+    animation_timeline: &mut crate::AnimationTimelineState,
     inherited_cell_padding: Option<f32>,
     inherited_color_scheme_dark: bool,
     fresh_styles: Option<&HashSet<NodeId>>,
@@ -2082,7 +2231,7 @@ fn cascade_walk(
             .map(|c| c.split_whitespace().map(|s| s.to_string()).collect())
             .unwrap_or_default();
         let effective_props = if let Some(evaluator) = container_evaluator.as_deref_mut() {
-            sheet.apply_with_container_queries(
+            sheet.apply_with_container_queries_at_animation_time(
                 tree,
                 matcher,
                 id,
@@ -2093,9 +2242,11 @@ fn cascade_walk(
                 parent_props,
                 node.get_attribute("style"),
                 evaluator,
+                animation_sample,
+                animation_timeline,
             )
         } else {
-            sheet.apply(
+            sheet.apply_at_animation_time(
                 tree,
                 matcher,
                 id,
@@ -2105,6 +2256,8 @@ fn cascade_walk(
                 &mut style,
                 parent_props,
                 node.get_attribute("style"),
+                animation_sample,
+                animation_timeline,
             )
         };
         if let Some(m) = effective_props {
@@ -2162,6 +2315,8 @@ fn cascade_walk(
             container_evaluator,
             quirks_mode,
             viewport,
+            animation_sample,
+            animation_timeline,
             descendant_cell_padding,
             descendant_color_scheme_dark,
             fresh_styles,
@@ -2425,6 +2580,63 @@ fn add_style_subtree(tree: &DomTree, root: NodeId, dirty: &mut HashSet<NodeId>) 
     dirty.extend(tree.ancestors(root));
 }
 
+fn add_container_query_reset_scopes(
+    tree: &DomTree,
+    id: NodeId,
+    sheet: &crate::css::Stylesheet,
+    matcher: &mut obscura_dom::selector::Matcher,
+    active_containers: &HashSet<NodeId>,
+    inside_active_container: bool,
+    selected_ancestor: bool,
+    dirty: &mut HashSet<NodeId>,
+) {
+    let is_element = tree.get_node(id).is_some_and(|node| node.is_element());
+    let can_query_here = inside_active_container || active_containers.contains(&id);
+    let selected_here = !selected_ancestor
+        && can_query_here
+        && is_element
+        && sheet.node_matches_container_query_rule(tree, matcher, id);
+    let selected = selected_ancestor || selected_here;
+    if selected {
+        // The retained style is the previous converged, query-enabled value.
+        // The convergence seed pass deliberately disables query rules, so
+        // reset every possible subject and inherited descendant to its base
+        // cascade before geometry is sampled again.
+        dirty.insert(id);
+    }
+    if selected_here {
+        // Stop as soon as an already-recorded context node is reached. An
+        // earlier selected sibling necessarily inserted the rest of this same
+        // ancestor chain, so each ancestor is visited at most once.
+        let mut ancestor = tree.get_node(id).and_then(|node| node.parent);
+        while let Some(parent) = ancestor {
+            if !dirty.insert(parent) {
+                break;
+            }
+            ancestor = tree.get_node(parent).and_then(|node| node.parent);
+        }
+    }
+    if is_element {
+        matcher.push_ancestor(tree, id);
+    }
+    let children_inside_container = inside_active_container || active_containers.contains(&id);
+    for child in tree.children(id) {
+        add_container_query_reset_scopes(
+            tree,
+            child,
+            sheet,
+            matcher,
+            active_containers,
+            children_inside_container,
+            selected,
+            dirty,
+        );
+    }
+    if is_element {
+        matcher.pop_ancestor();
+    }
+}
+
 fn add_following_sibling_subtrees(
     tree: &DomTree,
     node: NodeId,
@@ -2583,6 +2795,13 @@ fn add_relational_tree_invalidation(
                 continue;
             }
             if invalidation.unrepresentable_outer_path {
+                if std::env::var_os("OBSCURA_RENDER_TIMING").is_some() {
+                    eprintln!(
+                        "[timing] retained-style fallback reason=relational-unrepresentable rule_order={} anchor={} mutation={mutation:?}",
+                        invalidation.rule_order,
+                        anchor.index(),
+                    );
+                }
                 return false;
             }
             add_relational_anchor_scope(
@@ -2959,6 +3178,13 @@ fn retained_style_plan(
                         || node_is_style_text(tree, node, old_parent)
                         || node_is_style_text(tree, node, Some(new_parent))
                     {
+                        if std::env::var_os("OBSCURA_RENDER_TIMING").is_some() {
+                            eprintln!(
+                                "[timing] retained-style fallback reason=style-subtree-insert node={} old_parent={old_parent:?} new_parent={}",
+                                node.index(),
+                                new_parent.index(),
+                            );
+                        }
                         return RetainedStylePlan::Full;
                     }
                     if !add_relational_tree_invalidation(tree, map, mutation, &mut dirty) {
@@ -2989,6 +3215,13 @@ fn retained_style_plan(
                     if subtree_contains_style_element(tree, node)
                         || node_is_style_text(tree, node, Some(old_parent))
                     {
+                        if std::env::var_os("OBSCURA_RENDER_TIMING").is_some() {
+                            eprintln!(
+                                "[timing] retained-style fallback reason=style-subtree-remove node={} old_parent={}",
+                                node.index(),
+                                old_parent.index(),
+                            );
+                        }
                         return RetainedStylePlan::Full;
                     }
                     if !add_relational_tree_invalidation(tree, map, mutation, &mut dirty) {
@@ -3002,6 +3235,12 @@ fn retained_style_plan(
                 }
                 TreeStyleMutation::Text { node, parent } => {
                     if node_is_style_text(tree, node, parent) {
+                        if std::env::var_os("OBSCURA_RENDER_TIMING").is_some() {
+                            eprintln!(
+                                "[timing] retained-style fallback reason=style-text node={} parent={parent:?}",
+                                node.index(),
+                            );
+                        }
                         return RetainedStylePlan::Full;
                     }
                     if !add_relational_tree_invalidation(tree, map, mutation, &mut dirty) {
@@ -3018,24 +3257,15 @@ fn retained_style_plan(
             continue;
         };
         let name = mutation.name.to_ascii_lowercase();
-        // Phase one deliberately excludes attributes with independent HTML
-        // rendering behavior. class/id and data/ARIA state cover framework
-        // hydration churn while source selection, form state, mapped
-        // presentation hints, and inline declarations retain the full path.
-        if name != "class"
-            && name != "id"
-            && name != "style"
-            && !name.starts_with("data-")
-            && !name.starts_with("aria-")
-        {
-            return RetainedStylePlan::Full;
-        }
-
-        // Inline declarations always change this element's cascade and may
-        // change inherited values/custom properties throughout its subtree,
-        // even when no author selector explicitly mentions `[style]`.
-        if name == "style" {
-            add_style_subtree(tree, mutation.node, &mut dirty);
+        match retained_attribute_mutation_kind(tree, mutation.node, &name) {
+            RetainedAttributeMutationKind::Full => return RetainedStylePlan::Full,
+            RetainedAttributeMutationKind::Subtree => {
+                // Mapped hints and native-control sizing enter the mutable
+                // LayoutStyle graph. Re-cascade from specified values before
+                // post-cascade used-value repair runs again.
+                add_style_subtree(tree, mutation.node, &mut dirty);
+            }
+            RetainedAttributeMutationKind::Selector => {}
         }
 
         let map = sheet.invalidation_map();
@@ -3057,6 +3287,26 @@ fn retained_style_plan(
             {
                 dependencies.extend_from_slice(map.class_dependencies(class));
             }
+        }
+
+        // Several HTML boolean/value attributes also back selector pseudo
+        // states. Include both sides of paired states so removing an attribute
+        // invalidates rules such as `:enabled` and `:optional`, not only the
+        // positive state.
+        let states: &[&str] = match name.as_str() {
+            "checked" | "selected" => &["checked"],
+            "disabled" => &["disabled", "enabled"],
+            "dir" => &["dir"],
+            "href" => &["any-link", "link", "visited"],
+            "lang" | "xml:lang" => &["lang"],
+            "open" => &["open"],
+            "placeholder" | "value" => &["placeholder-shown"],
+            "readonly" => &["read-only", "read-write"],
+            "required" => &["required", "optional"],
+            _ => &[],
+        };
+        for state in states {
+            dependencies.extend_from_slice(map.state_dependencies(state));
         }
 
         for dependency in dependencies {
@@ -3086,6 +3336,7 @@ pub(crate) fn layout_dom_with_web_fonts(
     layout_dom_with_web_fonts_measured(tree, viewport, intrinsic, fonts).0
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn layout_dom_with_web_fonts_and_stylesheet_cache(
     tree: &DomTree,
     viewport: (f32, f32),
@@ -3093,7 +3344,49 @@ pub(crate) fn layout_dom_with_web_fonts_and_stylesheet_cache(
     fonts: &[crate::inline::WebFont],
     stylesheet_cache: &mut crate::css::StylesheetCache,
 ) -> DomLayout {
-    layout_dom_with_web_fonts_pass_limit(
+    layout_dom_with_web_fonts_and_stylesheet_cache_at_animation_time(
+        tree,
+        viewport,
+        intrinsic,
+        fonts,
+        stylesheet_cache,
+        crate::AnimationSampleTime::default(),
+    )
+}
+
+pub(crate) fn layout_dom_with_web_fonts_and_stylesheet_cache_at_animation_time(
+    tree: &DomTree,
+    viewport: (f32, f32),
+    intrinsic: &HashMap<NodeId, (f32, f32)>,
+    fonts: &[crate::inline::WebFont],
+    stylesheet_cache: &mut crate::css::StylesheetCache,
+    animation_sample_time: crate::AnimationSampleTime,
+) -> DomLayout {
+    let mut animation_timeline = crate::AnimationTimelineState::default();
+    layout_dom_with_web_fonts_and_stylesheet_cache_with_animation_state(
+        tree,
+        viewport,
+        intrinsic,
+        fonts,
+        stylesheet_cache,
+        crate::AnimationSample {
+            time: animation_sample_time,
+            mode: crate::AnimationSampleMode::DocumentTime,
+        },
+        &mut animation_timeline,
+    )
+}
+
+pub(crate) fn layout_dom_with_web_fonts_and_stylesheet_cache_with_animation_state(
+    tree: &DomTree,
+    viewport: (f32, f32),
+    intrinsic: &HashMap<NodeId, (f32, f32)>,
+    fonts: &[crate::inline::WebFont],
+    stylesheet_cache: &mut crate::css::StylesheetCache,
+    animation_sample: crate::AnimationSample,
+    animation_timeline: &mut crate::AnimationTimelineState,
+) -> DomLayout {
+    layout_dom_with_web_fonts_pass_limit_at_animation_time(
         tree,
         viewport,
         intrinsic,
@@ -3102,10 +3395,13 @@ pub(crate) fn layout_dom_with_web_fonts_and_stylesheet_cache(
         Some(stylesheet_cache),
         None,
         &[],
+        animation_sample,
+        animation_timeline,
     )
     .0
 }
 
+#[allow(dead_code)]
 pub(crate) fn layout_dom_with_web_fonts_and_retained_styles(
     tree: &DomTree,
     viewport: (f32, f32),
@@ -3115,7 +3411,57 @@ pub(crate) fn layout_dom_with_web_fonts_and_retained_styles(
     retained: RetainedStyleMaps,
     mutations: &[RetainedStyleMutation],
 ) -> DomLayout {
-    layout_dom_with_web_fonts_pass_limit(
+    layout_dom_with_web_fonts_and_retained_styles_at_animation_time(
+        tree,
+        viewport,
+        intrinsic,
+        fonts,
+        stylesheet_cache,
+        retained,
+        mutations,
+        crate::AnimationSampleTime::default(),
+    )
+}
+
+pub(crate) fn layout_dom_with_web_fonts_and_retained_styles_at_animation_time(
+    tree: &DomTree,
+    viewport: (f32, f32),
+    intrinsic: &HashMap<NodeId, (f32, f32)>,
+    fonts: &[crate::inline::WebFont],
+    stylesheet_cache: &mut crate::css::StylesheetCache,
+    retained: RetainedStyleMaps,
+    mutations: &[RetainedStyleMutation],
+    animation_sample_time: crate::AnimationSampleTime,
+) -> DomLayout {
+    let mut animation_timeline = crate::AnimationTimelineState::default();
+    layout_dom_with_web_fonts_and_retained_styles_with_animation_state(
+        tree,
+        viewport,
+        intrinsic,
+        fonts,
+        stylesheet_cache,
+        retained,
+        mutations,
+        crate::AnimationSample {
+            time: animation_sample_time,
+            mode: crate::AnimationSampleMode::DocumentTime,
+        },
+        &mut animation_timeline,
+    )
+}
+
+pub(crate) fn layout_dom_with_web_fonts_and_retained_styles_with_animation_state(
+    tree: &DomTree,
+    viewport: (f32, f32),
+    intrinsic: &HashMap<NodeId, (f32, f32)>,
+    fonts: &[crate::inline::WebFont],
+    stylesheet_cache: &mut crate::css::StylesheetCache,
+    retained: RetainedStyleMaps,
+    mutations: &[RetainedStyleMutation],
+    animation_sample: crate::AnimationSample,
+    animation_timeline: &mut crate::AnimationTimelineState,
+) -> DomLayout {
+    layout_dom_with_web_fonts_pass_limit_at_animation_time(
         tree,
         viewport,
         intrinsic,
@@ -3124,6 +3470,8 @@ pub(crate) fn layout_dom_with_web_fonts_and_retained_styles(
         Some(stylesheet_cache),
         Some(retained),
         mutations,
+        animation_sample,
+        animation_timeline,
     )
     .0
 }
@@ -3146,6 +3494,33 @@ fn layout_dom_with_web_fonts_pass_limit(
     stylesheet_cache: Option<&mut crate::css::StylesheetCache>,
     retained: Option<RetainedStyleMaps>,
     mutations: &[RetainedStyleMutation],
+) -> (DomLayout, ContainerLayoutTelemetry) {
+    let mut animation_timeline = crate::AnimationTimelineState::default();
+    layout_dom_with_web_fonts_pass_limit_at_animation_time(
+        tree,
+        viewport,
+        intrinsic,
+        fonts,
+        pass_limit,
+        stylesheet_cache,
+        retained,
+        mutations,
+        crate::AnimationSample::default(),
+        &mut animation_timeline,
+    )
+}
+
+fn layout_dom_with_web_fonts_pass_limit_at_animation_time(
+    tree: &DomTree,
+    viewport: (f32, f32),
+    intrinsic: &HashMap<NodeId, (f32, f32)>,
+    fonts: &[crate::inline::WebFont],
+    pass_limit: Option<usize>,
+    stylesheet_cache: Option<&mut crate::css::StylesheetCache>,
+    retained: Option<RetainedStyleMaps>,
+    mutations: &[RetainedStyleMutation],
+    animation_sample: crate::AnimationSample,
+    animation_timeline: &mut crate::AnimationTimelineState,
 ) -> (DomLayout, ContainerLayoutTelemetry) {
     let timing = std::env::var("OBSCURA_RENDER_TIMING").is_ok();
 
@@ -3177,14 +3552,16 @@ fn layout_dom_with_web_fonts_pass_limit(
 
     let retained_requested = retained.as_ref().map_or(0, |retained| retained.styles.len());
     let retained = retained.and_then(|mut retained| {
-        if !stylesheet_cache_hit
-            || retained
-                .styles
-                .values()
-                .any(|style| style.container_type != crate::ContainerType::Normal)
-        {
+        if !stylesheet_cache_hit {
             return None;
         }
+        let active_containers = retained
+            .styles
+            .iter()
+            .filter_map(|(node, style)| {
+                (style.container_type != crate::ContainerType::Normal).then_some(*node)
+            })
+            .collect::<HashSet<_>>();
         let connected = std::iter::once(tree.document())
             .chain(tree.descendants(tree.document()))
             .collect::<HashSet<_>>();
@@ -3193,7 +3570,22 @@ fn layout_dom_with_web_fonts_pass_limit(
             .custom_properties
             .retain(|node, _| connected.contains(node));
         match retained_style_plan(tree, &sheet, mutations) {
-            RetainedStylePlan::Reuse(dirty) => Some((retained, dirty)),
+            RetainedStylePlan::Reuse(mut dirty) => {
+                if !active_containers.is_empty() && sheet.has_container_queries() {
+                    let mut matcher = tree.matcher();
+                    add_container_query_reset_scopes(
+                        tree,
+                        tree.document(),
+                        &sheet,
+                        &mut matcher,
+                        &active_containers,
+                        false,
+                        false,
+                        &mut dirty,
+                    );
+                }
+                Some((retained, dirty))
+            }
             RetainedStylePlan::Full => None,
         }
     });
@@ -3209,7 +3601,17 @@ fn layout_dom_with_web_fonts_pass_limit(
         .map_or(0, |(retained, _)| retained.styles.len() - retained_fresh);
     let retained_fallback = usize::from(retained_requested != 0 && retained.is_none());
     let (mut laid, _, mut query, mut cascade_time) =
-        layout_dom_once(tree, viewport, intrinsic, fonts, &sheet, None, retained);
+        layout_dom_once(
+            tree,
+            viewport,
+            intrinsic,
+            fonts,
+            &sheet,
+            None,
+            retained,
+            animation_sample,
+            animation_timeline,
+        );
     if !sheet.has_container_queries() {
         if timing {
             let (r, i, c, a, l, u) = sheet.debug_stats();
@@ -3296,6 +3698,8 @@ fn layout_dom_with_web_fonts_pass_limit(
                 &sheet,
                 Some(&snapshot),
                 None,
+                animation_sample,
+                animation_timeline,
             );
         passes = pass;
         query.evaluations += pass_query.evaluations;
@@ -3343,7 +3747,17 @@ fn layout_dom_with_web_fonts_pass_limit(
         // geometry used to choose them. Disable the unstable conditional
         // rules for this render and expose the downgrade in telemetry.
         let (fallback, _, fallback_query, fallback_cascade) =
-            layout_dom_once(tree, viewport, intrinsic, fonts, &sheet, None, None);
+            layout_dom_once(
+                tree,
+                viewport,
+                intrinsic,
+                fonts,
+                &sheet,
+                None,
+                None,
+                animation_sample,
+                animation_timeline,
+            );
         laid = fallback;
         passes += 1;
         query.evaluations += fallback_query.evaluations;
@@ -3377,6 +3791,8 @@ fn layout_dom_once(
     sheet: &crate::css::Stylesheet,
     snapshot: Option<&crate::css::ContainerSnapshot>,
     retained: Option<(RetainedStyleMaps, HashSet<NodeId>)>,
+    animation_sample: crate::AnimationSample,
+    animation_timeline: &mut crate::AnimationTimelineState,
 ) -> (
     DomLayout,
     Option<crate::css::ContainerDecisionSignature>,
@@ -3414,6 +3830,8 @@ fn layout_dom_once(
         &mut evaluator_ref,
         quirks_mode,
         viewport,
+        animation_sample,
+        animation_timeline,
         None,
         false,
         fresh_styles.as_ref(),
@@ -13328,6 +13746,195 @@ mod tests {
         }
     }
 
+    #[test]
+    fn retained_insertions_with_active_container_queries_match_forced_full() {
+        let mut clean = String::new();
+        for index in 0..200 {
+            clean.push_str(&format!("<i class=clean data-index={index}></i>"));
+        }
+        let tree = parse_html(&format!(
+            r#"<!doctype html><style>
+                #container{{container-type:inline-size;width:200px}}
+                .item{{width:11px;height:7px}}
+                @container (min-width:100px){{.item{{width:71px}}}}
+                .clean{{height:1px}}
+            </style><main><section id=container><div id=stable class=item></div>
+                <div id=popup class=item><b id=first></b><b id=second></b></div>
+            </section><aside>{clean}</aside></main>"#,
+        ));
+        let container = tree.get_element_by_id("container").unwrap();
+        let popup = tree.get_element_by_id("popup").unwrap();
+        let first = tree.get_element_by_id("first").unwrap();
+        let second = tree.get_element_by_id("second").unwrap();
+        tree.remove_child(popup);
+        tree.remove_child(first);
+        tree.remove_child(second);
+
+        let mut cache = crate::css::StylesheetCache::default();
+        let mut initial = layout_dom_with_web_fonts_and_stylesheet_cache(
+            &tree,
+            (500.0, 300.0),
+            &HashMap::new(),
+            &[],
+            &mut cache,
+        );
+        tree.append_child(container, popup);
+        tree.append_child(popup, first);
+        tree.append_child(popup, second);
+        let retained = RetainedStyleMaps {
+            styles: std::mem::take(&mut initial.styles),
+            custom_properties: std::mem::take(&mut initial.custom_properties),
+        };
+        let mutations = [
+            TreeStyleMutation::Insert {
+                node: popup,
+                old_parent: None,
+                new_parent: container,
+            },
+            TreeStyleMutation::Insert {
+                node: first,
+                old_parent: None,
+                new_parent: popup,
+            },
+            TreeStyleMutation::Insert {
+                node: second,
+                old_parent: None,
+                new_parent: popup,
+            },
+        ]
+        .map(RetainedStyleMutation::from);
+        let (incremental, telemetry) = layout_dom_with_web_fonts_pass_limit(
+            &tree,
+            (500.0, 300.0),
+            &HashMap::new(),
+            &[],
+            None,
+            Some(&mut cache),
+            Some(retained),
+            &mutations,
+        );
+        let full = layout_dom(&tree, (500.0, 300.0));
+
+        assert_computed_styles_match("active container insertion batch", &incremental, &full);
+        assert_eq!(incremental.rects, full.rects);
+        assert_eq!(telemetry.retained_fallback, 0, "{telemetry:?}");
+        assert!(telemetry.retained_reused >= 200, "{telemetry:?}");
+        assert!(telemetry.retained_fresh > 0, "{telemetry:?}");
+        assert_eq!(
+            incremental.styles[&tree.get_element_by_id("stable").unwrap()].width,
+            crate::Dimension::Px(71.0)
+        );
+        assert_eq!(incremental.styles[&popup].width, crate::Dimension::Px(71.0));
+    }
+
+    #[test]
+    fn retained_dormant_container_queries_do_not_dirty_large_tree() {
+        let mut peers = String::new();
+        for index in 0..1_000 {
+            peers.push_str(&format!("<i class=peer data-index={index}></i>"));
+        }
+        let tree = parse_html(&format!(
+            r#"<!doctype html><style>
+                .peer{{height:1px}}
+                @container (min-width:1px){{*{{color:#123456}}}}
+            </style><main><input id=subject>{peers}</main>"#,
+        ));
+        let subject = tree.get_element_by_id("subject").unwrap();
+        let mut cache = crate::css::StylesheetCache::default();
+        let mut initial = layout_dom_with_web_fonts_and_stylesheet_cache(
+            &tree,
+            (500.0, 300.0),
+            &HashMap::new(),
+            &[],
+            &mut cache,
+        );
+        tree.with_node_mut(subject, |node| {
+            node.set_attribute("autocomplete", "off".into())
+        });
+        let retained = RetainedStyleMaps {
+            styles: std::mem::take(&mut initial.styles),
+            custom_properties: std::mem::take(&mut initial.custom_properties),
+        };
+        let (_, telemetry) = layout_dom_with_web_fonts_pass_limit(
+            &tree,
+            (500.0, 300.0),
+            &HashMap::new(),
+            &[],
+            None,
+            Some(&mut cache),
+            Some(retained),
+            &[AttributeStyleMutation {
+                node: subject,
+                name: "autocomplete".into(),
+                old_value: None,
+                new_value: Some("off".into()),
+            }
+            .into()],
+        );
+        assert_eq!(telemetry.retained_fallback, 0, "{telemetry:?}");
+        assert_eq!(telemetry.retained_fresh, 0, "{telemetry:?}");
+        assert!(telemetry.retained_reused >= 1_000, "{telemetry:?}");
+    }
+
+    #[test]
+    fn retained_nested_universal_container_reset_is_bounded_and_matches_full() {
+        let mut queried = String::new();
+        let mut clean = String::new();
+        for index in 0..500 {
+            queried.push_str(&format!("<i class=item data-index={index}></i>"));
+            clean.push_str(&format!("<i class=clean data-index={index}></i>"));
+        }
+        let tree = parse_html(&format!(
+            r#"<!doctype html><style>
+                #outer,#inner{{container-type:inline-size;width:200px}}
+                .item,.clean{{height:1px}}
+                @container (min-width:100px){{
+                    *{{color:#123456}}
+                    @container (min-width:100px){{*{{height:2px}}}}
+                }}
+            </style><main><section id=outer><section id=inner>{queried}</section></section>
+            <aside><input id=subject>{clean}</aside></main>"#,
+        ));
+        let subject = tree.get_element_by_id("subject").unwrap();
+        let mut cache = crate::css::StylesheetCache::default();
+        let mut initial = layout_dom_with_web_fonts_and_stylesheet_cache(
+            &tree,
+            (800.0, 600.0),
+            &HashMap::new(),
+            &[],
+            &mut cache,
+        );
+        tree.with_node_mut(subject, |node| {
+            node.set_attribute("autocomplete", "off".into())
+        });
+        let retained = RetainedStyleMaps {
+            styles: std::mem::take(&mut initial.styles),
+            custom_properties: std::mem::take(&mut initial.custom_properties),
+        };
+        let (incremental, telemetry) = layout_dom_with_web_fonts_pass_limit(
+            &tree,
+            (800.0, 600.0),
+            &HashMap::new(),
+            &[],
+            None,
+            Some(&mut cache),
+            Some(retained),
+            &[AttributeStyleMutation {
+                node: subject,
+                name: "autocomplete".into(),
+                old_value: None,
+                new_value: Some("off".into()),
+            }
+            .into()],
+        );
+        let full = layout_dom(&tree, (800.0, 600.0));
+        assert_computed_styles_match("nested universal CQ reset", &incremental, &full);
+        assert_eq!(incremental.rects, full.rects);
+        assert_eq!(telemetry.retained_fallback, 0, "{telemetry:?}");
+        assert!(telemetry.retained_fresh < 530, "{telemetry:?}");
+        assert!(telemetry.retained_reused >= 500, "{telemetry:?}");
+    }
+
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum RetainedDifferentialExpectation {
         Incremental,
@@ -13381,6 +13988,8 @@ mod tests {
                   <div id="adjacent" class="panel"><span id="adjacent-child" class="leaf"></span></div>
                   <div id="following" class="panel"><span id="following-child" class="leaf"></span></div>
                 </section>
+                <input id="control" type="text" size="20" value="old">
+                <img id="image" alt="old">
                 <aside id="clean" class="clean"><span id="clean-child"></span></aside>
             </body></html>"#,
             case.css
@@ -13612,11 +14221,142 @@ mod tests {
                 new_value: "true",
                 expectation: ReuseAll,
             },
+            RetainedDifferentialCase {
+                name: "unreferenced ordinary autocomplete mutation",
+                css: ".subject{width:103px;height:27px}",
+                target: "subject",
+                attribute: "autocomplete",
+                new_value: "off",
+                expectation: ReuseAll,
+            },
+            RetainedDifferentialCase {
+                name: "ordinary autocomplete attribute selector",
+                css: ".subject[autocomplete=off]{width:107px;height:29px}",
+                target: "subject",
+                attribute: "autocomplete",
+                new_value: "off",
+                expectation: Incremental,
+            },
+            RetainedDifferentialCase {
+                name: "ordinary autocomplete declaration attr dependency",
+                css: ".subject::before{content:attr(autocomplete);display:block;width:9px}",
+                target: "subject",
+                attribute: "autocomplete",
+                new_value: "off",
+                expectation: Incremental,
+            },
+            RetainedDifferentialCase {
+                name: "mapped width presentation hint",
+                css: ".subject{height:31px}",
+                target: "subject",
+                attribute: "width",
+                new_value: "109",
+                expectation: Incremental,
+            },
+            RetainedDifferentialCase {
+                name: "native input size mutation",
+                css: "#control{height:23px}",
+                target: "control",
+                attribute: "size",
+                new_value: "40",
+                expectation: Incremental,
+            },
+            RetainedDifferentialCase {
+                name: "image resource mutation",
+                css: "#image{width:17px;height:19px}",
+                target: "image",
+                attribute: "src",
+                new_value: "replacement.png",
+                expectation: ConservativeFallback,
+            },
+            RetainedDifferentialCase {
+                name: "inherited language semantic mutation",
+                css: ".scope{width:113px}",
+                target: "scope",
+                attribute: "lang",
+                new_value: "fr",
+                expectation: Incremental,
+            },
+            RetainedDifferentialCase {
+                name: "inherited direction semantic mutation",
+                css: ".scope{width:127px}",
+                target: "scope",
+                attribute: "dir",
+                new_value: "rtl",
+                expectation: Incremental,
+            },
+            RetainedDifferentialCase {
+                name: "functional language selector",
+                css: ".scope:lang(fr){width:131px}",
+                target: "scope",
+                attribute: "lang",
+                new_value: "fr",
+                expectation: ConservativeFallback,
+            },
+            RetainedDifferentialCase {
+                name: "functional direction selector",
+                css: ".scope:dir(rtl){width:137px}",
+                target: "scope",
+                attribute: "dir",
+                new_value: "rtl",
+                expectation: ConservativeFallback,
+            },
         ];
 
         for case in &cases {
             run_retained_differential_case(case);
         }
+    }
+
+    #[test]
+    fn retained_unreferenced_ordinary_attribute_keeps_large_tree_clean() {
+        let mut peers = String::new();
+        for index in 0..2_000 {
+            peers.push_str(&format!("<span class=peer data-index={index}></span>"));
+        }
+        let tree = parse_html(&format!(
+            r#"<!doctype html><style>.subject{{width:31px;height:7px}}.peer{{height:1px}}</style>
+               <main><input id=subject class=subject>{peers}</main>"#,
+        ));
+        let subject = tree.get_element_by_id("subject").unwrap();
+        let mut cache = crate::css::StylesheetCache::default();
+        let mut initial = layout_dom_with_web_fonts_and_stylesheet_cache(
+            &tree,
+            (800.0, 600.0),
+            &HashMap::new(),
+            &[],
+            &mut cache,
+        );
+        tree.with_node_mut(subject, |node| {
+            node.set_attribute("autocomplete", "off".into())
+        });
+        let retained = RetainedStyleMaps {
+            styles: std::mem::take(&mut initial.styles),
+            custom_properties: std::mem::take(&mut initial.custom_properties),
+        };
+        let (incremental, telemetry) = layout_dom_with_web_fonts_pass_limit(
+            &tree,
+            (800.0, 600.0),
+            &HashMap::new(),
+            &[],
+            None,
+            Some(&mut cache),
+            Some(retained),
+            &[AttributeStyleMutation {
+                node: subject,
+                name: "autocomplete".into(),
+                old_value: None,
+                new_value: Some("off".into()),
+            }
+            .into()],
+        );
+        let full = layout_dom(&tree, (800.0, 600.0));
+
+        assert_computed_styles_match("ordinary attribute 2k tree", &incremental, &full);
+        assert_eq!(incremental.rects, full.rects);
+        assert_eq!(telemetry.retained_fallback, 0, "{telemetry:?}");
+        assert_eq!(telemetry.retained_fresh, 0, "{telemetry:?}");
+        assert!(telemetry.retained_reused >= 2_000, "{telemetry:?}");
     }
 
     fn finish_retained_tree_case(

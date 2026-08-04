@@ -10,12 +10,14 @@ use obscura_dom::{DomTree, NodeId};
 pub use deno_core::v8::IsolateHandle;
 
 use crate::import_map::ImportMap;
-use crate::module_loader::ObscuraModuleLoader;
+use crate::module_loader::{ModuleLoadActivity, ObscuraModuleLoader};
 #[cfg(all(test, feature = "render"))]
 use crate::ops::ensure_prepared_render;
 use crate::ops::{build_extension, node_is_script, ObscuraState, StoredNetworkResponseBody};
 #[cfg(feature = "render")]
-use crate::ops::{clamp_scroll_offset, document_base_url, ensure_resolved_scroll};
+use crate::ops::{
+    begin_animation_task, clamp_scroll_offset, document_base_url, ensure_resolved_scroll,
+};
 
 static SNAPSHOT: &[u8] = include_bytes!(env!("OBSCURA_SNAPSHOT_PATH"));
 
@@ -65,6 +67,10 @@ pub struct ObscuraJsRuntime {
     object_store: HashMap<String, String>,
     object_counter: u64,
     import_map: Rc<RefCell<ImportMap>>,
+    /// Loader-owned signal for pending dynamic-import graph fetches. This is
+    /// intentionally separate from page fetch/XHR activity so analytics does
+    /// not hold screenshot readiness open.
+    module_load_activity: std::sync::Arc<ModuleLoadActivity>,
     /// Thread-safe handle to this runtime's V8 isolate, captured at
     /// construction. Lets a watchdog be armed from `&self` (the CDP dispatcher
     /// only holds `&Page` on the hot path) and is stable for the isolate's life.
@@ -161,6 +167,14 @@ impl WatchdogToken {
 }
 
 impl ObscuraJsRuntime {
+    /// Freeze the document timeline for one JavaScript task. Browser timelines
+    /// update at task/rendering boundaries, not on each forced style or layout
+    /// read. Keeping one sample across the task also lets repeated CSSOM reads
+    /// share the retained layout on pages with running animations.
+    fn begin_javascript_task(&mut self) {
+        #[cfg(feature = "render")]
+        begin_animation_task(&mut self.state.borrow_mut());
+    }
     pub fn new() -> Self {
         Self::with_base_url("about:blank")
     }
@@ -177,12 +191,14 @@ impl ObscuraJsRuntime {
         let state_clone = state.clone();
         let import_map = state.borrow().import_map.clone();
 
-        let module_loader = Rc::new(ObscuraModuleLoader::with_page_state(
+        let module_loader = ObscuraModuleLoader::with_page_state(
             base_url,
             proxy_url,
             &state,
             import_map.clone(),
-        ));
+        );
+        let module_load_activity = module_loader.activity();
+        let module_loader = Rc::new(module_loader);
 
         // Build the isolate under the process-wide creation lock so two
         // connection threads never construct isolates concurrently (#430).
@@ -217,6 +233,7 @@ impl ObscuraJsRuntime {
             object_store: HashMap::new(),
             object_counter: 0,
             import_map,
+            module_load_activity,
             isolate_handle,
         }
     }
@@ -257,6 +274,7 @@ impl ObscuraJsRuntime {
     pub fn set_dom(&self, dom: DomTree) {
         let mut gs = self.state.borrow_mut();
         gs.dom = Some(dom);
+        gs.document_generation = gs.document_generation.wrapping_add(1);
         gs.activity_generation = 0;
         gs.page_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         gs.already_started_scripts.borrow_mut().clear();
@@ -264,8 +282,14 @@ impl ObscuraJsRuntime {
         #[cfg(feature = "render")]
         {
             gs.prepared_render = None;
+            gs.animation_sample = obscura_render::AnimationSample::default();
+            gs.animation_timeline = obscura_render::AnimationTimelineState::default();
+            gs.animation_timeline_origin = std::time::Instant::now();
+            gs.animation_task_generation = 0;
+            gs.animation_sampled_task_generation = 0;
             gs.pending_style_mutations.clear();
             gs.render_resources = obscura_render::RenderResourceCache::default();
+            gs.render_image_in_flight.clear();
             gs.stylesheet_cache = obscura_render::StylesheetCache::default();
             gs.dynamic_fonts.clear();
             gs.scroll_offset = (0.0, 0.0);
@@ -428,6 +452,80 @@ impl ObscuraJsRuntime {
         clamp_scroll_offset(&mut state, requested)
     }
 
+    /// Select the document-timeline instant used by the next render flush.
+    /// Returns false for invalid times and preserves the current sample.
+    #[cfg(feature = "render")]
+    pub fn set_animation_sample_time(
+        &self,
+        sample: obscura_render::AnimationSampleTime,
+    ) -> bool {
+        self.set_animation_sample(obscura_render::AnimationSample::document(
+            sample.milliseconds,
+        ))
+    }
+
+    #[cfg(feature = "render")]
+    pub fn set_animation_sample(&self, sample: obscura_render::AnimationSample) -> bool {
+        if !sample.time.milliseconds.is_finite() || sample.time.milliseconds < 0.0 {
+            return false;
+        }
+        let mut state = self.state.borrow_mut();
+        if state.animation_sample != sample {
+            if sample.mode == obscura_render::AnimationSampleMode::DocumentTime
+                && state.animation_sample.mode == obscura_render::AnimationSampleMode::DocumentTime
+                && sample.time.milliseconds > state.animation_sample.time.milliseconds
+                && state.prepared_render.as_mut().is_some_and(|prepared| {
+                    prepared.advance_inactive_animation_sample_time(sample.time)
+                })
+            {
+                state.animation_sample = sample;
+                return true;
+            }
+            state.animation_sample = sample;
+            state.prepared_render = None;
+            state.pending_style_mutations.clear();
+            state.resolved_scroll = None;
+        }
+        true
+    }
+
+    #[cfg(feature = "render")]
+    pub fn animation_sample_time(&self) -> obscura_render::AnimationSampleTime {
+        self.state.borrow().animation_sample.time
+    }
+
+    #[cfg(feature = "render")]
+    pub fn live_animation_sample(&self) -> obscura_render::AnimationSample {
+        let state = self.state.borrow();
+        obscura_render::AnimationSample::document(
+            (state.animation_timeline_origin.elapsed().as_secs_f64() * 1_000.0)
+                .min(f64::from(f32::MAX)) as f32,
+        )
+    }
+
+    #[cfg(feature = "render")]
+    pub fn reset_animation_timeline(&self) {
+        let mut state = self.state.borrow_mut();
+        state.animation_timeline_origin = std::time::Instant::now();
+        state.animation_timeline = obscura_render::AnimationTimelineState::default();
+        state.animation_sample = obscura_render::AnimationSample::default();
+        state.prepared_render = None;
+        state.pending_style_mutations.clear();
+        state.resolved_scroll = None;
+    }
+
+    /// Read animation damage from the last prepared frame without causing a
+    /// style/layout flush. Screencast scheduling uses this to avoid rasterizing
+    /// static pages on every compositor tick.
+    #[cfg(feature = "render")]
+    pub fn prepared_has_active_css_animations(&self) -> bool {
+        self.state
+            .borrow()
+            .prepared_render
+            .as_ref()
+            .is_some_and(|prepared| prepared.has_active_css_animations())
+    }
+
     /// Capture the live render viewport from the same prepared layout used by
     /// CSSOM geometry. A mismatched ad-hoc viewport/base returns `None` so the
     /// browser layer can retain its compatibility one-shot path.
@@ -527,7 +625,7 @@ impl ObscuraJsRuntime {
     /// concurrently through the page-owned transport before synchronous layout
     /// or paint observes the cache.
     #[cfg(feature = "render")]
-    pub fn pending_render_image_urls(&self) -> Vec<String> {
+    pub fn pending_render_image_urls(&self) -> Vec<(String, crate::ops::ImageRequestProfile)> {
         let state = self.state.borrow();
         let base_url = document_base_url(&state);
         let Some(dom) = state.dom.as_ref() else {
@@ -553,7 +651,16 @@ impl ObscuraJsRuntime {
                 continue;
             };
             if !known && !url.starts_with("data:") {
-                urls.push(url);
+                let profile = match node
+                    .get_attribute("crossorigin")
+                    .map(|value| value.trim().to_ascii_lowercase())
+                    .as_deref()
+                {
+                    Some("use-credentials") => crate::ops::ImageRequestProfile::CorsInclude,
+                    Some(_) => crate::ops::ImageRequestProfile::CorsSameOrigin,
+                    None => crate::ops::ImageRequestProfile::NoCorsInclude,
+                };
+                urls.push((url, profile));
             }
         }
         urls.sort();
@@ -580,8 +687,39 @@ impl ObscuraJsRuntime {
     }
 
     #[cfg(feature = "render")]
+    pub fn seed_render_image_resource(
+        &mut self,
+        url: String,
+        profile: crate::ops::ImageRequestProfile,
+        bytes: Option<Vec<u8>>,
+    ) {
+        let mut state = self.state.borrow_mut();
+        match bytes {
+            Some(bytes) if obscura_render::image_intrinsic_dimensions(&bytes).is_some() => {
+                state.render_resources.seed_image(url, profile, bytes);
+                state.prepared_render = None;
+                state.pending_style_mutations.clear();
+                state.resolved_scroll = None;
+            }
+            _ => state.render_resources.seed_image_missing(url, profile),
+        }
+    }
+
+    #[cfg(feature = "render")]
     pub fn render_resource_is_known(&self, url: &str) -> bool {
         self.state.borrow().render_resources.has_live_outcome(url)
+    }
+
+    #[cfg(feature = "render")]
+    pub fn render_image_resource_is_known(
+        &self,
+        url: &str,
+        profile: crate::ops::ImageRequestProfile,
+    ) -> bool {
+        self.state
+            .borrow()
+            .render_resources
+            .has_live_image_outcome(url, profile)
     }
 
     /// Run __obscura_init() after all per-page properties (UA, platform, stealth, etc.)
@@ -607,6 +745,7 @@ impl ObscuraJsRuntime {
     }
 
     pub fn evaluate(&mut self, expression: &str) -> Result<serde_json::Value, String> {
+        self.begin_javascript_task();
         let wrapped = Self::wrap_expression(expression);
         let result = self
             .runtime
@@ -625,6 +764,7 @@ impl ObscuraJsRuntime {
             let val = self.evaluate(expression)?;
             return Ok(Self::info_from_json(&val));
         }
+        self.begin_javascript_task();
 
         self.object_counter += 1;
         let oid = self.make_oid(self.object_counter);
@@ -765,6 +905,7 @@ impl ObscuraJsRuntime {
         return_by_value: bool,
         await_promise: bool,
     ) -> Result<RemoteObjectInfo, String> {
+        self.begin_javascript_task();
         let this_expr = self.resolve_this(object_id);
         let (setup, args_list) = self.build_args(arguments);
 
@@ -933,6 +1074,7 @@ impl ObscuraJsRuntime {
         .await
     }
     pub fn store_object(&mut self, js_expression: &str) -> Result<String, String> {
+        self.begin_javascript_task();
         self.object_counter += 1;
         let oid = self.make_oid(self.object_counter);
         let code = format!(
@@ -953,6 +1095,7 @@ impl ObscuraJsRuntime {
         &mut self,
         js_expression: &str,
     ) -> Result<RemoteObjectInfo, String> {
+        self.begin_javascript_task();
         self.object_counter += 1;
         let oid = self.make_oid(self.object_counter);
         let code = format!(
@@ -1065,6 +1208,7 @@ impl ObscuraJsRuntime {
         budget_ms: u64,
         what: &str,
     ) -> Result<(), String> {
+        self.begin_javascript_task();
         let budget = tokio::time::Duration::from_millis(budget_ms);
         let result = self.runtime.mod_evaluate(module_id);
         tokio::pin!(result);
@@ -1185,6 +1329,7 @@ impl ObscuraJsRuntime {
     }
 
     fn execute_classic_script(&mut self, name: &str, source: &str) -> Result<(), String> {
+        self.begin_javascript_task();
         // JsRuntime::execute_script in deno_core 0.350 restricts `name` to a
         // &'static str. Browser script URLs are runtime data, and V8 uses this
         // origin as import()'s referrer, so compile in the runtime's main
@@ -1309,6 +1454,7 @@ impl ObscuraJsRuntime {
     }
 
     pub async fn run_event_loop(&mut self) -> Result<(), String> {
+        self.begin_javascript_task();
         // A browser performs a microtask checkpoint at the end of each task.
         // deno_core's event loop may return immediately when no async op is
         // pending, leaving an already-resolved Promise continuation stranded
@@ -1329,10 +1475,21 @@ impl ObscuraJsRuntime {
     /// Rust reads it through a hidden status function so page declarations
     /// cannot collide with or overwrite the queue itself.
     pub fn has_pending_dynamic_scripts(&mut self) -> bool {
-        self.evaluate("globalThis.__obscura_hasPendingDynamicScripts?.() === true")
+        let pending_dom_script = self
+            .evaluate("globalThis.__obscura_hasPendingDynamicScripts?.() === true")
             .ok()
             .and_then(|value| value.as_bool())
-            .unwrap_or(false)
+            .unwrap_or(false);
+        // A short tail bridges the parser/evaluator hand-off between one
+        // fetched module and the next dependency. It is below the lifecycle's
+        // existing 500ms fast-settle floor, so static entry graphs pay no new
+        // latency while lazy import graphs remain observable. deno_core's
+        // dynamic-module evaluation/TLA counters are private; the event-loop
+        // pump itself remains responsible for that non-fetch portion.
+        pending_dom_script
+            || self
+                .module_load_activity
+                .is_pending_or_recent(std::time::Duration::from_millis(100))
     }
 
     /// Generation of observable connected-document mutations. This excludes
@@ -1518,6 +1675,7 @@ impl ObscuraJsRuntime {
         if timeout.is_zero() {
             return self.evaluate(expression);
         }
+        self.begin_javascript_task();
         let wrapped = Self::wrap_expression(expression);
         let token = self.arm_watchdog(timeout);
         let result = self.runtime.execute_script("<eval>", wrapped);
@@ -1537,6 +1695,7 @@ impl ObscuraJsRuntime {
     }
 
     pub async fn resolve_promises(&mut self) {
+        self.begin_javascript_task();
         // Default settle: just pump until idle or 5s.
         let _ = tokio::time::timeout(
             tokio::time::Duration::from_secs(5),
@@ -1565,6 +1724,7 @@ impl ObscuraJsRuntime {
             tokio::time::Instant::now() + tokio::time::Duration::from_millis(max_total_ms);
         let mut tick_ms: u64 = 1;
         loop {
+            self.begin_javascript_task();
             if done_check(self) {
                 return;
             }
@@ -6094,6 +6254,30 @@ mod tests {
 
     #[cfg(feature = "render")]
     #[test]
+    fn element_text_content_replacement_recomputes_empty_selector() {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html(
+            r#"<style>#x { width: 10px; height: 5px } #x:empty { width: 30px }</style>
+               <div id="x">text</div>"#,
+        ));
+        rt.run_page_init();
+
+        assert_eq!(
+            rt.evaluate(
+                r#"(() => {
+                    const x = document.getElementById("x");
+                    const before = x.getBoundingClientRect().width;
+                    x.textContent = "";
+                    return [before, x.matches(":empty"), x.getBoundingClientRect().width];
+                })()"#,
+            )
+            .unwrap(),
+            serde_json::json!([10, true, 30])
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
     fn prepared_render_survives_detached_no_op_and_same_viewport_updates() {
         let dom = parse_html(
             r#"<html style="margin:0"><body style="margin:0">
@@ -6175,6 +6359,433 @@ mod tests {
                 .as_f64(),
             Some(60.0)
         );
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn forward_animation_samples_retain_static_prepared_render() {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html(
+            r#"<html style="margin:0"><body style="margin:0">
+                <div style="width:80px;height:60px;background:#1769aa"></div>
+            </body></html>"#,
+        ));
+        rt.set_url("http://example.test/page");
+        rt.set_viewport(80.0, 60.0);
+        rt.run_page_init();
+
+        assert!(rt.set_animation_sample_time(obscura_render::AnimationSampleTime {
+            milliseconds: 100.0,
+        }));
+        let first = rt
+            .screenshot_prepared((80.0, 60.0), Some("http://example.test/page"))
+            .expect("first static frame");
+        let prepared_address = {
+            let state = rt.state.borrow();
+            state.prepared_render.as_ref().unwrap() as *const _ as usize
+        };
+
+        assert!(rt.set_animation_sample_time(obscura_render::AnimationSampleTime {
+            milliseconds: 250.0,
+        }));
+        let second = rt
+            .screenshot_prepared((80.0, 60.0), Some("http://example.test/page"))
+            .expect("second static frame");
+        let state = rt.state.borrow();
+        assert_eq!(
+            state.prepared_render.as_ref().unwrap() as *const _ as usize,
+            prepared_address,
+            "a live timestamp alone must not relayout a static document"
+        );
+        assert_eq!(first, second);
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn completed_animation_retains_forward_frame_but_backward_seek_rebuilds() {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html(
+            r#"<html style="margin:0"><head><style>
+                @keyframes fade { from { opacity:1 } to { opacity:0 } }
+                #box { width:80px; height:60px; background:#ff0000;
+                       animation:fade 100ms linear forwards }
+            </style></head><body style="margin:0"><div id="box"></div></body></html>"#,
+        ));
+        rt.set_url("http://example.test/page");
+        rt.set_viewport(80.0, 60.0);
+        rt.run_page_init();
+
+        assert!(rt.set_animation_sample_time(obscura_render::AnimationSampleTime {
+            milliseconds: 150.0,
+        }));
+        let completed = rt
+            .screenshot_prepared((80.0, 60.0), Some("http://example.test/page"))
+            .expect("completed animation frame");
+        assert!(!rt.prepared_has_active_css_animations());
+        let prepared_address = {
+            let state = rt.state.borrow();
+            state.prepared_render.as_ref().unwrap() as *const _ as usize
+        };
+
+        assert!(rt.set_animation_sample_time(obscura_render::AnimationSampleTime {
+            milliseconds: 300.0,
+        }));
+        let later = rt
+            .screenshot_prepared((80.0, 60.0), Some("http://example.test/page"))
+            .expect("later completed frame");
+        assert_eq!(completed, later);
+        assert_eq!(
+            rt.state
+                .borrow()
+                .prepared_render
+                .as_ref()
+                .unwrap() as *const _ as usize,
+            prepared_address,
+            "a finite fill-forwards animation must not relayout after completion"
+        );
+
+        assert!(rt.set_animation_sample_time(obscura_render::AnimationSampleTime {
+            milliseconds: 0.0,
+        }));
+        assert!(
+            rt.state.borrow().prepared_render.is_none(),
+            "backward timeline seeks must invalidate the completed frame"
+        );
+        let initial = rt
+            .screenshot_prepared((80.0, 60.0), Some("http://example.test/page"))
+            .expect("initial animation frame");
+        assert_ne!(completed, initial);
+        assert!(rt.prepared_has_active_css_animations());
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn unsupported_custom_property_animation_does_not_keep_render_damage_active() {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html(
+            r#"<html style="margin:0"><head><style>
+                @property --brand-cycle { syntax:"<color>"; inherits:true; initial-value:#2dacf9 }
+                @keyframes brand-cycle {
+                    from { --brand-cycle:#2dacf9 }
+                    to { --brand-cycle:#7ce95a }
+                }
+                :root { animation:brand-cycle 10s linear infinite }
+            </style></head><body style="margin:0">
+                <div style="width:80px;height:60px;background:#1769aa"></div>
+            </body></html>"#,
+        ));
+        rt.set_url("http://example.test/page");
+        rt.set_viewport(80.0, 60.0);
+        rt.run_page_init();
+
+        let first = rt
+            .screenshot_prepared((80.0, 60.0), Some("http://example.test/page"))
+            .expect("initial frame");
+        assert!(
+            !rt.prepared_has_active_css_animations(),
+            "an unsupported custom-property-only animation has no render damage"
+        );
+        let prepared_address = {
+            let state = rt.state.borrow();
+            state.prepared_render.as_ref().unwrap() as *const _ as usize
+        };
+        assert!(rt.set_animation_sample_time(obscura_render::AnimationSampleTime {
+            milliseconds: 5_000.0,
+        }));
+        let later = rt
+            .screenshot_prepared((80.0, 60.0), Some("http://example.test/page"))
+            .expect("later frame");
+        assert_eq!(first, later);
+        assert_eq!(
+            rt.state.borrow().prepared_render.as_ref().unwrap() as *const _ as usize,
+            prepared_address
+        );
+    }
+
+    #[cfg(feature = "render")]
+    fn animation_test_width(rt: &ObscuraJsRuntime, id: &str) -> f32 {
+        let state = rt.state.borrow();
+        let dom = state.dom.as_ref().unwrap();
+        let node = dom.query_selector(&format!("#{id}")).unwrap().unwrap();
+        match state.prepared_render.as_ref().unwrap().layout().styles[&node].width {
+            obscura_render::Dimension::Px(width) => width,
+            ref other => panic!("expected animated pixel width, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "render")]
+    fn animation_epoch_runtime() -> ObscuraJsRuntime {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html(
+            r#"<html style="margin:0"><head><style>
+                @keyframes grow { from { width:0px } to { width:100px } }
+                .anim { height:10px; animation:grow 1000ms linear forwards }
+            </style></head><body style="margin:0"><i id="anchor"></i></body></html>"#,
+        ));
+        rt.set_url("http://example.test/page");
+        rt.set_viewport(200.0, 80.0);
+        rt.run_page_init();
+        rt
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn remove_and_reappend_restarts_animation_without_intermediate_flush() {
+        let mut rt = animation_epoch_runtime();
+        rt.evaluate("var box=document.createElement('div');box.id='box';box.className='anim';document.body.appendChild(box)")
+            .unwrap();
+        assert!(rt.set_animation_sample(obscura_render::AnimationSample::document(1_000.0)));
+        rt.screenshot_prepared((200.0, 80.0), Some("http://example.test/page"))
+            .unwrap();
+        assert!(animation_test_width(&rt, "box") > 95.0);
+
+        rt.state.borrow_mut().animation_timeline_origin =
+            std::time::Instant::now() - std::time::Duration::from_millis(1_000);
+        rt.evaluate("var box=document.getElementById('box');box.remove();document.body.appendChild(box)")
+            .unwrap();
+        assert!(rt.set_animation_sample(obscura_render::AnimationSample::document(1_100.0)));
+        rt.screenshot_prepared((200.0, 80.0), Some("http://example.test/page"))
+            .unwrap();
+        let restarted = animation_test_width(&rt, "box");
+        assert!((5.0..20.0).contains(&restarted), "restarted width={restarted}");
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn scoped_animation_epochs_survive_later_unrelated_mutations_and_t0_capture() {
+        let mut rt = animation_epoch_runtime();
+        rt.state.borrow_mut().animation_timeline_origin =
+            std::time::Instant::now() - std::time::Duration::from_millis(100);
+        rt.evaluate("var a=document.createElement('div');a.id='first';a.className='anim';document.body.appendChild(a)")
+            .unwrap();
+        rt.state.borrow_mut().animation_timeline_origin =
+            std::time::Instant::now() - std::time::Duration::from_millis(500);
+        rt.evaluate("var b=document.createElement('div');b.id='second';b.className='anim';document.body.appendChild(b)")
+            .unwrap();
+        rt.state.borrow_mut().animation_timeline_origin =
+            std::time::Instant::now() - std::time::Duration::from_millis(600);
+        rt.evaluate("document.getElementById('anchor').setAttribute('data-unrelated','yes')")
+            .unwrap();
+
+        assert!(rt.set_animation_sample(obscura_render::AnimationSample::local_override(0.0)));
+        rt.screenshot_prepared((200.0, 80.0), Some("http://example.test/page"))
+            .unwrap();
+        assert_eq!(animation_test_width(&rt, "first"), 0.0);
+        assert_eq!(animation_test_width(&rt, "second"), 0.0);
+
+        assert!(rt.set_animation_sample(obscura_render::AnimationSample::document(700.0)));
+        rt.screenshot_prepared((200.0, 80.0), Some("http://example.test/page"))
+            .unwrap();
+        let first = animation_test_width(&rt, "first");
+        let second = animation_test_width(&rt, "second");
+        assert!((55.0..65.0).contains(&first), "first width={first}");
+        assert!((15.0..25.0).contains(&second), "second width={second}");
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn timing_edits_preserve_identity_and_pause_holds_then_resumes() {
+        let mut rt = animation_epoch_runtime();
+        rt.evaluate("var box=document.createElement('div');box.id='box';box.className='anim';document.body.appendChild(box)")
+            .unwrap();
+        assert!(rt.set_animation_sample(obscura_render::AnimationSample::document(300.0)));
+        rt.screenshot_prepared((200.0, 80.0), Some("http://example.test/page"))
+            .unwrap();
+        assert!((25.0..35.0).contains(&animation_test_width(&rt, "box")));
+
+        rt.state.borrow_mut().animation_timeline_origin =
+            std::time::Instant::now() - std::time::Duration::from_millis(300);
+        rt.evaluate("document.getElementById('box').setAttribute('style','animation-duration:2000ms;animation-play-state:paused')")
+            .unwrap();
+        assert!(rt.set_animation_sample(obscura_render::AnimationSample::document(700.0)));
+        rt.screenshot_prepared((200.0, 80.0), Some("http://example.test/page"))
+            .unwrap();
+        let held = animation_test_width(&rt, "box");
+        assert!((12.0..18.0).contains(&held), "held width={held}");
+
+        rt.state.borrow_mut().animation_timeline_origin =
+            std::time::Instant::now() - std::time::Duration::from_millis(800);
+        rt.evaluate("document.getElementById('box').setAttribute('style','animation-duration:2000ms;animation-play-state:running')")
+            .unwrap();
+        assert!(rt.set_animation_sample(obscura_render::AnimationSample::document(1_000.0)));
+        rt.screenshot_prepared((200.0, 80.0), Some("http://example.test/page"))
+            .unwrap();
+        let resumed = animation_test_width(&rt, "box");
+        assert!((22.0..28.0).contains(&resumed), "resumed width={resumed}");
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn cssom_geometry_samples_live_document_time() {
+        let mut rt = animation_epoch_runtime();
+        rt.evaluate("var box=document.createElement('div');box.id='box';box.className='anim';document.body.appendChild(box)")
+            .unwrap();
+        let initial = rt
+            .evaluate("document.getElementById('box').getBoundingClientRect().width")
+            .unwrap()
+            .as_f64()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        let later = rt
+            .evaluate("document.getElementById('box').getBoundingClientRect().width")
+            .unwrap()
+            .as_f64()
+            .unwrap();
+        assert!(later >= initial + 8.0, "initial={initial}, later={later}");
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn cssom_animation_sample_is_frozen_within_one_javascript_task() {
+        let mut rt = animation_epoch_runtime();
+        rt.evaluate("var box=document.createElement('div');box.id='box';box.className='anim';document.body.appendChild(box)")
+            .unwrap();
+        let values = rt
+            .evaluate(
+                r#"(function(){
+                    const box = document.getElementById('box');
+                    const first = box.getBoundingClientRect().width;
+                    const deadline = Date.now() + 120;
+                    while (Date.now() < deadline) {}
+                    return [first, box.getBoundingClientRect().width];
+                })()"#,
+            )
+            .unwrap();
+        let widths = values.as_array().unwrap();
+        assert_eq!(
+            widths[0].as_f64(),
+            widths[1].as_f64(),
+            "forced layout reads in one long task must share one animation frame"
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn timer_callback_starts_a_fresh_lazy_animation_sample() {
+        let mut rt = animation_epoch_runtime();
+        rt.execute_script(
+            "timer-animation-sample",
+            r#"
+                var box=document.createElement('div');
+                box.id='box';box.className='anim';document.body.appendChild(box);
+                globalThis.__beforeTimerWidth=box.getBoundingClientRect().width;
+                setTimeout(() => {
+                    globalThis.__afterTimerWidth=box.getBoundingClientRect().width;
+                }, 100);
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(250).await.unwrap();
+        let values = rt
+            .evaluate("[globalThis.__beforeTimerWidth, globalThis.__afterTimerWidth]")
+            .unwrap();
+        let widths = values.as_array().unwrap();
+        let before = widths[0].as_f64().unwrap();
+        let after = widths[1].as_f64().unwrap();
+        assert!(after >= before + 7.0, "before={before}, after={after}");
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn autocomplete_attribute_retains_prepared_render_until_geometry_flush() {
+        let dom = parse_html(
+            r#"<html style="margin:0"><head><style>
+                input { display:block; width:40px; height:20px }
+                input[autocomplete="off"] { width:90px }
+            </style></head><body style="margin:0">
+                <input id="field" autocomplete="on">
+            </body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_viewport(200.0, 100.0);
+        rt.run_page_init();
+
+        assert_eq!(
+            rt.evaluate("document.getElementById('field').getBoundingClientRect().width")
+                .unwrap()
+                .as_f64(),
+            Some(40.0)
+        );
+        assert!(rt.state.borrow().prepared_render.is_some());
+
+        rt.evaluate("document.getElementById('field').setAttribute('autocomplete', 'off')")
+            .unwrap();
+        {
+            let state = rt.state.borrow();
+            assert!(
+                state.prepared_render.is_some(),
+                "ordinary selector attributes must retain the prepared render until flush"
+            );
+            assert!(matches!(
+                state.pending_style_mutations.as_slice(),
+                [obscura_render::RetainedStyleMutation::Attribute(
+                    obscura_render::AttributeStyleMutation { name, old_value, new_value, .. }
+                )] if name == "autocomplete"
+                    && old_value.as_deref() == Some("on")
+                    && new_value.as_deref() == Some("off")
+            ));
+        }
+
+        assert_eq!(
+            rt.evaluate("document.getElementById('field').getBoundingClientRect().width")
+                .unwrap()
+                .as_f64(),
+            Some(90.0),
+            "the retained selector invalidation must observe the new attribute value"
+        );
+        assert!(rt.state.borrow().pending_style_mutations.is_empty());
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn namespaced_attribute_mutations_participate_in_id_and_render_invalidation() {
+        let dom = parse_html(
+            r#"<html style="margin:0"><body style="margin:0"><div id="box" class="box" style="height:30px;width:40px"></div></body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_viewport(200.0, 100.0);
+        rt.run_page_init();
+
+        assert_eq!(
+            rt.evaluate("document.getElementById('box').getBoundingClientRect().height")
+                .unwrap()
+                .as_f64(),
+            Some(30.0)
+        );
+        assert!(rt.state.borrow().prepared_render.is_some());
+
+        rt.evaluate(
+            "document.getElementById('box').setAttributeNS(null, 'class', 'box')",
+        )
+        .unwrap();
+        assert!(
+            rt.state.borrow().prepared_render.is_some(),
+            "an identical null-namespace attribute must retain layout"
+        );
+
+        rt.evaluate(
+            "document.getElementById('box').setAttributeNS(null, 'style', 'height:70px;width:40px')",
+        )
+        .unwrap();
+        assert!(
+            rt.state.borrow().prepared_render.is_none(),
+            "a connected namespace-aware style mutation must invalidate layout"
+        );
+        assert_eq!(
+            rt.evaluate("document.getElementById('box').getBoundingClientRect().height")
+                .unwrap()
+                .as_f64(),
+            Some(70.0)
+        );
+
+        let id_result = rt
+            .evaluate(
+                "(function(){const box=document.getElementById('box');box.setAttributeNS(null,'id','renamed');const found=document.getElementById('renamed')===box;box.removeAttributeNS(null,'id');return found && document.getElementById('renamed')===null;})()",
+            )
+            .unwrap();
+        assert_eq!(id_result, serde_json::json!(true));
     }
 
     #[cfg(feature = "render")]
@@ -7941,6 +8552,270 @@ mod tests {
                     .replace(char::is_whitespace, ""),
             )
             .unwrap()
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn parser_images_load_concurrently_without_blocking_the_event_loop() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server_accepted = accepted.clone();
+        let server_active = active.clone();
+        let server_max_active = max_active.clone();
+        let png = two_by_three_png();
+        std::thread::spawn(move || {
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().unwrap();
+                server_accepted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let active = server_active.clone();
+                let max_active = server_max_active.clone();
+                let png = png.clone();
+                std::thread::spawn(move || {
+                    use std::io::{Read as _, Write as _};
+
+                    let mut request = [0u8; 2048];
+                    let _ = stream.read(&mut request);
+                    let concurrent = active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    max_active.fetch_max(concurrent, std::sync::atomic::Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        png.len()
+                    );
+                    stream.write_all(response.as_bytes()).unwrap();
+                    stream.write_all(&png).unwrap();
+                    active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                });
+            }
+        });
+
+        let base = format!("http://{address}");
+        let html = format!(
+            r#"<img src="{base}/one.png"><img src="{base}/two.png">
+                <img src="{base}/three.png"><img src="{base}/shared.png">
+                <img src="{base}/shared.png">"#
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html(&html));
+        rt.set_url(&format!("{base}/page.html"));
+        rt.set_http_client(std::sync::Arc::new(
+            obscura_net::ObscuraHttpClient::with_full_options(
+                std::sync::Arc::new(obscura_net::CookieJar::new()),
+                None,
+                true,
+            ),
+        ));
+        rt.run_page_init();
+
+        let started = std::time::Instant::now();
+        let result = rt
+            .evaluate_for_cdp(
+                r#"
+                new Promise(resolve => {
+                    globalThis.__imageTimerRan = false;
+                    setTimeout(() => { __imageTimerRan = true; }, 10);
+                    const images = Array.from(document.images);
+                    const events = [];
+                    const finish = (type, image) => {
+                        events.push([
+                            type,
+                            __imageTimerRan,
+                            image.naturalWidth,
+                            image.naturalHeight,
+                        ]);
+                        if (events.length === images.length) resolve(events);
+                    };
+                    for (const image of images) {
+                        image.addEventListener("load", () => finish("load", image));
+                        image.addEventListener("error", () => finish("error", image));
+                        void image.complete;
+                    }
+                    setTimeout(() => resolve([["timed out"]]), 2000);
+                })
+                "#,
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!([
+                ["load", true, 2, 3],
+                ["load", true, 2, 3],
+                ["load", true, 2, 3],
+                ["load", true, 2, 3],
+                ["load", true, 2, 3],
+            ])
+        );
+        assert_eq!(
+            accepted.load(std::sync::atomic::Ordering::SeqCst),
+            4,
+            "two elements selecting one URL must share a single request"
+        );
+        assert!(
+            max_active.load(std::sync::atomic::Ordering::SeqCst) >= 3,
+            "slow image requests did not overlap"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "four 150ms image requests serialized: {elapsed:?}"
+        );
+        assert_eq!(
+            rt.state
+                .borrow()
+                .page_in_flight
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn image_lifecycle_cache_is_separated_by_cors_credentials_profile() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server_requests = requests.clone();
+        let png = two_by_three_png();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 4096];
+                let read = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..read]).to_ascii_lowercase();
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("")
+                    .to_string();
+                let mode = request
+                    .lines()
+                    .find_map(|line| line.strip_prefix("sec-fetch-mode: "))
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                server_requests.lock().unwrap().push((path.clone(), mode));
+                let cors_headers = if path == "/cors.png" {
+                    // Anonymous accepts wildcard; use-credentials must reject
+                    // it even when credentials permission is also present.
+                    "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Credentials: true\r\n"
+                } else {
+                    ""
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\n{cors_headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    png.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+                stream.write_all(&png).unwrap();
+            }
+        });
+
+        let base = format!("http://{address}");
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html(&format!(r#"<img id="image" src="{base}/plain.png">"#)));
+        // Deliberately make the image cross-origin from the document.
+        rt.set_url("http://127.0.0.1:1/page.html");
+        rt.set_http_client(std::sync::Arc::new(
+            obscura_net::ObscuraHttpClient::with_full_options(
+                std::sync::Arc::new(obscura_net::CookieJar::new()),
+                None,
+                true,
+            ),
+        ));
+        rt.run_page_init();
+        rt.execute_script(
+            "observe-profiled-image",
+            r#"
+                globalThis.image = document.getElementById("image");
+                globalThis.__profileEvents = [];
+                image.addEventListener("load", () => __profileEvents.push("load"));
+                image.addEventListener("error", () => __profileEvents.push("error"));
+                void image.complete;
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("[image.complete, image.naturalWidth, __profileEvents]")
+                .unwrap(),
+            serde_json::json!([true, 2, ["load"]])
+        );
+
+        rt.execute_script("require-anonymous-cors", r#"image.crossOrigin = "anonymous";"#)
+            .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("[image.complete, image.naturalWidth, __profileEvents]")
+                .unwrap(),
+            serde_json::json!([true, 0, ["load", "error"]]),
+            "URL-keyed no-CORS bytes must not satisfy an anonymous CORS request"
+        );
+
+        rt.execute_script("restore-no-cors", "image.removeAttribute('crossorigin');")
+            .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("[image.complete, image.naturalWidth, __profileEvents]")
+                .unwrap(),
+            serde_json::json!([true, 2, ["load", "error", "load"]]),
+            "a CORS failure must not poison the earlier no-CORS success"
+        );
+
+        rt.execute_script(
+            "load-anonymous-cors",
+            &format!(r#"image.crossOrigin = "anonymous"; image.src = "{base}/cors.png";"#),
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("[image.complete, image.naturalWidth, __profileEvents]")
+                .unwrap(),
+            serde_json::json!([true, 2, ["load", "error", "load", "load"]])
+        );
+
+        rt.execute_script(
+            "require-credentialed-cors",
+            r#"image.crossOrigin = "use-credentials";"#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("[image.complete, image.naturalWidth, __profileEvents]")
+                .unwrap(),
+            serde_json::json!([true, 0, ["load", "error", "load", "load", "error"]]),
+            "anonymous CORS success must not satisfy use-credentials"
+        );
+
+        rt.execute_script(
+            "restore-anonymous-cors",
+            r#"image.crossOrigin = "anonymous";"#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("[image.complete, image.naturalWidth, __profileEvents]")
+                .unwrap(),
+            serde_json::json!([true, 2, ["load", "error", "load", "load", "error", "load"]]),
+            "credentialed CORS failure must not poison anonymous success"
+        );
+
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec![
+                ("/plain.png".to_string(), "no-cors".to_string()),
+                ("/plain.png".to_string(), "cors".to_string()),
+                ("/cors.png".to_string(), "cors".to_string()),
+                ("/cors.png".to_string(), "cors".to_string()),
+            ]
+        );
     }
 
     #[cfg(feature = "render")]

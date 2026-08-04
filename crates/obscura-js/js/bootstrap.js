@@ -647,7 +647,13 @@ const _scheduleAfter = (delay, fn) => {
   }
   // The callback runs only when the embedder pumps the event loop, after the
   // current microtask checkpoint.
-  return Deno.core.queueUserTimer(0, false, d, fn);
+  return Deno.core.queueUserTimer(0, false, d, () => {
+    // HTML timer/observer/rAF delivery starts a new task. Freeze animation
+    // time lazily on that task's first style/layout read so a callback that
+    // waited in the host queue samples its actual delivery instant.
+    Deno.core.ops.op_begin_render_task?.();
+    return fn();
+  });
 };
 
 // Timers accept a string first arg per the HTML spec (e.g. the Aliyun WAF
@@ -4530,7 +4536,8 @@ class HTMLImageElement extends Element {
   setAttribute(name, value) {
     const normalized = String(name).toLowerCase();
     super.setAttribute(name, value);
-    if (normalized === "src" || normalized === "srcset" || normalized === "sizes") {
+    if (normalized === "src" || normalized === "srcset" || normalized === "sizes"
+        || normalized === "crossorigin") {
       this._imageSourceChanged();
     }
     else if ((normalized === "onload" || normalized === "onerror")
@@ -4540,7 +4547,8 @@ class HTMLImageElement extends Element {
   removeAttribute(name) {
     const normalized = String(name).toLowerCase();
     super.removeAttribute(name);
-    if (normalized === "src" || normalized === "srcset" || normalized === "sizes") {
+    if (normalized === "src" || normalized === "srcset" || normalized === "sizes"
+        || normalized === "crossorigin") {
       this._imageSourceChanged();
     }
   }
@@ -4581,30 +4589,46 @@ class HTMLImageElement extends Element {
     this._imageQueued = true;
     const request = this._imageRequest;
     setTimeout(() => {
-      this._imageQueued = false;
       if (request === this._imageRequest && !this._imageComplete) {
         this._runImageRequest(request);
+      } else if (request === this._imageRequest) {
+        this._imageQueued = false;
       }
     }, 1);
   }
 
   _runImageRequest(request) {
-    let metadata = null;
+    const finish = (metadata) => {
+      if (request !== this._imageRequest) return;
+      this._imageQueued = false;
+      if (metadata && metadata.state === "stale") {
+        this._refreshImageFromCache(true);
+        this._queueImageRequest();
+        return;
+      }
+      this._applyImageMetadata(metadata, request, true);
+    };
     try {
-      const op = Deno.core.ops.op_image_metadata;
+      const op = Deno.core.ops.op_load_image_metadata;
       if (typeof op === "function") {
-        metadata = JSON.parse(op(this._nid >>> 0, false));
+        Promise.resolve(op(this._nid >>> 0)).then(
+          raw => {
+            let metadata = null;
+            try { metadata = JSON.parse(raw); }
+            catch (_error) { metadata = { ok: false, currentSrc: this.src }; }
+            finish(metadata);
+          },
+          () => finish({ ok: false, currentSrc: this.src }),
+        );
       } else {
         // Non-render builds have no authoritative resource cache. Preserve the
         // old non-blocking compatibility behavior without issuing a duplicate
         // network fetch: the request succeeds with unknown intrinsic size.
-        metadata = { ok: true, currentSrc: this.src, width: 0, height: 0 };
+        finish({ ok: true, currentSrc: this.src, width: 0, height: 0 });
       }
     } catch (_error) {
-      metadata = { ok: false, currentSrc: this.src };
+      finish({ ok: false, currentSrc: this.src });
     }
-    if (request !== this._imageRequest) return;
-    this._applyImageMetadata(metadata, request, true);
   }
 
   _refreshImageFromCache(deferCompletion) {

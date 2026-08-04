@@ -23,8 +23,8 @@ static FONT_OBLIQUE_BYTES: &[u8] = include_bytes!("../assets/liberation-sans-obl
 static FONT_BOLD_OBLIQUE_BYTES: &[u8] = include_bytes!("../assets/liberation-sans-boldoblique.ttf");
 
 use crate::dom::{
-    layout_dom_with_web_fonts_and_retained_styles,
-    layout_dom_with_web_fonts_and_stylesheet_cache, RetainedStyleMaps,
+    layout_dom_with_web_fonts_and_retained_styles_with_animation_state,
+    layout_dom_with_web_fonts_and_stylesheet_cache_with_animation_state, RetainedStyleMaps,
 };
 
 const DEFAULT_RESOURCE_CACHE_ENTRIES: usize = 512;
@@ -79,6 +79,49 @@ impl RenderResourceLoader for HttpResourceLoader {
 enum CachedResource {
     Bytes(Arc<[u8]>),
     Missing(std::time::Instant),
+}
+
+/// Fetch credentials/CORS identity for an HTML image request. No-CORS uses
+/// the ordinary URL cache key so CSS images can share the same response;
+/// CORS variants use private keys and can never contaminate one another.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ImageRequestProfile {
+    NoCorsInclude,
+    CorsSameOrigin,
+    CorsInclude,
+}
+
+fn image_request_profile(tree: &DomTree, id: obscura_dom::tree::NodeId) -> ImageRequestProfile {
+    match tree
+        .get_node(id)
+        .and_then(|node| node.get_attribute("crossorigin").map(str::to_owned))
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("use-credentials") => ImageRequestProfile::CorsInclude,
+        Some(_) => ImageRequestProfile::CorsSameOrigin,
+        None => ImageRequestProfile::NoCorsInclude,
+    }
+}
+
+fn image_resource_key(url: &str, profile: ImageRequestProfile) -> String {
+    let url = network_resource_url(url);
+    match profile {
+        ImageRequestProfile::NoCorsInclude => url,
+        ImageRequestProfile::CorsSameOrigin => format!("\0obscura-img-cors\0{url}"),
+        ImageRequestProfile::CorsInclude => format!("\0obscura-img-credentials\0{url}"),
+    }
+}
+
+fn network_resource_url(url: &str) -> String {
+    if url.starts_with('\0') || url.starts_with("data:") {
+        return url.to_string();
+    }
+    let Ok(mut parsed) = url::Url::parse(url) else {
+        return url.to_string();
+    };
+    parsed.set_fragment(None);
+    parsed.to_string()
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -162,11 +205,33 @@ impl RenderResourceCache {
     }
 
     pub fn has_live_outcome(&self, url: &str) -> bool {
-        match self.entries.get(url) {
+        match self.entries.get(&network_resource_url(url)) {
             Some(CachedResource::Bytes(_)) => true,
             Some(CachedResource::Missing(at)) => at.elapsed() < MISSING_RESOURCE_RETRY_AFTER,
             None => false,
         }
+    }
+
+    /// Whether this URL currently retains usable bytes (as opposed to a
+    /// short-lived negative-cache entry). Profile-specific HTML image loads
+    /// use this to avoid replacing paint bytes from another credential mode.
+    pub fn has_cached_bytes(&self, url: &str) -> bool {
+        matches!(
+            self.entries.get(&network_resource_url(url)),
+            Some(CachedResource::Bytes(_))
+        )
+    }
+
+    pub fn has_live_image_outcome(&self, url: &str, profile: ImageRequestProfile) -> bool {
+        self.has_live_outcome(&image_resource_key(url, profile))
+    }
+
+    pub fn seed_image(&mut self, url: String, profile: ImageRequestProfile, bytes: Vec<u8>) {
+        self.seed(image_resource_key(&url, profile), bytes);
+    }
+
+    pub fn seed_image_missing(&mut self, url: String, profile: ImageRequestProfile) {
+        self.seed_missing(image_resource_key(&url, profile));
     }
 
     /// Seed bytes fetched by the owning page's asynchronous browser transport.
@@ -176,6 +241,7 @@ impl RenderResourceCache {
     /// layer uses this entry point to fetch a bounded resource batch through
     /// its cookie/proxy/CORS-aware connection pool before entering layout.
     pub fn seed(&mut self, url: String, bytes: Vec<u8>) {
+        let url = network_resource_url(&url);
         self.remove(&url);
         self.insert_bytes(url, Arc::from(bytes));
     }
@@ -183,6 +249,7 @@ impl RenderResourceCache {
     /// Retain a page-transport failure so capture does not immediately repeat
     /// the same slow request through the renderer's compatibility loader.
     pub fn seed_missing(&mut self, url: String) {
+        let url = network_resource_url(&url);
         self.remove(&url);
         self.insert_missing(url);
     }
@@ -224,7 +291,30 @@ impl RenderResourceCache {
                     .map(|(width, height)| (resolved_url, width, height)),
             );
         }
-        match self.entries.get(&resolved_url) {
+        match self.entries.get(&network_resource_url(&resolved_url)) {
+            Some(CachedResource::Bytes(bytes)) => Some(
+                image_metadata_from_bytes(bytes)
+                    .map(|(width, height)| (resolved_url, width, height)),
+            ),
+            Some(CachedResource::Missing(at)) if at.elapsed() < MISSING_RESOURCE_RETRY_AFTER => {
+                Some(None)
+            }
+            _ => None,
+        }
+    }
+
+    fn cached_profiled_image_metadata(
+        &self,
+        src: &str,
+        base_url: Option<&str>,
+        profile: ImageRequestProfile,
+    ) -> Option<Option<(String, f32, f32)>> {
+        let resolved_url = resolve_resource_url(src, base_url)?;
+        if resolved_url.starts_with("data:") {
+            return self.cached_image_metadata(&resolved_url, None);
+        }
+        let key = image_resource_key(&resolved_url, profile);
+        match self.entries.get(&key) {
             Some(CachedResource::Bytes(bytes)) => Some(
                 image_metadata_from_bytes(bytes)
                     .map(|(width, height)| (resolved_url, width, height)),
@@ -250,7 +340,8 @@ impl RenderResourceCache {
     ) -> Option<(String, f32, Option<(f32, f32)>)> {
         let (src, density) = resolve_img_url(tree, id, viewport)?;
         let resolved_url = resolve_resource_url(&src, base_url).unwrap_or(src);
-        let dimensions = fetch_bytes(&resolved_url, None, self)
+        let profile = image_request_profile(tree, id);
+        let dimensions = fetch_profiled_image_bytes(&resolved_url, None, self, profile)
             .and_then(|bytes| image_metadata_from_bytes(&bytes))
             .map(|(width, height)| (width / density, height / density));
         Some((resolved_url, density, dimensions))
@@ -268,7 +359,8 @@ impl RenderResourceCache {
     ) -> Option<(String, f32, bool, Option<(f32, f32)>)> {
         let (src, density) = resolve_img_url(tree, id, viewport)?;
         let resolved_url = resolve_resource_url(&src, base_url).unwrap_or(src);
-        match self.cached_image_metadata(&resolved_url, None) {
+        let profile = image_request_profile(tree, id);
+        match self.cached_profiled_image_metadata(&resolved_url, None, profile) {
             None => Some((resolved_url, density, false, None)),
             Some(dimensions) => Some((
                 resolved_url,
@@ -280,7 +372,8 @@ impl RenderResourceCache {
     }
 
     fn get_or_load(&mut self, url: &str) -> Option<Arc<[u8]>> {
-        if let Some(entry) = self.entries.get(url) {
+        let url = network_resource_url(url);
+        if let Some(entry) = self.entries.get(&url) {
             match entry {
                 CachedResource::Bytes(bytes) => return Some(Arc::clone(bytes)),
                 CachedResource::Missing(at) if at.elapsed() < MISSING_RESOURCE_RETRY_AFTER => {
@@ -292,16 +385,53 @@ impl RenderResourceCache {
         if !self.sync_loading_enabled {
             return None;
         }
-        self.remove(url);
+        self.remove(&url);
 
-        let loaded = self.loader.load(url).map(Arc::<[u8]>::from);
+        let loaded = self.loader.load(&url).map(Arc::<[u8]>::from);
         match loaded {
             Some(bytes) => {
-                self.insert_bytes(url.to_string(), Arc::clone(&bytes));
+                self.insert_bytes(url, Arc::clone(&bytes));
                 Some(bytes)
             }
             None => {
-                self.insert_missing(url.to_string());
+                self.insert_missing(url);
+                None
+            }
+        }
+    }
+
+    fn get_or_load_image(
+        &mut self,
+        url: &str,
+        profile: ImageRequestProfile,
+    ) -> Option<Arc<[u8]>> {
+        let key = image_resource_key(url, profile);
+        if let Some(entry) = self.entries.get(&key) {
+            match entry {
+                CachedResource::Bytes(bytes) => return Some(Arc::clone(bytes)),
+                CachedResource::Missing(at) if at.elapsed() < MISSING_RESOURCE_RETRY_AFTER => {
+                    return None;
+                }
+                CachedResource::Missing(_) => {}
+            }
+        }
+        if !self.sync_loading_enabled {
+            return None;
+        }
+        self.remove(&key);
+        // The private profile key is cache identity only and must never escape
+        // into a network loader.
+        let loaded = self
+            .loader
+            .load(&network_resource_url(url))
+            .map(Arc::<[u8]>::from);
+        match loaded {
+            Some(bytes) => {
+                self.insert_bytes(key, Arc::clone(&bytes));
+                Some(bytes)
+            }
+            None => {
+                self.insert_missing(key);
                 None
             }
         }
@@ -382,6 +512,7 @@ impl RenderResourceCache {
                 SelectedImage {
                     resolved_url: value.resolved_url,
                     density: 1.0,
+                    profile: ImageRequestProfile::NoCorsInclude,
                 },
             );
             seeded.insert(nid);
@@ -426,11 +557,19 @@ impl RenderResourceCache {
     }
 }
 
+/// Inspect already-fetched image bytes without inserting them into a resource
+/// cache. HTMLImageElement keeps request-profile-specific lifecycle outcomes
+/// even though the renderer's ordinary paint cache is URL-keyed.
+pub fn image_intrinsic_dimensions(bytes: &[u8]) -> Option<(f32, f32)> {
+    image_metadata_from_bytes(bytes)
+}
+
 /// The exact responsive image candidate chosen during preparation.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SelectedImage {
     pub resolved_url: String,
     pub density: f32,
+    pub profile: ImageRequestProfile,
 }
 
 /// CSSOM scrolling metrics for one element box. Non-scroll containers expose
@@ -616,6 +755,7 @@ impl ResolvedScrollState {
 /// The DOM must not be mutated while this value is reused.
 pub struct PreparedRender {
     viewport: (f32, f32),
+    animation_sample: crate::AnimationSample,
     root_font_size: f32,
     base_url: Option<String>,
     content_size: (f32, f32),
@@ -630,6 +770,51 @@ pub struct PreparedRender {
 impl PreparedRender {
     pub fn viewport(&self) -> (f32, f32) {
         self.viewport
+    }
+
+    pub fn animation_sample_time(&self) -> crate::AnimationSampleTime {
+        self.animation_sample.time
+    }
+
+    pub fn animation_sample(&self) -> crate::AnimationSample {
+        self.animation_sample
+    }
+
+    /// Whether advancing the document timeline can still change a sampled CSS
+    /// animation. Finite animations stop producing compositor damage after
+    /// their active interval; paused and zero-duration animations never do.
+    pub fn has_active_css_animations(&self) -> bool {
+        self.layout.styles.values().any(|style| {
+            if style.animation_name.is_none()
+                || !style.animation_has_render_effect
+                || style.animation_timing.play_state == crate::AnimationPlayState::Paused
+                || style.animation_timing.duration_ms <= 0.0
+                || style.animation_timing.iteration_count <= 0.0
+            {
+                return false;
+            }
+            let end = style.animation_timing.delay_ms
+                + style.animation_timing.duration_ms * style.animation_timing.iteration_count;
+            end.is_infinite() || style.animation_local_time_ms < end.max(0.0)
+        })
+    }
+
+    /// Advance a frame whose animation cascade is already time-invariant.
+    /// This preserves retained layout for static pages and completed finite
+    /// animations. Backward seeks are never eligible because they can re-enter
+    /// an earlier active interval or undo forwards fill.
+    pub fn advance_inactive_animation_sample_time(
+        &mut self,
+        sample: crate::AnimationSampleTime,
+    ) -> bool {
+        if self.animation_sample.mode != crate::AnimationSampleMode::DocumentTime
+            || sample.milliseconds < self.animation_sample.time.milliseconds
+            || self.has_active_css_animations()
+        {
+            return false;
+        }
+        self.animation_sample.time = sample;
+        true
     }
 
     pub fn base_url(&self) -> Option<&str> {
@@ -1563,8 +1748,30 @@ pub fn paint_dom_scrolled(
     base_url: Option<&str>,
     scroll: (f32, f32),
 ) -> Option<Pixmap> {
+    paint_dom_scrolled_at_animation_time(
+        tree,
+        viewport,
+        base_url,
+        scroll,
+        crate::AnimationSampleTime::default(),
+    )
+}
+
+pub fn paint_dom_scrolled_at_animation_time(
+    tree: &DomTree,
+    viewport: (f32, f32),
+    base_url: Option<&str>,
+    scroll: (f32, f32),
+    animation_sample_time: crate::AnimationSampleTime,
+) -> Option<Pixmap> {
     let mut resources = RenderResourceCache::default();
-    let mut prepared = prepare_dom(tree, viewport, base_url, &mut resources)?;
+    let mut prepared = prepare_dom_at_animation_time(
+        tree,
+        viewport,
+        base_url,
+        &mut resources,
+        animation_sample_time,
+    )?;
     paint_prepared(tree, &mut prepared, &mut resources, scroll)
 }
 
@@ -1576,7 +1783,30 @@ pub fn prepare_dom(
     base_url: Option<&str>,
     resources: &mut RenderResourceCache,
 ) -> Option<PreparedRender> {
-    prepare_dom_with_dynamic_fonts(tree, viewport, base_url, resources, &[])
+    prepare_dom_at_animation_time(
+        tree,
+        viewport,
+        base_url,
+        resources,
+        crate::AnimationSampleTime::default(),
+    )
+}
+
+pub fn prepare_dom_at_animation_time(
+    tree: &DomTree,
+    viewport: (f32, f32),
+    base_url: Option<&str>,
+    resources: &mut RenderResourceCache,
+    animation_sample_time: crate::AnimationSampleTime,
+) -> Option<PreparedRender> {
+    prepare_dom_with_dynamic_fonts_at_animation_time(
+        tree,
+        viewport,
+        base_url,
+        resources,
+        &[],
+        animation_sample_time,
+    )
 }
 
 /// Prepare a DOM with the document's script-created `FontFace` registrations.
@@ -1590,14 +1820,33 @@ pub fn prepare_dom_with_dynamic_fonts(
     resources: &mut RenderResourceCache,
     dynamic_fonts: &[DynamicFontFace],
 ) -> Option<PreparedRender> {
+    prepare_dom_with_dynamic_fonts_at_animation_time(
+        tree,
+        viewport,
+        base_url,
+        resources,
+        dynamic_fonts,
+        crate::AnimationSampleTime::default(),
+    )
+}
+
+pub fn prepare_dom_with_dynamic_fonts_at_animation_time(
+    tree: &DomTree,
+    viewport: (f32, f32),
+    base_url: Option<&str>,
+    resources: &mut RenderResourceCache,
+    dynamic_fonts: &[DynamicFontFace],
+    animation_sample_time: crate::AnimationSampleTime,
+) -> Option<PreparedRender> {
     let mut stylesheet_cache = crate::css::StylesheetCache::default();
-    prepare_dom_with_dynamic_fonts_and_stylesheet_cache(
+    prepare_dom_with_dynamic_fonts_and_stylesheet_cache_at_animation_time(
         tree,
         viewport,
         base_url,
         resources,
         dynamic_fonts,
         &mut stylesheet_cache,
+        animation_sample_time,
     )
 }
 
@@ -1612,6 +1861,52 @@ pub fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache(
     dynamic_fonts: &[DynamicFontFace],
     stylesheet_cache: &mut crate::css::StylesheetCache,
 ) -> Option<PreparedRender> {
+    prepare_dom_with_dynamic_fonts_and_stylesheet_cache_at_animation_time(
+        tree,
+        viewport,
+        base_url,
+        resources,
+        dynamic_fonts,
+        stylesheet_cache,
+        crate::AnimationSampleTime::default(),
+    )
+}
+
+pub fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_at_animation_time(
+    tree: &DomTree,
+    viewport: (f32, f32),
+    base_url: Option<&str>,
+    resources: &mut RenderResourceCache,
+    dynamic_fonts: &[DynamicFontFace],
+    stylesheet_cache: &mut crate::css::StylesheetCache,
+    animation_sample_time: crate::AnimationSampleTime,
+) -> Option<PreparedRender> {
+    let mut animation_timeline = crate::AnimationTimelineState::default();
+    prepare_dom_with_dynamic_fonts_and_stylesheet_cache_with_animation_state(
+        tree,
+        viewport,
+        base_url,
+        resources,
+        dynamic_fonts,
+        stylesheet_cache,
+        crate::AnimationSample {
+            time: animation_sample_time,
+            mode: crate::AnimationSampleMode::DocumentTime,
+        },
+        &mut animation_timeline,
+    )
+}
+
+pub fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_with_animation_state(
+    tree: &DomTree,
+    viewport: (f32, f32),
+    base_url: Option<&str>,
+    resources: &mut RenderResourceCache,
+    dynamic_fonts: &[DynamicFontFace],
+    stylesheet_cache: &mut crate::css::StylesheetCache,
+    animation_sample: crate::AnimationSample,
+    animation_timeline: &mut crate::AnimationTimelineState,
+) -> Option<PreparedRender> {
     prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
         tree,
         viewport,
@@ -1620,6 +1915,8 @@ pub fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache(
         dynamic_fonts,
         stylesheet_cache,
         None,
+        animation_sample,
+        animation_timeline,
     )
 }
 
@@ -1663,9 +1960,76 @@ pub fn prepare_dom_with_retained_styles(
     resources: &mut RenderResourceCache,
     dynamic_fonts: &[DynamicFontFace],
     stylesheet_cache: &mut crate::css::StylesheetCache,
-    mut previous: PreparedRender,
+    previous: PreparedRender,
     mutations: &[crate::dom::RetainedStyleMutation],
 ) -> Option<PreparedRender> {
+    prepare_dom_with_retained_styles_at_animation_time(
+        tree,
+        viewport,
+        base_url,
+        resources,
+        dynamic_fonts,
+        stylesheet_cache,
+        previous,
+        mutations,
+        crate::AnimationSampleTime::default(),
+    )
+}
+
+pub fn prepare_dom_with_retained_styles_at_animation_time(
+    tree: &DomTree,
+    viewport: (f32, f32),
+    base_url: Option<&str>,
+    resources: &mut RenderResourceCache,
+    dynamic_fonts: &[DynamicFontFace],
+    stylesheet_cache: &mut crate::css::StylesheetCache,
+    previous: PreparedRender,
+    mutations: &[crate::dom::RetainedStyleMutation],
+    animation_sample_time: crate::AnimationSampleTime,
+) -> Option<PreparedRender> {
+    let mut animation_timeline = crate::AnimationTimelineState::default();
+    prepare_dom_with_retained_styles_with_animation_state(
+        tree,
+        viewport,
+        base_url,
+        resources,
+        dynamic_fonts,
+        stylesheet_cache,
+        previous,
+        mutations,
+        crate::AnimationSample {
+            time: animation_sample_time,
+            mode: crate::AnimationSampleMode::DocumentTime,
+        },
+        &mut animation_timeline,
+    )
+}
+
+pub fn prepare_dom_with_retained_styles_with_animation_state(
+    tree: &DomTree,
+    viewport: (f32, f32),
+    base_url: Option<&str>,
+    resources: &mut RenderResourceCache,
+    dynamic_fonts: &[DynamicFontFace],
+    stylesheet_cache: &mut crate::css::StylesheetCache,
+    mut previous: PreparedRender,
+    mutations: &[crate::dom::RetainedStyleMutation],
+    animation_sample: crate::AnimationSample,
+    animation_timeline: &mut crate::AnimationTimelineState,
+) -> Option<PreparedRender> {
+    if previous.animation_sample != animation_sample {
+        drop(previous);
+        return prepare_dom_with_dynamic_fonts_and_stylesheet_cache_with_animation_state(
+            tree,
+            viewport,
+            base_url,
+            resources,
+            dynamic_fonts,
+            stylesheet_cache,
+            animation_sample,
+            animation_timeline,
+        );
+    }
     let retained = RetainedStyleMaps {
         styles: std::mem::take(&mut previous.layout.styles),
         custom_properties: std::mem::take(&mut previous.layout.custom_properties),
@@ -1679,6 +2043,8 @@ pub fn prepare_dom_with_retained_styles(
         dynamic_fonts,
         stylesheet_cache,
         Some((retained, mutations)),
+        animation_sample,
+        animation_timeline,
     )
 }
 
@@ -1690,6 +2056,8 @@ fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
     dynamic_fonts: &[DynamicFontFace],
     stylesheet_cache: &mut crate::css::StylesheetCache,
     retained: Option<(RetainedStyleMaps, &[crate::dom::RetainedStyleMutation])>,
+    animation_sample: crate::AnimationSample,
+    animation_timeline: &mut crate::AnimationTimelineState,
 ) -> Option<PreparedRender> {
     if !viewport.0.is_finite() || !viewport.1.is_finite() || viewport.0 <= 0.0 || viewport.1 <= 0.0
     {
@@ -1731,7 +2099,7 @@ fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
         svg_font_database()
     };
     let mut laid = match retained {
-        Some((retained, mutations)) => layout_dom_with_web_fonts_and_retained_styles(
+        Some((retained, mutations)) => layout_dom_with_web_fonts_and_retained_styles_with_animation_state(
             tree,
             viewport,
             &intrinsic,
@@ -1739,13 +2107,17 @@ fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
             stylesheet_cache,
             retained,
             mutations,
+            animation_sample,
+            animation_timeline,
         ),
-        None => layout_dom_with_web_fonts_and_stylesheet_cache(
+        None => layout_dom_with_web_fonts_and_stylesheet_cache_with_animation_state(
             tree,
             viewport,
             &intrinsic,
             &fonts,
             stylesheet_cache,
+            animation_sample,
+            animation_timeline,
         ),
     };
     // `content:url(...)` is computed by the author cascade, whereas ordinary
@@ -1767,12 +2139,14 @@ fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
         {
             resources.content_image_layout_retries += 1;
         }
-        laid = layout_dom_with_web_fonts_and_stylesheet_cache(
+        laid = layout_dom_with_web_fonts_and_stylesheet_cache_with_animation_state(
             tree,
             viewport,
             &intrinsic,
             &fonts,
             stylesheet_cache,
+            animation_sample,
+            animation_timeline,
         );
     }
     let content_size = laid.scrolling_content_size(tree, viewport);
@@ -1788,6 +2162,7 @@ fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
         .unwrap_or(16.0);
     Some(PreparedRender {
         viewport,
+        animation_sample,
         root_font_size,
         base_url: base_url.map(str::to_string),
         content_size,
@@ -2945,6 +3320,7 @@ fn paint_laid_dom_scrolled(
                             &mut pixmap,
                             image_cache,
                             None,
+                            None,
                             background.clip_radii,
                             background_mask,
                         );
@@ -3048,6 +3424,7 @@ fn paint_laid_dom_scrolled(
                     style.object_fit,
                     &mut pixmap,
                     image_cache,
+                    Some(source.profile),
                     None,
                     radius,
                     element_clip_mask,
@@ -3675,6 +4052,7 @@ fn paint_inline_fragment_decorations(
                     crate::ObjectFit::Fill,
                     pixmap,
                     image_cache,
+                    None,
                     None,
                     background.clip_radii,
                     background_mask.as_ref(),
@@ -4704,6 +5082,23 @@ pub fn screenshot_png_scrolled(
     paint_dom_scrolled(tree, viewport, base_url, scroll).and_then(|pixmap| pixmap.encode_png().ok())
 }
 
+pub fn screenshot_png_scrolled_at_animation_time(
+    tree: &DomTree,
+    viewport: (f32, f32),
+    base_url: Option<&str>,
+    scroll: (f32, f32),
+    animation_sample_time: crate::AnimationSampleTime,
+) -> Option<Vec<u8>> {
+    paint_dom_scrolled_at_animation_time(
+        tree,
+        viewport,
+        base_url,
+        scroll,
+        animation_sample_time,
+    )
+    .and_then(|pixmap| pixmap.encode_png().ok())
+}
+
 /// PNG convenience wrapper for a retained resource-aware layout.
 pub fn screenshot_prepared(
     tree: &DomTree,
@@ -5179,6 +5574,19 @@ fn fetch_bytes(
     }
     let resolved = resolve_resource_url(src, base_url)?;
     cache.get_or_load(&resolved)
+}
+
+fn fetch_profiled_image_bytes(
+    src: &str,
+    base_url: Option<&str>,
+    cache: &mut RenderResourceCache,
+    profile: ImageRequestProfile,
+) -> Option<Arc<[u8]>> {
+    if src.starts_with("data:") {
+        return fetch_bytes(src, base_url, cache);
+    }
+    let resolved = resolve_resource_url(src, base_url)?;
+    cache.get_or_load_image(&resolved, profile)
 }
 
 fn resolve_resource_url(src: &str, base_url: Option<&str>) -> Option<String> {
@@ -6818,6 +7226,7 @@ fn paint_in_flow_generated_box(
                 pixmap,
                 image_cache,
                 None,
+                None,
                 background.clip_radii,
                 background_mask.as_ref(),
             );
@@ -7051,6 +7460,7 @@ fn paint_positioned_pseudo(
                 pixmap,
                 image_cache,
                 None,
+                None,
                 background.clip_radii,
                 background_mask.as_ref(),
             );
@@ -7143,14 +7553,16 @@ fn collect_image_intrinsics(
             continue;
         };
         let resolved_url = resolve_resource_url(&url, base_url).unwrap_or(url);
+        let profile = image_request_profile(tree, nid);
         selected.insert(
             nid,
             SelectedImage {
                 resolved_url: resolved_url.clone(),
                 density,
+                profile,
             },
         );
-        let Some(bytes) = fetch_bytes(&resolved_url, None, cache) else {
+        let Some(bytes) = fetch_profiled_image_bytes(&resolved_url, None, cache, profile) else {
             continue;
         };
         let dimensions = image_dimensions(&bytes)
@@ -7208,6 +7620,7 @@ fn collect_content_image_intrinsics(
             SelectedImage {
                 resolved_url: resolved_url.clone(),
                 density: 1.0,
+                profile: ImageRequestProfile::NoCorsInclude,
             },
         );
         // CSS content replaces the element's ordinary source. Remove the src
@@ -7528,6 +7941,7 @@ fn paint_image(
     object_fit: crate::ObjectFit,
     pixmap: &mut Pixmap,
     cache: &mut RenderResourceCache,
+    profile: Option<ImageRequestProfile>,
     transform: Option<crate::Affine2>,
     clip_radius: crate::ResolvedBorderRadii,
     extra_clip: Option<&tiny_skia::Mask>,
@@ -7541,7 +7955,11 @@ fn paint_image(
     if !rect_intersects_paint_surface(visible_rect, pixmap, 1.0) {
         return false;
     }
-    let Some(bytes) = fetch_bytes(src, base_url, cache) else {
+    let bytes = match profile {
+        Some(profile) => fetch_profiled_image_bytes(src, base_url, cache, profile),
+        None => fetch_bytes(src, base_url, cache),
+    };
+    let Some(bytes) = bytes else {
         return false;
     };
     let svg = is_svg(&bytes);
@@ -8747,6 +9165,56 @@ mod tests {
     }
 
     #[test]
+    fn html_image_profiles_keep_intrinsic_geometry_and_paint_separate() {
+        let network_url = "https://assets.test/shared.svg";
+        let url = "https://assets.test/shared.svg#icon";
+        let tree = parse_html(&format!(
+            r#"<html style="margin:0"><body style="margin:0">
+                <img id="plain" src="{url}" style="display:block">
+                <img id="anonymous" crossorigin="anonymous" src="{url}" style="display:block">
+                <img id="credentialed" crossorigin="use-credentials" alt="" src="{url}"
+                     style="display:block;width:20px;height:10px">
+            </body></html>"#
+        ));
+        let mut resources = RenderResourceCache::with_loader(|_url: &str| {
+            panic!("seeded profile resources must not reach the loader")
+        });
+        resources.seed_image(
+            network_url.to_string(),
+            ImageRequestProfile::NoCorsInclude,
+            br##"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"><rect width="20" height="10" fill="#f00"/></svg>"##.to_vec(),
+        );
+        resources.seed_image(
+            network_url.to_string(),
+            ImageRequestProfile::CorsSameOrigin,
+            br##"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="30"><rect width="40" height="30" fill="#0f0"/></svg>"##.to_vec(),
+        );
+        resources.seed_image_missing(network_url.to_string(), ImageRequestProfile::CorsInclude);
+
+        let mut prepared =
+            prepare_dom(&tree, (80.0, 60.0), None, &mut resources).expect("profiled layout");
+        let node = |selector| tree.query_selector(selector).unwrap().unwrap();
+        let plain = prepared.layout().rects[&node("#plain")];
+        let anonymous = prepared.layout().rects[&node("#anonymous")];
+        assert_eq!(prepared.selected_image(node("#plain")).unwrap().resolved_url, url);
+        assert_eq!((plain.width, plain.height), (20.0, 10.0));
+        assert_eq!((anonymous.width, anonymous.height), (40.0, 30.0));
+
+        let pixmap = paint_prepared(&tree, &mut prepared, &mut resources, (0.0, 0.0))
+            .expect("profiled paint");
+        let red = pixmap.pixel(5, 5).unwrap();
+        assert!(red.red() > 240 && red.green() < 20, "{red:?}");
+        let green = pixmap.pixel(5, 20).unwrap();
+        assert!(green.green() > 240 && green.red() < 20, "{green:?}");
+        let failed = pixmap.pixel(5, 45).unwrap();
+        assert_eq!(
+            (failed.red(), failed.green(), failed.blue(), failed.alpha()),
+            (255, 255, 255, 255),
+            "failed credentialed image must not paint bytes from another profile"
+        );
+    }
+
+    #[test]
     fn image_accept_advertises_exactly_decodable_mime_types() {
         assert!(!IMAGE_ACCEPT.contains('*'));
         assert!(!IMAGE_ACCEPT.to_ascii_lowercase().contains("avif"));
@@ -9075,6 +9543,7 @@ mod tests {
             Some(&SelectedImage {
                 resolved_url: "https://assets.test/hero.svg".to_string(),
                 density: 2.0,
+                profile: ImageRequestProfile::NoCorsInclude,
             })
         );
         let hero_rect = prepared.layout().rects.get(&hero).expect("hero rect");
@@ -12572,6 +13041,7 @@ mod tests {
             &mut pixmap,
             &mut resources,
             None,
+            None,
             crate::ResolvedBorderRadii::default(),
             None,
         ));
@@ -12611,5 +13081,50 @@ mod tests {
         assert!(fixed.green() > 240 && fixed.red() < 20);
         let sticky = pixmap.pixel(75, 15).expect("sticky pixel");
         assert!(sticky.blue() > 240 && sticky.red() < 20);
+    }
+
+    #[test]
+    fn prepared_render_samples_explicit_animation_time_and_reports_live_damage() {
+        let tree = parse_html(
+            r#"<style>
+                @keyframes dismiss {
+                    from { opacity:1; visibility:visible }
+                    to { opacity:0; visibility:hidden }
+                }
+                #overlay { opacity:1; animation:dismiss 600ms linear forwards }
+            </style><div id="overlay" style="width:20px;height:20px;background:red"></div>"#,
+        );
+        let overlay = tree.query_selector("#overlay").unwrap().unwrap();
+        let mut resources = RenderResourceCache::with_loader(|_url: &str| None);
+        let mut stylesheets = crate::css::StylesheetCache::default();
+        let at_zero = prepare_dom_with_dynamic_fonts_and_stylesheet_cache_at_animation_time(
+            &tree,
+            (40.0, 40.0),
+            None,
+            &mut resources,
+            &[],
+            &mut stylesheets,
+            crate::AnimationSampleTime { milliseconds: 0.0 },
+        )
+        .expect("T=0 render");
+        assert_eq!(at_zero.animation_sample_time().milliseconds, 0.0);
+        assert_eq!(at_zero.layout.styles[&overlay].opacity, Some(1.0));
+        assert_ne!(at_zero.layout.styles[&overlay].visibility_hidden, Some(true));
+        assert!(at_zero.has_active_css_animations());
+
+        let at_end = prepare_dom_with_dynamic_fonts_and_stylesheet_cache_at_animation_time(
+            &tree,
+            (40.0, 40.0),
+            None,
+            &mut resources,
+            &[],
+            &mut stylesheets,
+            crate::AnimationSampleTime { milliseconds: 600.0 },
+        )
+        .expect("animation-end render");
+        assert_eq!(at_end.layout.styles[&overlay].opacity, Some(0.0));
+        assert_eq!(at_end.layout.styles[&overlay].visibility_hidden, Some(true));
+        assert!(at_end.layout.styles[&overlay].effectively_invisible);
+        assert!(!at_end.has_active_css_animations());
     }
 }

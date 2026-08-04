@@ -278,12 +278,37 @@ impl Page {
     /// vertical slices become pages. This does not reflow into `@media print`
     /// or implement CSS paged media, headers, or footers.
     pub fn raster_pdf(&self, options: RasterPdfOptions) -> Result<Vec<u8>, RasterPdfError> {
+        self.raster_pdf_with_animation_sample(options, self.live_animation_sample())
+    }
+
+    pub fn raster_pdf_at_animation_time(
+        &self,
+        options: RasterPdfOptions,
+        animation_sample_time: obscura_js::AnimationSampleTime,
+    ) -> Result<Vec<u8>, RasterPdfError> {
+        self.raster_pdf_with_animation_sample(
+            options,
+            obscura_js::AnimationSample {
+                time: animation_sample_time,
+                mode: obscura_js::AnimationSampleMode::LocalOverride,
+            },
+        )
+    }
+
+    pub fn raster_pdf_with_animation_sample(
+        &self,
+        options: RasterPdfOptions,
+        animation_sample: obscura_js::AnimationSample,
+    ) -> Result<Vec<u8>, RasterPdfError> {
         let (page_width, page_height, printable_width, printable_height, left, bottom) =
             options.page_geometry()?;
         let js = self
             .js
             .as_ref()
             .ok_or(RasterPdfError::NoRenderableDocument)?;
+        if !js.set_animation_sample(animation_sample) {
+            return Err(RasterPdfError::NoRenderableDocument);
+        }
         let (content_width, content_height) = js
             .prepared_content_size()
             .ok_or(RasterPdfError::NoRenderableDocument)?;

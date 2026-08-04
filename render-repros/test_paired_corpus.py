@@ -119,6 +119,11 @@ class ControlledScrollTests(unittest.TestCase):
         self.assertEqual(environment["OBSCURA_SHOT_SCROLL_Y"], "bottom")
         self.assertEqual(environment["OBSCURA_SHOT_EVAL_AT_CAPTURE"], "1")
         self.assertEqual(environment["OBSCURA_SHOT_RESOURCE_WARMUP"], "1")
+        self.assertNotIn("OBSCURA_SHOT_ANIMATION_TIME_MS", environment)
+
+    def test_obscura_capture_exports_explicit_animation_sample(self):
+        environment = paired_corpus.obscura_environment(1280, 720, 0)
+        self.assertEqual(environment["OBSCURA_SHOT_ANIMATION_TIME_MS"], "0")
 
     def test_paired_state_expression_is_read_only_at_capture_boundary(self):
         expression = paired_corpus.obscura_state_eval_expression(

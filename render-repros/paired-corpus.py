@@ -561,7 +561,7 @@ def parse_obscura_scroll_report(stdout):
     }
 
 
-def obscura_environment(width, height):
+def obscura_environment(width, height, animation_time_ms=None):
     env = dict(
         os.environ,
         OBSCURA_SHOT_W=str(width),
@@ -587,6 +587,8 @@ def obscura_environment(width, height):
         # same warm-up shot in the paired process.
         OBSCURA_SHOT_RESOURCE_WARMUP="1",
     )
+    if animation_time_ms is not None:
+        env["OBSCURA_SHOT_ANIMATION_TIME_MS"] = str(animation_time_ms)
     return env
 
 
@@ -719,9 +721,10 @@ def capture_obscura(
     settle_ms,
     scroll=None,
     geometry_selectors=None,
+    animation_time_ms=None,
 ):
     env = with_controlled_scroll_environment(
-        obscura_environment(width, height), scroll
+        obscura_environment(width, height, animation_time_ms), scroll
     )
     command = [
         binary,
@@ -1987,6 +1990,7 @@ def main():
                     args.settle_ms,
                     controlled_scroll,
                     args.geometry_selector,
+                    args.animation_time_ms,
                 )
                 baseline_future = None
                 if args.baseline_bin:
@@ -2001,6 +2005,7 @@ def main():
                         args.settle_ms,
                         controlled_scroll,
                         args.geometry_selector,
+                        args.animation_time_ms,
                     )
 
                 chrome_started = time.time()

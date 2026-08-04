@@ -233,6 +233,10 @@ pub struct Page {
     /// Exposed to JS as `document.characterSet` and used for the URL query
     /// encoding override on `<a>`/`<area>` hrefs in legacy-charset documents.
     pub encoding: String,
+    /// Monotonic origin for the current document's CSS animation timeline.
+    /// It is reset once author styles are installed, so stylesheet download
+    /// latency does not incorrectly advance newly-created animations.
+    document_timeline_origin: std::time::Instant,
     /// Navigation history for Page.getNavigationHistory / navigateToHistoryEntry.
     /// Entries are URLs in visit order; `history_index` is the current position.
     /// Pushed on every successful navigation; truncated on goBack -> new nav.
@@ -724,6 +728,7 @@ impl Page {
             viewport: (1280.0, 720.0),
             device_scale_factor: 1.0,
             encoding: "UTF-8".to_string(),
+            document_timeline_origin: std::time::Instant::now(),
             history: Vec::new(),
             history_index: 0,
             network_events: Vec::new(),
@@ -1852,6 +1857,11 @@ impl Page {
             let mut idle_count = 0u32;
             loop {
                 let now = tokio::time::Instant::now();
+                // `has_pending_dynamic_scripts` includes both inserted script
+                // elements and loader-owned ES-module graph activity. A lazy
+                // import may be the work which removes an SSR loading shell;
+                // do not take the 500ms fast exit while that graph is fetching.
+                // Unrelated fetch/XHR activity remains on the fast path.
                 if now >= deadline && (now >= dynamic_deadline || !js.has_pending_dynamic_scripts())
                 {
                     break;
@@ -2274,6 +2284,10 @@ impl Page {
                 }
             }
         }
+        self.document_timeline_origin = std::time::Instant::now();
+        if let Some(js) = &self.js {
+            js.reset_animation_timeline();
+        }
         if let Some(js) = &mut self.js {
             let _ = js.execute_script("<iframe-load>",
                 "(function() { var iframes = document.querySelectorAll('iframe[src]'); for (var i = 0; i < iframes.length; i++) { var src = iframes[i].getAttribute('src'); if (src && src !== 'about:blank') iframes[i]._loadIframeSrc(src); } })()");
@@ -2410,6 +2424,7 @@ impl Page {
         ));
         self.title = String::new();
         self.lifecycle = LifecycleState::Loaded;
+        self.document_timeline_origin = std::time::Instant::now();
     }
 
     pub fn url_string(&self) -> String {
@@ -2445,10 +2460,10 @@ impl Page {
         let mut candidates = std::collections::BTreeMap::new();
 
         if let Some(js) = &self.js {
-            for raw in js.pending_render_image_urls() {
+            for (raw, profile) in js.pending_render_image_urls() {
                 if let Ok(mut url) = url::Url::parse(&raw) {
                     url.set_fragment(None);
-                    candidates.insert(url.to_string(), ResourceType::Image);
+                    candidates.insert((url.to_string(), Some(profile)), ResourceType::Image);
                 }
             }
             let css_sources = js
@@ -2484,15 +2499,20 @@ impl Page {
                 .unwrap_or_default();
             for css in css_sources {
                 for raw in css_resource_urls(&css, &base_url) {
-                    if let Ok(url) = url::Url::parse(&raw) {
-                        candidates.insert(raw, render_resource_type(&url));
+                    if let Ok(mut url) = url::Url::parse(&raw) {
+                        let kind = render_resource_type(&url);
+                        url.set_fragment(None);
+                        candidates.insert((url.to_string(), None), kind);
                     }
                 }
             }
-            candidates.retain(|url, _| !js.render_resource_is_known(url));
+            candidates.retain(|(url, profile), _| match profile {
+                Some(profile) => !js.render_image_resource_is_known(url, *profile),
+                None => !js.render_resource_is_known(url),
+            });
         }
 
-        candidates.retain(|url, _| {
+        candidates.retain(|(url, _), _| {
             subresource_allowed(Some(&document_url), url) && !self.should_block_url(url)
         });
         if candidates.len() > 128 {
@@ -2502,14 +2522,18 @@ impl Page {
             return 0;
         }
 
-        let requested: Vec<(String, ResourceType)> = candidates.into_iter().collect();
+        let requested: Vec<(String, Option<obscura_js::ImageRequestProfile>, ResourceType)> =
+            candidates
+                .into_iter()
+                .map(|((url, profile), kind)| (url, profile, kind))
+                .collect();
         let client = self.http_client.clone();
         #[cfg(feature = "stealth")]
         let stealth_client = self.stealth_client.clone();
         let callbacks = self.callbacks.clone();
         let initiator = document_url.clone();
         use futures::StreamExt as _;
-        let requests = futures::stream::iter(requested.clone().into_iter().map(|(raw, kind)| {
+        let requests = futures::stream::iter(requested.into_iter().map(|(raw, profile, kind)| {
             let client = client.clone();
             #[cfg(feature = "stealth")]
             let stealth_client = stealth_client.clone();
@@ -2517,7 +2541,18 @@ impl Page {
             let initiator = initiator.clone();
             async move {
                 let parsed = url::Url::parse(&raw).expect("validated render resource URL");
-                let request = ResourceRequest::subresource(kind, &initiator);
+                let mut request = ResourceRequest::subresource(kind, &initiator);
+                match profile {
+                    Some(obscura_js::ImageRequestProfile::CorsSameOrigin) => {
+                        request.mode = obscura_net::RequestMode::Cors;
+                        request.credentials = obscura_net::RequestCredentials::SameOrigin;
+                    }
+                    Some(obscura_js::ImageRequestProfile::CorsInclude) => {
+                        request.mode = obscura_net::RequestMode::Cors;
+                        request.credentials = obscura_net::RequestCredentials::Include;
+                    }
+                    _ => {}
+                }
                 #[cfg(feature = "stealth")]
                 let result = if let Some(stealth_client) = stealth_client {
                     stealth_client
@@ -2532,57 +2567,54 @@ impl Page {
                 let result = client
                     .fetch_resource_with_callbacks(&parsed, request, Some(&callbacks))
                     .await;
-                (raw, kind, result)
+                (raw, profile, kind, result)
             }
         }))
         .buffer_unordered(16);
         futures::pin_mut!(requests);
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(max_ms);
-        let mut outcomes = std::collections::HashMap::new();
+        let mut loaded = 0usize;
         loop {
             match tokio::time::timeout_at(deadline, requests.next()).await {
-                Ok(Some((raw, kind, result))) => {
-                    outcomes.insert(raw, (kind, result));
+                Ok(Some((raw, profile, kind, result))) => {
+                    let outcome = match result {
+                        Ok(response) => {
+                            self.record_network_event_with_body(
+                                response.url.as_str(),
+                                "GET",
+                                match kind {
+                                    ResourceType::Font => "Font",
+                                    _ => "Image",
+                                },
+                                response.status,
+                                &response.headers,
+                                &response.body,
+                                true,
+                            );
+                            if (200..300).contains(&response.status) {
+                                loaded += 1;
+                                Some(response.body)
+                            } else {
+                                None
+                            }
+                        }
+                        Err(_) => None,
+                    };
+                    if let Some(js) = &mut self.js {
+                        match profile {
+                            Some(profile) => {
+                                js.seed_render_image_resource(raw, profile, outcome)
+                            }
+                            None => js.seed_render_resource(raw, outcome),
+                        }
+                    }
                 }
                 Ok(None) | Err(_) => break,
             }
         }
+        // A deadline drops unfinished futures without negative-caching them,
+        // so a later warmup can retry slow resources.
         drop(requests);
-
-        let mut loaded = 0usize;
-        for (raw, kind) in requested {
-            let outcome = match outcomes.remove(&raw) {
-                Some((_, Ok(response))) => {
-                    self.record_network_event_with_body(
-                        response.url.as_str(),
-                        "GET",
-                        match kind {
-                            ResourceType::Font => "Font",
-                            _ => "Image",
-                        },
-                        response.status,
-                        &response.headers,
-                        &response.body,
-                        true,
-                    );
-                    if (200..300).contains(&response.status) {
-                        loaded += 1;
-                        Some(response.body)
-                    } else {
-                        None
-                    }
-                }
-                Some((_, Err(_))) => None,
-                // The shared deadline cancelled this request before it had a
-                // transport outcome. Keep it unknown so the final capture can
-                // retry instead of suppressing a valid slow image/font behind
-                // the renderer's negative-cache TTL.
-                None => continue,
-            };
-            if let Some(js) = &mut self.js {
-                js.seed_render_resource(raw, outcome);
-            }
-        }
         tracing::debug!(
             loaded,
             elapsed_ms = started.elapsed().as_millis(),
@@ -2596,11 +2628,41 @@ impl Page {
     /// viewport is zero-sized.
     #[cfg(feature = "render")]
     pub fn screenshot(&self, viewport: (f32, f32)) -> Option<Vec<u8>> {
+        self.screenshot_with_animation_sample(viewport, self.live_animation_sample())
+    }
+
+    /// Rasterize every CSS animation at one explicit local time. This mirrors
+    /// Web Animations `currentTime` and is intended for deterministic parity
+    /// capture; ordinary screenshots use each live instance's start epoch.
+    #[cfg(feature = "render")]
+    pub fn screenshot_at_animation_time(
+        &self,
+        viewport: (f32, f32),
+        animation_sample_time: obscura_js::AnimationSampleTime,
+    ) -> Option<Vec<u8>> {
+        self.screenshot_with_animation_sample(
+            viewport,
+            obscura_js::AnimationSample {
+                time: animation_sample_time,
+                mode: obscura_js::AnimationSampleMode::LocalOverride,
+            },
+        )
+    }
+
+    #[cfg(feature = "render")]
+    pub fn screenshot_with_animation_sample(
+        &self,
+        viewport: (f32, f32),
+        animation_sample: obscura_js::AnimationSample,
+    ) -> Option<Vec<u8>> {
         // Needed to resolve the relative image URLs ("logo.svg") that make up
         // the overwhelming majority of real markup.
         let base_url = self.resolve_base_url();
         let base_url = base_url.as_ref().map(|u| u.as_str());
         if let Some(js) = &self.js {
+            if !js.set_animation_sample(animation_sample) {
+                return None;
+            }
             if let Some(png) = js.screenshot_prepared(viewport, base_url) {
                 return Some(png);
             }
@@ -2612,7 +2674,15 @@ impl Page {
             .as_ref()
             .map(|js| js.scroll_offset())
             .unwrap_or((0.0, 0.0));
-        self.with_dom(|dom| obscura_js::screenshot_png_scrolled(dom, viewport, base_url, scroll))
+        self.with_dom(|dom| {
+            obscura_js::screenshot_png_scrolled_at_animation_time(
+                dom,
+                viewport,
+                base_url,
+                scroll,
+                animation_sample.time,
+            )
+        })
             .flatten()
     }
 
@@ -2624,10 +2694,38 @@ impl Page {
         &self,
         region: obscura_js::CaptureRegion,
     ) -> Result<Vec<u8>, obscura_js::CaptureError> {
-        self.js
+        self.screenshot_region_with_animation_sample(region, self.live_animation_sample())
+    }
+
+    #[cfg(feature = "render")]
+    pub fn screenshot_region_at_animation_time(
+        &self,
+        region: obscura_js::CaptureRegion,
+        animation_sample_time: obscura_js::AnimationSampleTime,
+    ) -> Result<Vec<u8>, obscura_js::CaptureError> {
+        self.screenshot_region_with_animation_sample(
+            region,
+            obscura_js::AnimationSample {
+                time: animation_sample_time,
+                mode: obscura_js::AnimationSampleMode::LocalOverride,
+            },
+        )
+    }
+
+    #[cfg(feature = "render")]
+    pub fn screenshot_region_with_animation_sample(
+        &self,
+        region: obscura_js::CaptureRegion,
+        animation_sample: obscura_js::AnimationSample,
+    ) -> Result<Vec<u8>, obscura_js::CaptureError> {
+        let js = self
+            .js
             .as_ref()
-            .ok_or(obscura_js::CaptureError::PaintFailed)?
-            .screenshot_prepared_region(region)
+            .ok_or(obscura_js::CaptureError::PaintFailed)?;
+        if !js.set_animation_sample(animation_sample) {
+            return Err(obscura_js::CaptureError::PaintFailed);
+        }
+        js.screenshot_prepared_region(region)
     }
 
     /// Scrollable document dimensions from the retained render layout. Unlike
@@ -2635,7 +2733,50 @@ impl Page {
     /// monkey-patched by the document being captured.
     #[cfg(feature = "render")]
     pub fn prepared_content_size(&self) -> Option<(f32, f32)> {
-        self.js.as_ref()?.prepared_content_size()
+        self.prepared_content_size_with_animation_sample(self.live_animation_sample())
+    }
+
+    #[cfg(feature = "render")]
+    pub fn prepared_content_size_at_animation_time(
+        &self,
+        animation_sample_time: obscura_js::AnimationSampleTime,
+    ) -> Option<(f32, f32)> {
+        self.prepared_content_size_with_animation_sample(obscura_js::AnimationSample {
+            time: animation_sample_time,
+            mode: obscura_js::AnimationSampleMode::LocalOverride,
+        })
+    }
+
+    #[cfg(feature = "render")]
+    pub fn prepared_content_size_with_animation_sample(
+        &self,
+        animation_sample: obscura_js::AnimationSample,
+    ) -> Option<(f32, f32)> {
+        let js = self.js.as_ref()?;
+        js.set_animation_sample(animation_sample)
+            .then(|| js.prepared_content_size())
+            .flatten()
+    }
+
+    #[cfg(feature = "render")]
+    pub fn live_animation_sample(&self) -> obscura_js::AnimationSample {
+        if let Some(js) = &self.js {
+            return js.live_animation_sample();
+        }
+        let milliseconds = self.document_timeline_origin.elapsed().as_secs_f64() * 1_000.0;
+        obscura_js::AnimationSample {
+            time: obscura_js::AnimationSampleTime {
+                milliseconds: milliseconds.min(f64::from(f32::MAX)) as f32,
+            },
+            mode: obscura_js::AnimationSampleMode::DocumentTime,
+        }
+    }
+
+    #[cfg(feature = "render")]
+    pub fn prepared_has_active_css_animations(&self) -> bool {
+        self.js
+            .as_ref()
+            .is_some_and(|js| js.prepared_has_active_css_animations())
     }
 
     /// Renderer-owned root scroll offset for document-space capture routing.
@@ -4027,6 +4168,128 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn lazy_module_graph_keeps_post_script_settle_alive() {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 2048];
+                let length = stream.read(&mut request).unwrap();
+                let request_text = String::from_utf8_lossy(&request[..length]);
+                let path = request_text
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_ascii_whitespace().nth(1))
+                    .unwrap_or("/");
+                let body = match path {
+                    "/app/lazy.js" => {
+                        "import { ready } from './lazy-child.js'; export { ready };"
+                    }
+                    "/app/lazy-child.js" => {
+                        // Cross the lifecycle's 500ms fast-settle floor on a
+                        // descendant edge. deno_core must propagate the lazy
+                        // graph marker beyond its root for this to stay alive.
+                        std::thread::sleep(std::time::Duration::from_millis(700));
+                        "export const ready = 'lazy-ready';"
+                    }
+                    unexpected => panic!("unexpected module request: {unexpected}"),
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+
+        let base = format!("http://{address}");
+        let mut page = import_map_test_page(
+            "lazy-module-readiness",
+            &base,
+            r#"<html><body><script>
+                import("./lazy.js").then(module => {
+                    document.body.setAttribute("data-lazy-state", module.ready);
+                });
+            </script></body></html>"#,
+        );
+        page.execute_scripts().await;
+
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("document.body.getAttribute('data-lazy-state')")
+                .unwrap(),
+            serde_json::json!("lazy-ready"),
+            "post-script readiness must include an in-flight lazy module graph",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ordinary_fetch_does_not_extend_dynamic_module_settle() {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = accepted_tx.send(());
+            let mut request = [0u8; 2048];
+            let length = stream.read(&mut request).unwrap();
+            assert!(String::from_utf8_lossy(&request[..length])
+                .starts_with("GET /app/analytics "));
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let body = "{}";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+
+        let base = format!("http://{address}");
+        let html = format!(
+            r#"<html><body><script>
+                globalThis.__analyticsStarted = true;
+                fetch("{base}/app/analytics").catch(error => {{
+                    globalThis.__analyticsError = error.message;
+                }});
+            </script></body></html>"#,
+        );
+        let mut page = import_map_test_page(
+            "ordinary-fetch-readiness",
+            &base,
+            &html,
+        );
+        let started = std::time::Instant::now();
+        page.execute_scripts().await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            accepted_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_ok(),
+            "ordinary fetch fixture must actually start its network request",
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(1_500),
+            "ordinary fetch/XHR must retain the fast settle path; elapsed={elapsed:?}",
+        );
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("globalThis.__analyticsStarted")
+                .unwrap(),
+            serde_json::json!(true),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn dynamic_import_map_uses_live_document_base_at_insertion() {
         let (base, requests) = spawn_parser_import_map_server(1);
         let mut page = import_map_test_page(
@@ -4142,7 +4405,8 @@ mod tests {
         let mut page = super::Page::new("render-prefetch".to_string(), context);
         page.set_viewport((100.0, 80.0));
         let page_url = format!("http://{address}/page");
-        let asset_url = format!("http://{address}/asset.svg");
+        let asset_network_url = format!("http://{address}/asset.svg");
+        let asset_url = format!("{asset_network_url}#icon");
         let dom = parse_html(&format!(
             r#"<html><body><img src="{asset_url}" style="width:20px;height:10px"></body></html>"#
         ));
@@ -4155,6 +4419,15 @@ mod tests {
         page.url = Some(url::Url::parse(&page_url).unwrap());
 
         assert_eq!(page.prepare_screenshot_resources(1_000).await, 1);
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("document.querySelector('img').currentSrc")
+                .unwrap(),
+            serde_json::json!(asset_url),
+            "cache/network fragment normalization must not alter currentSrc"
+        );
         page.screenshot(page.viewport).expect("prefetched capture");
         assert!(seen_rx
             .recv_timeout(std::time::Duration::from_secs(1))

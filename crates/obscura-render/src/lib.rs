@@ -97,15 +97,24 @@ mod image_capability_tests {
 mod paint;
 #[cfg(feature = "paint")]
 pub use paint::{
-    paint_dom, paint_dom_scrolled, paint_prepared, paint_prepared_region_with_scroll,
-    paint_prepared_with_scroll, prepare_dom, prepare_dom_with_dynamic_fonts,
-    prepare_dom_with_dynamic_fonts_and_stylesheet_cache, screenshot_png, screenshot_png_scrolled,
+    image_intrinsic_dimensions, paint_dom, paint_dom_scrolled,
+    paint_dom_scrolled_at_animation_time, paint_prepared,
+    paint_prepared_region_with_scroll,
+    paint_prepared_with_scroll, prepare_dom, prepare_dom_at_animation_time,
+    prepare_dom_with_dynamic_fonts, prepare_dom_with_dynamic_fonts_at_animation_time,
+    prepare_dom_with_dynamic_fonts_and_stylesheet_cache,
+    prepare_dom_with_dynamic_fonts_and_stylesheet_cache_at_animation_time,
+    prepare_dom_with_dynamic_fonts_and_stylesheet_cache_with_animation_state,
+    screenshot_png, screenshot_png_scrolled, screenshot_png_scrolled_at_animation_time,
     prepare_dom_with_retained_attribute_styles, prepare_dom_with_retained_styles,
+    prepare_dom_with_retained_styles_at_animation_time,
+    prepare_dom_with_retained_styles_with_animation_state,
     screenshot_prepared,
     screenshot_prepared_region_with_scroll,
     screenshot_prepared_region_with_scroll_and_backgrounds, screenshot_prepared_with_scroll,
     validate_capture_region, CaptureError, CaptureRegion, DynamicFontFace, ElementScrollMetrics,
-    PreparedRender, RenderResourceCache, RenderResourceLoader, ResolvedScrollState, SelectedImage,
+    ImageRequestProfile, PreparedRender, RenderResourceCache, RenderResourceLoader,
+    ResolvedScrollState, SelectedImage,
     MAX_CAPTURE_DIMENSION, MAX_CAPTURE_PIXELS,
 };
 
@@ -1140,6 +1149,12 @@ pub struct LayoutStyle {
     /// before author `!important`, matching the animation cascade origin.
     pub animation_name: Option<String>,
     pub animation_timing: AnimationTiming,
+    /// True when the selected keyframes contain at least one property this
+    /// renderer can sample. Unsupported custom-property-only animations must
+    /// not keep layout or screencast damage active forever.
+    pub animation_has_render_effect: bool,
+    /// Local time used for this element's sampled animation instance.
+    pub animation_local_time_ms: f32,
     /// `vertical-align` for a table cell's content. Cells effectively default
     /// to `middle` in browsers (the HTML UA sheet sets it on row groups and
     /// cells inherit it); obscura applies it as main-axis alignment of the
@@ -1488,13 +1503,47 @@ pub enum WordBreak {
     BreakWord,
 }
 
-/// Deterministic CSS animation sample time relative to the animation's
-/// timeline origin. Screenshot rendering currently uses the initial value
-/// (0ms); keeping it explicit lets capture plumbing freeze other engines at
-/// the same instant instead of depending on wall-clock settling.
+/// CSS animation sample time relative to the document timeline origin.
+/// Live capture uses elapsed document time, while deterministic comparison
+/// harnesses can request an exact instant such as T=0.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct AnimationSampleTime {
     pub milliseconds: f32,
+}
+
+/// Which clock an animation sample represents.
+///
+/// Live rendering subtracts each element's animation-instance start epoch
+/// from document time. Deterministic comparison instead assigns one local
+/// time to every animation, matching Web Animations `currentTime` rather than
+/// pretending all dynamically-created animations began at navigation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AnimationSampleMode {
+    #[default]
+    DocumentTime,
+    LocalOverride,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct AnimationSample {
+    pub time: AnimationSampleTime,
+    pub mode: AnimationSampleMode,
+}
+
+impl AnimationSample {
+    pub fn document(milliseconds: f32) -> Self {
+        Self {
+            time: AnimationSampleTime { milliseconds },
+            mode: AnimationSampleMode::DocumentTime,
+        }
+    }
+
+    pub fn local_override(milliseconds: f32) -> Self {
+        Self {
+            time: AnimationSampleTime { milliseconds },
+            mode: AnimationSampleMode::LocalOverride,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1546,6 +1595,148 @@ impl Default for AnimationTiming {
             fill_mode: AnimationFillMode::None,
             play_state: AnimationPlayState::Running,
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AnimationInstanceKey {
+    pub name: String,
+}
+
+#[derive(Debug, Clone)]
+struct AnimationInstance {
+    key: AnimationInstanceKey,
+    start_ms: f32,
+    hold_time_ms: Option<f32>,
+    was_paused: bool,
+}
+
+/// Page-owned CSS animation instance history retained across layout rebuilds.
+/// Node ids are document-scoped, so navigation must replace this value.
+#[derive(Debug, Default)]
+pub struct AnimationTimelineState {
+    instances: std::collections::HashMap<obscura_dom::tree::NodeId, AnimationInstance>,
+    start_candidates: std::collections::HashMap<obscura_dom::tree::NodeId, f32>,
+    subtree_start_candidates: std::collections::HashMap<obscura_dom::tree::NodeId, f32>,
+}
+
+impl AnimationTimelineState {
+    pub fn note_start_candidate(
+        &mut self,
+        node: obscura_dom::tree::NodeId,
+        document_time_ms: f32,
+    ) {
+        if document_time_ms.is_finite() && document_time_ms >= 0.0 {
+            self.start_candidates.insert(node, document_time_ms);
+        }
+    }
+
+    /// Defer expansion until the next style flush. This is needed for DOM
+    /// string APIs whose imported descendants do not exist until after the
+    /// mutation op has completed.
+    pub fn note_subtree_start_candidate(
+        &mut self,
+        root: obscura_dom::tree::NodeId,
+        document_time_ms: f32,
+    ) {
+        if document_time_ms.is_finite() && document_time_ms >= 0.0 {
+            self.subtree_start_candidates
+                .insert(root, document_time_ms);
+        }
+    }
+
+    pub fn materialize_start_candidates(&mut self, tree: &obscura_dom::DomTree) {
+        for (root, start_ms) in std::mem::take(&mut self.subtree_start_candidates) {
+            if tree.get_node(root).is_none() {
+                continue;
+            }
+            self.start_candidates.insert(root, start_ms);
+            for node in tree.descendants(root) {
+                self.start_candidates.entry(node).or_insert(start_ms);
+            }
+        }
+    }
+
+    pub fn remove_subtree<'a>(
+        &mut self,
+        nodes: impl IntoIterator<Item = &'a obscura_dom::tree::NodeId>,
+    ) {
+        for node in nodes {
+            self.instances.remove(node);
+            self.start_candidates.remove(node);
+            self.subtree_start_candidates.remove(node);
+        }
+    }
+
+    pub(crate) fn sample_for(
+        &mut self,
+        node: obscura_dom::tree::NodeId,
+        key: AnimationInstanceKey,
+        play_state: AnimationPlayState,
+        sample: AnimationSample,
+    ) -> AnimationSampleTime {
+        if sample.mode == AnimationSampleMode::LocalOverride {
+            return sample.time;
+        }
+        let document_time_ms = sample.time.milliseconds;
+        let transition_time_ms = self.start_candidates.remove(&node);
+        let retained = self
+            .instances
+            .get_mut(&node)
+            .filter(|instance| instance.key == key);
+        let instance = match retained {
+            Some(instance) => instance,
+            None => {
+                let candidate = transition_time_ms.unwrap_or(0.0);
+                let paused = play_state == AnimationPlayState::Paused;
+                self.instances.insert(
+                    node,
+                    AnimationInstance {
+                        key,
+                        start_ms: if paused { document_time_ms } else { candidate },
+                        hold_time_ms: paused.then_some(0.0),
+                        was_paused: paused,
+                    },
+                );
+                self.instances.get_mut(&node).expect("inserted animation instance")
+            }
+        };
+
+        let paused = play_state == AnimationPlayState::Paused;
+        if paused && !instance.was_paused {
+            let paused_at = transition_time_ms.unwrap_or(document_time_ms);
+            instance.hold_time_ms = Some((paused_at - instance.start_ms).max(0.0));
+        } else if !paused && instance.was_paused {
+            let held = instance.hold_time_ms.take().unwrap_or(0.0);
+            let resumed_at = transition_time_ms.unwrap_or(document_time_ms);
+            instance.start_ms = resumed_at - held;
+        }
+        instance.was_paused = paused;
+        AnimationSampleTime {
+            milliseconds: instance
+                .hold_time_ms
+                .unwrap_or_else(|| (document_time_ms - instance.start_ms).max(0.0)),
+        }
+    }
+
+    pub(crate) fn clear_animation(&mut self, node: obscura_dom::tree::NodeId, sample: AnimationSample) {
+        if sample.mode == AnimationSampleMode::DocumentTime {
+            self.instances.remove(&node);
+        }
+    }
+
+    pub fn retain_nodes(
+        &mut self,
+        mut keep: impl FnMut(obscura_dom::tree::NodeId) -> bool,
+    ) {
+        self.instances.retain(|node, _| keep(*node));
+        self.start_candidates.retain(|node, _| keep(*node));
+        self.subtree_start_candidates.retain(|node, _| keep(*node));
+    }
+
+    pub fn clear_start_candidates(&mut self) {
+        self.start_candidates.clear();
+        self.subtree_start_candidates.clear();
     }
 }
 

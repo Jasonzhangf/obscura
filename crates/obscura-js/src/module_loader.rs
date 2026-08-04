@@ -14,6 +14,58 @@ use deno_core::RequestedModuleType;
 use crate::import_map::ImportMap;
 use crate::ops::ObscuraState;
 
+/// Observable network activity for ES-module graphs.
+///
+/// deno_core keeps dynamic-import state inside its private module map. The
+/// browser lifecycle still needs to distinguish a genuinely idle page from a
+/// graph whose fetch future is being advanced in short event-loop slices. A
+/// loader-owned counter provides that signal without treating unrelated
+/// fetch/XHR analytics as render-blocking work.
+#[derive(Debug, Default)]
+pub(crate) struct ModuleLoadActivity {
+    pending: std::sync::atomic::AtomicUsize,
+    last_activity: std::sync::Mutex<Option<std::time::Instant>>,
+}
+
+impl ModuleLoadActivity {
+    fn begin(self: &Arc<Self>) -> ModuleLoadGuard {
+        self.pending
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        *self
+            .last_activity
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(std::time::Instant::now());
+        ModuleLoadGuard(self.clone())
+    }
+
+    pub(crate) fn is_pending_or_recent(&self, grace: std::time::Duration) -> bool {
+        if self.pending.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+            return true;
+        }
+        self.last_activity
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some_and(|last| last.elapsed() <= grace)
+    }
+}
+
+struct ModuleLoadGuard(Arc<ModuleLoadActivity>);
+
+impl Drop for ModuleLoadGuard {
+    fn drop(&mut self) {
+        let previous = self
+            .0
+            .pending
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        debug_assert!(previous > 0, "module load activity counter underflow");
+        *self
+            .0
+            .last_activity
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(std::time::Instant::now());
+    }
+}
+
 pub struct ObscuraModuleLoader {
     pub base_url: String,
     /// Proxy URL threaded through to every dynamic ES-module fetch (#139).
@@ -29,6 +81,7 @@ pub struct ObscuraModuleLoader {
     /// connection pool; they simply have an isolated cookie jar.
     standalone_client: Option<Arc<obscura_net::ObscuraHttpClient>>,
     import_map: Rc<RefCell<ImportMap>>,
+    activity: Arc<ModuleLoadActivity>,
 }
 
 impl ObscuraModuleLoader {
@@ -56,6 +109,7 @@ impl ObscuraModuleLoader {
             page_state: None,
             standalone_client: Some(standalone_client),
             import_map,
+            activity: Arc::new(ModuleLoadActivity::default()),
         }
     }
 
@@ -71,7 +125,12 @@ impl ObscuraModuleLoader {
             page_state: Some(Rc::downgrade(page_state)),
             standalone_client: None,
             import_map,
+            activity: Arc::new(ModuleLoadActivity::default()),
         }
+    }
+
+    pub(crate) fn activity(&self) -> Arc<ModuleLoadActivity> {
+        self.activity.clone()
     }
 }
 
@@ -117,13 +176,19 @@ impl ModuleLoader for ObscuraModuleLoader {
         &self,
         module_specifier: &ModuleSpecifier,
         _maybe_referrer: Option<&ModuleSpecifier>,
-        _is_dyn_import: bool,
+        is_dyn_import: bool,
         _requested_module_type: RequestedModuleType,
     ) -> ModuleLoadResponse {
         let url = module_specifier.to_string();
         // Capture the loader's proxy here so the async closure below owns a
         // plain Option<String> rather than borrowing &self across an `await`.
         let proxy_url = self.proxy_url.clone();
+        let activity = self.activity.clone();
+        // Register before returning the future. The lifecycle can inspect the
+        // runtime between deno_core accepting the load and first polling it.
+        // Keeping the guard inside the future makes cancellation/navigation
+        // decrement the count through Drop as well as success and failure.
+        let activity_guard = is_dyn_import.then(|| activity.begin());
         let page_network = match self.page_state.as_ref() {
             Some(weak) => (|| {
                 let state = weak
@@ -146,6 +211,10 @@ impl ModuleLoader for ObscuraModuleLoader {
         };
 
         ModuleLoadResponse::Async(Pin::from(Box::new(async move {
+            // deno_core propagates `is_dyn_import` to every dependency edge in
+            // the recursive graph, so this excludes parser-discovered/static
+            // graphs without losing descendant fetches of a lazy graph.
+            let _activity_guard = activity_guard;
             tracing::debug!(
                 "Loading ES module: {} (proxy: {})",
                 url,
