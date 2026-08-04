@@ -10104,6 +10104,161 @@ mod tests {
     }
 
     #[test]
+    fn shadow_stylesheet_lists_and_adoption_are_live_across_roots() {
+        let mut rt = setup_runtime(
+            "<html><head></head><body><div id='one'></div><div id='two'></div></body></html>",
+        );
+        let result = rt
+            .evaluate(
+                r#"
+                (() => {
+                    const first = document.getElementById('one').attachShadow({ mode: 'open' });
+                    const second = document.getElementById('two').attachShadow({ mode: 'open' });
+                    const inline = document.createElement('style');
+                    inline.textContent = '.local { width: 17px }';
+                    first.appendChild(inline);
+                    const inlineSheet = inline.sheet;
+                    const firstList = first.styleSheets;
+                    const firstAdopted = first.adoptedStyleSheets;
+                    const secondAdopted = second.adoptedStyleSheets;
+                    const documentAdopted = document.adoptedStyleSheets;
+
+                    const shared = new CSSStyleSheet();
+                    first.adoptedStyleSheets = [shared];
+                    second.adoptedStyleSheets.push(shared);
+                    document.adoptedStyleSheets = [shared];
+
+                    const firstNode = first.querySelector('style[data-obscura-adopted]');
+                    const secondNode = second.querySelector('style[data-obscura-adopted]');
+                    const documentNode = document.querySelector('style[data-obscura-adopted]');
+                    const initial = [
+                        first.styleSheets === firstList,
+                        firstList.length,
+                        firstList[0] === inlineSheet,
+                        firstList.item(0) === inlineSheet,
+                        second.styleSheets === second.styleSheets,
+                        second.styleSheets.length,
+                        first.adoptedStyleSheets === firstAdopted,
+                        second.adoptedStyleSheets === secondAdopted,
+                        document.adoptedStyleSheets === documentAdopted,
+                        firstAdopted.length,
+                        secondAdopted.length,
+                        documentAdopted.length,
+                        firstNode.parentNode === first,
+                        secondNode.parentNode === second,
+                        documentNode.parentNode === document.head,
+                    ];
+
+                    shared.insertRule('.shared { width: 31px }', 0);
+                    const synchronized = [firstNode, secondNode, documentNode]
+                        .map(node => node.textContent.includes('width: 31px'));
+
+                    second.adoptedStyleSheets = [];
+                    shared.replaceSync('.shared { width: 47px }');
+                    const afterRemoval = [
+                        second.adoptedStyleSheets === secondAdopted,
+                        secondAdopted.length,
+                        secondNode.parentNode,
+                        second.querySelectorAll('style[data-obscura-adopted]').length,
+                        firstNode.textContent.includes('width: 47px'),
+                        documentNode.textContent.includes('width: 47px'),
+                        secondNode.textContent.includes('width: 31px'),
+                    ];
+
+                    inline.remove();
+                    const inlineRemoval = [
+                        first.styleSheets === firstList,
+                        firstList.length,
+                        inlineSheet.ownerNode,
+                    ];
+                    return { initial, synchronized, afterRemoval, inlineRemoval };
+                })()
+                "#,
+            )
+            .unwrap();
+
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "initial": [
+                    true, 1, true, true, true, 0,
+                    true, true, true, 1, 1, 1,
+                    true, true, true
+                ],
+                "synchronized": [true, true, true],
+                "afterRemoval": [true, 0, null, 0, true, true, true],
+                "inlineRemoval": [true, 0, null],
+            })
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn shadow_adopted_stylesheets_apply_and_sync_the_live_cascade() {
+        let mut rt = setup_runtime(
+            r#"<html style="margin:0"><head>
+                <style>.target { width:11px; height:10px }</style>
+                </head><body style="margin:0">
+                <div id="one"></div><div id="two"></div><div class="target" id="outside"></div>
+                </body></html>"#,
+        );
+        rt.set_viewport(200.0, 100.0);
+        let result = rt
+            .evaluate(
+                r#"
+                (() => {
+                    const first = document.getElementById('one').attachShadow({ mode: 'open' });
+                    const second = document.getElementById('two').attachShadow({ mode: 'open' });
+                    first.innerHTML = '<style>.target { width:18px; height:10px }</style><div class="target"></div>';
+                    second.innerHTML = '<style>.target { width:23px; height:10px }</style><div class="target"></div>';
+                    const firstTarget = first.querySelector('.target');
+                    const secondTarget = second.querySelector('.target');
+                    const outside = document.getElementById('outside');
+                    const widths = () => [firstTarget, secondTarget, outside]
+                        .map(node => node.getBoundingClientRect().width);
+
+                    const inline = widths();
+                    const shared = new CSSStyleSheet();
+                    shared.replaceSync('.target { width:42px; height:10px }');
+                    first.adoptedStyleSheets = [shared];
+                    second.adoptedStyleSheets = [shared];
+                    document.adoptedStyleSheets = [shared];
+                    const adopted = widths();
+
+                    shared.cssRules[0].style.setProperty('width', '67px');
+                    const mutated = widths();
+
+                    second.adoptedStyleSheets = [];
+                    document.adoptedStyleSheets = [];
+                    const selectivelyRemoved = widths();
+
+                    shared.replaceSync('.target { width:81px; height:10px }');
+                    const remainingRootUpdated = widths();
+                    return [
+                        inline, adopted, mutated, selectivelyRemoved, remainingRootUpdated,
+                        first.styleSheets.length,
+                        second.styleSheets.length,
+                    ];
+                })()
+                "#,
+            )
+            .unwrap();
+
+        assert_eq!(
+            result,
+            serde_json::json!([
+                [18, 23, 11],
+                [42, 42, 42],
+                [67, 67, 67],
+                [67, 23, 11],
+                [81, 23, 11],
+                1,
+                1,
+            ])
+        );
+    }
+
+    #[test]
     fn unavailable_webgl_context_does_not_claim_success() {
         let mut rt = setup_runtime("<html><body><canvas></canvas></body></html>");
         let result = rt

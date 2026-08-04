@@ -7654,6 +7654,7 @@ class CSSStyleSheet {
     this._sourceText = "";
     this._rules = [];
     this._cssRules = new CSSRuleList(this);
+    this._adopters = new Set();
   }
   get type() { return "text/css"; }
   get ownerNode() { return this._ownerNode; }
@@ -7815,28 +7816,49 @@ globalThis.CSSStyleSheet = CSSStyleSheet;
 globalThis.StyleSheetList = StyleSheetList;
 
 function _syncAdoptedStyleSheet(sheet) {
-  const doc = globalThis.document;
-  if (doc && doc._adoptedStyleSheets?.includes(sheet)) {
-    _syncDocumentAdoptedStyles(doc);
+  for (const root of Array.from(sheet._adopters || [])) {
+    _syncAdoptedStyles(root);
   }
 }
 
-function _syncDocumentAdoptedStyles(doc) {
-  const sheets = doc._adoptedStyleSheets || [];
-  const nodes = doc._adoptedStyleNodes || (doc._adoptedStyleNodes = new Map());
+function _reconcileAdoptedStyleSheetAdopters(root, sheets) {
+  const previous = root._registeredAdoptedStyleSheets
+    || (root._registeredAdoptedStyleSheets = new Set());
+  const current = new Set(Array.from(sheets || []).filter(sheet => sheet instanceof CSSStyleSheet));
+  for (const sheet of previous) {
+    if (!current.has(sheet)) sheet._adopters?.delete(root);
+  }
+  for (const sheet of current) {
+    if (!previous.has(sheet)) sheet._adopters.add(root);
+  }
+  root._registeredAdoptedStyleSheets = current;
+}
+
+function _adoptedStyleTarget(root) {
+  if (!root) return null;
+  if (root.nodeType === 9) return root.head || root.documentElement;
+  return root instanceof globalThis.ShadowRoot ? root : null;
+}
+
+function _syncAdoptedStyles(root) {
+  const sheets = root._adoptedStyleSheets || [];
+  _reconcileAdoptedStyleSheetAdopters(root, sheets);
+  const nodes = root._adoptedStyleNodes || (root._adoptedStyleNodes = new Map());
   for (const [sheet, node] of Array.from(nodes.entries())) {
     if (!sheets.includes(sheet)) {
       node.remove();
       nodes.delete(sheet);
     }
   }
+  const target = _adoptedStyleTarget(root);
+  if (!target) return;
   for (const sheet of sheets) {
     if (!(sheet instanceof CSSStyleSheet)) continue;
     let node = nodes.get(sheet);
-    if (!node || !node.parentNode) {
-      node = doc.createElement("style");
+    if (!node || node.parentNode !== target) {
+      node = (root.ownerDocument || globalThis.document).createElement("style");
       node.setAttribute("data-obscura-adopted", "");
-      (doc.head || doc.documentElement).appendChild(node);
+      target.appendChild(node);
       nodes.set(sheet, node);
     }
     const css = Array.from(sheet.cssRules || [], rule => rule.cssText || "").join("\n");
@@ -7844,32 +7866,49 @@ function _syncDocumentAdoptedStyles(doc) {
   }
 }
 
-function _makeAdoptedSheetList(doc, values) {
+// Keep the [SameObject] array identity stable even when the IDL setter replaces
+// its contents. Mutating the backing target directly avoids intermediate
+// materializations while assignment is in progress; ordinary array mutations
+// still pass through the proxy and synchronize immediately.
+const _adoptedSheetListTargets = new WeakMap();
+function _makeAdoptedSheetList(root, values) {
   const target = Array.from(values || []);
-  return new Proxy(target, {
+  const list = new Proxy(target, {
     set(array, property, value) {
       Reflect.set(array, property, value);
-      _syncDocumentAdoptedStyles(doc);
+      _syncAdoptedStyles(root);
       return true;
     },
     deleteProperty(array, property) {
       Reflect.deleteProperty(array, property);
-      _syncDocumentAdoptedStyles(doc);
+      _syncAdoptedStyles(root);
       return true;
     },
   });
+  _adoptedSheetListTargets.set(root, target);
+  return list;
+}
+
+function _adoptedStyleSheetsFor(root) {
+  if (!root._adoptedStyleSheets) {
+    root._adoptedStyleSheets = _makeAdoptedSheetList(root, []);
+  }
+  return root._adoptedStyleSheets;
+}
+
+function _replaceAdoptedStyleSheets(root, sheets) {
+  const list = _adoptedStyleSheetsFor(root);
+  const values = Array.from(sheets || []);
+  const target = _adoptedSheetListTargets.get(root);
+  target.splice(0, target.length, ...values);
+  _syncAdoptedStyles(root);
+  return list;
 }
 
 Object.defineProperty(Document.prototype, 'adoptedStyleSheets', {
-  get() {
-    if (!this._adoptedStyleSheets) {
-      this._adoptedStyleSheets = _makeAdoptedSheetList(this, []);
-    }
-    return this._adoptedStyleSheets;
-  },
+  get() { return _adoptedStyleSheetsFor(this); },
   set(sheets) {
-    this._adoptedStyleSheets = _makeAdoptedSheetList(this, sheets);
-    _syncDocumentAdoptedStyles(this);
+    _replaceAdoptedStyleSheets(this, sheets);
   },
 });
 
@@ -8026,7 +8065,10 @@ globalThis.ShadowRoot = class ShadowRoot extends DocumentFragment {
     return options?.composed ? this._host.getRootNode(options) : this;
   }
   get activeElement() { return null; }
-  get styleSheets() { return []; }
+  get styleSheets() {
+    if (!this._styleSheetList) this._styleSheetList = new StyleSheetList(this);
+    return this._styleSheetList;
+  }
   cloneNode() {
     throw new DOMException(
       'Failed to execute cloneNode on Node: ShadowRoot nodes are not clonable.',
@@ -8038,8 +8080,8 @@ globalThis.ShadowRoot = class ShadowRoot extends DocumentFragment {
 };
 // Constructible-stylesheet adoption, mirroring Document.adoptedStyleSheets.
 Object.defineProperty(globalThis.ShadowRoot.prototype, 'adoptedStyleSheets', {
-  get() { return this._adoptedStyleSheets || []; },
-  set(sheets) { this._adoptedStyleSheets = sheets; },
+  get() { return _adoptedStyleSheetsFor(this); },
+  set(sheets) { _replaceAdoptedStyleSheets(this, sheets); },
   configurable: true,
 });
 globalThis.__obscura_shadowHostNames = new Set(['article','aside','blockquote','body','div','footer','h1','h2','h3','h4','h5','h6','header','main','nav','p','section','span']);
