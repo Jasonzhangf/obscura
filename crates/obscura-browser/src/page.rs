@@ -467,6 +467,14 @@ fn css_resource_urls(css: &str, base: &url::Url) -> Vec<String> {
             }
             continue;
         }
+        // `@import url(...)` is a stylesheet dependency, not a paint asset.
+        // It is fetched by the bounded stylesheet graph above. Letting the
+        // generic image/font warmup rediscover it issues a second request with
+        // the wrong ResourceType::Image classification.
+        if let Some(length) = css_import_rule_len(rest) {
+            index += length;
+            continue;
+        }
         let Some(first) = rest.chars().next() else {
             break;
         };
@@ -542,6 +550,61 @@ fn css_resource_urls(css: &str, base: &url::Url) -> Vec<String> {
         index += end + 1;
     }
     urls
+}
+
+/// Return the byte length of a leading CSS `@import` rule, including its
+/// terminating semicolon. Semicolons inside quoted URLs, comments, or `url()`
+/// parentheses do not end the rule. A malformed import is left to the normal
+/// scanner so this helper cannot swallow following declarations.
+fn css_import_rule_len(css: &str) -> Option<usize> {
+    let prefix = css.get(..7)?;
+    if !prefix.eq_ignore_ascii_case("@import") {
+        return None;
+    }
+    if css[7..]
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+    {
+        return None;
+    }
+
+    let bytes = css.as_bytes();
+    let mut index = 7usize;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut paren_depth = 0usize;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if let Some(open) = quote {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == open {
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        if byte == b'/' && bytes.get(index + 1) == Some(&b'*') {
+            let Some(end) = css[index + 2..].find("*/") else {
+                return None;
+            };
+            index += end + 4;
+            continue;
+        }
+        match byte {
+            b'\'' | b'"' => quote = Some(byte),
+            b'(' => paren_depth += 1,
+            b')' => paren_depth = paren_depth.saturating_sub(1),
+            b';' if paren_depth == 0 => return Some(index + 1),
+            b'{' if paren_depth == 0 => return None,
+            _ => {}
+        }
+        index += 1;
+    }
+    None
 }
 
 fn render_resource_type(url: &url::Url) -> ResourceType {
@@ -3510,6 +3573,8 @@ mod tests {
         let css = r#"
             /* url(ignored.png) */
             .copy::before { content: "url(also-ignored.png)"; }
+            @import URL("theme.css") print;
+            @import url("semi;colon.css") screen;
             .hero { background: url('../img/hero.png'); }
             .icon { mask: URL("https://cdn.test/icon.svg#shape"); }
             .inline { background: url(data:image/svg+xml,<svg/>); }
@@ -3594,7 +3659,10 @@ mod tests {
         std::thread::spawn(move || {
             use std::io::{Read as _, Write as _};
 
-            for _ in 0..3 {
+            // Five requests are expected after import/image deduplication. Keep
+            // two extra accepts alive so a regression's bogus CSS-as-image
+            // warmup still reaches the request callback and server cleanly.
+            for _ in 0..7 {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut request = [0u8; 4096];
                 let length = stream.read(&mut request).unwrap();
@@ -3612,11 +3680,18 @@ mod tests {
                         r#"<!doctype html><style media="screen, print">
                             @import url('/a.css') print;
                             @import '/b.css' print;
-                            .local { color: white }
+                            .local { color: white; background-image: url('/local.svg') }
                         </style><div class="local imported-a imported-b">marker</div>"#,
                     ),
-                    "/a.css" => ("text/css", ".imported-a{background:#9020d0}"),
+                    "/a.css" => (
+                        "text/css",
+                        ".imported-a{background:#9020d0 url('/imported.svg')}",
+                    ),
                     "/b.css" => ("text/css", ".imported-b{border-color:#f0d020}"),
+                    "/local.svg" | "/imported.svg" => (
+                        "image/svg+xml",
+                        r#"<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"><rect width="1" height="1" fill="white"/></svg>"#,
+                    ),
                     _ => ("text/plain", "unexpected"),
                 };
                 let response = format!(
@@ -3817,6 +3892,14 @@ mod tests {
         ));
         let mut page = super::Page::new("inline-imports".to_string(), context);
         page.set_viewport((100.0, 80.0));
+        let observed_requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let callback_requests = observed_requests.clone();
+        page.on_request(std::sync::Arc::new(move |request| {
+            callback_requests
+                .lock()
+                .unwrap()
+                .push((request.url.path().to_string(), request.resource_type));
+        }));
         page.navigate(&format!("{origin}/")).await.unwrap();
 
         let mut paths = (0..3)
@@ -3828,6 +3911,30 @@ mod tests {
             .collect::<Vec<_>>();
         paths.sort();
         assert_eq!(paths, vec!["/", "/a.css", "/b.css"]);
+        let observed_requests = observed_requests.lock().unwrap();
+        for path in ["/a.css", "/b.css"] {
+            assert_eq!(
+                observed_requests
+                    .iter()
+                    .filter(|(request_path, _)| request_path == path)
+                    .map(|(_, resource_type)| *resource_type)
+                    .collect::<Vec<_>>(),
+                vec![obscura_net::ResourceType::Stylesheet],
+                "an inline import must fetch exactly once as a stylesheet"
+            );
+        }
+        for path in ["/local.svg", "/imported.svg"] {
+            assert_eq!(
+                observed_requests
+                    .iter()
+                    .filter(|(request_path, _)| request_path == path)
+                    .map(|(_, resource_type)| *resource_type)
+                    .collect::<Vec<_>>(),
+                vec![obscura_net::ResourceType::Image],
+                "ordinary rule assets must remain in render warmup"
+            );
+        }
+        drop(observed_requests);
 
         let styles = page
             .js
