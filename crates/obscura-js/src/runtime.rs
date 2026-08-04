@@ -4708,13 +4708,19 @@ mod tests {
                     CSS.supports("word-break", "break-all"),
                     CSS.supports("filter", "blur(2px)"),
                     CSS.supports("content", "attr(data-label)"),
-                    CSS.supports("display", "grid;")
+                    CSS.supports("display", "grid;"),
+                    CSS.supports("flex-flow", "column"),
+                    CSS.supports("flex-flow", "wrap column"),
+                    CSS.supports("flex-flow", "column wrap"),
+                    CSS.supports("flex-flow", "row column"),
+                    CSS.supports("flex-flow", "nowrap wrap-reverse"),
+                    CSS.supports("(flex-flow:column)")
                 ])"#,
             )
             .unwrap();
         assert_eq!(
             result,
-            serde_json::json!("[false,false,false,false,false,true,true,true,false,false,false,true,false,true,true,false,false,true,false,true,false,true,false]")
+            serde_json::json!("[false,false,false,false,false,true,true,true,false,false,false,true,false,true,true,false,false,true,false,true,false,true,false,true,true,true,false,false,true]")
         );
     }
 

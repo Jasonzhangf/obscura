@@ -6714,7 +6714,7 @@ globalThis.getComputedStyle = (el) => {
     'z-index': 'auto', 'pointer-events': 'auto',
     'box-sizing': 'content-box', cursor: 'auto',
     'white-space': 'normal', 'text-align': 'start',
-    'flex-direction': 'row', 'flex-wrap': 'nowrap', 'align-items': 'normal',
+    'flex-flow': 'row nowrap', 'flex-direction': 'row', 'flex-wrap': 'nowrap', 'align-items': 'normal',
     'justify-content': 'normal', gap: 'normal',
     'grid-template-columns': 'none', 'grid-template-rows': 'none',
     'will-change': 'auto', 'backface-visibility': 'visible',
@@ -8563,7 +8563,7 @@ const _CSS_SUPPORTED_DECLARATIONS = new Set((
   "stroke stroke-width border-color font-size font font-weight font-family font-style text-align " +
   "text-transform text-decoration text-decoration-line line-height white-space overflow-wrap word-wrap word-break text-wrap text-wrap-style align-items justify-items " +
   "place-items align-self justify-self place-self align-content justify-content place-content " +
-  "flex-direction flex-wrap flex-grow flex-shrink flex-basis flex order position float object-fit " +
+  "flex-flow flex-direction flex-wrap flex-grow flex-shrink flex-basis flex order position float object-fit " +
   "top right bottom left inset overflow overflow-x overflow-y scrollbar-gutter visibility opacity animation " +
   "animation-name animation-fill-mode animation-iteration-count z-index clear vertical-align " +
   "list-style list-style-type gap grid-gap row-gap grid-row-gap column-gap grid-column-gap " +
@@ -8738,6 +8738,23 @@ function _cssSupportsDeclaration(name, value) {
   }
   if (name === "align-content" || name === "justify-content") {
     return _cssSupportsContentAlignment(lower) || (name === "justify-content" && ["left", "right"].includes(lower));
+  }
+  if (name === "flex-flow") {
+    const tokens = _cssSplitWhitespace(lower);
+    if (tokens.length < 1 || tokens.length > 2) return false;
+    let direction = false, wrap = false;
+    for (const token of tokens) {
+      if (["row", "row-reverse", "column", "column-reverse"].includes(token)) {
+        if (direction) return false;
+        direction = true;
+      } else if (["nowrap", "wrap", "wrap-reverse"].includes(token)) {
+        if (wrap) return false;
+        wrap = true;
+      } else {
+        return false;
+      }
+    }
+    return true;
   }
   if (name === "flex-direction") return ["row", "row-reverse", "column", "column-reverse"].includes(lower);
   if (name === "flex-wrap") return ["nowrap", "wrap", "wrap-reverse"].includes(lower);

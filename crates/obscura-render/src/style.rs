@@ -1220,6 +1220,15 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                 style.justify_content = Some(justify);
             }
         }
+        "flex-flow" => {
+            if let Some((direction, wrap)) = parse_flex_flow_shorthand(value) {
+                // A shorthand always assigns both longhands. In particular,
+                // `flex-flow: column` resets an earlier flex-wrap to nowrap,
+                // while `flex-flow: wrap` resets direction to row.
+                style.flex_direction = Some(direction);
+                style.flex_wrap = Some(wrap);
+            }
+        }
         "flex-direction" => match value {
             "row" => style.flex_direction = Some(taffy::FlexDirection::Row),
             "row-reverse" => style.flex_direction = Some(taffy::FlexDirection::RowReverse),
@@ -1970,6 +1979,7 @@ pub fn supports_declaration(name: &str, value: &str) -> bool {
             | "align-content"
             | "justify-content"
             | "place-content"
+            | "flex-flow"
             | "flex-direction"
             | "flex-wrap"
             | "flex-grow"
@@ -2527,6 +2537,7 @@ fn supports_conservative_known_value(name: &str, value: &str) -> bool {
             matches!(lower.as_str(), "left" | "right") || content_alignment_value(value).is_some()
         }
         "place-content" => content_alignment_pair(value).is_some(),
+        "flex-flow" => parse_flex_flow_shorthand(value).is_some(),
         "flex-direction" => matches!(
             lower.as_str(),
             "row" | "row-reverse" | "column" | "column-reverse"
@@ -7388,6 +7399,61 @@ fn parse_flex_shorthand(style: &mut LayoutStyle, value: &str) {
     };
 }
 
+/// Parse `flex-flow: <flex-direction> || <flex-wrap>`. The two constituents
+/// may appear in either order and each may appear at most once. Shorthand
+/// omission resets the other constituent to its initial value rather than
+/// retaining an earlier longhand winner.
+fn parse_flex_flow_shorthand(
+    value: &str,
+) -> Option<(taffy::FlexDirection, taffy::FlexWrap)> {
+    let lower = value.trim().to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "initial" | "unset" | "revert" | "revert-layer"
+    ) {
+        return Some((taffy::FlexDirection::Row, taffy::FlexWrap::NoWrap));
+    }
+
+    let tokens = lower.split_whitespace().collect::<Vec<_>>();
+    if tokens.is_empty() || tokens.len() > 2 {
+        return None;
+    }
+    let mut direction = None;
+    let mut wrap = None;
+    for token in tokens {
+        let parsed_direction = match token {
+            "row" => Some(taffy::FlexDirection::Row),
+            "row-reverse" => Some(taffy::FlexDirection::RowReverse),
+            "column" => Some(taffy::FlexDirection::Column),
+            "column-reverse" => Some(taffy::FlexDirection::ColumnReverse),
+            _ => None,
+        };
+        if let Some(parsed) = parsed_direction {
+            if direction.replace(parsed).is_some() {
+                return None;
+            }
+            continue;
+        }
+        let parsed_wrap = match token {
+            "nowrap" => Some(taffy::FlexWrap::NoWrap),
+            "wrap" => Some(taffy::FlexWrap::Wrap),
+            "wrap-reverse" => Some(taffy::FlexWrap::WrapReverse),
+            _ => None,
+        };
+        if let Some(parsed) = parsed_wrap {
+            if wrap.replace(parsed).is_some() {
+                return None;
+            }
+        } else {
+            return None;
+        }
+    }
+    Some((
+        direction.unwrap_or(taffy::FlexDirection::Row),
+        wrap.unwrap_or(taffy::FlexWrap::NoWrap),
+    ))
+}
+
 /// `background-size: 10px` / `0.857em` / `10px 20px` -> explicit px pair.
 /// Keyword values (`cover`, `contain`, `auto`) are left unhandled (`None`, the
 /// "stretch to fill the box" fallback) since evaluating them needs the
@@ -9829,6 +9895,64 @@ mod tests {
         let s = compute_style("div", Some("flex: 2"));
         assert_eq!(s.flex_grow, Some(2.0));
         assert_eq!(s.flex_shrink, Some(1.0));
+    }
+
+    #[test]
+    fn flex_flow_is_unordered_resets_omissions_and_rejects_atomically() {
+        for value in [
+            "column",
+            "wrap",
+            "column wrap",
+            "wrap column",
+            "row-reverse wrap-reverse",
+            "WRAP COLUMN-REVERSE",
+        ] {
+            assert!(supports_declaration("flex-flow", value), "{value}");
+        }
+        for value in [
+            "",
+            "none",
+            "row column",
+            "nowrap wrap-reverse",
+            "row wrap extra",
+            "10px",
+        ] {
+            assert!(!supports_declaration("flex-flow", value), "{value}");
+        }
+
+        let direction_only = compute_style(
+            "div",
+            Some("flex-wrap:wrap;flex-flow:column"),
+        );
+        assert_eq!(
+            direction_only.flex_direction,
+            Some(taffy::FlexDirection::Column)
+        );
+        assert_eq!(direction_only.flex_wrap, Some(taffy::FlexWrap::NoWrap));
+
+        let wrap_only = compute_style(
+            "div",
+            Some("flex-direction:column;flex-flow:wrap"),
+        );
+        assert_eq!(wrap_only.flex_direction, Some(taffy::FlexDirection::Row));
+        assert_eq!(wrap_only.flex_wrap, Some(taffy::FlexWrap::Wrap));
+
+        let reversed = compute_style("div", Some("flex-flow:wrap column-reverse"));
+        assert_eq!(
+            reversed.flex_direction,
+            Some(taffy::FlexDirection::ColumnReverse)
+        );
+        assert_eq!(reversed.flex_wrap, Some(taffy::FlexWrap::Wrap));
+
+        let invalid_later = compute_style(
+            "div",
+            Some("flex-flow:column wrap;flex-flow:row column"),
+        );
+        assert_eq!(
+            invalid_later.flex_direction,
+            Some(taffy::FlexDirection::Column)
+        );
+        assert_eq!(invalid_later.flex_wrap, Some(taffy::FlexWrap::Wrap));
     }
 
     #[test]
