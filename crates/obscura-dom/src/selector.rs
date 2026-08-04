@@ -319,11 +319,16 @@ impl<'a> Element for DomElement<'a> {
     }
 
     fn parent_node_is_shadow_root(&self) -> bool {
-        false
+        self.tree
+            .with_node(self.node_id, |node| node.parent)
+            .flatten()
+            .is_some_and(|parent| self.tree.is_shadow_root(parent))
     }
 
     fn containing_shadow_host(&self) -> Option<Self> {
-        None
+        let root = self.tree.containing_shadow_root(self.node_id)?;
+        let host = self.tree.shadow_root_info(root)?.host;
+        Some(DomElement::new(self.tree, host))
     }
 
     fn pseudo_element_originating_element(&self) -> Option<Self> {
@@ -586,9 +591,11 @@ impl<'a> Element for DomElement<'a> {
             .with_node(self.node_id, |n| {
                 n.parent
                     .map(|parent_id| {
-                        self.tree
-                            .with_node(parent_id, |p| p.is_document())
-                            .unwrap_or(false)
+                        !self.tree.is_shadow_root(parent_id)
+                            && self
+                                .tree
+                                .with_node(parent_id, |p| p.is_document())
+                                .unwrap_or(false)
                     })
                     .unwrap_or(false)
             })
@@ -1160,9 +1167,32 @@ fn subject_keys(sel: &parser::Selector<ObscuraSelector>) -> Vec<SelectorKey> {
 
 #[cfg(test)]
 mod tests {
+    use html5ever::{LocalName, Namespace, QualName};
+    use selectors::Element;
+
+    use crate::tree::{Attribute, NodeData, ShadowRootMode};
     use crate::tree_sink::parse_html;
 
-    use super::SelectorKey;
+    use super::{DomElement, SelectorKey};
+
+    fn shadow_element(
+        tree: &crate::tree::DomTree,
+        tag: &str,
+        attrs: &[(&str, &str)],
+    ) -> crate::tree::NodeId {
+        tree.new_node(NodeData::Element {
+            name: QualName::new(None, ns!(html), LocalName::from(tag)),
+            attrs: attrs
+                .iter()
+                .map(|(name, value)| Attribute {
+                    name: QualName::new(None, Namespace::default(), LocalName::from(*name)),
+                    value: (*value).to_string(),
+                })
+                .collect(),
+            template_contents: None,
+            mathml_annotation_xml_integration_point: false,
+        })
+    }
 
     fn candidate_keys(tree: &crate::tree::DomTree, selector: &str) -> Vec<SelectorKey> {
         tree.compile_rule_selector(selector)
@@ -1573,5 +1603,71 @@ mod tests {
         assert!(tree.query_selector_from(root, ".x").unwrap().is_none());
         // `span` finds the child.
         assert!(tree.query_selector_from(root, "span").unwrap().is_some());
+    }
+
+    #[test]
+    fn selectors_respect_native_shadow_tree_scopes_and_host_hooks() {
+        let tree = parse_html(
+            r#"<!doctype html><x-card id="host"><span id="light-only" class="target">light</span></x-card>"#,
+        );
+        let host = tree.get_element_by_id("host").unwrap();
+        let light = tree.get_element_by_id("light-only").unwrap();
+        let root = tree.attach_shadow_root(host, ShadowRootMode::Open).unwrap();
+        let shadow = shadow_element(&tree, "span", &[("id", "shadow-only"), ("class", "target")]);
+        tree.append_child(root, shadow);
+
+        // Document- and host-rooted selectors walk only the light tree. The
+        // id assertion exercises the O(1) id-index fast path as well as its
+        // scoped fallback; neither path may expose a shadow descendant.
+        assert_eq!(tree.query_selector_all(".target").unwrap(), vec![light]);
+        assert_eq!(tree.query_selector("#shadow-only").unwrap(), None);
+        assert_eq!(
+            tree.query_selector_all_from(host, ".target").unwrap(),
+            vec![light]
+        );
+
+        // A query rooted at the ShadowRoot remains useful to the shadow DOM
+        // API and sees only that local tree scope.
+        assert_eq!(
+            tree.query_selector_all_from(root, ".target").unwrap(),
+            vec![shadow]
+        );
+        assert_eq!(
+            tree.query_selector_from(root, "#shadow-only").unwrap(),
+            Some(shadow)
+        );
+
+        let matched_shadow = DomElement::new(&tree, shadow);
+        assert!(matched_shadow.parent_node_is_shadow_root());
+        assert_eq!(
+            matched_shadow
+                .containing_shadow_host()
+                .map(|element| element.node_id),
+            Some(host)
+        );
+        assert!(!matched_shadow.is_root());
+        assert!(!tree.matches_selector(shadow, ":root").unwrap());
+
+        // Each nested shadow scope reports its nearest host. Walking the same
+        // hook again from that inner host reaches the outer host.
+        let inner_host = shadow_element(&tree, "x-inner", &[]);
+        tree.append_child(root, inner_host);
+        let inner_root = tree
+            .attach_shadow_root(inner_host, ShadowRootMode::Closed)
+            .unwrap();
+        let inner_child = shadow_element(&tree, "b", &[]);
+        tree.append_child(inner_root, inner_child);
+        assert_eq!(
+            DomElement::new(&tree, inner_child)
+                .containing_shadow_host()
+                .map(|element| element.node_id),
+            Some(inner_host)
+        );
+        assert_eq!(
+            DomElement::new(&tree, inner_host)
+                .containing_shadow_host()
+                .map(|element| element.node_id),
+            Some(host)
+        );
     }
 }
