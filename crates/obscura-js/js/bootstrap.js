@@ -5463,7 +5463,7 @@ if (typeof URLSearchParams === "undefined") globalThis.URLSearchParams = class U
 const _checkXmlWellFormed = (html) => {
   // Strip comments, CDATA sections, processing instructions, and DOCTYPE
   // declarations — they may contain angle brackets.
-  let s = html
+  const s = html
     .replace(/<!--[\s\S]*?-->/g, '')
     .replace(/<!\[CDATA\[[\s\S]*?\]\]>/g, '')
     .replace(/<\?[\s\S]*?\?>/g, '')
@@ -5530,10 +5530,9 @@ globalThis.DOMParser = class DOMParser {
     // check fires, build a <parsererror> root so callers doing
     // doc.querySelector('parsererror') get the same signal as in Chrome.
     const xmlError = isXml ? _checkXmlWellFormed(html) : null;
-    if (xmlError && !xmlError.wellFormed) {
+    const isParserError = xmlError && !xmlError.wellFormed;
+    if (isParserError) {
       root.innerHTML = '<parsererror>' + xmlError.error + '</parsererror>';
-      // Make sure querySelector('parsererror') finds the root element.
-      root._parserError = true;
     } else {
       // innerHTML parses children via html5ever fragment-parsing rules. Most
       // HTML inputs start with `<!DOCTYPE>` / `<html>` / `<head>` etc.; the
@@ -5564,7 +5563,7 @@ globalThis.DOMParser = class DOMParser {
       get documentElement() {
         // For XML parsererror docs, return the <parsererror> child, not the
         // <html> wrapper — matches Chrome's behavior.
-        if (root._parserError) return root.firstElementChild;
+        if (isParserError) return root.firstElementChild;
         return root;
       },
       get body() { return findByTagName("BODY"); },
@@ -5595,7 +5594,7 @@ globalThis.DOMParser = class DOMParser {
       querySelector(s) {
         // For XML parsererror docs, check the root element as well —
         // the <parsererror> is the documentElement, not a descendant.
-        return root.querySelector(s) || (root._parserError && root.matches(s) ? root : null);
+        return root.querySelector(s) || (isParserError && root.matches(s) ? root : null);
       },
       querySelectorAll(s) { return root.querySelectorAll(s); },
       getElementById(id) {
