@@ -525,6 +525,7 @@ impl ObscuraJsRuntime {
                 && state.animation_sample.mode == obscura_render::AnimationSampleMode::DocumentTime
                 && sample.time.milliseconds > state.animation_sample.time.milliseconds;
             if forward_document_sample
+                && state.pending_style_mutations.is_empty()
                 && state.prepared_render.as_mut().is_some_and(|prepared| {
                     prepared.advance_inactive_animation_sample_time(sample.time)
                 })
@@ -7943,6 +7944,8 @@ mod tests {
         rt.set_viewport(120.0, 40.0);
         rt.state.borrow_mut().animation_timeline_origin = std::time::Instant::now();
         assert!(rt.set_animation_sample(obscura_render::AnimationSample::document(0.0)));
+        rt.screenshot_prepared((120.0, 40.0), Some("http://example.com/test"))
+            .expect("static frame before WAAPI registration");
         rt.execute_script(
             "waapi-retained-frame",
             r#"document.getElementById('box').animate(
@@ -7952,6 +7955,23 @@ mod tests {
             )"#,
         )
         .unwrap();
+        {
+            let state = rt.state.borrow();
+            let box_node = state
+                .dom
+                .as_ref()
+                .unwrap()
+                .get_element_by_id("box")
+                .unwrap();
+            assert!(
+                state.prepared_render.is_some(),
+                "registering one WAAPI effect must retain the previous style graph"
+            );
+            assert_eq!(
+                state.pending_style_mutations,
+                vec![obscura_render::RetainedStyleMutation::Animation { node: box_node }]
+            );
+        }
         let initial = rt
             .screenshot_prepared((120.0, 40.0), Some("http://example.com/test"))
             .expect("initial WAAPI frame");
@@ -7978,6 +7998,41 @@ mod tests {
             "WAAPI midpoint opacity={midpoint_opacity}"
         );
         assert_ne!(initial, midpoint, "WAAPI paint output must advance");
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn waapi_cancel_retains_static_style_graph_and_restores_authored_style() {
+        let mut rt = setup_runtime(
+            r#"<html><body><div id="box" style="opacity:.25;width:20px;height:20px"></div></body></html>"#,
+        );
+        rt.set_viewport(40.0, 40.0);
+        rt.screenshot_prepared((40.0, 40.0), Some("http://example.com/test"))
+            .expect("static frame");
+        rt.execute_script(
+            "waapi-retained-cancel",
+            r#"globalThis.__cancelAnimation = document.getElementById('box').animate(
+                [{opacity:1}, {opacity:0}], {duration:1000, fill:'both'}
+            )"#,
+        )
+        .unwrap();
+        let animated_opacity = rt
+            .evaluate("Number(getComputedStyle(document.getElementById('box')).opacity)")
+            .unwrap()
+            .as_f64()
+            .unwrap();
+        assert!(animated_opacity > 0.9, "animated opacity={animated_opacity}");
+
+        rt.evaluate("__cancelAnimation.cancel()").unwrap();
+        assert!(
+            rt.state.borrow().prepared_render.is_some(),
+            "canceling one WAAPI effect must retain the previous style graph until recascade"
+        );
+        assert_eq!(
+            rt.evaluate("getComputedStyle(document.getElementById('box')).opacity")
+                .unwrap(),
+            serde_json::json!("0.25")
+        );
     }
 
     #[cfg(feature = "render")]

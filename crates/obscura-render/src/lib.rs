@@ -1910,6 +1910,13 @@ impl AnimationTimelineState {
         self.waapi.insert(animation.id, animation);
     }
 
+    /// Target node for a registered Web Animation. Control operations use
+    /// this before mutating/removing the record so retained style damage can
+    /// stay scoped to the affected element.
+    pub fn waapi_node(&self, id: u64) -> Option<obscura_dom::tree::NodeId> {
+        self.waapi.get(&id).map(|animation| animation.node)
+    }
+
     /// Exact set of nodes currently targeted by registered Web Animations.
     /// The render preparation boundary additionally filters disconnected
     /// targets against the current DOM before producing restyle damage.

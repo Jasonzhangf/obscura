@@ -690,6 +690,17 @@ fn queue_retained_style_mutation(
     pending: &mut Vec<obscura_render::RetainedStyleMutation>,
     mutation: obscura_render::RetainedStyleMutation,
 ) -> bool {
+    if let obscura_render::RetainedStyleMutation::Animation { node } = &mutation {
+        if pending.iter().any(|queued| {
+            matches!(
+                queued,
+                obscura_render::RetainedStyleMutation::Animation { node: current }
+                    if current == node
+            )
+        }) {
+            return true;
+        }
+    }
     if let obscura_render::RetainedStyleMutation::Attribute(next) = &mutation {
         if next.name.eq_ignore_ascii_case("style")
             && pending.iter().any(|queued| {
@@ -2874,6 +2885,31 @@ mod tests {
 
     #[cfg(feature = "render")]
     #[test]
+    fn repeated_animation_changes_share_one_retained_dirty_marker_per_node() {
+        let mut pending = Vec::new();
+        let first = obscura_dom::tree::NodeId::new(1);
+        let second = obscura_dom::tree::NodeId::new(2);
+        for _ in 0..300 {
+            assert!(queue_retained_style_mutation(
+                &mut pending,
+                obscura_render::RetainedStyleMutation::Animation { node: first },
+            ));
+        }
+        assert!(queue_retained_style_mutation(
+            &mut pending,
+            obscura_render::RetainedStyleMutation::Animation { node: second },
+        ));
+        assert_eq!(
+            pending,
+            vec![
+                obscura_render::RetainedStyleMutation::Animation { node: first },
+                obscura_render::RetainedStyleMutation::Animation { node: second },
+            ]
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
     fn geometry_consumer_defers_paint_only_sample_until_exact_consumer() {
         let dom = parse_html(
             r#"<style>
@@ -3826,8 +3862,21 @@ fn waapi_document_time_ms(state: &ObscuraState) -> f32 {
 }
 
 #[cfg(feature = "render")]
-fn invalidate_waapi_render(state: &mut ObscuraState) {
-    state.prepared_render = None;
+fn invalidate_waapi_render(state: &mut ObscuraState, node: NodeId) {
+    // Adding or controlling one effect changes the animation cascade only for
+    // its target subtree. Keep the previous style graph available to the
+    // retained planner instead of turning every animation setup into a full
+    // document cascade. The bounded mutation queue remains the safety valve
+    // for genuinely broad animation bursts.
+    if state.prepared_render.is_some()
+        && !queue_retained_style_mutation(
+            &mut state.pending_style_mutations,
+            obscura_render::RetainedStyleMutation::Animation { node },
+        )
+    {
+        state.prepared_render = None;
+        state.pending_style_mutations.clear();
+    }
     state.resolved_scroll = None;
     state.activity_generation = state.activity_generation.wrapping_add(1);
 }
@@ -3893,7 +3942,7 @@ fn op_waapi_create(state: &OpState, #[string] input: &str) -> bool {
         hold_time_ms: None,
         play_state: obscura_render::WaapiPlayState::Running,
     });
-    invalidate_waapi_render(&mut state);
+    invalidate_waapi_render(&mut state, node);
     true
 }
 
@@ -3911,6 +3960,9 @@ fn op_waapi_control(
     let shared = state.borrow::<SharedState>().clone();
     let mut state = shared.borrow_mut();
     let id = id as u64;
+    let Some(node) = state.animation_timeline.waapi_node(id) else {
+        return false;
+    };
     let document_time = waapi_document_time_ms(&state);
     let changed = match action {
         "cancel" => state.animation_timeline.cancel_waapi(id),
@@ -3933,7 +3985,7 @@ fn op_waapi_control(
         _ => false,
     };
     if changed {
-        invalidate_waapi_render(&mut state);
+        invalidate_waapi_render(&mut state, node);
     }
     changed
 }
@@ -4089,6 +4141,7 @@ pub(crate) fn sample_live_document_animations(state: &mut ObscuraState) {
     }
     if sample.time.milliseconds > state.animation_sample.time.milliseconds
         && state.animation_sample.mode == obscura_render::AnimationSampleMode::DocumentTime
+        && state.pending_style_mutations.is_empty()
         && state.prepared_render.as_mut().is_some_and(|prepared| {
             prepared.advance_inactive_animation_sample_time(sample.time)
         })
