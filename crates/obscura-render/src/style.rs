@@ -43,7 +43,14 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
         "tr" => Display::Flex,
         _ => Display::Block,
     };
-    if tag == "center" {
+    if tag == "slot" {
+        // HTML's UA sheet makes a slot transparent to box generation; its
+        // assigned nodes or fallback children participate at the slot's
+        // position in the flattened tree. Author `display` declarations may
+        // still replace this default through the normal declaration parser.
+        style.display = Display::Block;
+        style.display_contents = true;
+    } else if tag == "center" {
         // Browser UA sheets keep <center> block-level and give it a special
         // inherited text alignment which also centers fixed-width block
         // descendants. Keep that provenance separate from ordinary authored

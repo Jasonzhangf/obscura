@@ -407,7 +407,23 @@ struct RenderMutationImpact {
 }
 
 fn node_is_connected(dom: &DomTree, node: NodeId) -> bool {
-    node == dom.document() || dom.ancestors(node).contains(&dom.document())
+    dom.shadow_including_root(node) == Some(dom.document())
+}
+
+#[cfg(feature = "render")]
+fn shadow_including_connected_nodes(dom: &DomTree) -> HashSet<NodeId> {
+    let mut connected = HashSet::new();
+    let mut stack = vec![dom.document()];
+    while let Some(node) = stack.pop() {
+        if !connected.insert(node) {
+            continue;
+        }
+        stack.extend(dom.children(node));
+        if let Some(shadow_children) = dom.shadow_children(node) {
+            stack.extend(shadow_children);
+        }
+    }
+    connected
 }
 
 /// Classify whether a DOM command can make the retained document layout
@@ -552,6 +568,13 @@ fn retained_style_mutation(
     arg2: &str,
 ) -> Option<obscura_render::RetainedStyleMutation> {
     let node = NodeId::new(arg1.parse::<u32>().ok()?);
+    // The retained planner and document stylesheet cache are intentionally
+    // light-tree scoped. A mutation inside a connected shadow tree must still
+    // invalidate rendering, but cannot be represented by that document-local
+    // dirty set until scoped stylesheet invalidation is retained separately.
+    if dom.containing_shadow_root(node).is_some() {
+        return None;
+    }
     match cmd {
         "set_attribute" => {
             let (name, value) = arg2.split_once('\0')?;
@@ -620,6 +643,9 @@ fn retained_style_mutation(
         "insert_before" => {
             let reference = NodeId::new(arg2.parse::<u32>().ok()?);
             let new_parent = dom.get_node(reference)?.parent?;
+            if dom.containing_shadow_root(new_parent).is_some() {
+                return None;
+            }
             let old_parent = dom.get_node(node)?.parent;
             Some(
                 obscura_render::TreeStyleMutation::Insert {
@@ -2494,6 +2520,11 @@ fn glob_match(pattern: &str, url: &str) -> bool {
 mod tests {
     use super::{cors_response_allows, glob_match, validate_fetch_url, FetchCredentials};
 
+    #[cfg(feature = "render")]
+    use super::{node_is_connected, retained_style_mutation, shadow_including_connected_nodes};
+    #[cfg(feature = "render")]
+    use obscura_dom::{parse_html, ShadowRootMode};
+
     #[test]
     fn glob_match_handles_cdp_blocked_url_patterns() {
         assert!(glob_match(
@@ -2570,6 +2601,35 @@ mod tests {
     fn fetch_url_validation_honors_per_context_private_network_opt_in() {
         let loopback = url::Url::parse("http://127.0.0.1:8080/resource").unwrap();
         assert!(validate_fetch_url(&loopback, true).is_ok());
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn connected_shadow_nodes_invalidate_without_entering_light_tree_retention() {
+        let dom = parse_html(
+            r#"<x-host id="host"></x-host><div id="source"><span id="shadow-child"></span></div>"#,
+        );
+        let host = dom.get_element_by_id("host").unwrap();
+        let source = dom.get_element_by_id("source").unwrap();
+        let child = dom.get_element_by_id("shadow-child").unwrap();
+        let root = dom
+            .attach_shadow_root(host, ShadowRootMode::Open)
+            .unwrap();
+        dom.append_child(root, child);
+
+        assert!(node_is_connected(&dom, child));
+        assert!(shadow_including_connected_nodes(&dom).contains(&child));
+        assert!(
+            retained_style_mutation(&dom, "set_attribute", &child.index().to_string(), "class\0changed")
+                .is_none(),
+            "shadow mutations require a full scoped cascade"
+        );
+
+        dom.append_child(source, host);
+        assert!(node_is_connected(&dom, child));
+        dom.remove(source);
+        assert!(!node_is_connected(&dom, child));
+        assert!(!shadow_including_connected_nodes(&dom).contains(&child));
     }
 }
 
@@ -3662,11 +3722,10 @@ pub(crate) fn ensure_prepared_render(
         if animation_sample.mode == obscura_render::AnimationSampleMode::DocumentTime {
             state.animation_timeline.clear_start_candidates();
         }
-        let connected = state.dom.as_ref().map(|dom| {
-            std::iter::once(dom.document())
-                .chain(dom.descendants(dom.document()))
-                .collect::<HashSet<_>>()
-        });
+        let connected = state
+            .dom
+            .as_ref()
+            .map(shadow_including_connected_nodes);
         if let Some(connected) = connected {
             state
                 .animation_timeline

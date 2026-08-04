@@ -2808,14 +2808,14 @@ fn stacking_z_index(
         return Some(z);
     }
 
-    let mut parent = tree.get_node(id).and_then(|node| node.parent);
+    let mut parent = crate::dom::rendered_parent(tree, id);
     while let Some(parent_id) = parent {
         let Some(parent_style) = laid.styles.get(&parent_id) else {
-            parent = tree.get_node(parent_id).and_then(|node| node.parent);
+            parent = crate::dom::rendered_parent(tree, parent_id);
             continue;
         };
         if parent_style.display_contents {
-            parent = tree.get_node(parent_id).and_then(|node| node.parent);
+            parent = crate::dom::rendered_parent(tree, parent_id);
             continue;
         }
         let is_flex_or_grid = parent_style.display == crate::Display::Grid
@@ -2846,14 +2846,14 @@ fn is_effective_float(
         return false;
     }
 
-    let mut parent = tree.get_node(id).and_then(|node| node.parent);
+    let mut parent = crate::dom::rendered_parent(tree, id);
     while let Some(parent_id) = parent {
         let Some(parent_style) = laid.styles.get(&parent_id) else {
-            parent = tree.get_node(parent_id).and_then(|node| node.parent);
+            parent = crate::dom::rendered_parent(tree, parent_id);
             continue;
         };
         if parent_style.display_contents {
-            parent = tree.get_node(parent_id).and_then(|node| node.parent);
+            parent = crate::dom::rendered_parent(tree, parent_id);
             continue;
         }
         return parent_style.display != crate::Display::Grid
@@ -2881,7 +2881,7 @@ fn transform_subtree_source_bounds(
     root: obscura_dom::tree::NodeId,
 ) -> Option<crate::Rect> {
     let mut bounds: Option<crate::Rect> = None;
-    for id in std::iter::once(root).chain(tree.descendants(root)) {
+    for id in std::iter::once(root).chain(crate::dom::rendered_descendants(tree, root)) {
         let Some(rect) = laid.rects.get(&id) else {
             continue;
         };
@@ -3209,7 +3209,10 @@ fn paint_laid_dom_scrolled(
     let mut consumed: std::collections::HashSet<obscura_dom::tree::NodeId> =
         std::collections::HashSet::new();
     let mut paint_nodes = paint_root.into_iter().collect::<Vec<_>>();
-    paint_nodes.extend(tree.descendants(paint_root.unwrap_or_else(|| tree.document())));
+    paint_nodes.extend(crate::dom::rendered_descendants(
+        tree,
+        paint_root.unwrap_or_else(|| tree.document()),
+    ));
     for nid in paint_nodes.iter().copied() {
         if consumed.contains(&nid) {
             continue;
@@ -3228,7 +3231,7 @@ fn paint_laid_dom_scrolled(
         let is_float_root = paint_root != Some(nid) && is_effective_float(tree, laid, nid);
         if is_opacity_root || is_transform_root {
             let mut sub = vec![nid];
-            sub.extend(tree.descendants(nid));
+            sub.extend(crate::dom::rendered_descendants(tree, nid));
             for &member in &sub {
                 consumed.insert(member);
             }
@@ -3242,7 +3245,7 @@ fn paint_laid_dom_scrolled(
             }
         } else if let Some(z) = z {
             let mut sub = vec![nid];
-            sub.extend(tree.descendants(nid));
+            sub.extend(crate::dom::rendered_descendants(tree, nid));
             for &m in &sub {
                 consumed.insert(m);
             }
@@ -3253,7 +3256,7 @@ fn paint_laid_dom_scrolled(
             }
         } else if is_float_root {
             consumed.insert(nid);
-            consumed.extend(tree.descendants(nid));
+            consumed.extend(crate::dom::rendered_descendants(tree, nid));
             float_layers.push(nid);
         } else {
             normal.push(nid);
@@ -3296,7 +3299,7 @@ fn paint_laid_dom_scrolled(
                 continue;
             };
             if paint_root != Some(nid) {
-                if let Some(parent) = tree.get_node(nid).and_then(|node| node.parent) {
+                if let Some(parent) = crate::dom::rendered_parent(tree, nid) {
                     last_index
                         .entry(parent)
                         .and_modify(|last| *last = (*last).max(index))
@@ -3329,7 +3332,7 @@ fn paint_laid_dom_scrolled(
         }
         if suppress_stacking_for != Some(nid) && stacking_z_index(tree, laid, nid).is_some() {
             opacity_subtree_skip.insert(nid);
-            opacity_subtree_skip.extend(tree.descendants(nid));
+            opacity_subtree_skip.extend(crate::dom::rendered_descendants(tree, nid));
             // A stacking context is one structural paint item in its parent.
             // Re-enter the same display-list builder with this root suppressed
             // so all of its decorations, descendants, and shaped inline text
@@ -3366,7 +3369,7 @@ fn paint_laid_dom_scrolled(
         }
         if paint_root != Some(nid) && is_effective_float(tree, laid, nid) {
             opacity_subtree_skip.insert(nid);
-            opacity_subtree_skip.extend(tree.descendants(nid));
+            opacity_subtree_skip.extend(crate::dom::rendered_descendants(tree, nid));
             // CSS paints each float as an atomic unit in the float band. The
             // recursive display-list build preserves the float's own stacking,
             // opacity, transforms, generated boxes, replaced content, and
@@ -3466,7 +3469,7 @@ fn paint_laid_dom_scrolled(
 
         if suppress_transform_for != Some(nid) && has_authored_transform(style) {
             opacity_subtree_skip.insert(nid);
-            opacity_subtree_skip.extend(tree.descendants(nid));
+            opacity_subtree_skip.extend(crate::dom::rendered_descendants(tree, nid));
             let transform =
                 crate::dom::resolved_transform_matrix(style, &rect, root_font_size, viewport);
             if transform.is_translation() {
@@ -3614,7 +3617,7 @@ fn paint_laid_dom_scrolled(
             .clamp(0.0, 1.0);
         if suppress_opacity_for != Some(nid) && own_opacity < 1.0 {
             opacity_subtree_skip.insert(nid);
-            opacity_subtree_skip.extend(tree.descendants(nid));
+            opacity_subtree_skip.extend(crate::dom::rendered_descendants(tree, nid));
             if own_opacity <= 0.0 {
                 continue;
             }
@@ -4002,7 +4005,7 @@ fn paint_laid_dom_scrolled(
                         // usable rectangle in this representation. Keep walking
                         // to the nearest positioned ancestor that does have one.
                     }
-                    ancestor = tree.get_node(candidate).and_then(|node| node.parent);
+                    ancestor = crate::dom::rendered_parent(tree, candidate);
                 }
                 found.unwrap_or(rect)
             };
@@ -4214,7 +4217,7 @@ fn paint_laid_dom_scrolled(
                     );
                 }
             }
-            for child in tree.descendants(nid) {
+            for child in crate::dom::rendered_descendants(tree, nid) {
                 svg_subtree_skip.insert(child);
             }
         }
@@ -4907,7 +4910,7 @@ impl<'a> ScrollPaintState<'a> {
                 return None;
             }
             let mut owners = Vec::new();
-            let mut current = self.tree.get_node(id).and_then(|node| node.parent);
+            let mut current = crate::dom::rendered_parent(self.tree, id);
             let mut found = false;
             while let Some(owner) = current {
                 owners.push(owner);
@@ -4915,7 +4918,7 @@ impl<'a> ScrollPaintState<'a> {
                     found = true;
                     break;
                 }
-                current = self.tree.get_node(owner).and_then(|node| node.parent);
+                current = crate::dom::rendered_parent(self.tree, owner);
             }
             if found {
                 let mut clip: Option<crate::dom::OverflowClip> = None;
@@ -6142,8 +6145,7 @@ fn paint_text_node(
     raster_scale: f32,
 ) -> Option<()> {
     let runs = laid.text_runs.get(&nid)?;
-    let node = tree.get_node(nid)?;
-    let parent = node.parent?;
+    let parent = crate::dom::rendered_parent(tree, nid)?;
     let style = laid.styles.get(&parent)?;
     if style.effectively_invisible {
         return Some(());
@@ -6464,7 +6466,7 @@ fn collect_web_fonts(
     let mut fonts = Vec::new();
     let mut rules = Vec::new();
 
-    for nid in tree.descendants(tree.document()) {
+    for nid in crate::dom::rendered_descendants(tree, tree.document()) {
         let Some(node) = tree.get_node(nid) else {
             continue;
         };
@@ -6516,7 +6518,7 @@ fn collect_web_fonts(
     // already resolved relative to the HTML. Fetch those first, while retaining
     // the matching @font-face descriptors needed for CSS family/weight lookup.
     let mut preloads = Vec::new();
-    for nid in tree.descendants(tree.document()) {
+    for nid in crate::dom::rendered_descendants(tree, tree.document()) {
         let Some(node) = tree.get_node(nid) else {
             continue;
         };
@@ -8494,7 +8496,7 @@ fn collect_image_intrinsics(
 ) {
     let mut out = std::collections::HashMap::new();
     let mut selected = HashMap::new();
-    for nid in tree.descendants(tree.document()) {
+    for nid in crate::dom::rendered_descendants(tree, tree.document()) {
         let Some(node) = tree.get_node(nid) else {
             continue;
         };
@@ -9648,12 +9650,14 @@ fn svg_font_database_with_web_fonts(
 }
 
 fn has_inline_svg_text(tree: &DomTree) -> bool {
-    tree.descendants(tree.document()).into_iter().any(|nid| {
+    crate::dom::rendered_descendants(tree, tree.document())
+        .into_iter()
+        .any(|nid| {
         tree.get_node(nid).is_some_and(|node| {
             node.as_element()
                 .is_some_and(|name| matches!(name.local.as_ref(), "text" | "tspan" | "textPath"))
         })
-    })
+        })
 }
 
 /// Return SVG XML whose root `width`/`height` are the resolved CSS viewport.
@@ -10775,7 +10779,32 @@ fn paint_mask(
 mod tests {
     use super::*;
     use crate::dom::layout_dom_with_web_fonts;
+    use obscura_dom::tree::ShadowRootMode;
     use obscura_dom::tree_sink::parse_html;
+
+    #[test]
+    fn native_shadow_flat_tree_paints_shadow_and_slotted_content_only() {
+        let tree = parse_html(
+            r#"<html style="background:white"><body style="margin:0"><x-card id="host" style="display:block;width:30px"><span id="light" style="display:block;height:10px;background:rgb(255,0,0)"></span><span id="unslotted" slot="missing" style="display:block;height:10px;background:rgb(0,255,0)"></span></x-card><div id="source"><div style="height:10px;background:rgb(0,0,255)"></div><slot></slot><div style="height:10px;background:rgb(255,255,0)"></div></div></body></html>"#,
+        );
+        let host = tree.get_element_by_id("host").unwrap();
+        let source = tree.get_element_by_id("source").unwrap();
+        let root = tree
+            .attach_shadow_root(host, ShadowRootMode::Open)
+            .expect("attach native shadow root");
+        for child in tree.children(source) {
+            tree.append_child(root, child);
+        }
+        tree.remove(source);
+
+        let pixmap = paint_dom(&tree, (30.0, 30.0), None).expect("shadow paint");
+        let blue = pixmap.pixel(5, 5).unwrap();
+        let red = pixmap.pixel(5, 15).unwrap();
+        let yellow = pixmap.pixel(5, 25).unwrap();
+        assert!(blue.blue() > 240 && blue.red() < 20 && blue.green() < 20);
+        assert!(red.red() > 240 && red.green() < 20 && red.blue() < 20);
+        assert!(yellow.red() > 240 && yellow.green() > 240 && yellow.blue() < 20);
+    }
 
     #[test]
     fn svg_image_metadata_keeps_view_box_as_ratio_only() {

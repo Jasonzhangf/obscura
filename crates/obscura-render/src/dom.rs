@@ -775,8 +775,8 @@ impl DomLayout {
         let mut fixed = HashSet::new();
         let mut has_fixed_cb: HashMap<NodeId, bool> = HashMap::new();
 
-        for id in tree.descendants(tree.document()) {
-            let parent = tree.get_node(id).and_then(|node| node.parent);
+        for id in rendered_descendants(tree, tree.document()) {
+            let parent = rendered_parent(tree, id);
             let parent_is_fixed = parent.is_some_and(|parent| fixed.contains(&parent));
             let ancestor_has_fixed_cb = parent
                 .and_then(|parent| has_fixed_cb.get(&parent).copied())
@@ -811,7 +811,7 @@ impl DomLayout {
         root_content_size: (f32, f32),
         viewport_fixed: &HashSet<NodeId>,
     ) -> ScrollTree {
-        let nodes = tree.descendants(tree.document());
+        let nodes = rendered_descendants(tree, tree.document());
         let node_capacity = nodes
             .iter()
             .map(|id| id.index())
@@ -863,9 +863,7 @@ impl DomLayout {
             movement_owner: &mut [Option<ScrollId>],
         ) {
             let fixed = viewport_fixed.contains(&id);
-            let parent_fixed = tree
-                .get_node(id)
-                .and_then(|node| node.parent)
+            let parent_fixed = rendered_parent(tree, id)
                 .is_some_and(|parent| viewport_fixed.contains(&parent));
             // Only the boundary that enters the viewport-fixed coordinate
             // space drops root movement. Descendants inherit that zero-based
@@ -1119,8 +1117,8 @@ impl DomLayout {
         let mut inherited_clip_sticky: HashMap<NodeId, Option<NodeId>> = HashMap::new();
         let mut inside_nested_scroller: HashMap<NodeId, bool> = HashMap::new();
 
-        for id in tree.descendants(tree.document()) {
-            let parent = tree.get_node(id).and_then(|node| node.parent);
+        for id in rendered_descendants(tree, tree.document()) {
+            let parent = rendered_parent(tree, id);
             let has_nested_scroll_container = parent.is_some_and(|parent| {
                 inside_nested_scroller
                     .get(&parent)
@@ -1222,7 +1220,7 @@ impl DomLayout {
                         break;
                     }
                 }
-                ancestor = tree.get_node(candidate).and_then(|node| node.parent);
+                ancestor = rendered_parent(tree, candidate);
             }
 
             let resolve_inset = |value: Option<crate::Dimension>, basis: f32| match value {
@@ -1510,9 +1508,7 @@ fn resolve_atomic_percentage_heights(
         let dom_id = id_map.get(&node).copied();
 
         if let (Some(dom_id), Some(parent_id)) = (dom_id, nearest_dom_parent) {
-            let is_direct_dom_child = tree
-                .get_node(dom_id)
-                .is_some_and(|node| node.parent == Some(parent_id));
+            let is_direct_dom_child = rendered_parent(tree, dom_id) == Some(parent_id);
             let child_percent = styles.get(&dom_id).and_then(|style| {
                 (style.size_expressions[1].is_none()
                     && !style.ignores_used_box_sizes()
@@ -2099,6 +2095,7 @@ fn cascade_walk(
     tree: &DomTree,
     id: NodeId,
     sheet: &crate::css::Stylesheet,
+    shadow_sheets: &HashMap<NodeId, std::sync::Arc<crate::css::Stylesheet>>,
     matcher: &mut obscura_dom::selector::Matcher,
     styles: &mut HashMap<NodeId, crate::LayoutStyle>,
     custom_properties: &mut HashMap<NodeId, std::rc::Rc<HashMap<String, String>>>,
@@ -2332,6 +2329,7 @@ fn cascade_walk(
             tree,
             cid,
             sheet,
+            shadow_sheets,
             matcher,
             styles,
             custom_properties,
@@ -2345,6 +2343,35 @@ fn cascade_walk(
             descendant_color_scheme_dark,
             fresh_styles,
         );
+    }
+    if let Some(root) = tree.shadow_root(id) {
+        // Start matching with an empty ancestor filter at each tree-scope
+        // boundary. That keeps document rules out of the shadow tree and
+        // shadow rules out of the document/other roots by construction.
+        if let Some(shadow_sheet) = shadow_sheets.get(&root) {
+            let mut shadow_matcher = tree.matcher();
+            let mut no_container_evaluator = None;
+            for child in tree.children(root) {
+                cascade_walk(
+                    tree,
+                    child,
+                    shadow_sheet,
+                    shadow_sheets,
+                    &mut shadow_matcher,
+                    styles,
+                    custom_properties,
+                    &this_props,
+                    &mut no_container_evaluator,
+                    quirks_mode,
+                    viewport,
+                    animation_sample,
+                    animation_timeline,
+                    None,
+                    descendant_color_scheme_dark,
+                    fresh_styles,
+                );
+            }
+        }
     }
     if is_element {
         matcher.pop_ancestor();
@@ -3585,6 +3612,63 @@ fn layout_dom_with_web_fonts_pass_limit(
     )
 }
 
+/// Compile one author stylesheet per native ShadowRoot.
+///
+/// `DomTree::descendants` deliberately stays inside one tree scope, so the
+/// document collector cannot accidentally absorb a component's styles and a
+/// shadow collector cannot absorb a nested component's styles. Walking host
+/// edges explicitly here also discovers roots nested inside other roots.
+fn collect_shadow_stylesheets(
+    tree: &DomTree,
+    viewport: (f32, f32),
+    media_type: crate::CssMediaType,
+) -> HashMap<NodeId, std::sync::Arc<crate::css::Stylesheet>> {
+    let mut roots = Vec::new();
+    let mut stack = vec![tree.document()];
+    let mut visited = HashSet::new();
+    while let Some(node) = stack.pop() {
+        if !visited.insert(node) {
+            continue;
+        }
+        if let Some(root) = tree.shadow_root(node) {
+            roots.push(root);
+            stack.extend(tree.children(root).into_iter().rev());
+        }
+        stack.extend(tree.children(node).into_iter().rev());
+    }
+
+    roots
+        .into_iter()
+        .map(|root| {
+            let sources = tree
+                .descendants(root)
+                .into_iter()
+                .filter_map(|node_id| {
+                    let node = tree.get_node(node_id)?;
+                    let element = node.as_element()?;
+                    (element.local.as_ref() == "style"
+                        && node.get_attribute("media").is_none_or(|media| {
+                            media.trim().is_empty()
+                                || crate::css::media_query_applies_for_viewport_and_type(
+                                    media,
+                                    viewport,
+                                    media_type,
+                                )
+                        }))
+                    .then(|| tree.text_content(node_id))
+                })
+                .collect::<Vec<_>>();
+            let sheet = crate::css::Stylesheet::parse_for_viewport_and_media(
+                tree,
+                &sources,
+                viewport,
+                media_type,
+            );
+            (root, std::sync::Arc::new(sheet))
+        })
+        .collect()
+}
+
 fn layout_dom_with_web_fonts_pass_limit_at_animation_time(
     tree: &DomTree,
     viewport: (f32, f32),
@@ -3634,10 +3718,19 @@ fn layout_dom_with_web_fonts_pass_limit_at_animation_time(
             false,
         ),
     };
+    let shadow_sheets = collect_shadow_stylesheets(tree, viewport, media_type);
     let t_parse = t0.elapsed();
 
     let retained_requested = retained.as_ref().map_or(0, |retained| retained.styles.len());
     let retained = retained.and_then(|mut retained| {
+        // The document cache key intentionally contains only document-scope
+        // sources. Until shadow sheets have their own retained cache keys and
+        // invalidation maps, reusing any computed styles in a document with a
+        // native root could preserve stale shadow rules or inherited host
+        // custom properties after a mutation. Prefer a full correct cascade.
+        if !shadow_sheets.is_empty() {
+            return None;
+        }
         if !stylesheet_cache_hit {
             return None;
         }
@@ -3649,7 +3742,7 @@ fn layout_dom_with_web_fonts_pass_limit_at_animation_time(
             })
             .collect::<HashSet<_>>();
         let connected = std::iter::once(tree.document())
-            .chain(tree.descendants(tree.document()))
+            .chain(rendered_descendants(tree, tree.document()))
             .collect::<HashSet<_>>();
         retained.styles.retain(|node, _| connected.contains(node));
         retained
@@ -3712,6 +3805,7 @@ fn layout_dom_with_web_fonts_pass_limit_at_animation_time(
             intrinsic,
             fonts,
             &sheet,
+            &shadow_sheets,
             None,
             retained,
             animation_sample,
@@ -3776,12 +3870,11 @@ fn layout_dom_with_web_fonts_pass_limit_at_animation_time(
     let mut element_depths = HashMap::new();
     element_depths.insert(tree.document(), 0usize);
     let mut max_dom_depth = 1usize;
-    for id in tree.descendants(tree.document()) {
+    for id in rendered_descendants(tree, tree.document()) {
         let Some(node) = tree.get_node(id) else {
             continue;
         };
-        let parent_depth = node
-            .parent
+        let parent_depth = rendered_parent(tree, id)
             .and_then(|parent| element_depths.get(&parent).copied())
             .unwrap_or(0);
         let depth = parent_depth + usize::from(node.is_element());
@@ -3801,6 +3894,7 @@ fn layout_dom_with_web_fonts_pass_limit_at_animation_time(
                 intrinsic,
                 fonts,
                 &sheet,
+                &shadow_sheets,
                 Some(&snapshot),
                 None,
                 animation_sample,
@@ -3858,6 +3952,7 @@ fn layout_dom_with_web_fonts_pass_limit_at_animation_time(
                 intrinsic,
                 fonts,
                 &sheet,
+                &shadow_sheets,
                 None,
                 None,
                 animation_sample,
@@ -3894,6 +3989,7 @@ fn layout_dom_once(
     intrinsic: &ReplacedIntrinsicMap,
     fonts: &[crate::inline::WebFont],
     sheet: &crate::css::Stylesheet,
+    shadow_sheets: &HashMap<NodeId, std::sync::Arc<crate::css::Stylesheet>>,
     snapshot: Option<&crate::css::ContainerSnapshot>,
     retained: Option<(RetainedStyleMaps, HashSet<NodeId>)>,
     animation_sample: crate::AnimationSample,
@@ -3928,6 +4024,7 @@ fn layout_dom_once(
         tree,
         tree.document(),
         &sheet,
+        shadow_sheets,
         &mut matcher,
         &mut styles,
         &mut custom_properties,
@@ -4270,15 +4367,14 @@ fn layout_dom_once(
                 }
                 inh.cb_width = child_cb_width;
                 inh.cb_height_definite = child_cb_height_definite;
-                for child in tree.children(id).into_iter().rev() {
+                for child in style_children(tree, id).into_iter().rev() {
                     queue.push((child, inh.clone()));
                 }
                 continue;
             }
             let inherited_grid_auto_tracks = styles.get(&id).and_then(|style| {
                 (style.grid_auto_columns_inherit || style.grid_auto_rows_inherit).then(|| {
-                    tree.get_node(id)
-                        .and_then(|node| node.parent)
+                    rendered_parent(tree, id)
                         .and_then(|parent| styles.get(&parent))
                         .map(|parent| {
                             (
@@ -5055,7 +5151,7 @@ fn layout_dom_once(
             }
             inh.cb_width = child_cb_width;
             inh.cb_height_definite = child_cb_height_definite;
-            for cid in tree.children(id).into_iter().rev() {
+            for cid in style_children(tree, id).into_iter().rev() {
                 queue.push((cid, inh.clone()));
             }
         }
@@ -6519,7 +6615,7 @@ fn folded_inline_relative_offset(
         rects: &HashMap<NodeId, Rect>,
         styles: &HashMap<NodeId, crate::LayoutStyle>,
     ) -> Option<(f32, f32)> {
-        let mut ancestor = tree.get_node(owner).and_then(|node| node.parent);
+        let mut ancestor = rendered_parent(tree, owner);
         while let Some(id) = ancestor {
             let style = styles.get(&id)?;
             if !style.ignores_used_box_sizes() && !style.display_contents {
@@ -6539,7 +6635,7 @@ fn folded_inline_relative_offset(
                         .max(0.0),
                 ));
             }
-            ancestor = tree.get_node(id).and_then(|node| node.parent);
+            ancestor = rendered_parent(tree, id);
         }
         None
     }
@@ -6586,7 +6682,7 @@ fn folded_inline_relative_offset(
                 offset.1 -= bottom;
             }
         }
-        current = tree.get_node(id).and_then(|node| node.parent);
+        current = rendered_parent(tree, id);
     }
     Some(offset)
 }
@@ -6672,7 +6768,7 @@ fn grow_trailing_auto_cells(tree: &DomTree, styles: &mut HashMap<NodeId, crate::
             None => false,
         }
     };
-    for tr in tree.descendants(tree.document()) {
+    for tr in rendered_descendants(tree, tree.document()) {
         if !is_tag(tr, &["tr"]) {
             continue;
         }
@@ -6727,7 +6823,7 @@ fn propagate_border_spacing(tree: &DomTree, styles: &mut HashMap<NodeId, crate::
         }
     }
 
-    for id in tree.descendants(tree.document()) {
+    for id in rendered_descendants(tree, tree.document()) {
         if local_name(tree, id).as_deref() != Some("table") {
             continue;
         }
@@ -7460,11 +7556,11 @@ fn reparent_inset_positioned_nodes(
     let mut nearest_fixed_cb_for_children: HashMap<NodeId, taffy::NodeId> = HashMap::new();
     let mut static_candidates = Vec::new();
 
-    for dom_id in tree.descendants(tree.document()) {
+    for dom_id in rendered_descendants(tree, tree.document()) {
         let Some(style) = styles.get(&dom_id) else {
             continue;
         };
-        let parent = tree.get_node(dom_id).and_then(|node| node.parent);
+        let parent = rendered_parent(tree, dom_id);
         let inherited_abs_cb = parent
             .and_then(|id| nearest_abs_cb_for_children.get(&id).copied())
             .unwrap_or(taffy_root);
@@ -7775,7 +7871,7 @@ fn apply_float_continuations(
         // blocks so only the leaf/block bands that actually intersect the
         // float are narrowed; later siblings below the float stay full width.
         let mut current = continuation.owner;
-        while let Some(parent) = tree.get_node(current).and_then(|node| node.parent) {
+        while let Some(parent) = rendered_parent(tree, current) {
             let siblings = rendered_children(tree, parent);
             let Some(index) = siblings.iter().position(|candidate| *candidate == current) else {
                 break;
@@ -8315,8 +8411,98 @@ fn resolve_static_positions_and_reparent(
     }
 }
 
-/// Return the DOM children that generate boxes for `id`.
+fn is_html_slot(tree: &DomTree, id: NodeId) -> bool {
+    tree.get_node(id).is_some_and(|node| {
+        node.as_element().is_some_and(|name| {
+            name.ns.as_ref() == "http://www.w3.org/1999/xhtml" && name.local.as_ref() == "slot"
+        })
+    })
+}
+
+/// Children which need computed-value resolution below `id`.
+///
+/// CSSOM still exposes and styles unslotted light DOM, so this differs from
+/// `rendered_children`: process the ordinary child list and additionally enter
+/// the host's detached shadow tree scope.
+fn style_children(tree: &DomTree, id: NodeId) -> Vec<NodeId> {
+    let mut children = tree.children(id);
+    if let Some(shadow_children) = tree.shadow_children(id) {
+        children.extend(shadow_children);
+    }
+    children
+}
+
+/// Resolve the named-slot assignment for one `<slot>` in a native shadow tree.
+///
+/// Slot names are exact strings (the empty string is the default slot), and
+/// only the first slot with a given name in shadow-tree order receives the
+/// host's matching slottables. Text and element light children are slottable;
+/// comments and other node kinds are not. When no node is assigned, the slot's
+/// ordinary children remain its fallback content.
+fn assigned_nodes_for_slot(tree: &DomTree, slot: NodeId) -> Option<Vec<NodeId>> {
+    if !is_html_slot(tree, slot) {
+        return None;
+    }
+    let root = tree.containing_shadow_root(slot)?;
+    let host = tree.shadow_root_info(root)?.host;
+    let name = tree
+        .get_node(slot)
+        .and_then(|node| node.get_attribute("name").map(str::to_owned))
+        .unwrap_or_default();
+
+    let is_same_name_slot = |candidate: NodeId| {
+        is_html_slot(tree, candidate)
+            && tree
+                .get_node(candidate)
+                .and_then(|node| node.get_attribute("name").map(str::to_owned))
+                .unwrap_or_default()
+                == name
+    };
+    if tree
+        .descendants(root)
+        .into_iter()
+        .take_while(|candidate| *candidate != slot)
+        .any(is_same_name_slot)
+    {
+        return Some(tree.children(slot));
+    }
+
+    let assigned = tree
+        .children(host)
+        .into_iter()
+        .filter(|candidate| {
+            let Some(node) = tree.get_node(*candidate) else {
+                return false;
+            };
+            let candidate_name = if node.is_element() {
+                node.get_attribute("slot").unwrap_or("")
+            } else if node.text_content_of_text_node().is_some() {
+                ""
+            } else {
+                return false;
+            };
+            candidate_name == name
+        })
+        .collect::<Vec<_>>();
+    Some(if assigned.is_empty() {
+        tree.children(slot)
+    } else {
+        assigned
+    })
+}
+
+/// Return the flattened-tree children that generate boxes for `id`.
 pub(crate) fn rendered_children(tree: &DomTree, id: NodeId) -> Vec<NodeId> {
+    if let Some(shadow_children) = tree.shadow_children(id) {
+        // A shadow host's light children stay in the DOM but its box tree is
+        // generated from the shadow root. Matching light children re-enter at
+        // slot insertion points below; unslotted children generate no boxes.
+        return shadow_children;
+    }
+    if let Some(assigned_or_fallback) = assigned_nodes_for_slot(tree, id) {
+        return assigned_or_fallback;
+    }
+
     let Some(node) = tree.get_node(id) else {
         return Vec::new();
     };
@@ -8348,6 +8534,64 @@ pub(crate) fn rendered_children(tree: &DomTree, id: NodeId) -> Vec<NodeId> {
         })
         .into_iter()
         .collect()
+}
+
+/// The parent of `id` in the flattened rendering tree.
+///
+/// Shadow-root children are parented to the host for layout/paint ancestry;
+/// an assigned light child is parented to its slot; and an unslotted light
+/// child has no rendered parent at all.
+pub(crate) fn rendered_parent(tree: &DomTree, id: NodeId) -> Option<NodeId> {
+    let parent = tree.get_node(id)?.parent?;
+    if let Some(root) = tree.shadow_root_info(parent) {
+        return Some(root.host);
+    }
+    let Some(shadow_root) = tree.shadow_root(parent) else {
+        return Some(parent);
+    };
+    let node = tree.get_node(id)?;
+    let name = if node.is_element() {
+        node.get_attribute("slot").unwrap_or("")
+    } else if node.text_content_of_text_node().is_some() {
+        ""
+    } else {
+        return None;
+    };
+    tree.descendants(shadow_root).into_iter().find(|candidate| {
+        is_html_slot(tree, *candidate)
+            && tree
+                .get_node(*candidate)
+                .and_then(|slot| slot.get_attribute("name").map(str::to_owned))
+                .unwrap_or_default()
+                == name
+    })
+}
+
+/// Flattened-tree descendants in preorder, excluding `root`.
+///
+/// This is the traversal paint and resource discovery must use: ordinary DOM
+/// descendants omit native shadow trees, while walking both light and shadow
+/// subtrees would paint slotted nodes twice and expose unslotted light DOM.
+/// The live-node bound and visited set are defense in depth against a corrupt
+/// assignment/tree graph; a valid flat tree visits every generated node once.
+pub(crate) fn rendered_descendants(tree: &DomTree, root: NodeId) -> Vec<NodeId> {
+    let limit = tree.len();
+    let mut result = Vec::new();
+    let mut visited = HashSet::new();
+    let mut stack = rendered_children(tree, root);
+    stack.reverse();
+    while let Some(id) = stack.pop() {
+        if !visited.insert(id) {
+            continue;
+        }
+        result.push(id);
+        if result.len() >= limit {
+            break;
+        }
+        let children = rendered_children(tree, id);
+        stack.extend(children.into_iter().rev());
+    }
+    result
 }
 
 /// Does `id` have any direct rendered child that is inline-level (a
@@ -8794,7 +9038,7 @@ fn build_text_words(
     let mut line_height = fsize * 1.2;
     let mut transform = crate::TextTransform::None;
     let mut letter_spacing = 0.0;
-    if let Some(parent_id) = node.parent {
+    if let Some(parent_id) = rendered_parent(tree, id) {
         if let Some(p_style) = styles.get(&parent_id) {
             fsize = p_style.font_size.unwrap_or(16.0);
             is_bold = crate::style::used_font_weight(p_style) >= 600;
@@ -8804,7 +9048,7 @@ fn build_text_words(
             letter_spacing = p_style.letter_spacing.unwrap_or(0.0);
         }
     }
-    if let Some(style) = node.parent.and_then(|parent| styles.get(&parent)) {
+    if let Some(style) = rendered_parent(tree, id).and_then(|parent| styles.get(&parent)) {
         let shaped = build_shaped_word_leaves(
             id,
             &display_text,
@@ -9108,7 +9352,7 @@ fn synthesize_row_rects(tree: &DomTree, rects: &mut HashMap<NodeId, Rect>) {
     let mut rows = Vec::new();
     let mut sections = Vec::new();
     let mut table_inline: HashMap<NodeId, Rect> = HashMap::new();
-    for id in tree.descendants(tree.document()) {
+    for id in rendered_descendants(tree, tree.document()) {
         let local = match tree
             .get_node(id)
             .and_then(|n| n.as_element().map(|e| e.local.to_string()))
@@ -9120,7 +9364,7 @@ fn synthesize_row_rects(tree: &DomTree, rects: &mut HashMap<NodeId, Rect>) {
             "tr" => rows.push(id),
             "tbody" | "thead" | "tfoot" => sections.push(id),
             "td" | "th" => {
-                let mut ancestor = tree.get_node(id).and_then(|node| node.parent);
+                let mut ancestor = rendered_parent(tree, id);
                 while let Some(parent) = ancestor {
                     let is_table = tree.get_node(parent).map_or(false, |node| {
                         node.as_element()
@@ -9135,7 +9379,7 @@ fn synthesize_row_rects(tree: &DomTree, rects: &mut HashMap<NodeId, Rect>) {
                         }
                         break;
                     }
-                    ancestor = tree.get_node(parent).and_then(|node| node.parent);
+                    ancestor = rendered_parent(tree, parent);
                 }
             }
             _ => {}
@@ -9181,14 +9425,14 @@ fn synthesize_row_rects(tree: &DomTree, rects: &mut HashMap<NodeId, Rect>) {
             }
         }
         if let Some(mut inline) = inline {
-            let mut ancestor = tree.get_node(id).and_then(|node| node.parent);
+            let mut ancestor = rendered_parent(tree, id);
             while let Some(parent) = ancestor {
                 if let Some(table_band) = table_inline.get(&parent) {
                     inline.x = table_band.x;
                     inline.width = table_band.width;
                     break;
                 }
-                ancestor = tree.get_node(parent).and_then(|node| node.parent);
+                ancestor = rendered_parent(tree, parent);
             }
             let block = block.unwrap_or(inline);
             rects.insert(
@@ -9239,7 +9483,7 @@ fn table_ancestor_depth(
 ) -> usize {
     let mut depth = 0usize;
     let mut cur = id;
-    while let Some(p) = tree.get_node(cur).and_then(|n| n.parent) {
+    while let Some(p) = rendered_parent(tree, cur) {
         if styles.get(&p).is_some_and(|style| style.is_table_box) {
             depth += 1;
         }
@@ -9275,13 +9519,13 @@ fn reliable_normal_flow_content_width(
         return None;
     }
 
-    let mut parent = tree.get_node(id).and_then(|node| node.parent);
+    let mut parent = rendered_parent(tree, id);
     while parent.is_some_and(|parent_id| {
         styles
             .get(&parent_id)
             .is_some_and(|parent_style| parent_style.display_contents)
     }) {
-        parent = parent.and_then(|parent_id| tree.get_node(parent_id).and_then(|node| node.parent));
+        parent = parent.and_then(|parent_id| rendered_parent(tree, parent_id));
     }
     let containing_width = if let Some(parent_id) = parent {
         if let Some(parent_style) = styles.get(&parent_id) {
@@ -9367,14 +9611,13 @@ fn reliable_declared_content_width(
     ) || matches!(style.min_width, crate::Dimension::Percent(_))
         || matches!(style.max_width, crate::Dimension::Percent(_));
     let containing_width = needs_containing_width.then(|| {
-        let mut parent = tree.get_node(id).and_then(|node| node.parent);
+        let mut parent = rendered_parent(tree, id);
         while parent.is_some_and(|parent_id| {
             styles
                 .get(&parent_id)
                 .is_some_and(|parent_style| parent_style.display_contents)
         }) {
-            parent = parent
-                .and_then(|parent_id| tree.get_node(parent_id).and_then(|node| node.parent));
+            parent = parent.and_then(|parent_id| rendered_parent(tree, parent_id));
         }
         if let Some(parent_id) = parent {
             reliable_normal_flow_content_width(
@@ -9444,21 +9687,17 @@ fn reliable_ratio_only_available_width(
     initial_cb_width: f32,
 ) -> Option<f32> {
     let image = styles.get(&id)?;
-    let mut parent = tree.get_node(id).and_then(|node| node.parent);
+    let mut parent = rendered_parent(tree, id);
     while let Some(parent_id) = parent {
         let Some(parent_style) = styles.get(&parent_id) else {
-            parent = tree
-                .get_node(parent_id)
-                .and_then(|node| node.parent);
+            parent = rendered_parent(tree, parent_id);
             continue;
         };
         if parent_style.display_contents
             || (parent_style.display == crate::Display::Inline
                 && !parent_style.is_inline_block)
         {
-            parent = tree
-                .get_node(parent_id)
-                .and_then(|node| node.parent);
+            parent = rendered_parent(tree, parent_id);
             continue;
         }
         break;
@@ -9496,13 +9735,13 @@ fn reliable_table_available_width(
     {
         return None;
     }
-    let mut parent = tree.get_node(id).and_then(|node| node.parent);
+    let mut parent = rendered_parent(tree, id);
     while parent.is_some_and(|parent_id| {
         styles
             .get(&parent_id)
             .is_some_and(|parent_style| parent_style.display_contents)
     }) {
-        parent = parent.and_then(|parent_id| tree.get_node(parent_id).and_then(|node| node.parent));
+        parent = parent.and_then(|parent_id| rendered_parent(tree, parent_id));
     }
     let containing_width = match parent {
         Some(parent_id) if styles.contains_key(&parent_id) => {
@@ -10599,7 +10838,7 @@ fn container_auto_inline_size(
         };
     }
 
-    let mut parent = tree.get_node(id).and_then(|node| node.parent);
+    let mut parent = rendered_parent(tree, id);
     let parent_style = loop {
         let Some(parent_id) = parent else {
             return ContainerAutoInlineSize::FillAvailable;
@@ -10608,7 +10847,7 @@ fn container_auto_inline_size(
             return ContainerAutoInlineSize::FillAvailable;
         };
         if parent_style.display_contents {
-            parent = tree.get_node(parent_id).and_then(|node| node.parent);
+            parent = rendered_parent(tree, parent_id);
             continue;
         }
         break parent_style;
@@ -10660,7 +10899,7 @@ fn container_auto_block_size(
         return ContainerAutoBlockSize::Intrinsic;
     }
 
-    let mut parent = tree.get_node(id).and_then(|node| node.parent);
+    let mut parent = rendered_parent(tree, id);
     let parent_style = loop {
         let Some(parent_id) = parent else {
             return ContainerAutoBlockSize::Intrinsic;
@@ -10669,7 +10908,7 @@ fn container_auto_block_size(
             return ContainerAutoBlockSize::Intrinsic;
         };
         if parent_style.display_contents {
-            parent = tree.get_node(parent_id).and_then(|node| node.parent);
+            parent = rendered_parent(tree, parent_id);
             continue;
         }
         break parent_style;
@@ -10810,16 +11049,16 @@ fn defer_cyclic_flex_inline_sizes(
         // node itself. A percentage-sized direct child of a nested flex
         // container makes that container's contribution cyclic when the
         // container is itself an item in an outer flex row.
-        let mut candidate = tree.get_node(id).and_then(|node| node.parent);
+        let mut candidate = rendered_parent(tree, id);
         let mut flex_item = None;
         while let Some(item) = candidate {
-            let mut parent = tree.get_node(item).and_then(|node| node.parent);
+            let mut parent = rendered_parent(tree, item);
             while let Some(parent_id) = parent {
                 let Some(parent_style) = styles.get(&parent_id) else {
                     break;
                 };
                 if parent_style.display_contents {
-                    parent = tree.get_node(parent_id).and_then(|node| node.parent);
+                    parent = rendered_parent(tree, parent_id);
                     continue;
                 }
                 let row_flex = parent_style.display == crate::Display::Flex
@@ -10844,7 +11083,7 @@ fn defer_cyclic_flex_inline_sizes(
             if flex_item.is_some() {
                 break;
             }
-            candidate = tree.get_node(item).and_then(|node| node.parent);
+            candidate = rendered_parent(tree, item);
         }
         let Some(flex_item) = flex_item else {
             continue;
@@ -10931,18 +11170,18 @@ fn resolve_deferred_flex_inline_sizes(
     }
 
     for entry in deferred {
-        let mut containing = tree.get_node(entry.node).and_then(|node| node.parent);
+        let mut containing = rendered_parent(tree, entry.node);
         let basis = loop {
             let Some(parent) = containing else {
                 break None;
             };
             let parent_style = styles.get(&parent);
             if parent_style.is_some_and(|style| style.display_contents) {
-                containing = tree.get_node(parent).and_then(|node| node.parent);
+                containing = rendered_parent(tree, parent);
                 continue;
             }
             let Some(&taffy_id) = taffy_by_dom.get(&parent) else {
-                containing = tree.get_node(parent).and_then(|node| node.parent);
+                containing = rendered_parent(tree, parent);
                 continue;
             };
             let Ok(layout) = taffy_tree.layout(taffy_id) else {
@@ -11013,7 +11252,7 @@ fn is_in_flow_grid_item(
     if matches!(style.position, Some(taffy::Position::Absolute)) {
         return false;
     }
-    let mut parent = tree.get_node(id).and_then(|node| node.parent);
+    let mut parent = rendered_parent(tree, id);
     loop {
         let Some(parent_id) = parent else {
             return false;
@@ -11022,7 +11261,7 @@ fn is_in_flow_grid_item(
             return false;
         };
         if parent_style.display_contents {
-            parent = tree.get_node(parent_id).and_then(|node| node.parent);
+            parent = rendered_parent(tree, parent_id);
             continue;
         }
         return parent_style.display == crate::Display::Grid;
@@ -11118,14 +11357,14 @@ fn build(
     // inner mode only in that formatting context; doing it globally turns
     // inline-block lists into one full-width item per line.
     if style.is_inline_block {
-        let mut parent = node.parent;
+        let mut parent = rendered_parent(tree, id);
         let flex_or_grid_item = loop {
             let Some(parent_id) = parent else { break false };
             let Some(parent_style) = styles.get(&parent_id) else {
                 break false;
             };
             if parent_style.display_contents {
-                parent = tree.get_node(parent_id).and_then(|node| node.parent);
+                parent = rendered_parent(tree, parent_id);
                 continue;
             }
             break matches!(
@@ -12114,7 +12353,7 @@ fn needs_column_flex_text_fit_content_cap(
         return false;
     }
 
-    let mut parent = tree.get_node(id).and_then(|node| node.parent);
+    let mut parent = rendered_parent(tree, id);
     let parent_style = loop {
         let Some(parent_id) = parent else {
             return false;
@@ -12123,7 +12362,7 @@ fn needs_column_flex_text_fit_content_cap(
             return false;
         };
         if parent_style.display_contents {
-            parent = tree.get_node(parent_id).and_then(|node| node.parent);
+            parent = rendered_parent(tree, parent_id);
             continue;
         }
         break parent_style;
@@ -13578,7 +13817,166 @@ fn build_children_with_float_zone(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use obscura_dom::tree::ShadowRootMode;
     use obscura_dom::tree_sink::parse_html;
+
+    fn attach_programmatic_shadow(tree: &DomTree, host: NodeId, source: NodeId) -> NodeId {
+        let root = tree
+            .attach_shadow_root(host, ShadowRootMode::Open)
+            .expect("attach native shadow root");
+        for child in tree.children(source) {
+            tree.append_child(root, child);
+        }
+        tree.remove(source);
+        root
+    }
+
+    #[test]
+    fn shadow_rendered_children_distribute_named_and_default_slots() {
+        let tree = parse_html(
+            r#"<x-card id="host"><span id="default"></span><span id="title" slot="title"></span><span id="unslotted" slot="missing"></span></x-card><div id="source"><div id="before"></div><slot id="title-slot" name="title"><b id="title-fallback"></b></slot><slot id="duplicate-title" name="title"><i id="duplicate-fallback"></i></slot><slot id="default-slot"><em id="default-fallback"></em></slot><div id="after"></div></div>"#,
+        );
+        let node = |id| {
+            tree.get_element_by_id(id)
+                .unwrap_or_else(|| panic!("fixture node {id}"))
+        };
+        let host = node("host");
+        let source = node("source");
+        let before = node("before");
+        let title_slot = node("title-slot");
+        let duplicate_title = node("duplicate-title");
+        let duplicate_fallback = node("duplicate-fallback");
+        let default_slot = node("default-slot");
+        let after = node("after");
+        let default_light = node("default");
+        let title_light = node("title");
+        let unslotted = node("unslotted");
+        attach_programmatic_shadow(&tree, host, source);
+
+        assert_eq!(
+            rendered_children(&tree, host),
+            vec![
+                before,
+                title_slot,
+                duplicate_title,
+                default_slot,
+                after,
+            ]
+        );
+        assert_eq!(rendered_children(&tree, title_slot), vec![title_light]);
+        assert_eq!(
+            rendered_children(&tree, duplicate_title),
+            vec![duplicate_fallback],
+            "only the first slot with a given name receives assignments"
+        );
+        assert_eq!(rendered_children(&tree, default_slot), vec![default_light]);
+        assert_eq!(rendered_parent(&tree, before), Some(host));
+        assert_eq!(rendered_parent(&tree, title_light), Some(title_slot));
+        assert_eq!(rendered_parent(&tree, default_light), Some(default_slot));
+        assert_eq!(rendered_parent(&tree, unslotted), None);
+        assert!(
+            !rendered_children(&tree, host).contains(&unslotted),
+            "an unmatched light child must not enter the host's box tree"
+        );
+    }
+
+    #[test]
+    fn native_shadow_tree_and_slotted_light_child_generate_layout_boxes() {
+        let tree = parse_html(
+            r#"<html style="width:100px"><body style="margin:0"><x-card id="host" style="display:block;width:30px"><span id="light" style="display:block;height:10px"></span><span id="unslotted" slot="missing" style="display:block;height:80px"></span></x-card><div id="source"><div id="before" style="height:10px"></div><slot id="slot"></slot><div id="after" style="height:10px"></div></div></body></html>"#,
+        );
+        let host = tree.get_element_by_id("host").unwrap();
+        let source = tree.get_element_by_id("source").unwrap();
+        let light = tree.get_element_by_id("light").unwrap();
+        let unslotted = tree.get_element_by_id("unslotted").unwrap();
+        let before = tree.get_element_by_id("before").unwrap();
+        let after = tree.get_element_by_id("after").unwrap();
+        attach_programmatic_shadow(&tree, host, source);
+
+        let laid = layout_dom(&tree, (100.0, 100.0));
+        let host_rect = laid.rects[&host];
+        let before_rect = laid.rects[&before];
+        let light_rect = laid.rects[&light];
+        let after_rect = laid.rects[&after];
+        assert_eq!((host_rect.width, host_rect.height), (30.0, 30.0));
+        assert_eq!(before_rect.y, host_rect.y);
+        assert_eq!(light_rect.y, host_rect.y + 10.0);
+        assert_eq!(after_rect.y, host_rect.y + 20.0);
+        assert!(
+            !laid.rects.contains_key(&unslotted),
+            "unmatched light DOM must not generate a layout box"
+        );
+    }
+
+    #[test]
+    fn native_shadow_author_styles_are_ordered_isolated_and_inherit_from_host() {
+        let tree = parse_html(
+            r#"<style>
+                 .target { width:123px; height:9px; padding-left:13px; color:#ff0000 }
+                 .only-first-root { margin-left:99px }
+               </style>
+               <x-one id="host-one" style="display:block;--host-width:41px;color:#123456">
+                 <div id="light" class="target only-first-root"></div>
+               </x-one>
+               <x-two id="host-two" style="display:block"></x-two>
+               <div id="source-one">
+                 <style>.target { width:20px; height:var(--local-height) }</style>
+                 <style>.target { width:var(--host-width); color:inherit }
+                        .holder { --local-height:23px }
+                        .only-first-root { margin-left:7px }
+                 </style>
+                 <section class="holder"><div id="shadow-one" class="target only-first-root"></div></section>
+               </div>
+               <div id="source-two">
+                 <style>.target { width:67px; height:31px }</style>
+                 <div id="shadow-two" class="target only-first-root"></div>
+               </div>"#,
+        );
+        let host_one = tree.get_element_by_id("host-one").unwrap();
+        let host_two = tree.get_element_by_id("host-two").unwrap();
+        let light = tree.get_element_by_id("light").unwrap();
+        let source_one = tree.get_element_by_id("source-one").unwrap();
+        let source_two = tree.get_element_by_id("source-two").unwrap();
+        let shadow_one = tree.get_element_by_id("shadow-one").unwrap();
+        let shadow_two = tree.get_element_by_id("shadow-two").unwrap();
+        attach_programmatic_shadow(&tree, host_one, source_one);
+        attach_programmatic_shadow(&tree, host_two, source_two);
+
+        let laid = layout_dom(&tree, (400.0, 300.0));
+        let light_style = &laid.styles[&light];
+        let first_style = &laid.styles[&shadow_one];
+        let second_style = &laid.styles[&shadow_two];
+
+        assert_eq!(light_style.width, crate::Dimension::Px(123.0));
+        assert_eq!(light_style.height, crate::Dimension::Px(9.0));
+        assert_eq!(light_style.padding.left, 13.0);
+        assert_eq!(light_style.margin.left, 0.0);
+        assert_eq!(first_style.width, crate::Dimension::Px(41.0));
+        assert_eq!(first_style.height, crate::Dimension::Px(23.0));
+        assert_eq!(first_style.padding.left, 0.0);
+        assert_eq!(first_style.margin.left, 7.0);
+        assert_eq!(first_style.color, Some([0x12, 0x34, 0x56, 0xff]));
+        assert_eq!(second_style.width, crate::Dimension::Px(67.0));
+        assert_eq!(second_style.height, crate::Dimension::Px(31.0));
+        assert_eq!(second_style.margin.left, 0.0);
+    }
+
+    #[test]
+    fn direct_shadow_inline_block_is_blockified_as_a_flex_item() {
+        let tree = parse_html(
+            r#"<html><body style="margin:0"><x-row id="host" style="display:flex;width:100px"><div id="source"><span id="item" style="display:inline-block;width:20px"><span style="display:block;height:10px"></span><span style="display:block;height:10px"></span></span></div></x-row></body></html>"#,
+        );
+        let host = tree.get_element_by_id("host").unwrap();
+        let source = tree.get_element_by_id("source").unwrap();
+        let item = tree.get_element_by_id("item").unwrap();
+        attach_programmatic_shadow(&tree, host, source);
+
+        let laid = layout_dom(&tree, (120.0, 80.0));
+        assert_eq!(
+            laid.rects[&item].height, 20.0,
+            "the flex formatting-context parent must be found across ShadowRoot→host"
+        );
+    }
 
     #[test]
     fn lays_out_real_dom() {
