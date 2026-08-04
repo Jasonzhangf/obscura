@@ -168,7 +168,14 @@ impl RequestMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceRequest {
     pub resource_type: ResourceType,
+    /// Origin-bearing environment that owns the request. This controls CORS,
+    /// credentials, and Sec-Fetch-Site and must remain the document/realm for
+    /// every descendant in a module graph.
     pub initiator: Option<Url>,
+    /// URL used to derive the Referer header. Usually the same as `initiator`,
+    /// but a module dependency is referred by its importing module while its
+    /// credentials mode is still relative to the owning document.
+    pub referrer: Option<Url>,
     pub mode: RequestMode,
     pub credentials: RequestCredentials,
     /// Hard limit for the decoded response body retained by this request.
@@ -181,6 +188,7 @@ impl ResourceRequest {
         Self {
             resource_type: ResourceType::Document,
             initiator: None,
+            referrer: None,
             mode: RequestMode::Navigate,
             credentials: RequestCredentials::Include,
             max_response_bytes: 64 * 1024 * 1024,
@@ -209,6 +217,7 @@ impl ResourceRequest {
         Self {
             resource_type,
             initiator: Some(initiator.clone()),
+            referrer: Some(initiator.clone()),
             mode,
             credentials,
             max_response_bytes: match resource_type {
@@ -219,6 +228,21 @@ impl ResourceRequest {
                 | ResourceType::Xhr
                 | ResourceType::Fetch => 64 * 1024 * 1024,
             },
+        }
+    }
+
+    /// Fetch profile for JavaScript modules. Unlike classic scripts, module
+    /// scripts are CORS-enabled and use `same-origin` credentials by default.
+    /// Keep this separate from `subresource(Script, ..)`, whose no-CORS,
+    /// include-credentials profile is still correct for classic scripts.
+    pub fn module_script(initiator: &Url, referrer: &Url) -> Self {
+        Self {
+            resource_type: ResourceType::Script,
+            initiator: Some(initiator.clone()),
+            referrer: Some(referrer.clone()),
+            mode: RequestMode::Cors,
+            credentials: RequestCredentials::SameOrigin,
+            max_response_bytes: 32 * 1024 * 1024,
         }
     }
 
@@ -398,7 +422,10 @@ pub(crate) fn request_fetch_site(request: &ResourceRequest, target: &Url) -> &'s
 }
 
 pub(crate) fn request_referrer(request: &ResourceRequest, target: &Url) -> Option<String> {
-    let source = request.initiator.as_ref()?;
+    let source = request
+        .referrer
+        .as_ref()
+        .or(request.initiator.as_ref())?;
     if !matches!(source.scheme(), "http" | "https")
         || !matches!(target.scheme(), "http" | "https")
         || (source.scheme() == "https" && target.scheme() == "http")
@@ -830,6 +857,7 @@ struct ResourceCacheKey {
     mode: RequestMode,
     credentials: RequestCredentials,
     initiator: Option<String>,
+    referrer: Option<String>,
     user_agent: String,
     extra_headers: Vec<(String, String)>,
     max_response_bytes: usize,
@@ -1177,6 +1205,7 @@ impl ObscuraHttpClient {
             mode: request.mode,
             credentials: request.credentials,
             initiator: request.initiator.as_ref().map(ToString::to_string),
+            referrer: request.referrer.as_ref().map(ToString::to_string),
             user_agent: self.user_agent.read().await.clone(),
             extra_headers,
             max_response_bytes: request.max_response_bytes,
@@ -1738,6 +1767,19 @@ mod ssrf_tests {
         assert!(!font.sends_credentials_to(
             &Url::parse("https://cdn.example/font.woff2").unwrap()
         ));
+
+        let module = ResourceRequest::module_script(&document, &document);
+        assert_eq!(module.resource_type, ResourceType::Script);
+        assert_eq!(module.mode, RequestMode::Cors);
+        assert_eq!(module.credentials, RequestCredentials::SameOrigin);
+        assert_eq!(module.destination(), "script");
+        assert_eq!(module.accept(), "*/*");
+        assert!(module.sends_credentials_to(
+            &Url::parse("https://app.example/chunk.js").unwrap()
+        ));
+        assert!(!module.sends_credentials_to(
+            &Url::parse("https://cdn.example/chunk.js").unwrap()
+        ));
     }
 
     #[test]
@@ -1831,6 +1873,37 @@ mod ssrf_tests {
         assert!(request.contains("origin: http://127.0.0.1:1\r\n"));
         assert!(request.contains("sec-fetch-mode: cors\r\n"));
         assert!(request.contains("sec-fetch-dest: font\r\n"));
+        assert!(!request.contains("cookie:"));
+        assert_eq!(jar.get_cookie_header(&target), "seed=1");
+    }
+
+    #[tokio::test]
+    async fn cross_origin_module_uses_cors_script_profile_without_credentials() {
+        let (target, mut received) = http_fixture(vec![ok_response(
+            "Access-Control-Allow-Origin: *\r\nSet-Cookie: rejected=1; Path=/\r\n",
+            "export default 1;",
+        )])
+        .await;
+        let initiator = Url::parse("http://127.0.0.1:1/page").unwrap();
+        let importing_module = target.join("/parent.js").unwrap();
+        let jar = Arc::new(CookieJar::new());
+        jar.set_cookie("seed=1; Path=/", &target);
+        let client = ObscuraHttpClient::with_full_options(jar.clone(), None, true);
+
+        let response = client
+            .fetch_resource_with_callbacks(
+                &target,
+                ResourceRequest::module_script(&initiator, &importing_module),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.body, b"export default 1;");
+        let request = received.recv().await.unwrap().to_ascii_lowercase();
+        assert!(request.contains("origin: http://127.0.0.1:1\r\n"));
+        assert!(request.contains("sec-fetch-mode: cors\r\n"));
+        assert!(request.contains("sec-fetch-dest: script\r\n"));
+        assert!(request.contains(&format!("referer: {}\r\n", importing_module)));
         assert!(!request.contains("cookie:"));
         assert_eq!(jar.get_cookie_header(&target), "seed=1");
     }
@@ -2208,6 +2281,42 @@ mod ssrf_tests {
         assert_eq!(network_requests.load(Ordering::SeqCst), 1);
         assert_eq!(callback_requests.load(Ordering::SeqCst), 32);
         assert_eq!(callback_responses.load(Ordering::SeqCst), 32);
+    }
+
+    #[tokio::test]
+    async fn cacheable_identical_module_scripts_share_one_in_flight_request() {
+        let (url, network_requests) = cacheable_resource_fixture(
+            200,
+            "Cache-Control: public, max-age=3600\r\n",
+        )
+        .await;
+        let initiator = url.join("/app.js").unwrap();
+        let client = Arc::new(ObscuraHttpClient::with_full_options(
+            Arc::new(CookieJar::new()),
+            None,
+            true,
+        ));
+
+        let mut fetches = tokio::task::JoinSet::new();
+        for _ in 0..16 {
+            let client = client.clone();
+            let url = url.clone();
+            let request = ResourceRequest::module_script(&initiator, &initiator);
+            fetches.spawn(async move {
+                client
+                    .fetch_resource_with_callbacks(&url, request, None)
+                    .await
+                    .unwrap()
+            });
+        }
+        let mut responses = Vec::new();
+        while let Some(response) = fetches.join_next().await {
+            responses.push(response.unwrap());
+        }
+
+        assert_eq!(responses.len(), 16);
+        assert!(responses.iter().all(|response| response.status == 200));
+        assert_eq!(network_requests.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

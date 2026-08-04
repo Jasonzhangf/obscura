@@ -175,11 +175,21 @@ impl ModuleLoader for ObscuraModuleLoader {
     fn load(
         &self,
         module_specifier: &ModuleSpecifier,
-        _maybe_referrer: Option<&ModuleSpecifier>,
+        maybe_referrer: Option<&ModuleSpecifier>,
         is_dyn_import: bool,
         _requested_module_type: RequestedModuleType,
     ) -> ModuleLoadResponse {
         let url = module_specifier.to_string();
+        // Module-graph CORS and same-origin credentials are relative to the
+        // owning document, not to the importing module. The importer remains
+        // the HTTP referrer for a dependency; keeping these URLs distinct
+        // prevents a cross-origin parent module from gaining CDN cookies when
+        // it imports a sibling on that CDN.
+        let document_url = ModuleSpecifier::parse(&self.base_url)
+            .unwrap_or_else(|_| module_specifier.clone());
+        let referrer = maybe_referrer
+            .cloned()
+            .unwrap_or_else(|| document_url.clone());
         // Capture the loader's proxy here so the async closure below owns a
         // plain Option<String> rather than borrowing &self across an `await`.
         let proxy_url = self.proxy_url.clone();
@@ -226,7 +236,11 @@ impl ModuleLoader for ObscuraModuleLoader {
                     let requested = ModuleSpecifier::parse(&url)
                         .map_err(|e| io_err(format!("Invalid module URL {}: {}", url, e)))?;
                     let resp = client
-                        .fetch_with_callbacks(&requested, callbacks.as_deref())
+                        .fetch_resource_with_callbacks(
+                            &requested,
+                            obscura_net::ResourceRequest::module_script(&document_url, &referrer),
+                            callbacks.as_deref(),
+                        )
                         .await
                         .map_err(|e| io_err(format!("Failed to fetch module {}: {}", url, e)))?;
                     if !(200..=299).contains(&resp.status) {

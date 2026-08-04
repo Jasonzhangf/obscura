@@ -12876,6 +12876,87 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn cross_origin_module_descendant_does_not_gain_module_origin_cookies() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let module_base = format!("http://{address}");
+        let document_url = "http://127.0.0.1:1/page";
+        let document_origin = "http://127.0.0.1:1";
+        let (requests_tx, requests_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 4096];
+                let length = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..length]).to_string();
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_ascii_whitespace().nth(1))
+                    .unwrap_or("/");
+                let body = match path {
+                    "/entry.js" => {
+                        "import { value } from './child.js'; globalThis.__cors_value = value;"
+                    }
+                    "/child.js" => "export const value = 'safe';",
+                    _ => "throw new Error('unexpected module path');",
+                };
+                requests_tx.send(request).unwrap();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\n\
+                     Content-Type: application/javascript\r\n\
+                     Access-Control-Allow-Origin: {document_origin}\r\n\
+                     Cache-Control: public, max-age=3600\r\n\
+                     Content-Length: {}\r\n\
+                     Connection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+
+        let module_origin = url::Url::parse(&module_base).unwrap();
+        let jar = std::sync::Arc::new(obscura_net::CookieJar::new());
+        jar.set_cookie("cdn_session=secret; Path=/", &module_origin);
+        let client = std::sync::Arc::new(obscura_net::ObscuraHttpClient::with_full_options(
+            jar, None, true,
+        ));
+        let mut rt = ObscuraJsRuntime::with_base_url(document_url);
+        rt.set_http_client(client);
+        rt.load_module(&format!("{module_base}/entry.js"), 1_000)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            rt.evaluate("globalThis.__cors_value").unwrap(),
+            serde_json::json!("safe"),
+        );
+        let requests = (0..2)
+            .map(|_| {
+                requests_rx
+                    .recv_timeout(std::time::Duration::from_secs(1))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        for request in &requests {
+            let lower = request.to_ascii_lowercase();
+            assert!(lower.contains("\r\norigin: http://127.0.0.1:1\r\n"), "{request}");
+            assert!(!lower.contains("\r\ncookie:"), "{request}");
+        }
+        let child = requests
+            .iter()
+            .find(|request| request.starts_with("GET /child.js "))
+            .expect("child module request")
+            .to_ascii_lowercase();
+        assert!(
+            child.contains(&format!("\r\nreferer: {module_base}/entry.js\r\n")),
+            "{child}",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn descendant_module_follows_page_client_redirects() {
         let (base, requests) = spawn_module_graph_server(ModuleGraphFixture::RedirectedChild);
         let jar = std::sync::Arc::new(obscura_net::CookieJar::new());
