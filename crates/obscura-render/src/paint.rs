@@ -1719,6 +1719,70 @@ impl PreparedRender {
     pub fn selected_image(&self, id: obscura_dom::tree::NodeId) -> Option<&SelectedImage> {
         self.selected_images.get(&id)
     }
+
+    /// Whether newly available bytes for one selected image can change box
+    /// geometry. A replaced image whose two used axes are authored lengths
+    /// does not consult its natural dimensions; resource completion only
+    /// changes the pixels painted inside the existing content box.
+    ///
+    /// Keep flex/grid items on the conservative path. Their intrinsic
+    /// contribution participates in sizing algorithms even when the item has
+    /// preferred dimensions, and browsers likewise propagate image-size
+    /// invalidation through those formatting contexts.
+    pub fn image_resource_needs_geometry(
+        &self,
+        tree: &DomTree,
+        url: &str,
+        profile: ImageRequestProfile,
+    ) -> bool {
+        self.selected_images.iter().any(|(id, selected)| {
+            if selected.resolved_url != url || selected.profile != profile {
+                return false;
+            }
+            if !tree.get_node(*id).is_some_and(|node| {
+                node.as_element()
+                    .is_some_and(|name| name.local.as_ref() == "img")
+            }) {
+                return true;
+            }
+            let Some(style) = self.layout.styles.get(id) else {
+                return true;
+            };
+            // CSS replaced content has its own selected intrinsic metadata;
+            // do not mistake an <img> owner for an ordinary fixed source
+            // image merely because both selections share the element id.
+            if style.content_image.is_some() {
+                return true;
+            }
+            let fixed_box = matches!(style.width, crate::Dimension::Px(_))
+                && matches!(style.height, crate::Dimension::Px(_))
+                && matches!(style.min_width, crate::Dimension::Auto | crate::Dimension::Px(_))
+                && matches!(style.min_height, crate::Dimension::Auto | crate::Dimension::Px(_))
+                && matches!(style.max_width, crate::Dimension::Auto | crate::Dimension::Px(_))
+                && matches!(style.max_height, crate::Dimension::Auto | crate::Dimension::Px(_))
+                && !style.width_fit_content
+                && style.size_expressions.iter().all(Option::is_none);
+            if !fixed_box {
+                return true;
+            }
+
+            let mut parent = crate::dom::rendered_parent(tree, *id);
+            while let Some(parent_id) = parent {
+                let Some(parent_style) = self.layout.styles.get(&parent_id) else {
+                    parent = crate::dom::rendered_parent(tree, parent_id);
+                    continue;
+                };
+                if parent_style.display_contents {
+                    parent = crate::dom::rendered_parent(tree, parent_id);
+                    continue;
+                }
+                return parent_style.display == crate::Display::Grid
+                    || (parent_style.display == crate::Display::Flex
+                        && !parent_style.internal_flex_container);
+            }
+            false
+        })
+    }
 }
 
 fn css_number(value: f32) -> String {
@@ -2208,19 +2272,23 @@ pub fn prepare_dom_with_retained_styles_with_animation_state(
             animation_timeline,
         );
     }
-    let animation_nodes = sample_changed
-        .then(|| retained_animation_restyle_nodes(tree, &previous.layout.styles, animation_timeline))
+    let sampled_animation_mutations = sample_changed
+        .then(|| {
+            retained_animation_restyle_mutations(
+                tree,
+                &previous.layout.styles,
+                animation_timeline,
+            )
+        })
         .unwrap_or_default();
     let animation_mutations;
-    let mutations = if animation_nodes.is_empty() {
+    let mutations = if sampled_animation_mutations.is_empty() {
         mutations
     } else {
         animation_mutations = mutations
             .iter()
             .cloned()
-            .chain(animation_nodes.into_iter().map(|node| {
-                crate::dom::RetainedStyleMutation::Animation { node }
-            }))
+            .chain(sampled_animation_mutations)
             .collect::<Vec<_>>();
         animation_mutations.as_slice()
     };
@@ -2243,24 +2311,35 @@ pub fn prepare_dom_with_retained_styles_with_animation_state(
     )
 }
 
-fn retained_animation_restyle_nodes(
+fn retained_animation_restyle_mutations(
     tree: &DomTree,
     styles: &HashMap<obscura_dom::tree::NodeId, crate::LayoutStyle>,
     animation_timeline: &crate::AnimationTimelineState,
-) -> std::collections::HashSet<obscura_dom::tree::NodeId> {
-    let mut nodes = styles
+) -> Vec<crate::dom::RetainedStyleMutation> {
+    let connected = |node: obscura_dom::tree::NodeId| {
+        tree.get_node(node).is_some()
+            && (node == tree.document() || tree.ancestors(node).contains(&tree.document()))
+    };
+    let mut css_nodes = styles
         .iter()
         .filter_map(|(node, style)| {
             (style.animation_name.is_some() && style.animation_has_render_effect)
                 .then_some(*node)
         })
         .collect::<std::collections::HashSet<_>>();
-    nodes.extend(animation_timeline.waapi_nodes());
-    nodes.retain(|node| {
-        tree.get_node(*node).is_some()
-            && (*node == tree.document() || tree.ancestors(*node).contains(&tree.document()))
-    });
-    nodes
+    css_nodes.retain(|node| connected(*node));
+    let mut mutations = css_nodes
+        .into_iter()
+        .map(|node| crate::dom::RetainedStyleMutation::Animation { node })
+        .collect::<Vec<_>>();
+    mutations.extend(
+        animation_timeline
+            .waapi_nodes()
+            .into_iter()
+            .filter(|node| connected(*node))
+            .map(|node| crate::dom::RetainedStyleMutation::WaapiAnimation { node }),
+    );
+    mutations
 }
 
 fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
@@ -15521,10 +15600,9 @@ mod tests {
     }
 
     #[test]
-    fn animation_restyle_nodes_deduplicate_waapi_and_filter_disconnected_targets() {
-        let tree = parse_html(
-            "<main><div id=connected></div><div id=detached></div></main>",
-        );
+    fn animation_restyle_mutations_deduplicate_waapi_and_filter_disconnected_targets() {
+        let tree =
+            parse_html("<main><div id=connected></div><div id=detached></div></main>");
         let connected = tree.get_element_by_id("connected").unwrap();
         let detached = tree.get_element_by_id("detached").unwrap();
         tree.remove_child(detached);
@@ -15556,10 +15634,12 @@ mod tests {
             "the timeline accessor must return the exact deduplicated target set"
         );
 
-        let nodes = retained_animation_restyle_nodes(&tree, &HashMap::new(), &timeline);
+        let mutations = retained_animation_restyle_mutations(&tree, &HashMap::new(), &timeline);
         assert_eq!(
-            nodes,
-            std::collections::HashSet::from([connected]),
+            mutations,
+            vec![crate::dom::RetainedStyleMutation::WaapiAnimation {
+                node: connected
+            }],
             "only connected WAAPI targets may enter retained style damage"
         );
     }

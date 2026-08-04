@@ -880,8 +880,17 @@ impl ObscuraJsRuntime {
         let mut state = self.state.borrow_mut();
         match bytes {
             Some(bytes) if obscura_render::image_intrinsic_dimensions(&bytes).is_some() => {
+                let needs_geometry = match (&state.prepared_render, &state.dom) {
+                    (Some(prepared), Some(dom)) => {
+                        prepared.image_resource_needs_geometry(dom, &url, profile)
+                    }
+                    _ => true,
+                };
                 state.render_resources.seed_image(url, profile, bytes);
-                crate::ops::invalidate_render_resource_geometry(&mut state);
+                state.activity_generation = state.activity_generation.wrapping_add(1);
+                if needs_geometry {
+                    crate::ops::invalidate_render_resource_geometry(&mut state);
+                }
             }
             _ => state.render_resources.seed_image_missing(url, profile),
         }
@@ -7515,6 +7524,135 @@ mod tests {
 
     #[cfg(feature = "render")]
     #[test]
+    fn fixed_image_resource_arrival_repaints_without_rebuilding_geometry() {
+        let dom = parse_html(
+            r#"<html style="margin:0"><body style="margin:0">
+                <img id="hero" src="http://example.test/fixed.png"
+                     style="display:block;width:20px;height:10px">
+                <div id="after" style="height:10px;background:blue"></div>
+            </body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_url("http://example.test/page");
+        rt.set_viewport(80.0, 60.0);
+        rt.state.borrow_mut().render_resources =
+            obscura_render::RenderResourceCache::with_loader(|_: &str| None);
+        rt.run_page_init();
+
+        assert_eq!(
+            rt.evaluate("[hero.offsetWidth, hero.offsetHeight, after.offsetTop]")
+                .expect("fixed geometry"),
+            serde_json::json!([20, 10, 10])
+        );
+        let before_png = rt
+            .screenshot_prepared((80.0, 60.0), Some("http://example.test/page"))
+            .expect("capture before image arrival");
+        let (prepared_address, resolved_address, activity_before) = {
+            let state = rt.state.borrow();
+            (
+                state.prepared_render.as_ref().unwrap() as *const _ as usize,
+                &state.resolved_scroll.as_ref().unwrap().1 as *const _ as usize,
+                state.activity_generation,
+            )
+        };
+
+        rt.seed_render_image_resource(
+            "http://example.test/fixed.png".to_string(),
+            crate::ops::ImageRequestProfile::NoCorsInclude,
+            Some(two_by_three_png()),
+        );
+        {
+            let state = rt.state.borrow();
+            assert_eq!(
+                state.prepared_render.as_ref().unwrap() as *const _ as usize,
+                prepared_address,
+                "fixed replaced content must keep the prepared geometry"
+            );
+            assert_eq!(
+                &state.resolved_scroll.as_ref().unwrap().1 as *const _ as usize,
+                resolved_address,
+                "paint-only resource damage must keep resolved scrolling"
+            );
+            assert!(state.pending_style_mutations.is_empty());
+            assert!(state.activity_generation > activity_before);
+        }
+        assert_eq!(
+            rt.evaluate("[hero.offsetWidth, hero.offsetHeight, after.offsetTop]")
+                .expect("retained fixed geometry"),
+            serde_json::json!([20, 10, 10])
+        );
+        let after_png = rt
+            .screenshot_prepared((80.0, 60.0), Some("http://example.test/page"))
+            .expect("capture after image arrival");
+        assert_ne!(after_png, before_png, "new image pixels must reach paint");
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn fixed_flex_image_resource_arrival_still_rebuilds_geometry() {
+        let dom = parse_html(
+            r#"<html><body><div style="display:flex">
+                <img id="hero" src="http://example.test/flex.png"
+                     style="width:20px;height:10px">
+            </div></body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_url("http://example.test/page");
+        rt.state.borrow_mut().render_resources =
+            obscura_render::RenderResourceCache::with_loader(|_: &str| None);
+        rt.run_page_init();
+        rt.evaluate("hero.getBoundingClientRect().width")
+            .expect("prepare flex geometry");
+        assert!(rt.state.borrow().resolved_scroll.is_some());
+
+        rt.seed_render_image_resource(
+            "http://example.test/flex.png".to_string(),
+            crate::ops::ImageRequestProfile::NoCorsInclude,
+            Some(two_by_three_png()),
+        );
+        let state = rt.state.borrow();
+        assert_eq!(
+            state.pending_style_mutations,
+            vec![obscura_render::RetainedStyleMutation::Resource]
+        );
+        assert!(state.resolved_scroll.is_none());
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn fixed_css_content_image_arrival_still_rebuilds_intrinsic_geometry() {
+        let dom = parse_html(
+            r#"<html><body><img id="hero" src="fallback.png"
+                style="display:block;width:20px;height:10px;content:url('http://example.test/content.png')">
+            </body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_url("http://example.test/page");
+        rt.state.borrow_mut().render_resources =
+            obscura_render::RenderResourceCache::with_loader(|_: &str| None);
+        rt.run_page_init();
+        rt.evaluate("hero.getBoundingClientRect().width")
+            .expect("prepare CSS replaced content");
+        assert!(rt.state.borrow().resolved_scroll.is_some());
+
+        rt.seed_render_image_resource(
+            "http://example.test/content.png".to_string(),
+            crate::ops::ImageRequestProfile::NoCorsInclude,
+            Some(two_by_three_png()),
+        );
+        let state = rt.state.borrow();
+        assert_eq!(
+            state.pending_style_mutations,
+            vec![obscura_render::RetainedStyleMutation::Resource]
+        );
+        assert!(state.resolved_scroll.is_none());
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
     fn document_region_capture_preserves_live_runtime_state_and_resource_cache() {
         let dom = parse_html(
             r#"<html style="margin:0"><body style="margin:0;height:260px">
@@ -8056,7 +8194,9 @@ mod tests {
             );
             assert_eq!(
                 state.pending_style_mutations,
-                vec![obscura_render::RetainedStyleMutation::Animation { node: box_node }]
+                vec![obscura_render::RetainedStyleMutation::WaapiAnimation {
+                    node: box_node
+                }]
             );
         }
         let initial = rt

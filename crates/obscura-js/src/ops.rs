@@ -711,6 +711,17 @@ pub(crate) fn queue_retained_style_mutation(
             return true;
         }
     }
+    if let obscura_render::RetainedStyleMutation::WaapiAnimation { node } = &mutation {
+        if pending.iter().any(|queued| {
+            matches!(
+                queued,
+                obscura_render::RetainedStyleMutation::WaapiAnimation { node: current }
+                    if current == node
+            )
+        }) {
+            return true;
+        }
+    }
     if let obscura_render::RetainedStyleMutation::Attribute(next) = &mutation {
         if let Some(obscura_render::RetainedStyleMutation::Attribute(current)) =
             pending.iter_mut().find(|queued| {
@@ -3972,14 +3983,14 @@ fn waapi_document_time_ms(state: &ObscuraState) -> f32 {
 #[cfg(feature = "render")]
 fn invalidate_waapi_render(state: &mut ObscuraState, node: NodeId) {
     // Adding or controlling one effect changes the animation cascade only for
-    // its target subtree. Keep the previous style graph available to the
+    // its target. Keep the previous style graph available to the
     // retained planner instead of turning every animation setup into a full
     // document cascade. The bounded mutation queue remains the safety valve
     // for genuinely broad animation bursts.
     if state.prepared_render.is_some()
         && !queue_retained_style_mutation(
             &mut state.pending_style_mutations,
-            obscura_render::RetainedStyleMutation::Animation { node },
+            obscura_render::RetainedStyleMutation::WaapiAnimation { node },
         )
     {
         state.prepared_render = None;

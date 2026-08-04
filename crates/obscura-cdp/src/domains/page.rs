@@ -1864,7 +1864,7 @@ mod tests {
         .expect("semi-transparent override");
         crate::domains::emulation::handle(
             "setDeviceMetricsOverride",
-            &json!({"width": 40, "height": 30, "deviceScaleFactor": 2}),
+            &json!({"width": 40, "height": 30, "deviceScaleFactor": 2, "mobile": false}),
             &mut ctx,
             &session,
         )

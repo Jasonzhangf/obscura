@@ -544,6 +544,12 @@ pub enum RetainedStyleMutation {
     /// stable. Re-cascade this animation owner and its inheritance-dependent
     /// subtree while retaining unrelated branches.
     Animation { node: NodeId },
+    /// A Web Animation sample changed. Obscura's WAAPI surface currently
+    /// animates only transform and opacity; neither property inherits, so the
+    /// target alone needs a fresh animation cascade. Transform descendants
+    /// are moved later by visual-geometry propagation, not by recascading
+    /// their declarations.
+    WaapiAnimation { node: NodeId },
     /// Cached image or font bytes became available. Resource selection,
     /// intrinsic sizes, shaping, layout, and paint must be rebuilt, but the
     /// DOM, stylesheet, and computed declarations are unchanged, so no style
@@ -3250,6 +3256,7 @@ fn empty_state_may_have_changed(
         .filter(|mutation| match mutation {
             RetainedStyleMutation::Attribute(_) => false,
             RetainedStyleMutation::Animation { .. } => false,
+            RetainedStyleMutation::WaapiAnimation { .. } => false,
             RetainedStyleMutation::Resource => false,
             RetainedStyleMutation::Tree(TreeStyleMutation::Insert {
                 old_parent,
@@ -3325,6 +3332,11 @@ fn retained_style_plan(
             // rebuilt with their originating element. The existing subtree
             // expansion covers all three while retaining sibling branches.
             add_style_subtree(tree, *node, &mut dirty);
+            has_animation_damage = true;
+            continue;
+        }
+        if let RetainedStyleMutation::WaapiAnimation { node } = mutation {
+            dirty.insert(*node);
             has_animation_damage = true;
             continue;
         }
@@ -15753,6 +15765,27 @@ mod tests {
                 "{id} custom properties"
             );
         }
+    }
+
+    #[test]
+    fn retained_waapi_restyle_dirties_only_the_non_inherited_effect_target() {
+        let tree = parse_html(
+            "<main><section id=target><div id=child><span id=grandchild></span></div></section><aside id=clean></aside></main>",
+        );
+        let target = tree.get_element_by_id("target").unwrap();
+        let sheet = crate::css::Stylesheet::parse_for_viewport(&tree, &[], (800.0, 600.0));
+        let RetainedStylePlan::Reuse {
+            dirty,
+            has_animation_damage,
+        } = retained_style_plan(
+            &tree,
+            &sheet,
+            &[RetainedStyleMutation::WaapiAnimation { node: target }],
+        ) else {
+            panic!("WAAPI target damage must remain retainable")
+        };
+        assert_eq!(dirty, HashSet::from([target]));
+        assert!(has_animation_damage);
     }
 
     #[test]
