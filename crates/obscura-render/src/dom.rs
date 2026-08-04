@@ -12563,7 +12563,17 @@ fn can_use_native_float_band(
             continue;
         };
         if !node.is_element() {
-            if !tree.text_content(id).trim().is_empty() {
+            // Comments, doctypes, and processing instructions generate no
+            // formatting box and cannot split a float band. In particular,
+            // Bootstrap labels closing navbar wrappers with non-empty HTML
+            // comments between the floated header and ordinary collapse
+            // block. Only actual non-whitespace text requires the legacy
+            // inline float path.
+            if matches!(
+                &node.data,
+                obscura_dom::tree::NodeData::Text { contents }
+                    if !contents.trim().is_empty()
+            ) {
                 return false;
             }
             continue;
@@ -14333,6 +14343,53 @@ mod tests {
             "display:none floats must not suppress the later visible float's line band"
         );
         assert_eq!((header.width, header.height), (780.0, 100.0));
+    }
+
+    #[test]
+    fn html_comments_do_not_split_nested_native_float_bands() {
+        // HTML comments generate no box. Bootstrap emits descriptive comments
+        // between its floated navbar header, ordinary full-width collapse
+        // block, and the floats inside that block. Gecko's per-BFC float
+        // manager ignores those nodes completely.
+        let tree = parse_html(
+            r#"<style>
+                *{box-sizing:border-box} html,body{margin:0}
+                #parent{width:780px;height:100px}
+                #parent::before,#parent::after,#collapse::before,#collapse::after{
+                    display:table;content:" "
+                }
+                #parent::after,#collapse::after{clear:both}
+                #header{float:left;width:250px;height:100px}
+                #collapse{position:relative;padding:0 15px}
+                #nav{float:left;width:400px;height:50px;margin-top:20px}
+                #right{float:right;width:80px;height:50px;margin-top:20px}
+            </style>
+            <div id="parent">
+              <!-- floated brand wrapper -->
+              <div id="header"></div><!-- /.navbar-header -->
+              <div id="collapse">
+                <!-- desktop navigation -->
+                <div id="nav"></div><!-- /.navbar-nav -->
+                <div id="right"></div>
+              </div><!-- /.navbar-collapse -->
+            </div>"#,
+        );
+        let laid = layout_dom(&tree, (900.0, 300.0));
+        let rect = |id: &str| laid.rects[&tree.get_element_by_id(id).unwrap()];
+        let collapse = rect("collapse");
+        let nav = rect("nav");
+        let right = rect("right");
+
+        assert_eq!(
+            (collapse.x, collapse.y, collapse.width, collapse.height),
+            (0.0, 0.0, 780.0, 100.0),
+            "the ordinary block border box spans beneath the outer float"
+        );
+        assert_eq!((nav.x, nav.y, nav.width, nav.height), (250.0, 20.0, 400.0, 50.0));
+        assert_eq!(
+            (right.x, right.y, right.width, right.height),
+            (685.0, 20.0, 80.0, 50.0)
+        );
     }
 
     #[test]
