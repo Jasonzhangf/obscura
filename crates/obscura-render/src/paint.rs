@@ -1153,6 +1153,25 @@ impl PreparedRender {
         };
         out.insert("display", display.to_string());
         out.insert(
+            "float",
+            match style.float {
+                Some(crate::Float::Left) => "left",
+                Some(crate::Float::Right) => "right",
+                None => "none",
+            }
+            .to_string(),
+        );
+        out.insert(
+            "clear",
+            match style.clear {
+                Some(crate::Clear::Left) => "left",
+                Some(crate::Clear::Right) => "right",
+                Some(crate::Clear::Both) => "both",
+                None => "none",
+            }
+            .to_string(),
+        );
+        out.insert(
             "position",
             if style.position_fixed {
                 "fixed"
@@ -13903,6 +13922,29 @@ mod tests {
             computed.get("word-break").map(String::as_str),
             Some("keep-all")
         );
+    }
+
+    #[test]
+    fn computed_style_exposes_float_and_clear() {
+        let tree = parse_html(
+            r#"<style>#left{float:left} #right{float:right;clear:both}</style>
+               <div id="left"></div><div id="right"></div><div id="plain"></div>"#,
+        );
+        let mut resources = RenderResourceCache::default();
+        let prepared =
+            prepare_dom(&tree, (320.0, 200.0), None, &mut resources).expect("prepared render");
+        let computed = |id| {
+            prepared
+                .computed_style(tree.get_element_by_id(id).unwrap())
+                .expect("computed style")
+        };
+
+        assert_eq!(computed("left")["float"], "left");
+        assert_eq!(computed("left")["clear"], "none");
+        assert_eq!(computed("right")["float"], "right");
+        assert_eq!(computed("right")["clear"], "both");
+        assert_eq!(computed("plain")["float"], "none");
+        assert_eq!(computed("plain")["clear"], "none");
     }
 
     #[test]
