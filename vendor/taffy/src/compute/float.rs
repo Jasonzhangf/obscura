@@ -147,13 +147,16 @@ pub struct FloatContext {
     /// A list of non-overlapping horizontal "segments" within the context.
     /// Each segment has the same available width for it's entire height.
     segments: Vec<Segment>,
-    /// A closed-open range indicating which segment the last placed float
-    /// was placed(on each side).
-    last_placed_floats: [Range<usize>; 2],
-    // Left hwm in slot 0. Right hwm in slot 1.
-    // high_water_marks: [usize; 2],
-    // left_float_high_water_mark: usize,
-    // right_float_high_water_mark: usize,
+    /// The lowest block-start reached by the last placed float. CSS source
+    /// order forbids any later float from rising above this coordinate.
+    last_float_top: Option<f32>,
+    /// The lowest block-end reached by a float on each side.
+    ///
+    /// This is deliberately stored as geometry rather than derived from
+    /// the segment list: placing a later, shorter float can subdivide a segment
+    /// that an earlier, taller float occupied. Segment indices then change
+    /// meaning, but CSS clearance must retain the earlier maximum.
+    lowest_float_bottoms: [Option<f32>; 2],
 }
 
 impl Default for FloatContext {
@@ -164,7 +167,8 @@ impl Default for FloatContext {
             left_floats: Vec::new(),
             right_floats: Vec::new(),
             segments: Vec::new(),
-            last_placed_floats: [0..0, 0..0], // high_water_marks: [0, 0],
+            last_float_top: None,
+            lowest_float_bottoms: [None, None],
         }
     }
 }
@@ -217,13 +221,6 @@ impl FloatContext {
         self.segments.splice((idx + 1)..(idx + 1), core::iter::once(new_segment));
     }
 
-    /// Update the last placed float start and end values
-    fn update_last_placed_float(&mut self, direction: FloatDirection, placement: Range<usize>) {
-        let slot = direction as usize;
-        self.last_placed_floats[slot].start = self.last_placed_floats[slot].start.max(placement.start);
-        self.last_placed_floats[slot].end = self.last_placed_floats[slot].end.max(placement.end);
-    }
-
     /// Position a floated box with the context, returning the (x, y) coordinates
     pub fn place_floated_box(
         &mut self,
@@ -240,6 +237,12 @@ impl FloatContext {
 
         let x_inset = placed_floated_box.x_inset;
         let y = placed_floated_box.y;
+        self.last_float_top = Some(self.last_float_top.map_or(y, |previous| previous.max(y)));
+        let slot = direction as usize;
+        let bottom = y + placed_floated_box.height;
+        self.lowest_float_bottoms[slot] = Some(
+            self.lowest_float_bottoms[slot].map_or(bottom, |previous| previous.max(bottom)),
+        );
         match direction {
             FloatDirection::Left => {
                 self.left_floats.push(placed_floated_box);
@@ -262,38 +265,21 @@ impl FloatContext {
         clear: Clear,
     ) -> PlacedFloatedBox {
         let slot = direction as usize;
+        let min_y = self.cleared_threshold(clear).map_or(min_y, |threshold| min_y.max(threshold));
+        let min_y = self.last_float_top.map_or(min_y, |last_top| min_y.max(last_top));
 
         // Ensure that float:
-        //    - Starts at or after the last placed float that was floated in the same direction as it
+        //    - Starts at or after the last float placed in source order
         //    - Respects "clear"
-        let hwm = match clear {
-            Clear::Left => {
-                let float_dir_start = self.last_placed_floats[slot].start;
-                let left_end = self.last_placed_floats[0].end;
-                float_dir_start.max(left_end + 1)
-            }
-            Clear::Right => {
-                let float_dir_start = self.last_placed_floats[slot].start;
-                let right_end = self.last_placed_floats[1].end;
-                float_dir_start.max(right_end + 1)
-            }
-            Clear::Both => {
-                let left_end = self.last_placed_floats[0].end;
-                let right_end = self.last_placed_floats[1].end;
-                left_end.max(right_end) + 1
-            }
-            Clear::None => {
-                // float_dir_start
-                self.last_placed_floats[slot].start
-            }
-        };
+        // Both constraints are geometric: segment indices can be invalidated
+        // whenever a later float subdivides an earlier segment.
 
         // Ensure that float is placed in a segment at or below "min_y"
         // (ensuring that it is placed at or below min_y within it's segment happens below)
         let start_idx = self
             .segments
-            .get(hwm..)
-            .and_then(|segments| segments.iter().position(|segment| segment.y.end > min_y).map(|idx| idx + hwm));
+            .iter()
+            .position(|segment| segment.y.end > min_y);
 
         let mut start_idx = start_idx.unwrap_or(self.segments.len());
         let mut start_y = min_y;
@@ -393,11 +379,6 @@ impl FloatContext {
             insets[slot] += floated_box.width;
             self.segments.push(Segment { y: start_y..(start_y + floated_box.height), insets });
 
-            // Update last_placed_float
-            let start_idx = self.segments.len() - 1;
-            let end_idx = start_idx + 1;
-            self.update_last_placed_float(direction, start_idx..end_idx);
-
             return PlacedFloatedBox {
                 width: floated_box.width,
                 height: floated_box.height,
@@ -444,32 +425,20 @@ impl FloatContext {
             segment.insets[slot] = placed_inset_plus_width;
         }
 
-        // Update last_placed_float
-        self.update_last_placed_float(direction, start_idx..(end_idx + 1));
-
         PlacedFloatedBox { width: floated_box.width, height: floated_box.height, y: start_y, x_inset: placed_inset }
-    }
-
-    /// Get the end segment of the last float on side(s) specified by the clear parameter (if any)
-    fn cleared_segment(&self, clear: Clear) -> Option<usize> {
-        let placed_end = |slot: usize| {
-            let placed = &self.last_placed_floats[slot];
-            (placed.start < placed.end).then_some(placed.end)
-        };
-        match clear {
-            Clear::Left => placed_end(0),
-            Clear::Right => placed_end(1),
-            Clear::Both => match (placed_end(0), placed_end(1)) {
-                (Some(left), Some(right)) => Some(left.max(right)),
-                (left, right) => left.or(right),
-            },
-            Clear::None => None,
-        }
     }
 
     /// Get the bottom of lowest relevant float for the specific clear property
     pub fn cleared_threshold(&self, clear: Clear) -> Option<f32> {
-        self.cleared_segment(clear).and_then(|idx| self.segments.get(idx.max(1) - 1)).map(|seg| seg.y.end)
+        match clear {
+            Clear::Left => self.lowest_float_bottoms[0],
+            Clear::Right => self.lowest_float_bottoms[1],
+            Clear::Both => match self.lowest_float_bottoms {
+                [Some(left), Some(right)] => Some(left.max(right)),
+                [left, right] => left.or(right),
+            },
+            Clear::None => None,
+        }
     }
 
     /// Search for a space suitable for laying out non-floated content into
@@ -480,6 +449,7 @@ impl FloatContext {
         clear: Clear,
         after: Option<usize>,
     ) -> ContentSlot {
+        let min_y = self.cleared_threshold(clear).map_or(min_y, |threshold| min_y.max(threshold));
         if !self.has_active_floats(min_y) {
             return ContentSlot {
                 segment_id: None,
@@ -492,12 +462,13 @@ impl FloatContext {
 
         // The min starting segment index
         let at_least = after.map(|idx| idx + 1).unwrap_or(0);
-        let hwm = at_least.max(self.cleared_segment(clear).map(|idx| idx + 1).unwrap_or(0));
 
         let start_idx = self
             .segments
-            .get(hwm..)
-            .and_then(|segments| segments.iter().position(|segment| segment.y.end > min_y).map(|idx| idx + hwm));
+            .get(at_least..)
+            .and_then(|segments| {
+                segments.iter().position(|segment| segment.y.end > min_y).map(|idx| idx + at_least)
+            });
         let start_idx = start_idx.unwrap_or(self.segments.len());
         let segment = self.segments.get(start_idx);
         match segment {
@@ -551,5 +522,99 @@ impl FloatIntrinsicWidthCalculator {
     /// Get the computed float contribution to intrinsic width
     pub fn result(&self) -> f32 {
         self.contribution
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn place_at(
+        context: &mut FloatContext,
+        width: f32,
+        height: f32,
+        min_y: f32,
+        direction: FloatDirection,
+    ) -> Point<f32> {
+        context.place_floated_box(
+            Size { width, height },
+            min_y,
+            [0.0, 0.0],
+            direction,
+            Clear::None,
+        )
+    }
+
+    fn place(context: &mut FloatContext, width: f32, height: f32, direction: FloatDirection) {
+        place_at(context, width, height, 0.0, direction);
+    }
+
+    #[test]
+    fn clearance_keeps_the_tallest_bottom_after_segment_subdivision() {
+        let mut context = FloatContext::new();
+        context.set_width(1000.0);
+
+        place(&mut context, 241.0, 100.0, FloatDirection::Left);
+        place(&mut context, 434.0, 73.0, FloatDirection::Left);
+        place(&mut context, 80.0, 73.0, FloatDirection::Right);
+
+        assert_eq!(context.cleared_threshold(Clear::Left), Some(100.0));
+        assert_eq!(context.cleared_threshold(Clear::Right), Some(73.0));
+        assert_eq!(context.cleared_threshold(Clear::Both), Some(100.0));
+    }
+
+    #[test]
+    fn side_clearance_is_monotonic_for_left_and_right_floats() {
+        for direction in [FloatDirection::Left, FloatDirection::Right] {
+            let mut context = FloatContext::new();
+            context.set_width(1000.0);
+
+            place(&mut context, 200.0, 120.0, direction);
+            place(&mut context, 200.0, 40.0, direction);
+
+            let matching_clear = match direction {
+                FloatDirection::Left => Clear::Left,
+                FloatDirection::Right => Clear::Right,
+            };
+            assert_eq!(context.cleared_threshold(matching_clear), Some(120.0));
+            assert_eq!(context.cleared_threshold(Clear::Both), Some(120.0));
+        }
+    }
+
+    #[test]
+    fn cleared_float_and_content_slot_use_the_geometric_bottom() {
+        let mut context = FloatContext::new();
+        context.set_width(1000.0);
+
+        place(&mut context, 241.0, 100.0, FloatDirection::Left);
+        place(&mut context, 434.0, 73.0, FloatDirection::Left);
+
+        let slot = context.find_content_slot(0.0, [0.0, 0.0], Clear::Left, None);
+        assert_eq!(slot.y, 100.0);
+
+        let cleared = context.place_floated_box(
+            Size { width: 100.0, height: 20.0 },
+            0.0,
+            [0.0, 0.0],
+            FloatDirection::Right,
+            Clear::Left,
+        );
+        assert_eq!(cleared.y, 100.0);
+    }
+
+    #[test]
+    fn source_order_top_survives_a_segment_inserted_before_the_old_start() {
+        let mut context = FloatContext::new();
+        context.set_width(1000.0);
+
+        let first = place_at(&mut context, 200.0, 50.0, 50.0, FloatDirection::Left);
+        assert_eq!(first.y, 50.0);
+
+        // This models the index shift caused when another float subdivides an
+        // earlier free segment. Source-order placement must be independent of
+        // the old segment index.
+        context.subdivide_segment(0, 25.0);
+        let later = place_at(&mut context, 200.0, 20.0, 0.0, FloatDirection::Left);
+        assert_eq!(later.y, 50.0);
     }
 }

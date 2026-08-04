@@ -911,6 +911,81 @@ fn native_float_clearance_is_side_sensitive() {
 }
 
 #[test]
+fn nested_clearfix_uses_the_tallest_float_in_the_shared_bfc() {
+    let tree = parse_html(
+        r#"<style>
+            *{box-sizing:border-box}
+            html,body{margin:0}
+            #container{height:100px;padding:0 15px}
+            #container::before,#container::after,#header::before,#header::after,
+            #collapse::before,#collapse::after{display:table;content:" "}
+            #container::after,#header::after,#collapse::after{clear:both}
+            #header{float:left;height:100px}
+            #inner-float{float:left;width:208px;height:100px;margin-right:33px}
+            #collapse{padding:0 15px}
+            #nav{float:left;width:434px;height:50px;margin-top:23px}
+            #right{float:right;width:80px;height:50px;margin-top:23px}
+        </style>
+        <div id="container"><div id="header"><div id="inner-float"></div></div><div id="collapse"><div id="nav"></div><div id="right"></div></div></div>"#,
+    );
+    let layout = layout_dom(&tree, (1280.0, 900.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    let collapse = rect("collapse");
+    let nav = rect("nav");
+    let right = rect("right");
+
+    assert!(
+        (collapse.x - 15.0).abs() < 0.01
+            && (collapse.y - 0.0).abs() < 0.01
+            && (collapse.width - 1250.0).abs() < 0.01
+            && (collapse.height - 100.0).abs() < 0.01,
+        "collapse: {collapse:?}"
+    );
+    assert!(
+        (nav.x - 256.0).abs() < 0.01
+            && (nav.y - 23.0).abs() < 0.01
+            && (nav.width - 434.0).abs() < 0.01
+            && (nav.height - 50.0).abs() < 0.01,
+        "nav: {nav:?}"
+    );
+    assert!(
+        (right.x - 1170.0).abs() < 0.01
+            && (right.y - 23.0).abs() < 0.01
+            && (right.width - 80.0).abs() < 0.01
+            && (right.height - 50.0).abs() < 0.01,
+        "right: {right:?}"
+    );
+}
+
+#[test]
+fn nested_clearfix_does_not_cross_a_bfc_boundary() {
+    let tree = parse_html(
+        r#"<style>
+            *{box-sizing:border-box}
+            html,body{margin:0}
+            #container{height:100px;padding:0 15px}
+            #container::before,#container::after,#collapse::before,#collapse::after{display:table;content:" "}
+            #container::after,#collapse::after{clear:both}
+            #header{float:left;width:241px;height:100px}
+            #collapse{overflow:hidden;padding:0 15px}
+            #nav{float:left;width:434px;height:50px;margin-top:23px}
+            #right{float:right;width:80px;height:50px;margin-top:23px}
+        </style>
+        <div id="container"><div id="header"></div><div id="collapse"><div id="nav"></div><div id="right"></div></div></div>"#,
+    );
+    let layout = layout_dom(&tree, (1280.0, 900.0));
+    let collapse = layout.rects[&tree.get_element_by_id("collapse").unwrap()];
+
+    assert!(
+        (collapse.x - 256.0).abs() < 0.01
+            && (collapse.y - 0.0).abs() < 0.01
+            && (collapse.width - 1009.0).abs() < 0.01
+            && (collapse.height - 73.0).abs() < 0.01,
+        "collapse BFC: {collapse:?}"
+    );
+}
+
+#[test]
 fn float_flow_zone_preserves_blocks_inline_runs_and_clearance() {
     let tree = parse_html(include_str!("../../../render-repros/float-flow-bands.html"));
     let layout = layout_dom(&tree, (900.0, 1000.0));

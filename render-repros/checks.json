@@ -222,6 +222,11 @@
     {"name": "same-side floats remain adjacent", "color": "#1971c2", "x": 80, "y": 0, "width": 80, "height": 30},
     {"name": "trailing right float shares the band", "color": "#e8590c", "x": 340, "y": 0, "width": 60, "height": 30}
   ],
+  "nested-float-clearance": [
+    {"name": "earlier tall float keeps its full shared-BFC endpoint", "color": "#087f5b", "x": 0, "y": 0, "width": 120, "height": 100},
+    {"name": "later shorter descendant float shares the remaining band", "color": "#1971c2", "x": 120, "y": 20, "width": 200, "height": 50},
+    {"name": "clearfix advances following flow below the tallest float", "color": "#862e9c", "x": 0, "y": 100, "width": 600, "height": 20}
+  ],
   "modern-hydration-contracts": [
     {"name": "modern hydration contracts", "color": "#16803c", "width": 360, "height": 90}
   ],
