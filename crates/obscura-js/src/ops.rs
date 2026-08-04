@@ -2521,7 +2521,10 @@ mod tests {
     use super::{cors_response_allows, glob_match, validate_fetch_url, FetchCredentials};
 
     #[cfg(feature = "render")]
-    use super::{node_is_connected, retained_style_mutation, shadow_including_connected_nodes};
+    use super::{
+        ensure_prepared_geometry, ensure_prepared_render, node_is_connected,
+        retained_style_mutation, shadow_including_connected_nodes, ObscuraState,
+    };
     #[cfg(feature = "render")]
     use obscura_dom::{parse_html, ShadowRootMode};
 
@@ -2630,6 +2633,60 @@ mod tests {
         dom.remove(source);
         assert!(!node_is_connected(&dom, child));
         assert!(!shadow_including_connected_nodes(&dom).contains(&child));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn geometry_consumer_defers_paint_only_sample_until_exact_consumer() {
+        let dom = parse_html(
+            r#"<style>
+                @keyframes fade { from { opacity:0 } to { opacity:1 } }
+                #box { width:40px;height:20px;animation:fade 1000ms linear both }
+            </style><div id="box"></div>"#,
+        );
+        let box_node = dom.get_element_by_id("box").unwrap();
+        let mut state = ObscuraState::new();
+        state.dom = Some(dom);
+        state.animation_sample = obscura_render::AnimationSample::document(0.0);
+        ensure_prepared_render(&mut state).expect("initial render");
+        assert_eq!(
+            state.prepared_render.as_ref().unwrap().layout().styles[&box_node].opacity,
+            Some(0.0),
+        );
+
+        state.animation_sample = obscura_render::AnimationSample::document(500.0);
+        let geometry = ensure_prepared_geometry(&mut state).expect("retained geometry");
+        assert_eq!(geometry.animation_sample_time().milliseconds, 0.0);
+        assert_eq!(geometry.document_rect(box_node).unwrap().width, 40.0);
+        assert_eq!(geometry.layout().styles[&box_node].opacity, Some(0.0));
+
+        let exact = ensure_prepared_render(&mut state).expect("exact sampled style");
+        assert_eq!(exact.animation_sample_time().milliseconds, 500.0);
+        let opacity = exact.layout().styles[&box_node].opacity.unwrap();
+        assert!((opacity - 0.5).abs() < 0.01, "exact opacity was {opacity}");
+        assert_eq!(exact.document_rect(box_node).unwrap().width, 40.0);
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn geometry_consumer_materializes_geometry_animation_sample() {
+        let dom = parse_html(
+            r#"<style>
+                @keyframes grow { from { width:20px } to { width:100px } }
+                #box { height:20px;animation:grow 1000ms linear both }
+            </style><div id="box"></div>"#,
+        );
+        let box_node = dom.get_element_by_id("box").unwrap();
+        let mut state = ObscuraState::new();
+        state.dom = Some(dom);
+        state.animation_sample = obscura_render::AnimationSample::document(0.0);
+        ensure_prepared_render(&mut state).expect("initial render");
+
+        state.animation_sample = obscura_render::AnimationSample::document(500.0);
+        let geometry = ensure_prepared_geometry(&mut state).expect("sampled geometry");
+        assert_eq!(geometry.animation_sample_time().milliseconds, 500.0);
+        let width = geometry.document_rect(box_node).unwrap().width;
+        assert!((width - 60.0).abs() < 0.1, "sampled width was {width}");
     }
 }
 
@@ -3739,6 +3796,29 @@ pub(crate) fn ensure_prepared_render(
     state.prepared_render.as_ref()
 }
 
+/// Prepare enough state for a geometry-only CSSOM consumer. A forward sample
+/// with only paint effects may read the retained layout without resampling its
+/// styles. `animation_sample` on PreparedRender remains behind intentionally,
+/// making a later paint or computed-style consumer take the exact path above.
+#[cfg(feature = "render")]
+fn ensure_prepared_geometry(
+    state: &mut ObscuraState,
+) -> Option<&obscura_render::PreparedRender> {
+    let base_url = document_base_url(state);
+    let reusable = state.pending_style_mutations.is_empty()
+        && !state.animation_timeline.has_pending_start_candidates()
+        && state.prepared_render.as_ref().is_some_and(|prepared| {
+            prepared.viewport() == state.viewport
+                && prepared.base_url() == base_url.as_deref()
+                && (prepared.animation_sample() == state.animation_sample
+                    || prepared.can_reuse_geometry_for_animation_sample(state.animation_sample))
+        });
+    if reusable {
+        return state.prepared_render.as_ref();
+    }
+    ensure_prepared_render(state)
+}
+
 #[cfg(feature = "render")]
 pub(crate) fn sample_live_document_animations(state: &mut ObscuraState) {
     if state.animation_sampled_task_generation == state.animation_task_generation {
@@ -3787,7 +3867,24 @@ fn op_begin_render_task(state: &OpState) {
 
 #[cfg(feature = "render")]
 pub(crate) fn ensure_resolved_scroll(state: &mut ObscuraState) -> Option<()> {
-    ensure_prepared_render(state)?;
+    ensure_resolved_scroll_for_consumer(state, false)
+}
+
+#[cfg(feature = "render")]
+fn ensure_resolved_scroll_for_geometry(state: &mut ObscuraState) -> Option<()> {
+    ensure_resolved_scroll_for_consumer(state, true)
+}
+
+#[cfg(feature = "render")]
+fn ensure_resolved_scroll_for_consumer(
+    state: &mut ObscuraState,
+    geometry_only: bool,
+) -> Option<()> {
+    if geometry_only {
+        ensure_prepared_geometry(state)?;
+    } else {
+        ensure_prepared_render(state)?;
+    }
     if state
         .resolved_scroll
         .as_ref()
@@ -4206,7 +4303,29 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
 
 #[cfg(feature = "render")]
 pub(crate) fn clamp_scroll_offset(state: &mut ObscuraState, requested: (f32, f32)) -> (f32, f32) {
-    let clamped = ensure_prepared_render(state)
+    clamp_scroll_offset_for_consumer(state, requested, false)
+}
+
+#[cfg(feature = "render")]
+fn clamp_scroll_offset_for_geometry(
+    state: &mut ObscuraState,
+    requested: (f32, f32),
+) -> (f32, f32) {
+    clamp_scroll_offset_for_consumer(state, requested, true)
+}
+
+#[cfg(feature = "render")]
+fn clamp_scroll_offset_for_consumer(
+    state: &mut ObscuraState,
+    requested: (f32, f32),
+    geometry_only: bool,
+) -> (f32, f32) {
+    let prepared = if geometry_only {
+        ensure_prepared_geometry(state)
+    } else {
+        ensure_prepared_render(state)
+    };
+    let clamped = prepared
         .map(|prepared| prepared.clamp_scroll(requested))
         .unwrap_or((0.0, 0.0));
     if state.scroll_offset != clamped {
@@ -4236,7 +4355,7 @@ fn op_layout_geometry(state: &OpState, #[string] nid_str: String) -> String {
     let nid = obscura_dom::tree::NodeId::new(nid);
     let mut gs = shared.borrow_mut();
     sample_live_document_animations(&mut gs);
-    if ensure_resolved_scroll(&mut gs).is_some() {
+    if ensure_resolved_scroll_for_geometry(&mut gs).is_some() {
         let Some((_, scroll)) = gs.resolved_scroll.as_ref() else {
             return String::new();
         };
@@ -4301,7 +4420,7 @@ fn op_resize_observer_measurements(state: &OpState, #[string] nids_json: String)
     let shared = state.borrow::<SharedState>().clone();
     let mut gs = shared.borrow_mut();
     sample_live_document_animations(&mut gs);
-    if ensure_resolved_scroll(&mut gs).is_none() {
+    if ensure_resolved_scroll_for_geometry(&mut gs).is_none() {
         return serde_json::to_string(&vec![serde_json::Value::Null; nids.len()])
             .unwrap_or_else(|_| "[]".to_string());
     }
@@ -4369,7 +4488,7 @@ fn op_intersection_observer_measurements(
     let shared = state.borrow::<SharedState>().clone();
     let mut gs = shared.borrow_mut();
     sample_live_document_animations(&mut gs);
-    if ensure_resolved_scroll(&mut gs).is_none() {
+    if ensure_resolved_scroll_for_geometry(&mut gs).is_none() {
         return serde_json::to_string(&vec![serde_json::Value::Null; nids.len()])
             .unwrap_or_else(|_| "[]".to_string());
     }
@@ -4459,7 +4578,7 @@ fn op_layout_metrics(state: &OpState) -> String {
     let mut gs = shared.borrow_mut();
     sample_live_document_animations(&mut gs);
     let viewport = gs.viewport;
-    let content = ensure_prepared_render(&mut gs)
+    let content = ensure_prepared_geometry(&mut gs)
         .map(|prepared| prepared.content_size())
         .unwrap_or(viewport);
     format!(
@@ -4476,7 +4595,7 @@ fn op_element_scroll_metrics(state: &OpState, #[string] nid_str: String) -> Stri
     let nid = NodeId::new(nid_str.parse().unwrap_or(0));
     let mut gs = shared.borrow_mut();
     sample_live_document_animations(&mut gs);
-    if ensure_resolved_scroll(&mut gs).is_none() {
+    if ensure_resolved_scroll_for_geometry(&mut gs).is_none() {
         return String::new();
     }
     let Some((_, scroll)) = gs.resolved_scroll.as_ref() else {
@@ -4513,7 +4632,7 @@ fn op_element_scroll_to(state: &OpState, #[string] nid_str: String, x: f64, y: f
     let nid = NodeId::new(nid_str.parse().unwrap_or(0));
     let mut gs = shared.borrow_mut();
     sample_live_document_animations(&mut gs);
-    if ensure_resolved_scroll(&mut gs).is_none() {
+    if ensure_resolved_scroll_for_geometry(&mut gs).is_none() {
         return String::new();
     }
     let current = gs.resolved_scroll.as_ref().and_then(|(_, scroll)| {
@@ -4557,7 +4676,7 @@ fn op_scroll_offset(state: &OpState) -> String {
     let mut gs = shared.borrow_mut();
     sample_live_document_animations(&mut gs);
     let requested = gs.scroll_offset;
-    let (x, y) = clamp_scroll_offset(&mut gs, requested);
+    let (x, y) = clamp_scroll_offset_for_geometry(&mut gs, requested);
     format!("{{\"x\":{},\"y\":{}}}", x, y)
 }
 
@@ -4568,6 +4687,6 @@ fn op_scroll_to(state: &OpState, x: f64, y: f64) -> String {
     let shared = state.borrow::<SharedState>().clone();
     let mut gs = shared.borrow_mut();
     sample_live_document_animations(&mut gs);
-    let (x, y) = clamp_scroll_offset(&mut gs, (x as f32, y as f32));
+    let (x, y) = clamp_scroll_offset_for_geometry(&mut gs, (x as f32, y as f32));
     format!("{{\"x\":{},\"y\":{}}}", x, y)
 }

@@ -1237,6 +1237,10 @@ pub struct LayoutStyle {
     /// renderer can sample. Unsupported custom-property-only animations must
     /// not keep layout or screencast damage active forever.
     pub animation_has_render_effect: bool,
+    /// Strongest effect of the selected CSS keyframes. Geometry consumers use
+    /// this to retain an older sampled layout only when every live effect is
+    /// known to be paint-only.
+    pub(crate) animation_effect_impact: AnimationEffectImpact,
     /// Local time used for this element's sampled animation instance.
     pub animation_local_time_ms: f32,
     /// `vertical-align` for a table cell's content. Cells effectively default
@@ -1714,6 +1718,19 @@ pub struct AnimationSample {
     pub mode: AnimationSampleMode,
 }
 
+/// Strongest renderer-visible consequence of an animation effect.
+///
+/// Ordering is intentional: aggregating with `max` keeps unknown or
+/// geometry-affecting tracks conservative while still distinguishing
+/// compositor/paint-only effects from an inactive animation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub enum AnimationEffectImpact {
+    #[default]
+    None,
+    Paint,
+    Geometry,
+}
+
 impl AnimationSample {
     pub fn document(milliseconds: f32) -> Self {
         Self {
@@ -1969,20 +1986,39 @@ impl AnimationTimelineState {
     }
 
     pub(crate) fn has_active_waapi(&self, document_time: AnimationSampleTime) -> bool {
-        self.waapi.values().any(|animation| {
-            if animation.play_state != WaapiPlayState::Running
-                || animation.timing.duration_ms <= 0.0
-                || animation.timing.iteration_count <= 0.0
-            {
-                return false;
-            }
-            let local = animation.hold_time_ms.unwrap_or_else(|| {
-                (document_time.milliseconds - animation.start_time_ms).max(0.0)
-            });
-            let end = animation.timing.delay_ms
-                + animation.timing.duration_ms * animation.timing.iteration_count;
-            local < end.max(0.0)
-        })
+        self.waapi
+            .values()
+            .any(|animation| waapi_is_active(animation, document_time))
+    }
+
+    pub(crate) fn active_waapi_effect_impact(
+        &self,
+        document_time: AnimationSampleTime,
+    ) -> AnimationEffectImpact {
+        self.waapi
+            .values()
+            .filter(|animation| waapi_is_active(animation, document_time))
+            .map(|animation| {
+                if animation
+                    .keyframes
+                    .iter()
+                    .any(|frame| frame.transform.is_some())
+                {
+                    // A specified WAAPI transform remains geometry-affecting
+                    // even when this renderer cannot parse its value.
+                    AnimationEffectImpact::Geometry
+                } else if animation
+                    .keyframes
+                    .iter()
+                    .any(|frame| frame.opacity.is_some())
+                {
+                    AnimationEffectImpact::Paint
+                } else {
+                    AnimationEffectImpact::None
+                }
+            })
+            .max()
+            .unwrap_or_default()
     }
 
     pub(crate) fn sample_for(
@@ -2056,6 +2092,21 @@ impl AnimationTimelineState {
         self.start_candidates.clear();
         self.subtree_start_candidates.clear();
     }
+}
+
+fn waapi_is_active(animation: &WaapiAnimation, document_time: AnimationSampleTime) -> bool {
+    if animation.play_state != WaapiPlayState::Running
+        || animation.timing.duration_ms <= 0.0
+        || animation.timing.iteration_count <= 0.0
+    {
+        return false;
+    }
+    let local = animation.hold_time_ms.unwrap_or_else(|| {
+        (document_time.milliseconds - animation.start_time_ms).max(0.0)
+    });
+    let end = animation.timing.delay_ms
+        + animation.timing.duration_ms * animation.timing.iteration_count;
+    local < end.max(0.0)
 }
 
 /// The implemented `text-wrap-style` values. Other line-breaking strategies

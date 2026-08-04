@@ -831,6 +831,7 @@ pub struct PreparedRender {
     viewport: (f32, f32),
     animation_sample: crate::AnimationSample,
     has_active_waapi_animations: bool,
+    active_animation_impact: crate::AnimationEffectImpact,
     root_font_size: f32,
     base_url: Option<String>,
     content_size: (f32, f32),
@@ -859,19 +860,26 @@ impl PreparedRender {
     /// animation. Finite animations stop producing compositor damage after
     /// their active interval; paused and zero-duration animations never do.
     pub fn has_active_css_animations(&self) -> bool {
-        self.has_active_waapi_animations || self.layout.styles.values().any(|style| {
-            if style.animation_name.is_none()
-                || !style.animation_has_render_effect
-                || style.animation_timing.play_state == crate::AnimationPlayState::Paused
-                || style.animation_timing.duration_ms <= 0.0
-                || style.animation_timing.iteration_count <= 0.0
-            {
-                return false;
-            }
-            let end = style.animation_timing.delay_ms
-                + style.animation_timing.duration_ms * style.animation_timing.iteration_count;
-            end.is_infinite() || style.animation_local_time_ms < end.max(0.0)
-        })
+        self.has_active_waapi_animations
+            || self
+                .layout
+                .styles
+                .values()
+                .any(css_animation_is_active)
+    }
+
+    /// Whether a geometry-only consumer may retain this layout while moving
+    /// to `sample`. The prepared style/paint sample deliberately stays
+    /// unchanged; a later computed-style or paint consumer will materialize
+    /// the exact requested sample through the normal retained-style path.
+    pub fn can_reuse_geometry_for_animation_sample(
+        &self,
+        sample: crate::AnimationSample,
+    ) -> bool {
+        sample.mode == crate::AnimationSampleMode::DocumentTime
+            && self.animation_sample.mode == crate::AnimationSampleMode::DocumentTime
+            && sample.time.milliseconds >= self.animation_sample.time.milliseconds
+            && self.active_animation_impact < crate::AnimationEffectImpact::Geometry
     }
 
     /// Advance a frame whose animation cascade is already time-invariant.
@@ -2376,6 +2384,16 @@ fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
         viewport,
         animation_sample,
         has_active_waapi_animations: animation_timeline.has_active_waapi(animation_sample.time),
+        active_animation_impact: laid
+            .styles
+            .values()
+            .filter(|style| css_animation_is_active(style))
+            .map(|style| style.animation_effect_impact)
+            .chain(std::iter::once(
+                animation_timeline.active_waapi_effect_impact(animation_sample.time),
+            ))
+            .max()
+            .unwrap_or_default(),
         root_font_size,
         base_url: base_url.map(str::to_string),
         content_size,
@@ -2386,6 +2404,20 @@ fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
         svg_fonts,
         layout: laid,
     })
+}
+
+fn css_animation_is_active(style: &crate::LayoutStyle) -> bool {
+    if style.animation_name.is_none()
+        || !style.animation_has_render_effect
+        || style.animation_timing.play_state == crate::AnimationPlayState::Paused
+        || style.animation_timing.duration_ms <= 0.0
+        || style.animation_timing.iteration_count <= 0.0
+    {
+        return false;
+    }
+    let end = style.animation_timing.delay_ms
+        + style.animation_timing.duration_ms * style.animation_timing.iteration_count;
+    end.is_infinite() || style.animation_local_time_ms < end.max(0.0)
 }
 
 /// Paint one root-scroll position from an already prepared resource-aware
@@ -15531,6 +15563,46 @@ mod tests {
             nodes,
             std::collections::HashSet::from([connected]),
             "only connected WAAPI targets may enter retained style damage"
+        );
+    }
+
+    #[test]
+    fn active_waapi_transform_is_conservatively_geometry_affecting() {
+        let tree = parse_html("<div id=target></div>");
+        let target = tree.get_element_by_id("target").unwrap();
+        let animation = |id, opacity, transform| crate::WaapiAnimation {
+            id,
+            node: target,
+            keyframes: vec![crate::WaapiKeyframe {
+                offset: 0.0,
+                opacity,
+                transform,
+            }],
+            timing: crate::AnimationTiming {
+                duration_ms: 1_000.0,
+                ..crate::AnimationTiming::default()
+            },
+            easing: None,
+            linear_easing: None,
+            start_time_ms: 0.0,
+            hold_time_ms: None,
+            play_state: crate::WaapiPlayState::Running,
+        };
+        let sample = crate::AnimationSampleTime { milliseconds: 100.0 };
+        let mut timeline = crate::AnimationTimelineState::default();
+        timeline.register_waapi(animation(1, Some(0.5), None));
+        assert_eq!(
+            timeline.active_waapi_effect_impact(sample),
+            crate::AnimationEffectImpact::Paint,
+        );
+        timeline.register_waapi(animation(
+            2,
+            None,
+            Some("future-transform(1)".to_string()),
+        ));
+        assert_eq!(
+            timeline.active_waapi_effect_impact(sample),
+            crate::AnimationEffectImpact::Geometry,
         );
     }
 

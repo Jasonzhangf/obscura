@@ -1937,6 +1937,48 @@ enum AnimatedProperty {
     Visibility,
 }
 
+impl AnimatedProperty {
+    fn effect_impact(self) -> crate::AnimationEffectImpact {
+        use AnimatedProperty::*;
+        match self {
+            Opacity
+            | Color
+            | BackgroundColor
+            | BorderTopColor
+            | BorderRightColor
+            | BorderBottomColor
+            | BorderLeftColor
+            | BackgroundPosition
+            | Visibility => crate::AnimationEffectImpact::Paint,
+            Transform
+            | Translate
+            | Rotate
+            | Scale
+            | Width
+            | Height
+            | MinWidth
+            | MinHeight
+            | MaxWidth
+            | MaxHeight
+            | Top
+            | Right
+            | Bottom
+            | Left
+            | MarginTop
+            | MarginRight
+            | MarginBottom
+            | MarginLeft
+            | PaddingTop
+            | PaddingRight
+            | PaddingBottom
+            | PaddingLeft
+            | RowGap
+            | ColumnGap
+            | FlexBasis => crate::AnimationEffectImpact::Geometry,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct AnimatedDeclaration {
     name: String,
@@ -3960,6 +4002,7 @@ impl Stylesheet {
                 .iter()
                 .any(|&(_, _, i)| self.rules[i].important_flags.has_animation);
         style.animation_has_render_effect = false;
+        style.animation_effect_impact = crate::AnimationEffectImpact::None;
         if !self.keyframes.is_empty() && (style.animation_name.is_some() || important_has_animation)
         {
             let mut animation_style = style.clone();
@@ -3994,6 +4037,13 @@ impl Stylesheet {
             if let Some(name) = animation_style.animation_name.as_deref() {
                 if let Some(keyframes) = self.keyframes.get(name) {
                     style.animation_has_render_effect = !keyframes.tracks.is_empty();
+                    style.animation_effect_impact = keyframes
+                        .tracks
+                        .keys()
+                        .copied()
+                        .map(AnimatedProperty::effect_impact)
+                        .max()
+                        .unwrap_or_default();
                     let local_sample = animation_timeline.sample_for(
                         nid,
                         crate::AnimationInstanceKey {
@@ -8206,6 +8256,50 @@ mod tests {
         assert!(
             (actual - expected).abs() < 0.0001,
             "expected opacity {expected}, got {actual}"
+        );
+    }
+
+    #[test]
+    fn animation_effect_impact_separates_paint_from_geometry_tracks() {
+        let sampled = |declarations: &str| {
+            sampled_animation_style(
+                &format!(
+                    "@keyframes effect {{ from {{ {declarations} }} to {{ {declarations} }} }}\
+                     #target {{ animation:effect 1s linear infinite }}"
+                ),
+                100.0,
+                "target",
+            )
+            .animation_effect_impact
+        };
+
+        assert_eq!(
+            sampled("opacity:.5;color:red;background-color:blue;border-color:green;\
+                     background-position:20% 30%;visibility:hidden"),
+            crate::AnimationEffectImpact::Paint,
+        );
+        for declarations in [
+            "transform:translateX(1px)",
+            "translate:1px 2px",
+            "rotate:10deg",
+            "scale:2",
+            "width:20px",
+            "height:20px",
+            "inset:1px",
+            "margin:1px",
+            "padding:1px",
+            "gap:1px",
+            "flex-basis:20px",
+        ] {
+            assert_eq!(
+                sampled(declarations),
+                crate::AnimationEffectImpact::Geometry,
+                "{declarations}",
+            );
+        }
+        assert_eq!(
+            sampled("--unsupported:1"),
+            crate::AnimationEffectImpact::None,
         );
     }
 
