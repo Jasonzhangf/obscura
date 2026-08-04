@@ -471,9 +471,11 @@ impl ObscuraJsRuntime {
         }
         let mut state = self.state.borrow_mut();
         if state.animation_sample != sample {
-            if sample.mode == obscura_render::AnimationSampleMode::DocumentTime
+            let forward_document_sample =
+                sample.mode == obscura_render::AnimationSampleMode::DocumentTime
                 && state.animation_sample.mode == obscura_render::AnimationSampleMode::DocumentTime
-                && sample.time.milliseconds > state.animation_sample.time.milliseconds
+                && sample.time.milliseconds > state.animation_sample.time.milliseconds;
+            if forward_document_sample
                 && state.prepared_render.as_mut().is_some_and(|prepared| {
                     prepared.advance_inactive_animation_sample_time(sample.time)
                 })
@@ -482,8 +484,10 @@ impl ObscuraJsRuntime {
                 return true;
             }
             state.animation_sample = sample;
-            state.prepared_render = None;
-            state.pending_style_mutations.clear();
+            if !forward_document_sample {
+                state.prepared_render = None;
+                state.pending_style_mutations.clear();
+            }
             state.resolved_scroll = None;
         }
         true
@@ -6877,6 +6881,100 @@ mod tests {
             "a live timestamp alone must not relayout a static document"
         );
         assert_eq!(first, second);
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn forward_active_animation_sample_updates_geometry_and_paint_from_retained_frame() {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html(
+            r#"<html style="margin:0"><head><style>
+                @keyframes grow {
+                    from { width:20px; background-color:#ff0000 }
+                    to { width:100px; background-color:#0000ff }
+                }
+                #box { height:40px; animation:grow 1000ms linear both }
+            </style></head><body style="margin:0"><div id="box"></div></body></html>"#,
+        ));
+        rt.set_url("http://example.test/page");
+        rt.set_viewport(120.0, 40.0);
+        rt.run_page_init();
+
+        assert!(rt.set_animation_sample(obscura_render::AnimationSample::document(0.0)));
+        let initial = rt
+            .screenshot_prepared((120.0, 40.0), Some("http://example.test/page"))
+            .expect("initial animation frame");
+        assert!((animation_test_width(&rt, "box") - 20.0).abs() < 0.1);
+
+        assert!(rt.set_animation_sample(obscura_render::AnimationSample::document(500.0)));
+        assert!(
+            rt.state.borrow().prepared_render.is_some(),
+            "a forward active sample should retain the previous style graph until flush"
+        );
+        let midpoint = rt
+            .screenshot_prepared((120.0, 40.0), Some("http://example.test/page"))
+            .expect("retained midpoint animation frame");
+
+        assert!((animation_test_width(&rt, "box") - 60.0).abs() < 0.1);
+        assert_ne!(initial, midpoint, "animated paint output must advance");
+        assert_eq!(
+            rt.state
+                .borrow()
+                .prepared_render
+                .as_ref()
+                .unwrap()
+                .animation_sample_time()
+                .milliseconds,
+            500.0
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn forward_waapi_sample_updates_retained_style_and_paint() {
+        let mut rt = setup_runtime(
+            r#"<html style="margin:0"><body style="margin:0">
+                <div id="box" style="width:40px;height:40px;background:#1769aa"></div>
+            </body></html>"#,
+        );
+        rt.set_viewport(120.0, 40.0);
+        rt.state.borrow_mut().animation_timeline_origin = std::time::Instant::now();
+        assert!(rt.set_animation_sample(obscura_render::AnimationSample::document(0.0)));
+        rt.execute_script(
+            "waapi-retained-frame",
+            r#"document.getElementById('box').animate(
+                [{opacity:0,transform:'translateX(0px)'},
+                 {opacity:1,transform:'translateX(80px)'}],
+                {duration:1000,fill:'both',easing:'linear'}
+            )"#,
+        )
+        .unwrap();
+        let initial = rt
+            .screenshot_prepared((120.0, 40.0), Some("http://example.com/test"))
+            .expect("initial WAAPI frame");
+
+        assert!(rt.set_animation_sample(obscura_render::AnimationSample::document(500.0)));
+        assert!(
+            rt.state.borrow().prepared_render.is_some(),
+            "a forward WAAPI sample should preserve the prepared style graph until flush"
+        );
+        let midpoint = rt
+            .screenshot_prepared((120.0, 40.0), Some("http://example.com/test"))
+            .expect("retained WAAPI midpoint");
+        let midpoint_opacity = {
+            let state = rt.state.borrow();
+            let dom = state.dom.as_ref().unwrap();
+            let box_node = dom.get_element_by_id("box").unwrap();
+            state.prepared_render.as_ref().unwrap().layout().styles[&box_node]
+                .opacity
+                .unwrap()
+        };
+
+        assert!(
+            (0.45..0.55).contains(&midpoint_opacity),
+            "WAAPI midpoint opacity={midpoint_opacity}"
+        );
+        assert_ne!(initial, midpoint, "WAAPI paint output must advance");
     }
 
     #[cfg(feature = "render")]

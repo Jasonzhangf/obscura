@@ -3427,18 +3427,22 @@ pub(crate) fn ensure_prepared_render(
     let base_url = document_base_url(state);
     let viewport = state.viewport;
     let animation_sample = state.animation_sample;
-    let stale = state.prepared_render.as_ref().map_or(true, |prepared| {
+    let incompatible = state.prepared_render.as_ref().is_some_and(|prepared| {
         prepared.viewport() != viewport
             || prepared.base_url() != base_url.as_deref()
-            || prepared.animation_sample() != animation_sample
     });
-    if stale || !state.pending_style_mutations.is_empty() {
+    let needs_rebuild = state.prepared_render.as_ref().map_or(true, |prepared| {
+        incompatible || prepared.animation_sample() != animation_sample
+    }) || !state.pending_style_mutations.is_empty();
+    if needs_rebuild {
         if let Some(dom) = state.dom.as_ref() {
             state
                 .animation_timeline
                 .materialize_start_candidates(dom);
         }
-        let previous = (!stale).then(|| state.prepared_render.take()).flatten();
+        let previous = (!incompatible)
+            .then(|| state.prepared_render.take())
+            .flatten();
         let mutations = std::mem::take(&mut state.pending_style_mutations);
         let prepared = {
             let dom = state.dom.as_ref()?;
@@ -3520,9 +3524,15 @@ pub(crate) fn sample_live_document_animations(state: &mut ObscuraState) {
         state.animation_sample = sample;
         return;
     }
+    let forward_document_sample =
+        sample.mode == obscura_render::AnimationSampleMode::DocumentTime
+        && state.animation_sample.mode == obscura_render::AnimationSampleMode::DocumentTime
+        && sample.time.milliseconds > state.animation_sample.time.milliseconds;
     state.animation_sample = sample;
-    state.prepared_render = None;
-    state.pending_style_mutations.clear();
+    if !forward_document_sample {
+        state.prepared_render = None;
+        state.pending_style_mutations.clear();
+    }
     state.resolved_scroll = None;
 }
 

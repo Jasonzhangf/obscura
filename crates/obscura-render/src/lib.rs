@@ -1886,6 +1886,21 @@ impl AnimationTimelineState {
         self.waapi.insert(animation.id, animation);
     }
 
+    /// Exact set of nodes currently targeted by registered Web Animations.
+    /// The render preparation boundary additionally filters disconnected
+    /// targets against the current DOM before producing restyle damage.
+    pub fn waapi_nodes(
+        &self,
+    ) -> std::collections::HashSet<obscura_dom::tree::NodeId> {
+        self.waapi.values().map(|animation| animation.node).collect()
+    }
+
+    /// New animation instance epochs must observe a complete cascade. They
+    /// can be created by DOM mutations which have not yet reached style flush.
+    pub fn has_pending_start_candidates(&self) -> bool {
+        !self.start_candidates.is_empty() || !self.subtree_start_candidates.is_empty()
+    }
+
     pub fn cancel_waapi(&mut self, id: u64) -> bool {
         self.waapi.remove(&id).is_some()
     }

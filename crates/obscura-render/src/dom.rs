@@ -540,6 +540,10 @@ pub enum TreeStyleMutation {
 pub enum RetainedStyleMutation {
     Attribute(AttributeStyleMutation),
     Tree(TreeStyleMutation),
+    /// A document-timeline sample changed while the DOM and stylesheet stayed
+    /// stable. Re-cascade this animation owner and its inheritance-dependent
+    /// subtree while retaining unrelated branches.
+    Animation { node: NodeId },
 }
 
 impl From<AttributeStyleMutation> for RetainedStyleMutation {
@@ -2594,7 +2598,10 @@ fn container_iteration_termination<T: PartialEq>(
 }
 
 enum RetainedStylePlan {
-    Reuse(HashSet<NodeId>),
+    Reuse {
+        dirty: HashSet<NodeId>,
+        has_animation_damage: bool,
+    },
     Full,
 }
 
@@ -3126,6 +3133,7 @@ fn empty_state_may_have_changed(
         .iter()
         .filter(|mutation| match mutation {
             RetainedStyleMutation::Attribute(_) => false,
+            RetainedStyleMutation::Animation { .. } => false,
             RetainedStyleMutation::Tree(TreeStyleMutation::Insert {
                 old_parent,
                 new_parent,
@@ -3189,7 +3197,17 @@ fn retained_style_plan(
     mutations: &[RetainedStyleMutation],
 ) -> RetainedStylePlan {
     let mut dirty = HashSet::new();
+    let mut has_animation_damage = false;
     for mutation in mutations {
+        if let RetainedStyleMutation::Animation { node } = mutation {
+            // Animated color and visibility inherit, keyframe endpoints can
+            // consume inherited custom properties, and generated pseudos are
+            // rebuilt with their originating element. The existing subtree
+            // expansion covers all three while retaining sibling branches.
+            add_style_subtree(tree, *node, &mut dirty);
+            has_animation_damage = true;
+            continue;
+        }
         let RetainedStyleMutation::Attribute(mutation) = mutation else {
             let RetainedStyleMutation::Tree(mutation) = mutation else {
                 unreachable!()
@@ -3353,7 +3371,10 @@ fn retained_style_plan(
             }
         }
     }
-    RetainedStylePlan::Reuse(dirty)
+    RetainedStylePlan::Reuse {
+        dirty,
+        has_animation_damage,
+    }
 }
 
 pub(crate) fn layout_dom_with_web_fonts(
@@ -3599,7 +3620,10 @@ fn layout_dom_with_web_fonts_pass_limit_at_animation_time(
             .custom_properties
             .retain(|node, _| connected.contains(node));
         match retained_style_plan(tree, &sheet, mutations) {
-            RetainedStylePlan::Reuse(mut dirty) => {
+            RetainedStylePlan::Reuse {
+                mut dirty,
+                has_animation_damage,
+            } => {
                 if !active_containers.is_empty() && sheet.has_container_queries() {
                     let mut matcher = tree.matcher();
                     add_container_query_reset_scopes(
@@ -3612,6 +3636,22 @@ fn layout_dom_with_web_fonts_pass_limit_at_animation_time(
                         false,
                         &mut dirty,
                     );
+                }
+                // Once animation damage reaches at least half of the retained
+                // style graph, sparse HashMap reuse no longer offsets dirty-set
+                // bookkeeping and branch checks. This is a document-relative
+                // coverage threshold, not a site- or node-count heuristic.
+                if has_animation_damage
+                    && dirty.len().saturating_mul(2) >= retained.styles.len()
+                {
+                    if std::env::var_os("OBSCURA_RENDER_TIMING").is_some() {
+                        eprintln!(
+                            "[timing] retained-style fallback reason=animation-dirty-coverage dirty={} retained={}",
+                            dirty.len(),
+                            retained.styles.len(),
+                        );
+                    }
+                    return None;
                 }
                 Some((retained, dirty))
             }
@@ -14579,6 +14619,87 @@ mod tests {
                 "{id} custom properties"
             );
         }
+    }
+
+    #[test]
+    fn retained_animation_restyle_reuses_clean_branches_and_matches_full() {
+        let mut clean = String::new();
+        for index in 0..2_000 {
+            clean.push_str(&format!(
+                "<span class=clean data-index={index}><i></i></span>"
+            ));
+        }
+        let tree = parse_html(&format!(
+            r#"<style>
+                html,body{{margin:0}}
+                @keyframes grow {{
+                    from {{ width:20px; color:#ff0000 }}
+                    to {{ width:120px; color:#0000ff }}
+                }}
+                #animated{{height:20px;animation:grow 1000ms linear both}}
+                #animated > b{{color:inherit}}
+                .clean{{display:block;width:3px;height:1px}}
+            </style><main><section id=animated><b id=child>x</b></section>
+            <aside>{clean}</aside></main>"#,
+        ));
+        let animated = tree.get_element_by_id("animated").unwrap();
+        let mut cache = crate::css::StylesheetCache::default();
+        let mut timeline = crate::AnimationTimelineState::default();
+        let (mut initial, _) = layout_dom_with_web_fonts_pass_limit_at_animation_time(
+            &tree,
+            (800.0, 600.0),
+            &HashMap::new(),
+            &[],
+            None,
+            Some(&mut cache),
+            None,
+            &[],
+            crate::AnimationSample::document(0.0),
+            &mut timeline,
+        );
+        let retained = RetainedStyleMaps {
+            styles: std::mem::take(&mut initial.styles),
+            custom_properties: std::mem::take(&mut initial.custom_properties),
+        };
+        let (incremental, telemetry) =
+            layout_dom_with_web_fonts_pass_limit_at_animation_time(
+                &tree,
+                (800.0, 600.0),
+                &HashMap::new(),
+                &[],
+                None,
+                Some(&mut cache),
+                Some(retained),
+                &[RetainedStyleMutation::Animation { node: animated }],
+                crate::AnimationSample::document(500.0),
+                &mut timeline,
+            );
+        let mut full_timeline = crate::AnimationTimelineState::default();
+        let (full, _) = layout_dom_with_web_fonts_pass_limit_at_animation_time(
+            &tree,
+            (800.0, 600.0),
+            &HashMap::new(),
+            &[],
+            None,
+            Some(&mut cache),
+            None,
+            &[],
+            crate::AnimationSample::document(500.0),
+            &mut full_timeline,
+        );
+
+        assert_computed_styles_match("animation retained-vs-full", &incremental, &full);
+        assert_eq!(incremental.rects, full.rects);
+        assert_eq!(telemetry.retained_fallback, 0, "{telemetry:?}");
+        assert!(telemetry.retained_reused >= 4_000, "{telemetry:?}");
+        assert!(telemetry.retained_fresh < 16, "{telemetry:?}");
+        assert!(
+            (incremental.rects[&animated].width - 70.0).abs() < 0.1,
+            "animated geometry did not advance: {:?}",
+            incremental.rects[&animated]
+        );
+        let child = tree.get_element_by_id("child").unwrap();
+        assert_eq!(incremental.styles[&child].color, Some([128, 0, 128, 255]));
     }
 
     #[test]

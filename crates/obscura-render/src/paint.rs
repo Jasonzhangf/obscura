@@ -2098,7 +2098,14 @@ pub fn prepare_dom_with_retained_styles_with_animation_state(
     animation_sample: crate::AnimationSample,
     animation_timeline: &mut crate::AnimationTimelineState,
 ) -> Option<PreparedRender> {
-    if previous.animation_sample != animation_sample {
+    let sample_changed = previous.animation_sample != animation_sample;
+    let forward_document_sample = sample_changed
+        && previous.animation_sample.mode == crate::AnimationSampleMode::DocumentTime
+        && animation_sample.mode == crate::AnimationSampleMode::DocumentTime
+        && animation_sample.time.milliseconds >= previous.animation_sample.time.milliseconds;
+    if sample_changed
+        && (!forward_document_sample || animation_timeline.has_pending_start_candidates())
+    {
         drop(previous);
         return prepare_dom_with_dynamic_fonts_and_stylesheet_cache_with_animation_state(
             tree,
@@ -2111,6 +2118,22 @@ pub fn prepare_dom_with_retained_styles_with_animation_state(
             animation_timeline,
         );
     }
+    let animation_nodes = sample_changed
+        .then(|| retained_animation_restyle_nodes(tree, &previous.layout.styles, animation_timeline))
+        .unwrap_or_default();
+    let animation_mutations;
+    let mutations = if animation_nodes.is_empty() {
+        mutations
+    } else {
+        animation_mutations = mutations
+            .iter()
+            .cloned()
+            .chain(animation_nodes.into_iter().map(|node| {
+                crate::dom::RetainedStyleMutation::Animation { node }
+            }))
+            .collect::<Vec<_>>();
+        animation_mutations.as_slice()
+    };
     let retained = RetainedStyleMaps {
         styles: std::mem::take(&mut previous.layout.styles),
         custom_properties: std::mem::take(&mut previous.layout.custom_properties),
@@ -2127,6 +2150,26 @@ pub fn prepare_dom_with_retained_styles_with_animation_state(
         animation_sample,
         animation_timeline,
     )
+}
+
+fn retained_animation_restyle_nodes(
+    tree: &DomTree,
+    styles: &HashMap<obscura_dom::tree::NodeId, crate::LayoutStyle>,
+    animation_timeline: &crate::AnimationTimelineState,
+) -> std::collections::HashSet<obscura_dom::tree::NodeId> {
+    let mut nodes = styles
+        .iter()
+        .filter_map(|(node, style)| {
+            (style.animation_name.is_some() && style.animation_has_render_effect)
+                .then_some(*node)
+        })
+        .collect::<std::collections::HashSet<_>>();
+    nodes.extend(animation_timeline.waapi_nodes());
+    nodes.retain(|node| {
+        tree.get_node(*node).is_some()
+            && (*node == tree.document() || tree.ancestors(*node).contains(&tree.document()))
+    });
+    nodes
 }
 
 fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
@@ -14405,6 +14448,50 @@ mod tests {
         assert!(fixed.green() > 240 && fixed.red() < 20);
         let sticky = pixmap.pixel(75, 15).expect("sticky pixel");
         assert!(sticky.blue() > 240 && sticky.red() < 20);
+    }
+
+    #[test]
+    fn animation_restyle_nodes_deduplicate_waapi_and_filter_disconnected_targets() {
+        let tree = parse_html(
+            "<main><div id=connected></div><div id=detached></div></main>",
+        );
+        let connected = tree.get_element_by_id("connected").unwrap();
+        let detached = tree.get_element_by_id("detached").unwrap();
+        tree.remove_child(detached);
+        let animation = |id, node| crate::WaapiAnimation {
+            id,
+            node,
+            keyframes: vec![crate::WaapiKeyframe {
+                offset: 0.0,
+                opacity: Some(0.0),
+                transform: None,
+            }],
+            timing: crate::AnimationTiming {
+                duration_ms: 1_000.0,
+                ..crate::AnimationTiming::default()
+            },
+            easing: None,
+            linear_easing: None,
+            start_time_ms: 0.0,
+            hold_time_ms: None,
+            play_state: crate::WaapiPlayState::Running,
+        };
+        let mut timeline = crate::AnimationTimelineState::default();
+        timeline.register_waapi(animation(1, connected));
+        timeline.register_waapi(animation(2, connected));
+        timeline.register_waapi(animation(3, detached));
+        assert_eq!(
+            timeline.waapi_nodes(),
+            std::collections::HashSet::from([connected, detached]),
+            "the timeline accessor must return the exact deduplicated target set"
+        );
+
+        let nodes = retained_animation_restyle_nodes(&tree, &HashMap::new(), &timeline);
+        assert_eq!(
+            nodes,
+            std::collections::HashSet::from([connected]),
+            "only connected WAAPI targets may enter retained style damage"
+        );
     }
 
     #[test]
