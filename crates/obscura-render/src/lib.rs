@@ -1198,6 +1198,9 @@ pub struct LayoutStyle {
     /// positioned decorative boxes for layout-independent painting.
     pub before_pseudo: Option<Box<LayoutStyle>>,
     pub after_pseudo: Option<Box<LayoutStyle>>,
+    /// Computed author style for the native text-control `::placeholder`
+    /// pseudo-element. Its anonymous glyphs are painted by the control.
+    pub placeholder_pseudo: Option<Box<LayoutStyle>>,
 
     /// True for `inline-block`/`inline-flex`/`inline-grid`: participates in
     /// the surrounding inline flow from the outside, like plain `inline`

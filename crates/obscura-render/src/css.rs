@@ -2310,6 +2310,7 @@ pub struct Stylesheet {
     /// generated text and positioned decorative boxes.
     before_rules: PseudoRuleMap,
     after_rules: PseudoRuleMap,
+    placeholder_rules: PseudoRuleMap,
 }
 
 const MAX_STYLESHEET_CACHE_SOURCE_BYTES: usize = 8 * 1024 * 1024;
@@ -2357,8 +2358,10 @@ impl StylesheetCache {
         let source_bytes = sources
             .iter()
             .try_fold(0usize, |total, source| total.checked_add(source.len()));
-        let compiled_rules =
-            sheet.rules.len() + sheet.before_rules.rules.len() + sheet.after_rules.rules.len();
+        let compiled_rules = sheet.rules.len()
+            + sheet.before_rules.rules.len()
+            + sheet.after_rules.rules.len()
+            + sheet.placeholder_rules.rules.len();
         if source_bytes.is_some_and(|bytes| bytes <= MAX_STYLESHEET_CACHE_SOURCE_BYTES)
             && compiled_rules <= MAX_STYLESHEET_CACHE_RULES
         {
@@ -2422,6 +2425,7 @@ impl Stylesheet {
                 .rules
                 .iter()
                 .chain(&self.after_rules.rules)
+                .chain(&self.placeholder_rules.rules)
                 .any(|rule| rule.container_condition_id != ContainerConditionId::NONE)
     }
 
@@ -2508,6 +2512,9 @@ impl Stylesheet {
                     nid,
                 )
         });
+        let supports_placeholder = node.as_element().is_some_and(|element| {
+            matches!(element.local.as_ref(), "input" | "textarea")
+        });
         normal_match
             || self
                 .before_rules
@@ -2515,6 +2522,10 @@ impl Stylesheet {
             || self
                 .after_rules
                 .node_matches_container_query_rule(tree, matcher, nid)
+            || (supports_placeholder
+                && self
+                    .placeholder_rules
+                    .node_matches_container_query_rule(tree, matcher, nid))
     }
 
     pub(crate) fn container_condition_depth(&self) -> usize {
@@ -2578,6 +2589,7 @@ impl Stylesheet {
             candidate_slot_count: 0,
             before_rules: PseudoRuleMap::default(),
             after_rules: PseudoRuleMap::default(),
+            placeholder_rules: PseudoRuleMap::default(),
         };
         let mut order = 0usize;
         let mut layers = LayerRegistry::default();
@@ -2717,6 +2729,45 @@ impl Stylesheet {
                     order += 1;
                     continue;
                 }
+                if let Some(base) = strip_pseudo_element(sel_trim, "placeholder") {
+                    if let Some(sel) = tree.compile_rule_selector(base) {
+                        note_selector_for_invalidation(
+                            &mut sheet.invalidation_map,
+                            base,
+                            order,
+                        );
+                        note_declaration_attribute_dependencies(
+                            &mut sheet.invalidation_map,
+                            &decls,
+                            order,
+                        );
+                        let (normal_decls, important_decls) =
+                            crate::style::partition_declarations(&decls);
+                        let normal_flags = declaration_stream_flags(&normal_decls);
+                        let important_flags = declaration_stream_flags(&important_decls);
+                        let specificity = sel.specificity();
+                        sheet.placeholder_rules.push(PseudoRule {
+                            sel,
+                            specificity,
+                            normal_decls,
+                            important_decls,
+                            normal_flags,
+                            important_flags,
+                            candidate_slot: NO_CANDIDATE_SLOT,
+                            order,
+                            container_condition_id,
+                            layer,
+                        });
+                    } else if selector_requires_conservative_tracking(base) {
+                        note_selector_for_invalidation(
+                            &mut sheet.invalidation_map,
+                            base,
+                            order,
+                        );
+                    }
+                    order += 1;
+                    continue;
+                }
                 let Some(sel) = tree.compile_rule_selector(&selector) else {
                     if selector_requires_conservative_tracking(&selector) {
                         note_selector_for_invalidation(
@@ -2793,19 +2844,25 @@ impl Stylesheet {
         props: &HashMap<String, String>,
         host_style: &LayoutStyle,
     ) -> (Option<LayoutStyle>, Option<LayoutStyle>) {
-        self.pseudo_styles_internal(tree, matcher, nid, props, host_style, None)
+        let (before, after, _) =
+            self.pseudo_styles_internal(tree, matcher, nid, props, host_style, None);
+        (before, after)
     }
 
-    pub(crate) fn pseudo_styles_with_container_queries(
+    pub(crate) fn all_pseudo_styles(
         &self,
         tree: &DomTree,
         matcher: &mut Matcher,
         nid: NodeId,
         props: &HashMap<String, String>,
         host_style: &LayoutStyle,
-        evaluator: &mut ContainerQueryEvaluator<'_>,
-    ) -> (Option<LayoutStyle>, Option<LayoutStyle>) {
-        self.pseudo_styles_internal(tree, matcher, nid, props, host_style, Some(evaluator))
+        evaluator: Option<&mut ContainerQueryEvaluator<'_>>,
+    ) -> (
+        Option<LayoutStyle>,
+        Option<LayoutStyle>,
+        Option<LayoutStyle>,
+    ) {
+        self.pseudo_styles_internal(tree, matcher, nid, props, host_style, evaluator)
     }
 
     fn pseudo_styles_internal(
@@ -2816,8 +2873,12 @@ impl Stylesheet {
         props: &HashMap<String, String>,
         host_style: &LayoutStyle,
         mut evaluator: Option<&mut ContainerQueryEvaluator<'_>>,
-    ) -> (Option<LayoutStyle>, Option<LayoutStyle>) {
-        let mut build = |rules: &PseudoRuleMap, matcher: &mut Matcher| {
+    ) -> (
+        Option<LayoutStyle>,
+        Option<LayoutStyle>,
+        Option<LayoutStyle>,
+    ) {
+        let mut build = |rules: &PseudoRuleMap, matcher: &mut Matcher, is_placeholder: bool| {
             let mut normal_matched: Vec<(u32, usize, usize)> = Vec::new();
             let mut important_matched: Vec<(u32, usize, usize)> = Vec::new();
             if rules.candidate_slot_count != 0 {
@@ -2945,6 +3006,11 @@ impl Stylesheet {
                 ..Default::default()
             };
             style.color_scheme_dark = host_style.color_scheme_dark;
+            if is_placeholder {
+                // Chromium's light native-control placeholder color. Author
+                // declarations cascade over this UA-origin initial value.
+                style.color = Some([117, 117, 117, 255]);
+            }
             let inherited_color_scheme_dark = host_style.color_scheme_dark;
             let mut generated_content = None;
             for &(_, _, index) in &normal_matched {
@@ -3001,15 +3067,33 @@ impl Stylesheet {
                 .as_ref()
                 .map(|items| generated_content_with_zero_counters(items));
             style.generated_content = generated_content;
-            if style.generated_content.is_some() || style.content_image.is_some() {
+            if is_placeholder {
+                // `color` is inherited on the pseudo. The declaration parser
+                // represents `inherit` as None, so resolve it against the
+                // originating control after the author cascade.
+                if style.color.is_none() {
+                    style.color = host_style.color;
+                }
+                Some(style)
+            } else if style.generated_content.is_some() || style.content_image.is_some() {
                 Some(style)
             } else {
                 None
             }
         };
+        let supports_placeholder = tree
+            .get_node(nid)
+            .is_some_and(|node| {
+                node.as_element().is_some_and(|element| {
+                    matches!(element.local.as_ref(), "input" | "textarea")
+                })
+            });
         (
-            build(&self.before_rules, matcher),
-            build(&self.after_rules, matcher),
+            build(&self.before_rules, matcher, false),
+            build(&self.after_rules, matcher, false),
+            supports_placeholder
+                .then(|| build(&self.placeholder_rules, matcher, true))
+                .flatten(),
         )
     }
 

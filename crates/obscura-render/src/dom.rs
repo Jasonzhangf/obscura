@@ -2266,19 +2266,14 @@ fn cascade_walk(
         custom_properties.insert(id, this_props.clone());
         style.is_replaced_box |= style.content_image.is_some();
         style.has_replaced_sizing |= style.content_image.is_some();
-        let (mut before_pseudo, mut after_pseudo) =
-            if let Some(evaluator) = container_evaluator.as_deref_mut() {
-                sheet.pseudo_styles_with_container_queries(
-                    tree,
-                    matcher,
-                    id,
-                    &this_props,
-                    &style,
-                    evaluator,
-                )
-            } else {
-                sheet.pseudo_styles(tree, matcher, id, &this_props, &style)
-            };
+        let (mut before_pseudo, mut after_pseudo, placeholder_pseudo) = sheet.all_pseudo_styles(
+            tree,
+            matcher,
+            id,
+            &this_props,
+            &style,
+            container_evaluator.as_deref_mut(),
+        );
         for pseudo in [&mut before_pseudo, &mut after_pseudo]
             .into_iter()
             .flatten()
@@ -2296,6 +2291,7 @@ fn cascade_walk(
             .and_then(|pseudo| pseudo.before_content.clone());
         style.before_pseudo = before_pseudo.map(Box::new);
         style.after_pseudo = after_pseudo.map(Box::new);
+        style.placeholder_pseudo = placeholder_pseudo.map(Box::new);
         descendant_color_scheme_dark = style.color_scheme_dark;
         styles.insert(id, style);
     }

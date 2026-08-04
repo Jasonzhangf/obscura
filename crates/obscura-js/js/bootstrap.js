@@ -8278,6 +8278,7 @@ globalThis.atob = globalThis.atob || ((s) => {
 (() => {
   const stack = [{state: null, url: undefined}]; // initial entry; url=undefined means "use document URL"
   let idx = 0;
+  const historyToken = Symbol("History");
   const resolveOrFallback = (url) => {
     // A missing url (pushState/replaceState called with < 3 args) keeps the
     // current document URL per the HTML spec — capture it so the entry does not
@@ -8301,10 +8302,19 @@ globalThis.atob = globalThis.atob || ((s) => {
       }
     } catch {}
   };
-  globalThis.history = {
-    get length() { return stack.length; },
-    get state() { return stack[idx].state; },
-    scrollRestoration: "auto",
+  class History {
+    constructor(token) {
+      if (token !== historyToken) throw new TypeError("Illegal constructor");
+    }
+    get length() { return stack.length; }
+    get state() { return stack[idx].state; }
+    get scrollRestoration() { return this._scrollRestoration || "auto"; }
+    set scrollRestoration(value) {
+      const normalized = String(value);
+      if (normalized === "auto" || normalized === "manual") {
+        this._scrollRestoration = normalized;
+      }
+    }
     pushState(state, _title, url) {
       const prevUrl = __currentUrl();
       const resolved = resolveOrFallback(url);
@@ -8315,14 +8325,14 @@ globalThis.atob = globalThis.atob || ((s) => {
       idx = stack.length - 1;
       applyVirtual();
       fireHashChangeIfNeeded(prevUrl);
-    },
+    }
     replaceState(state, _title, url) {
       const prevUrl = __currentUrl();
       const resolved = resolveOrFallback(url);
       stack[idx] = {state: state ?? null, url: resolved};
       applyVirtual();
       fireHashChangeIfNeeded(prevUrl);
-    },
+    }
     go(n) {
       n = (n | 0);
       if (n === 0) return; // real spec: go(0) reloads. We don't reload SPAs.
@@ -8337,10 +8347,17 @@ globalThis.atob = globalThis.atob || ((s) => {
         globalThis.dispatchEvent(ev);
       } catch {}
       fireHashChangeIfNeeded(prevUrl);
-    },
-    back() { this.go(-1); },
-    forward() { this.go(1); },
-  };
+    }
+    back() { this.go(-1); }
+    forward() { this.go(1); }
+  }
+  Object.defineProperty(History.prototype, Symbol.toStringTag, {value: "History"});
+  Object.defineProperty(globalThis, "History", {
+    value: History, writable: true, configurable: true,
+  });
+  Object.defineProperty(globalThis, "history", {
+    value: new History(historyToken), writable: true, configurable: true,
+  });
 })();
 
 // Navigation API. New framework routers increasingly prefer `navigation`
@@ -12075,7 +12092,10 @@ globalThis.__obscura_init = function() {
     ? globalThis.__obscura_viewport_h : sh - 80;
   globalThis.screen = new Screen(sw, sh);
   globalThis.visualViewport = { width:vw, height:vh, offsetLeft:0, offsetTop:0, scale:1, addEventListener(){}, removeEventListener(){} };
-  globalThis.devicePixelRatio = sw >= 2560 ? 2 : 1;
+  // Screen dimensions do not determine the output device scale. The embedding
+  // browser applies an explicit device metric after page initialization; the
+  // standalone runtime has the same 1x default as Obscura's render surface.
+  globalThis.devicePixelRatio = 1;
   globalThis.innerWidth = vw; globalThis.innerHeight = vh;
   globalThis.outerWidth = sw; globalThis.outerHeight = sh - 40;
 

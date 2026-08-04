@@ -3669,27 +3669,40 @@ fn paint_laid_dom_scrolled(
             let has_value = node
                 .get_attribute("value")
                 .map(|v| !v.is_empty())
-                .unwrap_or(false);
+                .unwrap_or(false)
+                || (name.local.as_ref() == "textarea"
+                    && !tree.text_content(nid).is_empty());
             if !has_value {
                 if let Some(placeholder) = node.get_attribute("placeholder") {
                     if !placeholder.is_empty() {
                         let fsize = style.font_size.unwrap_or(16.0);
                         let text_x = rect.x + style.padding.left + style.border.left;
                         let text_y = rect.y + style.padding.top + style.border.top;
-                        draw_text(
-                            &mut pixmap,
-                            placeholder,
-                            text_x,
-                            text_y,
-                            [117, 117, 117, 255],
-                            fsize,
-                            false,
-                            style.font_family.as_deref(),
-                            style.letter_spacing.unwrap_or(0.0),
-                            clip,
-                            element_clip_mask,
-                            raster_scale,
-                        );
+                        let placeholder_style = style.placeholder_pseudo.as_deref();
+                        let mut color = placeholder_style
+                            .and_then(|pseudo| pseudo.color)
+                            .unwrap_or([117, 117, 117, 255]);
+                        let opacity = placeholder_style
+                            .and_then(|pseudo| pseudo.opacity)
+                            .unwrap_or(1.0)
+                            .clamp(0.0, 1.0);
+                        color[3] = ((color[3] as f32) * opacity).round() as u8;
+                        if color[3] != 0 {
+                            draw_text(
+                                &mut pixmap,
+                                placeholder,
+                                text_x,
+                                text_y,
+                                color,
+                                fsize,
+                                false,
+                                style.font_family.as_deref(),
+                                style.letter_spacing.unwrap_or(0.0),
+                                clip,
+                                element_clip_mask,
+                                raster_scale,
+                            );
+                        }
                     }
                 }
             }
@@ -9138,6 +9151,84 @@ mod tests {
     use super::*;
     use crate::dom::layout_dom_with_web_fonts;
     use obscura_dom::tree_sink::parse_html;
+
+    #[test]
+    fn native_placeholders_honor_default_author_color_opacity_and_value_state() {
+        let tree = parse_html(
+            r#"<html><head><style>
+                html,body { margin:0; background:white }
+                input { display:block; box-sizing:border-box; width:180px; height:30px;
+                        padding:0; border:0; font-size:20px; background:white }
+                #colored::placeholder { color:rgb(255,0,0) }
+                #hidden::placeholder { opacity:0 }
+                #inherited { color:rgb(0,0,255) }
+                #inherited::placeholder { color:inherit; opacity:.5 }
+            </style></head><body>
+                <input id="default" placeholder="default">
+                <input id="colored" placeholder="colored">
+                <input id="hidden" placeholder="hidden">
+                <input id="filled" placeholder="must not paint" value="actual">
+                <input id="inherited" placeholder="inherited">
+            </body></html>"#,
+        );
+        let mut resources = RenderResourceCache::default();
+        let mut prepared = prepare_dom(&tree, (200.0, 130.0), None, &mut resources)
+            .expect("placeholder layout");
+        let node = |selector| tree.query_selector(selector).unwrap().unwrap();
+
+        assert!(
+            prepared.layout().styles[&node("#default")]
+                .placeholder_pseudo
+                .is_none(),
+            "the native default must not require an authored pseudo rule"
+        );
+        assert_eq!(
+            prepared.layout().styles[&node("#colored")]
+                .placeholder_pseudo
+                .as_deref()
+                .and_then(|style| style.color),
+            Some([255, 0, 0, 255])
+        );
+        assert_eq!(
+            prepared.layout().styles[&node("#hidden")]
+                .placeholder_pseudo
+                .as_deref()
+                .and_then(|style| style.opacity),
+            Some(0.0)
+        );
+        let inherited = prepared.layout().styles[&node("#inherited")]
+            .placeholder_pseudo
+            .as_deref()
+            .expect("inherited placeholder style");
+        assert_eq!(inherited.color, Some([0, 0, 255, 255]));
+        assert_eq!(inherited.opacity, Some(0.5));
+
+        let pixmap = paint_prepared(&tree, &mut prepared, &mut resources, (0.0, 0.0))
+            .expect("placeholder paint");
+        let non_white = |top: u32| {
+            (top..top + 30)
+                .flat_map(|y| (0..180).map(move |x| (x, y)))
+                .filter(|&(x, y)| {
+                    let pixel = pixmap.pixel(x, y).unwrap();
+                    pixel.red() < 245 || pixel.green() < 245 || pixel.blue() < 245
+                })
+                .count()
+        };
+        assert!(non_white(0) > 10, "the native default placeholder must paint");
+        assert!(
+            (30..60).any(|y| (0..180).any(|x| {
+                let pixel = pixmap.pixel(x, y).unwrap();
+                pixel.red() > 200 && pixel.green() < 80 && pixel.blue() < 80
+            })),
+            "the authored placeholder color must reach glyph paint"
+        );
+        assert_eq!(non_white(60), 0, "opacity:0 must suppress placeholder glyphs");
+        assert_eq!(
+            non_white(90),
+            0,
+            "a non-empty control value must suppress placeholder glyphs"
+        );
+    }
 
     #[test]
     fn cache_only_mode_does_not_load_or_negative_cache_unknown_urls() {

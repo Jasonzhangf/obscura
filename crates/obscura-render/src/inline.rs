@@ -4120,6 +4120,40 @@ mod tests {
         wuff::decompress_woff2(&compressed).expect("decompress variable-font fixture")
     }
 
+    #[test]
+    fn variable_font_multi_axis_shaping_preserves_space_advance() {
+        let mut engine = TextEngine::new_with_web_fonts(&[WebFont {
+            data: variable_font_fixture(),
+            family: Some("Obscura VF Test".into()),
+            weight: Some((100, 900)),
+            italic: Some(false),
+        }]);
+        let tree = obscura_dom::parse_html("<p id='copy'>Tools and</p>");
+        let copy = tree.get_element_by_id("copy").unwrap();
+        let mut style = LayoutStyle::default();
+        style.display = Display::Block;
+        style.font_family = Some("Obscura VF Test".into());
+        style.font_weight = Some("700".into());
+        style.font_size = Some(32.0);
+        style.font_optical_sizing = Some(crate::FontOpticalSizing::Auto);
+        let item = engine
+            .try_build(&tree, copy, &HashMap::from([(copy, style)]))
+            .unwrap();
+        engine.finalize(item, (0.0, 0.0), 600.0, None);
+        let shaped_text = engine.item_text(item).to_string();
+        let space_advance = engine.items[item]
+            .buffer
+            .layout_runs()
+            .flat_map(|run| run.glyphs.iter())
+            .find(|glyph| &shaped_text[glyph.start..glyph.end] == " ")
+            .map(|glyph| glyph.w)
+            .expect("shaped space glyph");
+        assert!(
+            space_advance > 5.0,
+            "setting wght and opsz must not repeatedly remap avar coordinates and collapse the space advance: {space_advance}"
+        );
+    }
+
     fn isolated_fallback_engine() -> (TextEngine, cosmic_text::fontdb::ID, cosmic_text::fontdb::ID)
     {
         let mut engine = TextEngine::new_with_web_fonts(&[

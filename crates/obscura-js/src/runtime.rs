@@ -2707,6 +2707,35 @@ mod tests {
     }
 
     #[test]
+    fn history_exposes_the_web_platform_constructor_and_prototype() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(function(){
+                    const original = history.replaceState;
+                    History.prototype.replaceState.call(history, {ok:true}, "", "/prototype");
+                    let illegal = false;
+                    try { new History(); } catch (error) { illegal = error instanceof TypeError; }
+                    return {
+                        instance: history instanceof History,
+                        prototype: Object.getPrototypeOf(history) === History.prototype,
+                        method: original === History.prototype.replaceState,
+                        tag: Object.prototype.toString.call(history),
+                        path: location.pathname,
+                        illegal,
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(result["instance"], serde_json::json!(true));
+        assert_eq!(result["prototype"], serde_json::json!(true));
+        assert_eq!(result["method"], serde_json::json!(true));
+        assert_eq!(result["tag"], serde_json::json!("[object History]"));
+        assert_eq!(result["path"], serde_json::json!("/prototype"));
+        assert_eq!(result["illegal"], serde_json::json!(true));
+    }
+
+    #[test]
     fn style_attribute_parses_into_style_object() {
         // Inline styles present in the parsed HTML must be visible via el.style.*
         let mut rt = setup_runtime(
@@ -6636,6 +6665,54 @@ mod tests {
 
     #[cfg(feature = "render")]
     #[test]
+    fn fixed_animation_capture_is_invariant_after_geometry_flush() {
+        let make_runtime = || {
+            let mut rt = ObscuraJsRuntime::new();
+            rt.set_dom(parse_html(
+                r#"<html style="margin:0"><head><style>
+                    @keyframes dismiss {
+                        from { opacity:1; transform:translateY(0) }
+                        to { opacity:0; transform:translateY(-80px) }
+                    }
+                    body { margin:0; width:160px; height:100px; background:#f5f7fa }
+                    #content { width:120px; height:50px; margin:20px; background:#1769aa }
+                    #shell { position:fixed; inset:0; background:#111827 }
+                    #shell.dismissed { animation:dismiss 600ms linear forwards }
+                </style></head><body><div id="content"></div>
+                    <div id="shell"></div></body></html>"#,
+            ));
+            rt.set_url("http://example.test/github-like-shell");
+            rt.set_viewport(160.0, 100.0);
+            rt.run_page_init();
+            rt.evaluate("document.getElementById('shell').className='dismissed'")
+                .unwrap();
+            rt
+        };
+        let fixed = obscura_render::AnimationSample::local_override(750.0);
+        let direct_rt = make_runtime();
+        assert!(direct_rt.set_animation_sample(fixed));
+        let direct = direct_rt
+            .screenshot_prepared((160.0, 100.0), Some("http://example.test/github-like-shell"))
+            .expect("direct fixed-time capture");
+
+        let mut geometry_rt = make_runtime();
+        let rect = geometry_rt
+            .evaluate("document.getElementById('content').getBoundingClientRect().toJSON()")
+            .expect("geometry flush before capture");
+        assert_eq!(rect["width"].as_f64(), Some(120.0));
+        assert!(geometry_rt.set_animation_sample(fixed));
+        let after_geometry = geometry_rt
+            .screenshot_prepared((160.0, 100.0), Some("http://example.test/github-like-shell"))
+            .expect("fixed-time capture after geometry");
+
+        assert_eq!(
+            direct, after_geometry,
+            "a CSSOM geometry flush must not change fixed-time capture output"
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
     fn cssom_animation_sample_is_frozen_within_one_javascript_task() {
         let mut rt = animation_epoch_runtime();
         rt.evaluate("var box=document.createElement('div');box.id='box';box.className='anim';document.body.appendChild(box)")
@@ -7056,6 +7133,29 @@ mod tests {
             &serde_json::json!([0, 0]).as_array().unwrap()[..]
         );
         assert_eq!(values[2], values[3]);
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn fingerprinted_screen_does_not_invent_a_device_scale_factor() {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.set_viewport(300.0, 200.0);
+        // Force the fingerprint seed whose screen-pool entry is 2560x1440.
+        // That physical screen must not silently turn a 1x render surface into
+        // a 2x devicePixelContentBoxSize surface.
+        rt.execute_script(
+            "deterministic-high-resolution-screen",
+            "Date.now = () => 0; Math.random = () => 2 / 0xFFFFFFFF;",
+        )
+        .unwrap();
+        rt.run_page_init();
+
+        assert_eq!(
+            rt.evaluate("[screen.width, screen.height, devicePixelRatio]")
+                .unwrap(),
+            serde_json::json!([2560, 1440, 1])
+        );
     }
 
     #[cfg(feature = "render")]
