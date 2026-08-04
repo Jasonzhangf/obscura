@@ -1570,4 +1570,74 @@ mod tests {
         assert_eq!(after_ack["params"]["sessionId"], stream_id);
         assert!(!ctx.screencasts[&session_id].autonomous_frame_pending);
     }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn autonomous_screencast_observes_raf_visual_mutations() {
+        let mut ctx = crate::dispatch::CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = format!("{page_id}-session");
+        ctx.sessions.insert(session_id.clone(), page_id);
+        let session = Some(session_id.clone());
+        ctx.get_session_page_mut(&session)
+            .expect("page")
+            .set_viewport((96.0, 64.0));
+        crate::domains::page::handle(
+            "navigate",
+            &json!({
+                "url": "data:text/html,<html style='margin:0'><body style='margin:0;width:96px;height:64px;background:red'></body></html>",
+                "waitUntil": "load",
+            }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("navigate visual-damage fixture");
+        ctx.pending_events.clear();
+        crate::domains::page::handle(
+            "startScreencast",
+            &json!({}),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("start screencast");
+        let initial = ctx
+            .pending_events
+            .iter()
+            .find(|event| event.method == "Page.screencastFrame")
+            .expect("initial frame");
+        let stream_id = initial.params["sessionId"].as_i64().unwrap();
+        let initial_data = initial.params["data"].as_str().unwrap().to_string();
+        ctx.pending_events.clear();
+        crate::domains::page::handle(
+            "screencastFrameAck",
+            &json!({"sessionId": stream_id}),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("ack initial frame");
+
+        // Bypass CDP dispatch after scheduling the callback. The only path
+        // which can deliver and capture this update is the active stream's
+        // periodic event-loop/render pump.
+        ctx.get_session_page_mut(&session)
+            .expect("page")
+            .evaluate(
+                "requestAnimationFrame(() => document.body.setAttribute('style','margin:0;width:96px;height:64px;background:lime'))",
+            );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        pump_and_forward_screencast_frames(&mut ctx, None).await;
+        let raf_frame = ctx
+            .pending_events
+            .iter()
+            .find(|event| event.method == "Page.screencastFrame")
+            .expect("RAF visual mutation must autonomously emit a frame");
+        assert_ne!(
+            raf_frame.params["data"].as_str().unwrap(),
+            initial_data,
+            "RAF-driven paint must capture the updated visible state"
+        );
+    }
 }
