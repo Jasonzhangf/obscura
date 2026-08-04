@@ -1844,8 +1844,12 @@ pub fn supports_declaration(name: &str, value: &str) -> bool {
     if value.is_empty() || has_invalid_supports_value_syntax(value) {
         return false;
     }
+    let variable_syntax = supports_variable_substitution_syntax(value);
+    if variable_syntax == VariableSubstitutionSyntax::Invalid {
+        return false;
+    }
     if name.starts_with("--") {
-        return name.len() > 2;
+        return valid_custom_property_name(&name);
     }
     let css_wide = matches!(
         value.to_ascii_lowercase().as_str(),
@@ -2071,6 +2075,23 @@ pub fn supports_declaration(name: &str, value: &str) -> bool {
     if !known {
         return false;
     }
+    // A syntactically valid var() makes the declaration valid at parse time;
+    // its substituted value is checked later at computed-value time. Keep the
+    // deliberately unadvertised effect stubs false: accepting a variable for
+    // those properties would activate framework branches that we cannot paint.
+    if variable_syntax == VariableSubstitutionSyntax::Valid
+        && !matches!(
+            name.as_str(),
+            "filter"
+                | "backdrop-filter"
+                | "-webkit-backdrop-filter"
+                | "perspective"
+                | "contain"
+                | "content-visibility"
+        )
+    {
+        return true;
+    }
     if css_wide {
         return true;
     }
@@ -2294,6 +2315,239 @@ fn has_invalid_supports_value_syntax(value: &str) -> bool {
         index += 1;
     }
     depth != 0 || quote.is_some()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VariableSubstitutionSyntax {
+    None,
+    Valid,
+    Invalid,
+}
+
+/// Validate var() at CSS token-stream time, before property-specific parsing.
+/// Values containing a variable are deliberately not parsed against the
+/// property's grammar until substitution. This is why `grid:var(--tw)` is a
+/// true feature query in browsers even though `var(--tw)` is not a grid value
+/// by itself.
+fn supports_variable_substitution_syntax(value: &str) -> VariableSubstitutionSyntax {
+    fn scan(value: &str, found: &mut bool) -> bool {
+        let bytes = value.as_bytes();
+        let mut index = 0usize;
+        while index < bytes.len() {
+            if matches!(bytes[index], b'\'' | b'"') {
+                let quote = bytes[index];
+                index += 1;
+                while index < bytes.len() {
+                    if bytes[index] == b'\\' {
+                        index += 2;
+                    } else if bytes[index] == quote {
+                        index += 1;
+                        break;
+                    } else {
+                        index += 1;
+                    }
+                }
+                continue;
+            }
+            if bytes[index] == b'\\' {
+                index += 2;
+                continue;
+            }
+            if bytes[index] != b'(' {
+                index += 1;
+                continue;
+            }
+
+            let open = index;
+            let mut ident_start = open;
+            while ident_start > 0
+                && matches!(bytes[ident_start - 1], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_')
+            {
+                ident_start -= 1;
+            }
+            let Some(close) = matching_parenthesis(value, open) else {
+                return false;
+            };
+            let arguments = &value[open + 1..close];
+            if value[ident_start..open].eq_ignore_ascii_case("var") {
+                let Some((name, fallback)) = split_variable_arguments(arguments) else {
+                    return false;
+                };
+                if !valid_custom_property_name(name.trim()) {
+                    return false;
+                }
+                if let Some(fallback) = fallback {
+                    if has_top_level_variable_forbidden_token(fallback) != Some(false)
+                        || !scan(fallback, found)
+                    {
+                        return false;
+                    }
+                }
+                *found = true;
+            } else if !scan(arguments, found) {
+                return false;
+            }
+            index = close + 1;
+        }
+        true
+    }
+
+    let mut found = false;
+    if !scan(value, &mut found) {
+        VariableSubstitutionSyntax::Invalid
+    } else if found {
+        VariableSubstitutionSyntax::Valid
+    } else {
+        VariableSubstitutionSyntax::None
+    }
+}
+
+fn matching_parenthesis(value: &str, open: usize) -> Option<usize> {
+    let bytes = value.as_bytes();
+    let mut depth = 1usize;
+    let mut quote = None;
+    let mut index = open + 1;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if let Some(active) = quote {
+            if byte == b'\\' {
+                index += 2;
+                continue;
+            }
+            if byte == active {
+                quote = None;
+            }
+        } else {
+            match byte {
+                b'\'' | b'"' => quote = Some(byte),
+                b'\\' => {
+                    index += 2;
+                    continue;
+                }
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(index);
+                    }
+                }
+                _ => {}
+            }
+        }
+        index += 1;
+    }
+    None
+}
+
+fn split_variable_arguments(arguments: &str) -> Option<(&str, Option<&str>)> {
+    let bytes = arguments.as_bytes();
+    let mut stack = Vec::new();
+    let mut quote = None;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if let Some(active) = quote {
+            if byte == b'\\' {
+                index += 2;
+                continue;
+            }
+            if byte == active {
+                quote = None;
+            }
+        } else {
+            match byte {
+                b'\'' | b'"' => quote = Some(byte),
+                b'\\' => {
+                    index += 2;
+                    continue;
+                }
+                b'(' | b'[' | b'{' => stack.push(byte),
+                close @ (b')' | b']' | b'}') => {
+                    let expected = match close {
+                        b')' => b'(',
+                        b']' => b'[',
+                        _ => b'{',
+                    };
+                    if stack.pop() != Some(expected) {
+                        return None;
+                    }
+                }
+                b',' if stack.is_empty() => {
+                    return Some((&arguments[..index], Some(&arguments[index + 1..])));
+                }
+                _ => {}
+            }
+        }
+        index += 1;
+    }
+    stack
+        .is_empty()
+        .then_some((arguments, None))
+}
+
+fn has_top_level_variable_forbidden_token(value: &str) -> Option<bool> {
+    let bytes = value.as_bytes();
+    let mut stack = Vec::new();
+    let mut quote = None;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if let Some(active) = quote {
+            if byte == b'\\' {
+                index += 2;
+                continue;
+            }
+            if byte == active {
+                quote = None;
+            }
+        } else {
+            match byte {
+                b'\'' | b'"' => quote = Some(byte),
+                b'\\' => {
+                    index += 2;
+                    continue;
+                }
+                b'(' | b'[' | b'{' => stack.push(byte),
+                close @ (b')' | b']' | b'}') => {
+                    let expected = match close {
+                        b')' => b'(',
+                        b']' => b'[',
+                        _ => b'{',
+                    };
+                    if stack.pop() != Some(expected) {
+                        return None;
+                    }
+                }
+                b'!' | b';' if stack.is_empty() => return Some(true),
+                _ => {}
+            }
+        }
+        index += 1;
+    }
+    stack.is_empty().then_some(false)
+}
+
+fn valid_custom_property_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("--") else {
+        return false;
+    };
+    if rest.is_empty() {
+        return false;
+    }
+    let mut escaped = false;
+    for character in rest.chars() {
+        if escaped {
+            if matches!(character, '\n' | '\r' | '\u{c}') {
+                return false;
+            }
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else if !(character.is_alphanumeric() || character == '-' || character == '_' || !character.is_ascii()) {
+            return false;
+        }
+    }
+    !escaped
 }
 
 fn supports_content_value(value: &str) -> bool {
@@ -7823,6 +8077,49 @@ mod tests {
     }
 
     #[test]
+    fn supports_variable_values_at_parse_time_for_implemented_properties() {
+        for (property, value) in [
+            ("grid", "var(--tw)"),
+            ("color", "var(--brand-color)"),
+            ("width", "calc(100% - var(--gutter))"),
+            ("transform", "var(--transform, garbage(1px))"),
+            ("transform", "translateX(var(--offset, garbage(1px)))"),
+        ] {
+            assert!(supports_declaration(property, value), "{property}:{value}");
+        }
+        for property in [
+            "filter",
+            "backdrop-filter",
+            "-webkit-backdrop-filter",
+            "perspective",
+            "contain",
+            "content-visibility",
+        ] {
+            assert!(
+                !supports_declaration(property, "var(--effect)"),
+                "{property} must not advertise an unimplemented effect"
+            );
+        }
+    }
+
+    #[test]
+    fn supports_variable_values_reject_malformed_variable_syntax() {
+        for value in [
+            "var(color)",
+            "var(--)",
+            "var(--x,!)",
+            "var(--x,foo;bar)",
+            "var(--x,})",
+            "calc(1px + var(x))",
+        ] {
+            assert!(!supports_declaration("grid", value), "{value}");
+        }
+        assert!(supports_declaration("--theme", "var(--base, red)"));
+        assert!(!supports_declaration("--theme", "var(base)"));
+        assert!(!supports_declaration("--", "red"));
+    }
+
+    #[test]
     fn transform_support_rejects_invalid_z_types_nonfinite_numbers_and_fake_math() {
         for value in [
             "translateZ(10px)",
@@ -7847,7 +8144,6 @@ mod tests {
             "translateX(garbage(10px))",
             "translateX(calc(garbage))",
             "translateX(var(x))",
-            "translateX(var(--x, garbage(1px)))",
         ] {
             assert!(!supports_declaration("transform", value), "{value}");
         }

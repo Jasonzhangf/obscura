@@ -298,6 +298,9 @@
     {"name": "text alignment does not shrink a flex item", "color": "#087f5b", "x": 20, "y": 20, "width": 360, "height": 80},
     {"name": "inherited text alignment centers inline content", "color": "#c2255c", "x": 150, "y": 100, "width": 100, "height": 20}
   ],
+  "supports-var-feature-query": [
+    {"name": "variable feature query enables implemented grid support", "color": "#2f9e44", "x": 0, "y": 0, "width": 240, "height": 40}
+  ],
   "transform-containing-block": [
     {"name": "absolute captured by transform", "color": "#087f5b", "x": 205, "y": 160, "width": 70, "height": 55},
     {"name": "fixed captured by transform", "color": "#1971c2", "x": 335, "y": 235, "width": 80, "height": 50},
