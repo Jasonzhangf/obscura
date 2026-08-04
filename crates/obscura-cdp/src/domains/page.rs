@@ -512,8 +512,8 @@ fn encode_screencast_frame(
         scale = scale.min(f64::from(max_height) / f64::from(source.height()));
     }
     let size = (
-        (f64::from(source.width()) * scale).floor().max(1.0) as u32,
-        (f64::from(source.height()) * scale).floor().max(1.0) as u32,
+        (f64::from(source.width()) * scale).round().max(1.0) as u32,
+        (f64::from(source.height()) * scale).round().max(1.0) as u32,
     );
     let raster = if size == source.dimensions() {
         source
@@ -1974,6 +1974,27 @@ mod tests {
                 > 0.0
         );
         assert_eq!(frame.params["sessionId"], 1);
+
+        // Chromium's PageHandler::DetermineSnapshotSize scales the surface
+        // through gfx::ToRoundedSize. Preserve the fractional 40.8px height
+        // instead of truncating it to 40px.
+        ctx.pending_events.clear();
+        handle(
+            "startScreencast",
+            &json!({"format": "png", "maxWidth": 51}),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("start fractionally scaled screencast");
+        let rounded_frame = ctx
+            .pending_events
+            .iter()
+            .find(|event| event.method == "Page.screencastFrame")
+            .expect("fractionally scaled initial frame");
+        let (format, raster) = decode_capture(&rounded_frame.params);
+        assert_eq!(format, image::ImageFormat::Png);
+        assert_eq!(raster.dimensions(), (51, 41));
     }
 
     #[cfg(feature = "render")]
