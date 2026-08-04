@@ -6,6 +6,10 @@ use crate::dispatch::CdpContext;
 
 #[cfg(feature = "render")]
 const MAX_BASE64_PDF_BYTES: usize = 64 * 1024 * 1024;
+#[cfg(feature = "render")]
+const MAX_PAGE_RANGES_BYTES: usize = 16 * 1024;
+#[cfg(feature = "render")]
+const MAX_PAGE_RANGE_PARTS: usize = 512;
 
 #[cfg(feature = "render")]
 fn base64_encoded_len(raw_len: usize) -> Option<usize> {
@@ -20,7 +24,7 @@ enum PdfTransferMode {
 }
 
 #[cfg(feature = "render")]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct ParsedPdfOptions {
     raster: obscura_browser::RasterPdfOptions,
     transfer_mode: PdfTransferMode,
@@ -50,6 +54,92 @@ fn boolean(params: &Value, name: &str, default: bool) -> Result<bool, String> {
 }
 
 #[cfg(feature = "render")]
+fn parse_page_ranges(value: &str) -> Result<Vec<obscura_browser::RasterPdfPageRange>, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(Vec::new());
+    }
+    if value.len() > MAX_PAGE_RANGES_BYTES {
+        return Err(format!(
+            "Invalid parameters: pageRanges exceeds the {MAX_PAGE_RANGES_BYTES}-byte limit"
+        ));
+    }
+
+    let mut ranges = Vec::new();
+    for (index, part) in value.split(',').enumerate() {
+        if index >= MAX_PAGE_RANGE_PARTS {
+            return Err(format!(
+                "Invalid parameters: pageRanges exceeds the {MAX_PAGE_RANGE_PARTS}-range limit"
+            ));
+        }
+        let part = part.trim();
+        if part.is_empty() {
+            return Err("Invalid parameters: pageRanges contains an empty range".to_string());
+        }
+        let page = |text: &str| -> Result<Option<usize>, String> {
+            let text = text.trim();
+            if text.is_empty() {
+                return Ok(None);
+            }
+            text.parse::<usize>()
+                .ok()
+                .filter(|page| *page > 0)
+                .map(Some)
+                .ok_or_else(|| {
+                    format!("Invalid parameters: pageRanges has invalid page {text:?}")
+                })
+        };
+        let (start, end) = match part.split_once('-') {
+            Some((start, end)) if !end.contains('-') => (page(start)?, page(end)?),
+            Some(_) => {
+                return Err(format!(
+                    "Invalid parameters: pageRanges has invalid range {part:?}"
+                ))
+            }
+            None => {
+                let page = page(part)?.ok_or_else(|| {
+                    "Invalid parameters: pageRanges contains an empty page".to_string()
+                })?;
+                (Some(page), Some(page))
+            }
+        };
+        if start.is_none() && end.is_none() {
+            return Err("Invalid parameters: pageRanges range '-' is empty".to_string());
+        }
+        if matches!((start, end), (Some(start), Some(end)) if start > end) {
+            return Err(format!(
+                "Invalid parameters: pageRanges range {part:?} is descending"
+            ));
+        }
+        ranges.push(obscura_browser::RasterPdfPageRange { start, end });
+    }
+
+    // Normalize before crossing the CDP/browser boundary. This bounds later
+    // selection work and makes repeated or overlapping user ranges occupy one
+    // entry while preserving Chromium's document-order, print-once semantics.
+    ranges.sort_by_key(|range| (range.start.unwrap_or(1), range.end.unwrap_or(usize::MAX)));
+    let mut normalized: Vec<obscura_browser::RasterPdfPageRange> = Vec::new();
+    for range in ranges {
+        let start = range.start.unwrap_or(1);
+        if let Some(previous) = normalized.last_mut() {
+            let previous_end = previous.end.unwrap_or(usize::MAX);
+            if start <= previous_end.saturating_add(1) {
+                previous.end = match (previous.end, range.end) {
+                    (None, _) | (_, None) => None,
+                    (Some(previous), Some(next)) => Some(previous.max(next)),
+                };
+                continue;
+            }
+        }
+        normalized.push(obscura_browser::RasterPdfPageRange {
+            start: Some(start),
+            end: range.end,
+        });
+    }
+    Ok(normalized)
+}
+
+#[cfg(feature = "render")]
 fn parse_options(params: &Value) -> Result<ParsedPdfOptions, String> {
     if !params.is_object() {
         return Err("Invalid parameters: expected an object".to_string());
@@ -72,20 +162,18 @@ fn parse_options(params: &Value) -> Result<ParsedPdfOptions, String> {
     // unusable. Accept and truthfully report `taggedPdf:false` in the response.
     let requested_tagged_pdf = boolean(params, "generateTaggedPDF", false)?;
     let scale = number(params, "scale", 1.0)?;
-    if (scale - 1.0).abs() > f32::EPSILON {
-        return Err(
-            "Page.printToPDF scale is not supported by the raster paginator; only scale=1 is accepted"
-                .to_string(),
-        );
+    if !(0.1..=2.0).contains(&scale) {
+        return Err("Invalid parameters: scale must be between 0.1 and 2".to_string());
     }
-    if let Some(value) = params.get("pageRanges") {
-        let ranges = value
-            .as_str()
-            .ok_or("Invalid parameters: pageRanges must be a string")?;
-        if !ranges.trim().is_empty() {
-            return Err("Page.printToPDF pageRanges are not yet supported".to_string());
+    let page_ranges = match params.get("pageRanges") {
+        Some(value) => {
+            let ranges = value
+                .as_str()
+                .ok_or("Invalid parameters: pageRanges must be a string")?;
+            parse_page_ranges(ranges)?
         }
-    }
+        None => Vec::new(),
+    };
     for name in ["headerTemplate", "footerTemplate"] {
         if let Some(value) = params.get(name) {
             let template = value
@@ -111,6 +199,8 @@ fn parse_options(params: &Value) -> Result<ParsedPdfOptions, String> {
         raster: obscura_browser::RasterPdfOptions {
             landscape: boolean(params, "landscape", defaults.landscape)?,
             print_background: requested_print_background,
+            scale,
+            page_ranges,
             paper_width_in: number(params, "paperWidth", defaults.paper_width_in)?,
             paper_height_in: number(params, "paperHeight", defaults.paper_height_in)?,
             margin_top_in: number(params, "marginTop", defaults.margin_top_in)?,
@@ -148,6 +238,8 @@ pub async fn print_to_pdf(
             "obscuraCapabilities": {
                 "cssPagedMedia": false,
                 "honorsPrintBackground": true,
+                "honorsScale": true,
+                "pageRanges": true,
                 "printColorAdjustExact": false,
                 "taggedPdf": false,
             },
@@ -212,17 +304,78 @@ mod tests {
         assert!(!standard.requested_print_background);
         assert!(!standard.raster.print_background);
         assert!(standard.requested_tagged_pdf);
+        assert_eq!(standard.raster.scale, 1.0);
+        assert!(standard.raster.page_ranges.is_empty());
 
         for params in [
             json!({"displayHeaderFooter": true}),
             json!({"preferCSSPageSize": true}),
-            json!({"scale": 0.5}),
-            json!({"pageRanges": "2-3"}),
             json!({"headerTemplate": "<span>title</span>"}),
             json!({"generateDocumentOutline": true}),
         ] {
             assert!(parse_options(&params).is_err(), "must reject {params}");
         }
+
+        let ranged = parse_options(&json!({
+            "scale": 0.5,
+            "pageRanges": "1, 3-5, 8-",
+        }))
+        .expect("CDP scale and page ranges");
+        assert_eq!(ranged.raster.scale, 0.5);
+        assert_eq!(
+            ranged.raster.page_ranges,
+            vec![
+                obscura_browser::RasterPdfPageRange {
+                    start: Some(1),
+                    end: Some(1),
+                },
+                obscura_browser::RasterPdfPageRange {
+                    start: Some(3),
+                    end: Some(5),
+                },
+                obscura_browser::RasterPdfPageRange {
+                    start: Some(8),
+                    end: None,
+                },
+            ]
+        );
+        assert_eq!(
+            parse_page_ranges("5-8, 1-3, 3-6, 10, 9, 12-").unwrap(),
+            vec![
+                obscura_browser::RasterPdfPageRange {
+                    start: Some(1),
+                    end: Some(10),
+                },
+                obscura_browser::RasterPdfPageRange {
+                    start: Some(12),
+                    end: None,
+                },
+            ],
+            "overlapping, adjacent, and repeated ranges must normalize before pagination"
+        );
+        for params in [
+            json!({"scale": 0.09}),
+            json!({"scale": 2.01}),
+            json!({"pageRanges": "0"}),
+            json!({"pageRanges": "3-2"}),
+            json!({"pageRanges": "1,,2"}),
+            json!({"pageRanges": "1-2-3"}),
+        ] {
+            assert!(parse_options(&params).is_err(), "must reject {params}");
+        }
+
+        let too_many_parts = std::iter::repeat_n("1", MAX_PAGE_RANGE_PARTS + 1)
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(
+            parse_page_ranges(&too_many_parts).is_err(),
+            "range-token work must remain bounded before output allocation"
+        );
+        let too_many_bytes = "1".repeat(MAX_PAGE_RANGES_BYTES + 1);
+        assert!(
+            parse_page_ranges(&too_many_bytes).is_err(),
+            "range input bytes must be bounded before numeric parsing"
+        );
     }
 
     #[test]
@@ -317,6 +470,8 @@ mod tests {
             streamed["obscuraCapabilities"]["honorsPrintBackground"],
             true
         );
+        assert_eq!(streamed["obscuraCapabilities"]["honorsScale"], true);
+        assert_eq!(streamed["obscuraCapabilities"]["pageRanges"], true);
         assert_eq!(streamed["obscuraTaggedPDF"], false);
         assert_eq!(streamed["obscuraRequestedTaggedPDF"], true);
         assert_eq!(
@@ -353,5 +508,25 @@ mod tests {
                 .is_err(),
             "closed PDF handles must release their buffer"
         );
+
+        let ranged = print_to_pdf(
+            &json!({
+                "paperWidth": 4.0, "paperHeight": 6.0,
+                "marginTop": 0.5, "marginBottom": 0.5,
+                "marginLeft": 0.5, "marginRight": 0.5,
+                "scale": 1,
+                "pageRanges": "2",
+            }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("single selected page");
+        let ranged_bytes = base64::engine::general_purpose::STANDARD
+            .decode(ranged["data"].as_str().unwrap())
+            .unwrap();
+        let ranged_text = String::from_utf8_lossy(&ranged_bytes);
+        assert!(ranged_text.contains("/Count 1"));
+        assert_eq!(ranged_text.matches("/Subtype /Image").count(), 1);
     }
 }

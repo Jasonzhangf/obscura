@@ -12,7 +12,7 @@ pub use obscura_js::HTML_TO_MARKDOWN_JS;
 pub use obscura_js::{validate_capture_region, CaptureError, CaptureRegion};
 pub use page::{NetworkEvent, Page, PageError};
 #[cfg(feature = "render")]
-pub use pdf::{RasterPdfError, RasterPdfOptions};
+pub use pdf::{RasterPdfError, RasterPdfOptions, RasterPdfPageRange};
 // Re-exported so the embeddable `obscura` crate (which depends on obscura-browser,
 // not obscura-js) can surface the interception channel types.
 pub use obscura_js::ops::{InterceptResolution, InterceptedRequest};

@@ -2596,20 +2596,337 @@ fn add_relational_tree_invalidation(
     true
 }
 
-/// A child-list change can alter every structural/sibling match under each
-/// affected parent. Re-cascade that complete parent subtree, the parent's
-/// following siblings (for `:empty +/~ ...`), and the ancestor context chain.
-/// This deliberately does not depend on whether the current sheet happens to
-/// contain nth/sibling selectors: the broad local scope remains correct when
-/// multiple queued mutations introduce selector keys before the next flush.
-fn add_tree_parent_scope(
+fn add_style_context_chain(tree: &DomTree, node: NodeId, dirty: &mut HashSet<NodeId>) {
+    dirty.insert(node);
+    dirty.extend(tree.ancestors(node));
+}
+
+fn add_table_row_child_scope(tree: &DomTree, parent: NodeId, dirty: &mut HashSet<NodeId>) {
+    let is_table_row = tree.get_node(parent).is_some_and(|node| {
+        node.as_element()
+            .is_some_and(|element| element.local.as_ref() == "tr")
+    });
+    if !is_table_row {
+        return;
+    }
+    // The table fallback assigns surplus growth to the trailing auto cell
+    // after cascade. A child-list change can move that role even without an
+    // authored structural selector, so reset every surviving cell from its
+    // specified style before running the fixup again.
+    for child in element_children(tree, parent) {
+        add_style_subtree(tree, child, dirty);
+    }
+}
+
+fn element_children(tree: &DomTree, parent: NodeId) -> Vec<NodeId> {
+    tree.children(parent)
+        .into_iter()
+        .filter(|child| tree.get_node(*child).is_some_and(|node| node.is_element()))
+        .collect()
+}
+
+fn element_local_name(tree: &DomTree, node: NodeId) -> Option<String> {
+    tree.get_node(node)
+        .and_then(|node| node.as_element().map(|element| element.local.to_string()))
+}
+
+/// Re-cascade a node whose structural pseudo state may have changed. Even a
+/// self-only selector can change an inherited property, so the node's complete
+/// subtree is the smallest renderer-independent safe unit. A structural state
+/// used left of a sibling combinator additionally reaches following siblings.
+fn add_structural_candidate_scope(
     tree: &DomTree,
+    map: &crate::css::InvalidationMap,
+    state: &str,
+    candidate: NodeId,
     parent: NodeId,
-    dirty_following_siblings: bool,
     dirty: &mut HashSet<NodeId>,
 ) {
+    let invalidations = map
+        .structural_invalidations(state)
+        .into_iter()
+        .filter(|invalidation| {
+            !invalidation.inside_relational
+                && invalidation.subject_may_match(tree, candidate)
+        })
+        .collect::<Vec<_>>();
+    if invalidations.is_empty() {
+        return;
+    }
+    if invalidations.iter().any(|invalidation| {
+        invalidation
+            .reaches
+            .contains(crate::css::InvalidationReaches::CONSERVATIVE)
+    }) {
+        add_style_subtree(tree, parent, dirty);
+        return;
+    }
+    add_style_subtree(tree, candidate, dirty);
+    if invalidations.iter().any(|invalidation| {
+        invalidation
+            .reaches
+            .contains(crate::css::InvalidationReaches::SIBLINGS)
+    }) {
+        add_following_sibling_subtrees(tree, candidate, dirty);
+    }
+}
+
+fn add_inserted_structural_scopes(
+    tree: &DomTree,
+    map: &crate::css::InvalidationMap,
+    node: NodeId,
+    parent: NodeId,
+    mutations: &[RetainedStyleMutation],
+    dirty: &mut HashSet<NodeId>,
+) {
+    let siblings = element_children(tree, parent);
+    let Some(position) = siblings.iter().position(|candidate| *candidate == node) else {
+        return;
+    };
+    let mut add = |state: &str, candidates: &[NodeId]| {
+        for candidate in candidates.iter().copied() {
+            add_structural_candidate_scope(tree, map, state, candidate, parent, dirty);
+        }
+    };
+
+    let insertion_count = mutations
+        .iter()
+        .filter(|mutation| {
+            matches!(
+                mutation,
+                RetainedStyleMutation::Tree(TreeStyleMutation::Insert {
+                    node,
+                    new_parent,
+                    ..
+                }) if *new_parent == parent
+                    && tree.get_node(*node).is_some_and(|node| node.is_element())
+            )
+        })
+        .count();
+    if insertion_count > 1 {
+        // Mutation records do not retain the old sibling boundaries. With two
+        // fresh insertions, the old first/last/only child can sit beyond the
+        // final two boundary nodes and would otherwise keep a stale match.
+        // Direct children are still a bounded scope, and keyed structural
+        // metadata avoids cascading unrelated candidates.
+        for state in [
+            "first-child",
+            "last-child",
+            "only-child",
+            "first-of-type",
+            "last-of-type",
+            "only-of-type",
+        ] {
+            add(state, &siblings);
+        }
+    }
+
+    if position == 0 {
+        add("first-child", &siblings[..siblings.len().min(2)]);
+    }
+    if position + 1 == siblings.len() {
+        add(
+            "last-child",
+            &siblings[position.saturating_sub(1)..],
+        );
+    }
+    if siblings.len() <= 2 {
+        add("only-child", &siblings);
+    }
+    add("nth-child", &siblings[position..]);
+    add("nth-last-child", &siblings[..=position]);
+
+    let Some(local) = element_local_name(tree, node) else {
+        return;
+    };
+    let same_type = siblings
+        .iter()
+        .copied()
+        .filter(|candidate| element_local_name(tree, *candidate).as_deref() == Some(&local))
+        .collect::<Vec<_>>();
+    let Some(type_position) = same_type.iter().position(|candidate| *candidate == node) else {
+        return;
+    };
+    if type_position == 0 {
+        add("first-of-type", &same_type[..same_type.len().min(2)]);
+    }
+    if type_position + 1 == same_type.len() {
+        add(
+            "last-of-type",
+            &same_type[type_position.saturating_sub(1)..],
+        );
+    }
+    if same_type.len() <= 2 {
+        add("only-of-type", &same_type);
+    }
+    add("nth-of-type", &same_type[type_position..]);
+    add("nth-last-of-type", &same_type[..=type_position]);
+}
+
+fn add_removed_structural_scopes(
+    tree: &DomTree,
+    map: &crate::css::InvalidationMap,
+    removed: NodeId,
+    parent: NodeId,
+    dirty: &mut HashSet<NodeId>,
+) {
+    let siblings = element_children(tree, parent);
+    if let Some(first) = siblings.first().copied() {
+        add_structural_candidate_scope(tree, map, "first-child", first, parent, dirty);
+    }
+    if let Some(last) = siblings.last().copied() {
+        add_structural_candidate_scope(tree, map, "last-child", last, parent, dirty);
+    }
+    if siblings.len() <= 1 {
+        for candidate in siblings.iter().copied() {
+            add_structural_candidate_scope(tree, map, "only-child", candidate, parent, dirty);
+        }
+    }
+    for state in ["nth-child", "nth-last-child"] {
+        for candidate in siblings.iter().copied() {
+            add_structural_candidate_scope(tree, map, state, candidate, parent, dirty);
+        }
+    }
+
+    let Some(local) = element_local_name(tree, removed) else {
+        return;
+    };
+    let same_type = siblings
+        .iter()
+        .copied()
+        .filter(|candidate| element_local_name(tree, *candidate).as_deref() == Some(&local))
+        .collect::<Vec<_>>();
+    if let Some(first) = same_type.first().copied() {
+        add_structural_candidate_scope(tree, map, "first-of-type", first, parent, dirty);
+    }
+    if let Some(last) = same_type.last().copied() {
+        add_structural_candidate_scope(tree, map, "last-of-type", last, parent, dirty);
+    }
+    if same_type.len() <= 1 {
+        for candidate in same_type.iter().copied() {
+            add_structural_candidate_scope(tree, map, "only-of-type", candidate, parent, dirty);
+        }
+    }
+    for state in ["nth-of-type", "nth-last-of-type"] {
+        for candidate in same_type.iter().copied() {
+            add_structural_candidate_scope(tree, map, state, candidate, parent, dirty);
+        }
+    }
+}
+
+fn add_inserted_sibling_scopes(
+    tree: &DomTree,
+    map: &crate::css::InvalidationMap,
+    node: NodeId,
+    parent: NodeId,
+    dirty: &mut HashSet<NodeId>,
+) {
+    let siblings = element_children(tree, parent);
+    let Some(position) = siblings.iter().position(|candidate| *candidate == node) else {
+        return;
+    };
+    let may_start_sibling_selector = map.node_may_start_sibling_selector(tree, node);
+    if map.has_adjacent_sibling_selectors() {
+        if position != 0 || may_start_sibling_selector {
+            if let Some(next) = siblings.get(position + 1).copied() {
+                add_style_subtree(tree, next, dirty);
+            }
+        }
+    }
+    if map.has_general_sibling_selectors() && may_start_sibling_selector {
+        for following in siblings.iter().skip(position + 1).copied() {
+            add_style_subtree(tree, following, dirty);
+        }
+    }
+}
+
+fn add_removed_sibling_scopes(
+    tree: &DomTree,
+    map: &crate::css::InvalidationMap,
+    parent: NodeId,
+    dirty: &mut HashSet<NodeId>,
+) {
+    if !map.has_adjacent_sibling_selectors() && !map.has_general_sibling_selectors() {
+        return;
+    }
+    // Removal records intentionally do not retain old sibling pointers. All
+    // direct element siblings are the bounded sound recovery set; their clean
+    // descendant subtrees remain reusable when no sibling selector reaches
+    // through them.
+    for sibling in element_children(tree, parent) {
+        add_style_subtree(tree, sibling, dirty);
+    }
+}
+
+fn empty_state_may_have_changed(
+    tree: &DomTree,
+    parent: NodeId,
+    mutations: &[RetainedStyleMutation],
+) -> bool {
+    let relevant_children = tree
+        .children(parent)
+        .into_iter()
+        .filter(|child| {
+            tree.get_node(*child).is_some_and(|node| match &node.data {
+                obscura_dom::tree::NodeData::Element { .. } => true,
+                obscura_dom::tree::NodeData::Text { contents } => !contents.is_empty(),
+                _ => false,
+            })
+        })
+        .count();
+    let boundary_mutations = mutations
+        .iter()
+        .filter(|mutation| match mutation {
+            RetainedStyleMutation::Attribute(_) => false,
+            RetainedStyleMutation::Tree(TreeStyleMutation::Insert {
+                old_parent,
+                new_parent,
+                ..
+            }) => *new_parent == parent || *old_parent == Some(parent),
+            RetainedStyleMutation::Tree(TreeStyleMutation::Remove { old_parent, .. }) => {
+                *old_parent == parent
+            }
+            RetainedStyleMutation::Tree(TreeStyleMutation::Text {
+                parent: text_parent,
+                ..
+            }) => *text_parent == Some(parent),
+        })
+        .count();
+    // At least one relevant child untouched by this mutation batch proves the
+    // parent was non-empty before and after every queued boundary operation.
+    relevant_children <= boundary_mutations
+}
+
+fn add_empty_parent_scope(
+    tree: &DomTree,
+    map: &crate::css::InvalidationMap,
+    parent: NodeId,
+    mutations: &[RetainedStyleMutation],
+    dirty: &mut HashSet<NodeId>,
+) {
+    if !empty_state_may_have_changed(tree, parent, mutations) {
+        return;
+    }
+    let invalidations = map
+        .structural_invalidations("empty")
+        .into_iter()
+        .filter(|invalidation| {
+            !invalidation.inside_relational
+                && invalidation.subject_may_match(tree, parent)
+        })
+        .collect::<Vec<_>>();
+    if invalidations.is_empty() {
+        return;
+    }
     add_style_subtree(tree, parent, dirty);
-    if dirty_following_siblings {
+    if invalidations.iter().any(|invalidation| {
+        invalidation
+            .reaches
+            .contains(crate::css::InvalidationReaches::SIBLINGS)
+            || invalidation
+                .reaches
+                .contains(crate::css::InvalidationReaches::CONSERVATIVE)
+    }) {
         add_following_sibling_subtrees(tree, parent, dirty);
     }
 }
@@ -2630,14 +2947,6 @@ fn retained_style_plan(
                 unreachable!()
             };
             let map = sheet.invalidation_map();
-            let dirty_parent_siblings = map.state_dependencies("empty").iter().any(|dependency| {
-                dependency
-                    .reaches
-                    .contains(crate::css::InvalidationReaches::SIBLINGS)
-                    || dependency
-                        .reaches
-                        .contains(crate::css::InvalidationReaches::CONSERVATIVE)
-            });
             match *mutation {
                 TreeStyleMutation::Insert {
                     node,
@@ -2657,9 +2966,24 @@ fn retained_style_plan(
                     }
                     add_style_subtree(tree, node, &mut dirty);
                     if let Some(parent) = old_parent {
-                        add_tree_parent_scope(tree, parent, dirty_parent_siblings, &mut dirty);
+                        add_style_context_chain(tree, parent, &mut dirty);
+                        add_table_row_child_scope(tree, parent, &mut dirty);
+                        add_removed_structural_scopes(tree, map, node, parent, &mut dirty);
+                        add_removed_sibling_scopes(tree, map, parent, &mut dirty);
+                        add_empty_parent_scope(tree, map, parent, mutations, &mut dirty);
                     }
-                    add_tree_parent_scope(tree, new_parent, dirty_parent_siblings, &mut dirty);
+                    add_style_context_chain(tree, new_parent, &mut dirty);
+                    add_table_row_child_scope(tree, new_parent, &mut dirty);
+                    add_inserted_structural_scopes(
+                        tree,
+                        map,
+                        node,
+                        new_parent,
+                        mutations,
+                        &mut dirty,
+                    );
+                    add_inserted_sibling_scopes(tree, map, node, new_parent, &mut dirty);
+                    add_empty_parent_scope(tree, map, new_parent, mutations, &mut dirty);
                 }
                 TreeStyleMutation::Remove { node, old_parent } => {
                     if subtree_contains_style_element(tree, node)
@@ -2670,7 +2994,11 @@ fn retained_style_plan(
                     if !add_relational_tree_invalidation(tree, map, mutation, &mut dirty) {
                         return RetainedStylePlan::Full;
                     }
-                    add_tree_parent_scope(tree, old_parent, dirty_parent_siblings, &mut dirty);
+                    add_style_context_chain(tree, old_parent, &mut dirty);
+                    add_table_row_child_scope(tree, old_parent, &mut dirty);
+                    add_removed_structural_scopes(tree, map, node, old_parent, &mut dirty);
+                    add_removed_sibling_scopes(tree, map, old_parent, &mut dirty);
+                    add_empty_parent_scope(tree, map, old_parent, mutations, &mut dirty);
                 }
                 TreeStyleMutation::Text { node, parent } => {
                     if node_is_style_text(tree, node, parent) {
@@ -2680,7 +3008,8 @@ fn retained_style_plan(
                         return RetainedStylePlan::Full;
                     }
                     if let Some(parent) = parent {
-                        add_tree_parent_scope(tree, parent, dirty_parent_siblings, &mut dirty);
+                        add_style_context_chain(tree, parent, &mut dirty);
+                        add_empty_parent_scope(tree, map, parent, mutations, &mut dirty);
                     } else {
                         dirty.insert(node);
                     }
@@ -5787,10 +6116,89 @@ fn propagate_border_spacing(tree: &DomTree, styles: &mut HashMap<NodeId, crate::
     }
 }
 
+#[derive(Clone, Copy)]
+enum EffectiveGridChild {
+    Dom(NodeId),
+    Generated {
+        host: NodeId,
+        kind: GeneratedBoxKind,
+    },
+}
+
+fn collect_effective_grid_children(
+    tree: &DomTree,
+    children: &[NodeId],
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+    out: &mut Vec<EffectiveGridChild>,
+) {
+    for &child in children {
+        let transparent = styles
+            .get(&child)
+            .is_some_and(|style| style.display_contents && style.display != crate::Display::None);
+        if !transparent {
+            out.push(EffectiveGridChild::Dom(child));
+            continue;
+        }
+        if styles
+            .get(&child)
+            .and_then(|style| style.before_pseudo.as_ref())
+            .is_some()
+        {
+            out.push(EffectiveGridChild::Generated {
+                host: child,
+                kind: GeneratedBoxKind::Before,
+            });
+        }
+        collect_effective_grid_children(tree, &rendered_children(tree, child), styles, out);
+        if styles
+            .get(&child)
+            .and_then(|style| style.after_pseudo.as_ref())
+            .is_some()
+        {
+            out.push(EffectiveGridChild::Generated {
+                host: child,
+                kind: GeneratedBoxKind::After,
+            });
+        }
+    }
+}
+
+fn effective_grid_child_style<'a>(
+    child: EffectiveGridChild,
+    styles: &'a HashMap<NodeId, crate::LayoutStyle>,
+) -> Option<&'a crate::LayoutStyle> {
+    match child {
+        EffectiveGridChild::Dom(node) => styles.get(&node),
+        EffectiveGridChild::Generated { host, kind } => {
+            let host = styles.get(&host)?;
+            match kind {
+                GeneratedBoxKind::Before => host.before_pseudo.as_deref(),
+                GeneratedBoxKind::After => host.after_pseudo.as_deref(),
+            }
+        }
+    }
+}
+
+fn effective_grid_child_style_mut<'a>(
+    child: EffectiveGridChild,
+    styles: &'a mut HashMap<NodeId, crate::LayoutStyle>,
+) -> Option<&'a mut crate::LayoutStyle> {
+    match child {
+        EffectiveGridChild::Dom(node) => styles.get_mut(&node),
+        EffectiveGridChild::Generated { host, kind } => {
+            let host = styles.get_mut(&host)?;
+            match kind {
+                GeneratedBoxKind::Before => host.before_pseudo.as_deref_mut(),
+                GeneratedBoxKind::After => host.after_pseudo.as_deref_mut(),
+            }
+        }
+    }
+}
+
 /// Walk the tree; for each `display: grid` element that declares
-/// `grid-template-areas`, resolve each direct child's `grid-area` name to a
-/// taffy line placement. This is how Vector 2022 (and most grid layouts) place
-/// their header/sidebar/content/footer regions.
+/// `grid-template-areas`, resolve each box child's `grid-area` name to a taffy
+/// line placement. `display:contents` wrappers are transparent here for the
+/// same reason they are transparent when the Taffy child list is built.
 fn resolve_grid_areas(
     tree: &DomTree,
     root: NodeId,
@@ -5812,6 +6220,13 @@ fn resolve_grid_areas(
         if areas.is_none() && col_lines.is_none() && row_lines.is_none() {
             continue;
         }
+        let mut grid_children = Vec::new();
+        collect_effective_grid_children(
+            tree,
+            &rendered_children(tree, id),
+            styles,
+            &mut grid_children,
+        );
 
         if let Some(areas) = &areas {
             // name -> (row_start, row_end, col_start, col_end) in 0-based track indices.
@@ -5833,8 +6248,8 @@ fn resolve_grid_areas(
                 }
             }
 
-            for cid in rendered_children(tree, id) {
-                let Some(cstyle) = styles.get_mut(&cid) else {
+            for child in grid_children.iter().copied() {
+                let Some(cstyle) = effective_grid_child_style_mut(child, styles) else {
                     continue;
                 };
                 let Some(name) = cstyle.grid_area_name.clone() else {
@@ -5857,8 +6272,8 @@ fn resolve_grid_areas(
         // Named grid lines: resolve children placed with `grid-column`/`grid-row`
         // values that reference a line name against this container's maps.
         if col_lines.is_some() || row_lines.is_some() {
-            for cid in rendered_children(tree, id) {
-                let Some(cstyle) = styles.get_mut(&cid) else {
+            for child in grid_children.iter().copied() {
+                let Some(cstyle) = effective_grid_child_style_mut(child, styles) else {
                     continue;
                 };
                 if let (Some(raw), Some(map)) = (cstyle.grid_column_raw.clone(), &col_lines) {
@@ -7374,6 +7789,14 @@ fn blockify_layout_children(
             .get(&child)
             .is_some_and(|style| style.display_contents && style.display != crate::Display::None);
         if transparent {
+            if let Some(style) = styles.get_mut(&child) {
+                for pseudo in [style.before_pseudo.as_mut(), style.after_pseudo.as_mut()]
+                    .into_iter()
+                    .flatten()
+                {
+                    crate::blockify_outer_display(pseudo);
+                }
+            }
             blockify_layout_children(tree, child, styles);
         } else if let Some(style) = styles.get_mut(&child) {
             crate::blockify_outer_display(style);
@@ -7573,7 +7996,6 @@ fn build_any(
 fn build_flex_grid_children(
     tree: &DomTree,
     parent: NodeId,
-    dom_children: &[NodeId],
     taffy_tree: &mut TaffyTree<usize>,
     id_map: &mut HashMap<taffy::NodeId, NodeId>,
     words: &mut HashMap<taffy::NodeId, (NodeId, String)>,
@@ -7581,37 +8003,64 @@ fn build_flex_grid_children(
     ifc_items: &mut IfcRegistry,
     styles: &HashMap<NodeId, crate::LayoutStyle>,
 ) -> Vec<taffy::NodeId> {
+    let mut effective_children = Vec::new();
+    collect_effective_grid_children(
+        tree,
+        &rendered_children(tree, parent),
+        styles,
+        &mut effective_children,
+    );
+    effective_children.retain(|child| match child {
+        EffectiveGridChild::Dom(node) => {
+            tree.get_node(*node).is_some_and(|node| node.is_element())
+                || !tree.text_content(*node).trim().is_empty()
+        }
+        EffectiveGridChild::Generated { .. } => true,
+    });
+    effective_children.sort_by_key(|child| {
+        effective_grid_child_style(*child, styles)
+            .map(|style| style.order)
+            .unwrap_or(0)
+    });
+
     let mut children = Vec::new();
     let mut index = 0;
-    while index < dom_children.len() {
-        let is_text = tree.get_node(dom_children[index]).map_or(false, |node| {
-            matches!(node.data, obscura_dom::tree::NodeData::Text { .. })
-        });
+    while index < effective_children.len() {
+        let is_text = match effective_children[index] {
+            EffectiveGridChild::Dom(node) => tree.get_node(node).is_some_and(|node| {
+                matches!(node.data, obscura_dom::tree::NodeData::Text { .. })
+            }),
+            EffectiveGridChild::Generated { .. } => false,
+        };
         if !is_text {
-            children.extend(build_any(
-                tree,
-                dom_children[index],
-                taffy_tree,
-                id_map,
-                words,
-                engine,
-                ifc_items,
-                styles,
-            ));
+            match effective_children[index] {
+                EffectiveGridChild::Dom(node) => children.extend(build_any(
+                    tree, node, taffy_tree, id_map, words, engine, ifc_items, styles,
+                )),
+                EffectiveGridChild::Generated { host, kind } => {
+                    let pseudo = effective_grid_child_style(effective_children[index], styles);
+                    if let Some((nodes, _)) = build_in_flow_pseudo(
+                        host, kind, pseudo, taffy_tree, words, ifc_items,
+                    ) {
+                        children.extend(nodes);
+                    }
+                }
+            }
             index += 1;
             continue;
         }
 
-        let start = index;
-        while index < dom_children.len()
-            && tree.get_node(dom_children[index]).map_or(false, |node| {
+        let mut run = Vec::new();
+        while let Some(EffectiveGridChild::Dom(node)) = effective_children.get(index).copied() {
+            if !tree.get_node(node).is_some_and(|node| {
                 matches!(node.data, obscura_dom::tree::NodeData::Text { .. })
-            })
-        {
+            }) {
+                break;
+            }
+            run.push(node);
             index += 1;
         }
-        let run = &dom_children[start..index];
-        if let Some(item) = engine.try_build_run(tree, parent, run, styles) {
+        if let Some(item) = engine.try_build_run(tree, parent, &run, styles) {
             let style = taffy::Style {
                 display: taffy::style::Display::Block,
                 ..Default::default()
@@ -7622,7 +8071,7 @@ fn build_flex_grid_children(
                 continue;
             }
         }
-        for &text in run {
+        for text in run {
             children.extend(build_any(
                 tree, text, taffy_tree, id_map, words, engine, ifc_items, styles,
             ));
@@ -9900,7 +10349,6 @@ fn build(
         build_flex_grid_children(
             tree,
             id,
-            &dom_children,
             taffy_tree,
             id_map,
             words,
@@ -13175,14 +13623,37 @@ mod tests {
         name: &str,
         tree: &DomTree,
         cache: &mut crate::css::StylesheetCache,
-        mut initial: DomLayout,
+        initial: DomLayout,
         mutation: TreeStyleMutation,
+        expectation: RetainedDifferentialExpectation,
+    ) -> DomLayout {
+        finish_retained_tree_batch_case(
+            name,
+            tree,
+            cache,
+            initial,
+            &[mutation],
+            expectation,
+        )
+    }
+
+    fn finish_retained_tree_batch_case(
+        name: &str,
+        tree: &DomTree,
+        cache: &mut crate::css::StylesheetCache,
+        mut initial: DomLayout,
+        mutations: &[TreeStyleMutation],
         expectation: RetainedDifferentialExpectation,
     ) -> DomLayout {
         let retained = RetainedStyleMaps {
             styles: std::mem::take(&mut initial.styles),
             custom_properties: std::mem::take(&mut initial.custom_properties),
         };
+        let mutations = mutations
+            .iter()
+            .cloned()
+            .map(RetainedStyleMutation::from)
+            .collect::<Vec<_>>();
         let (incremental, telemetry) = layout_dom_with_web_fonts_pass_limit(
             tree,
             (360.0, 260.0),
@@ -13191,7 +13662,7 @@ mod tests {
             None,
             Some(cache),
             Some(retained),
-            &[mutation.into()],
+            &mutations,
         );
         let full = layout_dom(tree, (360.0, 260.0));
         match expectation {
@@ -13749,6 +14220,165 @@ mod tests {
     }
 
     #[test]
+    fn retained_mixed_outer_has_dependencies_match_forced_full() {
+        use RetainedDifferentialExpectation::Incremental;
+
+        // `:has()` owns its relative path, but structural state on the anchor
+        // remains an ordinary tree dependency and must not be discarded just
+        // because both occur in the same compiled rule.
+        let tree = parse_html(
+            r#"<style>.host:has(.signal):first-child .desc{width:173px}.clean{height:7px}</style>
+               <main id=parent><b id=blocker></b><section id=host class=host><i class=signal></i><span class=desc></span></section><aside class=clean></aside></main>"#,
+        );
+        let parent = tree.get_element_by_id("parent").unwrap();
+        let blocker = tree.get_element_by_id("blocker").unwrap();
+        let host = tree.get_element_by_id("host").unwrap();
+        tree.remove_child(blocker);
+        let mut cache = crate::css::StylesheetCache::default();
+        let initial = layout_dom_with_web_fonts_and_stylesheet_cache(
+            &tree,
+            (360.0, 260.0),
+            &HashMap::new(),
+            &[],
+            &mut cache,
+        );
+        tree.insert_before(host, blocker);
+        finish_retained_tree_case(
+            "outer structural state beside has",
+            &tree,
+            &mut cache,
+            initial,
+            TreeStyleMutation::Insert {
+                node: blocker,
+                old_parent: None,
+                new_parent: parent,
+            },
+            Incremental,
+        );
+
+        // A freshly inserted anchor at position zero can create both adjacent
+        // and general sibling matches outside `:has()`.
+        let tree = parse_html(
+            r#"<style>
+                 .left:has(.signal) + .adjacent{width:179px}
+                 .left:has(.signal) ~ .following{height:31px}
+                 .clean{height:9px}
+               </style><main id=parent><section id=left class=left><i class=signal></i></section><b id=adjacent class=adjacent></b><b class=following></b><aside class=clean></aside></main>"#,
+        );
+        let parent = tree.get_element_by_id("parent").unwrap();
+        let left = tree.get_element_by_id("left").unwrap();
+        let adjacent = tree.get_element_by_id("adjacent").unwrap();
+        tree.remove_child(left);
+        let mut cache = crate::css::StylesheetCache::default();
+        let initial = layout_dom_with_web_fonts_and_stylesheet_cache(
+            &tree,
+            (360.0, 260.0),
+            &HashMap::new(),
+            &[],
+            &mut cache,
+        );
+        tree.insert_before(adjacent, left);
+        finish_retained_tree_case(
+            "outer sibling paths beside has",
+            &tree,
+            &mut cache,
+            initial,
+            TreeStyleMutation::Insert {
+                node: left,
+                old_parent: None,
+                new_parent: parent,
+            },
+            Incremental,
+        );
+
+        // Text can toggle an outer :empty while the relative `:has()` path is
+        // entirely sibling-based and therefore has no text side effect.
+        let tree = parse_html(
+            r#"<style>.host:has(~ .peer):empty ~ .panel{width:181px}.clean{height:11px}</style>
+               <main><section id=host class=host></section><i class=peer></i><b class=panel></b><aside class=clean></aside></main>"#,
+        );
+        let host = tree.get_element_by_id("host").unwrap();
+        let text = tree.new_node(obscura_dom::tree::NodeData::Text {
+            contents: String::new(),
+        });
+        tree.append_child(host, text);
+        let mut cache = crate::css::StylesheetCache::default();
+        let initial = layout_dom_with_web_fonts_and_stylesheet_cache(
+            &tree,
+            (360.0, 260.0),
+            &HashMap::new(),
+            &[],
+            &mut cache,
+        );
+        tree.with_node_mut(text, |node| {
+            if let obscura_dom::tree::NodeData::Text { contents } = &mut node.data {
+                *contents = "now non-empty".into();
+            }
+        });
+        finish_retained_tree_case(
+            "outer empty state beside has",
+            &tree,
+            &mut cache,
+            initial,
+            TreeStyleMutation::Text {
+                node: text,
+                parent: Some(host),
+            },
+            Incremental,
+        );
+    }
+
+    #[test]
+    fn retained_batched_insertions_restore_old_structural_boundaries() {
+        use RetainedDifferentialExpectation::Incremental;
+
+        let tree = parse_html(
+            r#"<style>
+                 .item:first-child{width:191px}.item:last-child{height:37px}
+                 .item:only-child{color:#123456}
+                 i:first-of-type{margin-left:13px}i:last-of-type{margin-right:17px}
+                 i:only-of-type{padding-top:19px}.clean{height:13px}
+               </style><main><section id=list><i id=before-a class=item></i><i id=before-b class=item></i><i id=old class=item></i><i id=after-a class=item></i><i id=after-b class=item></i></section><aside class=clean></aside></main>"#,
+        );
+        let list = tree.get_element_by_id("list").unwrap();
+        let old = tree.get_element_by_id("old").unwrap();
+        let before_a = tree.get_element_by_id("before-a").unwrap();
+        let before_b = tree.get_element_by_id("before-b").unwrap();
+        let after_a = tree.get_element_by_id("after-a").unwrap();
+        let after_b = tree.get_element_by_id("after-b").unwrap();
+        for inserted in [before_a, before_b, after_a, after_b] {
+            tree.remove_child(inserted);
+        }
+        let mut cache = crate::css::StylesheetCache::default();
+        let initial = layout_dom_with_web_fonts_and_stylesheet_cache(
+            &tree,
+            (360.0, 260.0),
+            &HashMap::new(),
+            &[],
+            &mut cache,
+        );
+        tree.insert_before(old, before_a);
+        tree.insert_before(old, before_b);
+        tree.append_child(list, after_a);
+        tree.append_child(list, after_b);
+        let mutations = [before_a, before_b, after_a, after_b].map(|node| {
+            TreeStyleMutation::Insert {
+                node,
+                old_parent: None,
+                new_parent: list,
+            }
+        });
+        finish_retained_tree_batch_case(
+            "batched first last only boundaries",
+            &tree,
+            &mut cache,
+            initial,
+            &mutations,
+            Incremental,
+        );
+    }
+
+    #[test]
     fn retained_relational_invalidation_keeps_two_thousand_node_peer_clean() {
         let mut clean = String::new();
         for index in 0..2_000 {
@@ -13842,6 +14472,61 @@ mod tests {
         assert_computed_styles_match("large unrelated branch", &incremental, &full);
         assert_eq!(incremental.rects, full.rects);
         assert_eq!(telemetry.retained_fallback, 0);
+        assert!(telemetry.retained_reused >= 2_000, "{telemetry:?}");
+        assert!(telemetry.retained_fresh < 16, "{telemetry:?}");
+    }
+
+    #[test]
+    fn retained_keyed_start_insertion_keeps_large_body_branch_clean() {
+        let mut clean = String::new();
+        for index in 0..2_000 {
+            clean.push_str(&format!("<span class=clean data-index={index}></span>"));
+        }
+        let tree = parse_html(&format!(
+            r#"<!doctype html><html><head><style>
+                   .item:nth-child(2){{width:31px}}
+                   .left + .right{{height:7px}}
+                   .early ~ .late{{height:9px}}
+                   .maybe-empty:empty + .after{{height:11px}}
+                   .clean{{height:1px}}
+               </style></head><body><main id=stable>{clean}</main><i id=watcher data-scroll-watcher></i></body></html>"#,
+        ));
+        let body = tree.query_selector("body").unwrap().unwrap();
+        let stable = tree.get_element_by_id("stable").unwrap();
+        let watcher = tree.get_element_by_id("watcher").unwrap();
+        tree.remove_child(watcher);
+        let mut cache = crate::css::StylesheetCache::default();
+        let mut initial = layout_dom_with_web_fonts_and_stylesheet_cache(
+            &tree,
+            (800.0, 600.0),
+            &HashMap::new(),
+            &[],
+            &mut cache,
+        );
+        tree.insert_before(stable, watcher);
+        let retained = RetainedStyleMaps {
+            styles: std::mem::take(&mut initial.styles),
+            custom_properties: std::mem::take(&mut initial.custom_properties),
+        };
+        let (incremental, telemetry) = layout_dom_with_web_fonts_pass_limit(
+            &tree,
+            (800.0, 600.0),
+            &HashMap::new(),
+            &[],
+            None,
+            Some(&mut cache),
+            Some(retained),
+            &[TreeStyleMutation::Insert {
+                node: watcher,
+                old_parent: None,
+                new_parent: body,
+            }
+            .into()],
+        );
+        let full = layout_dom(&tree, (800.0, 600.0));
+        assert_computed_styles_match("keyed start insertion large body branch", &incremental, &full);
+        assert_eq!(incremental.rects, full.rects);
+        assert_eq!(telemetry.retained_fallback, 0, "{telemetry:?}");
         assert!(telemetry.retained_reused >= 2_000, "{telemetry:?}");
         assert!(telemetry.retained_fresh < 16, "{telemetry:?}");
     }
@@ -15102,6 +15787,104 @@ mod tests {
         assert!(
             (18.0..=22.0).contains(&rect.height),
             "closed native select should have one-line control height: {rect:?}"
+        );
+    }
+
+    #[test]
+    fn display_contents_descendants_resolve_as_named_grid_area_items() {
+        let tree = parse_html(
+            r#"<style>
+                html,body{margin:0}
+                #grid{
+                    display:grid;width:400px;height:100px;
+                    grid-template-columns:100px 300px;
+                    grid-template-rows:40px 60px;
+                    grid-template-areas:"nav head" "nav main";
+                }
+                #contents{display:contents}
+                #nav{grid-area:nav}#head{grid-area:head}#main{grid-area:main}
+            </style>
+            <div id="grid"><div id="contents">
+                <nav id="nav"></nav><header id="head"></header><article id="main"></article>
+            </div></div>"#,
+        );
+        let laid = layout_dom(&tree, (600.0, 300.0));
+        let rect = |id| laid.rects[&tree.get_element_by_id(id).unwrap()];
+
+        assert_eq!(
+            rect("nav"),
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 100.0,
+            }
+        );
+        assert_eq!(
+            rect("head"),
+            Rect {
+                x: 100.0,
+                y: 0.0,
+                width: 300.0,
+                height: 40.0,
+            }
+        );
+        assert_eq!(
+            rect("main"),
+            Rect {
+                x: 100.0,
+                y: 40.0,
+                width: 300.0,
+                height: 60.0,
+            }
+        );
+    }
+
+    #[test]
+    fn display_contents_generated_pseudo_remains_a_named_grid_item() {
+        let tree = parse_html(
+            r#"<style>
+                html,body{margin:0}
+                #grid{
+                    display:grid;width:400px;height:50px;
+                    grid-template-columns:100px 300px;
+                    grid-template-rows:50px;
+                    grid-template-areas:"marker body";
+                }
+                #contents{display:contents}
+                #contents::before{content:"";display:block;grid-area:marker}
+                #body{grid-area:body}
+            </style>
+            <div id="grid"><div id="contents"><article id="body"></article></div></div>"#,
+        );
+        let laid = layout_dom(&tree, (600.0, 300.0));
+        let contents = tree.get_element_by_id("contents").unwrap();
+        let body = tree.get_element_by_id("body").unwrap();
+        let generated = laid
+            .generated_boxes
+            .iter()
+            .find(|box_| {
+                box_.host == contents && box_.kind == GeneratedBoxKind::Before
+            })
+            .expect("display:contents ::before must generate an effective grid item");
+
+        assert_eq!(
+            generated.rect,
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 50.0,
+            }
+        );
+        assert_eq!(
+            laid.rects[&body],
+            Rect {
+                x: 100.0,
+                y: 0.0,
+                width: 300.0,
+                height: 50.0,
+            }
         );
     }
 

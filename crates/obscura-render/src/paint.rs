@@ -2140,20 +2140,12 @@ fn transform_subtree_source_bounds(
             width: rect.width,
             height: rect.height,
         };
-        if let Some(shadow) = laid
-            .styles
-            .get(&id)
-            .and_then(|style| style.box_shadow)
-            .filter(|shadow| !shadow.inset && shadow.color[3] != 0)
-        {
-            let expansion = shadow.spread + shadow.blur.max(0.0);
-            let shadow_rect = crate::Rect {
-                x: visual.x + shadow.offset_x - expansion,
-                y: visual.y + shadow.offset_y - expansion,
-                width: (visual.width + 2.0 * expansion).max(0.0),
-                height: (visual.height + 2.0 * expansion).max(0.0),
-            };
-            visual = visual.union(&shadow_rect);
+        if let Some(style) = laid.styles.get(&id) {
+            // The atomic source surface must retain every primitive that can
+            // extend beyond the border box. In particular, a thick outline
+            // is transformed with the element and cannot be reconstructed
+            // after the tight source layer has already clipped it.
+            visual = non_text_ink_bounds(&visual, style);
         }
         bounds = Some(match bounds {
             Some(current) => current.union(&visual),
@@ -2241,6 +2233,11 @@ fn paint_laid_dom_scrolled(
     // inline svg on the page rather than re-parsing the sprite per icon.
     let mut sprite_cache: std::collections::HashMap<String, Option<String>> =
         std::collections::HashMap::new();
+    // An overflow clip is inherited by every descendant until another clip
+    // joins the chain. Rasterizing the same full-surface alpha mask per child
+    // made clipped long pages scale as surface area times descendant count.
+    // Cache immutable masks for this one paint surface and share them by Arc.
+    let mut overflow_mask_cache: OverflowClipMaskCache = HashMap::new();
     // Whether any element carries a `transform: translate()`. When none does
     // (the overwhelmingly common case), every node's accumulated offset is
     // zero, so skip the per-node ancestor walk entirely and keep the paint
@@ -2419,7 +2416,8 @@ fn paint_laid_dom_scrolled(
                     clip.viewport_rect(scroll_state.surface_extent.unwrap_or(viewport))
                 });
                 let clip_mask = overflow_clip.as_ref().and_then(|clip| {
-                    overflow_clip_mask(
+                    cached_overflow_clip_mask(
+                        &mut overflow_mask_cache,
                         pixmap.width(),
                         pixmap.height(),
                         clip,
@@ -2432,7 +2430,7 @@ fn paint_laid_dom_scrolled(
                         &mut pixmap,
                         offset,
                         clip,
-                        clip_mask.as_ref(),
+                        clip_mask.as_deref(),
                         raster_scale,
                         print_economy,
                     );
@@ -2589,7 +2587,8 @@ fn paint_laid_dom_scrolled(
                 transform.f,
             );
             let clip_mask = outside_overflow_clip.as_ref().and_then(|clip| {
-                overflow_clip_mask(
+                cached_overflow_clip_mask(
+                    &mut overflow_mask_cache,
                     pixmap.width(),
                     pixmap.height(),
                     clip,
@@ -2602,7 +2601,7 @@ fn paint_laid_dom_scrolled(
                 layer.as_ref(),
                 &tiny_skia::PixmapPaint::default(),
                 transform,
-                clip_mask.as_ref(),
+                clip_mask.as_deref(),
             );
             continue;
         }
@@ -2688,14 +2687,6 @@ fn paint_laid_dom_scrolled(
         let clip = overflow_clip
             .as_ref()
             .map(|clip| clip.viewport_rect(scroll_state.surface_extent.unwrap_or(viewport)));
-        let ancestor_clip_mask = overflow_clip.as_ref().and_then(|clip| {
-            overflow_clip_mask(
-                pixmap.width(),
-                pixmap.height(),
-                clip,
-                scroll_state.surface_extent.unwrap_or(viewport),
-            )
-        });
         let cull_rect = rect;
         let visible_rect = match clip {
             Some(c) => match cull_rect.intersect(&c) {
@@ -2713,17 +2704,55 @@ fn paint_laid_dom_scrolled(
             Some(rect) => rect,
             None => continue,
         };
-        let clip_path_mask = style.clip_path.as_ref().and_then(|polygon| {
-            polygon_clip_mask(
-                pixmap.width(),
-                pixmap.height(),
-                polygon,
-                &rect,
-                style.font_size.unwrap_or(16.0),
-                root_font_size,
-                viewport,
-            )
-        });
+        let surface = paint_surface_rect(&pixmap, raster_scale);
+        let box_on_surface = visible_rect.intersect(&surface).is_some();
+        let ink_bounds = non_text_ink_bounds(&rect, style);
+        // Mask allocation follows the raw ink bounds, not the already-clipped
+        // bounds. A distant box can cast a large offset shadow onto the paint
+        // surface while its ancestor overflow clip remains offscreen. In that
+        // case the primitive still needs the ancestor mask so it cannot leak
+        // through the clip.
+        let non_text_on_surface = ink_bounds.intersect(&surface).is_some();
+        // A list marker or generated run may protrude modestly from the host
+        // border box. Keep its clip masks available without letting a box
+        // thousands of pixels away allocate full-surface masks.
+        let text_guard = style.font_size.unwrap_or(16.0) * 4.0 + 4.0;
+        let text_bounds = crate::Rect {
+            x: rect.x - text_guard,
+            y: rect.y - text_guard,
+            width: rect.width + 2.0 * text_guard,
+            height: rect.height + 2.0 * text_guard,
+        };
+        let text_on_surface = text_bounds.intersect(&surface).is_some();
+        let needs_host_masks = non_text_on_surface || text_on_surface;
+        let ancestor_clip_mask = needs_host_masks
+            .then(|| {
+                overflow_clip.as_ref().and_then(|clip| {
+                    cached_overflow_clip_mask(
+                        &mut overflow_mask_cache,
+                        pixmap.width(),
+                        pixmap.height(),
+                        clip,
+                        scroll_state.surface_extent.unwrap_or(viewport),
+                    )
+                })
+            })
+            .flatten();
+        let clip_path_mask = needs_host_masks
+            .then(|| {
+                style.clip_path.as_ref().and_then(|polygon| {
+                    polygon_clip_mask(
+                        pixmap.width(),
+                        pixmap.height(),
+                        polygon,
+                        &rect,
+                        style.font_size.unwrap_or(16.0),
+                        root_font_size,
+                        viewport,
+                    )
+                })
+            })
+            .flatten();
         let has_background_box_paint = !style.background_clip_text
             && (style.background_color.is_some()
                 || style.background_image.is_some()
@@ -2747,7 +2776,7 @@ fn paint_laid_dom_scrolled(
                 &rect,
                 style,
                 clip,
-                ancestor_clip_mask.as_ref(),
+                ancestor_clip_mask.as_deref(),
                 root_font_size,
                 viewport,
                 base_url,
@@ -2767,7 +2796,7 @@ fn paint_laid_dom_scrolled(
                     &shadow,
                     &rect,
                     style.border_model.radii,
-                    ancestor_clip_mask.as_ref(),
+                    ancestor_clip_mask.as_deref(),
                 );
             }
         }
@@ -2780,14 +2809,22 @@ fn paint_laid_dom_scrolled(
         let has_radius = !radius.is_zero();
         let background = background_geometry(&rect, style);
         let background_path = background_clip_path(background);
-        let element_clip_mask =
-            background_extra_clip(ancestor_clip_mask.as_ref(), clip_path_mask.as_ref());
-        let background_mask = element_clip_mask.clone();
+        let combined_clip_mask = clip_path_mask.as_ref().and_then(|polygon| {
+            intersect_clip_masks(ancestor_clip_mask.as_deref().cloned(), Some(polygon))
+        });
+        let element_clip_mask = combined_clip_mask
+            .as_ref()
+            .or_else(|| ancestor_clip_mask.as_deref());
+        let background_mask = element_clip_mask;
         // A linear-gradient background (heavily used by modern hero sections);
         // without this it paints white. Takes precedence over a solid color.
         // `background-clip: text` clips the background to the glyphs, so it must
         // not paint as a box here; the text paint path fills the glyphs instead.
-        if !paints_inline_fragments && style.mask_image.is_none() && !style.background_clip_text {
+        if box_on_surface
+            && !paints_inline_fragments
+            && style.mask_image.is_none()
+            && !style.background_clip_text
+        {
             if let Some(bg) = style.background_color {
                 if let Some(path) = background_path.as_ref() {
                     let mut paint = Paint::default();
@@ -2798,7 +2835,7 @@ fn paint_laid_dom_scrolled(
                         &paint,
                         FillRule::Winding,
                         raster_transform(raster_scale),
-                        background_mask.as_ref(),
+                        background_mask,
                     );
                 }
             }
@@ -2813,7 +2850,7 @@ fn paint_laid_dom_scrolled(
                         style,
                         root_font_size,
                         viewport,
-                        background_mask.as_ref(),
+                        background_mask,
                         raster_scale,
                     );
                 }
@@ -2826,7 +2863,7 @@ fn paint_laid_dom_scrolled(
                             &background.origin_rect,
                             *center,
                             stops,
-                            background_mask.as_ref(),
+                            background_mask,
                             raster_scale,
                         );
                     }
@@ -2840,7 +2877,7 @@ fn paint_laid_dom_scrolled(
                         *angle,
                         *center,
                         stops,
-                        background_mask.as_ref(),
+                        background_mask,
                     );
                 }
                 if let Some((angle, stops)) = &style.background_gradient {
@@ -2851,7 +2888,7 @@ fn paint_laid_dom_scrolled(
                             &background.origin_rect,
                             *angle,
                             stops,
-                            background_mask.as_ref(),
+                            background_mask,
                             raster_scale,
                         );
                     }
@@ -2859,7 +2896,7 @@ fn paint_laid_dom_scrolled(
             }
         }
 
-        if !paints_inline_fragments {
+        if box_on_surface && !paints_inline_fragments {
             if let Some(mask_url) = &style.mask_image {
                 let fill = style
                     .background_color
@@ -2876,7 +2913,7 @@ fn paint_laid_dom_scrolled(
                     style.background_conic_gradient.as_ref(),
                     style.mask_size,
                     style.mask_repeat,
-                    element_clip_mask.as_ref(),
+                    element_clip_mask,
                     &mut pixmap,
                     image_cache,
                 );
@@ -2909,80 +2946,75 @@ fn paint_laid_dom_scrolled(
                             image_cache,
                             None,
                             background.clip_radii,
-                            background_mask.as_ref(),
+                            background_mask,
                         );
                     }
                 }
             }
         }
-        let positioned_pseudo_containing_block = {
-            let mut ancestor = Some(nid);
-            let mut found = None;
-            while let Some(candidate) = ancestor {
-                let candidate_style = laid.styles.get(&candidate);
-                let establishes = candidate_style.is_some_and(|candidate_style| {
-                    candidate_style.position.is_some()
-                        || candidate_style.establishes_positioning_containing_block()
-                });
-                if establishes {
-                    if let Some(candidate_rect) = laid.rects.get(&candidate).copied() {
-                        let (candidate_x, candidate_y) =
-                            scroll_state.translation_for(laid, candidate);
-                        found = Some(crate::Rect {
-                            x: candidate_rect.x + candidate_x,
-                            y: candidate_rect.y + candidate_y,
-                            width: candidate_rect.width,
-                            height: candidate_rect.height,
-                        });
-                        break;
-                    }
-                    // A positioned inline can be flattened out of the taffy
-                    // tree when its block children form the real layout
-                    // boxes. It is still the CSS containing block, but has no
-                    // usable rectangle in this representation. Keep walking
-                    // to the nearest positioned ancestor that does have one
-                    // instead of falling back to the host line itself. The
-                    // latter places `left:0` generated gutters directly over
-                    // their margin-shifted text.
-                }
-                ancestor = tree.get_node(candidate).and_then(|node| node.parent);
-            }
-            found.unwrap_or(rect)
-        };
-        let positioned_pseudo_overflow_clip = scroll_state.descendant_overflow_clip_for(laid, nid);
-        let positioned_pseudo_clip = positioned_pseudo_overflow_clip
-            .as_ref()
-            .map(|clip| clip.viewport_rect(scroll_state.surface_extent.unwrap_or(viewport)));
-        let positioned_pseudo_clip_mask =
-            positioned_pseudo_overflow_clip.as_ref().and_then(|clip| {
-                overflow_clip_mask(
-                    pixmap.width(),
-                    pixmap.height(),
-                    clip,
-                    scroll_state.surface_extent.unwrap_or(viewport),
-                )
-            });
-        for pseudo in [
+        let has_positioned_pseudo = [
             style.before_pseudo.as_deref(),
             style.after_pseudo.as_deref(),
         ]
         .into_iter()
         .flatten()
-        {
-            paint_positioned_pseudo(
-                &mut laid.text_engine,
-                &mut pixmap,
-                pseudo,
-                &positioned_pseudo_containing_block,
-                &rect,
-                viewport,
-                root_font_size,
-                positioned_pseudo_clip,
-                positioned_pseudo_clip_mask.as_ref(),
-                base_url,
-                image_cache,
-                raster_scale,
-            );
+        .any(|pseudo| pseudo.position == Some(taffy::Position::Absolute));
+        if has_positioned_pseudo {
+            let positioned_pseudo_containing_block = {
+                let mut ancestor = Some(nid);
+                let mut found = None;
+                while let Some(candidate) = ancestor {
+                    let candidate_style = laid.styles.get(&candidate);
+                    let establishes = candidate_style.is_some_and(|candidate_style| {
+                        candidate_style.position.is_some()
+                            || candidate_style.establishes_positioning_containing_block()
+                    });
+                    if establishes {
+                        if let Some(candidate_rect) = laid.rects.get(&candidate).copied() {
+                            let (candidate_x, candidate_y) =
+                                scroll_state.translation_for(laid, candidate);
+                            found = Some(crate::Rect {
+                                x: candidate_rect.x + candidate_x,
+                                y: candidate_rect.y + candidate_y,
+                                width: candidate_rect.width,
+                                height: candidate_rect.height,
+                            });
+                            break;
+                        }
+                        // A positioned inline can be flattened out of the taffy
+                        // tree when its block children form the real layout
+                        // boxes. It is still the CSS containing block, but has no
+                        // usable rectangle in this representation. Keep walking
+                        // to the nearest positioned ancestor that does have one.
+                    }
+                    ancestor = tree.get_node(candidate).and_then(|node| node.parent);
+                }
+                found.unwrap_or(rect)
+            };
+            let positioned_pseudo_overflow_clip =
+                scroll_state.descendant_overflow_clip_for(laid, nid);
+            for pseudo in [
+                style.before_pseudo.as_deref(),
+                style.after_pseudo.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                paint_positioned_pseudo(
+                    &mut laid.text_engine,
+                    &mut pixmap,
+                    pseudo,
+                    &positioned_pseudo_containing_block,
+                    &rect,
+                    viewport,
+                    root_font_size,
+                    scroll_state.surface_extent.unwrap_or(viewport),
+                    positioned_pseudo_overflow_clip.as_ref(),
+                    base_url,
+                    image_cache,
+                    raster_scale,
+                );
+            }
         }
 
         if !paints_inline_fragments {
@@ -2990,7 +3022,7 @@ fn paint_laid_dom_scrolled(
                 &mut pixmap,
                 &rect,
                 style,
-                element_clip_mask.as_ref(),
+                element_clip_mask,
                 raster_scale,
             );
         }
@@ -2998,11 +3030,11 @@ fn paint_laid_dom_scrolled(
             &mut pixmap,
             &rect,
             style,
-            element_clip_mask.as_ref(),
+            element_clip_mask,
             raster_scale,
         );
 
-        if name.local.as_ref() == "img" {
+        if box_on_surface && name.local.as_ref() == "img" {
             if let Some(source) = selected_images.get(&nid) {
                 // `visible_rect` is the border box already intersected with the
                 // ancestor overflow clip: the raster must not paint past it (a
@@ -3018,7 +3050,7 @@ fn paint_laid_dom_scrolled(
                     image_cache,
                     None,
                     radius,
-                    element_clip_mask.as_ref(),
+                    element_clip_mask,
                 );
                 // Fall back when the image itself did not paint, following
                 // what browsers show for a broken image: a non-empty alt
@@ -3042,7 +3074,7 @@ fn paint_laid_dom_scrolled(
                                 None,
                                 0.0,
                                 clip,
-                                element_clip_mask.as_ref(),
+                                element_clip_mask,
                                 raster_scale,
                             );
                         }
@@ -3072,61 +3104,63 @@ fn paint_laid_dom_scrolled(
         // is drawn at its full border-box size (undistorted) and clipped to the
         // overflow-visible region.
         if name.local.as_ref() == "svg" {
-            let mut markup = serialize_svg_styled(
-                tree,
-                nid,
-                &laid.styles,
-                (suppress_opacity_for == Some(nid)).then_some(nid),
-            );
-            // Resolve referenced symbols before carrying the host color into
-            // the standalone document. A document-level/external symbol may
-            // itself contain `currentColor`, and therefore has to be present
-            // when the root color is established.
-            inject_external_sprites(
-                tree,
-                nid,
-                base_url,
-                &mut markup,
-                image_cache,
-                &mut sprite_cache,
-            );
-            // resvg parses the serialized subtree as a standalone SVG
-            // document, outside the page's author stylesheet. Preserve the
-            // host element's computed `color` so paths using `currentColor`
-            // (the standard framework-logo/icon pattern) do not fall back to
-            // black.
-            if let Some(color) = style.color {
-                inject_svg_current_color(&mut markup, color);
-            }
-            // `<use href="url#id">` pointing at an EXTERNAL sprite file resolves
-            // to nothing in resvg (the symbol lives in another document). Fetch
-            // the sprite, splice the referenced `<symbol>` into a local `<defs>`,
-            // and rewrite the href to a same-document `#id`. Same-document
-            // `<use href="#id">` (empty url) is untouched.
-            if let Some(content) = render_svg_with_font_database(
-                markup.as_bytes(),
-                rect.width as u32,
-                rect.height as u32,
-                &svg_fonts,
-            ) {
-                let mut mask = element_clip_mask.clone();
-                if has_radius {
-                    let own = rounded_box_clip_mask_radii(
-                        pixmap.width(),
-                        pixmap.height(),
-                        &visible_rect,
-                        radius,
-                    );
-                    mask = intersect_clip_masks(mask, own.as_ref());
-                }
-                pixmap.draw_pixmap(
-                    rect.x as i32,
-                    rect.y as i32,
-                    content.as_ref(),
-                    &tiny_skia::PixmapPaint::default(),
-                    Transform::identity(),
-                    mask.as_ref(),
+            if box_on_surface {
+                let mut markup = serialize_svg_styled(
+                    tree,
+                    nid,
+                    &laid.styles,
+                    (suppress_opacity_for == Some(nid)).then_some(nid),
                 );
+                // Resolve referenced symbols before carrying the host color into
+                // the standalone document. A document-level/external symbol may
+                // itself contain `currentColor`, and therefore has to be present
+                // when the root color is established.
+                inject_external_sprites(
+                    tree,
+                    nid,
+                    base_url,
+                    &mut markup,
+                    image_cache,
+                    &mut sprite_cache,
+                );
+                // resvg parses the serialized subtree as a standalone SVG
+                // document, outside the page's author stylesheet. Preserve the
+                // host element's computed `color` so paths using `currentColor`
+                // (the standard framework-logo/icon pattern) do not fall back to
+                // black.
+                if let Some(color) = style.color {
+                    inject_svg_current_color(&mut markup, color);
+                }
+                // `<use href="url#id">` pointing at an EXTERNAL sprite file resolves
+                // to nothing in resvg (the symbol lives in another document). Fetch
+                // the sprite, splice the referenced `<symbol>` into a local `<defs>`,
+                // and rewrite the href to a same-document `#id`. Same-document
+                // `<use href="#id">` (empty url) is untouched.
+                if let Some(content) = render_svg_with_font_database(
+                    markup.as_bytes(),
+                    rect.width as u32,
+                    rect.height as u32,
+                    &svg_fonts,
+                ) {
+                    let mut mask = element_clip_mask.cloned();
+                    if has_radius {
+                        let own = rounded_box_clip_mask_radii(
+                            pixmap.width(),
+                            pixmap.height(),
+                            &visible_rect,
+                            radius,
+                        );
+                        mask = intersect_clip_masks(mask, own.as_ref());
+                    }
+                    pixmap.draw_pixmap(
+                        rect.x as i32,
+                        rect.y as i32,
+                        content.as_ref(),
+                        &tiny_skia::PixmapPaint::default(),
+                        Transform::identity(),
+                        mask.as_ref(),
+                    );
+                }
             }
             for child in tree.descendants(nid) {
                 svg_subtree_skip.insert(child);
@@ -3170,7 +3204,7 @@ fn paint_laid_dom_scrolled(
                     style.font_family.as_deref(),
                     style.letter_spacing.unwrap_or(0.0),
                     clip,
-                    element_clip_mask.as_ref(),
+                    element_clip_mask,
                     raster_scale,
                 );
             }
@@ -3196,7 +3230,7 @@ fn paint_laid_dom_scrolled(
                     style.font_family.as_deref(),
                     style.letter_spacing.unwrap_or(0.0),
                     clip,
-                    element_clip_mask.as_ref(),
+                    element_clip_mask,
                     raster_scale,
                 );
             }
@@ -3222,7 +3256,7 @@ fn paint_laid_dom_scrolled(
                     style.font_family.as_deref(),
                     style.letter_spacing.unwrap_or(0.0),
                     Some(visible_rect),
-                    element_clip_mask.as_ref(),
+                    element_clip_mask,
                     raster_scale,
                 );
             }
@@ -3244,7 +3278,7 @@ fn paint_laid_dom_scrolled(
                         &arrow_paint,
                         FillRule::Winding,
                         raster_transform(raster_scale),
-                        element_clip_mask.as_ref(),
+                        element_clip_mask,
                     );
                 }
             }
@@ -3276,7 +3310,7 @@ fn paint_laid_dom_scrolled(
                             style.font_family.as_deref(),
                             style.letter_spacing.unwrap_or(0.0),
                             clip,
-                            element_clip_mask.as_ref(),
+                            element_clip_mask,
                             raster_scale,
                         );
                     }
@@ -3328,7 +3362,8 @@ fn paint_laid_dom_scrolled(
             .as_ref()
             .map(|clip| clip.viewport_rect(scroll_state.surface_extent.unwrap_or(viewport)));
         let clip_mask = overflow_clip.as_ref().and_then(|clip| {
-            overflow_clip_mask(
+            cached_overflow_clip_mask(
+                &mut overflow_mask_cache,
                 pixmap.width(),
                 pixmap.height(),
                 clip,
@@ -3341,7 +3376,7 @@ fn paint_laid_dom_scrolled(
                 &mut pixmap,
                 off,
                 clip,
-                clip_mask.as_ref(),
+                clip_mask.as_deref(),
                 raster_scale,
                 print_economy,
             );
@@ -3355,7 +3390,7 @@ fn paint_laid_dom_scrolled(
                     &mut pixmap,
                     off,
                     clip,
-                    clip_mask.as_ref(),
+                    clip_mask.as_deref(),
                     raster_scale,
                     print_economy,
                 );
@@ -3368,6 +3403,67 @@ fn paint_laid_dom_scrolled(
 
 fn raster_transform(scale: f32) -> Transform {
     Transform::from_scale(scale, scale)
+}
+
+/// The raster target in the CSS-pixel coordinate space used by paint items.
+/// Region captures can raster directly above 1x, so device dimensions alone
+/// are not a valid cull rect.
+fn paint_surface_rect(pixmap: &Pixmap, raster_scale: f32) -> crate::Rect {
+    let scale = if raster_scale.is_finite() && raster_scale > 0.0 {
+        raster_scale
+    } else {
+        1.0
+    };
+    crate::Rect {
+        x: 0.0,
+        y: 0.0,
+        width: pixmap.width() as f32 / scale,
+        height: pixmap.height() as f32 / scale,
+    }
+}
+
+fn rect_intersects_paint_surface(
+    rect: &crate::Rect,
+    pixmap: &Pixmap,
+    raster_scale: f32,
+) -> bool {
+    rect.width > 0.0
+        && rect.height > 0.0
+        && rect.intersect(&paint_surface_rect(pixmap, raster_scale)).is_some()
+}
+
+/// Conservative ink overflow for the non-text primitives emitted by one CSS
+/// box. Gecko performs the analogous dirty-rect test against a frame's ink
+/// overflow before constructing display items. A border box alone is not
+/// sufficient because an outset shadow or outline can enter the capture while
+/// the box itself remains outside it.
+fn non_text_ink_bounds(rect: &crate::Rect, style: &crate::LayoutStyle) -> crate::Rect {
+    let mut bounds = *rect;
+    if let Some(shadow) = style
+        .box_shadow
+        .filter(|shadow| !shadow.inset && shadow.color[3] != 0)
+    {
+        let expansion = shadow.spread + shadow.blur.max(0.0);
+        let shadow_bounds = crate::Rect {
+            x: rect.x + shadow.offset_x - expansion,
+            y: rect.y + shadow.offset_y - expansion,
+            width: (rect.width + 2.0 * expansion).max(0.0),
+            height: (rect.height + 2.0 * expansion).max(0.0),
+        };
+        if shadow_bounds.width > 0.0 && shadow_bounds.height > 0.0 {
+            bounds = bounds.union(&shadow_bounds);
+        }
+    }
+    let outline = (style.outline.offset + style.outline.used_width()).max(0.0);
+    if outline > 0.0 {
+        bounds = bounds.union(&crate::Rect {
+            x: rect.x - outline,
+            y: rect.y - outline,
+            width: rect.width + 2.0 * outline,
+            height: rect.height + 2.0 * outline,
+        });
+    }
+    bounds
 }
 
 /// Paint an ordinary inline's sliced border boxes instead of its multiline
@@ -3419,6 +3515,16 @@ fn paint_inline_fragment_decorations(
             fragment_style.border.right = 0.0;
             fragment_style.border_model.radii.top_right = crate::CornerRadius::default();
             fragment_style.border_model.radii.bottom_right = crate::CornerRadius::default();
+        }
+        let ink = non_text_ink_bounds(&fragment, &fragment_style);
+        let visible_ink = match clip {
+            Some(clip) => ink.intersect(&clip),
+            None => Some(ink),
+        };
+        if !visible_ink
+            .is_some_and(|ink| rect_intersects_paint_surface(&ink, pixmap, raster_scale))
+        {
+            continue;
         }
         let radius = fragment_style
             .border_model
@@ -3900,6 +4006,9 @@ fn paint_css_border(
     if widths.as_array().iter().all(|width| *width <= 0.0) {
         return;
     }
+    if !rect_intersects_paint_surface(rect, pixmap, raster_scale) {
+        return;
+    }
     let current = style.color.unwrap_or([0, 0, 0, 255]);
     let colors = style
         .border_model
@@ -4050,6 +4159,16 @@ fn paint_css_outline(
 ) {
     let width = style.outline.used_width();
     if width <= 0.0 {
+        return;
+    }
+    let outer_expansion = (style.outline.offset + width).max(0.0);
+    let outline_bounds = crate::Rect {
+        x: rect.x - outer_expansion,
+        y: rect.y - outer_expansion,
+        width: rect.width + 2.0 * outer_expansion,
+        height: rect.height + 2.0 * outer_expansion,
+    };
+    if !rect_intersects_paint_surface(&outline_bounds, pixmap, raster_scale) {
         return;
     }
     let center_expansion = style.outline.offset + width / 2.0;
@@ -4418,6 +4537,17 @@ fn paint_box_shadow(
     let rx0 = (radius.0 + spread).max(0.0);
     let ry0 = (radius.1 + spread).max(0.0);
     let blur = shadow.blur.max(0.0);
+    let shadow_bounds = crate::Rect {
+        x: x0 - blur,
+        y: y0 - blur,
+        width: w0 + 2.0 * blur,
+        height: h0 + 2.0 * blur,
+    };
+    // Shadows disable the native >1x path, so their paint coordinate space is
+    // the pixmap's one-CSS-pixel-per-pixel surface.
+    if !rect_intersects_paint_surface(&shadow_bounds, pixmap, 1.0) {
+        return;
+    }
     // Ancestor overflow clip is already the complete rect/rounded chain.
     let mask = ancestor_clip;
     let color = shadow.color;
@@ -6531,6 +6661,16 @@ fn paint_in_flow_generated_box(
     if visible.width <= 0.0 || visible.height <= 0.0 {
         return;
     }
+    let ink = non_text_ink_bounds(&rect, style);
+    let visible_ink = match clip {
+        Some(clip) => ink.intersect(&clip),
+        None => Some(ink),
+    };
+    if !visible_ink
+        .is_some_and(|ink| rect_intersects_paint_surface(&ink, pixmap, raster_scale))
+    {
+        return;
+    }
     let ancestor_clip_mask = overflow_clip.as_ref().and_then(|clip| {
         overflow_clip_mask(
             pixmap.width(),
@@ -6708,8 +6848,8 @@ fn paint_positioned_pseudo(
     static_position_rect: &crate::Rect,
     viewport: (f32, f32),
     root_font_size: f32,
-    ancestor_clip: Option<crate::Rect>,
-    ancestor_clip_mask: Option<&tiny_skia::Mask>,
+    clip_extent: (f32, f32),
+    ancestor_overflow_clip: Option<&crate::dom::OverflowClip>,
     base_url: Option<&str>,
     image_cache: &mut RenderResourceCache,
     raster_scale: f32,
@@ -6770,11 +6910,19 @@ fn paint_positioned_pseudo(
         width,
         height,
     };
+    let ancestor_clip = ancestor_overflow_clip
+        .map(|clip| clip.viewport_rect(clip_extent));
     let visible = match ancestor_clip {
         Some(clip) => rect.intersect(&clip),
         None => Some(rect),
     };
     let Some(visible) = visible else { return };
+    if !rect_intersects_paint_surface(&non_text_ink_bounds(&rect, style), pixmap, raster_scale) {
+        return;
+    }
+    let ancestor_clip_mask = ancestor_overflow_clip.and_then(|clip| {
+        overflow_clip_mask(pixmap.width(), pixmap.height(), clip, clip_extent)
+    });
     let radius = style.border_model.radii.resolve(rect.width, rect.height);
     let clip_path_mask = style.clip_path.as_ref().and_then(|polygon| {
         polygon_clip_mask(
@@ -6789,7 +6937,8 @@ fn paint_positioned_pseudo(
     });
     let background = background_geometry(&rect, style);
     let background_path = background_clip_path(background);
-    let element_clip_mask = background_extra_clip(ancestor_clip_mask, clip_path_mask.as_ref());
+    let element_clip_mask =
+        background_extra_clip(ancestor_clip_mask.as_ref(), clip_path_mask.as_ref());
     let background_mask = element_clip_mask.clone();
     if style.mask_image.is_none() && !style.background_clip_text {
         if let (Some(color), Some(path)) = (style.background_color, background_path.as_ref()) {
@@ -7386,6 +7535,12 @@ fn paint_image(
     if rect.width <= 0.0 || rect.height <= 0.0 {
         return false;
     }
+    // Image-bearing display lists currently use the proven CSS-pixel raster
+    // path (`native_raster_scale_supported` rejects them). Cull before cache
+    // lookup, SVG parsing, or bitmap resizing.
+    if !rect_intersects_paint_surface(visible_rect, pixmap, 1.0) {
+        return false;
+    }
     let Some(bytes) = fetch_bytes(src, base_url, cache) else {
         return false;
     };
@@ -7578,6 +7733,72 @@ fn overflow_clip_mask(
         }
         current = node.parent.as_deref();
     }
+    Some(mask)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct OverflowClipMaskKey {
+    bounds: [u32; 4],
+    rounded_chain: usize,
+    rounded_offset: [u32; 2],
+}
+
+type OverflowClipMaskCache = HashMap<
+    OverflowClipMaskKey,
+    (
+        Option<Arc<crate::dom::RoundedOverflowClipChain>>,
+        Arc<tiny_skia::Mask>,
+    ),
+>;
+
+const MAX_OVERFLOW_CLIP_MASK_CACHE_ENTRIES: usize = 2;
+
+fn overflow_clip_mask_key(
+    clip: &crate::dom::OverflowClip,
+    viewport: (f32, f32),
+) -> OverflowClipMaskKey {
+    let bounds = clip.viewport_rect(viewport);
+    let rounded_offset = clip.rounded_offset();
+    OverflowClipMaskKey {
+        bounds: [
+            bounds.x.to_bits(),
+            bounds.y.to_bits(),
+            bounds.width.to_bits(),
+            bounds.height.to_bits(),
+        ],
+        rounded_chain: clip
+            .rounded_chain()
+            .map_or(0, |chain| Arc::as_ptr(chain) as usize),
+        rounded_offset: [rounded_offset.0.to_bits(), rounded_offset.1.to_bits()],
+    }
+}
+
+fn cached_overflow_clip_mask(
+    cache: &mut OverflowClipMaskCache,
+    pw: u32,
+    ph: u32,
+    clip: &crate::dom::OverflowClip,
+    viewport: (f32, f32),
+) -> Option<Arc<tiny_skia::Mask>> {
+    let key = overflow_clip_mask_key(clip, viewport);
+    if let Some((_, mask)) = cache.get(&key) {
+        return Some(Arc::clone(mask));
+    }
+    let mask = Arc::new(overflow_clip_mask(pw, ph, clip, viewport)?);
+    // A mask is one byte per output pixel. Two entries keep the ubiquitous
+    // shared scrollport fast without turning a page with many distinct clips
+    // into an unbounded surface-sized memory cache. DOM traversal is locally
+    // ordered, so clearing at the bound retains the useful descendant burst.
+    if cache.len() >= MAX_OVERFLOW_CLIP_MASK_CACHE_ENTRIES {
+        cache.clear();
+    }
+    // `clip_scope_root` can synthesize a temporary rounded chain. Keeping its
+    // root Arc alongside the pointer-based key prevents allocator reuse from
+    // making a later, different chain alias this entry during the same paint.
+    cache.insert(
+        key,
+        (clip.rounded_chain().cloned(), Arc::clone(&mask)),
+    );
     Some(mask)
 }
 
@@ -8398,6 +8619,11 @@ fn paint_mask(
     cache: &mut RenderResourceCache,
 ) -> bool {
     if rect.width <= 0.0 || rect.height <= 0.0 {
+        return false;
+    }
+    // Masks likewise force the CSS-pixel raster path. Avoid decoding and the
+    // O(box area) recolor loop when their destination misses this capture.
+    if !rect_intersects_paint_surface(rect, pixmap, 1.0) {
         return false;
     }
     let Some(bytes) = fetch_bytes(src, base_url, cache) else {
@@ -12212,5 +12438,178 @@ mod tests {
         let expected =
             image::imageops::resize(&source, 60, 60, image::imageops::FilterType::Lanczos3);
         assert_eq!(two_x.data(), expected.as_raw());
+    }
+
+    #[test]
+    fn paint_surface_culling_uses_css_coordinates_and_ink_overflow() {
+        let pixmap = Pixmap::new(200, 160).expect("surface");
+        assert!(rect_intersects_paint_surface(
+            &crate::Rect {
+                x: 90.0,
+                y: 70.0,
+                width: 20.0,
+                height: 20.0,
+            },
+            &pixmap,
+            2.0,
+        ));
+        assert!(!rect_intersects_paint_surface(
+            &crate::Rect {
+                x: 0.0,
+                y: 81.0,
+                width: 20.0,
+                height: 20.0,
+            },
+            &pixmap,
+            2.0,
+        ));
+
+        let mut style = crate::LayoutStyle::default();
+        style.box_shadow = Some(crate::BoxShadow {
+            offset_x: -24.0,
+            offset_y: 0.0,
+            blur: 8.0,
+            spread: 2.0,
+            color: [0, 0, 0, 255],
+            inset: false,
+        });
+        style.outline.style = crate::BorderStyle::Solid;
+        style.outline.specified_width = 4.0;
+        style.outline.offset = 3.0;
+        let ink = non_text_ink_bounds(
+            &crate::Rect {
+                x: 110.0,
+                y: 10.0,
+                width: 10.0,
+                height: 10.0,
+            },
+            &style,
+        );
+        assert_eq!(ink.x, 76.0, "outset shadow must widen the cull rect");
+        assert_eq!(ink.y, 0.0, "shadow blur must widen the cull rect vertically");
+        assert_eq!(ink.x + ink.width, 127.0);
+    }
+
+    #[test]
+    fn offscreen_overflow_clip_suppresses_offset_shadow_and_outline_ink() {
+        let paint = |overflow: &str| {
+            let html = format!(
+                r#"<html style="margin:0"><body style="margin:0">
+                <div style="position:absolute;left:200px;top:0;width:100px;height:120px;
+                            overflow:{overflow}">
+                    <div style="position:absolute;left:50px;top:20px;width:20px;height:20px;
+                                box-shadow:-210px 0 0 0 black"></div>
+                    <div style="position:absolute;left:50px;top:75px;width:20px;height:20px;
+                                outline:210px solid red"></div>
+                </div>
+            </body></html>"#
+            );
+            let tree = parse_html(&html);
+            paint_dom(&tree, (100.0, 120.0), None).expect("offscreen ink")
+        };
+
+        let unclipped = paint("visible");
+        for (x, y, label) in [(45, 25, "shadow"), (45, 85, "outline")] {
+            let pixel = unclipped.pixel(x, y).expect(label);
+            assert_ne!(
+                (pixel.red(), pixel.green(), pixel.blue()),
+                (255, 255, 255),
+                "control must place {label} ink at the regression sample"
+            );
+        }
+
+        let pixmap = paint("hidden");
+        for (x, y, label) in [(45, 25, "shadow"), (45, 85, "outline")] {
+            let pixel = pixmap.pixel(x, y).expect(label);
+            assert_eq!(
+                (pixel.red(), pixel.green(), pixel.blue(), pixel.alpha()),
+                (255, 255, 255, 255),
+                "offscreen ancestor overflow clip must suppress {label}: {pixel:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn transformed_outline_survives_tight_atomic_source_bounds() {
+        let tree = parse_html(
+            r#"<html style="margin:0"><body style="margin:0">
+                <div style="position:absolute;left:40px;top:40px;width:20px;height:20px;
+                            outline:10px solid red;transform-origin:0 0;transform:scale(2)">
+                </div>
+            </body></html>"#,
+        );
+        let pixmap = paint_dom(&tree, (120.0, 120.0), None).expect("transformed outline");
+        let outer_outline = pixmap.pixel(25, 50).expect("transformed outer outline");
+        assert!(
+            outer_outline.red() > 220
+                && outer_outline.green() < 40
+                && outer_outline.blue() < 40,
+            "outline ink outside the border-box source bounds must survive the transform: {outer_outline:?}"
+        );
+    }
+
+    #[test]
+    fn offscreen_image_is_rejected_before_resource_lookup_and_decode() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let loader_calls = Arc::clone(&calls);
+        let mut resources = RenderResourceCache::with_loader(move |_url: &str| {
+            loader_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Some(vec![0; 1024])
+        });
+        let mut pixmap = Pixmap::new(100, 100).expect("surface");
+        let rect = crate::Rect {
+            x: 0.0,
+            y: 10_000.0,
+            width: 80.0,
+            height: 80.0,
+        };
+        assert!(!paint_image(
+            "https://example.test/offscreen.svg",
+            None,
+            &rect,
+            &rect,
+            crate::ObjectFit::Fill,
+            &mut pixmap,
+            &mut resources,
+            None,
+            crate::ResolvedBorderRadii::default(),
+            None,
+        ));
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "offscreen culling must happen before any resource work"
+        );
+    }
+
+    #[test]
+    fn viewport_cull_uses_post_translate_fixed_and_sticky_coordinates() {
+        let tree = parse_html(
+            r#"<html style="margin:0"><body style="margin:0;height:1400px">
+                <div style="position:absolute;left:10px;top:1000px;width:20px;height:20px;
+                     transform:translateY(-990px);background:red"></div>
+                <div style="position:fixed;left:40px;top:10px;width:20px;height:20px;
+                     background:lime"></div>
+                <div style="height:1000px"></div>
+                <div style="position:sticky;left:70px;top:10px;width:20px;height:20px;
+                     background:blue"></div>
+            </body></html>"#,
+        );
+        let mut resources = RenderResourceCache::with_loader(|_url: &str| None);
+        let mut prepared =
+            prepare_dom(&tree, (120.0, 80.0), None, &mut resources).expect("prepared render");
+        let top = prepared.resolve_scroll_state(&tree, (0.0, 0.0), &HashMap::new());
+        let top_pixmap = paint_prepared_with_scroll(&tree, &mut prepared, &mut resources, &top)
+            .expect("top paint");
+        let translated = top_pixmap.pixel(15, 15).expect("translated pixel");
+        assert!(translated.red() > 240 && translated.green() < 20);
+
+        let scroll = prepared.resolve_scroll_state(&tree, (0.0, 990.0), &HashMap::new());
+        let pixmap = paint_prepared_with_scroll(&tree, &mut prepared, &mut resources, &scroll)
+            .expect("scrolled paint");
+        let fixed = pixmap.pixel(45, 15).expect("fixed pixel");
+        assert!(fixed.green() > 240 && fixed.red() < 20);
+        let sticky = pixmap.pixel(75, 15).expect("sticky pixel");
+        assert!(sticky.blue() > 240 && sticky.red() < 20);
     }
 }

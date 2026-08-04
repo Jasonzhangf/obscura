@@ -90,7 +90,14 @@ const _DOM_MUTATION_COMMANDS = new Set([
 ]);
 const _dom = (cmd, a1, a2) => {
   const result = Deno.core.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""));
-  if (_DOM_MUTATION_COMMANDS.has(cmd)) _domMutationEpoch++;
+  if (_DOM_MUTATION_COMMANDS.has(cmd)) {
+    _domMutationEpoch++;
+    // Resize observation is tied to rendering-invalidating DOM work. The
+    // hook is installed later in bootstrap, before page script can run.
+    if (typeof globalThis.__obscura_recompute_resizes === "function") {
+      globalThis.__obscura_recompute_resizes();
+    }
+  }
   return result;
 };
 
@@ -3240,6 +3247,7 @@ class Element extends Node {
     if (changed && !this._scrollSuppress) this._fireScroll();
     if (changed &&
         typeof globalThis.__obscura_recompute_intersections === "function") {
+      // Scrolling changes target positions, not ResizeObserver box sizes.
       globalThis.__obscura_recompute_intersections();
     }
   }
@@ -4634,6 +4642,13 @@ class HTMLImageElement extends Element {
 
   _applyImageMetadata(metadata, request, dispatchEvent) {
     if (request !== this._imageRequest) return;
+    const previousLifecycle = [
+      this._imageComplete,
+      this._imageDecoded,
+      this._imageCurrentSrc,
+      this._imageNaturalWidth,
+      this._imageNaturalHeight,
+    ];
     const selected = metadata && metadata.currentSrc
       ? String(metadata.currentSrc)
       : "";
@@ -4665,6 +4680,18 @@ class HTMLImageElement extends Element {
       if (dispatchEvent) {
         try { this.dispatchEvent(new Event("error")); } catch (_error) {}
       }
+    }
+    const lifecycleChanged =
+      previousLifecycle[0] !== this._imageComplete ||
+      previousLifecycle[1] !== this._imageDecoded ||
+      previousLifecycle[2] !== this._imageCurrentSrc ||
+      previousLifecycle[3] !== this._imageNaturalWidth ||
+      previousLifecycle[4] !== this._imageNaturalHeight;
+    if (lifecycleChanged) {
+      // Intrinsic dimensions can become layout input at request completion
+      // even though no DOM attribute changed. Stable cache-only getters must
+      // not manufacture rendering updates on every read.
+      _scheduleResizeRenderCheckpoint();
     }
   }
 
@@ -5959,43 +5986,280 @@ if (!('isConnected' in Node.prototype)) {
   });
 }
 
+// Resize observation is part of the rendering update, not a timer. Keep the
+// last delivered size for each observed box and perform one coalesced geometry
+// checkpoint after DOM/viewport work. This follows the browser lifecycle and,
+// importantly, does not keep the event loop alive with speculative re-fires.
+globalThis.__resizeObservers = [];
+let _resizeRenderCheckpointPending = false;
+let _resizeRenderCheckpointRunning = false;
+let _resizeRenderCheckpointRerun = false;
+function _registerResizeObserver(observer) {
+  if (!globalThis.__resizeObservers.includes(observer)) {
+    globalThis.__resizeObservers.push(observer);
+  }
+}
+function _unregisterResizeObserver(observer) {
+  const index = globalThis.__resizeObservers.indexOf(observer);
+  if (index >= 0) globalThis.__resizeObservers.splice(index, 1);
+}
+function _scheduleResizeRenderCheckpoint() {
+  if (!globalThis.__resizeObservers.length) return;
+  if (_resizeRenderCheckpointRunning) {
+    _resizeRenderCheckpointRerun = true;
+    return;
+  }
+  if (_resizeRenderCheckpointPending) return;
+  _resizeRenderCheckpointPending = true;
+  _scheduleAfter(0, () => {
+    _resizeRenderCheckpointPending = false;
+    _resizeRenderCheckpointRunning = true;
+    let depth = 0;
+    let skipped = false;
+    // Depth strictly increases after each broadcast, so this is naturally
+    // bounded by tree depth. Keep a hard ceiling for adversarial callbacks
+    // that manufacture an ever-deeper subtree during one delivery cycle.
+    for (let iteration = 0; iteration < 64; iteration++) {
+      _resizeRenderCheckpointRerun = false;
+      const measurements = new Map();
+      let shallowest = Infinity;
+      let active = false;
+      skipped = false;
+      const observers = [...globalThis.__resizeObservers];
+      // Gather every observer before invoking any callback. A callback from an
+      // earlier observer must not change the geometry gathered for a later one.
+      for (const observer of observers) {
+        const gathered = observer._gather(measurements, depth);
+        active = active || gathered.active;
+        skipped = skipped || gathered.skipped;
+        shallowest = Math.min(shallowest, gathered.shallowest);
+      }
+      if (!active) break;
+      for (const observer of observers) observer._broadcast();
+      depth = shallowest;
+      if (!_resizeRenderCheckpointRerun) break;
+      if (iteration === 63) skipped = true;
+    }
+    _resizeRenderCheckpointRunning = false;
+    _resizeRenderCheckpointRerun = false;
+    if (skipped) {
+      // Match the standardized loop-limit signal without queuing another
+      // internal task that could keep a pathological page permanently busy.
+      try {
+        globalThis.dispatchEvent(new ErrorEvent("error", {
+          message: "ResizeObserver loop completed with undelivered notifications."
+        }));
+      } catch (_error) {}
+    }
+  });
+}
+globalThis.__obscura_recompute_resizes = _scheduleResizeRenderCheckpoint;
+function _roNumber(value) {
+  const number = Number.parseFloat(value);
+  return Number.isFinite(number) ? number : 0;
+}
+function _roPhysicalSize(inlineSize, blockSize, vertical) {
+  return vertical
+    ? new ResizeObserverSize(_roConstructionKey, blockSize, inlineSize)
+    : new ResizeObserverSize(_roConstructionKey, inlineSize, blockSize);
+}
+function _roNodeDepth(target) {
+  let depth = 1;
+  let node = target;
+  while (node && (node = node.parentNode || node.host || null)) depth++;
+  return depth;
+}
+function _roMeasurement(target) {
+  let geometry = null;
+  const hasRenderer = typeof Deno.core.ops.op_layout_geometry === "function";
+  if (hasRenderer && target?._nid != null) {
+    try {
+      const raw = Deno.core.ops.op_layout_geometry(String(target._nid | 0));
+      geometry = raw ? JSON.parse(raw) : null;
+    } catch (_error) {}
+  }
+
+  // Preserve deterministic geometry in non-render builds. This path has no
+  // native layout cache, but lifecycle behavior (initial delivery and
+  // change-only rechecks) should remain useful to automation consumers.
+  if (!hasRenderer && target?.getBoundingClientRect) {
+    const rect = target.getBoundingClientRect();
+    geometry = {
+      x: rect.x, y: rect.y,
+      clientWidth: rect.width, clientHeight: rect.height,
+    };
+  }
+
+  // No renderer box (detached, display:none) has zero sizes. The initial zero
+  // is still delivered because an observation starts without a reported size.
+  if (!geometry) {
+    const zero = _roPhysicalSize(0, 0, false);
+    return {
+      contentRect: _ioRect(0, 0, 0, 0),
+      contentBoxSize: [zero],
+      borderBoxSize: [_roPhysicalSize(0, 0, false)],
+      devicePixelContentBoxSize: [_roPhysicalSize(0, 0, false)],
+      selected: { "content-box": [0, 0], "border-box": [0, 0], "device-pixel-content-box": [0, 0] },
+    };
+  }
+
+  const style = getComputedStyle(target);
+  const paddingTop = _roNumber(style.paddingTop);
+  const paddingRight = _roNumber(style.paddingRight);
+  const paddingBottom = _roNumber(style.paddingBottom);
+  const paddingLeft = _roNumber(style.paddingLeft);
+  const borderTop = _roNumber(style.borderTopWidth);
+  const borderRight = _roNumber(style.borderRightWidth);
+  const borderBottom = _roNumber(style.borderBottomWidth);
+  const borderLeft = _roNumber(style.borderLeftWidth);
+  const clientWidth = Math.max(0, Number(geometry.clientWidth) || 0);
+  const clientHeight = Math.max(0, Number(geometry.clientHeight) || 0);
+  const contentWidth = Math.max(0, clientWidth - paddingLeft - paddingRight);
+  const contentHeight = Math.max(0, clientHeight - paddingTop - paddingBottom);
+  const borderWidth = Math.max(0, clientWidth + borderLeft + borderRight);
+  const borderHeight = Math.max(0, clientHeight + borderTop + borderBottom);
+  const vertical = /^(?:vertical|sideways)/.test(style.writingMode || "");
+  // Per Resize Observer, ordinary non-replaced inline elements have an empty
+  // observed box even though getBoundingClientRect() encloses their glyphs.
+  const replaced = /^(?:IMG|VIDEO|AUDIO|IFRAME|EMBED|OBJECT|INPUT|TEXTAREA|SELECT|CANVAS|SVG)$/.test(
+    target.tagName || ""
+  );
+  const emptyInline = style.display === "inline" && !replaced;
+  const observedContentWidth = emptyInline ? 0 : contentWidth;
+  const observedContentHeight = emptyInline ? 0 : contentHeight;
+  const observedBorderWidth = emptyInline ? 0 : borderWidth;
+  const observedBorderHeight = emptyInline ? 0 : borderHeight;
+  const contentSize = _roPhysicalSize(observedContentWidth, observedContentHeight, vertical);
+  const borderSize = _roPhysicalSize(observedBorderWidth, observedBorderHeight, vertical);
+
+  // Device-pixel content sizes snap the content edges, rather than merely
+  // rounding a CSS size multiplied by DPR. Preserve that distinction for
+  // fractional positions and dimensions.
+  const dpr = Math.max(0, Number(globalThis.devicePixelRatio) || 1);
+  const contentLeft = (Number(geometry.x) + borderLeft + paddingLeft) * dpr;
+  const contentTop = (Number(geometry.y) + borderTop + paddingTop) * dpr;
+  const deviceWidth = emptyInline ? 0 : Math.max(0,
+    Math.round(contentLeft + contentWidth * dpr) - Math.round(contentLeft));
+  const deviceHeight = emptyInline ? 0 : Math.max(0,
+    Math.round(contentTop + contentHeight * dpr) - Math.round(contentTop));
+  const deviceSize = _roPhysicalSize(deviceWidth, deviceHeight, vertical);
+  return {
+    contentRect: emptyInline
+      ? _ioRect(0, 0, 0, 0)
+      : _ioRect(paddingLeft, paddingTop, contentWidth, contentHeight),
+    contentBoxSize: [contentSize],
+    borderBoxSize: [borderSize],
+    devicePixelContentBoxSize: [deviceSize],
+    selected: {
+      "content-box": [contentSize.inlineSize, contentSize.blockSize],
+      "border-box": [borderSize.inlineSize, borderSize.blockSize],
+      "device-pixel-content-box": [deviceSize.inlineSize, deviceSize.blockSize],
+    },
+  };
+}
+
+const _roConstructionKey = {};
+const _roSizeValues = new WeakMap();
+globalThis.ResizeObserverSize = class ResizeObserverSize {
+  constructor(key, inlineSize, blockSize) {
+    if (key !== _roConstructionKey) throw new TypeError("Illegal constructor");
+    _roSizeValues.set(this, { inlineSize, blockSize });
+  }
+  get inlineSize() { return _roSizeValues.get(this)?.inlineSize; }
+  get blockSize() { return _roSizeValues.get(this)?.blockSize; }
+};
+const _roEntryValues = new WeakMap();
+globalThis.ResizeObserverEntry = class ResizeObserverEntry {
+  constructor(key, target, measurement) {
+    if (key !== _roConstructionKey) throw new TypeError("Illegal constructor");
+    _roEntryValues.set(this, { target, measurement });
+  }
+  get target() { return _roEntryValues.get(this)?.target; }
+  get contentRect() { return _roEntryValues.get(this)?.measurement.contentRect; }
+  get borderBoxSize() { return _roEntryValues.get(this)?.measurement.borderBoxSize; }
+  get contentBoxSize() { return _roEntryValues.get(this)?.measurement.contentBoxSize; }
+  get devicePixelContentBoxSize() {
+    return _roEntryValues.get(this)?.measurement.devicePixelContentBoxSize;
+  }
+};
 globalThis.ResizeObserver = class ResizeObserver {
   constructor(callback) {
+    if (typeof callback !== "function") {
+      throw new TypeError("ResizeObserver callback must be a function");
+    }
     this._callback = callback;
-    this._targets = new Set();
-    this._connected = true;
-    this._fireCount = 0;
+    this._targets = new Map();
+    this._active = [];
+    this._skipped = false;
   }
-  _fireFor(targets) {
-    if (!this._connected || !targets.length) return;
-    const records = targets.map(target => {
-      const r = target.getBoundingClientRect ? target.getBoundingClientRect() : { x: 0, y: 0, width: 100, height: 20 };
-      return {
-        target,
-        contentRect: { x: r.x || 0, y: r.y || 0, width: r.width || 100, height: r.height || 20, top: r.top || 0, left: r.left || 0, bottom: r.bottom || 20, right: r.right || 100 },
-        borderBoxSize: [{ blockSize: r.height || 20, inlineSize: r.width || 100 }],
-        contentBoxSize: [{ blockSize: r.height || 20, inlineSize: r.width || 100 }],
-        devicePixelContentBoxSize: [{ blockSize: r.height || 20, inlineSize: r.width || 100 }],
-      };
+  _gather(measurements, depth) {
+    this._active = [];
+    this._skipped = false;
+    let shallowest = Infinity;
+    for (const [target, observation] of this._targets) {
+      let measurement = measurements.get(target);
+      if (!measurement) {
+        measurement = _roMeasurement(target);
+        measurements.set(target, measurement);
+      }
+      const size = measurement.selected[observation.box];
+      const last = observation.last;
+      if (last && last[0] === size[0] && last[1] === size[1]) continue;
+      const targetDepth = _roNodeDepth(target);
+      // A callback may disconnect and begin observing a different target.
+      // Browsers deliver that initial observation on the next rendering
+      // opportunity. We fold that opportunity into this bounded cycle so it
+      // does not require a persistent frame timer; already-reported targets
+      // still obey the loop-depth guard.
+      if (targetDepth <= depth && last) {
+        this._skipped = true;
+        continue;
+      }
+      shallowest = Math.min(shallowest, targetDepth);
+      this._active.push({ target, observation, measurement, size });
+    }
+    return {
+      active: this._active.length > 0,
+      skipped: this._skipped,
+      shallowest,
+    };
+  }
+  _broadcast() {
+    if (!this._active.length) return;
+    const entries = this._active.map(({ target, observation, measurement, size }) => {
+      // Update before invoking callbacks. Callback-driven mutations are
+      // compared against this delivery in the same bounded delivery cycle.
+      observation.last = size.slice();
+      return new ResizeObserverEntry(_roConstructionKey, target, measurement);
     });
-    try { this._callback(records, this); } catch (e) { /* RO callbacks must not propagate */ }
+    this._active = [];
+    try { this._callback(entries, this); } catch (_error) {}
   }
-  observe(el) {
-    if (!el || !this._connected) return;
-    if (this._targets.has(el)) return;
-    this._targets.add(el);
-    Promise.resolve().then(() => this._fireFor([el]));
-    [200, 800].forEach(delay => {
-      setTimeout(() => {
-        if (this._connected && this._targets.has(el) && this._fireCount < 16) {
-          this._fireCount++;
-          this._fireFor([el]);
-        }
-      }, delay);
-    });
+  observe(target, options = {}) {
+    if (!(target instanceof Element)) {
+      throw new TypeError("ResizeObserver.observe requires an Element");
+    }
+    const box = options && options.box != null ? String(options.box) : "content-box";
+    if (box !== "content-box" && box !== "border-box" &&
+        box !== "device-pixel-content-box") {
+      throw new TypeError(`Invalid ResizeObserver box option: ${box}`);
+    }
+    const current = this._targets.get(target);
+    if (current && current.box === box) return;
+    this._targets.set(target, { box, last: null });
+    _registerResizeObserver(this);
+    _scheduleResizeRenderCheckpoint();
   }
-  unobserve(el) { this._targets.delete(el); }
-  disconnect() { this._connected = false; this._targets.clear(); }
+  unobserve(target) {
+    this._targets.delete(target);
+    if (!this._targets.size) _unregisterResizeObserver(this);
+  }
+  disconnect() {
+    this._targets.clear();
+    this._active = [];
+    this._skipped = false;
+    _unregisterResizeObserver(this);
+  }
 };
 
 if (typeof TextEncoder === 'undefined') {
@@ -6786,12 +7050,19 @@ function _ioMargins(value) {
   if (parsed.length === 3) return [parsed[0], parsed[1], parsed[2], parsed[1]];
   return parsed;
 }
-function _ioUnsupportedRoot() {
-  const error = new Error(
-    "Obscura IntersectionObserver element roots require element scroll-container layout"
-  );
-  error.name = "NotSupportedError";
-  return error;
+function _ioClipsOverflow(value) {
+  return /^(?:auto|clip|hidden|overlay|scroll)$/.test(String(value || ""));
+}
+function _ioElementPaddingBox(element, style) {
+  const geometry = element._renderBoxGeometry();
+  const rect = geometry
+    ? element._rectFromRenderGeometry(geometry)
+    : element.getBoundingClientRect();
+  const borderLeft = _roNumber(style.borderLeftWidth);
+  const borderTop = _roNumber(style.borderTopWidth);
+  const width = geometry ? geometry.clientWidth : element.clientWidth;
+  const height = geometry ? geometry.clientHeight : element.clientHeight;
+  return _ioRect(rect.left + borderLeft, rect.top + borderTop, width, height);
 }
 globalThis.IntersectionObserver = class IntersectionObserver {
   constructor(callback, options) {
@@ -6800,7 +7071,11 @@ globalThis.IntersectionObserver = class IntersectionObserver {
     }
     this._callback = callback;
     this._options = options || {};
-    if (this._options.root != null) throw _ioUnsupportedRoot();
+    this._root = this._options.root == null ? null : this._options.root;
+    if (this._root !== null && !(this._root instanceof Element) &&
+        this._root?.nodeType !== 9) {
+      throw new TypeError("IntersectionObserver root must be an Element or Document");
+    }
     this._margins = _ioMargins(this._options.rootMargin || "0px");
     if (!this._margins) throw new SyntaxError("Invalid IntersectionObserver rootMargin");
     const raw = this._options.threshold == null
@@ -6819,8 +7094,29 @@ globalThis.IntersectionObserver = class IntersectionObserver {
     globalThis.__intersectionObservers.push(this);
   }
   _rootBounds() {
-    const width = globalThis.innerWidth || 1280;
-    const height = globalThis.innerHeight || 720;
+    let x = 0, y = 0;
+    let width = globalThis.innerWidth || 1280;
+    let height = globalThis.innerHeight || 720;
+    if (this._root instanceof Element) {
+      const style = getComputedStyle(this._root);
+      const clips = _ioClipsOverflow(style.overflowX) ||
+        _ioClipsOverflow(style.overflowY);
+      if (clips) {
+        const paddingBox = _ioElementPaddingBox(this._root, style);
+        x = paddingBox.left;
+        y = paddingBox.top;
+        // The intersection root for a content-clipping element is its padding
+        // box (the CSSOM client box), independent of its current scroll offset.
+        width = paddingBox.width;
+        height = paddingBox.height;
+      } else {
+        const rect = this._root.getBoundingClientRect();
+        x = rect.left;
+        y = rect.top;
+        width = rect.width;
+        height = rect.height;
+      }
+    }
     const resolve = (margin, basis) =>
       margin.unit === "%" ? margin.value * basis / 100 : margin.value;
     // IntersectionObserver resolves every rootMargin percentage against the
@@ -6829,27 +7125,55 @@ globalThis.IntersectionObserver = class IntersectionObserver {
     const right = resolve(this._margins[1], width);
     const bottom = resolve(this._margins[2], width);
     const left = resolve(this._margins[3], width);
-    return _ioRect(-left, -top, width + left + right, height + top + bottom);
+    return _ioRect(x - left, y - top, width + left + right, height + top + bottom);
   }
-  _entry(target) {
+  _entry(target, root) {
     const rect = target.getBoundingClientRect();
-    const root = this._rootBounds();
-    const left = Math.max(rect.left, root.left);
-    const top = Math.max(rect.top, root.top);
-    const right = Math.min(rect.right, root.right);
-    const bottom = Math.min(rect.bottom, root.bottom);
-    const edgesTouch = right >= left && bottom >= top;
+    let inRootTree = !(this._root instanceof Element) || this._root.contains(target);
+    let left = Math.max(rect.left, root.left);
+    let top = Math.max(rect.top, root.top);
+    let right = Math.min(rect.right, root.right);
+    let bottom = Math.min(rect.bottom, root.bottom);
+
+    // Mapping a target to its intersection root clips it at every intervening
+    // overflow container. Intersecting only with the final root incorrectly
+    // exposes offscreen children of nested carousels, virtual lists, and lazy
+    // loading viewports. Use each ancestor's padding box, independently by
+    // axis, matching Chromium's rectangular overflow clip chain.
+    let ancestor = target.parentNode || target.host || null;
+    while (inRootTree && ancestor && ancestor !== this._root && ancestor.nodeType !== 9) {
+      if (ancestor instanceof Element) {
+        const style = getComputedStyle(ancestor);
+        const clipX = _ioClipsOverflow(style.overflowX);
+        const clipY = _ioClipsOverflow(style.overflowY);
+        if (clipX || clipY) {
+          const clip = _ioElementPaddingBox(ancestor, style);
+          if (clipX) {
+            left = Math.max(left, clip.left);
+            right = Math.min(right, clip.right);
+          }
+          if (clipY) {
+            top = Math.max(top, clip.top);
+            bottom = Math.min(bottom, clip.bottom);
+          }
+        }
+      }
+      ancestor = ancestor.parentNode || ancestor.host || null;
+    }
+    if (this._root instanceof Element && ancestor !== this._root) inRootTree = false;
+
+    const edgesTouch = inRootTree && right >= left && bottom >= top;
     const width = Math.max(0, right - left);
     const height = Math.max(0, bottom - top);
     const targetArea = Math.max(0, rect.width) * Math.max(0, rect.height);
-    const area = width * height;
     const isIntersecting = edgesTouch;
+    const area = isIntersecting ? width * height : 0;
     return {
       target,
       isIntersecting,
       intersectionRatio: targetArea > 0 ? area / targetArea : (isIntersecting ? 1 : 0),
       boundingClientRect: _ioRect(rect.x, rect.y, rect.width, rect.height),
-      intersectionRect: _ioRect(left, top, width, height),
+      intersectionRect: isIntersecting ? _ioRect(left, top, width, height) : _ioRect(0, 0, 0, 0),
       rootBounds: root,
       time: performance.now(),
     };
@@ -6859,8 +7183,8 @@ globalThis.IntersectionObserver = class IntersectionObserver {
     while (index < this._thresholds.length && this._thresholds[index] <= ratio) index++;
     return index;
   }
-  _queueChanged(target, forceInitial) {
-    const entry = this._entry(target);
+  _queueChanged(target, forceInitial, root) {
+    const entry = this._entry(target, root);
     const previous = this._previous.get(target);
     const changed = forceInitial || !previous ||
       previous.isIntersecting !== entry.isIntersecting ||
@@ -6874,8 +7198,9 @@ globalThis.IntersectionObserver = class IntersectionObserver {
   }
   _check(targets, forceInitial) {
     if (!this._connected) return;
+    const root = this._rootBounds();
     for (const target of targets) {
-      if (this._targets.has(target)) this._queueChanged(target, !!forceInitial);
+      if (this._targets.has(target)) this._queueChanged(target, !!forceInitial, root);
     }
     if (!this._records.length || this._deliveryPending) return;
     this._deliveryPending = true;
@@ -6915,23 +7240,30 @@ globalThis.IntersectionObserver = class IntersectionObserver {
     if (index >= 0) globalThis.__intersectionObservers.splice(index, 1);
   }
   takeRecords() { return this._records.splice(0); }
-  get root() { return null; }
+  get root() { return this._root; }
   get rootMargin() {
     return this._margins.map((margin) => `${margin.value}${margin.unit}`).join(" ");
   }
   get thresholds() { return this._thresholds.slice(); }
 };
 (function() {
-  const recompute = () => {
+  const renderingUpdate = () => {
     _scheduleIntersectionRenderCheckpoint();
+    _scheduleResizeRenderCheckpoint();
   };
-  globalThis.__obscura_recompute_intersections = recompute;
-  globalThis.addEventListener("resize", recompute);
+  // Scrolling calls the IO-only hook. Actual viewport resizing remains a full
+  // rendering update and schedules both observer families.
+  globalThis.__obscura_recompute_intersections = _scheduleIntersectionRenderCheckpoint;
+  globalThis.addEventListener("resize", renderingUpdate);
   const wireUp = () => {
-    if (!globalThis.document?.body) return;
-    const observer = new MutationObserver(recompute);
+    if (!globalThis.document) return;
+    // DOM writes synchronously mark ResizeObserver dirty through `_dom`; this
+    // MutationObserver is only needed for intersection geometry. Scheduling RO
+    // again here would escape its depth-bounded delivery cycle and allow a
+    // self-resizing callback to create an infinite chain of zero-delay tasks.
+    const observer = new MutationObserver(_scheduleIntersectionRenderCheckpoint);
     try {
-      observer.observe(globalThis.document.body, {
+      observer.observe(globalThis.document, {
         childList: true,
         subtree: true,
         attributes: true,
@@ -6939,7 +7271,7 @@ globalThis.IntersectionObserver = class IntersectionObserver {
       });
     } catch {}
   };
-  if (globalThis.document?.body) wireUp();
+  if (globalThis.document) wireUp();
   else Promise.resolve().then(wireUp);
 })();
 globalThis.IntersectionObserverEntry = class IntersectionObserverEntry {};
@@ -11491,6 +11823,7 @@ if (typeof FontFace === 'undefined') {
         unicodeRange: face.unicodeRange
       });
       Deno.core.ops.op_set_dynamic_fonts(JSON.stringify(registrations.filter(face => !face.skip)));
+      _scheduleResizeRenderCheckpoint();
     }
     _faceChanged(face) {
       this._syncNative();

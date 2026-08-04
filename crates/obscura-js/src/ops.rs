@@ -3271,6 +3271,20 @@ fn op_image_metadata(state: &OpState, nid: u32, cached_only: bool) -> String {
     }
     let base_url = document_base_url(&gs);
     let viewport = gs.viewport;
+    let previous_dimensions = (!cached_only)
+        .then(|| {
+            gs.dom.as_ref().and_then(|dom| {
+                gs.render_resources
+                    .cached_image_element_metadata(
+                        dom,
+                        node_id,
+                        viewport,
+                        base_url.as_deref(),
+                    )
+                    .and_then(|(_, _, known, dimensions)| known.then_some(dimensions).flatten())
+            })
+        })
+        .flatten();
     let ObscuraState {
         dom,
         render_resources,
@@ -3316,6 +3330,15 @@ fn op_image_metadata(state: &OpState, nid: u32, cached_only: bool) -> String {
             "density": density,
         })
         .to_string();
+    }
+    // The page transport invalidates prepared layout when it seeds successful
+    // bytes. Cover the synchronous compatibility-loader path too, but only
+    // when this call actually discovers a new decodable intrinsic size. A
+    // cache hit or retained decode failure cannot change used geometry.
+    if !cached_only && dimensions.is_some() && dimensions != previous_dimensions {
+        gs.prepared_render = None;
+        gs.pending_style_mutations.clear();
+        gs.resolved_scroll = None;
     }
     match dimensions {
         Some((width, height)) => serde_json::json!({

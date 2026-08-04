@@ -412,6 +412,9 @@ impl ObscuraJsRuntime {
                  }}\
                  if(typeof globalThis.__obscura_recompute_intersections==='function'){{\
                    globalThis.__obscura_recompute_intersections();\
+                 }}\
+                 if(typeof globalThis.__obscura_recompute_resizes==='function'){{\
+                   globalThis.__obscura_recompute_resizes();\
                  }}",
             ),
         );
@@ -6446,6 +6449,310 @@ mod tests {
 
     #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
+    async fn resize_observer_reports_real_boxes_only_when_selected_size_changes() {
+        let dom = parse_html(
+            r#"<html style="margin:0"><body style="margin:0">
+                <div id="target" style="box-sizing:border-box;width:120px;height:80px;
+                     padding:5px 7px;border:2px solid black"></div>
+            </body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_viewport(300.0, 200.0);
+        rt.run_page_init();
+        rt.execute_script(
+            "resize-observer-boxes",
+            r#"
+                globalThis.__resizeRecords = [];
+                globalThis.__resizeObserver = new ResizeObserver(entries => {
+                    __resizeRecords.push(...entries.map(entry => ({
+                        interfaces: [
+                            entry instanceof ResizeObserverEntry,
+                            entry.contentBoxSize[0] instanceof ResizeObserverSize,
+                            entry.borderBoxSize[0] instanceof ResizeObserverSize,
+                            entry.devicePixelContentBoxSize[0] instanceof ResizeObserverSize,
+                        ],
+                        contentRect: [
+                            entry.contentRect.x, entry.contentRect.y,
+                            entry.contentRect.width, entry.contentRect.height,
+                        ],
+                        content: [
+                            entry.contentBoxSize[0].inlineSize,
+                            entry.contentBoxSize[0].blockSize,
+                        ],
+                        border: [
+                            entry.borderBoxSize[0].inlineSize,
+                            entry.borderBoxSize[0].blockSize,
+                        ],
+                        device: [
+                            entry.devicePixelContentBoxSize[0].inlineSize,
+                            entry.devicePixelContentBoxSize[0].blockSize,
+                        ],
+                    })));
+                });
+                __resizeObserver.observe(document.getElementById("target"));
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(40).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__resizeRecords").unwrap(),
+            serde_json::json!([{
+                "interfaces": [true, true, true, true],
+                "contentRect": [7, 5, 102, 66],
+                "content": [102, 66],
+                "border": [120, 80],
+                "device": [102, 66],
+            }])
+        );
+
+        // A style mutation still causes a rendering checkpoint, but unchanged
+        // observed geometry must not produce a speculative notification.
+        rt.evaluate(r#"document.getElementById("target").style.color = "red""#)
+            .unwrap();
+        rt.run_event_loop_bounded(40).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__resizeRecords.length").unwrap().as_f64(),
+            Some(1.0)
+        );
+
+        rt.evaluate(r#"document.getElementById("target").style.width = "140px""#)
+            .unwrap();
+        rt.run_event_loop_bounded(40).await.unwrap();
+        assert_eq!(
+            rt.evaluate(
+                "__resizeRecords.map(record => [record.content[0], record.border[0]])"
+            )
+            .unwrap(),
+            serde_json::json!([[102, 120], [122, 140]])
+        );
+        assert_eq!(
+            rt.evaluate("__obscura_nextPendingTimeoutDelay()")
+                .unwrap()
+                .as_f64(),
+            Some(-1.0)
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn resize_observer_selected_box_and_viewport_lifecycle_match_chromium() {
+        let dom = parse_html(
+            r#"<html style="margin:0"><body style="margin:0">
+                <div id="target" style="box-sizing:border-box;width:50vw;height:40px;
+                     padding:4px;border:2px solid"></div>
+            </body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_viewport(200.0, 100.0);
+        rt.run_page_init();
+        rt.execute_script(
+            "resize-observer-selected-box",
+            r#"
+                globalThis.__contentWidths = [];
+                globalThis.__borderWidths = [];
+                const target = document.getElementById("target");
+                globalThis.__contentObserver = new ResizeObserver(entries => {
+                    __contentWidths.push(entries[0].contentBoxSize[0].inlineSize);
+                });
+                globalThis.__borderObserver = new ResizeObserver(entries => {
+                    __borderWidths.push(entries[0].borderBoxSize[0].inlineSize);
+                });
+                __contentObserver.observe(target, { box: "content-box" });
+                __borderObserver.observe(target, { box: "border-box" });
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(40).await.unwrap();
+        assert_eq!(
+            rt.evaluate("[__contentWidths, __borderWidths]").unwrap(),
+            serde_json::json!([[88], [100]])
+        );
+
+        // A viewport update is a rendering update even without a DOM mutation.
+        rt.set_viewport(300.0, 100.0);
+        rt.run_event_loop_bounded(40).await.unwrap();
+        assert_eq!(
+            rt.evaluate("[__contentWidths, __borderWidths]").unwrap(),
+            serde_json::json!([[88, 138], [100, 150]])
+        );
+
+        // With border-box sizing a thicker border shrinks the content box but
+        // leaves the selected border box unchanged.
+        rt.evaluate(r#"document.getElementById("target").style.borderWidth = "4px""#)
+            .unwrap();
+        rt.run_event_loop_bounded(40).await.unwrap();
+        assert_eq!(
+            rt.evaluate("[__contentWidths, __borderWidths]").unwrap(),
+            serde_json::json!([[88, 138, 134], [100, 150]])
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn scrolling_does_not_remeasure_resize_observer_targets() {
+        let dom = parse_html(
+            r#"<html style="margin:0"><body style="margin:0;height:1000px">
+                <div id="probe" style="width:40px;height:20px"></div>
+            </body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_viewport(200.0, 100.0);
+        rt.run_page_init();
+        rt.execute_script(
+            "observe-before-scroll",
+            r#"
+                globalThis.__scrollResizeRecords = 0;
+                globalThis.__scrollResizeObserver = new ResizeObserver(entries => {
+                    __scrollResizeRecords += entries.length;
+                });
+                __scrollResizeObserver.observe(document.getElementById("probe"));
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(40).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__scrollResizeRecords").unwrap().as_f64(),
+            Some(1.0)
+        );
+
+        rt.execute_script(
+            "count-scroll-geometry-reads",
+            r#"
+                globalThis.__scrollGeometryReads = 0;
+                globalThis.__nativeLayoutGeometry = Deno.core.ops.op_layout_geometry;
+                Deno.core.ops.op_layout_geometry = (...args) => {
+                    __scrollGeometryReads++;
+                    return __nativeLayoutGeometry(...args);
+                };
+                window.scrollTo(0, 50);
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(40).await.unwrap();
+        let result = rt
+            .evaluate("[scrollY, __scrollGeometryReads, __scrollResizeRecords]")
+            .unwrap();
+        rt.execute_script(
+            "restore-layout-geometry-op",
+            "Deno.core.ops.op_layout_geometry = __nativeLayoutGeometry;",
+        )
+        .unwrap();
+        assert_eq!(result, serde_json::json!([50, 0, 1]));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn resize_observer_disconnect_is_reusable_and_inline_boxes_are_empty() {
+        let dom = parse_html(
+            r#"<html><body><div id="first" style="width:40px;height:20px"></div>
+                <span id="inline" style="padding:8px;border:2px solid">text</span>
+            </body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_viewport(200.0, 100.0);
+        rt.run_page_init();
+        let result = rt
+            .evaluate_for_cdp(
+                r#"
+                new Promise(resolve => {
+                    const deliveries = [];
+                    const observer = new ResizeObserver(entries => {
+                        deliveries.push(entries.map(entry => [
+                            entry.target.id,
+                            entry.contentRect.width,
+                            entry.borderBoxSize[0].inlineSize,
+                        ]));
+                        if (deliveries.length === 1) {
+                            observer.disconnect();
+                            observer.observe(document.getElementById("inline"));
+                        } else {
+                            observer.disconnect();
+                            resolve([deliveries, __resizeObservers.length]);
+                        }
+                    });
+                    observer.observe(document.getElementById("first"));
+                    setTimeout(() => resolve(["timed out"]), 100);
+                })
+                "#,
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!([[[["first", 40, 40]], [["inline", 0, 0]]], 0])
+        );
+
+        assert_eq!(
+            rt.evaluate(
+                r#"[
+                    (() => { try { new ResizeObserver(null); } catch (e) { return e.name; } })(),
+                    (() => { try { new ResizeObserver(() => {}).observe(document); } catch (e) { return e.name; } })(),
+                    (() => { try { new ResizeObserver(() => {}).observe(document.body, {box:"margin-box"}); } catch (e) { return e.name; } })(),
+                ]"#,
+            )
+            .unwrap(),
+            serde_json::json!(["TypeError", "TypeError", "TypeError"])
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn resize_observer_self_resize_is_depth_bounded_without_timer_spin() {
+        let dom = parse_html(
+            r#"<html><body><div id="target" style="width:40px;height:20px"></div>
+            </body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_viewport(200.0, 100.0);
+        rt.run_page_init();
+        rt.execute_script(
+            "resize-observer-loop-limit",
+            r#"
+                globalThis.__resizeCallbacks = 0;
+                globalThis.__resizeLoopErrors = 0;
+                addEventListener("error", event => {
+                    if (event.message === "ResizeObserver loop completed with undelivered notifications.") {
+                        __resizeLoopErrors++;
+                    }
+                });
+                const target = document.getElementById("target");
+                globalThis.__loopingResizeObserver = new ResizeObserver(() => {
+                    __resizeCallbacks++;
+                    target.style.width = (40 + __resizeCallbacks) + "px";
+                });
+                __loopingResizeObserver.observe(target);
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(40).await.unwrap();
+        assert_eq!(
+            rt.evaluate(
+                "[__resizeCallbacks, __resizeLoopErrors, __obscura_nextPendingTimeoutDelay()]"
+            )
+            .unwrap(),
+            serde_json::json!([1, 1, -1])
+        );
+
+        // A later external rendering change starts a fresh bounded cycle; the
+        // suppressed same-depth observation did not poison future delivery.
+        rt.evaluate(r#"document.getElementById("target").style.width = "60px""#)
+            .unwrap();
+        rt.run_event_loop_bounded(40).await.unwrap();
+        assert_eq!(
+            rt.evaluate("[__resizeCallbacks, __resizeLoopErrors]").unwrap(),
+            serde_json::json!([2, 2])
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
     async fn intersection_observer_tracks_viewport_threshold_crossings() {
         let dom = parse_html(
             r#"<html style="margin:0"><body style="margin:0">
@@ -6489,6 +6796,134 @@ mod tests {
         assert_eq!(
             result.value.unwrap(),
             serde_json::json!([[false, 0, 150, 0], [true, 0.5, 50, 50], [false, 0, -110, 0],])
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn intersection_observer_element_root_uses_live_padding_box_and_scroll() {
+        let dom = parse_html(
+            r#"<html style="margin:0"><body style="margin:0">
+                <div id="root" style="position:absolute;left:10px;top:20px;width:100px;
+                     height:80px;padding:10px;border:5px solid;overflow:auto">
+                    <div style="height:100px"></div>
+                    <div id="target" style="height:20px"></div>
+                </div>
+            </body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_viewport(300.0, 200.0);
+        rt.run_page_init();
+
+        let result = rt
+            .evaluate_for_cdp(
+                r#"
+                new Promise(resolve => {
+                    const records = [];
+                    const root = document.getElementById("root");
+                    const observer = new IntersectionObserver(entries => {
+                        records.push(...entries.map(entry => ({
+                            intersecting: entry.isIntersecting,
+                            ratio: entry.intersectionRatio,
+                            root: [
+                                entry.rootBounds.x, entry.rootBounds.y,
+                                entry.rootBounds.width, entry.rootBounds.height,
+                            ],
+                            intersection: [
+                                entry.intersectionRect.x, entry.intersectionRect.y,
+                                entry.intersectionRect.width, entry.intersectionRect.height,
+                            ],
+                        })));
+                    }, { root, threshold: [0, 1] });
+                    observer.observe(document.getElementById("target"));
+                    setTimeout(() => { root.scrollTop = 999; }, 5);
+                    setTimeout(() => resolve(records), 30);
+                })
+                "#,
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!([
+                {
+                    "intersecting": false,
+                    "ratio": 0,
+                    "root": [15, 25, 120, 100],
+                    "intersection": [0, 0, 0, 0],
+                },
+                {
+                    "intersecting": true,
+                    "ratio": 1,
+                    "root": [15, 25, 120, 100],
+                    "intersection": [25, 95, 100, 20],
+                },
+            ])
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn intersection_observer_clips_through_intermediate_overflow_ancestors() {
+        let dom = parse_html(
+            r#"<html style="margin:0"><body style="margin:0">
+                <div id="root" style="position:absolute;left:10px;top:20px;
+                     width:300px;height:300px;overflow:visible">
+                    <div id="clip" style="width:100px;height:100px;overflow:hidden">
+                        <div style="height:150px"></div>
+                        <div id="target" style="height:20px"></div>
+                    </div>
+                </div>
+            </body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_viewport(400.0, 400.0);
+        rt.run_page_init();
+
+        let result = rt
+            .evaluate_for_cdp(
+                r#"
+                new Promise(resolve => {
+                    const records = [];
+                    const clip = document.getElementById("clip");
+                    const observer = new IntersectionObserver(entries => {
+                        records.push(...entries.map(entry => [
+                            entry.isIntersecting,
+                            entry.intersectionRatio,
+                            [
+                                entry.intersectionRect.x,
+                                entry.intersectionRect.y,
+                                entry.intersectionRect.width,
+                                entry.intersectionRect.height,
+                            ],
+                        ]));
+                    }, {
+                        root: document.getElementById("root"),
+                        threshold: [0, 1],
+                    });
+                    observer.observe(document.getElementById("target"));
+                    setTimeout(() => { clip.scrollTop = 999; }, 5);
+                    setTimeout(() => resolve(records), 30);
+                })
+                "#,
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        // Chromium reports the initial target as non-intersecting: although it
+        // lies inside the explicit root, the intermediate overflow container
+        // clips it. Programmatic scrolling then reveals the complete box.
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!([
+                [false, 0, [0, 0, 0, 0]],
+                [true, 1, [10, 100, 100, 20]],
+            ])
         );
     }
 
@@ -6571,16 +7006,17 @@ mod tests {
                     );
                     marginObserver.observe(document.getElementById("margin-target"));
                     zeroObserver.observe(document.getElementById("zero"));
-                    let unsupported = "";
+                    let elementRoot = false;
                     try {
-                        new IntersectionObserver(() => {}, {
+                        const rooted = new IntersectionObserver(() => {}, {
                             root: document.getElementById("root")
                         });
+                        elementRoot = rooted.root === document.getElementById("root");
                     } catch (error) {
-                        unsupported = error.name;
+                        elementRoot = error.name;
                     }
                     setTimeout(() => resolve([
-                        marginRecords, zeroRecords, unsupported,
+                        marginRecords, zeroRecords, elementRoot,
                         marginObserver.rootMargin, marginObserver.thresholds,
                     ]), 200);
                 })
@@ -6595,7 +7031,7 @@ mod tests {
             serde_json::json!([
                 [[true, 1, 120]],
                 [[true, 1]],
-                "NotSupportedError",
+                true,
                 "0px 0px 20px 0px",
                 [0, 1],
             ])
@@ -7774,6 +8210,177 @@ mod tests {
             serde_json::json!([true, 2, 3, "http://example.com/page/cached.png"])
         );
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn parser_image_fallback_invalidates_only_new_intrinsic_geometry() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let loader_calls = calls.clone();
+        let png = two_by_three_png();
+        let mut rt = parser_image_runtime(
+            r#"<img id="late" src="late.png">"#,
+            move |_url: &str| {
+                loader_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Some(png.clone())
+            },
+        );
+        {
+            let mut state = rt.state.borrow_mut();
+            let previous = state.render_resources.set_sync_loading_enabled(false);
+            assert!(ensure_prepared_render(&mut state).is_some());
+            state
+                .render_resources
+                .set_sync_loading_enabled(previous);
+            assert!(state.prepared_render.is_some());
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        rt.execute_script(
+            "load-image-after-layout",
+            r#"
+                globalThis.__lateEvents = [];
+                const late = document.getElementById("late");
+                late.addEventListener("load", () => __lateEvents.push("load"));
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate(
+                "[late.complete, late.naturalWidth, late.naturalHeight, __lateEvents]"
+            )
+            .unwrap(),
+            serde_json::json!([true, 2, 3, ["load"]])
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(rt.state.borrow().prepared_render.is_none());
+
+        // Once the successful dimensions are retained, another loading-form
+        // metadata probe is only a cache hit and must preserve fresh layout.
+        {
+            let mut state = rt.state.borrow_mut();
+            assert!(ensure_prepared_render(&mut state).is_some());
+            assert!(state.prepared_render.is_some());
+        }
+        rt.execute_script(
+            "reload-retained-image",
+            r#"late.src = "late.png";"#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(rt.state.borrow().prepared_render.is_some());
+
+        let missing_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let missing_loader_calls = missing_calls.clone();
+        let mut missing = parser_image_runtime(
+            r#"<img id="missing" src="missing.png">"#,
+            move |_url: &str| {
+                missing_loader_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                None
+            },
+        );
+        {
+            let mut state = missing.state.borrow_mut();
+            let previous = state.render_resources.set_sync_loading_enabled(false);
+            assert!(ensure_prepared_render(&mut state).is_some());
+            state
+                .render_resources
+                .set_sync_loading_enabled(previous);
+            assert!(state.prepared_render.is_some());
+        }
+        missing
+            .execute_script(
+                "fail-image-after-layout",
+                r#"
+                    globalThis.__missingEvents = [];
+                    const missing = document.getElementById("missing");
+                    missing.addEventListener("error", () => __missingEvents.push("error"));
+                "#,
+            )
+            .unwrap();
+        missing.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            missing
+                .evaluate(
+                    "[missing.complete, missing.naturalWidth, missing.naturalHeight, __missingEvents]"
+                )
+                .unwrap(),
+            serde_json::json!([true, 0, 0, ["error"]])
+        );
+        assert_eq!(
+            missing_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert!(missing.state.borrow().prepared_render.is_some());
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn stable_cached_image_getters_do_not_queue_resize_geometry_work() {
+        let png = two_by_three_png();
+        let mut rt = parser_image_runtime(
+            r#"<img id="cached" src="cached.png">
+               <div id="probe" style="width:40px;height:20px"></div>"#,
+            move |_url: &str| Some(png.clone()),
+        );
+        rt.execute_script(
+            "settle-cached-image",
+            r#"
+                const cached = document.getElementById("cached");
+                void cached.complete;
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("[cached.complete, cached.naturalWidth, cached.naturalHeight]")
+                .unwrap(),
+            serde_json::json!([true, 2, 3])
+        );
+
+        rt.execute_script(
+            "observe-unrelated-geometry",
+            r#"
+                globalThis.__stableGetterResizeRecords = 0;
+                globalThis.__stableGetterObserver = new ResizeObserver(entries => {
+                    __stableGetterResizeRecords += entries.length;
+                });
+                __stableGetterObserver.observe(document.getElementById("probe"));
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate(
+                "[__stableGetterResizeRecords, __obscura_nextPendingTimeoutDelay()]"
+            )
+            .unwrap(),
+            serde_json::json!([1, -1])
+        );
+
+        rt.execute_script(
+            "read-stable-image-cache",
+            r#"
+                for (let i = 0; i < 50; i++) {
+                    void cached.complete;
+                    void cached.currentSrc;
+                    void cached.naturalWidth;
+                    void cached.naturalHeight;
+                }
+            "#,
+        )
+        .unwrap();
+        // Cached lifecycle reads do not change intrinsic dimensions, so they
+        // must not enqueue a rendering checkpoint (and its geometry walk).
+        assert_eq!(
+            rt.evaluate(
+                "[__stableGetterResizeRecords, __obscura_nextPendingTimeoutDelay()]"
+            )
+            .unwrap(),
+            serde_json::json!([1, -1])
+        );
     }
 
     #[cfg(feature = "render")]

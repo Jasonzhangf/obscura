@@ -14,14 +14,28 @@ use crate::Page;
 const POINTS_PER_INCH: f32 = 72.0;
 const MAX_PAPER_INCHES: f32 = 200.0;
 const MAX_PDF_PAGES: usize = 250;
+// Page ranges may select a small bounded subset from a much longer document.
+// Keep the arithmetic/index space finite without charging unselected pages
+// against the output-page limit.
+const MAX_PDF_DOCUMENT_PAGES: usize = 1_000_000;
 const MAX_PDF_PAGE_PIXELS: u64 = 16 * 1024 * 1024;
 const MAX_PDF_TOTAL_RASTER_PIXELS: u64 = 64 * 1024 * 1024;
 const MAX_PDF_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RasterPdfPageRange {
+    /// One-based inclusive first page. `None` means the first page.
+    pub start: Option<usize>,
+    /// One-based inclusive last page. `None` means the final page.
+    pub end: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct RasterPdfOptions {
     pub landscape: bool,
     pub print_background: bool,
+    pub scale: f32,
+    pub page_ranges: Vec<RasterPdfPageRange>,
     pub paper_width_in: f32,
     pub paper_height_in: f32,
     pub margin_top_in: f32,
@@ -35,6 +49,8 @@ impl Default for RasterPdfOptions {
         Self {
             landscape: false,
             print_background: false,
+            scale: 1.0,
+            page_ranges: Vec::new(),
             paper_width_in: 8.5,
             paper_height_in: 11.0,
             // CDP's defaults are one centimetre.
@@ -52,6 +68,10 @@ pub enum RasterPdfError {
     InvalidPaperSize,
     #[error("PDF margins must be finite, non-negative, and leave a printable area")]
     InvalidMargins,
+    #[error("PDF scale must be finite and between 0.1 and 2")]
+    InvalidScale,
+    #[error("PDF page ranges select no pages from this document")]
+    EmptyPageRange,
     #[error("the page has no retained renderable document")]
     NoRenderableDocument,
     #[error("PDF pagination would exceed the {0}-page safety limit")]
@@ -85,7 +105,7 @@ struct PaginationPlan {
 }
 
 impl RasterPdfOptions {
-    fn page_geometry(self) -> Result<(f32, f32, f32, f32, f32, f32), RasterPdfError> {
+    fn page_geometry(&self) -> Result<(f32, f32, f32, f32, f32, f32), RasterPdfError> {
         let values = [self.paper_width_in, self.paper_height_in];
         if values
             .iter()
@@ -137,8 +157,12 @@ fn pagination_plan(
     content_height: f32,
     printable_width: f32,
     printable_height: f32,
+    scale: f32,
 ) -> Result<PaginationPlan, RasterPdfError> {
-    let points_per_css_pixel = printable_width / content_width;
+    if !scale.is_finite() || !(0.1..=2.0).contains(&scale) {
+        return Err(RasterPdfError::InvalidScale);
+    }
+    let points_per_css_pixel = printable_width / content_width * scale;
     let css_page_height = printable_height / points_per_css_pixel;
     if !points_per_css_pixel.is_finite()
         || points_per_css_pixel <= 0.0
@@ -149,10 +173,24 @@ fn pagination_plan(
     }
 
     let page_count_value = (content_height / css_page_height).ceil().max(1.0);
-    if !page_count_value.is_finite() || page_count_value > MAX_PDF_PAGES as f32 {
-        return Err(RasterPdfError::TooManyPages(MAX_PDF_PAGES));
+    if !page_count_value.is_finite() || page_count_value > MAX_PDF_DOCUMENT_PAGES as f32 {
+        return Err(RasterPdfError::TooManyPages(MAX_PDF_DOCUMENT_PAGES));
     }
     let page_count = page_count_value as usize;
+
+    Ok(PaginationPlan {
+        points_per_css_pixel,
+        css_page_height,
+        page_count,
+    })
+}
+
+fn validate_selected_raster_work(
+    content_width: f32,
+    content_height: f32,
+    plan: PaginationPlan,
+    selected_pages: &[usize],
+) -> Result<(), RasterPdfError> {
     let pixel_width = content_width.ceil();
     if !pixel_width.is_finite()
         || pixel_width <= 0.0
@@ -162,9 +200,12 @@ fn pagination_plan(
     }
     let pixel_width = pixel_width as u64;
     let mut total_pixels = 0u64;
-    for page_index in 0..page_count {
-        let y = page_index as f32 * css_page_height;
-        let slice_height = (content_height - y).min(css_page_height).ceil();
+    for &page_index in selected_pages {
+        if page_index >= plan.page_count {
+            return Err(RasterPdfError::EmptyPageRange);
+        }
+        let y = page_index as f32 * plan.css_page_height;
+        let slice_height = (content_height - y).min(plan.css_page_height).ceil();
         if !slice_height.is_finite()
             || slice_height <= 0.0
             || slice_height > obscura_js::MAX_CAPTURE_DIMENSION as f32
@@ -185,11 +226,49 @@ fn pagination_plan(
         }
     }
 
-    Ok(PaginationPlan {
-        points_per_css_pixel,
-        css_page_height,
-        page_count,
-    })
+    Ok(())
+}
+
+fn selected_page_indices(
+    page_count: usize,
+    ranges: &[RasterPdfPageRange],
+) -> Result<Vec<usize>, RasterPdfError> {
+    if page_count == 0 {
+        return Err(RasterPdfError::EmptyPageRange);
+    }
+    if ranges.is_empty() {
+        if page_count > MAX_PDF_PAGES {
+            return Err(RasterPdfError::TooManyPages(MAX_PDF_PAGES));
+        }
+        return Ok((0..page_count).collect());
+    }
+    let mut selected = std::collections::BTreeSet::new();
+    for range in ranges {
+        let start = range.start.unwrap_or(1);
+        let end = range.end.unwrap_or(page_count);
+        if start == 0 || end == 0 || start > end {
+            return Err(RasterPdfError::EmptyPageRange);
+        }
+        if start > page_count {
+            continue;
+        }
+        let end = end.min(page_count);
+        let span = end - start + 1;
+        if span > MAX_PDF_PAGES {
+            return Err(RasterPdfError::TooManyPages(MAX_PDF_PAGES));
+        }
+        for page in start..=end {
+            selected.insert(page - 1);
+            if selected.len() > MAX_PDF_PAGES {
+                return Err(RasterPdfError::TooManyPages(MAX_PDF_PAGES));
+            }
+        }
+    }
+    let selected = selected.into_iter().collect::<Vec<_>>();
+    if selected.is_empty() {
+        return Err(RasterPdfError::EmptyPageRange);
+    }
+    Ok(selected)
 }
 
 impl Page {
@@ -197,7 +276,7 @@ impl Page {
     ///
     /// The full document width is scaled uniformly into the printable width;
     /// vertical slices become pages. This does not reflow into `@media print`
-    /// or implement CSS paged media, headers, footers, or page ranges.
+    /// or implement CSS paged media, headers, or footers.
     pub fn raster_pdf(&self, options: RasterPdfOptions) -> Result<Vec<u8>, RasterPdfError> {
         let (page_width, page_height, printable_width, printable_height, left, bottom) =
             options.page_geometry()?;
@@ -221,16 +300,20 @@ impl Page {
             content_height,
             printable_width,
             printable_height,
+            options.scale,
         )?;
+        let selected_pages = selected_page_indices(plan.page_count, &options.page_ranges)?;
+        validate_selected_raster_work(content_width, content_height, plan, &selected_pages)?;
 
         encode_pdf_pages(
-            plan.page_count,
+            selected_pages.len(),
             page_width,
             page_height,
             left,
             bottom,
             printable_height,
-            |page_index| {
+            |output_page_index| {
+                let page_index = selected_pages[output_page_index];
                 let y = page_index as f32 * plan.css_page_height;
                 let slice_height = (content_height - y).min(plan.css_page_height);
                 let png = js
@@ -249,7 +332,7 @@ impl Page {
                 let rgb = decoded.into_rgb8();
                 Ok(RasterPage {
                     rgb,
-                    draw_width_pt: printable_width,
+                    draw_width_pt: content_width * plan.points_per_css_pixel,
                     draw_height_pt: slice_height * plan.points_per_css_pixel,
                     #[cfg(test)]
                     _lifetime_probe: None,
@@ -443,23 +526,163 @@ mod tests {
     fn pagination_preflight_bounds_pages_and_raster_work() {
         let (_, _, printable_width, printable_height, _, _) =
             RasterPdfOptions::default().page_geometry().unwrap();
-        let ordinary = pagination_plan(1280.0, 10_000.0, printable_width, printable_height)
+        let ordinary = pagination_plan(1280.0, 10_000.0, printable_width, printable_height, 1.0)
             .expect("an ordinary multi-page document stays inside the budget");
         assert!(ordinary.page_count > 1);
+        let ordinary_pages = selected_page_indices(ordinary.page_count, &[]).unwrap();
+        validate_selected_raster_work(1280.0, 10_000.0, ordinary, &ordinary_pages).unwrap();
 
+        let oversized_page =
+            pagination_plan(5_000.0, 5_000.0, printable_width, printable_height, 1.0).unwrap();
+        let oversized_page_selection =
+            selected_page_indices(oversized_page.page_count, &[]).unwrap();
         assert_eq!(
-            pagination_plan(5_000.0, 5_000.0, printable_width, printable_height).unwrap_err(),
+            validate_selected_raster_work(
+                5_000.0,
+                5_000.0,
+                oversized_page,
+                &oversized_page_selection,
+            )
+            .unwrap_err(),
             RasterPdfError::RasterWorkLimitExceeded,
             "one excessively large raster page must fail before capture"
         );
+
+        let too_much_total =
+            pagination_plan(1_000.0, 70_000.0, printable_width, printable_height, 1.0).unwrap();
+        let too_much_total_selection =
+            selected_page_indices(too_much_total.page_count, &[]).unwrap();
         assert_eq!(
-            pagination_plan(1_000.0, 70_000.0, printable_width, printable_height).unwrap_err(),
+            validate_selected_raster_work(
+                1_000.0,
+                70_000.0,
+                too_much_total,
+                &too_much_total_selection,
+            )
+            .unwrap_err(),
             RasterPdfError::RasterWorkLimitExceeded,
             "many individually valid pages must still respect a total work budget"
         );
+
+        let too_many =
+            pagination_plan(1_000.0, 400_000.0, printable_width, printable_height, 1.0).unwrap();
         assert_eq!(
-            pagination_plan(1_000.0, 400_000.0, printable_width, printable_height).unwrap_err(),
+            selected_page_indices(too_many.page_count, &[]).unwrap_err(),
             RasterPdfError::TooManyPages(MAX_PDF_PAGES),
+        );
+    }
+
+    #[test]
+    fn selected_ranges_alone_determine_output_and_raster_budgets() {
+        let (_, _, printable_width, printable_height, _, _) =
+            RasterPdfOptions::default().page_geometry().unwrap();
+        let long =
+            pagination_plan(1_000.0, 400_000.0, printable_width, printable_height, 1.0).unwrap();
+        assert!(long.page_count > MAX_PDF_PAGES);
+        let selected = selected_page_indices(
+            long.page_count,
+            &[RasterPdfPageRange {
+                start: Some(1),
+                end: Some(1),
+            }],
+        )
+        .unwrap();
+        assert_eq!(selected, vec![0]);
+        validate_selected_raster_work(1_000.0, 400_000.0, long, &selected).unwrap();
+
+        assert_eq!(
+            selected_page_indices(
+                long.page_count,
+                &[RasterPdfPageRange {
+                    start: Some(1),
+                    end: Some(MAX_PDF_PAGES + 1),
+                }],
+            ),
+            Err(RasterPdfError::TooManyPages(MAX_PDF_PAGES))
+        );
+
+        let base = pagination_plan(800.0, 2_000.0, printable_width, printable_height, 1.0)
+            .expect("base geometry");
+        let impossible_height =
+            base.css_page_height * (MAX_PDF_DOCUMENT_PAGES as f32 + 16.0);
+        assert_eq!(
+            pagination_plan(
+                800.0,
+                impossible_height,
+                printable_width,
+                printable_height,
+                1.0,
+            )
+            .unwrap_err(),
+            RasterPdfError::TooManyPages(MAX_PDF_DOCUMENT_PAGES)
+        );
+    }
+
+    #[test]
+    fn scale_changes_css_page_span_and_rejects_invalid_values() {
+        let (_, _, printable_width, printable_height, _, _) =
+            RasterPdfOptions::default().page_geometry().unwrap();
+        let normal =
+            pagination_plan(800.0, 2_000.0, printable_width, printable_height, 1.0).unwrap();
+        let enlarged =
+            pagination_plan(800.0, 2_000.0, printable_width, printable_height, 2.0).unwrap();
+        assert_eq!(
+            enlarged.points_per_css_pixel,
+            normal.points_per_css_pixel * 2.0
+        );
+        assert_eq!(enlarged.css_page_height, normal.css_page_height / 2.0);
+        assert!(enlarged.page_count >= normal.page_count);
+        assert_eq!(
+            pagination_plan(800.0, 2_000.0, printable_width, printable_height, 0.09,)
+                .unwrap_err(),
+            RasterPdfError::InvalidScale
+        );
+    }
+
+    #[test]
+    fn page_ranges_clip_deduplicate_and_preserve_document_order() {
+        assert_eq!(selected_page_indices(4, &[]).unwrap(), vec![0, 1, 2, 3]);
+        assert_eq!(
+            selected_page_indices(
+                6,
+                &[
+                    RasterPdfPageRange {
+                        start: Some(3),
+                        end: Some(5),
+                    },
+                    RasterPdfPageRange {
+                        start: Some(1),
+                        end: Some(3),
+                    },
+                    RasterPdfPageRange {
+                        start: Some(5),
+                        end: None,
+                    },
+                ],
+            )
+            .unwrap(),
+            vec![0, 1, 2, 3, 4, 5]
+        );
+        assert_eq!(
+            selected_page_indices(
+                6,
+                &[RasterPdfPageRange {
+                    start: None,
+                    end: Some(2),
+                }],
+            )
+            .unwrap(),
+            vec![0, 1]
+        );
+        assert_eq!(
+            selected_page_indices(
+                3,
+                &[RasterPdfPageRange {
+                    start: Some(9),
+                    end: Some(12),
+                }],
+            ),
+            Err(RasterPdfError::EmptyPageRange)
         );
     }
 

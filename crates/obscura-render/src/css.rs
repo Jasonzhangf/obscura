@@ -79,36 +79,59 @@ pub(crate) struct RelationalInvalidation {
     pub unrepresentable_outer_path: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StructuralInvalidation {
+    pub rule_order: usize,
+    pub state: String,
+    subject_key: Option<RelationalSelectorKey>,
+    pub reaches: InvalidationReaches,
+    pub inside_relational: bool,
+}
+
+impl StructuralInvalidation {
+    pub(crate) fn subject_may_match(&self, tree: &DomTree, node: NodeId) -> bool {
+        relational_key_may_match(self.subject_key.as_ref(), tree, node)
+    }
+}
+
+fn relational_key_may_match(
+    key: Option<&RelationalSelectorKey>,
+    tree: &DomTree,
+    node: NodeId,
+) -> bool {
+    let Some(dom_node) = tree.get_node(node) else {
+        return false;
+    };
+    if dom_node.as_element().is_none() {
+        return false;
+    }
+    let quirks = tree.is_quirks();
+    match key {
+        None => true,
+        Some(RelationalSelectorKey::Id(expected)) => dom_node
+            .get_attribute("id")
+            .is_some_and(|actual| {
+                actual == expected || (quirks && actual.eq_ignore_ascii_case(expected))
+            }),
+        Some(RelationalSelectorKey::Class(expected)) => dom_node
+            .get_attribute("class")
+            .is_some_and(|classes| {
+                classes.split_whitespace().any(|actual| {
+                    actual == expected || (quirks && actual.eq_ignore_ascii_case(expected))
+                })
+            }),
+        Some(RelationalSelectorKey::Attribute(expected)) => {
+            dom_node.get_attribute(expected).is_some()
+        }
+        Some(RelationalSelectorKey::LocalName(expected)) => dom_node
+            .as_element()
+            .is_some_and(|element| element.local.as_ref().eq_ignore_ascii_case(expected)),
+    }
+}
+
 impl RelationalInvalidation {
     pub(crate) fn anchor_may_match(&self, tree: &DomTree, node: NodeId) -> bool {
-        let Some(dom_node) = tree.get_node(node) else {
-            return false;
-        };
-        if dom_node.as_element().is_none() {
-            return false;
-        }
-        let quirks = tree.is_quirks();
-        match self.anchor_key.as_ref() {
-            None => true,
-            Some(RelationalSelectorKey::Id(expected)) => dom_node
-                .get_attribute("id")
-                .is_some_and(|actual| {
-                    actual == expected || (quirks && actual.eq_ignore_ascii_case(expected))
-                }),
-            Some(RelationalSelectorKey::Class(expected)) => dom_node
-                .get_attribute("class")
-                .is_some_and(|classes| {
-                    classes.split_whitespace().any(|actual| {
-                        actual == expected || (quirks && actual.eq_ignore_ascii_case(expected))
-                    })
-                }),
-            Some(RelationalSelectorKey::Attribute(expected)) => {
-                dom_node.get_attribute(expected).is_some()
-            }
-            Some(RelationalSelectorKey::LocalName(expected)) => dom_node
-                .as_element()
-                .is_some_and(|element| element.local.as_ref().eq_ignore_ascii_case(expected)),
-        }
+        relational_key_may_match(self.anchor_key.as_ref(), tree, node)
     }
 
     pub(crate) fn relative_path_may_match(&self, tree: &DomTree, node: NodeId) -> bool {
@@ -161,6 +184,10 @@ pub struct InvalidationMap {
     relational_rule_orders: Vec<usize>,
     unkeyed_relational_rule_orders: Vec<usize>,
     relational_invalidations: Vec<RelationalInvalidation>,
+    structural_invalidations: Vec<StructuralInvalidation>,
+    adjacent_sibling_selectors: bool,
+    general_sibling_selectors: bool,
+    unkeyed_sibling_selectors: bool,
 }
 
 impl InvalidationMap {
@@ -211,6 +238,68 @@ impl InvalidationMap {
 
     pub(crate) fn relational_invalidations(&self) -> &[RelationalInvalidation] {
         &self.relational_invalidations
+    }
+
+    pub(crate) fn structural_invalidations<'a>(
+        &'a self,
+        state: &str,
+    ) -> Vec<&'a StructuralInvalidation> {
+        self.structural_invalidations
+            .iter()
+            .filter(move |invalidation| invalidation.state == state)
+            .collect()
+    }
+
+    pub(crate) fn has_adjacent_sibling_selectors(&self) -> bool {
+        self.adjacent_sibling_selectors
+    }
+
+    pub(crate) fn has_general_sibling_selectors(&self) -> bool {
+        self.general_sibling_selectors
+    }
+
+    pub(crate) fn node_may_start_sibling_selector(
+        &self,
+        tree: &DomTree,
+        node: NodeId,
+    ) -> bool {
+        if self.unkeyed_sibling_selectors
+            || (tree.is_quirks()
+                && (self.adjacent_sibling_selectors || self.general_sibling_selectors))
+        {
+            return true;
+        }
+        let Some(node) = tree.get_node(node) else {
+            return false;
+        };
+        let reaches_sibling = |dependencies: &[InvalidationDependency]| {
+            dependencies.iter().any(|dependency| {
+                dependency.reaches.contains(InvalidationReaches::SIBLINGS)
+            })
+        };
+        if node
+            .get_attribute("id")
+            .is_some_and(|id| reaches_sibling(self.id_dependencies(id)))
+        {
+            return true;
+        }
+        if node.get_attribute("class").is_some_and(|classes| {
+            classes
+                .split_whitespace()
+                .any(|class| reaches_sibling(self.class_dependencies(class)))
+        }) {
+            return true;
+        }
+        if node.attrs().is_some_and(|attributes| {
+            attributes.iter().any(|attribute| {
+                reaches_sibling(self.attribute_dependencies(attribute.name.local.as_ref()))
+            })
+        }) {
+            return true;
+        }
+        node.as_element().is_some_and(|element| {
+            reaches_sibling(self.local_name_dependencies(element.local.as_ref()))
+        })
     }
 
     pub fn dependency_count(&self) -> usize {
@@ -299,6 +388,12 @@ impl InvalidationMap {
     fn push_relational_invalidation(&mut self, invalidation: RelationalInvalidation) {
         if !self.relational_invalidations.contains(&invalidation) {
             self.relational_invalidations.push(invalidation);
+        }
+    }
+
+    fn push_structural_invalidation(&mut self, invalidation: StructuralInvalidation) {
+        if !self.structural_invalidations.contains(&invalidation) {
+            self.structural_invalidations.push(invalidation);
         }
     }
 }
@@ -929,11 +1024,54 @@ fn selector_contains_adjacent_combinator(selector: &str) -> bool {
     false
 }
 
+/// Sibling combinators which participate in the current selector path.
+///
+/// Parentheses are deliberately skipped here. `:is()`/`:where()`/`:not()`
+/// alternatives are fed back through dependency collection separately, while
+/// `:has()` owns an upward invalidation path and must not poison ordinary
+/// sibling invalidation outside its anchor.
+fn selector_sibling_combinators(selector: &str) -> (bool, bool) {
+    let chars = selector.chars().collect::<Vec<_>>();
+    let mut index = 0usize;
+    let mut quote = None;
+    let mut bracket_depth = 0usize;
+    let mut paren_depth = 0usize;
+    let mut adjacent = false;
+    let mut general = false;
+    while index < chars.len() {
+        let ch = chars[index];
+        if ch == '\\' {
+            index = (index + 2).min(chars.len());
+            continue;
+        }
+        if let Some(active_quote) = quote {
+            if ch == active_quote {
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '(' if bracket_depth == 0 => paren_depth += 1,
+            ')' if bracket_depth == 0 => paren_depth = paren_depth.saturating_sub(1),
+            '+' if bracket_depth == 0 && paren_depth == 0 => adjacent = true,
+            '~' if bracket_depth == 0 && paren_depth == 0 => general = true,
+            _ => {}
+        }
+        index += 1;
+    }
+    (adjacent, general)
+}
+
 fn note_compound_dependencies(
     map: &mut InvalidationMap,
     compound: &str,
     reaches: InvalidationReaches,
     rule_order: usize,
+    inside_relational: bool,
 ) {
     if let Some(local_name) = compound_local_name(compound) {
         map.push_local_name(local_name, rule_order, reaches);
@@ -1002,6 +1140,24 @@ fn note_compound_dependencies(
                     map.push_state(name.clone(), rule_order, reaches);
                     if matches!(
                         name.as_str(),
+                        "empty"
+                            | "first-child"
+                            | "last-child"
+                            | "only-child"
+                            | "first-of-type"
+                            | "last-of-type"
+                            | "only-of-type"
+                    ) {
+                        map.push_structural_invalidation(StructuralInvalidation {
+                            rule_order,
+                            state: name.clone(),
+                            subject_key: relational_anchor_key(compound),
+                            reaches,
+                            inside_relational,
+                        });
+                    }
+                    if matches!(
+                        name.as_str(),
                         "root"
                             | "scope"
                             | "target"
@@ -1037,6 +1193,7 @@ fn note_compound_dependencies(
                                 alternative.trim(),
                                 reaches,
                                 rule_order,
+                                !inside_relational,
                             );
                         }
                     }
@@ -1105,11 +1262,19 @@ fn note_compound_dependencies(
                                 alternative.trim(),
                                 InvalidationReaches::CONSERVATIVE,
                                 rule_order,
+                                false,
                             );
                         }
                     }
                     "nth-child" | "nth-last-child" | "nth-of-type" | "nth-last-of-type" => {
-                        map.push_state(name, rule_order, reaches);
+                        map.push_state(name.clone(), rule_order, reaches);
+                        map.push_structural_invalidation(StructuralInvalidation {
+                            rule_order,
+                            state: name,
+                            subject_key: relational_anchor_key(compound),
+                            reaches,
+                            inside_relational,
+                        });
                         // Structural index changes and `of <complex-selector>`
                         // need sibling-wide bookkeeping not present in phase 1.
                         map.mark_conservative(rule_order);
@@ -1120,6 +1285,7 @@ fn note_compound_dependencies(
                                     alternative.trim(),
                                     InvalidationReaches::CONSERVATIVE,
                                     rule_order,
+                                    !inside_relational,
                                 );
                             }
                         }
@@ -1144,17 +1310,35 @@ fn note_selector_dependencies(
     selector: &str,
     outer_reaches: InvalidationReaches,
     rule_order: usize,
+    record_tree_siblings: bool,
 ) {
+    if record_tree_siblings {
+        let (adjacent, general) = selector_sibling_combinators(selector);
+        map.adjacent_sibling_selectors |= adjacent;
+        map.general_sibling_selectors |= general;
+    }
     let (compounds, malformed) = invalidation_compounds(selector);
     if malformed {
         map.mark_conservative(rule_order);
     }
     for (compound, local_reaches) in compounds {
+        if record_tree_siblings
+            && local_reaches.contains(InvalidationReaches::SIBLINGS)
+            && !relative_selector_subject_has_key(&compound)
+        {
+            map.unkeyed_sibling_selectors = true;
+        }
         if local_reaches.contains(InvalidationReaches::CONSERVATIVE) {
             map.mark_conservative(rule_order);
         }
         let reaches = compose_invalidation_reach(map, local_reaches, outer_reaches, rule_order);
-        note_compound_dependencies(map, &compound, reaches, rule_order);
+        note_compound_dependencies(
+            map,
+            &compound,
+            reaches,
+            rule_order,
+            !record_tree_siblings,
+        );
     }
 }
 
@@ -1163,7 +1347,13 @@ fn note_selector_for_invalidation(
     selector: &str,
     rule_order: usize,
 ) {
-    note_selector_dependencies(map, selector, InvalidationReaches::SELF, rule_order);
+    note_selector_dependencies(
+        map,
+        selector,
+        InvalidationReaches::SELF,
+        rule_order,
+        true,
+    );
 }
 
 /// Record element attributes read from declaration values.
@@ -6041,10 +6231,25 @@ fn extract_length(s: &str, prop: &str, viewport: (f32, f32), axis: LengthAxis) -
     let start = s.find(prop)? + prop.len();
     let rest = &s[start..];
     if let Some(inner) = rest.strip_prefix("calc(") {
-        let end = inner.find(')')?;
+        let end = matching_paren_end(inner)?;
         return eval_length_sum(&inner[..end], viewport, axis);
     }
     parse_length_prefix(rest, viewport, axis)
+}
+
+/// Find the closing parenthesis paired with an opening parenthesis immediately
+/// before `input`. Nested CSS math groups must not terminate the outer calc.
+fn matching_paren_end(input: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    for (index, character) in input.char_indices() {
+        match character {
+            '(' => depth += 1,
+            ')' if depth == 0 => return Some(index),
+            ')' => depth -= 1,
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Read the length immediately before a range marker (`64rem<=width`).
@@ -6056,12 +6261,23 @@ fn extract_length_before(
 ) -> Option<f32> {
     let end = s.find(marker)?;
     let prefix = &s[..end];
-    let start = prefix
-        .rfind(|c: char| matches!(c, '(' | ')' | ':' | ','))
-        .map_or(0, |idx| idx + 1);
-    let value = &prefix[start..];
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (index, character) in prefix.char_indices().rev() {
+        match character {
+            ')' => depth += 1,
+            '(' if depth > 0 => depth -= 1,
+            '(' | ':' | ',' if depth == 0 => {
+                start = index + character.len_utf8();
+                break;
+            }
+            _ => {}
+        }
+    }
+    let value = prefix[start..].trim();
     if let Some(inner) = value.strip_prefix("calc(") {
-        return eval_length_sum(inner, viewport, axis);
+        let end = matching_paren_end(inner)?;
+        return eval_length_sum(&inner[..end], viewport, axis);
     }
     parse_length_prefix(value, viewport, axis)
 }
@@ -6102,32 +6318,23 @@ fn parse_length_prefix(input: &str, viewport: (f32, f32), axis: LengthAxis) -> O
     px.is_finite().then_some(px)
 }
 
-/// Sum the common media-query `calc()` form (`64rem - 1px`) left to right.
+/// Resolve media-query `calc()` lengths with the same typed CSS math used by
+/// layout. Real responsive breakpoints combine grouping and scalar arithmetic
+/// (for example `calc(1rem * 2 + (15rem + 2rem) * 2 + 31rem)`), so a flat
+/// plus/minus scanner silently turns those queries into unconditional rules.
 fn eval_length_sum(expr: &str, viewport: (f32, f32), axis: LengthAxis) -> Option<f32> {
-    let mut total = 0.0;
-    let mut sign = 1.0;
-    let mut term = String::new();
-    let flush = |term: &mut String, sign: f32, total: &mut f32| -> Option<()> {
-        let value = parse_length_prefix(term, viewport, axis)?;
-        *total += sign * value;
-        term.clear();
-        Some(())
+    let percent_base = match axis {
+        LengthAxis::Width => viewport.0,
+        LengthAxis::Height => viewport.1,
     };
-    for (idx, c) in expr.char_indices() {
-        match c {
-            '+' if idx > 0 => {
-                flush(&mut term, sign, &mut total)?;
-                sign = 1.0;
-            }
-            '-' if idx > 0 => {
-                flush(&mut term, sign, &mut total)?;
-                sign = -1.0;
-            }
-            _ => term.push(c),
-        }
-    }
-    flush(&mut term, sign, &mut total)?;
-    Some(total)
+    crate::style::resolve_contextual_length(
+        &format!("calc({expr})"),
+        16.0,
+        16.0,
+        viewport.0 / 100.0,
+        viewport.1 / 100.0,
+        percent_base,
+    )
 }
 
 fn split_media_query_list(query: &str) -> Vec<&str> {
@@ -6212,6 +6419,25 @@ mod tests {
             .reaches
             .contains(InvalidationReaches::DESCENDANTS));
         assert!(!map.requires_conservative_invalidation());
+    }
+
+    #[test]
+    fn invalidation_map_distinguishes_tree_sibling_paths_from_has_paths() {
+        let map = test_invalidation_map(
+            r#"
+                .left + .right { color:red }
+                :is(.early ~ .late, .plain) { color:blue }
+                .host:has(.inside + .peer) { color:green }
+                [data-token="+"] { color:black }
+            "#,
+        );
+        assert!(map.has_adjacent_sibling_selectors());
+        assert!(map.has_general_sibling_selectors());
+
+        let relational_only =
+            test_invalidation_map(".host:has(.inside + .peer){color:red}");
+        assert!(!relational_only.has_adjacent_sibling_selectors());
+        assert!(!relational_only.has_general_sibling_selectors());
     }
 
     #[test]
@@ -8673,6 +8899,35 @@ mod tests {
         assert!(!media_query_applies_for_viewport(
             "@media (width > calc(60em - 1px))",
             (900.0, 1000.0)
+        ));
+        let two_sidebar_breakpoint =
+            "@media (width < calc(1rem * 2 + (15rem + 2rem) * 2 + 31rem))";
+        assert!(media_query_applies_for_viewport(
+            two_sidebar_breakpoint,
+            (1000.0, 900.0)
+        ));
+        assert!(!media_query_applies_for_viewport(
+            two_sidebar_breakpoint,
+            (1440.0, 1000.0)
+        ));
+        let left_width_calc =
+            "@media (calc(1rem * 2 + (15rem + 2rem) * 2 + 31rem) <= width)";
+        assert!(!media_query_applies_for_viewport(
+            left_width_calc,
+            (1000.0, 900.0)
+        ));
+        assert!(media_query_applies_for_viewport(
+            left_width_calc,
+            (1440.0, 1000.0)
+        ));
+        let left_height_calc = "@media (calc(40rem + (2rem * 2)) < height)";
+        assert!(!media_query_applies_for_viewport(
+            left_height_calc,
+            (1280.0, 704.0)
+        ));
+        assert!(media_query_applies_for_viewport(
+            left_height_calc,
+            (1280.0, 705.0)
         ));
     }
 
