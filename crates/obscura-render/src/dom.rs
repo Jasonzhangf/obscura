@@ -4467,6 +4467,19 @@ fn layout_dom_once(
                     let Some(expression) = style.size_expressions[index].as_deref() else {
                         continue;
                     };
+                    // A proper replaced box's cyclic percentage maximum has a
+                    // distinct intrinsic-sizing rule. Preserve functional
+                    // spellings such as calc(100%) as the same typed percent
+                    // used by the bare-token path instead of prematurely
+                    // collapsing them against an ancestor width.
+                    if index == 4 && style.has_replaced_sizing {
+                        if let Some(percent) =
+                            crate::style::functional_percentage_factor(expression)
+                        {
+                            style.max_width = crate::Dimension::Percent(percent);
+                            continue;
+                        }
+                    }
                     let percent_base = if matches!(index, 1 | 3 | 5) {
                         viewport.1
                     } else {
@@ -10768,6 +10781,7 @@ fn defer_cyclic_flex_inline_sizes(
                 let functional = style.size_expressions[slot]
                     .as_ref()
                     .filter(|expression| expression.contains('%'))
+                    .filter(|_| slot != 4 || !style.has_replaced_sizing)
                     .cloned()
                     .map(DeferredCyclicInlineSource::Expression);
                 let dimension = match slot {

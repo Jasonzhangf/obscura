@@ -6310,6 +6310,31 @@ pub(crate) fn resolve_contextual_length(
     resolve_contextual(value, &context)
 }
 
+/// Return the percentage factor of a functional length whose value is purely
+/// proportional to its percentage basis.
+///
+/// CSSOM preserves spellings such as `calc(100%)`, but sizing algorithms must
+/// treat them like the typed `100%` value. Sampling at zero and two positive
+/// bases rejects offsets and non-linear min/max/clamp expressions while still
+/// accepting algebraically equivalent percentage-only forms.
+pub(crate) fn functional_percentage_factor(value: &str) -> Option<f32> {
+    if !value.contains('%') || !value.contains('(') {
+        return None;
+    }
+    let at_zero = resolve_contextual_length(value, 16.0, 16.0, 1.0, 1.0, 0.0)?;
+    let at_hundred = resolve_contextual_length(value, 16.0, 16.0, 1.0, 1.0, 100.0)?;
+    let at_two_hundred =
+        resolve_contextual_length(value, 16.0, 16.0, 1.0, 1.0, 200.0)?;
+    let tolerance = 0.0001;
+    if at_zero.abs() > tolerance
+        || (at_two_hundred - at_hundred * 2.0).abs() > tolerance
+        || !at_hundred.is_finite()
+    {
+        return None;
+    }
+    Some(at_hundred / 100.0)
+}
+
 #[derive(Clone, Copy)]
 struct LengthContext {
     em_px: f32,

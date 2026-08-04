@@ -3366,6 +3366,51 @@ fn percentage_max_replaced_items_shrink_in_a_flex_row() {
     );
 }
 
+/// Functional percentage-only maximums have the same computed sizing type as
+/// a bare percentage. Framework and utility stylesheets emit both spellings,
+/// so the replaced-element intrinsic contribution cannot depend on syntax.
+#[test]
+fn functional_percentage_max_replaced_items_shrink_in_a_flex_row() {
+    let tree = parse_html(
+        r#"
+        <style>
+          html, body { margin:0 }
+          #row { display:flex; gap:8px; width:1184px; overflow:hidden }
+          .col { display:flex; flex-direction:column; gap:8px }
+          img { display:block; max-width:calc(100%); height:auto }
+        </style>
+        <div id="row">
+          <div id="c1" class="col"><img id="i1" width="303" height="255"></div>
+          <div id="c2" class="col"><img id="i2" width="200" height="400"></div>
+          <div id="c3" class="col"><img id="i3" width="500" height="250"></div>
+          <div id="c4" class="col"><img id="i4" width="200" height="400"></div>
+          <div id="c5" class="col"><img id="i5" width="293" height="354"></div>
+        </div>
+        "#,
+    );
+    let ids = ["i1", "i2", "i3", "i4", "i5"]
+        .map(|id| tree.get_element_by_id(id).unwrap());
+    let intrinsic = HashMap::from([
+        (ids[0], (303.0, 255.0)),
+        (ids[1], (200.0, 400.0)),
+        (ids[2], (500.0, 250.0)),
+        (ids[3], (200.0, 400.0)),
+        (ids[4], (293.0, 354.0)),
+    ]);
+    let layout = layout_dom_with_images(&tree, (1280.0, 1000.0), &intrinsic);
+    let columns = ["c1", "c2", "c3", "c4", "c5"]
+        .map(|id| layout.rects[&tree.get_element_by_id(id).unwrap()]);
+    let images = ids.map(|id| layout.rects[&id]);
+    let expected_widths: [f32; 5] =
+        [233.328125, 154.0, 385.03125, 154.015625, 225.625];
+
+    for (index, expected) in expected_widths.into_iter().enumerate() {
+        let expected = expected.round();
+        assert_eq!(columns[index].width, expected, "column {index}: {:?}", columns[index]);
+        assert_eq!(images[index].width, expected, "image {index}: {:?}", images[index]);
+    }
+}
+
 /// The compressible-percentage exception is specific to proper replaced
 /// sizing. A non-replaced descendant with `max-width:100%` keeps its ordinary
 /// min-content contribution while its flex item is intrinsically sized; its
