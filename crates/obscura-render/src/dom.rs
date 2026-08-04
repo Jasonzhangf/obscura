@@ -2095,6 +2095,7 @@ fn cascade_walk(
     tree: &DomTree,
     id: NodeId,
     sheet: &crate::css::Stylesheet,
+    document_sheet: &crate::css::Stylesheet,
     shadow_sheets: &HashMap<NodeId, std::sync::Arc<crate::css::Stylesheet>>,
     matcher: &mut obscura_dom::selector::Matcher,
     styles: &mut HashMap<NodeId, crate::LayoutStyle>,
@@ -2362,11 +2363,19 @@ fn cascade_walk(
     if is_element {
         matcher.push_ancestor(tree, id);
     }
+    let is_shadow_host = tree.shadow_root(id).is_some();
     for cid in tree.children(id) {
+        // Assigned light children are cascaded from their flattened slot
+        // below. Unslotted children still need CSSOM-computed styles and stay
+        // on the ordinary host path.
+        if is_shadow_host && tree.assigned_slot(cid).is_some() {
+            continue;
+        }
         cascade_walk(
             tree,
             cid,
             sheet,
+            document_sheet,
             shadow_sheets,
             matcher,
             styles,
@@ -2382,6 +2391,42 @@ fn cascade_walk(
             fresh_styles,
         );
     }
+    if let Some(assigned_nodes) = tree.assigned_nodes(id) {
+        for cid in assigned_nodes {
+            let assigned_sheet = tree
+                .containing_shadow_root(cid)
+                .and_then(|root| shadow_sheets.get(&root).map(|sheet| &**sheet))
+                .unwrap_or(document_sheet);
+            let mut assigned_matcher = tree.matcher();
+            for ancestor in tree.ancestors(cid).into_iter().rev() {
+                if tree
+                    .get_node(ancestor)
+                    .is_some_and(|node| node.is_element())
+                {
+                    assigned_matcher.push_ancestor(tree, ancestor);
+                }
+            }
+            cascade_walk(
+                tree,
+                cid,
+                assigned_sheet,
+                document_sheet,
+                shadow_sheets,
+                &mut assigned_matcher,
+                styles,
+                custom_properties,
+                &this_props,
+                container_evaluator,
+                quirks_mode,
+                viewport,
+                animation_sample,
+                animation_timeline,
+                descendant_cell_padding,
+                descendant_color_scheme_dark,
+                fresh_styles,
+            );
+        }
+    }
     if let Some(root) = tree.shadow_root(id) {
         // Start matching with an empty ancestor filter at each tree-scope
         // boundary. That keeps document rules out of the shadow tree and
@@ -2394,6 +2439,7 @@ fn cascade_walk(
                     tree,
                     child,
                     shadow_sheet,
+                    document_sheet,
                     shadow_sheets,
                     &mut shadow_matcher,
                     styles,
@@ -4061,6 +4107,7 @@ fn layout_dom_once(
     cascade_walk(
         tree,
         tree.document(),
+        &sheet,
         &sheet,
         shadow_sheets,
         &mut matcher,
@@ -8449,15 +8496,19 @@ fn resolve_static_positions_and_reparent(
     }
 }
 
-/// Children which need computed-value resolution below `id`.
+/// Children for computed-value inheritance traversal.
 ///
-/// CSSOM still exposes and styles unslotted light DOM, so this differs from
-/// `rendered_children`: process the ordinary child list and additionally enter
-/// the host's detached shadow tree scope.
+/// Assigned light children inherit through their flattened parent slot, while
+/// unslotted light DOM still receives computed CSSOM styles through its host.
+/// Fallback children remain in the style traversal even when not rendered.
 fn style_children(tree: &DomTree, id: NodeId) -> Vec<NodeId> {
     let mut children = tree.children(id);
     if let Some(shadow_children) = tree.shadow_children(id) {
+        children.retain(|child| tree.assigned_slot(*child).is_none());
         children.extend(shadow_children);
+    }
+    if let Some(assigned) = tree.assigned_nodes(id) {
+        children.extend(assigned);
     }
     children
 }
@@ -14054,6 +14105,144 @@ mod tests {
         assert_eq!(second.border.left, 0.0, "first shadow root cannot leak");
         assert_eq!(hidden.border.left, 0.0, "unassigned light child is not slotted");
         assert!(!laid.rects.contains_key(&unslotted));
+    }
+
+    #[test]
+    fn assigned_nodes_inherit_slot_styles_and_custom_properties() {
+        let tree = parse_html(
+            r#"<html><body style="margin:0">
+               <x-card id="host" style="display:block;color:#010203;font-size:13px;--host-width:61px">
+                 <span id="assigned" slot="title" style="display:block;width:var(--slot-width);height:5px"></span>
+                 <span id="unslotted" slot="missing" style="display:block;width:var(--host-width);height:80px"></span>
+               </x-card>
+               <div id="source">
+                 <style>
+                   slot { color:#123456; font-size:21px; font-weight:700; --slot-width:47px }
+                   #empty { color:#654321; font-size:17px; --fallback-width:31px }
+                 </style>
+                 <slot id="title-slot" name="title">
+                   <span id="suppressed-fallback" style="display:block;width:var(--slot-width);height:70px"></span>
+                 </slot>
+                 <slot id="empty" name="empty">
+                   <span id="visible-fallback" style="display:block;width:var(--fallback-width);height:6px"></span>
+                 </slot>
+               </div>
+               </body></html>"#,
+        );
+        let host = tree.get_element_by_id("host").unwrap();
+        let source = tree.get_element_by_id("source").unwrap();
+        let assigned = tree.get_element_by_id("assigned").unwrap();
+        let unslotted = tree.get_element_by_id("unslotted").unwrap();
+        let suppressed_fallback = tree.get_element_by_id("suppressed-fallback").unwrap();
+        let visible_fallback = tree.get_element_by_id("visible-fallback").unwrap();
+        attach_programmatic_shadow(&tree, host, source);
+
+        let laid = layout_dom(&tree, (200.0, 200.0));
+        let assigned_style = &laid.styles[&assigned];
+        assert_eq!(assigned_style.color, Some([0x12, 0x34, 0x56, 0xff]));
+        assert_eq!(assigned_style.font_size, Some(21.0));
+        assert_eq!(crate::style::used_font_weight(assigned_style), 700);
+        assert_eq!(
+            assigned_style.width,
+            crate::Dimension::Px(47.0),
+            "the assigned element's own declaration must resolve a custom property inherited from the slot"
+        );
+        assert_eq!(
+            laid.custom_properties[&assigned]
+                .get("--slot-width")
+                .map(String::as_str),
+            Some("47px")
+        );
+
+        let fallback_style = &laid.styles[&visible_fallback];
+        assert_eq!(fallback_style.color, Some([0x65, 0x43, 0x21, 0xff]));
+        assert_eq!(fallback_style.font_size, Some(17.0));
+        assert_eq!(fallback_style.width, crate::Dimension::Px(31.0));
+        assert!(laid.rects.contains_key(&visible_fallback));
+
+        let suppressed_style = &laid.styles[&suppressed_fallback];
+        assert_eq!(suppressed_style.color, Some([0x12, 0x34, 0x56, 0xff]));
+        assert_eq!(suppressed_style.width, crate::Dimension::Px(47.0));
+        assert!(
+            !laid.rects.contains_key(&suppressed_fallback),
+            "assigned content suppresses fallback boxes without suppressing fallback computed style"
+        );
+
+        let unslotted_style = &laid.styles[&unslotted];
+        assert_eq!(unslotted_style.color, Some([0x01, 0x02, 0x03, 0xff]));
+        assert_eq!(unslotted_style.font_size, Some(13.0));
+        assert_eq!(unslotted_style.width, crate::Dimension::Px(61.0));
+        assert!(
+            !laid.rects.contains_key(&unslotted),
+            "unmatched light DOM keeps CSSOM style but generates no box"
+        );
+    }
+
+    #[test]
+    fn nested_slot_reassignment_uses_each_flattened_parent_in_order() {
+        let tree = parse_html(
+            r#"<html><body style="margin:0">
+               <x-outer id="outer" style="display:block">
+                 <span id="target" slot="forward" style="display:block;width:var(--inner-width);height:var(--forward-height)"></span>
+               </x-outer>
+               <div id="outer-source">
+                 <style>
+                   slot[name=forward] { color:#445566; --forward-height:23px }
+                 </style>
+                 <x-inner id="inner">
+                   <slot id="forward-slot" name="forward" slot="bridge"></slot>
+                 </x-inner>
+               </div>
+               <div id="inner-source">
+                 <style>
+                   slot[name=bridge] { color:#112233; font-size:19px; font-weight:700; --inner-width:47px }
+                 </style>
+                 <slot id="bridge-slot" name="bridge"></slot>
+               </div>
+               </body></html>"#,
+        );
+        let outer = tree.get_element_by_id("outer").unwrap();
+        let inner = tree.get_element_by_id("inner").unwrap();
+        let outer_source = tree.get_element_by_id("outer-source").unwrap();
+        let inner_source = tree.get_element_by_id("inner-source").unwrap();
+        let forward_slot = tree.get_element_by_id("forward-slot").unwrap();
+        let bridge_slot = tree.get_element_by_id("bridge-slot").unwrap();
+        let target = tree.get_element_by_id("target").unwrap();
+        attach_programmatic_shadow(&tree, outer, outer_source);
+        attach_programmatic_shadow(&tree, inner, inner_source);
+
+        assert_eq!(tree.assigned_slot(target), Some(forward_slot));
+        assert_eq!(tree.assigned_slot(forward_slot), Some(bridge_slot));
+
+        let laid = layout_dom(&tree, (200.0, 200.0));
+        let bridge_style = &laid.styles[&bridge_slot];
+        let forward_style = &laid.styles[&forward_slot];
+        let target_style = &laid.styles[&target];
+
+        assert_eq!(bridge_style.color, Some([0x11, 0x22, 0x33, 0xff]));
+        assert_eq!(forward_style.color, Some([0x44, 0x55, 0x66, 0xff]));
+        assert_eq!(
+            target_style.color,
+            Some([0x44, 0x55, 0x66, 0xff]),
+            "the closest flattened parent wins for inherited properties"
+        );
+        assert_eq!(forward_style.font_size, Some(19.0));
+        assert_eq!(target_style.font_size, Some(19.0));
+        assert_eq!(crate::style::used_font_weight(target_style), 700);
+        assert_eq!(target_style.width, crate::Dimension::Px(47.0));
+        assert_eq!(target_style.height, crate::Dimension::Px(23.0));
+        assert_eq!(
+            laid.custom_properties[&target]
+                .get("--inner-width")
+                .map(String::as_str),
+            Some("47px"),
+            "the inner slot's custom property must cross both flattened edges"
+        );
+        assert!(
+            !laid.rects.contains_key(&forward_slot),
+            "the reassigned slot remains box-transparent"
+        );
+        assert!(laid.rects.contains_key(&target));
     }
 
     #[test]

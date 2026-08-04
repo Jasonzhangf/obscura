@@ -968,9 +968,10 @@ impl DomTree {
         })
     }
 
-    /// Flattened children for an HTML slot. Assigned nodes replace fallback
-    /// children; an unassigned slot exposes its ordinary child list.
-    pub fn slot_rendered_children(&self, slot: NodeId) -> Option<Vec<NodeId>> {
+    /// Nodes directly assigned to an HTML slot. The first same-name slot wins;
+    /// later duplicate slots and slots with no matching light children return
+    /// an empty list. `None` means `slot` is not a slot in a shadow tree.
+    pub fn assigned_nodes(&self, slot: NodeId) -> Option<Vec<NodeId>> {
         if !self.is_html_slot_element(slot) {
             return None;
         }
@@ -994,25 +995,32 @@ impl DomTree {
             .take_while(|candidate| *candidate != slot)
             .any(is_same_name_slot)
         {
-            return Some(self.children(slot));
+            return Some(Vec::new());
         }
-        let assigned = self
-            .children(host)
-            .into_iter()
-            .filter(|candidate| {
-                let Some(node) = self.get_node(*candidate) else {
-                    return false;
-                };
-                let candidate_name = if node.is_element() {
-                    node.get_attribute("slot").unwrap_or("")
-                } else if node.text_content_of_text_node().is_some() {
-                    ""
-                } else {
-                    return false;
-                };
-                candidate_name == name
-            })
-            .collect::<Vec<_>>();
+        Some(
+            self.children(host)
+                .into_iter()
+                .filter(|candidate| {
+                    let Some(node) = self.get_node(*candidate) else {
+                        return false;
+                    };
+                    let candidate_name = if node.is_element() {
+                        node.get_attribute("slot").unwrap_or("")
+                    } else if node.text_content_of_text_node().is_some() {
+                        ""
+                    } else {
+                        return false;
+                    };
+                    candidate_name == name
+                })
+                .collect(),
+        )
+    }
+
+    /// Flattened children for an HTML slot. Assigned nodes replace fallback
+    /// children; an unassigned slot exposes its ordinary child list.
+    pub fn slot_rendered_children(&self, slot: NodeId) -> Option<Vec<NodeId>> {
+        let assigned = self.assigned_nodes(slot)?;
         Some(if assigned.is_empty() {
             self.children(slot)
         } else {
