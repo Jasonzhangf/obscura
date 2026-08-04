@@ -1638,12 +1638,49 @@ impl ObscuraJsRuntime {
         }
     }
 
+    /// Drive one deno_core event-loop tick at a time. When the first tick
+    /// parks, process one more tick after its registered waker fires, then
+    /// yield back to the embedder even if that tick schedules more work.
+    ///
+    /// `JsRuntime::run_event_loop()` is a run-to-idle future. When a page keeps
+    /// it continuously ready (zero-delay schedulers, streaming traffic, or a
+    /// framework work queue), Tokio never regains control to observe a timeout
+    /// or our readiness policy. This future deliberately turns the wake for a
+    /// second tick into a return to the caller. If no work is immediately
+    /// ready, it remains parked on deno_core's real I/O/timer waker, so the
+    /// adaptive settle loop does not poll at a fixed frequency.
+    async fn run_cooperative_event_loop_tick(&mut self) -> Result<bool, String> {
+        self.begin_javascript_task();
+        self.runtime.v8_isolate().perform_microtask_checkpoint();
+        let mut waiting_for_wake = false;
+        std::future::poll_fn(|cx| {
+            let tick = self
+                .runtime
+                .poll_event_loop(cx, deno_core::PollEventLoopOptions::default());
+            match tick {
+                std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(true)),
+                std::task::Poll::Ready(Err(error)) => std::task::Poll::Ready(Err(format!(
+                    "Event loop error: {error}"
+                ))),
+                std::task::Poll::Pending if waiting_for_wake => {
+                    std::task::Poll::Ready(Ok(false))
+                }
+                std::task::Poll::Pending => {
+                    waiting_for_wake = true;
+                    std::task::Poll::Pending
+                }
+            }
+        })
+        .await
+    }
+
     /// Pump deferred work until deno_core reports true idle, or until the page
-    /// has had no connected-document mutation, active request, dynamic script
-    /// work, or near-term one-shot timeout for `quiet_ms`. Long analytics
-    /// timers and perpetual animation intervals therefore do not consume the
-    /// entire settle budget, while short render timers and fetch chains extend
-    /// the quiet window.
+    /// has had no connected-document mutation, relevant request/dynamic-script
+    /// work, or near-term one-shot timeout for `quiet_ms`. Network and script
+    /// work gets a bounded post-load grace period: this retains ordinary app
+    /// hydration without allowing analytics, telemetry, or a hung endpoint to
+    /// consume the caller's complete budget. Long timers and perpetual visual
+    /// mutations are bounded separately for the same reason.
     /// `budget_ms` remains an absolute wall-clock bound.
     pub async fn run_event_loop_until_quiescent(
         &mut self,
@@ -1658,33 +1695,27 @@ impl ObscuraJsRuntime {
         let quiet = std::time::Duration::from_millis(quiet_ms.max(1).min(budget_ms));
         let started = tokio::time::Instant::now();
         let deadline = started + budget;
-        // A genuinely pending request/script may use the complete caller
-        // budget. Observable mutations alone get a shorter window: animated
-        // pages can mutate forever, and Chromium captures their current frame
-        // rather than waiting for an impossible stable DOM.
-        let activity_window = std::time::Duration::from_millis(500).min(budget);
-        let mut activity_deadline = started + activity_window;
+        // A one-second grace covers the common load -> fetch -> framework
+        // commit path (and matches the CLI's established one-second useful
+        // hydration window), but it is intentionally independent of a larger
+        // caller budget. Requests which remain pending after this point are no
+        // longer readiness evidence by themselves. Their eventual connected
+        // DOM mutation is still observed during the bounded activity tail.
+        const EXTERNAL_WORK_GRACE_MS: u64 = 1_000;
+        const OBSERVABLE_ACTIVITY_TAIL_MS: u64 = 500;
+        let external_work_grace =
+            std::time::Duration::from_millis(EXTERNAL_WORK_GRACE_MS).min(budget);
+        let external_work_deadline = started + external_work_grace;
+        let activity_tail = std::time::Duration::from_millis(OBSERVABLE_ACTIVITY_TAIL_MS);
+        let mut activity_deadline = deadline.min(started + activity_tail);
         let token = self.arm_watchdog(budget + std::time::Duration::from_millis(500));
         let mut generation = self.activity_generation();
         let mut quiet_since: Option<tokio::time::Instant> = None;
         let result = loop {
             let now = tokio::time::Instant::now();
-            let Some(remaining) = deadline.checked_duration_since(now) else {
+            let Some(_remaining) = deadline.checked_duration_since(now) else {
                 break Ok(());
             };
-            if remaining.is_zero() {
-                break Ok(());
-            }
-
-            // Short slices let us observe useful work without treating a
-            // future timer as proof that the page is still rendering.
-            let slice = remaining.min(tokio::time::Duration::from_millis(10));
-            match tokio::time::timeout(slice, self.run_event_loop()).await {
-                Ok(done) => break done,
-                Err(_) => {}
-            }
-
-            let now = tokio::time::Instant::now();
             let next_generation = self.activity_generation();
             // One-shot timers up to two quiet windows away are commonly app
             // hydration/debounce work (`setTimeout(render, 200)`). Intervals
@@ -1694,26 +1725,67 @@ impl ObscuraJsRuntime {
             let near_timeout = self
                 .next_pending_timeout_delay_ms()
                 .is_some_and(|delay| delay <= quiet.as_secs_f64() * 2_000.0);
-            let external_work_pending =
-                self.has_pending_network_requests() || self.has_pending_dynamic_scripts();
+            let external_work_pending = now < external_work_deadline
+                && (self.has_pending_network_requests() || self.has_pending_dynamic_scripts());
             if external_work_pending {
-                activity_deadline = deadline.min(now + activity_window);
+                activity_deadline = deadline.min(external_work_deadline + activity_tail);
                 generation = next_generation;
                 quiet_since = None;
-                continue;
-            }
-            if near_timeout || next_generation != generation {
+            } else if now < activity_deadline && near_timeout {
                 generation = next_generation;
                 quiet_since = None;
-                if now >= activity_deadline {
+            } else {
+                if now < activity_deadline && next_generation != generation {
+                    // A mutation starts a fresh quiet interval at its observed
+                    // delivery time. There is no need for a fixed-rate poll to
+                    // discover that the interval has begun.
+                    quiet_since = Some(now);
+                }
+                generation = next_generation;
+                let since = quiet_since.get_or_insert(now);
+                if now.duration_since(*since) >= quiet {
                     break Ok(());
                 }
-                continue;
             }
 
-            let since = quiet_since.get_or_insert(now);
-            if now.duration_since(*since) >= quiet {
+            // Park on the runtime's actual waker. The policy deadline is only
+            // a fallback for a hung request, a quiet-window expiry, or the
+            // caller's absolute budget; it is not a periodic polling quantum.
+            let policy_deadline = if external_work_pending {
+                external_work_deadline
+            } else if now < activity_deadline && near_timeout {
+                activity_deadline
+            } else {
+                quiet_since.map_or(deadline, |since| since + quiet)
+            }
+            .min(deadline);
+            // deno_core's public poll is one event-loop iteration, but an
+            // iteration may synchronously drain an arbitrarily long chain of
+            // nextTick/macrotask/microtask callbacks before returning. Tokio's
+            // deadline cannot preempt that native V8 call. Bound the individual
+            // turn to the readiness horizon plus the same 500ms synchronous
+            // safety margin used by fixed waits. Reaching this bound means the
+            // adaptive observation window is exhausted; clear V8 termination
+            // and capture the current stable frame instead of starting another
+            // unbounded turn.
+            let tick_watchdog = self.arm_watchdog(
+                policy_deadline.saturating_duration_since(now)
+                    + std::time::Duration::from_millis(500),
+            );
+            let tick = tokio::time::timeout_at(
+                policy_deadline,
+                self.run_cooperative_event_loop_tick(),
+            )
+            .await;
+            let tick_fired = self.disarm_watchdog(tick_watchdog);
+            if tick_fired {
                 break Ok(());
+            }
+            self.runtime.v8_isolate().perform_microtask_checkpoint();
+            match tick {
+                Ok(Ok(true)) => break Ok(()),
+                Ok(Ok(false)) | Err(_) => {}
+                Ok(Err(error)) => break Err(error),
             }
         };
         let fired = self.disarm_watchdog(token);
@@ -4018,6 +4090,66 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn quiescent_event_loop_yields_from_continuously_ready_non_visual_work() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "quiescent-continuously-ready",
+            "setInterval(() => {\
+                 globalThis.__schedulerTicks = (globalThis.__schedulerTicks || 0) + 1;\
+             }, 0);",
+        )
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        rt.run_event_loop_until_quiescent(2_000, 150)
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "a continuously-ready non-visual scheduler pinned adaptive settle: {elapsed:?}"
+        );
+        assert!(
+            rt.evaluate("globalThis.__schedulerTicks > 0")
+                .unwrap()
+                .as_bool()
+                .unwrap_or(false),
+            "the cooperative policy must still drive scheduler work"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn quiescent_event_loop_bounds_a_single_unyielding_callback_drain() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "quiescent-unyielding-task",
+            "setTimeout(() => { while (true) {} }, 0);",
+        )
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        rt.run_event_loop_until_quiescent(2_000, 150)
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_millis(1_200),
+            "one synchronous callback drain consumed the adaptive budget: {elapsed:?}"
+        );
+        assert_eq!(
+            rt.evaluate(
+                "(document.body.setAttribute('data-after-watchdog', 'usable'), \
+                  document.body.getAttribute('data-after-watchdog'))",
+            )
+            .unwrap(),
+            serde_json::json!("usable"),
+            "the per-turn watchdog must leave the isolate reusable",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn quiescent_event_loop_retains_delayed_network_and_dom_update() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let client = std::sync::Arc::new(obscura_net::ObscuraHttpClient::with_full_options(
@@ -4044,6 +4176,142 @@ mod tests {
             rt.evaluate("document.body.getAttribute('data-ready')")
                 .unwrap(),
             serde_json::json!("ready"),
+        );
+    }
+
+    fn delayed_fetch_runtime(
+        response_delay: std::time::Duration,
+    ) -> (ObscuraJsRuntime, std::sync::mpsc::Receiver<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request);
+            accepted_tx.send(()).unwrap();
+            std::thread::sleep(response_delay);
+            let body = "hydrated";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+
+        let origin = format!("http://{address}");
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.set_url(&format!("{origin}/page"));
+        rt.set_http_client(std::sync::Arc::new(
+            obscura_net::ObscuraHttpClient::with_full_options(
+                std::sync::Arc::new(obscura_net::CookieJar::new()),
+                None,
+                true,
+            ),
+        ));
+        rt.run_page_init();
+        (rt, accepted_rx)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn quiescent_event_loop_allows_fetch_hydration_within_network_grace() {
+        let (mut rt, accepted) =
+            delayed_fetch_runtime(std::time::Duration::from_millis(700));
+        rt.execute_script(
+            "quiescent-fetch-hydration",
+            "fetch('/hydrate').then(response => response.text()).then(text => {\
+                 document.body.setAttribute('data-ready', text);\
+             });",
+        )
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        rt.run_event_loop_until_quiescent(3_000, 150)
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        accepted
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .expect("fixture fetch was not issued");
+        assert!(
+            elapsed >= std::time::Duration::from_millis(650),
+            "settle returned before the delayed response: {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(1_500),
+            "completed hydration should only pay its following quiet window: {elapsed:?}"
+        );
+        assert_eq!(
+            rt.evaluate("document.body.getAttribute('data-ready')")
+                .unwrap(),
+            serde_json::json!("hydrated"),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn quiescent_event_loop_bounds_a_hanging_page_request() {
+        let (mut rt, accepted) = delayed_fetch_runtime(std::time::Duration::from_secs(3));
+        rt.execute_script(
+            "quiescent-hanging-fetch",
+            "fetch('/analytics').catch(() => {});",
+        )
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        rt.run_event_loop_until_quiescent(4_000, 150)
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        accepted
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .expect("fixture fetch was not issued");
+        assert!(
+            elapsed >= std::time::Duration::from_millis(900),
+            "pending page work must receive the network grace: {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(1_700),
+            "a hanging request consumed more than its bounded grace: {elapsed:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn quiescent_event_loop_gives_post_grace_dom_activity_a_quiet_window() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.state
+            .borrow()
+            .page_in_flight
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        rt.execute_script(
+            "quiescent-post-grace-commit",
+            "setInterval(() => {}, 1000);\
+             setTimeout(() => document.body.setAttribute('data-ready', 'late'), 1100);",
+        )
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        rt.run_event_loop_until_quiescent(4_000, 150)
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            rt.evaluate("document.body.getAttribute('data-ready')")
+                .unwrap(),
+            serde_json::json!("late"),
+        );
+        assert!(
+            elapsed >= std::time::Duration::from_millis(1_200),
+            "the late commit did not receive a following quiet window: {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(1_800),
+            "late observable work escaped the bounded activity tail: {elapsed:?}"
         );
     }
 
