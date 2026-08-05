@@ -1605,6 +1605,7 @@ struct DeclarationStreamFlags {
     has_color_scheme: bool,
     has_animation: bool,
     has_transform: bool,
+    has_opacity: bool,
 }
 
 /// Cache the declaration features which otherwise require an extra stream
@@ -1632,6 +1633,9 @@ fn declaration_stream_flags(css: &str) -> DeclarationStreamFlags {
         }
         if name.eq_ignore_ascii_case("transform") || name.eq_ignore_ascii_case("all") {
             flags.has_transform = true;
+        }
+        if name.eq_ignore_ascii_case("opacity") || name.eq_ignore_ascii_case("all") {
+            flags.has_opacity = true;
         }
     }
     flags
@@ -4084,6 +4088,7 @@ impl Stylesheet {
             .next()
             .is_some();
         let waapi_underlying_transform_ops = has_waapi.then(|| style.transform_ops.clone());
+        let waapi_underlying_opacity = style.opacity;
         sample_waapi_properties(animation_timeline, nid, style, animation_sample);
 
         let important_has_transform = shadow_important_flags.has_transform
@@ -4091,6 +4096,11 @@ impl Stylesheet {
             || important_matched
                 .iter()
                 .any(|&(_, _, i)| self.rules[i].important_flags.has_transform);
+        let important_has_opacity = shadow_important_flags.has_opacity
+            || inline_important_flags.has_opacity
+            || important_matched
+                .iter()
+                .any(|&(_, _, i)| self.rules[i].important_flags.has_opacity);
 
         for &(_, _, i) in &important_matched {
             let rule = &self.rules[i];
@@ -4107,11 +4117,13 @@ impl Stylesheet {
             shadow_important_flags.has_var,
         );
         crate::style::apply_declarations_with_locked_color_scheme(style, &expanded);
-        style.waapi_transform_sample_state =
+        style.waapi_sample_state =
             waapi_underlying_transform_ops.map(|underlying_transform_ops| {
-                Box::new(crate::WaapiTransformSampleState {
+                Box::new(crate::WaapiSampleState {
                     underlying_transform_ops,
-                    fast_path: !important_has_transform,
+                    underlying_opacity: waapi_underlying_opacity,
+                    transform_fast_path: !important_has_transform,
+                    opacity_fast_path: !important_has_opacity,
                 })
             });
         effective
@@ -4121,35 +4133,48 @@ impl Stylesheet {
 /// Replay transform-only Web Animations from their exact underlying cascade
 /// value. Returns the sampled operations and transform containing-block bit;
 /// callers apply them only after every target has passed preflight.
-pub(crate) fn resample_transform_only_waapi(
+pub(crate) struct ResampledVisualWaapi {
+    pub transform_ops: Vec<crate::TransformOp>,
+    pub opacity: Option<f32>,
+    pub has_transform_effect: bool,
+    pub has_opacity_effect: bool,
+    pub establishes_transform_cb: bool,
+}
+
+pub(crate) fn resample_visual_waapi(
     timeline: &crate::AnimationTimelineState,
     node: NodeId,
     style: &LayoutStyle,
     sample: crate::AnimationSample,
-) -> Option<(Vec<crate::TransformOp>, bool)> {
-    let retained = style.waapi_transform_sample_state.as_deref()?;
-    if !retained.fast_path {
-        return None;
-    }
+) -> Option<ResampledVisualWaapi> {
+    let retained = style.waapi_sample_state.as_deref()?;
     let animations = timeline
         .waapi_for_node(node, sample.time)
         .collect::<Vec<_>>();
-    if animations.is_empty()
-        || animations.iter().any(|(animation, _)| {
-            animation
-                .keyframes
-                .iter()
-                .any(|frame| frame.opacity.is_some())
-                || !animation
-                    .keyframes
-                    .iter()
-                    .any(|frame| frame.transform.is_some())
-        })
+    if animations.is_empty() {
+        return None;
+    }
+    let has_transform_effect = animations.iter().any(|(animation, _)| {
+        animation.keyframes.iter().any(|frame| frame.transform.is_some())
+    });
+    let has_opacity_effect = animations.iter().any(|(animation, _)| {
+        animation.keyframes.iter().any(|frame| frame.opacity.is_some())
+    });
+    let all_effects_supported = animations.iter().all(|(animation, _)| {
+        animation
+            .keyframes
+            .iter()
+            .any(|frame| frame.transform.is_some() || frame.opacity.is_some())
+    });
+    if !all_effects_supported
+        || (has_transform_effect && !retained.transform_fast_path)
+        || (has_opacity_effect && !retained.opacity_fast_path)
     {
         return None;
     }
     let mut sampled = style.clone();
     sampled.transform_ops = retained.underlying_transform_ops.clone();
+    sampled.opacity = retained.underlying_opacity;
     let has_underlying_transform = !sampled.transform_ops.is_empty();
     set_animation_containing_block_trigger(
         &mut sampled,
@@ -4157,10 +4182,15 @@ pub(crate) fn resample_transform_only_waapi(
         has_underlying_transform,
     );
     sample_waapi_properties(timeline, node, &mut sampled, sample);
-    Some((
-        sampled.transform_ops,
-        sampled.containing_block_triggers & crate::CB_TRIGGER_TRANSFORM != 0,
-    ))
+    Some(ResampledVisualWaapi {
+        transform_ops: sampled.transform_ops,
+        opacity: sampled.opacity,
+        has_transform_effect,
+        has_opacity_effect,
+        establishes_transform_cb: sampled.containing_block_triggers
+            & crate::CB_TRIGGER_TRANSFORM
+            != 0,
+    })
 }
 
 fn sample_waapi_properties(
@@ -8649,13 +8679,14 @@ mod tests {
         let mut timeline = make_timeline();
         let retained = apply(0.0, &mut timeline);
         for time in [500.0, 750.0] {
-            let (resampled, _) = resample_transform_only_waapi(
+            let resampled = resample_visual_waapi(
                 &timeline,
                 target,
                 &retained,
                 crate::AnimationSample::document(time),
             )
-            .expect("sparse transform target is eligible");
+            .expect("sparse transform target is eligible")
+            .transform_ops;
             let mut fresh_timeline = make_timeline();
             let fresh = apply(time, &mut fresh_timeline);
             assert_eq!(format!("{resampled:?}"), format!("{:?}", fresh.transform_ops));
@@ -8703,7 +8734,7 @@ mod tests {
             crate::AnimationSample::document(0.0),
             &mut important_timeline,
         );
-        assert!(resample_transform_only_waapi(
+        assert!(resample_visual_waapi(
             &important_timeline,
             important_target,
             &important_style,

@@ -873,11 +873,11 @@ impl PreparedRender {
         self.layout.styles.values().any(css_animation_is_active)
     }
 
-    /// Advance a pure transform Web Animation without rebuilding normal-flow
+    /// Advance opacity/transform Web Animations without rebuilding normal-flow
     /// layout. Eligibility is intentionally strict: every target is sampled
     /// from retained pre-WAAPI cascade provenance, and every update passes
     /// preflight before the prepared render is mutated.
-    fn try_advance_transform_only_waapi_sample(
+    fn try_advance_visual_waapi_sample(
         &mut self,
         tree: &DomTree,
         sample: crate::AnimationSample,
@@ -891,42 +891,52 @@ impl PreparedRender {
                 && (node == tree.document() || tree.ancestors(node).contains(&tree.document()))
         };
         let mut updates = Vec::new();
+        let mut has_transform_effect = false;
+        let mut has_opacity_effect = false;
         for node in timeline.waapi_nodes().into_iter().filter(|node| connected(*node)) {
             let Some(style) = self.layout.styles.get(&node) else {
                 return false;
             };
-            let Some((transform_ops, establishes_transform_cb)) =
-                crate::css::resample_transform_only_waapi(timeline, node, style, sample)
+            let Some(sampled) =
+                crate::css::resample_visual_waapi(timeline, node, style, sample)
             else {
                 return false;
             };
             let established_transform_cb =
                 style.containing_block_triggers & crate::CB_TRIGGER_TRANSFORM != 0;
-            if establishes_transform_cb != established_transform_cb {
+            if sampled.establishes_transform_cb != established_transform_cb {
                 return false;
             }
-            updates.push((node, transform_ops));
+            has_transform_effect |= sampled.has_transform_effect;
+            has_opacity_effect |= sampled.has_opacity_effect;
+            updates.push((node, sampled));
         }
         if updates.is_empty() {
             return false;
         }
-        for (node, transform_ops) in updates {
-            self.layout
+        for (node, sampled) in updates {
+            let style = self.layout
                 .styles
                 .get_mut(&node)
-                .expect("WAAPI target passed preflight")
-                .transform_ops = transform_ops;
+                .expect("WAAPI target passed preflight");
+            style.transform_ops = sampled.transform_ops;
+            style.opacity = sampled.opacity;
         }
-        self.layout.refresh_visual_geometry(tree, self.viewport);
-        self.content_size = self.layout.scrolling_content_size(tree, self.viewport);
-        self.viewport_fixed = self.layout.viewport_fixed_nodes(tree);
-        self.sticky = self.layout.root_sticky_layout(tree, self.viewport);
-        self.scroll_tree = self.layout.scroll_tree(
-            tree,
-            self.viewport,
-            self.content_size,
-            &self.viewport_fixed,
-        );
+        if has_opacity_effect {
+            self.layout.refresh_effective_visibility(tree);
+        }
+        if has_transform_effect {
+            self.layout.refresh_visual_geometry(tree, self.viewport);
+            self.content_size = self.layout.scrolling_content_size(tree, self.viewport);
+            self.viewport_fixed = self.layout.viewport_fixed_nodes(tree);
+            self.sticky = self.layout.root_sticky_layout(tree, self.viewport);
+            self.scroll_tree = self.layout.scroll_tree(
+                tree,
+                self.viewport,
+                self.content_size,
+                &self.viewport_fixed,
+            );
+        }
         self.animation_sample = sample;
         self.has_active_waapi_animations = timeline.has_active_waapi(sample.time);
         self.active_animation_impact = timeline.active_waapi_effect_impact(sample.time);
@@ -2343,7 +2353,7 @@ pub fn prepare_dom_with_retained_styles_with_animation_state(
         && !previous.has_dynamic_fonts
         && dynamic_fonts.is_empty()
         && mutations.is_empty()
-        && previous.try_advance_transform_only_waapi_sample(tree, animation_sample, animation_timeline)
+        && previous.try_advance_visual_waapi_sample(tree, animation_sample, animation_timeline)
     {
         return Some(previous);
     }
@@ -15761,7 +15771,7 @@ mod tests {
     }
 
     #[test]
-    fn transform_only_waapi_refresh_matches_forced_full_geometry_and_pixels() {
+    fn visual_waapi_refresh_matches_forced_full_geometry_and_pixels() {
         let tree = parse_html(
             r#"<html style="margin:0;background:white"><body style="margin:0">
                 <div id="moving" style="position:absolute;left:20px;top:20px;width:80px;height:60px;
@@ -15813,6 +15823,32 @@ mod tests {
                     play_state: crate::WaapiPlayState::Running,
                 });
             }
+            timeline.register_waapi(crate::WaapiAnimation {
+                id: 4,
+                node: moving,
+                keyframes: vec![
+                    crate::WaapiKeyframe {
+                        offset: 0.0,
+                        opacity: Some(0.0),
+                        transform: None,
+                    },
+                    crate::WaapiKeyframe {
+                        offset: 1.0,
+                        opacity: Some(1.0),
+                        transform: None,
+                    },
+                ],
+                timing: crate::AnimationTiming {
+                    duration_ms: 1_000.0,
+                    fill_mode: crate::AnimationFillMode::Both,
+                    ..Default::default()
+                },
+                easing: None,
+                linear_easing: None,
+                start_time_ms: 0.0,
+                hold_time_ms: None,
+                play_state: crate::WaapiPlayState::Running,
+            });
             timeline
         };
         let viewport = (240.0, 120.0);
@@ -15832,7 +15868,7 @@ mod tests {
             )
             .expect("initial candidate");
         let initial_transforms = candidate.layout.transforms.clone();
-        assert!(candidate.try_advance_transform_only_waapi_sample(
+        assert!(candidate.try_advance_visual_waapi_sample(
             &tree,
             crate::AnimationSample::document(500.0),
             &candidate_timeline,
@@ -15890,7 +15926,7 @@ mod tests {
     }
 
     #[test]
-    fn transform_only_waapi_refresh_rejects_mixed_effect_atomically() {
+    fn visual_waapi_refresh_rejects_unsupported_effect_atomically() {
         let tree = parse_html(
             r#"<div id="pure" style="transform:translateX(0px)"></div>
                 <div id="mixed" style="transform:translateX(0px)"></div>"#,
@@ -15898,14 +15934,17 @@ mod tests {
         let pure = tree.get_element_by_id("pure").unwrap();
         let mixed = tree.get_element_by_id("mixed").unwrap();
         let mut timeline = crate::AnimationTimelineState::default();
-        for (id, node, opacity) in [(1, pure, None), (2, mixed, Some(0.5))] {
+        for (id, node, opacity, transform) in [
+            (1, pure, None, Some("translateX(40px)".to_string())),
+            (2, mixed, None, None),
+        ] {
             timeline.register_waapi(crate::WaapiAnimation {
                 id,
                 node,
                 keyframes: vec![crate::WaapiKeyframe {
                     offset: 1.0,
                     opacity,
-                    transform: Some("translateX(40px)".into()),
+                    transform,
                 }],
                 timing: crate::AnimationTiming {
                     duration_ms: 1_000.0,
@@ -15935,7 +15974,7 @@ mod tests {
             .expect("initial render");
         let sample_before = prepared.animation_sample;
         let pure_before = prepared.layout.styles[&pure].transform_ops.clone();
-        assert!(!prepared.try_advance_transform_only_waapi_sample(
+        assert!(!prepared.try_advance_visual_waapi_sample(
             &tree,
             crate::AnimationSample::document(500.0),
             &timeline,
@@ -15948,7 +15987,7 @@ mod tests {
     }
 
     #[test]
-    fn transform_only_waapi_refresh_rejects_containing_block_topology_change() {
+    fn visual_waapi_refresh_rejects_containing_block_topology_change() {
         let tree = parse_html(
             r#"<div id="target"><div style="position:fixed;left:10px;top:10px"></div></div>"#,
         );
@@ -15992,7 +16031,7 @@ mod tests {
                 & crate::CB_TRIGGER_TRANSFORM,
             0,
         );
-        assert!(!prepared.try_advance_transform_only_waapi_sample(
+        assert!(!prepared.try_advance_visual_waapi_sample(
             &tree,
             crate::AnimationSample::document(500.0),
             &timeline,

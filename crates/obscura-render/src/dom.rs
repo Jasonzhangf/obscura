@@ -777,6 +777,33 @@ fn sticky_axis_position(
 }
 
 impl DomLayout {
+    /// Refresh the derived paint-culling bit after an opacity-only sample.
+    /// Keep opacity as a binary zero ancestor flag instead of multiplying the
+    /// chain, which avoids underflow making a deep fractional-opacity subtree
+    /// incorrectly disappear.
+    pub(crate) fn refresh_effective_visibility(&mut self, tree: &DomTree) {
+        let mut inherited: HashMap<NodeId, (bool, bool)> = HashMap::new();
+        for id in rendered_descendants(tree, tree.document()) {
+            let parent_state = rendered_parent(tree, id)
+                .and_then(|parent| inherited.get(&parent).copied())
+                .unwrap_or((false, false));
+            let Some(style) = self.styles.get_mut(&id) else {
+                inherited.insert(id, parent_state);
+                continue;
+            };
+            let visibility_hidden = style.visibility_hidden.unwrap_or(parent_state.0);
+            let opacity_zero = parent_state.1 || style.opacity.is_some_and(|value| value <= 0.0);
+            style.effectively_invisible = visibility_hidden || opacity_zero;
+            if let Some(pseudo) = style.before_pseudo.as_deref_mut() {
+                pseudo.effectively_invisible = style.effectively_invisible;
+            }
+            if let Some(pseudo) = style.after_pseudo.as_deref_mut() {
+                pseudo.effectively_invisible = style.effectively_invisible;
+            }
+            inherited.insert(id, (visibility_hidden, opacity_zero));
+        }
+    }
+
     /// Rebuild visual geometry after a transform-only animation sample while
     /// retaining normal-flow boxes and shaped text. This is deliberately a
     /// complete top-down visual walk: ancestor transforms affect descendant
@@ -4302,7 +4329,7 @@ fn layout_dom_once(
             text_indent: crate::Dimension,
             legacy_center: bool,
             visibility_hidden: bool,
-            opacity_product: f32,
+            has_zero_opacity: bool,
             list_style: crate::ListStyle,
             line_height: crate::LineHeight,
             white_space: crate::WhiteSpace,
@@ -4354,7 +4381,7 @@ fn layout_dom_once(
                     text_indent: crate::Dimension::Px(0.0),
                     legacy_center: false,
                     visibility_hidden: false,
-                    opacity_product: 1.0,
+                    has_zero_opacity: false,
                     // CSS initial value of list-style-type.
                     list_style: crate::ListStyle::Disc,
                     line_height: crate::LineHeight::Normal,
@@ -4471,7 +4498,7 @@ fn layout_dom_once(
                     inh.visibility_hidden = style
                         .visibility_hidden
                         .unwrap_or(inh.visibility_hidden);
-                    inh.opacity_product *= style.opacity.unwrap_or(1.0);
+                    inh.has_zero_opacity |= style.opacity.is_some_and(|value| value <= 0.0);
                     if let Some(value) = style.list_style {
                         inh.list_style = value;
                     }
@@ -4921,8 +4948,8 @@ fn layout_dom_once(
                     None => style.text_indent = Some(inh.text_indent),
                 }
                 inh.visibility_hidden = style.visibility_hidden.unwrap_or(inh.visibility_hidden);
-                inh.opacity_product *= style.opacity.unwrap_or(1.0);
-                style.effectively_invisible = inh.visibility_hidden || inh.opacity_product <= 0.0;
+                inh.has_zero_opacity |= style.opacity.is_some_and(|value| value <= 0.0);
+                style.effectively_invisible = inh.visibility_hidden || inh.has_zero_opacity;
                 match style.list_style {
                     Some(v) => inh.list_style = v,
                     None => style.list_style = Some(inh.list_style),

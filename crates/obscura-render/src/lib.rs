@@ -776,9 +776,11 @@ pub enum GeneratedContentItem {
 /// Kept behind one pointer so ordinary, non-animated elements do not pay for
 /// another `Vec` in every `LayoutStyle`.
 #[derive(Debug, Clone)]
-pub(crate) struct WaapiTransformSampleState {
+pub(crate) struct WaapiSampleState {
     pub underlying_transform_ops: Vec<TransformOp>,
-    pub fast_path: bool,
+    pub underlying_opacity: Option<f32>,
+    pub transform_fast_path: bool,
+    pub opacity_fast_path: bool,
 }
 
 /// The subset of CSS that influences box layout. Expanded in later phases.
@@ -1399,7 +1401,7 @@ pub struct LayoutStyle {
     /// A retained compositor-style sample restores this value before replaying
     /// the registered effects, so sparse keyframes never compound on the
     /// previously sampled transform.
-    pub(crate) waapi_transform_sample_state: Option<Box<WaapiTransformSampleState>>,
+    pub(crate) waapi_sample_state: Option<Box<WaapiSampleState>>,
     /// Individual CSS `translate` property. This composes independently with
     /// the legacy `transform` property, so `transform:none` must not clear it.
     /// Functional values are retained separately until the final border box
