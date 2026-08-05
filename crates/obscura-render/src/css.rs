@@ -1604,6 +1604,7 @@ struct DeclarationStreamFlags {
     has_var: bool,
     has_color_scheme: bool,
     has_animation: bool,
+    has_transform: bool,
 }
 
 /// Cache the declaration features which otherwise require an extra stream
@@ -1628,6 +1629,9 @@ fn declaration_stream_flags(css: &str) -> DeclarationStreamFlags {
                 .is_some_and(|prefix| prefix.eq_ignore_ascii_case("animation-"))
         {
             flags.has_animation = true;
+        }
+        if name.eq_ignore_ascii_case("transform") || name.eq_ignore_ascii_case("all") {
+            flags.has_transform = true;
         }
     }
     flags
@@ -4075,7 +4079,18 @@ impl Stylesheet {
         // author !important. Keep the renderer-side effect separate from the
         // authored declaration block so cancel() reveals the exact underlying
         // value and CSSOM never observes a synthetic inline rewrite.
+        let has_waapi = animation_timeline
+            .waapi_for_node(nid, animation_sample.time)
+            .next()
+            .is_some();
+        let waapi_underlying_transform_ops = has_waapi.then(|| style.transform_ops.clone());
         sample_waapi_properties(animation_timeline, nid, style, animation_sample);
+
+        let important_has_transform = shadow_important_flags.has_transform
+            || inline_important_flags.has_transform
+            || important_matched
+                .iter()
+                .any(|&(_, _, i)| self.rules[i].important_flags.has_transform);
 
         for &(_, _, i) in &important_matched {
             let rule = &self.rules[i];
@@ -4092,8 +4107,60 @@ impl Stylesheet {
             shadow_important_flags.has_var,
         );
         crate::style::apply_declarations_with_locked_color_scheme(style, &expanded);
+        style.waapi_transform_sample_state =
+            waapi_underlying_transform_ops.map(|underlying_transform_ops| {
+                Box::new(crate::WaapiTransformSampleState {
+                    underlying_transform_ops,
+                    fast_path: !important_has_transform,
+                })
+            });
         effective
     }
+}
+
+/// Replay transform-only Web Animations from their exact underlying cascade
+/// value. Returns the sampled operations and transform containing-block bit;
+/// callers apply them only after every target has passed preflight.
+pub(crate) fn resample_transform_only_waapi(
+    timeline: &crate::AnimationTimelineState,
+    node: NodeId,
+    style: &LayoutStyle,
+    sample: crate::AnimationSample,
+) -> Option<(Vec<crate::TransformOp>, bool)> {
+    let retained = style.waapi_transform_sample_state.as_deref()?;
+    if !retained.fast_path {
+        return None;
+    }
+    let animations = timeline
+        .waapi_for_node(node, sample.time)
+        .collect::<Vec<_>>();
+    if animations.is_empty()
+        || animations.iter().any(|(animation, _)| {
+            animation
+                .keyframes
+                .iter()
+                .any(|frame| frame.opacity.is_some())
+                || !animation
+                    .keyframes
+                    .iter()
+                    .any(|frame| frame.transform.is_some())
+        })
+    {
+        return None;
+    }
+    let mut sampled = style.clone();
+    sampled.transform_ops = retained.underlying_transform_ops.clone();
+    let has_underlying_transform = !sampled.transform_ops.is_empty();
+    set_animation_containing_block_trigger(
+        &mut sampled,
+        crate::CB_TRIGGER_TRANSFORM,
+        has_underlying_transform,
+    );
+    sample_waapi_properties(timeline, node, &mut sampled, sample);
+    Some((
+        sampled.transform_ops,
+        sampled.containing_block_triggers & crate::CB_TRIGGER_TRANSFORM != 0,
+    ))
 }
 
 fn sample_waapi_properties(
@@ -4221,7 +4288,17 @@ fn sample_waapi_track<T: Clone>(
     if resolved.last().is_some_and(|stop| stop.0 < 1.0) {
         resolved.push((1.0, underlying));
     }
-    if progress <= resolved[0].0 {
+    // At a duplicate offset the later keyframe is the outgoing value. The
+    // first duplicate remains the incoming interpolation endpoint just before
+    // the boundary, so do not deduplicate the track.
+    if let Some((_, value)) = resolved
+        .iter()
+        .rev()
+        .find(|(offset, _)| progress == *offset)
+    {
+        return Some(value.clone());
+    }
+    if progress < resolved[0].0 {
         return Some(resolved[0].1.clone());
     }
     for pair in resolved.windows(2) {
@@ -8521,6 +8598,121 @@ mod tests {
     }
 
     #[test]
+    fn retained_waapi_transform_resampling_uses_underlying_and_respects_important() {
+        let tree = obscura_dom::parse_html(
+            r#"<div id="target" style="transform:translateX(10px)"></div>"#,
+        );
+        let target = tree.get_element_by_id("target").unwrap();
+        let sheet = Stylesheet::parse_for_viewport(&tree, &[], (800.0, 600.0));
+        let make_timeline = || {
+            let mut timeline = crate::AnimationTimelineState::default();
+            timeline.register_waapi(crate::WaapiAnimation {
+                id: 1,
+                node: target,
+                keyframes: vec![crate::WaapiKeyframe {
+                    offset: 0.5,
+                    opacity: None,
+                    transform: Some("translateX(50px)".into()),
+                }],
+                timing: crate::AnimationTiming {
+                    duration_ms: 1_000.0,
+                    fill_mode: crate::AnimationFillMode::Both,
+                    ..Default::default()
+                },
+                easing: None,
+                linear_easing: None,
+                start_time_ms: 0.0,
+                hold_time_ms: None,
+                play_state: crate::WaapiPlayState::Running,
+            });
+            timeline
+        };
+        let apply = |time, timeline: &mut crate::AnimationTimelineState| {
+            let node = tree.get_node(target).unwrap();
+            let mut matcher = tree.matcher();
+            let mut style = LayoutStyle::default();
+            sheet.apply_at_animation_time(
+                &tree,
+                &mut matcher,
+                target,
+                node.get_attribute("id"),
+                &[],
+                "div",
+                &mut style,
+                &HashMap::new(),
+                node.get_attribute("style"),
+                crate::AnimationSample::document(time),
+                timeline,
+            );
+            style
+        };
+        let mut timeline = make_timeline();
+        let retained = apply(0.0, &mut timeline);
+        for time in [500.0, 750.0] {
+            let (resampled, _) = resample_transform_only_waapi(
+                &timeline,
+                target,
+                &retained,
+                crate::AnimationSample::document(time),
+            )
+            .expect("sparse transform target is eligible");
+            let mut fresh_timeline = make_timeline();
+            let fresh = apply(time, &mut fresh_timeline);
+            assert_eq!(format!("{resampled:?}"), format!("{:?}", fresh.transform_ops));
+        }
+
+        let important_tree = obscura_dom::parse_html(
+            r#"<div id="target" style="transform:translateX(10px) !important"></div>"#,
+        );
+        let important_target = important_tree.get_element_by_id("target").unwrap();
+        let important_sheet =
+            Stylesheet::parse_for_viewport(&important_tree, &[], (800.0, 600.0));
+        let mut important_timeline = crate::AnimationTimelineState::default();
+        important_timeline.register_waapi(crate::WaapiAnimation {
+            id: 2,
+            node: important_target,
+            keyframes: vec![crate::WaapiKeyframe {
+                offset: 1.0,
+                opacity: None,
+                transform: Some("translateX(100px)".into()),
+            }],
+            timing: crate::AnimationTiming {
+                duration_ms: 1_000.0,
+                fill_mode: crate::AnimationFillMode::Both,
+                ..Default::default()
+            },
+            easing: None,
+            linear_easing: None,
+            start_time_ms: 0.0,
+            hold_time_ms: None,
+            play_state: crate::WaapiPlayState::Running,
+        });
+        let node = important_tree.get_node(important_target).unwrap();
+        let mut matcher = important_tree.matcher();
+        let mut important_style = LayoutStyle::default();
+        important_sheet.apply_at_animation_time(
+            &important_tree,
+            &mut matcher,
+            important_target,
+            node.get_attribute("id"),
+            &[],
+            "div",
+            &mut important_style,
+            &HashMap::new(),
+            node.get_attribute("style"),
+            crate::AnimationSample::document(0.0),
+            &mut important_timeline,
+        );
+        assert!(resample_transform_only_waapi(
+            &important_timeline,
+            important_target,
+            &important_style,
+            crate::AnimationSample::document(500.0),
+        )
+        .is_none());
+    }
+
+    #[test]
     fn conditional_keyframes_and_empty_later_definitions_follow_browser_selection() {
         let css = r#"
             @keyframes chosen { from, to { width:222px } }
@@ -8749,6 +8941,16 @@ mod tests {
                 .collect::<Vec<_>>(),
             [0.0, 0.25, 0.5, 0.75, 1.0]
         );
+    }
+
+    #[test]
+    fn waapi_duplicate_offset_uses_later_value_at_boundary() {
+        let track = [(0.0, 0.0), (0.5, 10.0), (0.5, 20.0), (1.0, 30.0)];
+        assert_eq!(sample_numeric_waapi_track(&track, -1.0, 0.5), Some(20.0));
+        let before = sample_numeric_waapi_track(&track, -1.0, 0.499).unwrap();
+        assert!(before < 10.0, "incoming segment must end at the first duplicate");
+        let after = sample_numeric_waapi_track(&track, -1.0, 0.501).unwrap();
+        assert!(after > 20.0, "outgoing segment must start at the later duplicate");
     }
 
     #[test]

@@ -772,6 +772,15 @@ pub enum GeneratedContentItem {
     },
 }
 
+/// Sparse retained provenance for direct transform-only WAAPI sampling.
+/// Kept behind one pointer so ordinary, non-animated elements do not pay for
+/// another `Vec` in every `LayoutStyle`.
+#[derive(Debug, Clone)]
+pub(crate) struct WaapiTransformSampleState {
+    pub underlying_transform_ops: Vec<TransformOp>,
+    pub fast_path: bool,
+}
+
 /// The subset of CSS that influences box layout. Expanded in later phases.
 #[derive(Debug, Clone, Default)]
 pub struct LayoutStyle {
@@ -1386,6 +1395,11 @@ pub struct LayoutStyle {
     /// Ordered operations in the non-inherited `transform` property. Length
     /// percentages remain unresolved until the final border box is known.
     pub transform_ops: Vec<TransformOp>,
+    /// Transform value immediately below the Web Animations cascade origin.
+    /// A retained compositor-style sample restores this value before replaying
+    /// the registered effects, so sparse keyframes never compound on the
+    /// previously sampled transform.
+    pub(crate) waapi_transform_sample_state: Option<Box<WaapiTransformSampleState>>,
     /// Individual CSS `translate` property. This composes independently with
     /// the legacy `transform` property, so `transform:none` must not clear it.
     /// Functional values are retained separately until the final border box

@@ -777,6 +777,85 @@ fn sticky_axis_position(
 }
 
 impl DomLayout {
+    /// Rebuild visual geometry after a transform-only animation sample while
+    /// retaining normal-flow boxes and shaped text. This is deliberately a
+    /// complete top-down visual walk: ancestor transforms affect descendant
+    /// matrices, overflow clips, scrolling overflow, and text raster clips.
+    pub(crate) fn refresh_visual_geometry(&mut self, tree: &DomTree, viewport: (f32, f32)) {
+        self.clip_rects.clear();
+        self.translates.clear();
+        self.transforms.clear();
+
+        let root = rendered_descendants(tree, tree.document())
+            .into_iter()
+            .find(|id| tree.get_node(*id).is_some_and(|node| node.is_element()));
+        if let Some(root_id) = root {
+            let root_font_size = self
+                .styles
+                .get(&root_id)
+                .and_then(|style| style.font_size)
+                .unwrap_or(16.0);
+            resolve_clip_rects(
+                tree,
+                root_id,
+                None,
+                0.0,
+                0.0,
+                &self.rects,
+                &self.styles,
+                &mut self.clip_rects,
+                &mut self.translates,
+                crate::Affine2::IDENTITY,
+                &mut self.transforms,
+                root_font_size,
+                viewport,
+            );
+        }
+
+        #[cfg(feature = "paint")]
+        {
+            for (&node, &item) in &self.ifc_items {
+                self.text_engine.set_clip(
+                    item,
+                    shaped_item_clip(
+                        node,
+                        &self.rects,
+                        &self.styles,
+                        &self.clip_rects,
+                        &self.translates,
+                        viewport,
+                    ),
+                );
+            }
+            for (&parent, items) in &self.run_ifc_items {
+                let clip = shaped_item_clip(
+                    parent,
+                    &self.rects,
+                    &self.styles,
+                    &self.clip_rects,
+                    &self.translates,
+                    viewport,
+                );
+                for &item in items {
+                    self.text_engine.set_clip(item, clip);
+                }
+            }
+            for (&text_node, items) in &self.word_ifc_items {
+                let clip = shaped_item_clip(
+                    text_node,
+                    &self.rects,
+                    &self.styles,
+                    &self.clip_rects,
+                    &self.translates,
+                    viewport,
+                );
+                for &item in items {
+                    self.text_engine.set_clip(item, clip);
+                }
+            }
+        }
+    }
+
     /// Nodes whose painted coordinate space is anchored to the initial
     /// containing block. A viewport-fixed element and its whole subtree stay
     /// stationary when the document scrolls. A fixed element captured by a

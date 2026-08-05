@@ -834,6 +834,7 @@ pub struct PreparedRender {
     active_animation_impact: crate::AnimationEffectImpact,
     root_font_size: f32,
     base_url: Option<String>,
+    has_dynamic_fonts: bool,
     content_size: (f32, f32),
     viewport_fixed: std::collections::HashSet<obscura_dom::tree::NodeId>,
     sticky: crate::StickyLayout,
@@ -866,6 +867,70 @@ impl PreparedRender {
                 .styles
                 .values()
                 .any(css_animation_is_active)
+    }
+
+    fn has_active_declarative_css_animations(&self) -> bool {
+        self.layout.styles.values().any(css_animation_is_active)
+    }
+
+    /// Advance a pure transform Web Animation without rebuilding normal-flow
+    /// layout. Eligibility is intentionally strict: every target is sampled
+    /// from retained pre-WAAPI cascade provenance, and every update passes
+    /// preflight before the prepared render is mutated.
+    fn try_advance_transform_only_waapi_sample(
+        &mut self,
+        tree: &DomTree,
+        sample: crate::AnimationSample,
+        timeline: &crate::AnimationTimelineState,
+    ) -> bool {
+        if self.has_active_declarative_css_animations() {
+            return false;
+        }
+        let connected = |node: obscura_dom::tree::NodeId| {
+            tree.get_node(node).is_some()
+                && (node == tree.document() || tree.ancestors(node).contains(&tree.document()))
+        };
+        let mut updates = Vec::new();
+        for node in timeline.waapi_nodes().into_iter().filter(|node| connected(*node)) {
+            let Some(style) = self.layout.styles.get(&node) else {
+                return false;
+            };
+            let Some((transform_ops, establishes_transform_cb)) =
+                crate::css::resample_transform_only_waapi(timeline, node, style, sample)
+            else {
+                return false;
+            };
+            let established_transform_cb =
+                style.containing_block_triggers & crate::CB_TRIGGER_TRANSFORM != 0;
+            if establishes_transform_cb != established_transform_cb {
+                return false;
+            }
+            updates.push((node, transform_ops));
+        }
+        if updates.is_empty() {
+            return false;
+        }
+        for (node, transform_ops) in updates {
+            self.layout
+                .styles
+                .get_mut(&node)
+                .expect("WAAPI target passed preflight")
+                .transform_ops = transform_ops;
+        }
+        self.layout.refresh_visual_geometry(tree, self.viewport);
+        self.content_size = self.layout.scrolling_content_size(tree, self.viewport);
+        self.viewport_fixed = self.layout.viewport_fixed_nodes(tree);
+        self.sticky = self.layout.root_sticky_layout(tree, self.viewport);
+        self.scroll_tree = self.layout.scroll_tree(
+            tree,
+            self.viewport,
+            self.content_size,
+            &self.viewport_fixed,
+        );
+        self.animation_sample = sample;
+        self.has_active_waapi_animations = timeline.has_active_waapi(sample.time);
+        self.active_animation_impact = timeline.active_waapi_effect_impact(sample.time);
+        true
     }
 
     /// Whether a geometry-only consumer may retain this layout while moving
@@ -2272,6 +2337,16 @@ pub fn prepare_dom_with_retained_styles_with_animation_state(
             animation_timeline,
         );
     }
+    if forward_document_sample
+        && previous.viewport == viewport
+        && previous.base_url.as_deref() == base_url
+        && !previous.has_dynamic_fonts
+        && dynamic_fonts.is_empty()
+        && mutations.is_empty()
+        && previous.try_advance_transform_only_waapi_sample(tree, animation_sample, animation_timeline)
+    {
+        return Some(previous);
+    }
     let sampled_animation_mutations = sample_changed
         .then(|| {
             retained_animation_restyle_mutations(
@@ -2473,6 +2548,7 @@ fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
             .unwrap_or_default(),
         root_font_size,
         base_url: base_url.map(str::to_string),
+        has_dynamic_fonts: !dynamic_fonts.is_empty(),
         content_size,
         viewport_fixed,
         sticky,
@@ -15682,6 +15758,246 @@ mod tests {
             timeline.active_waapi_effect_impact(sample),
             crate::AnimationEffectImpact::Geometry,
         );
+    }
+
+    #[test]
+    fn transform_only_waapi_refresh_matches_forced_full_geometry_and_pixels() {
+        let tree = parse_html(
+            r#"<html style="margin:0;background:white"><body style="margin:0">
+                <div id="moving" style="position:absolute;left:20px;top:20px;width:80px;height:60px;
+                     overflow:hidden;border-radius:12px;background:red;transform:translateX(0px)">
+                    <div style="width:130px;height:60px;background:lime"></div>
+                </div>
+                <div style="position:absolute;left:145px;top:20px;width:75px;height:75px;overflow:hidden">
+                    <div id="affine" style="width:60px;height:60px;background:blue;
+                         transform-origin:30px 30px;transform:rotate(0deg)"></div>
+                </div>
+                <div id="overflow" style="position:absolute;left:10px;top:100px;width:10px;height:10px;
+                     background:black;transform:translateX(0px)"></div>
+            </body></html>"#,
+        );
+        let moving = tree.get_element_by_id("moving").unwrap();
+        let affine = tree.get_element_by_id("affine").unwrap();
+        let overflow = tree.get_element_by_id("overflow").unwrap();
+        let make_timeline = || {
+            let mut timeline = crate::AnimationTimelineState::default();
+            for (id, node, from, to) in [
+                (1, moving, "translateX(0px)", "translateX(36px)"),
+                (2, affine, "rotate(0deg)", "rotate(28deg)"),
+                (3, overflow, "translateX(0px)", "translateX(500px)"),
+            ] {
+                timeline.register_waapi(crate::WaapiAnimation {
+                    id,
+                    node,
+                    keyframes: vec![
+                        crate::WaapiKeyframe {
+                            offset: 0.0,
+                            opacity: None,
+                            transform: Some(from.to_string()),
+                        },
+                        crate::WaapiKeyframe {
+                            offset: 1.0,
+                            opacity: None,
+                            transform: Some(to.to_string()),
+                        },
+                    ],
+                    timing: crate::AnimationTiming {
+                        duration_ms: 1_000.0,
+                        fill_mode: crate::AnimationFillMode::Both,
+                        ..Default::default()
+                    },
+                    easing: None,
+                    linear_easing: None,
+                    start_time_ms: 0.0,
+                    hold_time_ms: None,
+                    play_state: crate::WaapiPlayState::Running,
+                });
+            }
+            timeline
+        };
+        let viewport = (240.0, 120.0);
+        let mut candidate_resources = RenderResourceCache::with_loader(|_url: &str| None);
+        let mut candidate_cache = crate::css::StylesheetCache::default();
+        let mut candidate_timeline = make_timeline();
+        let mut candidate =
+            prepare_dom_with_dynamic_fonts_and_stylesheet_cache_with_animation_state(
+                &tree,
+                viewport,
+                None,
+                &mut candidate_resources,
+                &[],
+                &mut candidate_cache,
+                crate::AnimationSample::document(0.0),
+                &mut candidate_timeline,
+            )
+            .expect("initial candidate");
+        let initial_transforms = candidate.layout.transforms.clone();
+        assert!(candidate.try_advance_transform_only_waapi_sample(
+            &tree,
+            crate::AnimationSample::document(500.0),
+            &candidate_timeline,
+        ));
+        assert_ne!(candidate.layout.transforms, initial_transforms);
+
+        let mut oracle_resources = RenderResourceCache::with_loader(|_url: &str| None);
+        let mut oracle_cache = crate::css::StylesheetCache::default();
+        let mut oracle_timeline = make_timeline();
+        let mut oracle =
+            prepare_dom_with_dynamic_fonts_and_stylesheet_cache_with_animation_state(
+                &tree,
+                viewport,
+                None,
+                &mut oracle_resources,
+                &[],
+                &mut oracle_cache,
+                crate::AnimationSample::document(500.0),
+                &mut oracle_timeline,
+            )
+            .expect("forced-full oracle");
+
+        assert_eq!(candidate.layout.rects, oracle.layout.rects);
+        assert_eq!(candidate.layout.inline_fragments, oracle.layout.inline_fragments);
+        assert_eq!(candidate.layout.translates, oracle.layout.translates);
+        assert_eq!(candidate.layout.transforms, oracle.layout.transforms);
+        assert_eq!(candidate.layout.clip_rects, oracle.layout.clip_rects);
+        assert_eq!(candidate.content_size, oracle.content_size);
+        assert!(candidate.content_size.0 > viewport.0);
+        assert_eq!(candidate.viewport_fixed, oracle.viewport_fixed);
+        for node in [moving, affine, overflow] {
+            assert_eq!(
+                format!("{:?}", candidate.layout.styles[&node]),
+                format!("{:?}", oracle.layout.styles[&node]),
+            );
+        }
+        let candidate_scroll =
+            candidate.resolve_scroll_state(&tree, (0.0, 0.0), &HashMap::new());
+        let oracle_scroll = oracle.resolve_scroll_state(&tree, (0.0, 0.0), &HashMap::new());
+        let candidate_pixels = paint_prepared_with_scroll(
+            &tree,
+            &mut candidate,
+            &mut candidate_resources,
+            &candidate_scroll,
+        )
+        .expect("candidate pixels");
+        let oracle_pixels = paint_prepared_with_scroll(
+            &tree,
+            &mut oracle,
+            &mut oracle_resources,
+            &oracle_scroll,
+        )
+        .expect("oracle pixels");
+        assert_eq!(candidate_pixels.data(), oracle_pixels.data());
+    }
+
+    #[test]
+    fn transform_only_waapi_refresh_rejects_mixed_effect_atomically() {
+        let tree = parse_html(
+            r#"<div id="pure" style="transform:translateX(0px)"></div>
+                <div id="mixed" style="transform:translateX(0px)"></div>"#,
+        );
+        let pure = tree.get_element_by_id("pure").unwrap();
+        let mixed = tree.get_element_by_id("mixed").unwrap();
+        let mut timeline = crate::AnimationTimelineState::default();
+        for (id, node, opacity) in [(1, pure, None), (2, mixed, Some(0.5))] {
+            timeline.register_waapi(crate::WaapiAnimation {
+                id,
+                node,
+                keyframes: vec![crate::WaapiKeyframe {
+                    offset: 1.0,
+                    opacity,
+                    transform: Some("translateX(40px)".into()),
+                }],
+                timing: crate::AnimationTiming {
+                    duration_ms: 1_000.0,
+                    fill_mode: crate::AnimationFillMode::Both,
+                    ..Default::default()
+                },
+                easing: None,
+                linear_easing: None,
+                start_time_ms: 0.0,
+                hold_time_ms: None,
+                play_state: crate::WaapiPlayState::Running,
+            });
+        }
+        let mut resources = RenderResourceCache::with_loader(|_url: &str| None);
+        let mut cache = crate::css::StylesheetCache::default();
+        let mut prepared =
+            prepare_dom_with_dynamic_fonts_and_stylesheet_cache_with_animation_state(
+                &tree,
+                (100.0, 100.0),
+                None,
+                &mut resources,
+                &[],
+                &mut cache,
+                crate::AnimationSample::document(0.0),
+                &mut timeline,
+            )
+            .expect("initial render");
+        let sample_before = prepared.animation_sample;
+        let pure_before = prepared.layout.styles[&pure].transform_ops.clone();
+        assert!(!prepared.try_advance_transform_only_waapi_sample(
+            &tree,
+            crate::AnimationSample::document(500.0),
+            &timeline,
+        ));
+        assert_eq!(prepared.animation_sample, sample_before);
+        assert_eq!(
+            format!("{:?}", prepared.layout.styles[&pure].transform_ops),
+            format!("{pure_before:?}"),
+        );
+    }
+
+    #[test]
+    fn transform_only_waapi_refresh_rejects_containing_block_topology_change() {
+        let tree = parse_html(
+            r#"<div id="target"><div style="position:fixed;left:10px;top:10px"></div></div>"#,
+        );
+        let target = tree.get_element_by_id("target").unwrap();
+        let mut timeline = crate::AnimationTimelineState::default();
+        timeline.register_waapi(crate::WaapiAnimation {
+            id: 1,
+            node: target,
+            keyframes: vec![crate::WaapiKeyframe {
+                offset: 1.0,
+                opacity: None,
+                transform: Some("translateX(40px)".into()),
+            }],
+            timing: crate::AnimationTiming {
+                delay_ms: 100.0,
+                duration_ms: 1_000.0,
+                ..Default::default()
+            },
+            easing: None,
+            linear_easing: None,
+            start_time_ms: 0.0,
+            hold_time_ms: None,
+            play_state: crate::WaapiPlayState::Running,
+        });
+        let mut resources = RenderResourceCache::with_loader(|_url: &str| None);
+        let mut cache = crate::css::StylesheetCache::default();
+        let mut prepared =
+            prepare_dom_with_dynamic_fonts_and_stylesheet_cache_with_animation_state(
+                &tree,
+                (100.0, 100.0),
+                None,
+                &mut resources,
+                &[],
+                &mut cache,
+                crate::AnimationSample::document(0.0),
+                &mut timeline,
+            )
+            .expect("initial render before delayed effect");
+        assert_eq!(
+            prepared.layout.styles[&target].containing_block_triggers
+                & crate::CB_TRIGGER_TRANSFORM,
+            0,
+        );
+        assert!(!prepared.try_advance_transform_only_waapi_sample(
+            &tree,
+            crate::AnimationSample::document(500.0),
+            &timeline,
+        ));
+        assert_eq!(prepared.animation_sample, crate::AnimationSample::document(0.0));
     }
 
     #[test]
