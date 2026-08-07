@@ -1760,15 +1760,7 @@ impl ObscuraJsRuntime {
     }
 
     fn next_pending_timeout_delay_ms(&mut self) -> Option<f64> {
-        self.evaluate(
-            "(()=>{\
-             if(typeof __obscuraPendingTimeoutDeadlines==='undefined')return -1;\
-             const now=performance.now();let nearest=Infinity;\
-             for(const deadline of __obscuraPendingTimeoutDeadlines.values())\
-               nearest=Math.min(nearest,Math.max(0,deadline-now));\
-             return Number.isFinite(nearest)?nearest:-1;\
-             })()",
-        )
+        self.evaluate("globalThis.__obscura_nextPendingTimeoutDelay?.() ?? -1")
         .ok()
         .and_then(|value| value.as_f64())
         .filter(|delay| *delay >= 0.0)

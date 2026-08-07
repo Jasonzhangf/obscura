@@ -455,12 +455,49 @@ fn render_mutation_impact(
                 actual_change: old.as_deref() != Some(value),
             }
         }
+        "set_attribute_ns" => {
+            let Some(target) = node(arg1) else {
+                return RenderMutationImpact::default();
+            };
+            let mut parts = arg2.splitn(3, '\0');
+            let namespace = parts.next().unwrap_or("");
+            let qualified = parts.next().unwrap_or("");
+            let value = parts.next().unwrap_or("");
+            let local = qualified
+                .split_once(':')
+                .map(|(_, local)| local)
+                .unwrap_or(qualified);
+            let old = dom
+                .with_node(target, |node| {
+                    node.get_attribute_ns(namespace, local).map(str::to_owned)
+                })
+                .flatten();
+            RenderMutationImpact {
+                connected: node_is_connected(dom, target),
+                actual_change: old.as_deref() != Some(value),
+            }
+        }
         "remove_attribute" => {
             let Some(target) = node(arg1) else {
                 return RenderMutationImpact::default();
             };
             let existed = dom
                 .with_node(target, |node| node.get_attribute(arg2).is_some())
+                .unwrap_or(false);
+            RenderMutationImpact {
+                connected: node_is_connected(dom, target),
+                actual_change: existed,
+            }
+        }
+        "remove_attribute_ns" => {
+            let Some(target) = node(arg1) else {
+                return RenderMutationImpact::default();
+            };
+            let (namespace, local) = arg2.split_once('\0').unwrap_or(("", arg2));
+            let existed = dom
+                .with_node(target, |node| {
+                    node.get_attribute_ns(namespace, local).is_some()
+                })
                 .unwrap_or(false);
             RenderMutationImpact {
                 connected: node_is_connected(dom, target),
@@ -780,6 +817,8 @@ fn is_render_mutation_command(cmd: &str) -> bool {
         cmd,
         "set_attribute"
             | "remove_attribute"
+            | "set_attribute_ns"
+            | "remove_attribute_ns"
             | "append_child"
             | "remove_child"
             | "insert_before"
@@ -1445,21 +1484,45 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
         }
         "set_attribute_ns" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
+            let node_id = NodeId::new(nid);
             let mut parts = arg2.splitn(3, '\0');
             let ns = parts.next().unwrap_or("");
             let qualified = parts.next().unwrap_or("");
             let value = parts.next().unwrap_or("");
             if !qualified.is_empty() {
-                dom.with_node_mut(NodeId::new(nid), |n| {
-                    n.set_attribute_ns(ns, qualified, value.to_string())
-                });
+                let local = qualified
+                    .split_once(':')
+                    .map(|(_, local)| local)
+                    .unwrap_or(qualified);
+                if ns.is_empty() && local == "id" {
+                    let old_id = dom
+                        .with_node(node_id, |n| n.get_attribute("id").map(str::to_owned))
+                        .flatten();
+                    dom.with_node_mut(node_id, |n| {
+                        n.set_attribute_ns(ns, qualified, value.to_string())
+                    });
+                    dom.update_id_index(node_id, old_id.as_deref(), Some(value));
+                } else {
+                    dom.with_node_mut(node_id, |n| {
+                        n.set_attribute_ns(ns, qualified, value.to_string())
+                    });
+                }
             }
             "true".into()
         }
         "remove_attribute_ns" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
+            let node_id = NodeId::new(nid);
             let (ns, local) = arg2.split_once('\0').unwrap_or(("", arg2.as_str()));
-            dom.with_node_mut(NodeId::new(nid), |n| n.remove_attribute_ns(ns, local));
+            if ns.is_empty() && local == "id" {
+                let old_id = dom
+                    .with_node(node_id, |n| n.get_attribute("id").map(str::to_owned))
+                    .flatten();
+                dom.with_node_mut(node_id, |n| n.remove_attribute_ns(ns, local));
+                dom.update_id_index(node_id, old_id.as_deref(), None);
+            } else {
+                dom.with_node_mut(node_id, |n| n.remove_attribute_ns(ns, local));
+            }
             "true".into()
         }
         "set_inner_html" => {
