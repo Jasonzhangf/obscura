@@ -20,11 +20,6 @@
 
 Obscura is a headless browser engine written in Rust, built for web scraping and AI agent automation. It runs real JavaScript via V8, supports the Chrome DevTools Protocol, and acts as a drop-in replacement for headless Chrome with Puppeteer and Playwright.
 
-Rendering and stealth are both first-class Obscura capabilities. The rendering
-engine provides layout, screenshots, screencasting, and PDF export; stealth
-keeps the browser identity, TLS transport, and anti-fingerprinting surfaces
-consistent for automation workloads.
-
 ### Why Obscura over headless Chrome?
 
 Designed for automation at scale, not desktop browsing.
