@@ -620,6 +620,22 @@ pub(crate) struct ScrollTree {
     pub movement_owner: Vec<Option<ScrollId>>,
 }
 
+/// Prepared geometry shared by CSSOM, scrolling, sticky positioning, and
+/// paint. Building these values together avoids independently rediscovering
+/// viewport-fixed ownership and root overflow several times per frame.
+pub(crate) struct DerivedLayoutState {
+    pub content_size: (f32, f32),
+    pub viewport_fixed: HashSet<NodeId>,
+    pub sticky: StickyLayout,
+    pub scroll_tree: ScrollTree,
+}
+
+pub(crate) struct DerivedGeometryState {
+    pub content_size: (f32, f32),
+    pub sticky: StickyLayout,
+    pub scroll_tree: ScrollTree,
+}
+
 /// Root-scroll sticky-position constraints captured from normal-flow layout.
 ///
 /// The normal boxes stay immutable in the layout cache. A scroll offset is
@@ -777,6 +793,42 @@ fn sticky_axis_position(
 }
 
 impl DomLayout {
+    pub(crate) fn derived_layout_state(
+        &self,
+        tree: &DomTree,
+        viewport: (f32, f32),
+    ) -> DerivedLayoutState {
+        let viewport_fixed = self.viewport_fixed_nodes(tree);
+        let geometry = self.derived_geometry_with_fixed(tree, viewport, &viewport_fixed);
+        DerivedLayoutState {
+            content_size: geometry.content_size,
+            viewport_fixed,
+            sticky: geometry.sticky,
+            scroll_tree: geometry.scroll_tree,
+        }
+    }
+
+    pub(crate) fn derived_geometry_with_fixed(
+        &self,
+        tree: &DomTree,
+        viewport: (f32, f32),
+        viewport_fixed: &HashSet<NodeId>,
+    ) -> DerivedGeometryState {
+        let content_size = self.scrolling_content_size_with_fixed(tree, viewport, viewport_fixed);
+        let sticky = self.root_sticky_layout_with_geometry(
+            tree,
+            viewport,
+            viewport_fixed,
+            content_size,
+        );
+        let scroll_tree = self.scroll_tree(tree, viewport, content_size, viewport_fixed);
+        DerivedGeometryState {
+            content_size,
+            sticky,
+            scroll_tree,
+        }
+    }
+
     /// Refresh the derived paint-culling bit after an opacity-only sample.
     /// Keep opacity as a binary zero ancestor flag instead of multiplying the
     /// chain, which avoids underflow making a deep fractional-opacity subtree
@@ -1192,6 +1244,15 @@ impl DomLayout {
     /// overflow clips. Viewport-fixed subtrees do not enlarge the document.
     pub fn scrolling_content_size(&self, tree: &DomTree, viewport: (f32, f32)) -> (f32, f32) {
         let fixed = self.viewport_fixed_nodes(tree);
+        self.scrolling_content_size_with_fixed(tree, viewport, &fixed)
+    }
+
+    fn scrolling_content_size_with_fixed(
+        &self,
+        tree: &DomTree,
+        viewport: (f32, f32),
+        fixed: &HashSet<NodeId>,
+    ) -> (f32, f32) {
         let mut right = viewport.0.max(0.0);
         let mut bottom = viewport.1.max(0.0);
 
@@ -1204,7 +1265,7 @@ impl DomLayout {
                 tree,
                 root,
                 None,
-                &fixed,
+                fixed,
                 &self.rects,
                 &self.styles,
                 &self.translates,
@@ -1222,7 +1283,17 @@ impl DomLayout {
     /// their sticky frames will need a scroll-container-specific instance.
     pub fn root_sticky_layout(&self, tree: &DomTree, viewport: (f32, f32)) -> StickyLayout {
         let viewport_fixed = self.viewport_fixed_nodes(tree);
-        let content = self.scrolling_content_size(tree, viewport);
+        let content = self.scrolling_content_size_with_fixed(tree, viewport, &viewport_fixed);
+        self.root_sticky_layout_with_geometry(tree, viewport, &viewport_fixed, content)
+    }
+
+    fn root_sticky_layout_with_geometry(
+        &self,
+        tree: &DomTree,
+        viewport: (f32, f32),
+        viewport_fixed: &HashSet<NodeId>,
+        content: (f32, f32),
+    ) -> StickyLayout {
         let root_containing = Rect {
             x: 0.0,
             y: 0.0,
@@ -1420,7 +1491,7 @@ fn accumulate_scrolling_overflow(
         }
         _ => inherited_clip,
     };
-    for child in tree.children(id) {
+    for child in rendered_children(tree, id) {
         accumulate_scrolling_overflow(
             tree,
             child,
@@ -14225,6 +14296,36 @@ mod tests {
         assert!(
             !laid.rects.contains_key(&unslotted),
             "unmatched light DOM must not generate a layout box"
+        );
+    }
+
+    #[test]
+    fn root_scrolling_overflow_uses_composed_shadow_tree() {
+        let tree = parse_html(
+            r#"<html style="margin:0"><body style="margin:0">
+                <x-card id="host" style="display:block;position:relative;width:100px;height:20px">
+                    <div id="unslotted" slot="missing"
+                         style="position:absolute;top:600px;width:10px;height:30px"></div>
+                </x-card>
+                <div id="source">
+                    <div id="shadow-overflow"
+                         style="position:absolute;top:250px;width:10px;height:30px"></div>
+                </div>
+            </body></html>"#,
+        );
+        let host = tree.get_element_by_id("host").unwrap();
+        let source = tree.get_element_by_id("source").unwrap();
+        let unslotted = tree.get_element_by_id("unslotted").unwrap();
+        let shadow_overflow = tree.get_element_by_id("shadow-overflow").unwrap();
+        attach_programmatic_shadow(&tree, host, source);
+
+        let laid = layout_dom(&tree, (100.0, 100.0));
+        assert!(!laid.rects.contains_key(&unslotted));
+        assert_eq!(laid.rects[&shadow_overflow].y, 250.0);
+        assert_eq!(
+            laid.scrolling_content_size(&tree, (100.0, 100.0)),
+            (100.0, 280.0),
+            "shadow overflow must contribute while unslotted light DOM must not",
         );
     }
 

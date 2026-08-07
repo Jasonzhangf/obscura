@@ -927,15 +927,19 @@ impl PreparedRender {
         }
         if has_transform_effect {
             self.layout.refresh_visual_geometry(tree, self.viewport);
-            self.content_size = self.layout.scrolling_content_size(tree, self.viewport);
-            self.viewport_fixed = self.layout.viewport_fixed_nodes(tree);
-            self.sticky = self.layout.root_sticky_layout(tree, self.viewport);
-            self.scroll_tree = self.layout.scroll_tree(
+            // A retained transform sample may change visual overflow, sticky
+            // constraints, and scrolling ranges, but the preflight above has
+            // already rejected any containing-block topology change. Reuse
+            // the immutable viewport-fixed ownership instead of walking the
+            // document again on every animation frame.
+            let derived = self.layout.derived_geometry_with_fixed(
                 tree,
                 self.viewport,
-                self.content_size,
                 &self.viewport_fixed,
             );
+            self.content_size = derived.content_size;
+            self.sticky = derived.sticky;
+            self.scroll_tree = derived.scroll_tree;
         }
         self.animation_sample = sample;
         self.has_active_waapi_animations = timeline.has_active_waapi(sample.time);
@@ -2531,10 +2535,7 @@ fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
             animation_timeline,
         );
     }
-    let content_size = laid.scrolling_content_size(tree, viewport);
-    let viewport_fixed = laid.viewport_fixed_nodes(tree);
-    let sticky = laid.root_sticky_layout(tree, viewport);
-    let scroll_tree = laid.scroll_tree(tree, viewport, content_size, &viewport_fixed);
+    let derived = laid.derived_layout_state(tree, viewport);
     let root_font_size = tree
         .query_selector("html")
         .ok()
@@ -2559,10 +2560,10 @@ fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
         root_font_size,
         base_url: base_url.map(str::to_string),
         has_dynamic_fonts: !dynamic_fonts.is_empty(),
-        content_size,
-        viewport_fixed,
-        sticky,
-        scroll_tree,
+        content_size: derived.content_size,
+        viewport_fixed: derived.viewport_fixed,
+        sticky: derived.sticky,
+        scroll_tree: derived.scroll_tree,
         selected_images,
         svg_fonts,
         layout: laid,
@@ -15777,6 +15778,8 @@ mod tests {
                 <div id="moving" style="position:absolute;left:20px;top:20px;width:80px;height:60px;
                      overflow:hidden;border-radius:12px;background:red;transform:translateX(0px)">
                     <div style="width:130px;height:60px;background:lime"></div>
+                    <div id="captured-fixed" style="position:fixed;left:4px;top:4px;
+                         width:12px;height:12px;background:yellow"></div>
                 </div>
                 <div style="position:absolute;left:145px;top:20px;width:75px;height:75px;overflow:hidden">
                     <div id="affine" style="width:60px;height:60px;background:blue;
@@ -15784,11 +15787,29 @@ mod tests {
                 </div>
                 <div id="overflow" style="position:absolute;left:10px;top:100px;width:10px;height:10px;
                      background:black;transform:translateX(0px)"></div>
+                <div id="scroller" style="position:absolute;left:150px;top:96px;width:70px;height:22px;
+                     overflow:auto;background:purple">
+                    <div id="scroll-target" style="width:150px;height:80px;background:orange"></div>
+                </div>
+                <div id="flow" style="width:24px;height:320px">
+                    <div style="height:65px"></div>
+                    <div id="sticky" style="position:sticky;top:3px;width:24px;height:12px;background:cyan">
+                        <div id="sticky-child" style="width:8px;height:8px;background:black"></div>
+                    </div>
+                </div>
+                <div id="viewport-fixed" style="position:fixed;right:0;top:0;
+                     width:8px;height:8px;background:magenta"></div>
             </body></html>"#,
         );
         let moving = tree.get_element_by_id("moving").unwrap();
         let affine = tree.get_element_by_id("affine").unwrap();
         let overflow = tree.get_element_by_id("overflow").unwrap();
+        let captured_fixed = tree.get_element_by_id("captured-fixed").unwrap();
+        let viewport_fixed = tree.get_element_by_id("viewport-fixed").unwrap();
+        let scroller = tree.get_element_by_id("scroller").unwrap();
+        let scroll_target = tree.get_element_by_id("scroll-target").unwrap();
+        let sticky = tree.get_element_by_id("sticky").unwrap();
+        let sticky_child = tree.get_element_by_id("sticky-child").unwrap();
         let make_timeline = || {
             let mut timeline = crate::AnimationTimelineState::default();
             for (id, node, from, to) in [
@@ -15898,16 +15919,58 @@ mod tests {
         assert_eq!(candidate.layout.clip_rects, oracle.layout.clip_rects);
         assert_eq!(candidate.content_size, oracle.content_size);
         assert!(candidate.content_size.0 > viewport.0);
+        assert!(candidate.content_size.1 > viewport.1);
         assert_eq!(candidate.viewport_fixed, oracle.viewport_fixed);
+        assert!(candidate.viewport_fixed.contains(&viewport_fixed));
+        assert!(!candidate.viewport_fixed.contains(&captured_fixed));
+        assert_eq!(
+            candidate.scroll_container_nodes().collect::<Vec<_>>(),
+            oracle.scroll_container_nodes().collect::<Vec<_>>(),
+        );
+        assert!(candidate.scroll_container_nodes().any(|node| node == scroller));
         for node in [moving, affine, overflow] {
             assert_eq!(
                 format!("{:?}", candidate.layout.styles[&node]),
                 format!("{:?}", oracle.layout.styles[&node]),
             );
         }
-        let candidate_scroll =
-            candidate.resolve_scroll_state(&tree, (0.0, 0.0), &HashMap::new());
-        let oracle_scroll = oracle.resolve_scroll_state(&tree, (0.0, 0.0), &HashMap::new());
+        let element_offsets = HashMap::from([(scroller, (9999.0, 9999.0))]);
+        let candidate_scroll = candidate.resolve_scroll_state(&tree, (0.0, 80.0), &element_offsets);
+        let oracle_scroll = oracle.resolve_scroll_state(&tree, (0.0, 80.0), &element_offsets);
+        assert_eq!(candidate_scroll.root_offset, oracle_scroll.root_offset);
+        assert_eq!(
+            candidate_scroll.container_offsets,
+            oracle_scroll.container_offsets
+        );
+        assert_eq!(candidate_scroll.node_movement, oracle_scroll.node_movement);
+        assert_eq!(
+            candidate_scroll.inherited_clips,
+            oracle_scroll.inherited_clips
+        );
+        assert_eq!(
+            candidate.element_scroll_metrics(scroller, &candidate_scroll),
+            oracle.element_scroll_metrics(scroller, &oracle_scroll),
+        );
+        assert_eq!(
+            candidate.viewport_rect_with_scroll(sticky, &candidate_scroll),
+            oracle.viewport_rect_with_scroll(sticky, &oracle_scroll),
+        );
+        assert_eq!(
+            candidate.viewport_rect_with_scroll(sticky_child, &candidate_scroll),
+            oracle.viewport_rect_with_scroll(sticky_child, &oracle_scroll),
+        );
+        assert_eq!(
+            candidate.viewport_rect_with_scroll(captured_fixed, &candidate_scroll),
+            oracle.viewport_rect_with_scroll(captured_fixed, &oracle_scroll),
+        );
+        assert_eq!(
+            candidate.viewport_rect_with_scroll(scroll_target, &candidate_scroll),
+            oracle.viewport_rect_with_scroll(scroll_target, &oracle_scroll),
+        );
+        assert_ne!(
+            candidate.sticky.translations(viewport, candidate_scroll.root_offset),
+            HashMap::new(),
+        );
         let candidate_pixels = paint_prepared_with_scroll(
             &tree,
             &mut candidate,
