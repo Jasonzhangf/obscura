@@ -108,10 +108,26 @@ scaling, full-page capture through `captureBeyondViewport`, device metrics, and
 transparent background overrides. `fromSurface: false` is not supported, and
 the WebP encoder does not currently accept a quality setting.
 
+Create a page-scoped CDP session using the API for your client:
+
+Puppeteer:
+
+```js
+const client = await page.createCDPSession();
+```
+
+Playwright:
+
+```js
+const client = await context.newCDPSession(page);
+```
+
+The examples below assume that `client` has been created with the appropriate
+line above.
+
 ```js
 import fs from 'node:fs';
 
-const client = await page.createCDPSession();
 const { data } = await client.send('Page.captureScreenshot', {
   format: 'png',
   captureBeyondViewport: true,
@@ -127,8 +143,6 @@ Clients must acknowledge frames; Obscura bounds unacknowledged work instead of
 letting a slow consumer grow memory without limit.
 
 ```js
-const client = await page.createCDPSession();
-
 client.on('Page.screencastFrame', async ({ data, metadata, sessionId }) => {
   // Consume or forward Buffer.from(data, 'base64') here.
   console.log(metadata.timestamp, metadata.scrollOffsetY);
@@ -146,10 +160,13 @@ await client.send('Page.startScreencast', {
 // ...navigate and interact...
 
 await client.send('Page.stopScreencast');
+await client.detach();
 ```
 
 This is an activity-driven page stream, not desktop/window capture or a
-guarantee of a fixed frame rate.
+guarantee of a fixed frame rate. Playwright's `page.video()` is a separate
+desktop-capture workflow and is not implemented; use the CDP stream above when
+page frames are the required output.
 
 ## PDF export
 

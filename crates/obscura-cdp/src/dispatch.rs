@@ -53,6 +53,7 @@ pub struct CdpContext {
     pub browser_contexts: HashMap<String, Arc<BrowserContext>>,
     page_counter: u32,
     browser_context_counter: u32,
+    target_session_counter: u64,
     pub preload_scripts: Vec<(String, String)>, // (identifier, source)
     pub preload_counter: u32,
     // World names registered via Page.createIsolatedWorld. After every
@@ -163,6 +164,7 @@ impl CdpContext {
             browser_contexts: HashMap::new(),
             page_counter: 0,
             browser_context_counter: 0,
+            target_session_counter: 0,
             preload_scripts: Vec::new(),
             preload_counter: 0,
             fetch_intercept: FetchInterceptState::new(),
@@ -241,6 +243,16 @@ impl CdpContext {
         let context = Arc::new(self.default_context.isolated_copy(id.clone(), false));
         self.browser_contexts.insert(id.clone(), context);
         id
+    }
+
+    /// Allocate a distinct CDP session for every explicit target attachment.
+    /// A target may have more than one client session at a time (for example,
+    /// Playwright's managed page session plus `newCDPSession(page)`). Reusing
+    /// the page's auto-attach session id makes the client's session registry
+    /// overwrite the original route.
+    pub(crate) fn next_target_session(&mut self, target_id: &str) -> String {
+        self.target_session_counter = self.target_session_counter.saturating_add(1);
+        format!("{target_id}-session-{}", self.target_session_counter)
     }
 
     pub fn dispose_browser_context(&mut self, id: &str) -> Result<Vec<String>, String> {
@@ -470,7 +482,7 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
     };
 
     let result = match domain {
-        "Target" => domains::target::handle(method, &req.params, ctx).await,
+        "Target" => domains::target::handle(method, &req.params, ctx, &req.session_id).await,
         "Browser" => domains::browser::handle(method, &req.params).await,
         "Page" => domains::page::handle(method, &req.params, ctx, &req.session_id).await,
         "DOM" => domains::dom::handle(method, &req.params, ctx, &req.session_id).await,

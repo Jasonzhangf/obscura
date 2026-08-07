@@ -81,7 +81,8 @@ await page.goto('https://example.com', { waitUntil: 'load' });
 - `page.content`, `page.title`, `page.url`
 - `page.screenshot` for viewport, clipped, and full-page capture
 - `page.pdf` for raster-backed print output
-- raw CDP `Page.startScreencast` with frame acknowledgements
+- raw CDP `Page.startScreencast` with frame acknowledgements (`page.createCDPSession()`
+  in Puppeteer; `context.newCDPSession(page)` in Playwright)
 
 DOM-agent frameworks such as browser-use also connect: obscura implements `DOMSnapshot.captureSnapshot` and `Target.targetInfoChanged` for perception, and `DOM.focus` so a focused field receives `Input.dispatchKeyEvent` keystrokes.
 

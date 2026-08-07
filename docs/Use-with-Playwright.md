@@ -110,8 +110,37 @@ await page.pdf({ path: 'page.pdf', format: 'A4', printBackground: true });
 ```
 
 A normal screenshot captures the live viewport and scroll position;
-`fullPage: true` captures document space. PDF output is raster-backed. For raw
-CDP screencasting and detailed limits, see
+`fullPage: true` captures document space. PDF output is raster-backed.
+
+## Screencasting
+
+Playwright does not expose CDP screencasting as a page method. Attach a raw CDP
+session to the page, acknowledge every frame, and detach it when finished:
+
+```js
+const client = await context.newCDPSession(page);
+
+client.on('Page.screencastFrame', async ({ data, sessionId }) => {
+  const jpeg = Buffer.from(data, 'base64');
+  // Consume or forward `jpeg` here.
+  await client.send('Page.screencastFrameAck', { sessionId });
+});
+
+await client.send('Page.startScreencast', {
+  format: 'jpeg',
+  quality: 80,
+  maxWidth: 1280,
+  maxHeight: 720,
+});
+
+// ...navigate, scroll, and interact...
+
+await client.send('Page.stopScreencast');
+await client.detach();
+```
+
+Frames are activity-driven page captures, not fixed-rate desktop video. For
+detailed format and output limits, see
 [Rendering, screenshots, screencasting, and PDF](Rendering-screenshots-screencasting-and-PDF.md).
 
 ## Disconnect
@@ -123,7 +152,7 @@ await browser.close();  // closes the CDP connection, leaves obscura serve runni
 ## Current limits
 
 - Playwright `page.video()` and tracing artifacts that require desktop capture
-  are not implemented. Use CDP `Page.startScreencast` for page frames.
+  are not implemented. Use the raw CDP flow above for page frames.
 - `BrowserContext` storage-state save/restore remains limited; use
   `--storage-dir` on `obscura serve`, as described in
   [Persist cookies and storage](Persist-cookies-and-storage.md).
