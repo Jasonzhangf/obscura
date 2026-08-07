@@ -6810,8 +6810,19 @@ fn set_inset_side(style: &mut LayoutStyle, index: usize, value: &str) {
         style.inset[index] = None;
         style.inset_expressions[index] = Some(expression);
     } else {
-        style.inset[index] = inset_dim(value);
-        style.inset_expressions[index] = None;
+        let inset = inset_dim(value);
+        style.inset[index] = inset;
+        style.inset_expressions[index] = inset
+            .filter(|dimension| {
+                matches!(
+                    dimension,
+                    crate::Dimension::Vw(_)
+                        | crate::Dimension::Vh(_)
+                        | crate::Dimension::Vmin(_)
+                        | crate::Dimension::Vmax(_)
+                )
+            })
+            .map(|_| value.to_string());
     }
 }
 

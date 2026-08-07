@@ -1022,6 +1022,39 @@ impl PreparedRender {
         )
     }
 
+    fn root_only_movement_for(
+        &self,
+        id: obscura_dom::tree::NodeId,
+        requested_scroll: (f32, f32),
+    ) -> (f32, f32) {
+        let root = self.clamp_scroll(requested_scroll);
+        let mut cumulative = vec![(0.0, 0.0); self.scroll_tree.containers.len()];
+        cumulative[0] = (-root.0, -root.1);
+        for index in 1..cumulative.len() {
+            let parent = self.scroll_tree.containers[index].parent;
+            cumulative[index] = parent
+                .map(|parent| cumulative[parent.index()])
+                .unwrap_or((0.0, 0.0));
+        }
+        let mut movement = self
+            .scroll_tree
+            .movement_owner
+            .get(id.index())
+            .copied()
+            .flatten()
+            .and_then(|owner| cumulative.get(owner.index()).copied())
+            .unwrap_or((0.0, 0.0));
+        let sticky = self.sticky.resolved_translation_for(
+            id,
+            self.viewport,
+            &self.scroll_tree,
+            &cumulative,
+        );
+        movement.0 += sticky.0;
+        movement.1 += sticky.1;
+        movement
+    }
+
     /// Element scroll containers in this prepared layout, in stable DOM order.
     pub fn scroll_container_nodes(&self) -> impl Iterator<Item = obscura_dom::tree::NodeId> + '_ {
         self.scroll_tree
@@ -1101,10 +1134,10 @@ impl PreparedRender {
                 node_movement[index] = cumulative[owner.index()];
             }
         }
-        // Stage 1 keeps the established root sticky behavior. Nested sticky is
-        // intentionally absent from ScrollTree until its constraints are made
-        // scroll-container-relative in Stage 2.
-        for (id, sticky) in self.sticky.translations(viewport, root) {
+        for (id, sticky) in
+            self.sticky
+                .resolved_translations(viewport, &self.scroll_tree, &cumulative)
+        {
             if let Some(movement) = node_movement.get_mut(id.index()) {
                 movement.0 += sticky.0;
                 movement.1 += sticky.1;
@@ -1116,10 +1149,25 @@ impl PreparedRender {
             tree: &DomTree,
             laid: &crate::DomLayout,
             movement: &[(f32, f32)],
+            viewport_fixed: &std::collections::HashSet<obscura_dom::tree::NodeId>,
             id: obscura_dom::tree::NodeId,
             inherited: Option<crate::dom::OverflowClip>,
             out: &mut [Option<crate::dom::OverflowClip>],
         ) {
+            // A fixed-position box whose containing block is the viewport
+            // escapes clips established by ancestors in document space. Only
+            // reset at the boundary: descendants still inherit clips created
+            // inside the fixed subtree, while transform/filter/contain-
+            // captured fixed boxes are absent from `viewport_fixed` and retain
+            // their ordinary ancestor clips.
+            let starts_viewport_fixed = viewport_fixed.contains(&id)
+                && crate::dom::rendered_parent(tree, id)
+                    .is_none_or(|parent| !viewport_fixed.contains(&parent));
+            let inherited = if starts_viewport_fixed {
+                None
+            } else {
+                inherited
+            };
             if let Some(slot) = out.get_mut(id.index()) {
                 *slot = inherited.clone();
             }
@@ -1143,7 +1191,15 @@ impl PreparedRender {
                 _ => inherited,
             };
             for child in crate::dom::rendered_children(tree, id) {
-                resolve_clips(tree, laid, movement, child, next.clone(), out);
+                resolve_clips(
+                    tree,
+                    laid,
+                    movement,
+                    viewport_fixed,
+                    child,
+                    next.clone(),
+                    out,
+                );
             }
         }
         if let Some(root_node) = tree
@@ -1155,6 +1211,7 @@ impl PreparedRender {
                 tree,
                 &self.layout,
                 &node_movement,
+                &self.viewport_fixed,
                 root_node,
                 None,
                 &mut inherited_clips,
@@ -1695,12 +1752,9 @@ impl PreparedRender {
         requested_scroll: (f32, f32),
     ) -> Option<crate::Rect> {
         let mut rect = self.document_rect(id)?;
-        let scroll = self.clamp_scroll(requested_scroll);
-        if !self.viewport_fixed.contains(&id) {
-            let sticky = self.sticky.translation_for(id, self.viewport, scroll);
-            rect.x += sticky.0 - scroll.0;
-            rect.y += sticky.1 - scroll.1;
-        }
+        let movement = self.root_only_movement_for(id, requested_scroll);
+        rect.x += movement.0;
+        rect.y += movement.1;
         Some(rect)
     }
 
@@ -1734,13 +1788,7 @@ impl PreparedRender {
             .get(&id)
             .cloned()
             .or_else(|| self.layout.rects.get(&id).copied().map(|rect| vec![rect]))?;
-        let scroll = self.clamp_scroll(requested_scroll);
-        let movement = if self.viewport_fixed.contains(&id) {
-            (0.0, 0.0)
-        } else {
-            let sticky = self.sticky.translation_for(id, self.viewport, scroll);
-            (sticky.0 - scroll.0, sticky.1 - scroll.1)
-        };
+        let movement = self.root_only_movement_for(id, requested_scroll);
         Some(
             source
                 .into_iter()
@@ -2625,6 +2673,7 @@ fn paint_prepared_with_surface_color(
         prepared.base_url.as_deref(),
         scroll,
         None,
+        None,
         pixmap,
         resources,
         &prepared.selected_images,
@@ -2633,6 +2682,7 @@ fn paint_prepared_with_surface_color(
         prepared.content_size,
         &prepared.viewport_fixed,
         &prepared.sticky,
+        &prepared.scroll_tree,
         &mut prepared.layout,
         None,
         None,
@@ -2712,6 +2762,7 @@ pub fn paint_prepared_with_scroll_and_surface_color_and_canvas_surfaces(
         prepared.base_url.as_deref(),
         scroll.root_offset(),
         Some(scroll),
+        None,
         pixmap,
         resources,
         &prepared.selected_images,
@@ -2720,6 +2771,7 @@ pub fn paint_prepared_with_scroll_and_surface_color_and_canvas_surfaces(
         prepared.content_size,
         &prepared.viewport_fixed,
         &prepared.sticky,
+        &prepared.scroll_tree,
         &mut prepared.layout,
         None,
         None,
@@ -2862,6 +2914,7 @@ fn paint_prepared_region_with_scroll_policy(
         prepared.base_url.as_deref(),
         root,
         Some(scroll),
+        None,
         pixmap,
         resources,
         &prepared.selected_images,
@@ -2870,6 +2923,7 @@ fn paint_prepared_region_with_scroll_policy(
         prepared.content_size,
         &prepared.viewport_fixed,
         &prepared.sticky,
+        &prepared.scroll_tree,
         &mut prepared.layout,
         None,
         None,
@@ -3281,6 +3335,7 @@ fn paint_laid_dom_scrolled(
     base_url: Option<&str>,
     scroll: (f32, f32),
     resolved_scroll: Option<&ResolvedScrollState>,
+    shared_scroll_state: Option<&ScrollPaintState<'_>>,
     mut pixmap: Pixmap,
     image_cache: &mut RenderResourceCache,
     selected_images: &HashMap<obscura_dom::tree::NodeId, SelectedImage>,
@@ -3289,6 +3344,7 @@ fn paint_laid_dom_scrolled(
     content_size: (f32, f32),
     viewport_fixed: &std::collections::HashSet<obscura_dom::tree::NodeId>,
     sticky: &crate::StickyLayout,
+    scroll_tree: &crate::dom::ScrollTree,
     laid: &mut crate::DomLayout,
     paint_root: Option<obscura_dom::tree::NodeId>,
     suppress_opacity_for: Option<obscura_dom::tree::NodeId>,
@@ -3318,6 +3374,9 @@ fn paint_laid_dom_scrolled(
             content_size,
             viewport_fixed,
             sticky,
+            scroll_tree,
+            laid,
+            shared_scroll_state,
             clip_scope_root,
             surface_extent,
             surface_offset,
@@ -3547,6 +3606,7 @@ fn paint_laid_dom_scrolled(
                 base_url,
                 scroll,
                 resolved_scroll,
+                Some(&scroll_state),
                 pixmap,
                 image_cache,
                 selected_images,
@@ -3555,6 +3615,7 @@ fn paint_laid_dom_scrolled(
                 content_size,
                 viewport_fixed,
                 sticky,
+                scroll_tree,
                 laid,
                 Some(nid),
                 suppress_opacity_for,
@@ -3582,6 +3643,7 @@ fn paint_laid_dom_scrolled(
                 base_url,
                 scroll,
                 resolved_scroll,
+                Some(&scroll_state),
                 pixmap,
                 image_cache,
                 selected_images,
@@ -3590,6 +3652,7 @@ fn paint_laid_dom_scrolled(
                 content_size,
                 viewport_fixed,
                 sticky,
+                scroll_tree,
                 laid,
                 Some(nid),
                 suppress_opacity_for,
@@ -3684,6 +3747,7 @@ fn paint_laid_dom_scrolled(
                     base_url,
                     scroll,
                     resolved_scroll,
+                    Some(&scroll_state),
                     pixmap,
                     image_cache,
                     selected_images,
@@ -3692,6 +3756,7 @@ fn paint_laid_dom_scrolled(
                     content_size,
                     viewport_fixed,
                     sticky,
+                    scroll_tree,
                     laid,
                     Some(nid),
                     suppress_opacity_for,
@@ -3758,6 +3823,7 @@ fn paint_laid_dom_scrolled(
                 base_url,
                 scroll,
                 resolved_scroll,
+                Some(&scroll_state),
                 layer,
                 image_cache,
                 selected_images,
@@ -3766,6 +3832,7 @@ fn paint_laid_dom_scrolled(
                 content_size,
                 viewport_fixed,
                 sticky,
+                scroll_tree,
                 laid,
                 Some(nid),
                 suppress_opacity_for,
@@ -3833,6 +3900,7 @@ fn paint_laid_dom_scrolled(
                 base_url,
                 scroll,
                 resolved_scroll,
+                Some(&scroll_state),
                 layer,
                 image_cache,
                 selected_images,
@@ -3841,6 +3909,7 @@ fn paint_laid_dom_scrolled(
                 content_size,
                 viewport_fixed,
                 sticky,
+                scroll_tree,
                 laid,
                 Some(nid),
                 Some(nid),
@@ -4980,13 +5049,94 @@ struct ScrollPaintState<'a> {
     viewport: (f32, f32),
     scroll: (f32, f32),
     viewport_fixed: &'a std::collections::HashSet<obscura_dom::tree::NodeId>,
-    sticky: std::collections::HashMap<obscura_dom::tree::NodeId, (f32, f32)>,
-    sticky_clips: std::collections::HashMap<obscura_dom::tree::NodeId, (f32, f32)>,
+    sticky: Arc<std::collections::HashMap<obscura_dom::tree::NodeId, (f32, f32)>>,
+    sticky_clips: Arc<std::collections::HashMap<obscura_dom::tree::NodeId, (f32, f32)>>,
+    viewport_fixed_clips: Arc<
+        std::collections::HashMap<
+            obscura_dom::tree::NodeId,
+            Option<crate::dom::OverflowClip>,
+        >,
+    >,
     resolved: Option<&'a ResolvedScrollState>,
     clip_scope_root: Option<obscura_dom::tree::NodeId>,
     surface_extent: Option<(f32, f32)>,
     surface_offset: (f32, f32),
     active: bool,
+}
+
+fn viewport_fixed_clip_map(
+    tree: &DomTree,
+    laid: &crate::DomLayout,
+    viewport_fixed: &std::collections::HashSet<obscura_dom::tree::NodeId>,
+    sticky: &std::collections::HashMap<obscura_dom::tree::NodeId, (f32, f32)>,
+) -> std::collections::HashMap<
+    obscura_dom::tree::NodeId,
+    Option<crate::dom::OverflowClip>,
+> {
+    fn walk(
+        tree: &DomTree,
+        laid: &crate::DomLayout,
+        viewport_fixed: &std::collections::HashSet<obscura_dom::tree::NodeId>,
+        sticky: &std::collections::HashMap<obscura_dom::tree::NodeId, (f32, f32)>,
+        id: obscura_dom::tree::NodeId,
+        inherited: Option<crate::dom::OverflowClip>,
+        out: &mut std::collections::HashMap<
+            obscura_dom::tree::NodeId,
+            Option<crate::dom::OverflowClip>,
+        >,
+    ) {
+        out.insert(id, inherited.clone());
+        let next = match (laid.styles.get(&id), laid.rects.get(&id)) {
+            (Some(style), Some(rect))
+                if style.overflow_hidden && !style.overflow_propagated_to_viewport =>
+            {
+                let base = laid.translates.get(&id).copied().unwrap_or((0.0, 0.0));
+                let movement = sticky.get(&id).copied().unwrap_or((0.0, 0.0));
+                let own = crate::dom::OverflowClip::for_box(
+                    rect,
+                    style,
+                    base.0 + movement.0,
+                    base.1 + movement.1,
+                );
+                Some(match inherited {
+                    Some(clip) => clip.intersect(own),
+                    None => own,
+                })
+            }
+            _ => inherited,
+        };
+        for child in crate::dom::rendered_children(tree, id) {
+            if viewport_fixed.contains(&child) {
+                walk(
+                    tree,
+                    laid,
+                    viewport_fixed,
+                    sticky,
+                    child,
+                    next.clone(),
+                    out,
+                );
+            }
+        }
+    }
+
+    let mut out = std::collections::HashMap::with_capacity(viewport_fixed.len());
+    for &id in viewport_fixed {
+        let starts_subtree = crate::dom::rendered_parent(tree, id)
+            .is_none_or(|parent| !viewport_fixed.contains(&parent));
+        if starts_subtree {
+            walk(
+                tree,
+                laid,
+                viewport_fixed,
+                sticky,
+                id,
+                None,
+                &mut out,
+            );
+        }
+    }
+    out
 }
 
 impl<'a> ScrollPaintState<'a> {
@@ -4997,6 +5147,9 @@ impl<'a> ScrollPaintState<'a> {
         content: (f32, f32),
         viewport_fixed: &'a std::collections::HashSet<obscura_dom::tree::NodeId>,
         sticky_layout: &crate::StickyLayout,
+        scroll_tree: &crate::dom::ScrollTree,
+        laid: &crate::DomLayout,
+        shared: Option<&ScrollPaintState<'_>>,
         clip_scope_root: Option<obscura_dom::tree::NodeId>,
         surface_extent: Option<(f32, f32)>,
         surface_offset: (f32, f32),
@@ -5019,24 +5172,27 @@ impl<'a> ScrollPaintState<'a> {
         };
         let scroll = (scroll_x, scroll_y);
         let active = scroll != (0.0, 0.0) || !sticky_layout.is_empty();
-        if !active {
-            return Self {
+        let (sticky, sticky_clips, viewport_fixed_clips) = if let Some(shared) = shared {
+            (
+                Arc::clone(&shared.sticky),
+                Arc::clone(&shared.sticky_clips),
+                Arc::clone(&shared.viewport_fixed_clips),
+            )
+        } else {
+            let sticky = Arc::new(if active {
+                sticky_layout.resolved_root_translations(viewport, scroll_tree, scroll)
+            } else {
+                std::collections::HashMap::new()
+            });
+            let sticky_clips = Arc::new(sticky_layout.clip_translations_from(&sticky));
+            let viewport_fixed_clips = Arc::new(viewport_fixed_clip_map(
                 tree,
-                viewport,
-                scroll,
+                laid,
                 viewport_fixed,
-                sticky: std::collections::HashMap::new(),
-                sticky_clips: std::collections::HashMap::new(),
-                resolved: None,
-                clip_scope_root,
-                surface_extent,
-                surface_offset,
-                active,
-            };
-        }
-
-        let sticky = sticky_layout.translations(viewport, scroll);
-        let sticky_clips = sticky_layout.clip_translations_from(&sticky);
+                &sticky,
+            ));
+            (sticky, sticky_clips, viewport_fixed_clips)
+        };
         Self {
             tree,
             viewport,
@@ -5044,6 +5200,7 @@ impl<'a> ScrollPaintState<'a> {
             viewport_fixed,
             sticky,
             sticky_clips,
+            viewport_fixed_clips,
             resolved: None,
             clip_scope_root,
             surface_extent,
@@ -5066,8 +5223,9 @@ impl<'a> ScrollPaintState<'a> {
             viewport,
             scroll: resolved.root_offset(),
             viewport_fixed,
-            sticky: std::collections::HashMap::new(),
-            sticky_clips: std::collections::HashMap::new(),
+            sticky: Arc::new(std::collections::HashMap::new()),
+            sticky_clips: Arc::new(std::collections::HashMap::new()),
+            viewport_fixed_clips: Arc::new(std::collections::HashMap::new()),
             resolved: Some(resolved),
             clip_scope_root,
             surface_extent,
@@ -5089,16 +5247,21 @@ impl<'a> ScrollPaintState<'a> {
                 base.1 + movement.1 + self.surface_offset.1,
             );
         }
-        if !self.active || self.viewport_fixed.contains(&id) {
+        if !self.active {
             return (
                 base.0 + self.surface_offset.0,
                 base.1 + self.surface_offset.1,
             );
         }
         let sticky = self.sticky.get(&id).copied().unwrap_or((0.0, 0.0));
+        let root = if self.viewport_fixed.contains(&id) {
+            (0.0, 0.0)
+        } else {
+            (-self.scroll.0, -self.scroll.1)
+        };
         (
-            base.0 + sticky.0 - self.scroll.0 + self.surface_offset.0,
-            base.1 + sticky.1 - self.scroll.1 + self.surface_offset.1,
+            base.0 + sticky.0 + root.0 + self.surface_offset.0,
+            base.1 + sticky.1 + root.1 + self.surface_offset.1,
         )
     }
 
@@ -5107,22 +5270,49 @@ impl<'a> ScrollPaintState<'a> {
         laid: &crate::DomLayout,
         id: obscura_dom::tree::NodeId,
     ) -> Option<crate::dom::OverflowClip> {
-        if let Some(root) = self.clip_scope_root {
-            if id == root {
+        if self.clip_scope_root.is_none() {
+            if let Some(resolved) = self.resolved {
+                let mut clip = resolved.inherited_clip_for(id)?;
+                clip.translate(self.surface_offset.0, self.surface_offset.1);
+                return Some(clip);
+            }
+            if let Some(clip) = self.viewport_fixed_clips.get(&id) {
+                let mut clip = clip.clone()?;
+                clip.translate(self.surface_offset.0, self.surface_offset.1);
+                return Some(clip);
+            }
+        }
+        let in_viewport_fixed_subtree = self.viewport_fixed.contains(&id);
+        if self.clip_scope_root.is_some() {
+            if self.clip_scope_root == Some(id) {
                 return None;
             }
             let mut owners = Vec::new();
             let mut current = crate::dom::rendered_parent(self.tree, id);
-            let mut found = false;
+            let mut found_scope = self.clip_scope_root.is_none();
+            let mut found_fixed_boundary = false;
             while let Some(owner) = current {
+                // Crossing out of a viewport-fixed subtree would reintroduce
+                // a document-space clip that fixed positioning escapes.
+                if in_viewport_fixed_subtree && !self.viewport_fixed.contains(&owner) {
+                    found_fixed_boundary = true;
+                    break;
+                }
                 owners.push(owner);
-                if owner == root {
-                    found = true;
+                if self.clip_scope_root == Some(owner) {
+                    found_scope = true;
+                    break;
+                }
+                if in_viewport_fixed_subtree
+                    && crate::dom::rendered_parent(self.tree, owner)
+                        .is_none_or(|parent| !self.viewport_fixed.contains(&parent))
+                {
+                    found_fixed_boundary = true;
                     break;
                 }
                 current = crate::dom::rendered_parent(self.tree, owner);
             }
-            if found {
+            if found_scope || found_fixed_boundary {
                 let mut clip: Option<crate::dom::OverflowClip> = None;
                 for owner in owners.into_iter().rev() {
                     let (Some(style), Some(rect)) =
@@ -15064,6 +15254,413 @@ mod tests {
             pixel(&top, 95, 85),
             pixel(&scrolled, 95, 85),
             "newly visible nested content did not move into the scrollport"
+        );
+    }
+
+    #[test]
+    fn nested_scroll_sticky_geometry_pixels_and_percentage_basis_share_one_state() {
+        let tree = parse_html(
+            r#"<html style="margin:0"><body style="margin:0">
+                <div id="plain" style="position:relative;width:100px;height:80px;
+                     overflow:hidden;background:red">
+                    <div style="height:40px"></div>
+                    <div id="plain-sticky" style="position:sticky;top:5px;
+                         width:30px;height:20px;background:lime">
+                        <div id="fixed-child" style="position:fixed;right:0;top:0;
+                             width:5px;height:5px;background:black"></div>
+                    </div>
+                    <div id="plain-tail" style="height:160px;background:blue"></div>
+                </div>
+                <div id="padded" style="position:absolute;left:120px;top:0;
+                     width:100px;height:80px;padding-top:20px;overflow:hidden;background:red">
+                    <div style="height:70px"></div>
+                    <div id="percent-sticky" style="position:sticky;top:50%;
+                         width:30px;height:20px;background:lime"></div>
+                    <div style="height:160px;background:blue"></div>
+                </div>
+                <div id="fixed-scroller" style="position:fixed;left:240px;top:0;
+                     width:100px;height:80px;overflow:hidden;background:red">
+                    <div style="height:40px"></div>
+                    <div id="fixed-sticky" style="position:sticky;top:5px;
+                         width:30px;height:20px;background:lime"></div>
+                    <div style="height:160px;background:blue"></div>
+                </div>
+                <div id="calc-scroller" style="position:absolute;left:360px;top:0;
+                     width:100px;height:80px;padding-top:20px;overflow:hidden;background:red">
+                    <div style="height:70px"></div>
+                    <div id="calc-sticky" style="position:sticky;top:calc(50% + 1px);
+                         width:30px;height:20px;background:lime"></div>
+                    <div style="height:160px;background:blue"></div>
+                </div>
+            </body></html>"#,
+        );
+        let plain = tree.get_element_by_id("plain").unwrap();
+        let plain_sticky = tree.get_element_by_id("plain-sticky").unwrap();
+        let plain_tail = tree.get_element_by_id("plain-tail").unwrap();
+        let padded = tree.get_element_by_id("padded").unwrap();
+        let percent_sticky = tree.get_element_by_id("percent-sticky").unwrap();
+        let fixed_child = tree.get_element_by_id("fixed-child").unwrap();
+        let fixed_scroller = tree.get_element_by_id("fixed-scroller").unwrap();
+        let fixed_sticky = tree.get_element_by_id("fixed-sticky").unwrap();
+        let calc_scroller = tree.get_element_by_id("calc-scroller").unwrap();
+        let calc_sticky = tree.get_element_by_id("calc-sticky").unwrap();
+        let mut resources = RenderResourceCache::with_loader(|_url: &str| None);
+        let mut prepared =
+            prepare_dom(&tree, (480.0, 120.0), None, &mut resources).expect("prepared");
+
+        let top = prepared.resolve_scroll_state(&tree, (0.0, 0.0), &HashMap::new());
+        assert_eq!(
+            prepared.viewport_rect_with_scroll(plain_sticky, &top).unwrap().y,
+            40.0,
+        );
+        let offsets = HashMap::from([
+            (plain, (0.0, 60.0)),
+            (padded, (0.0, 80.0)),
+            (fixed_scroller, (0.0, 60.0)),
+            (calc_scroller, (0.0, 80.0)),
+        ]);
+        let scrolled = prepared.resolve_scroll_state(&tree, (0.0, 0.0), &offsets);
+        assert_eq!(
+            prepared.element_scroll_metrics(plain, &scrolled).unwrap().offset,
+            (0.0, 60.0),
+        );
+        assert_eq!(
+            prepared.viewport_rect_with_scroll(plain, &scrolled).unwrap().y,
+            0.0,
+            "scroll-container chrome must remain stationary",
+        );
+        assert_eq!(
+            prepared
+                .viewport_rect_with_scroll(plain_sticky, &scrolled)
+                .unwrap()
+                .y,
+            5.0,
+        );
+        assert_eq!(
+            prepared
+                .viewport_rect_with_scroll(plain_tail, &scrolled)
+                .unwrap()
+                .y,
+            0.0,
+            "ordinary content must retain the element scroll movement",
+        );
+        assert_eq!(
+            prepared
+                .viewport_rect_with_scroll(percent_sticky, &scrolled)
+                .unwrap()
+                .y,
+            60.0,
+            "50% sticky inset must use the 80px content box after 20px padding",
+        );
+        assert_eq!(
+            prepared
+                .viewport_rect_with_scroll(fixed_sticky, &scrolled)
+                .unwrap()
+                .y,
+            5.0,
+            "an element scroller inside a fixed subtree must still drive sticky positioning",
+        );
+        assert_eq!(
+            prepared
+                .viewport_rect_with_scroll(fixed_child, &scrolled)
+                .unwrap()
+                .y,
+            0.0,
+            "a viewport-fixed descendant must not inherit its sticky ancestor's movement",
+        );
+        assert_eq!(
+            prepared
+                .viewport_rect_with_scroll(calc_sticky, &scrolled)
+                .unwrap()
+                .y,
+            61.0,
+            "calc() percentage inset must use the nested content-box basis",
+        );
+
+        let pixels = paint_prepared_with_scroll(
+            &tree,
+            &mut prepared,
+            &mut resources,
+            &scrolled,
+        )
+        .expect("paint");
+        let plain_pixel = pixels.pixel(10, 10).unwrap();
+        let percent_pixel = pixels.pixel(130, 65).unwrap();
+        let fixed_pixel = pixels.pixel(250, 10).unwrap();
+        let calc_pixel = pixels.pixel(370, 65).unwrap();
+        assert!(plain_pixel.green() > 240 && plain_pixel.red() < 20);
+        assert!(percent_pixel.green() > 240 && percent_pixel.red() < 20);
+        assert!(fixed_pixel.green() > 240 && fixed_pixel.red() < 20);
+        assert!(calc_pixel.green() > 240 && calc_pixel.red() < 20);
+    }
+
+    #[test]
+    fn viewport_fixed_descendant_escapes_nested_scrollport_clip_in_all_paint_paths() {
+        let tree = parse_html(
+            r#"<html style="margin:0"><body style="margin:0">
+                <div id="scroller" style="position:relative;width:100px;height:80px;
+                     overflow:hidden;background:red">
+                    <div style="height:40px"></div>
+                    <div style="position:sticky;top:5px;width:30px;height:20px;background:blue">
+                        <div id="fixed" style="position:fixed;z-index:10;left:150px;top:10px;
+                             width:20px;height:20px;background:lime"></div>
+                    </div>
+                    <div style="height:160px"></div>
+                </div>
+                <div id="captured-host" style="position:absolute;left:0;top:50px;
+                     width:100px;height:30px;overflow:hidden;transform:translateX(0);background:red">
+                    <div id="captured-fixed" style="position:fixed;left:150px;top:0;
+                         width:20px;height:20px;background:blue"></div>
+                </div>
+                <div id="fixed-clip" style="position:fixed;left:100px;top:75px;
+                     width:40px;height:25px;overflow:hidden;background:red">
+                    <div style="position:absolute;left:50px;top:0;
+                         width:20px;height:20px;background:blue"></div>
+                </div>
+            </body></html>"#,
+        );
+        let scroller = tree.get_element_by_id("scroller").unwrap();
+        let fixed = tree.get_element_by_id("fixed").unwrap();
+        let captured_fixed = tree.get_element_by_id("captured-fixed").unwrap();
+        let mut resources = RenderResourceCache::with_loader(|_url: &str| None);
+        let mut prepared =
+            prepare_dom(&tree, (220.0, 100.0), None, &mut resources).expect("prepared");
+        assert!(prepared.viewport_fixed_nodes().contains(&fixed));
+        assert!(!prepared.viewport_fixed_nodes().contains(&captured_fixed));
+
+        let tuple = paint_prepared(&tree, &mut prepared, &mut resources, (0.0, 0.0))
+            .expect("tuple paint");
+        let tuple_pixel = tuple.pixel(155, 15).unwrap();
+        assert!(
+            tuple_pixel.green() > 240 && tuple_pixel.red() < 20 && tuple_pixel.blue() < 20,
+            "the default paint path retained the ancestor scroller clip: {tuple_pixel:?}",
+        );
+        let captured_pixel = tuple.pixel(155, 55).unwrap();
+        assert!(
+            captured_pixel.red() > 240
+                && captured_pixel.green() > 240
+                && captured_pixel.blue() > 240,
+            "a containing-block-captured fixed descendant must remain clipped: {captured_pixel:?}",
+        );
+        let internal_clip_pixel = tuple.pixel(155, 80).unwrap();
+        assert!(
+            internal_clip_pixel.red() > 240
+                && internal_clip_pixel.green() > 240
+                && internal_clip_pixel.blue() > 240,
+            "clips created inside a viewport-fixed subtree must still apply: {internal_clip_pixel:?}",
+        );
+
+        let offsets = HashMap::from([(scroller, (0.0, 60.0))]);
+        let scroll = prepared.resolve_scroll_state(&tree, (0.0, 0.0), &offsets);
+        assert!(
+            scroll.inherited_clip_for(fixed).is_none(),
+            "a viewport-fixed boundary must clear document-space overflow clips",
+        );
+        let resolved =
+            paint_prepared_with_scroll(&tree, &mut prepared, &mut resources, &scroll)
+                .expect("resolved paint");
+        let resolved_pixel = resolved.pixel(155, 15).unwrap();
+        assert!(
+            resolved_pixel.green() > 240
+                && resolved_pixel.red() < 20
+                && resolved_pixel.blue() < 20,
+            "the resolved paint path retained the ancestor scroller clip: {resolved_pixel:?}",
+        );
+        let captured_pixel = resolved.pixel(155, 55).unwrap();
+        assert!(captured_pixel.red() > 240 && captured_pixel.green() > 240 && captured_pixel.blue() > 240);
+        let internal_clip_pixel = resolved.pixel(155, 80).unwrap();
+        assert!(
+            internal_clip_pixel.red() > 240
+                && internal_clip_pixel.green() > 240
+                && internal_clip_pixel.blue() > 240
+        );
+    }
+
+    #[test]
+    fn virtual_viewport_re_resolves_functional_and_viewport_sticky_insets() {
+        let tree = parse_html(
+            r#"<html style="margin:0"><body style="margin:0;height:600px">
+                <div style="height:150px"></div>
+                <div id="calc" style="position:sticky;top:calc(50% + 1px);
+                     width:20px;height:20px"></div>
+                <div id="vh" style="position:sticky;top:10vh;width:20px;height:20px"></div>
+            </body></html>"#,
+        );
+        let calc = tree.get_element_by_id("calc").unwrap();
+        let vh = tree.get_element_by_id("vh").unwrap();
+        let mut resources = RenderResourceCache::with_loader(|_url: &str| None);
+        let prepared =
+            prepare_dom(&tree, (200.0, 200.0), None, &mut resources).expect("prepared");
+        let live = prepared.resolve_scroll_state_for_viewport(
+            &tree,
+            (0.0, 200.0),
+            &HashMap::new(),
+            (200.0, 200.0),
+        );
+        let page = prepared.resolve_scroll_state_for_viewport(
+            &tree,
+            (0.0, 200.0),
+            &HashMap::new(),
+            (200.0, 100.0),
+        );
+
+        assert_eq!(prepared.viewport_rect_with_scroll(calc, &live).unwrap().y, 101.0);
+        assert_eq!(prepared.viewport_rect_with_scroll(calc, &page).unwrap().y, 51.0);
+        assert_eq!(prepared.viewport_rect_with_scroll(vh, &live).unwrap().y, 20.0);
+        assert_eq!(prepared.viewport_rect_with_scroll(vh, &page).unwrap().y, 10.0);
+    }
+
+    #[test]
+    fn hidden_scroller_captures_sticky_while_overflow_clip_does_not() {
+        let tree = parse_html(
+            r#"<html style="margin:0"><body style="margin:0;height:400px">
+                <div id="hidden" style="position:absolute;left:0;top:50px;
+                     width:100px;height:80px;overflow:hidden">
+                    <div id="hidden-sticky" style="position:sticky;top:0;
+                         width:20px;height:20px;background:lime"></div>
+                </div>
+                <div id="clip" style="position:absolute;left:120px;top:50px;
+                     width:100px;height:80px;overflow:clip">
+                    <div id="clip-sticky" style="position:sticky;top:0;
+                         width:20px;height:20px;background:lime"></div>
+                </div>
+            </body></html>"#,
+        );
+        let hidden = tree.get_element_by_id("hidden").unwrap();
+        let hidden_sticky = tree.get_element_by_id("hidden-sticky").unwrap();
+        let clip = tree.get_element_by_id("clip").unwrap();
+        let clip_sticky = tree.get_element_by_id("clip-sticky").unwrap();
+        let mut resources = RenderResourceCache::with_loader(|_url: &str| None);
+        let prepared =
+            prepare_dom(&tree, (240.0, 120.0), None, &mut resources).expect("prepared");
+        assert!(prepared.scroll_container_nodes().any(|node| node == hidden));
+        assert!(!prepared.scroll_container_nodes().any(|node| node == clip));
+
+        let scrolled = prepared.resolve_scroll_state(&tree, (0.0, 100.0), &HashMap::new());
+        assert_eq!(
+            prepared
+                .viewport_rect_with_scroll(hidden_sticky, &scrolled)
+                .unwrap()
+                .y,
+            -50.0,
+            "overflow:hidden must capture sticky even without local overflow",
+        );
+        assert_eq!(
+            prepared
+                .viewport_rect_with_scroll(clip_sticky, &scrolled)
+                .unwrap()
+                .y,
+            0.0,
+            "overflow:clip must leave sticky owned by the root viewport",
+        );
+    }
+
+    #[test]
+    fn outer_sticky_motion_cancels_from_inner_scrollport_constraints() {
+        let tree = parse_html(
+            r#"<html style="margin:0"><body style="margin:0;height:400px">
+                <div style="height:40px"></div>
+                <div id="outer-sticky" style="position:sticky;top:0;
+                     width:100px;height:80px;background:red">
+                    <div id="inner-scroller" style="width:100px;height:60px;
+                         overflow:hidden;background:blue">
+                        <div style="height:30px"></div>
+                        <div id="inner-sticky" style="position:sticky;top:5px;
+                             width:30px;height:10px;background:lime"></div>
+                        <div style="height:100px"></div>
+                    </div>
+                </div>
+            </body></html>"#,
+        );
+        let outer_sticky = tree.get_element_by_id("outer-sticky").unwrap();
+        let inner_scroller = tree.get_element_by_id("inner-scroller").unwrap();
+        let inner_sticky = tree.get_element_by_id("inner-sticky").unwrap();
+        let mut resources = RenderResourceCache::with_loader(|_url: &str| None);
+        let mut prepared =
+            prepare_dom(&tree, (120.0, 100.0), None, &mut resources).expect("prepared");
+        let offsets = HashMap::from([(inner_scroller, (0.0, 40.0))]);
+        let scrolled = prepared.resolve_scroll_state(&tree, (0.0, 60.0), &offsets);
+
+        assert_eq!(
+            prepared
+                .viewport_rect_with_scroll(outer_sticky, &scrolled)
+                .unwrap()
+                .y,
+            0.0,
+        );
+        assert_eq!(
+            prepared
+                .viewport_rect_with_scroll(inner_scroller, &scrolled)
+                .unwrap()
+                .y,
+            0.0,
+        );
+        assert_eq!(
+            prepared
+                .viewport_rect_with_scroll(inner_sticky, &scrolled)
+                .unwrap()
+                .y,
+            5.0,
+            "outer sticky movement must affect the inner port and its content equally",
+        );
+
+        let pixels = paint_prepared_with_scroll(
+            &tree,
+            &mut prepared,
+            &mut resources,
+            &scrolled,
+        )
+        .expect("paint");
+        let pixel = pixels.pixel(10, 7).unwrap();
+        assert!(pixel.green() > 240 && pixel.red() < 20 && pixel.blue() < 20);
+    }
+
+    #[test]
+    fn tuple_capture_and_geometry_resolve_nested_sticky_at_zero_element_scroll() {
+        let tree = parse_html(
+            r#"<html style="margin:0"><body style="margin:0">
+                <div id="scroller" style="width:100px;height:80px;overflow:hidden;background:red">
+                    <div style="height:100px"></div>
+                    <div id="sticky" style="position:sticky;bottom:0;
+                         width:30px;height:20px;background:lime"></div>
+                    <div style="height:20px"></div>
+                </div>
+                <div style="position:fixed;left:120px;top:0;width:100px;height:80px;
+                     overflow:hidden;background:red">
+                    <div style="height:100px"></div>
+                    <div id="fixed-sticky" style="position:sticky;bottom:0;
+                         width:30px;height:20px;background:lime"></div>
+                    <div style="height:20px"></div>
+                </div>
+            </body></html>"#,
+        );
+        let sticky = tree.get_element_by_id("sticky").unwrap();
+        let fixed_sticky = tree.get_element_by_id("fixed-sticky").unwrap();
+        let mut resources = RenderResourceCache::with_loader(|_url: &str| None);
+        let mut prepared =
+            prepare_dom(&tree, (240.0, 100.0), None, &mut resources).expect("prepared");
+        let resolved = prepared.resolve_scroll_state(&tree, (0.0, 0.0), &HashMap::new());
+        assert_eq!(prepared.viewport_rect(sticky, (0.0, 0.0)).unwrap().y, 60.0);
+        assert_eq!(
+            prepared.viewport_rect(fixed_sticky, (0.0, 0.0)).unwrap().y,
+            60.0,
+        );
+        assert_eq!(
+            prepared
+                .viewport_rect_with_scroll(sticky, &resolved)
+                .unwrap()
+                .y,
+            60.0,
+        );
+
+        let pixels = paint_prepared(&tree, &mut prepared, &mut resources, (0.0, 0.0))
+            .expect("tuple paint");
+        let pixel = pixels.pixel(10, 65).unwrap();
+        let fixed_pixel = pixels.pixel(130, 65).unwrap();
+        assert!(pixel.green() > 240 && pixel.red() < 20 && pixel.blue() < 20);
+        assert!(
+            fixed_pixel.green() > 240 && fixed_pixel.red() < 20 && fixed_pixel.blue() < 20,
+            "tuple paint dropped nested sticky movement in a fixed subtree: {fixed_pixel:?}",
         );
     }
 

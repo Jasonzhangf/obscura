@@ -646,16 +646,28 @@ pub struct StickyLayout {
     frames: Vec<StickyFrame>,
     owners: HashMap<NodeId, NodeId>,
     clip_owners: HashMap<NodeId, NodeId>,
+    // Only populated by the public compatibility constructor. Production
+    // prepared renders own the topology separately and avoid duplicating its
+    // dense node vectors.
+    compatibility_scroll_tree: Option<ScrollTree>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct StickyFrame {
     id: NodeId,
     parent_sticky: Option<NodeId>,
+    scroll_owner: ScrollId,
+    scrollport_node: Option<NodeId>,
+    scrollport: Rect,
     normal: Rect,
     containing: Rect,
+    containing_is_scrollport: bool,
     margin: crate::Edges,
-    inset: [Option<f32>; 4],
+    inset: [Option<crate::Dimension>; 4],
+    inset_expressions: [Option<String>; 4],
+    font_size: f32,
+    root_font_size: f32,
+    rtl_inline: bool,
 }
 
 impl StickyLayout {
@@ -664,12 +676,23 @@ impl StickyLayout {
         viewport: (f32, f32),
         scroll: (f32, f32),
     ) -> HashMap<NodeId, (f32, f32)> {
+        if let Some(scroll_tree) = &self.compatibility_scroll_tree {
+            let cumulative = root_only_cumulative_scroll(scroll_tree, scroll);
+            return self.resolved_frame_offsets(viewport, scroll_tree, &cumulative);
+        }
         let mut frame_offsets = HashMap::with_capacity(self.frames.len());
         for frame in &self.frames {
             let inherited = frame
                 .parent_sticky
                 .and_then(|id| frame_offsets.get(&id).copied())
                 .unwrap_or((0.0, 0.0));
+            if frame.scroll_owner != ScrollId::ROOT {
+                // Tuple-only callers carry no element scroll state. A nested
+                // sticky frame therefore has no local movement, but it still
+                // inherits an outer root-sticky frame when one exists.
+                frame_offsets.insert(frame.id, inherited);
+                continue;
+            }
             let normal = Rect {
                 x: frame.normal.x + inherited.0,
                 y: frame.normal.y + inherited.1,
@@ -687,8 +710,9 @@ impl StickyLayout {
                 containing.x + containing.width - frame.margin.right - normal.width,
                 scroll.0,
                 viewport.0,
-                frame.inset[3],
-                frame.inset[1],
+                resolve_frame_sticky_inset(frame, 3, viewport.0, viewport),
+                resolve_frame_sticky_inset(frame, 1, viewport.0, viewport),
+                frame.rtl_inline,
             );
             let y = sticky_axis_position(
                 normal.y,
@@ -697,8 +721,9 @@ impl StickyLayout {
                 containing.y + containing.height - frame.margin.bottom - normal.height,
                 scroll.1,
                 viewport.1,
-                frame.inset[0],
-                frame.inset[2],
+                resolve_frame_sticky_inset(frame, 0, viewport.1, viewport),
+                resolve_frame_sticky_inset(frame, 2, viewport.1, viewport),
+                false,
             );
             frame_offsets.insert(
                 frame.id,
@@ -706,6 +731,139 @@ impl StickyLayout {
             );
         }
         frame_offsets
+    }
+
+    pub(crate) fn resolved_translations(
+        &self,
+        viewport: (f32, f32),
+        scroll_tree: &ScrollTree,
+        cumulative_scroll: &[(f32, f32)],
+    ) -> HashMap<NodeId, (f32, f32)> {
+        let frame_offsets = self.resolved_frame_offsets(viewport, scroll_tree, cumulative_scroll);
+        self.owners
+            .iter()
+            .filter_map(|(&id, owner)| frame_offsets.get(owner).copied().map(|offset| (id, offset)))
+            .collect()
+    }
+
+    pub(crate) fn resolved_root_translations(
+        &self,
+        viewport: (f32, f32),
+        scroll_tree: &ScrollTree,
+        scroll: (f32, f32),
+    ) -> HashMap<NodeId, (f32, f32)> {
+        let cumulative = root_only_cumulative_scroll(scroll_tree, scroll);
+        self.resolved_translations(viewport, scroll_tree, &cumulative)
+    }
+
+    fn resolved_frame_offsets(
+        &self,
+        viewport: (f32, f32),
+        scroll_tree: &ScrollTree,
+        cumulative_scroll: &[(f32, f32)],
+    ) -> HashMap<NodeId, (f32, f32)> {
+        let mut frame_offsets = HashMap::with_capacity(self.frames.len());
+        for frame in &self.frames {
+            let inherited = frame
+                .parent_sticky
+                .and_then(|id| frame_offsets.get(&id).copied())
+                .unwrap_or((0.0, 0.0));
+            let container = scroll_tree.containers[frame.scroll_owner.index()];
+            let content_move = cumulative_scroll
+                .get(frame.scroll_owner.index())
+                .copied()
+                .unwrap_or((0.0, 0.0));
+            let port_parent_move = container
+                .parent
+                .and_then(|parent| cumulative_scroll.get(parent.index()).copied())
+                .unwrap_or((0.0, 0.0));
+            let port_sticky = frame
+                .scrollport_node
+                .and_then(|node| self.owners.get(&node))
+                .and_then(|owner| frame_offsets.get(owner).copied())
+                .unwrap_or((0.0, 0.0));
+            let normal = Rect {
+                x: frame.normal.x + content_move.0 + inherited.0,
+                y: frame.normal.y + content_move.1 + inherited.1,
+                ..frame.normal
+            };
+            let scrollport = if frame.scroll_owner == ScrollId::ROOT {
+                Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: viewport.0,
+                    height: viewport.1,
+                }
+            } else {
+                Rect {
+                    x: frame.scrollport.x + port_parent_move.0 + port_sticky.0,
+                    y: frame.scrollport.y + port_parent_move.1 + port_sticky.1,
+                    ..frame.scrollport
+                }
+            };
+            let containing_move = if frame.containing_is_scrollport {
+                (
+                    port_parent_move.0 + port_sticky.0,
+                    port_parent_move.1 + port_sticky.1,
+                )
+            } else {
+                (
+                    content_move.0 + inherited.0,
+                    content_move.1 + inherited.1,
+                )
+            };
+            let containing = Rect {
+                x: frame.containing.x + containing_move.0,
+                y: frame.containing.y + containing_move.1,
+                ..frame.containing
+            };
+            let x = sticky_axis_position(
+                normal.x,
+                normal.width,
+                containing.x + frame.margin.left,
+                containing.x + containing.width - frame.margin.right - normal.width,
+                scrollport.x,
+                scrollport.width,
+                resolve_frame_sticky_inset(frame, 3, scrollport.width, viewport),
+                resolve_frame_sticky_inset(frame, 1, scrollport.width, viewport),
+                frame.rtl_inline,
+            );
+            let y = sticky_axis_position(
+                normal.y,
+                normal.height,
+                containing.y + frame.margin.top,
+                containing.y + containing.height - frame.margin.bottom - normal.height,
+                scrollport.y,
+                scrollport.height,
+                resolve_frame_sticky_inset(frame, 0, scrollport.height, viewport),
+                resolve_frame_sticky_inset(frame, 2, scrollport.height, viewport),
+                false,
+            );
+            frame_offsets.insert(
+                frame.id,
+                (
+                    inherited.0 + x - normal.x,
+                    inherited.1 + y - normal.y,
+                ),
+            );
+        }
+        frame_offsets
+    }
+
+    pub(crate) fn resolved_translation_for(
+        &self,
+        id: NodeId,
+        viewport: (f32, f32),
+        scroll_tree: &ScrollTree,
+        cumulative_scroll: &[(f32, f32)],
+    ) -> (f32, f32) {
+        let Some(owner) = self.owners.get(&id) else {
+            return (0.0, 0.0);
+        };
+        self.resolved_frame_offsets(viewport, scroll_tree, cumulative_scroll)
+            .get(owner)
+            .copied()
+            .unwrap_or((0.0, 0.0))
     }
 
     /// Resolve a single geometry query without materializing an entry for
@@ -761,6 +919,47 @@ impl StickyLayout {
     }
 }
 
+fn root_only_cumulative_scroll(scroll_tree: &ScrollTree, scroll: (f32, f32)) -> Vec<(f32, f32)> {
+    let mut cumulative = vec![(0.0, 0.0); scroll_tree.containers.len()];
+    if let Some(root) = cumulative.first_mut() {
+        *root = (-scroll.0, -scroll.1);
+    }
+    for index in 1..cumulative.len() {
+        cumulative[index] = scroll_tree.containers[index]
+            .parent
+            .map(|parent| cumulative[parent.index()])
+            .unwrap_or((0.0, 0.0));
+    }
+    cumulative
+}
+
+fn resolve_sticky_inset(value: Option<crate::Dimension>, basis: f32) -> Option<f32> {
+    match value {
+        Some(crate::Dimension::Px(px)) => Some(px),
+        Some(crate::Dimension::Percent(percent)) => Some(percent * basis),
+        _ => None,
+    }
+}
+
+fn resolve_frame_sticky_inset(
+    frame: &StickyFrame,
+    index: usize,
+    percent_basis: f32,
+    viewport: (f32, f32),
+) -> Option<f32> {
+    if let Some(expression) = frame.inset_expressions[index].as_deref() {
+        return crate::style::resolve_contextual_length(
+            expression,
+            frame.font_size,
+            frame.root_font_size,
+            viewport.0 / 100.0,
+            viewport.1 / 100.0,
+            percent_basis,
+        );
+    }
+    resolve_sticky_inset(frame.inset[index], percent_basis)
+}
+
 fn sticky_axis_position(
     normal: f32,
     size: f32,
@@ -770,15 +969,21 @@ fn sticky_axis_position(
     viewport: f32,
     start: Option<f32>,
     end: Option<f32>,
+    end_is_inline_start: bool,
 ) -> f32 {
     let mut stick_start = start.map(|inset| scroll + inset);
     let mut stick_end = end.map(|inset| scroll + viewport - inset - size);
 
     // When both insets leave a sticky view rectangle smaller than the box,
-    // the end inset is reduced so the start edge wins in the start direction.
+    // the physical end inset is reduced in LTR, while the physical start
+    // inset is reduced in RTL so the logical inline-start edge wins.
     if let (Some(start), Some(end)) = (stick_start, stick_end) {
         if end < start {
-            stick_end = Some(start);
+            if end_is_inline_start {
+                stick_start = Some(end);
+            } else {
+                stick_end = Some(start);
+            }
         }
     }
 
@@ -815,13 +1020,9 @@ impl DomLayout {
         viewport_fixed: &HashSet<NodeId>,
     ) -> DerivedGeometryState {
         let content_size = self.scrolling_content_size_with_fixed(tree, viewport, viewport_fixed);
-        let sticky = self.root_sticky_layout_with_geometry(
-            tree,
-            viewport,
-            viewport_fixed,
-            content_size,
-        );
         let scroll_tree = self.scroll_tree(tree, viewport, content_size, viewport_fixed);
+        let sticky =
+            self.sticky_layout_with_geometry(tree, viewport, content_size, &scroll_tree);
         DerivedGeometryState {
             content_size,
             sticky,
@@ -1050,7 +1251,9 @@ impl DomLayout {
             let style = laid.styles.get(&id);
             let rect = laid.rects.get(&id).copied();
             let establishes = style.is_some_and(|style| {
-                style.overflow_scroll_container && !style.overflow_propagated_to_viewport
+                style.overflow_scroll_container
+                    && !style.overflow_propagated_to_viewport
+                    && !style.display_contents
             }) && rect.is_some()
                 && !affine_coordinate_space
                     .get(id.index())
@@ -1278,21 +1481,24 @@ impl DomLayout {
         (right.ceil(), bottom.ceil())
     }
 
-    /// Capture root/window-scroll sticky constraints from the normal-flow
-    /// result. Nested overflow scrollers are intentionally outside this slice;
-    /// their sticky frames will need a scroll-container-specific instance.
+    /// Capture sticky constraints from the normal-flow result. The historical
+    /// method name remains for API compatibility; returned frames include both
+    /// the root viewport and element scrolling containers.
     pub fn root_sticky_layout(&self, tree: &DomTree, viewport: (f32, f32)) -> StickyLayout {
         let viewport_fixed = self.viewport_fixed_nodes(tree);
         let content = self.scrolling_content_size_with_fixed(tree, viewport, &viewport_fixed);
-        self.root_sticky_layout_with_geometry(tree, viewport, &viewport_fixed, content)
+        let scroll_tree = self.scroll_tree(tree, viewport, content, &viewport_fixed);
+        let mut sticky = self.sticky_layout_with_geometry(tree, viewport, content, &scroll_tree);
+        sticky.compatibility_scroll_tree = Some(scroll_tree);
+        sticky
     }
 
-    fn root_sticky_layout_with_geometry(
+    fn sticky_layout_with_geometry(
         &self,
         tree: &DomTree,
         viewport: (f32, f32),
-        viewport_fixed: &HashSet<NodeId>,
         content: (f32, f32),
+        scroll_tree: &ScrollTree,
     ) -> StickyLayout {
         let root_containing = Rect {
             x: 0.0,
@@ -1303,21 +1509,45 @@ impl DomLayout {
         let mut layout = StickyLayout::default();
         let mut nearest_sticky: HashMap<NodeId, Option<NodeId>> = HashMap::new();
         let mut inherited_clip_sticky: HashMap<NodeId, Option<NodeId>> = HashMap::new();
-        let mut inside_nested_scroller: HashMap<NodeId, bool> = HashMap::new();
+        // Propagate the nearest authored scroll container once in rendered
+        // preorder. The boolean distinguishes a supported ScrollTree owner
+        // from a real but affine/otherwise unsupported scrolling coordinate
+        // space, which must not accidentally promote sticky to the viewport.
+        let mut nearest_scrollport = vec![None; scroll_tree.movement_owner.len()];
+        let root_font_size = tree
+            .query_selector("html")
+            .ok()
+            .flatten()
+            .and_then(|root| self.styles.get(&root).and_then(|style| style.font_size))
+            .unwrap_or(16.0);
 
         for id in rendered_descendants(tree, tree.document()) {
             let parent = rendered_parent(tree, id);
-            let has_nested_scroll_container = parent.is_some_and(|parent| {
-                inside_nested_scroller
-                    .get(&parent)
-                    .copied()
-                    .unwrap_or(false)
-                    || self.styles.get(&parent).is_some_and(|style| {
-                        style.overflow_scroll_container
-                            && !is_viewport_overflow_source(parent, &self.styles)
-                    })
-            });
-            inside_nested_scroller.insert(id, has_nested_scroll_container);
+            let inherited_scrollport = parent
+                .and_then(|parent| nearest_scrollport.get(parent.index()).copied())
+                .flatten();
+            let style = self.styles.get(&id);
+            let establishes_authored_scrollport = style.is_some_and(|style| {
+                style.overflow_scroll_container
+                    && !is_viewport_overflow_source(id, &self.styles)
+                    && !style.display_contents
+            }) && self.rects.contains_key(&id);
+            let descendants_scrollport = if establishes_authored_scrollport {
+                Some((
+                    id,
+                    scroll_tree
+                        .node_container
+                        .get(id.index())
+                        .copied()
+                        .flatten()
+                        .is_some(),
+                ))
+            } else {
+                inherited_scrollport
+            };
+            if let Some(slot) = nearest_scrollport.get_mut(id.index()) {
+                *slot = descendants_scrollport;
+            }
             let parent_sticky = parent
                 .and_then(|parent| nearest_sticky.get(&parent).copied())
                 .flatten();
@@ -1334,16 +1564,38 @@ impl DomLayout {
             }
             inherited_clip_sticky.insert(id, inherited_clip);
 
-            if viewport_fixed.contains(&id) {
+            let scroll_owner = scroll_tree
+                .movement_owner
+                .get(id.index())
+                .copied()
+                .flatten();
+            let Some(scroll_owner) = scroll_owner else {
                 nearest_sticky.insert(id, None);
                 continue;
-            }
+            };
+            let container = scroll_tree.containers[scroll_owner.index()];
+            let scrollport_node = container.node;
+            // ScrollTree conservatively declines affine scrolling coordinate
+            // spaces. Preserve that fallback for sticky too instead of
+            // accidentally attaching such a frame to the root viewport.
+            let supported_scroll_owner = match inherited_scrollport {
+                Some((authored, true)) => scrollport_node == Some(authored),
+                Some((_authored, false)) => false,
+                None => scrollport_node.is_none(),
+            };
+            // General affine sticky constraints require solving in the
+            // transformed scrollport coordinate space. Until that solver is
+            // present, decline sticky below an affine ancestor instead of
+            // returning geometry that disagrees with paint.
+            let supported_coordinate_space = parent
+                .and_then(|parent| self.transforms.get(&parent))
+                .is_none_or(|transform| transform.is_translation());
 
-            let style = self.styles.get(&id);
             let is_sticky = style.is_some_and(|style| {
                 style.position_sticky
                     && style.inset.iter().any(Option::is_some)
-                    && !has_nested_scroll_container
+                    && supported_scroll_owner
+                    && supported_coordinate_space
             });
             if !is_sticky {
                 nearest_sticky.insert(id, parent_sticky);
@@ -1369,6 +1621,7 @@ impl DomLayout {
             };
 
             let mut containing = None;
+            let mut containing_node = None;
             let mut ancestor = parent;
             while let Some(candidate) = ancestor {
                 if let (Some(candidate_style), Some(candidate_rect)) = (
@@ -1405,30 +1658,56 @@ impl DomLayout {
                                 - candidate_style.padding.bottom)
                                 .max(0.0),
                         });
+                        containing_node = Some(candidate);
                         break;
                     }
                 }
                 ancestor = rendered_parent(tree, candidate);
             }
 
-            let resolve_inset = |value: Option<crate::Dimension>, basis: f32| match value {
-                Some(crate::Dimension::Px(px)) => Some(px),
-                Some(crate::Dimension::Percent(percent)) => Some(percent * basis),
-                _ => None,
-            };
-            let inset = [
-                resolve_inset(style.inset[0], viewport.1),
-                resolve_inset(style.inset[1], viewport.0),
-                resolve_inset(style.inset[2], viewport.1),
-                resolve_inset(style.inset[3], viewport.0),
-            ];
+            let scrollport = scrollport_node
+                .and_then(|node| {
+                    let style = self.styles.get(&node)?;
+                    let rect = self.rects.get(&node).copied()?;
+                    let (tx, ty) = self.translates.get(&node).copied().unwrap_or((0.0, 0.0));
+                    Some(Rect {
+                        x: rect.x + tx + style.border.left + style.padding.left,
+                        y: rect.y + ty + style.border.top + style.padding.top,
+                        width: (rect.width
+                            - style.border.left
+                            - style.border.right
+                            - style.padding.left
+                            - style.padding.right)
+                            .max(0.0),
+                        height: (rect.height
+                            - style.border.top
+                            - style.border.bottom
+                            - style.padding.top
+                            - style.padding.bottom)
+                            .max(0.0),
+                    })
+                })
+                .unwrap_or(Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: viewport.0,
+                    height: viewport.1,
+                });
             layout.frames.push(StickyFrame {
                 id,
                 parent_sticky,
+                scroll_owner,
+                scrollport_node,
+                scrollport,
                 normal,
                 containing: containing.unwrap_or(root_containing),
+                containing_is_scrollport: containing_node == scrollport_node,
                 margin: style.margin,
-                inset,
+                inset: style.inset,
+                inset_expressions: style.inset_expressions.clone(),
+                font_size: style.font_size.unwrap_or(16.0),
+                root_font_size,
+                rtl_inline: style.direction == Some(taffy::Direction::Rtl),
             });
             layout.owners.insert(id, id);
             nearest_sticky.insert(id, Some(id));
@@ -14881,6 +15160,63 @@ mod tests {
             "ancestor transform must remain in sticky constraint coordinates: \
              rect={rect:?} frame={frame:?}"
         );
+    }
+
+    #[test]
+    fn sticky_horizontal_overconstraint_prioritizes_logical_inline_start() {
+        let ltr = sticky_axis_position(0.0, 80.0, -100.0, 100.0, 0.0, 100.0, Some(30.0), Some(30.0), false);
+        let rtl = sticky_axis_position(0.0, 80.0, -100.0, 100.0, 0.0, 100.0, Some(30.0), Some(30.0), true);
+        assert_eq!(ltr, 30.0, "LTR physical left is inline-start");
+        assert_eq!(rtl, -10.0, "RTL physical right is inline-start");
+    }
+
+    #[test]
+    fn sticky_owner_validation_skips_boxless_scrollers_and_declines_affine_spaces() {
+        let tree = parse_html(
+            r#"<style>
+                html,body{margin:0}
+                #boxless{display:contents;overflow:auto}
+                #root-sticky{position:sticky;top:0;width:20px;height:20px}
+                #affine{transform:rotate(2deg)}
+                #affine-sticky{position:sticky;top:0;width:20px;height:20px}
+            </style>
+            <div style="height:50px"></div>
+            <div id="boxless"><div id="root-sticky"></div></div>
+            <div id="affine"><div id="affine-sticky"></div></div>
+            <div style="height:400px"></div>"#,
+        );
+        let laid = layout_dom(&tree, (200.0, 100.0));
+        let root_sticky = tree.get_element_by_id("root-sticky").unwrap();
+        let affine_sticky = tree.get_element_by_id("affine-sticky").unwrap();
+        let sticky = laid.root_sticky_layout(&tree, (200.0, 100.0));
+
+        assert!(
+            sticky.frames.iter().any(|frame| {
+                frame.id == root_sticky && frame.scroll_owner == ScrollId::ROOT
+            }),
+            "display:contents cannot capture a sticky descendant",
+        );
+        assert!(
+            sticky.frames.iter().all(|frame| frame.id != affine_sticky),
+            "affine ancestor sticky must use the explicit non-sticky fallback",
+        );
+    }
+
+    #[test]
+    fn public_sticky_layout_resolves_nested_zero_offset_constraints() {
+        let tree = parse_html(
+            r#"<style>html,body{margin:0}</style>
+            <div style="width:100px;height:80px;overflow:hidden">
+                <div style="height:100px"></div>
+                <div id="sticky" style="position:sticky;bottom:0;width:20px;height:20px"></div>
+                <div style="height:20px"></div>
+            </div>"#,
+        );
+        let laid = layout_dom(&tree, (120.0, 100.0));
+        let id = tree.get_element_by_id("sticky").unwrap();
+        let sticky = laid.root_sticky_layout(&tree, (120.0, 100.0));
+        assert_eq!(sticky.translation_for(id, (120.0, 100.0), (0.0, 0.0)).1, -40.0);
+        assert_eq!(sticky.translations((120.0, 100.0), (0.0, 0.0))[&id].1, -40.0);
     }
 
     #[test]
