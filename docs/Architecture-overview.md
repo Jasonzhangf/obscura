@@ -1,4 +1,4 @@
-Obscura is a workspace of eight crates.
+Obscura is a workspace of nine crates.
 
 ```
 obscura-cli       CLI entry point. fetch, serve, scrape, mcp.
@@ -8,6 +8,7 @@ obscura-js        V8 runtime via deno_core. bootstrap.js + Rust ops.
 obscura-dom       DOM tree implementation.
 obscura-net       HTTP client, stealth client, cookie jar, robots cache, tracker blocklist.
 obscura-mcp       Model Context Protocol server.
+obscura-render    CSS cascade, retained layout, text shaping, and CPU paint.
 obscura           Embeddable Rust library API (Browser, Page, Element, CookieStore).
 ```
 
@@ -40,6 +41,20 @@ obscura-browser/page.rs         navigate_with_wait
 ```
 
 The dispatcher emits CDP events (`Network.requestWillBeSent`, `Page.frameNavigated`, `Page.lifecycleEvent`) back to the client through the same WebSocket.
+
+## Rendering flow
+
+`obscura-render` consumes the shared DOM and computed style state. Taffy
+provides the flex/grid foundation; Obscura adds browser formatting behavior,
+text shaping, intrinsic replaced-element sizing, retained geometry, scrolling,
+and CPU-backed paint. `obscura-js` exposes renderer-owned geometry to DOM APIs,
+`obscura-browser` prepares resources and owns capture, and `obscura-cdp` maps
+screenshots, screencast frames, and raster PDF output onto CDP.
+
+Layout is retained between captures and invalidated by relevant DOM, style,
+viewport, scroll, animation, font, and resource changes. The same geometry
+therefore drives browser APIs and paint instead of maintaining separate
+measurement and screenshot models.
 
 ## Single V8 isolate
 

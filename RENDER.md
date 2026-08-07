@@ -1,98 +1,69 @@
-# obscura-render
+# Obscura rendering engine
 
-An optional, scoped render layer for Obscura. It adds real CSS box geometry to
-the JS surface and rasterizes PNG screenshots, pure Rust, behind an opt-in
-feature. The default scraping build is unchanged.
+Obscura has an optional pure-Rust layout and paint pipeline for browser
+automation. The `render` feature powers live DOM geometry, viewport and
+full-page screenshots, CDP screencasting, and raster PDF export without
+launching Chromium.
 
-## Why
-
-Obscura's speed and low memory come from not carrying a full browser rendering
-pipeline. This layer adds only what scraping and automation need, real box
-geometry (so `getBoundingClientRect`, `elementFromPoint`, and
-`IntersectionObserver` return true values) and screenshots, without the weight
-of a Chromium-class engine.
-
-## Enable
+Official release archives and the Docker image are built with rendering. When
+building from source, enable it explicitly:
 
 ```bash
 cargo build --release --features render
+
+# Rendering plus the optional stealth transport
+cargo build --release --features render,stealth
 ```
 
-The feature propagates from `obscura-cli` through `obscura-browser`,
-`obscura-cdp`, and `obscura-js` to `obscura-render`. The default build compiles
-it out entirely.
+## Capture surfaces
 
-## Use
+- CLI PNG: `obscura fetch https://example.com --screenshot page.png`
+- Puppeteer/Playwright: `page.screenshot()` and `page.pdf()` over CDP
+- Raw CDP: `Page.captureScreenshot`, `Page.startScreencast`, and
+  `Page.printToPDF`
+- MCP: `browser_screenshot` and `browser_pdf` in render-enabled builds
 
-CLI screenshot of the settled page:
+Screencasting is an activity-driven CDP stream. Consumers must acknowledge
+each `Page.screencastFrame` with `Page.screencastFrameAck`; it is not a desktop
+video-recorder API.
 
-```bash
-obscura fetch --screenshot out.png https://example.com/
-```
+## Implemented rendering coverage
 
-CDP (Puppeteer / Playwright `page.screenshot()`), driving `obscura serve`:
+The engine includes selector matching and cascade, media queries, inherited
+and relative values, block and inline formatting, flexbox, grid, tables,
+floats, positioned and sticky elements, overflow and scrolling, transforms,
+clipping, backgrounds, borders, shadows, shaped text and web fonts, images,
+SVG, canvas, generated content, and animation sampling. Layout is retained and
+invalidated by relevant DOM/style/resource mutations so geometry and capture
+observe the same page state.
 
-```js
-await page.goto('https://example.com/');
-await page.screenshot({ path: 'out.png' });   // Page.captureScreenshot
-```
-
-Real geometry in JS (no screenshot needed):
-
-```js
-const r = await page.evaluate(() => document.querySelector('div').getBoundingClientRect());
-// r.x, r.y, r.width, r.height are laid-out values, not synthetic
-```
-
-## What it renders
-
-- Block, flexbox, and CSS grid box layout via [taffy](https://github.com/dioxusLabs/taffy).
-- Inline styles plus a small built-in UA default sheet, parsed for the
-  layout-relevant properties (display, width/height, margin, padding, border)
-  and background-color.
-- Background colors painted to the pixmap (backgrounds, borders, and text are
-  staged below).
-
-## Benchmark
-
-Same page, same 1280x720 viewport, warmed, on the same host. Headless Chrome is
-`google-chrome --headless=new --screenshot`.
-
-| page          | engine   | wall     | peak RSS | PNG    |
-| ------------- | -------- | -------- | -------- | ------ |
-| local fixture | obscura  | ~0.06s   | ~33 MB   | 5.3 KB |
-| local fixture | chrome   | ~0.90s   | ~195 MB  | 4.4 KB |
-| example.com   | obscura  | ~0.10s   | ~34 MB   | 5.2 KB |
-| example.com   | chrome   | ~0.98s   | ~199 MB  | 17 KB  |
-
-Obscura is roughly 10-15x faster and uses about 6x less memory than headless
-Chrome for a screenshot. Chrome's larger PNG on example.com is because it
-renders text, which obscura does not yet paint.
-
-## Limitations and next steps
-
-These are tracked enhancements, not bugs:
-
-- **Text** is not rendered yet (the biggest fidelity gap).
-- **Borders and images** are not painted; only background colors.
-- **CSS coverage** is the layout-relevant subset. Full cascade (selector
-  matching, media queries, inheritance of all properties, relative units) is
-  not implemented.
-- The layout cache is computed lazily and cleared on navigation. It is not
-  invalidated on every DOM mutation, so geometry read mid-script may lag a
-  frame; reading after settle is reliable.
+This is broad browser-rendering support, not a claim that every long-tail CSS,
+DOM, compositor, font, or graphics behavior is already identical to Chromium.
+Test the sites and workflows that matter to you and report reduced fixtures
+for reproducible differences.
 
 ## Architecture
 
-`obscura-render` is its own workspace crate with two optional capabilities:
+`obscura-render` consumes the shared DOM and computed style state. Taffy
+provides the flex/grid foundation; Obscura layers browser formatting behavior,
+text shaping, intrinsic replaced-element sizing, retained layout, and a
+CPU-backed paint pipeline on top. `obscura-js` exposes renderer-owned geometry
+to browser APIs, `obscura-browser` owns resource preparation and capture, and
+`obscura-cdp` maps the result to Chrome DevTools Protocol methods.
 
-- **Layout (default):** `layout_dom(dom, viewport)` walks a `DomTree`, computes
-  each element's style, builds a taffy tree, and returns border-box geometry
-  keyed by `NodeId`. Exposed to JS by `op_layout_geometry` (feature-gated).
-- **Paint (`paint` feature):** `paint_dom` / `screenshot_png` rasterize the
-  laid-out tree with [tiny-skia](https://crates.io/crates/tiny-skia) (CPU, pure
-  Rust, deterministic) to a pixmap or PNG bytes.
+PDF output is intentionally raster-backed. It honors print media, backgrounds,
+paper size, margins, landscape, scale, and page ranges, but does not yet provide
+selectable PDF text, tagged structure, headers/footers, outlines, or complete
+CSS paged-media support.
 
-The JS surface stays synthetic when the feature is off: `bootstrap.js` probes
-`op_layout_geometry` with `typeof` and falls through to the existing synthetic
-rect, so the default build is byte-for-byte equivalent.
+## Verification
+
+Rendering changes are checked with deterministic fixtures first, then a broad
+real-site suite against Chromium. Captures must use the same viewport, identity,
+settle policy, animation time, scroll position, and output boundary. Pixel
+error is a regression tripwire, not a standalone correctness verdict; geometry,
+structural edges, missing resources, nonblank output, and reduced repros decide
+whether a difference is real.
+
+See [Rendering, screenshots, screencasting, and PDF](docs/Rendering-screenshots-screencasting-and-PDF.md)
+for user-facing examples and current limits.

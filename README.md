@@ -18,21 +18,24 @@
 
 ---
 
-Obscura is a headless browser engine written in Rust, built for web scraping and AI agent automation. It runs real JavaScript via V8, supports the Chrome DevTools Protocol, and acts as a drop-in replacement for headless Chrome with Puppeteer and Playwright.
+Obscura is a headless browser engine written in Rust for web scraping and AI-agent automation. It runs JavaScript through V8, owns its DOM, layout, and paint pipeline, and exposes Chrome DevTools Protocol (CDP) compatibility for common Puppeteer and Playwright workflows.
 
 ### Why Obscura over headless Chrome?
 
 Designed for automation at scale, not desktop browsing.
 
-| Metric       | Obscura      | Headless Chrome |
-|--------------|--------------|------------------|
-| Memory       | **30 MB**    | 200+ MB          |
-| Binary size  | **70 MB**    | 300+ MB          |
-| Anti-detect  | **Built-in** | None          |
-| Page load    | **85 ms**    | ~500 ms          |
-| Startup      | **Instant**  | ~2s              |
-| Puppeteer    | **Yes**      | Yes              |
-| Playwright   | **Yes**      | Yes              |
+| Capability | Obscura | Headless Chrome |
+|------------|---------|-----------------|
+| JavaScript and DOM | V8 + native Rust DOM | V8 + Blink |
+| Puppeteer / Playwright | CDP compatibility | Native |
+| Screenshots | PNG, JPEG, lossless WebP | Yes |
+| Screencasting | Activity-driven CDP frames | Yes |
+| PDF | Raster-backed print output | Vector/text-aware output |
+| Deployment | Single-purpose browser binary | Full browser distribution |
+
+Performance varies substantially by page, hardware, network, build features,
+and capture settings. Use the published benchmark suite, or measure your own
+workload with identical inputs, before making capacity decisions.
 
 ## 🎉 10,000 stars and what's next
 
@@ -176,7 +179,7 @@ No Chrome, no Node.js, no dependencies. Release archives include both
 `obscura` and `obscura-worker`; keep them in the same directory for the
 parallel `scrape` command.
 
-Default archive names contain the lean binary. Archives ending in
+Standard archive names contain the render-enabled rustls binary. Archives ending in
 `-stealth.tar.gz` or `-stealth.zip` additionally include the wreq/BoringSSL
 transport used for TLS impersonation.
 
@@ -189,17 +192,17 @@ usable on common LTS servers with glibc 2.35+.
 docker run -d --name obscura -p 127.0.0.1:9222:9222 h4ckf0r0day/obscura
 ```
 
-Image on [Docker Hub](https://hub.docker.com/r/h4ckf0r0day/obscura). Multi-stage build on `distroless/cc`, no shell, no package manager, ~57 MB compressed.
+Image on [Docker Hub](https://hub.docker.com/r/h4ckf0r0day/obscura). Multi-stage build on `distroless/cc`, with no shell or package manager in the runtime image.
 
 ### Build from source
 
 ```bash
 git clone https://github.com/h4ckf0r0day/obscura.git
 cd obscura
-cargo build --release
+cargo build --release --features render
 
-# With stealth mode (anti-detection + tracker blocking)
-cargo build --release --features stealth
+# Rendering plus the optional stealth transport
+cargo build --release --features render,stealth
 ```
 
 Requires Rust 1.75+ ([rustup.rs](https://rustup.rs)). First build takes ~5 min (V8 compiles from source, cached after).
@@ -210,7 +213,7 @@ CMake, Clang, and the libclang/LLVM development libraries. On Ubuntu/Debian:
 sudo apt-get install build-essential cmake clang libclang-dev llvm-dev
 ```
 
-The default build does not require these additional stealth dependencies.
+The render-only build does not require these additional stealth dependencies.
 
 ## Quick Start
 
@@ -244,7 +247,32 @@ obscura fetch https://example.com --wait-until networkidle0
 
 # Bound navigation time for slow or broken pages
 obscura fetch https://example.com --timeout 10
+
+# Capture the settled page as PNG
+obscura fetch https://example.com --screenshot page.png
 ```
+
+## Rendering and capture
+
+Official release archives and the Docker image include the rendering engine.
+It provides modern CSS layout and paint, viewport and full-page screenshots,
+scroll-aware fixed and sticky geometry, activity-driven CDP screencasting, and
+raster PDF export without starting Chromium.
+
+```javascript
+await page.setViewport({ width: 1440, height: 1000 });
+await page.goto('https://example.com', { waitUntil: 'load' });
+await page.screenshot({ path: 'page.png', fullPage: true });
+await page.pdf({ path: 'page.pdf', format: 'A4', printBackground: true });
+```
+
+The engine covers the common block, inline, flex, grid, table, float,
+positioning, overflow, transform, text, image, SVG, canvas, background, border,
+and animation paths used by modern sites. It remains an evolving independent
+engine: long-tail CSS, some Web APIs, media playback, compositor effects, and
+platform font rasterization may differ from Chromium. See the
+[rendering guide](docs/Rendering-screenshots-screencasting-and-PDF.md) for
+scrolling, screencasting, raw CDP, MCP, PDF limits, and comparison methodology.
 
 ### Start the CDP server
 
@@ -331,7 +359,7 @@ await page.evaluate(() => {
 
 ## Benchmarks
 
-Page load:
+Historical page-load samples from the benchmark repository:
 
 | Page | Obscura | Chrome |
 |------|---------|--------|
@@ -339,11 +367,15 @@ Page load:
 | JS + XHR + fetch | **84 ms** | ~800 ms |
 | Dynamic scripts | **78 ms** | ~700 ms |
 
-The full benchmark suite (WPT conformance, obstacle course, real-world corpus, and vs-Chrome speed) lives in a separate repo: https://github.com/h4ckf0r0day/obscura-benchmark
+These figures are not universal performance guarantees. The full benchmark
+suite (WPT conformance, obstacle course, real-world corpus, and comparative
+speed tests) lives in a separate repo:
+https://github.com/h4ckf0r0day/obscura-benchmark
 
 ## Stealth Mode
 
-Enable with `--features stealth`.
+Build with `--features render,stealth`, then enable the behavior at runtime with
+the global `--stealth` flag.
 
 ### Anti-fingerprinting
 - Per-session fingerprint randomization (GPU, screen, canvas, audio, battery)
@@ -366,7 +398,7 @@ Obscura implements the Chrome DevTools Protocol for Puppeteer/Playwright compati
 | Domain | Methods |
 |--------|---------|
 | **Target** | createTarget, closeTarget, attachToTarget, createBrowserContext, disposeBrowserContext |
-| **Page** | navigate, getFrameTree, addScriptToEvaluateOnNewDocument, lifecycleEvents |
+| **Page** | navigate, getFrameTree, lifecycleEvents, captureScreenshot, start/stopScreencast, printToPDF |
 | **Runtime** | evaluate, callFunctionOn, getProperties, addBinding |
 | **DOM** | getDocument, querySelector, querySelectorAll, getOuterHTML, resolveNode |
 | **Network** | enable, setCookies, getCookies, setExtraHTTPHeaders, setUserAgentOverride |
@@ -417,7 +449,9 @@ Fetch and render a single page.
 | `--eval` | — | JavaScript expression to evaluate |
 | `--wait-until` | `load` | Wait: `load`, `domcontentloaded`, `networkidle0` |
 | `--timeout` | `30` | Maximum navigation time in seconds |
+| `--wait` | adaptive, up to `5` | Post-load settling; an explicit value is a fixed delay in seconds |
 | `--selector` | — | Wait for CSS selector |
+| `--screenshot` | — | Write a PNG screenshot (single URL; render-enabled build) |
 | `--stealth` | off | Anti-detection mode |
 | `--output` | — | Write dump or eval output to a file |
 | `--quiet` | off | Suppress banner |
@@ -480,9 +514,11 @@ Optional flags (both transports):
 | Tool | Description |
 |------|-------------|
 | `browser_navigate` | Navigate to a URL (`url`, optional `waitUntil`: `load` / `domcontentloaded` / `networkidle0`) |
-| `browser_snapshot` | Return the current page URL, title, and body text |
-| `browser_click` | Click an element by CSS selector |
-| `browser_fill` | Set an input value (triggers `input` + `change` events) |
+| `browser_snapshot` | Return the current page URL, title, readable body text, and element references |
+| `browser_screenshot` | Return the current page as an MCP PNG image (render-enabled build) |
+| `browser_pdf` | Return the current page as an embedded PDF resource (render-enabled build) |
+| `browser_click` | Click by current snapshot reference or CSS selector |
+| `browser_fill` | Set an input value by reference or selector (triggers `input` + `change`) |
 | `browser_type` | Append text to an input |
 | `browser_press_key` | Dispatch a keyboard event (`key`, optional `selector`) |
 | `browser_select_option` | Select an `<option>` by value or text |
@@ -491,6 +527,9 @@ Optional flags (both transports):
 | `browser_network_requests` | List network requests made by the current page |
 | `browser_console_messages` | Return console messages logged by the page |
 | `browser_close` | Close the page and reset browser state |
+
+The MCP server exposes still-image and PDF output. Use CDP when you need the
+streaming `Page.startScreencast` protocol.
 
 ## Integrations
 

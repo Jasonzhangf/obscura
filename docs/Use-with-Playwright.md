@@ -96,15 +96,37 @@ await Promise.all([
 
 Pages share one V8 isolate. CPU-bound JS on one page blocks the others.
 
+## Screenshots, scrolling, and PDF
+
+```js
+await page.setViewportSize({ width: 1440, height: 1000 });
+await page.screenshot({ path: 'viewport.png' });
+
+await page.evaluate(() => window.scrollTo(0, 1200));
+await page.screenshot({ path: 'scrolled.png' });
+
+await page.screenshot({ path: 'full-page.png', fullPage: true });
+await page.pdf({ path: 'page.pdf', format: 'A4', printBackground: true });
+```
+
+A normal screenshot captures the live viewport and scroll position;
+`fullPage: true` captures document space. PDF output is raster-backed. For raw
+CDP screencasting and detailed limits, see
+[Rendering, screenshots, screencasting, and PDF](Rendering-screenshots-screencasting-and-PDF.md).
+
 ## Disconnect
 
 ```js
 await browser.close();  // closes the CDP connection, leaves obscura serve running
 ```
 
-## Not supported
+## Current limits
 
-- `page.screenshot()`, `page.pdf()`: no pixel rendering.
-- `page.video()`, tracing artifacts that need a real browser.
-- `BrowserContext` storage state save/restore: use `--storage-dir` on `obscura serve` instead, see [Persist cookies and storage](Persist-cookies-and-storage.md).
-- Service workers.
+- Playwright `page.video()` and tracing artifacts that require desktop capture
+  are not implemented. Use CDP `Page.startScreencast` for page frames.
+- `BrowserContext` storage-state save/restore remains limited; use
+  `--storage-dir` on `obscura serve`, as described in
+  [Persist cookies and storage](Persist-cookies-and-storage.md).
+- Service workers, native media, some Web APIs, long-tail CSS, and compositor
+  behavior remain incomplete relative to Chromium.
+- PDF text is not selectable/searchable and tagged PDF is not yet available.

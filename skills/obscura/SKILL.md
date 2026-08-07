@@ -1,125 +1,103 @@
 ---
 name: obscura
-description: Use Obscura — a Rust headless browser with a Chrome DevTools Protocol server — for fast page fetches, JS execution, scraping, and CDP automation. Drop-in CDP replacement for Chrome with Puppeteer or Playwright. Trigger on requests to "open a page", "fetch a URL with JS", "scrape a site", "render this page", "automate browser via CDP", or any task where Chrome would be too heavy. Also use when the user mentions stealth fingerprinting, tracker blocking, `navigator.webdriver` masking, or evading basic bot detection.
+description: Operate and validate Obscura for JavaScript page loading, screenshots and visual comparison, CDP automation with Puppeteer or Playwright, screencasting, PDF export, MCP browser interaction, and web extraction. Use when running Obscura against deterministic fixtures or real sites, diagnosing render, geometry, or resource failures, or choosing the correct CLI, CDP, or MCP workflow.
 ---
 
 # Obscura
 
-Single-developer, open-source Rust headless browser. Boots instantly, ~70 MB binary, ~30 MB RAM at runtime, and serves a Chrome DevTools Protocol port that Puppeteer and Playwright connect to unchanged. **You swap the binary, not the code.**
+Use Obscura as an independent Rust headless browser for automation. It embeds
+V8, owns the DOM and rendering pipeline, and exposes common Chrome DevTools
+Protocol workflows without launching Chromium.
 
-Repo: https://github.com/h4ckf0r0day/obscura
+## Build the right binary
 
-## Why pick Obscura over Chrome
-
-| | Obscura | Chrome |
-|---|---|---|
-| Binary | ~70 MB | ~300 MB |
-| RAM | ~30 MB | ~200 MB |
-| Cold start | instant | ~2 s |
-| Page load (upstream claim) | ~85 ms | varies |
-
-Field measurement on Cloudflare-protected `nairaland.com` (warm fetch): **Obscura ~4.1–4.9 s, returns real HTML body**. Real Chrome over CDP: ~5.1 s warm / 9.3 s cold. `curl`: 0.5–0.9 s but only the CF challenge interstitial.
-
-Obscura is roughly as fast as warm Chrome, ~2× faster cold, parallelizes far better because it doesn't carry Chrome's per-process overhead, and clears Cloudflare's basic JS challenge **without** the stealth feature.
-
-## Build
+Official release archives and Docker images include rendering. For a source
+checkout, build release mode with the render feature:
 
 ```bash
-git clone https://github.com/h4ckf0r0day/obscura.git
-cd obscura
-CARGO_TARGET_DIR=/tmp/obscura-target cargo build -p obscura-cli --bin obscura
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release --features render
 ```
 
-Resulting binary: `/tmp/obscura-target/debug/obscura`
-
-The default build has no stealth and needs no extra tools. Stealth is opt-in (see below) and pulls `wreq` / BoringSSL, so it needs `cmake` locally.
-
-### Stealth build
+Add the optional stealth transport only when the task requires it:
 
 ```bash
-CARGO_TARGET_DIR=/tmp/obscura-target cargo build -p obscura-cli --bin obscura --features stealth
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release --features render,stealth
 ```
 
-What stealth gives you:
+Use `./target/release/obscura` in the commands below when working from source.
 
-- **Consistent browser fingerprint** so cross-layer checks pass: the TLS ClientHello, User-Agent, `navigator` surfaces, and WebGL renderer all agree on one Chrome identity rather than contradicting each other
-- **3,520 tracker domains blocked** (built-in blocklist)
-- **`navigator.webdriver` masked**
-- **Native functions patched** so common automation detectors can't unmask them via `Function.prototype.toString` inspection
-- **TLS / HTTP-2 fingerprint** matching real Chromium (defeats most JA3/JA4 + ALPN-ordering bot management)
-
-Enable it at runtime with the global `--stealth` flag (works on `fetch`, `serve`, `scrape`, and `mcp`, before or after the subcommand). The flag needs a stealth-feature build for the TLS layer; without it `--stealth` still does tracker blocking.
+## Fetch, evaluate, and capture
 
 ```bash
-/tmp/obscura-target/debug/obscura fetch https://example.com/ --stealth --dump text
+obscura fetch https://example.com --dump text
+obscura fetch https://example.com --eval "document.title"
+obscura fetch https://example.com --screenshot page.png
+obscura fetch https://example.com \
+  --eval "window.scrollTo(0, document.documentElement.scrollHeight)" \
+  --screenshot bottom.png
 ```
 
-Use stealth against: Cloudflare Turnstile non-interactive, Akamai BMP, PerimeterX, DataDome.
-Stealth still won't clear: hard interactive CAPTCHAs (Turnstile interactive, hCaptcha challenge), and fingerprinters using WebGPU/WebAssembly quirks not yet patched.
+The CLI screenshot path writes PNG and accepts one URL. An omitted `--wait`
+uses adaptive settling with a five-second cap. An explicit `--wait N` is a
+fixed delay of `N` seconds. `--timeout` is also measured in seconds and bounds
+navigation separately.
 
-## CLI fetch
+Use `--dump original` for a binary or raw HTTP response that should bypass DOM
+and JavaScript processing. Use `scrape` for many URLs when the requested output
+does not require one screenshot per URL.
+
+## Drive CDP
+
+Start the server:
 
 ```bash
-/tmp/obscura-target/debug/obscura fetch https://example.com/ --dump text --quiet
+obscura serve --port 9222
 ```
 
-Useful flags:
-- `--dump text`: visible text only
-- `--dump html`: full rendered DOM
-- `--dump assets`: every external resource plus `fetch()`/XHR URLs, one JSON object per line
-- `--dump cookies`: all cookies as JSON, including HttpOnly
-- `--quiet`: suppress progress logs
-- `--timeout <ms>`: per-page timeout
+Connect Puppeteer with `puppeteer-core` or Playwright with
+`chromium.connectOverCDP`. Standard `page.screenshot()` supports viewport and
+full-page capture; `page.pdf()` produces raster-backed print output. Scroll
+with page JavaScript before a viewport capture when the user wants a lower
+section of the page.
 
-## CDP server (Puppeteer / Playwright)
+Use raw CDP for `Page.captureScreenshot`, `Page.startScreencast`, and
+`Page.printToPDF`. A screencast client must acknowledge every
+`Page.screencastFrame` using `Page.screencastFrameAck`. Frames are driven by
+page activity; this is not fixed-frame-rate desktop capture.
 
-```bash
-/tmp/obscura-target/debug/obscura serve --port 9222
-```
+PDF output supports paper dimensions, margins, landscape, scale, backgrounds,
+and page ranges. It does not currently provide selectable text, tagged PDF,
+outlines, headers/footers, or complete CSS paged-media behavior.
 
-**Playwright:**
+## Drive MCP
 
-```ts
-import { chromium } from "playwright-core";
+Run `obscura mcp` for stdio or `obscura mcp --http --port 3000` for HTTP.
+Navigate first, then inspect or interact with the current page. Refresh a
+snapshot or interactive-element listing after navigation, clicking, scrolling,
+or a framework rerender because element references may have changed.
 
-const browser = await chromium.connectOverCDP("ws://127.0.0.1:9222");
-const page = await browser.newContext().then((ctx) => ctx.newPage());
-await page.goto("https://example.com/");
-console.log(await page.title());
-await browser.close();
-```
+Render-enabled MCP builds expose `browser_screenshot` as an MCP PNG image and
+`browser_pdf` as an embedded PDF resource. MCP does not stream screencast
+frames; choose CDP for that workflow.
 
-**Puppeteer:**
+## Validate visual behavior
 
-```ts
-import puppeteer from "puppeteer-core";
+Start with a deterministic fixture that isolates the behavior. Then test a
+broad real-site set at both initial and scrolled positions. For an engine
+comparison, keep viewport, device scale, user agent, network inputs, settle
+policy, scroll, animation time, and capture boundary identical.
 
-const browser = await puppeteer.connect({
-  browserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser",
-});
-const page = await browser.newPage();
-await page.goto("https://example.com/");
-console.log(await page.title());
-await browser.disconnect();
-```
+Confirm both engines navigated successfully and produced nonblank images before
+interpreting a diff. Treat a pixel metric as a regression tripwire, not a
+verdict. Inspect resource completion, box geometry, line wrapping, structural
+edges, clipping, and fixed or sticky behavior, then reduce real failures to a
+fixture. Do not introduce hostname-specific rendering logic.
 
-## Request interception
+## Set expectations accurately
 
-Over CDP, `page.setRequestInterception(true)` (Puppeteer) or `page.route` (Playwright) block, modify, or mock requests as usual. Embedding the engine with the `obscura` Rust crate gives the same thing as a native `Page` API: `on_request` / `on_response` callbacks (capture SPA API payloads without reverse-engineering the bundle), an `enable_interception()` channel to block, mock, or rewrite, and `add_preload_script` to run code before the page's own scripts.
-
-## Scaling profile
-
-- ✅ **High concurrency, low resource:** static + lightly-dynamic pages — hundreds of parallel fetches per box.
-- ⚠️ **Medium:** JS-rendered SPAs, light bot protection — works but slower than raw HTTP, watch timeouts.
-- ❌ **Low / unreliable:** aggressive bot defense (Turnstile interactive, Akamai BMP), real auth-walled apps, anything needing pixel-perfect rendering parity with Chrome.
-
-## Known limits
-
-- Not full Chrome — some browser APIs and CDP methods are incomplete relative to upstream Chromium.
-- Screenshot capture is not implemented (no layout/rendering engine).
-- Authenticated pages need cookie or session injection via CDP; Obscura won't run interactive logins.
-- Hard CAPTCHAs (Turnstile interactive, hCaptcha) require a human or a third-party solver.
-
-## Safety
-
-Treat Obscura like any external Rust crate: `cargo build` runs dependency build scripts (V8, TLS). Build into a disposable target dir (`CARGO_TARGET_DIR=/tmp/obscura-target`) when evaluating new branches.
+Obscura has broad modern layout and paint coverage but is not a bundled Chrome
+build. Long-tail CSS, service workers, some Web APIs, native media, GPU or
+compositor effects, PDF structure, and platform font rasterization can differ
+from Chromium. Measure performance and fidelity on the user's actual workload;
+do not repeat fixed speed, memory, or exact-parity claims without current,
+reproducible evidence.

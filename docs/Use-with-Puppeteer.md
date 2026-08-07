@@ -111,14 +111,33 @@ await Promise.all([
 
 Pages share one V8 isolate. Concurrent JS execution serializes through a lock. CPU-bound JS on one page blocks the others.
 
+## Screenshots, scrolling, and PDF
+
+```js
+await page.setViewport({ width: 1440, height: 1000, deviceScaleFactor: 1 });
+await page.screenshot({ path: 'viewport.png' });
+
+await page.evaluate(() => window.scrollTo(0, 1200));
+await page.screenshot({ path: 'scrolled.png' });
+
+await page.screenshot({ path: 'full-page.png', fullPage: true });
+await page.pdf({ path: 'page.pdf', format: 'A4', printBackground: true });
+```
+
+A normal screenshot captures the live viewport and scroll position;
+`fullPage: true` captures document space. PDF output is raster-backed. For raw
+CDP screencasting and detailed limits, see
+[Rendering, screenshots, screencasting, and PDF](Rendering-screenshots-screencasting-and-PDF.md).
+
 ## Disconnect
 
 ```js
 await browser.disconnect();  // leaves obscura serve running
 ```
 
-## Not supported
+## Current limits
 
-- `page.screenshot()` and `page.pdf()`: no pixel rendering.
-- `page.emulate()` device emulation: viewport metadata only, no real layout.
-- Service workers: not implemented.
+- Some device emulation, service-worker, native media, long-tail CSS, and
+  compositor behavior remains incomplete relative to Chromium.
+- Pages share one V8 isolate; CPU-bound JavaScript serializes across pages.
+- PDF text is not selectable/searchable and tagged PDF is not yet available.

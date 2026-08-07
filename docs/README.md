@@ -1,16 +1,10 @@
-Obscura is an open-source headless browser engine written in Rust. It runs JavaScript via V8, speaks the Chrome DevTools Protocol, and works as a drop-in replacement for headless Chrome with Puppeteer and Playwright.
+Obscura is an open-source headless browser engine written in Rust. It runs JavaScript through V8, owns its DOM, layout, and paint pipeline, and speaks the Chrome DevTools Protocol for common Puppeteer and Playwright workflows.
 
-## Versus headless Chrome
-
-| Metric      | Obscura  | Headless Chrome |
-| ----------- | -------- | --------------- |
-| Memory      | 30 MB    | 200+ MB         |
-| Binary size | 70 MB    | 300+ MB         |
-| Startup     | Instant  | ~2s             |
-| Page load   | 85 ms    | ~500 ms         |
-| Anti-detect | Built-in | None            |
-| Puppeteer   | Yes      | Yes             |
-| Playwright  | Yes      | Yes             |
+The render-enabled release supports screenshots, scroll-aware layout,
+activity-driven CDP screencasting, and raster PDF export. Obscura is an
+independent engine rather than a bundled Chromium build, so compatibility and
+performance should be measured against the pages and automation flows that
+matter to you.
 
 ## Quickstart
 
@@ -22,6 +16,7 @@ Obscura is an open-source headless browser engine written in Rust. It runs JavaS
 ## Guides
 
 - [Build from source](Build-from-source.md)
+- [Rendering, screenshots, screencasting, and PDF](Rendering-screenshots-screencasting-and-PDF.md)
 - [Configure stealth and proxies](Configure-stealth-and-proxies.md)
 - [Markdown extraction](Markdown-extraction.md)
 - [Use with Puppeteer](Use-with-Puppeteer.md)

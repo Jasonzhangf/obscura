@@ -16,12 +16,12 @@ What `--stealth` changes:
 - Bundles webpki roots instead of relying on the system store.
 
 Requires a build that includes the stealth feature. The Releases page provides
-explicitly named `-stealth` archives alongside the lean default archives, so
+explicitly named `-stealth` archives alongside the standard render-enabled archives, so
 users who do not need wreq/BoringSSL do not pay its binary-size or RSS cost. To
 build the stealth variant yourself:
 
 ```bash
-cargo build --release --features stealth
+cargo build --release --features render,stealth
 ```
 
 ## What stealth handles

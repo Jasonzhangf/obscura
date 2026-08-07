@@ -11,15 +11,19 @@ First build takes about 5 minutes. Incremental builds are seconds.
 ```bash
 git clone https://github.com/h4ckf0r0day/obscura.git
 cd obscura
-cargo build --release
+cargo build --release --features render
 ```
 
 Binary is at `./target/release/obscura`.
 
-## With stealth
+This produces the release-capable binary, including geometry, screenshots,
+screencasting, and PDF export. A build without `render` remains available for
+text/DOM-only deployments.
+
+## With rendering and stealth
 
 ```bash
-cargo build --release --features stealth
+cargo build --release --features render,stealth
 ```
 
 Adds TLS fingerprint randomization and the tracker blocklist. See [Configure stealth and proxies](Configure-stealth-and-proxies.md).
@@ -43,7 +47,7 @@ libc++ while compiling BoringSSL. Use the active SDK for that build:
 ```bash
 SDK_PATH="$(xcrun --show-sdk-path)"
 SDKROOT="$SDK_PATH" CXXFLAGS="-isystem $SDK_PATH/usr/include/c++/v1" \
-  cargo build --release --features stealth
+  cargo build --release --features render,stealth
 ```
 
 ## OpenSSL on older systems
@@ -51,7 +55,7 @@ SDKROOT="$SDK_PATH" CXXFLAGS="-isystem $SDK_PATH/usr/include/c++/v1" \
 If the build fails on the vendored OpenSSL with an AVX-512 assembler error (common on older VPS hosts):
 
 ```bash
-OPENSSL_NO_VENDOR=1 cargo build --release
+OPENSSL_NO_VENDOR=1 cargo build --release --features render
 ```
 
 Uses the system OpenSSL instead.
@@ -66,13 +70,13 @@ Uses the system OpenSSL instead.
 Install system-wide:
 
 ```bash
-cargo install --path crates/obscura-cli
+cargo install --path crates/obscura-cli --features render
 ```
 
 ## Tests
 
 ```bash
-cargo test --release
+cargo nextest run --release --features render --no-fail-fast
 ```
 
 Integration suite:
@@ -80,3 +84,6 @@ Integration suite:
 ```bash
 python3 tests/test_all.py
 ```
+
+Use `cargo nextest`, not `cargo test`: runtime tests require process isolation
+because the engine owns a single V8 isolate per process.
