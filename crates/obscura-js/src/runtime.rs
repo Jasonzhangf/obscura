@@ -3553,6 +3553,20 @@ mod tests {
     }
 
     #[test]
+    fn cssstyledeclaration_is_a_usable_global_interface() {
+        // CSSStyleDeclaration was pre-declared non-enumerable but never assigned
+        // a value (the only WebIDL interface missing its globalThis.X = X line),
+        // so it was `undefined` while `'CSSStyleDeclaration' in window` was true,
+        // and `el.style instanceof CSSStyleDeclaration` threw. It must be a real
+        // constructor, non-enumerable like a browser, and the type of .style.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let v = rt
+            .evaluate("(function(){var d=Object.getOwnPropertyDescriptor(window,'CSSStyleDeclaration');return (typeof window.CSSStyleDeclaration)+'|'+(document.body.style instanceof CSSStyleDeclaration)+'|'+(d?d.enumerable:'missing');})()")
+            .unwrap();
+        assert_eq!(v, serde_json::json!("function|true|false"));
+    }
+
+    #[test]
     fn test_create_event_unknown_type_returns_event() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let kind = rt

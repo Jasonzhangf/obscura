@@ -6049,6 +6049,12 @@ globalThis.DocumentType = DocumentType;
 globalThis.Node = Node;
 globalThis.Element = Element;
 globalThis.Document = Document;
+// CSSStyleDeclaration is the type of element.style and getComputedStyle(); it is
+// pre-declared non-enumerable in _preHideInternals, but unlike the other WebIDL
+// interfaces it had no value assignment, leaving `window.CSSStyleDeclaration`
+// undefined (so `el.style instanceof CSSStyleDeclaration` threw). Assigning here
+// only fills the value; the property stays enumerable:false, matching Chrome.
+globalThis.CSSStyleDeclaration = CSSStyleDeclaration;
 globalThis.XPathResult = globalThis.XPathResult || class XPathResult {};
 Object.assign(globalThis.XPathResult, {
   ANY_TYPE: 0,
