@@ -20,10 +20,10 @@ with rendering or a `-no-render-stealth` archive without it. To build the
 rendering variant yourself:
 
 ```bash
-cargo build --release --features render,stealth
+cargo build --release -p obscura-cli --bins --features render,stealth
 ```
 
-Omit rendering with `cargo build --release --no-default-features --features stealth`.
+Omit rendering with `cargo build --release -p obscura-cli --bins --no-default-features --features stealth`.
 
 ## What stealth handles
 

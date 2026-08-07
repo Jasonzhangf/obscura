@@ -16,21 +16,21 @@ Official release archives and Docker images include rendering. For a source
 checkout, build release mode with the render feature:
 
 ```bash
-CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release --features render
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bins --features render
 ```
 
 Build rendering and stealth together for the wreq/BoringSSL transport,
 browser-identity protections, and tracker blocking:
 
 ```bash
-CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release --features render,stealth
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bins --features render,stealth
 ```
 
 Build without rendering when only DOM, extraction, or CDP automation is needed:
 
 ```bash
-CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release --no-default-features
-CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release --no-default-features --features stealth
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bins --no-default-features
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bins --no-default-features --features stealth
 ```
 
 Use `./target/release/obscura` in the commands below when working from source.

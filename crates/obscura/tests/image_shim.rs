@@ -113,6 +113,7 @@ async fn new_image_still_emulates_load_when_src_is_configurable() {
     );
 }
 
+#[cfg(feature = "render")]
 #[tokio::test]
 async fn invalid_image_bytes_emit_error_like_chromium() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");

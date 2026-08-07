@@ -13,14 +13,14 @@ capabilities. It targets web scraping and AI-agent automation.
 ## Build
 
 ```bash
-CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release --features render
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bins --features render
 
 # Rendering and stealth
-CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release --features render,stealth
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bins --features render,stealth
 
 # No rendering, with rustls or stealth
-CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release --no-default-features
-CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release --no-default-features --features stealth
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bins --no-default-features
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bins --no-default-features --features stealth
 ```
 
 - The first build compiles V8 from source: ~5 minutes and a few GB of disk.

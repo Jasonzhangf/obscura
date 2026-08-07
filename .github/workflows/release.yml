@@ -75,7 +75,7 @@ jobs:
           "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Build no-render release binary
-        run: cargo build --release --target ${{ matrix.target }} --no-default-features
+        run: cargo build --release --target ${{ matrix.target }} -p obscura-cli --bins --no-default-features
 
       - name: Stage no-render release binary
         shell: bash
@@ -89,7 +89,7 @@ jobs:
           fi
 
       - name: Build no-render stealth release binary
-        run: cargo build --release --target ${{ matrix.target }} --no-default-features --features stealth
+        run: cargo build --release --target ${{ matrix.target }} -p obscura-cli --bins --no-default-features --features stealth
 
       - name: Stage no-render stealth release binary
         shell: bash
@@ -103,7 +103,7 @@ jobs:
           fi
 
       - name: Build render-enabled release binary
-        run: cargo build --release --target ${{ matrix.target }} --features render
+        run: cargo build --release --target ${{ matrix.target }} -p obscura-cli --bins --features render
 
       - name: Stage default release binary
         shell: bash
@@ -117,7 +117,7 @@ jobs:
           fi
 
       - name: Build render-enabled stealth release binary
-        run: cargo build --release --target ${{ matrix.target }} --features render,stealth
+        run: cargo build --release --target ${{ matrix.target }} -p obscura-cli --bins --features render,stealth
 
       - name: Stage stealth release binary
         shell: bash

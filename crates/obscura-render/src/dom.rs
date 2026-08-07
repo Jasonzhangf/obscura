@@ -18465,6 +18465,7 @@ mod tests {
         assert_eq!(laid.rects.get(&b).unwrap().y, 50.0);
     }
 
+    #[cfg(feature = "paint")]
     #[test]
     fn text_transform_applies_to_word_leaves_in_flex_ui() {
         let tree = parse_html(
@@ -18481,6 +18482,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "paint")]
     #[test]
     fn word_leaves_use_the_computed_line_height() {
         let tree = parse_html(
@@ -18989,6 +18991,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "paint")]
     #[test]
     fn forced_break_in_pseudo_joined_inline_run_has_no_phantom_line() {
         let tree = parse_html(
@@ -19184,6 +19187,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "paint")]
     #[test]
     fn ordinary_inline_fragment_uses_font_box_while_line_keeps_line_height() {
         let tree = parse_html(
@@ -19233,6 +19237,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "paint")]
     #[test]
     fn nested_inline_uses_final_shaping_for_its_canonical_fragment() {
         let tree = parse_html(
@@ -19364,6 +19369,7 @@ mod tests {
         assert!(fragments.iter().all(|fragment| fragment.width <= 70.01));
     }
 
+    #[cfg(feature = "paint")]
     #[test]
     fn empty_decorated_inline_has_a_box_and_advances_following_text() {
         let tree = parse_html(

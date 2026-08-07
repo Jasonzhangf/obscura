@@ -5540,7 +5540,11 @@ class HTMLImageElement extends Element {
   }
 
   _imageSourceChanged() {
-    this._adoptImageCandidate("");
+    // The lightweight build has no retained render-resource cache. It still
+    // preserves the historical non-blocking Image lifecycle so preloaders do
+    // not hang while rendering is disabled.
+    const hasMetadataLoader = typeof Deno.core.ops.op_load_image_metadata === "function";
+    this._adoptImageCandidate(hasMetadataLoader ? "" : this.src);
     this._imageCompletionDeferred = true;
     this._refreshImageFromCache(true);
     if (!this._imageComplete) this._queueImageRequest();
@@ -7761,7 +7765,13 @@ globalThis.getComputedStyle = (el) => {
     // Non-render builds and properties outside the renderer snapshot retain
     // the lightweight inline CSSOM behavior.
     const inlineVal = target.getPropertyValue ? target.getPropertyValue(rawProp) : '';
-    if (inlineVal) return inlineVal;
+    if (inlineVal) {
+      if (kebab === 'opacity') {
+        const value = Number(inlineVal);
+        if (Number.isFinite(value)) return String(Math.min(1, Math.max(0, value)));
+      }
+      return inlineVal;
+    }
     const dim = dimensionFor(kebab);
     if (dim != null) return dim;
     if (defaultsKebab[rawProp]) return defaultsKebab[rawProp];

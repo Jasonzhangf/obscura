@@ -201,16 +201,16 @@ git clone https://github.com/h4ckf0r0day/obscura.git
 cd obscura
 
 # Rendering
-cargo build --release --features render
+cargo build --release -p obscura-cli --bins --features render
 
 # Rendering and stealth
-cargo build --release --features render,stealth
+cargo build --release -p obscura-cli --bins --features render,stealth
 
 # No rendering
-cargo build --release --no-default-features
+cargo build --release -p obscura-cli --bins --no-default-features
 
 # No rendering, with stealth
-cargo build --release --no-default-features --features stealth
+cargo build --release -p obscura-cli --bins --no-default-features --features stealth
 ```
 
 Requires Rust 1.75+ ([rustup.rs](https://rustup.rs)). First build takes ~5 min (V8 compiles from source, cached after).

@@ -141,12 +141,41 @@ pub mod inline {
     use obscura_dom::tree::{DomTree, NodeId};
     use std::collections::HashMap;
 
+    #[derive(Clone)]
+    pub(crate) struct WebFont {
+        pub data: Vec<u8>,
+        pub family: Option<String>,
+        pub weight: Option<(u16, u16)>,
+        pub italic: Option<bool>,
+    }
+
     #[derive(Default)]
     pub struct TextEngine;
 
     impl TextEngine {
         pub fn new() -> Self {
             TextEngine
+        }
+
+        pub(crate) fn new_with_web_fonts(_fonts: &[WebFont]) -> Self {
+            TextEngine
+        }
+
+        pub fn register_replaced(
+            &mut self,
+            _width: f32,
+            _height: f32,
+            _style: &crate::LayoutStyle,
+        ) -> usize {
+            0
+        }
+
+        pub(crate) fn register_replaced_intrinsic(
+            &mut self,
+            _intrinsic: crate::ReplacedIntrinsic,
+            _style: &crate::LayoutStyle,
+        ) -> usize {
+            0
         }
         /// Layout-only builds have no shaper, so no container is ever treated
         /// as a cosmic-text inline formatting context: the word-split path
@@ -201,6 +230,142 @@ pub mod inline {
         pub(crate) fn measure_word(&mut self, _idx: usize) -> (f32, f32) {
             (0.0, 0.0)
         }
+    }
+
+    pub(crate) fn used_line_height(style: &crate::LayoutStyle) -> f32 {
+        TextEngine.selected_line_height(style)
+    }
+
+    pub(crate) fn is_replaced(local: &str) -> bool {
+        matches!(
+            local,
+            "img"
+                | "svg"
+                | "canvas"
+                | "video"
+                | "audio"
+                | "iframe"
+                | "embed"
+                | "object"
+                | "input"
+                | "textarea"
+                | "select"
+                | "button"
+                | "progress"
+                | "meter"
+        )
+    }
+
+    pub(crate) fn has_replaced_sizing(local: &str) -> bool {
+        matches!(
+            local,
+            "img"
+                | "canvas"
+                | "video"
+                | "audio"
+                | "iframe"
+                | "embed"
+                | "object"
+                | "progress"
+                | "meter"
+        )
+    }
+
+    pub(crate) fn default_replaced_intrinsic_size(
+        local: &str,
+        font_size: f32,
+        has_controls: bool,
+        has_resource: bool,
+    ) -> Option<(f32, f32)> {
+        match local {
+            "canvas" | "video" | "iframe" | "object" => Some((300.0, 150.0)),
+            "embed" if has_resource => Some((300.0, 150.0)),
+            "audio" if has_controls => Some((300.0, 54.0)),
+            "progress" => Some((font_size * 10.0, font_size)),
+            "meter" => Some((font_size * 5.0, font_size)),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn constrained_auto_replaced_size(
+        width: f32,
+        height: f32,
+        style: &crate::LayoutStyle,
+    ) -> taffy::Size<f32> {
+        let px = |dimension| match dimension {
+            crate::Dimension::Px(value) => Some(value.max(0.0)),
+            _ => None,
+        };
+        let ratio = style
+            .aspect_ratio
+            .filter(|ratio| ratio.is_finite() && *ratio > 0.0)
+            .unwrap_or_else(|| {
+                if width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0 {
+                    width / height
+                } else {
+                    2.0
+                }
+            });
+        let preferred_width = px(style.width);
+        let preferred_height = px(style.height);
+        let min_width = px(style.min_width).unwrap_or(0.0);
+        let min_height = px(style.min_height).unwrap_or(0.0);
+        let max_width = px(style.max_width)
+            .unwrap_or(f32::INFINITY)
+            .max(min_width);
+        let max_height = px(style.max_height)
+            .unwrap_or(f32::INFINITY)
+            .max(min_height);
+
+        let (width, height) = match (preferred_width, preferred_height) {
+            (Some(width), Some(height)) => (
+                width.min(max_width).max(min_width),
+                height.min(max_height).max(min_height),
+            ),
+            (Some(width), None) => {
+                let width = width.min(max_width).max(min_width);
+                (width, (width / ratio).min(max_height).max(min_height))
+            }
+            (None, Some(height)) => {
+                let height = height.min(max_height).max(min_height);
+                ((height * ratio).min(max_width).max(min_width), height)
+            }
+            (None, None) => {
+                let height_at_max_width = (max_width / ratio).max(min_height);
+                let height_at_min_width = (min_width / ratio).min(max_height);
+                let width_at_max_height = (max_height * ratio).max(min_width);
+                let width_at_min_height = (min_height * ratio).min(max_width);
+                if width > max_width {
+                    if height > max_height {
+                        if max_width * height <= max_height * width {
+                            (max_width, height_at_max_width)
+                        } else {
+                            (width_at_max_height, max_height)
+                        }
+                    } else {
+                        (max_width, height_at_max_width)
+                    }
+                } else if width < min_width {
+                    if height < min_height {
+                        if min_width * height <= min_height * width {
+                            (width_at_min_height, min_height)
+                        } else {
+                            (min_width, height_at_min_width)
+                        }
+                    } else {
+                        (min_width, height_at_min_width)
+                    }
+                } else if height > max_height {
+                    (width_at_max_height, max_height)
+                } else if height < min_height {
+                    (width_at_min_height, min_height)
+                } else {
+                    (width, height)
+                }
+            }
+        };
+
+        taffy::Size { width, height }
     }
 }
 

@@ -5475,6 +5475,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
     async fn raf_geometry_mutation_reaches_settled_intersection_before_next_frame() {
         let mut rt = setup_runtime(

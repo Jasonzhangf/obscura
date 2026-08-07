@@ -11,7 +11,7 @@ First build takes about 5 minutes. Incremental builds are seconds.
 ```bash
 git clone https://github.com/h4ckf0r0day/obscura.git
 cd obscura
-cargo build --release --features render
+cargo build --release -p obscura-cli --bins --features render
 ```
 
 Binary is at `./target/release/obscura`.
@@ -22,7 +22,7 @@ and PDF export.
 ## Rendering and stealth
 
 ```bash
-cargo build --release --features render,stealth
+cargo build --release -p obscura-cli --bins --features render,stealth
 ```
 
 This is the complete rendering build with the stealth wreq/BoringSSL transport,
@@ -32,8 +32,8 @@ blocklist. See [Configure stealth and proxies](Configure-stealth-and-proxies.md)
 ## Without rendering
 
 ```bash
-cargo build --release --no-default-features
-cargo build --release --no-default-features --features stealth
+cargo build --release -p obscura-cli --bins --no-default-features
+cargo build --release -p obscura-cli --bins --no-default-features --features stealth
 ```
 
 The second command keeps stealth while excluding layout, screenshots,
@@ -58,7 +58,7 @@ libc++ while compiling BoringSSL. Use the active SDK for that build:
 ```bash
 SDK_PATH="$(xcrun --show-sdk-path)"
 SDKROOT="$SDK_PATH" CXXFLAGS="-isystem $SDK_PATH/usr/include/c++/v1" \
-  cargo build --release --features render,stealth
+  cargo build --release -p obscura-cli --bins --features render,stealth
 ```
 
 ## OpenSSL on older systems
@@ -66,7 +66,7 @@ SDKROOT="$SDK_PATH" CXXFLAGS="-isystem $SDK_PATH/usr/include/c++/v1" \
 If the build fails on the vendored OpenSSL with an AVX-512 assembler error (common on older VPS hosts):
 
 ```bash
-OPENSSL_NO_VENDOR=1 cargo build --release --features render
+OPENSSL_NO_VENDOR=1 cargo build --release -p obscura-cli --bins --features render
 ```
 
 Uses the system OpenSSL instead.

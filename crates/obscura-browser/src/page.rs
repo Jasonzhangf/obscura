@@ -4124,16 +4124,19 @@ mod tests {
                 "an inline import must fetch exactly once as a stylesheet"
             );
         }
-        for path in ["/local.svg", "/imported.svg"] {
-            assert_eq!(
-                observed_requests
-                    .iter()
-                    .filter(|(request_path, _)| request_path == path)
-                    .map(|(_, resource_type)| *resource_type)
-                    .collect::<Vec<_>>(),
-                vec![obscura_net::ResourceType::Image],
-                "ordinary rule assets must remain in render warmup"
-            );
+        #[cfg(feature = "render")]
+        {
+            for path in ["/local.svg", "/imported.svg"] {
+                assert_eq!(
+                    observed_requests
+                        .iter()
+                        .filter(|(request_path, _)| request_path == path)
+                        .map(|(_, resource_type)| *resource_type)
+                        .collect::<Vec<_>>(),
+                    vec![obscura_net::ResourceType::Image],
+                    "ordinary rule assets must remain in render warmup"
+                );
+            }
         }
         drop(observed_requests);
 
@@ -4165,19 +4168,22 @@ mod tests {
         assert!(styles[0].2.starts_with("@media print {\n"));
         assert!(styles[1].2.starts_with("@media print {\n"));
 
-        let pdf = page
-            .raster_pdf(crate::RasterPdfOptions {
-                print_background: true,
-                paper_width_in: 100.0 / 72.0,
-                paper_height_in: 80.0 / 72.0,
-                margin_top_in: 0.0,
-                margin_bottom_in: 0.0,
-                margin_left_in: 0.0,
-                margin_right_in: 0.0,
-                ..crate::RasterPdfOptions::default()
-            })
-            .expect("inline-import print PDF");
-        assert!(pdf.starts_with(b"%PDF-1.4"));
+        #[cfg(feature = "render")]
+        {
+            let pdf = page
+                .raster_pdf(crate::RasterPdfOptions {
+                    print_background: true,
+                    paper_width_in: 100.0 / 72.0,
+                    paper_height_in: 80.0 / 72.0,
+                    margin_top_in: 0.0,
+                    margin_bottom_in: 0.0,
+                    margin_left_in: 0.0,
+                    margin_right_in: 0.0,
+                    ..crate::RasterPdfOptions::default()
+                })
+                .expect("inline-import print PDF");
+            assert!(pdf.starts_with(b"%PDF-1.4"));
+        }
     }
 
     fn client_replacement_page(name: &str, deferred: bool) -> super::Page {
