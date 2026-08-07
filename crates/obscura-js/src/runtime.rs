@@ -1713,6 +1713,34 @@ mod tests {
     }
 
     #[test]
+    fn dom_parser_flags_malformed_xml_with_parsererror() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let has_err = rt
+            .evaluate("(function(){var d=new DOMParser().parseFromString('<a><b></a>','application/xml'); return d.querySelector('parsererror') ? true : false;})()")
+            .unwrap();
+        assert_eq!(has_err, serde_json::json!(true));
+    }
+
+    #[test]
+    fn dom_parser_accepts_well_formed_xml() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let ok = rt
+            .evaluate("(function(){var d=new DOMParser().parseFromString('<root><child>x</child></root>','application/xml'); return d.querySelector('parsererror') ? 'ERR' : 'OK';})()")
+            .unwrap();
+        assert_eq!(ok, serde_json::json!("OK"));
+    }
+
+    #[test]
+    fn dom_parser_html_never_gets_parsererror() {
+        // HTML parsing is tolerant and must never synthesize a parsererror.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let ok = rt
+            .evaluate("(function(){var d=new DOMParser().parseFromString('<div><p>hi</a>','text/html'); return d.querySelector('parsererror') ? 'ERR' : 'OK';})()")
+            .unwrap();
+        assert_eq!(ok, serde_json::json!("OK"));
+    }
+
+    #[test]
     fn test_document_title() {
         let mut rt = setup_runtime("<html><head><title>Test</title></head><body></body></html>");
         let title = rt.evaluate("document.title").unwrap();
