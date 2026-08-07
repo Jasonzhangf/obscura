@@ -431,7 +431,7 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                     Some(name) => obscura_dom::parse_fragment_with_context(&arg2, name),
                     None => obscura_dom::parse_fragment(&arg2),
                 };
-                let import_root = fragment.find_body_or_root();
+                let import_root = fragment.fragment_root();
                 dom.import_children_from(target, &fragment, import_root);
             }
             "true".into()

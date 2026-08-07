@@ -2142,6 +2142,38 @@ mod tests {
         );
     }
 
+    /// Setting innerHTML on the <html> element parses in the "before head"
+    /// insertion mode, which synthesizes head and body. The importer must keep
+    /// both; it previously returned the synthesized body and dropped the head
+    /// (so a <title>/<meta> assigned this way vanished).
+    #[test]
+    fn documentelement_inner_html_keeps_head_and_body() {
+        let mut rt = setup_runtime("<html><head></head><body></body></html>");
+        let v = rt
+            .evaluate(
+                "(function(){ document.documentElement.innerHTML = '<head><title>T</title></head><body><p>hi</p></body>'; \
+                 var t = document.querySelector('title'); var p = document.querySelector('p'); \
+                 return (t ? t.textContent : 'no-title') + '|' + (p ? p.textContent : 'no-p'); })()",
+            )
+            .unwrap();
+        assert_eq!(v, serde_json::json!("T|hi"));
+    }
+
+    /// Regression guard: innerHTML on an ordinary element still imports the
+    /// parsed nodes directly (no head/body is synthesized for a div context),
+    /// so the fix above must not change the common case.
+    #[test]
+    fn ordinary_element_inner_html_imports_content_directly() {
+        let mut rt = setup_runtime("<html><body><div id=\"d\"></div></body></html>");
+        let v = rt
+            .evaluate(
+                "(function(){ var d=document.getElementById('d'); d.innerHTML='<span>a</span><span>b</span>'; \
+                 return d.children.length + '|' + d.textContent; })()",
+            )
+            .unwrap();
+        assert_eq!(v, serde_json::json!("2|ab"));
+    }
+
     /// Issue #463: the same must hold for a template that arrives via innerHTML
     /// rather than the initial document parse — that is how most frameworks
     /// inject templates.

@@ -839,18 +839,22 @@ impl DomTree {
         self.append_child(parent_id, text_id);
     }
 
-    pub fn find_body_or_root(&self) -> NodeId {
+    /// The node whose children are a parsed fragment's top-level nodes: the
+    /// synthetic root `<html>` element html5ever wraps a fragment in, or the
+    /// document if there is none. Importing this node's children reproduces the
+    /// fragment as written.
+    ///
+    /// This must NOT descend into a synthesized `<body>`. A `<body>` child of the
+    /// root only appears when the fragment is parsed in the `<html>` context
+    /// (documentElement.innerHTML), where html5ever's "before head" mode
+    /// synthesizes both `<head>` and `<body>`; returning the body there dropped
+    /// the head siblings. Every other element context leaves the parsed content
+    /// directly under the root, so it is unaffected.
+    pub fn fragment_root(&self) -> NodeId {
         let doc = self.document();
         for child in self.children(doc) {
             if let Some(n) = self.get_node(child) {
                 if n.as_element().map(|name| name.local.as_ref() == "html").unwrap_or(false) {
-                    for html_child in self.children(child) {
-                        if let Some(hc) = self.get_node(html_child) {
-                            if hc.as_element().map(|name| name.local.as_ref() == "body").unwrap_or(false) {
-                                return html_child;
-                            }
-                        }
-                    }
                     return child;
                 }
             }
