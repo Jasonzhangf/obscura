@@ -3546,6 +3546,34 @@ mod tests {
     }
 
     #[test]
+    fn event_constructor_matches_webidl_conformance() {
+        // new Event()/new CustomEvent() must throw (type is a required arg),
+        // the type argument must be coerced to a string, CustomEvent.detail must
+        // default to null (not undefined), createEvent must still build a
+        // type-"" event, and an explicit detail must be preserved.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let v = rt
+            .evaluate(
+                "(function(){\
+                 var out=[];\
+                 try{new Event();out.push('no-throw')}catch(e){out.push(e.name)}\
+                 try{new CustomEvent();out.push('no-throw')}catch(e){out.push(e.name)}\
+                 out.push(new Event(123).type+':'+typeof new Event(123).type);\
+                 out.push(String(new CustomEvent('x').detail));\
+                 out.push(String(new CustomEvent('x',{detail:7}).detail));\
+                 out.push(new Event('click').type);\
+                 out.push(JSON.stringify(document.createEvent('Event').type));\
+                 return out.join('|');\
+                 })()",
+            )
+            .unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!("TypeError|TypeError|123:string|null|7|click|\"\"")
+        );
+    }
+
+    #[test]
     fn test_promise_rejection_event_requires_promise() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt
