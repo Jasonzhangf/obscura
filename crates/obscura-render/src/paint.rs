@@ -2999,6 +2999,12 @@ fn stacking_z_index(
     if style.display == crate::Display::None || style.display_contents {
         return None;
     }
+    // Fixed and sticky positioned boxes establish stacking contexts even
+    // when their used z-index is `auto`. Treat that context as stack level
+    // zero so a high-z descendant cannot escape above a later sibling layer.
+    if style.position_fixed || style.position_sticky {
+        return Some(style.z_index.unwrap_or(0));
+    }
     let z = style.z_index?;
     if style.position.is_some() {
         return Some(z);
@@ -13486,6 +13492,38 @@ mod tests {
             covered.blue() > 240 && covered.red() < 20,
             "high-z descendant must stay inside the earlier opacity group: {covered:?}"
         );
+    }
+
+    #[test]
+    fn fixed_and_sticky_auto_z_index_contain_descendant_stacking() {
+        let tree = parse_html(
+            r#"<html><body style="margin:0">
+                <div id="fixed" style="position:fixed;left:0;top:0;width:20px;height:20px;background:red">
+                    <div style="position:absolute;z-index:999;inset:0;background:lime"></div>
+                </div>
+                <div style="position:absolute;z-index:1;left:0;top:0;width:20px;height:20px;background:blue"></div>
+                <div style="position:absolute;left:0;top:30px">
+                    <div id="sticky" style="position:sticky;top:0;width:20px;height:20px;background:red">
+                        <div style="position:absolute;z-index:999;inset:0;background:lime"></div>
+                    </div>
+                </div>
+                <div style="position:absolute;z-index:1;left:0;top:30px;width:20px;height:20px;background:blue"></div>
+            </body></html>"#,
+        );
+        let fixed = tree.get_element_by_id("fixed").unwrap();
+        let sticky = tree.get_element_by_id("sticky").unwrap();
+        let laid = crate::layout_dom(&tree, (40.0, 60.0));
+        assert_eq!(stacking_z_index(&tree, &laid, fixed), Some(0));
+        assert_eq!(stacking_z_index(&tree, &laid, sticky), Some(0));
+
+        let pixmap = paint_dom(&tree, (40.0, 60.0), None).expect("pixmap");
+        for (label, y) in [("fixed", 10), ("sticky", 40)] {
+            let pixel = pixmap.pixel(10, y).unwrap();
+            assert!(
+                pixel.blue() > 240 && pixel.red() < 20 && pixel.green() < 20,
+                "{label} high-z descendant escaped its auto-z stacking context: {pixel:?}",
+            );
+        }
     }
 
     #[test]
