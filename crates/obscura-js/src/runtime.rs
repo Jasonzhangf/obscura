@@ -1331,6 +1331,26 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn string_timeout_declarations_reach_global_scope() {
+        // A string timer handler runs as a classic script in global scope, so a
+        // top-level var/function declaration in it becomes a global. new Function()
+        // kept those declarations local to the compiled function, so they never
+        // reached globalThis.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.evaluate(
+            "setTimeout('var __leaked = 42; function __leakedFn(){ return 7; }', 0)",
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        let v = rt
+            .evaluate(
+                "String(globalThis.__leaked) + '|' + (typeof globalThis.__leakedFn === 'function' ? globalThis.__leakedFn() : 'missing')",
+            )
+            .unwrap();
+        assert_eq!(v, serde_json::json!("42|7"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn string_interval_handler_repeats_and_can_clear_itself() {
         let mut rt = setup_runtime("<html><body></body></html>");
         rt.evaluate("globalThis.__ticks=0").unwrap();
