@@ -29,7 +29,7 @@
     '_isSpecialScheme', '_applyDocQueryEncoding', '_anchorBase',
     '_elemHrefURL', '_setElemHrefPart', '_pad', '_daysInMonth',
     '_isoWeek1Monday', '_inputParseNumber', '_inputFormatNumber',
-    '_htmlAttrName', '_convertNodes', '_parseHTMLFragment', '_xmlWellFormed', '_elementClassFor', '_wrap', '_wrapEl',
+    '_htmlAttrName', '_convertNodes', '_fragmentContextPayload', '_parseHTMLFragment', '_xmlWellFormed', '_elementClassFor', '_wrap', '_wrapEl',
     '_resolveUrl', '_registerIframe', '_base64ToUint8Array',
     '_bodyToUint8Array', '_arrayBufferFromBytes',
     '_installWasmStreamingFallback', '_urlParseOp', '_urlSetOp',
@@ -2496,6 +2496,20 @@ function _isSubmitButton(el) {
   return false;
 }
 
+// Carry the context element's full qualified name into html5ever. Fragment
+// parsing depends on both the local name and namespace (SVG/MathML included).
+function _fragmentContextPayload(context, html) {
+  let namespace = 'http://www.w3.org/1999/xhtml';
+  let qualified = 'body';
+  if (typeof context === 'string') {
+    qualified = context || 'body';
+  } else if (context && context.nodeType === 1) {
+    namespace = context.namespaceURI || '';
+    qualified = context.nodeName || context.localName || 'body';
+  }
+  return namespace + "\0" + qualified + "\0" + String(html == null ? '' : html);
+}
+
 // Parse an HTML string into detached nodes using the actual insertion element
 // as html5ever's fragment context. This preserves table/select parsing rules,
 // comments, text-node order, and foreign-content namespaces without a wrap map.
@@ -2904,11 +2918,12 @@ class Element extends Node {
   }
   get nodeName() { return this.tagName; }
   get localName() {
-    // tagName is an op call and the tag never changes, so cache the lowercased
-    // localName. This keeps the new <a>/<area> href getters (which read
-    // localName) and every other localName consumer off the op path.
+    // The native tree owns the namespace-aware QualName. Reading its local
+    // component directly preserves case-sensitive SVG/MathML names such as
+    // `linearGradient`; deriving this from HTML's uppercased tagName loses it.
     if (this._lname !== undefined) return this._lname;
-    const ln = (this.tagName || "").toLowerCase();
+    const ln = _domParse("local_name", this._nid)
+      || (this.tagName || "").toLowerCase();
     if (ln) this._lname = ln;
     return ln;
   }
@@ -5201,7 +5216,7 @@ class Document extends Node {
     var body = this.body;
     if (!body) return;
     var temp = this.createDocumentFragment();
-    _dom("set_fragment_html_executable", temp._nid, "body\0" + html);
+    _dom("set_fragment_html_executable", temp._nid, _fragmentContextPayload('body', html));
     var children = Array.from(temp.childNodes);
     for (var i = 0; i < children.length; i++) {
       body.appendChild(children[i]);
@@ -5234,7 +5249,7 @@ class DocumentFragment extends Node {
   set innerHTML(v) {
     const html = String(v ?? "");
     if (this._fragmentContext) {
-      _dom("set_inner_html_context", this._nid, this._fragmentContext + "\0" + html);
+      _dom("set_inner_html_context", this._nid, _fragmentContextPayload(this._fragmentContext, html));
     } else {
       _dom("set_inner_html", this._nid, html);
     }
@@ -11169,9 +11184,12 @@ globalThis.Range = class Range {
     const frag = ownerDoc.createDocumentFragment();
     let context = node;
     if (context && context.nodeType !== 1) context = context.parentElement;
-    let contextName = (context && context.localName) || 'body';
-    if (contextName === 'html') contextName = 'body';
-    _dom("set_fragment_html_executable", frag._nid, contextName + "\0" + String(html));
+    if (context && context.localName === 'html') context = null;
+    _dom(
+      "set_fragment_html_executable",
+      frag._nid,
+      _fragmentContextPayload(context || 'body', html),
+    );
     return frag;
   }
   toString() {

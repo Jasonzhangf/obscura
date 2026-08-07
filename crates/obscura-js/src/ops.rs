@@ -789,6 +789,35 @@ fn is_render_mutation_command(cmd: &str) -> bool {
     )
 }
 
+fn fragment_context_and_html(arg: &str) -> (html5ever::QualName, &str) {
+    let mut parts = arg.splitn(3, '\0');
+    let first = parts.next().unwrap_or("body");
+    let second = parts.next();
+    let third = parts.next();
+    let (namespace, qualified, html) = match (second, third) {
+        // Namespace-aware encoding used by the current bootstrap.
+        (Some(qualified), Some(html)) => (first, qualified, html),
+        // Backward-compatible encoding for older snapshots: `local\0html`.
+        (Some(html), None) => ("http://www.w3.org/1999/xhtml", first, html),
+        (None, None) => ("http://www.w3.org/1999/xhtml", "body", first),
+        (None, Some(_)) => unreachable!(),
+    };
+    let (prefix, local) = match qualified.split_once(':') {
+        Some((prefix, local)) if !prefix.is_empty() && !local.is_empty() => {
+            (Some(html5ever::Prefix::from(prefix)), local)
+        }
+        _ => (None, if qualified.is_empty() { "body" } else { qualified }),
+    };
+    (
+        html5ever::QualName::new(
+            prefix,
+            html5ever::Namespace::from(namespace),
+            html5ever::LocalName::from(local),
+        ),
+        html,
+    )
+}
+
 #[op2(fast)]
 fn op_script_mark_started(state: &OpState, nid: u32) -> bool {
     let shared = state.borrow::<SharedState>().clone();
@@ -1268,8 +1297,26 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
             let nid = arg1.parse::<u32>().unwrap_or(0);
             let name = dom
                 .with_node(NodeId::new(nid), |n| {
-                    n.as_element()
-                        .map(|name| name.local.as_ref().to_ascii_uppercase())
+                    n.as_element().map(|name| {
+                        if name.ns == html5ever::ns!(html) {
+                            name.local.as_ref().to_ascii_uppercase()
+                        } else {
+                            match &name.prefix {
+                                Some(prefix) => format!("{}:{}", prefix, name.local),
+                                None => name.local.to_string(),
+                            }
+                        }
+                    })
+                })
+                .flatten()
+                .unwrap_or_default();
+            serde_json::to_string(&name).unwrap_or("\"\"".into())
+        }
+        "local_name" => {
+            let nid = arg1.parse::<u32>().unwrap_or(0);
+            let name = dom
+                .with_node(NodeId::new(nid), |n| {
+                    n.as_element().map(|name| name.local.to_string())
                 })
                 .flatten()
                 .unwrap_or_default();
@@ -1452,16 +1499,11 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                 _ => return "false".into(),
             };
             let target = NodeId::new(nid);
-            let (context, html) = arg2.split_once('\0').unwrap_or(("body", arg2.as_str()));
+            let (context_name, html) = fragment_context_and_html(&arg2);
             for child in dom.children(target) {
                 dom.detach(child);
             }
             if !html.is_empty() {
-                let context_name = html5ever::QualName::new(
-                    None,
-                    html5ever::ns!(html),
-                    html5ever::LocalName::from(context.to_ascii_lowercase()),
-                );
                 let fragment = obscura_dom::parse_fragment_with_context(html, context_name);
                 let import_root = fragment.fragment_root();
                 dom.import_children_from(target, &fragment, import_root);
@@ -1480,16 +1522,11 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                 _ => return "false".into(),
             };
             let target = NodeId::new(nid);
-            let (context, html) = arg2.split_once('\0').unwrap_or(("body", arg2.as_str()));
+            let (context_name, html) = fragment_context_and_html(&arg2);
             for child in dom.children(target) {
                 dom.detach(child);
             }
             if !html.is_empty() {
-                let context_name = html5ever::QualName::new(
-                    None,
-                    html5ever::ns!(html),
-                    html5ever::LocalName::from(context.to_ascii_lowercase()),
-                );
                 let fragment = obscura_dom::parse_fragment_with_context(html, context_name);
                 let import_root = fragment.fragment_root();
                 dom.import_children_from(target, &fragment, import_root);
@@ -1549,6 +1586,28 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
             })
             .index()
             .to_string(),
+        "create_element_ns" => {
+            let (namespace, qualified) = arg1.split_once('\0').unwrap_or(("", arg1.as_str()));
+            let (prefix, local) = match qualified.split_once(':') {
+                Some((prefix, local)) if !prefix.is_empty() && !local.is_empty() => {
+                    (Some(html5ever::Prefix::from(prefix)), local)
+                }
+                None if !qualified.is_empty() => (None, qualified),
+                _ => return "-1".into(),
+            };
+            dom.new_node(NodeData::Element {
+                name: html5ever::QualName::new(
+                    prefix,
+                    html5ever::Namespace::from(namespace),
+                    html5ever::LocalName::from(local),
+                ),
+                attrs: vec![],
+                template_contents: None,
+                mathml_annotation_xml_integration_point: false,
+            })
+            .index()
+            .to_string()
+        }
         "create_text_node" => dom
             .new_node(NodeData::Text {
                 contents: arg1.clone(),
