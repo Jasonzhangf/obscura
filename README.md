@@ -15,7 +15,7 @@
   <strong>The open-source headless browser for AI agents and web scraping.</strong><br>
   Lightweight, stealthy, and built in Rust.
 </p>
-<h3 align="center">Native rendering is here. No Chromium required.</h3>
+<h3 align="center">Native rendering is here. No Chromium required. 🎉 </h3>
 <p align="center">
   Capture screenshots, screencast live pages, and export PDFs directly with Obscura.
 </p>
