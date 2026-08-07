@@ -39,7 +39,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 # Enabling it on other platforms produces unresolved `build_script_main_*`
 # symbols at link time (see issue #39).
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
-wreq = { version = "=6.0.0-rc.29", optional = true, features = ["prefix-symbols", "socks"] }
+wreq = { version = "=6.0.0-rc.29", optional = true, features = ["prefix-symbols", "socks", "gzip", "brotli", "deflate", "zstd"] }
 
 [target.'cfg(not(any(target_os = "linux", target_os = "android")))'.dependencies]
-wreq = { version = "=6.0.0-rc.29", optional = true, features = ["socks"] }
+wreq = { version = "=6.0.0-rc.29", optional = true, features = ["socks", "gzip", "brotli", "deflate", "zstd"] }
