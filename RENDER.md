@@ -37,7 +37,7 @@ SVG, canvas, generated content, and animation sampling. Layout is retained and
 invalidated by relevant DOM/style/resource mutations so geometry and capture
 observe the same page state.
 
-This is broad browser-rendering support, not a claim that every long-tail CSS,
+This is browser-rendering support, not a claim that every long-tail CSS,
 DOM, compositor, font, or graphics behavior is already identical to Chromium.
 Test the sites and workflows that matter to you and report reduced fixtures
 for reproducible differences.
@@ -58,7 +58,7 @@ CSS paged-media support.
 
 ## Verification
 
-Rendering changes are checked with deterministic fixtures first, then a broad
+Rendering changes are checked with deterministic fixtures first, then a
 real-site suite against Chromium. Captures must use the same viewport, identity,
 settle policy, animation time, scroll position, and output boundary. Pixel
 error is a regression tripwire, not a standalone correctness verdict; geometry,

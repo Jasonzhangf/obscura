@@ -13,16 +13,16 @@
 </p>
 <p align="center">
   <strong>The open-source headless browser for AI agents and web scraping.</strong><br>
-  Lightweight, stealthy, and built in Rust.
+  Independent, scriptable, and built in Rust.
 </p>
 
 ---
 
 Obscura is a headless browser engine written in Rust for web scraping and AI-agent automation. It runs JavaScript through V8, owns its DOM, layout, and paint pipeline, and exposes Chrome DevTools Protocol (CDP) compatibility for common Puppeteer and Playwright workflows.
 
-### Why Obscura over headless Chrome?
+### How Obscura differs from headless Chrome
 
-Designed for automation at scale, not desktop browsing.
+Obscura is scoped to headless automation rather than desktop browsing.
 
 | Capability | Obscura | Headless Chrome |
 |------------|---------|-----------------|
@@ -41,7 +41,7 @@ workload with identical inputs, before making capacity decisions.
 
 We are working on **Obscura Cloud** the hosted version, with managed infrastructure, residential proxies, and dedicated support. For people who want the engine without operating it themselves.
 
-The open-source engine stays Apache-2.0, fully featured. No feature gating, ever.
+The open-source engine remains available under Apache-2.0.
 
 **[Get on the waitlist →](https://tally.so/r/gDWzdD)**
 <br>
@@ -175,7 +175,7 @@ tar xzf obscura-x86_64-macos.tar.gz
 Download the `.zip` from the releases page and extract it manually.
 ```
 
-No Chrome, no Node.js, no dependencies. Release archives include both
+No Chrome or Node.js runtime is required. Release archives include both
 `obscura` and `obscura-worker`; keep them in the same directory for the
 parallel `scrape` command.
 
@@ -250,12 +250,15 @@ obscura fetch https://example.com --timeout 10
 
 # Capture the settled page as PNG
 obscura fetch https://example.com --screenshot page.png
+
+# The screenshot flag also has a short form
+obscura fetch https://example.com -s page.png
 ```
 
 ## Rendering and capture
 
 Official release archives and the Docker image include the rendering engine.
-It provides modern CSS layout and paint, viewport and full-page screenshots,
+It provides CSS layout and paint, viewport and full-page screenshots,
 scroll-aware fixed and sticky geometry, activity-driven CDP screencasting, and
 raster PDF export without starting Chromium.
 
@@ -266,9 +269,9 @@ await page.screenshot({ path: 'page.png', fullPage: true });
 await page.pdf({ path: 'page.pdf', format: 'A4', printBackground: true });
 ```
 
-The engine covers the common block, inline, flex, grid, table, float,
+The current implementation covers block, inline, flex, grid, table, float,
 positioning, overflow, transform, text, image, SVG, canvas, background, border,
-and animation paths used by modern sites. It remains an evolving independent
+and animation paths. It remains an evolving independent
 engine: long-tail CSS, some Web APIs, media playback, compositor effects, and
 platform font rasterization may differ from Chromium. See the
 [rendering guide](docs/Rendering-screenshots-screencasting-and-PDF.md) for
@@ -359,17 +362,9 @@ await page.evaluate(() => {
 
 ## Benchmarks
 
-Historical page-load samples from the benchmark repository:
-
-| Page | Obscura | Chrome |
-|------|---------|--------|
-| Static HTML | **51 ms** | ~500 ms |
-| JS + XHR + fetch | **84 ms** | ~800 ms |
-| Dynamic scripts | **78 ms** | ~700 ms |
-
-These figures are not universal performance guarantees. The full benchmark
-suite (WPT conformance, obstacle course, real-world corpus, and comparative
-speed tests) lives in a separate repo:
+Performance depends on the page, network, hardware, enabled features, and
+capture settings. The benchmark suite contains WPT conformance checks, an
+obstacle course, a real-world corpus, and comparative speed tests:
 https://github.com/h4ckf0r0day/obscura-benchmark
 
 ## Stealth Mode
@@ -451,7 +446,7 @@ Fetch and render a single page.
 | `--timeout` | `30` | Maximum navigation time in seconds |
 | `--wait` | adaptive, up to `5` | Post-load settling; an explicit value is a fixed delay in seconds |
 | `--selector` | — | Wait for CSS selector |
-| `--screenshot` | — | Write a PNG screenshot (single URL; render-enabled build) |
+| `-s`, `--screenshot` | — | Write a PNG screenshot (single URL; render-enabled build) |
 | `--stealth` | off | Anti-detection mode |
 | `--output` | — | Write dump or eval output to a file |
 | `--quiet` | off | Suppress banner |

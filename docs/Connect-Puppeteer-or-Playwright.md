@@ -1,4 +1,5 @@
-Obscura speaks the Chrome DevTools Protocol over WebSocket. Puppeteer and Playwright connect to it like remote Chrome.
+Obscura speaks the Chrome DevTools Protocol over WebSocket. Puppeteer and
+Playwright can connect to its CDP endpoint for the supported workflows below.
 
 ## Start the server
 

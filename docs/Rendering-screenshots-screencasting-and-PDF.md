@@ -14,6 +14,7 @@ Capture the settled page as a PNG:
 
 ```bash
 obscura fetch https://example.com --screenshot page.png --timeout 30
+# Equivalent short form: obscura fetch https://example.com -s page.png
 ```
 
 JavaScript supplied with `--eval` runs before capture, so it can prepare or
@@ -186,8 +187,8 @@ screencast frames; use the CDP API for that workflow.
 
 ## Current boundaries
 
-Obscura implements broad modern layout and paint support, including block and
-inline formatting, flexbox, grid, tables, floats, positioned/fixed/sticky
+The current renderer implements block and inline formatting, flexbox, grid,
+tables, floats, positioned/fixed/sticky
 boxes, transforms, overflow, text and web fonts, images, SVG, canvas,
 backgrounds, borders, clipping, generated content, and animation sampling.
 

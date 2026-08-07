@@ -33,7 +33,7 @@ Load a URL and print its content or an evaluated expression.
     --stealth                Consistent browser fingerprint + tracker blocking (global)
 -e, --eval <JS>              Evaluate JS, print the result as JSON
 -o, --output <FILE>          Write to a file instead of stdout
-    --screenshot <FILE>      Render the settled page to PNG (single URL)
+-s, --screenshot <FILE>      Capture the settled page as PNG (single URL)
 -q, --quiet                  Suppress info logging
 -v, --verbose                Enable verbose logging
 ```

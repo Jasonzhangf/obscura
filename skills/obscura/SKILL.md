@@ -95,7 +95,7 @@ fixture. Do not introduce hostname-specific rendering logic.
 
 ## Set expectations accurately
 
-Obscura has broad modern layout and paint coverage but is not a bundled Chrome
+Obscura supports many common layout and paint paths but is not a bundled Chrome
 build. Long-tail CSS, service workers, some Web APIs, native media, GPU or
 compositor effects, PDF structure, and platform font rasterization can differ
 from Chromium. Measure performance and fidelity on the user's actual workload;

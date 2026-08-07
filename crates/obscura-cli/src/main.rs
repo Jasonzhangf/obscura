@@ -156,9 +156,8 @@ enum Command {
         #[arg(long)]
         storage_dir: Option<std::path::PathBuf>,
 
-        /// Render the page to a PNG screenshot at this path. Requires a build
-        /// with the `render` feature.
-        #[arg(long)]
+        /// Capture the settled page as a PNG. Requires the `render` feature.
+        #[arg(long, short = 's', value_name = "FILE", conflicts_with = "file")]
         screenshot: Option<std::path::PathBuf>,
     },
 
@@ -2232,6 +2231,34 @@ mod tests {
             Some(Command::Fetch { wait, .. }) => assert_eq!(wait, Some(0)),
             _ => panic!("expected Fetch command"),
         }
+    }
+
+    #[test]
+    fn fetch_screenshot_has_a_short_alias_and_rejects_batch_mode() {
+        let args = Args::try_parse_from([
+            "obscura",
+            "fetch",
+            "https://example.com",
+            "-s",
+            "page.png",
+        ])
+        .unwrap();
+        match args.command {
+            Some(Command::Fetch { screenshot, .. }) => {
+                assert_eq!(screenshot, Some(std::path::PathBuf::from("page.png")));
+            }
+            _ => panic!("expected Fetch command"),
+        }
+
+        assert!(Args::try_parse_from([
+            "obscura",
+            "fetch",
+            "--file",
+            "urls.txt",
+            "--screenshot",
+            "page.png",
+        ])
+        .is_err());
     }
 
     fn configured_fetch_timeout(args: Args) -> std::time::Duration {
