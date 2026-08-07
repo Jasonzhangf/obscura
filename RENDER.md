@@ -1,7 +1,7 @@
 # Obscura rendering engine
 
-Obscura has an optional pure-Rust layout and paint pipeline for browser
-automation. The `render` feature powers live DOM geometry, viewport and
+Obscura has a pure-Rust layout and paint pipeline for browser automation. The
+`render` feature powers live DOM geometry, viewport and
 full-page screenshots, CDP screencasting, and raster PDF export without
 launching Chromium.
 
@@ -11,9 +11,13 @@ building from source, enable it explicitly:
 ```bash
 cargo build --release --features render
 
-# Rendering plus the optional stealth transport
+# Rendering and stealth
 cargo build --release --features render,stealth
 ```
+
+Rendering and stealth are complementary release capabilities. The stealth
+build retains the entire rendering and capture surface while adding the
+wreq/BoringSSL transport and browser-identity protections.
 
 ## Capture surfaces
 

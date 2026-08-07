@@ -62,8 +62,10 @@ See [Build from source](Build-from-source.md).
 - `obscura`: CLI and CDP server.
 - `obscura-worker`: helper for the parallel `scrape` command. Keep both in the same directory.
 
-Standard archives include rendering. Choose the matching archive with a
-`-stealth` suffix when you also need the optional wreq/BoringSSL transport.
+Release archives come in standard and stealth variants. Both include rendering.
+The `-stealth` archives add the wreq/BoringSSL transport and browser-identity
+protections without removing any screenshot, screencast, PDF, CDP, or MCP
+functionality.
 
 ## Smoke test
 

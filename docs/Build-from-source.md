@@ -16,17 +16,18 @@ cargo build --release --features render
 
 Binary is at `./target/release/obscura`.
 
-This produces the release-capable binary, including geometry, screenshots,
-screencasting, and PDF export. A build without `render` remains available for
-text/DOM-only deployments.
+This produces the release binary with geometry, screenshots, screencasting,
+and PDF export.
 
-## With rendering and stealth
+## Rendering and stealth
 
 ```bash
 cargo build --release --features render,stealth
 ```
 
-Adds TLS fingerprint randomization and the tracker blocklist. See [Configure stealth and proxies](Configure-stealth-and-proxies.md).
+This is the complete rendering build with the stealth wreq/BoringSSL transport,
+TLS fingerprint randomization, browser-identity protections, and tracker
+blocklist. See [Configure stealth and proxies](Configure-stealth-and-proxies.md).
 
 The stealth feature builds BoringSSL and generates Rust bindings. In addition
 to the default requirements, install CMake, Clang, and the libclang/LLVM

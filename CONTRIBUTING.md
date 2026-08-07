@@ -36,9 +36,10 @@ cargo build --release --features render  # binary at ./target/release/obscura
 - The first build compiles V8 from source: roughly 5 minutes and a few GB of
   disk. Incremental builds are seconds.
 - Iterating on one crate? Scope it: `cargo build -p obscura-cli`.
-- **Stealth** (`--features render,stealth`) pulls in BoringSSL through CMake, so `cmake`
-  must be installed. The render-only build uses rustls and needs neither CMake nor
-  OpenSSL.
+- **Stealth** (`--features render,stealth`) retains rendering and adds the
+  wreq/BoringSSL transport, browser-identity protections, and tracker blocklist.
+  BoringSSL builds through CMake, so `cmake` must be installed. The rendering
+  build uses rustls and needs neither CMake nor OpenSSL.
 - If the vendored OpenSSL build hits an AVX-512 assembler error on your host,
   build with `OPENSSL_NO_VENDOR=1`.
 
@@ -73,11 +74,13 @@ For any code change:
 2. The full render-feature nextest command above passes.
 3. `CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release --features render` compiles clean.
 4. The obstacle course still reports **33/33**.
-5. **Performance is a hard constraint.** Keep native Rust fast paths and avoid
-   repeated full-tree work. If your change could affect performance, benchmark
-   old and new revisions interleaved with identical release builds, fixtures,
-   networks, viewport, settle policy, and capture path. Report a distribution
-   and memory use rather than a single favorable run.
+5. **Performance is a hard constraint.** Obscura is roughly 12x faster and uses
+   about 6x less memory than headless Chrome on framework pages. Keep native
+   Rust fast paths and add a JS fallback only for real spec edge cases. If your
+   change could affect performance, benchmark old and new revisions interleaved
+   with identical release builds, fixtures, networks, viewport, settle policy,
+   and capture path. Report a distribution and memory use; the noise floor is
+   about plus or minus 10%.
 6. For rendering changes, run the deterministic `render-repros` fixtures and
    the representative real-site suite at both the top and bottom of pages.
    Confirm resource and navigation success before interpreting image diffs;

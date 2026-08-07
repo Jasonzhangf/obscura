@@ -1,15 +1,16 @@
 ---
 name: obscura
-description: Operate and validate Obscura for JavaScript page loading, screenshots and visual comparison, CDP automation with Puppeteer or Playwright, screencasting, PDF export, MCP browser interaction, and web extraction. Use when running Obscura against deterministic fixtures or real sites, diagnosing render, geometry, or resource failures, or choosing the correct CLI, CDP, or MCP workflow.
+description: Operate and validate Obscura for JavaScript page loading, stealth browsing, anti-fingerprinting, tracker blocking, screenshots and visual comparison, CDP automation with Puppeteer or Playwright, screencasting, PDF export, MCP browser interaction, and web extraction. Use when running Obscura against deterministic fixtures or real sites, diagnosing rendering, geometry, resource, identity, or transport failures, or choosing the correct CLI, CDP, MCP, rendering, or stealth workflow.
 ---
 
 # Obscura
 
-Use Obscura as an independent Rust headless browser for automation. It embeds
-V8, owns the DOM and rendering pipeline, and exposes common Chrome DevTools
-Protocol workflows without launching Chromium.
+Use Obscura as a lightweight, stealth-capable Rust headless browser for
+automation. It embeds V8, owns the DOM and rendering pipeline, and exposes
+Chrome DevTools Protocol workflows without launching Chromium. Treat rendering
+and stealth as first-class, complementary capabilities.
 
-## Build the right binary
+## Build variants
 
 Official release archives and Docker images include rendering. For a source
 checkout, build release mode with the render feature:
@@ -18,13 +19,32 @@ checkout, build release mode with the render feature:
 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release --features render
 ```
 
-Add the optional stealth transport only when the task requires it:
+Build rendering and stealth together for the wreq/BoringSSL transport,
+browser-identity protections, and tracker blocking:
 
 ```bash
 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release --features render,stealth
 ```
 
 Use `./target/release/obscura` in the commands below when working from source.
+
+## Use stealth
+
+The stealth build keeps the complete rendering, screenshot, screencast, PDF,
+CDP, and MCP surface. It adds a consistent browser fingerprint across TLS,
+HTTP headers, user agent, navigator, and WebGL surfaces; masks
+`navigator.webdriver`; masks patched native functions; and blocks the built-in
+tracker-domain list.
+
+Enable stealth at runtime with the global `--stealth` flag. It applies to
+`fetch`, `serve`, `scrape`, and `mcp`, before or after the subcommand:
+
+```bash
+obscura --stealth fetch https://example.com --screenshot page.png
+obscura serve --stealth --port 9222
+```
+
+The runtime flag needs a `render,stealth` build for the wreq/BoringSSL transport.
 
 ## Fetch, evaluate, and capture
 
@@ -98,6 +118,6 @@ fixture. Do not introduce hostname-specific rendering logic.
 Obscura supports many common layout and paint paths but is not a bundled Chrome
 build. Long-tail CSS, service workers, some Web APIs, native media, GPU or
 compositor effects, PDF structure, and platform font rasterization can differ
-from Chromium. Measure performance and fidelity on the user's actual workload;
-do not repeat fixed speed, memory, or exact-parity claims without current,
-reproducible evidence.
+from Chromium. Preserve the project's existing positioning and published
+benchmark claims when editing its documentation. Use the benchmark suite and
+matched inputs when adding or updating performance or fidelity measurements.

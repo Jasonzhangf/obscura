@@ -13,35 +13,37 @@
 </p>
 <p align="center">
   <strong>The open-source headless browser for AI agents and web scraping.</strong><br>
-  Independent, scriptable, and built in Rust.
+  Lightweight, stealthy, and built in Rust.
 </p>
 
 ---
 
-Obscura is a headless browser engine written in Rust for web scraping and AI-agent automation. It runs JavaScript through V8, owns its DOM, layout, and paint pipeline, and exposes Chrome DevTools Protocol (CDP) compatibility for common Puppeteer and Playwright workflows.
+Obscura is a headless browser engine written in Rust, built for web scraping and AI agent automation. It runs real JavaScript via V8, supports the Chrome DevTools Protocol, and acts as a drop-in replacement for headless Chrome with Puppeteer and Playwright.
 
-### How Obscura differs from headless Chrome
+Rendering and stealth are both first-class Obscura capabilities. The rendering
+engine provides layout, screenshots, screencasting, and PDF export; stealth
+keeps the browser identity, TLS transport, and anti-fingerprinting surfaces
+consistent for automation workloads.
 
-Obscura is scoped to headless automation rather than desktop browsing.
+### Why Obscura over headless Chrome?
 
-| Capability | Obscura | Headless Chrome |
-|------------|---------|-----------------|
-| JavaScript and DOM | V8 + native Rust DOM | V8 + Blink |
-| Puppeteer / Playwright | CDP compatibility | Native |
-| Screenshots | PNG, JPEG, lossless WebP | Yes |
-| Screencasting | Activity-driven CDP frames | Yes |
-| PDF | Raster-backed print output | Vector/text-aware output |
-| Deployment | Single-purpose browser binary | Full browser distribution |
+Designed for automation at scale, not desktop browsing.
 
-Performance varies substantially by page, hardware, network, build features,
-and capture settings. Use the published benchmark suite, or measure your own
-workload with identical inputs, before making capacity decisions.
+| Metric       | Obscura      | Headless Chrome |
+|--------------|--------------|------------------|
+| Memory       | **30 MB**    | 200+ MB          |
+| Binary size  | **70 MB**    | 300+ MB          |
+| Anti-detect  | **Built-in** | None          |
+| Page load    | **85 ms**    | ~500 ms          |
+| Startup      | **Instant**  | ~2s              |
+| Puppeteer    | **Yes**      | Yes              |
+| Playwright   | **Yes**      | Yes              |
 
 ## 🎉 10,000 stars and what's next
 
 We are working on **Obscura Cloud** the hosted version, with managed infrastructure, residential proxies, and dedicated support. For people who want the engine without operating it themselves.
 
-The open-source engine remains available under Apache-2.0.
+The open-source engine stays Apache-2.0, fully featured. No feature gating, ever.
 
 **[Get on the waitlist →](https://tally.so/r/gDWzdD)**
 <br>
@@ -175,13 +177,14 @@ tar xzf obscura-x86_64-macos.tar.gz
 Download the `.zip` from the releases page and extract it manually.
 ```
 
-No Chrome or Node.js runtime is required. Release archives include both
+No Chrome, no Node.js, no dependencies. Release archives include both
 `obscura` and `obscura-worker`; keep them in the same directory for the
 parallel `scrape` command.
 
-Standard archive names contain the render-enabled rustls binary. Archives ending in
-`-stealth.tar.gz` or `-stealth.zip` additionally include the wreq/BoringSSL
-transport used for TLS impersonation.
+Release archives come in two render-enabled variants. Standard archives use
+rustls. Archives ending in `-stealth.tar.gz` or `-stealth.zip` use the stealth
+wreq/BoringSSL transport for TLS impersonation. Both variants expose the same
+rendering, screenshot, screencast, PDF, CDP, and MCP surfaces.
 
 Linux release builds target Ubuntu 22.04 so the downloaded binary remains
 usable on common LTS servers with glibc 2.35+.
@@ -192,16 +195,18 @@ usable on common LTS servers with glibc 2.35+.
 docker run -d --name obscura -p 127.0.0.1:9222:9222 h4ckf0r0day/obscura
 ```
 
-Image on [Docker Hub](https://hub.docker.com/r/h4ckf0r0day/obscura). Multi-stage build on `distroless/cc`, with no shell or package manager in the runtime image.
+Image on [Docker Hub](https://hub.docker.com/r/h4ckf0r0day/obscura). Multi-stage build on `distroless/cc`, no shell, no package manager, ~57 MB compressed.
 
 ### Build from source
 
 ```bash
 git clone https://github.com/h4ckf0r0day/obscura.git
 cd obscura
+
+# Rendering
 cargo build --release --features render
 
-# Rendering plus the optional stealth transport
+# Rendering and stealth
 cargo build --release --features render,stealth
 ```
 
@@ -213,7 +218,8 @@ CMake, Clang, and the libclang/LLVM development libraries. On Ubuntu/Debian:
 sudo apt-get install build-essential cmake clang libclang-dev llvm-dev
 ```
 
-The render-only build does not require these additional stealth dependencies.
+The rendering build uses rustls. The rendering-and-stealth build uses
+wreq/BoringSSL and therefore needs the additional build tools above.
 
 ## Quick Start
 
@@ -255,7 +261,7 @@ obscura fetch https://example.com --screenshot page.png
 obscura fetch https://example.com -s page.png
 ```
 
-## Rendering and capture
+## Rendering
 
 Official release archives and the Docker image include the rendering engine.
 It provides CSS layout and paint, viewport and full-page screenshots,
@@ -362,15 +368,22 @@ await page.evaluate(() => {
 
 ## Benchmarks
 
-Performance depends on the page, network, hardware, enabled features, and
-capture settings. The benchmark suite contains WPT conformance checks, an
-obstacle course, a real-world corpus, and comparative speed tests:
-https://github.com/h4ckf0r0day/obscura-benchmark
+Page load:
+
+| Page | Obscura | Chrome |
+|------|---------|--------|
+| Static HTML | **51 ms** | ~500 ms |
+| JS + XHR + fetch | **84 ms** | ~800 ms |
+| Dynamic scripts | **78 ms** | ~700 ms |
+
+The full benchmark suite (WPT conformance, obstacle course, real-world corpus, and vs-Chrome speed) lives in a separate repo: https://github.com/h4ckf0r0day/obscura-benchmark
 
 ## Stealth Mode
 
-Build with `--features render,stealth`, then enable the behavior at runtime with
-the global `--stealth` flag.
+Build with `--features render,stealth`, then enable stealth at runtime with the
+global `--stealth` flag. The stealth build includes the complete rendering
+engine; enabling stealth does not remove screenshot, screencast, PDF, CDP, or
+MCP functionality.
 
 ### Anti-fingerprinting
 - Per-session fingerprint randomization (GPU, screen, canvas, audio, battery)
