@@ -29,6 +29,16 @@ This is the complete rendering build with the stealth wreq/BoringSSL transport,
 TLS fingerprint randomization, browser-identity protections, and tracker
 blocklist. See [Configure stealth and proxies](Configure-stealth-and-proxies.md).
 
+## Without rendering
+
+```bash
+cargo build --release --no-default-features
+cargo build --release --no-default-features --features stealth
+```
+
+The second command keeps stealth while excluding layout, screenshots,
+screencasting, and PDF export.
+
 The stealth feature builds BoringSSL and generates Rust bindings. In addition
 to the default requirements, install CMake, Clang, and the libclang/LLVM
 development libraries. On Ubuntu/Debian:

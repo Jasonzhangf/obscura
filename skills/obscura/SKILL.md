@@ -26,6 +26,13 @@ browser-identity protections, and tracker blocking:
 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release --features render,stealth
 ```
 
+Build without rendering when only DOM, extraction, or CDP automation is needed:
+
+```bash
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release --no-default-features
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release --no-default-features --features stealth
+```
+
 Use `./target/release/obscura` in the commands below when working from source.
 
 ## Use stealth

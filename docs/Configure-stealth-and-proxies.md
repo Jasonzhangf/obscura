@@ -15,15 +15,15 @@ What `--stealth` changes:
 - Loads a tracker blocklist that drops requests to known analytics and fingerprinting endpoints.
 - Bundles webpki roots instead of relying on the system store.
 
-Requires a build that includes the stealth feature. The Releases page provides
-explicitly named `-stealth` archives alongside the standard archives. Both
-variants include the complete rendering surface; the stealth archives add the
-wreq/BoringSSL transport and browser-identity protections. To build the stealth
-variant yourself:
+Requires a build that includes the stealth feature. Use a `-stealth` archive
+with rendering or a `-no-render-stealth` archive without it. To build the
+rendering variant yourself:
 
 ```bash
 cargo build --release --features render,stealth
 ```
+
+Omit rendering with `cargo build --release --no-default-features --features stealth`.
 
 ## What stealth handles
 

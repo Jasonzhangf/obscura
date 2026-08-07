@@ -176,10 +176,12 @@ No Chrome, no Node.js, no dependencies. Release archives include both
 `obscura` and `obscura-worker`; keep them in the same directory for the
 parallel `scrape` command.
 
-Release archives come in two render-enabled variants. Standard archives use
-rustls. Archives ending in `-stealth.tar.gz` or `-stealth.zip` use the stealth
-wreq/BoringSSL transport for TLS impersonation. Both variants expose the same
-rendering, screenshot, screencast, PDF, CDP, and MCP surfaces.
+| Archive suffix | Rendering | Stealth transport |
+|----------------|-----------|-------------------|
+| none | Yes | No |
+| `-stealth` | Yes | Yes |
+| `-no-render` | No | No |
+| `-no-render-stealth` | No | Yes |
 
 Linux release builds target Ubuntu 22.04 so the downloaded binary remains
 usable on common LTS servers with glibc 2.35+.
@@ -203,6 +205,12 @@ cargo build --release --features render
 
 # Rendering and stealth
 cargo build --release --features render,stealth
+
+# No rendering
+cargo build --release --no-default-features
+
+# No rendering, with stealth
+cargo build --release --no-default-features --features stealth
 ```
 
 Requires Rust 1.75+ ([rustup.rs](https://rustup.rs)). First build takes ~5 min (V8 compiles from source, cached after).
