@@ -136,7 +136,11 @@ impl Node {
 
     pub fn set_attribute(&mut self, name: &str, value: String) {
         if let NodeData::Element { attrs, .. } = &mut self.data {
-            if let Some(attr) = attrs.iter_mut().find(|a| a.name.local.as_ref() == name) {
+            // Match by qualified name, consistent with get_attribute and the
+            // remove_attribute op. A parsed namespaced attribute is stored with
+            // a separate prefix (e.g. xlink:href -> prefix="xlink", local="href");
+            // matching on local name alone would miss it and push a duplicate.
+            if let Some(attr) = attrs.iter_mut().find(|a| a.qualified_name_eq(name)) {
                 attr.value = value;
             } else {
                 attrs.push(Attribute {

@@ -1683,6 +1683,22 @@ mod tests {
     }
 
     #[test]
+    fn set_attribute_updates_a_parsed_namespaced_attribute_in_place() {
+        // setAttribute matched the stored attribute by local name only, so a
+        // parsed `xlink:href` (prefix=xlink, local=href) was never found by the
+        // qualified name "xlink:href": the update was pushed as a *second*
+        // attribute, getAttribute kept returning the stale original, and the
+        // element serialized `xlink:href` twice.
+        let mut rt = setup_runtime(
+            r##"<html><body><svg><use id="u" xlink:href="#a"></use></svg></body></html>"##,
+        );
+        let v = rt
+            .evaluate("(function(){var u=document.getElementById('u');u.setAttribute('xlink:href','#b');var dup=(u.outerHTML.match(/xlink:href/g)||[]).length;return u.getAttribute('xlink:href')+'|'+u.getAttributeNS('http://www.w3.org/1999/xlink','href')+'|'+u.getAttributeNames().join(',')+'|'+dup;})()")
+            .unwrap();
+        assert_eq!(v, serde_json::json!("#b|#b|id,xlink:href|1"));
+    }
+
+    #[test]
     fn set_attribute_ns_validates_namespace_constraints() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let v = rt
