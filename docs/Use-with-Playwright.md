@@ -139,9 +139,7 @@ await client.send('Page.stopScreencast');
 await client.detach();
 ```
 
-Frames are activity-driven page captures, not fixed-rate desktop video. For
-detailed format and output limits, see
-[Rendering, screenshots, screencasting, and PDF](Rendering-screenshots-screencasting-and-PDF.md).
+Frames are activity-driven page captures, not fixed-rate desktop video.
 
 ## Disconnect
 

@@ -90,8 +90,7 @@ stale after navigation, interaction, scrolling, or a framework rerender. Take
 a fresh snapshot or interactive-element listing before acting again.
 
 MCP exposes still-image and PDF output. It does not stream video frames; use
-CDP `Page.startScreencast` for activity-driven screencasting. See
-[Rendering, screenshots, screencasting, and PDF](Rendering-screenshots-screencasting-and-PDF.md).
+CDP `Page.startScreencast` for activity-driven screencasting.
 
 ## Claude Desktop
 

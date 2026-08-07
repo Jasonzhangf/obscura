@@ -27,7 +27,6 @@ the wreq/BoringSSL transport and browser-identity protections.
 ## Guides
 
 - [Build from source](Build-from-source.md)
-- [Rendering, screenshots, screencasting, and PDF](Rendering-screenshots-screencasting-and-PDF.md)
 - [Configure stealth and proxies](Configure-stealth-and-proxies.md)
 - [Markdown extraction](Markdown-extraction.md)
 - [Use with Puppeteer](Use-with-Puppeteer.md)

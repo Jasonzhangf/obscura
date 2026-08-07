@@ -279,9 +279,10 @@ The current implementation covers block, inline, flex, grid, table, float,
 positioning, overflow, transform, text, image, SVG, canvas, background, border,
 and animation paths. It remains an evolving independent
 engine: long-tail CSS, some Web APIs, media playback, compositor effects, and
-platform font rasterization may differ from Chromium. See the
-[rendering guide](docs/Rendering-screenshots-screencasting-and-PDF.md) for
-scrolling, screencasting, raw CDP, MCP, PDF limits, and comparison methodology.
+platform font rasterization may differ from Chromium. The existing
+[Puppeteer](docs/Use-with-Puppeteer.md),
+[Playwright](docs/Use-with-Playwright.md), and
+[MCP](docs/Use-the-MCP-server.md) guides cover their capture APIs and limits.
 
 ### Start the CDP server
 

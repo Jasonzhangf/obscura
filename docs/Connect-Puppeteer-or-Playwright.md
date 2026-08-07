@@ -96,8 +96,8 @@ await page.pdf({ path: 'page.pdf', format: 'A4', printBackground: true });
 ```
 
 Rendering is included in official binaries and requires `--features render`
-for source builds. See [Rendering, screenshots, screencasting, and PDF](Rendering-screenshots-screencasting-and-PDF.md)
-for scrolling, raw CDP examples, and current output limits.
+for source builds. The client-specific guides cover scrolling, raw CDP
+screencasting, and current output limits.
 
 ## Current limits
 
