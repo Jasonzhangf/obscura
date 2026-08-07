@@ -15,6 +15,10 @@
   <strong>The open-source headless browser for AI agents and web scraping.</strong><br>
   Lightweight, stealthy, and built in Rust.
 </p>
+<h3 align="center">Native rendering is here. No Chromium required. 🎉 </h3>
+<p align="center">
+  Capture screenshots, screencast live pages, and export PDFs directly with Obscura.
+</p>
 
 ---
 
@@ -176,9 +180,12 @@ No Chrome, no Node.js, no dependencies. Release archives include both
 `obscura` and `obscura-worker`; keep them in the same directory for the
 parallel `scrape` command.
 
-Default archive names contain the lean binary. Archives ending in
-`-stealth.tar.gz` or `-stealth.zip` additionally include the wreq/BoringSSL
-transport used for TLS impersonation.
+| Archive suffix | Rendering | Stealth transport |
+|----------------|-----------|-------------------|
+| none | Yes | No |
+| `-stealth` | Yes | Yes |
+| `-no-render` | No | No |
+| `-no-render-stealth` | No | Yes |
 
 Linux release builds target Ubuntu 22.04 so the downloaded binary remains
 usable on common LTS servers with glibc 2.35+.
@@ -196,10 +203,18 @@ Image on [Docker Hub](https://hub.docker.com/r/h4ckf0r0day/obscura). Multi-stage
 ```bash
 git clone https://github.com/h4ckf0r0day/obscura.git
 cd obscura
-cargo build --release
 
-# With stealth mode (anti-detection + tracker blocking)
-cargo build --release --features stealth
+# Rendering
+cargo build --release -p obscura-cli --bins --features render
+
+# Rendering and stealth
+cargo build --release -p obscura-cli --bins --features render,stealth
+
+# No rendering
+cargo build --release -p obscura-cli --bins --no-default-features
+
+# No rendering, with stealth
+cargo build --release -p obscura-cli --bins --no-default-features --features stealth
 ```
 
 Requires Rust 1.75+ ([rustup.rs](https://rustup.rs)). First build takes ~5 min (V8 compiles from source, cached after).
@@ -210,7 +225,8 @@ CMake, Clang, and the libclang/LLVM development libraries. On Ubuntu/Debian:
 sudo apt-get install build-essential cmake clang libclang-dev llvm-dev
 ```
 
-The default build does not require these additional stealth dependencies.
+The rendering build uses rustls. The rendering-and-stealth build uses
+wreq/BoringSSL and therefore needs the additional build tools above.
 
 ## Quick Start
 
@@ -244,7 +260,36 @@ obscura fetch https://example.com --wait-until networkidle0
 
 # Bound navigation time for slow or broken pages
 obscura fetch https://example.com --timeout 10
+
+# Capture the settled page as PNG
+obscura fetch https://example.com --screenshot page.png
+
+# The screenshot flag also has a short form
+obscura fetch https://example.com -s page.png
 ```
+
+## Rendering
+
+Official release archives and the Docker image include the rendering engine.
+It provides CSS layout and paint, viewport and full-page screenshots,
+scroll-aware fixed and sticky geometry, activity-driven CDP screencasting, and
+raster PDF export without starting Chromium.
+
+```javascript
+await page.setViewport({ width: 1440, height: 1000 });
+await page.goto('https://example.com', { waitUntil: 'load' });
+await page.screenshot({ path: 'page.png', fullPage: true });
+await page.pdf({ path: 'page.pdf', format: 'A4', printBackground: true });
+```
+
+The current implementation covers block, inline, flex, grid, table, float,
+positioning, overflow, transform, text, image, SVG, canvas, background, border,
+and animation paths. It remains an evolving independent
+engine: long-tail CSS, some Web APIs, media playback, compositor effects, and
+platform font rasterization may differ from Chromium. The existing
+[Puppeteer](docs/Use-with-Puppeteer.md),
+[Playwright](docs/Use-with-Playwright.md), and
+[MCP](docs/Use-the-MCP-server.md) guides cover their capture APIs and limits.
 
 ### Start the CDP server
 
@@ -343,7 +388,10 @@ The full benchmark suite (WPT conformance, obstacle course, real-world corpus, a
 
 ## Stealth Mode
 
-Enable with `--features stealth`.
+Build with `--features render,stealth`, then enable stealth at runtime with the
+global `--stealth` flag. The stealth build includes the complete rendering
+engine; enabling stealth does not remove screenshot, screencast, PDF, CDP, or
+MCP functionality.
 
 ### Anti-fingerprinting
 - Per-session fingerprint randomization (GPU, screen, canvas, audio, battery)
@@ -366,7 +414,7 @@ Obscura implements the Chrome DevTools Protocol for Puppeteer/Playwright compati
 | Domain | Methods |
 |--------|---------|
 | **Target** | createTarget, closeTarget, attachToTarget, createBrowserContext, disposeBrowserContext |
-| **Page** | navigate, getFrameTree, addScriptToEvaluateOnNewDocument, lifecycleEvents |
+| **Page** | navigate, getFrameTree, lifecycleEvents, captureScreenshot, start/stopScreencast, printToPDF |
 | **Runtime** | evaluate, callFunctionOn, getProperties, addBinding |
 | **DOM** | getDocument, querySelector, querySelectorAll, getOuterHTML, resolveNode |
 | **Network** | enable, setCookies, getCookies, setExtraHTTPHeaders, setUserAgentOverride |
@@ -417,7 +465,9 @@ Fetch and render a single page.
 | `--eval` | — | JavaScript expression to evaluate |
 | `--wait-until` | `load` | Wait: `load`, `domcontentloaded`, `networkidle0` |
 | `--timeout` | `30` | Maximum navigation time in seconds |
+| `--wait` | adaptive, up to `5` | Post-load settling; an explicit value is a fixed delay in seconds |
 | `--selector` | — | Wait for CSS selector |
+| `-s`, `--screenshot` | — | Write a PNG screenshot (single URL; render-enabled build) |
 | `--stealth` | off | Anti-detection mode |
 | `--output` | — | Write dump or eval output to a file |
 | `--quiet` | off | Suppress banner |
@@ -480,9 +530,11 @@ Optional flags (both transports):
 | Tool | Description |
 |------|-------------|
 | `browser_navigate` | Navigate to a URL (`url`, optional `waitUntil`: `load` / `domcontentloaded` / `networkidle0`) |
-| `browser_snapshot` | Return the current page URL, title, and body text |
-| `browser_click` | Click an element by CSS selector |
-| `browser_fill` | Set an input value (triggers `input` + `change` events) |
+| `browser_snapshot` | Return the current page URL, title, readable body text, and element references |
+| `browser_screenshot` | Return the current page as an MCP PNG image (render-enabled build) |
+| `browser_pdf` | Return the current page as an embedded PDF resource (render-enabled build) |
+| `browser_click` | Click by current snapshot reference or CSS selector |
+| `browser_fill` | Set an input value by reference or selector (triggers `input` + `change`) |
 | `browser_type` | Append text to an input |
 | `browser_press_key` | Dispatch a keyboard event (`key`, optional `selector`) |
 | `browser_select_option` | Select an `<option>` by value or text |
@@ -491,6 +543,9 @@ Optional flags (both transports):
 | `browser_network_requests` | List network requests made by the current page |
 | `browser_console_messages` | Return console messages logged by the page |
 | `browser_close` | Close the page and reset browser state |
+
+The MCP server exposes still-image and PDF output. Use CDP when you need the
+streaming `Page.startScreencast` protocol.
 
 ## Integrations
 

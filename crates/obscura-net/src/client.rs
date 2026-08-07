@@ -1,6 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant};
 
 use std::net::{IpAddr, SocketAddr};
 
@@ -8,7 +9,7 @@ use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, USER_AGENT};
 use reqwest::redirect::Policy;
 use reqwest::{Client, Method};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, watch};
 use url::Url;
 
 use crate::cookies::CookieJar;
@@ -123,7 +124,7 @@ pub struct RequestInfo {
     pub resource_type: ResourceType,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub enum ResourceType {
     Document,
     Script,
@@ -133,6 +134,313 @@ pub enum ResourceType {
     Xhr,
     Fetch,
     Other,
+}
+
+/// Fetch metadata for a browser-owned request. Navigation keeps its existing
+/// profile; render resources use this type so they do not masquerade as HTML
+/// documents when they move onto the page's asynchronous transport.
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+pub enum RequestMode {
+    Navigate,
+    NoCors,
+    Cors,
+    SameOrigin,
+}
+
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+pub enum RequestCredentials {
+    Omit,
+    SameOrigin,
+    Include,
+}
+
+impl RequestMode {
+    pub(crate) fn header_value(self) -> &'static str {
+        match self {
+            Self::Navigate => "navigate",
+            Self::NoCors => "no-cors",
+            Self::Cors => "cors",
+            Self::SameOrigin => "same-origin",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceRequest {
+    pub resource_type: ResourceType,
+    /// Origin-bearing environment that owns the request. This controls CORS,
+    /// credentials, and Sec-Fetch-Site and must remain the document/realm for
+    /// every descendant in a module graph.
+    pub initiator: Option<Url>,
+    /// URL used to derive the Referer header. Usually the same as `initiator`,
+    /// but a module dependency is referred by its importing module while its
+    /// credentials mode is still relative to the owning document.
+    pub referrer: Option<Url>,
+    pub mode: RequestMode,
+    pub credentials: RequestCredentials,
+    /// Hard limit for the decoded response body retained by this request.
+    /// Callers can lower it for especially constrained resource consumers.
+    pub max_response_bytes: usize,
+}
+
+impl ResourceRequest {
+    pub fn navigation() -> Self {
+        Self {
+            resource_type: ResourceType::Document,
+            initiator: None,
+            referrer: None,
+            mode: RequestMode::Navigate,
+            credentials: RequestCredentials::Include,
+            max_response_bytes: 64 * 1024 * 1024,
+        }
+    }
+
+    pub fn subresource(resource_type: ResourceType, initiator: &Url) -> Self {
+        let mode = match resource_type {
+            ResourceType::Font | ResourceType::Xhr | ResourceType::Fetch => RequestMode::Cors,
+            ResourceType::Document => RequestMode::Navigate,
+            ResourceType::Script
+            | ResourceType::Stylesheet
+            | ResourceType::Image
+            | ResourceType::Other => RequestMode::NoCors,
+        };
+        let credentials = match resource_type {
+            ResourceType::Document
+            | ResourceType::Script
+            | ResourceType::Stylesheet
+            | ResourceType::Image
+            | ResourceType::Other => RequestCredentials::Include,
+            ResourceType::Font | ResourceType::Xhr | ResourceType::Fetch => {
+                RequestCredentials::SameOrigin
+            }
+        };
+        Self {
+            resource_type,
+            initiator: Some(initiator.clone()),
+            referrer: Some(initiator.clone()),
+            mode,
+            credentials,
+            max_response_bytes: match resource_type {
+                ResourceType::Stylesheet | ResourceType::Font => 16 * 1024 * 1024,
+                ResourceType::Script | ResourceType::Other => 32 * 1024 * 1024,
+                ResourceType::Document
+                | ResourceType::Image
+                | ResourceType::Xhr
+                | ResourceType::Fetch => 64 * 1024 * 1024,
+            },
+        }
+    }
+
+    /// Fetch profile for JavaScript modules. Unlike classic scripts, module
+    /// scripts are CORS-enabled and use `same-origin` credentials by default.
+    /// Keep this separate from `subresource(Script, ..)`, whose no-CORS,
+    /// include-credentials profile is still correct for classic scripts.
+    pub fn module_script(initiator: &Url, referrer: &Url) -> Self {
+        Self {
+            resource_type: ResourceType::Script,
+            initiator: Some(initiator.clone()),
+            referrer: Some(referrer.clone()),
+            mode: RequestMode::Cors,
+            credentials: RequestCredentials::SameOrigin,
+            max_response_bytes: 32 * 1024 * 1024,
+        }
+    }
+
+    pub fn with_max_response_bytes(mut self, max_response_bytes: usize) -> Self {
+        self.max_response_bytes = max_response_bytes;
+        self
+    }
+
+    pub(crate) fn destination(&self) -> &'static str {
+        match self.resource_type {
+            ResourceType::Document => "document",
+            ResourceType::Script => "script",
+            ResourceType::Stylesheet => "style",
+            ResourceType::Image => "image",
+            ResourceType::Font => "font",
+            ResourceType::Xhr | ResourceType::Fetch | ResourceType::Other => "empty",
+        }
+    }
+
+    pub(crate) fn accept(&self) -> &'static str {
+        match self.resource_type {
+            ResourceType::Document => "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+            ResourceType::Stylesheet => "text/css,*/*;q=0.1",
+            // AVIF is intentionally omitted until obscura's decoder can paint
+            // it. Advertising a format and then discarding the selected body
+            // is less faithful than negotiating the best format we can use.
+            ResourceType::Image => "image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+            ResourceType::Script
+            | ResourceType::Font
+            | ResourceType::Xhr
+            | ResourceType::Fetch
+            | ResourceType::Other => "*/*",
+        }
+    }
+
+    pub(crate) fn sends_credentials_to(&self, target: &Url) -> bool {
+        match self.credentials {
+            RequestCredentials::Omit => false,
+            RequestCredentials::Include => true,
+            RequestCredentials::SameOrigin => self
+                .initiator
+                .as_ref()
+                .is_some_and(|initiator| initiator.origin() == target.origin()),
+        }
+    }
+}
+
+pub(crate) struct InFlightGuard {
+    counter: Arc<AtomicU32>,
+}
+
+impl InFlightGuard {
+    pub(crate) fn new(counter: &Arc<AtomicU32>) -> Self {
+        counter.fetch_add(1, Ordering::AcqRel);
+        Self {
+            counter: counter.clone(),
+        }
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+pub(crate) fn same_origin(request: &ResourceRequest, target: &Url) -> bool {
+    request
+        .initiator
+        .as_ref()
+        .is_some_and(|initiator| initiator.origin() == target.origin())
+}
+
+pub(crate) fn cors_required(request: &ResourceRequest, target: &Url) -> bool {
+    request.mode == RequestMode::Cors && !same_origin(request, target)
+}
+
+/// Serialize the request origin used by both the Origin request header and the
+/// response CORS check. A redirect chain that changes origin after it has
+/// already left the initiator origin is tainted and serializes to `null`.
+pub(crate) fn serialized_request_origin(
+    request: &ResourceRequest,
+    redirect_tainted: bool,
+) -> String {
+    if redirect_tainted {
+        return "null".to_string();
+    }
+    request
+        .initiator
+        .as_ref()
+        .filter(|url| matches!(url.scheme(), "http" | "https"))
+        .map(|url| url.origin().ascii_serialization())
+        .unwrap_or_else(|| "null".to_string())
+}
+
+pub(crate) fn redirect_taints_origin(
+    request: &ResourceRequest,
+    current: &Url,
+    next: &Url,
+) -> bool {
+    current.origin() != next.origin()
+        && request
+            .initiator
+            .as_ref()
+            .is_none_or(|initiator| initiator.origin() != current.origin())
+}
+
+pub(crate) fn validate_request_mode(
+    request: &ResourceRequest,
+    target: &Url,
+) -> Result<(), ObscuraNetError> {
+    if request.mode == RequestMode::SameOrigin && !same_origin(request, target) {
+        return Err(ObscuraNetError::Cors(format!(
+            "same-origin request blocked for {}",
+            target
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_cors_response(
+    request: &ResourceRequest,
+    target: &Url,
+    serialized_origin: &str,
+    allow_origin: Option<&str>,
+    allow_credentials: Option<&str>,
+) -> Result<(), ObscuraNetError> {
+    if !cors_required(request, target) {
+        return Ok(());
+    }
+
+    let allow_origin = allow_origin.ok_or_else(|| {
+        ObscuraNetError::Cors(format!(
+            "{} did not include Access-Control-Allow-Origin for origin {}",
+            target, serialized_origin
+        ))
+    })?;
+    if request.credentials != RequestCredentials::Include && allow_origin == "*" {
+        return Ok(());
+    }
+    if allow_origin != serialized_origin {
+        return Err(ObscuraNetError::Cors(format!(
+            "{} returned Access-Control-Allow-Origin {:?}, expected {:?}",
+            target, allow_origin, serialized_origin
+        )));
+    }
+    if request.credentials == RequestCredentials::Include
+        && allow_credentials != Some("true")
+    {
+        return Err(ObscuraNetError::Cors(format!(
+            "credentialed response from {} requires Access-Control-Allow-Credentials: true",
+            target
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn response_too_large(url: &Url, limit: usize) -> ObscuraNetError {
+    ObscuraNetError::ResponseTooLarge {
+        url: url.to_string(),
+        limit,
+    }
+}
+
+pub(crate) fn request_fetch_site(request: &ResourceRequest, target: &Url) -> &'static str {
+    let Some(initiator) = request.initiator.as_ref() else {
+        return "none";
+    };
+    if initiator.origin() == target.origin() {
+        "same-origin"
+    } else {
+        // A public-suffix-aware `same-site` classification will be added with
+        // the page resource scheduler. Until then, cross-site is the safe
+        // conservative value; it never overstates ambient trust.
+        "cross-site"
+    }
+}
+
+pub(crate) fn request_referrer(request: &ResourceRequest, target: &Url) -> Option<String> {
+    let source = request
+        .referrer
+        .as_ref()
+        .or(request.initiator.as_ref())?;
+    if !matches!(source.scheme(), "http" | "https")
+        || !matches!(target.scheme(), "http" | "https")
+        || (source.scheme() == "https" && target.scheme() == "http")
+    {
+        return None;
+    }
+    if source.origin() == target.origin() {
+        let mut value = source.clone();
+        let _ = value.set_username("");
+        let _ = value.set_password(None);
+        value.set_fragment(None);
+        Some(value.to_string())
+    } else {
+        Some(format!("{}/", source.origin().ascii_serialization()))
+    }
 }
 
 pub type RequestCallback = Arc<dyn Fn(&RequestInfo) + Send + Sync>;
@@ -333,7 +641,7 @@ impl Resolve for SsrfGuardResolver {
     }
 }
 
-fn validate_url(url: &Url, allow_private_network: bool) -> Result<(), ObscuraNetError> {
+pub(crate) fn validate_url(url: &Url, allow_private_network: bool) -> Result<(), ObscuraNetError> {
     let allow_private_network = allow_private_network || env_allows_private_network();
     let scheme = url.scheme();
     if scheme != "http" && scheme != "https" && scheme != "file" {
@@ -384,13 +692,24 @@ fn validate_url(url: &Url, allow_private_network: bool) -> Result<(), ObscuraNet
     Ok(())
 }
 
-async fn fetch_file_url(url: &Url) -> Result<Response, ObscuraNetError> {
+pub(crate) async fn fetch_file_url(
+    url: &Url,
+    max_response_bytes: usize,
+) -> Result<Response, ObscuraNetError> {
     let path = url
         .to_file_path()
         .map_err(|_| ObscuraNetError::Network("Invalid file URL".to_string()))?;
+    if let Ok(metadata) = tokio::fs::metadata(&path).await {
+        if metadata.len() > max_response_bytes as u64 {
+            return Err(response_too_large(url, max_response_bytes));
+        }
+    }
     let body = tokio::fs::read(&path)
         .await
         .map_err(|e| ObscuraNetError::Network(format!("Failed to read file: {}", e)))?;
+    if body.len() > max_response_bytes {
+        return Err(response_too_large(url, max_response_bytes));
+    }
 
     let mut headers = HashMap::new();
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
@@ -419,6 +738,98 @@ async fn fetch_file_url(url: &Url) -> Result<Response, ObscuraNetError> {
     })
 }
 
+fn response_header_value<'a>(
+    headers: &'a HeaderMap,
+    name: &'static str,
+    url: &Url,
+) -> Result<Option<&'a str>, ObscuraNetError> {
+    let mut values = headers.get_all(name).iter();
+    let Some(first) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(ObscuraNetError::Cors(format!(
+            "{} returned multiple {} headers",
+            url, name
+        )));
+    }
+    first.to_str().map(Some).map_err(|_| {
+        ObscuraNetError::Cors(format!("{} returned an invalid {} header", url, name))
+    })
+}
+
+fn validate_reqwest_cors_response(
+    request: &ResourceRequest,
+    target: &Url,
+    serialized_origin: &str,
+    headers: &HeaderMap,
+) -> Result<(), ObscuraNetError> {
+    if !cors_required(request, target) {
+        return Ok(());
+    }
+    let allow_origin = response_header_value(
+        headers,
+        "access-control-allow-origin",
+        target,
+    )?;
+    let allow_credentials = response_header_value(
+        headers,
+        "access-control-allow-credentials",
+        target,
+    )?;
+    validate_cors_response(
+        request,
+        target,
+        serialized_origin,
+        allow_origin,
+        allow_credentials,
+    )
+}
+
+fn reject_oversized_content_length(
+    headers: &HeaderMap,
+    url: &Url,
+    limit: usize,
+) -> Result<(), ObscuraNetError> {
+    let Some(value) = headers.get(reqwest::header::CONTENT_LENGTH) else {
+        return Ok(());
+    };
+    let Ok(value) = value.to_str() else {
+        return Ok(());
+    };
+    if value
+        .trim()
+        .parse::<u64>()
+        .is_ok_and(|length| length > limit as u64)
+    {
+        return Err(response_too_large(url, limit));
+    }
+    Ok(())
+}
+
+async fn read_reqwest_body_limited(
+    mut response: reqwest::Response,
+    url: &Url,
+    limit: usize,
+) -> Result<Vec<u8>, ObscuraNetError> {
+    reject_oversized_content_length(response.headers(), url, limit)?;
+    let capacity = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or(0)
+        .min(limit);
+    let mut body = Vec::with_capacity(capacity);
+    while let Some(chunk) = response.chunk().await.map_err(|error| {
+        ObscuraNetError::Network(format!("Failed to read body: {}", error))
+    })? {
+        if chunk.len() > limit.saturating_sub(body.len()) {
+            return Err(response_too_large(url, limit));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 pub struct ObscuraHttpClient {
     client: tokio::sync::OnceCell<Client>,
     proxy_url: Option<String>,
@@ -429,10 +840,147 @@ pub struct ObscuraHttpClient {
     pub timeout: Duration,
     pub in_flight: Arc<std::sync::atomic::AtomicU32>,
     pub block_trackers: bool,
+    resource_loader: std::sync::Mutex<ResourceLoaderState>,
     /// When true, `validate_url` lets localhost / RFC1918 / link-local addresses
     /// through in addition to the `OBSCURA_ALLOW_PRIVATE_NETWORK` env var.
     /// Set via `--allow-private-network` on the CLI (issue #33).
     pub allow_private_network: bool,
+}
+
+const RESOURCE_CACHE_MAX_ENTRIES: usize = 256;
+const RESOURCE_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct ResourceCacheKey {
+    url: String,
+    resource_type: ResourceType,
+    mode: RequestMode,
+    credentials: RequestCredentials,
+    initiator: Option<String>,
+    referrer: Option<String>,
+    user_agent: String,
+    extra_headers: Vec<(String, String)>,
+    max_response_bytes: usize,
+}
+
+#[derive(Clone)]
+struct ResourceCacheEntry {
+    response: Response,
+    expires_at: Instant,
+}
+
+#[derive(Default)]
+struct ResourceCache {
+    entries: HashMap<ResourceCacheKey, ResourceCacheEntry>,
+    insertion_order: VecDeque<ResourceCacheKey>,
+    body_bytes: usize,
+}
+
+#[derive(Default)]
+struct ResourceLoaderState {
+    cache: ResourceCache,
+    shared_fetches: HashMap<ResourceCacheKey, SharedFetchSender>,
+}
+
+#[derive(Clone)]
+enum SharedFetchOutcome {
+    Cacheable(Response),
+    RetryUncoalesced,
+}
+
+type SharedFetchSender = watch::Sender<Option<SharedFetchOutcome>>;
+
+struct SharedFetchLeader<'a> {
+    loader: &'a std::sync::Mutex<ResourceLoaderState>,
+    key: ResourceCacheKey,
+    sender: SharedFetchSender,
+    finished: bool,
+}
+
+impl SharedFetchLeader<'_> {
+    fn finish(mut self, outcome: SharedFetchOutcome) {
+        self.loader.lock().unwrap().shared_fetches.remove(&self.key);
+        let _ = self.sender.send(Some(outcome));
+        self.finished = true;
+    }
+}
+
+impl Drop for SharedFetchLeader<'_> {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.loader.lock().unwrap().shared_fetches.remove(&self.key);
+        let _ = self.sender.send(Some(SharedFetchOutcome::RetryUncoalesced));
+    }
+}
+
+impl ResourceCache {
+    fn get(&mut self, key: &ResourceCacheKey) -> Option<Response> {
+        let entry = self.entries.get(key)?;
+        if entry.expires_at <= Instant::now() {
+            let expired = self.entries.remove(key)?;
+            self.body_bytes = self.body_bytes.saturating_sub(expired.response.body.len());
+            return None;
+        }
+        Some(entry.response.clone())
+    }
+
+    fn insert(&mut self, key: ResourceCacheKey, response: Response, lifetime: Duration) {
+        let response_bytes = response.body.len();
+        if response_bytes > RESOURCE_CACHE_MAX_BYTES {
+            return;
+        }
+        if let Some(previous) = self.entries.remove(&key) {
+            self.body_bytes = self.body_bytes.saturating_sub(previous.response.body.len());
+            self.insertion_order.retain(|queued| queued != &key);
+        }
+        while self.entries.len() >= RESOURCE_CACHE_MAX_ENTRIES
+            || self.body_bytes.saturating_add(response_bytes) > RESOURCE_CACHE_MAX_BYTES
+        {
+            let Some(oldest) = self.insertion_order.pop_front() else {
+                break;
+            };
+            if let Some(entry) = self.entries.remove(&oldest) {
+                self.body_bytes = self.body_bytes.saturating_sub(entry.response.body.len());
+            }
+        }
+        self.body_bytes = self.body_bytes.saturating_add(response_bytes);
+        self.insertion_order.push_back(key.clone());
+        self.entries.insert(
+            key,
+            ResourceCacheEntry {
+                response,
+                expires_at: Instant::now() + lifetime,
+            },
+        );
+    }
+}
+
+fn response_cache_lifetime(response: &Response) -> Option<Duration> {
+    if !(200..300).contains(&response.status)
+        || !response.redirected_from.is_empty()
+        || response.header("set-cookie").is_some()
+        || response
+            .header("vary")
+            .is_some_and(|vary| vary.split(',').any(|name| name.trim() == "*"))
+    {
+        return None;
+    }
+    let cache_control = response.header("cache-control")?;
+    let mut max_age = None;
+    for directive in cache_control.split(',').map(str::trim) {
+        let lower = directive.to_ascii_lowercase();
+        if lower == "no-store" || lower == "no-cache" {
+            return None;
+        }
+        if let Some(value) = lower.strip_prefix("max-age=") {
+            max_age = value.trim_matches('"').parse::<u64>().ok();
+        }
+    }
+    max_age
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
 }
 
 /// Derive the sec-ch-ua and sec-ch-ua-platform client-hint header values from a
@@ -505,6 +1053,7 @@ impl ObscuraHttpClient {
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             timeout: Duration::from_secs(30),
             block_trackers: false,
+            resource_loader: std::sync::Mutex::new(ResourceLoaderState::default()),
             allow_private_network,
         }
     }
@@ -513,7 +1062,7 @@ impl ObscuraHttpClient {
         self.client.get_or_init(|| async {
             let mut builder = Client::builder()
                 .redirect(Policy::none())
-                .timeout(Duration::from_secs(30))
+                .timeout(self.timeout)
                 .danger_accept_invalid_certs(false)
                 // SSRF guard: reject hostnames that resolve to a private/loopback IP.
                 .dns_resolver(Arc::new(SsrfGuardResolver::new(self.allow_private_network)))
@@ -591,10 +1140,235 @@ impl ObscuraHttpClient {
         initial_body: Option<Vec<u8>>,
         callbacks: Option<&CallbackRegistry>,
     ) -> Result<Response, ObscuraNetError> {
+        self.fetch_with_profile(
+            initial_method,
+            url,
+            initial_body,
+            callbacks,
+            ResourceRequest::navigation(),
+        )
+        .await
+    }
+
+    /// Fetch a non-navigation resource through the same validated client,
+    /// cookie jar, proxy, connection pool, interception and callback path as
+    /// the owning page. The renderer can seed its byte cache from this result
+    /// instead of opening a second synchronous HTTP stack.
+    pub async fn fetch_resource_with_callbacks(
+        &self,
+        url: &Url,
+        request: ResourceRequest,
+        callbacks: Option<&CallbackRegistry>,
+    ) -> Result<Response, ObscuraNetError> {
+        self.fetch_with_profile(Method::GET, url, None, callbacks, request)
+            .await
+    }
+
+    async fn resource_cache_key(
+        &self,
+        method: &Method,
+        url: &Url,
+        body: &Option<Vec<u8>>,
+        request: &ResourceRequest,
+    ) -> Option<ResourceCacheKey> {
+        if *method != Method::GET
+            || body.is_some()
+            || request.resource_type == ResourceType::Document
+            || !matches!(url.scheme(), "http" | "https")
+            || self.interceptor.read().await.is_some()
+        {
+            return None;
+        }
+        let mut extra_headers = self
+            .extra_headers
+            .read()
+            .await
+            .iter()
+            .map(|(name, value)| (name.to_ascii_lowercase(), value.clone()))
+            .collect::<Vec<_>>();
+        extra_headers.sort();
+        if extra_headers.iter().any(|(name, value)| {
+            name == "authorization"
+                || name == "cookie"
+                || (name == "cache-control"
+                    && (value.to_ascii_lowercase().contains("no-cache")
+                        || value.to_ascii_lowercase().contains("no-store")))
+        }) {
+            return None;
+        }
+        if request.sends_credentials_to(url) && !self.cookie_jar.get_cookie_header(url).is_empty() {
+            return None;
+        }
+        Some(ResourceCacheKey {
+            url: url.to_string(),
+            resource_type: request.resource_type,
+            mode: request.mode,
+            credentials: request.credentials,
+            initiator: request.initiator.as_ref().map(ToString::to_string),
+            referrer: request.referrer.as_ref().map(ToString::to_string),
+            user_agent: self.user_agent.read().await.clone(),
+            extra_headers,
+            max_response_bytes: request.max_response_bytes,
+        })
+    }
+
+    async fn fetch_with_profile(
+        &self,
+        initial_method: Method,
+        url: &Url,
+        initial_body: Option<Vec<u8>>,
+        callbacks: Option<&CallbackRegistry>,
+        request: ResourceRequest,
+    ) -> Result<Response, ObscuraNetError> {
+        let Some(cache_key) = self
+            .resource_cache_key(&initial_method, url, &initial_body, &request)
+            .await
+        else {
+            return self
+                .fetch_with_profile_uncached(initial_method, url, initial_body, callbacks, request)
+                .await;
+        };
+
+        enum Acquisition {
+            Cached(Response),
+            Follower(watch::Receiver<Option<SharedFetchOutcome>>),
+            Leader(SharedFetchSender),
+        }
+
+        // Cache lookup and leader election are one critical section.  Without
+        // that atomicity a request can miss the cache, pause, and install a
+        // second leader after the first request has already populated it.
+        let acquisition = {
+            let mut loader = self.resource_loader.lock().unwrap();
+            if let Some(response) = loader.cache.get(&cache_key) {
+                Acquisition::Cached(response)
+            } else if let Some(sender) = loader.shared_fetches.get(&cache_key) {
+                Acquisition::Follower(sender.subscribe())
+            } else {
+                let (sender, _receiver) = watch::channel(None);
+                loader
+                    .shared_fetches
+                    .insert(cache_key.clone(), sender.clone());
+                Acquisition::Leader(sender)
+            }
+        };
+
+        match acquisition {
+            Acquisition::Cached(response) => {
+                self.fire_logical_resource_callbacks(callbacks, url, &request, &response)
+                    .await;
+                Ok(response)
+            }
+            Acquisition::Follower(mut receiver) => loop {
+                let outcome = { receiver.borrow().clone() };
+                if let Some(outcome) = outcome {
+                    break match outcome {
+                        SharedFetchOutcome::Cacheable(response) => {
+                            self.fire_logical_resource_callbacks(
+                                callbacks, url, &request, &response,
+                            )
+                            .await;
+                            Ok(response)
+                        }
+                        SharedFetchOutcome::RetryUncoalesced => {
+                            self.fetch_with_profile_uncached(
+                                initial_method,
+                                url,
+                                initial_body,
+                                callbacks,
+                                request,
+                            )
+                            .await
+                        }
+                    };
+                }
+                if receiver.changed().await.is_err() {
+                    break self
+                        .fetch_with_profile_uncached(
+                            initial_method,
+                            url,
+                            initial_body,
+                            callbacks,
+                            request,
+                        )
+                        .await;
+                }
+            },
+            Acquisition::Leader(sender) => {
+                // If this future is cancelled or panics while awaiting I/O,
+                // the guard removes the stale leader and wakes followers so
+                // they can retry instead of waiting forever.
+                let leader = SharedFetchLeader {
+                    loader: &self.resource_loader,
+                    key: cache_key.clone(),
+                    sender,
+                    finished: false,
+                };
+                let result = self
+                    .fetch_with_profile_uncached(
+                        initial_method,
+                        url,
+                        initial_body,
+                        callbacks,
+                        request,
+                    )
+                    .await;
+                let shared_outcome = match &result {
+                    Ok(response) => match response_cache_lifetime(response) {
+                        Some(lifetime) => {
+                            self.resource_loader.lock().unwrap().cache.insert(
+                                cache_key,
+                                response.clone(),
+                                lifetime,
+                            );
+                            SharedFetchOutcome::Cacheable(response.clone())
+                        }
+                        None => SharedFetchOutcome::RetryUncoalesced,
+                    },
+                    Err(_) => SharedFetchOutcome::RetryUncoalesced,
+                };
+                leader.finish(shared_outcome);
+                result
+            }
+        }
+    }
+
+    /// A cache hit or shared transport still represents an independent page
+    /// request.  Keep passive request/response observers at logical-resource
+    /// granularity even when only one HTTP transaction reaches the server.
+    async fn fire_logical_resource_callbacks(
+        &self,
+        callbacks: Option<&CallbackRegistry>,
+        url: &Url,
+        request: &ResourceRequest,
+        response: &Response,
+    ) {
+        let Some(callbacks) = callbacks else {
+            return;
+        };
+        let request_info = RequestInfo {
+            url: url.clone(),
+            method: Method::GET.to_string(),
+            headers: self.extra_headers.read().await.clone(),
+            resource_type: request.resource_type,
+        };
+        callbacks.fire_request(&request_info).await;
+        callbacks.fire_response(&request_info, response).await;
+    }
+
+    async fn fetch_with_profile_uncached(
+        &self,
+        initial_method: Method,
+        url: &Url,
+        initial_body: Option<Vec<u8>>,
+        callbacks: Option<&CallbackRegistry>,
+        request: ResourceRequest,
+    ) -> Result<Response, ObscuraNetError> {
         validate_url(url, self.allow_private_network)?;
+        validate_request_mode(&request, url)?;
 
         if url.scheme() == "file" {
-            return fetch_file_url(url).await;
+            return fetch_file_url(url, request.max_response_bytes).await;
         }
 
         let mut method = initial_method;
@@ -617,13 +1391,16 @@ impl ObscuraHttpClient {
         let mut current_url = url.clone();
         let mut redirects = Vec::new();
         let max_redirects = 20;
+        let mut redirect_tainted = false;
+        let mut request_callback_fired = false;
 
         for _redirect_count in 0..max_redirects {
+            validate_request_mode(&request, &current_url)?;
             let request_info = RequestInfo {
                 url: current_url.clone(),
                 method: method.to_string(),
                 headers: self.extra_headers.read().await.clone(),
-                resource_type: ResourceType::Document,
+                resource_type: request.resource_type.clone(),
             };
 
             if let Some(interceptor) = self.interceptor.read().await.as_ref() {
@@ -642,8 +1419,11 @@ impl ObscuraHttpClient {
                 }
             }
 
-            if let Some(cbs) = callbacks {
-                cbs.fire_request(&request_info).await;
+            if !request_callback_fired {
+                if let Some(cbs) = callbacks {
+                    cbs.fire_request(&request_info).await;
+                }
+                request_callback_fired = true;
             }
 
             let ua = self.user_agent.read().await.clone();
@@ -663,24 +1443,47 @@ impl ObscuraHttpClient {
                 HeaderValue::from_str(&sec_ch_ua_platform)
                     .unwrap_or_else(|_| HeaderValue::from_static("\"Windows\"")),
             );
-            headers.insert(HeaderName::from_static("upgrade-insecure-requests"), HeaderValue::from_static("1"));
+            if request.mode == RequestMode::Navigate {
+                headers.insert(HeaderName::from_static("upgrade-insecure-requests"), HeaderValue::from_static("1"));
+            }
             headers.insert(USER_AGENT, HeaderValue::from_str(&ua).unwrap_or_else(|_| {
                 HeaderValue::from_static("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36")
             }));
             headers.insert(
                 reqwest::header::ACCEPT,
-                HeaderValue::from_static("text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"),
+                HeaderValue::from_static(request.accept()),
             );
-            headers.insert(HeaderName::from_static("sec-fetch-site"), HeaderValue::from_static("none"));
-            headers.insert(HeaderName::from_static("sec-fetch-mode"), HeaderValue::from_static("navigate"));
-            headers.insert(HeaderName::from_static("sec-fetch-user"), HeaderValue::from_static("?1"));
-            headers.insert(HeaderName::from_static("sec-fetch-dest"), HeaderValue::from_static("document"));
+            headers.insert(
+                HeaderName::from_static("sec-fetch-site"),
+                HeaderValue::from_static(request_fetch_site(&request, &current_url)),
+            );
+            headers.insert(
+                HeaderName::from_static("sec-fetch-mode"),
+                HeaderValue::from_static(request.mode.header_value()),
+            );
+            if request.mode == RequestMode::Navigate {
+                headers.insert(HeaderName::from_static("sec-fetch-user"), HeaderValue::from_static("?1"));
+            }
+            headers.insert(
+                HeaderName::from_static("sec-fetch-dest"),
+                HeaderValue::from_static(request.destination()),
+            );
+            if let Some(referer) = request_referrer(&request, &current_url) {
+                if let Ok(value) = HeaderValue::from_str(&referer) {
+                    headers.insert(reqwest::header::REFERER, value);
+                }
+            }
+            let request_origin = serialized_request_origin(&request, redirect_tainted);
             headers.insert(
                 reqwest::header::ACCEPT_LANGUAGE,
                 HeaderValue::from_static("en-US,en;q=0.9"),
             );
 
-            let cookie_header = self.cookie_jar.get_cookie_header(&current_url);
+            let cookie_header = if request.sends_credentials_to(&current_url) {
+                self.cookie_jar.get_cookie_header(&current_url)
+            } else {
+                String::new()
+            };
             tracing::debug!(
                 "Cookie header for {}: {} cookies ({} bytes)",
                 current_url.host_str().unwrap_or("?"),
@@ -719,6 +1522,15 @@ impl ObscuraHttpClient {
                     headers.insert(name, val);
                 }
             }
+            // Origin is a forbidden browser request header. Keep it derived
+            // from the initiator even when callers supplied extra headers.
+            if cors_required(&request, &current_url) {
+                if let Ok(value) = HeaderValue::from_str(&request_origin) {
+                    headers.insert(reqwest::header::ORIGIN, value);
+                }
+            } else {
+                headers.remove(reqwest::header::ORIGIN);
+            }
 
             let mut req_builder = self.get_client().await.request(method.clone(), current_url.as_str())
                 .headers(headers);
@@ -733,18 +1545,24 @@ impl ObscuraHttpClient {
                 req_builder = req_builder.body(b.clone());
             }
 
-            self.in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let in_flight = InFlightGuard::new(&self.in_flight);
             let resp = req_builder.send().await.map_err(|e| {
-                self.in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 ObscuraNetError::Network(format!("{}: {}", current_url, e))
             })?;
-            self.in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
 
             let status = resp.status();
+            validate_reqwest_cors_response(
+                &request,
+                &current_url,
+                &request_origin,
+                resp.headers(),
+            )?;
 
-            for val in resp.headers().get_all(reqwest::header::SET_COOKIE) {
-                if let Ok(s) = val.to_str() {
-                    self.cookie_jar.set_cookie(s, &current_url);
+            if request.sends_credentials_to(&current_url) {
+                for val in resp.headers().get_all(reqwest::header::SET_COOKIE) {
+                    if let Ok(s) = val.to_str() {
+                        self.cookie_jar.set_cookie(s, &current_url);
+                    }
                 }
             }
 
@@ -763,6 +1581,9 @@ impl ObscuraHttpClient {
                         ObscuraNetError::Network(format!("Invalid redirect URL: {}", e))
                     })?;
                     validate_url(&next_url, self.allow_private_network)?;
+                    validate_request_mode(&request, &next_url)?;
+                    redirect_tainted |=
+                        redirect_taints_origin(&request, &current_url, &next_url);
                     redirects.push(current_url.clone());
                     current_url = next_url;
                     if status == reqwest::StatusCode::MOVED_PERMANENTLY
@@ -776,9 +1597,13 @@ impl ObscuraHttpClient {
                 }
             }
 
-            let body_bytes = resp.bytes().await.map_err(|e| {
-                ObscuraNetError::Network(format!("Failed to read body: {}", e))
-            })?.to_vec();
+            let body_bytes = read_reqwest_body_limited(
+                resp,
+                &current_url,
+                request.max_response_bytes,
+            )
+            .await?;
+            drop(in_flight);
 
             let response = Response {
                 url: current_url,
@@ -831,16 +1656,29 @@ pub enum ObscuraNetError {
 
     #[error("Request blocked: {0}")]
     Blocked(String),
+
+    #[error("CORS error: {0}")]
+    Cors(String),
+
+    #[error("Response body exceeded {limit} byte limit: {url}")]
+    ResponseTooLarge { url: String, limit: usize },
 }
 
 #[cfg(test)]
 mod ssrf_tests {
-    use super::{is_forbidden_ip, validate_url, ObscuraHttpClient, SsrfGuardResolver};
+    use super::{
+        is_forbidden_ip, request_fetch_site, request_referrer, validate_url,
+        CallbackRegistry, ObscuraHttpClient, ObscuraNetError, RequestCredentials, RequestMode,
+        ResourceRequest, ResourceType, SsrfGuardResolver,
+    };
     use crate::cookies::CookieJar;
     use reqwest::dns::{Name, Resolve};
+    use std::collections::HashMap;
     use std::net::IpAddr;
     use std::str::FromStr;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
     use url::Url;
 
     fn ip(s: &str) -> IpAddr {
@@ -899,6 +1737,680 @@ mod ssrf_tests {
         assert!(validate_url(&Url::parse("http://example.com/").unwrap(), false).is_ok());
         // The allow flag bypasses the guard (local-dev escape hatch).
         assert!(validate_url(&Url::parse("http://127.0.0.1/").unwrap(), true).is_ok());
+    }
+
+    #[test]
+    fn resource_profiles_use_type_specific_fetch_metadata() {
+        let document = Url::parse("https://app.example/page?q=1#fragment").unwrap();
+        let image = ResourceRequest::subresource(ResourceType::Image, &document);
+        assert_eq!(image.mode, RequestMode::NoCors);
+        assert_eq!(image.credentials, RequestCredentials::Include);
+        assert_eq!(image.destination(), "image");
+        assert!(image.accept().starts_with("image/webp"));
+
+        let stylesheet = ResourceRequest::subresource(ResourceType::Stylesheet, &document);
+        assert_eq!(stylesheet.destination(), "style");
+        assert_eq!(stylesheet.accept(), "text/css,*/*;q=0.1");
+
+        let font = ResourceRequest::subresource(ResourceType::Font, &document);
+        assert_eq!(font.mode, RequestMode::Cors);
+        assert_eq!(font.credentials, RequestCredentials::SameOrigin);
+        assert_eq!(font.destination(), "font");
+        assert_eq!(font.accept(), "*/*");
+
+        assert!(image.sends_credentials_to(
+            &Url::parse("https://cdn.example/image.png").unwrap()
+        ));
+        assert!(font.sends_credentials_to(
+            &Url::parse("https://app.example/font.woff2").unwrap()
+        ));
+        assert!(!font.sends_credentials_to(
+            &Url::parse("https://cdn.example/font.woff2").unwrap()
+        ));
+
+        let module = ResourceRequest::module_script(&document, &document);
+        assert_eq!(module.resource_type, ResourceType::Script);
+        assert_eq!(module.mode, RequestMode::Cors);
+        assert_eq!(module.credentials, RequestCredentials::SameOrigin);
+        assert_eq!(module.destination(), "script");
+        assert_eq!(module.accept(), "*/*");
+        assert!(module.sends_credentials_to(
+            &Url::parse("https://app.example/chunk.js").unwrap()
+        ));
+        assert!(!module.sends_credentials_to(
+            &Url::parse("https://cdn.example/chunk.js").unwrap()
+        ));
+    }
+
+    #[test]
+    fn subresource_referrer_and_fetch_site_follow_default_browser_policy() {
+        let source = Url::parse("https://user:secret@app.example/path?q=1#frag").unwrap();
+        let request = ResourceRequest::subresource(ResourceType::Image, &source);
+        let same_origin = Url::parse("https://app.example/image.png").unwrap();
+        let cross_origin = Url::parse("https://cdn.example/image.png").unwrap();
+        let downgrade = Url::parse("http://cdn.example/image.png").unwrap();
+
+        assert_eq!(request_fetch_site(&request, &same_origin), "same-origin");
+        assert_eq!(request_fetch_site(&request, &cross_origin), "cross-site");
+        assert_eq!(
+            request_referrer(&request, &same_origin).as_deref(),
+            Some("https://app.example/path?q=1")
+        );
+        assert_eq!(
+            request_referrer(&request, &cross_origin).as_deref(),
+            Some("https://app.example/")
+        );
+        assert_eq!(request_referrer(&request, &downgrade), None);
+    }
+
+    async fn http_fixture(
+        responses: Vec<String>,
+    ) -> (Url, tokio::sync::mpsc::UnboundedReceiver<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            for response in responses {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 2048];
+                loop {
+                    let Ok(read) = stream.read(&mut buffer).await else {
+                        return;
+                    };
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let _ = request_tx.send(String::from_utf8_lossy(&request).into_owned());
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (
+            Url::parse(&format!("http://{address}/resource")).unwrap(),
+            request_rx,
+        )
+    }
+
+    fn ok_response(headers: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[tokio::test]
+    async fn cross_origin_font_sends_origin_and_omits_cross_origin_cookies() {
+        let (target, mut received) = http_fixture(vec![ok_response(
+            "Access-Control-Allow-Origin: *\r\nSet-Cookie: rejected=1; Path=/\r\n",
+            "font",
+        )])
+        .await;
+        let initiator = Url::parse("http://127.0.0.1:1/page").unwrap();
+        let jar = Arc::new(CookieJar::new());
+        jar.set_cookie("seed=1; Path=/", &target);
+        let client = ObscuraHttpClient::with_full_options(jar.clone(), None, true);
+
+        let response = client
+            .fetch_resource_with_callbacks(
+                &target,
+                ResourceRequest::subresource(ResourceType::Font, &initiator),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.body, b"font");
+        let request = received.recv().await.unwrap().to_ascii_lowercase();
+        assert!(request.contains("origin: http://127.0.0.1:1\r\n"));
+        assert!(request.contains("sec-fetch-mode: cors\r\n"));
+        assert!(request.contains("sec-fetch-dest: font\r\n"));
+        assert!(!request.contains("cookie:"));
+        assert_eq!(jar.get_cookie_header(&target), "seed=1");
+    }
+
+    #[tokio::test]
+    async fn cross_origin_module_uses_cors_script_profile_without_credentials() {
+        let (target, mut received) = http_fixture(vec![ok_response(
+            "Access-Control-Allow-Origin: *\r\nSet-Cookie: rejected=1; Path=/\r\n",
+            "export default 1;",
+        )])
+        .await;
+        let initiator = Url::parse("http://127.0.0.1:1/page").unwrap();
+        let importing_module = target.join("/parent.js").unwrap();
+        let jar = Arc::new(CookieJar::new());
+        jar.set_cookie("seed=1; Path=/", &target);
+        let client = ObscuraHttpClient::with_full_options(jar.clone(), None, true);
+
+        let response = client
+            .fetch_resource_with_callbacks(
+                &target,
+                ResourceRequest::module_script(&initiator, &importing_module),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.body, b"export default 1;");
+        let request = received.recv().await.unwrap().to_ascii_lowercase();
+        assert!(request.contains("origin: http://127.0.0.1:1\r\n"));
+        assert!(request.contains("sec-fetch-mode: cors\r\n"));
+        assert!(request.contains("sec-fetch-dest: script\r\n"));
+        assert!(request.contains(&format!("referer: {}\r\n", importing_module)));
+        assert!(!request.contains("cookie:"));
+        assert_eq!(jar.get_cookie_header(&target), "seed=1");
+    }
+
+    #[tokio::test]
+    async fn credentialed_cors_rejects_wildcard_and_accepts_exact_origin() {
+        let initiator = Url::parse("http://127.0.0.1:1/page").unwrap();
+        let wildcard = ok_response(
+            "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Credentials: true\r\n",
+            "blocked",
+        );
+        let exact = ok_response(
+            "Access-Control-Allow-Origin: http://127.0.0.1:1\r\nAccess-Control-Allow-Credentials: true\r\nSet-Cookie: accepted=1; Path=/\r\n",
+            "allowed",
+        );
+        let (target, mut received) = http_fixture(vec![wildcard, exact]).await;
+        let jar = Arc::new(CookieJar::new());
+        jar.set_cookie("seed=1; Path=/", &target);
+        let client = ObscuraHttpClient::with_full_options(jar.clone(), None, true);
+        let mut request = ResourceRequest::subresource(ResourceType::Image, &initiator);
+        request.mode = RequestMode::Cors;
+        request.credentials = RequestCredentials::Include;
+
+        let error = client
+            .fetch_resource_with_callbacks(&target, request.clone(), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ObscuraNetError::Cors(_)));
+        client
+            .fetch_resource_with_callbacks(&target, request, None)
+            .await
+            .unwrap();
+
+        let first = received.recv().await.unwrap().to_ascii_lowercase();
+        let second = received.recv().await.unwrap().to_ascii_lowercase();
+        assert!(first.contains("cookie: seed=1\r\n"));
+        assert!(second.contains("cookie: seed=1\r\n"));
+        let cookies = jar.get_cookie_header(&target);
+        assert!(cookies.contains("seed=1"));
+        assert!(cookies.contains("accepted=1"));
+    }
+
+    #[tokio::test]
+    async fn same_origin_font_needs_no_cors_header_and_sends_cookies() {
+        let (target, mut received) = http_fixture(vec![ok_response("", "same")]).await;
+        let mut initiator = target.clone();
+        initiator.set_path("/page");
+        let jar = Arc::new(CookieJar::new());
+        jar.set_cookie("same=1; Path=/", &target);
+        let client = ObscuraHttpClient::with_full_options(jar, None, true);
+        client
+            .fetch_resource_with_callbacks(
+                &target,
+                ResourceRequest::subresource(ResourceType::Font, &initiator),
+                None,
+            )
+            .await
+            .unwrap();
+        let request = received.recv().await.unwrap().to_ascii_lowercase();
+        assert!(!request.contains("origin:"));
+        assert!(request.contains("cookie: same=1\r\n"));
+    }
+
+    #[tokio::test]
+    async fn response_limits_reject_content_length_and_streamed_overflow() {
+        let advertised = "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n";
+        let chunked = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n4\r\nabcd\r\n4\r\nefgh\r\n0\r\n\r\n";
+        let (target, _) = http_fixture(vec![advertised.to_string(), chunked.to_string()]).await;
+        let client = ObscuraHttpClient::with_full_options(
+            Arc::new(CookieJar::new()),
+            None,
+            true,
+        );
+        let initiator = target.clone();
+        let request = ResourceRequest::subresource(ResourceType::Image, &initiator)
+            .with_max_response_bytes(6);
+
+        for _ in 0..2 {
+            let error = client
+                .fetch_resource_with_callbacks(&target, request.clone(), None)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                ObscuraNetError::ResponseTooLarge { limit: 6, .. }
+            ));
+            assert_eq!(client.active_requests(), 0);
+        }
+    }
+
+    async fn hanging_fixture() -> (Url, tokio::sync::oneshot::Receiver<()>) {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buffer = [0u8; 2048];
+            let _ = stream.read(&mut buffer).await;
+            let _ = started_tx.send(());
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        });
+        (
+            Url::parse(&format!("http://{address}/hang")).unwrap(),
+            started_rx,
+        )
+    }
+
+    async fn cancelled_shared_fetch_fixture(
+    ) -> (Url, tokio::sync::oneshot::Receiver<()>, Arc<AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed = requests.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let mut first_stream = None;
+            let mut started_tx = Some(started_tx);
+            for index in 0..3 {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut request = [0u8; 2048];
+                let _ = stream.read(&mut request).await;
+                observed.fetch_add(1, Ordering::SeqCst);
+                if index == 0 {
+                    if let Some(started_tx) = started_tx.take() {
+                        let _ = started_tx.send(());
+                    }
+                    // Hold the transport open until the leader task is
+                    // cancelled. The next two connections prove both the
+                    // waiting follower retry and a fresh cache leader work.
+                    first_stream = Some(stream);
+                    continue;
+                }
+                let body = "shared";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nCache-Control: public, max-age=3600\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+            drop(first_stream);
+        });
+        (
+            Url::parse(&format!("http://{address}/shared.js")).unwrap(),
+            started_rx,
+            requests,
+        )
+    }
+
+    #[tokio::test]
+    async fn cancellation_returns_active_requests_to_zero() {
+        let (target, started) = hanging_fixture().await;
+        let client = Arc::new(ObscuraHttpClient::with_full_options(
+            Arc::new(CookieJar::new()),
+            None,
+            true,
+        ));
+        let task = tokio::spawn({
+            let client = client.clone();
+            async move { client.fetch(&target).await }
+        });
+        started.await.unwrap();
+        assert_eq!(client.active_requests(), 1);
+        task.abort();
+        let _ = task.await;
+        assert_eq!(client.active_requests(), 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_shared_subresource_leader_wakes_follower_and_clears_slot() {
+        let (target, started, network_requests) = cancelled_shared_fetch_fixture().await;
+        let initiator = target.join("/page.html").unwrap();
+        let request = ResourceRequest::subresource(ResourceType::Script, &initiator);
+        let client = Arc::new(ObscuraHttpClient::with_full_options(
+            Arc::new(CookieJar::new()),
+            None,
+            true,
+        ));
+
+        let leader = tokio::spawn({
+            let client = client.clone();
+            let target = target.clone();
+            let request = request.clone();
+            async move {
+                client
+                    .fetch_resource_with_callbacks(&target, request, None)
+                    .await
+            }
+        });
+        started.await.unwrap();
+
+        let follower = tokio::spawn({
+            let client = client.clone();
+            let target = target.clone();
+            let request = request.clone();
+            async move {
+                client
+                    .fetch_resource_with_callbacks(&target, request, None)
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let follower_is_waiting = client
+                    .resource_loader
+                    .lock()
+                    .unwrap()
+                    .shared_fetches
+                    .values()
+                    .next()
+                    .is_some_and(|sender| sender.receiver_count() > 0);
+                if follower_is_waiting {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("follower did not join the shared fetch");
+
+        leader.abort();
+        let _ = leader.await;
+        let response = tokio::time::timeout(Duration::from_secs(2), follower)
+            .await
+            .expect("follower remained blocked after leader cancellation")
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.body, b"shared");
+
+        // The follower intentionally retried without populating the cache.
+        // A subsequent request must be able to install a fresh leader, and
+        // its successful response is then reusable.
+        client
+            .fetch_resource_with_callbacks(&target, request.clone(), None)
+            .await
+            .unwrap();
+        client
+            .fetch_resource_with_callbacks(&target, request, None)
+            .await
+            .unwrap();
+        assert_eq!(network_requests.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn transport_timeout_returns_active_requests_to_zero() {
+        let (target, started) = hanging_fixture().await;
+        let mut client = ObscuraHttpClient::with_full_options(
+            Arc::new(CookieJar::new()),
+            None,
+            true,
+        );
+        client.timeout = std::time::Duration::from_millis(25);
+        let fetch = client.fetch(&target);
+        let (_, result) = tokio::join!(started, fetch);
+        assert!(result.is_err());
+        assert_eq!(client.active_requests(), 0);
+    }
+
+    #[tokio::test]
+    async fn callbacks_fire_once_across_redirects() {
+        let redirect = "HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let (target, _) = http_fixture(vec![redirect.to_string(), ok_response("", "done")]).await;
+        let client = ObscuraHttpClient::with_full_options(
+            Arc::new(CookieJar::new()),
+            None,
+            true,
+        );
+        let callbacks = CallbackRegistry::new();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let responses = Arc::new(AtomicUsize::new(0));
+        let request_count = requests.clone();
+        callbacks.add_request(Arc::new(move |_| {
+            request_count.fetch_add(1, Ordering::SeqCst);
+        }));
+        let response_count = responses.clone();
+        callbacks.add_response(Arc::new(move |_, _| {
+            response_count.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        client
+            .fetch_with_callbacks(&target, Some(&callbacks))
+            .await
+            .unwrap();
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert_eq!(responses.load(Ordering::SeqCst), 1);
+    }
+
+    async fn cacheable_resource_fixture(
+        status: u16,
+        headers: &'static str,
+    ) -> (Url, Arc<AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed = requests.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let observed = observed.clone();
+                tokio::spawn(async move {
+                    let mut request = [0u8; 2048];
+                    let _ = stream.read(&mut request).await;
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(80)).await;
+                    let body = "globalThis.__sharedRuns=(globalThis.__sharedRuns||0)+1;";
+                    let response = format!(
+                        "HTTP/1.1 {status} Test\r\nContent-Type: application/javascript\r\nContent-Length: {}\r\n{headers}Connection: close\r\n\r\n{body}",
+                        body.len(),
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        (
+            Url::parse(&format!("http://{address}/shared.js")).unwrap(),
+            requests,
+        )
+    }
+
+    #[tokio::test]
+    async fn cacheable_identical_subresources_share_one_in_flight_request() {
+        let (url, network_requests) = cacheable_resource_fixture(
+            200,
+            "Cache-Control: public, max-age=3600\r\nVary: Accept-Language\r\n",
+        )
+        .await;
+        let initiator = url.join("/page.html").unwrap();
+        let client = Arc::new(ObscuraHttpClient::with_full_options(
+            Arc::new(CookieJar::new()),
+            None,
+            true,
+        ));
+        let callbacks = Arc::new(CallbackRegistry::new());
+        let callback_requests = Arc::new(AtomicUsize::new(0));
+        let callback_responses = Arc::new(AtomicUsize::new(0));
+        let observed_requests = callback_requests.clone();
+        callbacks.add_request(Arc::new(move |_| {
+            observed_requests.fetch_add(1, Ordering::SeqCst);
+        }));
+        let observed_responses = callback_responses.clone();
+        callbacks.add_response(Arc::new(move |_, _| {
+            observed_responses.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        let mut fetches = tokio::task::JoinSet::new();
+        for _ in 0..32 {
+            let client = client.clone();
+            let callbacks = callbacks.clone();
+            let url = url.clone();
+            let request = ResourceRequest::subresource(ResourceType::Script, &initiator);
+            fetches.spawn(async move {
+                client
+                    .fetch_resource_with_callbacks(&url, request, Some(&callbacks))
+                    .await
+                    .unwrap()
+            });
+        }
+        let mut responses = Vec::new();
+        while let Some(response) = fetches.join_next().await {
+            responses.push(response.unwrap());
+        }
+
+        assert_eq!(responses.len(), 32);
+        assert!(responses.iter().all(|response| response.status == 200));
+        assert_eq!(network_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(callback_requests.load(Ordering::SeqCst), 32);
+        assert_eq!(callback_responses.load(Ordering::SeqCst), 32);
+    }
+
+    #[tokio::test]
+    async fn cacheable_identical_module_scripts_share_one_in_flight_request() {
+        let (url, network_requests) = cacheable_resource_fixture(
+            200,
+            "Cache-Control: public, max-age=3600\r\n",
+        )
+        .await;
+        let initiator = url.join("/app.js").unwrap();
+        let client = Arc::new(ObscuraHttpClient::with_full_options(
+            Arc::new(CookieJar::new()),
+            None,
+            true,
+        ));
+
+        let mut fetches = tokio::task::JoinSet::new();
+        for _ in 0..16 {
+            let client = client.clone();
+            let url = url.clone();
+            let request = ResourceRequest::module_script(&initiator, &initiator);
+            fetches.spawn(async move {
+                client
+                    .fetch_resource_with_callbacks(&url, request, None)
+                    .await
+                    .unwrap()
+            });
+        }
+        let mut responses = Vec::new();
+        while let Some(response) = fetches.join_next().await {
+            responses.push(response.unwrap());
+        }
+
+        assert_eq!(responses.len(), 16);
+        assert!(responses.iter().all(|response| response.status == 200));
+        assert_eq!(network_requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn distinct_subresource_urls_do_not_coalesce() {
+        let (url, network_requests) =
+            cacheable_resource_fixture(200, "Cache-Control: public, max-age=3600\r\n").await;
+        let initiator = url.join("/page.html").unwrap();
+        let client = Arc::new(ObscuraHttpClient::with_full_options(
+            Arc::new(CookieJar::new()),
+            None,
+            true,
+        ));
+
+        let mut fetches = tokio::task::JoinSet::new();
+        for index in 0..24 {
+            let client = client.clone();
+            let url = url.join(&format!("/distinct/{index}.js")).unwrap();
+            let request = ResourceRequest::subresource(ResourceType::Script, &initiator);
+            fetches.spawn(async move {
+                client
+                    .fetch_resource_with_callbacks(&url, request, None)
+                    .await
+                    .unwrap()
+            });
+        }
+        let mut responses = Vec::new();
+        while let Some(response) = fetches.join_next().await {
+            responses.push(response.unwrap());
+        }
+
+        assert_eq!(responses.len(), 24);
+        assert_eq!(network_requests.load(Ordering::SeqCst), 24);
+    }
+
+    #[tokio::test]
+    async fn no_store_vary_star_and_error_responses_are_not_reused() {
+        for (status, headers) in [
+            (200, "Cache-Control: no-store\r\n"),
+            (200, "Cache-Control: public, max-age=3600\r\nVary: *\r\n"),
+            (500, "Cache-Control: public, max-age=3600\r\n"),
+        ] {
+            let (url, network_requests) = cacheable_resource_fixture(status, headers).await;
+            let initiator = url.join("/page.html").unwrap();
+            let client =
+                ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
+            let request = ResourceRequest::subresource(ResourceType::Script, &initiator);
+            client
+                .fetch_resource_with_callbacks(&url, request.clone(), None)
+                .await
+                .unwrap();
+            client
+                .fetch_resource_with_callbacks(&url, request, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                network_requests.load(Ordering::SeqCst),
+                2,
+                "status={status} headers={headers:?}",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn authorization_and_cookie_bearing_requests_bypass_resource_cache() {
+        for header in [
+            ("Authorization", "Bearer secret"),
+            ("Cookie", "session=secret"),
+        ] {
+            let (url, network_requests) =
+                cacheable_resource_fixture(200, "Cache-Control: public, max-age=3600\r\n").await;
+            let initiator = url.join("/page.html").unwrap();
+            let client =
+                ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
+            client
+                .set_extra_headers(HashMap::from([(
+                    header.0.to_string(),
+                    header.1.to_string(),
+                )]))
+                .await;
+            let request = ResourceRequest::subresource(ResourceType::Script, &initiator);
+            client
+                .fetch_resource_with_callbacks(&url, request.clone(), None)
+                .await
+                .unwrap();
+            client
+                .fetch_resource_with_callbacks(&url, request, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                network_requests.load(Ordering::SeqCst),
+                2,
+                "header={header:?}"
+            );
+        }
     }
 
     #[tokio::test]

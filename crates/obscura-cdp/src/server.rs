@@ -711,6 +711,20 @@ async fn cdp_processor(
     // registers and stays registered across iterations, so a later
     // `notify_waiters()` wakes this processor even while it is mid-dispatch.
     let mut shutdown = Box::pin(shutdown_notify.notified());
+    // Chromium's PageHandler receives compositor video frames continuously.
+    // Obscura has no separate compositor thread yet, so active screencasts get
+    // a bounded 30 Hz opportunity on this connection's owning LocalSet.
+    let mut screencast_tick = tokio::time::interval(tokio::time::Duration::from_millis(33));
+    screencast_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut connection_reply_tx: Option<mpsc::UnboundedSender<String>> = None;
+    // A real browser renderer continues servicing timers, networking, posted
+    // tasks, and animation callbacks while its DevTools client is silent. Keep
+    // one wake-driven deno_core turn armed after work may have been scheduled;
+    // the future parks on the runtime's own waker and is cancelled whenever a
+    // higher-priority protocol command arrives. Full idle disarms it until the
+    // next command/navigation, so static pages consume no polling budget.
+    let mut runtime_pump_armed = false;
+    let mut runtime_pump_error_streak = 0_u8;
 
     loop {
         // Drain any deferred messages from the previous interception window
@@ -718,22 +732,116 @@ async fn cdp_processor(
         // nav-task spawn_local in flight, so this connection's only entered
         // Isolate is the one dispatch is about to touch.
         let msg = if let Some(d) = deferred.pop_front() {
-            d
+            Some(d)
         } else {
+            let screencast_active = has_active_screencast(&ctx);
+            let live_page_route = ctx
+                .pages
+                .iter()
+                .find(|page| page.has_js())
+                .and_then(|page| {
+                    ctx.sessions
+                        .iter()
+                        .find(|(_, page_id)| *page_id == &page.id)
+                        .map(|(session_id, _)| (session_id.clone(), page.frame_id.clone()))
+                });
+            let has_intercept_rx = intercept_rx.is_some();
             tokio::select! {
+                biased;
                 msg = rx.recv() => match msg {
-                    Some(m) => m,
+                    Some(m) => Some(m),
                     None => break,
                 },
                 _ = &mut shutdown => {
                     tracing::info!("Shutdown signal received (connection processor)");
                     break;
+                },
+                pump_result = pump_live_page_event_loop(&mut ctx), if runtime_pump_armed => {
+                    match pump_result {
+                        Ok(reached_idle) => {
+                            runtime_pump_error_streak = 0;
+                            runtime_pump_armed = !reached_idle;
+                        }
+                        Err(error) => {
+                            runtime_pump_error_streak = runtime_pump_error_streak.saturating_add(1);
+                            runtime_pump_armed = runtime_pump_error_streak <= 3
+                                && ctx.pages.iter().any(|page| page.has_js());
+                            tracing::warn!("autonomous page task failed: {error}");
+                            tokio::task::yield_now().await;
+                        }
+                    }
+                    sync_live_page_network_events(&mut ctx);
+                    dispatch::drain_binding_calls(&mut ctx);
+                    forward_pending_events(&mut ctx, connection_reply_tx.as_ref());
+                    if let (Some(reply_tx), Some((session_id, url, method, body))) = (
+                        connection_reply_tx.as_ref(),
+                        take_live_pending_navigation(&ctx),
+                    ) {
+                        let navigation = json!({
+                            "id": 0,
+                            "method": "Page.navigate",
+                            "params": {"url": url, "__method": method, "__body": body},
+                            "sessionId": session_id,
+                        })
+                        .to_string();
+                        process_with_interception(
+                            &navigation,
+                            &mut ctx,
+                            reply_tx,
+                            &mut rx,
+                            &mut intercept_rx,
+                            &mut intercepted_paused,
+                            &mut deferred,
+                            false,
+                        )
+                        .await;
+                        runtime_pump_armed = ctx.pages.iter().any(|page| page.has_js());
+                    }
+                    None
+                },
+                Some(intercepted) = async {
+                    if let Some(ref mut receiver) = intercept_rx {
+                        receiver.recv().await
+                    } else {
+                        std::future::pending().await
+                    }
+                }, if has_intercept_rx => {
+                    if let (Some((session_id, frame_id)), Some(reply_tx)) =
+                        (live_page_route.as_ref(), connection_reply_tx.as_ref())
+                    {
+                        emit_intercepted_request(
+                            intercepted,
+                            frame_id,
+                            Some(session_id.clone()),
+                            reply_tx,
+                            &mut intercepted_paused,
+                        );
+                    } else {
+                        let _ = intercepted.resolver.send(
+                            obscura_js::ops::InterceptResolution::Fail {
+                                reason: "Aborted".into(),
+                            },
+                        );
+                    }
+                    None
+                },
+                _ = screencast_tick.tick(), if screencast_active => {
+                    pump_and_forward_screencast_frames(
+                        &mut ctx,
+                        connection_reply_tx.as_ref(),
+                    ).await;
+                    None
                 }
             }
         };
 
+        let Some(msg) = msg else {
+            continue;
+        };
+
         match msg {
             ServerMessage::NewConnection { reply_tx } => {
+                connection_reply_tx = Some(reply_tx.clone());
                 let _ = reply_tx.send(
                     json!({"__init": true})
                         .to_string(),
@@ -754,22 +862,187 @@ async fn cdp_processor(
                     process_with_interception(
                         &cdp_msg.text, &mut ctx, &cdp_msg.reply_tx, &mut rx,
                         &mut intercept_rx, &mut intercepted_paused,
-                        &mut deferred,
+                        &mut deferred, true,
                     ).await;
                 } else {
-                    if cdp_msg.text.contains("Fetch.") {
-                        handle_fetch_resolution(&cdp_msg.text, &mut ctx, &cdp_msg.reply_tx, &mut intercepted_paused);
+                    let fetch_was_resolved = cdp_msg.text.contains("Fetch.")
+                        && handle_fetch_resolution(
+                            &cdp_msg.text,
+                            &mut ctx,
+                            &cdp_msg.reply_tx,
+                            &mut intercepted_paused,
+                        );
+                    if !fetch_was_resolved {
+                        process_cdp_message(&cdp_msg.text, &mut ctx, &cdp_msg.reply_tx).await;
                     }
-                    process_cdp_message(&cdp_msg.text, &mut ctx, &cdp_msg.reply_tx).await;
                 }
             }
         }
+
+        // Dispatch may have created a page or scheduled new asynchronous work.
+        // A single live isolate is the connection's current active target; the
+        // pump will park cheaply if its next task is a distant timer.
+        runtime_pump_armed = ctx.pages.iter().any(|page| page.has_js());
+        runtime_pump_error_streak = 0;
 
     }
 
     // The connection thread merges this context's cookie delta into the
     // persistence template after the processor stops.
     let _ = &ctx;
+}
+
+fn emit_intercepted_request(
+    intercepted: obscura_js::ops::InterceptedRequest,
+    frame_id: &str,
+    session_id: Option<String>,
+    reply_tx: &mpsc::UnboundedSender<String>,
+    intercepted_paused: &mut HashMap<
+        String,
+        tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>,
+    >,
+) {
+    tracing::info!(
+        "INTERCEPTION: requestPaused for {} {} (sending to client)",
+        intercepted.method,
+        intercepted.url
+    );
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+    let request = json!({
+        "url": intercepted.url,
+        "method": intercepted.method,
+        "headers": intercepted.headers,
+        "initialPriority": "High",
+        "referrerPolicy": "strict-origin-when-cross-origin",
+    });
+    let request_will_be_sent = json!({
+        "method": "Network.requestWillBeSent",
+        "params": {
+            "requestId": intercepted.request_id,
+            "loaderId": "",
+            "documentURL": "",
+            "request": request,
+            "timestamp": now,
+            "wallTime": now,
+            "initiator": {"type": "script"},
+            "type": intercepted.resource_type,
+            "frameId": frame_id,
+        },
+        "sessionId": session_id,
+    });
+    let _ = reply_tx.send(request_will_be_sent.to_string());
+
+    let request_paused = json!({
+        "method": "Fetch.requestPaused",
+        "params": {
+            "requestId": intercepted.request_id,
+            "request": request,
+            "frameId": frame_id,
+            "resourceType": intercepted.resource_type,
+            "networkId": intercepted.request_id,
+            "responseErrorReason": null,
+            "responseStatusCode": null,
+            "responseHeaders": null,
+        },
+        "sessionId": session_id,
+    });
+    let _ = reply_tx.send(request_paused.to_string());
+    intercepted_paused.insert(intercepted.request_id, intercepted.resolver);
+}
+
+async fn pump_live_page_event_loop(ctx: &mut CdpContext) -> Result<bool, String> {
+    let Some(page) = ctx.pages.iter_mut().find(|page| page.has_js()) else {
+        return Ok(true);
+    };
+    page.run_autonomous_event_loop_turn().await
+}
+
+fn sync_live_page_network_events(ctx: &mut CdpContext) {
+    let page_route = ctx.pages.iter().find(|page| page.has_js()).and_then(|page| {
+        ctx.sessions
+            .iter()
+            .find(|(_, page_id)| *page_id == &page.id)
+            .map(|(session_id, _)| {
+                (
+                    Some(session_id.clone()),
+                    page.id.clone(),
+                    page.frame_id.clone(),
+                    page.url_string(),
+                )
+            })
+    });
+    let Some((session_id, page_id, frame_id, page_url)) = page_route else {
+        return;
+    };
+    let network_events = {
+        let Some(page) = ctx.get_page_mut(&page_id) else {
+            return;
+        };
+        page.sync_js_network_events();
+        page.network_events.drain(..).collect::<Vec<_>>()
+    };
+    crate::domains::page::emit_runtime_network_events(
+        ctx,
+        &session_id,
+        &frame_id,
+        &page_url,
+        &page_id,
+        &network_events,
+    );
+}
+
+fn take_live_pending_navigation(
+    ctx: &CdpContext,
+) -> Option<(String, String, String, String)> {
+    let page = ctx.pages.iter().find(|page| page.has_js())?;
+    let session_id = ctx
+        .sessions
+        .iter()
+        .find(|(_, page_id)| *page_id == &page.id)
+        .map(|(session_id, _)| session_id.clone())?;
+    let (url, method, body) = page.take_pending_navigation()?;
+    Some((session_id, url, method, body))
+}
+
+fn forward_pending_events(
+    ctx: &mut CdpContext,
+    reply_tx: Option<&mpsc::UnboundedSender<String>>,
+) {
+    let Some(reply_tx) = reply_tx else {
+        return;
+    };
+    for event in ctx.pending_events.drain(..) {
+        if let Ok(json) = serde_json::to_string(&event) {
+            let _ = reply_tx.send(json);
+        }
+    }
+}
+
+fn has_active_screencast(ctx: &CdpContext) -> bool {
+    #[cfg(feature = "render")]
+    {
+        !ctx.screencasts.is_empty()
+    }
+    #[cfg(not(feature = "render"))]
+    {
+        let _ = ctx;
+        false
+    }
+}
+
+async fn pump_and_forward_screencast_frames(
+    ctx: &mut CdpContext,
+    reply_tx: Option<&mpsc::UnboundedSender<String>>,
+) {
+    #[cfg(feature = "render")]
+    crate::domains::page::pump_screencast_frames(ctx).await;
+    #[cfg(not(feature = "render"))]
+    let _ = ctx;
+
+    forward_pending_events(ctx, reply_tx);
 }
 
 // Whether a raw CDP frame is exactly a `Page.navigate` call, and so should take
@@ -807,7 +1080,7 @@ fn handle_fetch_resolution(
     _ctx: &mut CdpContext,
     reply_tx: &mpsc::UnboundedSender<String>,
     intercepted_paused: &mut HashMap<String, tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>>,
-) {
+) -> bool {
     if let Ok(req) = serde_json::from_str::<CdpRequest>(text) {
         let method = req.method.as_str();
         let request_id = req.params.get("requestId").and_then(|v| v.as_str()).unwrap_or("");
@@ -842,15 +1115,17 @@ fn handle_fetch_resolution(
                     let reason = req.params.get("errorReason").and_then(|v| v.as_str()).unwrap_or("Failed").to_string();
                     obscura_js::ops::InterceptResolution::Fail { reason }
                 }
-                _ => return,
+                _ => return false,
             };
             let _ = resolver.send(resolution);
             let resp = crate::types::CdpResponse::success(req.id, json!({}), req.session_id);
             if let Ok(json) = serde_json::to_string(&resp) {
                 let _ = reply_tx.send(json);
             }
+            return true;
         }
     }
+    false
 }
 
 async fn process_with_interception(
@@ -861,6 +1136,7 @@ async fn process_with_interception(
     intercept_rx: &mut Option<mpsc::UnboundedReceiver<obscura_js::ops::InterceptedRequest>>,
     intercepted_paused: &mut HashMap<String, tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>>,
     deferred: &mut std::collections::VecDeque<ServerMessage>,
+    send_command_response: bool,
 ) {
     let req: CdpRequest = match serde_json::from_str(text) {
         Ok(r) => r,
@@ -989,54 +1265,13 @@ async fn process_with_interception(
                     std::future::pending().await
                 }
             }, if has_irx => {
-                tracing::info!("INTERCEPTION: requestPaused for {} {} (sending to client)", intercepted.method, intercepted.url);
-                let rws_event = json!({
-                    "method": "Network.requestWillBeSent",
-                    "params": {
-                        "requestId": intercepted.request_id,
-                        "loaderId": "",
-                        "documentURL": "",
-                        "request": {
-                            "url": intercepted.url,
-                            "method": intercepted.method,
-                            "headers": intercepted.headers,
-                            "initialPriority": "High",
-                            "referrerPolicy": "strict-origin-when-cross-origin",
-                        },
-                        "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64(),
-                        "wallTime": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64(),
-                        "initiator": {"type": "script"},
-                        "type": intercepted.resource_type,
-                        "frameId": frame_id,
-                    },
-                    "sessionId": session_for_events,
-                });
-                let _ = reply_tx.send(rws_event.to_string());
-
-                let event_json = json!({
-                    "method": "Fetch.requestPaused",
-                    "params": {
-                        "requestId": intercepted.request_id,
-                        "request": {
-                            "url": intercepted.url,
-                            "method": intercepted.method,
-                            "headers": intercepted.headers,
-                            "initialPriority": "High",
-                            "referrerPolicy": "strict-origin-when-cross-origin",
-                        },
-                        "frameId": frame_id,
-                        "resourceType": intercepted.resource_type,
-                        "networkId": intercepted.request_id,
-                        "responseErrorReason": null,
-                        "responseStatusCode": null,
-                        "responseHeaders": null,
-                    },
-                    "sessionId": session_for_events,
-                });
-                let event_str = event_json.to_string();
-                tracing::info!("INTERCEPTION event JSON: {}", crate::util::truncate_on_char_boundary(&event_str, 300));
-                let _ = reply_tx.send(event_str);
-                intercepted_paused.insert(intercepted.request_id.clone(), intercepted.resolver);
+                emit_intercepted_request(
+                    intercepted,
+                    &frame_id,
+                    session_for_events.clone(),
+                    reply_tx,
+                    intercepted_paused,
+                );
                 tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
             }
             Some(msg) = rx.recv() => {
@@ -1106,6 +1341,8 @@ async fn process_with_interception(
 
     ctx.pages.push(page);
 
+    #[cfg(feature = "render")]
+    let navigation_succeeded = navigate_result.is_ok();
     let response = match navigate_result {
         Ok(()) => crate::types::CdpResponse::success(
             req.id,
@@ -1115,8 +1352,10 @@ async fn process_with_interception(
         Err(e) => crate::types::CdpResponse::error(req.id, -32000, e, req.session_id.clone()),
     };
 
-    if let Ok(json) = serde_json::to_string(&response) {
-        let _ = reply_tx.send(json);
+    if send_command_response {
+        if let Ok(json) = serde_json::to_string(&response) {
+            let _ = reply_tx.send(json);
+        }
     }
 
     // Shared event emission: includes the post-#190 Network.requestWillBeSent
@@ -1135,6 +1374,14 @@ async fn process_with_interception(
         wait_until,
         reached_network_idle,
     );
+    #[cfg(feature = "render")]
+    if navigation_succeeded {
+        if let Err(error) = crate::domains::page::queue_screencast_frame(
+            ctx, &session_for_events, false,
+        ) {
+            tracing::warn!("could not produce post-navigation screencast frame: {error}");
+        }
+    }
     for event in ctx.pending_events.drain(..) {
         if let Ok(json) = serde_json::to_string(&event) {
             let _ = reply_tx.send(json);
@@ -1227,7 +1474,7 @@ fn fast_path_response(text: &str) -> Option<String> {
         "Page.enable" | "Page.setLifecycleEventsEnabled" | "Page.setInterceptFileChooserDialog" |
         "Runtime.runIfWaitingForDebugger" | "Runtime.discardConsoleEntries" |
         "Performance.enable" | "Log.enable" | "Security.enable" |
-        "Emulation.setDeviceMetricsOverride" | "Emulation.setTouchEmulationEnabled" |
+        "Emulation.setTouchEmulationEnabled" |
         "CSS.enable" | "Accessibility.enable" | "ServiceWorker.enable" |
         "Inspector.enable" | "Debugger.enable" | "Profiler.enable" |
         "HeapProfiler.enable" | "Overlay.enable" | "Storage.enable" |
@@ -1346,9 +1593,14 @@ async fn handle_connection_ws(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_navigate_method, merge_cookie_delta, parse_cdp_headers};
+    use super::{
+        handle_fetch_resolution, is_navigate_method, merge_cookie_delta, parse_cdp_headers,
+    };
+    #[cfg(feature = "render")]
+    use super::{pump_and_forward_screencast_frames, pump_live_page_event_loop};
     use obscura_net::{CookieInfo, CookieJar};
     use serde_json::json;
+    use std::collections::HashMap;
 
     fn cookie(name: &str, value: &str) -> CookieInfo {
         CookieInfo {
@@ -1361,6 +1613,130 @@ mod tests {
             same_site: "Lax".to_string(),
             expires: None,
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn page_runtime_advances_while_cdp_client_is_silent() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (server_tx, server_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+                let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+                let default_context = crate::dispatch::CdpContext::new().default_context;
+                let processor = tokio::task::spawn_local(super::cdp_processor(
+                    server_rx,
+                    default_context,
+                    shutdown,
+                ));
+
+                server_tx
+                    .send(super::ServerMessage::NewConnection {
+                        reply_tx: reply_tx.clone(),
+                    })
+                    .unwrap();
+                let init = reply_rx.recv().await.expect("processor init");
+                assert!(init.contains("__init"));
+
+                let send = |value: serde_json::Value| {
+                    server_tx
+                        .send(super::ServerMessage::Cdp(super::CdpMessage {
+                            text: value.to_string(),
+                            reply_tx: reply_tx.clone(),
+                        }))
+                        .unwrap();
+                };
+                send(json!({
+                    "id": 1,
+                    "method": "Target.createTarget",
+                    "params": {"url": "about:blank"},
+                }));
+
+                let mut session_id = None;
+                loop {
+                    let value: serde_json::Value = serde_json::from_str(
+                        &tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            reply_rx.recv(),
+                        )
+                        .await
+                        .expect("create target response timeout")
+                        .expect("create target response channel"),
+                    )
+                    .unwrap();
+                    if session_id.is_none() {
+                        session_id = value["params"]["sessionId"]
+                            .as_str()
+                            .map(str::to_string);
+                    }
+                    if value["id"] == 1 {
+                        break;
+                    }
+                }
+                let session_id = session_id.expect("attached page session");
+
+                send(json!({
+                    "id": 2,
+                    "method": "Runtime.evaluate",
+                    "sessionId": session_id,
+                    "params": {
+                        "expression": "(() => { setTimeout(() => globalThis.__autonomousDone = 'yes', 40); return 'armed'; })()",
+                        "returnByValue": true,
+                    },
+                }));
+                loop {
+                    let value: serde_json::Value = serde_json::from_str(
+                        &tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            reply_rx.recv(),
+                        )
+                        .await
+                        .expect("timer arm response timeout")
+                        .expect("timer arm response channel"),
+                    )
+                    .unwrap();
+                    if value["id"] == 2 {
+                        break;
+                    }
+                }
+
+                // This is deliberately host/client time. No CDP message is sent
+                // while the timeout becomes due; Chrome's renderer still runs,
+                // and Obscura's connection-owned page pump must do the same.
+                tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+
+                send(json!({
+                    "id": 3,
+                    "method": "Runtime.evaluate",
+                    "sessionId": session_id,
+                    "params": {
+                        "expression": "globalThis.__autonomousDone || 'missing'",
+                        "returnByValue": true,
+                    },
+                }));
+                loop {
+                    let value: serde_json::Value = serde_json::from_str(
+                        &tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            reply_rx.recv(),
+                        )
+                        .await
+                        .expect("timer observation response timeout")
+                        .expect("timer observation response channel"),
+                    )
+                    .unwrap();
+                    if value["id"] == 3 {
+                        assert_eq!(value["result"]["result"]["value"], "yes");
+                        break;
+                    }
+                }
+
+                drop(server_tx);
+                tokio::time::timeout(std::time::Duration::from_secs(2), processor)
+                    .await
+                    .expect("processor shutdown timeout")
+                    .expect("processor task");
+            })
+            .await;
     }
 
     #[test]
@@ -1425,5 +1801,188 @@ mod tests {
     #[test]
     fn parse_cdp_headers_absent_is_none() {
         assert!(parse_cdp_headers(&json!({"url": "https://example.com"})).is_none());
+    }
+
+    #[test]
+    fn fetch_resolution_is_handled_once_by_the_outer_processor() {
+        let (resolution_tx, mut resolution_rx) = tokio::sync::oneshot::channel();
+        let mut paused = HashMap::from([("request-1".to_string(), resolution_tx)]);
+        let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let mut ctx = crate::dispatch::CdpContext::new();
+
+        assert!(handle_fetch_resolution(
+            r#"{"id":17,"method":"Fetch.continueRequest","params":{"requestId":"request-1"}}"#,
+            &mut ctx,
+            &reply_tx,
+            &mut paused,
+        ));
+        assert!(matches!(
+            resolution_rx.try_recv(),
+            Ok(obscura_js::ops::InterceptResolution::Continue { .. })
+        ));
+        let response: serde_json::Value =
+            serde_json::from_str(&reply_rx.try_recv().expect("one command response")).unwrap();
+        assert_eq!(response["id"], 17);
+        assert!(reply_rx.try_recv().is_err(), "must not emit a duplicate response");
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn autonomous_screencast_pumps_timers_and_retains_backpressured_damage() {
+        let mut ctx = crate::dispatch::CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = format!("{page_id}-session");
+        ctx.sessions.insert(session_id.clone(), page_id);
+        let session = Some(session_id.clone());
+        ctx.get_session_page_mut(&session)
+            .expect("page")
+            .set_viewport((96.0, 64.0));
+        crate::domains::page::handle(
+            "navigate",
+            &json!({
+                "url": "data:text/html,<html style='margin:0'><body style='margin:0;width:96px;height:64px;background:red'></body></html>",
+                "waitUntil": "load",
+            }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("navigate screencast fixture");
+        ctx.pending_events.clear();
+        crate::domains::page::handle(
+            "startScreencast",
+            &json!({}),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("start screencast");
+        let stream_id = ctx
+            .pending_events
+            .iter()
+            .find(|event| event.method == "Page.screencastFrame")
+            .and_then(|event| event.params["sessionId"].as_i64())
+            .expect("initial stream id");
+        ctx.pending_events.clear();
+
+        let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+        ctx.get_session_page_mut(&session)
+            .expect("page")
+            .evaluate(
+                "setTimeout(() => document.body.setAttribute('style', 'margin:0;width:96px;height:64px;background:green'), 0)",
+            );
+        pump_live_page_event_loop(&mut ctx).await.unwrap();
+        pump_and_forward_screencast_frames(&mut ctx, Some(&reply_tx)).await;
+        let first_update: serde_json::Value = serde_json::from_str(
+            &reply_rx.try_recv().expect("timer mutation should emit a frame"),
+        )
+        .unwrap();
+        assert_eq!(first_update["method"], "Page.screencastFrame");
+        assert_eq!(first_update["params"]["sessionId"], stream_id);
+        assert!(reply_rx.try_recv().is_err());
+        assert_eq!(ctx.screencasts[&session_id].frames_in_flight, 2);
+
+        // The second mutation is pumped while the two-frame acknowledgement
+        // window is full. It must not emit yet, but its damage must remain
+        // pending and appear immediately after capacity is returned.
+        ctx.get_session_page_mut(&session)
+            .expect("page")
+            .evaluate(
+                "setTimeout(() => document.body.setAttribute('style', 'margin:0;width:96px;height:64px;background:blue'), 0)",
+            );
+        pump_live_page_event_loop(&mut ctx).await.unwrap();
+        pump_and_forward_screencast_frames(&mut ctx, Some(&reply_tx)).await;
+        assert!(reply_rx.try_recv().is_err());
+        assert!(ctx.screencasts[&session_id].autonomous_frame_pending);
+
+        crate::domains::page::handle(
+            "screencastFrameAck",
+            &json!({"sessionId": stream_id}),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("ack current frame");
+        pump_and_forward_screencast_frames(&mut ctx, Some(&reply_tx)).await;
+        let after_ack: serde_json::Value = serde_json::from_str(
+            &reply_rx
+                .try_recv()
+                .expect("backpressured damage should emit after ack"),
+        )
+        .unwrap();
+        assert_eq!(after_ack["method"], "Page.screencastFrame");
+        assert_eq!(after_ack["params"]["sessionId"], stream_id);
+        assert!(!ctx.screencasts[&session_id].autonomous_frame_pending);
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn autonomous_screencast_observes_raf_visual_mutations() {
+        let mut ctx = crate::dispatch::CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = format!("{page_id}-session");
+        ctx.sessions.insert(session_id.clone(), page_id);
+        let session = Some(session_id.clone());
+        ctx.get_session_page_mut(&session)
+            .expect("page")
+            .set_viewport((96.0, 64.0));
+        crate::domains::page::handle(
+            "navigate",
+            &json!({
+                "url": "data:text/html,<html style='margin:0'><body style='margin:0;width:96px;height:64px;background:red'></body></html>",
+                "waitUntil": "load",
+            }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("navigate visual-damage fixture");
+        ctx.pending_events.clear();
+        crate::domains::page::handle(
+            "startScreencast",
+            &json!({}),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("start screencast");
+        let initial = ctx
+            .pending_events
+            .iter()
+            .find(|event| event.method == "Page.screencastFrame")
+            .expect("initial frame");
+        let stream_id = initial.params["sessionId"].as_i64().unwrap();
+        let initial_data = initial.params["data"].as_str().unwrap().to_string();
+        ctx.pending_events.clear();
+        crate::domains::page::handle(
+            "screencastFrameAck",
+            &json!({"sessionId": stream_id}),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("ack initial frame");
+
+        // Bypass CDP dispatch after scheduling the callback. The only path
+        // which can deliver and capture this update is the active stream's
+        // periodic event-loop/render pump.
+        ctx.get_session_page_mut(&session)
+            .expect("page")
+            .evaluate(
+                "requestAnimationFrame(() => document.body.setAttribute('style','margin:0;width:96px;height:64px;background:lime'))",
+            );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        pump_live_page_event_loop(&mut ctx).await.unwrap();
+        pump_and_forward_screencast_frames(&mut ctx, None).await;
+        let raf_frame = ctx
+            .pending_events
+            .iter()
+            .find(|event| event.method == "Page.screencastFrame")
+            .expect("RAF visual mutation must autonomously emit a frame");
+        assert_ne!(
+            raf_frame.params["data"].as_str().unwrap(),
+            initial_data,
+            "RAF-driven paint must capture the updated visible state"
+        );
     }
 }

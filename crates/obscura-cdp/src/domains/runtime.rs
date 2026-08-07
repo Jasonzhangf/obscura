@@ -117,11 +117,17 @@ pub async fn handle(
                 .ok_or("No page")?;
             let info = match tokio::time::timeout(
                 std::time::Duration::from_millis(timeout_ms),
-                page.evaluate_for_cdp(expression, return_by_value, await_promise),
+                page.evaluate_for_cdp_with_timeout(
+                    expression,
+                    return_by_value,
+                    await_promise,
+                    timeout_ms,
+                ),
             )
             .await
             {
-                Ok(info) => info,
+                Ok(Ok(info)) => info,
+                Ok(Err(error)) => return Err(error),
                 Err(_) => {
                     return Err(format!(
                         "Runtime.evaluate exceeded {timeout_ms}ms timeout"
@@ -159,11 +165,39 @@ pub async fn handle(
             // no-op and the default context is used.
             validate_context_id(params, "executionContextId", ctx, "callFunctionOn")?;
 
+            // Keep awaitPromise alive for the same command budget as evaluate.
+            // Playwright implements waits with callFunctionOn on some utility
+            // paths, so a shorter hidden cap makes the client return before the
+            // requested browser timer fires.
+            let timeout_ms = params
+                .get("timeout")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(30_000);
+
             let page = ctx
                 .get_session_page_mut(session_id)
                 .ok_or("No page")?;
-            let info =
-                page.call_function_on_for_cdp(function_declaration, object_id, &arguments, return_by_value, await_promise).await;
+            let info = match tokio::time::timeout(
+                std::time::Duration::from_millis(timeout_ms),
+                page.call_function_on_for_cdp_with_timeout(
+                    function_declaration,
+                    object_id,
+                    &arguments,
+                    return_by_value,
+                    await_promise,
+                    timeout_ms,
+                ),
+            )
+            .await
+            {
+                Ok(Ok(info)) => info,
+                Ok(Err(error)) => return Err(error),
+                Err(_) => {
+                    return Err(format!(
+                        "Runtime.callFunctionOn exceeded {timeout_ms}ms timeout"
+                    ));
+                }
+            };
             emit_post_eval_nav(ctx, session_id).await?;
 
             Ok(json!({ "result": remote_object_from_info(&info) }))
@@ -486,6 +520,32 @@ mod tests {
                 "contextId=1 must be accepted, got: {e}"
             ),
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn evaluate_await_promise_reports_the_requested_timeout() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = "await-timeout-session".to_string();
+        ctx.sessions.insert(session_id.clone(), page_id);
+
+        let error = handle(
+            "evaluate",
+            &json!({
+                "expression": "new Promise(() => {})",
+                "returnByValue": true,
+                "awaitPromise": true,
+                "timeout": 25,
+            }),
+            &mut ctx,
+            &Some(session_id),
+        )
+        .await
+        .expect_err("an unsettled promise must not return stale result metadata");
+        assert!(
+            error.contains("25ms timeout") || error.contains("within 25ms"),
+            "unexpected timeout error: {error}"
+        );
     }
 
     #[tokio::test]
