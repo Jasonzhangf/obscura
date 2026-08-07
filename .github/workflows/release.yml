@@ -74,8 +74,11 @@ jobs:
         run: |
           "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Build default release binary
-        run: cargo build --release --target ${{ matrix.target }}
+      # Rendering is part of the shipped browser. Keep the Cargo feature
+      # opt-in for embedders that only need DOM extraction, but every official
+      # binary must support screenshots, screencasting, and PDF export.
+      - name: Build render-enabled release binary
+        run: cargo build --release --target ${{ matrix.target }} --features render
 
       - name: Stage default release binary
         shell: bash
@@ -88,11 +91,11 @@ jobs:
             cp "$BIN_DIR/obscura" "$BIN_DIR/obscura-worker" dist/default/
           fi
 
-      # Build and package stealth separately so the default download keeps its
-      # lower RSS while the advertised wreq/BoringSSL variant cannot silently
-      # fall back to a non-stealth binary.
-      - name: Build stealth release binary
-        run: cargo build --release --target ${{ matrix.target }} --features stealth
+      # Build and package stealth separately so the advertised wreq/BoringSSL
+      # variant cannot silently fall back to a non-stealth transport. It still
+      # includes the same rendering surface as the standard archive.
+      - name: Build render-enabled stealth release binary
+        run: cargo build --release --target ${{ matrix.target }} --features render,stealth
 
       - name: Stage stealth release binary
         shell: bash
@@ -116,6 +119,9 @@ jobs:
             BIN=dist/$VARIANT/obscura
             [ -f "$BIN.exe" ] && BIN="$BIN.exe"
             "$BIN" fetch "data:text/html,<title>ok</title>" --eval "1+1"
+            "$BIN" fetch "data:text/html,<style>body{margin:0;background:%23123456}</style>" --screenshot smoke.png
+            test -s smoke.png
+            rm smoke.png
           done
 
       - name: Package (Unix)
