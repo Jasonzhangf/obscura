@@ -113,7 +113,7 @@ RUST_LOG=obscura_cdp=trace,obscura_browser=debug obscura serve
 Forces `cargo build` to use the system OpenSSL instead of compiling the vendored copy. Set to `1` on hosts where the vendored OpenSSL fails (older VPS with AVX-512 issues).
 
 ```bash
-OPENSSL_NO_VENDOR=1 cargo build --release
+OPENSSL_NO_VENDOR=1 cargo build --release --features render
 ```
 
 ## V8

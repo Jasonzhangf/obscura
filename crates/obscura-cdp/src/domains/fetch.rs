@@ -115,10 +115,19 @@ pub async fn handle(
 
             if let Some(paused) = ctx.fetch_intercept.paused.remove(request_id) {
                 let _ = paused.resolver.send(FetchResolution::Continue {
-                    url: params.get("url").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                    method: params.get("method").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    url: params
+                        .get("url")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                    method: params
+                        .get("method")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
                     headers: None,
-                    post_data: params.get("postData").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    post_data: params
+                        .get("postData")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
                 });
             }
             Ok(json!({}))
@@ -178,9 +187,7 @@ pub async fn handle(
             }
             Ok(json!({}))
         }
-        "getResponseBody" => {
-            Ok(json!({ "body": "", "base64Encoded": false }))
-        }
+        "getResponseBody" => Ok(json!({ "body": "", "base64Encoded": false })),
         "takeResponseBodyAsStream" => {
             // Hand the client a streaming handle for a large response body so it
             // can pull it in chunks via IO.read and free it with IO.close,
@@ -206,7 +213,10 @@ pub async fn handle(
                 format!("Fetch.takeResponseBodyAsStream: no cached body for {request_id}")
             })?;
 
-            let handle = ctx.io_streams.insert(bytes);
+            let handle = ctx
+                .io_streams
+                .insert(bytes)
+                .map_err(|error| format!("Fetch.takeResponseBodyAsStream: {error}"))?;
             Ok(json!({ "stream": handle }))
         }
         _ => Err(format!("Unknown Fetch method: {}", method)),
