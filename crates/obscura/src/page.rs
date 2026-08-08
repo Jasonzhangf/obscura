@@ -164,9 +164,13 @@ impl Element {
     /// Get an attribute value.
     pub fn attribute(&self, name: &str) -> Option<String> {
         let page = unsafe { &mut *(self.page as *mut Page) };
+        // Escape the name like query_selector escapes its selector, so a name
+        // containing a quote/backslash cannot break out of the JS string literal
+        // and inject code into the page.
+        let escaped = name.replace('\\', "\\\\").replace('\'', "\\'");
         let val = page.evaluate(&format!(
             "(function() {{ var el = globalThis._wrap && globalThis._wrap({}); return el ? el.getAttribute('{}') : null; }})()",
-            self.node_id, name
+            self.node_id, escaped
         ));
         if val.is_null() { None } else { Some(val.as_str().unwrap_or("").to_string()) }
     }
