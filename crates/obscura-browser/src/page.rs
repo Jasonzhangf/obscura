@@ -3682,7 +3682,9 @@ impl Page {
             self.push_history(self.url_string());
             Ok(true)
         } else {
-            Ok(false)
+            // Fork: a page that routed itself through history has still
+            // navigated. See fork_virtual_url.rs.
+            Ok(self.sync_virtual_url())
         }
     }
 
