@@ -11468,15 +11468,115 @@ class _IframeDocument {
   close() {}
 }
 
+const _iframeRealmGlobalCache = new WeakMap();
+let _iframeRealmGlobalNames = [];
+let _iframeRealmGlobalNameSet = new Set();
+
+function _iframeSourceIsConstructor(value) {
+  try {
+    Reflect.construct(Object, [], value);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+function _iframeRealmFunction(target, name, source) {
+  let wrapped;
+  if (_iframeSourceIsConstructor(source)) {
+    wrapped = function (...args) {
+      if (new.target) return Reflect.construct(source, args, new.target);
+      return Reflect.apply(source, this === target ? globalThis : this, args);
+    };
+    if (source.prototype && (typeof source.prototype === 'object' || typeof source.prototype === 'function')) {
+      const prototype = Object.create(source.prototype);
+      Object.defineProperty(prototype, 'constructor', {
+        value: wrapped,
+        writable: true,
+        configurable: true,
+      });
+      wrapped.prototype = prototype;
+    }
+  } else {
+    wrapped = (...args) => Reflect.apply(source, globalThis, args);
+  }
+  // Inherit static members such as Promise.resolve, Object.keys, and
+  // Array.isArray while keeping the constructor identity realm-local.
+  try { Object.setPrototypeOf(wrapped, source); } catch (e) {}
+  try { Object.defineProperty(wrapped, 'name', { value: name, configurable: true }); } catch (e) {}
+  try { Object.defineProperty(wrapped, 'length', { value: source.length, configurable: true }); } catch (e) {}
+  return _markNative(wrapped);
+}
+
+function _iframeRealmGlobal(target, name) {
+  let cache = _iframeRealmGlobalCache.get(target);
+  if (!cache) {
+    cache = new Map();
+    _iframeRealmGlobalCache.set(target, cache);
+  }
+  if (cache.has(name)) return cache.get(name);
+
+  const source = globalThis[name];
+  let value = source;
+  if (typeof source === 'function') {
+    value = _iframeRealmFunction(target, name, source);
+  } else if (source && typeof source === 'object') {
+    // Namespace objects such as Math, JSON, Reflect, and Intl belong to the
+    // child global too. A lightweight facade gives each iframe a stable,
+    // distinct object without copying large immutable tables.
+    value = Object.create(source);
+  }
+  cache.set(name, value);
+  return value;
+}
+
+const _iframeWindowProxyHandler = {
+  get(target, key, receiver) {
+    if (key === 'globalThis') return receiver;
+    if (Reflect.has(target, key)) return Reflect.get(target, key, receiver);
+    if (typeof key === 'string' && _iframeRealmGlobalNameSet.has(key)) {
+      return _iframeRealmGlobal(target, key);
+    }
+    return undefined;
+  },
+  has(target, key) {
+    return key === 'globalThis'
+      || Reflect.has(target, key)
+      || (typeof key === 'string' && _iframeRealmGlobalNameSet.has(key));
+  },
+  ownKeys(target) {
+    const keys = Reflect.ownKeys(target);
+    const seen = new Set(keys);
+    for (const name of _iframeRealmGlobalNames) {
+      if (!seen.has(name)) keys.push(name);
+    }
+    if (!seen.has('globalThis')) keys.push('globalThis');
+    return keys;
+  },
+  getOwnPropertyDescriptor(target, key) {
+    const own = Reflect.getOwnPropertyDescriptor(target, key);
+    if (own) return own;
+    if (key === 'globalThis') {
+      return { value: target.self, writable: true, enumerable: false, configurable: true };
+    }
+    if (typeof key === 'string' && _iframeRealmGlobalNameSet.has(key)) {
+      return {
+        value: _iframeRealmGlobal(target, key),
+        writable: true,
+        enumerable: false,
+        configurable: true,
+      };
+    }
+    return undefined;
+  },
+};
+
 class _IframeWindow {
   constructor(doc, url) {
     this.document = doc;
     this._url = url;
-    this.self = this;
     this.top = globalThis;
     this.parent = globalThis;
-    this.window = this;
-    this.frames = this;
     this.frameElement = null;
     this.length = 0;
     this.name = '';
@@ -11506,6 +11606,12 @@ class _IframeWindow {
     } catch(e) {
       this.location = { href: url, origin: '', protocol: '', host: '', hostname: '', port: '', pathname: '/', search: '', hash: '', toString() { return url; }, assign(){}, reload(){}, replace(){} };
     }
+
+    const proxy = new Proxy(this, _iframeWindowProxyHandler);
+    this.self = proxy;
+    this.window = proxy;
+    this.frames = proxy;
+    return proxy;
   }
 
   postMessage(data, origin) {
@@ -14461,6 +14567,25 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
 // accessors) plus the constructor itself native. This runs once at snapshot
 // build time, so it costs nothing per page, and genuinely-native V8 builtins
 // already report native, so only the JS-backed members are affected.
+(function _collectIframeRealmGlobals() {
+  const standardGlobals = [
+    'Infinity', 'NaN', 'undefined',
+    'eval', 'isFinite', 'isNaN', 'parseFloat', 'parseInt',
+    'decodeURI', 'decodeURIComponent', 'encodeURI', 'encodeURIComponent',
+    'escape', 'unescape',
+    'Atomics', 'Intl', 'JSON', 'Math', 'Reflect', 'WebAssembly',
+    'atob', 'btoa', 'queueMicrotask', 'reportError', 'structuredClone',
+  ];
+  const constructors = Object.getOwnPropertyNames(globalThis).filter(name => {
+    if (!/^[A-Z]/.test(name)) return false;
+    try { return typeof globalThis[name] === 'function'; }
+    catch (e) { return false; }
+  });
+  _iframeRealmGlobalNames = Array.from(new Set(constructors.concat(standardGlobals)))
+    .filter(name => name in globalThis);
+  _iframeRealmGlobalNameSet = new Set(_iframeRealmGlobalNames);
+})();
+
 (function _markBuiltinsNative() {
   var seen = new Set();
   function walk(ctor) {

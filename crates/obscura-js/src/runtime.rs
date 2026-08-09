@@ -2550,6 +2550,58 @@ mod tests {
     }
 
     #[test]
+    fn iframe_content_window_exposes_realm_globals() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+
+        assert_eq!(
+            rt.evaluate(
+                r#"(() => {
+                    const iframe = document.createElement("iframe");
+                    document.body.appendChild(iframe);
+                    const child = iframe.contentWindow;
+                    const names = [
+                        "Object", "Function", "Error", "Promise", "Proxy",
+                        "XMLHttpRequest", "Worker", "Blob", "FormData",
+                        "WebSocket", "MutationObserver",
+                    ];
+                    return {
+                        types: names.map(name => typeof child[name]),
+                        separate: [
+                            child.Object !== Object,
+                            child.Promise !== Promise,
+                            child.XMLHttpRequest !== XMLHttpRequest,
+                            child.Math !== Math,
+                        ],
+                        constructible: [
+                            new child.Object() instanceof child.Object,
+                            new child.Promise(resolve => resolve()) instanceof child.Promise,
+                            new child.XMLHttpRequest() instanceof child.XMLHttpRequest,
+                            new child.Blob([]) instanceof child.Blob,
+                            new child.FormData() instanceof child.FormData,
+                            new child.MutationObserver(() => {}) instanceof child.MutationObserver,
+                        ],
+                        utilities: [
+                            child.Object.keys({ first: 1 })[0] === "first",
+                            child.Array.isArray([]),
+                            child.Promise.resolve(1) instanceof child.Promise,
+                            child.Function("return 7")() === 7,
+                            Object.getOwnPropertyNames(child).includes("XMLHttpRequest"),
+                            child.globalThis === child,
+                        ],
+                    };
+                })()"#,
+            )
+            .unwrap(),
+            serde_json::json!({
+                "types": vec!["function"; 11],
+                "separate": vec![true; 4],
+                "constructible": vec![true; 6],
+                "utilities": vec![true; 6],
+            })
+        );
+    }
+
+    #[test]
     fn document_domain_getter_and_valid_relaxation_match_effective_host() {
         let dom = parse_html("<html><body></body></html>");
         let mut rt = ObscuraJsRuntime::new();
