@@ -55,28 +55,6 @@ The open-source engine stays Apache-2.0, fully featured. No feature gating, ever
 Want to sponsor? Email [hello@obscura.sh](mailto:hello@obscura.sh).
 
 <table>
-  <tr>
-    <td width="200" align="center" valign="middle">
-      <a href="https://sx.org/?c=40h-N7" target="_blank">
-        <img alt="SX.org" src="assets/sponsors/sxproxy.png" width="180"/>
-      </a>
-    </td>
-    <td valign="middle">
-      🚀 <b>Obscura × SX.org</b><br>
-      Using Obscura for AI agents, browser automation, or web scraping? Power your workflow with stable proxies from <a href="https://sx.org/?c=40h-N7"><b>SX.org</b></a>.<br><br>
-      <b>🌍 12M+ IPs across 235 countries<br>
-      🏠 7M+ residential IPs<br>
-      📱 4M+ mobile IPs<br>
-      🏢 1M+ corporate proxies<br>
-      🔁 Rotating & sticky sessions<br>
-      📍 Flexible geo setup<br>
-      🌐 HTTP, HTTPS & SOCKS5 support<br>
-      ⚡ Up to 99.97% connection success<br>
-      🛟 24/7 support<br><br>
-      🎁 Use code <b>Obscura3gb</b> to get a <b>free 3GB trial</b>.<br><br></b>
-      Stable proxies. Fewer blocks. Most reliable Obscura automation.
-    </td>
-  </tr>
    <tr>
     <td width="200" align="center" valign="middle">
       <a href="https://go.nodemaven.com/obscura" target="_blank">
