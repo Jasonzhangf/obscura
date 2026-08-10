@@ -145,6 +145,21 @@ pub struct ObscuraJsRuntime {
     /// those URLs so a dependency later encountered as a top-level script is a
     /// browser-style no-op instead of a second deno_core `mod_evaluate` call.
     evaluated_module_specifiers: HashMap<String, Result<(), String>>,
+    /// The bound op table, taken from bootstrap at construction and removed from
+    /// the global in the same step. Child frame realms are handed this object so
+    /// their shims can call ops; nothing else can reach it, including page
+    /// script.
+    ops_handoff: Option<deno_core::v8::Global<deno_core::v8::Value>>,
+}
+
+/// Renders a caught V8 exception as a message for realm evaluation errors.
+fn exception_text(
+    scope: &mut deno_core::v8::TryCatch<'_, deno_core::v8::HandleScope<'_>>,
+) -> String {
+    match scope.exception() {
+        Some(exception) => exception.to_rust_string_lossy(scope),
+        None => "unknown error".to_string(),
+    }
 }
 
 /// A fetched and instantiated module graph whose evaluation is intentionally
@@ -297,7 +312,14 @@ impl ObscuraJsRuntime {
                 ..Default::default()
             });
 
-            runtime.op_state().borrow_mut().put(state_clone);
+            {
+                let op_state = runtime.op_state();
+                let mut op_state = op_state.borrow_mut();
+                op_state.put(state_clone);
+                // Empty until a frame realm exists, which is what keeps the
+                // lookup free for pages that have no frames.
+                op_state.put(Rc::new(RefCell::new(crate::ops::RealmStates::default())));
+            }
 
             let isolate_handle = runtime.v8_isolate().thread_safe_handle();
             let heap_limit_state = std::sync::Arc::new(HeapLimitState::default());
@@ -317,7 +339,7 @@ impl ObscuraJsRuntime {
             (runtime, isolate_handle, heap_limit_state)
         };
 
-        ObscuraJsRuntime {
+        let mut instance = ObscuraJsRuntime {
             runtime,
             state,
             object_store: HashMap::new(),
@@ -329,7 +351,259 @@ impl ObscuraJsRuntime {
             module_evaluations: HashMap::new(),
             loaded_module_specifiers,
             evaluated_module_specifiers: HashMap::new(),
+            ops_handoff: None,
+        };
+        // Take the op table before any page script can run, and drop the global
+        // that exposed it in the same step.
+        instance.ops_handoff = instance.take_ops_handoff();
+        instance
+    }
+
+    /// Creates an additional realm in this isolate: a second `v8::Context`.
+    ///
+    /// The startup snapshot already contains the whole bootstrap (see
+    /// `build.rs`), so a context restored from it arrives with every DOM class
+    /// and shim installed. Building a realm is therefore a context restore, not
+    /// a re-parse of the whole bootstrap.
+    ///
+    /// The new context has no ops: deno_core binds those into the main context
+    /// only. Use [`Self::share_ops_with_realm`] to give it the same `Deno.core`
+    /// object, which is legal because native function objects are shareable
+    /// between contexts of one isolate.
+    pub(crate) fn create_realm_context(
+        &mut self,
+    ) -> Option<deno_core::v8::Global<deno_core::v8::Context>> {
+        let context = {
+            let isolate = self.runtime.v8_isolate();
+            let scope = &mut deno_core::v8::HandleScope::new(isolate);
+            let context = deno_core::v8::Context::from_snapshot(
+                scope,
+                1,
+                deno_core::v8::ContextOptions::default(),
+            )
+            .or_else(|| {
+                deno_core::v8::Context::from_snapshot(
+                    scope,
+                    0,
+                    deno_core::v8::ContextOptions::default(),
+                )
+            })?;
+            deno_core::v8::Global::new(scope, context)
+        };
+        Some(context)
+    }
+
+    /// Takes the ops object bootstrap handed out, and removes the handoff from
+    /// the global so page script can never reach `Deno.core.ops`.
+    ///
+    /// deno_core hides `globalThis.Deno` after setup and bootstrap keeps its
+    /// reference in a private const, so this handoff is the only way for the
+    /// host to reach the bound op functions and pass them to a child realm.
+    fn take_ops_handoff(&mut self) -> Option<deno_core::v8::Global<deno_core::v8::Value>> {
+        use deno_core::v8;
+
+        let main = self.runtime.main_context();
+        let isolate = self.runtime.v8_isolate();
+        let scope = &mut v8::HandleScope::new(isolate);
+        let context = v8::Local::new(scope, main);
+        let scope = &mut v8::ContextScope::new(scope, context);
+
+        let handoff_key = v8::String::new(scope, "__obscura_core_handoff")?;
+        let ops_key = v8::String::new(scope, "ops")?;
+        let global = context.global(scope);
+
+        let core = global.get(scope, handoff_key.into())?;
+        let core = core.to_object(scope)?;
+        let ops = core.get(scope, ops_key.into())?;
+        if !ops.is_object() {
+            return None;
         }
+        let ops = v8::Global::new(scope, ops);
+        global.delete(scope, handoff_key.into());
+        Some(ops)
+    }
+
+    /// Points a child realm's `Deno.core.ops` at the main realm's ops object.
+    ///
+    /// A realm restored from the snapshot has its own `Deno.core` with an empty
+    /// ops table, and its bootstrap captured that exact object, so filling the
+    /// `ops` table on it is enough to give every shim in that realm a working
+    /// op surface. The functions are shared, not copied: same isolate.
+    pub(crate) fn share_ops_with_realm(
+        &mut self,
+        realm: &deno_core::v8::Global<deno_core::v8::Context>,
+    ) -> bool {
+        use deno_core::v8;
+
+        let Some(ops) = self.ops_handoff.clone() else {
+            return false;
+        };
+        let isolate = self.runtime.v8_isolate();
+        let scope = &mut v8::HandleScope::new(isolate);
+        let context = v8::Local::new(scope, realm);
+        let scope = &mut v8::ContextScope::new(scope, context);
+
+        let Some(handoff_key) = v8::String::new(scope, "__obscura_core_handoff") else {
+            return false;
+        };
+        let Some(ops_key) = v8::String::new(scope, "ops") else {
+            return false;
+        };
+        let global = context.global(scope);
+        let Some(core) = global.get(scope, handoff_key.into()) else {
+            return false;
+        };
+        let Some(core) = core.to_object(scope) else {
+            return false;
+        };
+        // `Deno.core.ops` is non-writable and non-configurable, so the table
+        // cannot be swapped wholesale: V8 reports success and changes nothing.
+        // Copy the bound op functions into the realm's existing table instead.
+        let Some(target) = core
+            .get(scope, ops_key.into())
+            .and_then(|value| value.to_object(scope))
+        else {
+            return false;
+        };
+        let source = v8::Local::new(scope, ops);
+        let Some(source) = source.to_object(scope) else {
+            return false;
+        };
+        let Some(names) = source.get_own_property_names(scope, Default::default()) else {
+            return false;
+        };
+        let mut copied = 0;
+        for index in 0..names.length() {
+            let Some(key) = names.get_index(scope, index) else {
+                continue;
+            };
+            let Some(value) = source.get(scope, key) else {
+                continue;
+            };
+            if target.set(scope, key, value).unwrap_or(false) {
+                copied += 1;
+            }
+        }
+        // The child realm must not expose the handoff to frame script either.
+        global.delete(scope, handoff_key.into());
+        copied > 0
+    }
+
+    /// Runs `source` inside `realm` and returns its value as a string. Errors
+    /// come back as `Err(message)`.
+    pub(crate) fn eval_in_realm(
+        &mut self,
+        realm: &deno_core::v8::Global<deno_core::v8::Context>,
+        source: &str,
+    ) -> Result<String, String> {
+        use deno_core::v8;
+
+        let isolate = self.runtime.v8_isolate();
+        let scope = &mut v8::HandleScope::new(isolate);
+        let context = v8::Local::new(scope, realm);
+        let scope = &mut v8::ContextScope::new(scope, context);
+        let scope = &mut v8::TryCatch::new(scope);
+
+        let code = v8::String::new(scope, source).ok_or("source too large")?;
+        let script = match v8::Script::compile(scope, code, None) {
+            Some(script) => script,
+            None => return Err(exception_text(scope)),
+        };
+        match script.run(scope) {
+            Some(value) => Ok(value.to_rust_string_lossy(scope)),
+            None => Err(exception_text(scope)),
+        }
+    }
+
+    /// Copies the browser-identity globals from the main realm into `realm`.
+    ///
+    /// A frame must present the same identity as its parent: anti-bot code
+    /// fingerprints inside the frame and compares it with the top document.
+    /// Copying the values the parent already has makes that true by
+    /// construction, instead of relying on a caller to reapply the same
+    /// settings to both.
+    pub(crate) fn copy_identity_to_realm(
+        &mut self,
+        realm: &deno_core::v8::Global<deno_core::v8::Context>,
+    ) {
+        use deno_core::v8;
+
+        const IDENTITY_GLOBALS: [&str; 7] = [
+            "__obscura_ua",
+            "__obscura_platform",
+            "__obscura_ua_platform",
+            "__obscura_ua_platform_version",
+            "__obscura_stealth",
+            "__obscura_geo_lat",
+            "__obscura_geo_lon",
+        ];
+
+        let main = self.runtime.main_context();
+        let isolate = self.runtime.v8_isolate();
+        let scope = &mut v8::HandleScope::new(isolate);
+
+        let main_context = v8::Local::new(scope, main);
+        let mut carried = Vec::new();
+        {
+            let scope = &mut v8::ContextScope::new(scope, main_context);
+            let global = main_context.global(scope);
+            for name in IDENTITY_GLOBALS {
+                let Some(key) = v8::String::new(scope, name) else {
+                    continue;
+                };
+                match global.get(scope, key.into()) {
+                    Some(value) if !value.is_undefined() => {
+                        carried.push((name, v8::Global::new(scope, value)));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let realm_context = v8::Local::new(scope, realm);
+        let scope = &mut v8::ContextScope::new(scope, realm_context);
+        let global = realm_context.global(scope);
+        for (name, value) in carried {
+            let Some(key) = v8::String::new(scope, name) else {
+                continue;
+            };
+            let value = v8::Local::new(scope, value);
+            global.set(scope, key.into(), value);
+        }
+    }
+
+    /// Gives a frame's state the resources the page owns: cookie jar, HTTP
+    /// client, callbacks and the stealth transport. A frame shares these with
+    /// its page, exactly as it shares them in a browser.
+    pub(crate) fn share_resources_with(&self, frame: &mut ObscuraState) {
+        let parent = self.state.borrow();
+        frame.cookie_jar = parent.cookie_jar.clone();
+        frame.http_client = parent.http_client.clone();
+        frame.callbacks = parent.callbacks.clone();
+        frame.encoding = parent.encoding.clone();
+        frame.blocked_urls = parent.blocked_urls.clone();
+        frame.intercept_enabled = parent.intercept_enabled;
+        frame.page_in_flight = parent.page_in_flight.clone();
+        #[cfg(feature = "stealth")]
+        {
+            frame.stealth_client = parent.stealth_client.clone();
+        }
+    }
+
+    /// The table ops consult to find the calling realm's document.
+    pub(crate) fn realm_states(&self) -> Rc<RefCell<crate::ops::RealmStates>> {
+        self.runtime
+            .op_state()
+            .borrow()
+            .borrow::<Rc<RefCell<crate::ops::RealmStates>>>()
+            .clone()
+    }
+
+    /// Frame documents fetched by any realm that still need one of their own.
+    /// The op queues onto the page's state whichever frame asked, so a frame
+    /// nested inside a frame is drained here too.
+    pub fn take_pending_frames(&self) -> Vec<crate::ops::PendingFrame> {
+        std::mem::take(&mut self.state.borrow_mut().pending_frames)
     }
 
     /// Restore the configured V8 heap limit after the emergency headroom has

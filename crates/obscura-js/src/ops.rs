@@ -8,6 +8,7 @@ use deno_core::op2;
 use deno_core::Extension;
 #[cfg(feature = "render")]
 use deno_core::JsBuffer;
+use deno_core::v8;
 use deno_core::OpState;
 use obscura_dom::{DomTree, NodeData, NodeId};
 use obscura_dom::tree::{AttachShadowError, ShadowRootMode};
@@ -139,6 +140,14 @@ pub struct ObscuraState {
     // drained by the Page into its network_events so the CDP layer emits
     // Network.requestWillBeSent / responseReceived for them (issue #406).
     pub js_network_events: Vec<JsNetworkEvent>,
+    // Frame documents that have been fetched and are waiting for a realm.
+    // Building one needs the whole runtime, which an op cannot reach, so
+    // `op_frame_document_ready` queues here and the Page drains it between
+    // event loop turns. Same shape as `pending_binding_calls`.
+    pub pending_frames: Vec<PendingFrame>,
+    pub frame_id_counter: u32,
+    /// Which frame this state belongs to; 0 is the page's own realm.
+    pub frame_id: u32,
     /// Requests initiated by this runtime only. Browser contexts share their
     /// transport client across pages, so the client's aggregate counter cannot
     /// be used as a page-readiness signal.
@@ -228,6 +237,17 @@ pub struct ObscuraState {
     pub(crate) already_started_scripts: RefCell<HashSet<NodeId>>,
 }
 
+/// A frame document waiting to be given a realm.
+pub struct PendingFrame {
+    pub frame_id: u32,
+    pub url: String,
+    pub html: String,
+    pub viewport_width: u64,
+    pub viewport_height: u64,
+    /// The frame that holds this one; 0 when the page does.
+    pub parent_frame_id: u32,
+}
+
 impl ObscuraState {
     pub fn new() -> Self {
         ObscuraState {
@@ -252,6 +272,9 @@ impl ObscuraState {
             network_response_body_counter: 0,
             fetched_urls: Vec::new(),
             js_network_events: Vec::new(),
+            pending_frames: Vec::new(),
+            frame_id_counter: 0,
+            frame_id: 0,
             page_in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             activity_generation: 0,
             document_generation: 0,
@@ -399,6 +422,56 @@ fn response_body_byte_limit() -> usize {
 }
 
 pub type SharedState = Rc<RefCell<ObscuraState>>;
+
+/// Which document belongs to which realm.
+///
+/// An op has to read the state of the realm that *called* it. Making a realm
+/// "current" around the host's own calls into it is not enough: a frame's
+/// deferred work, a timer firing or a promise settling, re-enters JavaScript
+/// from the event loop, where nothing had the chance to swap anything. Without
+/// this a frame's `setTimeout` callback runs with the frame's globals but
+/// writes to the *parent's* DOM.
+#[derive(Default)]
+pub struct RealmStates {
+    entries: Vec<(v8::Global<v8::Context>, SharedState)>,
+}
+
+impl RealmStates {
+    pub fn register(&mut self, context: v8::Global<v8::Context>, state: SharedState) {
+        self.entries.push((context, state));
+    }
+
+    pub fn forget(&mut self, context: &v8::Global<v8::Context>) {
+        self.entries.retain(|(known, _)| known != context);
+    }
+}
+
+/// The state of the realm running right now, or the page's when the caller is
+/// the page itself.
+///
+/// A page with no frames pays only an `is_empty` check: looking up the current
+/// context is not free, and `op_dom` is the hottest op in the system.
+pub fn realm_state(scope: &mut v8::HandleScope, op_state: &OpState) -> SharedState {
+    let page = || op_state.borrow::<SharedState>().clone();
+    let registry = match op_state.try_borrow::<Rc<RefCell<RealmStates>>>() {
+        Some(registry) => registry.clone(),
+        None => return page(),
+    };
+    let registry = registry.borrow();
+    if registry.entries.is_empty() {
+        return page();
+    }
+    // Not `get_current_context`: an op is a native function bound in the page
+    // realm, so V8 reports that realm as current no matter who called it. This
+    // one answers "whose code is running", which is the question.
+    let current = scope.get_entered_or_microtask_context();
+    registry
+        .entries
+        .iter()
+        .find(|(context, _)| *context == current)
+        .map(|(_, state)| state.clone())
+        .unwrap_or_else(page)
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 struct RenderMutationImpact {
@@ -937,11 +1010,13 @@ fn op_shadow_root_info(state: &OpState, host_nid: u32) -> String {
 #[op2]
 #[string]
 fn op_dom(
+    scope: &mut v8::HandleScope,
     state: &OpState,
     #[string] cmd: String,
     #[string] arg1: String,
     #[string] arg2: String,
 ) -> String {
+    let shared = realm_state(scope, state);
     // Anti-panic boundary: a panic in a DOM op would unwind through deno_core
     // into V8's FFI frame, where V8_Fatal calls abort(3) and takes the whole
     // engine (and every CDP client) down. Catch it so one malformed selector or
@@ -949,7 +1024,7 @@ fn op_dom(
     // No per-call clone: on the happy path this is just a landing pad, so the
     // hot DOM path (querySelector/getAttribute/...) pays nothing measurable.
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-        op_dom_inner(state, cmd, arg1, arg2)
+        op_dom_inner(shared, cmd, arg1, arg2)
     }))
     .unwrap_or_else(|_| {
         tracing::error!("op_dom panicked; returning null");
@@ -957,8 +1032,7 @@ fn op_dom(
     })
 }
 
-fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> String {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) -> String {
     {
         // Scroll offsets belong to a node at its current tree position.
         // Temporary box/style loss keeps that latent state, but DOM removal,
@@ -3261,8 +3335,8 @@ fn validate_fetch_url(url: &url::Url, allow_private_network: bool) -> Result<(),
 
 #[op2]
 #[string]
-fn op_get_cookies(state: &OpState) -> String {
-    let gs = state.borrow::<SharedState>().clone();
+fn op_get_cookies(scope: &mut v8::HandleScope, state: &OpState) -> String {
+    let gs = realm_state(scope, state);
     let gs = gs.borrow();
     let jar = match &gs.cookie_jar {
         Some(j) => j,
@@ -3276,8 +3350,8 @@ fn op_get_cookies(state: &OpState) -> String {
 }
 
 #[op2(fast)]
-fn op_set_cookie(state: &OpState, #[string] cookie_str: &str) {
-    let gs = state.borrow::<SharedState>().clone();
+fn op_set_cookie(scope: &mut v8::HandleScope, state: &OpState, #[string] cookie_str: &str) {
+    let gs = realm_state(scope, state);
     let gs = gs.borrow();
     let jar = match &gs.cookie_jar {
         Some(j) => j,
@@ -3290,12 +3364,62 @@ fn op_set_cookie(state: &OpState, #[string] cookie_str: &str) {
     jar.set_cookie_from_js(cookie_str, &url);
 }
 
+// A frame that navigates itself must not move the top document. Recording the
+// navigation against the calling realm keeps it inside that frame.
 #[op2(fast)]
-fn op_navigate(state: &OpState, #[string] url: &str, #[string] method: &str, #[string] body: &str) {
-    let gs = state.borrow::<SharedState>().clone();
+fn op_navigate(
+    scope: &mut v8::HandleScope,
+    state: &OpState,
+    #[string] url: &str,
+    #[string] method: &str,
+    #[string] body: &str,
+) {
+    let gs = realm_state(scope, state);
     let mut gs = gs.borrow_mut();
     gs.url = url.to_string();
     gs.pending_navigation = Some((url.to_string(), method.to_string(), body.to_string()));
+}
+
+/// Resolves after `millis`, as the timer source for child frame realms.
+///
+/// deno_core's own timer queue is not usable from a frame: `op_timer_queue`
+/// resolves per-context state that only a deno_core-created context carries,
+/// and a snapshot-restored realm has none. This resolves an ordinary promise
+/// instead, and V8 reports the frame as the microtask context, so the ops a
+/// timer callback makes still find the frame's own document.
+#[op2(async)]
+async fn op_sleep(#[number] millis: u64) {
+    tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
+}
+
+// Hands a fetched frame document to the host and returns the id the frame will
+// have. The realm itself is built later, by whoever owns the runtime.
+#[op2(fast)]
+fn op_frame_document_ready(
+    scope: &mut v8::HandleScope,
+    state: &OpState,
+    #[string] url: &str,
+    #[string] html: &str,
+    #[number] viewport_width: u64,
+    #[number] viewport_height: u64,
+) -> u32 {
+    // Whoever called this is the new frame's parent, which is how a frame
+    // nested two deep gets `parent` pointing at the frame above it rather than
+    // at the page.
+    let parent_frame_id = realm_state(scope, state).borrow().frame_id;
+    let gs = state.borrow::<SharedState>().clone();
+    let mut gs = gs.borrow_mut();
+    gs.frame_id_counter += 1;
+    let frame_id = gs.frame_id_counter;
+    gs.pending_frames.push(PendingFrame {
+        frame_id,
+        url: url.to_string(),
+        html: html.to_string(),
+        viewport_width,
+        viewport_height,
+        parent_frame_id,
+    });
+    frame_id
 }
 
 /// Whether async host work can be scheduled without aborting the isolate.
@@ -4021,6 +4145,8 @@ pub fn build_extension() -> Extension {
         op_get_cookies(),
         op_set_cookie(),
         op_navigate(),
+        op_frame_document_ready(),
+        op_sleep(),
         op_async_runtime_available(),
         op_posted_task(),
         op_binding_called(),

@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use obscura_dom::{parse_html, DomTree};
+use obscura_js::frame::FrameRealm;
 use obscura_js::runtime::ObscuraJsRuntime;
 use obscura_net::{
     CallbackRegistry, ObscuraHttpClient, ObscuraNetError, RequestCallback, ResourceRequest,
@@ -218,6 +219,10 @@ pub struct Page {
     pub frame_id: String,
     pub url: Option<Url>,
     pub dom: Option<DomTree>,
+    /// Live child frame realms, in creation order. Declared before `js` on
+    /// purpose: a realm holds a V8 handle into that isolate, and fields drop in
+    /// declaration order, so the frames must go first.
+    pub frames: Vec<FrameRealm>,
     pub js: Option<ObscuraJsRuntime>,
     pub lifecycle: LifecycleState,
     pub http_client: Arc<ObscuraHttpClient>,
@@ -888,6 +893,7 @@ impl Page {
             frame_id,
             url: None,
             dom: None,
+            frames: Vec::new(),
             js: None,
             lifecycle: LifecycleState::Idle,
             http_client,
@@ -948,6 +954,107 @@ impl Page {
             }
         }
         false
+    }
+
+    /// Gives every frame document the page has fetched a realm of its own, and
+    /// runs the scripts that came with it (issue #600).
+    ///
+    /// Building a realm needs the whole runtime, which an op cannot reach, so
+    /// the JS side queues the fetched document and this drains the queue between
+    /// event loop turns. Reports whether anything was attached, so a caller can
+    /// settle and come back for frames that these frames created.
+    async fn attach_pending_frames(&mut self) -> bool {
+        let pending = match self.js.as_ref() {
+            Some(js) => js.take_pending_frames(),
+            None => return false,
+        };
+        if pending.is_empty() {
+            return false;
+        }
+
+        for frame in pending {
+            let realm = match self.js.as_mut().and_then(|js| {
+                FrameRealm::new(js, frame.frame_id, frame.parent_frame_id, &frame.url, &frame.html)
+            }) {
+                Some(realm) => realm,
+                None => {
+                    tracing::warn!("could not build a realm for frame {}", frame.url);
+                    continue;
+                }
+            };
+
+            // A frame's scripts resolve and are fetched against the frame's own
+            // URL, so they need fetching before run_document_scripts, which
+            // resolves sources synchronously.
+            let wanted = match self.js.as_mut() {
+                Some(js) => realm.external_script_urls(js),
+                None => Vec::new(),
+            };
+            let mut sources: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            for url in wanted {
+                let Ok(parsed) = Url::parse(&url) else { continue };
+                if self.should_block_url(&url) {
+                    continue;
+                }
+                match self.do_fetch(&parsed).await {
+                    Ok(response) => {
+                        sources.insert(url, String::from_utf8_lossy(&response.body).into_owned());
+                    }
+                    Err(error) => {
+                        tracing::warn!("frame script {} failed: {}", url, error);
+                    }
+                }
+            }
+
+            if let Some(js) = self.js.as_mut() {
+                if let Err(error) = realm.set_viewport(
+                    js,
+                    frame.viewport_width as f64,
+                    frame.viewport_height as f64,
+                ) {
+                    tracing::debug!("frame {} viewport setup failed: {error}", frame.url);
+                }
+                // Page.addScriptToEvaluateOnNewDocument applies to every new
+                // document, including child frames. Debug hooks and browser
+                // automation setup must be present before frame scripts run.
+                for source in &self.preload_scripts {
+                    if let Err(error) = realm.execute_script(js, source) {
+                        tracing::debug!("frame {} preload failed: {error}", frame.url);
+                    }
+                }
+                for problem in realm.run_document_scripts(js, |url| sources.get(url).cloned()) {
+                    tracing::debug!("frame {}: {}", frame.url, problem);
+                }
+                // The frame's scripts have run, so its document is loaded. Say
+                // so: everything a widget defers to DOMContentLoaded or load
+                // hangs on this, which is most of its interface.
+                if let Err(error) = realm.dispatch_load_events(js) {
+                    tracing::debug!("frame {} load events failed: {error}", frame.url);
+                }
+            }
+            self.frames.push(realm);
+        }
+        true
+    }
+
+    /// URLs of the page's live child frames, in creation order.
+    pub fn frame_urls(&self) -> Vec<String> {
+        self.frames
+            .iter()
+            .map(|frame| frame.url().to_string())
+            .collect()
+    }
+
+    /// Evaluates an expression inside one of the page's child frames.
+    pub fn evaluate_in_frame(
+        &mut self,
+        index: usize,
+        expression: &str,
+    ) -> Result<serde_json::Value, String> {
+        let realm = self.frames.get(index).ok_or("no such frame")?;
+        let js = self.js.as_mut().ok_or("no runtime")?;
+        realm.evaluate(js, expression)
     }
 
     /// Update the page's CSS viewport. Calling this before navigation makes
@@ -1076,6 +1183,9 @@ impl Page {
         // attacker-controlled state, trigger a navigation, and then
         // run code in the next document's context.
         if self.js.is_some() {
+            // Every frame realm holds a V8 handle into this isolate, so the
+            // frames of the outgoing document must go before the runtime does.
+            self.frames.clear();
             let _ = self.js.take();
         }
 
@@ -2276,17 +2386,30 @@ impl Page {
             return;
         }
         let settle_started = std::time::Instant::now();
-        if let Some(js) = &mut self.js {
-            if std::env::var_os("OBSCURA_STRICT_SETTLE").is_some() {
-                Self::settle_runtime_for_duration(js, max_ms).await;
-            } else {
-                // A deno_core event loop remains "busy" for any future timer,
-                // including analytics intervals and animation loops which do
-                // not make the page more ready. Require a short window without
-                // observable document/network/script activity instead. The
-                // absolute caller budget and V8 watchdog still bound both
-                // asynchronous work and synchronous microtask storms.
-                let _ = js.run_event_loop_until_quiescent(max_ms, 150).await;
+        // Pump, then give any frame document that finished fetching a realm of
+        // its own. Attaching one runs its scripts, which can start timers,
+        // fetches and further frames, so keep alternating until no new frame
+        // appears or the budget is gone (issue #600).
+        loop {
+            let remaining = max_ms.saturating_sub(settle_started.elapsed().as_millis() as u64);
+            if remaining == 0 {
+                break;
+            }
+            if let Some(js) = &mut self.js {
+                if std::env::var_os("OBSCURA_STRICT_SETTLE").is_some() {
+                    Self::settle_runtime_for_duration(js, remaining).await;
+                } else {
+                    // A deno_core event loop remains "busy" for any future timer,
+                    // including analytics intervals and animation loops which do
+                    // not make the page more ready. Require a short window without
+                    // observable document/network/script activity instead. The
+                    // absolute caller budget and V8 watchdog still bound both
+                    // asynchronous work and synchronous microtask storms.
+                    let _ = js.run_event_loop_until_quiescent(remaining, 150).await;
+                }
+            }
+            if !self.attach_pending_frames().await {
+                break;
             }
         }
         #[cfg(feature = "render")]
@@ -2321,6 +2444,11 @@ impl Page {
         if let Some(js) = &mut self.js {
             Self::settle_runtime_for_duration(js, duration_ms).await;
         }
+        // A fixed wait must retain its full wall clock, so frames get their
+        // realms once at the end instead of being interleaved as in `settle`.
+        // Their document scripts still run; only their own deferred work is
+        // left for a later settle.
+        self.attach_pending_frames().await;
     }
 
     /// Advance one wake-driven browser task for a continuously owned page.

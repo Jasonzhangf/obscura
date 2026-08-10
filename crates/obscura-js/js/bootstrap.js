@@ -15,7 +15,8 @@
     '__obscura_errors', '__obscura_init', '__obscura_hide_list',
     '__obscura_objects', '__obscura_oid', '__obscura_ua',
     '__obscura_platform', '__obscura_ua_platform', '__obscura_ua_platform_version',
-    '__obscura_stealth', '__obscura_markTrusted',
+    '__obscura_stealth', '__obscura_markTrusted', '__obscura_core_handoff',
+    '__obscura_frameId', '__obscura_parentFrameId',
     '__obscura_registerLinkedStylesheet',
     '__markParserScripts', '__obscura_hasPendingDynamicScripts',
     '__obscura_hasPendingLoadDelayingScripts',
@@ -63,6 +64,14 @@
     try { Object.defineProperty(globalThis, _names[_i], _desc); } catch (_e) {}
   }
 })();
+
+// Handoff for child frame realms. deno_core binds ops into the main context
+// only, so a realm restored from the snapshot arrives with its own empty
+// `Deno.core.ops`. The host reads this to take the main realm's bound op table
+// and to find each new realm's own table to fill, then deletes the global in
+// the same step, so page script never sees it (see runtime.rs
+// `take_ops_handoff` / `share_ops_with_realm`).
+globalThis.__obscura_core_handoff = Deno.core;
 
 globalThis.__obscura_errors = [];
 
@@ -762,6 +771,9 @@ Object.defineProperty(globalThis, '__obscura_nextPendingTimeoutDelay', {
   configurable: false,
 });
 
+let _frameTimerSeq = 0;
+const _cancelledFrameTimers = new Set();
+
 const _scheduleAfter = (delay, fn) => {
   const d = Math.max(0, Number(delay) || 0);
   // HTML timers queue tasks even when their delay is zero. Treating a
@@ -777,6 +789,23 @@ const _scheduleAfter = (delay, fn) => {
   if (!Deno.core.ops.op_async_runtime_available()) {
     return undefined;
   }
+  // A child frame realm cannot use deno_core's timer queue: op_timer_queue
+  // reads per-context state that only a deno_core-created context carries, and
+  // a realm restored from the snapshot has none, so queueing from a frame
+  // dereferences uninitialized memory. A host sleep does the same job, and
+  // because its continuation is an ordinary microtask, V8 reports the frame as
+  // the microtask context and the ops the callback makes still resolve against
+  // the frame's own document. Frame timer ids are negative so clearTimeout can
+  // tell the two queues apart.
+  if (globalThis.__obscura_frameId) {
+    const frameTimerId = -(++_frameTimerSeq);
+    Deno.core.ops.op_sleep(d).then(() => {
+      if (_cancelledFrameTimers.delete(frameTimerId)) return;
+      Deno.core.ops.op_begin_render_task?.();
+      fn();
+    });
+    return frameTimerId;
+  }
   // The callback runs only when the embedder pumps the event loop, after the
   // current microtask checkpoint.
   return Deno.core.queueUserTimer(0, false, d, () => {
@@ -786,6 +815,11 @@ const _scheduleAfter = (delay, fn) => {
     Deno.core.ops.op_begin_render_task?.();
     return fn();
   });
+};
+
+const _cancelScheduled = (nativeId) => {
+  if (nativeId < 0) _cancelledFrameTimers.add(nativeId);
+  else Deno.core.cancelTimer(nativeId);
 };
 
 // Timers accept a string first arg per the HTML spec (e.g. the Aliyun WAF
@@ -830,7 +864,7 @@ globalThis.clearTimeout = (id) => {
   __obscuraPendingTimeoutDeadlines.delete(id);
   const nativeId = _nativeTimerIds.get(id);
   if (nativeId !== undefined) {
-    Deno.core.cancelTimer(nativeId);
+    _cancelScheduled(nativeId);
     _nativeTimerIds.delete(id);
   }
 };
@@ -3794,10 +3828,21 @@ class Element extends Node {
     if (!url.includes('://')) {
       try { fullUrl = new URL(url, _domParse("document_url") || "about:blank").href; } catch(e) {}
     }
+    // Both the src setter and the parser sweep in __obscura_init reach here, so
+    // a frame the page assigned before init must not be fetched a second time.
+    if (this._iframeLoadingUrl === fullUrl) return;
+    this._iframeLoadingUrl = fullUrl;
     const el = this;
     fetch(fullUrl, {mode: 'no-cors'}).then(async resp => {
       if (resp.ok || resp.type === 'opaque') {
         const html = await resp.text();
+        // Hand the document to the host, which gives this frame a realm of its
+        // own and runs the scripts that came with it (issue #600). The shim
+        // document below stays: it is what the parent reads through
+        // contentDocument.
+        const box = el.getBoundingClientRect();
+        el._frameId = Deno.core.ops.op_frame_document_ready(
+          fullUrl, html, Math.round(box.width) || 300, Math.round(box.height) || 150);
         el._iframeDoc = new _IframeDocument(html, fullUrl, el);
         el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
       } else {
@@ -14049,6 +14094,16 @@ globalThis.__obscura_init = function() {
   // userAgentData brands and getHighEntropyValues now derive the Chrome
   // version from navigator.userAgent and read the platform from the page
   // globals, so every stealth surface agrees without a per-mode override.
+
+  // A parser-created <iframe src> never went through the src setter, so
+  // nothing had started its load and the frame stayed empty (issue #600).
+  // This also runs inside a frame realm, so a frame nested in a frame loads
+  // by the same path, with op_frame_document_ready recording the caller as
+  // its parent.
+  for (const frame of globalThis.document.querySelectorAll('iframe')) {
+    const src = frame.getAttribute('src');
+    if (src && src !== 'about:blank') frame._loadIframeSrc(src);
+  }
 
   // Hide internals (_*, obscura, Obscura). The set of keys is static at
   // snapshot-build time, so we precompute it ONCE below (after this
