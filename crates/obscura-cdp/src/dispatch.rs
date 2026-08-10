@@ -405,6 +405,7 @@ fn is_v8_free_method(method: &str) -> bool {
             | "IO.close"
             | "Storage.getCookies"
             | "Storage.setCookies"
+            | "Storage.clearCookies"
             | "Storage.deleteCookies"
     )
 }
