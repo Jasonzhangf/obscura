@@ -82,6 +82,11 @@ pub struct ObscuraModuleLoader {
     standalone_client: Option<Arc<obscura_net::ObscuraHttpClient>>,
     import_map: Rc<RefCell<ImportMap>>,
     activity: Arc<ModuleLoadActivity>,
+    /// Canonical and requested specifiers fetched into deno_core's module map.
+    /// The runtime uses a cursor into this append-only list to associate a
+    /// prepared root with the dependencies that its successful evaluation also
+    /// evaluates.
+    loaded_specifiers: Rc<RefCell<Vec<String>>>,
 }
 
 impl ObscuraModuleLoader {
@@ -110,6 +115,7 @@ impl ObscuraModuleLoader {
             standalone_client: Some(standalone_client),
             import_map,
             activity: Arc::new(ModuleLoadActivity::default()),
+            loaded_specifiers: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -126,11 +132,16 @@ impl ObscuraModuleLoader {
             standalone_client: None,
             import_map,
             activity: Arc::new(ModuleLoadActivity::default()),
+            loaded_specifiers: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
     pub(crate) fn activity(&self) -> Arc<ModuleLoadActivity> {
         self.activity.clone()
+    }
+
+    pub(crate) fn loaded_specifiers(&self) -> Rc<RefCell<Vec<String>>> {
+        self.loaded_specifiers.clone()
     }
 }
 
@@ -194,6 +205,8 @@ impl ModuleLoader for ObscuraModuleLoader {
         // plain Option<String> rather than borrowing &self across an `await`.
         let proxy_url = self.proxy_url.clone();
         let activity = self.activity.clone();
+        let loaded_specifiers = self.loaded_specifiers.clone();
+        loaded_specifiers.borrow_mut().push(url.clone());
         // Register before returning the future. The lifecycle can inspect the
         // runtime between deno_core accepting the load and first polling it.
         // Keeping the guard inside the future makes cancellation/navigation
@@ -252,6 +265,11 @@ impl ModuleLoader for ObscuraModuleLoader {
                     let found = ModuleSpecifier::parse(resp.url.as_str()).map_err(|e| {
                         io_err(format!("Invalid final module URL {}: {}", resp.url, e))
                     })?;
+                    if found.as_str() != requested.as_str() {
+                        loaded_specifiers
+                            .borrow_mut()
+                            .push(found.to_string());
+                    }
                     let code = obscura_net::decode_non_html(&resp.body, resp.content_type());
                     Ok(ModuleSource::new_with_redirect(
                         deno_core::ModuleType::JavaScript,

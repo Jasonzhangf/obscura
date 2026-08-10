@@ -51,6 +51,41 @@ static SNAPSHOT: &[u8] = include_bytes!(env!("OBSCURA_SNAPSHOT_PATH"));
 static ISOLATE_CREATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 const DEFAULT_CDP_AWAIT_TIMEOUT_MS: u64 = 30_000;
+const HEAP_LIMIT_RECOVERY_HEADROOM_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Default)]
+struct HeapLimitState {
+    tripped: std::sync::atomic::AtomicBool,
+    restore_limit: std::sync::atomic::AtomicUsize,
+}
+
+fn install_heap_limit_guard(
+    runtime: &mut JsRuntime,
+    isolate_handle: IsolateHandle,
+    state: std::sync::Arc<HeapLimitState>,
+) {
+    runtime.add_near_heap_limit_callback(move |current_limit, _initial_limit| {
+        let _ = state.restore_limit.compare_exchange(
+            0,
+            current_limit,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        state
+            .tripped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        isolate_handle.terminate_execution();
+        current_limit.saturating_add(HEAP_LIMIT_RECOVERY_HEADROOM_BYTES)
+    });
+}
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&'static str>().copied())
+        .unwrap_or("unknown panic")
+}
 
 #[cfg(feature = "render")]
 fn with_sync_render_loading_disabled<R>(
@@ -94,6 +129,22 @@ pub struct ObscuraJsRuntime {
     /// construction. Lets a watchdog be armed from `&self` (the CDP dispatcher
     /// only holds `&Page` on the hot path) and is stable for the isolate's life.
     isolate_handle: IsolateHandle,
+    /// Signals that V8 approached its configured heap limit. The callback
+    /// terminates the current script and temporarily raises the limit just
+    /// enough for V8 to unwind instead of aborting the worker process.
+    heap_limit_state: std::sync::Arc<HeapLimitState>,
+    /// Browser module-map evaluation is idempotent. deno_core 0.350 asserts if
+    /// the same ModuleId is evaluated twice, so retain the first outcome for
+    /// duplicate script tags and roots already seen by Obscura.
+    module_evaluations: HashMap<deno_core::ModuleId, Result<(), String>>,
+    /// Append-only record owned by the module loader. A cursor around each
+    /// graph load identifies the dependency specifiers that become evaluated
+    /// with its root.
+    loaded_module_specifiers: Rc<RefCell<Vec<String>>>,
+    /// Successful graph evaluation also evaluates every dependency. Remember
+    /// those URLs so a dependency later encountered as a top-level script is a
+    /// browser-style no-op instead of a second deno_core `mod_evaluate` call.
+    evaluated_module_specifiers: HashMap<String, Result<(), String>>,
 }
 
 /// A fetched and instantiated module graph whose evaluation is intentionally
@@ -101,6 +152,8 @@ pub struct ObscuraJsRuntime {
 pub struct PreparedModule {
     module_id: deno_core::ModuleId,
     description: String,
+    entry_specifier: Option<String>,
+    graph_specifiers: Vec<String>,
 }
 
 fn remaining_deadline_ms(deadline: tokio::time::Instant) -> Option<u64> {
@@ -197,6 +250,10 @@ impl ObscuraJsRuntime {
     /// read. Keeping one sample across the task also lets repeated CSSOM reads
     /// share the retained layout on pages with running animations.
     fn begin_javascript_task(&mut self) {
+        // Some internal callers intentionally ignore script errors. Recover a
+        // heap-limit termination before any later task enters V8 even when the
+        // caller that triggered it did not need the error value.
+        self.recover_heap_limit();
         #[cfg(feature = "render")]
         begin_animation_task(&mut self.state.borrow_mut());
     }
@@ -223,11 +280,12 @@ impl ObscuraJsRuntime {
             import_map.clone(),
         );
         let module_load_activity = module_loader.activity();
+        let loaded_module_specifiers = module_loader.loaded_specifiers();
         let module_loader = Rc::new(module_loader);
 
         // Build the isolate under the process-wide creation lock so two
         // connection threads never construct isolates concurrently (#430).
-        let (runtime, isolate_handle) = {
+        let (runtime, isolate_handle, heap_limit_state) = {
             let _create_guard = ISOLATE_CREATE_LOCK
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -241,6 +299,14 @@ impl ObscuraJsRuntime {
 
             runtime.op_state().borrow_mut().put(state_clone);
 
+            let isolate_handle = runtime.v8_isolate().thread_safe_handle();
+            let heap_limit_state = std::sync::Arc::new(HeapLimitState::default());
+            install_heap_limit_guard(
+                &mut runtime,
+                isolate_handle.clone(),
+                heap_limit_state.clone(),
+            );
+
             runtime
                 .execute_script(
                     "<obscura:init>",
@@ -248,8 +314,7 @@ impl ObscuraJsRuntime {
                 )
                 .expect("init should not fail");
 
-            let isolate_handle = runtime.v8_isolate().thread_safe_handle();
-            (runtime, isolate_handle)
+            (runtime, isolate_handle, heap_limit_state)
         };
 
         ObscuraJsRuntime {
@@ -260,7 +325,59 @@ impl ObscuraJsRuntime {
             import_map,
             module_load_activity,
             isolate_handle,
+            heap_limit_state,
+            module_evaluations: HashMap::new(),
+            loaded_module_specifiers,
+            evaluated_module_specifiers: HashMap::new(),
         }
+    }
+
+    /// Restore the configured V8 heap limit after the emergency headroom has
+    /// allowed a terminated allocation to unwind. The callback is then armed
+    /// again so a second hostile script cannot grow the isolate without bound.
+    fn recover_heap_limit(&mut self) -> bool {
+        if !self
+            .heap_limit_state
+            .tripped
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return false;
+        }
+
+        self.runtime.v8_isolate().cancel_terminate_execution();
+        let restore_limit = self
+            .heap_limit_state
+            .restore_limit
+            .swap(0, std::sync::atomic::Ordering::SeqCst);
+        self.runtime
+            .remove_near_heap_limit_callback(restore_limit);
+        install_heap_limit_guard(
+            &mut self.runtime,
+            self.isolate_handle.clone(),
+            self.heap_limit_state.clone(),
+        );
+        tracing::warn!("V8 heap limit reached: terminated the current JavaScript task");
+        true
+    }
+
+    fn finish_heap_checked<T>(&mut self, result: Result<T, String>) -> Result<T, String> {
+        if self.recover_heap_limit() {
+            Err("JavaScript heap limit exceeded; execution terminated".to_string())
+        } else {
+            result
+        }
+    }
+
+    fn execute_runtime_script(
+        &mut self,
+        name: &'static str,
+        source: String,
+    ) -> Result<deno_core::v8::Global<deno_core::v8::Value>, String> {
+        let result = self
+            .runtime
+            .execute_script(name, source)
+            .map_err(|error| error.to_string());
+        self.finish_heap_checked(result)
     }
 
     /// Parse and merge an inline document import map. Rules which would alter
@@ -406,7 +523,7 @@ impl ObscuraJsRuntime {
 
     pub fn set_user_agent(&mut self, ua: &str) {
         let escaped = ua.replace('\\', "\\\\").replace('\'', "\\'");
-        let _ = self.runtime.execute_script(
+        let _ = self.execute_runtime_script(
             "<set-ua>",
             format!("globalThis.__obscura_ua = '{}';", escaped),
         );
@@ -416,7 +533,7 @@ impl ObscuraJsRuntime {
         let p = platform.replace('\'', "\\'");
         let uap = ua_platform.replace('\'', "\\'");
         let uapv = ua_platform_version.replace('\'', "\\'");
-        let _ = self.runtime.execute_script(
+        let _ = self.execute_runtime_script(
             "<set-platform>",
             format!(
                 "globalThis.__obscura_platform='{}';globalThis.__obscura_ua_platform='{}';globalThis.__obscura_ua_platform_version='{}';",
@@ -426,7 +543,7 @@ impl ObscuraJsRuntime {
     }
 
     pub fn set_stealth(&mut self, enabled: bool) {
-        let _ = self.runtime.execute_script(
+        let _ = self.execute_runtime_script(
             "<set-stealth>",
             format!("globalThis.__obscura_stealth = {};", enabled),
         );
@@ -450,7 +567,7 @@ impl ObscuraJsRuntime {
                 state.resolved_scroll = None;
             }
         }
-        let _ = self.runtime.execute_script(
+        let _ = self.execute_runtime_script(
             "<set-viewport>",
             format!(
                 "globalThis.__obscura_viewport_w={width};\
@@ -490,7 +607,7 @@ impl ObscuraJsRuntime {
                 "globalThis.__obscura_set_screen_override(null,null,{emulated});"
             ),
         };
-        let _ = self.runtime.execute_script("<set-screen-size>", script);
+        let _ = self.execute_runtime_script("<set-screen-size>", script);
     }
 
     /// Current clamped root scroll offset shared by CSSOM geometry and paint.
@@ -916,7 +1033,7 @@ impl ObscuraJsRuntime {
     /// Run __obscura_init() after all per-page properties (UA, platform, stealth, etc.)
     /// have been set. Must be called once per page setup, after all set_* methods.
     pub fn run_page_init(&mut self) {
-        let _ = self.runtime.execute_script(
+        let _ = self.execute_runtime_script(
             "<obscura:page-init>",
             "globalThis.__obscura_init();".to_string(),
         );
@@ -926,7 +1043,7 @@ impl ObscuraJsRuntime {
     /// values are injected as numeric globals the bootstrap reads; when unset it
     /// keeps the built-in default. Callers validate the range before calling.
     pub fn set_geolocation(&mut self, latitude: f64, longitude: f64) {
-        let _ = self.runtime.execute_script(
+        let _ = self.execute_runtime_script(
             "<set-geo>",
             format!(
                 "globalThis.__obscura_geo_lat={};globalThis.__obscura_geo_lon={};",
@@ -939,8 +1056,7 @@ impl ObscuraJsRuntime {
         self.begin_javascript_task();
         let wrapped = Self::wrap_expression(expression);
         let result = self
-            .runtime
-            .execute_script("<eval>", wrapped)
+            .execute_runtime_script("<eval>", wrapped)
             .map_err(|e| format!("JS error: {}", e))?;
         self.v8_to_json(result)
     }
@@ -1025,8 +1141,7 @@ impl ObscuraJsRuntime {
         };
 
         let result = self
-            .runtime
-            .execute_script("<eval-remote>", meta_code)
+            .execute_runtime_script("<eval-remote>", meta_code)
             .map_err(|e| format!("JS error: {}", e))?;
 
         let meta_str = if await_promise {
@@ -1035,8 +1150,7 @@ impl ObscuraJsRuntime {
             let settled = self
                 .resolve_promises_until(
                     |rt| {
-                        rt.runtime
-                            .execute_script("<done?>", sentinel.clone())
+                        rt.execute_runtime_script("<done?>", sentinel.clone())
                             .ok()
                             .and_then(|v| rt.v8_to_json(v).ok())
                             .and_then(|j| j.as_bool())
@@ -1064,22 +1178,20 @@ impl ObscuraJsRuntime {
                 );
             }
             let rejected = self
-                .runtime
-                .execute_script(
+                .execute_runtime_script(
                     "<readRejected>",
                     "globalThis.__obscura_await_rejected".to_string(),
                 )
                 .map_err(|e| format!("JS error: {}", e))?;
             if self.v8_to_json(rejected)?.as_bool().unwrap_or(false) {
-                let err = self.runtime.execute_script("<readError>", format!("String(globalThis.__obscura_objects['{0}'] && (globalThis.__obscura_objects['{0}'].message || globalThis.__obscura_objects['{0}']))", oid))
+                let err = self.execute_runtime_script("<readError>", format!("String(globalThis.__obscura_objects['{0}'] && (globalThis.__obscura_objects['{0}'].message || globalThis.__obscura_objects['{0}']))", oid))
                     .map_err(|e| format!("JS error: {}", e))?;
                 return Err(format!(
                     "Promise rejected: {}",
                     self.v8_to_json(err)?.as_str().unwrap_or("")
                 ));
             }
-            self.runtime
-                .execute_script("<readMeta>", "globalThis.__obscura_await_meta".to_string())
+            self.execute_runtime_script("<readMeta>", "globalThis.__obscura_await_meta".to_string())
                 .map_err(|e| format!("JS error: {}", e))?
         } else {
             result
@@ -1097,8 +1209,7 @@ impl ObscuraJsRuntime {
 
         if await_promise && return_by_value {
             let read = self
-                .runtime
-                .execute_script(
+                .execute_runtime_script(
                     "<readResult>",
                     format!("globalThis.__obscura_objects['{}']", oid),
                 )
@@ -1176,8 +1287,7 @@ impl ObscuraJsRuntime {
                 done_counter = done_counter,
             );
 
-            self.runtime
-                .execute_script("<callFnAsync>", code)
+            self.execute_runtime_script("<callFnAsync>", code)
                 .map_err(|e| format!("JS error: {}", e))?;
 
             let __t0 = std::time::Instant::now();
@@ -1185,8 +1295,7 @@ impl ObscuraJsRuntime {
             let settled = self
                 .resolve_promises_until(
                     |rt| {
-                        rt.runtime
-                            .execute_script("<done?>", sentinel.clone())
+                        rt.execute_runtime_script("<done?>", sentinel.clone())
                             .ok()
                             .and_then(|v| rt.v8_to_json(v).ok())
                             .and_then(|j| j.as_bool())
@@ -1216,8 +1325,7 @@ impl ObscuraJsRuntime {
 
             if return_by_value {
                 let read = self
-                    .runtime
-                    .execute_script(
+                    .execute_runtime_script(
                         "<readResult>",
                         format!("globalThis.__obscura_objects['{}']", oid),
                     )
@@ -1227,8 +1335,7 @@ impl ObscuraJsRuntime {
             }
 
             let meta_result = self
-                .runtime
-                .execute_script("<readMeta>", "globalThis.__obscura_await_meta".to_string())
+                .execute_runtime_script("<readMeta>", "globalThis.__obscura_await_meta".to_string())
                 .map_err(|e| format!("JS error: {}", e))?;
             let meta_str = self.v8_to_json(meta_result)?;
             let meta_json = if let serde_json::Value::String(s) = &meta_str {
@@ -1257,8 +1364,7 @@ impl ObscuraJsRuntime {
                 args = args_list,
             );
             let result = self
-                .runtime
-                .execute_script("<callFnByValue>", code)
+                .execute_runtime_script("<callFnByValue>", code)
                 .map_err(|e| format!("JS error: {}", e))?;
             let json_val = self.v8_to_json(result)?;
             return Ok(Self::info_from_json(&json_val));
@@ -1281,8 +1387,7 @@ impl ObscuraJsRuntime {
             meta_fn = Self::meta_extract_js("__result"),
         );
         let result = self
-            .runtime
-            .execute_script("<callFnRemote>", code)
+            .execute_runtime_script("<callFnRemote>", code)
             .map_err(|e| format!("JS error: {}", e))?;
         let meta_str = self.v8_to_json(result)?;
         let meta_json = if let serde_json::Value::String(s) = &meta_str {
@@ -1320,8 +1425,7 @@ impl ObscuraJsRuntime {
             "globalThis.__obscura_objects['{}'] = ({});",
             oid, js_expression,
         );
-        self.runtime
-            .execute_script("<store>", code)
+        self.execute_runtime_script("<store>", code)
             .map_err(|e| format!("Store error: {}", e))?;
         self.object_store.insert(
             oid.clone(),
@@ -1348,8 +1452,7 @@ impl ObscuraJsRuntime {
             meta_fn = Self::meta_extract_js("__result"),
         );
         let result = self
-            .runtime
-            .execute_script("<store-meta>", code)
+            .execute_runtime_script("<store-meta>", code)
             .map_err(|e| format!("Store error: {}", e))?;
         let meta_str = self.v8_to_json(result)?;
         let meta_json = if let serde_json::Value::String(s) = &meta_str {
@@ -1367,12 +1470,12 @@ impl ObscuraJsRuntime {
     pub fn release_object(&mut self, object_id: &str) {
         if self.object_store.remove(object_id).is_some() {
             let code = format!("delete globalThis.__obscura_objects['{}'];", object_id,);
-            let _ = self.runtime.execute_script("<release>", code);
+            let _ = self.execute_runtime_script("<release>", code);
         }
     }
 
     pub fn release_object_group(&mut self) {
-        let _ = self.runtime.execute_script(
+        let _ = self.execute_runtime_script(
             "<releaseGroup>",
             "globalThis.__obscura_objects = {};".to_string(),
         );
@@ -1398,6 +1501,7 @@ impl ObscuraJsRuntime {
         let budget = tokio::time::Duration::from_millis(budget_ms);
         let specifier = deno_core::ModuleSpecifier::parse(url)
             .map_err(|e| format!("Invalid module URL {}: {}", url, e))?;
+        let loaded_start = self.loaded_module_specifiers.borrow().len();
 
         // Bound the recursive import-graph fetch. deno_core fetches the graph
         // concurrently through the one page-scoped module loader. Loading the
@@ -1425,9 +1529,16 @@ impl ObscuraJsRuntime {
         // Return as soon as the module finishes evaluating rather than waiting
         // for the loop to go fully idle: a page timer (setInterval) keeps the
         // loop busy forever and would otherwise burn the whole budget (#374).
+        let mut graph_specifiers = self.loaded_module_specifiers.borrow()[loaded_start..].to_vec();
+        graph_specifiers.push(specifier.to_string());
+        graph_specifiers.sort_unstable();
+        graph_specifiers.dedup();
+
         Ok(PreparedModule {
             module_id,
             description: format!("Module {}", url),
+            entry_specifier: Some(specifier.to_string()),
+            graph_specifiers,
         })
     }
 
@@ -1447,9 +1558,34 @@ impl ObscuraJsRuntime {
         budget_ms: u64,
         what: &str,
     ) -> Result<(), String> {
+        if let Some(outcome) = self.module_evaluations.get(&module_id) {
+            return outcome.clone();
+        }
+
         self.begin_javascript_task();
         let budget = tokio::time::Duration::from_millis(budget_ms);
-        let result = self.runtime.mod_evaluate(module_id);
+        // deno_core 0.350 asserts instead of treating a second evaluation as
+        // the module-map no-op required by browsers. The local outcome cache
+        // covers duplicate roots prepared by Obscura. A root can also have
+        // been evaluated earlier as another graph's dependency, which is only
+        // observable when mod_evaluate checks V8's private module status, so
+        // contain that dependency assertion at this boundary as well.
+        let evaluation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.runtime.mod_evaluate(module_id)
+        }));
+        let result = match evaluation {
+            Ok(result) => result,
+            Err(payload) => {
+                let message = panic_payload_message(payload.as_ref());
+                let outcome = if message.contains("Module already evaluated") {
+                    Ok(())
+                } else {
+                    Err(format!("{} evaluation panicked: {}", what, message))
+                };
+                self.module_evaluations.insert(module_id, outcome.clone());
+                return outcome;
+            }
+        };
         tokio::pin!(result);
 
         let outcome = tokio::time::timeout(budget, async {
@@ -1465,14 +1601,17 @@ impl ObscuraJsRuntime {
         })
         .await;
 
-        match outcome {
+        let outcome = match outcome {
             Ok(Ok(())) => Ok(()),
             Ok(Err(e)) => Err(format!("{} eval error: {}", what, e)),
             Err(_) => Err(format!(
                 "{} evaluation timed out after {}ms",
                 what, budget_ms
             )),
-        }
+        };
+        let outcome = self.finish_heap_checked(outcome);
+        self.module_evaluations.insert(module_id, outcome.clone());
+        outcome
     }
 
     pub async fn load_inline_module(
@@ -1508,6 +1647,7 @@ impl ObscuraJsRuntime {
         // each prepared module distinct until its scheduled evaluation.
         let specifier = deno_core::ModuleSpecifier::parse(base_url)
             .unwrap_or_else(|_| deno_core::ModuleSpecifier::parse("about:blank").unwrap());
+        let loaded_start = self.loaded_module_specifiers.borrow().len();
 
         let module_id = match tokio::time::timeout(
             budget,
@@ -1533,9 +1673,17 @@ impl ObscuraJsRuntime {
         // keeps the loop busy forever, and waiting for idle burned the whole
         // budget on this preamble module and starved the module that mounts the
         // app, leaving #root empty (issue #374).
+        let mut graph_specifiers = self.loaded_module_specifiers.borrow()[loaded_start..].to_vec();
+        graph_specifiers.sort_unstable();
+        graph_specifiers.dedup();
+
         Ok(PreparedModule {
             module_id,
             description: "Inline module".to_string(),
+            // Multiple inline modules intentionally share the document URL,
+            // but each has its own source and ModuleId.
+            entry_specifier: None,
+            graph_specifiers,
         })
     }
 
@@ -1547,7 +1695,15 @@ impl ObscuraJsRuntime {
         let PreparedModule {
             module_id,
             description,
+            entry_specifier,
+            graph_specifiers,
         } = prepared;
+        if let Some(outcome) = entry_specifier
+            .as_ref()
+            .and_then(|specifier| self.evaluated_module_specifiers.get(specifier))
+        {
+            return outcome.clone();
+        }
         // Tokio timeouts cannot run while synchronous top-level module work
         // pins the runtime thread in V8. Pair the async timeout with a hard V8
         // watchdog so this budget is a real wall-clock ceiling for both forms
@@ -1557,14 +1713,25 @@ impl ObscuraJsRuntime {
             .drive_module_eval(module_id, budget_ms, &description)
             .await;
         let watchdog_fired = self.disarm_watchdog(watchdog);
-        if watchdog_fired {
+        let result = if watchdog_fired {
             Err(format!(
                 "{} evaluation timed out after {}ms",
                 description, budget_ms
             ))
         } else {
             result
+        };
+
+        if let Some(entry_specifier) = entry_specifier {
+            self.evaluated_module_specifiers
+                .insert(entry_specifier, result.clone());
         }
+        if result.is_ok() {
+            for specifier in graph_specifiers {
+                self.evaluated_module_specifiers.insert(specifier, Ok(()));
+            }
+        }
+        result
     }
 
     fn execute_classic_script(&mut self, name: &str, source: &str) -> Result<(), String> {
@@ -1573,53 +1740,60 @@ impl ObscuraJsRuntime {
         // &'static str. Browser script URLs are runtime data, and V8 uses this
         // origin as import()'s referrer, so compile in the runtime's main
         // context directly instead of substituting the fixed "<script>" name.
-        let scope = &mut self.runtime.handle_scope();
-        let source = deno_core::v8::String::new(scope, source)
-            .ok_or_else(|| "JS error: source allocation failed".to_string())?;
-        let name = deno_core::v8::String::new(scope, name)
-            .ok_or_else(|| "JS error: script URL allocation failed".to_string())?;
-        let origin = deno_core::v8::ScriptOrigin::new(
-            scope,
-            name.into(),
-            0,
-            0,
-            false,
-            0,
-            None,
-            false,
-            false,
-            false,
-            None,
-        );
-        let scope = &mut deno_core::v8::TryCatch::new(scope);
-        let script = deno_core::v8::Script::compile(scope, source, Some(&origin));
-        let Some(script) = script else {
-            if scope.is_execution_terminating() {
-                scope.cancel_terminate_execution();
-                return Err("JS error: Uncaught Error: execution terminated".to_string());
-            }
-            return match scope.exception() {
-                Some(exception) => {
-                    let error = deno_core::error::JsError::from_v8_exception(scope, exception);
-                    Err(format!("JS error: {error}"))
+        let result = (|| {
+            let scope = &mut self.runtime.handle_scope();
+            let source = deno_core::v8::String::new(scope, source)
+                .ok_or_else(|| "JS error: source allocation failed".to_string())?;
+            let name = deno_core::v8::String::new(scope, name)
+                .ok_or_else(|| "JS error: script URL allocation failed".to_string())?;
+            let origin = deno_core::v8::ScriptOrigin::new(
+                scope,
+                name.into(),
+                0,
+                0,
+                false,
+                0,
+                None,
+                false,
+                false,
+                false,
+                None,
+            );
+            let scope = &mut deno_core::v8::TryCatch::new(scope);
+            let script = deno_core::v8::Script::compile(scope, source, Some(&origin));
+            let Some(script) = script else {
+                if scope.is_execution_terminating() {
+                    scope.cancel_terminate_execution();
+                    return Err("JS error: Uncaught Error: execution terminated".to_string());
                 }
-                None => Err("JS error: script compilation failed without an exception".to_string()),
+                return match scope.exception() {
+                    Some(exception) => {
+                        let error = deno_core::error::JsError::from_v8_exception(scope, exception);
+                        Err(format!("JS error: {error}"))
+                    }
+                    None => {
+                        Err("JS error: script compilation failed without an exception".to_string())
+                    }
+                };
             };
-        };
-        if script.run(scope).is_none() {
-            if scope.is_execution_terminating() {
-                scope.cancel_terminate_execution();
-                return Err("JS error: Uncaught Error: execution terminated".to_string());
-            }
-            return match scope.exception() {
-                Some(exception) => {
-                    let error = deno_core::error::JsError::from_v8_exception(scope, exception);
-                    Err(format!("JS error: {error}"))
+            if script.run(scope).is_none() {
+                if scope.is_execution_terminating() {
+                    scope.cancel_terminate_execution();
+                    return Err("JS error: Uncaught Error: execution terminated".to_string());
                 }
-                None => Err("JS error: script execution failed without an exception".to_string()),
-            };
-        }
-        Ok(())
+                return match scope.exception() {
+                    Some(exception) => {
+                        let error = deno_core::error::JsError::from_v8_exception(scope, exception);
+                        Err(format!("JS error: {error}"))
+                    }
+                    None => {
+                        Err("JS error: script execution failed without an exception".to_string())
+                    }
+                };
+            }
+            Ok(())
+        })();
+        self.finish_heap_checked(result)
     }
 
     pub fn execute_script(&mut self, name: &str, source: &str) -> Result<(), String> {
@@ -1706,7 +1880,7 @@ impl ObscuraJsRuntime {
             .await
             .map_err(|e| format!("Event loop error: {}", e));
         self.runtime.v8_isolate().perform_microtask_checkpoint();
-        result
+        self.finish_heap_checked(result)
     }
 
     /// Whether the serialized dynamic-script queue is still fetching or
@@ -1850,6 +2024,7 @@ impl ObscuraJsRuntime {
         };
         let fired = self.disarm_watchdog(token);
         match result {
+            Err(error) if error.contains("heap limit exceeded") => Err(error),
             Err(error) if fired || error.contains("execution terminated") => Ok(()),
             other => other,
         }
@@ -1887,7 +2062,7 @@ impl ObscuraJsRuntime {
         self.begin_javascript_task();
         self.runtime.v8_isolate().perform_microtask_checkpoint();
         let mut waiting_for_wake = false;
-        std::future::poll_fn(|cx| {
+        let result = std::future::poll_fn(|cx| {
             let tick = self
                 .runtime
                 .poll_event_loop(cx, deno_core::PollEventLoopOptions::default());
@@ -1905,7 +2080,8 @@ impl ObscuraJsRuntime {
                 }
             }
         })
-        .await
+        .await;
+        self.finish_heap_checked(result)
     }
 
     /// Drive one browser task while allowing the future to remain parked on
@@ -1935,10 +2111,13 @@ impl ObscuraJsRuntime {
             self.cancel_termination();
             return Err("autonomous microtask checkpoint exceeded its task budget".into());
         }
+        if self.recover_heap_limit() {
+            return Err("JavaScript heap limit exceeded; execution terminated".into());
+        }
 
         let isolate_handle = self.isolate_handle();
         let mut waiting_for_wake = false;
-        std::future::poll_fn(|cx| {
+        let result = std::future::poll_fn(|cx| {
             let watchdog = crate::cdp_watchdog::arm(
                 isolate_handle.clone(),
                 std::time::Duration::from_millis(AUTONOMOUS_TASK_WATCHDOG_MS),
@@ -1967,7 +2146,8 @@ impl ObscuraJsRuntime {
                 }
             }
         })
-        .await
+        .await;
+        self.finish_heap_checked(result)
     }
 
     /// Drive one cooperative event-loop turn for browser lifecycle code that
@@ -2098,6 +2278,7 @@ impl ObscuraJsRuntime {
         };
         let fired = self.disarm_watchdog(token);
         match result {
+            Err(error) if error.contains("heap limit exceeded") => Err(error),
             Err(error) if fired || error.contains("execution terminated") => Ok(()),
             other => other,
         }
@@ -2119,6 +2300,9 @@ impl ObscuraJsRuntime {
         let token = self.arm_watchdog(timeout);
         let result = self.runtime.execute_script("<eval>", wrapped);
         let fired = self.disarm_watchdog(token);
+        if self.recover_heap_limit() {
+            return Err("JavaScript heap limit exceeded; execution terminated".to_string());
+        }
         match result {
             Ok(v) if !fired => self.v8_to_json(v),
             Ok(_) => Err("eval timed out".to_string()),
@@ -2142,6 +2326,7 @@ impl ObscuraJsRuntime {
                 .run_event_loop(deno_core::PollEventLoopOptions::default()),
         )
         .await;
+        self.recover_heap_limit();
     }
 
     /// Pump the event loop until `done_check` returns true (e.g. an IIFE
@@ -2183,6 +2368,9 @@ impl ObscuraJsRuntime {
                     .run_event_loop(deno_core::PollEventLoopOptions::default()),
             )
             .await;
+            if self.recover_heap_limit() {
+                return false;
+            }
             // Backoff so a hung promise doesn't burn CPU. Caps at 50ms;
             // worst case we miss the result by <50ms.
             if tick_ms < 50 {
@@ -14014,6 +14202,45 @@ mod tests {
         format!("http://{}", address)
     }
 
+    fn spawn_duplicate_module_graph_server() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 2048];
+                let length = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..length]);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_ascii_whitespace().nth(1))
+                    .unwrap_or("/");
+                let body = match path {
+                    "/entry.js" => {
+                        "import './shared.js'; globalThis.__module_entry_ran = true;"
+                    }
+                    "/shared.js" => {
+                        "globalThis.__shared_module_runs = \
+                         (globalThis.__shared_module_runs || 0) + 1;"
+                    }
+                    _ => "throw new Error('unexpected module path');",
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\n\
+                     Content-Type: application/javascript\r\n\
+                     Content-Length: {}\r\n\
+                     Connection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        format!("http://{}", address)
+    }
+
     #[derive(Clone, Copy)]
     enum ModuleGraphFixture {
         CookieProtected,
@@ -14185,6 +14412,64 @@ mod tests {
             "expected entry fetch status in error, got: {}",
             error
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dependency_prepared_as_root_is_evaluated_only_once() {
+        let base = spawn_duplicate_module_graph_server();
+        let jar = std::sync::Arc::new(obscura_net::CookieJar::new());
+        let client = std::sync::Arc::new(obscura_net::ObscuraHttpClient::with_full_options(
+            jar, None, true,
+        ));
+        let mut rt = ObscuraJsRuntime::with_base_url(&format!("{}/", base));
+        rt.set_http_client(client);
+
+        // The HTML scheduler prepares all module graphs before evaluating any
+        // of them. The shared URL is both a dependency and a later root, which
+        // used to reach deno_core::mod_evaluate twice and panic (#591).
+        let entry = rt
+            .prepare_module(&format!("{}/entry.js", base), 1_000)
+            .await
+            .unwrap();
+        let shared = rt
+            .prepare_module(&format!("{}/shared.js", base), 1_000)
+            .await
+            .unwrap();
+
+        rt.evaluate_prepared_module(entry, 1_000).await.unwrap();
+        rt.evaluate_prepared_module(shared, 1_000).await.unwrap();
+
+        assert_eq!(
+            rt.evaluate("globalThis.__module_entry_ran === true").unwrap(),
+            serde_json::json!(true),
+        );
+        assert_eq!(
+            rt.evaluate("globalThis.__shared_module_runs").unwrap(),
+            serde_json::json!(1.0),
+        );
+    }
+
+    #[test]
+    fn heap_limit_terminates_script_and_runtime_recovers() {
+        crate::v8_flags::set_v8_flags("--max-old-space-size=32 --max-semi-space-size=1");
+        let mut rt = ObscuraJsRuntime::new();
+
+        for _ in 0..2 {
+            let error = rt
+                .evaluate(
+                    "(() => { const chunks = []; for (;;) { \
+                     chunks.push(new Array(262144).fill(1.25)); } })()",
+                )
+                .unwrap_err();
+            assert!(
+                error.contains("heap limit exceeded"),
+                "unexpected heap failure: {error}",
+            );
+            assert_eq!(
+                rt.evaluate("globalThis.__runtime_survived_oom = true").unwrap(),
+                serde_json::json!(true),
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
