@@ -1089,6 +1089,18 @@ impl Page {
         true
     }
 
+    /// Moves the frame tree forward by one step: give any fetched frame
+    /// document a realm, then hand on any message waiting for a realm.
+    ///
+    /// Reports whether anything happened, so a caller can pump again. A new
+    /// frame runs scripts that can post, and a message usually causes a reply,
+    /// so neither queue is finished until both are quiet.
+    async fn advance_frames(&mut self) -> bool {
+        let attached = self.attach_pending_frames().await;
+        let delivered = self.deliver_frame_messages();
+        attached || delivered
+    }
+
     /// URLs of the page's live child frames, in creation order.
     pub fn frame_urls(&self) -> Vec<String> {
         self.frames
@@ -2459,11 +2471,7 @@ impl Page {
                     let _ = js.run_event_loop_until_quiescent(remaining, 150).await;
                 }
             }
-            let attached = self.attach_pending_frames().await;
-            // A message usually causes a reply, so keep going while either the
-            // frame tree or the conversation is still moving.
-            let delivered = self.deliver_frame_messages();
-            if !attached && !delivered {
+            if !self.advance_frames().await {
                 break;
             }
         }
@@ -2503,8 +2511,7 @@ impl Page {
         // realms once at the end instead of being interleaved as in `settle`.
         // Their document scripts still run; only their own deferred work is
         // left for a later settle.
-        self.attach_pending_frames().await;
-        self.deliver_frame_messages();
+        self.advance_frames().await;
     }
 
     /// Advance one wake-driven browser task for a continuously owned page.
@@ -2920,7 +2927,48 @@ impl Page {
             self.lifecycle = LifecycleState::NetworkIdle;
         }
 
+        self.build_document_frames().await;
+
         Ok(())
+    }
+
+    /// Builds the child frames of the document that just loaded.
+    ///
+    /// Loading a document includes loading the frames in it, so this belongs to
+    /// navigation rather than to `settle`: a CDP client that only navigates
+    /// would otherwise be told the page has no frames, because nothing had
+    /// given them realms yet.
+    ///
+    /// A frame's document is fetched by page script, so it arrives from the
+    /// event loop rather than being ready the moment parsing ends. Pages
+    /// without an iframe skip the pumping entirely and pay one native selector
+    /// query.
+    async fn build_document_frames(&mut self) {
+        // How many rounds of "attach a frame, let it start its own" to follow.
+        // A frame can add a frame, so this needs a bound rather than a loop
+        // until quiet: a page that adds one on every turn would never finish.
+        const ROUNDS: usize = 8;
+        const ROUND_MS: u64 = 50;
+
+        let has_iframe = self
+            .with_dom(|dom| dom.query_selector("iframe").ok().flatten().is_some())
+            .unwrap_or(false);
+        if !has_iframe {
+            return;
+        }
+
+        for _ in 0..ROUNDS {
+            if let Some(js) = &mut self.js {
+                let _ = tokio::time::timeout(
+                    tokio::time::Duration::from_millis(ROUND_MS),
+                    js.run_event_loop(),
+                )
+                .await;
+            }
+            if !self.advance_frames().await {
+                break;
+            }
+        }
     }
 
     pub fn navigate_blank(&mut self) {

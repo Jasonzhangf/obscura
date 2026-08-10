@@ -44,6 +44,9 @@ pub struct CdpContext {
     /// script-initiated Network events must share this id; inventing a loader
     /// for each fetch breaks DevTools request grouping.
     pub current_loader_ids: HashMap<String, String>,
+    /// Child frame ids already reported to the client, per page, so each frame
+    /// is announced once and a frame that goes away can be retracted.
+    pub announced_frames: HashMap<String, Vec<String>>,
     pub pending_events: Vec<CdpEvent>,
     #[cfg(feature = "render")]
     pub(crate) screencasts: HashMap<String, ScreencastState>,
@@ -155,6 +158,7 @@ impl CdpContext {
             pages: Vec::new(),
             sessions: HashMap::new(),
             current_loader_ids: HashMap::new(),
+            announced_frames: HashMap::new(),
             pending_events: Vec::new(),
             #[cfg(feature = "render")]
             screencasts: HashMap::new(),
@@ -535,6 +539,7 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
     }
 
     drain_binding_calls(ctx);
+    drain_frame_events(ctx);
 
     match result {
         Ok(value) => CdpResponse::success(req.id, value, req.session_id.clone()),
@@ -586,6 +591,81 @@ pub(crate) fn drain_binding_calls(ctx: &mut CdpContext) {
             });
         }
     }
+    ctx.pending_events.extend(events);
+}
+
+// Announce child frames the client has not been told about yet, and retract
+// the ones that are gone.
+//
+// A frame is built when the page settles, which is not necessarily during the
+// navigation that created it: script can add an iframe at any time, and the
+// settle that gives it a realm may belong to a later command. Diffing here,
+// after every dispatch, reports a frame whenever it actually appears instead
+// of only at navigation, and is the same drain point binding calls use.
+pub(crate) fn drain_frame_events(ctx: &mut CdpContext) {
+    let page_to_session: HashMap<String, String> = ctx
+        .sessions
+        .iter()
+        .map(|(sid, pid)| (pid.clone(), sid.clone()))
+        .collect();
+
+    let mut events: Vec<CdpEvent> = Vec::new();
+    let mut announced: HashMap<String, Vec<String>> = HashMap::new();
+    for page in &ctx.pages {
+        let Some(session_id) = page_to_session.get(&page.id).cloned() else {
+            continue;
+        };
+        let live = crate::domains::page::child_frame_values(page);
+        let known = ctx.announced_frames.get(&page.id);
+        let live_ids: Vec<String> = live
+            .iter()
+            .map(|frame| frame["id"].as_str().unwrap_or_default().to_string())
+            .collect();
+
+        for frame in &live {
+            let id = frame["id"].as_str().unwrap_or_default();
+            if known.is_some_and(|ids| ids.iter().any(|seen| seen == id)) {
+                continue;
+            }
+            // Attach before navigate: a client builds its frame from the attach
+            // event and treats a navigation of a frame it has never seen as a
+            // protocol error.
+            events.push(CdpEvent {
+                method: "Page.frameAttached".into(),
+                params: json!({
+                    "frameId": id,
+                    "parentFrameId": frame["parentId"].as_str().unwrap_or_default(),
+                }),
+                session_id: Some(session_id.clone()),
+            });
+            events.push(CdpEvent {
+                method: "Page.frameNavigated".into(),
+                params: json!({ "frame": frame, "type": "Navigation" }),
+                session_id: Some(session_id.clone()),
+            });
+            // The frame's document scripts have already run by the time it is
+            // in this list, so it is not still loading.
+            events.push(CdpEvent {
+                method: "Page.frameStoppedLoading".into(),
+                params: json!({ "frameId": id }),
+                session_id: Some(session_id.clone()),
+            });
+        }
+
+        if let Some(known) = known {
+            for id in known {
+                if !live_ids.contains(id) {
+                    events.push(CdpEvent {
+                        method: "Page.frameDetached".into(),
+                        params: json!({ "frameId": id, "reason": "remove" }),
+                        session_id: Some(session_id.clone()),
+                    });
+                }
+            }
+        }
+        announced.insert(page.id.clone(), live_ids);
+    }
+    ctx.announced_frames.extend(announced);
     ctx.pending_events.extend(events);
 }
 
