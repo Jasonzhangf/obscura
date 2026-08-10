@@ -4536,11 +4536,24 @@ fn paint_laid_dom_scrolled(
             }
         }
 
-        // `::before`/`::after` generated text (see `dom::build_pseudo_content`)
-        // has no DOM text node of its own; its word runs are registered under
-        // the host element's own id instead, so paint them here rather than
-        // through `paint_text_node` (which only runs for real text nodes).
-        if let Some(runs) = laid.text_runs.get(&nid) {
+        // `::before`/`::after` generated text has no DOM text node of its own.
+        // Its shaped word items are registered under the host element, so
+        // paint them here. The static path remains for layout-only builds and
+        // for a face that cosmic-text cannot decode.
+        if let Some(items) = laid.word_ifc_items.get(&nid) {
+            let offset = scroll_state.translation_for(laid, nid);
+            for &item in items {
+                laid.text_engine.paint_item_with_clip_mask_scaled_for_print(
+                    item,
+                    &mut pixmap,
+                    offset,
+                    clip,
+                    element_clip_mask,
+                    raster_scale,
+                    print_economy,
+                );
+            }
+        } else if let Some(runs) = laid.text_runs.get(&nid) {
             let color = style.color.unwrap_or([0, 0, 0, 255]);
             let fsize = style.font_size.unwrap_or(16.0);
             let is_bold = crate::style::used_font_weight(style) >= 600;
@@ -6854,6 +6867,13 @@ fn collect_web_fonts(
     cache: &mut RenderResourceCache,
     dynamic_fonts: &[DynamicFontFace],
 ) -> Vec<crate::inline::WebFont> {
+    struct FontRule {
+        sources: Vec<(String, String)>,
+        family: Option<String>,
+        weight: Option<(u16, u16)>,
+        italic: Option<bool>,
+    }
+
     let mut seen = std::collections::HashSet::new();
     let mut fonts = Vec::new();
     let mut rules = Vec::new();
@@ -6874,16 +6894,20 @@ fn collect_web_fonts(
             if !font_face_covers_ascii(face) {
                 continue;
             }
-            let Some(src) = font_face_urls(face).into_iter().next() else {
+            let sources: Vec<_> = font_face_urls(face)
+                .into_iter()
+                .filter(|src| font_source_may_be_supported(src))
+                .map(|src| (font_resource_key(&src, base_url), src))
+                .collect();
+            if sources.is_empty() {
                 continue;
-            };
-            rules.push((
-                font_resource_key(&src, base_url),
-                src,
-                font_face_family(face),
-                font_face_weight(face),
-                font_face_italic(face),
-            ));
+            }
+            rules.push(FontRule {
+                sources,
+                family: font_face_family(face),
+                weight: font_face_weight(face),
+                italic: font_face_italic(face),
+            });
         }
     }
     for face in dynamic_fonts {
@@ -6894,16 +6918,20 @@ fn collect_web_fonts(
         if !font_face_covers_ascii(&descriptor_block) {
             continue;
         }
-        let Some(src) = font_face_urls(&descriptor_block).into_iter().next() else {
+        let sources: Vec<_> = font_face_urls(&descriptor_block)
+            .into_iter()
+            .filter(|src| font_source_may_be_supported(src))
+            .map(|src| (font_resource_key(&src, base_url), src))
+            .collect();
+        if sources.is_empty() {
             continue;
-        };
-        rules.push((
-            font_resource_key(&src, base_url),
-            src,
-            (!face.family.is_empty()).then(|| face.family.clone()),
-            font_face_weight(&descriptor_block),
-            font_face_italic(&descriptor_block),
-        ));
+        }
+        rules.push(FontRule {
+            sources,
+            family: (!face.family.is_empty()).then(|| face.family.clone()),
+            weight: font_face_weight(&descriptor_block),
+            italic: font_face_italic(&descriptor_block),
+        });
     }
 
     // Critical web fonts are normally preloaded from the document with a URL
@@ -6939,33 +6967,52 @@ fn collect_web_fonts(
             continue;
         }
         if let Some(decoded) = fetch_and_decode_font(src, base_url, cache) {
-            let metadata = rules.iter().find(|rule| rule.0 == key);
+            let metadata = rules.iter().find(|rule| {
+                rule.sources
+                    .iter()
+                    .any(|(source_key, _)| *source_key == key)
+            });
             fonts.push(crate::inline::WebFont {
                 data: decoded,
-                family: metadata.and_then(|rule| rule.2.clone()),
-                weight: metadata.and_then(|rule| rule.3),
-                italic: metadata.and_then(|rule| rule.4),
+                family: metadata.and_then(|rule| rule.family.clone()),
+                weight: metadata.and_then(|rule| rule.weight),
+                italic: metadata.and_then(|rule| rule.italic),
             });
         }
     }
 
-    for (key, src, family, weight, italic) in rules {
+    for rule in rules {
         if fonts.len() >= 16 {
             break;
         }
-        if !seen.insert(key) {
-            continue;
-        }
-        if let Some(decoded) = fetch_and_decode_font(&src, base_url, cache) {
-            fonts.push(crate::inline::WebFont {
-                data: decoded,
-                family,
-                weight,
-                italic,
-            });
+        for (key, src) in rule.sources {
+            if !seen.insert(key) {
+                continue;
+            }
+            if let Some(decoded) = fetch_and_decode_font(&src, base_url, cache) {
+                fonts.push(crate::inline::WebFont {
+                    data: decoded,
+                    family: rule.family,
+                    weight: rule.weight,
+                    italic: rule.italic,
+                });
+                break;
+            }
         }
     }
     fonts
+}
+
+/// Exclude source formats that fontdb cannot consume before issuing a request.
+/// Unknown and extensionless URLs are retained because their response bytes can
+/// still identify a supported sfnt, WOFF, or WOFF2 resource.
+fn font_source_may_be_supported(src: &str) -> bool {
+    let path = src
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(src)
+        .to_ascii_lowercase();
+    !path.ends_with(".eot") && !path.ends_with(".svg")
 }
 
 fn font_resource_key(src: &str, base_url: Option<&str>) -> String {
@@ -7055,13 +7102,14 @@ fn font_face_blocks(css: &str) -> Vec<&str> {
 fn font_face_declaration<'a>(face: &'a str, name: &str) -> Option<&'a str> {
     split_css_top_level(face, ';')
         .into_iter()
-        .find_map(|declaration| {
+        .filter_map(|declaration| {
             let (property, value) = declaration.split_once(':')?;
             property
                 .trim()
                 .eq_ignore_ascii_case(name)
                 .then_some(value.trim())
         })
+        .last()
 }
 
 fn font_face_family(face: &str) -> Option<String> {
@@ -15110,6 +15158,76 @@ mod tests {
         let face = font_face_blocks(css)[0];
         assert!(font_face_covers_ascii(face));
         assert_eq!(font_face_urls(face), vec!["example.otf"]);
+    }
+
+    #[test]
+    fn font_face_uses_the_first_decodable_source() {
+        let tree = parse_html(
+            r#"<html><head><style>
+                @font-face {
+                    font-family: Fixture;
+                    src: url("fixture.eot") format("embedded-opentype"),
+                         url("fixture.woff2") format("woff2"),
+                         url("fixture.ttf") format("truetype");
+                }
+            </style></head><body></body></html>"#,
+        );
+        let loads = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let loader_loads = Arc::clone(&loads);
+        let mut resources = RenderResourceCache::with_loader(move |url: &str| {
+            loader_loads
+                .lock()
+                .expect("font loads")
+                .push(url.to_string());
+            match url {
+                // A server can return malformed bytes for a preferred source;
+                // CSS Fonts requires trying the next candidate in the list.
+                "https://example.test/fixture.woff2" => Some(b"not a font".to_vec()),
+                "https://example.test/fixture.ttf" => Some(SERIF_FONT_BYTES.to_vec()),
+                _ => None,
+            }
+        });
+
+        let fonts = collect_web_fonts(
+            &tree,
+            Some("https://example.test/page.html"),
+            &mut resources,
+            &[],
+        );
+
+        assert_eq!(fonts.len(), 1);
+        assert_eq!(fonts[0].family.as_deref(), Some("Fixture"));
+        assert_eq!(fonts[0].data, SERIF_FONT_BYTES);
+        assert_eq!(
+            *loads.lock().expect("font loads"),
+            vec![
+                "https://example.test/fixture.woff2".to_string(),
+                "https://example.test/fixture.ttf".to_string(),
+            ],
+            "unsupported EOT must be skipped without a request"
+        );
+    }
+
+    #[test]
+    fn font_face_uses_the_last_duplicate_src_descriptor() {
+        let css = r#"@font-face {
+            font-family: FontAwesome;
+            src: url("legacy.eot");
+            src: url("legacy.eot?#iefix") format("embedded-opentype"),
+                 url("icons.woff2") format("woff2"),
+                 url("icons.ttf") format("truetype");
+        }"#;
+        let face = font_face_blocks(css)[0];
+
+        assert_eq!(
+            font_face_urls(face),
+            vec![
+                "legacy.eot?#iefix".to_string(),
+                "icons.woff2".to_string(),
+                "icons.ttf".to_string(),
+            ],
+            "CSS keeps the final duplicate @font-face descriptor"
+        );
     }
 
     #[test]
