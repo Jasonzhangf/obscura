@@ -2738,6 +2738,40 @@ mod tests {
     }
 
     #[test]
+    fn function_to_string_has_native_function_shape() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+
+        assert_eq!(
+            rt.evaluate(
+                r#"(() => {
+                    const fn = Function.prototype.toString;
+                    let constructible = true;
+                    try {
+                        Reflect.construct(function () {}, [], fn);
+                    } catch (error) {
+                        constructible = false;
+                    }
+                    return {
+                        source: fn.toString(),
+                        name: fn.name,
+                        length: fn.length,
+                        hasOwnPrototype: Object.prototype.hasOwnProperty.call(fn, "prototype"),
+                        constructible,
+                    };
+                })()"#,
+            )
+            .unwrap(),
+            serde_json::json!({
+                "source": "function toString() { [native code] }",
+                "name": "toString",
+                "length": 0,
+                "hasOwnPrototype": false,
+                "constructible": false,
+            })
+        );
+    }
+
+    #[test]
     fn iframe_content_window_exposes_realm_globals() {
         let mut rt = setup_runtime("<html><body></body></html>");
 
