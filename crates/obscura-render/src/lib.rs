@@ -152,12 +152,20 @@ pub mod inline {
     #[derive(Default)]
     pub struct TextEngine;
 
+    pub(crate) fn text_may_need_emoji_font(_text: &str) -> bool {
+        false
+    }
+
     impl TextEngine {
         pub fn new() -> Self {
             TextEngine
         }
 
         pub(crate) fn new_with_web_fonts(_fonts: &[WebFont]) -> Self {
+            TextEngine
+        }
+
+        pub(crate) fn new_with_web_fonts_and_emoji(_fonts: &[WebFont], _load_emoji: bool) -> Self {
             TextEngine
         }
 

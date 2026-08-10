@@ -4616,18 +4616,37 @@ fn layout_dom_once(
     );
     grow_trailing_auto_cells(tree, &mut styles);
 
+    let descendants = tree.descendants(tree.document());
+    let needs_emoji_font = descendants.iter().any(|id| {
+        tree.get_node(*id).is_some_and(|node| match &node.data {
+            obscura_dom::tree::NodeData::Text { contents } => {
+                crate::inline::text_may_need_emoji_font(contents)
+            }
+            _ => false,
+        })
+    }) || styles.values().any(|style| {
+        style
+            .before_content
+            .as_deref()
+            .is_some_and(crate::inline::text_may_need_emoji_font)
+            || style
+                .after_content
+                .as_deref()
+                .is_some_and(crate::inline::text_may_need_emoji_font)
+    });
+
     // The leaf context is the index of a cosmic-text inline formatting
     // context in `engine`; leaves without text carry no context.
     let mut taffy_tree: TaffyTree<usize> = crate::new_taffy_tree();
     let mut id_map: HashMap<taffy::NodeId, NodeId> = HashMap::new();
     let mut words: HashMap<taffy::NodeId, (NodeId, String)> = HashMap::new();
-    let mut engine = crate::inline::TextEngine::new_with_web_fonts(fonts);
+    let mut engine =
+        crate::inline::TextEngine::new_with_web_fonts_and_emoji(fonts, needs_emoji_font);
     let mut ifc_items = IfcRegistry::default();
 
     // The document node itself is not an element; lay out from the first
     // element descendant (the <html> root).
-    let root = tree
-        .descendants(tree.document())
+    let root = descendants
         .into_iter()
         .find(|id| tree.get_node(*id).map(|n| n.is_element()).unwrap_or(false));
 
@@ -9471,7 +9490,7 @@ fn build_flex_grid_children(
                 EffectiveGridChild::Generated { host, kind } => {
                     let pseudo = effective_grid_child_style(effective_children[index], styles);
                     if let Some((nodes, _)) = build_in_flow_pseudo(
-                        host, kind, pseudo, taffy_tree, words, ifc_items,
+                        host, kind, pseudo, taffy_tree, words, engine, ifc_items,
                     ) {
                         children.extend(nodes);
                     }
@@ -9774,7 +9793,14 @@ fn build_pseudo_content(
     style: &crate::LayoutStyle,
     taffy_tree: &mut TaffyTree<usize>,
     words: &mut HashMap<taffy::NodeId, (NodeId, String)>,
+    engine: &mut crate::inline::TextEngine,
+    ifc_items: &mut IfcRegistry,
 ) -> Vec<taffy::NodeId> {
+    let shaped = build_shaped_word_leaves(id, content, style, taffy_tree, words, engine, ifc_items);
+    if !shaped.is_empty() {
+        return shaped;
+    }
+
     let fsize = style.font_size.unwrap_or(16.0);
     let is_bold = crate::style::used_font_weight(style) >= 600;
     build_word_leaves(
@@ -9834,6 +9860,7 @@ fn build_in_flow_pseudo(
     pseudo: Option<&crate::LayoutStyle>,
     taffy_tree: &mut TaffyTree<usize>,
     words: &mut HashMap<taffy::NodeId, (NodeId, String)>,
+    engine: &mut crate::inline::TextEngine,
     ifc_items: &mut IfcRegistry,
 ) -> Option<(Vec<taffy::NodeId>, bool)> {
     let pseudo = pseudo?;
@@ -9844,7 +9871,8 @@ fn build_in_flow_pseudo(
     }
     let content = pseudo.before_content.as_deref();
     if !pseudo_requires_generated_box(pseudo, content) {
-        let leaves = build_pseudo_content(host, content?, pseudo, taffy_tree, words);
+        let leaves =
+            build_pseudo_content(host, content?, pseudo, taffy_tree, words, engine, ifc_items);
         return (!leaves.is_empty()).then_some((leaves, false));
     }
 
@@ -9854,7 +9882,7 @@ fn build_in_flow_pseudo(
         // retaining that text as a measured leaf gives the otherwise-empty
         // generated table a spurious space glyph of intrinsic width.
         .filter(|text| !text.is_empty() && !(pseudo.is_table_box && text.trim().is_empty()))
-        .map(|text| build_pseudo_content(host, text, pseudo, taffy_tree, words))
+        .map(|text| build_pseudo_content(host, text, pseudo, taffy_tree, words, engine, ifc_items))
         .unwrap_or_default();
     let mut taffy_style = to_taffy_style(pseudo);
     // A block pseudo's outer participation is block-level, but its generated
@@ -12536,6 +12564,7 @@ fn build(
             style.before_pseudo.as_deref(),
             taffy_tree,
             words,
+            engine,
             ifc_items,
         ) {
             before.append(&mut child_ids);
@@ -12547,6 +12576,7 @@ fn build(
             style.after_pseudo.as_deref(),
             taffy_tree,
             words,
+            engine,
             ifc_items,
         ) {
             child_ids.append(&mut after);
@@ -12797,6 +12827,7 @@ fn build_mixed_block(
         style.before_pseudo.as_deref(),
         taffy_tree,
         words,
+        engine,
         ifc_items,
     );
     let after = build_in_flow_pseudo(
@@ -12805,6 +12836,7 @@ fn build_mixed_block(
         style.after_pseudo.as_deref(),
         taffy_tree,
         words,
+        engine,
         ifc_items,
     );
     let (before_leaves, before_block) = before.unwrap_or_else(|| (Vec::new(), false));
@@ -13723,9 +13755,9 @@ fn build_children_with_native_float_band(
                 }
             }
         }
-        if let Some((nodes, _)) =
-            build_in_flow_pseudo(parent_id, kind, pseudo, taffy_tree, words, ifc_items)
-        {
+        if let Some((nodes, _)) = build_in_flow_pseudo(
+            parent_id, kind, pseudo, taffy_tree, words, engine, ifc_items,
+        ) {
             if let Some(style) = pseudo {
                 for node in nodes {
                     set_native_float_clear(taffy_tree, node, style, true);
@@ -19514,6 +19546,44 @@ mod tests {
             loaded.inline_fragments[&token],
             vec![loaded.rects[&token]],
             "the loaded-font fragment must be the geometry/paint source"
+        );
+    }
+
+    #[test]
+    fn generated_pseudo_content_shapes_with_the_loaded_webfont() {
+        let tree = parse_html(
+            r#"<style>
+                html,body,p { margin:0 }
+                #token::before {
+                    content:"WWWWiiii";
+                    font-family:Fixture, sans-serif;
+                    font-size:40px;
+                    line-height:50px
+                }
+            </style>
+            <p id="token"></p>"#,
+        );
+        let token = tree.get_element_by_id("token").unwrap();
+        let fallback = layout_dom(&tree, (500.0, 150.0));
+        let loaded = layout_dom_with_web_fonts(
+            &tree,
+            (500.0, 150.0),
+            &HashMap::new(),
+            &[crate::inline::WebFont {
+                data: include_bytes!("../assets/liberation-serif.ttf").to_vec(),
+                family: Some("Fixture".to_string()),
+                weight: Some((400, 400)),
+                italic: Some(false),
+            }],
+        );
+
+        assert!(
+            loaded.word_ifc_items.contains_key(&token),
+            "generated text must retain its webfont-shaped paint item"
+        );
+        assert_ne!(
+            fallback.text_runs[&token][0].0.width, loaded.text_runs[&token][0].0.width,
+            "the loaded face's advances must drive generated-content geometry"
         );
     }
 
