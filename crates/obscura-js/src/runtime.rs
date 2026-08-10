@@ -606,6 +606,13 @@ impl ObscuraJsRuntime {
         std::mem::take(&mut self.state.borrow_mut().pending_frames)
     }
 
+    /// postMessage traffic waiting to be delivered to another realm.
+    pub fn take_pending_frame_messages(&self) -> Vec<crate::ops::PendingFrameMessage> {
+        let mut state = self.state.borrow_mut();
+        state.pending_frame_message_bytes = 0;
+        std::mem::take(&mut state.pending_frame_messages)
+    }
+
     /// Restore the configured V8 heap limit after the emergency headroom has
     /// allowed a terminated allocation to unwind. The callback is then armed
     /// again so a second hostile script cannot grow the isolate without bound.

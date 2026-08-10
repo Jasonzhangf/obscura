@@ -1038,6 +1038,57 @@ impl Page {
         true
     }
 
+    /// Hands each queued `postMessage` to the realm it was addressed to.
+    ///
+    /// Reports whether anything was delivered, because a message usually causes
+    /// a reply: a widget posts its result, the page answers, and the exchange
+    /// only finishes if the caller settles and drains again.
+    fn deliver_frame_messages(&mut self) -> bool {
+        let pending = match self.js.as_ref() {
+            Some(js) => js.take_pending_frame_messages(),
+            None => return false,
+        };
+        if pending.is_empty() {
+            return false;
+        }
+
+        for message in pending {
+            let escaped_data = serde_json::to_string(&message.data_json).unwrap_or_default();
+            let escaped_origin = serde_json::to_string(&message.origin).unwrap_or_default();
+            if message.target_frame_id == 0 {
+                let Some(js) = self.js.as_mut() else { continue };
+                let script = format!(
+                    "globalThis.__obscura_deliverMessage({escaped_data}, {escaped_origin}, {});",
+                    message.source_frame_id,
+                );
+                if let Err(error) = js.execute_script("<frame-message>", &script) {
+                    tracing::debug!("message to the page failed: {error}");
+                }
+                continue;
+            }
+
+            let Some(index) = self
+                .frames
+                .iter()
+                .position(|frame| frame.frame_id() == message.target_frame_id)
+            else {
+                // The frame was torn down between the send and the drain.
+                tracing::debug!("message for frame {} which is gone", message.target_frame_id);
+                continue;
+            };
+            let Some(js) = self.js.as_mut() else { continue };
+            if let Err(error) = self.frames[index].deliver_message(
+                js,
+                &message.data_json,
+                &message.origin,
+                message.source_frame_id,
+            ) {
+                tracing::debug!("message to frame {} failed: {error}", message.target_frame_id);
+            }
+        }
+        true
+    }
+
     /// URLs of the page's live child frames, in creation order.
     pub fn frame_urls(&self) -> Vec<String> {
         self.frames
@@ -2408,7 +2459,11 @@ impl Page {
                     let _ = js.run_event_loop_until_quiescent(remaining, 150).await;
                 }
             }
-            if !self.attach_pending_frames().await {
+            let attached = self.attach_pending_frames().await;
+            // A message usually causes a reply, so keep going while either the
+            // frame tree or the conversation is still moving.
+            let delivered = self.deliver_frame_messages();
+            if !attached && !delivered {
                 break;
             }
         }
@@ -2449,6 +2504,7 @@ impl Page {
         // Their document scripts still run; only their own deferred work is
         // left for a later settle.
         self.attach_pending_frames().await;
+        self.deliver_frame_messages();
     }
 
     /// Advance one wake-driven browser task for a continuously owned page.

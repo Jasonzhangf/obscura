@@ -148,6 +148,15 @@ pub struct ObscuraState {
     pub frame_id_counter: u32,
     /// Which frame this state belongs to; 0 is the page's own realm.
     pub frame_id: u32,
+    // postMessage traffic between realms, waiting to be delivered. A realm
+    // cannot reach another realm's context on its own, so the message is queued
+    // here and the Page dispatches it, the same way frames themselves are
+    // built. Queued on the *page's* state whichever realm sent it, so one drain
+    // sees the traffic of the whole tree.
+    pub pending_frame_messages: Vec<PendingFrameMessage>,
+    /// Bytes of payload currently queued above, tracked rather than summed so
+    /// the cap costs nothing per message.
+    pub pending_frame_message_bytes: usize,
     /// Requests initiated by this runtime only. Browser contexts share their
     /// transport client across pages, so the client's aggregate counter cannot
     /// be used as a page-readiness signal.
@@ -248,6 +257,21 @@ pub struct PendingFrame {
     pub parent_frame_id: u32,
 }
 
+/// One `postMessage` in flight between two realms.
+pub struct PendingFrameMessage {
+    /// Where it is going. 0 is the page's realm.
+    pub target_frame_id: u32,
+    /// Where it came from, so the receiver can reply through `event.source`.
+    pub source_frame_id: u32,
+    /// The sender's origin, for `event.origin`.
+    pub origin: String,
+    /// The payload, JSON encoded. Structured clone is not available across
+    /// realms here, and JSON covers what postMessage is used for in practice:
+    /// a widget reporting a result. Anything it cannot encode is rejected by
+    /// the sender rather than silently arriving as null.
+    pub data_json: String,
+}
+
 impl ObscuraState {
     pub fn new() -> Self {
         ObscuraState {
@@ -275,6 +299,8 @@ impl ObscuraState {
             pending_frames: Vec::new(),
             frame_id_counter: 0,
             frame_id: 0,
+            pending_frame_messages: Vec::new(),
+            pending_frame_message_bytes: 0,
             page_in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             activity_generation: 0,
             document_generation: 0,
@@ -3380,6 +3406,63 @@ fn op_navigate(
     gs.pending_navigation = Some((url.to_string(), method.to_string(), body.to_string()));
 }
 
+fn frame_message_queue_entry_limit() -> usize {
+    std::env::var("OBSCURA_FRAME_MESSAGE_QUEUE_ENTRIES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4096)
+}
+
+fn frame_message_queue_byte_limit() -> usize {
+    std::env::var("OBSCURA_FRAME_MESSAGE_QUEUE_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8 * 1024 * 1024)
+}
+
+// Queues one postMessage for another realm. Always on the page's state, never
+// the caller's: the Page drains a single queue, and a message sent by a nested
+// frame would otherwise sit in that frame's own state and never be looked at.
+//
+// The queue is capped. Script can post in a synchronous loop while the host
+// only drains between event loop turns, and this buffer lives on the process
+// heap rather than V8's, so an unbounded queue would let a page grow memory
+// without bound in the one place the heap-limit guard cannot see. Over the cap
+// the newest message is dropped, keeping the earlier traffic that a widget
+// handshake actually depends on.
+#[op2(fast)]
+fn op_post_frame_message(
+    state: &OpState,
+    target_frame_id: u32,
+    source_frame_id: u32,
+    #[string] origin: &str,
+    #[string] data_json: &str,
+) {
+    let gs = state.borrow::<SharedState>().clone();
+    let mut gs = gs.borrow_mut();
+    let over_entries = gs.pending_frame_messages.len() >= frame_message_queue_entry_limit();
+    let over_bytes = gs
+        .pending_frame_message_bytes
+        .saturating_add(data_json.len())
+        > frame_message_queue_byte_limit();
+    if over_entries || over_bytes {
+        tracing::warn!(
+            "dropping a postMessage for frame {}: {} already queued, {} bytes",
+            target_frame_id,
+            gs.pending_frame_messages.len(),
+            gs.pending_frame_message_bytes,
+        );
+        return;
+    }
+    gs.pending_frame_message_bytes = gs.pending_frame_message_bytes.saturating_add(data_json.len());
+    gs.pending_frame_messages.push(PendingFrameMessage {
+        target_frame_id,
+        source_frame_id,
+        origin: origin.to_string(),
+        data_json: data_json.to_string(),
+    });
+}
+
 /// Resolves after `millis`, as the timer source for child frame realms.
 ///
 /// deno_core's own timer queue is not usable from a frame: `op_timer_queue`
@@ -4146,6 +4229,7 @@ pub fn build_extension() -> Extension {
         op_set_cookie(),
         op_navigate(),
         op_frame_document_ready(),
+        op_post_frame_message(),
         op_sleep(),
         op_async_runtime_available(),
         op_posted_task(),

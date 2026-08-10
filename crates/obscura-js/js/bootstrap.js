@@ -3845,6 +3845,11 @@ class Element extends Node {
           fullUrl, html, Math.round(box.width) || 300, Math.round(box.height) || 150);
         el._iframeDoc = new _IframeDocument(html, fullUrl, el);
         el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
+        // Bind the window to the realm the host just queued. This is what makes
+        // posting into the frame reach the frame's own listeners, and makes a
+        // message coming back out arrive with this window as its `source`.
+        el._iframeWin._frameId = el._frameId;
+        globalThis.__obscura_frameWindows[el._frameId] = el._iframeWin;
       } else {
         el._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', fullUrl, el);
         el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
@@ -11616,6 +11621,112 @@ const _iframeWindowProxyHandler = {
   },
 };
 
+// Cross-realm messaging.
+//
+// A realm cannot reach another realm's context on its own, so postMessage is
+// handed to the host, which delivers it into the target realm. These are
+// declared rather than assigned by the host so the snapshot-time hide list
+// picks them up; a global added later would stay enumerable on `window`.
+globalThis.__obscura_frameId = 0;        // 0 is the page's own realm
+globalThis.__obscura_parentFrameId = 0;
+globalThis.__obscura_frameWindows = Object.create(null); // frame id -> its window
+
+function _realmOrigin() {
+  try { return new URL(_domParse('document_url')).origin; } catch (_) { return 'null'; }
+}
+
+function _sendRealmMessage(targetFrameId, data) {
+  let json;
+  // Structured clone cannot cross realms here. JSON carries what postMessage is
+  // actually used for; anything else throws the same DataCloneError a browser
+  // throws for an unclonable value, rather than arriving silently as null.
+  try {
+    json = JSON.stringify({ v: data === undefined ? null : data });
+  } catch (_) {
+    throw new DOMException('The object could not be cloned.', 'DataCloneError');
+  }
+  if (json === undefined) json = '{"v":null}';
+  Deno.core.ops.op_post_frame_message(
+    targetFrameId >>> 0, globalThis.__obscura_frameId >>> 0, _realmOrigin(), json);
+}
+
+// The host calls this inside the target realm.
+globalThis.__obscura_deliverMessage = function(dataJson, origin, sourceFrameId) {
+  let data = null;
+  try { data = JSON.parse(dataJson).v; } catch (_) {}
+  // Who to reply to: the frame above, or one of the frames below.
+  const source = (globalThis.__obscura_frameId !== 0
+                  && sourceFrameId === globalThis.__obscura_parentFrameId)
+    ? globalThis.parent
+    : (globalThis.__obscura_frameWindows[sourceFrameId] || null);
+  try {
+    // Trusted, because the user agent delivers this event: the sender called
+    // postMessage, it did not dispatch this. Real embedders check the flag and
+    // drop anything untrusted, so an untrusted event is not merely suspicious,
+    // it is silently discarded and the widget waits forever.
+    globalThis.dispatchEvent(globalThis.__obscura_markTrusted(
+      new MessageEvent('message', { data, origin, source })));
+  } catch (error) {
+    console.error('message listener failed:', error && error.message || error);
+  }
+};
+
+// A window in another browsing context, as seen from this one.
+//
+// Only the cross-origin surface is exposed: reaching synchronously into another
+// realm's DOM is not something this engine does, and a browser forbids it
+// across origins anyway. Widgets use postMessage regardless, which is what it
+// is for.
+class _RemoteWindow {
+  constructor(frameId) {
+    Object.defineProperty(this, '_frameId', { value: frameId, enumerable: false });
+  }
+  postMessage(data, _targetOrigin, _transfer) { _sendRealmMessage(this._frameId, data); }
+  get self() { return this; }
+  get window() { return this; }
+  get frames() { return this; }
+  get parent() { return this; }
+  get top() { return this; }
+  get opener() { return null; }
+  get closed() { return false; }
+  get length() { return 0; }
+  focus() {}
+  blur() {}
+  close() {}
+}
+_markNative(_RemoteWindow.prototype.postMessage);
+
+const _remoteWindows = new Map();
+function _remoteWindow(frameId) {
+  let win = _remoteWindows.get(frameId);
+  if (!win) {
+    win = new _RemoteWindow(frameId);
+    _remoteWindows.set(frameId, win);
+  }
+  return win;
+}
+
+// Installs `parent` and `top` for a framed document. Called from
+// __obscura_init, before any of the document's own scripts run: `parent ===
+// window` is how a document decides it is top-level, and one script taking
+// that branch wrongly is enough to change everything after it.
+function _installFramingRelationships() {
+  if (!globalThis.__obscura_frameId) return; // the page really is the top
+  for (const [name, frameId] of [
+    ['parent', globalThis.__obscura_parentFrameId],
+    ['top', 0], // the top browsing context is always the page's realm
+  ]) {
+    try {
+      Object.defineProperty(globalThis, name, {
+        value: _remoteWindow(frameId),
+        writable: false,
+        enumerable: true,
+        configurable: true,
+      });
+    } catch (_) {}
+  }
+}
+
 class _IframeWindow {
   constructor(doc, url) {
     this.document = doc;
@@ -11659,15 +11770,13 @@ class _IframeWindow {
     return proxy;
   }
 
-  postMessage(data, origin) {
-    const event = new MessageEvent('message', {
-      data: data,
-      origin: this.location.origin,
-      source: this,
-    });
-    Promise.resolve().then(() => {
-      globalThis.dispatchEvent?.(event);
-    });
+  postMessage(data, _targetOrigin, _transfer) {
+    // Into the frame's own realm, through the host. This used to dispatch the
+    // event on the *parent's* window, so a page could never actually talk to
+    // the document inside its iframe. A frame that has not loaded yet has no
+    // browsing context to receive anything.
+    if (!this._frameId) return;
+    _sendRealmMessage(this._frameId, data);
   }
 
   setTimeout(fn, ms) { return globalThis.setTimeout(fn, ms); }
@@ -12661,7 +12770,30 @@ globalThis.prompt = function() { return null; }; _markNative(globalThis.prompt);
 globalThis.open = function() { return null; }; _markNative(globalThis.open);
 globalThis.close = function() {}; _markNative(globalThis.close);
 globalThis.stop = function() {}; _markNative(globalThis.stop);
-globalThis.postMessage = function() {}; _markNative(globalThis.postMessage);
+// `window.postMessage` targets this same window. It was a no-op, so a page
+// that posted to itself and waited for the `message` event waited forever.
+// Same realm, so this needs no host round trip; it is queued as a task because
+// postMessage never delivers synchronously.
+globalThis.postMessage = function(data, _targetOrigin, _transfer) {
+  let clone = data;
+  // Match the cross-realm path: a value postMessage cannot carry is rejected
+  // at the call, not delivered as something else.
+  try {
+    clone = JSON.parse(JSON.stringify({ v: data === undefined ? null : data })).v;
+  } catch (_) {
+    throw new DOMException('The object could not be cloned.', 'DataCloneError');
+  }
+  const origin = _realmOrigin();
+  setTimeout(() => {
+    try {
+      globalThis.dispatchEvent(globalThis.__obscura_markTrusted(
+        new MessageEvent('message', { data: clone, origin, source: globalThis })));
+    } catch (error) {
+      console.error('message listener failed:', error && error.message || error);
+    }
+  }, 0);
+};
+_markNative(globalThis.postMessage);
 globalThis.requestIdleCallback = globalThis.requestIdleCallback || function(cb) { return setTimeout(cb, 0); };
 globalThis.cancelIdleCallback = globalThis.cancelIdleCallback || function(id) { clearTimeout(id); };
 if (typeof ReadableStream === 'undefined') {
@@ -14094,6 +14226,11 @@ globalThis.__obscura_init = function() {
   // userAgentData brands and getHighEntropyValues now derive the Chrome
   // version from navigator.userAgent and read the platform from the page
   // globals, so every stealth surface agrees without a per-mode override.
+
+  // Before any of this document's own scripts run: `parent === window` is how
+  // a document decides it is top-level, and one script taking that branch
+  // wrongly changes everything after it.
+  _installFramingRelationships();
 
   // A parser-created <iframe src> never went through the src setter, so
   // nothing had started its load and the frame stayed empty (issue #600).

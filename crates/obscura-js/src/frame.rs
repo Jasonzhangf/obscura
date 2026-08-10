@@ -124,6 +124,24 @@ impl FrameRealm {
         )
     }
 
+    /// Delivers a `postMessage` that another realm sent to this one.
+    pub fn deliver_message(
+        &self,
+        parent: &mut ObscuraJsRuntime,
+        data_json: &str,
+        origin: &str,
+        source_frame_id: u32,
+    ) -> Result<(), String> {
+        self.execute_script(
+            parent,
+            &format!(
+                "globalThis.__obscura_deliverMessage({}, {}, {source_frame_id});",
+                encode_json_argument(data_json),
+                encode_json_argument(origin),
+            ),
+        )
+    }
+
     pub fn frame_id(&self) -> u32 {
         self.frame_id
     }
@@ -310,6 +328,12 @@ impl DocumentScript {
                 "text/javascript" | "application/javascript" | "text/ecmascript"
             )
     }
+}
+
+/// Embeds a string in JavaScript source as a literal, so a payload holding
+/// quotes or newlines cannot end the literal and be read as code.
+fn encode_json_argument(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string())
 }
 
 /// Serializes an origin the way `location.origin` does, using `"null"` for
@@ -711,6 +735,109 @@ mod tests {
                 .unwrap(),
             serde_json::json!("https://child.example/"),
         );
+    }
+
+    /// A frame posting to `parent` must reach the page, arrive trusted, and
+    /// carry the frame's origin. Turnstile and every widget like it drop an
+    /// untrusted message silently, so an untrusted delivery is not a cosmetic
+    /// difference, it is the widget hanging forever.
+    #[test]
+    fn a_frame_posts_to_its_parent_as_a_trusted_message() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        parent
+            .execute_script(
+                "p",
+                "globalThis.got = [];\
+                 addEventListener('message', (e) => globalThis.got.push(\
+                   [e.data, e.origin, e.isTrusted]));",
+            )
+            .unwrap();
+        let frame = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://child.example/f",
+            "<html><body></body></html>",
+        )
+        .expect("frame realm");
+
+        frame
+            .execute_script(&mut parent, "parent.postMessage({token: 'ok'}, '*');")
+            .unwrap();
+        // The host is the transport, exactly as `Page` does between turns.
+        let queued = parent.take_pending_frame_messages();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].target_frame_id, 0);
+        assert_eq!(queued[0].source_frame_id, 1);
+        let script = format!(
+            "globalThis.__obscura_deliverMessage({}, {}, {});",
+            serde_json::to_string(&queued[0].data_json).unwrap(),
+            serde_json::to_string(&queued[0].origin).unwrap(),
+            queued[0].source_frame_id,
+        );
+        parent.execute_script("<frame-message>", &script).unwrap();
+
+        assert_eq!(
+            parent.evaluate("globalThis.got").unwrap(),
+            serde_json::json!([[{"token": "ok"}, "https://child.example", true]]),
+        );
+    }
+
+    /// `parent === window` is how a document decides it is top-level, so a
+    /// framed realm must not see itself as the top.
+    #[test]
+    fn a_framed_realm_does_not_look_top_level() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let frame = FrameRealm::new(
+            &mut parent,
+            2,
+            0,
+            "https://child.example/f",
+            "<html><body></body></html>",
+        )
+        .expect("frame realm");
+        assert_eq!(
+            frame
+                .evaluate(&mut parent, "[parent === window, top === window]")
+                .unwrap(),
+            serde_json::json!([false, false]),
+        );
+        // The page itself really is the top and must still say so.
+        assert_eq!(
+            parent.evaluate("[parent === window, top === window]").unwrap(),
+            serde_json::json!([true, true]),
+        );
+    }
+
+    /// Script can post in a synchronous loop while the host only drains between
+    /// event loop turns, and this queue is on the process heap rather than
+    /// V8's, where the heap-limit guard would never see it.
+    #[test]
+    fn a_flood_of_messages_cannot_grow_the_queue_without_bound() {
+        std::env::set_var("OBSCURA_FRAME_MESSAGE_QUEUE_ENTRIES", "64");
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let frame = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://child.example/f",
+            "<html><body></body></html>",
+        )
+        .expect("frame realm");
+
+        frame
+            .execute_script(
+                &mut parent,
+                "for (let i = 0; i < 5000; i++) parent.postMessage(i, '*');",
+            )
+            .unwrap();
+
+        let queued = parent.take_pending_frame_messages();
+        assert_eq!(queued.len(), 64, "the queue was not capped");
+        // The messages kept are the earliest, which is the half of a handshake
+        // that matters.
+        assert_eq!(queued[0].data_json, r#"{"v":0}"#);
+        std::env::remove_var("OBSCURA_FRAME_MESSAGE_QUEUE_ENTRIES");
     }
 
     #[test]
