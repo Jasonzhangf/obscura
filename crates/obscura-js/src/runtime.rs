@@ -12674,6 +12674,39 @@ mod tests {
     }
 
     #[test]
+    fn test_location_navigation_coerces_url_objects() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let hrefs = rt
+            .evaluate(
+                r#"(() => {
+                    location.href = new URL('/from-href', location.href);
+                    const href = location.href;
+                    location.assign(new URL('/from-assign', location.href));
+                    const assigned = location.href;
+                    location.replace(new URL('/from-replace', location.href));
+                    return [href, assigned, location.href];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            hrefs,
+            serde_json::json!([
+                "http://example.com/from-href",
+                "http://example.com/from-assign",
+                "http://example.com/from-replace"
+            ])
+        );
+        assert_eq!(
+            rt.take_pending_navigation(),
+            Some((
+                "http://example.com/from-replace".to_string(),
+                "GET".to_string(),
+                "".to_string()
+            ))
+        );
+    }
+
+    #[test]
     fn test_submit_button_click_handler_can_prevent_default_and_navigate() {
         let mut rt =
             setup_runtime(r#"<form><button type="submit" id="submit">Submit</button></form>"#);

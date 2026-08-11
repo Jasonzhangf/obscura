@@ -5909,6 +5909,7 @@ globalThis.self = globalThis;
 
 globalThis.document = null;
 function _resolveUrl(url) {
+  url = String(url);
   if (!url) return url;
   if (url.startsWith('http://') || url.startsWith('https://') || url.startsWith('about:')) return url;
   try { return new URL(url, _domParse("document_url") || "about:blank").href; } catch(e) { return url; }
