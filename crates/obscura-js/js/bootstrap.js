@@ -3572,17 +3572,18 @@ class Element extends Node {
     }
     if (tag === 'select') {
       // Set selected on matching option, clear on others. Puppeteer's
-      // page.select(selector, value) round-trips through this setter.
+      // page.select(selector, value) round-trips through this setter and
+      // dispatches its own input/change events in-page afterwards, like a
+      // real browser: a programmatic value assignment never fires change
+      // itself. Dispatching here fed pages that assign inside a change
+      // handler back into that handler in an infinite loop.
       const wanted = String(v);
       const opts = this.querySelectorAll('option');
-      let matched = false;
       for (let i = 0; i < opts.length; i++) {
         const attrV = opts[i].getAttribute('value');
         const optVal = attrV !== null ? attrV : opts[i].textContent;
-        if (optVal === wanted) { opts[i].selected = true; matched = true; }
-        else { opts[i].selected = false; }
+        opts[i].selected = optVal === wanted;
       }
-      if (matched) try { this.dispatchEvent(new Event('change', { bubbles: true })); } catch (e) {}
       return;
     }
     _formValues[this._nid] = String(v);
@@ -3703,7 +3704,15 @@ class Element extends Node {
   }
   get disabled() { return this.hasAttribute("disabled"); }
   set disabled(v) { if (v) this.setAttribute("disabled", ""); else this.removeAttribute("disabled"); }
-  get type() { return this.getAttribute("type") || (this.localName === "input" ? "text" : ""); }
+  get type() {
+    // select and textarea report fixed IDL types, not the content attribute.
+    // jQuery's select valHook branches on type === "select-one" to decide
+    // scalar vs array .val(); "" here made every single select read as an
+    // array, so value comparisons against strings never matched.
+    if (this.localName === "select") return this.hasAttribute("multiple") ? "select-multiple" : "select-one";
+    if (this.localName === "textarea") return "textarea";
+    return this.getAttribute("type") || (this.localName === "input" ? "text" : "");
+  }
   set type(v) { this.setAttribute("type", v); }
   get name() { return this.getAttribute("name") || ""; }
   set name(v) { this.setAttribute("name", v); }
@@ -3878,7 +3887,9 @@ class Element extends Node {
     for (let i = 0; i < opts.length; i++) {
       if (opts[i].selected || opts[i].hasAttribute('selected')) return i;
     }
-    return opts.length ? 0 : -1;
+    // Only a single select implicitly selects its first option; a multiple
+    // select with nothing chosen idles at -1 like a real browser.
+    return opts.length && !this.hasAttribute('multiple') ? 0 : -1;
   }
   set selectedIndex(v) {
     const opts = this.options;
