@@ -50,7 +50,7 @@
     'Node', 'Element', 'Document', 'DocumentFragment', 'DocumentType',
     'Animation', 'KeyframeEffect', 'DocumentTimeline',
     'Text', 'Comment', 'CDATASection', 'ProcessingInstruction', 'CharacterData',
-    'CSSStyleDeclaration', 'DOMTokenList', 'NamedNodeMap', 'Screen', 'NetworkInformation',
+    'CSSStyleDeclaration', 'DOMStringMap', 'DOMTokenList', 'NamedNodeMap', 'Screen', 'NetworkInformation',
     'MessageChannel', 'MessagePort', 'BroadcastChannel', 'CustomElementRegistry',
     'Scheduler',
     'XMLHttpRequestEventTarget', 'HTMLMediaElement', 'HTMLVideoElement',
@@ -2337,6 +2337,16 @@ class DOMTokenList {
   toString() { return this.value; }
 }
 
+const _domStringMapConstructionKey = {};
+class DOMStringMap {
+  constructor(key) {
+    if (key !== _domStringMapConstructionKey) {
+      throw new TypeError("Failed to construct 'DOMStringMap': Illegal constructor");
+    }
+  }
+  get [Symbol.toStringTag]() { return "DOMStringMap"; }
+}
+
 // CDATASection: a Text-derived node (nodeType 4) used only in XML documents.
 // Extends Text so data/length/textContent/childNodes reuse the working text
 // node machinery; only the type-identifying getters differ.
@@ -3972,17 +3982,30 @@ class Element extends Node {
     const dataKeys = () => el.getAttributeNames()
       .filter((n) => n.startsWith("data-"))
       .map((n) => _cssKebabToCamel(n.slice(5)));
-    this._dataset = new Proxy({}, {
-      get(_, k) { if (typeof k !== "string") return undefined; return el.hasAttribute(attrFor(k)) ? el.getAttribute(attrFor(k)) : undefined; },
-      set(_, k, v) { el.setAttribute(attrFor(k), String(v)); return true; },
-      has(_, k) { return typeof k === "string" && el.hasAttribute(attrFor(k)); },
-      deleteProperty(_, k) { if (typeof k === "string") el.removeAttribute(attrFor(k)); return true; },
+    this._dataset = new Proxy(new DOMStringMap(_domStringMapConstructionKey), {
+      get(target, k, receiver) {
+        if (typeof k === "string" && el.hasAttribute(attrFor(k))) return el.getAttribute(attrFor(k));
+        return Reflect.get(target, k, receiver);
+      },
+      set(target, k, v, receiver) {
+        if (typeof k !== "string") return Reflect.set(target, k, v, receiver);
+        el.setAttribute(attrFor(k), String(v));
+        return true;
+      },
+      has(target, k) {
+        return (typeof k === "string" && el.hasAttribute(attrFor(k))) || Reflect.has(target, k);
+      },
+      deleteProperty(target, k) {
+        if (typeof k !== "string") return Reflect.deleteProperty(target, k);
+        el.removeAttribute(attrFor(k));
+        return true;
+      },
       ownKeys() { return dataKeys(); },
-      getOwnPropertyDescriptor(_, k) {
+      getOwnPropertyDescriptor(target, k) {
         if (typeof k === "string" && el.hasAttribute(attrFor(k))) {
           return { value: el.getAttribute(attrFor(k)), writable: true, enumerable: true, configurable: true };
         }
-        return undefined;
+        return Reflect.getOwnPropertyDescriptor(target, k);
       },
     });
     return this._dataset;
@@ -10838,6 +10861,7 @@ globalThis.Document = Document;
 // undefined (so `el.style instanceof CSSStyleDeclaration` threw). Assigning here
 // only fills the value; the property stays enumerable:false, matching Chrome.
 globalThis.CSSStyleDeclaration = CSSStyleDeclaration;
+globalThis.DOMStringMap = DOMStringMap;
 globalThis.Animation = Animation;
 globalThis.KeyframeEffect = KeyframeEffect;
 globalThis.DocumentTimeline = DocumentTimeline;
