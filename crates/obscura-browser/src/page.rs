@@ -3790,6 +3790,12 @@ impl Page {
         } else {
             self.suspended_started_script_ids.clear();
         }
+        // Every frame realm holds a V8 handle into this isolate, so the frames
+        // go before the runtime does — the same order init_js keeps on a new
+        // document. Suspending is a teardown of the realm the frames live in,
+        // and a realm cannot be suspended and resumed the way the page's DOM
+        // can, so they are rebuilt when the page next loads a document.
+        self.frames.clear();
         self.js = None;
     }
 
@@ -4704,6 +4710,73 @@ mod tests {
         assert!(!script_response_is_executable(401));
         assert!(!script_response_is_executable(404));
         assert!(!script_response_is_executable(500));
+    }
+
+    /// `/` embeds `/child.html`, which is enough for the page to build one
+    /// frame realm.
+    async fn spawn_child_frame_server() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 2048];
+                    let read = socket.read(&mut buf).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..read]).to_string();
+                    let body = if request.starts_with("GET /child.html ") {
+                        "<html><body><script>window.__ran = 1;</script></body></html>"
+                    } else {
+                        "<html><body><iframe src=\"/child.html\"></iframe></body></html>"
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://{addr}/")
+    }
+
+    /// A `FrameRealm` owns a `v8::Global` into the runtime's isolate, which is
+    /// why `init_js` clears the frames before it drops the runtime. `suspend_js`
+    /// drops the same runtime and has to honour the same order, otherwise the
+    /// realms of a suspended page outlive the isolate they point into and the
+    /// next navigation drops those handles against a different one.
+    #[tokio::test]
+    async fn suspending_the_runtime_releases_the_frame_realms_it_owns() {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let base = spawn_child_frame_server().await;
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "suspend-frames".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("suspend-frames".to_string(), context);
+        page.navigate(&base).await.unwrap();
+        assert_eq!(
+            page.frame_urls().len(),
+            1,
+            "the page never built its child frame, so this proves nothing"
+        );
+
+        page.suspend_js();
+        assert!(
+            page.frame_urls().is_empty(),
+            "the frame realms outlived the isolate they hold a handle into: {:?}",
+            page.frame_urls()
+        );
+
+        // The page still works afterwards: resuming rebuilds the runtime, and
+        // navigating again builds the frames of the new document.
+        page.resume_js();
+        page.navigate(&base).await.unwrap();
+        assert_eq!(page.frame_urls().len(), 1);
     }
 
     #[tokio::test(flavor = "current_thread")]
