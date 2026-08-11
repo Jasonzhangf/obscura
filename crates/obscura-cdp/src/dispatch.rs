@@ -603,16 +603,27 @@ pub(crate) fn drain_binding_calls(ctx: &mut CdpContext) {
 // after every dispatch, reports a frame whenever it actually appears instead
 // of only at navigation, and is the same drain point binding calls use.
 pub(crate) fn drain_frame_events(ctx: &mut CdpContext) {
-    let page_to_session: HashMap<String, String> = ctx
-        .sessions
-        .iter()
-        .map(|(sid, pid)| (pid.clone(), sid.clone()))
-        .collect();
+    // Every session on the page, not just one: a client that reaches a page the
+    // ordinary way holds two of them, because Target.createTarget opens a
+    // session and the Target.attachToTarget that follows opens another. A
+    // client drops any event whose sessionId is not the one it attached with,
+    // so announcing to an arbitrary session is the same as not announcing.
+    let mut page_to_sessions: HashMap<String, Vec<String>> = HashMap::new();
+    for (session_id, page_id) in &ctx.sessions {
+        page_to_sessions
+            .entry(page_id.clone())
+            .or_default()
+            .push(session_id.clone());
+    }
+    // ctx.sessions is a HashMap, so fix an order the events can be asserted in.
+    for sessions in page_to_sessions.values_mut() {
+        sessions.sort();
+    }
 
     let mut events: Vec<CdpEvent> = Vec::new();
     let mut announced: HashMap<String, Vec<String>> = HashMap::new();
     for page in &ctx.pages {
-        let Some(session_id) = page_to_session.get(&page.id).cloned() else {
+        let Some(session_ids) = page_to_sessions.get(&page.id) else {
             continue;
         };
         let live = crate::domains::page::child_frame_values(page);
@@ -627,39 +638,43 @@ pub(crate) fn drain_frame_events(ctx: &mut CdpContext) {
             if known.is_some_and(|ids| ids.iter().any(|seen| seen == id)) {
                 continue;
             }
-            // Attach before navigate: a client builds its frame from the attach
-            // event and treats a navigation of a frame it has never seen as a
-            // protocol error.
-            events.push(CdpEvent {
-                method: "Page.frameAttached".into(),
-                params: json!({
-                    "frameId": id,
-                    "parentFrameId": frame["parentId"].as_str().unwrap_or_default(),
-                }),
-                session_id: Some(session_id.clone()),
-            });
-            events.push(CdpEvent {
-                method: "Page.frameNavigated".into(),
-                params: json!({ "frame": frame, "type": "Navigation" }),
-                session_id: Some(session_id.clone()),
-            });
-            // The frame's document scripts have already run by the time it is
-            // in this list, so it is not still loading.
-            events.push(CdpEvent {
-                method: "Page.frameStoppedLoading".into(),
-                params: json!({ "frameId": id }),
-                session_id: Some(session_id.clone()),
-            });
+            for session_id in session_ids {
+                // Attach before navigate: a client builds its frame from the
+                // attach event and treats a navigation of a frame it has never
+                // seen as a protocol error.
+                events.push(CdpEvent {
+                    method: "Page.frameAttached".into(),
+                    params: json!({
+                        "frameId": id,
+                        "parentFrameId": frame["parentId"].as_str().unwrap_or_default(),
+                    }),
+                    session_id: Some(session_id.clone()),
+                });
+                events.push(CdpEvent {
+                    method: "Page.frameNavigated".into(),
+                    params: json!({ "frame": frame, "type": "Navigation" }),
+                    session_id: Some(session_id.clone()),
+                });
+                // The frame's document scripts have already run by the time it
+                // is in this list, so it is not still loading.
+                events.push(CdpEvent {
+                    method: "Page.frameStoppedLoading".into(),
+                    params: json!({ "frameId": id }),
+                    session_id: Some(session_id.clone()),
+                });
+            }
         }
 
         if let Some(known) = known {
             for id in known {
                 if !live_ids.contains(id) {
-                    events.push(CdpEvent {
-                        method: "Page.frameDetached".into(),
-                        params: json!({ "frameId": id, "reason": "remove" }),
-                        session_id: Some(session_id.clone()),
-                    });
+                    for session_id in session_ids {
+                        events.push(CdpEvent {
+                            method: "Page.frameDetached".into(),
+                            params: json!({ "frameId": id, "reason": "remove" }),
+                            session_id: Some(session_id.clone()),
+                        });
+                    }
                 }
             }
         }

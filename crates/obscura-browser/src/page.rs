@@ -2849,6 +2849,13 @@ impl Page {
 
         self.lifecycle = LifecycleState::DomContentLoaded;
 
+        // Before any `wait_until` can return, because the frames belong to the
+        // document rather than to one readiness level. Puppeteer and Playwright
+        // send `Page.navigate` with no `waitUntil`, which lands here and returns
+        // on the next line, so building frames further down left every real CDP
+        // client seeing a page with no frames at all.
+        self.build_document_frames().await;
+
         if wait_until == crate::lifecycle::WaitUntil::DomContentLoaded {
             return Ok(());
         }
@@ -2926,8 +2933,6 @@ impl Page {
             }
             self.lifecycle = LifecycleState::NetworkIdle;
         }
-
-        self.build_document_frames().await;
 
         Ok(())
     }

@@ -53,23 +53,55 @@ async fn cdp(ctx: &mut CdpContext, id: u64, method: &str, params: Value, session
     resp.result.unwrap_or_else(|| json!({}))
 }
 
+/// Gets a page and a session the way a real client does, rather than by
+/// inserting a session for a hand-made page: `Target.createTarget` then
+/// `Target.attachToTarget`, which is the only route Puppeteer and Playwright
+/// can take and therefore the only one worth asserting against.
+async fn attached_session(ctx: &mut CdpContext) -> String {
+    let created = dispatch(
+        &CdpRequest {
+            id: 900,
+            method: "Target.createTarget".to_string(),
+            params: json!({"url": "about:blank"}),
+            session_id: None,
+        },
+        ctx,
+    )
+    .await
+    .result
+    .expect("Target.createTarget produced no result");
+    let target_id = created["targetId"].as_str().expect("no targetId").to_string();
+
+    let attached = dispatch(
+        &CdpRequest {
+            id: 901,
+            method: "Target.attachToTarget".to_string(),
+            params: json!({"targetId": target_id, "flatten": true}),
+            session_id: None,
+        },
+        ctx,
+    )
+    .await
+    .result
+    .expect("Target.attachToTarget produced no result");
+    attached["sessionId"]
+        .as_str()
+        .expect("no sessionId")
+        .to_string()
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn get_frame_tree_reports_nested_child_frames() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
     let url = serve().await;
     let mut ctx = CdpContext::new();
-    let page_id = ctx.create_page();
-    let session = "session-1";
-    ctx.sessions.insert(session.to_string(), page_id);
+    let session = &attached_session(&mut ctx).await;
 
-    cdp(
-        &mut ctx,
-        1,
-        "Page.navigate",
-        json!({"url": url, "waitUntil": "load"}),
-        session,
-    )
-    .await;
+    // Deliberately no `waitUntil`: that is what Puppeteer and Playwright send,
+    // and it resolves to DomContentLoaded rather than to load. Passing
+    // "load" here hid the frame build behind a readiness level no real client
+    // asks for, so the tree came back empty for every one of them.
+    cdp(&mut ctx, 1, "Page.navigate", json!({"url": url}), session).await;
     // Frames are built when the page settles, which is not part of the
     // navigation itself.
     cdp(&mut ctx, 2, "Runtime.evaluate", json!({"expression": "1"}), session).await;
@@ -100,18 +132,43 @@ async fn get_frame_tree_reports_nested_child_frames() {
     assert_eq!(grandchild["frame"]["parentId"], child["frame"]["id"]);
 
     // A client builds its frame list from the events, so the tree alone is not
-    // enough. Attach must precede the navigation of the same frame.
+    // enough. They have to carry the session the client attached with, because
+    // a client discards anything addressed to a session it does not hold, and
+    // Target.createTarget leaves a second session on the same page.
     let child_id = child["frame"]["id"].as_str().unwrap().to_string();
+    let page_id = ctx.sessions.get(session.as_str()).cloned().unwrap();
+    // Announcing to one arbitrary session of the page is what the ordering of a
+    // HashMap decides, so require every session on the page to be told. That
+    // makes the client's own session covered whichever one it is.
+    for (candidate, owner) in &ctx.sessions {
+        if owner != &page_id {
+            continue;
+        }
+        assert!(
+            ctx.pending_events.iter().any(|e| {
+                e.method == "Page.frameAttached"
+                    && e.params["frameId"] == child_id
+                    && e.session_id.as_deref() == Some(candidate.as_str())
+            }),
+            "session {candidate} on the page was never told the child frame attached"
+        );
+    }
+
+    let mine = |e: &obscura_cdp::types::CdpEvent| e.session_id.as_deref() == Some(session.as_str());
     let attached = ctx
         .pending_events
         .iter()
-        .position(|e| e.method == "Page.frameAttached" && e.params["frameId"] == child_id)
-        .expect("no Page.frameAttached for the child frame");
+        .position(|e| {
+            e.method == "Page.frameAttached" && e.params["frameId"] == child_id && mine(e)
+        })
+        .expect("no Page.frameAttached for the child frame on the client's own session");
     let navigated = ctx
         .pending_events
         .iter()
-        .position(|e| e.method == "Page.frameNavigated" && e.params["frame"]["id"] == child_id)
-        .expect("no Page.frameNavigated for the child frame");
+        .position(|e| {
+            e.method == "Page.frameNavigated" && e.params["frame"]["id"] == child_id && mine(e)
+        })
+        .expect("no Page.frameNavigated for the child frame on the client's own session");
     assert!(
         attached < navigated,
         "frameAttached must come before frameNavigated"
