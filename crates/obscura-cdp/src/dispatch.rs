@@ -290,6 +290,7 @@ impl CdpContext {
     pub fn remove_page(&mut self, id: &str) {
         self.pages.retain(|p| p.id != id);
         self.current_loader_ids.remove(id);
+        self.announced_frames.remove(id);
         #[cfg(feature = "render")]
         {
             let removed: Vec<String> = self

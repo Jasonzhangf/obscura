@@ -706,7 +706,9 @@ impl ObscuraJsRuntime {
     /// The op queues onto the page's state whichever frame asked, so a frame
     /// nested inside a frame is drained here too.
     pub fn take_pending_frames(&self) -> Vec<crate::ops::PendingFrame> {
-        std::mem::take(&mut self.state.borrow_mut().pending_frames)
+        let mut state = self.state.borrow_mut();
+        state.pending_frame_bytes = 0;
+        std::mem::take(&mut state.pending_frames)
     }
 
     /// postMessage traffic waiting to be delivered to another realm.

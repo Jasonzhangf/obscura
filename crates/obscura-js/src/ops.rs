@@ -145,6 +145,8 @@ pub struct ObscuraState {
     // `op_frame_document_ready` queues here and the Page drains it between
     // event loop turns. Same shape as `pending_binding_calls`.
     pub pending_frames: Vec<PendingFrame>,
+    /// Total URL and HTML bytes held by `pending_frames`.
+    pub pending_frame_bytes: usize,
     pub frame_id_counter: u32,
     /// Which frame this state belongs to; 0 is the page's own realm.
     pub frame_id: u32,
@@ -297,6 +299,7 @@ impl ObscuraState {
             fetched_urls: Vec::new(),
             js_network_events: Vec::new(),
             pending_frames: Vec::new(),
+            pending_frame_bytes: 0,
             frame_id_counter: 0,
             frame_id: 0,
             pending_frame_messages: Vec::new(),
@@ -3507,8 +3510,12 @@ async fn op_sleep(#[number] millis: u64) {
     tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
 }
 
+const MAX_PENDING_FRAME_DOCUMENTS: usize = 64;
+const MAX_PENDING_FRAME_BYTES: usize = 32 * 1024 * 1024;
+
 // Hands a fetched frame document to the host and returns the id the frame will
-// have. The realm itself is built later, by whoever owns the runtime.
+// have. The realm itself is built later, by whoever owns the runtime. A zero
+// id means the bounded native queue refused the document.
 #[op2(fast)]
 fn op_frame_document_ready(
     scope: &mut v8::HandleScope,
@@ -3524,8 +3531,23 @@ fn op_frame_document_ready(
     let parent_frame_id = realm_state(scope, state).borrow().frame_id;
     let gs = state.borrow::<SharedState>().clone();
     let mut gs = gs.borrow_mut();
-    gs.frame_id_counter += 1;
-    let frame_id = gs.frame_id_counter;
+    let bytes = url.len().saturating_add(html.len());
+    if gs.pending_frames.len() >= MAX_PENDING_FRAME_DOCUMENTS
+        || gs.pending_frame_bytes.saturating_add(bytes) > MAX_PENDING_FRAME_BYTES
+    {
+        tracing::warn!(
+            "dropping frame document: {} pending documents, {} bytes",
+            gs.pending_frames.len(),
+            gs.pending_frame_bytes,
+        );
+        return 0;
+    }
+    let Some(frame_id) = gs.frame_id_counter.checked_add(1) else {
+        tracing::warn!("frame id space exhausted");
+        return 0;
+    };
+    gs.frame_id_counter = frame_id;
+    gs.pending_frame_bytes = gs.pending_frame_bytes.saturating_add(bytes);
     gs.pending_frames.push(PendingFrame {
         frame_id,
         url: url.to_string(),

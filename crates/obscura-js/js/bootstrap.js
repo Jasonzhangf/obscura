@@ -17,8 +17,8 @@
     '__obscura_platform', '__obscura_ua_platform', '__obscura_ua_platform_version',
     '__obscura_stealth', '__obscura_markTrusted', '__obscura_core_handoff',
     '__obscura_frameId', '__obscura_parentFrameId', '__obscura_frameWindows',
-    '__obscura_frameObjects', '__obscura_deliverMessage',
-    '__obscura_frameElements', '__obscura_liveFrameIds', '__obscura_forgetFrame',
+    '__obscura_frameObjects', '__obscura_frameElements', '__obscura_deliverMessage',
+    '__obscura_liveFrameIds', '__obscura_forgetFrame',
     '__obscura_registerLinkedStylesheet',
     '__markParserScripts', '__obscura_hasPendingDynamicScripts',
     '__obscura_hasPendingLoadDelayingScripts',
@@ -762,9 +762,10 @@ globalThis.console = {
 };
 
 let _tid = 0;
-const _clearedTimers = new Set();
 const _intervals = new Set();
 const _nativeTimerIds = new Map();
+const _timerStates = new Map();
+const _frameTimerStates = new Map();
 const __obscuraPendingTimeoutDeadlines = new Map();
 Object.defineProperty(globalThis, '__obscura_nextPendingTimeoutDelay', {
   value: function() {
@@ -805,11 +806,16 @@ const _scheduleAfter = (delay, fn) => {
   // because its continuation is an ordinary microtask, V8 reports the frame as
   // the microtask context and the ops the callback makes still resolve against
   // the frame's own document. Frame timer ids are negative so clearTimeout can
-  // tell the two queues apart.
+  // tell the two queues apart. Keep cancellation state by native id and remove
+  // it on either fire or clear, so repeated clearTimeout calls do not grow a
+  // permanent set.
   if (globalThis.__obscura_frameId) {
     const frameTimerId = -(++_frameTimerSeq);
+    const state = { cancelled: false };
+    _frameTimerStates.set(frameTimerId, state);
     Deno.core.ops.op_sleep(d).then(() => {
-      if (_cancelledFrameTimers.delete(frameTimerId)) return;
+      _frameTimerStates.delete(frameTimerId);
+      if (state.cancelled) return;
       Deno.core.ops.op_begin_render_task?.();
       fn();
     });
@@ -827,7 +833,11 @@ const _scheduleAfter = (delay, fn) => {
 };
 
 const _cancelScheduled = (nativeId) => {
-  if (nativeId < 0) _cancelledFrameTimers.add(nativeId);
+  if (nativeId < 0) {
+    const state = _frameTimerStates.get(nativeId);
+    if (state) state.cancelled = true;
+    _frameTimerStates.delete(nativeId);
+  }
   else Deno.core.cancelTimer(nativeId);
 };
 
@@ -855,13 +865,16 @@ globalThis.setTimeout = (fn, delay = 0, ...args) => {
   if (f === null) return ++_tid;
   const id = ++_tid;
   const normalizedDelay = Math.max(0, Number(delay) || 0);
+  const state = { cancelled: false };
   const nativeId = _scheduleAfter(normalizedDelay, () => {
+    _timerStates.delete(id);
     _nativeTimerIds.delete(id);
     __obscuraPendingTimeoutDeadlines.delete(id);
-    if (_clearedTimers.has(id)) return;
+    if (state.cancelled) return;
     try { f(...args); } catch(e) { console.error("Timer error:", e); }
   });
   if (nativeId !== undefined) {
+    _timerStates.set(id, state);
     _nativeTimerIds.set(id, nativeId);
     __obscuraPendingTimeoutDeadlines.set(id, performance.now() + normalizedDelay);
   }
@@ -869,7 +882,9 @@ globalThis.setTimeout = (fn, delay = 0, ...args) => {
 };
 
 globalThis.clearTimeout = (id) => {
-  _clearedTimers.add(id);
+  const state = _timerStates.get(id);
+  if (state) state.cancelled = true;
+  _timerStates.delete(id);
   __obscuraPendingTimeoutDeadlines.delete(id);
   const nativeId = _nativeTimerIds.get(id);
   if (nativeId !== undefined) {
@@ -3146,6 +3161,10 @@ class Element extends Node {
       : null;
     const value = String(v);
     _dom("set_attribute", this._nid, n + "\0" + value);
+    if (n === "src" && this.localName === "iframe") {
+      if (value && value !== "about:blank") this._loadIframeSrc(value);
+      else this._resetIframeFrame();
+    }
     if (this._nullNamespaceAttrs instanceof Map) {
       this._nullNamespaceAttrs.set(n, value);
     }
@@ -3828,9 +3847,18 @@ class Element extends Node {
   }
   set src(v) {
     this.setAttribute("src", v);
-    if (this.localName === 'iframe' && v && v !== 'about:blank') {
-      this._loadIframeSrc(v);
+  }
+  _resetIframeFrame() {
+    const oldId = this._frameId;
+    if (oldId) {
+      delete globalThis.__obscura_frameElements[oldId];
+      delete globalThis.__obscura_frameWindows[oldId];
     }
+    this._frameId = 0;
+    this._iframeLoadingUrl = null;
+    this._iframeDoc = new _IframeDocument(
+      '<!DOCTYPE html><html><head></head><body></body></html>', 'about:blank', this);
+    this._iframeWin = new _IframeWindow(this._iframeDoc, 'about:blank');
   }
   _loadIframeSrc(url) {
     let fullUrl = url;
@@ -3840,9 +3868,11 @@ class Element extends Node {
     // Both the src setter and the parser sweep in __obscura_init reach here, so
     // a frame the page assigned before init must not be fetched a second time.
     if (this._iframeLoadingUrl === fullUrl) return;
+    this._resetIframeFrame();
     this._iframeLoadingUrl = fullUrl;
     const el = this;
     fetch(fullUrl, {mode: 'no-cors'}).then(async resp => {
+      if (el._iframeLoadingUrl !== fullUrl) return;
       if (resp.ok || resp.type === 'opaque') {
         const html = await resp.text();
         // Hand the document to the host, which gives this frame a realm of its
@@ -3852,16 +3882,17 @@ class Element extends Node {
         const box = el.getBoundingClientRect();
         el._frameId = Deno.core.ops.op_frame_document_ready(
           fullUrl, html, Math.round(box.width) || 300, Math.round(box.height) || 150);
+        if (el._frameId) globalThis.__obscura_frameElements[el._frameId] = el;
         el._iframeDoc = new _IframeDocument(html, fullUrl, el);
         el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
         // Bind the window to the realm the host just queued. This is what makes
         // posting into the frame reach the frame's own listeners, and makes a
         // message coming back out arrive with this window as its `source`.
-        el._iframeWin._frameId = el._frameId;
-        globalThis.__obscura_frameWindows[el._frameId] = el._iframeWin;
-        // Remember the element, so "is this frame still in the page?" can be
-        // asked of the element itself. See __obscura_liveFrameIds.
-        globalThis.__obscura_frameElements[el._frameId] = el;
+        if (el._frameId) {
+          el._iframeWin._frameId = el._frameId;
+          globalThis.__obscura_frameWindows[el._frameId] = el._iframeWin;
+          globalThis.__obscura_frameElements[el._frameId] = el;
+        }
       } else {
         el._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', fullUrl, el);
         el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
@@ -3872,6 +3903,7 @@ class Element extends Node {
       // directly bypasses listeners registered via addEventListener.
       el.dispatchEvent(new Event('load'));
     }).catch(() => {
+      if (el._iframeLoadingUrl !== fullUrl) return;
       el._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', fullUrl, el);
       el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
 
@@ -11648,15 +11680,15 @@ const _iframeWindowProxyHandler = {
 globalThis.__obscura_frameId = 0;        // 0 is the page's own realm
 globalThis.__obscura_parentFrameId = 0;
 globalThis.__obscura_frameWindows = Object.create(null); // frame id -> its window
+// frame id -> the iframe element that owns it. The host uses this composed-tree
+// registry to retain frames inside closed shadow roots without keeping removed
+// elements alive after their browsing context is released.
+globalThis.__obscura_frameElements = Object.create(null);
 // frame id -> that frame's real window and document, filled by the host.
 // Declared here rather than created by the host at runtime: the hide list is
 // computed from this global at snapshot time, so a property the host adds later
 // would stay enumerable on `window` and be visible to any script that walks it.
 globalThis.__obscura_frameObjects = Object.create(null);
-// frame id -> the iframe element that owns it. Holds the element until the
-// frame is forgotten, which is bounded by the host's live-frame cap.
-globalThis.__obscura_frameElements = Object.create(null);
-
 // The frames of this realm whose element is still in the document.
 //
 // Liveness is asked of the element, not of a document query: an iframe inside

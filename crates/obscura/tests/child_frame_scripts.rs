@@ -15,6 +15,34 @@ const PARENT_HTML: &str = r#"<!doctype html><html><head><title>parent</title></h
 </script>
 </body></html>"#;
 
+const ATTRIBUTE_PARENT_HTML: &str = r#"<!doctype html><html><head><title>parent</title></head><body>
+<script>
+  var f = document.createElement('iframe');
+  f.setAttribute('src', '/child.html');
+  document.body.appendChild(f);
+</script>
+</body></html>"#;
+
+const SHADOW_PARENT_HTML: &str = r#"<!doctype html><html><head><title>parent</title></head><body>
+<script>
+  var host = document.createElement('div');
+  var root = host.attachShadow({mode: 'open'});
+  var f = document.createElement('iframe');
+  f.setAttribute('src', '/child.html');
+  root.appendChild(f);
+  document.body.appendChild(host);
+</script>
+</body></html>"#;
+
+const RESET_PARENT_HTML: &str = r#"<!doctype html><html><head><title>parent</title></head><body>
+<script>
+  var f = document.createElement('iframe');
+  f.src = '/child.html';
+  document.body.appendChild(f);
+  setTimeout(function () { f.src = 'about:blank'; }, 150);
+</script>
+</body></html>"#;
+
 const STATIC_PARENT_HTML: &str = r#"<!doctype html><html><head><title>parent</title></head><body>
 <iframe src="/child.html"></iframe>
 </body></html>"#;
@@ -119,6 +147,48 @@ async fn a_child_frame_runs_its_own_script() {
     assert_eq!(page.evaluate("window.__ran"), serde_json::Value::Null);
 }
 
+#[tokio::test]
+async fn a_child_frame_set_by_attribute_runs_its_own_script() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let base = spawn_server(ATTRIBUTE_PARENT_HTML);
+
+    let browser = Browser::new().unwrap();
+    let mut page = browser.new_page().await.unwrap();
+    page.goto(&base).await.unwrap();
+    page.settle(2000).await;
+
+    assert_eq!(
+        page.frame_urls(),
+        vec![format!("{base}/child.html")],
+        "setAttribute('src') did not start the child document"
+    );
+    assert_eq!(
+        page.evaluate_in_frame(0, "window.__ran").unwrap(),
+        serde_json::json!("YES"),
+    );
+}
+
+#[tokio::test]
+async fn a_shadow_dom_child_frame_stays_alive_and_runs_its_script() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let base = spawn_server(SHADOW_PARENT_HTML);
+
+    let browser = Browser::new().unwrap();
+    let mut page = browser.new_page().await.unwrap();
+    page.goto(&base).await.unwrap();
+    page.settle(2000).await;
+
+    assert_eq!(
+        page.frame_urls(),
+        vec![format!("{base}/child.html")],
+        "a shadow-root iframe realm was released as detached"
+    );
+    assert_eq!(
+        page.evaluate_in_frame(0, "window.__ran").unwrap(),
+        serde_json::json!("YES"),
+    );
+}
+
 /// The whole point of a child frame having a scripting context: it can report
 /// its result back out. This is the reporter's `parentGot` assertion.
 #[tokio::test]
@@ -218,4 +288,66 @@ async fn a_static_child_frame_runs_its_own_script() {
         page.evaluate_in_frame(0, "window.__ran").unwrap(),
         serde_json::json!("YES"),
     );
+}
+
+#[tokio::test]
+async fn a_rejected_child_frame_does_not_leave_js_references() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    std::env::set_var("OBSCURA_MAX_LIVE_FRAMES", "0");
+    let base = spawn_server(STATIC_PARENT_HTML);
+
+    let browser = Browser::new().unwrap();
+    let mut page = browser.new_page().await.unwrap();
+    page.goto(&base).await.unwrap();
+    page.settle(2000).await;
+
+    assert!(page.frame_urls().is_empty(), "the frame cap was not applied");
+    for registry in [
+        "__obscura_frameObjects",
+        "__obscura_frameWindows",
+        "__obscura_frameElements",
+    ] {
+        assert_eq!(
+            page.evaluate(&format!("Object.keys(globalThis.{registry}).length"))
+                .as_f64(),
+            Some(0.0),
+            "rejected frame stayed in {registry}",
+        );
+    }
+}
+
+#[tokio::test]
+async fn navigating_blank_releases_child_realms() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let base = spawn_server(STATIC_PARENT_HTML);
+
+    let browser = Browser::new().unwrap();
+    let mut page = browser.new_page().await.unwrap();
+    page.goto(&base).await.unwrap();
+    page.settle(2000).await;
+    assert_eq!(page.frame_urls().len(), 1);
+
+    page.goto("about:blank").await.unwrap();
+    assert!(page.frame_urls().is_empty(), "old frame realm survived navigation");
+}
+
+#[tokio::test]
+async fn changing_iframe_src_releases_the_previous_realm() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let base = spawn_server(RESET_PARENT_HTML);
+
+    let browser = Browser::new().unwrap();
+    let mut page = browser.new_page().await.unwrap();
+    page.goto(&base).await.unwrap();
+    page.settle(1000).await;
+
+    assert!(page.frame_urls().is_empty(), "old src realm survived replacement");
+    for registry in ["__obscura_frameWindows", "__obscura_frameElements"] {
+        assert_eq!(
+            page.evaluate(&format!("Object.keys(globalThis.{registry}).length"))
+                .as_f64(),
+            Some(0.0),
+            "old iframe stayed in {registry}",
+        );
+    }
 }

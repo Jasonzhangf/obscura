@@ -998,6 +998,7 @@ impl Page {
                     frame.url,
                     cap,
                 );
+                self.forget_frame_references(frame.frame_id, frame.parent_frame_id);
                 continue;
             }
             let realm = match self.js.as_mut().and_then(|js| {
@@ -1006,6 +1007,7 @@ impl Page {
                 Some(realm) => realm,
                 None => {
                     tracing::warn!("could not build a realm for frame {}", frame.url);
+                    self.forget_frame_references(frame.frame_id, frame.parent_frame_id);
                     continue;
                 }
             };
@@ -1116,6 +1118,59 @@ impl Page {
         true
     }
 
+    /// Removes the JS references owned by the iframe's parent realm and by the
+    /// page's same-origin frame table. This also covers a frame rejected before
+    /// a `FrameRealm` exists, so the normal drop path cannot be skipped.
+    fn forget_frame_references(&mut self, frame_id: u32, parent_frame_id: u32) {
+        let script = format!(
+            "if (globalThis.__obscura_frameElements[{frame_id}] &&\
+             globalThis.__obscura_frameElements[{frame_id}]._frameId === {frame_id}) {{\
+               globalThis.__obscura_frameElements[{frame_id}]._frameId = 0;\
+               if (globalThis.__obscura_frameElements[{frame_id}]._iframeWin)\
+                 globalThis.__obscura_frameElements[{frame_id}]._iframeWin._frameId = 0;\
+             }}\
+             delete globalThis.__obscura_frameObjects[{frame_id}];\
+             delete globalThis.__obscura_frameWindows[{frame_id}];\
+             delete globalThis.__obscura_frameElements[{frame_id}];"
+        );
+        self.execute_frame_owner_script(parent_frame_id, &script);
+        if parent_frame_id != 0 {
+            let page_script = format!(
+                "delete globalThis.__obscura_frameObjects[{frame_id}];"
+            );
+            if let Some(js) = self.js.as_mut() {
+                if let Err(error) = js.execute_script("<frame-detach>", &page_script) {
+                    tracing::debug!("releasing page frame reference failed: {error}");
+                }
+            }
+        }
+    }
+
+    /// Executes cleanup in the realm that owns the iframe element. Nested
+    /// iframe registries live in their parent frame, not in the page realm.
+    fn execute_frame_owner_script(&mut self, parent_frame_id: u32, script: &str) {
+        if parent_frame_id == 0 {
+            if let Some(js) = self.js.as_mut() {
+                if let Err(error) = js.execute_script("<frame-detach>", script) {
+                    tracing::debug!("releasing frame references failed: {error}");
+                }
+            }
+            return;
+        }
+
+        let Some(index) = self
+            .frames
+            .iter()
+            .position(|frame| frame.frame_id() == parent_frame_id)
+        else {
+            return;
+        };
+        let Some(js) = self.js.as_mut() else { return };
+        if let Err(error) = self.frames[index].execute_script(js, script) {
+            tracing::debug!("releasing nested frame references failed: {error}");
+        }
+    }
+
     /// Discards the realms whose iframe element has left the document.
     ///
     /// A browser discards a child browsing context when its element is
@@ -1165,29 +1220,23 @@ impl Page {
             }
         }
 
-        let discarded: Vec<u32> = self
+        let discarded: Vec<(u32, u32)> = self
             .frames
             .iter()
-            .map(|frame| frame.frame_id())
-            .filter(|id| !live.contains(id))
+            .map(|frame| (frame.frame_id(), frame.parent_frame_id()))
+            .filter(|(id, _)| !live.contains(id))
             .collect();
         if discarded.is_empty() {
             return;
         }
 
-        self.frames.retain(|frame| live.contains(&frame.frame_id()));
-        // Dropping the realm is not enough: the page realm still names the
-        // frame's window and document, which would keep the whole context
-        // reachable.
-        let script: String = discarded
-            .iter()
-            .map(|id| format!("__obscura_forgetFrame({id});"))
-            .collect();
-        if let Some(js) = self.js.as_mut() {
-            if let Err(error) = js.execute_script("<frame-detach>", &script) {
-                tracing::debug!("releasing detached frames failed: {error}");
-            }
+        // Clean owner realms before dropping any parent. This matters for a
+        // nested child whose iframe registry lives in a parent that is also
+        // being removed during this pass.
+        for &(frame_id, parent_frame_id) in &discarded {
+            self.forget_frame_references(frame_id, parent_frame_id);
         }
+        self.frames.retain(|frame| live.contains(&frame.frame_id()));
         tracing::debug!("discarded {} detached frame realm(s)", discarded.len());
     }
 
@@ -2623,10 +2672,16 @@ impl Page {
     /// higher-priority automation commands.
     #[doc(hidden)]
     pub async fn run_autonomous_event_loop_turn(&mut self) -> Result<bool, String> {
-        match self.js.as_mut() {
+        let reached_idle = match self.js.as_mut() {
             Some(js) => js.run_autonomous_event_loop_turn().await,
             None => Ok(true),
-        }
+        }?;
+        // Dynamic iframe fetches finish on the page event loop, but their
+        // realms must be built by Page between turns. Keep the autonomous CDP
+        // pump on the same generic frame path as settle(), so a client that
+        // stays attached can observe and run child documents as they arrive.
+        let frame_work = self.advance_frames().await;
+        Ok(reached_idle && !frame_work)
     }
 
     async fn settle_runtime_for_duration(js: &mut ObscuraJsRuntime, duration_ms: u64) {
@@ -3080,6 +3135,7 @@ impl Page {
     }
 
     pub fn navigate_blank(&mut self) {
+        self.frames.clear();
         self.js = None;
         self.url = Some(Url::parse("about:blank").unwrap());
         self.dom = Some(parse_html(
@@ -4868,7 +4924,7 @@ mod tests {
             true,
         ));
         let mut page = super::Page::new("suspend-frames".to_string(), context);
-        page.navigate(&base).await.unwrap();
+        page.navigate(&format!("{base}plain.html")).await.unwrap();
         assert_eq!(
             page.frame_urls().len(),
             1,
@@ -4885,7 +4941,7 @@ mod tests {
         // The page still works afterwards: resuming rebuilds the runtime, and
         // navigating again builds the frames of the new document.
         page.resume_js();
-        page.navigate(&base).await.unwrap();
+        page.navigate(&format!("{base}plain.html")).await.unwrap();
         assert_eq!(page.frame_urls().len(), 1);
     }
 
