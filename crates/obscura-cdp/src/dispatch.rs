@@ -56,6 +56,12 @@ pub struct CdpContext {
     target_session_counter: u64,
     pub preload_scripts: Vec<(String, String)>, // (identifier, source)
     pub preload_counter: u32,
+    // Which sessions asked for each `Runtime.addBinding` name. A binding is a
+    // session-scoped subscription in CDP, and a client discards any event whose
+    // sessionId is not one it holds, so the call has to go back to the session
+    // that registered the name rather than to whichever session of the page
+    // happens to come first out of a HashMap.
+    pub binding_sessions: HashMap<String, Vec<String>>, // binding name -> session ids
     // World names registered via Page.createIsolatedWorld. After every
     // navigation Obscura clears execution contexts (via
     // Runtime.executionContextsCleared) and must re-emit a
@@ -166,6 +172,7 @@ impl CdpContext {
             browser_context_counter: 0,
             target_session_counter: 0,
             preload_scripts: Vec::new(),
+            binding_sessions: HashMap::new(),
             preload_counter: 0,
             fetch_intercept: FetchInterceptState::new(),
             intercept_tx: None,
@@ -552,12 +559,21 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
 // in the queue while V8 is running inside a CDP handler, so there is no
 // window in which they could pile up without a draining opportunity.
 pub(crate) fn drain_binding_calls(ctx: &mut CdpContext) {
-    // page_id -> session_id (any one session that holds this page).
-    let page_to_session: HashMap<String, String> = ctx
-        .sessions
-        .iter()
-        .map(|(sid, pid)| (pid.clone(), sid.clone()))
-        .collect();
+    // page_id -> every session on that page. A page commonly has more than one:
+    // Target.createTarget opens a session and the Target.attachToTarget that
+    // follows opens another, so a client that reaches a page the ordinary way
+    // holds two and uses the second.
+    let mut page_to_sessions: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (session_id, page_id) in &ctx.sessions {
+        page_to_sessions
+            .entry(page_id.as_str())
+            .or_default()
+            .push(session_id.as_str());
+    }
+    // ctx.sessions is a HashMap, so fix an order the events can be asserted in.
+    for sessions in page_to_sessions.values_mut() {
+        sessions.sort_unstable();
+    }
 
     let mut events: Vec<CdpEvent> = Vec::new();
     for page in &mut ctx.pages {
@@ -565,25 +581,44 @@ pub(crate) fn drain_binding_calls(ctx: &mut CdpContext) {
         if calls.is_empty() {
             continue;
         }
-        let Some(session_id) = page_to_session.get(&page.id).cloned() else {
+        let Some(page_sessions) = page_to_sessions.get(page.id.as_str()) else {
             // No session attached — drop the calls; there is no client to
             // deliver them to.
             continue;
         };
         for (name, payload) in calls {
-            events.push(CdpEvent {
-                method: "Runtime.bindingCalled".into(),
-                // Use executionContextId=2: the default main-frame context
-                // emitted post-navigation (see domains/page.rs phase1).
-                // Puppeteer matches on session_id + binding name and
-                // tolerates any registered context id.
-                params: json!({
-                    "name": name,
-                    "payload": payload,
-                    "executionContextId": 2,
-                }),
-                session_id: Some(session_id.clone()),
-            });
+            // The sessions that asked for this binding, narrowed to the page the
+            // call came from. Falling back to every session of the page keeps a
+            // binding that was installed without a session (a preload, or a
+            // direct embedder) deliverable rather than silently dropped.
+            let registered = ctx.binding_sessions.get(&name);
+            let targets: Vec<&str> = page_sessions
+                .iter()
+                .copied()
+                .filter(|session| {
+                    registered.is_none_or(|owners| owners.iter().any(|owner| owner == session))
+                })
+                .collect();
+            let targets = if targets.is_empty() {
+                page_sessions.clone()
+            } else {
+                targets
+            };
+            for session_id in targets {
+                events.push(CdpEvent {
+                    method: "Runtime.bindingCalled".into(),
+                    // Use executionContextId=2: the default main-frame context
+                    // emitted post-navigation (see domains/page.rs phase1).
+                    // Puppeteer matches on session_id + binding name and
+                    // tolerates any registered context id.
+                    params: json!({
+                        "name": name,
+                        "payload": payload,
+                        "executionContextId": 2,
+                    }),
+                    session_id: Some(session_id.to_string()),
+                });
+            }
         }
     }
     ctx.pending_events.extend(events);

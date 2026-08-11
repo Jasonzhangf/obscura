@@ -365,6 +365,18 @@ pub async fn handle(
                 let key = format!("__obscura_binding__{}", name);
                 ctx.preload_scripts.retain(|(k, _)| k != &key);
                 ctx.preload_scripts.push((key, shim.clone()));
+                // Remember who subscribed, so the call goes back to this
+                // session rather than to whichever session of the page a
+                // HashMap happens to yield first. A client discards an event
+                // addressed to a session it does not hold, and the session
+                // Target.createTarget leaves behind is not the one a client
+                // ends up using.
+                if let Some(session_id) = session_id {
+                    let owners = ctx.binding_sessions.entry(name.to_string()).or_default();
+                    if !owners.contains(session_id) {
+                        owners.push(session_id.clone());
+                    }
+                }
                 // Install on the current page so the binding is usable
                 // immediately, without waiting for the next navigation.
                 if let Some(page) = ctx.get_session_page_mut(session_id) {
@@ -378,6 +390,14 @@ pub async fn handle(
             if !name.is_empty() {
                 let key = format!("__obscura_binding__{}", name);
                 ctx.preload_scripts.retain(|(k, _)| k != &key);
+                if let Some(session_id) = session_id {
+                    if let Some(owners) = ctx.binding_sessions.get_mut(name) {
+                        owners.retain(|owner| owner != session_id);
+                        if owners.is_empty() {
+                            ctx.binding_sessions.remove(name);
+                        }
+                    }
+                }
                 if let Some(page) = ctx.get_session_page_mut(session_id) {
                     page.evaluate(&format!("delete globalThis['{}'];", name));
                 }
