@@ -2456,28 +2456,31 @@ impl Page {
         self.network_events.clear();
 
         if self.context.obey_robots {
-            if let Some(domain) = url.host_str() {
-                if self.context.robots_cache.is_allowed(domain, "/robots.txt") {
-                    let robots_url = format!("{}://{}/robots.txt", url.scheme(), domain);
-                    if let Ok(robots_url) = Url::parse(&robots_url) {
-                        if let Ok(resp) = self
-                            .http_client
-                            .fetch_with_callbacks(&robots_url, Some(&self.callbacks))
-                            .await
-                        {
-                            if resp.status == 200 {
-                                let body = String::from_utf8_lossy(&resp.body);
-                                self.context.robots_cache.parse_and_store(
-                                    domain,
-                                    &body,
-                                    &self.context.user_agent,
-                                );
-                            }
+            if url.scheme() == "http" || url.scheme() == "https" {
+                let origin = url.origin().ascii_serialization();
+                if !self.context.robots_cache.contains(&origin) {
+                    let mut robots_url = url.clone();
+                    robots_url.set_path("/robots.txt");
+                    robots_url.set_query(None);
+                    robots_url.set_fragment(None);
+                    let body = match self
+                        .http_client
+                        .fetch_with_callbacks(&robots_url, Some(&self.callbacks))
+                        .await
+                    {
+                        Ok(resp) if resp.status == 200 => {
+                            String::from_utf8_lossy(&resp.body).into_owned()
                         }
-                    }
+                        _ => String::new(),
+                    };
+                    self.context.robots_cache.parse_and_store(
+                        &origin,
+                        &body,
+                        &self.context.user_agent,
+                    );
                 }
 
-                if !self.context.robots_cache.is_allowed(domain, url.path()) {
+                if !self.context.robots_cache.is_allowed(&origin, url.path()) {
                     self.lifecycle = LifecycleState::Failed;
                     return Err(PageError::NetworkError(format!(
                         "Blocked by robots.txt: {}",

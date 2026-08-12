@@ -32,7 +32,9 @@ struct Args {
     #[arg(long, global = true)]
     stealth: bool,
 
-    #[arg(long)]
+    /// Respect robots.txt before navigating to an HTTP(S) URL.
+    /// Global: applies to fetch and scrape.
+    #[arg(long, global = true)]
     obey_robots: bool,
 
     #[arg(long)]
@@ -353,6 +355,7 @@ async fn main() -> anyhow::Result<()> {
 
     let global_proxy = args.proxy.clone();
     let stealth = args.stealth;
+    let obey_robots = args.obey_robots;
 
     match args.command {
         Some(Command::Serve {
@@ -476,6 +479,7 @@ async fn main() -> anyhow::Result<()> {
                     global_proxy,
                     storage_dir,
                     args.allow_private_network,
+                    obey_robots,
                     screenshot,
                 )
                 .await?;
@@ -498,6 +502,7 @@ async fn main() -> anyhow::Result<()> {
                 quiet,
                 global_proxy,
                 stealth,
+                obey_robots,
             )
             .await?;
         }
@@ -686,6 +691,7 @@ async fn run_fetch(
     proxy: Option<String>,
     storage_dir: Option<std::path::PathBuf>,
     allow_private_network: bool,
+    obey_robots: bool,
     screenshot: Option<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
     // Whether the user explicitly passed --dump. With --eval also present this
@@ -704,14 +710,16 @@ async fn run_fetch(
         return Ok(());
     }
 
-    let context = Arc::new(BrowserContext::with_storage_and_network(
+    let mut context = BrowserContext::with_storage_and_network(
         "fetch".to_string(),
         proxy,
         stealth,
         user_agent.clone(),
         storage_dir.clone(),
         allow_private_network,
-    ));
+    );
+    context.obey_robots = obey_robots;
+    let context = Arc::new(context);
     let mut page = Page::new("fetch-page".to_string(), context.clone());
     // Keep the browser's end-to-end navigation ceiling aligned with the CLI
     // request deadline. Previously Page retained its independent 30s default,
@@ -1480,6 +1488,7 @@ async fn run_parallel_scrape(
     quiet: bool,
     proxy: Option<String>,
     stealth: bool,
+    obey_robots: bool,
 ) -> anyhow::Result<()> {
     let total = urls.len();
     let start = Instant::now();
@@ -1537,6 +1546,7 @@ async fn run_parallel_scrape(
                 .stderr(std::process::Stdio::null())
                 .env("OBSCURA_PROXY", proxy.as_deref().unwrap_or(""))
                 .env("OBSCURA_STEALTH", if stealth { "1" } else { "" })
+                .env("OBSCURA_OBEY_ROBOTS", if obey_robots { "1" } else { "" })
                 .spawn()
             {
                 Ok(c) => c,
