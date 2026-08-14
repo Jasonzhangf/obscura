@@ -2,9 +2,6 @@ name: PR checks
 
 on:
   pull_request:
-  merge_group:
-  push:
-    branches: [main]
 
 # Pull requests execute contributor-controlled build scripts, proc macros,
 # tests, and binaries. They must never receive a write token or repository
@@ -42,7 +39,7 @@ jobs:
         id: base
         shell: bash
         env:
-          EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+          EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           set -euo pipefail
           base_sha="$EVENT_BASE_SHA"
@@ -54,13 +51,8 @@ jobs:
 
           policy_root="$RUNNER_TEMP/obscura-policy"
           mkdir -p "$policy_root"
-          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
-            install -m 0644 scripts/ci/pr_policy.py "$policy_root/pr_policy.py"
-            install -m 0644 deny.toml "$policy_root/deny.toml"
-          else
-            git show "$base_sha:scripts/ci/pr_policy.py" > "$policy_root/pr_policy.py"
-            git show "$base_sha:deny.toml" > "$policy_root/deny.toml"
-          fi
+          git show "$base_sha:scripts/ci/pr_policy.py" > "$policy_root/pr_policy.py"
+          git show "$base_sha:deny.toml" > "$policy_root/deny.toml"
 
           # Container actions can only read paths mounted below the workspace.
           # Replace any PR-supplied file before exposing the trusted config.
@@ -148,8 +140,8 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           # PR caches are restored but never saved. A contributor therefore
-          # cannot poison a cache later consumed by main or a release.
-          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          # cannot poison a cache later consumed by a release.
+          save-if: false
 
       - name: Build render release
         run: cargo build --release -p obscura-cli --bins --features render
@@ -158,7 +150,6 @@ jobs:
         run: cargo nextest run --release --features render --no-fail-fast
 
       - name: Stage candidate binary for comparison
-        if: github.event_name != 'push'
         run: install -D -m 0755 target/release/obscura "$RUNNER_TEMP/obscura-ci/obscura-pr"
 
       - name: Build render and stealth release
@@ -195,7 +186,6 @@ jobs:
         run: cargo build --release -p obscura-cli --bins --no-default-features --features stealth
 
       - name: Upload candidate binary
-        if: github.event_name != 'push'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: obscura-pr-${{ github.run_id }}-${{ github.run_attempt }}
@@ -205,7 +195,7 @@ jobs:
 
   performance:
     name: PR / Performance
-    if: github.event_name != 'push' && needs.policy.outputs.runtime == 'true'
+    if: needs.policy.outputs.runtime == 'true'
     needs: [policy, core]
     runs-on: ubuntu-22.04
     timeout-minutes: 75
