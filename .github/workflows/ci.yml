@@ -29,6 +29,8 @@ jobs:
     timeout-minutes: 20
     outputs:
       base-sha: ${{ steps.base.outputs.sha }}
+      runtime: ${{ steps.changes.outputs.runtime }}
+      audit: ${{ steps.changes.outputs.audit }}
     steps:
       - name: Checkout merge result
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -68,21 +70,57 @@ jobs:
           printf 'sha=%s\n' "$base_sha" >> "$GITHUB_OUTPUT"
           printf 'policy=%s\n' "$policy_root/pr_policy.py" >> "$GITHUB_OUTPUT"
 
+      - name: Classify change scope
+        id: changes
+        shell: bash
+        env:
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+        run: |
+          set -euo pipefail
+          runtime=false
+          audit=false
+
+          while IFS= read -r -d '' path; do
+            case "$path" in
+              Cargo.toml|Cargo.lock|deny.toml|*/Cargo.toml|*/Cargo.lock|.cargo/config|.cargo/config.toml)
+                runtime=true
+                audit=true
+                ;;
+              .github/workflows/ci.yml)
+                runtime=true
+                audit=true
+                ;;
+              *.md|README*|LICENSE*|docs/*|.github/ISSUE_TEMPLATE/*|.github/PULL_REQUEST_TEMPLATE*|.github/CODEOWNERS|.gitignore|.gitattributes|.editorconfig)
+                ;;
+              *)
+                runtime=true
+                ;;
+            esac
+          # Disable rename detection so both sides of a rename are classified.
+          # Otherwise moving runtime code to a documentation-looking path could
+          # incorrectly skip the runtime checks.
+          done < <(git diff --no-ext-diff --no-renames --name-only -z "$BASE_SHA" "$GITHUB_SHA")
+
+          printf 'runtime=%s\n' "$runtime" >> "$GITHUB_OUTPUT"
+          printf 'audit=%s\n' "$audit" >> "$GITHUB_OUTPUT"
+          printf 'Change scope: runtime=%s audit=%s\n' "$runtime" "$audit"
+
       - name: Check PR policy
         env:
           BASE_SHA: ${{ steps.base.outputs.sha }}
         run: python3 "${{ steps.base.outputs.policy }}" --base "$BASE_SHA" --head "$GITHUB_SHA"
 
       - name: Check dependency advisories, licenses, bans, and sources
+        if: steps.changes.outputs.audit == 'true'
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
-          command: check
-          arguments: --all-features
-          command-arguments: --config .github/.trusted-deny.toml advisories bans licenses sources
+          arguments: --all-features --config .github/.trusted-deny.toml
+          command: check advisories bans licenses sources
 
   core:
     name: PR / Core
     needs: policy
+    if: needs.policy.outputs.runtime == 'true'
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     steps:
@@ -167,7 +205,7 @@ jobs:
 
   performance:
     name: PR / Performance
-    if: github.event_name != 'push'
+    if: github.event_name != 'push' && needs.policy.outputs.runtime == 'true'
     needs: [policy, core]
     runs-on: ubuntu-22.04
     timeout-minutes: 75
