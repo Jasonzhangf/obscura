@@ -15,7 +15,10 @@
     '__obscura_errors', '__obscura_init', '__obscura_hide_list',
     '__obscura_objects', '__obscura_oid', '__obscura_ua',
     '__obscura_platform', '__obscura_ua_platform', '__obscura_ua_platform_version',
-    '__obscura_stealth', '__obscura_markTrusted',
+    '__obscura_stealth', '__obscura_markTrusted', '__obscura_core_handoff',
+    '__obscura_frameId', '__obscura_parentFrameId', '__obscura_frameWindows',
+    '__obscura_frameObjects', '__obscura_frameElements', '__obscura_deliverMessage',
+    '__obscura_liveFrameIds', '__obscura_forgetFrame',
     '__obscura_registerLinkedStylesheet',
     '__markParserScripts', '__obscura_hasPendingDynamicScripts',
     '__obscura_hasPendingLoadDelayingScripts',
@@ -64,6 +67,14 @@
   }
 })();
 
+// Handoff for child frame realms. deno_core binds ops into the main context
+// only, so a realm restored from the snapshot arrives with its own empty
+// `Deno.core.ops`. The host reads this to take the main realm's bound op table
+// and to find each new realm's own table to fill, then deletes the global in
+// the same step, so page script never sees it (see runtime.rs
+// `take_ops_handoff` / `share_ops_with_realm`).
+globalThis.__obscura_core_handoff = Deno.core;
+
 globalThis.__obscura_errors = [];
 
 globalThis.addEventListener = globalThis.addEventListener || function(){};
@@ -101,8 +112,15 @@ const _DOM_TREE_MUTATION_COMMANDS = new Set([
   "append_child", "insert_before", "remove_child",
   "set_inner_html", "set_inner_html_context", "set_fragment_html_executable",
 ]);
+// Which realm this bootstrap closure belongs to. Every wrapper's methods come
+// from its own realm's prototypes, so a DOM call names the document it belongs
+// to instead of letting the host guess from whoever is calling. That is what
+// makes `iframe.contentDocument.title` read the frame's document rather than
+// the caller's. Set by __obscura_init; 0 is the page.
+let _realmFrameId = 0;
+
 const _dom = (cmd, a1, a2) => {
-  const result = Deno.core.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""));
+  const result = Deno.core.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""), _realmFrameId);
   if (_DOM_MUTATION_COMMANDS.has(cmd)) {
     _domMutationEpoch++;
     // Resize observation is tied to rendering-invalidating DOM work. The
@@ -749,9 +767,10 @@ globalThis.console = {
 };
 
 let _tid = 0;
-const _clearedTimers = new Set();
 const _intervals = new Set();
 const _nativeTimerIds = new Map();
+const _timerStates = new Map();
+const _frameTimerStates = new Map();
 const __obscuraPendingTimeoutDeadlines = new Map();
 Object.defineProperty(globalThis, '__obscura_nextPendingTimeoutDelay', {
   value: function() {
@@ -766,6 +785,9 @@ Object.defineProperty(globalThis, '__obscura_nextPendingTimeoutDelay', {
   enumerable: false,
   configurable: false,
 });
+
+let _frameTimerSeq = 0;
+const _cancelledFrameTimers = new Set();
 
 const _scheduleAfter = (delay, fn) => {
   const d = Math.max(0, Number(delay) || 0);
@@ -782,6 +804,28 @@ const _scheduleAfter = (delay, fn) => {
   if (!Deno.core.ops.op_async_runtime_available()) {
     return undefined;
   }
+  // A child frame realm cannot use deno_core's timer queue: op_timer_queue
+  // reads per-context state that only a deno_core-created context carries, and
+  // a realm restored from the snapshot has none, so queueing from a frame
+  // dereferences uninitialized memory. A host sleep does the same job, and
+  // because its continuation is an ordinary microtask, V8 reports the frame as
+  // the microtask context and the ops the callback makes still resolve against
+  // the frame's own document. Frame timer ids are negative so clearTimeout can
+  // tell the two queues apart. Keep cancellation state by native id and remove
+  // it on either fire or clear, so repeated clearTimeout calls do not grow a
+  // permanent set.
+  if (globalThis.__obscura_frameId) {
+    const frameTimerId = -(++_frameTimerSeq);
+    const state = { cancelled: false };
+    _frameTimerStates.set(frameTimerId, state);
+    Deno.core.ops.op_sleep(d).then(() => {
+      _frameTimerStates.delete(frameTimerId);
+      if (state.cancelled) return;
+      Deno.core.ops.op_begin_render_task?.();
+      fn();
+    });
+    return frameTimerId;
+  }
   // The callback runs only when the embedder pumps the event loop, after the
   // current microtask checkpoint.
   return Deno.core.queueUserTimer(0, false, d, () => {
@@ -791,6 +835,15 @@ const _scheduleAfter = (delay, fn) => {
     Deno.core.ops.op_begin_render_task?.();
     return fn();
   });
+};
+
+const _cancelScheduled = (nativeId) => {
+  if (nativeId < 0) {
+    const state = _frameTimerStates.get(nativeId);
+    if (state) state.cancelled = true;
+    _frameTimerStates.delete(nativeId);
+  }
+  else Deno.core.cancelTimer(nativeId);
 };
 
 // Timers accept a string first arg per the HTML spec (e.g. the Aliyun WAF
@@ -817,13 +870,16 @@ globalThis.setTimeout = (fn, delay = 0, ...args) => {
   if (f === null) return ++_tid;
   const id = ++_tid;
   const normalizedDelay = Math.max(0, Number(delay) || 0);
+  const state = { cancelled: false };
   const nativeId = _scheduleAfter(normalizedDelay, () => {
+    _timerStates.delete(id);
     _nativeTimerIds.delete(id);
     __obscuraPendingTimeoutDeadlines.delete(id);
-    if (_clearedTimers.has(id)) return;
+    if (state.cancelled) return;
     try { f(...args); } catch(e) { console.error("Timer error:", e); }
   });
   if (nativeId !== undefined) {
+    _timerStates.set(id, state);
     _nativeTimerIds.set(id, nativeId);
     __obscuraPendingTimeoutDeadlines.set(id, performance.now() + normalizedDelay);
   }
@@ -831,11 +887,13 @@ globalThis.setTimeout = (fn, delay = 0, ...args) => {
 };
 
 globalThis.clearTimeout = (id) => {
-  _clearedTimers.add(id);
+  const state = _timerStates.get(id);
+  if (state) state.cancelled = true;
+  _timerStates.delete(id);
   __obscuraPendingTimeoutDeadlines.delete(id);
   const nativeId = _nativeTimerIds.get(id);
   if (nativeId !== undefined) {
-    Deno.core.cancelTimer(nativeId);
+    _cancelScheduled(nativeId);
     _nativeTimerIds.delete(id);
   }
 };
@@ -3108,6 +3166,10 @@ class Element extends Node {
       : null;
     const value = String(v);
     _dom("set_attribute", this._nid, n + "\0" + value);
+    if (n === "src" && this.localName === "iframe") {
+      if (value && value !== "about:blank") this._loadIframeSrc(value);
+      else this._resetIframeFrame();
+    }
     if (this._nullNamespaceAttrs instanceof Map) {
       this._nullNamespaceAttrs.set(n, value);
     }
@@ -3799,21 +3861,52 @@ class Element extends Node {
   }
   set src(v) {
     this.setAttribute("src", v);
-    if (this.localName === 'iframe' && v && v !== 'about:blank') {
-      this._loadIframeSrc(v);
+  }
+  _resetIframeFrame() {
+    const oldId = this._frameId;
+    if (oldId) {
+      delete globalThis.__obscura_frameElements[oldId];
+      delete globalThis.__obscura_frameWindows[oldId];
     }
+    this._frameId = 0;
+    this._iframeLoadingUrl = null;
+    this._iframeDoc = new _IframeDocument(
+      '<!DOCTYPE html><html><head></head><body></body></html>', 'about:blank', this);
+    this._iframeWin = new _IframeWindow(this._iframeDoc, 'about:blank');
   }
   _loadIframeSrc(url) {
     let fullUrl = url;
     if (!url.includes('://')) {
       try { fullUrl = new URL(url, _domParse("document_url") || "about:blank").href; } catch(e) {}
     }
+    // Both the src setter and the parser sweep in __obscura_init reach here, so
+    // a frame the page assigned before init must not be fetched a second time.
+    if (this._iframeLoadingUrl === fullUrl) return;
+    this._resetIframeFrame();
+    this._iframeLoadingUrl = fullUrl;
     const el = this;
     fetch(fullUrl, {mode: 'no-cors'}).then(async resp => {
+      if (el._iframeLoadingUrl !== fullUrl) return;
       if (resp.ok || resp.type === 'opaque') {
         const html = await resp.text();
+        // Hand the document to the host, which gives this frame a realm of its
+        // own and runs the scripts that came with it (issue #600). The shim
+        // document below stays: it is what the parent reads through
+        // contentDocument.
+        const box = el.getBoundingClientRect();
+        el._frameId = Deno.core.ops.op_frame_document_ready(
+          fullUrl, html, Math.round(box.width) || 300, Math.round(box.height) || 150);
+        if (el._frameId) globalThis.__obscura_frameElements[el._frameId] = el;
         el._iframeDoc = new _IframeDocument(html, fullUrl, el);
         el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
+        // Bind the window to the realm the host just queued. This is what makes
+        // posting into the frame reach the frame's own listeners, and makes a
+        // message coming back out arrive with this window as its `source`.
+        if (el._frameId) {
+          el._iframeWin._frameId = el._frameId;
+          globalThis.__obscura_frameWindows[el._frameId] = el._iframeWin;
+          globalThis.__obscura_frameElements[el._frameId] = el;
+        }
       } else {
         el._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', fullUrl, el);
         el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
@@ -3824,6 +3917,7 @@ class Element extends Node {
       // directly bypasses listeners registered via addEventListener.
       el.dispatchEvent(new Event('load'));
     }).catch(() => {
+      if (el._iframeLoadingUrl !== fullUrl) return;
       el._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', fullUrl, el);
       el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
 
@@ -3832,6 +3926,8 @@ class Element extends Node {
   }
   get contentDocument() {
     if (this.localName !== 'iframe') return undefined;
+    const real = _frameObjectsFor(this);
+    if (real?.document) return real.document;
     if (this._iframeDoc) {
       const pageOrigin = (function(){ try { return new URL(_domParse("document_url")).origin; } catch(e) { return ''; } })();
       const iframeOrigin = (function(url){ try { return new URL(url).origin; } catch(e) { return ''; } })(this.src);
@@ -3848,6 +3944,10 @@ class Element extends Node {
   }
   get contentWindow() {
     if (this.localName !== 'iframe') return undefined;
+    if (_frameObjectsFor(this)) {
+      const win = _frameWindowFor(this._frameId);
+      if (win) return win;
+    }
     if (!this._iframeWin) {
       if (this.parentNode === null) return null;
       this.contentDocument;
@@ -11588,6 +11688,192 @@ const _iframeWindowProxyHandler = {
   },
 };
 
+// Cross-realm messaging.
+//
+// A realm cannot reach another realm's context on its own, so postMessage is
+// handed to the host, which delivers it into the target realm. These are
+// declared rather than assigned by the host so the snapshot-time hide list
+// picks them up; a global added later would stay enumerable on `window`.
+globalThis.__obscura_frameId = 0;        // 0 is the page's own realm
+globalThis.__obscura_parentFrameId = 0;
+globalThis.__obscura_frameWindows = Object.create(null); // frame id -> its window
+// frame id -> the iframe element that owns it. The host uses this composed-tree
+// registry to retain frames inside closed shadow roots without keeping removed
+// elements alive after their browsing context is released.
+globalThis.__obscura_frameElements = Object.create(null);
+// frame id -> that frame's real window and document, filled by the host.
+// Declared here rather than created by the host at runtime: the hide list is
+// computed from this global at snapshot time, so a property the host adds later
+// would stay enumerable on `window` and be visible to any script that walks it.
+globalThis.__obscura_frameObjects = Object.create(null);
+// The frames of this realm whose element is still in the document.
+//
+// Liveness is asked of the element, not of a document query: an iframe inside
+// a shadow root is absent from `document.querySelectorAll('iframe')` — the
+// shape a challenge widget uses — while `isConnected` reports it correctly.
+// Treating it as gone would tear down a frame that is still in the page.
+globalThis.__obscura_liveFrameIds = function () {
+  const live = [];
+  for (const id in globalThis.__obscura_frameElements) {
+    const element = globalThis.__obscura_frameElements[id];
+    if (element && element.isConnected) live.push(id >>> 0);
+  }
+  return live;
+};
+
+// Drop everything this realm holds for a frame the host has discarded. One
+// place, so a registry added later cannot be missed by the discard path: any
+// surviving reference keeps the frame's context and DOM tree alive.
+globalThis.__obscura_forgetFrame = function (frameId) {
+  delete globalThis.__obscura_frameElements[frameId];
+  delete globalThis.__obscura_frameObjects[frameId];
+  delete globalThis.__obscura_frameWindows[frameId];
+};
+
+function _realmOrigin() {
+  try { return new URL(_domParse('document_url')).origin; } catch (_) { return 'null'; }
+}
+
+function _sendRealmMessage(targetFrameId, data) {
+  let json;
+  // Structured clone cannot cross realms here. JSON carries what postMessage is
+  // actually used for; anything else throws the same DataCloneError a browser
+  // throws for an unclonable value, rather than arriving silently as null.
+  try {
+    json = JSON.stringify({ v: data === undefined ? null : data });
+  } catch (_) {
+    throw new DOMException('The object could not be cloned.', 'DataCloneError');
+  }
+  if (json === undefined) json = '{"v":null}';
+  Deno.core.ops.op_post_frame_message(
+    targetFrameId >>> 0, globalThis.__obscura_frameId >>> 0, _realmOrigin(), json);
+}
+
+// The frame's own window and document, when this page is allowed to touch
+// them. Same isolate, so these are the frame's real objects rather than a copy:
+// `contentWindow.someGlobal` reads the frame's global and `contentDocument` is
+// the document the frame's own scripts mutated.
+//
+// A free function, not a getter on Element.prototype: every own property of a
+// public interface is visible to anything that walks it, and real Chrome has no
+// such member.
+function _frameObjectsFor(element) {
+  const frameId = element._frameId;
+  if (!frameId) return null;
+  const entry = globalThis.__obscura_frameObjects[frameId];
+  return entry || null;
+}
+
+// The window object this realm uses to stand for frame `frameId`, built once
+// and reused so `event.source === iframe.contentWindow` holds.
+//
+// Once the host has published the frame's real global, that is the object,
+// wrapped only to keep `postMessage` meaning "send *into* the frame from
+// here". Calling the frame's own postMessage would make the frame both sender
+// and receiver, losing the sender's origin and source.
+function _frameWindowFor(frameId) {
+  if (!frameId) return null;
+  const real = globalThis.__obscura_frameObjects?.[frameId]?.window;
+  const existing = globalThis.__obscura_frameWindows[frameId];
+  if (!real) return existing || null;
+  if (existing && existing.__obscura_wrapsRealm) return existing;
+
+  const post = _markNative(function (data, _targetOrigin, _transfer) {
+    _sendRealmMessage(frameId, data);
+  });
+  const win = new Proxy(real, {
+    get(target, prop) {
+      if (prop === 'postMessage') return post;
+      if (prop === '__obscura_wrapsRealm') return true;
+      // Not `receiver`: an accessor on a real global must run with the global
+      // itself as `this`, not with this proxy.
+      return Reflect.get(target, prop);
+    },
+    has(target, prop) {
+      return prop === '__obscura_wrapsRealm' || Reflect.has(target, prop);
+    },
+  });
+  globalThis.__obscura_frameWindows[frameId] = win;
+  return win;
+}
+
+// The host calls this inside the target realm.
+globalThis.__obscura_deliverMessage = function(dataJson, origin, sourceFrameId) {
+  let data = null;
+  try { data = JSON.parse(dataJson).v; } catch (_) {}
+  // Who to reply to: the frame above, or one of the frames below.
+  const source = (globalThis.__obscura_frameId !== 0
+                  && sourceFrameId === globalThis.__obscura_parentFrameId)
+    ? globalThis.parent
+    : _frameWindowFor(sourceFrameId);
+  try {
+    // Trusted, because the user agent delivers this event: the sender called
+    // postMessage, it did not dispatch this. Real embedders check the flag and
+    // drop anything untrusted, so an untrusted event is not merely suspicious,
+    // it is silently discarded and the widget waits forever.
+    globalThis.dispatchEvent(globalThis.__obscura_markTrusted(
+      new MessageEvent('message', { data, origin, source })));
+  } catch (error) {
+    console.error('message listener failed:', error && error.message || error);
+  }
+};
+
+// A window in another browsing context, as seen from this one.
+//
+// Only the cross-origin surface is exposed: reaching synchronously into another
+// realm's DOM is not something this engine does, and a browser forbids it
+// across origins anyway. Widgets use postMessage regardless, which is what it
+// is for.
+class _RemoteWindow {
+  constructor(frameId) {
+    Object.defineProperty(this, '_frameId', { value: frameId, enumerable: false });
+  }
+  postMessage(data, _targetOrigin, _transfer) { _sendRealmMessage(this._frameId, data); }
+  get self() { return this; }
+  get window() { return this; }
+  get frames() { return this; }
+  get parent() { return this; }
+  get top() { return this; }
+  get opener() { return null; }
+  get closed() { return false; }
+  get length() { return 0; }
+  focus() {}
+  blur() {}
+  close() {}
+}
+_markNative(_RemoteWindow.prototype.postMessage);
+
+const _remoteWindows = new Map();
+function _remoteWindow(frameId) {
+  let win = _remoteWindows.get(frameId);
+  if (!win) {
+    win = new _RemoteWindow(frameId);
+    _remoteWindows.set(frameId, win);
+  }
+  return win;
+}
+
+// Installs `parent` and `top` for a framed document. Called from
+// __obscura_init, before any of the document's own scripts run: `parent ===
+// window` is how a document decides it is top-level, and one script taking
+// that branch wrongly is enough to change everything after it.
+function _installFramingRelationships() {
+  if (!globalThis.__obscura_frameId) return; // the page really is the top
+  for (const [name, frameId] of [
+    ['parent', globalThis.__obscura_parentFrameId],
+    ['top', 0], // the top browsing context is always the page's realm
+  ]) {
+    try {
+      Object.defineProperty(globalThis, name, {
+        value: _remoteWindow(frameId),
+        writable: false,
+        enumerable: true,
+        configurable: true,
+      });
+    } catch (_) {}
+  }
+}
+
 class _IframeWindow {
   constructor(doc, url) {
     this.document = doc;
@@ -11631,15 +11917,13 @@ class _IframeWindow {
     return proxy;
   }
 
-  postMessage(data, origin) {
-    const event = new MessageEvent('message', {
-      data: data,
-      origin: this.location.origin,
-      source: this,
-    });
-    Promise.resolve().then(() => {
-      globalThis.dispatchEvent?.(event);
-    });
+  postMessage(data, _targetOrigin, _transfer) {
+    // Into the frame's own realm, through the host. This used to dispatch the
+    // event on the *parent's* window, so a page could never actually talk to
+    // the document inside its iframe. A frame that has not loaded yet has no
+    // browsing context to receive anything.
+    if (!this._frameId) return;
+    _sendRealmMessage(this._frameId, data);
   }
 
   setTimeout(fn, ms) { return globalThis.setTimeout(fn, ms); }
@@ -12633,7 +12917,30 @@ globalThis.prompt = function() { return null; }; _markNative(globalThis.prompt);
 globalThis.open = function() { return null; }; _markNative(globalThis.open);
 globalThis.close = function() {}; _markNative(globalThis.close);
 globalThis.stop = function() {}; _markNative(globalThis.stop);
-globalThis.postMessage = function() {}; _markNative(globalThis.postMessage);
+// `window.postMessage` targets this same window. It was a no-op, so a page
+// that posted to itself and waited for the `message` event waited forever.
+// Same realm, so this needs no host round trip; it is queued as a task because
+// postMessage never delivers synchronously.
+globalThis.postMessage = function(data, _targetOrigin, _transfer) {
+  let clone = data;
+  // Match the cross-realm path: a value postMessage cannot carry is rejected
+  // at the call, not delivered as something else.
+  try {
+    clone = JSON.parse(JSON.stringify({ v: data === undefined ? null : data })).v;
+  } catch (_) {
+    throw new DOMException('The object could not be cloned.', 'DataCloneError');
+  }
+  const origin = _realmOrigin();
+  setTimeout(() => {
+    try {
+      globalThis.dispatchEvent(globalThis.__obscura_markTrusted(
+        new MessageEvent('message', { data: clone, origin, source: globalThis })));
+    } catch (error) {
+      console.error('message listener failed:', error && error.message || error);
+    }
+  }, 0);
+};
+_markNative(globalThis.postMessage);
 globalThis.requestIdleCallback = globalThis.requestIdleCallback || function(cb) { return setTimeout(cb, 0); };
 globalThis.cancelIdleCallback = globalThis.cancelIdleCallback || function(id) { clearTimeout(id); };
 if (typeof ReadableStream === 'undefined') {
@@ -14007,6 +14314,8 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
 }
 
 globalThis.__obscura_init = function() {
+  // The host sets __obscura_frameId on a frame realm before calling this.
+  _realmFrameId = globalThis.__obscura_frameId >>> 0;
   _fpSeed = Date.now() ^ (Math.random() * 0xFFFFFFFF >>> 0);
   _fpCache = null;
   // A real navigation just completed (this runs after set_url), so drop any
@@ -14066,6 +14375,21 @@ globalThis.__obscura_init = function() {
   // userAgentData brands and getHighEntropyValues now derive the Chrome
   // version from navigator.userAgent and read the platform from the page
   // globals, so every stealth surface agrees without a per-mode override.
+
+  // Before any of this document's own scripts run: `parent === window` is how
+  // a document decides it is top-level, and one script taking that branch
+  // wrongly changes everything after it.
+  _installFramingRelationships();
+
+  // A parser-created <iframe src> never went through the src setter, so
+  // nothing had started its load and the frame stayed empty (issue #600).
+  // This also runs inside a frame realm, so a frame nested in a frame loads
+  // by the same path, with op_frame_document_ready recording the caller as
+  // its parent.
+  for (const frame of globalThis.document.querySelectorAll('iframe')) {
+    const src = frame.getAttribute('src');
+    if (src && src !== 'about:blank') frame._loadIframeSrc(src);
+  }
 
   // Hide internals (_*, obscura, Obscura). The set of keys is static at
   // snapshot-build time, so we precompute it ONCE below (after this
