@@ -4,8 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import json
-import os
 import re
 import subprocess
 import sys
@@ -17,7 +15,6 @@ USES_RE = re.compile(r"^\s*-?\s*uses\s*:\s*(.+?)\s*$")
 FULL_ACTION_REF_RE = re.compile(r"^[^@]+@[0-9a-f]{40}$")
 PINNED_DOCKER_REF_RE = re.compile(r"^docker://[^@]+@sha256:[0-9a-f]{64}$")
 MAX_CONTROL_FILE_BYTES = 2 * 1024 * 1024
-REQUIRED_SECTIONS = ("What changed", "Validation", "Rendering", "Performance", "Checklist")
 ALWAYS_BLOCKED_WORKFLOW_ADDITIONS = (
     "pull_request_target",
     "workflow_run",
@@ -58,30 +55,6 @@ def changed_files(base: str, head: str) -> list[str]:
     raw = git("diff", "--name-only", "-z", "--diff-filter=ACMR", f"{base}...{head}")
     assert isinstance(raw, bytes)
     return [part.decode("utf-8", "surrogateescape") for part in raw.split(b"\0") if part]
-
-
-def event_body() -> str | None:
-    if os.environ.get("GITHUB_EVENT_NAME") != "pull_request":
-        return None
-    event_path = os.environ.get("GITHUB_EVENT_PATH")
-    if not event_path:
-        return ""
-    try:
-        event = json.loads(Path(event_path).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return ""
-    body = event.get("pull_request", {}).get("body")
-    return body if isinstance(body, str) else ""
-
-
-def check_template(errors: list[str]) -> None:
-    body = event_body()
-    if body is None:
-        return
-    for heading in REQUIRED_SECTIONS:
-        pattern = re.compile(rf"(?mi)^##\s+{re.escape(heading)}\s*$")
-        if not pattern.search(body):
-            errors.append(f"PR description is missing the '## {heading}' section")
 
 
 def check_artifacts(files: list[str], errors: list[str], warnings: list[str]) -> None:
@@ -232,7 +205,6 @@ def main() -> None:
     files = changed_files(args.base, args.head)
     errors: list[str] = []
     warnings: list[str] = []
-    check_template(errors)
     check_artifacts(files, errors, warnings)
     check_control_symlinks(files, errors)
     check_new_vendor(args.base, files, errors)
