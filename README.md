@@ -27,8 +27,6 @@ Obscura is a headless browser engine written in Rust, built for web scraping and
 
 ### Why Obscura over headless Chrome?
 
-Designed for automation at scale, not desktop browsing.
-
 | Metric       | Obscura      | Headless Chrome |
 |--------------|--------------|------------------|
 | Memory       | **30 MB**    | 200+ MB          |
@@ -51,7 +49,7 @@ The open-source engine stays Apache-2.0, fully featured. No feature gating, ever
 
 ## Sponsors
 
-**Obscura** is supported by sponsors who help keep development independent. 
+**Obscura** is supported by organizations helping us build independent open-source browser infrastructure.
 
 Want to sponsor? Email [hello@obscura.sh](mailto:hello@obscura.sh).
 
