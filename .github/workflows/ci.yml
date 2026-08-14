@@ -189,9 +189,10 @@ jobs:
       - name: Upload candidate binary
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: obscura-pr-${{ github.run_id }}-${{ github.run_attempt }}
+          name: obscura-pr-${{ github.run_id }}
           path: ${{ runner.temp }}/obscura-ci/obscura-pr
           if-no-files-found: error
+          overwrite: true
           retention-days: 1
 
   performance:
@@ -218,7 +219,7 @@ jobs:
       - name: Download candidate binary
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: obscura-pr-${{ github.run_id }}-${{ github.run_attempt }}
+          name: obscura-pr-${{ github.run_id }}
           path: ${{ runner.temp }}/obscura-ci
 
       - name: Install system dependencies
