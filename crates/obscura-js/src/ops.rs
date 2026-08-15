@@ -2063,8 +2063,17 @@ fn fetch_timeout() -> std::time::Duration {
 }
 
 /// Cap on the number of redirect hops op_fetch_url will follow.
-/// Matches reqwest's default policy of 10.
-const FETCH_REDIRECT_LIMIT: usize = 10;
+///
+/// The Fetch standard fixes the number at 20. HTTP-redirect fetch returns
+/// a network error as soon as a request's redirect count *reaches* 20,
+/// and only increments it afterwards. So the twentieth hop must still
+/// succeed and the twenty-first must fail:
+/// https://fetch.spec.whatwg.org/#http-redirect-fetch
+///
+/// The reqwest default of 10 does not apply here. The redirects are
+/// followed by hand in this file, one hop per loop iteration, so that
+/// each hop can be checked against the SSRF rules again.
+const FETCH_REDIRECT_LIMIT: usize = 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FetchCredentials {

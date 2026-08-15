@@ -14016,6 +14016,114 @@ mod tests {
             })
         );
     }
+    /// Serves a redirect chain across `connections` consecutive
+    /// requests: `/hop/N` replies with 302 to `/hop/N-1`, `/hop/0` is the
+    /// target. To a path the fixture cannot read it replies with 400
+    /// instead of the target. A broken fixture thereby fails the test
+    /// instead of letting it pass.
+    fn redirect_chain_runtime(connections: usize) -> ObscuraJsRuntime {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            for _ in 0..connections {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buffer = [0u8; 2048];
+                let read = stream.read(&mut buffer).unwrap_or(0);
+                let hop = String::from_utf8_lossy(&buffer[..read])
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|path| path.strip_prefix("/hop/"))
+                    .and_then(|hop| hop.parse::<usize>().ok());
+                let response = match hop {
+                    Some(0) => {
+                        let body = "arrived";
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len(),
+                        )
+                    }
+                    Some(hop) => format!(
+                        "HTTP/1.1 302 Found\r\nLocation: /hop/{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        hop - 1,
+                    ),
+                    None => {
+                        let body = "unparsed";
+                        format!(
+                            "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len(),
+                        )
+                    }
+                };
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let origin = format!("http://{address}");
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.set_url(&format!("{origin}/page"));
+        rt.set_http_client(std::sync::Arc::new(
+            obscura_net::ObscuraHttpClient::with_full_options(
+                std::sync::Arc::new(obscura_net::CookieJar::new()),
+                None,
+                true,
+            ),
+        ));
+        rt.run_page_init();
+        rt
+    }
+
+    /// HTTP-redirect fetch returns a network error as soon as the
+    /// redirect count *reaches* 20, and only increments it afterwards. So
+    /// the twentieth hop must still succeed:
+    /// https://fetch.spec.whatwg.org/#http-redirect-fetch
+    /// WPT covers the same pair in `fetch/api/redirect/redirect-count.any.js`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_follows_the_twentieth_redirect() {
+        let mut rt = redirect_chain_runtime(21);
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => (await fetch("/hop/20")).text()"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.value.unwrap(), serde_json::json!("arrived"));
+    }
+
+    /// The other end of the same pair: the twenty-first redirect must
+    /// fail. `fetch` reports a rejected result as a `TypeError`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_rejects_the_twenty_first_redirect() {
+        let mut rt = redirect_chain_runtime(21);
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    try {
+                        const response = await fetch("/hop/21");
+                        return "resolved " + (await response.text());
+                    } catch (error) {
+                        return error instanceof TypeError ? "rejected" : "other";
+                    }
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.value.unwrap(), serde_json::json!("rejected"));
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn dynamic_linked_stylesheet_enters_the_live_dom_with_imports_rebased() {
