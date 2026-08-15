@@ -25,6 +25,7 @@ use tokio::sync::Mutex;
 use serde::Deserialize;
 
 use crate::import_map::ImportMap;
+use crate::write_stream::DocumentWriteStream;
 
 pub type InterceptCallback = Arc<
     Mutex<
@@ -246,6 +247,9 @@ pub struct ObscuraState {
     /// rather than wrapper state, because it must survive moves and clones and
     /// because fragment parsing can create nodes before a JS wrapper exists.
     pub(crate) already_started_scripts: RefCell<HashSet<NodeId>>,
+    /// The document's input stream for `document.write()`, created on the first call.
+    /// Why the calls share one parser is in `write_stream`.
+    pub(crate) write_stream: RefCell<Option<crate::write_stream::DocumentWriteStream>>,
 }
 
 /// A frame document waiting to be given a realm.
@@ -345,6 +349,7 @@ impl ObscuraState {
             resolved_scroll: None,
             import_map: Rc::new(RefCell::new(ImportMap::default())),
             already_started_scripts: RefCell::new(HashSet::new()),
+            write_stream: RefCell::new(None),
         }
     }
 }
@@ -1729,6 +1734,33 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                 let import_root = fragment.fragment_root();
                 dom.import_children_from(target, &fragment, import_root);
             }
+            "true".into()
+        }
+        // document.write() feeds the document's input stream, so the calls
+        // share one parser and one tokenizer state. Returns the nodes that
+        // became complete with this call, for the caller to run scripts among.
+        // Returns [[parent, node], …], parents before children. A `parent` of 0 means the node
+        // belongs at the insertion point, which the caller knows. Nothing is inserted here:
+        // that must go through Node.appendChild on the JS side, because that call also reports
+        // the mutation, registers window named access, and loads a written stylesheet.
+        "document_write" => {
+            let mut slot = gs.write_stream.borrow_mut();
+            let stream = slot.get_or_insert_with(DocumentWriteStream::new);
+            let pairs: Vec<[i32; 2]> = stream
+                .write(&arg2, dom)
+                .iter()
+                .map(|placement| {
+                    [
+                        placement.parent.map_or(0, |id| id.index() as i32),
+                        placement.node.index() as i32,
+                    ]
+                })
+                .collect();
+            serde_json::to_string(&pairs).unwrap_or("[]".into())
+        }
+        // document.open() discards what the input stream holds and starts over.
+        "document_write_reset" => {
+            *gs.write_stream.borrow_mut() = None;
             "true".into()
         }
         "set_text_content" => {
