@@ -52,13 +52,13 @@ impl Page {
 
     /// URLs of the page's child frames, in creation order.
     pub fn frame_urls(&self) -> Vec<String> {
-        self.inner.frame_urls()
+        self.inner.borrow().frame_urls()
     }
 
     /// Execute JS inside one of the page's child frames. Each frame is its own
     /// realm with its own document, so this is the only way to observe one.
     pub fn evaluate_in_frame(&mut self, index: usize, expression: &str) -> Result<Value, String> {
-        self.inner.evaluate_in_frame(index, expression)
+        self.inner.borrow_mut().evaluate_in_frame(index, expression)
     }
 
     /// Get page HTML content.
