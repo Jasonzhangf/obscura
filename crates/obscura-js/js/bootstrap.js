@@ -2087,7 +2087,15 @@ class Node {
     _detachStyleSheetsInSubtree(oldChild);
     _registerWindowNamedTree(newChild);
     _reconcileWindowNamedProperties(removedWindowNames);
+    // As in appendChild and removeChild. A replacement is an insertion and a removal, an
+    // observer saw neither one nor the other.
+    if (globalThis.__mutationObservers?.length) {
+      globalThis.__notifyMutation('childList', this._nid, [newChild._nid], [oldChild._nid]);
+    }
     __prepareInsertedSubtree(newChild);
+    if (newChild instanceof Element && newChild.tagName === 'LINK') {
+      _loadLinkedStylesheet(newChild);
+    }
     return oldChild;
   }
   insertBefore(n, ref) {
@@ -2118,7 +2126,13 @@ class Node {
     _seedUnchangedConnection(this, parentConnected);
     _seedInsertedTreeState(n, this, parentConnected);
     _registerWindowNamedTree(n);
+    // The same steps as in appendChild. Where a node is inserted does not decide whether an
+    // observer sees it and whether a <link> loads its stylesheet.
+    if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('childList', this._nid, [n._nid], []);
     __prepareInsertedSubtree(n);
+    if (n instanceof Element && n.tagName === 'LINK') {
+      _loadLinkedStylesheet(n);
+    }
     return n;
   }
   contains(o) { return o ? _dom("contains", this._nid, o._nid) === "true" : false; }

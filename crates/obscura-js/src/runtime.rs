@@ -16098,4 +16098,72 @@ mod tests {
             .unwrap();
         assert_eq!(result, serde_json::json!(["range", "write"]));
     }
+
+    // before(), after() and replaceWith() all go through parent.insertBefore. replaceChild
+    // also goes there in the fragment branch. AGENTS.md requires whoever touches insertBefore
+    // to check them: the order of reference node versus parent nid is easy to break. The test
+    // also pins that every insertion is reported exactly once, not twice.
+    #[test]
+    fn child_node_methods_place_nodes_and_report_once() {
+        let mut rt = setup_runtime(r#"<html><body><p id="a"></p><p id="b"></p></body></html>"#);
+        let result = rt
+            .evaluate(
+                r#"
+                var scriptTestSetup = true;
+                const ids = () => Array.from(document.body.children).map((e) => e.id).join(',');
+                const make = (id) => { const e = document.createElement('span'); e.id = id; return e; };
+                const observer = new MutationObserver(() => {});
+                observer.observe(document.body, { childList: true });
+                const steps = {};
+
+                document.getElementById('b').before(make('x'));
+                steps.before = ids();
+                document.getElementById('b').after(make('y'));
+                steps.after = ids();
+                document.getElementById('y').replaceWith(make('z'));
+                steps.replaceWith = ids();
+                document.body.replaceChild(make('w'), document.getElementById('z'));
+                steps.replaceChild = ids();
+
+                const added = observer.takeRecords()
+                  .flatMap((record) => Array.from(record.addedNodes).map((n) => n.id));
+                observer.disconnect();
+                steps.added = added.join(',');
+                return JSON.stringify(steps);
+                "#,
+            )
+            .unwrap();
+        let steps: serde_json::Value =
+            serde_json::from_str(result.as_str().unwrap()).expect("steps json");
+        assert_eq!(steps["before"], "a,x,b");
+        assert_eq!(steps["after"], "a,x,b,y");
+        assert_eq!(steps["replaceWith"], "a,x,b,z");
+        assert_eq!(steps["replaceChild"], "a,x,b,w");
+        // Every inserted node exactly once, in the order of insertion.
+        assert_eq!(steps["added"], "x,y,z,w");
+    }
+
+    // insertBefore reported no mutation at all, appendChild did.
+    #[test]
+    fn insert_before_reports_to_mutation_observers() {
+        let mut rt = setup_runtime("<html><body><p id=\"ref\"></p></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                var scriptTestSetup = true;
+                const observer = new MutationObserver(() => {});
+                observer.observe(document.body, { childList: true });
+                document.body.insertBefore(
+                  document.createElement('span'),
+                  document.getElementById('ref'),
+                );
+                const seen = observer.takeRecords()
+                  .flatMap((record) => Array.from(record.addedNodes).map((n) => n.nodeName));
+                observer.disconnect();
+                return seen.join(',');
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!("SPAN"));
+    }
 }
