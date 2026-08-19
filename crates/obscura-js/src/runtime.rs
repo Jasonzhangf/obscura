@@ -11820,6 +11820,49 @@ mod tests {
     }
 
     #[test]
+    fn dom_string_map_is_exposed_and_backs_dataset() {
+        let mut rt = setup_runtime(r#"<div id="x" data-foo="bar"></div>"#);
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const dataset = document.getElementById("x").dataset;
+                    const interface = window.DOMStringMap;
+                    const descriptor = Object.getOwnPropertyDescriptor(window, "DOMStringMap");
+                    let illegalConstructor = false;
+                    if (interface) {
+                        try { new interface(); }
+                        catch (error) { illegalConstructor = error instanceof TypeError; }
+                    }
+                    return JSON.stringify({
+                        type: typeof interface,
+                        instance: !!interface && dataset instanceof interface,
+                        prototype: !!interface && Object.getPrototypeOf(dataset) === interface.prototype,
+                        constructor: !!interface && dataset.constructor === interface,
+                        tag: Object.prototype.toString.call(dataset),
+                        enumerable: descriptor ? descriptor.enumerable : "missing",
+                        illegalConstructor,
+                        value: dataset.foo,
+                    });
+                })()"#,
+            )
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(result.as_str().unwrap()).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "function",
+                "instance": true,
+                "prototype": true,
+                "constructor": true,
+                "tag": "[object DOMStringMap]",
+                "enumerable": false,
+                "illegalConstructor": true,
+                "value": "bar",
+            })
+        );
+    }
+
+    #[test]
     fn style_declaration_reflects_and_removes_parsed_attributes() {
         let mut rt = setup_runtime(
             "<html><body><div id='icon' style='font-size: 0px; color: red'></div></body></html>",
