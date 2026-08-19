@@ -14461,6 +14461,14 @@ mod tests {
             .evaluate("document.createEvent('KeyboardEvent') instanceof KeyboardEvent")
             .unwrap();
         assert_eq!(kb, serde_json::json!(true));
+        let hash_change = rt
+            .evaluate("document.createEvent('HashChangeEvent') instanceof HashChangeEvent")
+            .unwrap();
+        assert_eq!(hash_change, serde_json::json!(true));
+        let message = rt
+            .evaluate("document.createEvent('MessageEvent') instanceof MessageEvent")
+            .unwrap();
+        assert_eq!(message, serde_json::json!(true));
     }
 
     #[test]
@@ -14478,12 +14486,21 @@ mod tests {
     }
 
     #[test]
-    fn test_create_event_unknown_type_returns_event() {
+    fn test_create_event_rejects_unknown_interface() {
         let mut rt = setup_runtime("<html><body></body></html>");
-        let kind = rt
-            .evaluate("document.createEvent('NotARealType') instanceof Event")
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    try {
+                        document.createEvent('NotAnEventInterface');
+                        return null;
+                    } catch (error) {
+                        return [error.name, error instanceof DOMException];
+                    }
+                })()"#,
+            )
             .unwrap();
-        assert_eq!(kind, serde_json::json!(true));
+        assert_eq!(result, serde_json::json!(["NotSupportedError", true]));
     }
 
     #[test]
@@ -14559,6 +14576,28 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result, serde_json::json!(["NotSupportedError", true]));
+    }
+
+    #[test]
+    fn test_create_event_supports_legacy_event_aliases() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"['Event', 'Events', 'HTMLEvents', 'SVGEvents'].map(name => {
+                    const event = document.createEvent(name);
+                    return [event instanceof Event, event.constructor === Event, event.type];
+                })"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                [true, true, ""],
+                [true, true, ""],
+                [true, true, ""],
+                [true, true, ""]
+            ])
+        );
     }
 
     #[test]
