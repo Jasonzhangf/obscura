@@ -319,6 +319,7 @@ impl DomTree {
         self.inner.borrow()
     }
 
+
     /// Create and attach a native shadow-root node to `host`.
     pub fn attach_shadow_root(
         &self,
@@ -1410,7 +1411,7 @@ impl DomTree {
     pub fn import_children_from(&self, parent_id: NodeId, source: &DomTree, source_node: NodeId) {
         let source_children = source.children(source_node);
         for source_child_id in source_children {
-            self.import_node_from(parent_id, source, source_child_id);
+            let _ = self.import_node_from(parent_id, source, source_child_id);
         }
     }
 
@@ -1481,12 +1482,21 @@ impl DomTree {
         }
     }
 
-    fn import_node_from(&self, parent_id: NodeId, source: &DomTree, source_node_id: NodeId) {
+    /// Copies a node together with its subtree from `source` and attaches it to `parent_id`.
+    /// Returns the copy of `source_node_id` itself, so that a caller that keeps parsing into
+    /// `source` can map the source to its copy.
+    pub fn import_node_from(
+        &self,
+        parent_id: NodeId,
+        source: &DomTree,
+        source_node_id: NodeId,
+    ) -> Option<NodeId> {
         // Iterative DFS with an explicit (dest_parent, source_node) stack so a
         // deeply nested source tree cannot overflow the thread stack and abort
         // the process. Children are pushed in reverse so they are appended in
         // document order (append_child always appends to the end, so each level
         // keeps the source ordering).
+        let mut imported_root = None;
         let mut stack = vec![(parent_id, source_node_id)];
         while let Some((dest_parent, src_id)) = stack.pop() {
             let node_data = {
@@ -1499,6 +1509,10 @@ impl DomTree {
 
             let new_id = self.new_node(node_data);
             self.append_child(dest_parent, new_id);
+            // The first node off the stack is source_node_id itself.
+            if imported_root.is_none() {
+                imported_root = Some(new_id);
+            }
 
             // A <template>'s children hang off a separate contents document, so
             // the child walk below never reaches them. Worse, the cloned data
@@ -1536,6 +1550,7 @@ impl DomTree {
                 stack.push((new_id, child_id));
             }
         }
+        imported_root
     }
 
     pub fn len(&self) -> usize {

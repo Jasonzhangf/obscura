@@ -106,11 +106,12 @@ const _DOM_MUTATION_COMMANDS = new Set([
   "append_child", "insert_before", "remove_child",
   "set_attribute", "remove_attribute",
   "set_text_content", "set_inner_html", "set_inner_html_context",
-  "set_fragment_html_executable",
+  "set_fragment_html_executable", "document_write",
 ]);
 const _DOM_TREE_MUTATION_COMMANDS = new Set([
   "append_child", "insert_before", "remove_child",
   "set_inner_html", "set_inner_html_context", "set_fragment_html_executable",
+  "document_write",
 ]);
 // Which realm this bootstrap closure belongs to. Every wrapper's methods come
 // from its own realm's prototypes, so a DOM call names the document it belongs
@@ -2087,7 +2088,15 @@ class Node {
     _detachStyleSheetsInSubtree(oldChild);
     _registerWindowNamedTree(newChild);
     _reconcileWindowNamedProperties(removedWindowNames);
+    // As in appendChild and removeChild. A replacement is an insertion and a removal. An
+    // observer saw neither so far.
+    if (globalThis.__mutationObservers?.length) {
+      globalThis.__notifyMutation('childList', this._nid, [newChild._nid], [oldChild._nid]);
+    }
     __prepareInsertedSubtree(newChild);
+    if (newChild instanceof Element && newChild.tagName === 'LINK') {
+      _loadLinkedStylesheet(newChild);
+    }
     return oldChild;
   }
   insertBefore(n, ref) {
@@ -2118,7 +2127,13 @@ class Node {
     _seedUnchangedConnection(this, parentConnected);
     _seedInsertedTreeState(n, this, parentConnected);
     _registerWindowNamedTree(n);
+    // The same steps as in appendChild. Where a node is inserted does not decide whether an
+    // observer sees it and whether a <link> loads its stylesheet.
+    if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('childList', this._nid, [n._nid], []);
     __prepareInsertedSubtree(n);
+    if (n instanceof Element && n.tagName === 'LINK') {
+      _loadLinkedStylesheet(n);
+    }
     return n;
   }
   contains(o) { return o ? _dom("contains", this._nid, o._nid) === "true" : false; }
@@ -5354,16 +5369,52 @@ class Document extends Node {
     if (!v) return;
     Deno.core.ops.op_set_cookie(v);
   }
+  // Inserts into the document's input stream, which the host keeps alive across calls.
+  // Parsing each call on its own would lose every construct that spans two of them. This is
+  // exactly how the SAP UI5 cachebuster writes its bootstrap tags: one call for "<script",
+  // one per attribute, then ">".
+  // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-document-write
   write(...args) {
     var html = args.join('');
     if (!html) return;
     var body = this.body;
     if (!body) return;
-    var temp = this.createDocumentFragment();
-    _dom("set_fragment_html_executable", temp._nid, _fragmentContextPayload('body', html));
-    var children = Array.from(temp.childNodes);
-    for (var i = 0; i < children.length; i++) {
-      body.appendChild(children[i]);
+    // The host parses into the input stream and returns [[parent, node], …], parents first. The
+    // insertion stays here, because appendChild does more than append: it reports the
+    // mutation, registers window named access, and loads a written stylesheet.
+    var placements = _domParse("document_write", "", html) || [];
+    // The insertion point is the position of the running script. What it writes belongs
+    // behind it, not at the end of the body. The point moves along with every node placed,
+    // even across calls, so that a script's second call lands behind the first instead of
+    // directly behind the script again.
+    var scriptNid = globalThis.__currentScriptNid || 0;
+    var after = null;
+    if (scriptNid) {
+      var anchorNid = this._writeAnchorScript === scriptNid && this._writeAnchorNid
+        ? this._writeAnchorNid
+        : scriptNid;
+      var anchor = _wrap(anchorNid);
+      if (anchor && anchor.parentNode) after = anchor;
+    }
+    for (var i = 0; i < placements.length; i++) {
+      var parentNid = +placements[i][0];
+      var node = _wrap(+placements[i][1]);
+      if (!node) continue;
+      if (parentNid) {
+        var parent = _wrap(parentNid);
+        if (parent) parent.appendChild(node);
+        continue;
+      }
+      if (after) {
+        after.parentNode.insertBefore(node, after.nextSibling);
+        after = node;
+      } else {
+        body.appendChild(node);
+      }
+    }
+    if (scriptNid && after) {
+      this._writeAnchorScript = scriptNid;
+      this._writeAnchorNid = after._nid;
     }
   }
   writeln(...args) {
@@ -5372,6 +5423,10 @@ class Document extends Node {
   open() {
     var body = this.body;
     if (body) body.innerHTML = '';
+    // A new parse begins. Whatever the input stream still held is gone.
+    _dom("document_write_reset");
+    this._writeAnchorScript = 0;
+    this._writeAnchorNid = 0;
     return this;
   }
   close() {

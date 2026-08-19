@@ -16180,4 +16180,259 @@ mod tests {
             .unwrap();
         assert_eq!(result, serde_json::json!(["range", "write"]));
     }
+
+    // One stream per document. The tokenizer carries its state across the calls.
+    // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-document-write
+    #[test]
+    fn document_write_joins_an_element_split_across_calls() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                var scriptTestSetup = true;
+                document.write('<di');
+                document.write('v id="split">');
+                document.write('content</div>');
+                const el = document.getElementById('split');
+                return el ? el.textContent : null;
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!("content"));
+    }
+
+    #[test]
+    fn document_write_joins_a_tag_name_split_across_calls() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                var scriptTestSetup = true;
+                document.write('<spa');
+                document.write('n id="half">x</span>');
+                const el = document.getElementById('half');
+                return el ? el.tagName : null;
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!("SPAN"));
+    }
+
+    // The shape the UI5 cachebuster writes: "<script", one per attribute, then ">".
+    #[test]
+    fn document_write_runs_a_script_split_across_calls() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                var scriptTestSetup = true;
+                globalThis.__splitScriptRan = false;
+                document.write('<scr' + 'ipt');
+                document.write(' id="split-script"');
+                document.write('>');
+                document.write('globalThis.__splitScriptRan = true;');
+                document.write('<\/scr' + 'ipt>');
+                return [!!document.getElementById('split-script'), globalThis.__splitScriptRan];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([true, true]));
+    }
+
+    // A script in the <head> inserts behind itself, so that what it writes runs before what
+    // the parser saw after it.
+    #[test]
+    fn document_write_inserts_at_the_writing_scripts_position() {
+        let mut rt = setup_runtime(
+            r#"<html><head><script id="writer"></script></head><body><p id="existing">x</p></body></html>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+                var scriptTestSetup = true;
+                // What the production path sets while a script runs; bootstrap.js
+                // assigns __currentScriptNid around every script it prepares.
+                globalThis.__currentScriptNid = document.getElementById('writer')._nid;
+                document.write('<span id="written"></span>');
+                return JSON.stringify({
+                  head: Array.from(document.head.children).map(e => e.id || e.tagName),
+                  body: Array.from(document.body.children).map(e => e.id || e.tagName),
+                });
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!(r#"{"head":["writer","written"],"body":["existing"]}"#)
+        );
+    }
+
+    // Holding back until the close would lose everything written after it. It belongs inside.
+    #[test]
+    fn document_write_shows_an_element_that_is_never_closed() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                var scriptTestSetup = true;
+                document.write('<div id="unclosed">hello');
+                const el = document.getElementById('unclosed');
+                return el ? el.textContent : null;
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!("hello"));
+    }
+
+    #[test]
+    fn document_write_grows_an_open_element_across_calls() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                var scriptTestSetup = true;
+                document.write('<div id="wrap">');
+                document.write('<span id="inner">y</span>');
+                const inner = document.getElementById('inner');
+                return JSON.stringify({
+                  wrap: !!document.getElementById('wrap'),
+                  inner: !!inner,
+                  nested: !!(inner && inner.parentElement && inner.parentElement.id === 'wrap'),
+                });
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!(r#"{"wrap":true,"inner":true,"nested":true}"#)
+        );
+    }
+
+    // Writing goes through the same insertion steps as any other insertion.
+    #[test]
+    fn document_write_reports_to_mutation_observers() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                var scriptTestSetup = true;
+                globalThis.__seen = [];
+                const observer = new MutationObserver((records) => {
+                  for (const record of records) {
+                    for (const node of record.addedNodes) globalThis.__seen.push(node.nodeName);
+                  }
+                });
+                observer.observe(document.body, { childList: true });
+                document.write('<span id="watched">z</span>');
+                observer.takeRecords().forEach((record) => {
+                  for (const node of record.addedNodes) globalThis.__seen.push(node.nodeName);
+                });
+                return globalThis.__seen.join(',');
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!("SPAN"));
+    }
+
+    // before(), after() and replaceWith() all go through parent.insertBefore. replaceChild
+    // also goes there in the fragment branch. AGENTS.md requires whoever touches insertBefore
+    // to check them: the order of reference node versus parent nid is easy to break. The test
+    // also pins that every insertion is reported exactly once, not twice.
+    #[test]
+    fn child_node_methods_place_nodes_and_report_once() {
+        let mut rt = setup_runtime(r#"<html><body><p id="a"></p><p id="b"></p></body></html>"#);
+        let result = rt
+            .evaluate(
+                r#"
+                var scriptTestSetup = true;
+                const ids = () => Array.from(document.body.children).map((e) => e.id).join(',');
+                const make = (id) => { const e = document.createElement('span'); e.id = id; return e; };
+                const observer = new MutationObserver(() => {});
+                observer.observe(document.body, { childList: true });
+                const steps = {};
+
+                document.getElementById('b').before(make('x'));
+                steps.before = ids();
+                document.getElementById('b').after(make('y'));
+                steps.after = ids();
+                document.getElementById('y').replaceWith(make('z'));
+                steps.replaceWith = ids();
+                document.body.replaceChild(make('w'), document.getElementById('z'));
+                steps.replaceChild = ids();
+
+                const added = observer.takeRecords()
+                  .flatMap((record) => Array.from(record.addedNodes).map((n) => n.id));
+                observer.disconnect();
+                steps.added = added.join(',');
+                return JSON.stringify(steps);
+                "#,
+            )
+            .unwrap();
+        let steps: serde_json::Value =
+            serde_json::from_str(result.as_str().unwrap()).expect("steps json");
+        assert_eq!(steps["before"], "a,x,b");
+        assert_eq!(steps["after"], "a,x,b,y");
+        assert_eq!(steps["replaceWith"], "a,x,b,z");
+        assert_eq!(steps["replaceChild"], "a,x,b,w");
+        // Every inserted node exactly once, in the order of insertion.
+        assert_eq!(steps["added"], "x,y,z,w");
+    }
+
+    // insertBefore reported no mutation at all, appendChild did.
+    #[test]
+    fn insert_before_reports_to_mutation_observers() {
+        let mut rt = setup_runtime("<html><body><p id=\"ref\"></p></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                var scriptTestSetup = true;
+                const observer = new MutationObserver(() => {});
+                observer.observe(document.body, { childList: true });
+                document.body.insertBefore(
+                  document.createElement('span'),
+                  document.getElementById('ref'),
+                );
+                const seen = observer.takeRecords()
+                  .flatMap((record) => Array.from(record.addedNodes).map((n) => n.nodeName));
+                observer.disconnect();
+                return seen.join(',');
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!("SPAN"));
+    }
+
+    #[test]
+    fn document_write_registers_window_named_access() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                var scriptTestSetup = true;
+                document.write('<img name="namedImage" src="x.png">');
+                return typeof window.namedImage;
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!("object"));
+    }
+
+    #[test]
+    fn document_write_keeps_call_order_at_the_insertion_point() {
+        let mut rt = setup_runtime(
+            r#"<html><head><script id="writer"></script></head><body></body></html>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+                var scriptTestSetup = true;
+                globalThis.__currentScriptNid = document.getElementById('writer')._nid;
+                document.write('<span id="one"></span>');
+                document.write('<span id="two"></span>');
+                return Array.from(document.head.children).map(e => e.id).join(',');
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!("writer,one,two"));
+    }
 }
