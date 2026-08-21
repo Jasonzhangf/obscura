@@ -87,16 +87,6 @@ Want to sponsor? Email [hello@obscura.sh](mailto:hello@obscura.sh).
       🎁 Use code <b>OBSCURA35</b> for a <b>35% recurring discount</b>.<br><br></b>
       Better proxies. Fewer blocks. More scalable automation.
     </td>
-  </tr>
-      <td width="200" align="center" valign="middle">
-        <a href="https://9proxy.com/?utm_source=Github&utm_campaign=obscura" target="_blank">
-          <img alt="9Proxy" src="assets/sponsors/9proxy.png" width="180"/>
-        </a>
-      </td>
-      <td valign="middle">
-        <a href="https://9proxy.com/?utm_source=Github&utm_campaign=obscura"><b>9Proxy</b></a> provides residential proxies from
-  just $0.018/IP or $0.68/GB. 20M+ IPs across 90+ countries. Sticky or rotating sessions, managed from desktop or mobile app.
-      </td>
     </tr>
     <td width="200" align="center" valign="middle">
       <a href="https://www.thordata.com/?ls=dob&lk=dob" target="_blank">
