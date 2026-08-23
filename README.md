@@ -244,6 +244,22 @@ obscura fetch https://example.com --screenshot page.png
 
 # The screenshot flag also has a short form
 obscura fetch https://example.com -s page.png
+
+### Testing against localhost / LAN dev servers
+
+Obscura blocks fetches to private/internal IPs by default (SSRF protection).
+To point it at a local dev server, pass `--allow-private-network` (or set
+`OBSCURA_ALLOW_PRIVATE_NETWORK=1`):
+
+```bash
+obscura fetch http://127.0.0.1:3000 --allow-private-network --dump text
+
+# Works on any subcommand, e.g. the CDP server for local Puppeteer/Playwright:
+obscura serve --port 9222 --allow-private-network
+```
+
+See [docs/Environment-variables.md](docs/Environment-variables.md) for the
+full allow/deny rules (DNS-resolution-time checks included).
 ```
 
 ## Rendering
