@@ -159,6 +159,8 @@ function retry(err) {
 connect().catch(retry);
 ```
 
+
+> For a packaged version with adaptive pacing (fast while painting, idle back-off) and multi-page handling, see `tools/live-view.mjs`.
 ## Things worth knowing
 
 - **Why captureScreenshot polling instead of screencast.** `Page.startScreencast` frames stream to the CDP session that drives the page, so once an agent session takes over, a passive viewer session stops receiving frames. It also only produces frames when the page paints something new. An explicit `Page.captureScreenshot` always reflects the current page state regardless of which session navigated, which makes it the reliable choice for watching someone else's session.
