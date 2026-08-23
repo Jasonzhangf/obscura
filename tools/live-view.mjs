@@ -21,12 +21,43 @@
 // back off when it is idle, so watching feels live without burning CPU.
 
 import http from "node:http";
+import { spawn } from "node:child_process";
 
 const cdpPort = process.argv[2] ?? 9222;
 const httpPort = Number(process.argv[3] ?? 8080);
 const FAST_MS = 250; // capture cadence right after a visible change
 const IDLE_MS = 1500; // capture cadence while nothing changes
 const MIN_FRAME_BYTES = 100; // ignore blank placeholder frames
+
+async function ensureServe() {
+  try {
+    const r = await fetch(`http://127.0.0.1:${cdpPort}/json/version`);
+    if (r.ok) return;
+  } catch {}
+  // try spawning obscura directly (works in normal installs and in proot ubuntu)
+  try {
+    const child = spawn("obscura", ["serve", "--port", String(cdpPort)], {
+      stdio: "ignore",
+      detached: true,
+    });
+    child.unref();
+  } catch {}
+  // fallback for Termux proot setups where obscura lives inside ubuntu
+  try {
+    const child = spawn("proot-distro", ["login", "ubuntu", "--", "/usr/local/bin/obscura", "serve", "--port", String(cdpPort)], {
+      stdio: "ignore",
+      detached: true,
+    });
+    child.unref();
+  } catch {}
+  for (let i = 0; i < 30; i++) {
+    await new Promise((r) => setTimeout(r, 1000));
+    try {
+      const r = await fetch(`http://127.0.0.1:${cdpPort}/json/version`);
+      if (r.ok) return;
+    } catch {}
+  }
+}
 
 const clients = new Set();
 let latest = null;
@@ -144,6 +175,7 @@ async function ensureAttached(call) {
 }
 
 async function connect() {
+  await ensureServe();
   const gen = ++generation;
   sessionId = null;
   ws = new WebSocket(`ws://127.0.0.1:${cdpPort}/devtools/browser`);
