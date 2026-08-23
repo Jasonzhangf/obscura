@@ -37,7 +37,31 @@ Obscura is a headless browser engine written in Rust, built for web scraping and
 | Puppeteer    | **Yes**      | Yes              |
 | Playwright   | **Yes**      | Yes              |
 
-## 🎉 10,000 stars and what's next
+<table>
+  <tr>
+    <td width="90" align="center">
+      <a href="https://blog.cloudflare.com/kitesurf/">
+        <img
+          src="https://cdn.simpleicons.org/cloudflare/F38020"
+          alt="Cloudflare"
+          width="54"
+        />
+      </a>
+    </td>
+    <td>
+      <strong>Obscura inspired Cloudflare Kitesurf’s first prototype</strong>
+      <br>
+      Cloudflare began by porting Obscura to Workers while developing its
+      new agent-first browser.
+      <br>
+      <a href="https://blog.cloudflare.com/kitesurf/">
+        Read Cloudflare’s engineering story →
+      </a>
+    </td>
+  </tr>
+</table>
+
+## Obscura Cloud
 
 We are working on **Obscura Cloud** the hosted version, with managed infrastructure, residential proxies, and dedicated support. For people who want the engine without operating it themselves.
 
