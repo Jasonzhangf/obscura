@@ -1084,10 +1084,12 @@ impl Page {
         for message in pending {
             let escaped_data = serde_json::to_string(&message.data_json).unwrap_or_default();
             let escaped_origin = serde_json::to_string(&message.origin).unwrap_or_default();
+            let escaped_target_origin =
+                serde_json::to_string(&message.target_origin).unwrap_or_default();
             if message.target_frame_id == 0 {
                 let Some(js) = self.js.as_mut() else { continue };
                 let script = format!(
-                    "globalThis.__obscura_deliverMessage({escaped_data}, {escaped_origin}, {});",
+                    "globalThis.__obscura_deliverMessage({escaped_data}, {escaped_origin}, {}, {escaped_target_origin});",
                     message.source_frame_id,
                 );
                 if let Err(error) = js.execute_script("<frame-message>", &script) {
@@ -1111,6 +1113,7 @@ impl Page {
                 &message.data_json,
                 &message.origin,
                 message.source_frame_id,
+                &message.target_origin,
             ) {
                 tracing::debug!("message to frame {} failed: {error}", message.target_frame_id);
             }
