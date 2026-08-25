@@ -4,17 +4,6 @@ use serde_json::{json, Value};
 
 use crate::dispatch::CdpContext;
 
-/// Escape a client-supplied objectId for interpolation into a single-quoted JS
-/// string literal (`__obscura_objects['<here>']`). Backslashes must be escaped
-/// before single quotes, otherwise an id ending in `\` turns the closing quote
-/// into `\'` and produces a syntax error. All three objectId lookup sites route
-/// through this so they cannot diverge; not an injection vector (every `'` stays
-/// escaped, so the worst case is an unterminated string -> clean resolution
-/// failure), but a robustness fix.
-fn escape_object_id(oid: &str) -> String {
-    oid.replace('\\', "\\\\").replace('\'', "\\'")
-}
-
 /// Resolve a DOM `nodeId` from CDP params. Honors `nodeId`, `backendNodeId`,
 /// and `objectId` in that order. Playwright commonly passes only `objectId`
 /// (returned by a prior `DOM.resolveNode`); without this fallback those
@@ -28,9 +17,9 @@ fn resolve_node_id(page: &mut Page, params: &Value) -> Result<u64, String> {
     }
     if let Some(oid) = params.get("objectId").and_then(|v| v.as_str()) {
         let code = format!(
-            "(function() {{ var o = globalThis.__obscura_objects && globalThis.__obscura_objects['{}']; \
+            "(function() {{ var o = globalThis.__obscura_objects && globalThis.__obscura_objects[{}]; \
              return (o && typeof o._nid === 'number') ? o._nid : -1; }})()",
-            escape_object_id(oid)
+            crate::util::object_id_literal(oid)
         );
         let result = page.evaluate(&code);
         let nid = result.as_f64().map(|n| n as i64).unwrap_or(-1);
@@ -151,10 +140,9 @@ pub async fn handle(
             {
                 nid
             } else if let Some(oid) = params.get("objectId").and_then(|v| v.as_str()) {
-                let escaped_oid = escape_object_id(oid);
                 let code = format!(
-                    "(function() {{ var o = globalThis.__obscura_objects['{}']; if (!o) return -1; return (typeof o._nid === 'number') ? o._nid : -1; }})()",
-                    escaped_oid
+                    "(function() {{ var o = globalThis.__obscura_objects[{}]; if (!o) return -1; return (typeof o._nid === 'number') ? o._nid : -1; }})()",
+                    crate::util::object_id_literal(oid)
                 );
                 let result = page.evaluate(&code);
                 result.as_f64().map(|n| n as u64).unwrap_or(0)
@@ -175,8 +163,8 @@ pub async fn handle(
                 nid
             } else if let Some(oid) = params.get("objectId").and_then(|v| v.as_str()) {
                 let code = format!(
-                    "(function() {{ var o = globalThis.__obscura_objects['{}']; return (o && typeof o._nid === 'number') ? o._nid : -1; }})()",
-                    escape_object_id(oid)
+                    "(function() {{ var o = globalThis.__obscura_objects[{}]; return (o && typeof o._nid === 'number') ? o._nid : -1; }})()",
+                    crate::util::object_id_literal(oid)
                 );
                 let result = page.evaluate(&code);
                 result.as_f64().map(|n| n as u64).unwrap_or(0)
@@ -524,16 +512,10 @@ mod tests {
     use super::*;
     use crate::dispatch::CdpContext;
 
-    #[test]
-    fn escape_object_id_escapes_backslash_before_quote() {
-        // A trailing backslash must be doubled so it cannot escape the closing
-        // quote of __obscura_objects['...']; the old resolve_node_id path escaped
-        // only the quote, producing ['x\'] (syntax error) for the id `x\`.
-        assert_eq!(escape_object_id(r"x\"), r"x\\");
-        assert_eq!(escape_object_id("a'b"), r"a\'b");
-        assert_eq!(escape_object_id(r"a\'b"), r"a\\\'b");
-        assert_eq!(escape_object_id("plain"), "plain");
-    }
+    // The escaping this file used to own now lives in `util::object_id_literal`,
+    // which is where its tests went with it: the three lookup sites here embed
+    // the id as a JSON literal rather than splicing it into a single-quoted
+    // string, so there is no per-domain escaping left to assert on.
 
     #[tokio::test]
     async fn dom_focus_sets_active_element() {
