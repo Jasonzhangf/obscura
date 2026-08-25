@@ -737,31 +737,90 @@ function _getElementsByClassName(root, classNames) {
   }
   return HTMLCollection._from(matched);
 }
+let _consoleOid = 0;
+const _consoleObjectId = (value) => {
+  const objectId = "console-" + (globalThis.__obscura_frameId >>> 0) + "-" + (++_consoleOid);
+  const store = globalThis.__obscura_objects || (globalThis.__obscura_objects = {});
+  store[objectId] = value;
+  return objectId;
+};
+const _consoleRemoteObject = (value) => {
+  const type = typeof value;
+  if (value === null) return { type: "object", subtype: "null", value: null, description: "null" };
+  if (type === "undefined") return { type: "undefined" };
+  if (type === "string" || type === "boolean") return { type, value, description: String(value) };
+  if (type === "number") {
+    if (Number.isNaN(value)) return { type, unserializableValue: "NaN", description: "NaN" };
+    if (value === Infinity) return { type, unserializableValue: "Infinity", description: "Infinity" };
+    if (value === -Infinity) return { type, unserializableValue: "-Infinity", description: "-Infinity" };
+    if (Object.is(value, -0)) return { type, unserializableValue: "-0", description: "-0" };
+    return { type, value, description: String(value) };
+  }
+  if (type === "bigint") {
+    const description = String(value) + "n";
+    return { type, unserializableValue: description, description };
+  }
+  if (type === "symbol") return { type, description: String(value) };
+  if (value instanceof Error) {
+    const _pst = Error.prepareStackTrace;
+    if (_pst !== undefined) Error.prepareStackTrace = undefined;
+    const description = value.stack || value.message || String(value);
+    if (_pst !== undefined) Error.prepareStackTrace = _pst;
+    return {
+      type: "object", subtype: "error",
+      className: (value.constructor && value.constructor.name) || "Error",
+      description, objectId: _consoleObjectId(value)
+    };
+  }
+  const className = type === "function"
+    ? "Function"
+    : ((value.constructor && value.constructor.name) || "Object");
+  const remote = { type, className, description: type === "function" ? String(value) : className };
+  if (Array.isArray(value)) {
+    remote.subtype = "array";
+    remote.description = "Array(" + value.length + ")";
+  } else if (type === "object" && typeof value._nid === "number") {
+    remote.subtype = "node";
+    remote.description = value.tagName ? value.tagName.toLowerCase() : (value.nodeName || "node");
+  }
+  remote.objectId = _consoleObjectId(value);
+  return remote;
+};
 const _consoleFn = (level, args) => {
-  try { Deno.core.ops.op_console_msg(level, args.map(a => {
-    if (a === null) return "null";
-    if (a === undefined) return "undefined";
-    if (a instanceof Error) {
-      const _pst = Error.prepareStackTrace;
-      if (_pst !== undefined) Error.prepareStackTrace = undefined;
-      const _s = a.stack || a.message || String(a);
-      if (_pst !== undefined) Error.prepareStackTrace = _pst;
-      return _s;
-    }
-    if (typeof a === "object") {
-      try {
-        const s = JSON.stringify(a);
-        return s === "{}" && a.message ? a.message : s;
-      } catch { return String(a); }
-    }
-    return String(a);
-  }).join(" ")); } catch {}
+  try {
+    const text = args.map(a => {
+      if (a === null) return "null";
+      if (a === undefined) return "undefined";
+      if (a instanceof Error) {
+        const _pst = Error.prepareStackTrace;
+        if (_pst !== undefined) Error.prepareStackTrace = undefined;
+        const _s = a.stack || a.message || String(a);
+        if (_pst !== undefined) Error.prepareStackTrace = _pst;
+        return _s;
+      }
+      if (typeof a === "object") {
+        try {
+          const s = JSON.stringify(a);
+          return s === "{}" && a.message ? a.message : s;
+        } catch { return String(a); }
+      }
+      return String(a);
+    }).join(" ");
+    const eventArgs = Deno.core.ops.op_runtime_events_enabled()
+      ? JSON.stringify(args.map(a => {
+          try { return _consoleRemoteObject(a); }
+          catch { return { type: typeof a, description: "<unavailable>" }; }
+        }))
+      : "";
+    Deno.core.ops.op_console_msg(level, text, eventArgs);
+  } catch {}
 };
 
 globalThis.console = {
-  log: (...a) => _consoleFn("log", a), warn: (...a) => _consoleFn("warn", a),
-  error: (...a) => _consoleFn("error", a), info: (...a) => _consoleFn("log", a),
-  debug: () => {}, dir: () => {}, trace: () => {}, table: () => {}, group: () => {},
+  log: (...a) => _consoleFn("log", a), warn: (...a) => _consoleFn("warning", a),
+  error: (...a) => _consoleFn("error", a), info: (...a) => _consoleFn("info", a),
+  debug: (...a) => _consoleFn("debug", a), dir: (...a) => _consoleFn("dir", a),
+  trace: (...a) => _consoleFn("trace", a), table: (...a) => _consoleFn("table", a), group: () => {},
   groupEnd: () => {}, groupCollapsed: () => {}, time: () => {}, timeEnd: () => {},
   timeLog: () => {}, count: () => {}, countReset: () => {}, clear: () => {},
   assert: (c, ...a) => { if (!c) _consoleFn("error", ["Assertion failed:", ...a]); },

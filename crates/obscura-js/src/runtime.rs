@@ -13,7 +13,10 @@ use crate::import_map::ImportMap;
 use crate::module_loader::{ModuleLoadActivity, ObscuraModuleLoader};
 #[cfg(all(test, feature = "render"))]
 use crate::ops::ensure_prepared_render;
-use crate::ops::{build_extension, node_is_script, ObscuraState, StoredNetworkResponseBody};
+use crate::ops::{
+    build_extension, node_is_script, ObscuraState, RuntimeEvent, RuntimeExceptionEvent,
+    StoredNetworkResponseBody,
+};
 #[cfg(feature = "render")]
 use crate::ops::{
     begin_animation_task, clamp_scroll_offset, document_base_url, ensure_resolved_scroll,
@@ -873,6 +876,101 @@ impl ObscuraJsRuntime {
 
     pub fn take_pending_binding_calls(&self) -> Vec<(String, String)> {
         std::mem::take(&mut self.state.borrow_mut().pending_binding_calls)
+    }
+
+    pub fn take_pending_runtime_events(&mut self) -> Vec<RuntimeEvent> {
+        let events: Vec<_> = self
+            .state
+            .borrow_mut()
+            .pending_runtime_events
+            .drain(..)
+            .collect();
+        for event in &events {
+            let RuntimeEvent::Console(event) = event else {
+                continue;
+            };
+            for arg in &event.args {
+                let Some(object_id) = arg.get("objectId").and_then(|value| value.as_str()) else {
+                    continue;
+                };
+                let frame_id = object_id
+                    .strip_prefix("console-")
+                    .and_then(|rest| rest.split_once('-'))
+                    .and_then(|(frame_id, _)| frame_id.parse::<u32>().ok())
+                    .unwrap_or(0);
+                let retrieval = if frame_id == 0 {
+                    format!("globalThis.__obscura_objects['{object_id}']")
+                } else {
+                    format!(
+                        "globalThis.__obscura_frameObjects[{frame_id}]?.window?.__obscura_objects['{object_id}']"
+                    )
+                };
+                self.object_store.insert(object_id.to_string(), retrieval);
+            }
+        }
+        events
+    }
+
+    pub fn set_runtime_events_enabled(&self, enabled: bool) {
+        self.state.borrow_mut().runtime_events_enabled = enabled;
+    }
+
+    fn record_uncaught_exception(&self, error: &deno_core::error::JsError, fallback_url: &str) {
+        let mut state = self.state.borrow_mut();
+        if !state.runtime_events_enabled {
+            return;
+        }
+        state.runtime_exception_counter = state.runtime_exception_counter.saturating_add(1);
+        let first = error.frames.first();
+        let url = first
+            .and_then(|frame| frame.file_name.clone())
+            .filter(|url| !url.is_empty())
+            .unwrap_or_else(|| fallback_url.to_string());
+        let line_number = first
+            .and_then(|frame| frame.line_number)
+            .unwrap_or(1)
+            .saturating_sub(1);
+        let column_number = first
+            .and_then(|frame| frame.column_number)
+            .unwrap_or(1)
+            .saturating_sub(1);
+        let stack_trace = error
+            .frames
+            .iter()
+            .map(|frame| {
+                serde_json::json!({
+                    "functionName": frame.function_name.as_deref().unwrap_or(""),
+                    "scriptId": "",
+                    "url": frame.file_name.as_deref().unwrap_or(fallback_url),
+                    "lineNumber": frame.line_number.unwrap_or(1).saturating_sub(1),
+                    "columnNumber": frame.column_number.unwrap_or(1).saturating_sub(1),
+                })
+            })
+            .collect();
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64()
+            * 1_000.0;
+        if state.pending_runtime_events.len() >= 1_024 {
+            state.pending_runtime_events.pop_front();
+        }
+        let exception_id = state.runtime_exception_counter;
+        state
+            .pending_runtime_events
+            .push_back(RuntimeEvent::Exception(RuntimeExceptionEvent {
+                exception_id,
+                name: error.name.clone().unwrap_or_else(|| "Error".to_string()),
+                description: error
+                    .stack
+                    .clone()
+                    .unwrap_or_else(|| error.exception_message.clone()),
+                url,
+                line_number,
+                column_number,
+                stack_trace,
+                timestamp,
+            }));
     }
 
     pub fn get_network_response_body(&self, request_id: &str) -> Option<StoredNetworkResponseBody> {
@@ -1855,16 +1953,40 @@ impl ObscuraJsRuntime {
 
     pub fn release_object(&mut self, object_id: &str) {
         if self.object_store.remove(object_id).is_some() {
-            let code = format!("delete globalThis.__obscura_objects['{}'];", object_id,);
+            let frame_id = object_id
+                .strip_prefix("console-")
+                .and_then(|rest| rest.split_once('-'))
+                .and_then(|(frame_id, _)| frame_id.parse::<u32>().ok())
+                .unwrap_or(0);
+            let code = if frame_id == 0 {
+                format!("delete globalThis.__obscura_objects['{object_id}'];")
+            } else {
+                format!(
+                    "delete globalThis.__obscura_frameObjects[{frame_id}]?.window?.__obscura_objects['{object_id}'];"
+                )
+            };
             let _ = self.execute_runtime_script("<release>", code);
         }
     }
 
     pub fn release_object_group(&mut self) {
-        let _ = self.execute_runtime_script(
-            "<releaseGroup>",
-            "globalThis.__obscura_objects = {};".to_string(),
-        );
+        let mut frame_ids: Vec<u32> = self
+            .object_store
+            .keys()
+            .filter_map(|object_id| object_id.strip_prefix("console-"))
+            .filter_map(|rest| rest.split_once('-'))
+            .filter_map(|(frame_id, _)| frame_id.parse().ok())
+            .filter(|frame_id| *frame_id != 0)
+            .collect();
+        frame_ids.sort_unstable();
+        frame_ids.dedup();
+        let mut code = "globalThis.__obscura_objects = {};".to_string();
+        for frame_id in frame_ids {
+            code.push_str(&format!(
+                "if(globalThis.__obscura_frameObjects[{frame_id}]?.window)globalThis.__obscura_frameObjects[{frame_id}].window.__obscura_objects={{}};"
+            ));
+        }
+        let _ = self.execute_runtime_script("<releaseGroup>", code);
         self.object_store.clear();
     }
     pub async fn load_module(&mut self, url: &str, budget_ms: u64) -> Result<(), String> {
@@ -2122,16 +2244,17 @@ impl ObscuraJsRuntime {
 
     fn execute_classic_script(&mut self, name: &str, source: &str) -> Result<(), String> {
         self.begin_javascript_task();
+        let script_url = name.to_string();
         // JsRuntime::execute_script in deno_core 0.350 restricts `name` to a
         // &'static str. Browser script URLs are runtime data, and V8 uses this
         // origin as import()'s referrer, so compile in the runtime's main
         // context directly instead of substituting the fixed "<script>" name.
-        let result = (|| {
+        let result: Result<(), (String, Option<deno_core::error::JsError>)> = (|| {
             let scope = &mut self.runtime.handle_scope();
             let source = deno_core::v8::String::new(scope, source)
-                .ok_or_else(|| "JS error: source allocation failed".to_string())?;
+                .ok_or_else(|| ("JS error: source allocation failed".to_string(), None))?;
             let name = deno_core::v8::String::new(scope, name)
-                .ok_or_else(|| "JS error: script URL allocation failed".to_string())?;
+                .ok_or_else(|| ("JS error: script URL allocation failed".to_string(), None))?;
             let origin = deno_core::v8::ScriptOrigin::new(
                 scope,
                 name.into(),
@@ -2150,35 +2273,46 @@ impl ObscuraJsRuntime {
             let Some(script) = script else {
                 if scope.is_execution_terminating() {
                     scope.cancel_terminate_execution();
-                    return Err("JS error: Uncaught Error: execution terminated".to_string());
+                    return Err(("JS error: Uncaught Error: execution terminated".to_string(), None));
                 }
                 return match scope.exception() {
                     Some(exception) => {
                         let error = deno_core::error::JsError::from_v8_exception(scope, exception);
-                        Err(format!("JS error: {error}"))
+                        Err((format!("JS error: {error}"), Some(error)))
                     }
-                    None => {
-                        Err("JS error: script compilation failed without an exception".to_string())
-                    }
+                    None => Err((
+                        "JS error: script compilation failed without an exception".to_string(),
+                        None,
+                    )),
                 };
             };
             if script.run(scope).is_none() {
                 if scope.is_execution_terminating() {
                     scope.cancel_terminate_execution();
-                    return Err("JS error: Uncaught Error: execution terminated".to_string());
+                    return Err(("JS error: Uncaught Error: execution terminated".to_string(), None));
                 }
                 return match scope.exception() {
                     Some(exception) => {
                         let error = deno_core::error::JsError::from_v8_exception(scope, exception);
-                        Err(format!("JS error: {error}"))
+                        Err((format!("JS error: {error}"), Some(error)))
                     }
-                    None => {
-                        Err("JS error: script execution failed without an exception".to_string())
-                    }
+                    None => Err((
+                        "JS error: script execution failed without an exception".to_string(),
+                        None,
+                    )),
                 };
             }
             Ok(())
         })();
+        let result = match result {
+            Ok(()) => Ok(()),
+            Err((message, error)) => {
+                if let Some(error) = error.as_ref() {
+                    self.record_uncaught_exception(error, &script_url);
+                }
+                Err(message)
+            }
+        };
         self.finish_heap_checked(result)
     }
 

@@ -282,6 +282,10 @@ pub struct Page {
     // contract. Includes `Runtime.addBinding` shims so puppeteer's
     // `exposeFunction` bindings exist before inline `<script>` tags execute.
     preload_scripts: Vec<String>,
+    /// Whether at least one attached CDP session enabled the Runtime domain.
+    /// Page-owned so the subscription survives replacement of the JS runtime
+    /// during navigation.
+    runtime_events_enabled: std::cell::Cell<bool>,
     /// Document-owned HTML script preparation flags saved while the V8 realm
     /// is suspended for CDP/MCP tab switching.  These are restored only when
     /// the same surviving DomTree is resumed; navigation clears them.
@@ -932,6 +936,7 @@ impl Page {
             blocked_url_patterns: Vec::new(),
             intercept_tx: None,
             preload_scripts: Vec::new(),
+            runtime_events_enabled: std::cell::Cell::new(false),
             suspended_started_script_ids: Vec::new(),
             callbacks: Arc::new(CallbackRegistry::new()),
             #[cfg(feature = "stealth")]
@@ -1474,6 +1479,7 @@ impl Page {
         // runtime does not exist yet, so the new runtime would otherwise start
         // with interception disabled and op_fetch_url would never intercept.
         rt.set_intercept_enabled(self.intercept_enabled);
+        rt.set_runtime_events_enabled(self.runtime_events_enabled.get());
 
         if let Some(dom) = self.dom.take() {
             rt.set_dom(dom);
@@ -3995,6 +4001,21 @@ impl Page {
             js.take_pending_binding_calls()
         } else {
             Vec::new()
+        }
+    }
+
+    pub fn take_pending_runtime_events(&mut self) -> Vec<obscura_js::ops::RuntimeEvent> {
+        if let Some(js) = &mut self.js {
+            js.take_pending_runtime_events()
+        } else {
+            Vec::new()
+        }
+    }
+
+    pub fn set_runtime_events_enabled(&self, enabled: bool) {
+        self.runtime_events_enabled.set(enabled);
+        if let Some(js) = &self.js {
+            js.set_runtime_events_enabled(enabled);
         }
     }
 
