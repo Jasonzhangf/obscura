@@ -14077,6 +14077,207 @@ mod tests {
             })
         );
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_preserves_binary_body_sources_at_the_op_boundary() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const originalFetchOp = Deno.core.ops.op_fetch_url;
+                    const calls = [];
+                    try {
+                        Deno.core.ops.op_fetch_url =
+                            (url, method, headers, body) => {
+                                calls.push({
+                                    path: new URL(url).pathname,
+                                    isUint8Array: body instanceof Uint8Array,
+                                    bytes: Array.from(
+                                        body instanceof Uint8Array
+                                            ? body
+                                            : new TextEncoder().encode(body),
+                                    ),
+                                });
+                                return JSON.stringify({
+                                    status: 200,
+                                    headers: {},
+                                    body: "ok",
+                                    url,
+                                });
+                            };
+
+                        const sentinel = [0, 128, 255, 16];
+                        await fetch("/blob", {
+                            method: "POST",
+                            body: new Blob([new Uint8Array(sentinel)]),
+                        });
+
+                        const arrayBuffer = new Uint8Array(sentinel).buffer;
+                        await fetch("/array-buffer", { method: "POST", body: arrayBuffer });
+
+                        const backing = new Uint8Array([9, ...sentinel, 8]);
+                        await fetch("/typed-array-view", {
+                            method: "POST",
+                            body: backing.subarray(1, 5),
+                        });
+
+                        await fetch(new Request("/request", {
+                            method: "POST",
+                            body: new Uint8Array(sentinel),
+                        }));
+
+                        return calls;
+                    } finally {
+                        Deno.core.ops.op_fetch_url = originalFetchOp;
+                    }
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!([
+                { "path": "/blob", "isUint8Array": true, "bytes": [0, 128, 255, 16] },
+                { "path": "/array-buffer", "isUint8Array": true, "bytes": [0, 128, 255, 16] },
+                { "path": "/typed-array-view", "isUint8Array": true, "bytes": [0, 128, 255, 16] },
+                { "path": "/request", "isUint8Array": true, "bytes": [0, 128, 255, 16] },
+            ])
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_form_urlencoded_and_xhr_bodies_reach_the_op_as_bytes() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const originalFetchOp = Deno.core.ops.op_fetch_url;
+                    const calls = [];
+                    const includesBytes = (bytes, needle) => {
+                        outer: for (let i = 0; i <= bytes.length - needle.length; i++) {
+                            for (let j = 0; j < needle.length; j++) {
+                                if (bytes[i + j] !== needle[j]) continue outer;
+                            }
+                            return true;
+                        }
+                        return false;
+                    };
+                    try {
+                        Deno.core.ops.op_fetch_url =
+                            (url, method, headers, body) => {
+                                const bytes = Array.from(
+                                    body instanceof Uint8Array
+                                        ? body
+                                        : new TextEncoder().encode(body),
+                                );
+                                calls.push({
+                                    path: new URL(url).pathname,
+                                    headers: JSON.parse(headers),
+                                    isUint8Array: body instanceof Uint8Array,
+                                    bytes,
+                                    hasRawSentinel: includesBytes(bytes, [0, 128, 255, 16]),
+                                });
+                                return JSON.stringify({
+                                    status: 200,
+                                    headers: {},
+                                    body: "ok",
+                                    url,
+                                });
+                            };
+
+                        const form = new FormData();
+                        form.append("note", "snow \u96ea");
+                        form.append(
+                            "upload",
+                            new File([new Uint8Array([0, 128, 255, 16])], "sentinel.bin", {
+                                type: "application/octet-stream",
+                            }),
+                        );
+                        await fetch("/form-data", { method: "POST", body: form });
+
+                        const params = new URLSearchParams();
+                        params.append("greeting", "\u96ea space&");
+                        await fetch("/url-search-params", { method: "POST", body: params });
+
+                        await new Promise((resolve, reject) => {
+                            const xhr = new XMLHttpRequest();
+                            xhr.open("POST", "/xhr-typed-array");
+                            xhr.onload = resolve;
+                            xhr.onerror = reject;
+                            const backing = new Uint8Array([9, 0, 128, 255, 16, 8]);
+                            xhr.send(backing.subarray(1, 5));
+                        });
+
+                        const formCall = calls.find(call => call.path === "/form-data");
+                        const paramsCall = calls.find(call => call.path === "/url-search-params");
+                        const xhrCall = calls.find(call => call.path === "/xhr-typed-array");
+                        return {
+                            formData: {
+                                isUint8Array: formCall.isUint8Array,
+                                contentType: Object.entries(formCall.headers)
+                                    .find(([name]) => name.toLowerCase() === "content-type")[1]
+                                    .startsWith("multipart/form-data; boundary=----WebKitFormBoundary"),
+                                hasText: includesBytes(
+                                    formCall.bytes,
+                                    Array.from(new TextEncoder().encode("snow \u96ea")),
+                                ),
+                                hasFilename: includesBytes(
+                                    formCall.bytes,
+                                    Array.from(new TextEncoder().encode('filename="sentinel.bin"')),
+                                ),
+                                hasRawSentinel: formCall.hasRawSentinel,
+                            },
+                            urlSearchParams: {
+                                isUint8Array: paramsCall.isUint8Array,
+                                contentType: Object.entries(paramsCall.headers)
+                                    .find(([name]) => name.toLowerCase() === "content-type")[1],
+                                bytes: paramsCall.bytes,
+                            },
+                            xhr: {
+                                isUint8Array: xhrCall.isUint8Array,
+                                bytes: xhrCall.bytes,
+                            },
+                        };
+                    } finally {
+                        Deno.core.ops.op_fetch_url = originalFetchOp;
+                    }
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({
+                "formData": {
+                    "isUint8Array": true,
+                    "contentType": true,
+                    "hasText": true,
+                    "hasFilename": true,
+                    "hasRawSentinel": true,
+                },
+                "urlSearchParams": {
+                    "isUint8Array": true,
+                    "contentType": "application/x-www-form-urlencoded;charset=UTF-8",
+                    "bytes": "greeting=%E9%9B%AA+space%26".as_bytes(),
+                },
+                "xhr": {
+                    "isUint8Array": true,
+                    "bytes": [0, 128, 255, 16],
+                },
+            })
+        );
+    }
+
     /// Serves a redirect chain across `connections` consecutive
     /// requests: `/hop/N` replies with 302 to `/hop/N-1`, `/hop/0` is the
     /// target. To a path the fixture cannot read it replies with 400

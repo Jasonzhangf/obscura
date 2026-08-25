@@ -6,7 +6,6 @@ use std::sync::Arc;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use deno_core::op2;
 use deno_core::Extension;
-#[cfg(feature = "render")]
 use deno_core::JsBuffer;
 use deno_core::v8;
 use deno_core::OpState;
@@ -2160,11 +2159,12 @@ async fn op_fetch_url(
     #[string] url: String,
     #[string] method: String,
     #[string] headers_json: String,
-    #[string] body: String,
+    #[buffer] body: JsBuffer,
     #[string] origin: String,
     #[string] mode: String,
     #[string] credentials: String,
 ) -> Result<String, deno_error::JsErrorBox> {
+    let body = body.to_vec();
     tracing::debug!(
         "op_fetch_url called: {} {} (intercept check pending)",
         method,
@@ -2257,7 +2257,7 @@ async fn op_fetch_url(
     let mut override_url: Option<String> = None;
     let mut override_method: Option<String> = None;
     let mut override_headers: Option<HashMap<String, String>> = None;
-    let mut override_body: Option<String> = None;
+    let mut override_body: Option<Vec<u8>> = None;
 
     if let Some((tx, request_id)) = intercept_tx {
         let custom_headers: HashMap<String, String> =
@@ -2307,7 +2307,7 @@ async fn op_fetch_url(
                     override_url = url;
                     override_method = method;
                     override_headers = headers;
-                    override_body = body;
+                    override_body = body.map(String::into_bytes);
                     tracing::debug!(
                         "Interception: continue (overrides url={} method={} headers={} body={})",
                         override_url.is_some(),
@@ -2760,7 +2760,7 @@ async fn stealth_fetch_all(
     url: String,
     method: String,
     custom_headers: HashMap<String, String>,
-    body: String,
+    body: Vec<u8>,
     page_origin: String,
     mode: String,
     credentials: FetchCredentials,
