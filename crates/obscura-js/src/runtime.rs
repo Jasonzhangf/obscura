@@ -14091,6 +14091,8 @@ mod tests {
                             (url, method, headers, body) => {
                                 calls.push({
                                     path: new URL(url).pathname,
+                                    method,
+                                    headers: JSON.parse(headers),
                                     isUint8Array: body instanceof Uint8Array,
                                     bytes: Array.from(
                                         body instanceof Uint8Array
@@ -14121,10 +14123,27 @@ mod tests {
                             body: backing.subarray(1, 5),
                         });
 
-                        await fetch(new Request("/request", {
+                        const request = new Request("/request", {
                             method: "POST",
+                            headers: {
+                                authorization: "Bearer test-token",
+                                "x-request-source": "request",
+                            },
                             body: new Uint8Array(sentinel),
-                        }));
+                        });
+                        await fetch(request);
+                        await fetch(request, {
+                            headers: { "x-init-override": "yes" },
+                        });
+
+                        await fetch(new Request("/request-params-object", {
+                            method: "POST",
+                            body: new URLSearchParams({ a: "b" }),
+                        }), { headers: {} });
+                        await fetch(new Request("/request-params-headers", {
+                            method: "POST",
+                            body: new URLSearchParams({ a: "b" }),
+                        }), { headers: new Headers() });
 
                         return calls;
                     } finally {
@@ -14142,10 +14161,13 @@ mod tests {
         assert_eq!(
             result.value.unwrap(),
             serde_json::json!([
-                { "path": "/blob", "isUint8Array": true, "bytes": [0, 128, 255, 16] },
-                { "path": "/array-buffer", "isUint8Array": true, "bytes": [0, 128, 255, 16] },
-                { "path": "/typed-array-view", "isUint8Array": true, "bytes": [0, 128, 255, 16] },
-                { "path": "/request", "isUint8Array": true, "bytes": [0, 128, 255, 16] },
+                { "path": "/blob", "method": "POST", "headers": {}, "isUint8Array": true, "bytes": [0, 128, 255, 16] },
+                { "path": "/array-buffer", "method": "POST", "headers": {}, "isUint8Array": true, "bytes": [0, 128, 255, 16] },
+                { "path": "/typed-array-view", "method": "POST", "headers": {}, "isUint8Array": true, "bytes": [0, 128, 255, 16] },
+                { "path": "/request", "method": "POST", "headers": { "authorization": "Bearer test-token", "x-request-source": "request" }, "isUint8Array": true, "bytes": [0, 128, 255, 16] },
+                { "path": "/request", "method": "POST", "headers": { "x-init-override": "yes" }, "isUint8Array": true, "bytes": [0, 128, 255, 16] },
+                { "path": "/request-params-object", "method": "POST", "headers": {}, "isUint8Array": true, "bytes": [97, 61, 98] },
+                { "path": "/request-params-headers", "method": "POST", "headers": {}, "isUint8Array": true, "bytes": [97, 61, 98] },
             ])
         );
     }

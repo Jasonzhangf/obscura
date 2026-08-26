@@ -6715,21 +6715,21 @@ function _formDataToMultipart(fd) {
 
 // Coerce a fetch()/XHR body into the bytes op_fetch_url expects, attaching a
 // Content-Type header for body types that need one (FormData, URLSearchParams).
-function _serializeBody(initBody, headers) {
+function _serializeBody(initBody, headers, synthesizeContentType = true) {
   if (initBody == null || initBody === '') return new Uint8Array(0);
   if (initBody instanceof FormData) {
     const mp = _formDataToMultipart(initBody);
-    headers['Content-Type'] = 'multipart/form-data; boundary=' + mp.boundary;
+    if (synthesizeContentType) headers['Content-Type'] = 'multipart/form-data; boundary=' + mp.boundary;
     return mp.body;
   }
   if (initBody instanceof URLSearchParams) {
-    if (!Object.keys(headers).some(k => k.toLowerCase() === 'content-type')) {
+    if (synthesizeContentType && !Object.keys(headers).some(k => k.toLowerCase() === 'content-type')) {
       headers['Content-Type'] = 'application/x-www-form-urlencoded;charset=UTF-8';
     }
     return new TextEncoder().encode(initBody.toString());
   }
   if (typeof Blob !== 'undefined' && initBody instanceof Blob) {
-    if (initBody.type && !Object.keys(headers).some(k => k.toLowerCase() === 'content-type')) {
+    if (synthesizeContentType && initBody.type && !Object.keys(headers).some(k => k.toLowerCase() === 'content-type')) {
       headers['Content-Type'] = initBody.type;
     }
     return _bodyToUint8Array(initBody);
@@ -6745,26 +6745,29 @@ function _serializeBody(initBody, headers) {
 
 globalThis.fetch = async (input, init = {}) => {
   init = init || {};
+  const request = input instanceof Request ? input : null;
   let url = typeof input === "string"
     ? input
-    : (input instanceof Request
-      ? input.url
+    : (request
+      ? request.url
       : ((typeof URL === 'function' && input instanceof URL) ? input.href : (input?.url || input?.href || String(input || ""))));
   // Always resolve: the URL parser, not a "://" substring search, decides
   // whether the input is absolute. _resolveUrl leaves absolute URLs
   // unchanged and keeps unparseable input as-is.
   url = _resolveUrl(url);
-  const method = init.method || (input instanceof Request ? input.method : "GET");
-  let _h = init.headers instanceof Headers ? Object.fromEntries(init.headers.entries()) : (init.headers || {});
+  const method = init.method || (request ? request.method : "GET");
+  const headers = init.headers !== undefined ? init.headers : (request ? request.headers : undefined);
+  let _h = headers instanceof Headers ? Object.fromEntries(headers.entries()) : (headers || {});
+  const inheritsRequestBody = init.body === undefined && request !== null;
   const initBody = init.body !== undefined
     ? init.body
-    : (input instanceof Request ? input.body : undefined);
-  const body = _serializeBody(initBody, _h);
+    : (request ? request.body : undefined);
+  const body = _serializeBody(initBody, _h, !(inheritsRequestBody && init.headers !== undefined));
   const hdrs = JSON.stringify(_h);
-  const fetchMode = init.mode || (input instanceof Request ? input.mode : "cors");
+  const fetchMode = init.mode || (request ? request.mode : "cors");
   const fetchCredentials = init.credentials !== undefined
     ? String(init.credentials)
-    : (input instanceof Request ? input.credentials : "same-origin");
+    : (request ? request.credentials : "same-origin");
   if (fetchCredentials !== "omit" && fetchCredentials !== "same-origin" && fetchCredentials !== "include") {
     throw new TypeError("Failed to execute 'fetch': '" + fetchCredentials + "' is not a valid RequestCredentials value");
   }
