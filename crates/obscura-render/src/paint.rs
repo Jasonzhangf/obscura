@@ -2104,14 +2104,41 @@ pub fn paint_dom_scrolled_at_animation_time_with_surface_color(
     surface_color: [u8; 4],
 ) -> Option<Pixmap> {
     let mut resources = RenderResourceCache::default();
+    paint_dom_scrolled_at_animation_time_with_surface_color_and_resources(
+        tree,
+        viewport,
+        base_url,
+        scroll,
+        animation_sample_time,
+        surface_color,
+        &mut resources,
+    )
+}
+
+/// As [`paint_dom_scrolled_at_animation_time_with_surface_color`], but painting
+/// against a caller-owned resource cache instead of a fresh one.
+///
+/// The default-cache version starts empty, so every image is fetched again on
+/// every call. A caller that already holds a warm cache for this document — a
+/// page repeating a capture, for instance — can pass it here and pay the
+/// network cost once rather than per frame.
+pub fn paint_dom_scrolled_at_animation_time_with_surface_color_and_resources(
+    tree: &DomTree,
+    viewport: (f32, f32),
+    base_url: Option<&str>,
+    scroll: (f32, f32),
+    animation_sample_time: crate::AnimationSampleTime,
+    surface_color: [u8; 4],
+    resources: &mut RenderResourceCache,
+) -> Option<Pixmap> {
     let mut prepared = prepare_dom_at_animation_time(
         tree,
         viewport,
         base_url,
-        &mut resources,
+        resources,
         animation_sample_time,
     )?;
-    paint_prepared_with_surface_color(tree, &mut prepared, &mut resources, scroll, surface_color)
+    paint_prepared_with_surface_color(tree, &mut prepared, resources, scroll, surface_color)
 }
 
 /// Resolve image candidates and web fonts, then create the single final layout
@@ -6265,6 +6292,28 @@ pub fn screenshot_png_scrolled_at_animation_time_with_surface_color(
         scroll,
         animation_sample_time,
         surface_color,
+    )
+    .and_then(|pixmap| pixmap.encode_png().ok())
+}
+
+/// PNG wrapper for [`paint_dom_scrolled_at_animation_time_with_surface_color_and_resources`].
+pub fn screenshot_png_scrolled_at_animation_time_with_surface_color_and_resources(
+    tree: &DomTree,
+    viewport: (f32, f32),
+    base_url: Option<&str>,
+    scroll: (f32, f32),
+    animation_sample_time: crate::AnimationSampleTime,
+    surface_color: [u8; 4],
+    resources: &mut RenderResourceCache,
+) -> Option<Vec<u8>> {
+    paint_dom_scrolled_at_animation_time_with_surface_color_and_resources(
+        tree,
+        viewport,
+        base_url,
+        scroll,
+        animation_sample_time,
+        surface_color,
+        resources,
     )
     .and_then(|pixmap| pixmap.encode_png().ok())
 }
