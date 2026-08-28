@@ -872,6 +872,78 @@ mod tests {
         );
     }
 
+    /// SEC-001 / #704 — verifies the targetOrigin gate does NOT break legitimate
+    /// delivery *into* a frame (the "about:blank / empty origin" regression a
+    /// reviewer warned about): an explicit origin that matches the loaded frame
+    /// is delivered, the wildcard is always delivered (including to an opaque
+    /// about:blank frame), and only a genuine mismatch is dropped.
+    #[test]
+    fn post_message_into_a_frame_does_not_over_drop() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+
+        // A loaded, same-origin child frame.
+        let child = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://parent.example/child",
+            "<html><body></body></html>",
+        )
+        .expect("frame realm");
+        child
+            .execute_script(
+                &mut parent,
+                "globalThis.got = [];\
+                 addEventListener('message', (e) => globalThis.got.push(String(e.data)));",
+            )
+            .unwrap();
+
+        // Explicit matching origin -> delivered (the case that must not break).
+        child
+            .deliver_message(&mut parent, "{\"v\":\"m1\"}", "https://parent.example", 0, "https://parent.example")
+            .unwrap();
+        // Wildcard -> always delivered.
+        child
+            .deliver_message(&mut parent, "{\"v\":\"m2\"}", "https://parent.example", 0, "*")
+            .unwrap();
+        // Explicit non-matching origin -> dropped.
+        child
+            .deliver_message(&mut parent, "{\"v\":\"m3\"}", "https://parent.example", 0, "https://evil.example")
+            .unwrap();
+
+        assert_eq!(
+            child.evaluate(&mut parent, "globalThis.got").unwrap(),
+            serde_json::json!(["m1", "m2"]),
+            "matching origin and wildcard must deliver into the frame; only a real mismatch drops",
+        );
+
+        // An opaque (about:blank) frame: the wildcard must still deliver, so the
+        // common widget case never breaks even when the frame origin is 'null'.
+        let blank = FrameRealm::new(
+            &mut parent,
+            2,
+            0,
+            "about:blank",
+            "<html><body></body></html>",
+        )
+        .expect("blank frame realm");
+        blank
+            .execute_script(
+                &mut parent,
+                "globalThis.got = [];\
+                 addEventListener('message', (e) => globalThis.got.push(String(e.data)));",
+            )
+            .unwrap();
+        blank
+            .deliver_message(&mut parent, "{\"v\":\"w\"}", "https://parent.example", 0, "*")
+            .unwrap();
+        assert_eq!(
+            blank.evaluate(&mut parent, "globalThis.got").unwrap(),
+            serde_json::json!(["w"]),
+            "the wildcard must still deliver to an about:blank (opaque-origin) frame",
+        );
+    }
+
     /// `parent === window` is how a document decides it is top-level, so a
     /// framed realm must not see itself as the top.
     #[test]
