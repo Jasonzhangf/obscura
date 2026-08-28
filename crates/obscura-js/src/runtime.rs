@@ -1117,6 +1117,41 @@ impl ObscuraJsRuntime {
         )
     }
 
+    /// Paint an unprepared view of the current document against the runtime's
+    /// retained resource cache.
+    ///
+    /// `Page` falls back to a raw-DOM paint when a capture's viewport does not
+    /// match the prepared render key. That fallback used a fresh
+    /// `RenderResourceCache`, so it refetched every image on every call and a
+    /// repeated capture paid the network cost per frame. Reusing the cache the
+    /// runtime already holds for this document keeps the fallback correct while
+    /// fetching each resource once.
+    #[cfg(feature = "render")]
+    pub fn screenshot_unprepared_with_retained_resources(
+        &self,
+        viewport: (f32, f32),
+        base_url: Option<&str>,
+        scroll: (f32, f32),
+        animation_sample_time: obscura_render::AnimationSampleTime,
+        surface_color: [u8; 4],
+    ) -> Option<Vec<u8>> {
+        let mut state = self.state.borrow_mut();
+        let ObscuraState {
+            dom,
+            render_resources,
+            ..
+        } = &mut *state;
+        obscura_render::screenshot_png_scrolled_at_animation_time_with_surface_color_and_resources(
+            dom.as_ref()?,
+            viewport,
+            base_url,
+            scroll,
+            animation_sample_time,
+            surface_color,
+            render_resources,
+        )
+    }
+
     #[cfg(feature = "render")]
     pub fn screenshot_prepared_with_surface_color(
         &self,
