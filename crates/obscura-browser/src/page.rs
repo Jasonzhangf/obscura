@@ -527,6 +527,16 @@ fn css_resource_urls(css: &str, base: &url::Url) -> Vec<String> {
             index += length;
             continue;
         }
+        // A `@font-face` `src` list is a priority order, not a set of
+        // resources. Scanning it generically warms every entry of every
+        // descriptor; the renderer considers far fewer. `css_font_face_rule`
+        // collects the ones it will consider and reports the whole block as
+        // consumed, the same shape as the `@import` skip above.
+        if let Some((length, sources)) = css_font_face_rule(rest, base) {
+            urls.extend(sources);
+            index += length;
+            continue;
+        }
         let Some(first) = rest.chars().next() else {
             break;
         };
@@ -578,8 +588,172 @@ fn css_resource_urls(css: &str, base: &url::Url) -> Vec<String> {
             }
         }
         let Some(end) = end else { break };
-        let raw = rest[4..end].trim();
-        let value = if raw.len() >= 2
+        push_css_url(&rest[4..end], base, &mut urls);
+        index += end + 1;
+    }
+    urls
+}
+
+/// Record one `url(...)` value when it names a network resource.
+///
+/// Shared by the generic scan and the `@font-face` path so the two cannot
+/// disagree about quoting, fragments, `data:` or an unresolved `var()`.
+fn push_css_url(raw: &str, base: &url::Url, urls: &mut Vec<String>) {
+    let raw = raw.trim();
+    let value = if raw.len() >= 2
+        && ((raw.starts_with('"') && raw.ends_with('"'))
+            || (raw.starts_with('\'') && raw.ends_with('\'')))
+    {
+        &raw[1..raw.len() - 1]
+    } else {
+        raw
+    };
+    if value.is_empty()
+        || value.starts_with('#')
+        || value.starts_with("data:")
+        || value.contains("var(")
+    {
+        return;
+    }
+    if let Ok(mut url) = base.join(value) {
+        url.set_fragment(None);
+        if matches!(url.scheme(), "http" | "https") {
+            urls.push(url.to_string());
+        }
+    }
+}
+
+/// Return the byte length of a leading `@font-face` block, together with the
+/// sources the renderer will actually consider, in source order.
+///
+/// A `src` list is a priority order, not a set. Both rules here are taken from
+/// the layer this warms, `obscura-render`: `font_face_declaration` ends in
+/// `.last()`, so a rule carrying several `src` descriptors uses the final one,
+/// which is the cascade and what the `src: url(.eot); src: url(...)` idiom
+/// relies on; and `font_source_may_be_supported` drops `.eot` and `.svg` after
+/// stripping the query and fragment. Warming anything else fetches bytes the
+/// renderer has already ruled out.
+///
+/// A malformed block is left to the normal scanner, so this cannot swallow the
+/// rules that follow it.
+fn css_font_face_rule(css: &str, base: &url::Url) -> Option<(usize, Vec<String>)> {
+    if !css.get(..10)?.eq_ignore_ascii_case("@font-face") {
+        return None;
+    }
+    let open_relative = css[10..].find('{')?;
+    if !css[10..10 + open_relative].trim().is_empty() {
+        return None;
+    }
+    let open = 10 + open_relative;
+    let close = open + css_block_end(&css[open..])?;
+
+    let mut urls = Vec::new();
+    if let Some(src) = css_last_declaration(&css[open + 1..close], "src") {
+        for value in css_url_values(src) {
+            if font_source_is_decodable(value) {
+                push_css_url(value, base, &mut urls);
+            }
+        }
+    }
+    Some((close + 1, urls))
+}
+
+/// Byte offset of the brace closing the block that `css` opens, or `None` when
+/// the block is unterminated. Braces inside strings do not count.
+fn css_block_end(css: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (offset, ch) in css.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(open) = quote {
+            if ch == open {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '"' | '\'' => quote = Some(ch),
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(offset);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Value of the last declaration named `name` in a declaration block. Last
+/// rather than first, because that is what the cascade resolves to and what
+/// `obscura-render` reads.
+fn css_last_declaration<'a>(block: &'a str, name: &str) -> Option<&'a str> {
+    let mut found = None;
+    let mut start = 0usize;
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut boundaries: Vec<usize> = Vec::new();
+    for (offset, ch) in block.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(open) = quote {
+            if ch == open {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '"' | '\'' => quote = Some(ch),
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ';' if depth == 0 => boundaries.push(offset),
+            _ => {}
+        }
+    }
+    boundaries.push(block.len());
+    for end in boundaries {
+        let declaration = &block[start..end];
+        start = (end + 1).min(block.len());
+        let Some((property, value)) = declaration.split_once(':') else {
+            continue;
+        };
+        if property.trim().eq_ignore_ascii_case(name) {
+            found = Some(value.trim());
+        }
+    }
+    found
+}
+
+/// The `url(...)` values of one declaration, unquoted, in source order.
+fn css_url_values(value: &str) -> Vec<&str> {
+    let lower = value.to_ascii_lowercase();
+    let mut out = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(relative) = lower[cursor..].find("url(") {
+        let start = cursor + relative + 4;
+        let Some(end_relative) = value[start..].find(')') else {
+            break;
+        };
+        let end = start + end_relative;
+        let raw = value[start..end].trim();
+        let unquoted = if raw.len() >= 2
             && ((raw.starts_with('"') && raw.ends_with('"'))
                 || (raw.starts_with('\'') && raw.ends_with('\'')))
         {
@@ -587,21 +761,23 @@ fn css_resource_urls(css: &str, base: &url::Url) -> Vec<String> {
         } else {
             raw
         };
-        if !value.is_empty()
-            && !value.starts_with('#')
-            && !value.starts_with("data:")
-            && !value.contains("var(")
-        {
-            if let Ok(mut url) = base.join(value) {
-                url.set_fragment(None);
-                if matches!(url.scheme(), "http" | "https") {
-                    urls.push(url.to_string());
-                }
-            }
+        if !unquoted.is_empty() {
+            out.push(unquoted);
         }
-        index += end + 1;
+        cursor = end + 1;
     }
-    urls
+    out
+}
+
+/// Whether the renderer can decode a font source, by the same extension rule
+/// `obscura-render` applies before it will even consider one.
+fn font_source_is_decodable(src: &str) -> bool {
+    let path = src
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(src)
+        .to_ascii_lowercase();
+    !path.ends_with(".eot") && !path.ends_with(".svg")
 }
 
 /// Return the byte length of a leading CSS `@import` rule, including its
@@ -4210,6 +4386,88 @@ mod tests {
                 "https://example.test/css/img/hero.png".to_string(),
                 "https://cdn.test/icon.svg".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn font_face_warmup_takes_the_last_src_descriptor_and_skips_undecodable_sources() {
+        // The IE8 idiom: a bare `.eot` in its own descriptor, then the real
+        // list. The renderer resolves the cascade to the second descriptor and
+        // then drops `.eot` and `.svg`, so three of the six are all it will
+        // ever consider. The warmup used to fetch all six.
+        let base = url::Url::parse("https://example.test/css/app.css").unwrap();
+        let css = r#"
+            @font-face {
+              font-family: 'Probe';
+              src: url('/font/probe.eot');
+              src: url('/font/probe.eot?#iefix') format('embedded-opentype'),
+                   url('/font/probe.woff2') format('woff2'),
+                   url('/font/probe.woff') format('woff'),
+                   url('/font/probe.ttf') format('truetype'),
+                   url('/font/probe.svg#probe') format('svg');
+            }
+        "#;
+        assert_eq!(
+            css_resource_urls(css, &base),
+            vec![
+                "https://example.test/font/probe.woff2".to_string(),
+                "https://example.test/font/probe.woff".to_string(),
+                "https://example.test/font/probe.ttf".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn font_face_warmup_ignores_local_sources_and_keeps_scanning_after_the_block() {
+        // `local()` names an installed face and is not a fetch, and the block
+        // has to be reported as consumed at exactly its closing brace, or the
+        // rule after it would be skipped with it.
+        let base = url::Url::parse("https://example.test/css/app.css").unwrap();
+        let css = r#"
+            @font-face {
+              font-family: 'Probe';
+              src: local('Probe'), url('probe.woff2') format('woff2');
+            }
+            .hero { background: url('../img/hero.png'); }
+        "#;
+        assert_eq!(
+            css_resource_urls(css, &base),
+            vec![
+                "https://example.test/css/probe.woff2".to_string(),
+                "https://example.test/img/hero.png".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn font_face_warmup_skips_data_sources_and_survives_a_brace_in_a_string() {
+        let base = url::Url::parse("https://example.test/css/app.css").unwrap();
+        let css = r#"
+            @font-face {
+              font-family: 'A }';
+              src: url(data:font/woff2;base64,d09GMg==) format('woff2'),
+                   url('fallback.woff') format('woff');
+            }
+            .after { background: url('after.png'); }
+        "#;
+        assert_eq!(
+            css_resource_urls(css, &base),
+            vec![
+                "https://example.test/css/fallback.woff".to_string(),
+                "https://example.test/css/after.png".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unterminated_font_face_block_falls_back_to_the_generic_scan() {
+        // Better to warm too much than to drop the rest of the stylesheet on
+        // the floor, which is the same policy `css_import_rule_len` follows.
+        let base = url::Url::parse("https://example.test/css/app.css").unwrap();
+        let css = "@font-face { src: url('probe.woff2') format('woff2');";
+        assert_eq!(
+            css_resource_urls(css, &base),
+            vec!["https://example.test/css/probe.woff2".to_string()]
         );
     }
 
