@@ -317,6 +317,14 @@ impl ObscuraJsRuntime {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
 
+            // ICU falls back to the host OS locale when no default is set,
+            // so Intl.* formats and resolvedOptions().locale leaked the
+            // operator's real locale (an en-AU host showed en-AU) while
+            // navigator.language and Accept-Language say en-US. Pin the one
+            // locale the other surfaces claim (#734). Process-global and
+            // idempotent; setting it under the create lock guarantees it
+            // lands before the first isolate exists.
+            deno_core::v8::icu::set_default_locale("en-US");
 
             let mut runtime = JsRuntime::new(RuntimeOptions {
                 extensions: vec![build_extension()],
@@ -16804,5 +16812,28 @@ mod tests {
             "the pending timer must still fire after a page task error"
         );
     }
+
+    /// #734: ICU inherits the host OS locale when no default is set, so
+    /// Intl.resolvedOptions() contradicted navigator.language on any host
+    /// whose OS locale is not en-US. The pinned default must win.
+    #[test]
+    fn intl_locale_matches_navigator_language_regardless_of_host() {
+        // nextest runs each test in its own process, so setting the process
+        // locale here cannot race another test's V8 init.
+        std::env::set_var("LC_ALL", "de-DE");
+        std::env::set_var("LANG", "de-DE");
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                "Intl.DateTimeFormat().resolvedOptions().locale + '|' + navigator.language",
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!("en-US|en-US"),
+            "Intl must not leak the host OS locale while navigator.language says en-US"
+        );
+    }
 }
+
 
