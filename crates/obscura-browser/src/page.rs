@@ -1763,8 +1763,17 @@ impl Page {
                     }
                 }
                 Ok(Err(error)) => {
-                    tracing::warn!("load-delaying dynamic script event loop failed: {error}");
-                    return false;
+                    if obscura_js::runtime::is_fatal_event_loop_error(&error) {
+                        tracing::warn!("load-delaying dynamic script event loop failed: {error}");
+                        return false;
+                    }
+                    // A load-delaying script threw or left an unhandled
+                    // rejection. Chrome reports the error and runs the rest;
+                    // killing the pump would strand every still-pending script
+                    // (#699). The absolute deadline above bounds a page that
+                    // errors on every turn.
+                    tracing::warn!("load-delaying script task error, continuing: {error}");
+                    tokio::task::yield_now().await;
                 }
                 Err(_) => {
                     // This timeout only cancels a parked event-loop poll. The

@@ -87,6 +87,18 @@ fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
         .unwrap_or("unknown panic")
 }
 
+/// Whether an event-loop task error is fatal to the page or page-local noise.
+/// deno_core reports a task's uncaught exception and an unhandled promise
+/// rejection as an event-loop error, but a browser treats both as page-local:
+/// window.onerror / unhandledrejection fire and later tasks still run. Only
+/// engine-level failures (watchdog termination, the heap cap, an exhausted
+/// task budget) make the loop itself unusable. (#699)
+pub fn is_fatal_event_loop_error(error: &str) -> bool {
+    error.contains("execution terminated")
+        || error.contains("heap limit exceeded")
+        || error.contains("task budget")
+}
+
 #[cfg(feature = "render")]
 fn with_sync_render_loading_disabled<R>(
     state: &mut ObscuraState,
@@ -304,6 +316,7 @@ impl ObscuraJsRuntime {
             let _create_guard = ISOLATE_CREATE_LOCK
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+
 
             let mut runtime = JsRuntime::new(RuntimeOptions {
                 extensions: vec![build_extension()],
@@ -2439,7 +2452,17 @@ impl ObscuraJsRuntime {
                     self.runtime.v8_isolate().perform_microtask_checkpoint();
                     tokio::task::yield_now().await;
                 }
-                Ok(Err(error)) => break Err(error),
+                Ok(Err(error)) => {
+                    if is_fatal_event_loop_error(&error) {
+                        break Err(error);
+                    }
+                    // A page task threw or a promise rejected without a
+                    // handler. Chrome reports it and keeps scheduling; the
+                    // pump must do the same, or one throwing script starves
+                    // every later task (#699). The wall deadline above still
+                    // bounds a page that errors on every turn.
+                    tracing::warn!("page task error, continuing the event loop: {error}");
+                }
                 Err(_) => break Ok(()),
             }
         };
@@ -2555,6 +2578,15 @@ impl ObscuraJsRuntime {
             }
             match tick {
                 std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(true)),
+                // A page task error (uncaught exception, unhandled rejection)
+                // is page-local in a browser: log it, report one delivered
+                // task, and let the owner keep pumping (#699).
+                std::task::Poll::Ready(Err(error))
+                    if !is_fatal_event_loop_error(&error.to_string()) =>
+                {
+                    tracing::warn!("page task error, continuing the event loop: {error}");
+                    std::task::Poll::Ready(Ok(false))
+                }
                 std::task::Poll::Ready(Err(error)) => std::task::Poll::Ready(Err(format!(
                     "Event loop error: {error}"
                 ))),
@@ -2694,6 +2726,11 @@ impl ObscuraJsRuntime {
             match tick {
                 Ok(Ok(true)) => break Ok(()),
                 Ok(Ok(false)) | Err(_) => {}
+                // A page task error is page-local noise, not a reason to stop
+                // settling: later timers and fetches still run (#699).
+                Ok(Err(error)) if !is_fatal_event_loop_error(&error) => {
+                    tracing::warn!("page task error, continuing the event loop: {error}");
+                }
                 Ok(Err(error)) => break Err(error),
             }
         };
@@ -16741,4 +16778,31 @@ mod tests {
             .unwrap();
         assert_eq!(result, serde_json::json!("writer,one,two"));
     }
+
+    /// #699: an unhandled rejection from a failed dynamic import is page-local
+    /// noise in a browser. The bounded event loop must report it and keep
+    /// driving later tasks instead of dying on the error and starving every
+    /// pending timer.
+    #[tokio::test(flavor = "current_thread")]
+    async fn unhandled_rejection_does_not_starve_later_tasks() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.evaluate(
+            "(function() { \
+                import('http://192.0.0.1/unreachable-module.js'); \
+                globalThis.__t = false; \
+                setTimeout(() => { globalThis.__t = true; }, 5); \
+                return 'ok'; \
+            })()",
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(2_000)
+            .await
+            .expect("the pump must survive a page-local rejection");
+        assert_eq!(
+            rt.evaluate("globalThis.__t").unwrap(),
+            serde_json::json!(true),
+            "the pending timer must still fire after a page task error"
+        );
+    }
 }
+
