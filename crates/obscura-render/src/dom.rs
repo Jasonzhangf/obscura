@@ -19678,6 +19678,13 @@ mod tests {
         );
     }
 
+    /// Gated on `paint`: without it `TextEngine::new_with_web_fonts` ignores
+    /// the fonts it is handed, so neither half of this test has anything to
+    /// observe. `word_ifc_items` does not exist to read, and the advance-width
+    /// comparison sees the same fallback face on both sides and finds the two
+    /// widths equal. Gating only the field access would leave an assertion
+    /// that compiles and then fails.
+    #[cfg(feature = "paint")]
     #[test]
     fn generated_pseudo_content_shapes_with_the_loaded_webfont() {
         let tree = parse_html(
