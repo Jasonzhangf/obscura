@@ -275,6 +275,12 @@ pub struct PendingFrameMessage {
     pub source_frame_id: u32,
     /// The sender's origin, for `event.origin`.
     pub origin: String,
+    /// The origin the sender restricted delivery to (postMessage's
+    /// `targetOrigin`). `"*"` means any origin; `"/"` means the receiver must be
+    /// same-origin as the sender; anything else is matched against the
+    /// receiver's own origin, and a mismatch drops the message. An empty string
+    /// means the sender did not specify one and delivery stays permissive.
+    pub target_origin: String,
     /// The payload, JSON encoded. Structured clone is not available across
     /// realms here, and JSON covers what postMessage is used for in practice:
     /// a widget reporting a result. Anything it cannot encode is rejected by
@@ -3684,6 +3690,7 @@ fn op_post_frame_message(
     target_frame_id: u32,
     source_frame_id: u32,
     #[string] origin: &str,
+    #[string] target_origin: &str,
     #[string] data_json: &str,
 ) {
     let gs = state.borrow::<SharedState>().clone();
@@ -3707,6 +3714,7 @@ fn op_post_frame_message(
         target_frame_id,
         source_frame_id,
         origin: origin.to_string(),
+        target_origin: target_origin.to_string(),
         data_json: data_json.to_string(),
     });
 }

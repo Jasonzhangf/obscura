@@ -12085,7 +12085,23 @@ function _realmOrigin() {
   try { return new URL(_domParse('document_url')).origin; } catch (_) { return 'null'; }
 }
 
-function _sendRealmMessage(targetFrameId, data) {
+// Whether a postMessage restricted to `targetOrigin` may be delivered to a
+// realm whose current origin is `receiverOrigin`, given the sender's origin.
+// Mirrors the browser check done at delivery time: '*' (or an unspecified '')
+// allows any origin; '/' requires the receiver to be same-origin as the sender;
+// anything else must equal the receiver's own origin.
+function _targetOriginAllows(targetOrigin, receiverOrigin, senderOrigin) {
+  if (!targetOrigin || targetOrigin === '*') return true;
+  let expected;
+  if (targetOrigin === '/') {
+    expected = senderOrigin;
+  } else {
+    try { expected = new URL(targetOrigin).origin; } catch (_) { expected = targetOrigin; }
+  }
+  return receiverOrigin === expected;
+}
+
+function _sendRealmMessage(targetFrameId, data, targetOrigin) {
   let json;
   // Structured clone cannot cross realms here. JSON carries what postMessage is
   // actually used for; anything else throws the same DataCloneError a browser
@@ -12096,8 +12112,11 @@ function _sendRealmMessage(targetFrameId, data) {
     throw new DOMException('The object could not be cloned.', 'DataCloneError');
   }
   if (json === undefined) json = '{"v":null}';
+  // An unspecified targetOrigin stays permissive (empty string); the receiver
+  // enforces a specified one against its own origin in __obscura_deliverMessage.
+  const to = (targetOrigin === undefined || targetOrigin === null) ? '' : String(targetOrigin);
   Deno.core.ops.op_post_frame_message(
-    targetFrameId >>> 0, globalThis.__obscura_frameId >>> 0, _realmOrigin(), json);
+    targetFrameId >>> 0, globalThis.__obscura_frameId >>> 0, _realmOrigin(), to, json);
 }
 
 // The frame's own window and document, when this page is allowed to touch
@@ -12129,8 +12148,8 @@ function _frameWindowFor(frameId) {
   if (!real) return existing || null;
   if (existing && existing.__obscura_wrapsRealm) return existing;
 
-  const post = _markNative(function (data, _targetOrigin, _transfer) {
-    _sendRealmMessage(frameId, data);
+  const post = _markNative(function (data, targetOrigin, _transfer) {
+    _sendRealmMessage(frameId, data, targetOrigin);
   });
   const win = new Proxy(real, {
     get(target, prop) {
@@ -12149,7 +12168,11 @@ function _frameWindowFor(frameId) {
 }
 
 // The host calls this inside the target realm.
-globalThis.__obscura_deliverMessage = function(dataJson, origin, sourceFrameId) {
+globalThis.__obscura_deliverMessage = function(dataJson, origin, sourceFrameId, targetOrigin) {
+  // Enforce postMessage's targetOrigin against THIS (the receiving) realm's
+  // origin, the same check a real browser does at delivery time. A mismatch
+  // drops the message silently.
+  if (!_targetOriginAllows(targetOrigin, _realmOrigin(), origin)) return;
   let data = null;
   try { data = JSON.parse(dataJson).v; } catch (_) {}
   // Who to reply to: the frame above, or one of the frames below.
@@ -12179,7 +12202,7 @@ class _RemoteWindow {
   constructor(frameId) {
     Object.defineProperty(this, '_frameId', { value: frameId, enumerable: false });
   }
-  postMessage(data, _targetOrigin, _transfer) { _sendRealmMessage(this._frameId, data); }
+  postMessage(data, targetOrigin, _transfer) { _sendRealmMessage(this._frameId, data, targetOrigin); }
   get self() { return this; }
   get window() { return this; }
   get frames() { return this; }
@@ -12268,13 +12291,13 @@ class _IframeWindow {
     return proxy;
   }
 
-  postMessage(data, _targetOrigin, _transfer) {
+  postMessage(data, targetOrigin, _transfer) {
     // Into the frame's own realm, through the host. This used to dispatch the
     // event on the *parent's* window, so a page could never actually talk to
     // the document inside its iframe. A frame that has not loaded yet has no
     // browsing context to receive anything.
     if (!this._frameId) return;
-    _sendRealmMessage(this._frameId, data);
+    _sendRealmMessage(this._frameId, data, targetOrigin);
   }
 
   setTimeout(fn, ms) { return globalThis.setTimeout(fn, ms); }
@@ -13272,7 +13295,7 @@ globalThis.stop = function() {}; _markNative(globalThis.stop);
 // that posted to itself and waited for the `message` event waited forever.
 // Same realm, so this needs no host round trip; it is queued as a task because
 // postMessage never delivers synchronously.
-globalThis.postMessage = function(data, _targetOrigin, _transfer) {
+globalThis.postMessage = function(data, targetOrigin, _transfer) {
   let clone = data;
   // Match the cross-realm path: a value postMessage cannot carry is rejected
   // at the call, not delivered as something else.
@@ -13282,6 +13305,9 @@ globalThis.postMessage = function(data, _targetOrigin, _transfer) {
     throw new DOMException('The object could not be cloned.', 'DataCloneError');
   }
   const origin = _realmOrigin();
+  // A self-post honours targetOrigin too: sender and receiver are this realm,
+  // so a targetOrigin naming a different origin drops the message.
+  if (!_targetOriginAllows(targetOrigin, origin, origin)) return;
   setTimeout(() => {
     try {
       globalThis.dispatchEvent(globalThis.__obscura_markTrusted(
