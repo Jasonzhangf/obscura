@@ -5648,6 +5648,73 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn load_delaying_script_driver_survives_a_page_script_exception() {
+        // An exception from an async page callback reaches the pump as an
+        // event-loop error, and the pump used to answer it by abandoning every
+        // still-pending load-delaying script. The error is transient: measured
+        // against this runtime, the tick carrying it fails and the following
+        // ticks poll clean, so the pending script below was dropped over a
+        // condition that had already cleared, and dropped silently, since the
+        // script simply never arrives.
+        //
+        // The throw is deferred through a timer so it lands on a pump tick.
+        // Thrown during the installing script's own microtask drain it would
+        // clear the pending-script bookkeeping before the fetch even starts,
+        // which is a different bug from the one under test here.
+        let (base, requests) = spawn_delayed_classic_script_server(
+            std::time::Duration::from_millis(150),
+            "globalThis.__lateDynamicRan = true;",
+        );
+        let mut page = import_map_test_page(
+            "load-delayer-throws",
+            "http://127.0.0.1:9",
+            "<html><head></head><body></body></html>",
+        );
+        page.js
+            .as_mut()
+            .unwrap()
+            .execute_script(
+                "install-load-delayer",
+                &format!(
+                    "globalThis.__documentReadyState__ = 'loading'; \
+                     const script = document.createElement('script'); \
+                     script.src = '{base}/slow-dynamic.js'; \
+                     document.head.appendChild(script); \
+                     setTimeout(() => {{ \
+                         queueMicrotask(() => {{ throw new Error('page script boom'); }}); \
+                     }}, 0);",
+                ),
+            )
+            .unwrap();
+        assert!(page
+            .js
+            .as_mut()
+            .unwrap()
+            .has_pending_load_delaying_scripts());
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let completed =
+            super::Page::drive_load_delaying_scripts(page.js.as_mut().unwrap(), deadline).await;
+
+        assert!(
+            completed,
+            "the throw must not end the pump while a script is still pending"
+        );
+        assert_eq!(
+            requests
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap(),
+            "/slow-dynamic.js",
+            "the pending script must still be fetched"
+        );
+        assert!(!page
+            .js
+            .as_mut()
+            .unwrap()
+            .has_pending_load_delaying_scripts());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn post_load_dynamic_script_waits_only_when_caller_requests_settle() {
         let (base, requests) = spawn_delayed_classic_script_server(
             std::time::Duration::from_millis(400),
