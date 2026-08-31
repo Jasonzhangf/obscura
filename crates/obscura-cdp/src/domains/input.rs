@@ -140,7 +140,7 @@ pub async fn handle(
                     page.evaluate(&code);
                 }
             } else if event_type == "mouseReleased" {
-                if let Some(page) = ctx.get_session_page_mut(session_id) {
+                let moved_frame = if let Some(page) = ctx.get_session_page_mut(session_id) {
                     let code = format!(
                         "(function() {{\
                             var target = (document.elementFromPoint && document.elementFromPoint({x},{y})) || globalThis.__obscura_click_target || document.activeElement || document.body;\
@@ -233,22 +233,33 @@ pub async fn handle(
                     if moved {
                         let url = page.url_string();
                         let frame_id = page.frame_id.clone();
-                        ctx.pending_events.push(crate::types::CdpEvent {
-                            method: "Page.frameNavigated".into(),
-                            params: json!({
-                                "frame": {
-                                    "id": frame_id,
-                                    "url": url,
-                                    "domainAndRegistry": "",
-                                    "securityOrigin": "",
-                                    "mimeType": "text/html",
-                                    "adFrameStatus": { "adFrameType": "none" },
-                                },
-                                "type": "Navigation",
-                            }),
-                            session_id: Some(session_id.clone().unwrap_or_default()),
-                        });
+                        Some((page.id.clone(), frame_id, url))
+                    } else {
+                        None
                     }
+                } else {
+                    None
+                };
+                if let Some((page_id, frame_id, url)) = moved_frame {
+                    let loader_id = ctx
+                        .current_loader_ids
+                        .get(&page_id)
+                        .cloned()
+                        .unwrap_or_else(|| format!("loader-blank-{page_id}"));
+                    ctx.pending_events.push(crate::types::CdpEvent {
+                        method: "Page.frameNavigated".into(),
+                        params: json!({
+                            "frame": crate::domains::page::frame_value(
+                                &frame_id,
+                                None,
+                                &loader_id,
+                                &url,
+                                "text/html",
+                            ),
+                            "type": "Navigation",
+                        }),
+                        session_id: Some(session_id.clone().unwrap_or_default()),
+                    });
                 }
             } else if event_type == "mouseWheel" {
                 let delta_x = params.get("deltaX").and_then(|v| v.as_f64()).unwrap_or(0.0);
