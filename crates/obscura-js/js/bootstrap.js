@@ -326,7 +326,7 @@ async function __fetchDynClassicScript(task) {
     body = _decodeDataScriptUrl(task.url);
   } else {
     const raw = await Deno.core.ops.op_fetch_url(
-      task.url, "GET", "{}", "", task.pageOrigin, "no-cors", "same-origin"
+      task.url, "GET", "{}", new Uint8Array(0), task.pageOrigin, "no-cors", "same-origin"
     );
     const parsed = JSON.parse(raw);
     // The HTML script-fetch algorithm treats an unsuccessful HTTP response
@@ -552,7 +552,7 @@ async function _fetchLinkedCss(url, pageOrigin, depth = 0, seen = new Set()) {
   if (depth > 4 || seen.has(url)) return "";
   seen.add(url);
   const raw = await Deno.core.ops.op_fetch_url(
-    url, "GET", "{}", "", pageOrigin, "no-cors", "same-origin"
+    url, "GET", "{}", new Uint8Array(0), pageOrigin, "no-cors", "same-origin"
   );
   const parsed = JSON.parse(raw);
   if (parsed.blocked || parsed.status >= 400 || parsed.status === 0) {
@@ -6922,77 +6922,92 @@ function _formDataToMultipart(fd) {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
   let bnd = '----WebKitFormBoundary';
   for (let i = 0; i < 16; i++) bnd += chars[Math.floor(Math.random() * chars.length)];
-  let out = '';
+  const encoder = new TextEncoder();
+  const chunks = [];
+  let length = 0;
+  const append = (chunk) => {
+    const bytes = typeof chunk === 'string' ? encoder.encode(chunk) : _bodyToUint8Array(chunk);
+    chunks.push(bytes);
+    length += bytes.byteLength;
+  };
   const entries = fd._d || [];
   for (let i = 0; i < entries.length; i++) {
     const k = entries[i][0], v = entries[i][1];
-    out += '--' + bnd + '\r\n';
+    append('--' + bnd + '\r\n');
     if (v != null && typeof v === 'object' && v._bytes != null) {
-      out += 'Content-Disposition: form-data; name="' + k + '"; filename="' + (v.name || 'blob') + '"\r\n';
-      out += 'Content-Type: ' + (v.type || 'application/octet-stream') + '\r\n\r\n';
-      try { out += new TextDecoder().decode(v._bytes); } catch (e) {}
-      out += '\r\n';
+      append('Content-Disposition: form-data; name="' + k + '"; filename="' + (v.name || 'blob') + '"\r\n');
+      append('Content-Type: ' + (v.type || 'application/octet-stream') + '\r\n\r\n');
+      append(v._bytes);
+      append('\r\n');
     } else {
-      out += 'Content-Disposition: form-data; name="' + k + '"\r\n\r\n' + String(v) + '\r\n';
+      append('Content-Disposition: form-data; name="' + k + '"\r\n\r\n' + String(v) + '\r\n');
     }
   }
-  out += '--' + bnd + '--\r\n';
+  append('--' + bnd + '--\r\n');
+  const out = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
   return { boundary: bnd, body: out };
 }
 
-// Coerce a fetch()/XHR body into the string op_fetch_url expects, attaching a
+// Coerce a fetch()/XHR body into the bytes op_fetch_url expects, attaching a
 // Content-Type header for body types that need one (FormData, URLSearchParams).
-function _serializeBody(initBody, headers) {
-  if (initBody == null || initBody === '') return '';
+function _serializeBody(initBody, headers, synthesizeContentType = true) {
+  if (initBody == null || initBody === '') return new Uint8Array(0);
   if (initBody instanceof FormData) {
     const mp = _formDataToMultipart(initBody);
-    headers['Content-Type'] = 'multipart/form-data; boundary=' + mp.boundary;
+    if (synthesizeContentType) headers['Content-Type'] = 'multipart/form-data; boundary=' + mp.boundary;
     return mp.body;
   }
   if (initBody instanceof URLSearchParams) {
-    if (!Object.keys(headers).some(k => k.toLowerCase() === 'content-type')) {
+    if (synthesizeContentType && !Object.keys(headers).some(k => k.toLowerCase() === 'content-type')) {
       headers['Content-Type'] = 'application/x-www-form-urlencoded;charset=UTF-8';
     }
-    return initBody.toString();
+    return new TextEncoder().encode(initBody.toString());
   }
   if (typeof Blob !== 'undefined' && initBody instanceof Blob) {
-    if (initBody.type && !Object.keys(headers).some(k => k.toLowerCase() === 'content-type')) {
+    if (synthesizeContentType && initBody.type && !Object.keys(headers).some(k => k.toLowerCase() === 'content-type')) {
       headers['Content-Type'] = initBody.type;
     }
-    return _bytesToBinaryString(_bodyToUint8Array(initBody));
+    return _bodyToUint8Array(initBody);
   }
   if (typeof ArrayBuffer !== 'undefined' && initBody instanceof ArrayBuffer) {
-    const bytes = new Uint8Array(initBody);
-    let s = ''; for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
-    return s;
+    return new Uint8Array(initBody);
   }
   if (typeof ArrayBuffer !== 'undefined' && ArrayBuffer.isView(initBody) && initBody.buffer instanceof ArrayBuffer) {
-    const bytes = new Uint8Array(initBody.buffer, initBody.byteOffset, initBody.byteLength);
-    let s = ''; for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
-    return s;
+    return new Uint8Array(initBody.buffer, initBody.byteOffset, initBody.byteLength);
   }
-  return typeof initBody === 'string' ? initBody : String(initBody);
+  return new TextEncoder().encode(typeof initBody === 'string' ? initBody : String(initBody));
 }
 
 globalThis.fetch = async (input, init = {}) => {
   init = init || {};
+  const request = input instanceof Request ? input : null;
   let url = typeof input === "string"
     ? input
-    : (input instanceof Request
-      ? input.url
+    : (request
+      ? request.url
       : ((typeof URL === 'function' && input instanceof URL) ? input.href : (input?.url || input?.href || String(input || ""))));
   // Always resolve: the URL parser, not a "://" substring search, decides
   // whether the input is absolute. _resolveUrl leaves absolute URLs
   // unchanged and keeps unparseable input as-is.
   url = _resolveUrl(url);
-  const method = init.method || (input instanceof Request ? input.method : "GET");
-  let _h = init.headers instanceof Headers ? Object.fromEntries(init.headers.entries()) : (init.headers || {});
-  const body = _serializeBody(init.body, _h);
+  const method = init.method || (request ? request.method : "GET");
+  const headers = init.headers !== undefined ? init.headers : (request ? request.headers : undefined);
+  let _h = headers instanceof Headers ? Object.fromEntries(headers.entries()) : (headers || {});
+  const inheritsRequestBody = init.body === undefined && request !== null;
+  const initBody = init.body !== undefined
+    ? init.body
+    : (request ? request.body : undefined);
+  const body = _serializeBody(initBody, _h, !(inheritsRequestBody && init.headers !== undefined));
   const hdrs = JSON.stringify(_h);
-  const fetchMode = init.mode || (input instanceof Request ? input.mode : "cors");
+  const fetchMode = init.mode || (request ? request.mode : "cors");
   const fetchCredentials = init.credentials !== undefined
     ? String(init.credentials)
-    : (input instanceof Request ? input.credentials : "same-origin");
+    : (request ? request.credentials : "same-origin");
   if (fetchCredentials !== "omit" && fetchCredentials !== "same-origin" && fetchCredentials !== "include") {
     throw new TypeError("Failed to execute 'fetch': '" + fetchCredentials + "' is not a valid RequestCredentials value");
   }
