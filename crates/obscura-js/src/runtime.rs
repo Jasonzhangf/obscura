@@ -13401,6 +13401,48 @@ mod tests {
     }
 
     #[test]
+    fn test_checkbox_indeterminate_is_idl_only_and_cleared_by_activation() {
+        // `indeterminate` has no content attribute, so it exists only if the
+        // prototype defines it -- `'indeterminate' in el` is the check that
+        // fails when it is missing. Activation clears it as well as toggling
+        // checkedness (HTML legacy-pre-activation behaviour), and a cancelled
+        // click puts both back, so a script-set flag is never left stuck.
+        let mut rt = setup_runtime(
+            r#"<input type="checkbox" id="fresh">
+               <input type="checkbox" id="click">
+               <input type="checkbox" id="cancel">"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+            const fresh = document.getElementById('fresh');
+            const present = 'indeterminate' in fresh;
+            const initial = fresh.indeterminate;
+            fresh.indeterminate = true;
+            const roundTrip = fresh.indeterminate;
+
+            const clicked = document.getElementById('click');
+            clicked.indeterminate = true;
+            clicked.click();
+
+            const cancelled = document.getElementById('cancel');
+            cancelled.indeterminate = true;
+            cancelled.addEventListener('click', e => e.preventDefault());
+            cancelled.click();
+
+            return [present, initial, roundTrip,
+                    clicked.checked, clicked.indeterminate,
+                    cancelled.checked, cancelled.indeterminate];
+        "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([true, false, true, true, false, false, true])
+        );
+    }
+
+    #[test]
     fn test_disabled_only_applies_to_disableable_elements() {
         // A `disabled` attribute is meaningless on anything that cannot be
         // disabled, and only listed form controls inherit it from a fieldset.

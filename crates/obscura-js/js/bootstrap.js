@@ -699,9 +699,11 @@ function _fp(key) { return _getFp()[key]; }
 globalThis._eventRegistry = globalThis._eventRegistry || {};
 globalThis._formValues = globalThis._formValues || {};
 globalThis._formChecked = globalThis._formChecked || {};
+globalThis._formIndeterminate = globalThis._formIndeterminate || {};
 const _eventRegistry = globalThis._eventRegistry;
 const _formValues = globalThis._formValues;
 const _formChecked = globalThis._formChecked;
+const _formIndeterminate = globalThis._formIndeterminate;
 const _domParse = (cmd, a1, a2) => { try { return JSON.parse(_dom(cmd, a1, a2)); } catch { return null; } };
 
 // HTML "ASCII whitespace": U+0009 TAB, U+000A LF, U+000C FF, U+000D CR, U+0020 SPACE.
@@ -3617,9 +3619,10 @@ class Element extends Node {
     if (_isActuallyDisabled(this) && _tag !== 'LABEL') {
       return;
     }
-    let _oldChecked = false, _radioStates = null;
+    let _oldChecked = false, _oldIndeterminate = false, _radioStates = null;
     if (_checkable) {
       _oldChecked = !!this.checked;
+      _oldIndeterminate = !!this.indeterminate;
       if (_type === 'radio') {
         const _name = this.getAttribute('name') || '';
         if (_name) {
@@ -3635,7 +3638,12 @@ class Element extends Node {
         }
         this.checked = true;
       } else {
+        // Legacy-pre-activation behaviour (HTML spec): a checkbox toggles its
+        // checkedness *and* drops indeterminateness. Clearing it here, not on
+        // `change`, is what lets the cancelled-activation path put the old
+        // flag back instead of leaving it stuck off.
         this.checked = !_oldChecked;
+        this.indeterminate = false;
       }
     }
     const _clickEvent = new MouseEvent("click", {bubbles: true, cancelable: true});
@@ -3643,7 +3651,7 @@ class Element extends Node {
     const cancelled = !this.dispatchEvent(_clickEvent);
     if (cancelled) {
       if (_radioStates) { for (let i = 0; i < _radioStates.length; i++) _radioStates[i][0].checked = _radioStates[i][1]; }
-      else if (_checkable) this.checked = _oldChecked;
+      else if (_checkable) { this.checked = _oldChecked; this.indeterminate = _oldIndeterminate; }
       return;
     }
     if (_checkable && this.checked !== _oldChecked) {
@@ -3990,6 +3998,13 @@ class Element extends Node {
     return this.hasAttribute("checked");
   }
   set checked(v) { _formChecked[this._nid] = !!v; }
+  // `indeterminate` is IDL-only: it has no content attribute to reflect, so
+  // the property itself must exist on the prototype for `'indeterminate' in
+  // el` to be true on a freshly created element. It is node-keyed like
+  // `checked` because element wrappers are rebuilt on each lookup, so a
+  // per-instance field would not survive getElementById returning a new one.
+  get indeterminate() { return _formIndeterminate[this._nid] === true; }
+  set indeterminate(v) { _formIndeterminate[this._nid] = !!v; }
   get selected() {
     if (this._selected !== undefined) return this._selected;
     return this.hasAttribute("selected");

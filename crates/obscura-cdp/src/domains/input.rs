@@ -160,6 +160,7 @@ pub async fn handle(
                             if (globalThis.__obscura_isDisabled(clickTarget)) return;\
                             var checkable = tag === 'INPUT' && (type === 'checkbox' || type === 'radio');\
                             var oldChecked = checkable ? !!clickTarget.checked : false;\
+                            var oldIndeterminate = checkable ? !!clickTarget.indeterminate : false;\
                             var radioStates = null;\
                             if (checkable && type === 'radio') {{\
                                 var radioName = clickTarget.getAttribute('name') || '';\
@@ -176,13 +177,14 @@ pub async fn handle(
                                 clickTarget.checked = true;\
                             }} else if (checkable) {{\
                                 clickTarget.checked = !oldChecked;\
+                                clickTarget.indeterminate = false;\
                             }}\
                             var click = globalThis.__obscura_markTrusted(new MouseEvent('click', {{bubbles:true,cancelable:true,view:globalThis,clientX:{x},clientY:{y},button:0,buttons:0,detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
                             var cancelled = !clickTarget.dispatchEvent(click);\
                             if (cancelled) {{\
                                 if (radioStates) {{\
                                     for (var rr = 0; rr < radioStates.length; rr++) radioStates[rr][0].checked = radioStates[rr][1];\
-                                }} else if (checkable) clickTarget.checked = oldChecked;\
+                                }} else if (checkable) {{ clickTarget.checked = oldChecked; clickTarget.indeterminate = oldIndeterminate; }}\
                                 return;\
                             }}\
                             if (checkable && clickTarget.checked !== oldChecked) {{\
