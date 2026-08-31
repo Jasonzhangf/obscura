@@ -3309,6 +3309,11 @@ class Element extends Node {
       }
     }
     if (n === "style") this._style._replaceFromAttribute(value);
+    if (n === "onload" && _isWindowReflectingBodyElement(this)) {
+      _windowOnloadOverrideSet = false;
+      _windowOnloadOverride = null;
+      if (this.__inlineHandlerCache) delete this.__inlineHandlerCache.onload;
+    }
     if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev);
     if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('attributes', this._nid, [], [], n);
     if (this.localName === "source"
@@ -3349,6 +3354,11 @@ class Element extends Node {
       _reconcileWindowNamedProperty(previousWindowName);
     }
     if (n === "style") this._style._replaceFromAttribute("");
+    if (n === "onload" && _isWindowReflectingBodyElement(this)) {
+      _windowOnloadOverrideSet = false;
+      _windowOnloadOverride = null;
+      if (this.__inlineHandlerCache) delete this.__inlineHandlerCache.onload;
+    }
     if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev);
     if (this.localName === "source"
         && (n === "srcset" || n === "sizes" || n === "media" || n === "type")) {
@@ -6352,6 +6362,48 @@ for (const _ev of [
     }
   }
 }
+
+let _windowOnloadOverrideSet = false;
+let _windowOnloadOverride = null;
+function _windowReflectingBodyElement() {
+  const document = globalThis.document;
+  return document && (document.body || document.querySelector('frameset'));
+}
+function _isWindowReflectingBodyElement(element) {
+  return element === _windowReflectingBodyElement();
+}
+Object.defineProperty(globalThis, 'onload', {
+  get() {
+    if (_windowOnloadOverrideSet) return _windowOnloadOverride;
+    const body = _windowReflectingBodyElement();
+    return body && body._resolveInlineHandler
+      ? body._resolveInlineHandler('onload')
+      : null;
+  },
+  set(value) {
+    _windowOnloadOverrideSet = true;
+    _windowOnloadOverride = typeof value === 'function' ? value : null;
+  },
+  configurable: true,
+  enumerable: true,
+});
+Object.defineProperty(Element.prototype, 'onload', {
+  get() {
+    if (_isWindowReflectingBodyElement(this)) {
+      return globalThis.onload;
+    }
+    return this.__onload || null;
+  },
+  set(value) {
+    if (_isWindowReflectingBodyElement(this)) {
+      globalThis.onload = value;
+      return;
+    }
+    this.__onload = typeof value === 'function' ? value : null;
+  },
+  configurable: true,
+  enumerable: false,
+});
 
 globalThis.Window = globalThis.Window || function Window() {};
 Object.defineProperty(globalThis.Window, Symbol.hasInstance, {
