@@ -130,6 +130,11 @@ pub struct ObscuraState {
     // `op_binding_called` op. Drained by the CDP layer after each dispatch
     // and emitted as `Runtime.bindingCalled` events.
     pub pending_binding_calls: Vec<(String, String)>,
+    // Console calls and uncaught script exceptions, in occurrence order.
+    // The CDP layer drains this after commands and autonomous event-loop turns.
+    pub pending_runtime_events: VecDeque<RuntimeEvent>,
+    pub runtime_events_enabled: bool,
+    pub runtime_exception_counter: u64,
     pub network_response_bodies: HashMap<String, StoredNetworkResponseBody>,
     pub network_response_body_order: VecDeque<String>,
     pub network_response_body_counter: u64,
@@ -307,6 +312,9 @@ impl ObscuraState {
             intercept_counter: 0,
             intercept_enabled: false,
             pending_binding_calls: Vec::new(),
+            pending_runtime_events: VecDeque::new(),
+            runtime_events_enabled: false,
+            runtime_exception_counter: 0,
             network_response_bodies: HashMap::new(),
             network_response_body_order: VecDeque::new(),
             network_response_body_counter: 0,
@@ -363,6 +371,31 @@ impl ObscuraState {
             write_stream: RefCell::new(None),
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeConsoleEvent {
+    pub kind: String,
+    pub args: Vec<serde_json::Value>,
+    pub timestamp: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeExceptionEvent {
+    pub exception_id: u64,
+    pub name: String,
+    pub description: String,
+    pub url: String,
+    pub line_number: i64,
+    pub column_number: i64,
+    pub stack_trace: Vec<serde_json::Value>,
+    pub timestamp: f64,
+}
+
+#[derive(Debug, Clone)]
+pub enum RuntimeEvent {
+    Console(RuntimeConsoleEvent),
+    Exception(RuntimeExceptionEvent),
 }
 
 pub(crate) fn node_is_script(dom: &DomTree, node_id: NodeId) -> bool {
@@ -2080,13 +2113,45 @@ fn compare_node_order(dom: &DomTree, a: NodeId, b: NodeId) -> i32 {
 }
 
 #[op2(fast)]
-fn op_console_msg(state: &OpState, #[string] level: &str, #[string] msg: &str) {
-    let _ = state;
+fn op_runtime_events_enabled(state: &OpState) -> bool {
+    state.borrow::<SharedState>().borrow().runtime_events_enabled
+}
+
+#[op2(fast)]
+fn op_console_msg(
+    state: &OpState,
+    #[string] level: &str,
+    #[string] msg: &str,
+    #[string] args_json: &str,
+) {
     match level {
-        "warn" => tracing::warn!(target: "obscura::console", "{}", msg),
+        "warn" | "warning" => tracing::warn!(target: "obscura::console", "{}", msg),
         "error" => tracing::error!(target: "obscura::console", "{}", msg),
         _ => tracing::info!(target: "obscura::console", "{}", msg),
     }
+
+    let page = state.borrow::<SharedState>().clone();
+    let mut page = page.borrow_mut();
+    if !page.runtime_events_enabled {
+        return;
+    }
+    let Ok(args) = serde_json::from_str::<Vec<serde_json::Value>>(args_json) else {
+        return;
+    };
+    if page.pending_runtime_events.len() >= 1_024 {
+        page.pending_runtime_events.pop_front();
+    }
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
+        * 1_000.0;
+    page.pending_runtime_events
+        .push_back(RuntimeEvent::Console(RuntimeConsoleEvent {
+            kind: level.to_string(),
+            args,
+            timestamp,
+        }));
 }
 
 // Fallback cache for runtimes that have no owning ObscuraHttpClient, such as
@@ -4529,6 +4594,7 @@ pub fn build_extension() -> Extension {
         op_script_try_start(),
         op_shadow_attach(),
         op_shadow_root_info(),
+        op_runtime_events_enabled(),
         op_console_msg(),
         op_fetch_url(),
         op_get_cookies(),
