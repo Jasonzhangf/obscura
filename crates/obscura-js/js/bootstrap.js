@@ -4055,6 +4055,8 @@ class Element extends Node {
   set name(v) { this.setAttribute("name", v); }
   get placeholder() { return this.getAttribute("placeholder") || ""; }
   set placeholder(v) { this.setAttribute("placeholder", v); }
+  get accept() { return this.getAttribute("accept") || ""; }
+  set accept(v) { this.setAttribute("accept", v); }
   // For <a>/<area>, href returns the resolved absolute URL (the spec behavior,
   // and what scrapers want). It uses op_url_resolve, which returns just the
   // resolved string, rather than the full-component op the decomposition
