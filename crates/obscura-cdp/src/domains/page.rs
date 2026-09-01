@@ -906,51 +906,32 @@ pub fn emit_navigation_events(
         });
     }
 
-    // executionContextsCleared invalidates every prior context id, so a
-    // Runtime.evaluate / callFunctionOn targeting a pre-navigation context
-    // must be rejected (Chrome: "Cannot find context with specified id"). The
-    // default world (id 2) and isolated worlds are re-registered below as their
-    // executionContextCreated events are emitted. Issue #407: previously this
-    // set was insert-only, so stale ids kept validating and grew unbounded.
-    ctx.valid_context_ids.clear();
-    let mut phase1 = vec![
-        CdpEvent {
-            method: "Page.lifecycleEvent".into(),
-            params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "init", "timestamp": ts}),
-            session_id: es.clone(),
-        },
-        CdpEvent {
-            method: "Runtime.executionContextsCleared".into(),
-            params: json!({}),
-            session_id: es.clone(),
-        },
-        CdpEvent {
-            method: "Page.frameNavigated".into(),
-            params: json!({"frame": frame_value(frame_id, None, loader_id, page_url, &nav_mime), "type": "Navigation"}),
-            session_id: es.clone(),
-        },
-        CdpEvent {
-            method: "Runtime.executionContextCreated".into(),
-            params: json!({"context": {"id": 2, "origin": page_url, "name": "", "uniqueId": format!("ctx-nav-{}", page_id), "auxData": {"isDefault": true, "type": "default", "frameId": frame_id}}}),
-            session_id: es.clone(),
-        },
-    ];
-    // The default world is re-created as context id 2; re-register it. Isolated
-    // worlds register themselves via next_isolated_context in the loop below.
-    ctx.valid_context_ids.insert(2);
-    let world_names: Vec<String> = if ctx.isolated_worlds.is_empty() {
-        vec!["__puppeteer_utility_world__24.40.0".to_string()]
-    } else {
-        ctx.isolated_worlds.clone()
-    };
-    // Issue #192: fresh, monotonically increasing executionContextId per re-create.
-    for world_name in &world_names {
-        let world_ctx_id = ctx.next_isolated_context();
-        phase1.push(CdpEvent {
-            method: "Runtime.executionContextCreated".into(),
-            params: json!({"context": {"id": world_ctx_id, "origin": page_url, "name": world_name, "uniqueId": format!("ctx-isolated-nav-{}-{}", page_id, world_ctx_id), "auxData": {"isDefault": false, "type": "isolated", "frameId": frame_id}}}),
-            session_id: es.clone(),
-        });
+    let contexts = ctx.commit_default_context(page_id, frame_id, page_url);
+    let runtime_sessions = ctx.runtime_sessions_for_page(page_id);
+    let mut phase1 = vec![CdpEvent {
+        method: "Page.lifecycleEvent".into(),
+        params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "init", "timestamp": ts}),
+        session_id: es.clone(),
+    }];
+    for runtime_session in &runtime_sessions {
+        phase1.push(CdpEvent::with_session(
+            "Runtime.executionContextsCleared",
+            json!({}),
+            runtime_session.clone(),
+        ));
+    }
+    phase1.push(CdpEvent {
+        method: "Page.frameNavigated".into(),
+        params: json!({"frame": frame_value(frame_id, None, loader_id, page_url, &nav_mime), "type": "Navigation"}),
+        session_id: es.clone(),
+    });
+    for runtime_session in runtime_sessions {
+        for context in &contexts {
+            phase1.push(super::runtime::execution_context_created_event(
+                context,
+                Some(runtime_session.clone()),
+            ));
+        }
     }
     phase1.push(CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "commit", "timestamp": ts}), session_id: es.clone() });
     ctx.pending_events.extend(phase1);
@@ -1289,59 +1270,54 @@ pub async fn handle(
             Ok(json!({ "frameTree": frame_tree(page, &loader_id) }))
         }
         "createIsolatedWorld" => {
-            let (frame_id_param, world_name, page_url, page_id) = {
+            let (frame_id_param, world_name, origin, page_id, persist_across_navigation) = {
                 let page = ctx
                     .get_session_page(session_id)
                     .ok_or("No page for session")?;
-                (
-                    params
+                let frame_id = params
                         .get("frameId")
                         .and_then(|v| v.as_str())
                         .unwrap_or(&page.frame_id)
-                        .to_string(),
+                        .to_string();
+                let (origin, persist) = if frame_id == page.frame_id {
+                    (page.url_string(), true)
+                } else if let Some(frame) = page.frames.iter().find(|frame| {
+                    child_frame_id(&page.frame_id, frame.frame_id()) == frame_id
+                }) {
+                    (frame.url().to_string(), false)
+                } else {
+                    return Err(format!("No frame with given id found: {frame_id}"));
+                };
+                (
+                    frame_id,
                     params
                         .get("worldName")
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string(),
-                    page.url_string(),
+                    origin,
                     page.id.clone(),
+                    persist,
                 )
             };
-            // Track this world so Page.navigate can re-emit a context for it
-            // post-navigation. Without this, Playwright (and Puppeteer)
-            // hang in any operation that uses the utility world — including
-            // page.title() — because their utility world is gone after
-            // Runtime.executionContextsCleared and never re-created.
-            if !world_name.is_empty() && !ctx.isolated_worlds.contains(&world_name) {
-                ctx.isolated_worlds.push(world_name.clone());
+            ctx.ensure_default_context(&page_id)
+                .ok_or("No page for session")?;
+            let (context, created) = ctx.create_isolated_context(
+                &page_id,
+                &frame_id_param,
+                &origin,
+                &world_name,
+                persist_across_navigation,
+            );
+            if created {
+                for runtime_session in ctx.runtime_sessions_for_page(&page_id) {
+                    ctx.pending_events.push(super::runtime::execution_context_created_event(
+                        &context, Some(runtime_session),
+                    ));
+                }
             }
-            // Issue #192: every isolated world emission gets a fresh id from
-            // the monotonic counter and is registered as a valid contextId.
-            // Reusing id 100 across navigations made Playwright's bookkeeping
-            // diverge (it expected 101 on the second nav) and Runtime.evaluate
-            // failed with "Cannot find context with specified id: 101".
-            let context_id = ctx.next_isolated_context();
 
-            ctx.pending_events.push(CdpEvent {
-                method: "Runtime.executionContextCreated".to_string(),
-                params: json!({
-                    "context": {
-                        "id": context_id,
-                        "origin": page_url,
-                        "name": world_name,
-                        "uniqueId": format!("ctx-isolated-{}-{}", page_id, context_id),
-                        "auxData": {
-                            "isDefault": false,
-                            "type": "isolated",
-                            "frameId": frame_id_param,
-                        }
-                    }
-                }),
-                session_id: session_id.clone(),
-            });
-
-            Ok(json!({ "executionContextId": context_id }))
+            Ok(json!({ "executionContextId": context.id }))
         }
         "setLifecycleEventsEnabled" => Ok(json!({})),
         "addScriptToEvaluateOnNewDocument" => {
