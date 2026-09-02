@@ -1086,9 +1086,9 @@ globalThis.queueMicrotask = globalThis.queueMicrotask || ((fn) => Promise.resolv
 // Browser posted tasks need an event-loop boundary but no clock delay. Tokio's
 // timer wheel imposes roughly a one-millisecond floor even for delay zero,
 // which turns MessageChannel and scheduler chains into artificial latency.
-// Keep one shared priority/FIFO queue in JavaScript and use a yield-only async
-// op solely to wake one delivery. Scheduling the next wake after the callback
-// gives V8 a microtask checkpoint between every pair of posted tasks.
+// Keep one shared priority/FIFO queue in JavaScript and enqueue one callback on
+// deno_core's re-entrant-safe V8 task spawner. Scheduling the next wake after
+// the callback gives V8 a microtask checkpoint between every pair of tasks.
 const _browserPostedTaskQueues = Array.from({ length: 6 }, () => []);
 let _browserPostedTaskWakePending = false;
 
@@ -1096,15 +1096,7 @@ function _browserPostedTaskScheduleWake() {
   if (_browserPostedTaskWakePending) return;
   if (!Deno.core.ops.op_async_runtime_available()) return;
   _browserPostedTaskWakePending = true;
-  Deno.core.ops.op_posted_task().then(
-    _browserPostedTaskRunOne,
-    () => {
-      _browserPostedTaskWakePending = false;
-      if (_browserPostedTaskQueues.some(queue => queue.length)) {
-        _scheduleAfter(0, _browserPostedTaskRunOne);
-      }
-    },
-  );
+  Deno.core.ops.op_posted_task(_browserPostedTaskRunOne);
 }
 
 function _browserPostedTaskEnqueue(callback, priority) {

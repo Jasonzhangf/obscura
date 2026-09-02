@@ -559,6 +559,43 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_posted_task_runs_in_its_creation_realm() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let frame = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://child.example/",
+            "<html><body><output id='result'>pending</output></body></html>",
+        )
+        .expect("frame realm");
+
+        frame
+            .execute_script(
+                &mut parent,
+                "scheduler.postTask(() => {\
+                   document.getElementById('result').textContent = location.origin;\
+                 });",
+            )
+            .unwrap();
+        parent.run_event_loop_bounded(100).await.unwrap();
+
+        assert_eq!(
+            frame
+                .evaluate(
+                    &mut parent,
+                    "document.getElementById('result').textContent",
+                )
+                .unwrap(),
+            serde_json::json!("https://child.example"),
+        );
+        assert_eq!(
+            parent.evaluate("document.body.innerHTML").unwrap(),
+            serde_json::json!("")
+        );
+    }
+
     #[test]
     fn one_bad_frame_script_does_not_stop_the_rest() {
         let mut parent = page("https://parent.example/", "<html><body></body></html>");

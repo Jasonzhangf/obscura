@@ -3389,6 +3389,38 @@ mod tests {
         );
     }
 
+    /// A network-op Promise reaction can schedule browser work while
+    /// deno_core is dispatching an async-op result batch. Posted tasks must not
+    /// recursively submit another async op through that borrowed driver.
+    #[tokio::test(flavor = "current_thread")]
+    async fn posted_task_from_async_op_resolution_avoids_driver_submission() {
+        let mut runtime = ObscuraJsRuntime::new();
+        runtime.set_dom(parse_html("<html><body></body></html>"));
+        runtime.set_url("http://example.com/posted-task-from-async-op");
+        runtime.run_page_init();
+        runtime
+            .execute_script(
+                "posted-task-from-op-resolution",
+                r#"
+                    globalThis.__postedFromOp = 0;
+                    Deno.core.ops.op_sleep(0).then(() => {
+                        const rearm = () => scheduler.postTask(() => {
+                            __postedFromOp++;
+                            if (__postedFromOp < 250) rearm();
+                        });
+                        rearm();
+                    });
+                "#,
+            )
+            .unwrap();
+
+        runtime.run_event_loop_bounded(300).await.unwrap();
+        assert_eq!(
+            runtime.evaluate("__postedFromOp").unwrap(),
+            serde_json::json!(250.0),
+        );
+    }
+
     #[cfg(feature = "render")]
     #[test]
     fn connected_shadow_nodes_invalidate_without_entering_light_tree_retention() {
@@ -3857,14 +3889,27 @@ fn op_async_runtime_available() -> bool {
     tokio::runtime::Handle::try_current().is_ok()
 }
 
-/// Wake one browser posted task without routing through Tokio's timer wheel.
-/// `yield_now` guarantees the op cannot settle in the initiating JavaScript
-/// turn, while avoiding the roughly one-millisecond floor of a zero-duration
-/// timer. The bootstrap owns task priority, FIFO order, and one-at-a-time
-/// delivery; this op supplies only the event-loop wake boundary.
-#[op2(async)]
-async fn op_posted_task() {
-    tokio::task::yield_now().await;
+/// Queue one browser posted-task delivery on deno_core's engine-local V8 task
+/// spawner. It is safe to call from an async-op reaction and wakes the event
+/// loop without Tokio's timer-wheel floor or another async-op registration.
+#[op2]
+fn op_posted_task(
+    state: &OpState,
+    #[global] callback: v8::Global<v8::Function>,
+) {
+    let spawner = state.borrow::<deno_core::V8TaskSpawner>().clone();
+    spawner.spawn(move |scope| {
+        let scope = &mut v8::TryCatch::new(scope);
+        let callback = v8::Local::new(scope, callback);
+        let receiver = v8::undefined(scope).into();
+        if callback.call(scope, receiver, &[]).is_none() {
+            let message = scope
+                .exception()
+                .map(|exception| exception.to_rust_string_lossy(scope))
+                .unwrap_or_else(|| "execution terminated".to_string());
+            tracing::warn!("posted-task delivery failed: {message}");
+        }
+    });
 }
 
 // Records a binding call from page JS. The CDP layer drains this queue
