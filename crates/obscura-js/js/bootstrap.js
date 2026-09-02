@@ -928,23 +928,41 @@ const _coerceTimerFn = (fn) => {
   return typeof fn === "function" ? fn : null;
 };
 
+let _timerTaskNestingLevel = 0;
+const _timerDelayForNesting = (delay, nestingLevel) =>
+  nestingLevel > 5 ? Math.max(4, delay) : delay;
+const _runTimerTask = (nestingLevel, fn) => {
+  const previous = _timerTaskNestingLevel;
+  _timerTaskNestingLevel = nestingLevel;
+  try { return fn(); }
+  finally { _timerTaskNestingLevel = previous; }
+};
+
 globalThis.setTimeout = (fn, delay = 0, ...args) => {
   const f = _coerceTimerFn(fn);
   if (f === null) return ++_tid;
   const id = ++_tid;
   const normalizedDelay = Math.max(0, Number(delay) || 0);
+  const parentNestingLevel = _timerTaskNestingLevel;
+  const taskNestingLevel = parentNestingLevel + 1;
+  const scheduledDelay = _timerDelayForNesting(normalizedDelay, parentNestingLevel);
   const state = { cancelled: false };
-  const nativeId = _scheduleAfter(normalizedDelay, () => {
-    _timerStates.delete(id);
-    _nativeTimerIds.delete(id);
-    __obscuraPendingTimeoutDeadlines.delete(id);
-    if (state.cancelled) return;
-    try { f(...args); } catch(e) { console.error("Timer error:", e); }
-  });
+  const nativeId = _scheduleAfter(
+    scheduledDelay,
+    () => {
+      _timerStates.delete(id);
+      _nativeTimerIds.delete(id);
+      __obscuraPendingTimeoutDeadlines.delete(id);
+      if (state.cancelled) return;
+      _runTimerTask(taskNestingLevel, () => {
+        try { f(...args); } catch(e) { console.error("Timer error:", e); }
+      });
+    },
+  );
   if (nativeId !== undefined) {
     _timerStates.set(id, state);
     _nativeTimerIds.set(id, nativeId);
-    __obscuraPendingTimeoutDeadlines.set(id, performance.now() + normalizedDelay);
+    __obscuraPendingTimeoutDeadlines.set(id, performance.now() + scheduledDelay);
   }
   return id;
 };
@@ -965,15 +983,25 @@ globalThis.setInterval = (fn, delay = 0, ...args) => {
   const f = _coerceTimerFn(fn);
   if (f === null) return ++_tid;
   const id = ++_tid;
+  const normalizedDelay = Math.max(0, Number(delay) || 0);
+  const parentNestingLevel = _timerTaskNestingLevel;
+  let taskNestingLevel = parentNestingLevel + 1;
   _intervals.add(id);
   const tick = () => {
     if (!_intervals.has(id)) return;
-    try { f(...args); } catch(e) { console.error("Interval error:", e); }
+    _runTimerTask(taskNestingLevel, () => {
+      try { f(...args); } catch(e) { console.error("Interval error:", e); }
+    });
     if (!_intervals.has(id)) return;
-    const nativeId = _scheduleAfter(delay, tick);
+    const nextDelay = _timerDelayForNesting(normalizedDelay, taskNestingLevel);
+    taskNestingLevel++;
+    const nativeId = _scheduleAfter(nextDelay, tick);
     if (nativeId !== undefined) _nativeTimerIds.set(id, nativeId);
   };
-  const nativeId = _scheduleAfter(delay, tick);
+  const nativeId = _scheduleAfter(
+    _timerDelayForNesting(normalizedDelay, parentNestingLevel),
+    tick,
+  );
   if (nativeId !== undefined) _nativeTimerIds.set(id, nativeId);
   return id;
 };
