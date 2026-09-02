@@ -13284,8 +13284,31 @@ globalThis.Worker = class Worker {
 
 globalThis.__blobStore = globalThis.__blobStore || {};
 URL.createObjectURL = function(blob) {
-  if (blob) {
-    const id = 'blob:obscura/' + Math.random().toString(36).substring(2);
+  // Chrome mints blob:<document-origin>/<v4-uuid> (blob:null/<uuid> on an opaque
+  // origin) and throws a TypeError on missing/non-Blob input. The old code named
+  // the engine ("blob:obscura/") — a one-line anti-bot tell — used a base36 token
+  // no UUID parser accepts, and handed back a well-formed-looking string for
+  // invalid input so the caller only failed later at the fetch (issue #751).
+  if (arguments.length === 0) {
+    throw new TypeError("Failed to execute 'createObjectURL' on 'URL': 1 argument required, but only 0 present.");
+  }
+  const isBlob = blob != null && typeof blob === 'object' &&
+    (blob._bytes !== undefined ||
+     (typeof Blob === 'function' && blob instanceof Blob) ||
+     typeof blob.text === 'function');
+  if (!isBlob) {
+    throw new TypeError("Failed to execute 'createObjectURL' on 'URL': parameter 1 is not of type 'Blob'.");
+  }
+  {
+    let origin = 'null';
+    try { origin = new URL(location.href).origin || 'null'; } catch (e) {}
+    const uuid = (globalThis.crypto && typeof crypto.randomUUID === 'function')
+      ? crypto.randomUUID()
+      : 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+          const r = (Math.random() * 16) | 0;
+          return (c === 'x' ? r : (r & 0x3) | 0x8).toString(16);
+        });
+    const id = 'blob:' + origin + '/' + uuid;
     // Store synchronously so a Worker built from the blob URL in the same
     // tick sees its source. Blob-URL Worker construction is synchronous in
     // real browsers; the previous async blob.text().then() store raced the
@@ -13304,7 +13327,6 @@ URL.createObjectURL = function(blob) {
     }
     return id;
   }
-  return 'blob:obscura/fallback';
 };
 URL.revokeObjectURL = function(url) {
   delete globalThis.__blobStore[url];
