@@ -1407,11 +1407,16 @@ impl ObscuraHttpClient {
 
         let mut current_url = url.clone();
         let mut redirects = Vec::new();
+        // Follow up to 20 redirects, matching the Fetch spec and the fetch()/XHR
+        // path in obscura-js. `0..=max_redirects` makes max_redirects+1 requests
+        // (the initial one plus 20 hops), so the 20th redirect is still followed
+        // and only the 21st fails. The old `0..max_redirects` made 20 requests
+        // total and thus followed only 19 (WPT redirect-count: 20 must pass).
         let max_redirects = 20;
         let mut redirect_tainted = false;
         let mut request_callback_fired = false;
 
-        for _redirect_count in 0..max_redirects {
+        for _redirect_count in 0..=max_redirects {
             validate_request_mode(&request, &current_url)?;
             let request_info = RequestInfo {
                 url: current_url.clone(),
@@ -1902,6 +1907,36 @@ mod ssrf_tests {
             "HTTP/1.1 200 OK\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         )
+    }
+
+    fn redirect_to_self() -> String {
+        "HTTP/1.1 302 Found\r\nLocation: /resource\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            .to_string()
+    }
+
+    // WPT fetch/api/redirect/redirect-count: the 20th redirect must still be
+    // followed, the 21st must fail. Guards the `0..=max_redirects` boundary in
+    // fetch_with_profile_uncached; `0..max_redirects` regressed this to 19.
+    #[tokio::test]
+    async fn navigation_follows_twenty_redirects_but_not_twenty_one() {
+        let mut pass: Vec<String> = (0..20).map(|_| redirect_to_self()).collect();
+        pass.push(ok_response("", "arrived"));
+        let (target, _rx) = http_fixture(pass).await;
+        let client = ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
+        let response = client
+            .fetch(&target)
+            .await
+            .expect("the 20th redirect must be followed");
+        assert_eq!(response.body, b"arrived");
+
+        let fail: Vec<String> = (0..21).map(|_| redirect_to_self()).collect();
+        let (target, _rx) = http_fixture(fail).await;
+        let client = ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
+        let err = client
+            .fetch(&target)
+            .await
+            .expect_err("the 21st redirect must be too many");
+        assert!(matches!(err, ObscuraNetError::TooManyRedirects(_)), "got {err:?}");
     }
 
     #[tokio::test]
