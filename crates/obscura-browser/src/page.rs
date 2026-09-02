@@ -1594,7 +1594,12 @@ impl Page {
     async fn do_fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
         #[cfg(feature = "stealth")]
         if let Some(ref stealth) = self.stealth_client {
-            return stealth.fetch(url).await;
+            // Pass the page callbacks so CDP Network events and
+            // page.on('request'/'response') observers fire for stealth-mode
+            // navigations too, matching the non-stealth path below.
+            return stealth
+                .fetch_with_callbacks(url, Some(&self.callbacks))
+                .await;
         }
         self.http_client
             .fetch_with_callbacks(url, Some(&self.callbacks))
