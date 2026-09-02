@@ -559,6 +559,124 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_posted_task_runs_in_its_creation_realm() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let frame = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://child.example/",
+            "<html><body><output id='result'>pending</output></body></html>",
+        )
+        .expect("frame realm");
+
+        frame
+            .execute_script(
+                &mut parent,
+                "globalThis.__obscura_frameId = 0;\
+                 scheduler.postTask(() => {\
+                   document.getElementById('result').textContent = location.origin;\
+                 });",
+            )
+            .unwrap();
+        parent.run_event_loop_bounded(100).await.unwrap();
+
+        assert_eq!(
+            frame
+                .evaluate(
+                    &mut parent,
+                    "document.getElementById('result').textContent",
+                )
+                .unwrap(),
+            serde_json::json!("https://child.example"),
+        );
+        assert_eq!(
+            parent.evaluate("document.body.innerHTML").unwrap(),
+            serde_json::json!("")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_frame_cancels_its_queued_posted_task() {
+        let mut parent = page(
+            "https://parent.example/",
+            "<html><body data-owner='parent'></body></html>",
+        );
+        let frame = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://parent.example/child",
+            "<html><body data-owner='frame'></body></html>",
+        )
+        .expect("frame realm");
+
+        frame
+            .execute_script(
+                &mut parent,
+                "const staleController = new AbortController();\
+                 globalThis.__staleController = staleController;\
+                 staleController.signal.removeEventListener = () => {\
+                   document.body.setAttribute('data-stale-cleanup', 'ran');\
+                   parent.postMessage('stale-cleanup', '*');\
+                 };\
+                 scheduler.postTask(() => {\
+                   document.body.setAttribute('data-stale-task', 'ran');\
+                   parent.postMessage('stale-posted-task', '*');\
+                 }, { signal: staleController.signal });\
+                 setTimeout(() => scheduler.postTask(() => {\
+                   document.body.setAttribute('data-delayed-stale-task', 'ran');\
+                   parent.postMessage('delayed-stale-posted-task', '*');\
+                 }), 1);",
+            )
+            .unwrap();
+        drop(frame);
+        parent.run_event_loop_bounded(100).await.unwrap();
+
+        assert!(
+            parent.take_pending_frame_messages().is_empty(),
+            "a posted task from the detached frame still executed",
+        );
+
+        assert_eq!(
+            parent.evaluate("document.body.getAttribute('data-owner')").unwrap(),
+            serde_json::json!("parent"),
+        );
+        assert_eq!(
+            parent
+                .evaluate("document.body.getAttribute('data-stale-task')")
+                .unwrap(),
+            serde_json::Value::Null,
+        );
+        assert_eq!(
+            parent
+                .evaluate("document.body.getAttribute('data-delayed-stale-task')")
+                .unwrap(),
+            serde_json::Value::Null,
+        );
+        assert_eq!(
+            parent
+                .evaluate("document.body.getAttribute('data-stale-cleanup')")
+                .unwrap(),
+            serde_json::Value::Null,
+        );
+        assert_eq!(
+            parent
+                .evaluate(
+                    "(function(){\
+                       const window = globalThis.__obscura_frameObjects[1]?.window;\
+                       const controller = window?.__staleController;\
+                       return [typeof window, typeof controller,\
+                         controller?.signal?._listeners?.length];\
+                     })()",
+                )
+                .unwrap(),
+            serde_json::json!(["object", "object", 0]),
+            "the retained frame realm did not discard its scheduler listener",
+        );
+    }
+
     #[test]
     fn one_bad_frame_script_does_not_stop_the_rest() {
         let mut parent = page("https://parent.example/", "<html><body></body></html>");

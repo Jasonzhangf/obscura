@@ -1086,39 +1086,66 @@ globalThis.queueMicrotask = globalThis.queueMicrotask || ((fn) => Promise.resolv
 // Browser posted tasks need an event-loop boundary but no clock delay. Tokio's
 // timer wheel imposes roughly a one-millisecond floor even for delay zero,
 // which turns MessageChannel and scheduler chains into artificial latency.
-// Keep one shared priority/FIFO queue in JavaScript and use a yield-only async
-// op solely to wake one delivery. Scheduling the next wake after the callback
-// gives V8 a microtask checkpoint between every pair of posted tasks.
+// Keep one shared priority/FIFO queue in JavaScript and enqueue one callback on
+// deno_core's re-entrant-safe V8 task spawner. Scheduling the next wake after
+// the callback gives V8 a microtask checkpoint between every pair of tasks.
 const _browserPostedTaskQueues = Array.from({ length: 6 }, () => []);
 let _browserPostedTaskWakePending = false;
+const _invalidPostedTaskGeneration = -1;
+
+function _browserPostedTaskGeneration() {
+  return Deno.core.ops.op_posted_task_generation(_realmFrameId);
+}
+
+function _browserPostedTaskDiscardQueue(queue) {
+  const entries = queue.splice(0, queue.length);
+  for (const entry of entries) {
+    if (entry.discard) {
+      try { entry.discard(); } catch (_) {}
+    }
+  }
+}
 
 function _browserPostedTaskScheduleWake() {
   if (_browserPostedTaskWakePending) return;
   if (!Deno.core.ops.op_async_runtime_available()) return;
-  _browserPostedTaskWakePending = true;
-  Deno.core.ops.op_posted_task().then(
-    _browserPostedTaskRunOne,
-    () => {
-      _browserPostedTaskWakePending = false;
-      if (_browserPostedTaskQueues.some(queue => queue.length)) {
-        _scheduleAfter(0, _browserPostedTaskRunOne);
-      }
-    },
-  );
+  const generation = Deno.core.ops.op_posted_task(
+    _realmFrameId, _browserPostedTaskRunOne);
+  _browserPostedTaskWakePending = generation !== _invalidPostedTaskGeneration;
+  if (!_browserPostedTaskWakePending) {
+    for (const queue of _browserPostedTaskQueues) _browserPostedTaskDiscardQueue(queue);
+  }
 }
 
-function _browserPostedTaskEnqueue(callback, priority) {
-  _browserPostedTaskQueues[priority].push(callback);
+function _browserPostedTaskEnqueue(
+  callback, priority, generation = _browserPostedTaskGeneration(), discard = null) {
+  _browserPostedTaskQueues[priority].push({ callback, generation, discard });
   _browserPostedTaskScheduleWake();
 }
 
-function _browserPostedTaskRunOne() {
+function _browserPostedTaskRunOne(currentGeneration = _invalidPostedTaskGeneration) {
+  // Document replacement and frame teardown are cancellation boundaries.
+  // Borrow contention is cancelled too: a browser task must not unwind through
+  // V8 or enter a realm whose native owner is unavailable.
   _browserPostedTaskWakePending = false;
+  if (currentGeneration === _invalidPostedTaskGeneration) {
+    for (const queue of _browserPostedTaskQueues) _browserPostedTaskDiscardQueue(queue);
+    return;
+  }
   let callback = null;
   for (let priority = _browserPostedTaskQueues.length - 1; priority >= 0; priority--) {
     const queue = _browserPostedTaskQueues[priority];
+    let staleCount = 0;
+    while (staleCount < queue.length &&
+           queue[staleCount].generation !== currentGeneration) staleCount++;
+    const staleEntries = staleCount ? queue.splice(0, staleCount) : [];
+    for (const stale of staleEntries) {
+      if (stale.discard) {
+        try { stale.discard(); } catch (_) {}
+      }
+    }
     if (queue.length) {
-      callback = queue.shift();
+      callback = queue.shift().callback;
       break;
     }
   }
@@ -1150,7 +1177,11 @@ let _schedulerCurrentState = null;
 
 function _schedulerRemoveAbort(task) {
   if (task.signal && task.abortHandler) {
-    task.signal.removeEventListener("abort", task.abortHandler);
+    // Scheduler options accept only this realm's AbortSignal. Use its private
+    // listener store so page code cannot intercept teardown by overriding the
+    // public removeEventListener method.
+    const index = task.signal._listeners.indexOf(task.abortHandler);
+    if (index >= 0) task.signal._listeners.splice(index, 1);
     task.abortHandler = null;
   }
 }
@@ -1159,7 +1190,13 @@ function _schedulerEnqueue(task, continuation) {
   if (task.canceled) return;
   const effectivePriority = _schedulerPriorityRank[task.priority] * 2
     + (continuation ? 1 : 0);
-  _browserPostedTaskEnqueue(() => _schedulerRunTask(task), effectivePriority);
+  _browserPostedTaskEnqueue(
+    () => _schedulerRunTask(task), effectivePriority, task.documentGeneration,
+    () => {
+      task.canceled = true;
+      task.callback = null;
+      _schedulerRemoveAbort(task);
+    });
 }
 
 function _schedulerRunTask(task) {
@@ -1219,6 +1256,7 @@ function _schedulerNormalizeOptions(options) {
 function _schedulerCreateTask(callback, state, resolve, reject) {
   const task = {
     callback, state, resolve, reject,
+    documentGeneration: _browserPostedTaskGeneration(),
     priority: state.priority,
     signal: state.signal,
     abortHandler: null,
@@ -1235,7 +1273,8 @@ function _schedulerCreateTask(callback, state, resolve, reject) {
       _schedulerRemoveAbort(task);
       reject(task.signal.reason);
     };
-    task.signal.addEventListener("abort", task.abortHandler);
+    // See _schedulerRemoveAbort: the public method is intentionally bypassed.
+    task.signal._listeners.push(task.abortHandler);
   }
   return task;
 }
@@ -1347,6 +1386,7 @@ function _messagePortInstallEventHandler(port, type, callback) {
 function _messagePortScheduleDelivery(port) {
   const state = _messagePortStateFor(port);
   if (state.closed || !state.messageQueueEnabled || state.messageDeliveryPending || !state.messageQueue.length) return;
+  const deliveryGeneration = state.messageQueue[0].generation;
   state.messageDeliveryPending = true;
   // User-visible ordinary rank. Scheduler continuations at the same priority
   // remain immediately above this task; FIFO holds across all ordinary tasks.
@@ -1355,7 +1395,7 @@ function _messagePortScheduleDelivery(port) {
     if (!current) return;
     current.messageDeliveryPending = false;
     if (current.closed || !current.messageQueueEnabled || !current.messageQueue.length) return;
-    const data = current.messageQueue.shift();
+    const data = current.messageQueue.shift().data;
     const event = new MessageEvent("message", {
       data,
       origin: "",
@@ -1365,7 +1405,14 @@ function _messagePortScheduleDelivery(port) {
     });
     _eventTargetDispatch(port, event);
     _messagePortScheduleDelivery(port);
-  }, _schedulerPriorityRank["user-visible"] * 2);
+  }, _schedulerPriorityRank["user-visible"] * 2, deliveryGeneration, () => {
+    const current = _messagePortState.get(port);
+    if (!current) return;
+    current.messageDeliveryPending = false;
+    current.messageQueue = current.messageQueue.filter(
+      entry => entry.generation !== deliveryGeneration);
+    _messagePortScheduleDelivery(port);
+  });
 }
 class MessagePort {
   constructor(key) {
@@ -1396,7 +1443,10 @@ class MessagePort {
     const target = state.entangled;
     const targetState = target && _messagePortState.get(target);
     if (state.closed || !targetState || targetState.closed) return;
-    targetState.messageQueue.push(cloned);
+    targetState.messageQueue.push({
+      data: cloned,
+      generation: _browserPostedTaskGeneration(),
+    });
     _messagePortScheduleDelivery(target);
   }
   start() {
@@ -9117,6 +9167,11 @@ let _intersectionDeliveryTaskPending = false;
 
 function _scheduleIntersectionObserverDelivery(observer) {
   if (!observer._connected || !observer._records.length) return;
+  const documentGeneration = _browserPostedTaskGeneration();
+  if (observer._documentGeneration !== documentGeneration) {
+    observer._records.length = 0;
+    return;
+  }
   _intersectionDeliveryObservers.add(observer);
   if (_intersectionDeliveryTaskPending) return;
   _intersectionDeliveryTaskPending = true;
@@ -9134,7 +9189,17 @@ function _scheduleIntersectionObserverDelivery(observer) {
       const records = current.takeRecords();
       try { current._callback(records, current); } catch (e) {}
     }
-  }, _schedulerPriorityRank["user-visible"] * 2);
+  }, _schedulerPriorityRank["user-visible"] * 2, documentGeneration, () => {
+    _intersectionDeliveryTaskPending = false;
+    const currentGeneration = _browserPostedTaskGeneration();
+    const current = [];
+    for (const pending of _intersectionDeliveryObservers) {
+      if (pending._documentGeneration === currentGeneration) current.push(pending);
+      else pending._records.length = 0;
+    }
+    _intersectionDeliveryObservers.clear();
+    for (const pending of current) _scheduleIntersectionObserverDelivery(pending);
+  });
 }
 
 function _scheduleIntersectionRenderCheckpoint() {
@@ -9278,6 +9343,7 @@ globalThis.IntersectionObserver = class IntersectionObserver {
     this._targets = new Set();
     this._previous = new Map();
     this._records = [];
+    this._documentGeneration = _browserPostedTaskGeneration();
     this._connected = true;
     globalThis.__intersectionObservers.push(this);
   }
@@ -14806,6 +14872,8 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
 globalThis.__obscura_init = function() {
   // The host sets __obscura_frameId on a frame realm before calling this.
   _realmFrameId = globalThis.__obscura_frameId >>> 0;
+  _browserPostedTaskWakePending = false;
+  for (const queue of _browserPostedTaskQueues) _browserPostedTaskDiscardQueue(queue);
   _fpSeed = Date.now() ^ (Math.random() * 0xFFFFFFFF >>> 0);
   _fpCache = null;
   // A real navigation just completed (this runs after set_url), so drop any
