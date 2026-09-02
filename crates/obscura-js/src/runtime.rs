@@ -3837,6 +3837,36 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn message_port_drops_old_document_payloads_before_fresh_delivery() {
+        let mut rt = setup_runtime("<html><body data-document='old'></body></html>");
+        rt.execute_script(
+            "message-port-old-document",
+            r#"
+                globalThis.__replacementPortOrder = [];
+                globalThis.__replacementChannel = new MessageChannel();
+                __replacementChannel.port2.onmessage = event => {
+                    __replacementPortOrder.push(event.data);
+                };
+                __replacementChannel.port1.postMessage("old");
+            "#,
+        )
+        .unwrap();
+
+        rt.set_dom(parse_html("<html><body data-document='new'></body></html>"));
+        rt.execute_script(
+            "message-port-new-document",
+            r#"__replacementChannel.port1.postMessage("fresh");"#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+
+        assert_eq!(
+            rt.evaluate("__replacementPortOrder").unwrap(),
+            serde_json::json!(["fresh"]),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn message_port_close_discards_delivery_already_queued_for_a_task() {
         let mut rt = setup_runtime("<html><body></body></html>");
         rt.execute_script(
@@ -10467,6 +10497,45 @@ mod tests {
                 "second-observer",
                 "callback-posted-task",
             ])
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn intersection_delivery_recovers_across_document_replacement() {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.run_page_init();
+        rt.execute_script(
+            "old-intersection-delivery",
+            r#"
+                globalThis.__intersectionReplacementOrder = [];
+                const oldObserver = new IntersectionObserver(() => {
+                    __intersectionReplacementOrder.push("old");
+                });
+                oldObserver._records.push({ old: true });
+                oldObserver._check([], false, new Map());
+            "#,
+        )
+        .unwrap();
+
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.execute_script(
+            "fresh-intersection-delivery",
+            r#"
+                const freshObserver = new IntersectionObserver(() => {
+                    __intersectionReplacementOrder.push("fresh");
+                });
+                freshObserver._records.push({ fresh: true });
+                freshObserver._check([], false, new Map());
+            "#,
+        )
+        .unwrap();
+
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__intersectionReplacementOrder").unwrap(),
+            serde_json::json!(["fresh"]),
         );
     }
 
@@ -17548,5 +17617,3 @@ mod tests {
         );
     }
 }
-
-

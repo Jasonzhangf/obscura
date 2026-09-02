@@ -3057,15 +3057,19 @@ fn glob_match(pattern: &str, url: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{cors_response_allows, glob_match, validate_fetch_url, FetchCredentials};
+    use super::{
+        cors_response_allows, glob_match, validate_fetch_url, FetchCredentials, ObscuraState,
+    };
     use crate::runtime::ObscuraJsRuntime;
     use obscura_dom::parse_html;
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     #[cfg(feature = "render")]
     use super::{
         ensure_prepared_geometry, ensure_prepared_render, node_is_connected,
         queue_retained_style_mutation, retained_style_mutation,
-        shadow_including_connected_nodes, ObscuraState, MAX_PENDING_STYLE_MUTATIONS,
+        shadow_including_connected_nodes, MAX_PENDING_STYLE_MUTATIONS,
     };
     #[cfg(feature = "render")]
     use obscura_dom::ShadowRootMode;
@@ -3389,6 +3393,31 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn bulk_posted_task_batch_completes() {
+        let mut runtime = ObscuraJsRuntime::new();
+        runtime.set_dom(parse_html("<html><body></body></html>"));
+        runtime.set_url("http://example.com/posted-task-bulk");
+        runtime.run_page_init();
+        runtime
+            .execute_script(
+                "posted-task-bulk",
+                r#"
+                    globalThis.__bulkPosted = { count: 0 };
+                    const tasks = [];
+                    for (let i = 0; i < 4096; i++) {
+                        tasks.push(scheduler.postTask(() => __bulkPosted.count++));
+                    }
+                    Promise.all(tasks);
+                "#,
+            )
+            .unwrap();
+
+        runtime.run_event_loop_bounded(500).await.unwrap();
+        let result = runtime.evaluate("__bulkPosted").unwrap();
+        assert_eq!(result["count"].as_f64(), Some(4096.0));
+    }
+
     /// A network-op Promise reaction can schedule browser work while
     /// deno_core is dispatching an async-op result batch. Posted tasks must not
     /// recursively submit another async op through that borrowed driver.
@@ -3418,6 +3447,100 @@ mod tests {
         assert_eq!(
             runtime.evaluate("__postedFromOp").unwrap(),
             serde_json::json!(250.0),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn posted_task_is_cancelled_when_its_document_is_replaced() {
+        let mut runtime = ObscuraJsRuntime::new();
+        runtime.set_dom(parse_html("<html><body data-document='old'></body></html>"));
+        runtime.set_url("http://example.com/posted-task-old-document");
+        runtime.run_page_init();
+        runtime
+            .execute_script(
+                "posted-task-old-document",
+                "const staleController = new AbortController();\
+                 scheduler.postTask(\
+                   () => document.body.setAttribute('data-stale-task', 'ran'),\
+                   { signal: staleController.signal });",
+            )
+            .unwrap();
+
+        runtime.set_dom(parse_html("<html><body data-document='new'></body></html>"));
+        runtime
+            .execute_script(
+                "posted-task-new-document",
+                "scheduler.postTask(() => document.body.setAttribute('data-fresh-task', 'ran'));",
+            )
+            .unwrap();
+        runtime.run_event_loop_bounded(100).await.unwrap();
+
+        assert_eq!(
+            runtime
+                .evaluate("document.body.getAttribute('data-stale-task')")
+                .unwrap(),
+            serde_json::Value::Null,
+        );
+        assert_eq!(
+            runtime
+                .evaluate("document.body.getAttribute('data-document')")
+                .unwrap(),
+            serde_json::json!("new"),
+        );
+        assert_eq!(
+            runtime
+                .evaluate("document.body.getAttribute('data-fresh-task')")
+                .unwrap(),
+            serde_json::json!("ran"),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn delayed_posted_task_keeps_its_creation_document_generation() {
+        let mut runtime = ObscuraJsRuntime::new();
+        runtime.set_dom(parse_html("<html><body data-document='old'></body></html>"));
+        runtime.set_url("http://example.com/delayed-posted-task-old-document");
+        runtime.run_page_init();
+        runtime
+            .execute_script(
+                "delayed-posted-task-old-document",
+                "scheduler.postTask(\
+                   () => document.body.setAttribute('data-delayed-stale-task', 'ran'),\
+                   { delay: 1 });",
+            )
+            .unwrap();
+
+        runtime.set_dom(parse_html("<html><body data-document='new'></body></html>"));
+        runtime.run_event_loop_bounded(100).await.unwrap();
+
+        assert_eq!(
+            runtime
+                .evaluate("document.body.getAttribute('data-delayed-stale-task')")
+                .unwrap(),
+            serde_json::Value::Null,
+        );
+    }
+
+    #[test]
+    fn posted_task_owner_contention_is_panic_safe() {
+        let owner = Rc::new(RefCell::new(ObscuraState::new()));
+        let weak = Rc::downgrade(&owner);
+        let generation = owner.borrow().document_generation;
+
+        let held = owner.borrow_mut();
+        assert_eq!(
+            super::posted_task_owner_status(&weak),
+            super::PostedTaskOwnerStatus::Busy,
+        );
+        drop(held);
+        assert_eq!(
+            super::posted_task_owner_status(&weak),
+            super::PostedTaskOwnerStatus::Generation(generation),
+        );
+        drop(owner);
+        assert_eq!(
+            super::posted_task_owner_status(&weak),
+            super::PostedTaskOwnerStatus::Gone,
         );
     }
 
@@ -3895,14 +4018,31 @@ fn op_async_runtime_available() -> bool {
 #[op2]
 fn op_posted_task(
     state: &OpState,
+    frame_id: u32,
     #[global] callback: v8::Global<v8::Function>,
-) {
+) -> f64 {
+    let Some(owner) = posted_task_owner(state, frame_id) else {
+        return INVALID_POSTED_TASK_GENERATION;
+    };
+    let Ok(owner_state) = owner.try_borrow() else {
+        return INVALID_POSTED_TASK_GENERATION;
+    };
+    let document_generation = owner_state.document_generation;
+    drop(owner_state);
+    let owner = Rc::downgrade(&owner);
     let spawner = state.borrow::<deno_core::V8TaskSpawner>().clone();
     spawner.spawn(move |scope| {
+        let current_generation = match posted_task_owner_status(&owner) {
+            PostedTaskOwnerStatus::Gone | PostedTaskOwnerStatus::Busy => {
+                INVALID_POSTED_TASK_GENERATION
+            }
+            PostedTaskOwnerStatus::Generation(generation) => generation as f64,
+        };
         let scope = &mut v8::TryCatch::new(scope);
         let callback = v8::Local::new(scope, callback);
         let receiver = v8::undefined(scope).into();
-        if callback.call(scope, receiver, &[]).is_none() {
+        let current_generation = v8::Number::new(scope, current_generation);
+        if callback.call(scope, receiver, &[current_generation.into()]).is_none() {
             let message = scope
                 .exception()
                 .map(|exception| exception.to_rust_string_lossy(scope))
@@ -3910,6 +4050,49 @@ fn op_posted_task(
             tracing::warn!("posted-task delivery failed: {message}");
         }
     });
+    document_generation as f64
+}
+
+const INVALID_POSTED_TASK_GENERATION: f64 = -1.0;
+
+#[derive(Debug, PartialEq, Eq)]
+enum PostedTaskOwnerStatus {
+    Gone,
+    Busy,
+    Generation(u64),
+}
+
+fn posted_task_owner_status(
+    owner: &std::rc::Weak<RefCell<ObscuraState>>,
+) -> PostedTaskOwnerStatus {
+    let Some(owner) = owner.upgrade() else {
+        return PostedTaskOwnerStatus::Gone;
+    };
+    let Ok(owner) = owner.try_borrow() else {
+        return PostedTaskOwnerStatus::Busy;
+    };
+    PostedTaskOwnerStatus::Generation(owner.document_generation)
+}
+
+#[op2(fast)]
+fn op_posted_task_generation(state: &OpState, frame_id: u32) -> f64 {
+    let Some(owner) = posted_task_owner(state, frame_id) else {
+        return INVALID_POSTED_TASK_GENERATION;
+    };
+    let generation = owner
+        .try_borrow()
+        .map(|owner| owner.document_generation as f64)
+        .unwrap_or(INVALID_POSTED_TASK_GENERATION);
+    generation
+}
+
+fn posted_task_owner(state: &OpState, frame_id: u32) -> Option<SharedState> {
+    if frame_id == 0 {
+        return Some(state.borrow::<SharedState>().clone());
+    }
+    let registry = state.try_borrow::<Rc<RefCell<RealmStates>>>()?.clone();
+    let owner = registry.try_borrow().ok()?.by_frame_id(frame_id);
+    owner
 }
 
 // Records a binding call from page JS. The CDP layer drains this queue
@@ -4650,6 +4833,7 @@ pub fn build_extension() -> Extension {
         op_sleep(),
         op_async_runtime_available(),
         op_posted_task(),
+        op_posted_task_generation(),
         op_binding_called(),
         op_subtle_digest(),
         op_subtle_hmac(),
