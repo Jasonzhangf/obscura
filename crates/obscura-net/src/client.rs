@@ -573,12 +573,23 @@ pub fn env_allows_private_network() -> bool {
 pub fn is_forbidden_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
+            let o = v4.octets();
             v4.is_loopback()
                 || v4.is_private()
                 || v4.is_link_local()
                 || v4.is_broadcast()
                 || v4.is_documentation()
                 || v4.is_unspecified()
+                // std's is_private() covers only RFC1918, so add the IANA
+                // special-purpose ranges that also host internal services and
+                // are common SSRF targets:
+                //   100.64.0.0/10  CGNAT / RFC6598 — cloud metadata (e.g.
+                //                  Alibaba 100.100.100.200) lives here.
+                //   198.18.0.0/15  benchmarking / RFC2544.
+                //   192.88.99.0/24 6to4 relay anycast / RFC7526.
+                || (o[0] == 100 && (64..=127).contains(&o[1]))
+                || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
+                || (o[0] == 192 && o[1] == 88 && o[2] == 99)
         }
         IpAddr::V6(v6) => {
             if v6.is_loopback()
@@ -1717,6 +1728,39 @@ mod ssrf_tests {
     #[test]
     fn public_ipv4_is_allowed() {
         for s in ["1.1.1.1", "8.8.8.8", "93.184.216.34"] {
+            assert!(!is_forbidden_ip(ip(s)), "{s} should be allowed");
+        }
+    }
+
+    // SEC-401 / #810 — std's is_private() only covers RFC1918, so CGNAT and
+    // other IANA special-purpose ranges (which host cloud metadata) must be
+    // blocked explicitly, including their IPv4-mapped IPv6 forms.
+    #[test]
+    fn ipv4_cgnat_and_iana_special_ranges_are_forbidden() {
+        for s in [
+            "100.64.0.1",             // CGNAT / RFC 6598 start
+            "100.100.100.200",        // Alibaba Cloud metadata (CGNAT)
+            "100.127.255.255",        // CGNAT end
+            "198.18.0.1",             // benchmarking / RFC 2544 start
+            "198.19.255.255",         // benchmarking end
+            "192.88.99.1",            // 6to4 relay anycast / RFC 7526
+            "::ffff:100.100.100.200", // v4-mapped CGNAT
+        ] {
+            assert!(is_forbidden_ip(ip(s)), "{s} should be forbidden");
+        }
+    }
+
+    // Addresses just outside those prefixes must stay allowed (no over-block).
+    #[test]
+    fn ipv4_addresses_adjacent_to_special_ranges_stay_allowed() {
+        for s in [
+            "100.63.255.255", // just below 100.64.0.0/10
+            "100.128.0.0",    // just above 100.127.255.255
+            "198.17.255.255", // just below 198.18.0.0/15
+            "198.20.0.0",     // just above 198.19.255.255
+            "192.88.98.255",  // just below 192.88.99.0/24
+            "192.88.100.0",   // just above 192.88.99.0/24
+        ] {
             assert!(!is_forbidden_ip(ip(s)), "{s} should be allowed");
         }
     }
