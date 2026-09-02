@@ -186,6 +186,15 @@ pub struct PreparedModule {
     graph_specifiers: Vec<String>,
 }
 
+/// Embed a string as a JS string literal — double-quoted, with backslash,
+/// quotes, and control characters (newline, CR, NUL) escaped — for safe
+/// interpolation into generated script. Mirrors `object_id_literal` in
+/// obscura-cdp; a hand-rolled `replace('\'', ...)` misses backslashes and
+/// control chars, which either breaks out of the literal or SyntaxErrors.
+fn js_string_literal(s: &str) -> String {
+    serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
+}
+
 fn remaining_deadline_ms(deadline: tokio::time::Instant) -> Option<u64> {
     let remaining = deadline.checked_duration_since(tokio::time::Instant::now())?;
     if remaining.is_zero() {
@@ -1027,22 +1036,20 @@ impl ObscuraJsRuntime {
     }
 
     pub fn set_user_agent(&mut self, ua: &str) {
-        let escaped = ua.replace('\\', "\\\\").replace('\'', "\\'");
         let _ = self.execute_runtime_script(
             "<set-ua>",
-            format!("globalThis.__obscura_ua = '{}';", escaped),
+            format!("globalThis.__obscura_ua = {};", js_string_literal(ua)),
         );
     }
 
     pub fn set_platform(&mut self, platform: &str, ua_platform: &str, ua_platform_version: &str) {
-        let p = platform.replace('\'', "\\'");
-        let uap = ua_platform.replace('\'', "\\'");
-        let uapv = ua_platform_version.replace('\'', "\\'");
         let _ = self.execute_runtime_script(
             "<set-platform>",
             format!(
-                "globalThis.__obscura_platform='{}';globalThis.__obscura_ua_platform='{}';globalThis.__obscura_ua_platform_version='{}';",
-                p, uap, uapv
+                "globalThis.__obscura_platform={};globalThis.__obscura_ua_platform={};globalThis.__obscura_ua_platform_version={};",
+                js_string_literal(platform),
+                js_string_literal(ua_platform),
+                js_string_literal(ua_platform_version),
             ),
         );
     }
@@ -3335,6 +3342,39 @@ mod tests {
         rt.set_title("Test Page");
         rt.run_page_init();
         rt
+    }
+
+    // SEC-301 / SEC-302 / #792 — the profile setters must embed values safely.
+    // set_platform must not allow a backslash-before-quote to break out of the
+    // JS string literal (injection), and set_user_agent must not silently fail
+    // on a control character; both must store the value verbatim.
+    #[test]
+    fn profile_setters_escape_backslash_and_control_characters() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.evaluate("globalThis.__pwned = 0;").unwrap();
+
+        // SEC-301: `Win\';...` — the trailing backslash used to escape our own
+        // closing quote, letting the rest run as JS.
+        rt.set_platform("Win\\';globalThis.__pwned=1;//", "px", "pv");
+        assert_ne!(
+            rt.evaluate("globalThis.__pwned").unwrap().as_f64(),
+            Some(1.0),
+            "set_platform must not execute JS injected via the platform value"
+        );
+        assert_eq!(
+            rt.evaluate("globalThis.__obscura_platform").unwrap(),
+            serde_json::json!("Win\\';globalThis.__pwned=1;//"),
+            "the platform value must be stored verbatim"
+        );
+
+        // SEC-302: a UA with a literal newline used to SyntaxError into a silent
+        // no-op, leaving the wrong UA.
+        rt.set_user_agent("Mozilla/5.0 line1\nline2");
+        assert_eq!(
+            rt.evaluate("globalThis.__obscura_ua").unwrap(),
+            serde_json::json!("Mozilla/5.0 line1\nline2"),
+            "the UA must be stored verbatim, including control characters"
+        );
     }
 
     #[test]
