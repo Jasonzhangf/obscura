@@ -130,10 +130,25 @@ pub struct RemoteObjectInfo {
     pub value: Option<serde_json::Value>,
 }
 
+/// CDP remote objects that can be rebuilt when a page's V8 runtime is
+/// temporarily replaced during tab switching.
+///
+/// Obscura currently keeps one entered isolate per connection. Switching tabs
+/// therefore rebuilds the target page's runtime, but CDP clients reasonably
+/// expect handles returned by `Runtime.evaluate` to remain usable. Retaining
+/// the originating expressions lets the page restore a handle on demand under
+/// the same id without retaining a second isolate.
+#[derive(Default)]
+pub struct CdpObjectState {
+    object_counter: u64,
+    evaluation_recipes: HashMap<String, String>,
+}
+
 pub struct ObscuraJsRuntime {
     runtime: JsRuntime,
     state: Rc<RefCell<ObscuraState>>,
     object_store: HashMap<String, String>,
+    evaluation_recipes: HashMap<String, String>,
     object_counter: u64,
     import_map: Rc<RefCell<ImportMap>>,
     /// Loader-owned signal for pending dynamic-import graph fetches. This is
@@ -376,6 +391,7 @@ impl ObscuraJsRuntime {
             runtime,
             state,
             object_store: HashMap::new(),
+            evaluation_recipes: HashMap::new(),
             object_counter: 0,
             import_map,
             module_load_activity,
@@ -1753,6 +1769,10 @@ impl ObscuraJsRuntime {
             oid.clone(),
             format!("globalThis.__obscura_objects['{}']", oid),
         );
+        if !return_by_value {
+            self.evaluation_recipes
+                .insert(oid.clone(), cleaned_expr.to_string());
+        }
 
         if await_promise && return_by_value {
             let read = self
@@ -2015,6 +2035,7 @@ impl ObscuraJsRuntime {
     }
 
     pub fn release_object(&mut self, object_id: &str) {
+        self.evaluation_recipes.remove(object_id);
         if self.object_store.remove(object_id).is_some() {
             let frame_id = object_id
                 .strip_prefix("console-")
@@ -2051,6 +2072,19 @@ impl ObscuraJsRuntime {
         }
         let _ = self.execute_runtime_script("<releaseGroup>", code);
         self.object_store.clear();
+        self.evaluation_recipes.clear();
+    }
+
+    pub fn take_cdp_object_state(&mut self) -> CdpObjectState {
+        CdpObjectState {
+            object_counter: self.object_counter,
+            evaluation_recipes: std::mem::take(&mut self.evaluation_recipes),
+        }
+    }
+
+    pub fn restore_cdp_object_state(&mut self, state: CdpObjectState) {
+        self.object_counter = self.object_counter.max(state.object_counter);
+        self.evaluation_recipes = state.evaluation_recipes;
     }
     pub async fn load_module(&mut self, url: &str, budget_ms: u64) -> Result<(), String> {
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(budget_ms);
@@ -3132,11 +3166,27 @@ impl ObscuraJsRuntime {
         )
     }
 
-    fn resolve_this(&self, object_id: Option<&str>) -> String {
+    fn resolve_remote_object(&mut self, object_id: &str) -> Option<String> {
+        if let Some(retrieval) = self.object_store.get(object_id) {
+            return Some(retrieval.clone());
+        }
+        let expression = self.evaluation_recipes.get(object_id)?.clone();
+        let object_id_literal = js_string_literal(object_id);
+        let code = format!(
+            "globalThis.__obscura_objects[{object_id_literal}] = (\n{expression}\n);"
+        );
+        self.execute_runtime_script("<restore-cdp-object>", code).ok()?;
+        let retrieval = format!("globalThis.__obscura_objects[{object_id_literal}]");
+        self.object_store
+            .insert(object_id.to_string(), retrieval.clone());
+        Some(retrieval)
+    }
+
+    fn resolve_this(&mut self, object_id: Option<&str>) -> String {
         match object_id {
             Some(oid) => {
-                if let Some(retrieval) = self.object_store.get(oid) {
-                    retrieval.clone()
+                if let Some(retrieval) = self.resolve_remote_object(oid) {
+                    retrieval
                 } else if oid.starts_with("node-") {
                     let nid = oid.strip_prefix("node-").unwrap_or("0");
                     format!(
@@ -3156,7 +3206,7 @@ impl ObscuraJsRuntime {
         }
     }
 
-    fn build_args(&self, arguments: &[serde_json::Value]) -> (String, String) {
+    fn build_args(&mut self, arguments: &[serde_json::Value]) -> (String, String) {
         let mut setup_lines = Vec::new();
         let mut arg_names = Vec::new();
 
@@ -3167,7 +3217,7 @@ impl ObscuraJsRuntime {
                     serde_json::to_string(value).unwrap_or_else(|_| "undefined".to_string());
                 setup_lines.push(format!("var {} = {};", arg_name, json_str));
             } else if let Some(oid) = arg.get("objectId").and_then(|v| v.as_str()) {
-                if let Some(retrieval) = self.object_store.get(oid) {
+                if let Some(retrieval) = self.resolve_remote_object(oid) {
                     setup_lines.push(format!("var {} = {};", arg_name, retrieval));
                 } else {
                     setup_lines.push(format!("var {} = undefined;", arg_name));
