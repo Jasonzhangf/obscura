@@ -292,6 +292,10 @@ pub struct Page {
     /// is suspended for CDP/MCP tab switching.  These are restored only when
     /// the same surviving DomTree is resumed; navigation clears them.
     suspended_started_script_ids: Vec<u32>,
+    /// Re-creatable CDP handles retained while tab switching replaces this
+    /// page's V8 runtime. Chromium keeps these handles alive with the target;
+    /// preserving them avoids order-dependent failures in concurrent clients.
+    suspended_cdp_object_state: obscura_js::runtime::CdpObjectState,
     /// Passive on_request/on_response callbacks, scoped to this page (issue
     /// #408): they fire only for requests this page drives and die with it.
     /// Arc because the JS runtime state holds a second handle for fetch()/XHR.
@@ -1134,6 +1138,7 @@ impl Page {
             preload_scripts: Vec::new(),
             runtime_events_enabled: std::cell::Cell::new(false),
             suspended_started_script_ids: Vec::new(),
+            suspended_cdp_object_state: obscura_js::runtime::CdpObjectState::default(),
             callbacks: Arc::new(CallbackRegistry::new()),
             #[cfg(feature = "stealth")]
             stealth_client,
@@ -1611,6 +1616,7 @@ impl Page {
         // same DomTree is installed; a navigation must never inherit IDs from
         // a suspended prior document whose allocator may reuse them.
         self.suspended_started_script_ids.clear();
+        self.suspended_cdp_object_state = obscura_js::runtime::CdpObjectState::default();
         // Drop any existing runtime so the JS realm starts clean on
         // every navigation. The old code reused the V8 isolate and
         // only re-bound `globalThis.document`, leaving window.onload,
@@ -4188,10 +4194,11 @@ impl Page {
     }
 
     pub fn suspend_js(&mut self) {
-        let Some(js) = &self.js else {
+        let Some(js) = &mut self.js else {
             return;
         };
         let started_script_ids = js.started_script_ids();
+        self.suspended_cdp_object_state = js.take_cdp_object_state();
         let dom = js.take_dom();
         if let Some(dom) = dom {
             self.dom = Some(dom);
@@ -4213,9 +4220,11 @@ impl Page {
             return;
         }
         let started_script_ids = std::mem::take(&mut self.suspended_started_script_ids);
+        let cdp_object_state = std::mem::take(&mut self.suspended_cdp_object_state);
         self.init_js();
-        if let Some(js) = &self.js {
+        if let Some(js) = &mut self.js {
             js.restore_started_script_ids(&started_script_ids);
+            js.restore_cdp_object_state(cdp_object_state);
         }
     }
 
@@ -5621,6 +5630,44 @@ mod tests {
             )
             .unwrap();
         assert_eq!(after, serde_json::json!(["1", "1", "0"]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn suspend_resume_preserves_cdp_evaluation_handles() {
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "cdp-handle-suspend".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("cdp-handle-suspend".to_string(), context);
+        page.url = Some(url::Url::parse("http://example.com/").unwrap());
+        page.dom = Some(parse_html("<html><body></body></html>"));
+        page.init_js();
+
+        let object = page
+            .evaluate_for_cdp_with_timeout("({ increment(value) { return value + 1; } })", false, false, 1_000)
+            .await
+            .unwrap();
+        let object_id = object.object_id.expect("remote evaluation returned no handle");
+
+        page.suspend_js();
+        page.resume_js();
+
+        let result = page
+            .call_function_on_for_cdp_with_timeout(
+                "function(value) { return this.increment(value); }",
+                Some(&object_id),
+                &[serde_json::json!({ "value": 41 })],
+                true,
+                false,
+                1_000,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.value, Some(serde_json::json!(42.0)));
     }
 
     #[test]
