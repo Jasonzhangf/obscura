@@ -9725,6 +9725,11 @@ globalThis.IntersectionObserver = class IntersectionObserver {
 })();
 globalThis.IntersectionObserverEntry = class IntersectionObserverEntry {};
 globalThis.PerformanceObserver = class { constructor(){} observe(){} disconnect(){} };
+// Feature detection reads this static before deciding to observe anything;
+// absent it, supportedEntryTypes.includes(...) throws and instrumentation
+// bails. Report only types the engine can actually emit records for.
+PerformanceObserver.supportedEntryTypes = ["mark", "measure", "navigation", "resource", "paint"];
+_markNative(PerformanceObserver);
 
 globalThis.DOMException = (function () {
   const NAME_TO_CODE = {
