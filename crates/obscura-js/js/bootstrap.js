@@ -2799,6 +2799,25 @@ function _isSubmitButton(el) {
   return false;
 }
 
+// The HTML labelable-elements list (hidden inputs excluded), shared by the
+// Element.labels and HTMLLabelElement.control getters.
+function _isLabelable(el) {
+  if (!el || typeof el.localName !== "string") return false;
+  switch (el.localName) {
+    case "button":
+    case "meter":
+    case "output":
+    case "progress":
+    case "select":
+    case "textarea":
+      return true;
+    case "input":
+      return (((el.getAttribute && el.getAttribute("type")) || "").toLowerCase()) !== "hidden";
+    default:
+      return false;
+  }
+}
+
 // Carry the context element's full qualified name into html5ever. Fragment
 // parsing depends on both the local name and namespace (SVG/MathML included).
 function _fragmentContextPayload(context, html) {
@@ -4297,6 +4316,45 @@ class Element extends Node {
     let p = this.parentNode;
     while (p && p.localName !== 'form') p = p.parentNode;
     return p;
+  }
+  // Label association, per the HTML labelable-elements list. Playwright's
+  // getByLabel and its follow-label retargeting read these; without them a
+  // label-linked control is invisible to that engine.
+  get labels() {
+    if (!_isLabelable(this)) return _nodeList([]);
+    const doc = this.ownerDocument;
+    if (!doc || !doc.querySelectorAll) return _nodeList([]);
+    const out = [];
+    const id = this.getAttribute('id');
+    if (id) {
+      // Filter in JS rather than building a selector: an id containing a
+      // quote would break out of label[for="..."].
+      const all = doc.querySelectorAll('label');
+      for (let i = 0; i < all.length; i++) {
+        if (all[i].getAttribute('for') === id) out.push(all[i]);
+      }
+    }
+    let p = this.parentNode;
+    while (p) {
+      if (p.localName === 'label') out.push(p);
+      p = p.parentNode;
+    }
+    return _nodeList(out);
+  }
+  get control() {
+    if (this.localName !== 'label') return null;
+    const doc = this.ownerDocument;
+    const forId = this.getAttribute('for');
+    if (forId) {
+      if (!doc || !doc.getElementById) return null;
+      const target = doc.getElementById(forId);
+      return target && _isLabelable(target) ? target : null;
+    }
+    const candidates = this.querySelectorAll('button, input, meter, output, progress, select, textarea');
+    for (let i = 0; i < candidates.length; i++) {
+      if (_isLabelable(candidates[i])) return candidates[i];
+    }
+    return null;
   }
   get options() {
     if (this.localName !== 'select') return [];

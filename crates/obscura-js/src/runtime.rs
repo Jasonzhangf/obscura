@@ -17874,4 +17874,47 @@ mod tests {
             "Intl must not leak the host OS locale while navigator.language says en-US"
         );
     }
+
+    // Momentic POC / Playwright getByLabel: the label association getters must
+    // link <label for> to its control and expose element.labels, both for
+    // for-linked and wrapping labels.
+    #[test]
+    fn label_control_and_labels_link_labelable_elements() {
+        let mut rt = setup_runtime(
+            r#"<html><body>
+            <label for="name" id="l1">Name</label><input id="name">
+            <label id="l2">Age <input id="age"></label>
+            <input type="hidden" id="hid">
+            <div id="plain"></div>
+            </body></html>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"(function() {
+                    var l1 = document.getElementById('l1');
+                    var l2 = document.getElementById('l2');
+                    var name = document.getElementById('name');
+                    var age = document.getElementById('age');
+                    var hid = document.getElementById('hid');
+                    var plain = document.getElementById('plain');
+                    return [
+                        l1.control === name,
+                        l2.control === age,
+                        name.labels.length,
+                        name.labels[0] === l1,
+                        age.labels.length,
+                        age.labels[0] === l2,
+                        hid.labels.length,
+                        plain.labels.length,
+                        plain.control === null,
+                    ].join(',');
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!("true,true,1,true,1,true,0,0,true"),
+            "label association must follow the HTML labelable-element rules"
+        );
+    }
 }

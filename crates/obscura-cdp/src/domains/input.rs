@@ -316,6 +316,15 @@ pub async fn handle(
 
             Ok(json!({}))
         }
+        // Chrome's Input.insertText: Playwright's fill() focuses the field in
+        // page and then types the whole value through this one call (#577).
+        "insertText" => {
+            let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            if let Some(page) = ctx.get_session_page_mut(session_id) {
+                page.evaluate(&insert_text_js(text));
+            }
+            Ok(json!({}))
+        }
         "dispatchKeyEvent" => {
             let event_type = params.get("type").and_then(|v| v.as_str()).unwrap_or("");
             let key = params.get("key").and_then(|v| v.as_str()).unwrap_or("");
