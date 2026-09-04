@@ -3,7 +3,7 @@ use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, USER_AGENT};
@@ -580,6 +580,8 @@ pub fn is_forbidden_ip(ip: IpAddr) -> bool {
                 || v4.is_broadcast()
                 || v4.is_documentation()
                 || v4.is_unspecified()
+                || v4.is_multicast()
+                || o[0] == 0
                 // std's is_private() covers only RFC1918, so add the IANA
                 // special-purpose ranges that also host internal services and
                 // are common SSRF targets:
@@ -590,12 +592,24 @@ pub fn is_forbidden_ip(ip: IpAddr) -> bool {
                 || (o[0] == 100 && (64..=127).contains(&o[1]))
                 || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
                 || (o[0] == 192 && o[1] == 88 && o[2] == 99)
+                // Most of 192.0.0.0/24 is special-purpose and not globally
+                // reachable. Keep the two globally reachable PCP anycast
+                // assignments usable rather than blocking the entire /24.
+                || (o[0] == 192
+                    && o[1] == 0
+                    && o[2] == 0
+                    && o[3] != 9
+                    && o[3] != 10)
+                // 240.0.0.0/4 is reserved (255.255.255.255 was already
+                // covered by is_broadcast()).
+                || o[0] >= 240
         }
         IpAddr::V6(v6) => {
             if v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_unique_local()
                 || v6.is_unicast_link_local()
+                || v6.is_multicast()
             {
                 return true;
             }
@@ -605,7 +619,40 @@ pub fn is_forbidden_ip(ip: IpAddr) -> bool {
             if let Some(v4) = v6.to_ipv4_mapped().or_else(|| v6.to_ipv4()) {
                 return is_forbidden_ip(IpAddr::V4(v4));
             }
-            false
+
+            let s = v6.segments();
+            // IPv4/IPv6 translation prefix (RFC 6052). Only /96 has a fixed
+            // embedded-address position; the local-use /48 is therefore
+            // blocked outright below.
+            if s[0] == 0x64
+                && s[1] == 0xff9b
+                && s[2] == 0
+                && s[3] == 0
+                && s[4] == 0
+                && s[5] == 0
+            {
+                return is_forbidden_ip(IpAddr::V4(Ipv4Addr::new(
+                    (s[6] >> 8) as u8,
+                    s[6] as u8,
+                    (s[7] >> 8) as u8,
+                    s[7] as u8,
+                )));
+            }
+            // 6to4 carries its IPv4 endpoint in bits 16..48.
+            if s[0] == 0x2002 {
+                return is_forbidden_ip(IpAddr::V4(Ipv4Addr::new(
+                    (s[1] >> 8) as u8,
+                    s[1] as u8,
+                    (s[2] >> 8) as u8,
+                    s[2] as u8,
+                )));
+            }
+
+            // Discard-only, local-use NAT64, and documentation prefixes.
+            (s[0] == 0x100 && s[1] == 0 && s[2] == 0 && s[3] == 0)
+                || (s[0] == 0x64 && s[1] == 0xff9b && s[2] == 1)
+                || (s[0] == 0x2001 && s[1] == 0x0db8)
+                || (s[0] == 0x3fff && s[1] & 0xf000 == 0)
         }
     }
 }
@@ -1771,6 +1818,34 @@ mod ssrf_tests {
     }
 
     #[test]
+    fn remaining_non_global_ipv4_ranges_are_forbidden_without_blocking_exceptions() {
+        for s in [
+            "0.1.2.3",
+            "192.0.0.8",
+            "192.0.0.192",
+            "224.0.0.1",
+            "239.255.255.255",
+            "240.0.0.1",
+            "255.255.255.254",
+        ] {
+            assert!(is_forbidden_ip(ip(s)), "{s} should be forbidden");
+        }
+
+        // IANA marks these specific protocol anycast addresses and these
+        // special-purpose /24s globally reachable. Blocking them would be a
+        // network compatibility regression, not an SSRF hardening win.
+        for s in [
+            "192.0.0.9",
+            "192.0.0.10",
+            "192.31.196.1",
+            "192.52.193.1",
+            "192.175.48.1",
+        ] {
+            assert!(!is_forbidden_ip(ip(s)), "{s} should be allowed");
+        }
+    }
+
+    #[test]
     fn ipv6_loopback_ula_linklocal_and_mapped_are_forbidden() {
         for s in [
             "::1",                    // loopback
@@ -1787,7 +1862,45 @@ mod ssrf_tests {
 
     #[test]
     fn public_ipv6_is_allowed() {
-        assert!(!is_forbidden_ip(ip("2606:4700:4700::1111"))); // cloudflare dns
+        for s in [
+            "2606:4700:4700::1111", // Cloudflare DNS
+            "3ffe::1",               // below 3fff::/20
+            "3fff:1000::1",          // above 3fff:fff::/20
+        ] {
+            assert!(!is_forbidden_ip(ip(s)), "{s} should be allowed");
+        }
+    }
+
+    #[test]
+    fn ipv6_translation_cannot_hide_forbidden_ipv4() {
+        for s in [
+            "2002:7f00:1::",       // 6to4 loopback
+            "2002:a9fe:a9fe::",    // 6to4 link-local metadata
+            "2002:6464:64c8::",    // 6to4 CGNAT metadata
+            "64:ff9b::7f00:1",     // NAT64 loopback
+            "64:ff9b::a9fe:a9fe",  // NAT64 link-local metadata
+            "64:ff9b::6464:64c8",  // NAT64 CGNAT metadata
+            "64:ff9b:1::1",        // local-use translation prefix
+        ] {
+            assert!(is_forbidden_ip(ip(s)), "{s} should be forbidden");
+        }
+
+        for s in ["2002:808:808::", "64:ff9b::808:808"] {
+            assert!(!is_forbidden_ip(ip(s)), "{s} should be allowed");
+        }
+    }
+
+    #[test]
+    fn native_non_global_ipv6_ranges_are_forbidden() {
+        for s in [
+            "100::1",       // discard-only
+            "2001:db8::1",  // documentation
+            "3fff::1",      // documentation
+            "ff02::1",      // link-local multicast
+            "ff0e::1",      // global-scope multicast
+        ] {
+            assert!(is_forbidden_ip(ip(s)), "{s} should be forbidden");
+        }
     }
 
     #[test]
@@ -1796,6 +1909,16 @@ mod ssrf_tests {
         assert!(validate_url(&Url::parse("http://0.0.0.0:8080/").unwrap(), false).is_err());
         assert!(validate_url(&Url::parse("http://127.0.0.1/").unwrap(), false).is_err());
         assert!(validate_url(&Url::parse("http://example.com/").unwrap(), false).is_ok());
+        assert!(
+            validate_url(&Url::parse("http://[64:ff9b::7f00:1]/").unwrap(), false).is_err()
+        );
+        assert!(
+            validate_url(&Url::parse("http://[2002:a9fe:a9fe::]/").unwrap(), false).is_err()
+        );
+        assert!(validate_url(&Url::parse("http://192.0.0.9/").unwrap(), false).is_ok());
+        assert!(
+            validate_url(&Url::parse("http://[64:ff9b::808:808]/").unwrap(), false).is_ok()
+        );
         // The allow flag bypasses the guard (local-dev escape hatch).
         assert!(validate_url(&Url::parse("http://127.0.0.1/").unwrap(), true).is_ok());
     }
