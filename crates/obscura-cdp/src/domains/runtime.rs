@@ -166,7 +166,7 @@ pub async fn handle(
             };
             emit_post_eval_nav(ctx, session_id).await?;
 
-            Ok(json!({ "result": remote_object_from_info(&info) }))
+            Ok(evaluation_reply(&info))
         }
         "callFunctionOn" => {
             let function_declaration = params
@@ -230,7 +230,7 @@ pub async fn handle(
             };
             emit_post_eval_nav(ctx, session_id).await?;
 
-            Ok(json!({ "result": remote_object_from_info(&info) }))
+            Ok(evaluation_reply(&info))
         }
         "getProperties" => {
             // Puppeteer's $$() flow:
@@ -472,6 +472,33 @@ fn validate_context_id(
     Ok(())
 }
 
+/// Shape one `Runtime.evaluate` or `Runtime.callFunctionOn` reply.
+///
+/// A thrown value, or the value a promise rejected with, is not a protocol
+/// failure: the command succeeds and reports it through `exceptionDetails`,
+/// which is what a client rebuilds the page error from. The value is repeated
+/// in `result` the way Chrome does, so a client that reads only `result` sees
+/// the error object rather than a success that never happened.
+///
+/// `exceptionId` is a fixed 1 because nothing here correlates exceptions
+/// across commands; clients key off the presence of the field, not its id.
+fn evaluation_reply(info: &RemoteObjectInfo) -> Value {
+    let remote = remote_object_from_info(info);
+    if !info.thrown {
+        return json!({ "result": remote });
+    }
+    json!({
+        "result": remote.clone(),
+        "exceptionDetails": {
+            "exceptionId": 1,
+            "text": "Uncaught",
+            "lineNumber": 0,
+            "columnNumber": 0,
+            "exception": remote,
+        }
+    })
+}
+
 fn remote_object_from_info(info: &RemoteObjectInfo) -> Value {
     let mut obj = json!({ "type": info.js_type });
 
@@ -574,6 +601,99 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn evaluate_reports_a_rejection_through_exception_details() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = "evaluate-rejection".to_string();
+        ctx.sessions.insert(session_id.clone(), page_id);
+
+        let reply = handle(
+            "evaluate",
+            &json!({
+                "expression": "Promise.reject(new Error('boom'))",
+                "returnByValue": true,
+                "awaitPromise": true,
+                "timeout": 3000,
+            }),
+            &mut ctx,
+            &Some(session_id),
+        )
+        .await
+        .expect("a rejection is answered, not failed at the protocol level");
+
+        let details = reply
+            .get("exceptionDetails")
+            .expect("a thrown value is reported through exceptionDetails");
+        assert_eq!(details["text"], json!("Uncaught"));
+        assert_eq!(details["exception"]["subtype"], json!("error"));
+        assert_eq!(details["exception"]["className"], json!("Error"));
+        assert!(
+            details["exception"]["description"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("boom"),
+            "the description carries the page message: {details}"
+        );
+        // Chrome repeats the exception in `result`, so a client that reads
+        // only that field still sees the error rather than a stale success.
+        assert_eq!(reply["result"], details["exception"]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn call_function_on_reports_a_rejection_through_exception_details() {
+        // This is the path Puppeteer's page.evaluate(fn) takes. It used to
+        // answer successfully with `{}` for a rejected Error, so the caller
+        // could not tell a failure from an empty object.
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = "call-rejection".to_string();
+        ctx.sessions.insert(session_id.clone(), page_id);
+
+        let reply = handle(
+            "callFunctionOn",
+            &json!({
+                "functionDeclaration": "() => Promise.reject(new Error('boom'))",
+                "returnByValue": true,
+                "awaitPromise": true,
+                "timeout": 3000,
+            }),
+            &mut ctx,
+            &Some(session_id),
+        )
+        .await
+        .expect("a rejection is answered, not failed at the protocol level");
+
+        let details = reply
+            .get("exceptionDetails")
+            .expect("a rejected call is reported through exceptionDetails");
+        assert_eq!(details["exception"]["subtype"], json!("error"));
+        assert!(reply["result"]["value"].is_null(), "the error must not be serialized by value: {reply}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_resolved_evaluation_carries_no_exception_details() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = "evaluate-resolved".to_string();
+        ctx.sessions.insert(session_id.clone(), page_id);
+
+        let reply = handle(
+            "evaluate",
+            &json!({
+                "expression": "Promise.resolve(2)",
+                "returnByValue": true,
+                "awaitPromise": true,
+                "timeout": 3000,
+            }),
+            &mut ctx,
+            &Some(session_id),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply["result"]["value"], json!(2.0));
+        assert!(reply.get("exceptionDetails").is_none());
+    }
     #[tokio::test(flavor = "current_thread")]
     async fn evaluate_await_promise_reports_the_requested_timeout() {
         let mut ctx = CdpContext::new();

@@ -3887,6 +3887,7 @@ impl Page {
                 Err(e) => {
                     tracing::debug!("evaluate_for_cdp error: {}", e);
                     obscura_js::runtime::RemoteObjectInfo {
+                        thrown: false,
                         js_type: "undefined".into(),
                         subtype: None,
                         class_name: String::new(),
@@ -3899,6 +3900,7 @@ impl Page {
         } else {
             let val = self.evaluate(expression);
             obscura_js::runtime::RemoteObjectInfo {
+                thrown: false,
                 js_type: match &val {
                     serde_json::Value::String(_) => "string".into(),
                     serde_json::Value::Number(_) => "number".into(),
@@ -3932,6 +3934,7 @@ impl Page {
         } else {
             let value = self.evaluate(expression);
             Ok(obscura_js::runtime::RemoteObjectInfo {
+                thrown: false,
                 js_type: match &value {
                     serde_json::Value::String(_) => "string".into(),
                     serde_json::Value::Number(_) => "number".into(),
@@ -3970,6 +3973,7 @@ impl Page {
                 Err(e) => {
                     tracing::debug!("callFunctionOn error: {}", e);
                     obscura_js::runtime::RemoteObjectInfo {
+                        thrown: false,
                         js_type: "undefined".into(),
                         subtype: None,
                         class_name: String::new(),
@@ -3981,6 +3985,7 @@ impl Page {
             }
         } else {
             obscura_js::runtime::RemoteObjectInfo {
+                thrown: false,
                 js_type: "undefined".into(),
                 subtype: None,
                 class_name: String::new(),

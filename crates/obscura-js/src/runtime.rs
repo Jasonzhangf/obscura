@@ -126,6 +126,11 @@ fn with_sync_render_loading_disabled<R>(
 
 #[derive(Debug, Clone)]
 pub struct RemoteObjectInfo {
+    /// True when this object is a value that was thrown or that a promise
+    /// rejected with, rather than the evaluation result. CDP reports those
+    /// through `exceptionDetails` on a successful reply, so the difference
+    /// has to survive the trip out of the runtime.
+    pub thrown: bool,
     pub js_type: String,
     pub subtype: Option<String>,
     pub class_name: String,
@@ -1815,33 +1820,40 @@ impl ObscuraJsRuntime {
         await_promise: bool,
         await_timeout_ms: u64,
     ) -> Result<RemoteObjectInfo, String> {
-        if !await_promise && return_by_value {
-            let val = self.evaluate(expression)?;
-            return Ok(Self::info_from_json(&val));
-        }
+        // Every shape of this command now travels the same path. The
+        // by-value sync case used to short-circuit through `evaluate`,
+        // whose wrapper answers an exception with `null` — indistinguishable
+        // from an expression that really evaluated to null (#746).
         self.begin_javascript_task();
 
         self.object_counter += 1;
         let oid = self.make_oid(self.object_counter);
 
-        // Same trailing-semicolon trim as wrap_expression — Playwright's
-        // utility-script eval ends with `})();`, and `({expr})` would
-        // otherwise become `(...;)` which is a parse-time SyntaxError.
-        let cleaned_expr = expression
-            .trim()
-            .trim_end_matches(|c: char| c == ';' || c.is_whitespace());
-
-        // Puppeteer / Playwright bundles end with a `//# sourceURL=...`
-        // line comment. If we put `{expr})` on a single line the comment
-        // swallows the closing paren and our wrapper breaks. A newline
-        // before the `)` terminates any trailing line comment so the
-        // parens close on their own line.
+        // The expression travels as a *string* into an indirect eval rather
+        // than being pasted into a wrapper. Pasting forced two workarounds
+        // that only half worked: a trailing `;` had to be trimmed or
+        // `(expr;)` failed to parse, and a trailing `//# sourceURL=` comment
+        // (Puppeteer and Playwright both append one) would swallow the
+        // closing paren unless it sat on its own line. Neither can happen to
+        // a string literal.
+        //
+        // It also makes statements legal. `Runtime.evaluate` is specified to
+        // take a script, not an expression, so `throw new Error('x')` and
+        // `var x = 1; x * 2` are both valid input; wrapped in parentheses the
+        // first was a parse-time SyntaxError, which is not catchable, and the
+        // second returned the wrapper's own `undefined` instead of the
+        // completion value Chrome reports (#746).
+        //
+        // `(0, eval)` rather than `eval` so the script runs at global scope,
+        // where `var` lands on `globalThis` the way it does in Chrome, and
+        // cannot see this wrapper's `__result`.
+        let source_literal = serde_json::Value::String(expression.to_string());
         let done_counter = self.object_counter;
         let meta_code = if await_promise {
             format!(
                 "(async function() {{\n\
                     try {{\n\
-                        var __result = await (\n{expr}\n);\n\
+                        var __result = await (0, eval)({src});\n\
                         globalThis.__obscura_objects['{oid}'] = __result;\n\
                         globalThis.__obscura_await_meta = {meta_fn};\n\
                         globalThis.__obscura_await_rejected = false;\n\
@@ -1852,23 +1864,38 @@ impl ObscuraJsRuntime {
                     }}\n\
                     globalThis.__obscura_done_{done_counter} = true;\n\
                 }})()",
-                expr = cleaned_expr,
+                src = source_literal,
                 oid = oid,
                 meta_fn = Self::meta_extract_js("__result"),
                 err_meta_fn = Self::meta_extract_js("e"),
                 done_counter = done_counter,
             )
         } else {
+            // The synchronous half writes the same two globals as the await
+            // half above, so one outcome protocol covers both and the reply
+            // builder does not have to care which path produced the value.
+            // Before this, a throw here became `__result = undefined`: the
+            // command answered successfully with `undefined`, so a page error
+            // was indistinguishable from an expression with no value.
             format!(
                 "(function() {{\n\
                     var __result;\n\
-                    try {{ __result = (\n{expr}\n); }} catch(e) {{ __result = undefined; }}\n\
+                    try {{\n\
+                        __result = (0, eval)({src});\n\
+                    }} catch(e) {{\n\
+                        globalThis.__obscura_objects['{oid}'] = e;\n\
+                        globalThis.__obscura_await_meta = {err_meta_fn};\n\
+                        globalThis.__obscura_await_rejected = true;\n\
+                        return globalThis.__obscura_await_meta;\n\
+                    }}\n\
                     globalThis.__obscura_objects['{oid}'] = __result;\n\
+                    globalThis.__obscura_await_rejected = false;\n\
                     return {meta_fn};\n\
                 }})()",
-                expr = cleaned_expr,
+                src = source_literal,
                 oid = oid,
                 meta_fn = Self::meta_extract_js("__result"),
+                err_meta_fn = Self::meta_extract_js("e"),
             )
         };
 
@@ -1909,25 +1936,28 @@ impl ObscuraJsRuntime {
                     preview,
                 );
             }
-            let rejected = self
-                .execute_runtime_script(
-                    "<readRejected>",
-                    "globalThis.__obscura_await_rejected".to_string(),
-                )
-                .map_err(|e| format!("JS error: {}", e))?;
-            if self.v8_to_json(rejected)?.as_bool().unwrap_or(false) {
-                let err = self.execute_runtime_script("<readError>", format!("String(globalThis.__obscura_objects['{0}'] && (globalThis.__obscura_objects['{0}'].message || globalThis.__obscura_objects['{0}']))", oid))
-                    .map_err(|e| format!("JS error: {}", e))?;
-                return Err(format!(
-                    "Promise rejected: {}",
-                    self.v8_to_json(err)?.as_str().unwrap_or("")
-                ));
-            }
             self.execute_runtime_script("<readMeta>", "globalThis.__obscura_await_meta".to_string())
                 .map_err(|e| format!("JS error: {}", e))?
         } else {
             result
         };
+
+        // Neither a rejection nor a synchronous throw is a protocol failure.
+        // CDP answers the command and puts the value in `exceptionDetails`,
+        // which is what a client rebuilds the page error from, so it travels
+        // back as a remote object flagged `thrown`. It is reported by
+        // reference even when the caller asked for a value:
+        // `JSON.stringify(new Error("boom"))` is `{}`, so serializing it
+        // would throw the message away.
+        let thrown = self
+            .execute_runtime_script(
+                "<readRejected>",
+                "globalThis.__obscura_await_rejected".to_string(),
+            )
+            .map_err(|e| format!("JS error: {}", e))?;
+        if self.v8_to_json(thrown)?.as_bool().unwrap_or(false) {
+            return self.thrown_info(&oid);
+        }
         let meta_str = self.v8_to_json(meta_str)?;
         let meta_json = if let serde_json::Value::String(s) = &meta_str {
             serde_json::from_str(s).unwrap_or(meta_str)
@@ -1943,7 +1973,7 @@ impl ObscuraJsRuntime {
                 .insert(oid.clone(), cleaned_expr.to_string());
         }
 
-        if await_promise && return_by_value {
+        if return_by_value {
             let read = self
                 .execute_runtime_script(
                     "<readResult>",
@@ -2005,10 +2035,12 @@ impl ObscuraJsRuntime {
                         __result = await __fn.call(__this, {args});\n\
                         globalThis.__obscura_objects['{oid}'] = __result;\n\
                         globalThis.__obscura_await_meta = {meta_fn};\n\
+                        globalThis.__obscura_await_rejected = false;\n\
                     }} catch(e) {{\n\
                         __result = e;\n\
                         globalThis.__obscura_objects['{oid}'] = e;\n\
                         globalThis.__obscura_await_meta = {err_meta_fn};\n\
+                        globalThis.__obscura_await_rejected = true;\n\
                     }} finally {{\n\
                         globalThis.__obscura_done_{done_counter} = true;\n\
                     }}\n\
@@ -2057,6 +2089,22 @@ impl ObscuraJsRuntime {
                     __dt.as_millis(),
                     preview,
                 );
+            }
+
+            // Same rule as evaluate: a rejected call is answered, not failed,
+            // and the value is never serialized by value. Without this the
+            // wrapper stored the error under the object id a success uses, so
+            // a rejection came back as an ordinary result: an Error as `{}`,
+            // and `Promise.reject({code: 42})` as `{code: 42}`, which is
+            // indistinguishable from resolving with it.
+            let rejected = self
+                .execute_runtime_script(
+                    "<readRejected>",
+                    "globalThis.__obscura_await_rejected".to_string(),
+                )
+                .map_err(|e| format!("JS error: {}", e))?;
+            if self.v8_to_json(rejected)?.as_bool().unwrap_or(false) {
+                return self.thrown_info(&oid);
             }
 
             if return_by_value {
@@ -3322,6 +3370,12 @@ impl ObscuraJsRuntime {
                     cn = 'Function';
                     desc = v.name ? 'function ' + v.name + '()' : 'function()';
                 }}
+                else if (t === 'object' && v instanceof Error) {{
+                    st = 'error';
+                    cn = (v.constructor && v.constructor.name) || 'Error';
+                    desc = (typeof v.stack === 'string' && v.stack) ? v.stack
+                         : (cn + (v.message ? ': ' + v.message : ''));
+                }}
                 else if (t === 'object') {{
                     cn = (v.constructor && v.constructor.name) || 'Object';
                     desc = cn;
@@ -3451,6 +3505,7 @@ impl ObscuraJsRuntime {
     fn info_from_json(value: &serde_json::Value) -> RemoteObjectInfo {
         match value {
             serde_json::Value::Null => RemoteObjectInfo {
+                thrown: false,
                 js_type: "object".into(),
                 subtype: Some("null".into()),
                 class_name: String::new(),
@@ -3459,6 +3514,7 @@ impl ObscuraJsRuntime {
                 value: Some(serde_json::Value::Null),
             },
             serde_json::Value::Bool(b) => RemoteObjectInfo {
+                thrown: false,
                 js_type: "boolean".into(),
                 subtype: None,
                 class_name: String::new(),
@@ -3467,6 +3523,7 @@ impl ObscuraJsRuntime {
                 value: Some(value.clone()),
             },
             serde_json::Value::Number(n) => RemoteObjectInfo {
+                thrown: false,
                 js_type: "number".into(),
                 subtype: None,
                 class_name: String::new(),
@@ -3475,6 +3532,7 @@ impl ObscuraJsRuntime {
                 value: Some(value.clone()),
             },
             serde_json::Value::String(s) => RemoteObjectInfo {
+                thrown: false,
                 js_type: "string".into(),
                 subtype: None,
                 class_name: String::new(),
@@ -3483,6 +3541,7 @@ impl ObscuraJsRuntime {
                 value: Some(value.clone()),
             },
             serde_json::Value::Array(arr) => RemoteObjectInfo {
+                thrown: false,
                 js_type: "object".into(),
                 subtype: Some("array".into()),
                 class_name: "Array".into(),
@@ -3491,6 +3550,7 @@ impl ObscuraJsRuntime {
                 value: Some(value.clone()),
             },
             serde_json::Value::Object(_) => RemoteObjectInfo {
+                thrown: false,
                 js_type: "object".into(),
                 subtype: None,
                 class_name: "Object".into(),
@@ -3499,6 +3559,33 @@ impl ObscuraJsRuntime {
                 value: Some(value.clone()),
             },
         }
+    }
+
+    /// Build the remote object for a value that was thrown, or that a promise
+    /// rejected with.
+    ///
+    /// Both wrappers have already stored the value under `oid` and put its
+    /// metadata in `__obscura_await_meta`, so this reads them back and marks
+    /// the result. The mark is what lets the CDP layer answer the command with
+    /// `exceptionDetails` rather than fail it or, worse, present the value as
+    /// the evaluation result.
+    fn thrown_info(&mut self, oid: &str) -> Result<RemoteObjectInfo, String> {
+        let meta = self
+            .execute_runtime_script("<readMeta>", "globalThis.__obscura_await_meta".to_string())
+            .map_err(|e| format!("JS error: {}", e))?;
+        let meta = self.v8_to_json(meta)?;
+        let meta_json = if let serde_json::Value::String(text) = &meta {
+            serde_json::from_str(text).unwrap_or_else(|_| meta.clone())
+        } else {
+            meta
+        };
+        self.object_store.insert(
+            oid.to_string(),
+            format!("globalThis.__obscura_objects['{}']", oid),
+        );
+        let mut info = Self::info_from_meta(&meta_json, Some(oid.to_string()));
+        info.thrown = true;
+        Ok(info)
     }
 
     fn info_from_meta(meta: &serde_json::Value, object_id: Option<String>) -> RemoteObjectInfo {
@@ -3531,6 +3618,7 @@ impl ObscuraJsRuntime {
         };
 
         RemoteObjectInfo {
+            thrown: false,
             js_type,
             subtype,
             class_name,
@@ -14213,14 +14301,188 @@ mod tests {
         assert_eq!(result.value.unwrap().as_str().unwrap(), "async-ok");
     }
 
+    // This test used to assert that a rejection came back as `Err`. It does
+    // not any more, and the old expectation was the defect: CDP answers the
+    // command and reports the rejected value through `exceptionDetails`, so
+    // failing the command loses the page error rather than delivering it.
     #[tokio::test(flavor = "current_thread")]
     async fn test_evaluate_for_cdp_reports_promise_rejection() {
         let mut rt = setup_runtime("<html><body></body></html>");
-        let err = rt
+        let info = rt
             .evaluate_for_cdp("Promise.reject(new Error('boom'))", true, true)
             .await
-            .unwrap_err();
-        assert!(err.contains("boom"));
+            .expect("a rejection is answered, not failed");
+        assert!(info.thrown, "the rejected value must be marked as thrown");
+        assert_eq!(info.js_type, "object");
+        assert_eq!(info.subtype.as_deref(), Some("error"));
+        assert_eq!(info.class_name, "Error");
+        assert!(
+            info.description.contains("boom"),
+            "the description is what a client rebuilds the error from: {}",
+            info.description
+        );
+        // Reported by reference, never serialized: an Error has no own
+        // enumerable properties, so by value it would be `{}`.
+        assert!(info.value.is_none());
+        assert!(info.object_id.is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn call_function_on_marks_a_rejection_instead_of_returning_it() {
+        // The reported shape: returnByValue on a rejected call answered
+        // successfully with `{}`, because the wrapper stored the error under
+        // the object id a success uses and nothing said which branch ran.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let info = rt
+            .call_function_on_for_cdp("() => Promise.reject(new Error('boom'))", None, &[], true, true)
+            .await
+            .expect("a rejection is answered, not failed");
+        assert!(info.thrown, "expected a thrown value, got {:?}", info.value);
+        assert_eq!(info.subtype.as_deref(), Some("error"));
+        assert!(info.description.contains("boom"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn call_function_on_separates_a_rejected_object_from_a_resolved_one() {
+        // The sharper half of the same defect: rejecting with a plain object
+        // produced a reply byte-identical to resolving with it, so no client
+        // could tell the two apart.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let resolved = rt
+            .call_function_on_for_cdp("() => Promise.resolve({code: 42})", None, &[], true, true)
+            .await
+            .unwrap();
+        let rejected = rt
+            .call_function_on_for_cdp("() => Promise.reject({code: 42})", None, &[], true, true)
+            .await
+            .unwrap();
+        assert!(!resolved.thrown);
+        assert!(rejected.thrown);
+        assert_eq!(resolved.value, Some(serde_json::json!({"code": 42})));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_synchronous_throw_is_reported_instead_of_swallowed() {
+        // The sync wrapper answered a throw with `__result = undefined`, so the
+        // command succeeded and the page error vanished. A client cannot tell
+        // that from an expression that genuinely has no value.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let info = rt
+            .evaluate_for_cdp("undefined_variable_xyz", false, false)
+            .await
+            .expect("a page error is not a protocol failure");
+        assert!(info.thrown, "a ReferenceError must come back flagged thrown");
+        assert_eq!(info.subtype.as_deref(), Some("error"));
+        assert!(
+            info.description.contains("ReferenceError"),
+            "the description is what a client rebuilds the error from: {:?}",
+            info.description
+        );
+    }
+    
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_synchronous_throw_is_reported_when_a_value_was_asked_for() {
+        // returnByValue took a different route entirely, through `evaluate`,
+        // whose wrapper answers an exception with null. That is the shape a
+        // Puppeteer `page.evaluate` uses most, and it reported success.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let info = rt
+            .evaluate_for_cdp("undefined_variable_xyz", true, false)
+            .await
+            .expect("a page error is not a protocol failure");
+        assert!(info.thrown, "a ReferenceError must not serialize to null");
+        assert!(info.description.contains("ReferenceError"));
+    }
+    
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_throw_statement_is_run_as_a_script_not_wrapped_in_parentheses() {
+        // `Runtime.evaluate` takes a script. Pasted into `(...)` a throw is a
+        // parse-time SyntaxError, which no catch can see, so the whole command
+        // failed at the protocol level instead of reporting the page's error.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let info = rt
+            .evaluate_for_cdp("throw new Error('boom')", false, false)
+            .await
+            .expect("a throw statement must be evaluated, not rejected as invalid");
+        assert!(info.thrown);
+        assert!(
+            info.description.contains("boom"),
+            "the thrown error must survive: {:?}",
+            info.description
+        );
+    }
+    
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_statement_bundle_yields_its_completion_value() {
+        // Chrome reports the completion value of the script. The old wrapper
+        // put statement bundles in a function body with no `return`, so every
+        // one of them evaluated to the wrapper's own undefined.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let info = rt
+            .evaluate_for_cdp("var completion_x = 1; completion_x * 2", true, false)
+            .await
+            .expect("statement bundles are valid input");
+        assert!(!info.thrown);
+        // Compared as a number rather than against a literal: the engine
+        // boxes every number as f64, so `json!(2)` would not match `2.0`.
+        // That spelling is its own defect and does not belong to this test.
+        assert_eq!(
+            info.value.as_ref().and_then(serde_json::Value::as_f64),
+            Some(2.0),
+            "the bundle's completion value, not the wrapper's undefined"
+        );
+    }
+    
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_trailing_semicolon_and_source_url_still_parse() {
+        // Both were handled by hand before: the semicolon had to be trimmed or
+        // `(expr;)` failed to parse, and the sourceURL comment had to be closed
+        // by a newline or it swallowed the wrapper's own paren. Passing the
+        // script as a string removes the class, so these pin that it stays gone.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let info = rt
+            .evaluate_for_cdp("(() => 7)();", true, false)
+            .await
+            .expect("a trailing semicolon is legal");
+        assert_eq!(
+            info.value.as_ref().and_then(serde_json::Value::as_f64),
+            Some(7.0)
+        );
+    
+        let info = rt
+            .evaluate_for_cdp("(() => 8)()\n//# sourceURL=__puppeteer_evaluation_script__", true, false)
+            .await
+            .expect("a trailing sourceURL comment is legal");
+        assert_eq!(
+            info.value.as_ref().and_then(serde_json::Value::as_f64),
+            Some(8.0)
+        );
+    }
+    
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_rejection_does_not_leak_into_the_next_call() {
+        // `__obscura_await_rejected` is a global, so the success branch has to
+        // clear it. Without that the first rejection would mark every later
+        // call on the same runtime as thrown.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let rejected = rt
+            .call_function_on_for_cdp("() => Promise.reject(new Error('first'))", None, &[], true, true)
+            .await
+            .unwrap();
+        assert!(rejected.thrown);
+        let after = rt
+            .call_function_on_for_cdp("() => Promise.resolve(7)", None, &[], true, true)
+            .await
+            .unwrap();
+        assert!(!after.thrown, "a later success was still marked as thrown");
+        assert_eq!(after.value.unwrap().as_f64(), Some(7.0));
+
+        let evaluated = rt
+            .evaluate_for_cdp("Promise.resolve(8)", true, true)
+            .await
+            .unwrap();
+        assert!(!evaluated.thrown);
+        assert_eq!(evaluated.value.unwrap().as_f64(), Some(8.0));
     }
 
     #[tokio::test(flavor = "current_thread")]
