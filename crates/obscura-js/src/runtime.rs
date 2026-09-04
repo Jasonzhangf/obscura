@@ -6168,6 +6168,132 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn zero_delay_interval_created_by_timer_yields_to_embedder() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "nested-zero-interval",
+            "globalThis.__outerTimerRan = false;\
+             globalThis.__zeroIntervalTicks = 0;\
+             setTimeout(() => {\
+               globalThis.__outerTimerRan = true;\
+               globalThis.__zeroInterval = setInterval(\
+                 () => __zeroIntervalTicks++, 0);\
+             }, 0);",
+        )
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        rt.run_autonomous_event_loop_turn().await.unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "a repeating timer must yield between ticks; elapsed={elapsed:?}",
+        );
+        assert_eq!(
+            rt.evaluate("globalThis.__outerTimerRan").unwrap(),
+            serde_json::json!(true),
+        );
+        rt.run_autonomous_event_loop_turn().await.unwrap();
+        for _ in 0..5 {
+            rt.run_autonomous_event_loop_turn().await.unwrap();
+        }
+        assert_eq!(
+            rt.evaluate("globalThis.__zeroIntervalTicks").unwrap(),
+            serde_json::json!(6.0),
+            "the repeating timer must make one tick of progress per event-loop turn",
+        );
+        rt.execute_script("clear-zero-interval", "clearInterval(globalThis.__zeroInterval)")
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn top_level_zero_delay_interval_clamps_after_six_ticks() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "top-level-zero-interval",
+            "globalThis.__nestedTimerDelays = [];\
+             globalThis.__topInterval = setInterval(\
+               () => {\
+                 const nested = setTimeout(() => {}, 0);\
+                 __nestedTimerDelays.push(__obscura_nextPendingTimeoutDelay());\
+                 clearTimeout(nested);\
+               }, 0);",
+        )
+        .unwrap();
+
+        for _ in 0..7 {
+            rt.run_autonomous_event_loop_turn().await.unwrap();
+        }
+        assert_eq!(
+            rt.evaluate("globalThis.__nestedTimerDelays.length")
+                .unwrap(),
+            serde_json::json!(7.0),
+            "the interval must continue yielding and making progress",
+        );
+        let observed = rt.evaluate("globalThis.__nestedTimerDelays").unwrap();
+        let delays = observed.as_array().unwrap();
+        assert!(
+            delays[0].as_f64().unwrap() < 2.0,
+            "a shallow nested timer must remain unclamped: {delays:?}",
+        );
+        assert!(
+            delays[4].as_f64().unwrap() < 2.0,
+            "the fifth-level parent must remain below the clamp boundary: {delays:?}",
+        );
+        assert!(
+            delays[5].as_f64().unwrap() >= 2.0,
+            "a timer nested from the sixth interval task must receive the four-millisecond clamp: {delays:?}",
+        );
+        rt.execute_script("clear-top-interval", "clearInterval(globalThis.__topInterval)")
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn deeply_nested_interval_inherits_the_timer_task_nesting() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "deep-zero-interval",
+            "globalThis.__deepIntervalTicks = 0;\
+             function installDeepInterval(depth) {\
+               if (depth === 0) {\
+                 globalThis.__deepInterval = setInterval(\
+                   () => __deepIntervalTicks++, 0);\
+               } else {\
+                 setTimeout(() => installDeepInterval(depth - 1), 0);\
+               }\
+             }\
+             installDeepInterval(6);",
+        )
+        .unwrap();
+
+        for _ in 0..8 {
+            if rt.evaluate("globalThis.__deepInterval !== undefined")
+                .unwrap()
+                == serde_json::json!(true)
+            {
+                break;
+            }
+            rt.run_autonomous_event_loop_turn().await.unwrap();
+        }
+        assert_eq!(
+            rt.evaluate("globalThis.__deepIntervalTicks").unwrap(),
+            serde_json::json!(0.0),
+            "an interval installed by a level-six timer must clamp before its first tick",
+        );
+        rt.run_autonomous_event_loop_turn().await.unwrap();
+        assert_eq!(
+            rt.evaluate("globalThis.__deepIntervalTicks").unwrap(),
+            serde_json::json!(1.0),
+        );
+        rt.execute_script(
+            "clear-deep-interval",
+            "clearInterval(globalThis.__deepInterval)",
+        )
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn short_observation_deadline_does_not_terminate_the_active_task() {
         let mut rt = setup_runtime("<html><body></body></html>");
         rt.execute_script(
