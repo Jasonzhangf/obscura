@@ -2920,8 +2920,13 @@ impl Page {
             let _ = js.execute_script(
                 "<load-event>",
                 "globalThis.__documentReadyState__ = 'complete';\n\
-                 if (typeof window.onload === 'function') { try { window.onload(); } catch(e) {} }\n\
-                 try { window.dispatchEvent(new Event('load', {bubbles:false,cancelable:false})); } catch(e) {}",
+                 try {\n\
+                   const loadEvent = new Event('load', {bubbles:false,cancelable:false});\n\
+                   if (typeof window.onload === 'function') {\n\
+                     try { window.onload.call(window, loadEvent); } catch(e) {}\n\
+                   }\n\
+                   try { window.dispatchEvent(loadEvent); } catch(e) {}\n\
+                 } catch(e) {}",
             );
         }
         if let Some(token) = exec_wd {
@@ -6557,6 +6562,76 @@ mod tests {
                 .recv_timeout(std::time::Duration::from_secs(1))
                 .unwrap(),
             "/app/later.js"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn body_onload_content_attribute_reflects_to_window() {
+        let mut page = import_map_test_page(
+            "body-onload-content-attribute",
+            "http://127.0.0.1:9",
+            r#"<html><head></head><body onload="
+                globalThis.__bodyOnloadCalls++;
+                globalThis.__bodyOnloadThisIsWindow = this === window;
+                globalThis.__bodyOnloadEventType = event && event.type;
+                throw new Error('body onload failure');
+            "><script>
+                globalThis.__bodyOnloadCalls = 0;
+                globalThis.__bodyOnloadThisIsWindow = false;
+                globalThis.__bodyOnloadEventType = null;
+                globalThis.__bodyOnloadReflectedBeforeLoad =
+                    typeof document.body.onload === 'function' &&
+                    document.body.onload === window.onload;
+                globalThis.__windowLoadListenerCalls = 0;
+                window.addEventListener('load', () => __windowLoadListenerCalls++);
+            </script></body></html>"#,
+        );
+
+        page.execute_scripts().await;
+
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate(
+                    r#"[
+                        __bodyOnloadCalls,
+                        __bodyOnloadThisIsWindow,
+                        __bodyOnloadEventType,
+                        __bodyOnloadReflectedBeforeLoad,
+                        __windowLoadListenerCalls
+                    ]"#,
+                )
+                .unwrap(),
+            serde_json::json!([1, true, "load", true, 1]),
+        );
+
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate(
+                    r#"(function() {
+                        const fromBody = function fromBody() {};
+                        document.body.onload = fromBody;
+                        const bodySetsWindow = window.onload === fromBody;
+                        const fromWindow = function fromWindow() {};
+                        window.onload = fromWindow;
+                        const windowSetsBody = document.body.onload === fromWindow;
+                        document.body.setAttribute('onload', 'globalThis.__bodyOnloadFromAttribute = true');
+                        const attributeReplacesWindow = document.body.onload !== fromWindow
+                            && document.body.onload === window.onload;
+                        const reflected = window.onload;
+                        const detachedBody = document.createElement('body');
+                        detachedBody.onload = function detachedBodyOnload() {};
+                        const detachedBodyStaysLocal = window.onload === reflected
+                            && detachedBody.onload !== window.onload;
+                        return bodySetsWindow && windowSetsBody && attributeReplacesWindow
+                            && detachedBodyStaysLocal;
+                    })()"#,
+                )
+                .unwrap(),
+            serde_json::json!(true),
         );
     }
 

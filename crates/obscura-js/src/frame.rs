@@ -135,9 +135,10 @@ impl FrameRealm {
                  { bubbles: false, cancelable: false })); } catch (_) {}\
              globalThis.__documentReadyState__ = 'complete';\
              try { document.dispatchEvent(new Event('readystatechange')); } catch (_) {}\
-             if (typeof window.onload === 'function') { try { window.onload(); } catch (_) {} }\
-             try { window.dispatchEvent(new Event('load', \
-                 { bubbles: false, cancelable: false })); } catch (_) {}",
+             try { const loadEvent = new Event('load', \
+                 { bubbles: false, cancelable: false }); \
+                 if (typeof window.onload === 'function') { try { window.onload.call(window, loadEvent); } catch (_) {} } \
+                 try { window.dispatchEvent(loadEvent); } catch (_) {} } catch (_) {}",
         )
     }
 
@@ -674,6 +675,43 @@ mod tests {
                 .unwrap(),
             serde_json::json!(["object", "object", 0]),
             "the retained frame realm did not discard its scheduler listener",
+        );
+    }
+
+    #[test]
+    fn frame_body_onload_content_attribute_reflects_to_window() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let frame = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://child.example/",
+            r#"<html><body onload="
+                globalThis.__frameBodyOnload = [this === window, event.type];
+                throw new Error('frame body onload failure');
+            "><script>
+                globalThis.__frameBodyOnload = null;
+                globalThis.__frameLoadListenerCalls = 0;
+                window.addEventListener('load', () => __frameLoadListenerCalls++);
+            </script></body></html>"#,
+        )
+        .expect("frame realm");
+
+        assert!(frame
+            .run_document_scripts(&mut parent, |_| None)
+            .is_empty());
+        frame
+            .dispatch_load_events(&mut parent)
+            .expect("frame load events");
+
+        assert_eq!(
+            frame
+                .evaluate(
+                    &mut parent,
+                    "[globalThis.__frameBodyOnload, globalThis.__frameLoadListenerCalls]",
+                )
+                .unwrap(),
+            serde_json::json!([[true, "load"], 1]),
         );
     }
 
