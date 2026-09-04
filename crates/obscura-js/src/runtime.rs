@@ -3666,6 +3666,33 @@ mod tests {
         rt
     }
 
+    // SEC-503 / #820 — createObjectURL must reject non-Blob input (an object
+    // that merely has a .text() method, e.g. Response) with a TypeError, as
+    // Chrome does; a real Blob is still accepted.
+    #[test]
+    fn create_object_url_rejects_non_blob_input() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+
+        // A real Blob is accepted and yields a blob: URL.
+        let ok = rt
+            .evaluate("URL.createObjectURL(new Blob(['hello'])).startsWith('blob:')")
+            .unwrap();
+        assert_eq!(ok, serde_json::json!(true), "a real Blob must be accepted");
+
+        // A non-Blob object with only .text() must be rejected.
+        let rejected = rt
+            .evaluate(
+                "(function(){ try { URL.createObjectURL({ text: () => Promise.resolve('x') }); return false; }\
+                   catch (e) { return !!(e && e.name === 'TypeError'); } })()",
+            )
+            .unwrap();
+        assert_eq!(
+            rejected,
+            serde_json::json!(true),
+            "createObjectURL must throw TypeError for non-Blob input"
+        );
+    }
+
     // SEC-301 / SEC-302 / #792 — the profile setters must embed values safely.
     // set_platform must not allow a backslash-before-quote to break out of the
     // JS string literal (injection), and set_user_agent must not silently fail

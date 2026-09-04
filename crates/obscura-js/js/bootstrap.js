@@ -13457,10 +13457,12 @@ URL.createObjectURL = function(blob) {
   if (arguments.length === 0) {
     throw new TypeError("Failed to execute 'createObjectURL' on 'URL': 1 argument required, but only 0 present.");
   }
+  // Only a real Blob/File (or obscura's Blob, which carries _bytes) is valid —
+  // Chrome throws for anything else. Duck-typing on `.text()` used to accept
+  // Response and other unrelated objects.
   const isBlob = blob != null && typeof blob === 'object' &&
     (blob._bytes !== undefined ||
-     (typeof Blob === 'function' && blob instanceof Blob) ||
-     typeof blob.text === 'function');
+     (typeof Blob === 'function' && blob instanceof Blob));
   if (!isBlob) {
     throw new TypeError("Failed to execute 'createObjectURL' on 'URL': parameter 1 is not of type 'Blob'.");
   }
@@ -13470,7 +13472,10 @@ URL.createObjectURL = function(blob) {
     const uuid = (globalThis.crypto && typeof crypto.randomUUID === 'function')
       ? crypto.randomUUID()
       : 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
-          const r = (Math.random() * 16) | 0;
+          // CSPRNG, not Math.random() — blob IDs must not be predictable.
+          const b = new Uint8Array(1);
+          crypto.getRandomValues(b);
+          const r = b[0] & 0x0f;
           return (c === 'x' ? r : (r & 0x3) | 0x8).toString(16);
         });
     const id = 'blob:' + origin + '/' + uuid;
