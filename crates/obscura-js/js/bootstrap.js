@@ -9929,6 +9929,31 @@ globalThis.PromiseRejectionEvent = class PromiseRejectionEvent extends Event {
 };
 _markNative(globalThis.PromiseRejectionEvent);
 
+Deno.core.setUnhandledPromiseRejectionHandler((promise, reason) => {
+  const event = new PromiseRejectionEvent("unhandledrejection", {
+    promise,
+    reason,
+    cancelable: true,
+  });
+  globalThis.dispatchEvent(event);
+  if (typeof globalThis.onunhandledrejection === "function") {
+    try { globalThis.onunhandledrejection.call(globalThis, event); }
+    catch (error) { console.error(error); }
+  }
+  // Browsers report an unhandled rejection without terminating the page's
+  // event loop. Returning true tells deno_core that the host delivered it.
+  return true;
+});
+
+Deno.core.setHandledPromiseRejectionHandler((promise, reason) => {
+  const event = new PromiseRejectionEvent("rejectionhandled", { promise, reason });
+  globalThis.dispatchEvent(event);
+  if (typeof globalThis.onrejectionhandled === "function") {
+    try { globalThis.onrejectionhandled.call(globalThis, event); }
+    catch (error) { console.error(error); }
+  }
+});
+
 globalThis.StorageEvent = class StorageEvent extends Event {
   constructor(type, init = {}) {
     super(type, init);

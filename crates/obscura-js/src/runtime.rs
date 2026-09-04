@@ -2414,7 +2414,11 @@ impl ObscuraJsRuntime {
             Err(payload) => {
                 let message = panic_payload_message(payload.as_ref());
                 let outcome = if message.contains("Module already evaluated") {
-                    Ok(())
+                    self
+                        .runtime
+                        .get_module_namespace(module_id)
+                        .map(|_| ())
+                        .map_err(|error| format!("{} eval error: {}", what, error))
                 } else {
                     Err(format!("{} evaluation panicked: {}", what, message))
                 };
@@ -2438,7 +2442,11 @@ impl ObscuraJsRuntime {
         .await;
 
         let outcome = match outcome {
-            Ok(Ok(())) => Ok(()),
+            Ok(Ok(())) => self
+                .runtime
+                .get_module_namespace(module_id)
+                .map(|_| ())
+                .map_err(|error| format!("{} eval error: {}", what, error)),
             Ok(Err(e)) => Err(format!("{} eval error: {}", what, e)),
             Err(_) => Err(format!(
                 "{} evaluation timed out after {}ms",
