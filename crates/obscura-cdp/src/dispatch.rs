@@ -44,6 +44,11 @@ pub struct CdpContext {
     /// script-initiated Network events must share this id; inventing a loader
     /// for each fetch breaks DevTools request grouping.
     pub current_loader_ids: HashMap<String, String>,
+    /// Pages whose initial navigation event sequence has been emitted. A page
+    /// is created already loaded (about:blank), but Chrome emits that load's
+    /// events when the client attaches; Page.enable emits them once per page
+    /// so clients waiting on the initial load (chromiumoxide, #833) unblock.
+    pub nav_events_emitted: std::collections::HashSet<String>,
     /// Child frame ids already reported to the client, per page, so each frame
     /// is announced once and a frame that goes away can be retracted.
     pub announced_frames: HashMap<String, Vec<String>>,
@@ -167,6 +172,7 @@ impl CdpContext {
             pages: Vec::new(),
             sessions: HashMap::new(),
             current_loader_ids: HashMap::new(),
+            nav_events_emitted: std::collections::HashSet::new(),
             announced_frames: HashMap::new(),
             pending_events: Vec::new(),
             #[cfg(feature = "render")]
