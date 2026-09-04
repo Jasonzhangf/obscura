@@ -7633,11 +7633,49 @@ if (typeof Response === 'undefined') {
       this.ok = this.status >= 200 && this.status < 300;
       this.headers = new Headers(init.headers);
       this.type = init.type || 'basic'; this.url = init.url || ''; this.redirected = !!init.redirected;
+      // #818: body/bodyUsed. A null-body response (null or no body passed)
+      // has body === null; every other body is a one-chunk stream, created
+      // lazily so merely touching .body does not copy the bytes.
+      this._bodyNull = body === null || body === undefined;
+      this._bodyStream = null;
+      this._bodyUsed = false;
     }
-    async text() { return _decodeBodyWithCharset(this._bodyBytes, this.headers); }
-    async json() { return JSON.parse(await this.text()); }
-    async arrayBuffer() { return _arrayBufferFromBytes(this._bodyBytes); }
-    async blob() { return new Blob([this._bodyBytes]); }
+    _consumeBody() {
+      if (this._bodyUsed) throw new TypeError("Body is already consumed");
+      this._bodyUsed = true;
+    }
+    get body() {
+      if (this._bodyNull) return null;
+      if (this._bodyUsed) throw new TypeError("Body is already consumed");
+      if (!this._bodyStream) {
+        this._bodyStream = new ReadableStream({
+          start: (controller) => {
+            if (this._bodyBytes.length) controller.enqueue(this._bodyBytes);
+            controller.close();
+          },
+        });
+        // bodyUsed flips the moment the stream is locked for reading
+        // (spec: the body becomes "disturbed"), which no state probe can
+        // observe on a native ReadableStream, so hook getReader instead.
+        const response = this;
+        const stream = this._bodyStream;
+        const getReader = stream.getReader.bind(stream);
+        stream.getReader = function () {
+          response._bodyUsed = true;
+          return getReader();
+        };
+        stream.releaseLock = function () {
+          response._bodyUsed = true;
+          stream.locked = false;
+        };
+      }
+      return this._bodyStream;
+    }
+    get bodyUsed() { return this._bodyUsed; }
+    async text() { this._consumeBody(); return _decodeBodyWithCharset(this._bodyBytes, this.headers); }
+    async json() { this._consumeBody(); return JSON.parse(await _decodeBodyWithCharset(this._bodyBytes, this.headers)); }
+    async arrayBuffer() { this._consumeBody(); return _arrayBufferFromBytes(this._bodyBytes); }
+    async blob() { this._consumeBody(); return new Blob([this._bodyBytes]); }
     clone() { return new Response(this._bodyBytes, { status: this.status, statusText: this.statusText, headers: this.headers, type: this.type, url: this.url, redirected: this.redirected }); }
     static error() { return new Response(null, { status: 0 }); }
     static redirect(url, status) { return new Response(null, { status: status || 302, headers: { Location: url } }); }

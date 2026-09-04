@@ -14286,6 +14286,46 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn response_body_exposes_stream_and_consumption_state() {
+        // #818: a non-null Response body must expose a ReadableStream through
+        // .body, a boolean .bodyUsed, and a working getReader(); consuming
+        // the body marks it used and a second consumption throws.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(async () => {
+                    const r = new Response("hello");
+                    const meta = {
+                        bodyType: r.body === null ? "null" : typeof r.body,
+                        bodyUsed: r.bodyUsed,
+                        hasReader: !!(r.body && r.body.getReader),
+                    };
+                    const reader = r.body.getReader();
+                    const first = await reader.read();
+                    const second = await reader.read();
+                    const chunkText = first.value ? new TextDecoder().decode(first.value) : "";
+                    const consumed = r.bodyUsed;
+                    let doubleThrew = false;
+                    try { await r.text(); } catch (e) { doubleThrew = true; }
+                    return { meta, chunkText, done: second.done, consumed, doubleThrew, nullBody: new Response(null).body === null };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .expect("evaluation must succeed");
+        let out = result.value.unwrap();
+        assert_eq!(out["meta"]["bodyType"], "object");
+        assert_eq!(out["meta"]["bodyUsed"], false);
+        assert_eq!(out["meta"]["hasReader"], true);
+        assert_eq!(out["chunkText"], "hello");
+        assert_eq!(out["done"], true);
+        assert_eq!(out["consumed"], true);
+        assert_eq!(out["doubleThrew"], true);
+        assert_eq!(out["nullBody"], true);
+    }
+
     #[test]
     fn test_navigator() {
         let mut rt = setup_runtime("<html><body></body></html>");
