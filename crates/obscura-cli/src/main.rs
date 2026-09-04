@@ -1110,9 +1110,14 @@ async fn fetch_original_response(
     if stealth && url.scheme() != "file" {
         #[cfg(feature = "stealth")]
         {
+            // `false` matches the reqwest path below (`with_options`); the
+            // CLI mirrors --allow-private-network into
+            // OBSCURA_ALLOW_PRIVATE_NETWORK at startup, which this client
+            // honours.
             let client = obscura_net::StealthHttpClient::with_proxy(
                 Arc::new(obscura_net::CookieJar::new()),
                 proxy.as_deref(),
+                false,
             );
             return match timeout(Duration::from_secs(timeout_secs), client.fetch(&url)).await {
                 Ok(Ok(resp)) => Ok(resp),

@@ -1098,6 +1098,7 @@ impl Page {
             Some(Arc::new(StealthHttpClient::with_proxy(
                 context.cookie_jar.clone(),
                 context.proxy_url.as_deref(),
+                context.allow_private_network,
             )))
         } else {
             None
