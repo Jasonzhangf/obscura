@@ -7315,8 +7315,21 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
 
       xhr._setReadyState(2); // HEADERS_RECEIVED
 
-      const text = await resp.text();
+      // Read the body as bytes, ALWAYS. Going through resp.text() and then
+      // TextEncoder().encode() for the binary responseTypes is not a
+      // round-trip: the decode is lossy for anything that is not valid UTF-8,
+      // so bytes >= 0x80 come back re-encoded as the UTF-8 of whatever code
+      // point they decoded to, and the length changes with the content.
+      // Emscripten loaders fetch .wasm and data files this way, so they saw
+      // corrupted assets while fetch() was byte-correct.
+      const buffer = await resp.arrayBuffer();
       if (xhr._aborted) return;
+
+      const wantsText = xhr.responseType === '' || xhr.responseType === 'text'
+                     || xhr.responseType === 'json' || xhr.responseType === 'document';
+      // Decoding a multi-megabyte binary body into a string nobody reads is
+      // pure waste, and responseText is not defined for the binary types.
+      const text = wantsText ? new TextDecoder().decode(buffer) : '';
 
       xhr.responseText = text;
       xhr._setReadyState(3); // LOADING
@@ -7330,10 +7343,10 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
           xhr.response = text;
           break;
         case 'arraybuffer':
-          xhr.response = new TextEncoder().encode(text).buffer;
+          xhr.response = buffer;
           break;
         case 'blob':
-          xhr.response = new Blob([text]);
+          xhr.response = new Blob([buffer]);
           break;
         case 'document':
           xhr.response = text; // simplified
