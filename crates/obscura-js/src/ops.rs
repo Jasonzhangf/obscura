@@ -542,6 +542,22 @@ async fn read_body_capped(
     Ok(buf)
 }
 
+/// Cap on the append-only `fetched_urls` asset list. A page can otherwise loop
+/// `fetch()`/XHR and grow it without bound on the process heap (where V8's
+/// heap-limit guard never sees it). It only feeds the CLI's `--dump assets`
+/// listing, so keeping a bounded most-recent window is enough.
+const MAX_FETCHED_URLS: usize = 16384;
+
+/// Push `item` onto `list`, evicting the oldest entries so it never holds more
+/// than `max`. Mirrors the front-drain used for `js_network_events`.
+fn push_capped(list: &mut Vec<String>, item: String, max: usize) {
+    list.push(item);
+    if list.len() > max {
+        let overflow = list.len() - max;
+        list.drain(0..overflow);
+    }
+}
+
 pub type SharedState = Rc<RefCell<ObscuraState>>;
 
 /// Which document belongs to which realm.
@@ -2322,7 +2338,7 @@ async fn op_fetch_url(
         // Record the resource the page pulled in via fetch()/XHR so `--dump
         // assets` can list it (issue #301). URL is already absolute here, since
         // reqwest needs an absolute URL to send the request.
-        gs.fetched_urls.push(url.clone());
+        push_capped(&mut gs.fetched_urls, url.clone(), MAX_FETCHED_URLS);
         let jar = gs.cookie_jar.clone();
         let in_flight = gs.http_client.as_ref().map(|c| c.in_flight.clone());
         // #139: thread the configured proxy through to the per-request
@@ -3075,7 +3091,22 @@ mod tests {
     use obscura_dom::ShadowRootMode;
 
     use super::read_body_capped;
-    use super::{pbkdf2_derive, PBKDF2_MAX_ITERATIONS, PBKDF2_MAX_OUTPUT_BYTES};
+    use super::{pbkdf2_derive, push_capped, PBKDF2_MAX_ITERATIONS, PBKDF2_MAX_OUTPUT_BYTES};
+
+    // SEC-002 / #705 — fetched_urls (and the like) must not grow without bound.
+    #[test]
+    fn push_capped_bounds_the_list_and_keeps_the_newest() {
+        let mut list = Vec::new();
+        for i in 0..10 {
+            push_capped(&mut list, format!("u{i}"), 4);
+        }
+        assert_eq!(list.len(), 4, "the list must be capped at max");
+        assert_eq!(
+            list,
+            vec!["u6", "u7", "u8", "u9"],
+            "the newest entries must be kept, oldest evicted",
+        );
+    }
 
     // SEC-006 / #580 — PBKDF2 parameters arrive straight from page JS. Without
     // caps, a huge iteration count pins the single-threaded runtime and a huge
