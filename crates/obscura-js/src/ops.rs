@@ -2621,6 +2621,8 @@ async fn op_fetch_url(
     let mut current_method = req_method;
     let mut current_body = body;
     let mut redirects_followed: usize = 0;
+    let mut redirected_from = Vec::new();
+    let mut crossed_origin = is_cross_origin;
     let response = loop {
         let mut req = client
             .request(current_method.clone(), &current_url)
@@ -2629,6 +2631,7 @@ async fn op_fetch_url(
         let current_is_cross_origin = request_origin(&current_url)
             .map(|request_origin| request_origin != page_origin)
             .unwrap_or(false);
+        crossed_origin |= current_is_cross_origin;
         if current_is_cross_origin {
             req = req.header("Origin", &page_origin);
         }
@@ -2750,9 +2753,11 @@ async fn op_fetch_url(
             current_body.clear();
         }
 
+        redirected_from.push(base);
         current_url = next_url.to_string();
     };
 
+    let redirected = redirects_followed > 0;
     let status = response.status().as_u16();
 
     let resp_headers: std::collections::HashMap<String, String> = response
@@ -2799,10 +2804,16 @@ async fn op_fetch_url(
     let resp_body_base64 = BASE64.encode(&resp_bytes);
     if let Some(ref cbs) = callbacks {
         if cbs.has_response_callbacks().await {
-            let resp = fetch_response(&url, status, resp_headers.clone(), resp_bytes.to_vec());
+            let resp = fetch_response(
+                current_url.as_str(),
+                status,
+                resp_headers.clone(),
+                resp_bytes.to_vec(),
+                redirected_from,
+            );
             let info = RequestInfo {
                 url: resp.url.clone(),
-                method: method.clone(),
+                method: current_method.as_str().to_string(),
                 headers: resp_headers.clone(),
                 resource_type: ResourceType::Fetch,
             };
@@ -2842,8 +2853,8 @@ async fn op_fetch_url(
             .as_secs_f64();
         gs.js_network_events.push(JsNetworkEvent {
             request_id: request_id.clone(),
-            url: url.clone(),
-            method: method.clone(),
+            url: current_url.clone(),
+            method: current_method.as_str().to_string(),
             status,
             response_headers: resp_headers.clone(),
             body_size: resp_bytes.len(),
@@ -2869,7 +2880,9 @@ async fn op_fetch_url(
         "body": resp_body,
         "bodyBase64": resp_body_base64,
         "requestId": response_request_id,
-        "url": url,
+        "url": current_url,
+        "redirected": redirected,
+        "opaque": mode == "no-cors" && crossed_origin,
         "headers": resp_headers,
     })
     .to_string())
@@ -2883,13 +2896,14 @@ fn fetch_response(
     status: u16,
     headers: HashMap<String, String>,
     body: Vec<u8>,
+    redirected_from: Vec<url::Url>,
 ) -> Response {
     Response {
         url: url::Url::parse(url).unwrap_or_else(|_| url::Url::parse("http://0.0.0.0/").unwrap()),
         status,
         headers,
         body,
-        redirected_from: Vec::new(),
+        redirected_from,
     }
 }
 
@@ -2916,6 +2930,10 @@ async fn stealth_fetch_all(
     let mut current_method = method;
     let mut current_body = body;
     let mut redirects_followed: usize = 0;
+    let mut redirected_from = Vec::new();
+    let mut crossed_origin = request_origin(&current_url)
+        .map(|request_origin| request_origin != page_origin)
+        .unwrap_or(false);
 
     let (status, resp_headers, resp_bytes): (u16, HashMap<String, String>, Vec<u8>) = loop {
         let parsed_current = match url::Url::parse(&current_url) {
@@ -2930,6 +2948,7 @@ async fn stealth_fetch_all(
 
         let mut req_headers: HashMap<String, String> = HashMap::new();
         let current_is_cross_origin = parsed_current.origin().ascii_serialization() != page_origin;
+        crossed_origin |= current_is_cross_origin;
         if current_is_cross_origin {
             req_headers.insert("origin".to_string(), page_origin.clone());
         }
@@ -2984,6 +3003,7 @@ async fn stealth_fetch_all(
             current_method = "GET".to_string();
             current_body.clear();
         }
+        redirected_from.push(parsed_current);
         current_url = next_url.to_string();
     };
 
@@ -3023,7 +3043,13 @@ async fn stealth_fetch_all(
     let resp_body_base64 = BASE64.encode(&resp_bytes);
     if let Some(ref cbs) = callbacks {
         if cbs.has_response_callbacks().await {
-            let resp = fetch_response(&url, status, resp_headers.clone(), resp_bytes.clone());
+            let resp = fetch_response(
+                current_url.as_str(),
+                status,
+                resp_headers.clone(),
+                resp_bytes.clone(),
+                redirected_from,
+            );
             let info = RequestInfo {
                 url: resp.url.clone(),
                 method: current_method.clone(),
@@ -3038,7 +3064,9 @@ async fn stealth_fetch_all(
         "status": status,
         "body": resp_body,
         "bodyBase64": resp_body_base64,
-        "url": url,
+        "url": current_url,
+        "redirected": redirects_followed > 0,
+        "opaque": mode == "no-cors" && crossed_origin,
         "headers": resp_headers,
     })
     .to_string())

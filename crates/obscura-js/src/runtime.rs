@@ -15939,7 +15939,10 @@ mod tests {
             }
         });
 
-        let origin = format!("http://{address}");
+        redirect_runtime_for_origin(&format!("http://{address}"))
+    }
+
+    fn redirect_runtime_for_origin(origin: &str) -> ObscuraJsRuntime {
         let mut rt = ObscuraJsRuntime::new();
         rt.set_dom(parse_html("<html><body></body></html>"));
         rt.set_url(&format!("{origin}/page"));
@@ -15952,6 +15955,74 @@ mod tests {
         ));
         rt.run_page_init();
         rt
+    }
+
+    fn redirect_method_runtime(
+        status: u16,
+    ) -> (
+        ObscuraJsRuntime,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let requests_capture = requests.clone();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buffer = [0u8; 2048];
+                let read = stream.read(&mut buffer).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..read]);
+                requests_capture
+                    .lock()
+                    .unwrap()
+                    .push(request.lines().next().unwrap_or_default().to_string());
+                let response = if request.contains(" /start ") {
+                    format!(
+                        "HTTP/1.1 {status} Redirect\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                } else {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_string()
+                };
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        (
+            redirect_runtime_for_origin(&format!("http://{address}")),
+            requests,
+        )
+    }
+
+    fn cross_origin_redirect_runtime() -> ObscuraJsRuntime {
+        let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let target_address = target.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let (mut stream, _) = target.accept().unwrap();
+            let mut buffer = [0u8; 1024];
+            let _ = stream.read(&mut buffer);
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+            );
+        });
+
+        let source = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let source_address = source.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let (mut stream, _) = source.accept().unwrap();
+            let mut buffer = [0u8; 1024];
+            let _ = stream.read(&mut buffer);
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://{target_address}/final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+
+        redirect_runtime_for_origin(&format!("http://{source_address}"))
     }
 
     /// HTTP-redirect fetch returns a network error as soon as the
@@ -15974,6 +16045,248 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.value.unwrap(), serde_json::json!("arrived"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_response_reports_the_final_redirect_url() {
+        let mut rt = redirect_chain_runtime(3);
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const response = await fetch("/hop/1");
+                    const direct = await fetch("/hop/0");
+                    return {
+                        url: response.url,
+                        redirected: response.redirected,
+                        cloneUrl: response.clone().url,
+                        directRedirected: direct.redirected,
+                    };
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let value = result.value.unwrap();
+        assert!(
+            value["url"].as_str().unwrap_or_default().ends_with("/hop/0"),
+            "Response.url did not report the final URL: {value}"
+        );
+        assert_eq!(value["redirected"], true);
+        assert_eq!(value["cloneUrl"], value["url"]);
+        assert_eq!(value["directRedirected"], false);
+
+        let events = rt.take_js_network_events();
+        assert_eq!(events.len(), 2);
+        assert!(
+            events[0].url.ends_with("/hop/0"),
+            "network response event did not report the final URL: {:?}",
+            events[0].url
+        );
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn stealth_fetch_response_reports_the_final_redirect_url() {
+        let mut rt = redirect_chain_runtime(2);
+        rt.set_stealth_client(std::sync::Arc::new(
+            obscura_net::StealthHttpClient::new(std::sync::Arc::new(
+                obscura_net::CookieJar::new(),
+            )),
+        ));
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const response = await fetch("/hop/1");
+                    return { url: response.url, redirected: response.redirected };
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let value = result.value.unwrap();
+        assert!(value["url"].as_str().unwrap_or_default().ends_with("/hop/0"));
+        assert_eq!(value["redirected"], true);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn xhr_response_url_reports_the_final_redirect_url() {
+        let mut rt = redirect_chain_runtime(2);
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => await new Promise((resolve, reject) => {
+                    const xhr = new XMLHttpRequest();
+                    xhr.open("GET", "/hop/1");
+                    xhr.onload = () => resolve(xhr.responseURL);
+                    xhr.onerror = reject;
+                    xhr.send();
+                })"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            result
+                .value
+                .unwrap()
+                .as_str()
+                .unwrap_or_default()
+                .ends_with("/hop/0")
+        );
+    }
+
+    async fn assert_post_redirect_method(status: u16, expected_method: &str) {
+        let (mut rt, wire_requests) = redirect_method_runtime(status);
+        let request_callbacks = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let response_callbacks = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let callbacks = std::sync::Arc::new(obscura_net::CallbackRegistry::new());
+        let request_capture = request_callbacks.clone();
+        callbacks.add_request(std::sync::Arc::new(move |request| {
+            request_capture
+                .lock()
+                .unwrap()
+                .push((request.method.clone(), request.url.path().to_string()));
+        }));
+        let response_capture = response_callbacks.clone();
+        callbacks.add_response(std::sync::Arc::new(move |request, response| {
+            response_capture.lock().unwrap().push((
+                request.method.clone(),
+                request.url.path().to_string(),
+                response.url.path().to_string(),
+                response.redirected_from.len(),
+            ));
+        }));
+        rt.set_callbacks(callbacks);
+
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const response = await fetch("/start", { method: "POST", body: "payload" });
+                    return { url: response.url, redirected: response.redirected };
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        let value = result.value.unwrap();
+        assert!(value["url"].as_str().unwrap_or_default().ends_with("/final"));
+        assert_eq!(value["redirected"], true);
+        assert_eq!(
+            *request_callbacks.lock().unwrap(),
+            vec![("POST".to_string(), "/start".to_string())]
+        );
+        assert_eq!(
+            *response_callbacks.lock().unwrap(),
+            vec![(
+                expected_method.to_string(),
+                "/final".to_string(),
+                "/final".to_string(),
+                1,
+            )]
+        );
+        let events = rt.take_js_network_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].method, expected_method);
+        assert!(events[0].url.ends_with("/final"));
+        let wire_requests = wire_requests.lock().unwrap();
+        assert!(wire_requests[0].starts_with("POST /start "));
+        assert!(wire_requests[1].starts_with(&format!("{expected_method} /final ")));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_302_response_uses_the_final_get_method() {
+        assert_post_redirect_method(302, "GET").await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_307_response_preserves_the_post_method() {
+        assert_post_redirect_method(307, "POST").await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn same_origin_no_cors_redirect_keeps_response_identity() {
+        let mut rt = redirect_chain_runtime(2);
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const response = await fetch("/hop/1", { mode: "no-cors" });
+                    return { type: response.type, url: response.url, redirected: response.redirected };
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        let value = result.value.unwrap();
+        assert_eq!(value["type"], "basic");
+        assert!(value["url"].as_str().unwrap_or_default().ends_with("/hop/0"));
+        assert_eq!(value["redirected"], true);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cross_origin_no_cors_redirect_filters_response_identity() {
+        let mut rt = cross_origin_redirect_runtime();
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const response = await fetch("/start", { mode: "no-cors" });
+                    return { type: response.type, url: response.url, redirected: response.redirected };
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({ "type": "opaque", "url": "", "redirected": false })
+        );
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn stealth_cross_origin_no_cors_filters_response_identity() {
+        let mut rt = cross_origin_redirect_runtime();
+        rt.set_stealth_client(std::sync::Arc::new(
+            obscura_net::StealthHttpClient::new(std::sync::Arc::new(
+                obscura_net::CookieJar::new(),
+            )),
+        ));
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const response = await fetch("/start", { mode: "no-cors" });
+                    return { type: response.type, url: response.url, redirected: response.redirected };
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({ "type": "opaque", "url": "", "redirected": false })
+        );
     }
 
     /// The other end of the same pair: the twenty-first redirect must

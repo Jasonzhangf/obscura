@@ -7158,6 +7158,7 @@ globalThis.fetch = async (input, init = {}) => {
   const body = _serializeBody(initBody, _h, !(inheritsRequestBody && init.headers !== undefined));
   const hdrs = JSON.stringify(_h);
   const fetchMode = init.mode || (request ? request.mode : "cors");
+  const fetchRedirect = init.redirect || (request ? request.redirect : "follow");
   const fetchCredentials = init.credentials !== undefined
     ? String(init.credentials)
     : (request ? request.credentials : "same-origin");
@@ -7176,15 +7177,16 @@ globalThis.fetch = async (input, init = {}) => {
   if (parsed.corsBlocked) {
     throw new TypeError('Failed to fetch: ' + (parsed.corsError || 'CORS error'));
   }
-  const respType = parsed.status === 0 ? "opaque" : (fetchMode === "no-cors" ? "opaque" : "basic");
+  const respType = parsed.status === 0 || parsed.opaque ? "opaque" : "basic";
+  const exposeRedirectMetadata = respType !== "opaque" && fetchRedirect === "follow";
   const responseBody = parsed.bodyBase64 ? _base64ToUint8Array(parsed.bodyBase64) : (parsed.body || "");
   const response = new Response(responseBody, {
     status: parsed.status,
     statusText: "",
     headers: parsed.headers || {},
     type: respType,
-    url: parsed.url || url,
-    redirected: false,
+    url: exposeRedirectMetadata ? (parsed.url || url) : (respType === "opaque" ? "" : url),
+    redirected: exposeRedirectMetadata && !!parsed.redirected,
   });
   if (parsed.requestId) {
     Object.defineProperty(response, "__obscuraRequestId", {
