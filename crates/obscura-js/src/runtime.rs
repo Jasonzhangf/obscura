@@ -1,6 +1,10 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::future::Future;
+use std::marker::PhantomData;
+use std::pin::Pin;
 use std::rc::Rc;
+use std::task::{Context, Poll};
 
 use deno_core::{JsRuntime, RuntimeOptions};
 use obscura_dom::{DomTree, NodeId};
@@ -145,7 +149,6 @@ pub struct CdpObjectState {
 }
 
 pub struct ObscuraJsRuntime {
-    runtime: JsRuntime,
     state: Rc<RefCell<ObscuraState>>,
     object_store: HashMap<String, String>,
     evaluation_recipes: HashMap<String, String>,
@@ -180,6 +183,10 @@ pub struct ObscuraJsRuntime {
     /// their shims can call ops; nothing else can reach it, including page
     /// script.
     ops_handoff: Option<deno_core::v8::Global<deno_core::v8::Value>>,
+    // Keep the runtime last: custom `Drop` enters its isolate, then every
+    // V8-backed field above is released before `OwnedIsolate` performs the
+    // matching exit and disposes the isolate.
+    js_runtime: JsRuntime,
 }
 
 /// Renders a caught V8 exception as a message for realm evaluation errors.
@@ -298,7 +305,152 @@ impl WatchdogToken {
 const SYNCHRONOUS_TASK_FLOOR_MS: u64 = 5_000;
 const WATCHDOG_SCHEDULING_MARGIN_MS: u64 = 500;
 
+/// A [`JsRuntime`] whose isolate is entered for the duration of one operation.
+///
+/// V8 requires the isolate that owns a context to be the thread's *current*
+/// one whenever that context is entered or left, and rusty_v8's scopes do not
+/// arrange that themselves -- they only ever pass the isolate explicitly. What
+/// made it work by accident was rusty_v8 entering an isolate when it is
+/// constructed and leaving it entered for life: with a single page, that page's
+/// isolate is trivially the current one.
+///
+/// With two pages it is not. The isolates form a stack, only the newest is
+/// current, and the consequences were both immediate and fatal:
+///
+/// - running any script on the *older* page aborted the process
+///   (`Check failed: heap->isolate() == Isolate::TryGetCurrent()`), so a second
+///   page effectively disabled the first;
+/// - dropping either page aborted too, because rusty_v8 requires isolates to
+///   be dropped in reverse construction order -- a contract an embedder holding
+///   independent `Page` objects cannot keep (#756).
+///
+/// So the isolate is exited once construction finishes and entered again only
+/// around work that touches V8. Entries are then properly nested no matter how
+/// many pages exist or what order they are used and dropped in.
+struct EnteredRuntime<'a>(&'a mut JsRuntime);
+
+/// Enters an isolate only while an async deno_core operation is being polled.
+/// Holding an entry across `.await` would let interleaved page futures violate
+/// V8's per-thread isolate stack.
+struct EnteredRuntimeFuture<F> {
+    isolate: *mut deno_core::v8::Isolate,
+    future: Option<Pin<Box<F>>>,
+    _not_send: PhantomData<Rc<()>>,
+}
+
+struct IsolateEntry(*mut deno_core::v8::Isolate);
+
+impl IsolateEntry {
+    unsafe fn new(isolate: *mut deno_core::v8::Isolate) -> Self {
+        unsafe { (&mut *isolate).enter() };
+        Self(isolate)
+    }
+}
+
+impl Drop for IsolateEntry {
+    fn drop(&mut self) {
+        unsafe { (&mut *self.0).exit() };
+    }
+}
+
+impl<F: Future> Future for EnteredRuntimeFuture<F> {
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // SAFETY: construction ties the pointer and future to the same
+        // borrowed JsRuntime, which cannot move or drop while this exists.
+        let this = unsafe { self.get_unchecked_mut() };
+        let _entry = unsafe { IsolateEntry::new(this.isolate) };
+        this.future
+            .as_mut()
+            .expect("entered runtime future polled after drop")
+            .as_mut()
+            .poll(cx)
+    }
+}
+
+impl<F> Drop for EnteredRuntimeFuture<F> {
+    fn drop(&mut self) {
+        // deno_core futures can own V8 handles, so drop them while their
+        // isolate is current too.
+        let _entry = unsafe { IsolateEntry::new(self.isolate) };
+        drop(self.future.take());
+    }
+}
+
+fn entered_runtime_future<'a, F>(
+    runtime: &'a mut JsRuntime,
+    make_future: impl FnOnce(&'a mut JsRuntime) -> F,
+) -> EnteredRuntimeFuture<F>
+where
+    F: Future,
+{
+    let isolate: *mut deno_core::v8::Isolate = &mut **runtime.v8_isolate();
+    let entry = unsafe { IsolateEntry::new(isolate) };
+    let future = Box::pin(make_future(runtime));
+    drop(entry);
+    EnteredRuntimeFuture {
+        isolate,
+        future: Some(future),
+        _not_send: PhantomData,
+    }
+}
+
+impl std::ops::Deref for EnteredRuntime<'_> {
+    type Target = JsRuntime;
+
+    fn deref(&self) -> &JsRuntime {
+        self.0
+    }
+}
+
+impl std::ops::DerefMut for EnteredRuntime<'_> {
+    fn deref_mut(&mut self) -> &mut JsRuntime {
+        self.0
+    }
+}
+
+impl Drop for EnteredRuntime<'_> {
+    fn drop(&mut self) {
+        // SAFETY: this isolate was entered by the matching `runtime()` call
+        // and, entries being a per-thread stack, is the current one: any
+        // isolate entered since belongs to a nested operation that has already
+        // exited it.
+        unsafe {
+            self.0.v8_isolate().exit();
+        }
+    }
+}
+
+impl Drop for ObscuraJsRuntime {
+    fn drop(&mut self) {
+        // Teardown needs the isolate current as much as any other V8 work:
+        // deno_core's context cleanup clears the context's embedder slots, and
+        // rusty_v8's `OwnedIsolate::drop` asserts it before disposing. Both run
+        // when `js_runtime` is dropped, immediately after this returns, and
+        // that `OwnedIsolate::drop` performs the matching exit.
+        //
+        // SAFETY: `enter` only pushes this isolate onto the current thread's
+        // entry stack; the pop is guaranteed by the drop that follows.
+        unsafe {
+            self.js_runtime.v8_isolate().enter();
+        }
+    }
+}
+
 impl ObscuraJsRuntime {
+    /// The V8 runtime, with its isolate entered for as long as the returned
+    /// guard lives. Every path that touches V8 goes through here; see
+    /// [`EnteredRuntime`] for why.
+    fn runtime(&mut self) -> EnteredRuntime<'_> {
+        // SAFETY: entering is always sound -- it pushes this isolate onto the
+        // current thread's entry stack -- and the guard's `Drop` pops it.
+        unsafe {
+            self.js_runtime.v8_isolate().enter();
+        }
+        EnteredRuntime(&mut self.js_runtime)
+    }
+
     /// Freeze the document timeline for one JavaScript task. Browser timelines
     /// update at task/rendering boundaries, not on each forced style or layout
     /// read. Keeping one sample across the task also lets repeated CSSOM reads
@@ -388,7 +540,6 @@ impl ObscuraJsRuntime {
         };
 
         let mut instance = ObscuraJsRuntime {
-            runtime,
             state,
             object_store: HashMap::new(),
             evaluation_recipes: HashMap::new(),
@@ -401,10 +552,22 @@ impl ObscuraJsRuntime {
             loaded_module_specifiers,
             evaluated_module_specifiers: HashMap::new(),
             ops_handoff: None,
+            js_runtime: runtime,
         };
         // Take the op table before any page script can run, and drop the global
         // that exposed it in the same step.
         instance.ops_handoff = instance.take_ops_handoff();
+
+        // `JsRuntime::new` entered this isolate and rusty_v8 would leave it
+        // entered for life. Leave the thread's entry stack empty instead; every
+        // operation enters for its own duration. See `EnteredRuntime`.
+        //
+        // SAFETY: this isolate is the current one -- it was entered above and
+        // nothing on this thread has entered another since.
+        unsafe {
+            instance.js_runtime.v8_isolate().exit();
+        }
+
         instance
     }
 
@@ -423,7 +586,8 @@ impl ObscuraJsRuntime {
         &mut self,
     ) -> Option<deno_core::v8::Global<deno_core::v8::Context>> {
         let context = {
-            let isolate = self.runtime.v8_isolate();
+            let mut entered = self.runtime();
+            let isolate = entered.v8_isolate();
             let scope = &mut deno_core::v8::HandleScope::new(isolate);
             let context = deno_core::v8::Context::from_snapshot(
                 scope,
@@ -451,8 +615,9 @@ impl ObscuraJsRuntime {
     fn take_ops_handoff(&mut self) -> Option<deno_core::v8::Global<deno_core::v8::Value>> {
         use deno_core::v8;
 
-        let main = self.runtime.main_context();
-        let isolate = self.runtime.v8_isolate();
+        let main = self.runtime().main_context();
+        let mut entered = self.runtime();
+        let isolate = entered.v8_isolate();
         let scope = &mut v8::HandleScope::new(isolate);
         let context = v8::Local::new(scope, main);
         let scope = &mut v8::ContextScope::new(scope, context);
@@ -487,7 +652,8 @@ impl ObscuraJsRuntime {
         let Some(ops) = self.ops_handoff.clone() else {
             return false;
         };
-        let isolate = self.runtime.v8_isolate();
+        let mut entered = self.runtime();
+        let isolate = entered.v8_isolate();
         let scope = &mut v8::HandleScope::new(isolate);
         let context = v8::Local::new(scope, realm);
         let scope = &mut v8::ContextScope::new(scope, context);
@@ -547,7 +713,8 @@ impl ObscuraJsRuntime {
     ) -> Result<String, String> {
         use deno_core::v8;
 
-        let isolate = self.runtime.v8_isolate();
+        let mut entered = self.runtime();
+        let isolate = entered.v8_isolate();
         let scope = &mut v8::HandleScope::new(isolate);
         let context = v8::Local::new(scope, realm);
         let scope = &mut v8::ContextScope::new(scope, context);
@@ -587,8 +754,9 @@ impl ObscuraJsRuntime {
             "__obscura_geo_lon",
         ];
 
-        let main = self.runtime.main_context();
-        let isolate = self.runtime.v8_isolate();
+        let main = self.runtime().main_context();
+        let mut entered = self.runtime();
+        let isolate = entered.v8_isolate();
         let scope = &mut v8::HandleScope::new(isolate);
 
         let main_context = v8::Local::new(scope, main);
@@ -663,8 +831,9 @@ impl ObscuraJsRuntime {
     ) {
         use deno_core::v8;
 
-        let main = self.runtime.main_context();
-        let isolate = self.runtime.v8_isolate();
+        let main = self.runtime().main_context();
+        let mut entered = self.runtime();
+        let isolate = entered.v8_isolate();
         let scope = &mut v8::HandleScope::new(isolate);
         let main = v8::Local::new(scope, main);
         let realm = v8::Local::new(scope, realm);
@@ -688,8 +857,9 @@ impl ObscuraJsRuntime {
     ) -> bool {
         use deno_core::v8;
 
-        let main = self.runtime.main_context();
-        let isolate = self.runtime.v8_isolate();
+        let main = self.runtime().main_context();
+        let mut entered = self.runtime();
+        let isolate = entered.v8_isolate();
         let scope = &mut v8::HandleScope::new(isolate);
 
         // Read the frame's globals first, then install them in the page realm.
@@ -744,7 +914,8 @@ impl ObscuraJsRuntime {
 
     /// The table ops consult to find the calling realm's document.
     pub(crate) fn realm_states(&self) -> Rc<RefCell<crate::ops::RealmStates>> {
-        self.runtime
+        // `op_state` is a plain Rust-side table; no V8 access, no guard.
+        self.js_runtime
             .op_state()
             .borrow()
             .borrow::<Rc<RefCell<crate::ops::RealmStates>>>()
@@ -779,18 +950,16 @@ impl ObscuraJsRuntime {
             return false;
         }
 
-        self.runtime.v8_isolate().cancel_terminate_execution();
+        self.runtime().v8_isolate().cancel_terminate_execution();
         let restore_limit = self
             .heap_limit_state
             .restore_limit
             .swap(0, std::sync::atomic::Ordering::SeqCst);
-        self.runtime
+        self.runtime()
             .remove_near_heap_limit_callback(restore_limit);
-        install_heap_limit_guard(
-            &mut self.runtime,
-            self.isolate_handle.clone(),
-            self.heap_limit_state.clone(),
-        );
+        let isolate_handle = self.isolate_handle.clone();
+        let heap_limit_state = self.heap_limit_state.clone();
+        install_heap_limit_guard(&mut *self.runtime(), isolate_handle, heap_limit_state);
         tracing::warn!("V8 heap limit reached: terminated the current JavaScript task");
         true
     }
@@ -809,7 +978,7 @@ impl ObscuraJsRuntime {
         source: String,
     ) -> Result<deno_core::v8::Global<deno_core::v8::Value>, String> {
         let result = self
-            .runtime
+            .runtime()
             .execute_script(name, source)
             .map_err(|error| error.to_string());
         self.finish_heap_checked(result)
@@ -2115,12 +2284,10 @@ impl ObscuraJsRuntime {
         // the first import edge.
         // The caller sizes the budget: short for enhancement modules on an
         // already-rendered page, full for an unmounted SPA shell (#205).
-        let module_id = match tokio::time::timeout(
-            budget,
-            self.runtime.load_side_es_module(&specifier),
-        )
-        .await
-        {
+        let load = entered_runtime_future(&mut self.js_runtime, |runtime| {
+            runtime.load_side_es_module(&specifier)
+        });
+        let module_id = match tokio::time::timeout(budget, load).await {
             Ok(Ok(id)) => id,
             Ok(Err(e)) => return Err(format!("Module load error: {}", e)),
             Err(_) => {
@@ -2176,7 +2343,7 @@ impl ObscuraJsRuntime {
         // observable when mod_evaluate checks V8's private module status, so
         // contain that dependency assertion at this boundary as well.
         let evaluation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.runtime.mod_evaluate(module_id)
+            self.runtime().mod_evaluate(module_id)
         }));
         let result = match evaluation {
             Ok(result) => result,
@@ -2193,17 +2360,17 @@ impl ObscuraJsRuntime {
         };
         tokio::pin!(result);
 
-        let outcome = tokio::time::timeout(budget, async {
-            let event_loop = self
-                .runtime
-                .run_event_loop(deno_core::PollEventLoopOptions::default());
-            tokio::pin!(event_loop);
-            tokio::select! {
-                biased;
-                e = &mut event_loop => { e?; (&mut result).await }
-                r = &mut result => r,
-            }
-        })
+        let outcome = tokio::time::timeout(
+            budget,
+            std::future::poll_fn(|cx| {
+                let mut entered = self.runtime();
+                match entered.poll_event_loop(cx, deno_core::PollEventLoopOptions::default()) {
+                    Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+                    Poll::Ready(Ok(())) => result.as_mut().poll(cx),
+                    Poll::Pending => result.as_mut().poll(cx),
+                }
+            }),
+        )
         .await;
 
         let outcome = match outcome {
@@ -2254,15 +2421,13 @@ impl ObscuraJsRuntime {
             .unwrap_or_else(|_| deno_core::ModuleSpecifier::parse("about:blank").unwrap());
         let loaded_start = self.loaded_module_specifiers.borrow().len();
 
-        let module_id = match tokio::time::timeout(
-            budget,
-            self.runtime.load_side_es_module_from_code(
+        let load = entered_runtime_future(&mut self.js_runtime, |runtime| {
+            runtime.load_side_es_module_from_code(
                 &specifier,
                 deno_core::ModuleCodeString::from(code.to_string()),
-            ),
-        )
-        .await
-        {
+            )
+        });
+        let module_id = match tokio::time::timeout(budget, load).await {
             Ok(Ok(id)) => id,
             Ok(Err(e)) => return Err(format!("Inline module load error: {}", e)),
             Err(_) => {
@@ -2347,7 +2512,8 @@ impl ObscuraJsRuntime {
         // origin as import()'s referrer, so compile in the runtime's main
         // context directly instead of substituting the fixed "<script>" name.
         let result: Result<(), (String, Option<deno_core::error::JsError>)> = (|| {
-            let scope = &mut self.runtime.handle_scope();
+            let mut entered = self.runtime();
+            let scope = &mut entered.handle_scope();
             let source = deno_core::v8::String::new(scope, source)
                 .ok_or_else(|| ("JS error: source allocation failed".to_string(), None))?;
             let name = deno_core::v8::String::new(scope, name)
@@ -2435,7 +2601,7 @@ impl ObscuraJsRuntime {
             return self.execute_classic_script(name, source);
         }
 
-        let isolate_handle = self.runtime.v8_isolate().thread_safe_handle();
+        let isolate_handle = self.runtime().v8_isolate().thread_safe_handle();
 
         let pair = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
         let pair_clone = pair.clone();
@@ -2490,13 +2656,14 @@ impl ObscuraJsRuntime {
         // pending, leaving an already-resolved Promise continuation stranded
         // (document.fonts.load(...).then(...), framework post-render hooks,
         // and hydration follow-ups all rely on this boundary).
-        self.runtime.v8_isolate().perform_microtask_checkpoint();
-        let result = self
-            .runtime
-            .run_event_loop(deno_core::PollEventLoopOptions::default())
+        self.runtime().v8_isolate().perform_microtask_checkpoint();
+        let event_loop = entered_runtime_future(&mut self.js_runtime, |runtime| {
+            runtime.run_event_loop(deno_core::PollEventLoopOptions::default())
+        });
+        let result = event_loop
             .await
             .map_err(|e| format!("Event loop error: {}", e));
-        self.runtime.v8_isolate().perform_microtask_checkpoint();
+        self.runtime().v8_isolate().perform_microtask_checkpoint();
         self.finish_heap_checked(result)
     }
 
@@ -2564,7 +2731,7 @@ impl ObscuraJsRuntime {
     /// `budget` elapses, forcing V8 to throw an uncatchable error and hand
     /// control back. Always balance with [`Self::disarm_watchdog`].
     pub fn arm_watchdog(&mut self, budget: std::time::Duration) -> WatchdogToken {
-        spawn_watchdog(self.runtime.v8_isolate().thread_safe_handle(), budget)
+        spawn_watchdog(self.runtime().v8_isolate().thread_safe_handle(), budget)
     }
 
     /// Stop a watchdog armed by [`Self::arm_watchdog`]. If it had already fired
@@ -2573,7 +2740,7 @@ impl ObscuraJsRuntime {
     pub fn disarm_watchdog(&mut self, token: WatchdogToken) -> bool {
         let fired = token.stop();
         if fired {
-            self.runtime.v8_isolate().cancel_terminate_execution();
+            self.runtime().v8_isolate().cancel_terminate_execution();
             tracing::warn!("V8 watchdog fired: terminated a synchronous overrun");
         }
         fired
@@ -2590,7 +2757,7 @@ impl ObscuraJsRuntime {
     /// isolate handle) fired, so the isolate is usable for the next command.
     /// No-op when the isolate is not terminating.
     pub fn cancel_termination(&mut self) {
-        self.runtime.v8_isolate().cancel_terminate_execution();
+        self.runtime().v8_isolate().cancel_terminate_execution();
     }
 
     /// Drive the event loop for at most `budget_ms`, bounded against BOTH async
@@ -2632,7 +2799,7 @@ impl ObscuraJsRuntime {
                     // queued from them belongs to a subsequent cooperative
                     // turn. Yield so the wall deadline remains observable even
                     // when every turn immediately schedules another one.
-                    self.runtime.v8_isolate().perform_microtask_checkpoint();
+                    self.runtime().v8_isolate().perform_microtask_checkpoint();
                     tokio::task::yield_now().await;
                 }
                 Ok(Err(error)) => {
@@ -2687,11 +2854,11 @@ impl ObscuraJsRuntime {
     /// adaptive settle loop does not poll at a fixed frequency.
     async fn run_cooperative_event_loop_tick(&mut self) -> Result<bool, String> {
         self.begin_javascript_task();
-        self.runtime.v8_isolate().perform_microtask_checkpoint();
+        self.runtime().v8_isolate().perform_microtask_checkpoint();
         let mut waiting_for_wake = false;
         let result = std::future::poll_fn(|cx| {
             let tick = self
-                .runtime
+                .runtime()
                 .poll_event_loop(cx, deno_core::PollEventLoopOptions::default());
             match tick {
                 std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(true)),
@@ -2733,7 +2900,7 @@ impl ObscuraJsRuntime {
             self.isolate_handle(),
             std::time::Duration::from_millis(AUTONOMOUS_TASK_WATCHDOG_MS),
         );
-        self.runtime.v8_isolate().perform_microtask_checkpoint();
+        self.runtime().v8_isolate().perform_microtask_checkpoint();
         if crate::cdp_watchdog::disarm(checkpoint_watchdog) {
             self.cancel_termination();
             return Err("autonomous microtask checkpoint exceeded its task budget".into());
@@ -2750,11 +2917,11 @@ impl ObscuraJsRuntime {
                 std::time::Duration::from_millis(AUTONOMOUS_TASK_WATCHDOG_MS),
             );
             let tick = self
-                .runtime
+                .runtime()
                 .poll_event_loop(cx, deno_core::PollEventLoopOptions::default());
             let watchdog_fired = crate::cdp_watchdog::disarm(watchdog);
             if watchdog_fired {
-                self.runtime.v8_isolate().cancel_terminate_execution();
+                self.runtime().v8_isolate().cancel_terminate_execution();
                 return std::task::Poll::Ready(Err(
                     "autonomous browser task exceeded its task budget".into(),
                 ));
@@ -2905,7 +3072,7 @@ impl ObscuraJsRuntime {
             if tick_fired {
                 break Ok(());
             }
-            self.runtime.v8_isolate().perform_microtask_checkpoint();
+            self.runtime().v8_isolate().perform_microtask_checkpoint();
             match tick {
                 Ok(Ok(true)) => break Ok(()),
                 Ok(Ok(false)) | Err(_) => {}
@@ -2939,7 +3106,7 @@ impl ObscuraJsRuntime {
         self.begin_javascript_task();
         let wrapped = Self::wrap_expression(expression);
         let token = self.arm_watchdog(timeout);
-        let result = self.runtime.execute_script("<eval>", wrapped);
+        let result = self.runtime().execute_script("<eval>", wrapped);
         let fired = self.disarm_watchdog(token);
         if self.recover_heap_limit() {
             return Err("JavaScript heap limit exceeded; execution terminated".to_string());
@@ -2961,12 +3128,10 @@ impl ObscuraJsRuntime {
     pub async fn resolve_promises(&mut self) {
         self.begin_javascript_task();
         // Default settle: just pump until idle or 5s.
-        let _ = tokio::time::timeout(
-            tokio::time::Duration::from_secs(5),
-            self.runtime
-                .run_event_loop(deno_core::PollEventLoopOptions::default()),
-        )
-        .await;
+        let event_loop = entered_runtime_future(&mut self.js_runtime, |runtime| {
+            runtime.run_event_loop(deno_core::PollEventLoopOptions::default())
+        });
+        let _ = tokio::time::timeout(tokio::time::Duration::from_secs(5), event_loop).await;
         self.recover_heap_limit();
     }
 
@@ -3003,10 +3168,12 @@ impl ObscuraJsRuntime {
             }
             // Pump for a short slice. If the loop returns idle in <tick_ms,
             // run_event_loop returns Ok and we check the predicate again.
+            let event_loop = entered_runtime_future(&mut self.js_runtime, |runtime| {
+                runtime.run_event_loop(deno_core::PollEventLoopOptions::default())
+            });
             let _ = tokio::time::timeout(
                 tokio::time::Duration::from_millis(tick_ms),
-                self.runtime
-                    .run_event_loop(deno_core::PollEventLoopOptions::default()),
+                event_loop,
             )
             .await;
             if self.recover_heap_limit() {
@@ -3237,7 +3404,8 @@ impl ObscuraJsRuntime {
         &mut self,
         result: deno_core::v8::Global<deno_core::v8::Value>,
     ) -> Result<serde_json::Value, String> {
-        let scope = &mut self.runtime.handle_scope();
+        let mut entered = self.runtime();
+        let scope = &mut entered.handle_scope();
         let local = deno_core::v8::Local::new(scope, result);
 
         if local.is_undefined() || local.is_null() {
