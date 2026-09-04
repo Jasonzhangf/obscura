@@ -850,6 +850,7 @@ pub fn emit_navigation_events(
 ) {
     ctx.current_loader_ids
         .insert(page_id.to_string(), loader_id.to_string());
+    ctx.nav_events_emitted.insert(page_id.to_string());
     let es = session_id.clone();
     let ts = timestamp();
 
@@ -1259,7 +1260,47 @@ pub async fn handle(
     session_id: &Option<String>,
 ) -> Result<Value, String> {
     match method {
-        "enable" => Ok(json!({})),
+        "enable" => {
+            // Chrome loads a new target's initial about:blank right after
+            // createTarget, so by the time a client attaches and calls
+            // Page.enable the page has already produced its load events.
+            // obscura creates pages silently, which starves clients that wait
+            // for the initial load: chromiumoxide's new_page blocks until the
+            // main frame's "load" lifecycle event arrives (#833). Emit those
+            // events once, the first time a session enables the page domain
+            // on a page that has not emitted a navigation. This is not a
+            // document change, so there is no execution-context churn: the
+            // existing context announced by Runtime.enable stays valid.
+            let initial = ctx.get_session_page(session_id).and_then(|page| {
+                if ctx.nav_events_emitted.contains(&page.id) {
+                    return None;
+                }
+                Some((page.id.clone(), page.frame_id.clone(), page.url_string()))
+            });
+            if let Some((page_id, frame_id, url)) = initial {
+                ctx.nav_events_emitted.insert(page_id.clone());
+                let ts = timestamp();
+                let loader_id = format!("loader-blank-{page_id}");
+                let es = session_id.clone();
+                // Build the frame through the schema-complete helper: generated
+                // CDP clients (chromiumoxide) reject a frameNavigated payload
+                // missing secureContextType/crossOriginIsolatedContextType and
+                // drop the whole connection (#833).
+                let frame = frame_value(&frame_id, None, &loader_id, &url, "text/html");
+                let events = vec![
+                    CdpEvent { method: "Page.frameNavigated".into(), params: json!({"frame": frame, "type": "Navigation"}), session_id: es.clone() },
+                    CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "commit", "timestamp": ts}), session_id: es.clone() },
+                    CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "DOMContentLoaded", "timestamp": ts}), session_id: es.clone() },
+                    CdpEvent { method: "Page.domContentEventFired".into(), params: json!({"timestamp": ts}), session_id: es.clone() },
+                    CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "load", "timestamp": ts}), session_id: es.clone() },
+                    CdpEvent { method: "Page.loadEventFired".into(), params: json!({"timestamp": ts}), session_id: es.clone() },
+                    CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "networkIdle", "timestamp": ts}), session_id: es.clone() },
+                    CdpEvent { method: "Page.frameStoppedLoading".into(), params: json!({"frameId": frame_id, "timestamp": ts}), session_id: es },
+                ];
+                ctx.pending_events.extend(events);
+            }
+            Ok(json!({}))
+        }
         "navigate" => {
             let url = params
                 .get("url")
@@ -1729,6 +1770,57 @@ fn timestamp() -> f64 {
 mod tests {
     use super::*;
     use crate::dispatch::CdpContext;
+
+    // #833: chromiumoxide's new_page waits for the initial target's "load"
+    // lifecycle event before returning. Page.enable on a freshly created
+    // (silently loaded) page must emit the initial load sequence once, with a
+    // schema-complete frame, and must not replay it on a second enable.
+    #[tokio::test(flavor = "current_thread")]
+    async fn page_enable_emits_the_initial_load_events_once() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page_id);
+
+        handle("enable", &json!({}), &mut ctx, &session)
+            .await
+            .expect("enable must succeed");
+        let names: Vec<&str> = ctx
+            .pending_events
+            .iter()
+            .map(|e| e.method.as_str())
+            .collect();
+        assert!(
+            names.contains(&"Page.frameNavigated"),
+            "frameNavigated must be emitted, got {names:?}"
+        );
+        assert!(
+            names.contains(&"Page.loadEventFired"),
+            "loadEventFired must be emitted, got {names:?}"
+        );
+        let frame_navigated = ctx
+            .pending_events
+            .iter()
+            .find(|e| e.method == "Page.frameNavigated")
+            .expect("frameNavigated present");
+        let frame = &frame_navigated.params["frame"];
+        for field in ["id", "loaderId", "url", "secureContextType", "crossOriginIsolatedContextType"] {
+            assert!(
+                !frame[field].is_null(),
+                "frameNavigated frame must carry {field}: {frame}"
+            );
+        }
+        assert!(ctx.pending_events.is_empty() == false);
+
+        ctx.pending_events.clear();
+        handle("enable", &json!({}), &mut ctx, &session)
+            .await
+            .expect("second enable must succeed");
+        assert!(
+            ctx.pending_events.is_empty(),
+            "the initial sequence must not replay on a second enable"
+        );
+    }
 
     #[test]
     fn runtime_network_events_reuse_the_document_loader_without_lifecycle_replay() {
