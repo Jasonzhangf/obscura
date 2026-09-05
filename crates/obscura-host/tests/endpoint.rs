@@ -64,7 +64,7 @@ async fn exercise() {
     let (mut control, response) = client_async(format!("wss://localhost:{}/control", address.port()), tls).await.unwrap();
     let token = response.headers()["x-obscura-media-token"].to_str().unwrap().to_string();
     let ready: serde_json::Value = serde_json::from_str(control.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
-    assert_eq!(ready["version"], 3);
+    assert_eq!(ready["version"], 4);
     if let Ok(serial) = std::env::var("OBSCURA_ENDPOINT_ADB_SERIAL") {
         assert!(!bind_ip.is_loopback(), "Device probe requires an explicit reachable bind IP");
         // Ephemeral test-only pairing, never installed into device/system trust.
@@ -77,9 +77,21 @@ async fn exercise() {
     control.send(Message::text(r#"{"id":1,"command":{"type":"attach","mode":"agent"}}"#)).await.unwrap();
     let rejected: serde_json::Value = serde_json::from_str(control.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
     assert_eq!(rejected["code"], "REMOTE_COMMAND_FORBIDDEN");
-    control.send(Message::text(r#"{"id":2,"command":{"type":"attach","mode":"observe"}}"#)).await.unwrap();
+    control.send(Message::text(r#"{"id":2,"command":{"type":"attach","mode":"observe","viewport":{"device":"phone","css_width":391,"css_height":701,"orientation":"portrait"}}}"#)).await.unwrap();
     let attached: serde_json::Value = serde_json::from_str(control.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
     assert_eq!(attached["value"]["mode"], "observe");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        state = local_request(&mut local, serde_json::json!({"id":8,"command":{"type":"status"}})).await;
+        if state["viewport_pending"] == false { break; }
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(state["viewport"], serde_json::json!([391.0,701.0]));
+    assert_eq!(state["viewport_owner"], attached["value"]["attachment_id"]);
+    control.send(Message::text(r#"{"id":9,"command":{"type":"resize","width":100,"height":100}}"#)).await.unwrap();
+    let resize: serde_json::Value = serde_json::from_str(control.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+    assert_eq!(resize["code"], "REMOTE_COMMAND_FORBIDDEN");
     let tls = connector.connect(ServerName::try_from("localhost").unwrap(), tokio::net::TcpStream::connect(address).await.unwrap()).await.unwrap();
     let mut invalid = format!("wss://localhost:{}/media", address.port()).into_client_request().unwrap();
     invalid.headers_mut().insert("authorization", "Bearer invalid".parse().unwrap());
@@ -105,7 +117,10 @@ async fn exercise() {
             assert!(bytes.len() > 4);
             let length = u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize;
             let header: serde_json::Value = serde_json::from_slice(&bytes[4..4+length]).unwrap();
-            if header["type"] == "access_unit" { break bytes; }
+            if header["type"] == "access_unit" {
+                if header["source"]["viewport_revision"] == state["viewport_revision"] { break bytes; }
+                continue;
+            }
             assert_eq!(header["type"], "waiting");
         }
     };
@@ -113,7 +128,23 @@ async fn exercise() {
     let header: serde_json::Value = serde_json::from_slice(&packet[4..4+length]).unwrap();
     assert_eq!(header["type"], "access_unit");
     assert_eq!(header["source"]["session_id"], ready["session_id"]);
+    assert_eq!(header["source"]["width"], 391);
+    assert_eq!(header["source"]["height"], 701);
+    assert_eq!(header["coded_width"], 392);
+    assert_eq!(header["coded_height"], 702);
     assert_eq!(header["byte_length"].as_u64().unwrap() as usize, packet.len() - 4 - length);
+    control.send(Message::text(r#"{"id":10,"command":{"type":"declare_viewport","viewport":{"device":"phone","css_width":701,"css_height":391,"orientation":"landscape"}}}"#)).await.unwrap();
+    let declaration: serde_json::Value = serde_json::from_str(control.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+    assert_eq!(declaration["type"], "result");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        state = local_request(&mut local, serde_json::json!({"id":11,"command":{"type":"status"}})).await;
+        if state["viewport_pending"] == false { break; }
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(state["viewport"], serde_json::json!([701.0,391.0]));
+    assert_eq!(state["viewport_revision"], 2);
     control.send(Message::text(serde_json::json!({"id":3,"command":{"type":"request_takeover","epoch":attached["value"]["control"]["epoch"]}}).to_string())).await.unwrap();
     let takeover: serde_json::Value = serde_json::from_str(control.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
     assert_eq!(takeover["value"]["control"]["phase"]["type"], "human");

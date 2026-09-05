@@ -24,7 +24,9 @@ pub struct Operation {
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Command {
-    Attach { mode: Mode },
+    Attach { mode: Mode, viewport: Option<ViewportDeclaration> },
+    /// Attachment layout intent. Host elects one shared viewport; not input authority.
+    DeclareViewport { viewport: ViewportDeclaration },
     Detach {},
     Status {},
     RequestTakeover { epoch: u64 },
@@ -43,6 +45,23 @@ pub enum Command {
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Mode { Observe, Agent }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ViewportDeclaration {
+    pub device: Device,
+    /// Measured available page area in CSS pixels, excluding occupied native UI.
+    pub css_width: u32,
+    pub css_height: u32,
+    /// Explicit device orientation; keyboard occlusion may invert the area ratio.
+    pub orientation: Orientation,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Device { Phone, Desktop }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Orientation { Portrait, Landscape }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Control {
@@ -77,6 +96,10 @@ pub struct SessionStatus {
     pub viewport_revision: u64,
     pub document_revision: u64,
     pub viewport: Option<(f32, f32)>,
+    /// Attachment whose declaration supplied the committed viewport; null when unmanaged.
+    pub viewport_owner: Option<u64>,
+    /// Declaration accepted or layout executing, but not yet committed. Fence new input.
+    pub viewport_pending: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

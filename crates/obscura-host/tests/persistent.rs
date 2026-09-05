@@ -76,6 +76,188 @@ fn identity(status: &Value) -> Value {
 }
 
 struct Media(BufReader<UnixStream>);
+
+fn declaration(device: &str, width: u32, height: u32, orientation: &str) -> Value {
+    json!({"device":device,"css_width":width,"css_height":height,"orientation":orientation})
+}
+
+fn settled(client: &mut Client) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let status = client.ok(json!({"type":"status"}));
+        if status["viewport_pending"] == false { return status; }
+        assert!(Instant::now() < deadline, "viewport did not settle: {status}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn declared_phone_viewport_preserves_page_and_rejects_stale_input() {
+    let daemon = Daemon::start();
+    let mut agent = daemon.connect();
+    let initial = agent.ok(json!({"type":"attach","mode":"agent"}));
+    agent.ok(json!({"type":"navigate","url":"data:text/html,<input id='retained'><script>window.marker={value:17};document.getElementById('retained').value='kept';</script>"}));
+    let old = agent.ok(json!({"type":"status"}));
+    let mut phone = daemon.connect();
+    let attached = phone.ok(json!({"type":"attach","mode":"observe","viewport":declaration("phone",390,701,"portrait")}));
+    let status = settled(&mut phone);
+    assert_eq!(status["viewport"], json!([390.0,701.0]));
+    assert_eq!(status["viewport_owner"], attached["attachment_id"]);
+    assert_eq!(status["viewport_revision"], 1);
+    assert_eq!(status["document_revision"], old["document_revision"]);
+    assert_eq!(status["control"]["epoch"], initial["control"]["epoch"]);
+    assert_eq!(agent.raw(json!({"id":88,"operation":identity(&old),"command":{"type":"click","x":1,"y":1}}))["code"], "STALE_VIEWPORT");
+    assert_eq!(agent.eval("window.marker.value===17 && document.getElementById('retained').value==='kept'"), true);
+    assert_eq!(agent.send(json!({"type":"resize","width":800,"height":600}))["code"], "VIEWPORT_MANAGED");
+    phone.ok(json!({"type":"declare_viewport","viewport":declaration("phone",701,390,"landscape")}));
+    let rotated = settled(&mut phone);
+    assert_eq!(rotated["viewport"], json!([701.0,390.0]));
+    assert_eq!(rotated["viewport_revision"], 2);
+    phone.ok(json!({"type":"declare_viewport","viewport":declaration("phone",701,390,"portrait")}));
+    assert_eq!(settled(&mut phone)["viewport_revision"], 2, "orientation is independent; equal dimensions do not relayout");
+}
+
+#[test]
+fn viewport_election_uses_whole_smallest_phone_and_reselects_on_disconnect() {
+    let daemon = Daemon::start();
+    let mut desktop = daemon.connect();
+    let desk = desktop.ok(json!({"type":"attach","mode":"observe","viewport":declaration("desktop",200,100,"landscape")}));
+    settled(&mut desktop);
+    let mut first = daemon.connect();
+    let one = first.ok(json!({"type":"attach","mode":"observe","viewport":declaration("phone",300,800,"portrait")}));
+    assert_eq!(settled(&mut desktop)["viewport_owner"], one["attachment_id"]);
+    let mut second = daemon.connect();
+    let two = second.ok(json!({"type":"attach","mode":"observe","viewport":declaration("phone",400,500,"portrait")}));
+    let small = settled(&mut desktop);
+    assert_eq!(small["viewport_owner"], two["attachment_id"]);
+    assert_eq!(small["viewport"], json!([400.0,500.0]), "never combine widths/heights from different phones");
+    first.ok(json!({"type":"declare_viewport","viewport":declaration("phone",250,800,"portrait")}));
+    assert_eq!(settled(&mut desktop)["viewport_owner"], one["attachment_id"], "equal area prefers smaller width");
+    second.ok(json!({"type":"declare_viewport","viewport":declaration("phone",250,800,"portrait")}));
+    let tied = settled(&mut desktop);
+    assert_eq!(tied["viewport_owner"], one["attachment_id"], "equal size prefers older attachment");
+    first.ok(json!({"type":"detach"}));
+    let after_detach = settled(&mut desktop);
+    assert_eq!(after_detach["viewport_owner"], two["attachment_id"]);
+    assert_eq!(after_detach["viewport_revision"], tied["viewport_revision"], "same-size ownership transfer is not a resize");
+    drop(second);
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let state = settled(&mut desktop);
+        if state["viewport_owner"] == desk["attachment_id"] { break; }
+        assert!(Instant::now() < deadline); std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(settled(&mut desktop)["viewport"], json!([200.0,100.0]));
+    let last = desktop.ok(json!({"type":"detach"}));
+    drop(desktop);
+    let mut reconnect = daemon.connect();
+    reconnect.ok(json!({"type":"attach","mode":"observe"}));
+    let retained = settled(&mut reconnect);
+    assert_eq!(retained["viewport"], last["viewport"]);
+    assert_eq!(retained["viewport_revision"], last["viewport_revision"]);
+    assert!(retained["viewport_owner"].is_null());
+}
+
+#[test]
+fn viewport_declarations_validate_identity_and_capture_budget() {
+    let daemon = Daemon::start();
+    let mut viewer = daemon.connect();
+    assert_eq!(viewer.send(json!({"type":"declare_viewport","viewport":declaration("phone",300,600,"portrait")}))["code"], "ATTACH_REQUIRED");
+    assert_eq!(viewer.send(json!({"type":"attach","mode":"agent","viewport":declaration("phone",300,600,"portrait")}))["code"], "OBSERVER_REQUIRED");
+    viewer.ok(json!({"type":"attach","mode":"observe"}));
+    let initial = settled(&mut viewer);
+    for (width, height) in [(0,600),(4097,100),(4096,4096)] {
+        assert_eq!(viewer.send(json!({"type":"declare_viewport","viewport":declaration("phone",width,height,"portrait")}))["code"], "INVALID_VIEWPORT");
+    }
+    assert_eq!(viewer.raw(json!({"id":55,"operation":identity(&initial),"command":{"type":"declare_viewport","viewport":declaration("phone",300,600,"portrait")}}))["code"], "INVALID_OPERATION");
+    let invalid = json!({"device":"phone","css_width":300,"css_height":600,"orientation":"guessed"});
+    assert_eq!(viewer.send(json!({"type":"declare_viewport","viewport":invalid}))["code"], "INVALID_REQUEST");
+    assert_eq!(settled(&mut viewer)["viewport_revision"], initial["viewport_revision"]);
+    let mut agent = daemon.connect(); agent.ok(json!({"type":"attach","mode":"agent"}));
+    assert_eq!(agent.send(json!({"type":"declare_viewport","viewport":declaration("phone",300,600,"portrait")}))["code"], "OBSERVER_REQUIRED");
+    let before = agent.ok(json!({"type":"resize","width":400,"height":300}));
+    let after = agent.ok(json!({"type":"resize","width":400,"height":300}));
+    assert_eq!(before["viewport_revision"], after["viewport_revision"]);
+}
+
+#[test]
+fn viewport_waits_for_atomic_click_and_coalesces_before_human_input() {
+    let daemon = Daemon::start();
+    let mut agent = daemon.connect(); agent.ok(json!({"type":"attach","mode":"agent"}));
+    agent.ok(json!({"type":"navigate","url":"data:text/html,<button style='position:absolute;left:10px;top:10px;width:200px;height:60px' onmousedown='const end=Date.now()+1500;while(Date.now()<end){}' onclick='window.clickWidth=innerWidth;window.clicked=true'>hold</button>"}));
+    let mut observer = daemon.connect(); let original = observer.ok(json!({"type":"attach","mode":"observe"}));
+    let operation = identity(&agent.ok(json!({"type":"status"})));
+    writeln!(agent.0.get_mut(), "{}", json!({"id":90,"operation":operation,"command":{"type":"click","x":30,"y":30}})).unwrap();
+    let deadline = Instant::now() + Duration::from_millis(600);
+    while observer.ok(json!({"type":"status"}))["operation_running"] != true {
+        assert!(Instant::now() < deadline); std::thread::sleep(Duration::from_millis(5));
+    }
+    let pending = observer.ok(json!({"type":"declare_viewport","viewport":declaration("phone",390,701,"portrait")}));
+    assert_eq!(pending["viewport_pending"], true);
+    assert_eq!(pending["viewport"], original["viewport"]);
+    assert_eq!(pending["viewport_revision"], original["viewport_revision"]);
+    observer.ok(json!({"type":"declare_viewport","viewport":declaration("phone",701,390,"landscape")}));
+    let waiting = observer.ok(json!({"type":"request_takeover","epoch":original["control"]["epoch"]}));
+    assert_eq!(waiting["control"]["phase"]["type"], "waiting");
+    assert_eq!(observer.send(json!({"type":"click","x":30,"y":30}))["type"], "error");
+    assert_eq!(agent.read()["value"]["input"]["state"], "succeeded");
+    let applied = settled(&mut observer);
+    assert_eq!(applied["viewport"], json!([701.0,390.0]));
+    assert_eq!(applied["viewport_revision"], 1, "intermediate pending declaration must not resize");
+    assert_eq!(applied["control"]["phase"]["type"], "human");
+    observer.ok(json!({"type":"release_control","epoch":applied["control"]["epoch"]}));
+    assert_eq!(agent.eval("window.clicked===true && window.clickWidth===1280 && globalThis.__obscura_mouse_down===null"), true);
+}
+
+#[test]
+fn declared_viewports_publish_one_shared_frame_after_rotation() {
+    let daemon = Daemon::start();
+    let mut agent = daemon.connect(); agent.ok(json!({"type":"attach","mode":"agent"}));
+    agent.ok(json!({"type":"navigate","url":"data:text/html,<style>html,body{margin:0;background:rgb(12,34,56)}</style>"}));
+    let mut phone = daemon.connect();
+    phone.ok(json!({"type":"attach","mode":"observe","viewport":declaration("phone",391,701,"portrait")}));
+    let mut first = Media::connect(&daemon);
+    let mut second = Media::connect(&daemon);
+    for (width, height, orientation) in [(391,701,"portrait"),(701,391,"landscape")] {
+        phone.ok(json!({"type":"declare_viewport","viewport":declaration("phone",width,height,orientation)}));
+        let state = settled(&mut phone);
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let (mut a, mut pixels_a) = first.frame();
+        let (mut b, mut pixels_b) = second.frame();
+        while a["sequence"] != b["sequence"] || a["viewport_revision"] != state["viewport_revision"] {
+            assert!(Instant::now() < deadline, "shared viewport frames did not converge");
+            if a["sequence"].as_u64() <= b["sequence"].as_u64() { (a, pixels_a) = first.frame(); }
+            else { (b, pixels_b) = second.frame(); }
+        }
+        assert_eq!(a, b);
+        assert_eq!(pixels_a, pixels_b);
+        assert_eq!(a["width"], width);
+        assert_eq!(a["height"], height);
+        assert_eq!(a["document_revision"], state["document_revision"]);
+    }
+}
+
+#[test]
+fn viewport_callback_deadline_faults_without_committing_or_handover() {
+    let daemon = Daemon::start();
+    let mut agent = daemon.connect(); agent.ok(json!({"type":"attach","mode":"agent"}));
+    agent.eval("globalThis.__obscura_recompute_resizes=function(){while(true){}};true");
+    let mut observer = daemon.connect();
+    let original = observer.ok(json!({"type":"attach","mode":"observe"}));
+    observer.ok(json!({"type":"declare_viewport","viewport":declaration("phone",390,701,"portrait")}));
+    observer.ok(json!({"type":"request_takeover","epoch":original["control"]["epoch"]}));
+    let deadline = Instant::now() + Duration::from_secs(7);
+    let faulted = loop {
+        let state = observer.ok(json!({"type":"status"}));
+        if state["fault"].is_string() { break state; }
+        assert!(Instant::now() < deadline, "viewport callback left layout permanently pending");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(faulted["viewport_revision"], original["viewport_revision"]);
+    assert_eq!(faulted["viewport"], original["viewport"], "partial resize is not a committed layout");
+    assert_eq!(faulted["control"]["phase"]["type"], "waiting");
+    agent.ok(json!({"type":"close_session"}));
+}
 impl Media {
     fn connect(daemon: &Daemon) -> Self {
         let socket = UnixStream::connect(daemon.dir.join("frames.sock")).unwrap();
@@ -453,11 +635,15 @@ fn unknown_outcome_never_grants_pending_takeover() {
     while human.ok(json!({"type":"status"}))["operation_running"] != true {
         assert!(Instant::now() < deadline); std::thread::sleep(Duration::from_millis(5));
     }
+    human.ok(json!({"type":"declare_viewport","viewport":declaration("phone",390,701,"portrait")}));
     human.ok(json!({"type":"request_takeover","epoch":status["control"]["epoch"]}));
     assert_eq!(agent.read()["code"], "OUTCOME_UNKNOWN");
     let faulted = human.ok(json!({"type":"status"}));
     assert_eq!(faulted["control"]["phase"]["type"], "waiting");
     assert!(faulted["fault"].is_string());
+    assert_eq!(faulted["viewport_pending"], true);
+    assert_eq!(faulted["viewport_revision"], status["viewport_revision"]);
+    assert_eq!(faulted["viewport"], status["viewport"]);
     assert_eq!(human.send(json!({"type":"release_control","epoch":faulted["control"]["epoch"]}))["code"], "SESSION_FAULTED");
     agent.ok(json!({"type":"close_session"}));
 }
