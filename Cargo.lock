@@ -1941,6 +1941,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "obscura-host"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "futures-util",
+ "obscura-browser",
+ "obscura-host-protocol",
+ "obscura-js",
+ "rcgen",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite",
+ "uuid",
+]
+
+[[package]]
+name = "obscura-host-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "obscura-js"
 version = "0.1.0"
 dependencies = [
@@ -1986,6 +2012,18 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "obscura-media"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "obscura-host-protocol",
+ "serde_json",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

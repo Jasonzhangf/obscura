@@ -1532,6 +1532,17 @@ impl ObscuraJsRuntime {
         base_url: Option<&str>,
         surface_color: [u8; 4],
     ) -> Option<Vec<u8>> {
+        self.paint_prepared_with_surface_color(viewport, base_url, surface_color)?.encode_png().ok()
+    }
+
+    /// Original premultiplied RGBA8 pixels, before any image/video encoding.
+    #[cfg(feature = "render")]
+    pub fn paint_prepared_with_surface_color(
+        &self,
+        viewport: (f32, f32),
+        base_url: Option<&str>,
+        surface_color: [u8; 4],
+    ) -> Option<obscura_render::RenderPixmap> {
         let mut state = self.state.borrow_mut();
         let effective_base = document_base_url(&state);
         if viewport != state.viewport || base_url != effective_base.as_deref() {
@@ -1549,7 +1560,7 @@ impl ObscuraJsRuntime {
             } = state;
             let (_, scroll) = resolved_scroll.as_ref()?;
             let canvas_surfaces = RuntimeCanvasSurfaceSource(canvas_surfaces);
-            obscura_render::screenshot_prepared_with_scroll_and_surface_color_and_canvas_surfaces(
+            obscura_render::paint_prepared_with_scroll_and_surface_color_and_canvas_surfaces(
                 dom.as_ref()?,
                 prepared_render.as_mut()?,
                 render_resources,

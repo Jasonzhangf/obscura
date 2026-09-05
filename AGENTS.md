@@ -78,6 +78,21 @@ edit instead.
 
 ## Architecture
 
+- **obscura-host** — opt-in local persistent Session binary, one Page/V8 thread
+  per process, Unix socket attachments authenticated by a fresh 0700 directory.
+  Bootstrap wire types belong to `protocol/browser`; current scope and pending
+  remote/operation semantics are in `docs/Persistent-host.md`. Legacy CDP stays
+  connection-scoped. Host never derives session state from Relay or UI snapshots.
+  `frames.sock` distributes one latest immutable raw RGBA buffer separately from
+  control admission; `Page::render_frame` shares the screenshot paint owner.
+  `src/endpoint/` owns the opt-in `obscura-endpoint` binary: prepaired mTLS direct
+  WSS, attachment-bound media grants, and one shared encoder process. It forwards
+  observer/human requests to Host admission; it cannot grant browser control.
+- **obscura-media** — local raw socket consumer and H.264 encoder owner. One
+  adapter emits bounded Annex B access units to a consumer-owned Unix socket.
+  Requires external FFmpeg/libx264; no browser/control state or network listener.
+  `crates/obscura-media/tests/host-replay.py` verifies the actual Host/encode/decode
+  entrypoint. Media protocol types remain in `protocol/browser`.
 - **obscura-cli** — CLI: `fetch` (`--dump assets|html|text|links|markdown|original|cookies`, `--eval <JS>`, `--screenshot <PNG>`), `serve` (CDP server), `scrape`, `mcp`. `--proxy`, `--stealth`, and `--allow-private-network` are global flags: valid before or after the subcommand and applied to `fetch`, `serve`, `scrape`, and `mcp` (a `scrape` run forwards `--stealth` to each worker via `OBSCURA_STEALTH`).
 - **obscura-cdp** — Chrome DevTools Protocol server (WebSocket). Managed page
   sessions use `"{targetId}-session"`; explicit flattened attachments receive
@@ -85,7 +100,9 @@ edit instead.
 - **obscura-js** — V8/`deno_core` runtime. `js/bootstrap.js` is the DOM/browser shim; `src/ops.rs` bridges JS to Rust DOM ops; `src/runtime.rs` owns the isolate and the per-page `ObscuraState`.
 - **obscura-dom** — DOM tree (`src/tree.rs`).
 - **obscura-net** — HTTP client (`client.rs`), stealth client (`wreq_client.rs`), cookie jar, robots cache, tracker blocklist.
-- **obscura-browser** — the `Page` type, navigation, JS evaluation.
+- **obscura-browser** — the `Page` type, navigation, JS evaluation. `input.rs`
+  owns shared mouse/text/key dispatch. CDP projects navigation events; Host
+  owns atomic input admission/receipts and autonomous navigation afterward.
 - **obscura-render** — selector cascade, computed style, retained layout,
   scrolling, text shaping, images/SVG/canvas, and CPU-backed paint. The
   `render` feature powers geometry, screenshots, CDP screencasting, and PDF.
