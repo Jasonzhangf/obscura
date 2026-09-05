@@ -35,7 +35,7 @@ pub async fn control(mut remote: Socket, path: &Path, active: watch::Sender<bool
                 send(&mut remote, Message::text(serde_json::to_string(&error)?)).await?; continue;
             }
         };
-        let permitted = matches!(request.command, Command::Attach { mode: Mode::Observe } | Command::Status {} | Command::Detach {}
+        let permitted = matches!(request.command, Command::Attach { mode: Mode::Observe, .. } | Command::DeclareViewport { .. } | Command::Status {} | Command::Detach {}
             | Command::RequestTakeover { .. } | Command::ReleaseControl { .. } | Command::Click { .. } | Command::InputText { .. } | Command::Scroll { .. });
         let result = if permitted {
             let mut bytes = serde_json::to_vec(&request)?; bytes.push(b'\n');
