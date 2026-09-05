@@ -67,7 +67,7 @@ execute diagnostic JavaScript. The granted human holder can click, insert text
 and scroll through the same admission/receipt owner as Agent input.
 Evaluate remains an Agent diagnostic surface, not the final atomic input API:
 page-created timers/network continue after its completion, as before.
-Request IDs correlate replies only; version 3 requires the separate operation
+Request IDs correlate replies only; version 4 requires the separate operation
 envelope including document_revision.
 Typed SessionStatus returns the requesting attachment's connection-scoped ID
 and mode as well as the shared Session ID and viewport. Reconnect creates a new
@@ -87,7 +87,7 @@ execution both locally and at admission, including work already queued when
 an autonomous page callback fails. Graceful shutdown waits for accepted work
 before joining the owning thread.
 
-### Local operation and takeover contract (version 3)
+### Local operation and takeover contract (version 4)
 
 Every browser mutation, including diagnostic evaluation and explicit close,
 requires `operation`: session_id, attachment_id, sequence, control_epoch,
@@ -153,10 +153,55 @@ engine-failed evaluation faults the Session; further mutations and attachments
 are rejected. A remaining Agent may explicitly close it. Otherwise restart is
 explicit, with a new identity. JS exceptions are errors, not successful nulls.
 
-Current resize changes the one existing Page viewport and increments a revision;
-all observers can query that same status. Automatic mobile layout election and
-control-state push subscriptions are not implemented. Input already rejects
-old viewport revisions instead of reinterpreting coordinates.
+Resize changes the one existing Page viewport. Host assigns the next viewport
+revision and commits the matching worker completion; the worker only projects
+that assignment into frames. Equal dimensions perform no layout or revision
+change. Input rejects old viewport revisions instead of reinterpreting coordinates.
+Control-state push subscriptions are not implemented; clients query status.
+
+### Shared mobile viewport declaration (version 4)
+
+The sole ABI is `protocol/browser/src/lib.rs`. Observe attachments may include
+`viewport` in `attach`, then update it with `declare_viewport`. Both are control
+requests without an `operation` envelope. The declaration contains `device`
+(`phone` or `desktop`), `css_width`, `css_height` and explicit `orientation`
+(`portrait` or `landscape`). An Agent attachment cannot declare a viewer area.
+Clients measure the actual available page container, excluding occupied system
+bars, app chrome and keyboard space. Screen dimensions and decoded frame sizes
+are not substitutes. Device orientation is independent of the available area's
+aspect ratio, which keyboard occupation can invert.
+
+Host rejects dimensions outside 1..4096 or an area above 4,194,304 CSS pixels,
+matching the raw capture budget. It never clamps or scales a declaration.
+Phone declarations outrank Desktop declarations. Within one device class,
+Host selects the minimum `(width * height, width, attachment_id)` tuple and
+uses that attachment's complete width/height pair. It never minimizes the axes
+independently. Updates, detach and EOF cause reelection. Equal-size ownership
+changes do not resize. Without declarations, the last committed viewport remains;
+Agent `resize` is allowed only in this unmanaged state, otherwise it returns
+`VIEWPORT_MANAGED`. Layout selection does not grant input authority or change
+the control epoch.
+
+Declarations return promptly, even while an atomic operation runs.
+`viewport_pending` distinguishes accepted intent or an executing resize from a
+committed result. `viewport` and `viewport_revision` describe applied layout;
+`viewport_owner` identifies its elected attachment, or null when unmanaged.
+New mutations receive `VIEWPORT_PENDING` while layout is pending. The current
+accepted operation completes before the latest elected layout executes on the
+same Page. Pending declarations coalesce; they do not form an unbounded queue.
+Internal layout work targets the current document, while explicit Agent resize
+retains its operation's document fence. Unknown outcomes fault the session and
+do not apply waiting layout or grant pending takeover. Session close remains an
+explicit recovery operation. Layout callbacks run under the V8 deadline and
+process watchdog; a partial layout failure retains the last committed geometry
+and revision in Host status while fencing the faulted Page.
+
+All observers consume one shared buffer. Native clients must stop input while
+layout is pending and until the committed revision has actually been presented.
+They must discard old decoded/displayed revisions, never relabel an old frame
+with a newer status revision. Source width/height define the display ratio;
+H.264 even-dimension padding is separate. Other-sized viewers display the entire
+source proportionally, without stretching or cropping webpage content.
 
 ### Shared local raw frames
 
@@ -259,9 +304,9 @@ identity; clients must verify the Host certificate/hostname. This is the separat
 prepaired local authorization policy, not Relay account login or automatic route
 selection. Tailscale reachability alone grants no application capability.
 
-The direct WSS `/control` route forwards protocol-v3 JSON Request/Response text.
+The direct WSS `/control` route forwards protocol-v4 JSON Request/Response text.
 The endpoint restricts remote commands to observe attachment, status, detach,
-request_takeover, release_control and human click/text/scroll. Agent attachment,
+declare_viewport, request_takeover, release_control and human click/text/scroll. Agent attachment,
 diagnostic evaluation, navigation, resize, close and resume are rejected here.
 Host still owns and checks every input identity, epoch and revision. Disconnection
 does not cause operation replay. Native clients only: HTTP Origin and query-string
@@ -303,7 +348,7 @@ WSS upgrade/Host ready with system curl, then removes those device credentials.
 It does not install a system trust root or claim native Android media acceptance.
 
 The remaining connection work is client-side native ingress and UI integration,
-mobile layout negotiation, UDP/WebRTC and Relay adapters. The direct endpoint
+native viewport measurement/presentation, UDP/WebRTC and Relay adapters. The direct endpoint
 does not implement candidate selection or label a Tailscale path as peer-to-peer.
 
 ## Session and input invariants
@@ -352,7 +397,28 @@ course (33/33), as required by AGENTS.md. Add actual Host-entrypoint replay and
 AGY review. Plan text, isolated state-machine tests and socket health do not prove
 that the browser remains alive after detach.
 
-## Current handoff
+## Viewport v4 candidate evidence
+
+The viewport candidate imports the authorized persistent-host snapshot at
+`d80af25` from source HEAD `72c84adcc6ec3ea4a7144adb4e45d4d3038ebcda`.
+The initial attach-with-viewport regression failed with `INVALID_REQUEST`.
+The callback-deadline regression independently failed because layout stayed
+pending, then passed with the worker watchdog and committed-state fence.
+Final scoped release nextest for `obscura-host` and `obscura-media` passed
+25 tests, with four nextest leaky classifications and no skipped tests:
+`/tmp/obscura-mobile-viewport-focused-final.log`. This includes actual Host,
+shared raw frames, and mTLS/WSS declaration/media/input paths; it does not
+prove Android native presentation.
+
+The task owner explicitly requested the scoped candidate without waiting for
+the new worktree's long first repository-wide build. That full nextest command
+was interrupted during compilation and has no test verdict
+(`/tmp/obscura-mobile-viewport-full-nextest.log`). The final CLI build, obstacle
+rerun and AGY verdict remain pending at candidate handoff. The historical 32/33
+obstacle result below does not certify this candidate or satisfy the 33/33 gate.
+This is a reviewable source candidate, not a completed integrated release.
+
+## Prior endpoint candidate evidence
 
 The paired endpoint slice passed a real Host/encoder/mTLS/WSS test: missing
 client certificate denied, remote Agent attachment denied, observer attached,
