@@ -13,9 +13,16 @@ pub struct Completion {
     pub viewport: Option<(f32, f32)>,
     pub fault: Option<String>,
     pub document_revision: u64,
+    pub viewport_revision: u64,
 }
 pub struct PageUpdate { pub document_revision: u64, pub fault: Option<String> }
-pub struct Work { pub command: Command, pub document_revision: u64, pub reply: oneshot::Sender<Completion> }
+pub struct Work { pub kind: WorkKind, pub reply: oneshot::Sender<Completion> }
+pub enum WorkKind {
+    Browser { command: Command, document_revision: u64 },
+    /// Host-assigned shared viewport; declarations apply to the current Page,
+    /// while explicit Agent resize retains its admitted document fence.
+    Viewport { width: u32, height: u32, revision: u64, document_revision: Option<u64> },
+}
 const BUDGET: Duration = Duration::from_secs(5);
 
 // Bound actual synchronous polls, never parked timers/network futures.
@@ -108,27 +115,53 @@ pub fn start(id: String, network: bool, mut incoming: mpsc::Receiver<Work>,
                     }
                     work = incoming.recv() => {
                         let Some(work) = work else { break; };
-                        let completion = if failure.is_some() && !matches!(work.command, Command::CloseSession {}) {
+                        let expected_document = match &work.kind {
+                            WorkKind::Browser { document_revision, .. } => Some(*document_revision),
+                            WorkKind::Viewport { document_revision, .. } => *document_revision,
+                        };
+                        let mut completion = if failure.is_some() && !matches!(work.kind, WorkKind::Browser { command: Command::CloseSession {}, .. }) {
                             Completion {
                                 result: Err(("SESSION_FAULTED", failure.clone().unwrap())),
                                 viewport: page.as_ref().map(|page| page.viewport),
                                 fault: failure.clone(),
                                 document_revision,
+                                viewport_revision,
                             }
-                        } else if work.document_revision != document_revision {
-                            Completion { result: Err(("STALE_DOCUMENT", "Document changed before execution".into())), viewport: page.as_ref().map(|page| page.viewport), fault: None, document_revision }
+                        } else if expected_document.is_some_and(|expected| expected != document_revision) {
+                            Completion { result: Err(("STALE_DOCUMENT", "Document changed before execution".into())), viewport: page.as_ref().map(|page| page.viewport), fault: None, document_revision, viewport_revision }
                         } else {
-                            let navigation = matches!(work.command, Command::Navigate { .. });
-                            let resize = matches!(work.command, Command::Resize { .. });
-                            let mut completion = execute(&mut page, work.command).await;
-                            if navigation { document_revision += 1; }
-                            if resize && completion.result.is_ok() { viewport_revision += 1; }
-                            if navigation || resize {
-                                frames.send_replace(media::state(FramePacket::Waiting { session_id: id.clone() }));
+                            match work.kind {
+                                WorkKind::Viewport { width, height, revision, .. } => {
+                                    let mut fault = None;
+                                    let result = if let Some(page) = page.as_mut() {
+                                        if page.viewport != (width as f32, height as f32) {
+                                            // Invalidate before changing layout. The same Page retains DOM,
+                                            // JS, form state and pending tasks; no attachment-specific render.
+                                            frames.send_replace(media::state(FramePacket::Waiting { session_id: id.clone() }));
+                                            let watchdog = page.js.as_mut().map(|js| js.arm_watchdog(BUDGET));
+                                            page_work(async { page.set_viewport((width as f32, height as f32)); }).await;
+                                            if watchdog.is_some_and(|watchdog| page.js.as_mut().expect("viewport retains runtime").disarm_watchdog(watchdog)) {
+                                                fault = Some("Viewport callback deadline: partial layout outcome; recreate session explicitly".to_string());
+                                            }
+                                        }
+                                        if let Some(cause) = &fault { Err(("OUTCOME_UNKNOWN", cause.clone())) }
+                                        else { viewport_revision = revision; Ok(None) }
+                                    } else { Err(("SESSION_CLOSED", "Session was explicitly closed".into())) };
+                                    Completion { result, viewport: page.as_ref().map(|page| page.viewport), fault, document_revision, viewport_revision }
+                                }
+                                WorkKind::Browser { command, .. } => {
+                                    let navigation = matches!(command, Command::Navigate { .. });
+                                    let completion = execute(&mut page, command).await;
+                                    if navigation {
+                                        document_revision += 1;
+                                        frames.send_replace(media::state(FramePacket::Waiting { session_id: id.clone() }));
+                                    }
+                                    completion
+                                }
                             }
-                            completion.document_revision = document_revision;
-                            completion
                         };
+                        completion.document_revision = document_revision;
+                        completion.viewport_revision = viewport_revision;
                         if completion.fault.is_some() { failure = completion.fault.clone(); }
                         if page.is_none() { frames.send_replace(media::state(FramePacket::Closed { session_id: id.clone() })); }
                         else if let Some(message) = &failure { frames.send_replace(media::state(FramePacket::Unavailable { session_id: id.clone(), message: message.clone() })); }
@@ -175,10 +208,6 @@ async fn execute(page: &mut Option<Page>, command: Command) -> Completion {
         Ok(Some(ResultValue::Closed { closed: true }))
     } else if let Some(page) = page.as_mut() {
         match command {
-            Command::Resize { width, height } => {
-                page.set_viewport((width as f32, height as f32));
-                Ok(None)
-            }
             Command::Navigate { url } => match timeout(BUDGET, page_work(page.navigate(&url))).await {
                 Ok(Ok(())) => Ok(None),
                 Ok(Err(cause)) => Err(("NAVIGATION_FAILED", cause.to_string())),
@@ -234,5 +263,5 @@ async fn execute(page: &mut Option<Page>, command: Command) -> Completion {
             _ => unreachable!("control commands stay on daemon thread"),
         }
     } else { Err(("SESSION_CLOSED", "Session was explicitly closed".into())) };
-    Completion { result, viewport: page.as_ref().map(|page| page.viewport), fault, document_revision: 0 }
+    Completion { result, viewport: page.as_ref().map(|page| page.viewport), fault, document_revision: 0, viewport_revision: 0 }
 }

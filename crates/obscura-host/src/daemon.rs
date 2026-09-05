@@ -3,9 +3,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use anyhow::{Context, Result};
-use obscura_host_protocol::{Command, Control, ControlPhase, FramePacket, Mode, Operation, Request, Response, ResultValue, SessionStatus};
+use obscura_host_protocol::{Command, Control, ControlPhase, Device, FramePacket, Mode, Operation, Request, Response, ResultValue, SessionStatus, ViewportDeclaration};
 use crate::media;
-use crate::worker::{self, Completion, Work};
+use crate::worker::{self, Completion, Work, WorkKind};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot, Semaphore};
@@ -53,7 +53,7 @@ async fn write(stream: &mut tokio::net::unix::OwnedWriteHalf, response: Response
 async fn connection(stream: UnixStream, id: u64, session: String, events: mpsc::Sender<Event>) -> Result<()> {
     let (read, mut out) = stream.into_split();
     let mut reader = BufReader::new(read);
-    write(&mut out, Response::Ready { version: 3, session_id: session }).await?;
+    write(&mut out, Response::Ready { version: 4, session_id: session }).await?;
     loop {
         let mut frame = Vec::new();
         let size = (&mut reader).take((MAX_FRAME + 1) as u64).read_until(b'\n', &mut frame).await?;
@@ -76,7 +76,7 @@ async fn connection(stream: UnixStream, id: u64, session: String, events: mpsc::
 struct Session {
     id: String,
     viewport: Option<(f32, f32)>,
-    attachments: HashMap<u64, Mode>,
+    attachments: HashMap<u64, Attachment>,
     agent: Option<u64>,
     viewport_revision: u64,
     document_revision: u64,
@@ -84,9 +84,31 @@ struct Session {
     control: Control,
     records: HashMap<u64, Record>,
     retired: HashSet<u64>,
+    viewport_owner: Option<u64>,
+    viewport_update: Option<ViewportUpdate>,
 }
+struct Attachment { mode: Mode, viewport: Option<ViewportDeclaration> }
+struct ViewportUpdate { owner: Option<u64>, width: u32, height: u32, revision: u64 }
 struct Record { operation: Operation, command: Command, response: Option<Response> }
+fn valid_viewport(width: u32, height: u32) -> bool {
+    width > 0 && height > 0 && width <= 4096 && height <= 4096 && u64::from(width) * u64::from(height) <= 4_194_304
+}
 impl Session {
+    fn selected_viewport(&self) -> Option<(u64, ViewportDeclaration)> {
+        self.attachments.iter().filter_map(|(&id, attachment)| attachment.viewport.map(|viewport| (id, viewport)))
+            .min_by_key(|(id, viewport)| (match viewport.device { Device::Phone => 0, Device::Desktop => 1 },
+                u64::from(viewport.css_width) * u64::from(viewport.css_height), viewport.css_width, *id))
+    }
+    fn viewport_pending(&self) -> bool {
+        self.viewport_update.is_some() || self.selected_viewport().is_some_and(|(_, viewport)|
+            self.viewport != Some((viewport.css_width as f32, viewport.css_height as f32)))
+    }
+    fn viewport_work(&mut self, owner: Option<u64>, width: u32, height: u32, document_revision: Option<u64>) -> Result<WorkKind, String> {
+        let revision = if self.viewport == Some((width as f32, height as f32)) { self.viewport_revision }
+            else { self.viewport_revision.checked_add(1).ok_or("Viewport revision exhausted; recreate session")? };
+        self.viewport_update = Some(ViewportUpdate { owner, width, height, revision });
+        Ok(WorkKind::Viewport { width, height, revision, document_revision })
+    }
     fn detach(&mut self, connection: u64) {
         self.retired.insert(connection);
         self.attachments.remove(&connection);
@@ -112,7 +134,7 @@ impl Session {
         ResultValue::Status(SessionStatus {
             session_id: self.id.clone(), attachments: self.attachments.len(),
             attachment_id: self.attachments.contains_key(&connection).then_some(connection),
-            mode: self.attachments.get(&connection).copied(),
+            mode: self.attachments.get(&connection).map(|attachment| attachment.mode),
             agent_attached: self.agent.is_some(), viewport_revision: self.viewport_revision,
             document_revision: self.document_revision,
             operation_running: busy,
@@ -120,6 +142,8 @@ impl Session {
             fault: self.fault.clone(),
             next_sequence: self.records.get(&connection).map_or(1, |r| r.operation.sequence.saturating_add(1)),
             viewport: self.viewport,
+            viewport_owner: self.viewport_owner,
+            viewport_pending: self.viewport_pending(),
         })
     }
     fn request(&mut self, connection: u64, request: Request, busy: bool) -> Result<Response, Command> {
@@ -166,17 +190,28 @@ impl Session {
         }
         if let Some(fault) = &self.fault { return Ok(error(id, "SESSION_FAULTED", fault.clone())); }
         match request.command {
-            Command::Attach { mode } => {
+            Command::Attach { mode, viewport } => {
                 if self.retired.contains(&connection) { return Ok(error(id, "RECONNECT_REQUIRED", "Detached identities cannot be reused; open a new connection")); }
                 if self.attachments.contains_key(&connection) { return Ok(error(id, "ALREADY_ATTACHED", "Use a new connection to change attachment mode")); }
                 if mode == Mode::Agent && self.agent.is_some() { return Ok(error(id, "AGENT_BUSY", "Agent attachment already exists")); }
-                self.attachments.insert(connection, mode);
+                if let Some(viewport) = viewport {
+                    if mode != Mode::Observe { return Ok(error(id, "OBSERVER_REQUIRED", "Only observer attachments declare a viewport")); }
+                    if !valid_viewport(viewport.css_width, viewport.css_height) { return Ok(error(id, "INVALID_VIEWPORT", "Dimensions must be 1..4096 and at most 4194304 CSS pixels")); }
+                }
+                self.attachments.insert(connection, Attachment { mode, viewport });
                 if mode == Mode::Agent { self.agent = Some(connection); }
                 Ok(Response::Result { id, value: self.status(connection, busy) })
             }
             command => {
                 if !self.attachments.contains_key(&connection) { return Ok(error(id, "ATTACH_REQUIRED", "Attach first")); }
                 match command {
+                    Command::DeclareViewport { viewport } => {
+                        let attachment = self.attachments.get_mut(&connection).unwrap();
+                        if attachment.mode != Mode::Observe { return Ok(error(id, "OBSERVER_REQUIRED", "Only observer attachments declare a viewport")); }
+                        if !valid_viewport(viewport.css_width, viewport.css_height) { return Ok(error(id, "INVALID_VIEWPORT", "Dimensions must be 1..4096 and at most 4194304 CSS pixels")); }
+                        attachment.viewport = Some(viewport);
+                        return Ok(Response::Result { id, value: self.status(connection, busy) });
+                    }
                     Command::RequestTakeover { epoch } | Command::ReleaseControl { epoch } | Command::ResumeAgent { epoch } => {
                         if epoch != self.control.epoch { return Ok(error(id, "STALE_CONTROL", "Control epoch changed")); }
                         match command {
@@ -216,10 +251,12 @@ impl Session {
                     if self.agent != Some(connection) { return Ok(error(id, "AGENT_REQUIRED", "Observer cannot mutate or evaluate JavaScript")); }
                     if !matches!(self.control.phase, ControlPhase::Agent) { return Ok(error(id, "CONTROL_REQUIRED", "Agent control is suspended")); }
                 }
+                if self.viewport_pending() { return Ok(error(id, "VIEWPORT_PENDING", "Wait for the shared viewport to commit")); }
                 if busy { return Ok(error(id, "OPERATION_BUSY", "Wait for the accepted operation to finish")); }
                 match &command {
                     Command::Resize { width, height } => {
-                        if *width == 0 || *height == 0 || *width > 4096 || *height > 4096 { return Ok(error(id, "INVALID_VIEWPORT", "Dimensions must be 1..4096")); }
+                        if self.selected_viewport().is_some() { return Ok(error(id, "VIEWPORT_MANAGED", "Attached viewers select the shared viewport")); }
+                        if !valid_viewport(*width, *height) { return Ok(error(id, "INVALID_VIEWPORT", "Dimensions must be 1..4096 and at most 4194304 CSS pixels")); }
                     }
                     Command::Navigate { url } => {
                         // This local bootstrap surface never enables file navigation.
@@ -252,11 +289,13 @@ impl Session {
 }
 
 struct Pending {
+    operation: Option<PendingOperation>,
+    result: oneshot::Receiver<Completion>,
+}
+struct PendingOperation {
     id: u64,
     connection: u64,
-    resize: bool,
     reply: oneshot::Sender<Response>,
-    result: oneshot::Receiver<Completion>,
 }
 
 pub async fn serve(socket_dir: PathBuf, allow_private_network: bool) -> Result<()> {
@@ -270,7 +309,7 @@ pub async fn serve(socket_dir: PathBuf, allow_private_network: bool) -> Result<(
     let (interest, interested) = tokio::sync::watch::channel(0usize);
     let worker = worker::start(id.clone(), allow_private_network, incoming_work, ready, faults, frames, interested)?;
     let viewport = initialized.await.context("browser worker stopped during startup")?.map_err(anyhow::Error::msg)?;
-    let mut session = Session { id: id.clone(), viewport: Some(viewport), attachments: HashMap::new(), agent: None, viewport_revision: 0, document_revision: 0, fault: None, control: Control { epoch: 1, phase: ControlPhase::Agent }, records: HashMap::new(), retired: HashSet::new() };
+    let mut session = Session { id: id.clone(), viewport: Some(viewport), attachments: HashMap::new(), agent: None, viewport_revision: 0, document_revision: 0, fault: None, control: Control { epoch: 1, phase: ControlPhase::Agent }, records: HashMap::new(), retired: HashSet::new(), viewport_owner: None, viewport_update: None };
     let listener = UnixListener::bind(directory.0.join("host.sock"))?;
     std::fs::set_permissions(directory.0.join("host.sock"), std::fs::Permissions::from_mode(0o600))?;
     let media_listener = UnixListener::bind(directory.0.join("frames.sock"))?;
@@ -284,6 +323,25 @@ pub async fn serve(socket_dir: PathBuf, allow_private_network: bool) -> Result<(
     let mut pending: Option<Pending> = None;
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     loop {
+        // Declarations remain responsive while atomic work completes. Schedule only
+        // the latest elected pair, before admitting any subsequent browser mutation.
+        if pending.is_none() && session.fault.is_none() && session.viewport.is_some() {
+            match session.selected_viewport() {
+                Some((owner, viewport)) if session.viewport != Some((viewport.css_width as f32, viewport.css_height as f32)) => {
+                    match session.viewport_work(Some(owner), viewport.css_width, viewport.css_height, None) {
+                        Ok(kind) => {
+                            let (reply, result) = oneshot::channel();
+                            if work.try_send(Work { kind, reply }).is_err() {
+                                session.viewport_update = None;
+                                session.fault = Some("Browser worker unavailable; recreate session explicitly".into());
+                            } else { pending = Some(Pending { operation: None, result }); }
+                        }
+                        Err(cause) => session.fault = Some(cause),
+                    }
+                }
+                selected => session.viewport_owner = selected.map(|(owner, _)| owner),
+            }
+        }
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
             _ = term.recv() => break,
@@ -330,46 +388,76 @@ pub async fn serve(socket_dir: PathBuf, allow_private_network: bool) -> Result<(
                     match session.request(connection, request, pending.is_some()) {
                         Ok(response) => { let _ = reply.send(response); }
                         Err(command) => {
-                            let resize = matches!(command, Command::Resize { .. });
                             let record = Record { operation: operation.expect("mutation admission checked identity"), command: command.clone(), response: None };
+                            let kind = if let Command::Resize { width, height } = command {
+                                match session.viewport_work(None, width, height, Some(record.operation.document_revision)) {
+                                    Ok(kind) => kind,
+                                    Err(cause) => {
+                                        session.fault = Some(cause.clone());
+                                        let _ = reply.send(error(id, "SESSION_FAULTED", cause));
+                                        continue;
+                                    }
+                                }
+                            } else { WorkKind::Browser { command, document_revision: record.operation.document_revision } };
                             let (finished, result) = oneshot::channel();
-                            if work.try_send(Work { command, document_revision: record.operation.document_revision, reply: finished }).is_err() {
+                            if work.try_send(Work { kind, reply: finished }).is_err() {
+                                session.viewport_update = None;
                                 session.fault = Some("Browser worker unavailable; recreate session explicitly".into());
                                 let _ = reply.send(error(id, "SESSION_FAULTED", session.fault.clone().unwrap()));
                             } else {
                                 session.records.insert(connection, record);
-                                pending = Some(Pending { id, connection, resize, reply, result });
+                                pending = Some(Pending { operation: Some(PendingOperation { id, connection, reply }), result });
                             }
                         }
                     }
                 }
             },
             completion = async { (&mut pending.as_mut().unwrap().result).await }, if pending.is_some() => {
-                let operation = pending.take().unwrap();
-                let response = match completion {
+                let finished = pending.take().unwrap();
+                let viewport_update = session.viewport_update.take();
+                let outcome = match completion {
                     Ok(completion) => {
-                        session.viewport = completion.viewport;
+                        // A failed resize may have changed Page partially. Keep the
+                        // last committed geometry/revision and fence the faulted Page.
+                        if viewport_update.is_none() { session.viewport = completion.viewport; }
                         session.document_revision = session.document_revision.max(completion.document_revision);
                         if completion.fault.is_some() { session.fault = completion.fault; }
+                        if let Some(update) = viewport_update {
+                            if completion.result.is_ok() {
+                                if completion.viewport_revision != update.revision || completion.viewport != Some((update.width as f32, update.height as f32)) {
+                                    session.fault = Some("Viewport completion mismatched Host assignment; recreate session".into());
+                                } else {
+                                    session.viewport = completion.viewport;
+                                    session.viewport_revision = completion.viewport_revision;
+                                    session.viewport_owner = update.owner;
+                                }
+                            }
+                        }
+                        if finished.operation.is_none() {
+                            if let Err((code, cause)) = &completion.result { session.fault = Some(format!("Viewport application failed: {code}: {cause}")); }
+                        }
                         session.finish_handover();
                         match completion.result {
-                            Ok(value) => {
-                                if operation.resize { session.viewport_revision += 1; }
-                                Response::Result { id: operation.id, value: value.unwrap_or_else(|| session.status(operation.connection, false)) }
-                            }
-                            Err((code, cause)) => error(operation.id, code, cause),
+                            Ok(_) if session.fault.is_some() && session.viewport.is_some() => Err(("SESSION_FAULTED", session.fault.clone().unwrap())),
+                            result => result,
                         }
                     }
                     Err(_) => {
                         session.fault = Some("Browser worker stopped; operation outcome unknown".into());
-                        error(operation.id, "OUTCOME_UNKNOWN", session.fault.clone().unwrap())
+                        Err(("OUTCOME_UNKNOWN", session.fault.clone().unwrap()))
                     }
                 };
                 // Cache only the latest bounded receipt per live attachment. Earlier
                 // sequences are rejected, never silently evicted into re-execution.
-                let response = bounded_response(response)?;
-                if let Some(record) = session.records.get_mut(&operation.connection) { record.response = Some(response.clone()); }
-                let _ = operation.reply.send(response);
+                if let Some(operation) = finished.operation {
+                    let response = match outcome {
+                        Ok(value) => Response::Result { id: operation.id, value: value.unwrap_or_else(|| session.status(operation.connection, false)) },
+                        Err((code, cause)) => error(operation.id, code, cause),
+                    };
+                    let response = bounded_response(response)?;
+                    if let Some(record) = session.records.get_mut(&operation.connection) { record.response = Some(response.clone()); }
+                    let _ = operation.reply.send(response);
+                }
             },
             update = fault_events.recv(), if session.fault.is_none() => {
                 match update {
