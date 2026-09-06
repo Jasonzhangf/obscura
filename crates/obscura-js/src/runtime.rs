@@ -664,6 +664,44 @@ impl ObscuraJsRuntime {
     /// ops table, and its bootstrap captured that exact object, so filling the
     /// `ops` table on it is enough to give every shim in that realm a working
     /// op surface. The functions are shared, not copied: same isolate.
+    /// deno_core's isolate-global promise-reject and dynamic-`import()`
+    /// callbacks read per-context state from V8's `ContextState` and
+    /// `ModuleMap` embedder-data slots in the *current* context. A
+    /// snapshot-created frame realm leaves those slots null, so a promise
+    /// rejection or dynamic import inside a frame null-dereferenced in
+    /// deno_core's `clone_rc_raw` and segfaulted the whole process (#850, #841).
+    /// Alias the main context's slot pointers into the frame context so those
+    /// callbacks resolve to the main realm's state instead of crashing.
+    ///
+    /// Safe: the frame context only *borrows* these pointers. The callbacks
+    /// `clone_rc_raw` (increment then drop) them — net-zero on the strong count
+    /// — and obscura never tears a frame context down through deno_core's
+    /// `Rc::from_raw` destroy path (only the main realm owns and frees the Rc),
+    /// so no double-free is possible.
+    pub(crate) fn share_deno_context_state_with_realm(
+        &mut self,
+        realm: &deno_core::v8::Global<deno_core::v8::Context>,
+    ) {
+        use deno_core::{v8, CONTEXT_STATE_SLOT_INDEX, MODULE_MAP_SLOT_INDEX};
+
+        let main = self.runtime().main_context();
+        let mut entered = self.runtime();
+        let isolate = entered.v8_isolate();
+        let scope = &mut v8::HandleScope::new(isolate);
+        let main_ctx = v8::Local::new(scope, main);
+        let realm_ctx = v8::Local::new(scope, realm);
+        // SAFETY: these slots on the main context are `Rc::into_raw` pointers
+        // set by deno_core at runtime construction; they outlive every frame
+        // realm. We only copy (alias) them and never reconstruct the Rc from
+        // the frame.
+        unsafe {
+            let cs = main_ctx.get_aligned_pointer_from_embedder_data(CONTEXT_STATE_SLOT_INDEX);
+            let mm = main_ctx.get_aligned_pointer_from_embedder_data(MODULE_MAP_SLOT_INDEX);
+            realm_ctx.set_aligned_pointer_in_embedder_data(CONTEXT_STATE_SLOT_INDEX, cs);
+            realm_ctx.set_aligned_pointer_in_embedder_data(MODULE_MAP_SLOT_INDEX, mm);
+        }
+    }
+
     pub(crate) fn share_ops_with_realm(
         &mut self,
         realm: &deno_core::v8::Global<deno_core::v8::Context>,
