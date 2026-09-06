@@ -3,6 +3,8 @@ use std::{path::Path, process::Stdio, time::Duration};
 use anyhow::{ensure, Context, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
+#[cfg(feature = "webrtc-probe")]
+pub mod webrtc;
 pub const MAX_PIXELS: u64 = 4_194_304;
 pub const MAX_ACCESS_UNIT: usize = 4 * 1024 * 1024;
 
