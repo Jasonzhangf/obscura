@@ -368,11 +368,18 @@ obtain a new grant. A wrong binding is rejected on the typed DataChannel with
 
 After the DataChannel `Hello`/`HelloAck` exchange, the endpoint sends continuous
 H.264 Annex B access units as RTP over the explicitly negotiated UDP path.
-The DataChannel carries only typed transport control (`Hello`, `HelloAck`,
-`Ping`/`Pong`, video descriptors and errors). Browser operations are not
-implemented there: WSS remains the current real operation and human-input path.
-Each `VideoFrame` descriptor is derived from the Host media packet and carries
-the exact `rtp_timestamp` of its access unit. Receivers must associate a
+Protocol v3 carries typed `BrowserRequest`/`BrowserResponse` envelopes on that
+same authenticated DataChannel, so human browser operations use the DataChannel
+path after the Host has checked the embedded operation identity. WSS remains
+the mTLS attachment and SDP signaling bootstrap only; a DataChannel request
+never falls back to WSS. `Ping`/`Pong`, video descriptors and errors remain
+typed control messages on the DataChannel.
+
+Each `VideoFrame` descriptor preserves the complete Host source descriptor and
+encoder identity, then carries the exact `rtp_timestamp` of its access unit.
+`access_unit_bytes` is the canonical Annex-B length reconstructed from the RTP
+packets: H.264 packetization may omit AUD/filler NALUs and normalizes start
+codes, so it is not the raw FFmpeg source length. Receivers must associate a
 descriptor and decoded sample by that timestamp, not by arrival order; source
 dimensions and document/viewport revisions remain separate from even-dimension
 H.264 padding.
@@ -385,11 +392,13 @@ CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-host --f
 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo nextest run --release --features render -p obscura-host --test webrtc_endpoint
 ```
 
-This proves the Host-to-H.264-to-RTP-to-independent-decoder path, continuous
-frames, a click-driven frame change, stale-binding rejection and same-session /
-new-attachment reconnect fencing. It does not prove Android/Mac client
-integration, Relay operation, or a Tailscale/WebRTC network path. Tailscale
-path status remains unknown until separately replayed and evidenced.
+This proves the Host-to-H.264-to-RTP-to-independent-decoder path, selected
+loopback UDP host/host ICE, v3 HelloAck, typed DataChannel browser requests and
+responses, continuous frames, a click-driven frame change, stale operation and
+binding rejection, and same-session / new-attachment reconnect fencing. It does
+not prove Android/Mac client integration, Relay operation, or a Tailscale/WebRTC
+network path. Tailscale path status remains unknown until separately replayed and
+evidenced.
 
 ```sh
 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-host -p obscura-media --features render
