@@ -1,4 +1,4 @@
-use std::{collections::HashMap, os::unix::fs::{DirBuilderExt, PermissionsExt}, path::PathBuf, process::Stdio, sync::{Arc, Mutex}, time::Duration};
+use std::{collections::HashMap, net::SocketAddr, os::unix::fs::{DirBuilderExt, PermissionsExt}, path::PathBuf, process::Stdio, sync::{Arc, Mutex}, time::Duration};
 use anyhow::{ensure, Context, Result};
 use tokio::{net::{TcpListener, UnixListener}, sync::{watch, Semaphore}};
 use tokio_rustls::{TlsAcceptor, rustls::{self, pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer}}};
@@ -25,6 +25,7 @@ fn reject() -> ErrorResponse {
 }
 
 pub async fn serve(args: Args) -> Result<()> {
+    if args.enable_webrtc { ensure!(args.webrtc_bind_ip.is_some(), "--enable-webrtc requires explicit --webrtc-bind-ip"); }
     let key_permissions = std::fs::metadata(&args.server_key)?.permissions().mode();
     ensure!(key_permissions & 0o077 == 0, "Endpoint private key must not be group/world accessible");
     let mut roots = rustls::RootCertStore::empty(); roots.add(CertificateDer::from(std::fs::read(&args.client_ca)?))?;
@@ -43,9 +44,10 @@ pub async fn serve(args: Args) -> Result<()> {
         .arg("--frames-socket").arg(args.host_dir.join("frames.sock")).arg("--video-socket").arg(&encoded)
         .arg("--ffmpeg").arg(args.ffmpeg).stdout(Stdio::null()).stderr(Stdio::inherit()).kill_on_drop(true).spawn().context("Start single media adapter")?;
     let (latest, frames) = watch::channel(None);
+    let (encoded_latest, encoded_frames) = watch::channel(None);
     let media = async {
         let (socket, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept()).await.context("Media adapter startup deadline")??;
-        channels::ingest(socket, latest).await
+        channels::ingest(socket, latest, encoded_latest).await
     };
     tokio::pin!(media);
     let grants: Grants = Arc::new(Mutex::new(HashMap::new()));
@@ -61,6 +63,8 @@ pub async fn serve(args: Args) -> Result<()> {
                 let (socket, _) = accepted?;
                 let Ok(permit) = permits.clone().try_acquire_owned() else { continue; };
                 let acceptor = acceptor.clone(); let grants = grants.clone(); let frames = frames.clone();
+                let encoded_frames = encoded_frames.clone(); let enable_webrtc = args.enable_webrtc;
+                let webrtc_bind = args.webrtc_bind_ip.map(|ip| SocketAddr::new(ip, 0));
                 let host = args.host_dir.join("host.sock");
                 clients.spawn(async move {
                     let _permit = permit;
@@ -97,7 +101,7 @@ pub async fn serve(args: Args) -> Result<()> {
                             let (active, _) = watch::channel(false);
                             grants.lock().expect("grant owner").insert(token.clone(), Grant { peer, active: active.clone(), media_used: false });
                             let _lease = Lease { token, grants };
-                            channels::control(remote, &host, active).await
+                            channels::control(remote, &host, active, encoded_frames, enable_webrtc, webrtc_bind).await
                         } else { channels::media(remote, frames, media_active.context("Missing media grant")?).await }
                     }).await.context("Paired connection lifetime expired")?
                 });

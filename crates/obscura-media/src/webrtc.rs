@@ -46,10 +46,11 @@ use webrtc_rs::{
 };
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
-const H264_PAYLOAD_TYPE: u8 = 102;
-const H264_CLOCK_RATE: u32 = 90_000;
-const H264_SSRC: u32 = 0x4f42_5343;
-const FRAME_DURATION: Duration = Duration::from_millis(333);
+pub(crate) const H264_PAYLOAD_TYPE: u8 = 102;
+pub(crate) const H264_CLOCK_RATE: u32 = 90_000;
+pub(crate) const H264_SSRC: u32 = 0x4f42_5343;
+pub(crate) const H264_RTP_MTU: usize = 1200;
+pub(crate) const FRAME_DURATION: Duration = Duration::from_millis(333);
 const PROBE_FRAME_COUNT: u32 = 2;
 const CONTROL_PING_ID: u64 = 1;
 
@@ -372,7 +373,7 @@ fn validate_probe_input(input: &WebRtcProbeInput) -> Result<()> {
     Ok(())
 }
 
-fn h264_media_engine() -> Result<webrtc_rs::peer_connection::MediaEngine> {
+pub fn h264_media_engine() -> Result<webrtc_rs::peer_connection::MediaEngine> {
     let mut media_engine = webrtc_rs::peer_connection::MediaEngine::default();
     media_engine
         .register_codec(
@@ -392,7 +393,7 @@ fn h264_media_engine() -> Result<webrtc_rs::peer_connection::MediaEngine> {
     Ok(media_engine)
 }
 
-fn h264_media_track() -> MediaStreamTrack {
+pub(crate) fn h264_media_track() -> MediaStreamTrack {
     MediaStreamTrack::new(
         "obscura-probe-stream".to_owned(),
         "obscura-probe-video".to_owned(),
@@ -419,7 +420,7 @@ fn even_dimension(value: u32) -> u32 {
     value.saturating_add(1) & !1
 }
 
-async fn wait_for_notify(notify: &Notify, description: &str) -> Result<()> {
+pub(crate) async fn wait_for_notify(notify: &Notify, description: &str) -> Result<()> {
     timeout(PROBE_TIMEOUT, notify.notified())
         .await
         .with_context(|| format!("timed out waiting for {description}"))?;
@@ -446,7 +447,7 @@ async fn wait_for_data_channel_open(dc: &Arc<dyn DataChannel>) -> Result<()> {
     }
 }
 
-async fn send_control_message(
+pub(crate) async fn send_control_message(
     dc: &Arc<dyn DataChannel>,
     message: &WebRtcControlMessage,
 ) -> Result<()> {
