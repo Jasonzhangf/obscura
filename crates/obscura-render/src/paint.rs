@@ -6783,16 +6783,26 @@ fn fallback_font_bytes(family: Option<&str>) -> &'static [u8] {
     FONT_BYTES
 }
 
+fn character_font<'a>(primary: &'a FontRef<'static>, character: char) -> &'a FontRef<'static> {
+    if primary.glyph_id(character).0 != 0 {
+        return primary;
+    }
+    static CJK: std::sync::OnceLock<FontRef<'static>> = std::sync::OnceLock::new();
+    let cjk = CJK.get_or_init(|| FontRef::try_from_slice(crate::inline::CJK_R)
+        .expect("bundled CJK font must be valid"));
+    if cjk.glyph_id(character).0 != 0 { cjk } else { primary }
+}
+
 pub fn measure_text(text: &str, size: f32, is_bold: bool, family: Option<&str>) -> f32 {
     let font = FontRef::try_from_slice(fallback_font_bytes(family)).unwrap();
     let scale = PxScale::from(size);
-    let scaled_font = font.as_scaled(scale);
     let mut width = 0.0;
     for c in text.chars() {
         if c.is_control() {
             continue;
         }
-        width += scaled_font.h_advance(font.glyph_id(c));
+        let selected = character_font(&font, c);
+        width += selected.as_scaled(scale).h_advance(selected.glyph_id(c));
     }
     if is_bold {
         width += text.chars().filter(|c| !c.is_control()).count() as f32;
@@ -6843,10 +6853,12 @@ fn draw_text(
         if c.is_control() {
             continue;
         }
-        let glyph_id = font.glyph_id(c);
+        let selected = character_font(&font, c);
+        let scaled_font = selected.as_scaled(scale);
+        let glyph_id = selected.glyph_id(c);
         let id = glyph_id;
         let glyph = glyph_id.with_scale_and_position(scale, caret);
-        if let Some(outlined) = font.outline_glyph(glyph) {
+        if let Some(outlined) = selected.outline_glyph(glyph) {
             let bounds = outlined.px_bounds();
             outlined.draw(|gx, gy, c| {
                 let px = (bounds.min.x + gx as f32) as i32;
@@ -11367,6 +11379,22 @@ mod tests {
     use crate::dom::layout_dom_with_web_fonts;
     use obscura_dom::tree::ShadowRootMode;
     use obscura_dom::tree_sink::parse_html;
+
+    #[test]
+    fn cjk_control_glyphs_are_distinct_and_measured() {
+        let render = |text| {
+            let mut image = Pixmap::new(80, 60).unwrap();
+            draw_text(&mut image, text, 2.0, 2.0, [0,0,0,255], 32.0,
+                false, Some("sans-serif"), 0.0, None, None, 1.0);
+            assert!(image.pixels().iter().any(|pixel| pixel.alpha()>0));
+            image
+        };
+        let first=render("中");
+        let second=render("文");
+        assert_ne!(first.data(),second.data(),"CJK input glyphs must not share the missing-glyph box");
+        let pair=measure_text("中文",32.0,false,Some("sans-serif"));
+        assert_eq!(pair,measure_text("中",32.0,false,Some("sans-serif"))+measure_text("文",32.0,false,Some("sans-serif")));
+    }
 
     #[test]
     fn native_shadow_flat_tree_paints_shadow_and_slotted_content_only() {
