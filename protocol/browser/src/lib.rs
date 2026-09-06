@@ -2,7 +2,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Request {
     pub id: u64,
@@ -148,7 +148,7 @@ pub enum FramePacket {
     Unavailable { session_id: String, message: String },
     Closed { session_id: String },
 }
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct FrameInfo {
     pub session_id: String,
@@ -161,7 +161,7 @@ pub struct FrameInfo {
     pub byte_length: u64,
     pub pixel_format: PixelFormat,
 }
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PixelFormat { PremultipliedRgba8 }
 
@@ -189,7 +189,10 @@ pub enum VideoPacket {
 #[serde(rename_all = "snake_case")]
 pub enum VideoCodec { H264AnnexB }
 
-pub const WEBRTC_PROTOCOL_VERSION: u32 = 2;
+/// Version 3 adds the typed browser request/response envelopes and replaces
+/// the flat video identity projection with the complete source descriptor.
+/// Older v2 peers are rejected during the Hello exchange.
+pub const WEBRTC_PROTOCOL_VERSION: u32 = 3;
 pub const WEBRTC_CONTROL_LABEL: &str = "obscura.control.v1";
 pub const WEBRTC_H264_FMTP: &str = "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f";
 
@@ -227,11 +230,17 @@ pub struct WebRtcSessionBinding {
     pub auth_binding: Vec<u8>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WebRtcControlMessage {
     Hello { capability: WebRtcCapability, binding: WebRtcSessionBinding },
     HelloAck { capability: WebRtcCapability, binding: WebRtcSessionBinding },
+    /// A browser request forwarded through the already-authenticated control
+    /// attachment. Its operation identity is checked by the Host owner.
+    BrowserRequest { request: Request },
+    /// The terminal Host response for one `BrowserRequest`, correlated by the
+    /// embedded response id. No browser state is reconstructed from metadata.
+    BrowserResponse { response: Response },
     Error { code: String, message: String },
     VideoFrame { descriptor: WebRtcVideoFrame },
     Ping { request_id: u64 },
@@ -255,17 +264,18 @@ pub enum WebRtcSignal {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WebRtcVideoFrame {
-    pub session_id: String,
-    pub sequence: u64,
+    /// Exact source descriptor from the Host `VideoPacket::AccessUnit`.
+    pub source: FrameInfo,
+    /// Exact encoder incarnation from the Host media owner.
+    pub encoder_id: String,
     pub rtp_timestamp: u32,
-    pub document_revision: u64,
-    pub viewport_revision: u64,
-    pub width: u32,
-    pub height: u32,
     pub coded_width: u32,
     pub coded_height: u32,
+    pub codec: WebRtcVideoCodec,
     pub pts_us: u64,
     pub keyframe: bool,
+    /// Encoded H.264 bytes carried by the corresponding RTP access unit.
+    pub access_unit_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
