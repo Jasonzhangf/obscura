@@ -67,8 +67,29 @@ async fn exercise() -> anyhow::Result<()> {
     let first = run_receiver(&receiver_bin, address, &root, false, false).await?;
     anyhow::ensure!(first.status.success(), "independent WebRTC receiver failed: {}", String::from_utf8_lossy(&first.stderr));
     let first_report: serde_json::Value = serde_json::from_slice(&first.stdout)?;
-    anyhow::ensure!(first_report["pass"] == true && first_report["frames"].as_array().is_some_and(|frames| frames.len() >= 3), "continuous WebRTC evidence missing: {first_report}");
-    anyhow::ensure!(first_report["frames"].as_array().unwrap().iter().any(|frame| frame["changed"] == true), "Host click did not produce a different WebRTC frame: {first_report}");
+    anyhow::ensure!(first_report["pass"] == true && first_report["browser_path"] == "webrtc_data_channel", "WebRTC DataChannel browser path missing: {first_report}");
+    let ice = &first_report["ice"];
+    anyhow::ensure!(ice["transport"] == "udp" && ice["local_candidate"]["protocol"] == "udp" && ice["remote_candidate"]["protocol"] == "udp",
+        "selected ICE pair was not UDP: {first_report}");
+    anyhow::ensure!(ice["local_candidate"]["candidate_type"] == "host" && ice["remote_candidate"]["candidate_type"] == "host",
+        "selected ICE pair was not host/host: {first_report}");
+    let frames = first_report["frames"].as_array().ok_or_else(|| anyhow::anyhow!("continuous WebRTC frame evidence missing: {first_report}"))?;
+    anyhow::ensure!(frames.len() >= 3, "continuous WebRTC evidence has fewer than three frames: {first_report}");
+    for frame in frames {
+        anyhow::ensure!(frame["session_id"] == first_report["session_id"]
+            && frame["width"] == 160 && frame["height"] == 120 && frame["stride"] == 640
+            && frame["coded_width"] == 160 && frame["coded_height"] == 120
+            && frame["codec"] == "h264_annex_b" && frame["keyframe"] == true,
+            "incomplete WebRTC frame descriptor: {frame}");
+        anyhow::ensure!(frame["encoder_id"].as_str().is_some_and(|value| !value.is_empty())
+            && frame["rtp_timestamp"].as_u64().is_some()
+            && frame["pts_us"].as_u64().is_some()
+            && frame["source_byte_length"].as_u64().is_some_and(|value| value > 0)
+            && frame["access_unit_bytes"].as_u64().is_some_and(|value| value > 0)
+            && frame["rtp_packets"].as_u64().is_some_and(|value| value > 0),
+            "incomplete WebRTC frame identity or RTP evidence: {frame}");
+    }
+    anyhow::ensure!(frames.iter().any(|frame| frame["changed"] == true), "Host click did not produce a different WebRTC frame: {first_report}");
 
     let stale = run_receiver(&receiver_bin, address, &root, false, true).await?;
     anyhow::ensure!(stale.status.success(), "stale-binding receiver failed: {}", String::from_utf8_lossy(&stale.stderr));

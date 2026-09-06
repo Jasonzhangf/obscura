@@ -5,9 +5,9 @@ use std::{collections::BTreeMap, net::{IpAddr, SocketAddr}, path::PathBuf, sync:
 use anyhow::{Context, Result, bail, ensure};
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
-use obscura_host_protocol::{Command, ControlPhase, InputState, Mode, Operation, Request, Response,
-    ResultValue, SessionStatus, WebRtcCapability, WebRtcControlMessage, WebRtcSignal,
-    WebRtcVideoCodec, WebRtcVideoFrame, WebRtcTransport,
+use obscura_host_protocol::{Command, ControlPhase, InputState, Mode, Operation, PixelFormat,
+    Request, Response, ResultValue, SessionStatus, WebRtcCapability, WebRtcControlMessage,
+    WebRtcSignal, WebRtcVideoCodec, WebRtcVideoFrame, WebRtcTransport,
     WEBRTC_CONTROL_LABEL, WEBRTC_PROTOCOL_VERSION};
 use rtc::{media::io::sample_builder::SampleBuilder, rtp::codec::h264::H264Packet,
     rtp_transceiver::{RTCRtpTransceiverDirection, RTCRtpTransceiverInit},
@@ -24,6 +24,9 @@ use obscura_media::webrtc::h264_media_engine;
 
 const DEADLINE: Duration = Duration::from_secs(20);
 const H264_CLOCK_RATE: u32 = 90_000;
+const MAX_CONTROL_MESSAGE: usize = 64 * 1024;
+const MAX_ASSOCIATIONS: usize = 64;
+const INPUT_FIXTURE: &str = "data:text/html,<style>body{margin:0}button{position:absolute;left:10px;top:10px;width:120px;height:50px;background:red}input{position:absolute;left:10px;top:80px;width:130px;height:30px}.space{height:3000px;margin-top:150px}</style><button id='target' onclick=\"window.clicks=(window.clicks||0)+1;this.style.background='lime'\">target</button><input id='text'><div class='space'></div>";
 
 #[derive(Parser)]
 #[command(about = "Independent WebRTC receiver for an authenticated Obscura Host")]
@@ -107,6 +110,10 @@ async fn main() -> Result<()> {
     peer.set_remote_description(RTCSessionDescription::answer(sdp).context("parse Host WebRTC answer")?)
         .await.context("apply Host WebRTC answer")?;
     wait_for_open(&data_channel).await?;
+    let selected_pair = obscura_media::webrtc::selected_udp_candidate_pair(&peer).await?;
+    let mut media = MediaAssociations::new();
+    let (control_tx, mut control_rx) = mpsc::channel(128);
+    let control_reader = tokio::spawn(read_data_channel(Arc::clone(&data_channel), control_tx));
     let hello_binding = if args.bad_binding {
         let mut bad = binding.clone();
         bad.session_id.push_str("-stale");
@@ -114,125 +121,150 @@ async fn main() -> Result<()> {
     } else { binding.clone() };
     send_control(&data_channel, &WebRtcControlMessage::Hello { capability: capability.clone(), binding: hello_binding }).await?;
     if args.bad_binding {
-        timeout(DEADLINE, async {
-            loop {
-                match data_channel.poll().await.context("WebRTC DataChannel ended without explicit stale-binding rejection")? {
-                    DataChannelEvent::OnClose | DataChannelEvent::OnError => break,
-                    DataChannelEvent::OnMessage(message) => {
-                        let control: WebRtcControlMessage = serde_json::from_slice(&message.data)
-                            .context("decode stale-binding WebRTC rejection")?;
-                        match control {
-                            WebRtcControlMessage::Error { code, .. } => {
-                                ensure!(code == "STALE_WEBRTC_BINDING", "unexpected stale-binding rejection code: {code}");
-                                break;
-                            }
-                            _ => bail!("stale WebRTC binding was not rejected"),
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            Ok::<(), anyhow::Error>(())
-        }).await.context("timed out waiting for stale WebRTC binding rejection")??;
+        match next_control(&mut control_rx, "stale-binding rejection").await? {
+            WebRtcControlMessage::Error { code, .. } => ensure!(code == "STALE_WEBRTC_BINDING", "unexpected stale-binding rejection code: {code}"),
+            other => bail!("stale WebRTC binding was not rejected: {other:?}"),
+        }
         println!("{}", serde_json::json!({"pass": true, "negative": "stale_binding_rejected", "session_id": session_id}));
+        control_reader.abort();
+        let _ = control_reader.await;
         let _ = peer.close().await;
         return Ok(());
     }
 
+    wait_for_hello_ack(&mut control_rx, &mut media, &capability, &binding).await?;
+    send_control(&data_channel, &WebRtcControlMessage::Ping { request_id: 3 }).await?;
+    wait_for_pong(&mut control_rx, &mut media, &session_id, 3).await?;
     let track = timeout(DEADLINE, track_rx.recv()).await.context("timed out waiting for Host H.264 track")?
         .context("Host WebRTC track ended before media")?;
-    let mut descriptors: BTreeMap<u32, WebRtcVideoFrame> = BTreeMap::new();
-    let mut samples: BTreeMap<u32, DecodedSample> = BTreeMap::new();
     let mut evidence = Vec::new();
-    let mut builder = SampleBuilder::new(256, H264Packet::default(), H264_CLOCK_RATE)
-        .with_max_time_delay(Duration::from_secs(2));
-    let mut hello_ack = false;
-    let mut click_sent = false;
-    let mut rtp_packets = 0u64;
+    let mut browser_path_done = args.skip_click;
     let mut status = attached;
     let mut last_sequence = None;
     let mut last_pts = None;
+    let mut last_encoder_id = None;
+    let mut last_dimensions = None;
     let mut last_checksum = None;
     let deadline = tokio::time::Instant::now() + DEADLINE;
     loop {
-        if !args.skip_click && !click_sent && evidence.len() >= 1 {
-            status = request_takeover_and_click(&mut control, &status, args.click_x, args.click_y).await?;
-            click_sent = true;
-        }
-        while let Some(rtp_timestamp) = next_matching_timestamp(&samples, &descriptors) {
-            let descriptor = descriptors.remove(&rtp_timestamp).expect("descriptor key was checked present");
-            let sample = samples.remove(&rtp_timestamp).expect("sample key was checked present");
+        while let Some((rtp_timestamp, descriptor, sample)) = media.take_matching() {
+            validate_video_frame(&descriptor, &sample, rtp_timestamp, &session_id, &mut last_sequence, &mut last_pts,
+                &mut last_encoder_id, &mut last_dimensions)?;
             let decoded = decode_sample(&sample.data, descriptor.coded_width, descriptor.coded_height).await?;
-            ensure!(descriptor.session_id == session_id, "invalid frame descriptor session identity");
-            ensure!(descriptor.sequence > last_sequence.unwrap_or(0), "WebRTC frame sequence did not increase");
-            ensure!(descriptor.pts_us >= last_pts.unwrap_or(0), "WebRTC frame PTS did not increase");
-            ensure!(descriptor.width > 0 && descriptor.height > 0, "WebRTC frame descriptor has invalid source size");
-            ensure!(descriptor.coded_width >= descriptor.width && descriptor.coded_height >= descriptor.height,
-                "WebRTC frame descriptor coded size is smaller than source size");
-            last_sequence = Some(descriptor.sequence);
-            last_pts = Some(descriptor.pts_us);
             let changed = last_checksum.is_some_and(|checksum| checksum != decoded.checksum);
             last_checksum = Some(decoded.checksum);
             evidence.push(FrameEvidence { descriptor, checksum: decoded.checksum, rtp_packets: sample.packet_count, changed });
-            if evidence.len() >= args.frames && (args.skip_click || (click_sent && evidence.iter().any(|frame| frame.changed))) { break; }
         }
-        if evidence.len() >= args.frames && (args.skip_click || (click_sent && evidence.iter().any(|frame| frame.changed))) { break; }
+        if !browser_path_done && evidence.len() >= 1 && evidence.last().is_some_and(|frame|
+            frame.descriptor.source.width == 160 && frame.descriptor.source.height == 120) {
+            let initial_epoch = status.control.epoch;
+            let forbidden = request_dc(&data_channel, &mut control_rx, &track, &mut media, &session_id,
+                Request { id: 100, command: Command::Evaluate { expression: "window.location.href".into() }, operation: None }).await?;
+            expect_error(forbidden, "REMOTE_COMMAND_FORBIDDEN")?;
+
+            let takeover = request_dc(&data_channel, &mut control_rx, &track, &mut media, &session_id,
+                Request { id: 101, command: Command::RequestTakeover { epoch: initial_epoch }, operation: None }).await?;
+            status = status_from_response(takeover)?;
+            ensure!(matches!(status.control.phase, ControlPhase::Human { .. }), "Host did not grant human control over WebRTC DataChannel");
+
+            let stale_control = request_dc(&data_channel, &mut control_rx, &track, &mut media, &session_id,
+                Request { id: 102, command: Command::RequestTakeover { epoch: initial_epoch }, operation: None }).await?;
+            expect_error(stale_control, "STALE_CONTROL")?;
+
+            let navigate_operation = operation_for(&status)?;
+            let navigated = request_dc(&data_channel, &mut control_rx, &track, &mut media, &session_id,
+                Request { id: 103, command: Command::Navigate { url: INPUT_FIXTURE.into() }, operation: Some(navigate_operation.clone()) }).await?;
+            status = status_from_response(navigated)?;
+
+            let mut stale_document = operation_for(&status)?;
+            stale_document.document_revision = navigate_operation.document_revision;
+            let stale_document_response = request_dc(&data_channel, &mut control_rx, &track, &mut media, &session_id,
+                Request { id: 104, command: Command::Click { x: args.click_x, y: args.click_y }, operation: Some(stale_document) }).await?;
+            expect_error(stale_document_response, "STALE_DOCUMENT")?;
+
+            let mut stale_operation = operation_for(&status)?;
+            stale_operation.control_epoch = initial_epoch;
+            let stale_control_response = request_dc(&data_channel, &mut control_rx, &track, &mut media, &session_id,
+                Request { id: 105, command: Command::Click { x: args.click_x, y: args.click_y }, operation: Some(stale_operation) }).await?;
+            expect_error(stale_control_response, "STALE_CONTROL")?;
+
+            let click_operation = operation_for(&status)?;
+            let clicked = request_dc(&data_channel, &mut control_rx, &track, &mut media, &session_id,
+                Request { id: 106, command: Command::Click { x: args.click_x, y: args.click_y }, operation: Some(click_operation.clone()) }).await?;
+            expect_input(clicked)?;
+            let duplicate = request_dc(&data_channel, &mut control_rx, &track, &mut media, &session_id,
+                Request { id: 107, command: Command::Click { x: args.click_x, y: args.click_y }, operation: Some(click_operation) }).await?;
+            expect_input(duplicate)?;
+            status = status_from_response(request_dc(&data_channel, &mut control_rx, &track, &mut media, &session_id,
+                Request { id: 108, command: Command::Status {}, operation: None }).await?)?;
+
+            let focus_click = request_dc(&data_channel, &mut control_rx, &track, &mut media, &session_id,
+                Request { id: 109, command: Command::Click { x: 30.0, y: 95.0 }, operation: Some(operation_for(&status)?) }).await?;
+            expect_input(focus_click)?;
+            status = status_from_response(request_dc(&data_channel, &mut control_rx, &track, &mut media, &session_id,
+                Request { id: 110, command: Command::Status {}, operation: None }).await?)?;
+
+            let input = request_dc(&data_channel, &mut control_rx, &track, &mut media, &session_id,
+                Request { id: 111, command: Command::InputText { text: "移动端中文输入".into() }, operation: Some(operation_for(&status)?) }).await?;
+            expect_input(input)?;
+            status = status_from_response(request_dc(&data_channel, &mut control_rx, &track, &mut media, &session_id,
+                Request { id: 112, command: Command::Status {}, operation: None }).await?)?;
+
+            let scroll = request_dc(&data_channel, &mut control_rx, &track, &mut media, &session_id,
+                Request { id: 113, command: Command::Scroll { x: 30.0, y: 100.0, delta_x: 0.0, delta_y: 400.0 }, operation: Some(operation_for(&status)?) }).await?;
+            expect_input(scroll)?;
+            status = status_from_response(request_dc(&data_channel, &mut control_rx, &track, &mut media, &session_id,
+                Request { id: 114, command: Command::Status {}, operation: None }).await?)?;
+
+            let released = request_dc(&data_channel, &mut control_rx, &track, &mut media, &session_id,
+                Request { id: 115, command: Command::ReleaseControl { epoch: status.control.epoch }, operation: None }).await?;
+            status = status_from_response(released)?;
+            ensure!(matches!(status.control.phase, ControlPhase::Agent), "Host did not release WebRTC human control");
+            browser_path_done = true;
+        }
+        if evidence.len() >= args.frames && (args.skip_click || (browser_path_done && evidence.iter().any(|frame| frame.changed))) { break; }
         if tokio::time::Instant::now() >= deadline {
-            bail!("timed out collecting continuous WebRTC frames (rtp_packets={rtp_packets}, descriptors={}, samples={}, hello_ack={hello_ack})",
-                descriptors.len(), samples.len());
+            bail!("timed out collecting continuous WebRTC frames (rtp_packets={}, descriptors={}, samples={}, browser_path_done={browser_path_done})",
+                media.rtp_packets, media.descriptors.len(), media.samples.len());
         }
         tokio::select! {
-            event = data_channel.poll() => match event {
-                Some(DataChannelEvent::OnMessage(message)) => {
-                    let control: WebRtcControlMessage = serde_json::from_slice(&message.data).context("decode Host WebRTC control message")?;
-                    match control {
-                        WebRtcControlMessage::HelloAck { capability: ack_capability, binding: ack_binding } => {
-                            ensure!(ack_capability == capability && ack_binding == binding, "Host WebRTC HelloAck binding mismatch");
-                            hello_ack = true;
-                        }
-                        WebRtcControlMessage::Error { code, message } => bail!("Host WebRTC error {code}: {message}"),
-                        WebRtcControlMessage::VideoFrame { descriptor } => {
-                        ensure!(descriptor.session_id == session_id, "WebRTC descriptor session identity differs from Host session");
-                        ensure!(descriptors.insert(descriptor.rtp_timestamp, descriptor).is_none(), "duplicate WebRTC RTP timestamp descriptor");
-                        ensure!(descriptors.len() <= 64, "WebRTC descriptor association backlog exceeded 64 frames");
-                    }
-                        WebRtcControlMessage::Pong { .. } => {},
-                        other => bail!("unexpected Host WebRTC control message: {other:?}"),
-                    }
-                }
-                Some(DataChannelEvent::OnError) => bail!("receiver WebRTC DataChannel error"),
-                Some(DataChannelEvent::OnClose) | None => bail!("receiver WebRTC DataChannel closed"),
-                _ => {},
+            message = control_rx.recv() => match message.context("WebRTC DataChannel reader ended")?? {
+                WebRtcControlMessage::VideoFrame { descriptor } => media.accept_descriptor(descriptor, &session_id)?,
+                WebRtcControlMessage::Error { code, message } => bail!("receiver WebRTC error {code}: {message}"),
+                WebRtcControlMessage::Pong { .. } => {},
+                other => bail!("unexpected Host WebRTC control message: {other:?}"),
             },
             event = track.poll() => match event {
-                Some(TrackRemoteEvent::OnRtpPacket(packet)) => {
-                    rtp_packets += 1;
-                    builder.push(Instant::now(), packet);
-                    if let Some(sample) = builder.pop(Instant::now()) {
-                        let rtp_timestamp = sample.packet_timestamp;
-                        ensure!(samples.insert(rtp_timestamp, DecodedSample { data: sample.data.to_vec(), packet_count: 1 }).is_none(),
-                            "duplicate WebRTC RTP timestamp sample");
-                        ensure!(samples.len() <= 64, "WebRTC RTP association backlog exceeded 64 samples");
-                    }
-                }
-                Some(TrackRemoteEvent::OnError) => bail!("receiver H.264 track error"),
-                Some(TrackRemoteEvent::OnEnded) | None => bail!("receiver H.264 track ended"),
-                _ => {},
+                Some(event) => media.accept_track_event(event)?,
+                None => bail!("receiver H.264 track ended"),
             },
         }
     }
-    ensure!(hello_ack, "receiver did not receive Host WebRTC HelloAck");
     ensure!(evidence.len() >= 3, "continuous WebRTC evidence has fewer than three frames");
     println!("{}", serde_json::json!({
         "pass": true,
+        "browser_path": "webrtc_data_channel",
+        "ice": {
+            "transport": "udp",
+            "local_candidate": obscura_media::webrtc::candidate_evidence(selected_pair.local()),
+            "remote_candidate": obscura_media::webrtc::candidate_evidence(selected_pair.remote()),
+        },
         "session_id": session_id,
         "attachment_id": attachment_id,
         "frames": evidence.iter().map(|frame| serde_json::json!({
-            "sequence": frame.descriptor.sequence,
-            "document_revision": frame.descriptor.document_revision,
-            "viewport_revision": frame.descriptor.viewport_revision,
-            "width": frame.descriptor.width,
-            "height": frame.descriptor.height,
+            "sequence": frame.descriptor.source.sequence,
+            "document_revision": frame.descriptor.source.document_revision,
+            "viewport_revision": frame.descriptor.source.viewport_revision,
+            "session_id": frame.descriptor.source.session_id,
+            "width": frame.descriptor.source.width,
+            "height": frame.descriptor.source.height,
+            "stride": frame.descriptor.source.stride,
+            "source_byte_length": frame.descriptor.source.byte_length,
+            "encoder_id": frame.descriptor.encoder_id,
+            "rtp_timestamp": frame.descriptor.rtp_timestamp,
+            "codec": frame.descriptor.codec,
+            "keyframe": frame.descriptor.keyframe,
+            "access_unit_bytes": frame.descriptor.access_unit_bytes,
             "coded_width": frame.descriptor.coded_width,
             "coded_height": frame.descriptor.coded_height,
             "pts_us": frame.descriptor.pts_us,
@@ -241,6 +273,8 @@ async fn main() -> Result<()> {
             "changed": frame.changed,
         })).collect::<Vec<_>>(),
     }));
+    control_reader.abort();
+    let _ = control_reader.await;
     let _ = peer.close().await;
     Ok(())
 }
@@ -251,6 +285,258 @@ struct FrameEvidence { descriptor: WebRtcVideoFrame, checksum: u64, rtp_packets:
 struct DecodedSample { data: Vec<u8>, packet_count: u64 }
 #[derive(Debug)]
 struct Decoded { checksum: u64 }
+
+struct MediaAssociations {
+    descriptors: BTreeMap<u32, WebRtcVideoFrame>,
+    samples: BTreeMap<u32, DecodedSample>,
+    packet_counts: BTreeMap<u32, u64>,
+    builder: SampleBuilder<H264Packet>,
+    rtp_packets: u64,
+}
+
+impl MediaAssociations {
+    fn new() -> Self {
+        Self {
+            descriptors: BTreeMap::new(),
+            samples: BTreeMap::new(),
+            packet_counts: BTreeMap::new(),
+            builder: SampleBuilder::new(256, H264Packet::default(), H264_CLOCK_RATE)
+                .with_max_time_delay(Duration::from_secs(2)),
+            rtp_packets: 0,
+        }
+    }
+
+    fn accept_descriptor(&mut self, descriptor: WebRtcVideoFrame, session_id: &str) -> Result<()> {
+        validate_descriptor(&descriptor, session_id)?;
+        ensure!(self.descriptors.insert(descriptor.rtp_timestamp, descriptor).is_none(),
+            "duplicate WebRTC RTP timestamp descriptor");
+        ensure!(self.descriptors.len() <= MAX_ASSOCIATIONS, "WebRTC descriptor association backlog exceeded 64 frames");
+        Ok(())
+    }
+
+    fn accept_track_event(&mut self, event: TrackRemoteEvent) -> Result<()> {
+        match event {
+            TrackRemoteEvent::OnRtpPacket(packet) => {
+                self.rtp_packets += 1;
+                let timestamp = packet.header.timestamp;
+                *self.packet_counts.entry(timestamp).or_insert(0) += 1;
+                ensure!(self.packet_counts.len() <= MAX_ASSOCIATIONS,
+                    "WebRTC RTP packet association backlog exceeded 64 timestamps");
+                self.builder.push(Instant::now(), packet);
+                while let Some(sample) = self.builder.pop(Instant::now()) {
+                    ensure!(!sample.data.is_empty() && sample.data.len() <= obscura_media::MAX_ACCESS_UNIT,
+                        "invalid reassembled WebRTC H.264 access unit");
+                    let packet_count = self.packet_counts.remove(&sample.packet_timestamp)
+                        .context("missing RTP packet count for reassembled access unit")?;
+                    ensure!(self.samples.insert(sample.packet_timestamp, DecodedSample {
+                        data: sample.data.to_vec(), packet_count,
+                    }).is_none(), "duplicate WebRTC RTP timestamp sample");
+                    ensure!(self.samples.len() <= MAX_ASSOCIATIONS,
+                        "WebRTC RTP association backlog exceeded 64 samples");
+                }
+                Ok(())
+            }
+            TrackRemoteEvent::OnError => bail!("receiver H.264 track error"),
+            TrackRemoteEvent::OnEnded => bail!("receiver H.264 track ended"),
+            _ => Ok(()),
+        }
+    }
+
+    fn take_matching(&mut self) -> Option<(u32, WebRtcVideoFrame, DecodedSample)> {
+        let timestamp = next_matching_timestamp(&self.samples, &self.descriptors)?;
+        Some((timestamp, self.descriptors.remove(&timestamp)?, self.samples.remove(&timestamp)?))
+    }
+}
+
+fn even_dimension(value: u32) -> u32 { value.saturating_add(1) & !1 }
+
+fn validate_descriptor(descriptor: &WebRtcVideoFrame, session_id: &str) -> Result<()> {
+    ensure!(descriptor.source.session_id == session_id, "WebRTC frame session identity differs from Host session");
+    ensure!(matches!(descriptor.source.pixel_format, PixelFormat::PremultipliedRgba8),
+        "WebRTC frame source pixel format is unsupported");
+    obscura_media::validate_pixels(descriptor.source.width, descriptor.source.height, descriptor.source.byte_length)?;
+    ensure!(descriptor.source.stride == descriptor.source.width.checked_mul(4).context("WebRTC source stride overflow")?,
+        "WebRTC frame source stride does not match source width");
+    ensure!(!descriptor.encoder_id.is_empty() && descriptor.encoder_id.len() <= 128,
+        "WebRTC frame encoder identity is invalid");
+    ensure!(matches!(descriptor.codec, WebRtcVideoCodec::H264AnnexB),
+        "WebRTC frame codec is not H.264 Annex B");
+    ensure!(descriptor.keyframe, "WebRTC frame is not independently decodable");
+    ensure!(descriptor.access_unit_bytes > 0 && descriptor.access_unit_bytes <= obscura_media::MAX_ACCESS_UNIT as u64,
+        "WebRTC frame access-unit length is invalid");
+    ensure!(descriptor.coded_width == even_dimension(descriptor.source.width)
+        && descriptor.coded_height == even_dimension(descriptor.source.height),
+        "WebRTC frame coded dimensions do not match source dimensions");
+    Ok(())
+}
+
+fn validate_video_frame(
+    descriptor: &WebRtcVideoFrame,
+    sample: &DecodedSample,
+    rtp_timestamp: u32,
+    session_id: &str,
+    last_sequence: &mut Option<u64>,
+    last_pts: &mut Option<u64>,
+    last_encoder_id: &mut Option<String>,
+    last_dimensions: &mut Option<(u64, u64, u32, u32)>,
+) -> Result<()> {
+    validate_descriptor(descriptor, session_id)?;
+    ensure!(descriptor.rtp_timestamp == rtp_timestamp, "WebRTC RTP timestamp association changed");
+    ensure!(descriptor.access_unit_bytes == sample.data.len() as u64,
+        "WebRTC descriptor access-unit length differs from reassembled RTP bytes: descriptor={} rtp={}",
+        descriptor.access_unit_bytes, sample.data.len());
+    ensure!(sample.packet_count > 0, "WebRTC frame has no RTP packets");
+    if let Some(previous) = *last_sequence {
+        ensure!(descriptor.source.sequence > previous, "WebRTC frame sequence did not increase");
+    }
+    if let Some(previous) = *last_pts {
+        ensure!(descriptor.pts_us >= previous, "WebRTC frame PTS did not increase");
+    }
+    if let Some(previous) = last_encoder_id.as_ref() {
+        ensure!(previous == &descriptor.encoder_id, "WebRTC encoder identity changed during one connection");
+    } else {
+        *last_encoder_id = Some(descriptor.encoder_id.clone());
+    }
+    if let Some((viewport_revision, document_revision, width, height)) = *last_dimensions {
+        ensure!(descriptor.source.viewport_revision >= viewport_revision, "WebRTC viewport revision regressed");
+        ensure!(descriptor.source.document_revision >= document_revision, "WebRTC document revision regressed");
+        if descriptor.source.viewport_revision == viewport_revision {
+            ensure!((descriptor.source.width, descriptor.source.height) == (width, height),
+                "WebRTC source dimensions changed without a viewport revision");
+        }
+    }
+    *last_sequence = Some(descriptor.source.sequence);
+    *last_pts = Some(descriptor.pts_us);
+    *last_dimensions = Some((descriptor.source.viewport_revision, descriptor.source.document_revision,
+        descriptor.source.width, descriptor.source.height));
+    Ok(())
+}
+
+async fn read_data_channel(channel: Arc<dyn DataChannel>, tx: mpsc::Sender<Result<WebRtcControlMessage>>) {
+    let result: Result<()> = async {
+        loop {
+            let event = channel.poll().await.context("WebRTC DataChannel ended")?;
+            match event {
+                DataChannelEvent::OnMessage(message) => {
+                    ensure!(message.data.len() <= MAX_CONTROL_MESSAGE, "WebRTC control message exceeds 64 KiB");
+                    let control = serde_json::from_slice(&message.data).context("decode WebRTC control message")?;
+                    if tx.send(Ok(control)).await.is_err() { return Ok(()); }
+                }
+                DataChannelEvent::OnError => bail!("receiver WebRTC DataChannel error"),
+                DataChannelEvent::OnClose => bail!("receiver WebRTC DataChannel closed"),
+                _ => {}
+            }
+        }
+    }.await;
+    if let Err(error) = result { let _ = tx.send(Err(error)).await; }
+}
+
+async fn next_control(rx: &mut mpsc::Receiver<Result<WebRtcControlMessage>>, description: &str) -> Result<WebRtcControlMessage> {
+    Ok(timeout(DEADLINE, rx.recv()).await
+        .with_context(|| format!("timed out waiting for WebRTC {description}"))?
+        .context("WebRTC DataChannel reader ended")??)
+}
+
+async fn wait_for_hello_ack(
+    rx: &mut mpsc::Receiver<Result<WebRtcControlMessage>>,
+    media: &mut MediaAssociations,
+    capability: &WebRtcCapability,
+    binding: &obscura_host_protocol::WebRtcSessionBinding,
+) -> Result<()> {
+    loop {
+        match next_control(rx, "HelloAck").await? {
+            WebRtcControlMessage::HelloAck { capability: ack_capability, binding: ack_binding } => {
+                ensure!(ack_capability == *capability && ack_binding == *binding, "Host WebRTC HelloAck binding mismatch");
+                return Ok(());
+            }
+            WebRtcControlMessage::VideoFrame { descriptor } => media.accept_descriptor(descriptor, &binding.session_id)?,
+            WebRtcControlMessage::Error { code, message } => bail!("Host WebRTC error {code}: {message}"),
+            other => bail!("unexpected WebRTC control message while waiting for HelloAck: {other:?}"),
+        }
+    }
+}
+
+async fn wait_for_pong(
+    rx: &mut mpsc::Receiver<Result<WebRtcControlMessage>>,
+    media: &mut MediaAssociations,
+    session_id: &str,
+    request_id: u64,
+) -> Result<()> {
+    loop {
+        match next_control(rx, "Pong").await? {
+            WebRtcControlMessage::Pong { request_id: received } => {
+                ensure!(received == request_id, "WebRTC Pong request id mismatch");
+                return Ok(());
+            }
+            WebRtcControlMessage::VideoFrame { descriptor } => media.accept_descriptor(descriptor, session_id)?,
+            WebRtcControlMessage::Error { code, message } => bail!("Host WebRTC error {code}: {message}"),
+            other => bail!("unexpected WebRTC control message while waiting for Pong: {other:?}"),
+        }
+    }
+}
+
+async fn request_dc(
+    channel: &Arc<dyn DataChannel>,
+    rx: &mut mpsc::Receiver<Result<WebRtcControlMessage>>,
+    track: &Arc<dyn TrackRemote>,
+    media: &mut MediaAssociations,
+    session_id: &str,
+    request: Request,
+) -> Result<Response> {
+    let request_id = request.id;
+    send_control(channel, &WebRtcControlMessage::BrowserRequest { request }).await?;
+    timeout(DEADLINE, async {
+        loop {
+            tokio::select! {
+                message = rx.recv() => match message.context("WebRTC DataChannel reader ended")?? {
+                    WebRtcControlMessage::VideoFrame { descriptor } => media.accept_descriptor(descriptor, session_id)?,
+                    WebRtcControlMessage::BrowserResponse { response } => {
+                        ensure!(response_id(&response) == Some(request_id), "WebRTC browser response id mismatch");
+                        return Ok(response);
+                    }
+                    WebRtcControlMessage::Pong { .. } => {},
+                    WebRtcControlMessage::Error { code, message } => bail!("Host WebRTC error {code}: {message}"),
+                    other => bail!("unexpected WebRTC control message while waiting for browser response: {other:?}"),
+                },
+                event = track.poll() => media.accept_track_event(event.context("receiver H.264 track ended")?)?,
+            }
+        }
+    }).await.context("timed out waiting for WebRTC browser response")?
+}
+
+fn operation_for(status: &SessionStatus) -> Result<Operation> {
+    Ok(Operation {
+        session_id: status.session_id.clone(),
+        attachment_id: status.attachment_id.context("Host status has no WebRTC attachment")?,
+        sequence: status.next_sequence,
+        control_epoch: status.control.epoch,
+        viewport_revision: status.viewport_revision,
+        document_revision: status.document_revision,
+    })
+}
+
+fn response_id(response: &Response) -> Option<u64> {
+    match response {
+        Response::Result { id, .. } | Response::Error { id, .. } => Some(*id),
+        Response::Ready { .. } => None,
+    }
+}
+
+fn expect_error(response: Response, expected: &str) -> Result<()> {
+    match response {
+        Response::Error { code, .. } => ensure!(code == expected, "expected {expected}, got {code}"),
+        other => bail!("expected Host error {expected}, got {other:?}"),
+    }
+    Ok(())
+}
+
+fn expect_input(response: Response) -> Result<()> {
+    match response {
+        Response::Result { value: ResultValue::Input { input }, .. } => ensure!(matches!(input.state, InputState::Succeeded), "Host input receipt was not successful"),
+        other => bail!("expected successful Host input receipt, got {other:?}"),
+    }
+    Ok(())
+}
 
 fn next_matching_timestamp(
     samples: &BTreeMap<u32, DecodedSample>,
@@ -331,33 +617,15 @@ async fn wait_for_open(channel: &Arc<dyn DataChannel>) -> Result<()> {
 }
 
 async fn send_control(channel: &Arc<dyn DataChannel>, value: &WebRtcControlMessage) -> Result<()> {
-    channel.send_text(&serde_json::to_string(value)?).await?;
+    let text = serde_json::to_string(value)?;
+    ensure!(text.len() <= MAX_CONTROL_MESSAGE, "WebRTC control message exceeds 64 KiB");
+    channel.send_text(&text).await?;
     Ok(())
 }
 
 async fn wait_for_notify(notify: &Notify, description: &str) -> Result<()> {
     timeout(DEADLINE, notify.notified()).await.with_context(|| format!("timed out waiting for {description}"))?;
     Ok(())
-}
-
-async fn request_takeover_and_click(socket: &mut Socket, status: &SessionStatus, x: f64, y: f64) -> Result<SessionStatus> {
-    send_json(socket, &Request { id: 10, command: Command::RequestTakeover { epoch: status.control.epoch }, operation: None }).await?;
-    let takeover = status_from_response(next_response(socket).await?)?;
-    ensure!(matches!(takeover.control.phase, ControlPhase::Human { .. }), "Host did not grant human control for receiver click");
-    let operation = Operation { session_id: takeover.session_id.clone(), attachment_id: takeover.attachment_id.context("takeover attachment missing")?,
-        sequence: takeover.next_sequence, control_epoch: takeover.control.epoch, viewport_revision: takeover.viewport_revision, document_revision: takeover.document_revision };
-    send_json(socket, &Request { id: 11, command: Command::Click { x, y }, operation: Some(operation) }).await?;
-    match next_response(socket).await? {
-        Response::Result { value: ResultValue::Input { input }, .. } => ensure!(matches!(input.state, InputState::Succeeded), "Host click did not succeed"),
-        Response::Error { code, message, .. } => bail!("Host click rejected: {code}: {message}"),
-        other => bail!("unexpected Host click response: {other:?}"),
-    }
-    send_json(socket, &Request { id: 12, command: Command::Status {}, operation: None }).await?;
-    let after_click = status_from_response(next_response(socket).await?)?;
-    send_json(socket, &Request { id: 13, command: Command::ReleaseControl { epoch: after_click.control.epoch }, operation: None }).await?;
-    let released = status_from_response(next_response(socket).await?)?;
-    ensure!(matches!(released.control.phase, ControlPhase::Agent), "Host did not release human control");
-    Ok(released)
 }
 
 async fn decode_sample(data: &[u8], width: u32, height: u32) -> Result<Decoded> {
@@ -394,10 +662,14 @@ mod association_tests {
 
     fn descriptor(rtp_timestamp: u32, sequence: u64) -> WebRtcVideoFrame {
         WebRtcVideoFrame {
-            session_id: "session".into(), sequence, rtp_timestamp,
-            document_revision: 0, viewport_revision: 0,
-            width: 160, height: 120, coded_width: 160, coded_height: 120,
-            pts_us: sequence, keyframe: true,
+            source: obscura_host_protocol::FrameInfo {
+                session_id: "session".into(), sequence, document_revision: 0, viewport_revision: 0,
+                width: 160, height: 120, stride: 640, byte_length: 160 * 120 * 4,
+                pixel_format: PixelFormat::PremultipliedRgba8,
+            },
+            encoder_id: "encoder".into(), rtp_timestamp, coded_width: 160, coded_height: 120,
+            codec: WebRtcVideoCodec::H264AnnexB, pts_us: sequence, keyframe: true,
+            access_unit_bytes: 1,
         }
     }
 
@@ -413,7 +685,7 @@ mod association_tests {
 
         let timestamp = next_matching_timestamp(&samples, &descriptors).expect("later exact timestamp should match");
         assert_eq!(timestamp, 300);
-        assert_eq!(descriptors.get(&timestamp).expect("matching descriptor").sequence, 3);
+        assert_eq!(descriptors.get(&timestamp).expect("matching descriptor").source.sequence, 3);
         assert!(descriptors.contains_key(&100), "missing RTP frame descriptor must remain explicitly unmatched");
     }
 
@@ -426,6 +698,6 @@ mod association_tests {
         descriptors.insert(200, descriptor(200, 2));
 
         let timestamp = next_matching_timestamp(&samples, &descriptors).expect("late descriptor should match exact RTP timestamp");
-        assert_eq!(descriptors.get(&timestamp).expect("matching descriptor").sequence, 2);
+        assert_eq!(descriptors.get(&timestamp).expect("matching descriptor").source.sequence, 2);
     }
 }
