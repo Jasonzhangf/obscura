@@ -15131,6 +15131,25 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "render")]
+    fn test_live_input_value_repaints_without_changing_default() {
+        let mut rt = setup_runtime(r#"<style>body{margin:0}input{width:200px;height:40px;color:black;background:white}</style><input id="field" value="default" placeholder="hint">"#);
+        rt.set_viewport(240.0, 60.0);
+        let initial = rt.screenshot_prepared((240.0, 60.0), Some("http://example.com/test")).unwrap();
+        rt.execute_script("test", "document.getElementById('field').value='LIVE';").unwrap();
+        let live = rt.screenshot_prepared((240.0, 60.0), Some("http://example.com/test")).unwrap();
+        assert_ne!(initial, live, "live value must update rendered pixels");
+        assert_eq!(rt.evaluate("document.getElementById('field').getAttribute('value')").unwrap(), serde_json::json!("default"));
+        assert_eq!(rt.evaluate("document.getElementById('field').cloneNode(true).value").unwrap(), serde_json::json!("LIVE"));
+        rt.execute_script("test", "document.getElementById('field').value='';").unwrap();
+        let empty = rt.screenshot_prepared((240.0, 60.0), Some("http://example.com/test")).unwrap();
+        assert_ne!(empty, live, "clearing must repaint");
+        assert_ne!(empty, initial, "empty current value must override nonempty default");
+        rt.execute_script("test", "document.getElementById('field').value='LIVE';").unwrap();
+        assert_eq!(rt.screenshot_prepared((240.0, 60.0), Some("http://example.com/test")).unwrap(), live);
+    }
+
+    #[test]
     fn test_input_value() {
         let mut rt = setup_runtime(
             r#"<form><input id="name" type="text" value="initial"><textarea id="bio">old text</textarea></form>"#,

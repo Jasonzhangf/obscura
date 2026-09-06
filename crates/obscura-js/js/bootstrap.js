@@ -105,7 +105,7 @@ let _domMutationEpoch = 0;
 let _treeMutationEpoch = 0;
 const _DOM_MUTATION_COMMANDS = new Set([
   "append_child", "insert_before", "remove_child",
-  "set_attribute", "remove_attribute",
+  "set_attribute", "remove_attribute", "set_input_value",
   "set_text_content", "set_inner_html", "set_inner_html_context",
   "set_fragment_html_executable", "document_write",
 ]);
@@ -3972,7 +3972,10 @@ class Element extends Node {
       if (opts.length) return opts[0].getAttribute('value') !== null ? opts[0].getAttribute('value') : opts[0].textContent;
       return '';
     }
-    if (_formValues[this._nid] !== undefined) return _formValues[this._nid];
+    if (tag === 'input') {
+      const current = JSON.parse(_dom('get_input_value', this._nid));
+      if (current !== null) return current;
+    } else if (_formValues[this._nid] !== undefined) return _formValues[this._nid];
     if (tag === 'textarea') return this.textContent;
     if (tag === 'option') {
       const attr = this.getAttribute('value');
@@ -4021,6 +4024,10 @@ class Element extends Node {
         const optVal = attrV !== null ? attrV : opts[i].textContent;
         opts[i].selected = optVal === wanted;
       }
+      return;
+    }
+    if (tag === 'input') {
+      _dom('set_input_value', this._nid, String(v));
       return;
     }
     _formValues[this._nid] = String(v);
