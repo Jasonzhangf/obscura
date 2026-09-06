@@ -148,8 +148,8 @@ impl Session {
     }
     fn request(&mut self, connection: u64, request: Request, busy: bool) -> Result<Response, Command> {
         let id = request.id;
-        let input = matches!(request.command, Command::Click { .. } | Command::InputText { .. } | Command::Scroll { .. });
-        let mutation = input || matches!(request.command, Command::Navigate { .. } | Command::Evaluate { .. } | Command::Resize { .. } | Command::CloseSession {});
+        let controlled = matches!(request.command, Command::Click { .. } | Command::InputText { .. } | Command::Scroll { .. } | Command::Navigate { .. });
+        let mutation = controlled || matches!(request.command, Command::Evaluate { .. } | Command::Resize { .. } | Command::CloseSession {});
         if mutation {
             let Some(operation) = &request.operation else { return Ok(error(id, "OPERATION_REQUIRED", "Browser mutations require an operation identity")); };
             if operation.session_id != self.id || operation.attachment_id != connection {
@@ -243,7 +243,7 @@ impl Session {
                     }
                     _ => {},
                 }
-                if input {
+                if controlled {
                     let allowed = matches!(self.control.phase, ControlPhase::Agent) && self.agent == Some(connection)
                         || matches!(self.control.phase, ControlPhase::Human { attachment_id } if attachment_id == connection);
                     if !allowed { return Ok(error(id, "CONTROL_REQUIRED", "Input requires current control ownership")); }
