@@ -20,7 +20,7 @@ for f in "$DIR"/*.html; do
     continue
   fi
 
-  chrome_args=("$DIR/capture_chromium.py" "file://$f" "$OUT/$n.chrome.png")
+  chrome_args=("$DIR/capture_chromium.py" "file://$f" "$OUT/$n.chrome.png" --bundled-fonts)
   if [[ -n "$CHROME" ]]; then
     chrome_args+=(--executable "$CHROME")
   fi
