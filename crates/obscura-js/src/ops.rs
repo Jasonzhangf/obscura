@@ -682,6 +682,14 @@ fn render_mutation_impact(
 ) -> RenderMutationImpact {
     let node = |value: &str| value.parse::<u32>().ok().map(NodeId::new);
     match cmd {
+        "set_input_value" => {
+            let Some(target) = node(arg1) else { return RenderMutationImpact::default(); };
+            let old = dom.with_node(target, |node| node.input_value.clone()).flatten();
+            RenderMutationImpact {
+                connected: node_is_connected(dom, target),
+                actual_change: old.as_deref() != Some(arg2),
+            }
+        }
         "set_attribute" => {
             let Some(target) = node(arg1) else {
                 return RenderMutationImpact::default();
@@ -1058,6 +1066,7 @@ fn is_render_mutation_command(cmd: &str) -> bool {
     matches!(
         cmd,
         "set_attribute"
+            | "set_input_value"
             | "remove_attribute"
             | "set_attribute_ns"
             | "remove_attribute_ns"
@@ -1628,6 +1637,20 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                 .flatten()
                 .unwrap_or_default();
             serde_json::to_string(&ns).unwrap_or("\"\"".into())
+        }
+        "get_input_value" => {
+            let nid = arg1.parse::<u32>().unwrap_or(0);
+            let value = dom.with_node(NodeId::new(nid), |node| node.input_value.clone()).flatten();
+            serde_json::to_string(&value).unwrap_or("null".into())
+        }
+        "set_input_value" => {
+            let nid = arg1.parse::<u32>().unwrap_or(0);
+            dom.with_node_mut(NodeId::new(nid), |node| {
+                if node.as_element().is_some_and(|name| name.local.as_ref() == "input") {
+                    node.input_value = Some(arg2.to_owned());
+                }
+            });
+            "null".into()
         }
         "get_attribute" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
