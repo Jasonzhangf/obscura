@@ -496,6 +496,9 @@ impl ObscuraJsRuntime {
     /// through `proxy_url` (#139). `None` is equivalent to `with_base_url`
     /// (direct connection).
     pub fn with_base_url_and_proxy(base_url: &str, proxy_url: Option<String>) -> Self {
+        // A runtime is about to initialize the V8 platform; from here on a
+        // set_v8_flags call must be refused rather than aborting the process.
+        crate::v8_flags::mark_platform_started();
         let state = Rc::new(RefCell::new(ObscuraState::new()));
         let state_clone = state.clone();
         let import_map = state.borrow().import_map.clone();
