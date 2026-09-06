@@ -7,10 +7,10 @@
 use std::{net::SocketAddr, sync::Arc, time::{Duration, Instant}};
 
 use anyhow::{Context, Result, bail, ensure};
-use obscura_host_protocol::{VideoCodec, VideoPacket, WebRtcCapability, WebRtcControlMessage,
+use obscura_host_protocol::{Request, Response, VideoCodec, VideoPacket, WebRtcCapability, WebRtcControlMessage,
     WebRtcSessionBinding, WebRtcTransport, WebRtcVideoCodec, WebRtcVideoFrame,
     WEBRTC_CONTROL_LABEL, WEBRTC_PROTOCOL_VERSION};
-use rtc::rtp::{codec::h264::H264Payloader, packetizer::{new_packetizer, Packetizer}, sequence::new_random_sequencer};
+use rtc::rtp::{codec::h264::{H264Packet, H264Payloader}, packetizer::{new_packetizer, Depacketizer, Packetizer}, sequence::new_random_sequencer};
 use tokio::{sync::{mpsc, Notify, watch}, time::{sleep, timeout}};
 use webrtc_rs::{data_channel::{DataChannel, DataChannelEvent},
     media_stream::track_local::{TrackLocal, static_rtp::TrackLocalStaticRTP},
@@ -19,7 +19,7 @@ use webrtc_rs::{data_channel::{DataChannel, DataChannelEvent},
 
 use crate::{EncodedFrame, MAX_ACCESS_UNIT};
 use crate::webrtc::{h264_media_engine, h264_media_track, send_control_message, wait_for_notify,
-    H264_CLOCK_RATE, H264_PAYLOAD_TYPE, H264_RTP_MTU, H264_SSRC, FRAME_DURATION};
+    MAX_CONTROL_MESSAGE, H264_CLOCK_RATE, H264_PAYLOAD_TYPE, H264_RTP_MTU, H264_SSRC, FRAME_DURATION};
 
 const WEBRTC_DEADLINE: Duration = Duration::from_secs(15);
 
@@ -34,6 +34,8 @@ pub struct WebRtcEndpoint {
     capability: WebRtcCapability,
     binding: WebRtcSessionBinding,
     latest: watch::Receiver<Option<Arc<EncodedFrame>>>,
+    browser_requests: mpsc::Sender<Request>,
+    browser_responses: mpsc::Receiver<Response>,
 }
 
 /// Accept one complete SDP offer and prepare the answer. ICE candidates are
@@ -43,6 +45,8 @@ pub async fn accept_offer(
     capability: WebRtcCapability,
     binding: WebRtcSessionBinding,
     latest: watch::Receiver<Option<Arc<EncodedFrame>>>,
+    browser_requests: mpsc::Sender<Request>,
+    browser_responses: mpsc::Receiver<Response>,
     bind: SocketAddr,
 ) -> Result<(String, WebRtcEndpoint)> {
     validate_capability(&capability)?;
@@ -80,13 +84,23 @@ pub async fn accept_offer(
     wait_for_notify(&gathered, "Host WebRTC ICE gathering").await?;
     let answer = peer.local_description().await.context("Host WebRTC answer missing")?;
 
-    Ok((answer.sdp, WebRtcEndpoint { peer, track, packetizer, data_channels, capability, binding, latest }))
+    Ok((answer.sdp, WebRtcEndpoint {
+        peer,
+        track,
+        packetizer,
+        data_channels,
+        capability,
+        binding,
+        latest,
+        browser_requests,
+        browser_responses,
+    }))
 }
 
 impl WebRtcEndpoint {
     /// Send the continuous Host stream after DataChannel binding succeeds.
-    /// DataChannel carries only typed transport control and frame descriptors;
-    /// browser operations remain on the existing WSS control path.
+    /// DataChannel carries typed transport control, frame descriptors and the
+    /// browser request/response envelope. WSS remains signaling/bootstrap only.
     pub async fn run(self) -> Result<()> {
         let peer = Arc::clone(&self.peer);
         let result = self.run_inner().await;
@@ -134,18 +148,32 @@ impl WebRtcEndpoint {
                     self.packetizer.as_mut()).await?;
                 emit_current = false;
             }
-            tokio::select! {
-                changed = self.latest.changed() => {
-                    changed.context("Host encoded media stream ended")?;
-                    emit_current = true;
-                }
-                event = data_channel.poll() => match event {
-                    Some(DataChannelEvent::OnMessage(message)) => {
-                        let control: WebRtcControlMessage = serde_json::from_slice(&message.data)
+        tokio::select! {
+            changed = self.latest.changed() => {
+                changed.context("Host encoded media stream ended")?;
+                emit_current = true;
+            }
+            response = self.browser_responses.recv() => {
+                let response = response.context("Host browser request pump ended")?;
+                send_control_message(&data_channel, &WebRtcControlMessage::BrowserResponse { response }).await?;
+            }
+            event = data_channel.poll() => match event {
+                Some(DataChannelEvent::OnMessage(message)) => {
+                    ensure!(message.data.len() <= MAX_CONTROL_MESSAGE, "WebRTC control message exceeds 64 KiB");
+                    let control: WebRtcControlMessage = serde_json::from_slice(&message.data)
                             .context("decode WebRTC control message")?;
                         match control {
                             WebRtcControlMessage::Ping { request_id } => {
                                 send_control_message(&data_channel, &WebRtcControlMessage::Pong { request_id }).await?;
+                            }
+                            WebRtcControlMessage::BrowserRequest { request } => {
+                                self.browser_requests
+                                    .send(request)
+                                    .await
+                                    .context("send WebRTC browser request to Host pump")?;
+                            }
+                            WebRtcControlMessage::BrowserResponse { .. } => {
+                                bail!("remote sent Host-owned WebRTC browser response")
                             }
                             WebRtcControlMessage::Hello { .. } => bail!("duplicate WebRTC Hello"),
                             WebRtcControlMessage::HelloAck { .. } => bail!("remote sent WebRTC HelloAck"),
@@ -188,6 +216,7 @@ async fn authenticate(
     let DataChannelEvent::OnMessage(message) = message else {
         bail!("WebRTC DataChannel did not send Hello after opening");
     };
+    ensure!(message.data.len() <= MAX_CONTROL_MESSAGE, "WebRTC control message exceeds 64 KiB");
     let WebRtcControlMessage::Hello { capability, binding } = serde_json::from_slice(&message.data)
         .context("decode WebRTC Hello")? else {
         bail!("WebRTC DataChannel first message must be Hello");
@@ -211,7 +240,7 @@ async fn emit_frame(
     packetizer: &mut dyn Packetizer,
 ) -> Result<()> {
     let Some(frame) = frame else { return Ok(()); };
-    let VideoPacket::AccessUnit { source, pts_us, coded_width, coded_height, codec, keyframe, byte_length, .. } = &frame.packet else {
+    let VideoPacket::AccessUnit { source, encoder_id, pts_us, coded_width, coded_height, codec, keyframe, byte_length } = &frame.packet else {
         if matches!(frame.packet, VideoPacket::Closed { .. }) { bail!("Host session closed during WebRTC stream"); }
         return Ok(());
     };
@@ -236,12 +265,17 @@ async fn emit_frame(
     let rtp_timestamp = packets[0].header.timestamp;
     ensure!(packets.iter().all(|packet| packet.header.timestamp == rtp_timestamp),
         "Host H.264 access unit was split across RTP timestamps");
+    let access_unit_bytes = canonical_access_unit_len(&packets)?;
     let descriptor = WebRtcVideoFrame {
-        session_id: source.session_id.clone(), sequence: source.sequence,
+        source: source.clone(),
+        encoder_id: encoder_id.clone(),
         rtp_timestamp,
-        document_revision: source.document_revision, viewport_revision: source.viewport_revision,
-        width: source.width, height: source.height, coded_width: *coded_width,
-        coded_height: *coded_height, pts_us: *pts_us, keyframe: *keyframe,
+        coded_width: *coded_width,
+        coded_height: *coded_height,
+        codec: WebRtcVideoCodec::H264AnnexB,
+        pts_us: *pts_us,
+        keyframe: *keyframe,
+        access_unit_bytes: access_unit_bytes as u64,
     };
     send_control_message(channel, &WebRtcControlMessage::VideoFrame { descriptor }).await?;
     for mut packet in packets {
@@ -253,6 +287,25 @@ async fn emit_frame(
     *last_viewport_revision = source.viewport_revision;
     *last_pts = Some(*pts_us);
     Ok(())
+}
+
+/// Return the exact Annex-B length produced by the RTP H.264 adapter. The
+/// payloader may omit non-media NALUs and the depacketizer emits canonical
+/// four-byte start codes, so the encoder's source length is not the wire
+/// access-unit length advertised to a receiver.
+fn canonical_access_unit_len(packets: &[rtc::rtp::Packet]) -> Result<usize> {
+    let mut depacketizer = H264Packet::default();
+    let mut length = 0usize;
+    for packet in packets {
+        let data = depacketizer
+            .depacketize(&packet.payload)
+            .context("canonicalize Host H.264 RTP access unit")?;
+        length = length
+            .checked_add(data.len())
+            .context("Host H.264 canonical access-unit length overflow")?;
+    }
+    ensure!(length > 0 && length <= MAX_ACCESS_UNIT, "Host H.264 canonical access unit is empty or exceeds budget");
+    Ok(length)
 }
 
 fn validate_capability(capability: &WebRtcCapability) -> Result<()> {
