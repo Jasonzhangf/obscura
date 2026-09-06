@@ -1,10 +1,38 @@
 //! Bounded H.264 encoding. Owns no browser or control state.
-use std::{path::Path, process::Stdio, time::Duration};
+use std::{path::Path, process::Stdio, sync::Arc, time::Duration};
 use anyhow::{ensure, Context, Result};
+use obscura_host_protocol::VideoPacket;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
-#[cfg(feature = "webrtc-probe")]
+#[cfg(any(feature = "webrtc-probe", feature = "webrtc"))]
 pub mod webrtc;
+#[cfg(feature = "webrtc")]
+pub mod webrtc_endpoint;
+
+/// One encoded Host frame shared by the endpoint's WSS and WebRTC adapters.
+/// The packet descriptor remains typed source truth; bytes are only the H.264
+/// access unit belonging to that descriptor.
+#[derive(Debug, Clone)]
+pub struct EncodedFrame {
+    pub packet: VideoPacket,
+    pub bytes: Arc<[u8]>,
+}
+
+impl EncodedFrame {
+    pub fn wire_bytes(&self) -> Result<Vec<u8>> {
+        let mut header = serde_json::to_vec(&self.packet)?;
+        ensure!(header.len() < 4096, "Encoded media header exceeds limit");
+        let mut bytes = Vec::with_capacity(4 + header.len() + self.bytes.len());
+        bytes.extend_from_slice(&(header.len() as u32).to_be_bytes());
+        bytes.append(&mut header);
+        bytes.extend_from_slice(&self.bytes);
+        Ok(bytes)
+    }
+
+    pub fn closed(&self) -> bool {
+        matches!(self.packet, VideoPacket::Closed { .. })
+    }
+}
 pub const MAX_PIXELS: u64 = 4_194_304;
 pub const MAX_ACCESS_UNIT: usize = 4 * 1024 * 1024;
 

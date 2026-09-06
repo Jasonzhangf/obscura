@@ -40,6 +40,10 @@ pub enum Command {
     InputText { text: String },
     Scroll { x: f64, y: f64, delta_x: f64, delta_y: f64 },
     CloseSession {},
+    /// Host-local WebRTC grant lifecycle. Endpoint calls these on the same
+    /// attachment that was created through the mTLS control bootstrap.
+    AuthorizeWebRtc { capability: WebRtcCapability },
+    ConsumeWebRtc { binding: WebRtcSessionBinding, capability: WebRtcCapability },
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -116,6 +120,8 @@ pub enum ResultValue {
     Evaluation { result: EvaluationResult },
     Closed { closed: bool },
     Input { input: InputReceipt },
+    WebRtcAuthorization { binding: WebRtcSessionBinding, capability: WebRtcCapability },
+    WebRtcConsumed { session_id: String, attachment_id: u64 },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -183,7 +189,7 @@ pub enum VideoPacket {
 #[serde(rename_all = "snake_case")]
 pub enum VideoCodec { H264AnnexB }
 
-pub const WEBRTC_PROTOCOL_VERSION: u32 = 1;
+pub const WEBRTC_PROTOCOL_VERSION: u32 = 2;
 pub const WEBRTC_CONTROL_LABEL: &str = "obscura.control.v1";
 pub const WEBRTC_H264_FMTP: &str = "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f";
 
@@ -226,8 +232,40 @@ pub struct WebRtcSessionBinding {
 pub enum WebRtcControlMessage {
     Hello { capability: WebRtcCapability, binding: WebRtcSessionBinding },
     HelloAck { capability: WebRtcCapability, binding: WebRtcSessionBinding },
+    Error { code: String, message: String },
+    VideoFrame { descriptor: WebRtcVideoFrame },
     Ping { request_id: u64 },
     Pong { request_id: u64 },
+}
+
+/// Signaling envelope carried only on the already-authenticated WSS control
+/// bootstrap. It is disjoint from `Request`, so SDP cannot be interpreted as a
+/// browser operation or status payload.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WebRtcSignal {
+    Offer { id: u64, capability: WebRtcCapability, sdp: String },
+    Answer { id: u64, capability: WebRtcCapability, binding: WebRtcSessionBinding, sdp: String },
+    Error { id: u64, code: String, message: String },
+}
+
+/// Source identity sent on the typed DataChannel immediately before the
+/// corresponding RTP access unit. The receiver must validate this descriptor
+/// against the decoded media order; it may not invent revision metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebRtcVideoFrame {
+    pub session_id: String,
+    pub sequence: u64,
+    pub rtp_timestamp: u32,
+    pub document_revision: u64,
+    pub viewport_revision: u64,
+    pub width: u32,
+    pub height: u32,
+    pub coded_width: u32,
+    pub coded_height: u32,
+    pub pts_us: u64,
+    pub keyframe: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
