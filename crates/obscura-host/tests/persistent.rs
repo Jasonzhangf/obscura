@@ -370,6 +370,31 @@ fn human_click_text_and_scroll_use_the_live_page() {
 }
 
 #[test]
+fn human_navigation_respects_control_identity_and_document_revision() {
+    let daemon = Daemon::start();
+    let mut agent = daemon.connect();
+    agent.ok(json!({"type":"attach","mode":"agent"}));
+    agent.ok(json!({"type":"navigate","url":"data:text/html,<title>before</title>"}));
+
+    let mut observer = daemon.connect();
+    let attached = observer.ok(json!({"type":"attach","mode":"observe"}));
+    let operation = identity(&attached);
+    assert_eq!(observer.raw(json!({"id":201,"operation":operation,"command":{"type":"navigate","url":"about:blank"}}))["code"], "CONTROL_REQUIRED");
+
+    let human = observer.ok(json!({"type":"request_takeover","epoch":attached["control"]["epoch"]}));
+    assert_eq!(human["control"]["phase"]["type"], "human");
+    let stale = identity(&attached);
+    assert_eq!(observer.raw(json!({"id":202,"operation":stale,"command":{"type":"navigate","url":"about:blank"}}))["code"], "STALE_CONTROL");
+    assert_eq!(observer.send(json!({"type":"navigate","url":"file:///blocked"}))["code"], "INVALID_URL");
+
+    let before = observer.ok(json!({"type":"status"}));
+    let after = observer.ok(json!({"type":"navigate","url":"data:text/html,<title>after</title>"}));
+    assert_eq!(after["document_revision"].as_u64(), Some(before["document_revision"].as_u64().unwrap() + 1));
+    observer.ok(json!({"type":"release_control","epoch":after["control"]["epoch"]}));
+    assert_eq!(agent.eval("document.title"), "after");
+}
+
+#[test]
 fn click_receipt_precedes_navigation_and_old_document_input_is_rejected() {
     let daemon = Daemon::start_with_network(true);
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
