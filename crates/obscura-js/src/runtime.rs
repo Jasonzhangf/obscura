@@ -4130,6 +4130,294 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn worker_onmessage_bindings_do_not_mutate_window() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script("worker-onmessage-bindings", r#"
+            globalThis.__workerReplies = {};
+            const originalHandler = window.onmessage;
+            const sources = {
+                bare: 'onmessage = function(event) { postMessage([event.data, this === self]); };',
+                declared: 'var onmessage = function(event) { postMessage([event.data, this === self]); };',
+                strict: '"use strict"; onmessage = function(event) { postMessage([event.data, this === self]); };',
+            };
+            for (const [name, source] of Object.entries(sources)) {
+                const url = URL.createObjectURL(new Blob([source], { type: 'application/javascript' }));
+                const worker = new Worker(url);
+                worker.onmessage = event => {
+                    __workerReplies[name] = event.data;
+                    worker.terminate();
+                    URL.revokeObjectURL(url);
+                };
+                worker.postMessage(name);
+            }
+            globalThis.__workerWindowUnchanged = () => window.onmessage === originalHandler;
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__workerReplies").unwrap(),
+            serde_json::json!({
+                "bare": ["bare", true], "declared": ["declared", true], "strict": ["strict", true],
+            })
+        );
+        assert_eq!(
+            rt.evaluate("__workerWindowUnchanged()").unwrap(),
+            serde_json::json!(true)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_initializes_once_and_retains_message_state() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script("worker-persistent-state", r#"
+            globalThis.__workerReplies = [];
+            const source = 'let count = 0; postMessage("ready"); self.onmessage = () => postMessage(++count);';
+            const url = URL.createObjectURL(new Blob([source], { type: 'application/javascript' }));
+            const worker = new Worker(url);
+            worker.onmessage = event => {
+                __workerReplies.push(event.data);
+                if (event.data === 2) {
+                    worker.terminate();
+                    URL.revokeObjectURL(url);
+                }
+            };
+            worker.postMessage(null);
+            worker.postMessage(null);
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__workerReplies").unwrap(),
+            serde_json::json!(["ready", 1, 2])
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_scopes_keep_counters_and_handlers_independent() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "worker-independent-scopes",
+            r#"
+            globalThis.__workerReplies = [[], []];
+            const source = 'let count = 0; onmessage = () => postMessage(++count);';
+            const url = URL.createObjectURL(new Blob([source], { type: 'application/javascript' }));
+            const workers = [new Worker(url), new Worker(url)];
+            workers.forEach((worker, index) => {
+                worker.onmessage = event => __workerReplies[index].push(event.data);
+            });
+            workers[0].postMessage(null);
+            workers[1].postMessage(null);
+            workers[0].postMessage(null);
+        "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__workerReplies").unwrap(),
+            serde_json::json!([[1, 2], [1]])
+        );
+        rt.execute_script(
+            "worker-cleanup",
+            "workers.forEach(worker => worker.terminate()); URL.revokeObjectURL(url);",
+        )
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_delivers_to_handler_and_listener_without_reinitializing() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "worker-handler-and-listener",
+            r#"
+            globalThis.__workerReplies = [];
+            const source = `
+                let count = 0;
+                self.onmessage = event => postMessage(['handler', ++count]);
+                addEventListener('message', function(event) {
+                    postMessage(['listener', count, this === self]);
+                });
+            `;
+            const url = URL.createObjectURL(new Blob([source], { type: 'application/javascript' }));
+            const worker = new Worker(url);
+            worker.onmessage = event => __workerReplies.push(event.data);
+            worker.postMessage(null);
+            worker.postMessage(null);
+        "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__workerReplies").unwrap(),
+            serde_json::json!([
+                ["handler", 1],
+                ["listener", 1, true],
+                ["handler", 2],
+                ["listener", 2, true],
+            ])
+        );
+        rt.execute_script(
+            "worker-cleanup",
+            "worker.terminate(); URL.revokeObjectURL(url);",
+        )
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_queues_messages_while_source_is_loading() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script("worker-queued-messages", r#"
+            globalThis.__workerReplies = [];
+            const originalFetch = globalThis.fetch;
+            let finishSource;
+            globalThis.fetch = async () => ({ text: () => new Promise(resolve => { finishSource = resolve; }) });
+            const worker = new Worker('https://example.com/worker.js');
+            worker.onmessage = event => __workerReplies.push(event.data);
+            worker.postMessage('first');
+            worker.postMessage('second');
+            setTimeout(() => {
+                globalThis.fetch = originalFetch;
+                finishSource('let count = 0; onmessage = event => postMessage([++count, event.data]);');
+            }, 0);
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__workerReplies").unwrap(),
+            serde_json::json!([[1, "first"], [2, "second"]])
+        );
+        rt.execute_script("worker-cleanup", "worker.terminate();")
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_termination_discards_queued_messages() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "worker-terminated-messages",
+            r#"
+            globalThis.__workerReplies = [];
+            const source = 'postMessage("started"); onmessage = () => postMessage("reply");';
+            const url = URL.createObjectURL(new Blob([source], { type: 'application/javascript' }));
+            const worker = new Worker(url);
+            worker.onmessage = event => __workerReplies.push(event.data);
+            worker.postMessage('queued');
+            worker.terminate();
+            worker.postMessage('after termination');
+            URL.revokeObjectURL(url);
+        "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__workerReplies").unwrap(),
+            serde_json::json!([])
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_source_preserves_strict_mode_in_message_closures() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "worker-strict-closure",
+            r#"
+            globalThis.__workerReplies = [];
+            const source = `
+                'use strict';
+                onmessage = () => {
+                    try { workerUndeclaredVariable = 1; postMessage('unexpected assignment'); }
+                    catch (error) { postMessage(error.name); }
+                };
+            `;
+            const url = URL.createObjectURL(new Blob([source], { type: 'application/javascript' }));
+            const worker = new Worker(url);
+            worker.onmessage = event => __workerReplies.push(event.data);
+            worker.postMessage(null);
+        "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__workerReplies").unwrap(),
+            serde_json::json!(["ReferenceError"])
+        );
+        assert_eq!(
+            rt.evaluate("typeof workerUndeclaredVariable").unwrap(),
+            serde_json::json!("undefined")
+        );
+        rt.execute_script(
+            "worker-cleanup",
+            "worker.terminate(); URL.revokeObjectURL(url);",
+        )
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_initialization_error_does_not_rerun_source() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "worker-initialization-error",
+            r#"
+            globalThis.__workerReplies = [];
+            globalThis.__workerErrors = [];
+            const source = 'postMessage("started"); throw new Error("initialization failed");';
+            const url = URL.createObjectURL(new Blob([source], { type: 'application/javascript' }));
+            const worker = new Worker(url);
+            worker.onmessage = event => __workerReplies.push(event.data);
+            worker.onerror = error => __workerErrors.push(error.message);
+            worker.postMessage(null);
+            worker.postMessage(null);
+        "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__workerReplies").unwrap(),
+            serde_json::json!(["started"])
+        );
+        assert_eq!(
+            rt.evaluate("__workerErrors").unwrap(),
+            serde_json::json!(["initialization failed"])
+        );
+        rt.execute_script(
+            "worker-cleanup",
+            "worker.terminate(); URL.revokeObjectURL(url);",
+        )
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_startup_reply_does_not_overtake_queued_messages() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "worker-startup-order",
+            r#"
+            globalThis.__workerReplies = [];
+            const source = 'postMessage("ready"); onmessage = event => postMessage(event.data);';
+            const url = URL.createObjectURL(new Blob([source], { type: 'application/javascript' }));
+            const worker = new Worker(url);
+            let replied = false;
+            worker.onmessage = event => {
+                __workerReplies.push(event.data);
+                if (event.data === 'ready' && !replied) {
+                    replied = true;
+                    worker.postMessage(3);
+                }
+            };
+            worker.postMessage(1);
+            worker.postMessage(2);
+        "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__workerReplies").unwrap(),
+            serde_json::json!(["ready", 1, 2, 3])
+        );
+        rt.execute_script(
+            "worker-cleanup",
+            "worker.terminate(); URL.revokeObjectURL(url);",
+        )
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn self_requeueing_message_channel_yields_to_timers() {
         let mut rt = setup_runtime("<html><body></body></html>");
         rt.execute_script(

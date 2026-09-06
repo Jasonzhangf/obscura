@@ -13511,6 +13511,8 @@ globalThis.Worker = class Worker {
     this.onerror = null;
     this._terminated = false;
     this._listeners = {};
+    this._scope = null;
+    this._pendingMessages = [];
     const worker = this;
 
     let resolvedUrl = url;
@@ -13537,8 +13539,8 @@ globalThis.Worker = class Worker {
   }
   _makeScope() {
     const worker = this;
-    // WorkerGlobalScope defined + no document property → IS_WORKER_SCOPE = true in creepjs
     const scope = {
+      onmessage: null,
       WorkerGlobalScope: function WorkerGlobalScope() {},
       DedicatedWorkerGlobalScope: function DedicatedWorkerGlobalScope() {},
       postMessage: (msg) => {
@@ -13553,7 +13555,7 @@ globalThis.Worker = class Worker {
         if (!scope._ev[type]) scope._ev[type] = [];
         scope._ev[type].push(fn);
       },
-      close: () => { worker._terminated = true; },
+      close: () => { worker.terminate(); },
       crypto: globalThis.crypto,
       Crypto: globalThis.Crypto,
       TextEncoder: globalThis.TextEncoder,
@@ -13575,36 +13577,49 @@ globalThis.Worker = class Worker {
     return scope;
   }
   _autoRun() {
-    if (this._terminated || !this._code) return;
-    const worker = this;
-    const scope = worker._makeScope();
+    if (this._terminated || this._scope || this._code === undefined) return;
+    const scope = this._makeScope();
     try {
-      const fn = new Function('self', 'postMessage', 'addEventListener', 'close', worker._code);
-      fn(scope, scope.postMessage, scope.addEventListener, scope.close);
+      // Direct eval preserves script directives and resolves bare handler names
+      // against the worker scope. Run once so message closures retain their state.
+      const fn = new Function('scope', 'source', 'with (scope) { eval(source); }');
+      fn.call(scope, scope, this._code);
     } catch(e) {
       console.error('Worker error:', e.message);
-      if (worker.onerror) worker.onerror(e);
+      if (this.onerror) this.onerror(e);
+    } finally {
+      if (!this._terminated) {
+        this._scope = scope;
+        for (const data of this._pendingMessages.splice(0)) this.postMessage(data);
+      }
     }
   }
   postMessage(data) {
     if (this._terminated) return;
+    if (!this._scope) {
+      this._pendingMessages.push(data);
+      return;
+    }
     const worker = this;
     setTimeout(() => {
-      if (worker._terminated || !worker._code) return;
-      const scope = worker._makeScope();
+      if (worker._terminated || !worker._scope) return;
+      const scope = worker._scope;
       try {
-        const fn = new Function('self', 'postMessage', 'addEventListener', 'close', worker._code);
-        fn(scope, scope.postMessage, scope.addEventListener, scope.close);
+        const event = { data };
+        if (typeof scope.onmessage === 'function') scope.onmessage.call(scope, event);
         const evs = (scope._ev && scope._ev['message']) || [];
-        if (evs.length) { for (const h of evs) h({ data }); }
-        else if (scope.onmessage) scope.onmessage({ data });
+        for (const handler of evs.slice()) handler.call(scope, event);
       } catch(e) {
         console.error('Worker error:', e.message);
         if (worker.onerror) worker.onerror(e);
       }
     }, 0);
   }
-  terminate() { this._terminated = true; }
+  terminate() {
+    this._terminated = true;
+    this._pendingMessages.length = 0;
+    this._scope = null;
+  }
   addEventListener(type, fn) {
     if (!this._listeners[type]) this._listeners[type] = [];
     this._listeners[type].push(fn);
