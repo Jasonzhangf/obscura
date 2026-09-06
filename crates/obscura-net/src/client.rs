@@ -242,7 +242,13 @@ impl ResourceRequest {
             referrer: Some(referrer.clone()),
             mode: RequestMode::Cors,
             credentials: RequestCredentials::SameOrigin,
-            max_response_bytes: 32 * 1024 * 1024,
+            // OBSCURA_FETCH_MAX_BODY_BYTES (the fetch()/XHR override from #581)
+            // also raises this cap: a large SPA bundle otherwise dies silently
+            // at 32 MiB while fetch() of the same URL succeeds (#849).
+            max_response_bytes: std::env::var("OBSCURA_FETCH_MAX_BODY_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(32 * 1024 * 1024),
         }
     }
 
@@ -2089,6 +2095,37 @@ mod ssrf_tests {
         assert!(request.contains("sec-fetch-dest: font\r\n"));
         assert!(!request.contains("cookie:"));
         assert_eq!(jar.get_cookie_header(&target), "seed=1");
+    }
+
+    // #849 — the OBSCURA_FETCH_MAX_BODY_BYTES override #581 gave fetch()/XHR
+    // must also reach the module-script cap; a large SPA bundle otherwise dies
+    // silently at a hardcoded 32 MiB while fetch() of the same URL succeeds.
+    // (nextest runs each test in its own process, so set_var cannot race.)
+    #[test]
+    fn module_script_cap_honours_the_fetch_body_env_override() {
+        let u = Url::parse("https://example.com/app.mjs").unwrap();
+
+        std::env::remove_var("OBSCURA_FETCH_MAX_BODY_BYTES");
+        assert_eq!(
+            ResourceRequest::module_script(&u, &u).max_response_bytes,
+            32 * 1024 * 1024,
+            "default module cap stays 32 MiB"
+        );
+
+        std::env::set_var("OBSCURA_FETCH_MAX_BODY_BYTES", "134217728");
+        assert_eq!(
+            ResourceRequest::module_script(&u, &u).max_response_bytes,
+            128 * 1024 * 1024,
+            "the env override must reach the module-script cap"
+        );
+
+        // Garbage stays on the default rather than panicking.
+        std::env::set_var("OBSCURA_FETCH_MAX_BODY_BYTES", "not-a-number");
+        assert_eq!(
+            ResourceRequest::module_script(&u, &u).max_response_bytes,
+            32 * 1024 * 1024,
+        );
+        std::env::remove_var("OBSCURA_FETCH_MAX_BODY_BYTES");
     }
 
     #[tokio::test]
