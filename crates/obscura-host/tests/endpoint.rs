@@ -43,7 +43,7 @@ async fn exercise() {
     // Reserve a loopback port only for this test's explicit listener.
     let reservation = std::net::TcpListener::bind((bind_ip, 0)).unwrap();
     let address = reservation.local_addr().unwrap(); drop(reservation);
-    let media = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/release/obscura-media");
+    let media = PathBuf::from(env!("CARGO_BIN_EXE_obscura-host")).with_file_name("obscura-media");
     assert!(media.is_file(), "Build obscura-media before endpoint acceptance");
     let mut endpoint = tokio::process::Command::new(env!("CARGO_BIN_EXE_obscura-endpoint"))
         .arg("--listen").arg(address.to_string()).arg("--host-dir").arg(root.join("host"))
