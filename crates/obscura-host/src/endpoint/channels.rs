@@ -36,14 +36,14 @@ pub async fn control(mut remote: Socket, path: &Path, active: watch::Sender<bool
             }
         };
         let permitted = matches!(request.command, Command::Attach { mode: Mode::Observe, .. } | Command::DeclareViewport { .. } | Command::Status {} | Command::Detach {}
-            | Command::RequestTakeover { .. } | Command::ReleaseControl { .. } | Command::Click { .. } | Command::InputText { .. } | Command::Scroll { .. });
+            | Command::RequestTakeover { .. } | Command::ReleaseControl { .. } | Command::Navigate { .. } | Command::Click { .. } | Command::InputText { .. } | Command::Scroll { .. });
         let result = if permitted {
             let mut bytes = serde_json::to_vec(&request)?; bytes.push(b'\n');
             tokio::time::timeout(Duration::from_secs(2), write.write_all(&bytes)).await??;
             // Accepted input completes at its Host boundary even after remote EOF.
             tokio::time::timeout(Duration::from_secs(15), reply(&mut reader)).await.context("Host response deadline")??
         } else {
-            Response::Error { id: request.id, code: "REMOTE_COMMAND_FORBIDDEN".into(), message: "Prepaired remote access permits observation and human input only".into() }
+            Response::Error { id: request.id, code: "REMOTE_COMMAND_FORBIDDEN".into(), message: "Prepaired remote access permits observation and human browser operations only".into() }
         };
         if let Response::Result { value: ResultValue::Status(status), .. } = &result {
             active.send_replace(status.attachment_id.is_some());
