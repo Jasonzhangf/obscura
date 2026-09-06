@@ -274,7 +274,7 @@ pub struct WebRtcVideoFrame {
     pub codec: WebRtcVideoCodec,
     pub pts_us: u64,
     pub keyframe: bool,
-    /// Encoded H.264 bytes carried by the corresponding RTP access unit.
+    /// Canonical Annex-B bytes reconstructed from the corresponding RTP access unit.
     pub access_unit_bytes: u64,
 }
 

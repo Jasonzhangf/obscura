@@ -46,6 +46,7 @@ use webrtc_rs::{
 };
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const MAX_CONTROL_MESSAGE: usize = 64 * 1024;
 pub(crate) const H264_PAYLOAD_TYPE: u8 = 102;
 pub(crate) const H264_CLOCK_RATE: u32 = 90_000;
 pub(crate) const H264_SSRC: u32 = 0x4f42_5343;
@@ -452,6 +453,7 @@ pub(crate) async fn send_control_message(
     message: &WebRtcControlMessage,
 ) -> Result<()> {
     let text = serde_json::to_string(message).context("serialize typed WebRTC control message")?;
+    ensure!(text.len() <= MAX_CONTROL_MESSAGE, "WebRTC control message exceeds 64 KiB");
     dc.send_text(&text)
         .await
         .context("send typed WebRTC control message")?;
@@ -662,7 +664,8 @@ async fn decode_access_unit(
     Ok((decoded.len(), checksum, nonzero))
 }
 
-async fn selected_udp_candidate_pair(pc: &Arc<dyn PeerConnection>) -> Result<RTCIceCandidatePair> {
+/// Wait for and validate the selected local WebRTC UDP candidate pair.
+pub async fn selected_udp_candidate_pair(pc: &Arc<dyn PeerConnection>) -> Result<RTCIceCandidatePair> {
     let sctp = pc
         .sctp()
         .await
@@ -709,7 +712,7 @@ async fn selected_udp_candidate_pair(pc: &Arc<dyn PeerConnection>) -> Result<RTC
     Ok(pair)
 }
 
-fn candidate_evidence(
+pub fn candidate_evidence(
     candidate: &rtc::peer_connection::transport::RTCIceCandidate,
 ) -> WebRtcCandidateEvidence {
     WebRtcCandidateEvidence {
