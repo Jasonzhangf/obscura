@@ -665,8 +665,8 @@ impl ObscuraJsRuntime {
     /// `ops` table on it is enough to give every shim in that realm a working
     /// op surface. The functions are shared, not copied: same isolate.
     /// deno_core's isolate-global promise-reject and dynamic-`import()`
-    /// callbacks read per-context state from V8 embedder-data slots 1
-    /// (`ContextState`) and 2 (`ModuleMap`) of the *current* context. A
+    /// callbacks read per-context state from V8's `ContextState` and
+    /// `ModuleMap` embedder-data slots in the *current* context. A
     /// snapshot-created frame realm leaves those slots null, so a promise
     /// rejection or dynamic import inside a frame null-dereferenced in
     /// deno_core's `clone_rc_raw` and segfaulted the whole process (#850, #841).
@@ -682,10 +682,7 @@ impl ObscuraJsRuntime {
         &mut self,
         realm: &deno_core::v8::Global<deno_core::v8::Context>,
     ) {
-        use deno_core::v8;
-        // deno_core::runtime::jsrealm CONTEXT_STATE_SLOT_INDEX / MODULE_MAP_SLOT_INDEX.
-        const CONTEXT_STATE_SLOT_INDEX: i32 = 1;
-        const MODULE_MAP_SLOT_INDEX: i32 = 2;
+        use deno_core::{v8, CONTEXT_STATE_SLOT_INDEX, MODULE_MAP_SLOT_INDEX};
 
         let main = self.runtime().main_context();
         let mut entered = self.runtime();
@@ -693,9 +690,10 @@ impl ObscuraJsRuntime {
         let scope = &mut v8::HandleScope::new(isolate);
         let main_ctx = v8::Local::new(scope, main);
         let realm_ctx = v8::Local::new(scope, realm);
-        // SAFETY: slots 1/2 on the main context are `Rc::into_raw` pointers set
-        // by deno_core at runtime construction; they outlive every frame realm.
-        // We only copy (alias) them and never reconstruct the Rc from the frame.
+        // SAFETY: these slots on the main context are `Rc::into_raw` pointers
+        // set by deno_core at runtime construction; they outlive every frame
+        // realm. We only copy (alias) them and never reconstruct the Rc from
+        // the frame.
         unsafe {
             let cs = main_ctx.get_aligned_pointer_from_embedder_data(CONTEXT_STATE_SLOT_INDEX);
             let mm = main_ctx.get_aligned_pointer_from_embedder_data(MODULE_MAP_SLOT_INDEX);
