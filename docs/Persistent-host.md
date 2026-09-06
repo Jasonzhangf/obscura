@@ -229,10 +229,10 @@ WebRTC, Relay authentication or evidence of remote phone playback.
 
 `crates/obscura-media` consumes `frames.sock` and writes `VideoPacket` headers
 plus Annex B bytes to a separately supplied consumer-owned private Unix socket.
-It owns no browser state or network listener. The eventual authenticated endpoint
-must own one adapter and fan out its encoded output; starting one adapter per
-viewer is not the product architecture. The current standalone adapter proves
-the encoder boundary before that endpoint exists.
+It owns no browser state or network listener. The authenticated endpoint below
+owns one adapter and fans out its encoded output; starting one adapter per
+viewer is not the product architecture. The standalone adapter and endpoint
+share this encoded-frame boundary.
 
 `--ffmpeg` selects an external FFmpeg binary with libx264; default is `ffmpeg` on
 PATH. This initial backend uses H.264 baseline, YUV420, BT.709 limited-range and
@@ -287,9 +287,10 @@ page. Continue pumping timers and requests with zero attachments. Do not move a
 Page/isolate across threads and do not use socket activity as its clock.
 
 First acceptance uses a local authenticated connection and one tab per session.
-Relay integration, UDP/WebRTC, video encoding, restart restoration, Linux host
-support and multi-tab UX are subsequent slices. Profile disk persistence and
-live document persistence remain separate claims. Reconnection within the same
+The explicitly paired endpoint below adds the current direct WSS and opt-in UDP
+WebRTC paths; Relay integration, restart restoration, Linux host support and
+multi-tab UX remain subsequent slices. Profile disk persistence and live
+document persistence remain separate claims. Reconnection within the same
 daemon incarnation must recover the same page; daemon restart must report a new
 incarnation and must not claim continuation of an old in-flight operation.
 
@@ -333,6 +334,63 @@ writes at two seconds. Media ingestion failure closes endpoint connections;
 there is no automatic reconnect/replay or hidden alternate transport. Endpoint
 exit stops its encoder and leaves the independent Host/Page alive.
 
+### Opt-in UDP WebRTC media
+
+WebRTC is disabled by default. Enable it only with an explicit local bind IP:
+
+```sh
+target/release/obscura-endpoint \
+  --listen HOST_IP:PORT \
+  --host-dir HOST_DIR \
+  --socket-dir ENDPOINT_DIR \
+  --server-cert SERVER.der \
+  --server-key KEY.der \
+  --client-ca CLIENT_CA.der \
+  --media-bin target/release/obscura-media \
+  --enable-webrtc \
+  --webrtc-bind-ip HOST_IP
+```
+
+`--enable-webrtc` without `--webrtc-bind-ip` fails at startup. The endpoint
+does not silently upgrade WSS, fall back from WebRTC, or select a route from
+the network environment. The already-authenticated mTLS WSS `/control`
+connection is the signaling bootstrap: the client sends a typed
+`WebRtcSignal::Offer`, and the endpoint returns a typed answer on that same
+connection. SDP is not parsed as a Browser request.
+
+Before accepting the offer, the endpoint requires an active Observe attachment
+and asks the Host over its local socket for a one-time authorization. Host binds
+the opaque grant to the session, attachment and negotiated capability. The
+endpoint consumes the grant after preparing the answer; detach or control EOF
+invalidates the attachment-bound grant. A new connection must attach again and
+obtain a new grant. A wrong binding is rejected on the typed DataChannel with
+`STALE_WEBRTC_BINDING`, then the failed PeerConnection is closed.
+
+After the DataChannel `Hello`/`HelloAck` exchange, the endpoint sends continuous
+H.264 Annex B access units as RTP over the explicitly negotiated UDP path.
+The DataChannel carries only typed transport control (`Hello`, `HelloAck`,
+`Ping`/`Pong`, video descriptors and errors). Browser operations are not
+implemented there: WSS remains the current real operation and human-input path.
+Each `VideoFrame` descriptor is derived from the Host media packet and carries
+the exact `rtp_timestamp` of its access unit. Receivers must associate a
+descriptor and decoded sample by that timestamp, not by arrival order; source
+dimensions and document/viewport revisions remain separate from even-dimension
+H.264 padding.
+
+The current evidence is an independent local receiver process over loopback:
+
+```sh
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-media --features webrtc
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-host --features render
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo nextest run --release --features render -p obscura-host --test webrtc_endpoint
+```
+
+This proves the Host-to-H.264-to-RTP-to-independent-decoder path, continuous
+frames, a click-driven frame change, stale-binding rejection and same-session /
+new-attachment reconnect fencing. It does not prove Android/Mac client
+integration, Relay operation, or a Tailscale/WebRTC network path. Tailscale
+path status remains unknown until separately replayed and evidenced.
+
 ```sh
 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-host -p obscura-media --features render
 target/release/obscura-endpoint --listen HOST_IP:PORT --host-dir HOST_DIR --socket-dir NEW_ENDPOINT_DIR --server-cert SERVER.der --server-key KEY.der --client-ca CLIENT_CA.der --media-bin target/release/obscura-media
@@ -348,8 +406,9 @@ WSS upgrade/Host ready with system curl, then removes those device credentials.
 It does not install a system trust root or claim native Android media acceptance.
 
 The remaining connection work is client-side native ingress and UI integration,
-native viewport measurement/presentation, UDP/WebRTC and Relay adapters. The direct endpoint
-does not implement candidate selection or label a Tailscale path as peer-to-peer.
+native viewport measurement/presentation and Relay adapters. The direct endpoint
+does not implement candidate selection or label a Tailscale path as peer-to-peer;
+the Tailscale/WebRTC network path remains unknown.
 
 ## Session and input invariants
 

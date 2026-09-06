@@ -10,6 +10,7 @@ render = ["obscura-browser/render"]
 
 [dependencies]
 obscura-host-protocol = { path = "../../protocol/browser" }
+obscura-media = { path = "../obscura-media", features = ["webrtc"] }
 obscura-browser = { workspace = true }
 obscura-js = { workspace = true }
 tokio = { workspace = true }
