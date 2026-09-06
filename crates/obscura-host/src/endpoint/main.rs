@@ -20,6 +20,11 @@ struct Args {
     #[arg(long)] client_ca: PathBuf,
     #[arg(long)] media_bin: PathBuf,
     #[arg(long, default_value = "ffmpeg")] ffmpeg: PathBuf,
+    /// Explicitly enable the UDP WebRTC media backend. WSS remains available
+    /// independently; no implicit fallback or upgrade is performed.
+    #[arg(long, default_value_t = false)] enable_webrtc: bool,
+    /// Local address advertised by the explicitly enabled WebRTC backend.
+    #[arg(long)] webrtc_bind_ip: Option<std::net::IpAddr>,
 }
 
 #[cfg(unix)]

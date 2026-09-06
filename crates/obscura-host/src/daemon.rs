@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use anyhow::{Context, Result};
-use obscura_host_protocol::{Command, Control, ControlPhase, Device, FramePacket, Mode, Operation, Request, Response, ResultValue, SessionStatus, ViewportDeclaration};
+use obscura_host_protocol::{Command, Control, ControlPhase, Device, FramePacket, Mode, Operation, Request, Response, ResultValue, SessionStatus, ViewportDeclaration, WebRtcCapability, WebRtcSessionBinding, WebRtcTransport, WebRtcVideoCodec, WEBRTC_CONTROL_LABEL, WEBRTC_PROTOCOL_VERSION};
 use crate::media;
 use crate::worker::{self, Completion, Work, WorkKind};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -87,11 +87,30 @@ struct Session {
     viewport_owner: Option<u64>,
     viewport_update: Option<ViewportUpdate>,
 }
-struct Attachment { mode: Mode, viewport: Option<ViewportDeclaration> }
+struct Attachment { mode: Mode, viewport: Option<ViewportDeclaration>, webrtc: Option<WebRtcGrant> }
+struct WebRtcGrant { capability: WebRtcCapability, binding: WebRtcSessionBinding, consumed: bool }
 struct ViewportUpdate { owner: Option<u64>, width: u32, height: u32, revision: u64 }
 struct Record { operation: Operation, command: Command, response: Option<Response> }
 fn valid_viewport(width: u32, height: u32) -> bool {
     width > 0 && height > 0 && width <= 4096 && height <= 4096 && u64::from(width) * u64::from(height) <= 4_194_304
+}
+fn validate_webrtc_capability(capability: &WebRtcCapability) -> Result<(), String> {
+    if capability.protocol_version != WEBRTC_PROTOCOL_VERSION {
+        return Err(format!("Unsupported WebRTC protocol version {}", capability.protocol_version));
+    }
+    if capability.transport != WebRtcTransport::Udp {
+        return Err("Only explicitly negotiated UDP WebRTC transport is enabled".into());
+    }
+    if capability.video_codec != WebRtcVideoCodec::H264AnnexB {
+        return Err("Only H.264 Annex B WebRTC media is enabled".into());
+    }
+    if capability.data_channel_label != WEBRTC_CONTROL_LABEL {
+        return Err("WebRTC control DataChannel label does not match the Host ABI".into());
+    }
+    if capability.max_access_unit == 0 || capability.max_access_unit > obscura_media::MAX_ACCESS_UNIT as u64 {
+        return Err("WebRTC access-unit budget exceeds the Host media limit".into());
+    }
+    Ok(())
 }
 impl Session {
     fn selected_viewport(&self) -> Option<(u64, ViewportDeclaration)> {
@@ -198,13 +217,51 @@ impl Session {
                     if mode != Mode::Observe { return Ok(error(id, "OBSERVER_REQUIRED", "Only observer attachments declare a viewport")); }
                     if !valid_viewport(viewport.css_width, viewport.css_height) { return Ok(error(id, "INVALID_VIEWPORT", "Dimensions must be 1..4096 and at most 4194304 CSS pixels")); }
                 }
-                self.attachments.insert(connection, Attachment { mode, viewport });
+                self.attachments.insert(connection, Attachment { mode, viewport, webrtc: None });
                 if mode == Mode::Agent { self.agent = Some(connection); }
                 Ok(Response::Result { id, value: self.status(connection, busy) })
             }
             command => {
                 if !self.attachments.contains_key(&connection) { return Ok(error(id, "ATTACH_REQUIRED", "Attach first")); }
                 match command {
+                    Command::AuthorizeWebRtc { capability } => {
+                        let attachment = self.attachments.get_mut(&connection).unwrap();
+                        if attachment.mode != Mode::Observe {
+                            return Ok(error(id, "OBSERVER_REQUIRED", "WebRTC media requires an observer attachment"));
+                        }
+                        if let Err(message) = validate_webrtc_capability(&capability) {
+                            return Ok(error(id, "WEBRTC_CAPABILITY_REJECTED", message));
+                        }
+                        if attachment.webrtc.is_some() {
+                            return Ok(error(id, "WEBRTC_GRANT_EXISTS", "WebRTC authorization already exists; detach and reconnect"));
+                        }
+                        let binding = WebRtcSessionBinding {
+                            session_id: self.id.clone(),
+                            attachment_id: connection,
+                            auth_binding: uuid::Uuid::new_v4().as_bytes().to_vec(),
+                        };
+                        attachment.webrtc = Some(WebRtcGrant { capability: capability.clone(), binding: binding.clone(), consumed: false });
+                        return Ok(Response::Result { id, value: ResultValue::WebRtcAuthorization { binding, capability } });
+                    }
+                    Command::ConsumeWebRtc { binding, capability } => {
+                        let Some(attachment) = self.attachments.get_mut(&connection) else {
+                            return Ok(error(id, "ATTACH_REQUIRED", "Attach before consuming a WebRTC authorization"));
+                        };
+                        let Some(grant) = attachment.webrtc.as_mut() else {
+                            return Ok(error(id, "WEBRTC_GRANT_MISSING", "No Host-issued WebRTC authorization exists"));
+                        };
+                        if grant.consumed {
+                            return Ok(error(id, "WEBRTC_GRANT_USED", "WebRTC authorization is single-use"));
+                        }
+                        if grant.binding != binding {
+                            return Ok(error(id, "STALE_WEBRTC_BINDING", "WebRTC authorization does not match this Session attachment"));
+                        }
+                        if grant.capability != capability {
+                            return Ok(error(id, "WEBRTC_CAPABILITY_MISMATCH", "WebRTC capability differs from Host authorization"));
+                        }
+                        grant.consumed = true;
+                        return Ok(Response::Result { id, value: ResultValue::WebRtcConsumed { session_id: self.id.clone(), attachment_id: connection } });
+                    }
                     Command::DeclareViewport { viewport } => {
                         let attachment = self.attachments.get_mut(&connection).unwrap();
                         if attachment.mode != Mode::Observe { return Ok(error(id, "OBSERVER_REQUIRED", "Only observer attachments declare a viewport")); }
