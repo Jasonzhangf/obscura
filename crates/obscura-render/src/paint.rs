@@ -4655,20 +4655,20 @@ fn paint_laid_dom_scrolled(
         // not real content), so paint it directly from the attribute instead
         // of going through `paint_text_node`.
         if name.local.as_ref() == "input" || name.local.as_ref() == "textarea" {
-            let has_value = node
-                .get_attribute("value")
+            let input_value = node.input_value.as_deref().or_else(|| node.get_attribute("value"));
+            let has_value = input_value
                 .map(|v| !v.is_empty())
                 .unwrap_or(false)
                 || (name.local.as_ref() == "textarea"
                     && !tree.text_content(nid).is_empty());
             // A text `<input>`'s value is not a DOM text node either, so it
-            // needs painting from the attribute the same way. Without this the
+            // needs painting from its current value (or clean default). Without this the
             // control renders empty however it was filled in — from markup,
             // from script, or by typing — while its `value` reads back
             // correctly, so only a screenshot or PDF shows anything wrong.
             // `<textarea>` is unaffected: its value *is* a text node.
             if has_value && name.local.as_ref() == "input" {
-                if let Some(value) = node.get_attribute("value") {
+                if let Some(value) = input_value {
                     if !value.is_empty() {
                         let fsize = style.font_size.unwrap_or(16.0);
                         let text_x = rect.x + style.padding.left + style.border.left;
