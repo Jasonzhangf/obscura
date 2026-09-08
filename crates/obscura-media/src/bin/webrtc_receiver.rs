@@ -42,6 +42,7 @@ struct Args {
     #[arg(long, default_value_t = 20.0)] click_y: f64,
     #[arg(long, default_value_t = false)] skip_click: bool,
     #[arg(long, default_value_t = false)] bad_binding: bool,
+    #[arg(long, default_value_t = false)] expect_encoder_error: bool,
 }
 
 type Socket = WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
@@ -133,6 +134,16 @@ async fn main() -> Result<()> {
     }
 
     wait_for_hello_ack(&mut control_rx, &mut media, &capability, &binding).await?;
+    if args.expect_encoder_error {
+        let WebRtcControlMessage::Error { code, message } = next_control(&mut control_rx, "encoder failure").await?
+        else { bail!("Host did not return a typed encoder failure") };
+        ensure!(code == "ENCODER_UNAVAILABLE", "unexpected encoder failure code: {code}");
+        println!("{}", serde_json::json!({"pass": true, "error_code": code, "error_message": message, "session_id": session_id}));
+        control_reader.abort();
+        let _ = control_reader.await;
+        let _ = peer.close().await;
+        return Ok(());
+    }
     send_control(&data_channel, &WebRtcControlMessage::Ping { request_id: 3 }).await?;
     wait_for_pong(&mut control_rx, &mut media, &session_id, 3).await?;
     let track = timeout(DEADLINE, track_rx.recv()).await.context("timed out waiting for Host H.264 track")?
