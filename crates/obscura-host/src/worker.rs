@@ -1,5 +1,5 @@
 //! Sole Page owner. No attachment or transport state enters the browser thread.
-use std::sync::Arc;
+use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
 use anyhow::{Context, Result};
 use obscura_browser::{BrowserContext, Page};
 use obscura_host_protocol::{Command, EvaluationResult, FrameInfo, FramePacket, InputReceipt, InputState, PixelFormat, ResultValue};
@@ -21,7 +21,7 @@ pub enum WorkKind {
     Browser { command: Command, document_revision: u64 },
     /// Host-assigned shared viewport; declarations apply to the current Page,
     /// while explicit Agent resize retains its admitted document fence.
-    Viewport { width: u32, height: u32, revision: u64, document_revision: Option<u64> },
+    Viewport { width: u32, height: u32, revision: u64, document_revision: Option<u64>, cancel: Arc<AtomicBool> },
 }
 const BUDGET: Duration = Duration::from_secs(5);
 
@@ -69,6 +69,7 @@ pub fn start(id: String, network: bool, mut incoming: mpsc::Receiver<Work>,
             let mut frame_clock = tokio::time::interval(Duration::from_millis(333));
             frame_clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut idle = false;
+            let mut frame_fence: Option<Arc<AtomicBool>> = None;
             let mut clock = tokio::time::interval(Duration::from_millis(20));
             clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
@@ -95,6 +96,7 @@ pub fn start(id: String, network: bool, mut incoming: mpsc::Receiver<Work>,
                 tokio::select! {
                     changed = interested.changed() => { if changed.is_err() { break; } }
                     _ = frame_clock.tick(), if *interested.borrow() > 0 => {
+                        if frame_fence.as_ref().is_some_and(|cancel| cancel.load(Ordering::Acquire)) { continue; }
                         let frame = if let Some(cause) = &failure {
                             media::state(FramePacket::Unavailable { session_id: id.clone(), message: cause.clone() })
                         } else if let Some(page) = page.as_mut() {
@@ -111,6 +113,7 @@ pub fn start(id: String, network: bool, mut incoming: mpsc::Receiver<Work>,
                                 Err(message) => media::state(FramePacket::Unavailable { session_id: id.clone(), message }),
                             }
                         } else { media::state(FramePacket::Closed { session_id: id.clone() }) };
+                        if frame_fence.as_ref().is_some_and(|cancel| cancel.load(Ordering::Acquire)) { continue; }
                         frames.send_replace(frame);
                     }
                     work = incoming.recv() => {
@@ -131,9 +134,13 @@ pub fn start(id: String, network: bool, mut incoming: mpsc::Receiver<Work>,
                             Completion { result: Err(("STALE_DOCUMENT", "Document changed before execution".into())), viewport: page.as_ref().map(|page| page.viewport), fault: None, document_revision, viewport_revision }
                         } else {
                             match work.kind {
-                                WorkKind::Viewport { width, height, revision, .. } => {
+                                WorkKind::Viewport { width, height, revision, cancel, .. } => {
+                                    frame_fence = Some(Arc::clone(&cancel));
                                     let mut fault = None;
-                                    let result = if let Some(page) = page.as_mut() {
+                                    let result = if cancel.load(Ordering::Acquire) {
+                                        frames.send_replace(media::state(FramePacket::Waiting { session_id: id.clone() }));
+                                        Ok(None)
+                                    } else if let Some(page) = page.as_mut() {
                                         if page.viewport != (width as f32, height as f32) {
                                             // Invalidate before changing layout. The same Page retains DOM,
                                             // JS, form state and pending tasks; no attachment-specific render.
@@ -147,6 +154,9 @@ pub fn start(id: String, network: bool, mut incoming: mpsc::Receiver<Work>,
                                         if let Some(cause) = &fault { Err(("OUTCOME_UNKNOWN", cause.clone())) }
                                         else { viewport_revision = revision; Ok(None) }
                                     } else { Err(("SESSION_CLOSED", "Session was explicitly closed".into())) };
+                                    if cancel.load(Ordering::Acquire) {
+                                        frames.send_replace(media::state(FramePacket::Waiting { session_id: id.clone() }));
+                                    }
                                     Completion { result, viewport: page.as_ref().map(|page| page.viewport), fault, document_revision, viewport_revision }
                                 }
                                 WorkKind::Browser { command, .. } => {
