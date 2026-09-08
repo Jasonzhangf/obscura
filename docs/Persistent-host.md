@@ -244,12 +244,20 @@ FFmpeg is not bundled; binary/license packaging remains a release requirement.
 
 Input is capped at four megapixels, output at 4 MiB/access unit, diagnostics at
 64 KiB. Encoder work has a five-second deadline; incomplete raw pixels and output
-backpressure have two-second deadlines. On encoder failure the adapter sends
-Unavailable and exits nonzero. Invalid framing, inconsistent sizes or regressive
-frame identity fail explicitly; EOF without Closed is not success. Child encoder
-processes use kill-on-drop on error/cancellation. Odd viewport sizes pad to even
-coded dimensions; the display must crop to source.width/source.height. Alpha is
-composited over white before YUV conversion.
+backpressure have two-second deadlines. `FramePacket::Unavailable` is owned by
+the Host media source: it means capture/page output is temporarily unavailable,
+is forwarded as `VideoPacket::Unavailable`, and may be followed by another
+frame. It is not evidence of an encoder failure. A media-owned failure emits one
+`VideoPacket::EncoderUnavailable` marker, then the adapter exits nonzero and
+produces no further access units. The WebRTC endpoint classifies only that
+explicit marker as `ENCODER_UNAVAILABLE` and sends the typed DataChannel error
+before closing the failed peer; an `Unavailable` marker followed by EOF remains
+a generic Host/media stream failure. Invalid framing, inconsistent sizes or
+regressive frame identity fail explicitly; EOF without `Closed` is not success.
+Child encoder processes use kill-on-drop on error/cancellation. Odd viewport
+sizes pad to even coded dimensions; the display must crop to
+source.width/source.height. Alpha is composited over white before YUV
+conversion.
 
 VideoPacket preserves FrameInfo from the Host and adds encoder incarnation,
 monotonic receipt-time PTS in microseconds, coded size, codec, keyframe and encoded
@@ -257,6 +265,23 @@ byte length. PTS is sampled on receipt of the raw header, not a claim of native
 capture time. Source.byte_length still describes RGBA; the outer byte_length
 describes the following H.264 bytes. A new adapter has a new encoder_id, resets
 its PTS origin and never restores old input/control authority.
+
+The local encoded-media ABI is strict JSON: `VideoPacket` is a tagged enum with
+`type` in snake case and `deny_unknown_fields`. Unknown variants and unknown
+fields are rejected; consumers must not ignore a new marker, reinterpret
+`Unavailable`, or fall back to another codec/transport. This ABI carries no
+negotiated version field, so adding `EncoderUnavailable` is a producer/consumer
+compatibility boundary: the media producer and its readers must be updated as
+one ABI revision. The raw Host `FramePacket` stream retains its own
+`Unavailable` marker and does not emit `EncoderUnavailable`.
+
+This local marker boundary is separate from the WebRTC protocol version. Typed
+WebRTC signaling and DataChannel messages also deny unknown fields, and
+`WEBRTC_PROTOCOL_VERSION` is exactly `3`; the Hello exchange rejects older v2 or
+other versions. A v3 peer therefore gets the typed `ENCODER_UNAVAILABLE` error
+only after the endpoint has validated the v3 capability and binding. No version
+negotiation, unknown-field tolerance or compatibility fallback is implied by
+the local H.264 socket.
 
 ```sh
 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-host -p obscura-media --features render
