@@ -237,17 +237,17 @@ pub async fn ingest(
     encoded_latest: watch::Sender<Option<Arc<EncodedFrame>>>,
 ) -> Result<()> {
     let mut reader = BufReader::new(socket);
-    let mut last_packet_was_unavailable = false;
+    let mut last_packet_was_encoder_unavailable = false;
     loop {
         let mut header = Vec::new();
         let read = (&mut reader).take(4096).read_until(b'\n', &mut header).await?;
-        if read == 0 && last_packet_was_unavailable {
-            // The adapter contract sends one Unavailable packet before exiting
-            // nonzero on encoder failure. Close both fan-out watches so every
-            // endpoint connection observes the terminal stream state, then
-            // keep this media future alive: `server::serve` must not select a
-            // completed ingest future and abort the authenticated WebRTC task
-            // before it can deliver its typed DataChannel error.
+        if read == 0 && last_packet_was_encoder_unavailable {
+            // The media owner sends one EncoderUnavailable packet before
+            // exiting nonzero on encoder failure. Close both fan-out watches
+            // so every endpoint connection observes the terminal stream
+            // state, then keep this media future alive: `server::serve` must
+            // not select a completed ingest future and abort the authenticated
+            // WebRTC task before it can deliver its typed DataChannel error.
             drop(latest);
             drop(encoded_latest);
             // The server owns cancellation of this media future: it drops the
@@ -269,7 +269,7 @@ pub async fn ingest(
         bytes.extend_from_slice(&(header.len() as u32).to_be_bytes()); bytes.extend_from_slice(&header); bytes.extend_from_slice(&payload);
         let closed = matches!(packet, VideoPacket::Closed { .. });
         latest.send_replace(Some(Arc::new(Video { bytes, closed })));
-        last_packet_was_unavailable = matches!(packet, VideoPacket::Unavailable { .. });
+        last_packet_was_encoder_unavailable = matches!(packet, VideoPacket::EncoderUnavailable { .. });
         if closed { return Ok(()); }
     }
 }
@@ -280,12 +280,12 @@ mod tests {
     use tokio::io::AsyncWriteExt;
 
     #[tokio::test]
-    async fn terminal_unavailable_closes_fanout_watches() {
+    async fn terminal_encoder_unavailable_closes_fanout_watches() {
         let (mut writer, socket) = UnixStream::pair().expect("create encoded stream pair");
         let (latest_tx, mut latest_rx) = watch::channel(None);
         let (encoded_tx, mut encoded_rx) = watch::channel(None);
         let mut task = tokio::spawn(ingest(socket, latest_tx, encoded_tx));
-        let packet = VideoPacket::Unavailable {
+        let packet = VideoPacket::EncoderUnavailable {
             session_id: "terminal-session".into(),
             message: "configured encoder exited".into(),
         };
@@ -299,12 +299,35 @@ mod tests {
         assert!(tokio::time::timeout(Duration::from_secs(1), latest_rx.changed()).await
             .expect("latest watch closure was not observed").is_err());
         encoded_rx.changed().await.expect("receive unavailable encoded state");
-        assert!(matches!(encoded_rx.borrow().as_ref().map(|frame| &frame.packet), Some(VideoPacket::Unavailable { .. })));
+        assert!(matches!(encoded_rx.borrow().as_ref().map(|frame| &frame.packet), Some(VideoPacket::EncoderUnavailable { .. })));
         assert!(tokio::time::timeout(Duration::from_secs(1), encoded_rx.changed()).await
             .expect("encoded watch closure was not observed").is_err());
         assert!(tokio::time::timeout(Duration::from_millis(100), &mut task).await.is_err(),
             "terminal ingest must remain alive until endpoint shutdown");
         task.abort();
         let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn host_unavailable_eof_keeps_generic_stream_error() {
+        let (mut writer, socket) = UnixStream::pair().expect("create encoded stream pair");
+        let (latest_tx, mut latest_rx) = watch::channel(None);
+        let (encoded_tx, mut encoded_rx) = watch::channel(None);
+        let task = tokio::spawn(ingest(socket, latest_tx, encoded_tx));
+        let packet = VideoPacket::Unavailable {
+            session_id: "host-session".into(),
+            message: "capture temporarily unavailable".into(),
+        };
+        let mut header = serde_json::to_vec(&packet).expect("serialize host unavailable packet");
+        header.push(b'\n');
+        writer.write_all(&header).await.expect("write host unavailable packet");
+        writer.shutdown().await.expect("close encoded stream");
+
+        latest_rx.changed().await.expect("receive host unavailable media state");
+        encoded_rx.changed().await.expect("receive host unavailable encoded state");
+        assert!(matches!(encoded_rx.borrow().as_ref().map(|frame| &frame.packet), Some(VideoPacket::Unavailable { .. })));
+        assert!(tokio::time::timeout(Duration::from_secs(1), encoded_rx.changed()).await
+            .expect("encoded watch closure was not observed").is_err());
+        assert!(task.await.expect("ingest task panicked").is_err(), "Host unavailable EOF must remain a generic ingest error");
     }
 }
