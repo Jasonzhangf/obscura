@@ -182,6 +182,9 @@ pub enum VideoPacket {
         byte_length: u64,
     },
     Unavailable { session_id: String, message: String },
+    /// Terminal failure owned by the media encoder. This is distinct from
+    /// Host capture/page availability, which remains recoverable above.
+    EncoderUnavailable { session_id: String, message: String },
     Closed { session_id: String },
 }
 

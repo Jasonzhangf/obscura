@@ -313,22 +313,19 @@ fn frame_available(packet: &VideoPacket) -> Result<bool> {
     match packet {
         VideoPacket::AccessUnit { .. } => Ok(true),
         VideoPacket::Waiting { .. } => Ok(false),
+        VideoPacket::Unavailable { .. } | VideoPacket::EncoderUnavailable { .. } => Ok(false),
         VideoPacket::Closed { .. } => bail!("Host session closed during WebRTC stream"),
-        // Host capture/page failures are recoverable states on the raw media
-        // stream. Encoder failure is classified only after this state is
-        // followed by encoded-stream EOF (see `terminal_encoder_error`).
-        VideoPacket::Unavailable { .. } => Ok(false),
     }
 }
 
-/// Classify an unavailable packet only after the encoded watch sender has
-/// closed. The packet is shared with Host capture/page failures, so its
-/// arrival alone is not evidence of an encoder failure.
+/// Classify only the explicit terminal state emitted by the media encoder.
+/// Host capture/page failures use `VideoPacket::Unavailable` and remain
+/// recoverable or generic when their stream ends.
 fn terminal_encoder_error(packet: &VideoPacket) -> Option<(String, String)> {
-    let VideoPacket::Unavailable { session_id, message } = packet else { return None; };
+    let VideoPacket::EncoderUnavailable { session_id, message } = packet else { return None; };
     Some((
         "ENCODER_UNAVAILABLE".to_owned(),
-        format!("Host media for session {session_id} is unavailable: {message}"),
+        format!("Encoder for session {session_id} is unavailable: {message}"),
     ))
 }
 
@@ -373,7 +370,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unavailable_media_is_a_recoverable_host_state_until_stream_ends() {
+    fn host_unavailable_media_is_a_recoverable_state_until_stream_ends() {
         let packet = VideoPacket::Unavailable {
             session_id: "boundary-session".into(),
             message: "capture temporarily unavailable".into(),
@@ -382,20 +379,35 @@ mod tests {
     }
 
     #[test]
-    fn terminal_unavailable_media_has_a_typed_encoder_error() {
-        let packet = VideoPacket::Unavailable {
+    fn encoder_owned_terminal_marker_has_a_typed_error() {
+        let packet = VideoPacket::EncoderUnavailable {
             session_id: "boundary-session".into(),
             message: "configured encoder exited".into(),
         };
-        let (code, message) = terminal_encoder_error(&packet).expect("closed unavailable stream must classify encoder failure");
+        let (code, message) = terminal_encoder_error(&packet).expect("encoder-owned marker must classify encoder failure");
         assert_eq!(code, "ENCODER_UNAVAILABLE");
-        assert_eq!(message, "Host media for session boundary-session is unavailable: configured encoder exited");
+        assert_eq!(message, "Encoder for session boundary-session is unavailable: configured encoder exited");
     }
 
     #[test]
-    fn access_unit_and_waiting_states_are_not_terminal_encoder_errors() {
+    fn host_unavailable_access_unit_and_waiting_are_not_terminal_encoder_errors() {
+        let unavailable = VideoPacket::Unavailable {
+            session_id: "boundary-session".into(),
+            message: "capture temporarily unavailable".into(),
+        };
         let waiting = VideoPacket::Waiting { session_id: "boundary-session".into() };
+        let access_unit = VideoPacket::AccessUnit {
+            source: obscura_host_protocol::FrameInfo {
+                session_id: "boundary-session".into(), sequence: 1, document_revision: 1,
+                viewport_revision: 1, width: 2, height: 2, stride: 8, byte_length: 16,
+                pixel_format: obscura_host_protocol::PixelFormat::PremultipliedRgba8,
+            },
+            encoder_id: "encoder".into(), pts_us: 1, coded_width: 2, coded_height: 2,
+            codec: VideoCodec::H264AnnexB, keyframe: true, byte_length: 1,
+        };
+        assert!(terminal_encoder_error(&unavailable).is_none());
         assert!(terminal_encoder_error(&waiting).is_none());
+        assert!(terminal_encoder_error(&access_unit).is_none());
     }
 }
 

@@ -51,7 +51,7 @@ async fn exercise(missing_encoder: bool) {
         write(&mut source, &FramePacket::Frame { info }, &pixels).await;
         let (packet, bytes) = read(&mut receiver).await;
         if missing_encoder {
-            assert!(matches!(packet, VideoPacket::Unavailable { .. }));
+            assert!(matches!(packet, VideoPacket::EncoderUnavailable { .. }));
             assert!(!child.wait().await.unwrap().success()); return;
         }
         let VideoPacket::AccessUnit { source, encoder_id, pts_us, coded_width, coded_height, keyframe, .. } = packet else { panic!("expected access unit"); };
@@ -76,4 +76,31 @@ async fn public_adapter_preserves_host_identity_through_resize_and_close() {
 #[tokio::test]
 async fn public_adapter_reports_encoder_failure_and_exits() {
     tokio::time::timeout(Duration::from_secs(10), exercise(true)).await.unwrap();
+}
+
+#[tokio::test]
+async fn public_adapter_recovers_after_host_unavailable() {
+    let dir = Directory::new();
+    let raw = UnixListener::bind(dir.0.join("raw")).unwrap();
+    let video = UnixListener::bind(dir.0.join("video")).unwrap();
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_obscura-media"));
+    command.arg("--frames-socket").arg(dir.0.join("raw")).arg("--video-socket").arg(dir.0.join("video"));
+    let mut child = command.stdout(Stdio::null()).stderr(Stdio::piped()).kill_on_drop(true).spawn().unwrap();
+    let (mut source, _) = raw.accept().await.unwrap();
+    let mut receiver = BufReader::new(video.accept().await.unwrap().0);
+    write(&mut source, &FramePacket::Waiting { session_id: "recoverable-session".into() }, &[]).await;
+    assert!(matches!(read(&mut receiver).await.0, VideoPacket::Waiting { .. }));
+    write(&mut source, &FramePacket::Unavailable {
+        session_id: "recoverable-session".into(), message: "capture temporarily unavailable".into(),
+    }, &[]).await;
+    assert!(matches!(read(&mut receiver).await.0, VideoPacket::Unavailable { .. }));
+    let pixels = [0, 128, 0, 255].repeat(64 * 48);
+    let info = FrameInfo { session_id: "recoverable-session".into(), sequence: 1, document_revision: 1,
+        viewport_revision: 1, width: 64, height: 48, stride: 64 * 4,
+        byte_length: pixels.len() as u64, pixel_format: PixelFormat::PremultipliedRgba8 };
+    write(&mut source, &FramePacket::Frame { info }, &pixels).await;
+    assert!(matches!(read(&mut receiver).await.0, VideoPacket::AccessUnit { .. }));
+    write(&mut source, &FramePacket::Closed { session_id: "recoverable-session".into() }, &[]).await;
+    assert!(matches!(read(&mut receiver).await.0, VideoPacket::Closed { .. }));
+    assert!(child.wait().await.unwrap().success());
 }
