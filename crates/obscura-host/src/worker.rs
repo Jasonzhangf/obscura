@@ -176,6 +176,12 @@ pub fn start(id: String, network: bool, mut incoming: mpsc::Receiver<Work>,
                         if page.is_none() { frames.send_replace(media::state(FramePacket::Closed { session_id: id.clone() })); }
                         else if let Some(message) = &failure { frames.send_replace(media::state(FramePacket::Unavailable { session_id: id.clone(), message: message.clone() })); }
                         let _ = work.reply.send(completion);
+                        // A cancelled viewport keeps its fence until the daemon queues
+                        // and acknowledges a replacement layout. Completed work with
+                        // a live fence no longer needs to retain that allocation.
+                        if frame_fence.as_ref().is_some_and(|fence| !fence.load(Ordering::Acquire)) {
+                            frame_fence = None;
+                        }
                         idle = false;
                     }
                     result = async {
