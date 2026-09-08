@@ -493,7 +493,7 @@ pub async fn serve(socket_dir: PathBuf, allow_private_network: bool) -> Result<(
                         if completion.fault.is_some() { session.fault = completion.fault; }
                         if let Some(update) = viewport_update {
                             if update.cancelled {
-                                if completion.result.is_ok() && session.selected_viewport().is_none() {
+                                if completion.result.is_ok() {
                                     session.viewport_repair = session.viewport.map(|(width, height)| (width as u32, height as u32));
                                 }
                             } else if completion.result.is_ok() {
