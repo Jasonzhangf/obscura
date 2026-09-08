@@ -6,7 +6,7 @@
 
 use std::{net::SocketAddr, sync::Arc, time::{Duration, Instant}};
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use obscura_host_protocol::{Request, Response, VideoCodec, VideoPacket, WebRtcCapability, WebRtcControlMessage,
     WebRtcSessionBinding, WebRtcTransport, WebRtcVideoCodec, WebRtcVideoFrame,
     WEBRTC_CONTROL_LABEL, WEBRTC_PROTOCOL_VERSION};
@@ -150,7 +150,27 @@ impl WebRtcEndpoint {
             }
         tokio::select! {
             changed = self.latest.changed() => {
-                changed.context("Host encoded media stream ended")?;
+                if let Err(error) = changed {
+                    let terminal_error = self.latest
+                        .borrow()
+                        .as_deref()
+                        .and_then(|frame| terminal_encoder_error(&frame.packet));
+                    if let Some((code, message)) = terminal_error {
+                        let typed = send_control_message(&data_channel, &WebRtcControlMessage::Error {
+                            code: code.clone(), message: message.clone(),
+                        }).await;
+                        if let Err(send_error) = typed {
+                            return Err(anyhow!(
+                                "{code}: {message}; typed DataChannel delivery failed: {send_error}"
+                            ));
+                        }
+                        // DataChannel send queues into the SCTP driver; the bounded grace lets
+                        // the typed terminal error leave before the failed PeerConnection closes.
+                        sleep(Duration::from_millis(250)).await;
+                        return Err(anyhow!("{code}: {message}"));
+                    }
+                    return Err(error).context("Host encoded media stream ended");
+                }
                 emit_current = true;
             }
             response = self.browser_responses.recv() => {
@@ -294,10 +314,22 @@ fn frame_available(packet: &VideoPacket) -> Result<bool> {
         VideoPacket::AccessUnit { .. } => Ok(true),
         VideoPacket::Waiting { .. } => Ok(false),
         VideoPacket::Closed { .. } => bail!("Host session closed during WebRTC stream"),
-        VideoPacket::Unavailable { session_id, message } => bail!(
-            "ENCODER_UNAVAILABLE: Host media for session {session_id} is unavailable: {message}"
-        ),
+        // Host capture/page failures are recoverable states on the raw media
+        // stream. Encoder failure is classified only after this state is
+        // followed by encoded-stream EOF (see `terminal_encoder_error`).
+        VideoPacket::Unavailable { .. } => Ok(false),
     }
+}
+
+/// Classify an unavailable packet only after the encoded watch sender has
+/// closed. The packet is shared with Host capture/page failures, so its
+/// arrival alone is not evidence of an encoder failure.
+fn terminal_encoder_error(packet: &VideoPacket) -> Option<(String, String)> {
+    let VideoPacket::Unavailable { session_id, message } = packet else { return None; };
+    Some((
+        "ENCODER_UNAVAILABLE".to_owned(),
+        format!("Host media for session {session_id} is unavailable: {message}"),
+    ))
 }
 
 /// Return the exact Annex-B length produced by the RTP H.264 adapter. The
@@ -341,16 +373,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unavailable_media_is_an_explicit_endpoint_error() {
+    fn unavailable_media_is_a_recoverable_host_state_until_stream_ends() {
+        let packet = VideoPacket::Unavailable {
+            session_id: "boundary-session".into(),
+            message: "capture temporarily unavailable".into(),
+        };
+        assert!(!frame_available(&packet).expect("unavailable host state must be accepted"));
+    }
+
+    #[test]
+    fn terminal_unavailable_media_has_a_typed_encoder_error() {
         let packet = VideoPacket::Unavailable {
             session_id: "boundary-session".into(),
             message: "configured encoder exited".into(),
         };
-        let error = frame_available(&packet).expect_err("encoder failure must not be ignored");
-        assert_eq!(
-            error.to_string(),
-            "ENCODER_UNAVAILABLE: Host media for session boundary-session is unavailable: configured encoder exited"
-        );
+        let (code, message) = terminal_encoder_error(&packet).expect("closed unavailable stream must classify encoder failure");
+        assert_eq!(code, "ENCODER_UNAVAILABLE");
+        assert_eq!(message, "Host media for session boundary-session is unavailable: configured encoder exited");
+    }
+
+    #[test]
+    fn access_unit_and_waiting_states_are_not_terminal_encoder_errors() {
+        let waiting = VideoPacket::Waiting { session_id: "boundary-session".into() };
+        assert!(terminal_encoder_error(&waiting).is_none());
     }
 }
 
