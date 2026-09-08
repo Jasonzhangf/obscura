@@ -240,9 +240,9 @@ async fn emit_frame(
     packetizer: &mut dyn Packetizer,
 ) -> Result<()> {
     let Some(frame) = frame else { return Ok(()); };
+    if !frame_available(&frame.packet)? { return Ok(()); }
     let VideoPacket::AccessUnit { source, encoder_id, pts_us, coded_width, coded_height, codec, keyframe, byte_length } = &frame.packet else {
-        if matches!(frame.packet, VideoPacket::Closed { .. }) { bail!("Host session closed during WebRTC stream"); }
-        return Ok(());
+        unreachable!("non-access-unit media packet passed the availability guard");
     };
     ensure!(source.session_id == binding.session_id, "Host media session changed during WebRTC stream");
     ensure!(matches!(codec, VideoCodec::H264AnnexB), "Host produced a non-H.264 WebRTC access unit");
@@ -289,6 +289,17 @@ async fn emit_frame(
     Ok(())
 }
 
+fn frame_available(packet: &VideoPacket) -> Result<bool> {
+    match packet {
+        VideoPacket::AccessUnit { .. } => Ok(true),
+        VideoPacket::Waiting { .. } => Ok(false),
+        VideoPacket::Closed { .. } => bail!("Host session closed during WebRTC stream"),
+        VideoPacket::Unavailable { session_id, message } => bail!(
+            "ENCODER_UNAVAILABLE: Host media for session {session_id} is unavailable: {message}"
+        ),
+    }
+}
+
 /// Return the exact Annex-B length produced by the RTP H.264 adapter. The
 /// payloader may omit non-media NALUs and the depacketizer emits canonical
 /// four-byte start codes, so the encoder's source length is not the wire
@@ -323,6 +334,24 @@ fn even_dimension(value: u32) -> u32 { value.saturating_add(1) & !1 }
 struct EndpointHandler {
     gathered: Arc<Notify>,
     data_tx: mpsc::Sender<Arc<dyn DataChannel>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unavailable_media_is_an_explicit_endpoint_error() {
+        let packet = VideoPacket::Unavailable {
+            session_id: "boundary-session".into(),
+            message: "configured encoder exited".into(),
+        };
+        let error = frame_available(&packet).expect_err("encoder failure must not be ignored");
+        assert_eq!(
+            error.to_string(),
+            "ENCODER_UNAVAILABLE: Host media for session boundary-session is unavailable: configured encoder exited"
+        );
+    }
 }
 
 #[async_trait::async_trait]

@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use anyhow::{Context, Result};
 use obscura_host_protocol::{Command, Control, ControlPhase, Device, FramePacket, Mode, Operation, Request, Response, ResultValue, SessionStatus, ViewportDeclaration, WebRtcCapability, WebRtcSessionBinding, WebRtcTransport, WebRtcVideoCodec, WEBRTC_CONTROL_LABEL, WEBRTC_PROTOCOL_VERSION};
@@ -86,10 +86,11 @@ struct Session {
     retired: HashSet<u64>,
     viewport_owner: Option<u64>,
     viewport_update: Option<ViewportUpdate>,
+    viewport_repair: Option<(u32, u32)>,
 }
 struct Attachment { mode: Mode, viewport: Option<ViewportDeclaration>, webrtc: Option<WebRtcGrant> }
 struct WebRtcGrant { capability: WebRtcCapability, binding: WebRtcSessionBinding, consumed: bool }
-struct ViewportUpdate { owner: Option<u64>, width: u32, height: u32, revision: u64 }
+struct ViewportUpdate { owner: Option<u64>, width: u32, height: u32, revision: u64, cancelled: bool, cancel: Arc<AtomicBool> }
 struct Record { operation: Operation, command: Command, response: Option<Response> }
 fn valid_viewport(width: u32, height: u32) -> bool {
     width > 0 && height > 0 && width <= 4096 && height <= 4096 && u64::from(width) * u64::from(height) <= 4_194_304
@@ -119,18 +120,26 @@ impl Session {
                 u64::from(viewport.css_width) * u64::from(viewport.css_height), viewport.css_width, *id))
     }
     fn viewport_pending(&self) -> bool {
-        self.viewport_update.is_some() || self.selected_viewport().is_some_and(|(_, viewport)|
+        self.viewport_update.is_some() || self.viewport_repair.is_some() || self.selected_viewport().is_some_and(|(_, viewport)|
             self.viewport != Some((viewport.css_width as f32, viewport.css_height as f32)))
     }
     fn viewport_work(&mut self, owner: Option<u64>, width: u32, height: u32, document_revision: Option<u64>) -> Result<WorkKind, String> {
         let revision = if self.viewport == Some((width as f32, height as f32)) { self.viewport_revision }
             else { self.viewport_revision.checked_add(1).ok_or("Viewport revision exhausted; recreate session")? };
-        self.viewport_update = Some(ViewportUpdate { owner, width, height, revision });
-        Ok(WorkKind::Viewport { width, height, revision, document_revision })
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.viewport_update = Some(ViewportUpdate { owner, width, height, revision, cancelled: false, cancel: Arc::clone(&cancel) });
+        Ok(WorkKind::Viewport { width, height, revision, document_revision, cancel })
     }
     fn detach(&mut self, connection: u64) {
         self.retired.insert(connection);
         self.attachments.remove(&connection);
+        if self.viewport_owner == Some(connection) { self.viewport_owner = None; }
+        if let Some(update) = self.viewport_update.as_mut() {
+            if update.owner == Some(connection) {
+                update.cancelled = true;
+                update.cancel.store(true, Ordering::Release);
+            }
+        }
         if self.agent == Some(connection) { self.agent = None; }
         self.records.remove(&connection);
         if matches!(self.control.phase, ControlPhase::Waiting { attachment_id } | ControlPhase::Human { attachment_id } if attachment_id == connection) {
@@ -366,7 +375,7 @@ pub async fn serve(socket_dir: PathBuf, allow_private_network: bool) -> Result<(
     let (interest, interested) = tokio::sync::watch::channel(0usize);
     let worker = worker::start(id.clone(), allow_private_network, incoming_work, ready, faults, frames, interested)?;
     let viewport = initialized.await.context("browser worker stopped during startup")?.map_err(anyhow::Error::msg)?;
-    let mut session = Session { id: id.clone(), viewport: Some(viewport), attachments: HashMap::new(), agent: None, viewport_revision: 0, document_revision: 0, fault: None, control: Control { epoch: 1, phase: ControlPhase::Agent }, records: HashMap::new(), retired: HashSet::new(), viewport_owner: None, viewport_update: None };
+    let mut session = Session { id: id.clone(), viewport: Some(viewport), attachments: HashMap::new(), agent: None, viewport_revision: 0, document_revision: 0, fault: None, control: Control { epoch: 1, phase: ControlPhase::Agent }, records: HashMap::new(), retired: HashSet::new(), viewport_owner: None, viewport_update: None, viewport_repair: None };
     let listener = UnixListener::bind(directory.0.join("host.sock"))?;
     std::fs::set_permissions(directory.0.join("host.sock"), std::fs::Permissions::from_mode(0o600))?;
     let media_listener = UnixListener::bind(directory.0.join("frames.sock"))?;
@@ -383,9 +392,11 @@ pub async fn serve(socket_dir: PathBuf, allow_private_network: bool) -> Result<(
         // Declarations remain responsive while atomic work completes. Schedule only
         // the latest elected pair, before admitting any subsequent browser mutation.
         if pending.is_none() && session.fault.is_none() && session.viewport.is_some() {
-            match session.selected_viewport() {
-                Some((owner, viewport)) if session.viewport != Some((viewport.css_width as f32, viewport.css_height as f32)) => {
-                    match session.viewport_work(Some(owner), viewport.css_width, viewport.css_height, None) {
+            let target = session.viewport_repair.take().map(|(width, height)| (None, width, height, true))
+                .or_else(|| session.selected_viewport().map(|(owner, viewport)| (Some(owner), viewport.css_width, viewport.css_height, false)));
+            match target {
+                Some((owner, width, height, force)) if force || session.viewport != Some((width as f32, height as f32)) => {
+                    match session.viewport_work(owner, width, height, None) {
                         Ok(kind) => {
                             let (reply, result) = oneshot::channel();
                             if work.try_send(Work { kind, reply }).is_err() {
@@ -396,7 +407,8 @@ pub async fn serve(socket_dir: PathBuf, allow_private_network: bool) -> Result<(
                         Err(cause) => session.fault = Some(cause),
                     }
                 }
-                selected => session.viewport_owner = selected.map(|(owner, _)| owner),
+                Some((owner, _, _, _)) => session.viewport_owner = owner,
+                None => session.viewport_owner = None,
             }
         }
         tokio::select! {
@@ -480,7 +492,11 @@ pub async fn serve(socket_dir: PathBuf, allow_private_network: bool) -> Result<(
                         session.document_revision = session.document_revision.max(completion.document_revision);
                         if completion.fault.is_some() { session.fault = completion.fault; }
                         if let Some(update) = viewport_update {
-                            if completion.result.is_ok() {
+                            if update.cancelled {
+                                if completion.result.is_ok() && session.selected_viewport().is_none() {
+                                    session.viewport_repair = session.viewport.map(|(width, height)| (width as u32, height as u32));
+                                }
+                            } else if completion.result.is_ok() {
                                 if completion.viewport_revision != update.revision || completion.viewport != Some((update.width as f32, update.height as f32)) {
                                     session.fault = Some("Viewport completion mismatched Host assignment; recreate session".into());
                                 } else {
