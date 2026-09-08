@@ -294,6 +294,42 @@ fn detaching_pending_owner_reselects_remaining_observer_after_cancellation() {
 }
 
 #[test]
+fn detaching_pending_owner_with_remaining_committed_observer_keeps_frames_live() {
+    let daemon = Daemon::start();
+    let mut agent = daemon.connect(); agent.ok(json!({"type":"attach","mode":"agent"}));
+    let mut first = daemon.connect();
+    let first_attachment = first.ok(json!({"type":"attach","mode":"observe","viewport":declaration("phone",390,701,"portrait")}));
+    let committed = settled(&mut first);
+    assert_eq!(committed["viewport_owner"], first_attachment["attachment_id"]);
+
+    let mut media = Media::connect(&daemon);
+    let (initial_frame, _) = media.frame();
+    assert_eq!(initial_frame["width"], 390);
+    assert_eq!(initial_frame["height"], 701);
+    assert_eq!(initial_frame["viewport_revision"], committed["viewport_revision"]);
+
+    agent.eval("globalThis.__obscura_recompute_resizes=function(){const end=Date.now()+750;while(Date.now()<end){}};true");
+    first.ok(json!({"type":"declare_viewport","viewport":declaration("phone",400,700,"portrait")}));
+    assert_eq!(first.ok(json!({"type":"status"}))["viewport_pending"], true);
+
+    let mut remaining = daemon.connect();
+    let remaining_attachment = remaining.ok(json!({"type":"attach","mode":"observe","viewport":declaration("phone",390,701,"portrait")}));
+    assert_eq!(remaining_attachment["viewport_pending"], true);
+    first.ok(json!({"type":"detach"}));
+
+    let after = settled(&mut remaining);
+    assert_eq!(after["viewport_pending"], false);
+    assert_eq!(after["viewport"], committed["viewport"]);
+    assert_eq!(after["viewport_revision"], committed["viewport_revision"]);
+    assert_eq!(after["viewport_owner"], remaining_attachment["attachment_id"]);
+
+    let (next_frame, _) = media.frame();
+    assert_eq!(next_frame["width"], 390, "cancelled layout left stale frame width");
+    assert_eq!(next_frame["height"], 701, "cancelled layout left stale frame height");
+    assert_eq!(next_frame["viewport_revision"], committed["viewport_revision"], "cancelled layout left stale frame revision");
+}
+
+#[test]
 fn declared_viewports_publish_one_shared_frame_after_rotation() {
     let daemon = Daemon::start();
     let mut agent = daemon.connect(); agent.ok(json!({"type":"attach","mode":"agent"}));
