@@ -7,10 +7,15 @@ use tokio_rustls::rustls::{self, pki_types::{CertificateDer, PrivateKeyDer, Priv
 
 #[tokio::test]
 async fn real_receiver_gets_continuous_host_media_and_rejects_stale_binding() {
-    tokio::time::timeout(Duration::from_secs(180), exercise()).await.expect("WebRTC endpoint integration timed out").unwrap();
+    tokio::time::timeout(Duration::from_secs(180), exercise(false)).await.expect("WebRTC endpoint integration timed out").unwrap();
 }
 
-async fn exercise() -> anyhow::Result<()> {
+#[tokio::test]
+async fn real_receiver_gets_typed_encoder_unavailable_error() {
+    tokio::time::timeout(Duration::from_secs(180), exercise(true)).await.expect("WebRTC encoder failure integration timed out").unwrap();
+}
+
+async fn exercise(encoder_failure: bool) -> anyhow::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     let root = PathBuf::from("/tmp").join(format!("ow-{}", uuid::Uuid::new_v4().simple()));
     std::fs::DirBuilder::new().mode(0o700).create(&root)?;
@@ -51,20 +56,36 @@ async fn exercise() -> anyhow::Result<()> {
 
     let reservation = TcpListener::bind((bind_ip, 0)).await?;
     let address = reservation.local_addr()?; drop(reservation);
-    let media_bin = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/release/obscura-media");
-    let receiver_bin = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/release/obscura-webrtc-receiver");
+    let media_bin = release_binary("obscura-media");
+    let receiver_bin = release_binary("obscura-webrtc-receiver");
     anyhow::ensure!(media_bin.is_file(), "Build target/release/obscura-media with --features webrtc first");
     anyhow::ensure!(receiver_bin.is_file(), "Build target/release/obscura-webrtc-receiver with --features webrtc first");
-    let endpoint = Command::new(env!("CARGO_BIN_EXE_obscura-endpoint"))
+    let mut endpoint_command = Command::new(env!("CARGO_BIN_EXE_obscura-endpoint"));
+    endpoint_command
         .arg("--listen").arg(address.to_string()).arg("--host-dir").arg(root.join("host"))
         .arg("--socket-dir").arg(root.join("endpoint"))
         .arg("--server-cert").arg(root.join("server.der")).arg("--server-key").arg(root.join("server.key"))
         .arg("--client-ca").arg(root.join("ca.der")).arg("--media-bin").arg(&media_bin)
-        .arg("--enable-webrtc").arg("--webrtc-bind-ip").arg(bind_ip)
-        .stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true).spawn()?;
+        .arg("--enable-webrtc").arg("--webrtc-bind-ip").arg(bind_ip);
+    if encoder_failure { endpoint_command.arg("--ffmpeg").arg("/nonexistent-obscura-encoder"); }
+    let endpoint = endpoint_command.stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true).spawn()?;
     wait_socket(root.join("endpoint/encoded.sock")).await;
 
-    let first = run_receiver(&receiver_bin, address, &root, false, false).await?;
+    let first = run_receiver(&receiver_bin, address, &root, false, false, encoder_failure).await?;
+    if encoder_failure {
+        anyhow::ensure!(first.status.success(), "typed encoder failure receiver failed: {}", String::from_utf8_lossy(&first.stderr));
+        let report: serde_json::Value = serde_json::from_slice(&first.stdout)?;
+        anyhow::ensure!(report["pass"] == true && report["error_code"] == "ENCODER_UNAVAILABLE",
+            "remote encoder failure was not typed: {report}");
+        let mut endpoint = endpoint;
+        let mut host = host;
+        let _ = endpoint.kill().await;
+        let _ = endpoint.wait().await;
+        let _ = host.kill().await;
+        let _ = host.wait().await;
+        std::fs::remove_dir_all(root)?;
+        return Ok(());
+    }
     anyhow::ensure!(first.status.success(), "independent WebRTC receiver failed: {}", String::from_utf8_lossy(&first.stderr));
     let first_report: serde_json::Value = serde_json::from_slice(&first.stdout)?;
     anyhow::ensure!(first_report["pass"] == true && first_report["browser_path"] == "webrtc_data_channel", "WebRTC DataChannel browser path missing: {first_report}");
@@ -91,12 +112,12 @@ async fn exercise() -> anyhow::Result<()> {
     }
     anyhow::ensure!(frames.iter().any(|frame| frame["changed"] == true), "Host click did not produce a different WebRTC frame: {first_report}");
 
-    let stale = run_receiver(&receiver_bin, address, &root, false, true).await?;
+    let stale = run_receiver(&receiver_bin, address, &root, false, true, false).await?;
     anyhow::ensure!(stale.status.success(), "stale-binding receiver failed: {}", String::from_utf8_lossy(&stale.stderr));
     let stale_report: serde_json::Value = serde_json::from_slice(&stale.stdout)?;
     anyhow::ensure!(stale_report["negative"] == "stale_binding_rejected", "stale binding was not rejected: {stale_report}");
 
-    let second = run_receiver(&receiver_bin, address, &root, true, false).await?;
+    let second = run_receiver(&receiver_bin, address, &root, true, false, false).await?;
     anyhow::ensure!(second.status.success(), "reconnected WebRTC receiver failed: {}", String::from_utf8_lossy(&second.stderr));
     let second_report: serde_json::Value = serde_json::from_slice(&second.stdout)?;
     anyhow::ensure!(second_report["pass"] == true, "reconnect evidence missing: {second_report}");
@@ -113,13 +134,14 @@ async fn exercise() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_receiver(binary: &PathBuf, address: std::net::SocketAddr, root: &PathBuf, skip_click: bool, bad_binding: bool) -> anyhow::Result<std::process::Output> {
+async fn run_receiver(binary: &PathBuf, address: std::net::SocketAddr, root: &PathBuf, skip_click: bool, bad_binding: bool, expect_encoder_error: bool) -> anyhow::Result<std::process::Output> {
     let mut command = Command::new(binary);
     command.arg("--address").arg(address.to_string()).arg("--ca").arg(root.join("ca.der"))
         .arg("--client-cert").arg(root.join("client.der")).arg("--client-key").arg(root.join("client.key"))
         .arg("--frames").arg("3");
     if skip_click { command.arg("--skip-click"); }
     if bad_binding { command.arg("--bad-binding"); }
+    if expect_encoder_error { command.arg("--expect-encoder-error"); }
     Ok(command.output().await?)
 }
 
@@ -127,6 +149,13 @@ fn identity(state: &serde_json::Value) -> serde_json::Value {
     serde_json::json!({"session_id":state["session_id"],"attachment_id":state["attachment_id"],
         "sequence":state["next_sequence"],"control_epoch":state["control"]["epoch"],
         "viewport_revision":state["viewport_revision"],"document_revision":state["document_revision"]})
+}
+
+fn release_binary(name: &str) -> PathBuf {
+    std::env::var_os("OBSCURA_TEST_BINARY_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/release"))
+        .join(name)
 }
 
 async fn local_request(socket: &mut BufReader<tokio::net::UnixStream>, request: serde_json::Value) -> anyhow::Result<serde_json::Value> {
