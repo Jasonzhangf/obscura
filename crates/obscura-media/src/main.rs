@@ -65,7 +65,7 @@ async fn main() -> Result<()> {
                             keyframe: true, byte_length: bytes.len() as u64 }
                     }
                     Err(error) => {
-                        let failure = VideoPacket::Unavailable { session_id: info.session_id, message: error.to_string() };
+                        let failure = VideoPacket::EncoderUnavailable { session_id: info.session_id, message: error.to_string() };
                         send(&mut output, &failure, &[]).await?;
                         return Err(error);
                     }
