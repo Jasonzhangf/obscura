@@ -210,6 +210,90 @@ fn viewport_waits_for_atomic_click_and_coalesces_before_human_input() {
 }
 
 #[test]
+fn detaching_viewport_owner_during_pending_layout_does_not_publish_stale_owner_or_layout() {
+    let daemon = Daemon::start();
+    let mut agent = daemon.connect(); agent.ok(json!({"type":"attach","mode":"agent"}));
+    let mut owner = daemon.connect();
+    let attached = owner.ok(json!({"type":"attach","mode":"observe","viewport":declaration("phone",390,701,"portrait")}));
+    let committed = settled(&mut owner);
+    assert_eq!(committed["viewport_owner"], attached["attachment_id"]);
+
+    agent.eval("globalThis.__obscura_recompute_resizes=function(){const end=Date.now()+750;while(Date.now()<end){}};true");
+    owner.ok(json!({"type":"declare_viewport","viewport":declaration("phone",400,700,"portrait")}));
+    let pending = owner.ok(json!({"type":"status"}));
+    assert_eq!(pending["viewport_pending"], true);
+    assert_eq!(pending["viewport"], committed["viewport"]);
+    assert_eq!(pending["viewport_revision"], committed["viewport_revision"]);
+
+    let detached = owner.ok(json!({"type":"detach"}));
+    assert!(detached["attachment_id"].is_null());
+    assert!(detached["viewport_owner"].is_null(), "detached attachment remains elected: {detached}");
+    assert_eq!(detached["viewport"], committed["viewport"]);
+    assert_eq!(detached["viewport_revision"], committed["viewport_revision"]);
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let after = loop {
+        let state = agent.ok(json!({"type":"status"}));
+        if state["viewport_pending"] == false { break state; }
+        assert!(Instant::now() < deadline, "detached layout did not settle: {state}");
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert!(after["viewport_owner"].is_null(), "detached layout elected stale owner: {after}");
+    assert_eq!(after["viewport"], committed["viewport"], "detached layout committed stale dimensions");
+    assert_eq!(after["viewport_revision"], committed["viewport_revision"], "detached layout advanced revision");
+}
+
+#[test]
+fn detaching_pending_viewport_restores_committed_dimensions_before_next_frame() {
+    let daemon = Daemon::start();
+    let mut agent = daemon.connect(); agent.ok(json!({"type":"attach","mode":"agent"}));
+    let mut owner = daemon.connect();
+    owner.ok(json!({"type":"attach","mode":"observe","viewport":declaration("phone",390,701,"portrait")}));
+    let committed = settled(&mut owner);
+    let mut media = Media::connect(&daemon);
+    let (initial_frame, _) = media.frame();
+    assert_eq!(initial_frame["width"], 390);
+    assert_eq!(initial_frame["height"], 701);
+    assert_eq!(initial_frame["viewport_revision"], committed["viewport_revision"]);
+
+    agent.eval("globalThis.__obscura_recompute_resizes=function(){const end=Date.now()+750;while(Date.now()<end){}};true");
+    owner.ok(json!({"type":"declare_viewport","viewport":declaration("phone",400,700,"portrait")}));
+    owner.ok(json!({"type":"detach"}));
+    let after = settled(&mut agent);
+    assert!(after["viewport_owner"].is_null());
+    assert_eq!(after["viewport"], committed["viewport"]);
+    assert_eq!(after["viewport_revision"], committed["viewport_revision"]);
+
+    let (restored_frame, _) = media.frame();
+    assert_eq!(restored_frame["width"], 390, "detached layout leaked stale frame width");
+    assert_eq!(restored_frame["height"], 701, "detached layout leaked stale frame height");
+    assert_eq!(restored_frame["viewport_revision"], committed["viewport_revision"], "detached layout leaked a new frame revision");
+}
+
+#[test]
+fn detaching_pending_owner_reselects_remaining_observer_after_cancellation() {
+    let daemon = Daemon::start();
+    let mut agent = daemon.connect(); agent.ok(json!({"type":"attach","mode":"agent"}));
+    let mut first = daemon.connect();
+    let first_attachment = first.ok(json!({"type":"attach","mode":"observe","viewport":declaration("phone",390,701,"portrait")}));
+    let committed = settled(&mut first);
+    assert_eq!(committed["viewport_owner"], first_attachment["attachment_id"]);
+
+    let mut second = daemon.connect();
+    let second_attachment = second.ok(json!({"type":"attach","mode":"observe","viewport":declaration("phone",600,600,"portrait")}));
+    assert_eq!(settled(&mut second)["viewport_owner"], first_attachment["attachment_id"]);
+    agent.eval("globalThis.__obscura_recompute_resizes=function(){const end=Date.now()+750;while(Date.now()<end){}};true");
+    first.ok(json!({"type":"declare_viewport","viewport":declaration("phone",400,700,"portrait")}));
+    let detached = first.ok(json!({"type":"detach"}));
+    assert!(detached["viewport_owner"].is_null());
+
+    let after = settled(&mut second);
+    assert_eq!(after["viewport_owner"], second_attachment["attachment_id"]);
+    assert_eq!(after["viewport"], json!([600.0,600.0]));
+    assert_eq!(after["viewport_revision"], json!(committed["viewport_revision"].as_u64().unwrap() + 1));
+}
+
+#[test]
 fn declared_viewports_publish_one_shared_frame_after_rotation() {
     let daemon = Daemon::start();
     let mut agent = daemon.connect(); agent.ok(json!({"type":"attach","mode":"agent"}));
