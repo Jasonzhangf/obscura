@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
+    "protocol/browser",
+    "crates/obscura-host",
+    "crates/obscura-media",
     "crates/obscura-dom",
     "crates/obscura-net",
     "crates/obscura-browser",

@@ -1491,6 +1491,17 @@ impl ObscuraJsRuntime {
         base_url: Option<&str>,
         surface_color: [u8; 4],
     ) -> Option<Vec<u8>> {
+        self.paint_prepared_with_surface_color(viewport, base_url, surface_color)?.encode_png().ok()
+    }
+
+    /// Original premultiplied RGBA8 pixels, before any image/video encoding.
+    #[cfg(feature = "render")]
+    pub fn paint_prepared_with_surface_color(
+        &self,
+        viewport: (f32, f32),
+        base_url: Option<&str>,
+        surface_color: [u8; 4],
+    ) -> Option<obscura_render::RenderPixmap> {
         let mut state = self.state.borrow_mut();
         let effective_base = document_base_url(&state);
         if viewport != state.viewport || base_url != effective_base.as_deref() {
@@ -1508,7 +1519,7 @@ impl ObscuraJsRuntime {
             } = state;
             let (_, scroll) = resolved_scroll.as_ref()?;
             let canvas_surfaces = RuntimeCanvasSurfaceSource(canvas_surfaces);
-            obscura_render::screenshot_prepared_with_scroll_and_surface_color_and_canvas_surfaces(
+            obscura_render::paint_prepared_with_scroll_and_surface_color_and_canvas_surfaces(
                 dom.as_ref()?,
                 prepared_render.as_mut()?,
                 render_resources,
@@ -14788,6 +14799,25 @@ mod tests {
             .evaluate("document.querySelector('li').textContent")
             .unwrap();
         assert_eq!(text, serde_json::json!("A"));
+    }
+
+    #[test]
+    #[cfg(feature = "render")]
+    fn test_live_input_value_repaints_without_changing_default() {
+        let mut rt = setup_runtime(r#"<style>body{margin:0}input{width:200px;height:40px;color:black;background:white}</style><input id="field" value="default" placeholder="hint">"#);
+        rt.set_viewport(240.0, 60.0);
+        let initial = rt.screenshot_prepared((240.0, 60.0), Some("http://example.com/test")).unwrap();
+        rt.execute_script("test", "document.getElementById('field').value='LIVE';").unwrap();
+        let live = rt.screenshot_prepared((240.0, 60.0), Some("http://example.com/test")).unwrap();
+        assert_ne!(initial, live, "live value must update rendered pixels");
+        assert_eq!(rt.evaluate("document.getElementById('field').getAttribute('value')").unwrap(), serde_json::json!("default"));
+        assert_eq!(rt.evaluate("document.getElementById('field').cloneNode(true).value").unwrap(), serde_json::json!("LIVE"));
+        rt.execute_script("test", "document.getElementById('field').value='';").unwrap();
+        let empty = rt.screenshot_prepared((240.0, 60.0), Some("http://example.com/test")).unwrap();
+        assert_ne!(empty, live, "clearing must repaint");
+        assert_ne!(empty, initial, "empty current value must override nonempty default");
+        rt.execute_script("test", "document.getElementById('field').value='LIVE';").unwrap();
+        assert_eq!(rt.screenshot_prepared((240.0, 60.0), Some("http://example.com/test")).unwrap(), live);
     }
 
     #[test]
