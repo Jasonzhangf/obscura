@@ -46,6 +46,7 @@ static MONO_BO: &[u8] = include_bytes!("../assets/liberation-mono-boldoblique.tt
 static SYSTEM_R: &[u8] = include_bytes!("../assets/dejavu-sans.ttf");
 static SYSTEM_B: &[u8] = include_bytes!("../assets/dejavu-sans-bold.ttf");
 static EMOJI_R: &[u8] = include_bytes!("../assets/noto-color-emoji.ttf");
+pub(crate) static CJK_R: &[u8] = include_bytes!("../assets/noto-sans-cjk-sc.otf");
 #[cfg(test)]
 static FALLBACK: &[u8] = SYSTEM_R;
 
@@ -996,7 +997,7 @@ impl TextEngine {
         let mut declarations = Vec::new();
         for bytes in [
             SANS_R, SANS_B, SANS_O, SANS_BO, SERIF_R, SERIF_B, SERIF_O, SERIF_BO, MONO_R, MONO_B,
-            MONO_O, MONO_BO, SYSTEM_R, SYSTEM_B,
+            MONO_O, MONO_BO, SYSTEM_R, SYSTEM_B, CJK_R,
         ] {
             for id in db.load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(bytes))) {
                 declarations.push((id, None, None, None));
@@ -3537,6 +3538,18 @@ impl TextEngine {
 mod tests {
     use super::*;
     use base64::Engine as _;
+
+    #[test]
+    fn cjk_inline_glyphs_are_not_missing() {
+        let mut engine=TextEngine::new();
+        let mut buffer=Buffer::new(&mut engine.font_system,Metrics::new(20.0,30.0));
+        buffer.set_size(&mut engine.font_system,Some(500.0),Some(100.0));
+        buffer.set_text(&mut engine.font_system,"中文汉字繁體かな한글",&Attrs::new().family(Family::SansSerif),Shaping::Advanced);
+        buffer.shape_until_scroll(&mut engine.font_system,false);
+        let glyphs:Vec<_>=buffer.layout_runs().flat_map(|run|run.glyphs.iter()).collect();
+        assert!(!glyphs.is_empty());
+        assert!(glyphs.iter().all(|glyph|glyph.glyph_id!=0),"CJK must resolve to actual bundled glyphs");
+    }
 
     const RED: [u8; 4] = [255, 0, 0, 255];
     const BLUE: [u8; 4] = [0, 0, 255, 255];
