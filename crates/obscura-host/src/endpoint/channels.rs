@@ -237,26 +237,9 @@ pub async fn ingest(
     encoded_latest: watch::Sender<Option<Arc<EncodedFrame>>>,
 ) -> Result<()> {
     let mut reader = BufReader::new(socket);
-    let mut last_packet_was_encoder_unavailable = false;
     loop {
         let mut header = Vec::new();
-        let read = (&mut reader).take(4096).read_until(b'\n', &mut header).await?;
-        if read == 0 && last_packet_was_encoder_unavailable {
-            // The media owner sends one EncoderUnavailable packet before
-            // exiting nonzero on encoder failure. Close both fan-out watches
-            // so every endpoint connection observes the terminal stream
-            // state, then keep this media future alive: `server::serve` must
-            // not select a completed ingest future and abort the authenticated
-            // WebRTC task before it can deliver its typed DataChannel error.
-            drop(latest);
-            drop(encoded_latest);
-            // The server owns cancellation of this media future: it drops the
-            // pinned future after its shutdown branch wins. Release the
-            // adapter socket before waiting so the pending future retains no
-            // file descriptor while the endpoint remains alive.
-            drop(reader);
-            return std::future::pending::<Result<()>>().await;
-        }
+        (&mut reader).take(4096).read_until(b'\n', &mut header).await?;
         ensure!(header.len() < 4096 && header.last() == Some(&b'\n'), "Encoder stream ended or invalid header");
         header.pop();
         let packet: VideoPacket = serde_json::from_slice(&header)?;
@@ -269,7 +252,22 @@ pub async fn ingest(
         bytes.extend_from_slice(&(header.len() as u32).to_be_bytes()); bytes.extend_from_slice(&header); bytes.extend_from_slice(&payload);
         let closed = matches!(packet, VideoPacket::Closed { .. });
         latest.send_replace(Some(Arc::new(Video { bytes, closed })));
-        last_packet_was_encoder_unavailable = matches!(packet, VideoPacket::EncoderUnavailable { .. });
+        if matches!(packet, VideoPacket::EncoderUnavailable { .. }) {
+            // EncoderUnavailable is terminal at this local ABI boundary. Close
+            // both fan-out watches immediately so every endpoint can deliver
+            // its typed DataChannel error even if the adapter delays or fails
+            // to close its socket after sending the marker. Keep this media
+            // future alive: `server::serve` must not select a completed ingest
+            // future and abort the authenticated WebRTC task before delivery.
+            drop(latest);
+            drop(encoded_latest);
+            // The server owns cancellation of this media future: it drops the
+            // pinned future after its shutdown branch wins. Release the
+            // adapter socket before waiting so the pending future retains no
+            // file descriptor while the endpoint remains alive.
+            drop(reader);
+            return std::future::pending::<Result<()>>().await;
+        }
         if closed { return Ok(()); }
     }
 }
@@ -292,7 +290,6 @@ mod tests {
         let mut header = serde_json::to_vec(&packet).expect("serialize unavailable packet");
         header.push(b'\n');
         writer.write_all(&header).await.expect("write unavailable packet");
-        writer.shutdown().await.expect("close encoded stream");
 
         latest_rx.changed().await.expect("receive unavailable media state");
         assert!(matches!(latest_rx.borrow().as_ref().map(|frame| frame.closed), Some(false)));
