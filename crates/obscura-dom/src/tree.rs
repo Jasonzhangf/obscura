@@ -130,6 +130,8 @@ pub struct Node {
     pub prev_sibling: Option<NodeId>,
     pub next_sibling: Option<NodeId>,
     pub data: NodeData,
+    /// Input's dirty current value; None still follows the HTML value attribute.
+    pub input_value: Option<String>,
 }
 
 impl Node {
@@ -277,6 +279,7 @@ impl DomTree {
             prev_sibling: None,
             next_sibling: None,
             data: NodeData::Document,
+            input_value: None,
         };
         DomTree {
             inner: RefCell::new(DomTreeInner {
@@ -593,6 +596,7 @@ impl DomTree {
             prev_sibling: None,
             next_sibling: None,
             data,
+            input_value: None,
         });
         id
     }
@@ -1429,17 +1433,19 @@ impl DomTree {
         if self.is_shadow_root(source_node_id) {
             return None;
         }
-        let source_data = self.get_node(source_node_id)?.data;
-        let cloned_root = self.new_node(source_data);
+        let source = self.get_node(source_node_id)?;
+        let cloned_root = self.new_node(source.data);
+        self.with_node_mut(cloned_root, |node| node.input_value = source.input_value);
         let mut stack = Vec::new();
         self.prepare_cloned_children(source_node_id, cloned_root, deep, &mut stack);
 
         while let Some((dest_parent, source_node)) = stack.pop() {
-            let source_data = match self.get_node(source_node) {
-                Some(node) => node.data,
+            let source = match self.get_node(source_node) {
+                Some(node) => node,
                 None => continue,
             };
-            let cloned_node = self.new_node(source_data);
+            let cloned_node = self.new_node(source.data);
+            self.with_node_mut(cloned_node, |node| node.input_value = source.input_value);
             self.append_child(dest_parent, cloned_node);
             self.prepare_cloned_children(source_node, cloned_node, true, &mut stack);
         }
@@ -1669,6 +1675,26 @@ mod tests {
         assert_eq!(tree.len(), 1);
         let node = tree.get_node(tree.document()).unwrap();
         assert!(node.is_document());
+    }
+
+    #[test]
+    fn current_input_value_follows_node_lifetime_and_clone() {
+        let tree = DomTree::new();
+        let parent = element(&tree, "div");
+        let input = element(&tree, "input");
+        tree.append_child(tree.document(), parent);
+        tree.append_child(parent, input);
+        tree.with_node_mut(input, |node| node.input_value = Some("live".into()));
+        let cloned = tree.clone_node(parent, true).unwrap();
+        let cloned_input = tree.children(cloned)[0];
+        assert_eq!(tree.get_node(cloned_input).unwrap().input_value.as_deref(), Some("live"));
+        tree.remove_child(input);
+        assert_eq!(tree.get_node(input).unwrap().input_value.as_deref(), Some("live"));
+        tree.remove(input);
+        let reused = element(&tree, "input");
+        assert_eq!(reused, input, "exercise actual arena slot reuse");
+        assert_eq!(tree.get_node(reused).unwrap().input_value, None);
+        assert_eq!(tree.get_node(cloned_input).unwrap().input_value.as_deref(), Some("live"));
     }
 
     #[test]
