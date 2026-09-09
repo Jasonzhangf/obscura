@@ -306,6 +306,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn closed_packet_is_terminal_and_preserves_matching_session_state() {
+        let (mut writer, socket) = UnixStream::pair().expect("create encoded stream pair");
+        let (latest_tx, mut latest_rx) = watch::channel(None);
+        let (encoded_tx, mut encoded_rx) = watch::channel(None);
+        let mut task = tokio::spawn(ingest(socket, latest_tx, encoded_tx));
+        let packet = VideoPacket::Closed { session_id: "closed-session".into() };
+        let mut header = serde_json::to_vec(&packet).expect("serialize closed packet");
+        header.push(b'\n');
+        writer.write_all(&header).await.expect("write closed packet");
+
+        latest_rx.changed().await.expect("receive closed media state");
+        let latest = latest_rx.borrow();
+        assert!(latest.as_ref().is_some_and(|frame| frame.closed));
+        drop(latest);
+        encoded_rx.changed().await.expect("receive closed encoded state");
+        assert!(matches!(
+            encoded_rx.borrow().as_ref().map(|frame| &frame.packet),
+            Some(VideoPacket::Closed { session_id }) if session_id == "closed-session"
+        ));
+        assert!(tokio::time::timeout(Duration::from_secs(1), &mut task).await.is_ok(),
+            "closed ingest must finish after publishing the terminal state");
+        assert!(tokio::time::timeout(Duration::from_millis(100), latest_rx.changed()).await
+            .expect("latest watch closure was not observed").is_err());
+    }
+
+    #[tokio::test]
     async fn host_unavailable_eof_keeps_generic_stream_error() {
         let (mut writer, socket) = UnixStream::pair().expect("create encoded stream pair");
         let (latest_tx, mut latest_rx) = watch::channel(None);

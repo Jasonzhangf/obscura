@@ -7,6 +7,14 @@ use super::{Args, channels};
 
 struct Grant { peer: Vec<u8>, active: watch::Sender<bool>, media_used: bool }
 type Grants = Arc<Mutex<HashMap<String, Grant>>>;
+#[derive(Clone, Copy)]
+struct MediaLifecycle { ingest_done: bool, active: usize }
+struct MediaLease(watch::Sender<MediaLifecycle>);
+impl Drop for MediaLease {
+    fn drop(&mut self) {
+        self.0.send_modify(|state| state.active = state.active.saturating_sub(1));
+    }
+}
 struct Lease { token: String, grants: Grants }
 impl Drop for Lease {
     fn drop(&mut self) {
@@ -50,6 +58,8 @@ pub async fn serve(args: Args) -> Result<()> {
         channels::ingest(socket, latest, encoded_latest).await
     };
     tokio::pin!(media);
+    let (media_lifecycle, mut media_lifecycle_rx) = watch::channel(MediaLifecycle { ingest_done: false, active: 0 });
+    let media_failure: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let grants: Grants = Arc::new(Mutex::new(HashMap::new()));
     let permits = Arc::new(Semaphore::new(32));
     let mut clients = tokio::task::JoinSet::new();
@@ -58,12 +68,27 @@ pub async fn serve(args: Args) -> Result<()> {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break Ok(()),
             _ = term.recv() => break Ok(()),
-            result = &mut media => break result,
+            result = &mut media => {
+                if let Err(error) = result { break Err(error); }
+                media_lifecycle.send_modify(|state| state.ingest_done = true);
+                let drain = async {
+                    while media_lifecycle_rx.borrow().active != 0 {
+                        media_lifecycle_rx.changed().await.context("Media delivery state ended")?;
+                    }
+                    Ok::<(), anyhow::Error>(())
+                }.await;
+                if let Err(error) = drain { break Err(error); }
+                if let Some(error) = media_failure.lock().expect("media failure owner").take() {
+                    break Err(anyhow::anyhow!("Media channel failed while delivering Closed: {error}"));
+                }
+                break Ok(());
+            }
             accepted = tcp.accept() => {
                 let (socket, _) = accepted?;
                 let Ok(permit) = permits.clone().try_acquire_owned() else { continue; };
                 let acceptor = acceptor.clone(); let grants = grants.clone(); let frames = frames.clone();
                 let encoded_frames = encoded_frames.clone(); let enable_webrtc = args.enable_webrtc;
+                let media_lifecycle = media_lifecycle.clone(); let media_failure = media_failure.clone();
                 let webrtc_bind = args.webrtc_bind_ip.map(|ip| SocketAddr::new(ip, 0));
                 let host = args.host_dir.join("host.sock");
                 clients.spawn(async move {
@@ -73,7 +98,9 @@ pub async fn serve(args: Args) -> Result<()> {
                         let peer = tls.get_ref().1.peer_certificates().context("Paired client certificate required")?[0].as_ref().to_vec();
                         let token = format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
                         let mut media_active = None;
+                        let mut media_lease = None;
                         let mut is_control = false;
+                        let media_lifecycle_for_handshake = media_lifecycle.clone();
                         let mut config = WebSocketConfig::default();
                         config.max_message_size = Some(64 * 1024); config.max_frame_size = Some(64 * 1024);
                         config.max_write_buffer_size = 5 * 1024 * 1024;
@@ -91,6 +118,15 @@ pub async fn serve(args: Args) -> Result<()> {
                                     let mut entries = grants.lock().expect("grant owner");
                                     let grant = entries.get_mut(supplied).ok_or_else(reject)?;
                                     if grant.peer != peer || !*grant.active.borrow() || grant.media_used { return Err(reject()); }
+                                    let mut admitted = false;
+                                    media_lifecycle_for_handshake.send_modify(|state| {
+                                        if !state.ingest_done {
+                                            state.active += 1;
+                                            admitted = true;
+                                        }
+                                    });
+                                    if !admitted { return Err(reject()); }
+                                    media_lease = Some(MediaLease(media_lifecycle_for_handshake.clone()));
                                     grant.media_used = true; media_active = Some(grant.active.subscribe());
                                 }
                                 _ => return Err(reject()),
@@ -102,7 +138,15 @@ pub async fn serve(args: Args) -> Result<()> {
                             grants.lock().expect("grant owner").insert(token.clone(), Grant { peer, active: active.clone(), media_used: false });
                             let _lease = Lease { token, grants };
                             channels::control(remote, &host, active, encoded_frames, enable_webrtc, webrtc_bind).await
-                        } else { channels::media(remote, frames, media_active.context("Missing media grant")?).await }
+                        } else {
+                            let _media_lease = media_lease.context("Missing media lease")?;
+                            let result = channels::media(remote, frames, media_active.context("Missing media grant")?).await;
+                            if let Err(error) = &result {
+                                let mut failure = media_failure.lock().expect("media failure owner");
+                                if failure.is_none() { *failure = Some(error.to_string()); }
+                            }
+                            result
+                        }
                     }).await.context("Paired connection lifetime expired")?
                 });
             }

@@ -70,6 +70,47 @@ async fn exercise(missing_encoder: bool) {
 }
 
 #[tokio::test]
+async fn public_adapter_rejects_session_switch_and_exits() {
+    let dir = Directory::new();
+    let raw = UnixListener::bind(dir.0.join("raw")).unwrap();
+    let video = UnixListener::bind(dir.0.join("video")).unwrap();
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_obscura-media"));
+    command.arg("--frames-socket").arg(dir.0.join("raw")).arg("--video-socket").arg(dir.0.join("video"));
+    let child = command.stdout(Stdio::null()).stderr(Stdio::piped()).kill_on_drop(true).spawn().unwrap();
+    let (mut source, _) = raw.accept().await.unwrap();
+    let mut receiver = BufReader::new(video.accept().await.unwrap().0);
+    write(&mut source, &FramePacket::Waiting { session_id: "first-session".into() }, &[]).await;
+    assert!(matches!(read(&mut receiver).await.0, VideoPacket::Waiting { session_id } if session_id == "first-session"));
+    write(&mut source, &FramePacket::Unavailable {
+        session_id: "second-session".into(), message: "unexpected session switch".into(),
+    }, &[]).await;
+    let output = tokio::time::timeout(Duration::from_secs(10), child.wait_with_output()).await.unwrap().unwrap();
+    assert!(!output.status.success(), "session switch must fail the adapter process");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Host media session changed on live connection"));
+}
+
+#[tokio::test]
+async fn public_adapter_stops_after_first_closed_packet() {
+    let dir = Directory::new();
+    let raw = UnixListener::bind(dir.0.join("raw")).unwrap();
+    let video = UnixListener::bind(dir.0.join("video")).unwrap();
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_obscura-media"));
+    command.arg("--frames-socket").arg(dir.0.join("raw")).arg("--video-socket").arg(dir.0.join("video"));
+    let child = command.stdout(Stdio::null()).stderr(Stdio::piped()).kill_on_drop(true).spawn().unwrap();
+    let (mut source, _) = raw.accept().await.unwrap();
+    let mut receiver = BufReader::new(video.accept().await.unwrap().0);
+    write(&mut source, &FramePacket::Waiting { session_id: "terminal-session".into() }, &[]).await;
+    assert!(matches!(read(&mut receiver).await.0, VideoPacket::Waiting { session_id } if session_id == "terminal-session"));
+    write(&mut source, &FramePacket::Closed { session_id: "terminal-session".into() }, &[]).await;
+    assert!(matches!(read(&mut receiver).await.0, VideoPacket::Closed { session_id } if session_id == "terminal-session"));
+    let output = tokio::time::timeout(Duration::from_secs(10), child.wait_with_output()).await.unwrap().unwrap();
+    assert!(output.status.success(), "a valid Closed packet must end the adapter successfully");
+    let mut trailing = Vec::new();
+    let read = tokio::time::timeout(Duration::from_secs(1), receiver.read_until(b'\n', &mut trailing)).await.unwrap().unwrap();
+    assert_eq!(read, 0, "the adapter must not emit a second packet after Closed");
+}
+
+#[tokio::test]
 async fn public_adapter_preserves_host_identity_through_resize_and_close() {
     tokio::time::timeout(Duration::from_secs(10), exercise(false)).await.unwrap();
 }
