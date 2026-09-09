@@ -3760,6 +3760,20 @@ impl Page {
         self.screenshot_with_animation_sample(viewport, self.live_animation_sample())
     }
 
+    /// Paint the authoritative live viewport without an intermediate PNG.
+    /// Requires the current runtime's prepared render state; no ad-hoc viewport.
+    #[cfg(feature = "render")]
+    pub fn render_frame(&self) -> Result<(u32, u32, Vec<u8>), String> {
+        let js = self.js.as_ref().ok_or("Frame runtime unavailable")?;
+        if !js.set_animation_sample(self.live_animation_sample()) {
+            return Err("Frame animation state unavailable".into());
+        }
+        let base = self.resolve_base_url();
+        let pixmap = js.paint_prepared_with_surface_color(self.viewport, base.as_ref().map(|u| u.as_str()), self.capture_surface_color())
+            .ok_or("Prepared frame unavailable")?;
+        Ok((pixmap.width(), pixmap.height(), pixmap.take()))
+    }
+
     /// Rasterize every CSS animation at one explicit local time. This mirrors
     /// Web Animations `currentTime` and is intended for deterministic parity
     /// capture; ordinary screenshots use each live instance's start epoch.
