@@ -676,11 +676,15 @@ chain is complete from this local bootstrap.
 
 ## Operation-identity candidate verification (2026-09-10)
 
-Candidate `857d5f6` adds typed operation identities and preserves stale-control
-precedence. On the integration tree, focused release nextest passed 26/26
+The operation-identity candidate range `9990dd9..857d5f6` adds typed operation
+identities and preserves stale-control precedence (`9990dd9` owns the typed
+identity change; `857d5f6` owns the stale-control ordering fix). On the
+integration tree, focused release nextest passed 26/26
 (two tests classified leaky), and the full release nextest passed 1698 tests
 with four skips (`nextest run ID 4c217c5d-84af-40db-9db1-ec5fc5ba456c`). The
-required CLI release build with `--features render` also passed. The companion
+required CLI release build with `--features render` passed; its exact command,
+exit status, source identity, and binary hash are recorded in
+`evidence/m1-obscura-integration-c12/cli-build-20260910/verification.md`. The companion
 obscura-benchmark checkout is not present in this workspace, so the required
 33/33 obstacle-course replay could not be executed; earlier retained evidence
 for this repository reports the unchanged observer-intersection result as
