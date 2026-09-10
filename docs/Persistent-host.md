@@ -684,8 +684,11 @@ integration tree, focused release nextest passed 26/26
 with four skips (`nextest run ID 4c217c5d-84af-40db-9db1-ec5fc5ba456c`). The
 required CLI release build with `--features render` passed; its exact command,
 exit status, source identity, and binary hash are recorded in
-`evidence/m1-obscura-integration-c12/cli-build-20260910/verification.md`. The companion
-obscura-benchmark checkout is not present in this workspace, so the required
-33/33 obstacle-course replay could not be executed; earlier retained evidence
-for this repository reports the unchanged observer-intersection result as
-32/33. This is an open gate, not a waiver.
+`evidence/m1-obscura-integration-c12/cli-build-20260910/verification.md`. The
+companion checkout `/Volumes/extension/code/obscura/playground/obscura-benchmark-m1-20260910`
+was then replayed with the same integration binary; the exact command returned
+32/33, failing only `observer-intersection` (`expected 'io:50', got ''`). The
+fixture observes one zero-area sentinel and appends content without observing a
+replacement or scrolling it, so making the engine re-fire indefinitely would
+violate the existing geometry/threshold tests. This is an open gate, not a
+waiver; the fixture must be corrected before 33/33 can be claimed.
