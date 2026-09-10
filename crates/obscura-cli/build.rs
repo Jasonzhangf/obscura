@@ -21,6 +21,25 @@ fn github_tag_version() -> Option<String> {
         .map(normalize_version)
 }
 
+/// Local builds are not cut from a tag, so the bare workspace version cannot
+/// tell two checkouts apart. Append the commit when git is there to answer;
+/// tarball and minimal-image builds without git keep the bare version.
+fn local_version() -> String {
+    let package = env::var("CARGO_PKG_VERSION").expect("Cargo sets CARGO_PKG_VERSION");
+    let sha = std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|sha| sha.trim().to_string())
+        .filter(|sha| !sha.is_empty());
+    match sha {
+        Some(sha) => format!("{package}-dev+{sha}"),
+        None => package,
+    }
+}
+
 fn main() {
     println!("cargo:rerun-if-env-changed=OBSCURA_VERSION");
     println!("cargo:rerun-if-env-changed=GITHUB_REF_TYPE");
@@ -30,7 +49,7 @@ fn main() {
     let version = env_value("OBSCURA_VERSION")
         .map(normalize_version)
         .or_else(github_tag_version)
-        .unwrap_or_else(|| env::var("CARGO_PKG_VERSION").expect("Cargo sets CARGO_PKG_VERSION"));
+        .unwrap_or_else(local_version);
 
     println!("cargo:rustc-env=OBSCURA_BUILD_VERSION={version}");
 }

@@ -157,9 +157,22 @@ async fn exercise() {
     state = local_request(&mut local, serde_json::json!({"id":6,"command":{"type":"status"}})).await;
     let effect = local_request(&mut local, serde_json::json!({"id":7,"operation":identity(&state),"command":{"type":"evaluate","expression":"window.clicked"}})).await;
     assert_eq!(effect["result"]["value"].as_f64(), Some(1.0));
-    control.close(None).await.unwrap();
-    while let Some(Ok(message)) = video.next().await { if message.is_close() { break; } }
-    std::process::Command::new("kill").args(["-TERM", &endpoint.id().unwrap().to_string()]).status().unwrap();
+    state = local_request(&mut local, serde_json::json!({"id":8,"command":{"type":"status"}})).await;
+    let closed = local_request(&mut local, serde_json::json!({"id":9,"operation":identity(&state),"command":{"type":"close_session"}})).await;
+    assert_eq!(closed["closed"], true);
+    let closed_header = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let message = video.next().await.expect("media channel ended before Closed").expect("media read failed");
+            let Message::Binary(bytes) = message else { continue; };
+            assert!(bytes.len() >= 4, "media frame header is truncated");
+            let length = u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize;
+            assert!(bytes.len() >= 4 + length, "media frame payload is truncated");
+            let header: serde_json::Value = serde_json::from_slice(&bytes[4..4 + length]).unwrap();
+            if header["type"] == "closed" { break header; }
+        }
+    }).await.expect("media channel did not deliver Closed");
+    assert_eq!(closed_header["session_id"], ready["session_id"]);
+    drop(control);
     endpoint.wait().await.unwrap();
     std::process::Command::new("kill").args(["-TERM", &host.id().unwrap().to_string()]).status().unwrap();
     host.wait().await.unwrap();

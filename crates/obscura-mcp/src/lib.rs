@@ -304,7 +304,9 @@ fn handle_initialize(id: Value, params: &Value) -> RpcResponse {
         },
         "serverInfo": {
             "name": "obscura-mcp",
-            "version": env!("CARGO_PKG_VERSION")
+            // Same build version the CLI reports (tag-derived at release time),
+            // so MCP clients see the version the binary was actually cut from.
+            "version": env!("OBSCURA_BUILD_VERSION")
         }
     }))
 }

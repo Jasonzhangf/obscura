@@ -212,7 +212,12 @@ pub async fn send(remote: &mut Socket, message: Message) -> Result<()> {
 pub async fn media(mut remote: Socket, mut latest: watch::Receiver<Option<Frame>>, mut active: watch::Receiver<bool>) -> Result<()> {
     let mut emit = true;
     loop {
-        ensure!(*active.borrow(), "Control attachment ended");
+        // A client may end its control attachment before this endpoint receives
+        // or forwards the final Closed frame (for example MainActivity.onStop
+        // calls network.disconnect after moveTaskToBack). That is a normal
+        // client teardown, not a server/media delivery failure: there is no
+        // longer a consumer that must receive Closed.
+        if !*active.borrow() { return Ok(()); }
         let frame = if emit { latest.borrow_and_update().clone() } else { None };
         if let Some(frame) = frame {
             send(&mut remote, Message::Binary(frame.bytes.clone().into())).await?;
@@ -221,9 +226,16 @@ pub async fn media(mut remote: Socket, mut latest: watch::Receiver<Option<Frame>
         emit = false;
         tokio::select! {
             changed = latest.changed() => { changed.context("Encoder stream ended")?; emit = true; }
-            changed = active.changed() => { changed.context("Control attachment ended")?; }
+            changed = active.changed() => {
+                match changed {
+                    Ok(_) if !*active.borrow() => return Ok(()),
+                    Ok(_) => {}
+                    Err(_) => return Ok(()),
+                }
+            }
             message = remote.next() => match message {
                 Some(Ok(Message::Ping(bytes))) => send(&mut remote, Message::Pong(bytes)).await?,
+                Some(Ok(Message::Pong(_))) => {}
                 Some(Ok(Message::Close(_))) | None => return Ok(()),
                 _ => anyhow::bail!("Media channel is read-only"),
             }
@@ -303,6 +315,32 @@ mod tests {
             "terminal ingest must remain alive until endpoint shutdown");
         task.abort();
         let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn closed_packet_is_terminal_and_preserves_matching_session_state() {
+        let (mut writer, socket) = UnixStream::pair().expect("create encoded stream pair");
+        let (latest_tx, mut latest_rx) = watch::channel(None);
+        let (encoded_tx, mut encoded_rx) = watch::channel(None);
+        let mut task = tokio::spawn(ingest(socket, latest_tx, encoded_tx));
+        let packet = VideoPacket::Closed { session_id: "closed-session".into() };
+        let mut header = serde_json::to_vec(&packet).expect("serialize closed packet");
+        header.push(b'\n');
+        writer.write_all(&header).await.expect("write closed packet");
+
+        latest_rx.changed().await.expect("receive closed media state");
+        let latest = latest_rx.borrow();
+        assert!(latest.as_ref().is_some_and(|frame| frame.closed));
+        drop(latest);
+        encoded_rx.changed().await.expect("receive closed encoded state");
+        assert!(matches!(
+            encoded_rx.borrow().as_ref().map(|frame| &frame.packet),
+            Some(VideoPacket::Closed { session_id }) if session_id == "closed-session"
+        ));
+        assert!(tokio::time::timeout(Duration::from_secs(1), &mut task).await.is_ok(),
+            "closed ingest must finish after publishing the terminal state");
+        assert!(tokio::time::timeout(Duration::from_millis(100), latest_rx.changed()).await
+            .expect("latest watch closure was not observed").is_err());
     }
 
     #[tokio::test]

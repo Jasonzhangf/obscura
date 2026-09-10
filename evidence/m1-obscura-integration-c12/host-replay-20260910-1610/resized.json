@@ -1,0 +1,21 @@
+{
+  "type": "access_unit",
+  "source": {
+    "session_id": "00f97200-e82e-446f-8616-1ede8439662f",
+    "sequence": 3,
+    "document_revision": 1,
+    "viewport_revision": 2,
+    "width": 391,
+    "height": 845,
+    "stride": 1564,
+    "byte_length": 1321580,
+    "pixel_format": "premultiplied_rgba8"
+  },
+  "encoder_id": "2dd758b9-eae2-473d-9b4d-85aebf19311f",
+  "pts_us": 649746,
+  "coded_width": 392,
+  "coded_height": 846,
+  "codec": "h264_annex_b",
+  "keyframe": true,
+  "byte_length": 2416
+}
