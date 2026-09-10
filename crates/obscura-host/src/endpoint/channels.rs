@@ -212,7 +212,12 @@ pub async fn send(remote: &mut Socket, message: Message) -> Result<()> {
 pub async fn media(mut remote: Socket, mut latest: watch::Receiver<Option<Frame>>, mut active: watch::Receiver<bool>) -> Result<()> {
     let mut emit = true;
     loop {
-        ensure!(*active.borrow(), "Control attachment ended");
+        // A client may end its control attachment before this endpoint receives
+        // or forwards the final Closed frame (for example MainActivity.onStop
+        // calls network.disconnect after moveTaskToBack). That is a normal
+        // client teardown, not a server/media delivery failure: there is no
+        // longer a consumer that must receive Closed.
+        if !*active.borrow() { return Ok(()); }
         let frame = if emit { latest.borrow_and_update().clone() } else { None };
         if let Some(frame) = frame {
             send(&mut remote, Message::Binary(frame.bytes.clone().into())).await?;
@@ -221,9 +226,16 @@ pub async fn media(mut remote: Socket, mut latest: watch::Receiver<Option<Frame>
         emit = false;
         tokio::select! {
             changed = latest.changed() => { changed.context("Encoder stream ended")?; emit = true; }
-            changed = active.changed() => { changed.context("Control attachment ended")?; }
+            changed = active.changed() => {
+                match changed {
+                    Ok(_) if !*active.borrow() => return Ok(()),
+                    Ok(_) => {}
+                    Err(_) => return Ok(()),
+                }
+            }
             message = remote.next() => match message {
                 Some(Ok(Message::Ping(bytes))) => send(&mut remote, Message::Pong(bytes)).await?,
+                Some(Ok(Message::Pong(_))) => {}
                 Some(Ok(Message::Close(_))) | None => return Ok(()),
                 _ => anyhow::bail!("Media channel is read-only"),
             }
