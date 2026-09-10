@@ -72,7 +72,7 @@ impl Client {
     }
 }
 fn identity(status: &Value) -> Value {
-    json!({"session_id":status["session_id"],"attachment_id":status["attachment_id"],"sequence":status["next_sequence"],"control_epoch":status["control"]["epoch"],"viewport_revision":status["viewport_revision"],"document_revision":status["document_revision"]})
+    json!({"operation_id":format!("op-{}", status["next_sequence"]),"session_id":status["session_id"],"attachment_id":status["attachment_id"],"sequence":status["next_sequence"],"control_epoch":status["control"]["epoch"],"viewport_revision":status["viewport_revision"],"document_revision":status["document_revision"]})
 }
 
 struct Media(BufReader<UnixStream>);
@@ -747,6 +747,36 @@ fn operation_receipts_prevent_duplicate_effects_and_reject_stale_context() {
     assert_eq!(reconnect.raw(partial.clone())["code"], "JAVASCRIPT_EXCEPTION");
     assert_eq!(reconnect.raw(partial)["code"], "JAVASCRIPT_EXCEPTION");
     assert_eq!(reconnect.eval("window.count").as_f64(), Some(2.0));
+}
+
+#[test]
+fn evicted_operation_id_remains_rejected_without_reexecution() {
+    let daemon = Daemon::start();
+    let mut agent = daemon.connect();
+    agent.ok(json!({"type":"attach","mode":"agent"}));
+    let first_status = agent.ok(json!({"type":"status"}));
+    let first_operation = identity(&first_status);
+    let first = agent.raw(json!({
+        "id": 10,
+        "command": {"type":"evaluate","expression":"window.evicted=(window.evicted||0)+1"},
+        "operation": first_operation.clone()
+    }));
+    assert_eq!(first["type"], "result");
+    assert_eq!(agent.eval("window.evicted").as_f64(), Some(1.0));
+
+    for _ in 0..16 {
+        agent.eval("window.evicted");
+    }
+    let current = agent.ok(json!({"type":"status"}));
+    let mut stale = identity(&current);
+    stale["operation_id"] = first_operation["operation_id"].clone();
+    let replay = agent.raw(json!({
+        "id": 99,
+        "command": {"type":"evaluate","expression":"window.evicted=(window.evicted||0)+10"},
+        "operation": stale
+    }));
+    assert_eq!(replay["code"], "OPERATION_EXPIRED");
+    assert_eq!(agent.eval("window.evicted").as_f64(), Some(1.0));
 }
 
 #[test]

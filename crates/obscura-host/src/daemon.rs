@@ -1,9 +1,9 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use anyhow::{Context, Result};
-use obscura_host_protocol::{Command, Control, ControlPhase, Device, FramePacket, Mode, Operation, Request, Response, ResultValue, SessionStatus, ViewportDeclaration, WebRtcCapability, WebRtcSessionBinding, WebRtcTransport, WebRtcVideoCodec, WEBRTC_CONTROL_LABEL, WEBRTC_PROTOCOL_VERSION};
+use obscura_host_protocol::{Command, Control, ControlPhase, Device, FramePacket, Mode, Operation, OperationId, Request, Response, ResultValue, SessionStatus, ViewportDeclaration, WebRtcCapability, WebRtcSessionBinding, WebRtcTransport, WebRtcVideoCodec, HOST_PROTOCOL_VERSION, WEBRTC_CONTROL_LABEL, WEBRTC_PROTOCOL_VERSION};
 use crate::media;
 use crate::worker::{self, Completion, Work, WorkKind};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -12,6 +12,8 @@ use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio::time::{timeout, Duration};
 
 const MAX_FRAME: usize = 64 * 1024;
+const MAX_RECEIPTS: usize = 16;
+const MAX_OPERATION_IDS: usize = 4096;
 enum Event {
     Request { connection: u64, request: Request, reply: oneshot::Sender<Response> },
     Gone(u64),
@@ -53,7 +55,7 @@ async fn write(stream: &mut tokio::net::unix::OwnedWriteHalf, response: Response
 async fn connection(stream: UnixStream, id: u64, session: String, events: mpsc::Sender<Event>) -> Result<()> {
     let (read, mut out) = stream.into_split();
     let mut reader = BufReader::new(read);
-    write(&mut out, Response::Ready { version: 4, session_id: session }).await?;
+    write(&mut out, Response::Ready { version: HOST_PROTOCOL_VERSION, session_id: session }).await?;
     loop {
         let mut frame = Vec::new();
         let size = (&mut reader).take((MAX_FRAME + 1) as u64).read_until(b'\n', &mut frame).await?;
@@ -82,7 +84,8 @@ struct Session {
     document_revision: u64,
     fault: Option<String>,
     control: Control,
-    records: HashMap<u64, Record>,
+    records: HashMap<u64, VecDeque<Record>>,
+    operation_ids: HashMap<u64, HashSet<OperationId>>,
     retired: HashSet<u64>,
     viewport_owner: Option<u64>,
     viewport_update: Option<ViewportUpdate>,
@@ -142,6 +145,7 @@ impl Session {
         }
         if self.agent == Some(connection) { self.agent = None; }
         self.records.remove(&connection);
+        self.operation_ids.remove(&connection);
         if matches!(self.control.phase, ControlPhase::Waiting { attachment_id } | ControlPhase::Human { attachment_id } if attachment_id == connection) {
             self.transition(ControlPhase::Paused);
         }
@@ -168,7 +172,8 @@ impl Session {
             operation_running: busy,
             control: self.control.clone(),
             fault: self.fault.clone(),
-            next_sequence: self.records.get(&connection).map_or(1, |r| r.operation.sequence.saturating_add(1)),
+            next_sequence: self.records.get(&connection).and_then(|records| records.back())
+                .map_or(1, |record| record.operation.sequence.saturating_add(1)),
             viewport: self.viewport,
             viewport_owner: self.viewport_owner,
             viewport_pending: self.viewport_pending(),
@@ -180,13 +185,19 @@ impl Session {
         let mutation = controlled || matches!(request.command, Command::Evaluate { .. } | Command::Resize { .. } | Command::CloseSession {});
         if mutation {
             let Some(operation) = &request.operation else { return Ok(error(id, "OPERATION_REQUIRED", "Browser mutations require an operation identity")); };
+            if operation.operation_id.0.is_empty() || operation.operation_id.0.len() > 128 {
+                return Ok(error(id, "INVALID_OPERATION_ID", "Operation ID must be 1..128 bytes"));
+            }
             if operation.session_id != self.id || operation.attachment_id != connection {
                 return Ok(error(id, "STALE_ATTACHMENT", "Operation identity belongs to another session or connection"));
             }
-            if let Some(previous) = self.records.get(&connection) {
-                if operation.sequence == previous.operation.sequence {
+            if let Some(records) = self.records.get(&connection) {
+                if let Some(previous) = records.iter().find(|record| record.operation.operation_id == operation.operation_id) {
+                    if records.back().is_some_and(|record| previous.operation.sequence < record.operation.sequence) {
+                        return Ok(error(id, "OPERATION_EXPIRED", "Receipt expired; operation must not be replayed"));
+                    }
                     if *operation != previous.operation || request.command != previous.command {
-                        return Ok(error(id, "OPERATION_CONFLICT", "Sequence already belongs to different operation content"));
+                        return Ok(error(id, "OPERATION_CONFLICT", "Operation ID already belongs to different operation content"));
                     }
                     return Ok(match &previous.response {
                         Some(Response::Result { value, .. }) => Response::Result { id, value: value.clone() },
@@ -195,11 +206,21 @@ impl Session {
                         _ => unreachable!(),
                     });
                 }
-                if operation.sequence <= previous.operation.sequence {
+                if records.iter().any(|record| record.operation.sequence == operation.sequence) {
+                    return Ok(error(id, "OPERATION_CONFLICT", "Sequence already belongs to a different operation ID"));
+                }
+                if records.back().is_some_and(|record| operation.sequence <= record.operation.sequence) {
                     return Ok(error(id, "OPERATION_EXPIRED", "Receipt expired; operation must not be replayed"));
                 }
             }
-            let expected = self.records.get(&connection).map_or(Some(1), |r| r.operation.sequence.checked_add(1));
+            if self.operation_ids.get(&connection).is_some_and(|ids| ids.contains(&operation.operation_id)) {
+                return Ok(error(id, "OPERATION_EXPIRED", "Operation ID was already accepted; receipt is no longer retained"));
+            }
+            if self.operation_ids.get(&connection).is_some_and(|ids| ids.len() >= MAX_OPERATION_IDS) {
+                return Ok(error(id, "OPERATION_CAPACITY", "Attachment operation identity capacity reached; detach and reconnect"));
+            }
+            let expected = self.records.get(&connection).and_then(|records| records.back())
+                .map_or(Some(1), |record| record.operation.sequence.checked_add(1));
             if Some(operation.sequence) != expected { return Ok(error(id, "INVALID_SEQUENCE", "Use the next sequence from Host status")); }
             if operation.control_epoch != self.control.epoch { return Ok(error(id, "STALE_CONTROL", "Control epoch changed")); }
             if operation.viewport_revision != self.viewport_revision { return Ok(error(id, "STALE_VIEWPORT", "Viewport revision changed")); }
@@ -375,7 +396,7 @@ pub async fn serve(socket_dir: PathBuf, allow_private_network: bool) -> Result<(
     let (interest, interested) = tokio::sync::watch::channel(0usize);
     let worker = worker::start(id.clone(), allow_private_network, incoming_work, ready, faults, frames, interested)?;
     let viewport = initialized.await.context("browser worker stopped during startup")?.map_err(anyhow::Error::msg)?;
-    let mut session = Session { id: id.clone(), viewport: Some(viewport), attachments: HashMap::new(), agent: None, viewport_revision: 0, document_revision: 0, fault: None, control: Control { epoch: 1, phase: ControlPhase::Agent }, records: HashMap::new(), retired: HashSet::new(), viewport_owner: None, viewport_update: None, viewport_repair: None };
+    let mut session = Session { id: id.clone(), viewport: Some(viewport), attachments: HashMap::new(), agent: None, viewport_revision: 0, document_revision: 0, fault: None, control: Control { epoch: 1, phase: ControlPhase::Agent }, records: HashMap::new(), operation_ids: HashMap::new(), retired: HashSet::new(), viewport_owner: None, viewport_update: None, viewport_repair: None };
     let listener = UnixListener::bind(directory.0.join("host.sock"))?;
     std::fs::set_permissions(directory.0.join("host.sock"), std::fs::Permissions::from_mode(0o600))?;
     let media_listener = UnixListener::bind(directory.0.join("frames.sock"))?;
@@ -474,7 +495,10 @@ pub async fn serve(socket_dir: PathBuf, allow_private_network: bool) -> Result<(
                                 session.fault = Some("Browser worker unavailable; recreate session explicitly".into());
                                 let _ = reply.send(error(id, "SESSION_FAULTED", session.fault.clone().unwrap()));
                             } else {
-                                session.records.insert(connection, record);
+                                session.operation_ids.entry(connection).or_default().insert(record.operation.operation_id.clone());
+                                let records = session.records.entry(connection).or_default();
+                                if records.len() == MAX_RECEIPTS { records.pop_front(); }
+                                records.push_back(record);
                                 pending = Some(Pending { operation: Some(PendingOperation { id, connection, reply }), result });
                             }
                         }
@@ -528,7 +552,9 @@ pub async fn serve(socket_dir: PathBuf, allow_private_network: bool) -> Result<(
                         Err((code, cause)) => error(operation.id, code, cause),
                     };
                     let response = bounded_response(response)?;
-                    if let Some(record) = session.records.get_mut(&operation.connection) { record.response = Some(response.clone()); }
+                    if let Some(record) = session.records.get_mut(&operation.connection).and_then(|records| records.back_mut()) {
+                        record.response = Some(response.clone());
+                    }
                     let _ = operation.reply.send(response);
                 }
             },

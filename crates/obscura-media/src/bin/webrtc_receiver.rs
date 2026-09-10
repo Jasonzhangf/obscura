@@ -517,6 +517,7 @@ async fn request_dc(
 
 fn operation_for(status: &SessionStatus) -> Result<Operation> {
     Ok(Operation {
+        operation_id: obscura_host_protocol::OperationId(format!("op-{}", status.next_sequence)),
         session_id: status.session_id.clone(),
         attachment_id: status.attachment_id.context("Host status has no WebRTC attachment")?,
         sequence: status.next_sequence,

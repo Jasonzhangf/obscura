@@ -43,7 +43,7 @@ def main():
                     assert time.monotonic() < deadline and host.poll() is None
                     time.sleep(0.02)
             replies = control.makefile("rb")
-            assert receive(replies)["version"] == 4
+            assert receive(replies)["version"] == 5
 
             def request(command, operation=None):
                 control.sendall(json.dumps({"id": 1, "command": command, "operation": operation}).encode() + b"\n")
@@ -54,6 +54,7 @@ def main():
             def mutate(command):
                 state = request({"type": "status"})
                 operation = {k: state[k] for k in ["session_id", "attachment_id", "viewport_revision", "document_revision"]}
+                operation["operation_id"] = f"op-{state['next_sequence']}"
                 operation.update(sequence=state["next_sequence"], control_epoch=state["control"]["epoch"])
                 return request(command, operation)
 

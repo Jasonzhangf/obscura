@@ -146,7 +146,7 @@ async fn run_receiver(binary: &PathBuf, address: std::net::SocketAddr, root: &Pa
 }
 
 fn identity(state: &serde_json::Value) -> serde_json::Value {
-    serde_json::json!({"session_id":state["session_id"],"attachment_id":state["attachment_id"],
+    serde_json::json!({"operation_id":format!("op-{}", state["next_sequence"]),"session_id":state["session_id"],"attachment_id":state["attachment_id"],
         "sequence":state["next_sequence"],"control_epoch":state["control"]["epoch"],
         "viewport_revision":state["viewport_revision"],"document_revision":state["document_revision"]})
 }

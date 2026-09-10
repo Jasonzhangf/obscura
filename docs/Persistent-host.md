@@ -67,8 +67,8 @@ execute diagnostic JavaScript. The granted human holder can click, insert text
 and scroll through the same admission/receipt owner as Agent input.
 Evaluate remains an Agent diagnostic surface, not the final atomic input API:
 page-created timers/network continue after its completion, as before.
-Request IDs correlate replies only; version 4 requires the separate operation
-envelope including document_revision.
+Request IDs correlate replies only; version 5 requires the separate operation
+envelope including a typed operation_id and document_revision.
 Typed SessionStatus returns the requesting attachment's connection-scoped ID
 and mode as well as the shared Session ID and viewport. Reconnect creates a new
 attachment identity; daemon restart creates a new Session identity. Observation
@@ -87,19 +87,25 @@ execution both locally and at admission, including work already queued when
 an autonomous page callback fails. Graceful shutdown waits for accepted work
 before joining the owning thread.
 
-### Local operation and takeover contract (version 4)
+### Local operation and takeover contract (version 5)
 
 Every browser mutation, including diagnostic evaluation and explicit close,
-requires `operation`: session_id, attachment_id, sequence, control_epoch,
-viewport_revision and document_revision. The first three fields identify the operation. The Session
-checks this envelope before execution; control requests must not carry it.
+requires `operation`: operation_id, session_id, attachment_id, sequence,
+control_epoch, viewport_revision and document_revision. operation_id is the
+typed operation identity; it must be non-empty, at most 128 bytes, and unique
+for accepted Host work. The Session checks this envelope before execution;
+control requests must not carry it.
 Sequences begin at one and advance only on accepted work. Status exposes the
 next sequence and authoritative control epoch. No operation queue is replayed.
 
-The Host retains the latest accepted operation and bounded terminal response
-per live attachment (at most 16 receipts, each at most 1 MiB). An identical
-retry returns that receipt with the new request correlation ID; changed content
-under the same identity conflicts. Earlier sequences return OPERATION_EXPIRED.
+The Host retains accepted operations and bounded terminal responses per live
+attachment (at most 16 receipts, each at most 1 MiB). It also retains accepted
+operation IDs as bounded tombstones (at most 4096 IDs) after a receipt leaves the
+window; reaching that identity cap rejects new mutations until detach and
+reconnect. An identical typed ID and content retry returns that receipt with the
+new request correlation ID; changed content under the same typed ID conflicts.
+Earlier sequences return OPERATION_EXPIRED, and an unknown outcome is replayed
+only as OUTCOME_UNKNOWN, never as success or a new execution.
 Detach retires the connection's attachment identity; attaching again requires
 a new connection (RECONNECT_REQUIRED). Reconnect gives a new attachment ID,
 so old envelopes return STALE_ATTACHMENT
@@ -159,7 +165,7 @@ that assignment into frames. Equal dimensions perform no layout or revision
 change. Input rejects old viewport revisions instead of reinterpreting coordinates.
 Control-state push subscriptions are not implemented; clients query status.
 
-### Shared mobile viewport declaration (version 4)
+### Shared mobile viewport declaration (version 5)
 
 The sole ABI is `protocol/browser/src/lib.rs`. Observe attachments may include
 `viewport` in `attach`, then update it with `declare_viewport`. Both are control
@@ -277,9 +283,9 @@ one ABI revision. The raw Host `FramePacket` stream retains its own
 
 This local marker boundary is separate from the WebRTC protocol version. Typed
 WebRTC signaling and DataChannel messages also deny unknown fields, and
-`WEBRTC_PROTOCOL_VERSION` is exactly `3`; the Hello exchange rejects older v2 or
-other versions. A v3 peer therefore gets the typed `ENCODER_UNAVAILABLE` error
-only after the endpoint has validated the v3 capability and binding. No version
+`WEBRTC_PROTOCOL_VERSION` is exactly `4`; the Hello exchange rejects older
+versions. A v4 peer therefore gets the typed `ENCODER_UNAVAILABLE` error
+only after the endpoint has validated the v4 capability and binding. No version
 negotiation, unknown-field tolerance or compatibility fallback is implied by
 the local H.264 socket.
 

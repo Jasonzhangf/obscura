@@ -13,6 +13,7 @@ pub struct Request {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Operation {
+    pub operation_id: OperationId,
     pub session_id: String,
     pub attachment_id: u64,
     pub sequence: u64,
@@ -20,6 +21,10 @@ pub struct Operation {
     pub viewport_revision: u64,
     pub document_revision: u64,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(transparent)]
+pub struct OperationId(pub String);
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -192,10 +197,11 @@ pub enum VideoPacket {
 #[serde(rename_all = "snake_case")]
 pub enum VideoCodec { H264AnnexB }
 
-/// Version 3 adds the typed browser request/response envelopes and replaces
-/// the flat video identity projection with the complete source descriptor.
-/// Older v2 peers are rejected during the Hello exchange.
-pub const WEBRTC_PROTOCOL_VERSION: u32 = 3;
+/// Version 5 requires an explicit typed operation ID for every browser mutation.
+pub const HOST_PROTOCOL_VERSION: u32 = 5;
+/// Version 4 carries the version 5 browser operation envelope over DataChannel.
+/// Older peers are rejected during the Hello exchange.
+pub const WEBRTC_PROTOCOL_VERSION: u32 = 4;
 pub const WEBRTC_CONTROL_LABEL: &str = "obscura.control.v1";
 pub const WEBRTC_H264_FMTP: &str = "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f";
 
@@ -332,4 +338,35 @@ pub struct WebRtcProbeReport {
     pub video_codec: WebRtcVideoCodec,
     pub data_channel: WebRtcDataChannelEvidence,
     pub frame: WebRtcFrameEvidence,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Operation, OperationId};
+
+    #[test]
+    fn operation_id_is_required_and_round_trips_as_a_typed_field() {
+        let operation = Operation {
+            operation_id: OperationId("019d0d66-c5dc-7492-a097-39ac8f06f434".into()),
+            session_id: "session".into(),
+            attachment_id: 7,
+            sequence: 11,
+            control_epoch: 13,
+            viewport_revision: 17,
+            document_revision: 19,
+        };
+        let encoded = serde_json::to_value(&operation).unwrap();
+        assert_eq!(encoded["operation_id"], "019d0d66-c5dc-7492-a097-39ac8f06f434");
+        assert_eq!(serde_json::from_value::<Operation>(encoded).unwrap(), operation);
+
+        let missing = serde_json::json!({
+            "session_id": "session",
+            "attachment_id": 7,
+            "sequence": 11,
+            "control_epoch": 13,
+            "viewport_revision": 17,
+            "document_revision": 19
+        });
+        assert!(serde_json::from_value::<Operation>(missing).is_err());
+    }
 }
