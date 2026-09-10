@@ -193,6 +193,9 @@ impl Session {
             }
             if let Some(records) = self.records.get(&connection) {
                 if let Some(previous) = records.iter().find(|record| record.operation.operation_id == operation.operation_id) {
+                    if operation.control_epoch != self.control.epoch {
+                        return Ok(error(id, "STALE_CONTROL", "Control epoch changed"));
+                    }
                     if records.back().is_some_and(|record| previous.operation.sequence < record.operation.sequence) {
                         return Ok(error(id, "OPERATION_EXPIRED", "Receipt expired; operation must not be replayed"));
                     }
