@@ -65,6 +65,10 @@ impl FrameRealm {
             return None;
         }
         parent.copy_identity_to_realm(&context);
+        // A snapshot-created realm has null deno_core per-context state slots, so
+        // a promise rejection or dynamic import() in the frame would segfault in
+        // deno_core's global callbacks (#850, #841). Alias the main realm's state.
+        parent.share_deno_context_state_with_realm(&context);
 
         // Only a same-origin frame is reachable from the page. Cross-origin
         // keeps its own security token, so V8 answers `undefined` for any
@@ -912,6 +916,46 @@ mod tests {
                 .unwrap(),
             serde_json::json!("https://child.example/"),
         );
+    }
+
+    // #850 / #841 — a promise rejection or dynamic import() inside a frame realm
+    // used to null-deref deno_core's global callbacks (which read per-context
+    // state from V8 embedder slots) and segfault the whole process. The realm
+    // must now alias the main realm's state so these run without crashing.
+    #[test]
+    fn a_frame_rejection_does_not_crash_the_process() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let frame = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://parent.example/f",
+            "<html><body></body></html>",
+        )
+        .expect("frame realm");
+        // Reaching this line at all (no SIGSEGV) is the regression check.
+        frame
+            .execute_script(&mut parent, "Promise.reject(new Error('boom')); 'ok'")
+            .unwrap();
+    }
+
+    #[test]
+    fn a_frame_dynamic_import_does_not_crash_the_process() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let frame = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://parent.example/f",
+            "<html><body></body></html>",
+        )
+        .expect("frame realm");
+        frame
+            .execute_script(
+                &mut parent,
+                "import('data:text/javascript,export default 1').catch(() => {}); 'ok'",
+            )
+            .unwrap();
     }
 
     /// A frame posting to `parent` must reach the page, arrive trusted, and
