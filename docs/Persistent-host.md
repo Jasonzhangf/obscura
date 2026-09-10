@@ -673,3 +673,15 @@ After runtime admission, extend the control owner with real human input and
 terminal input receipts, then mobile viewport election and frame subscriptions.
 Do not expose diagnostic evaluation as human input or claim the remote browser
 chain is complete from this local bootstrap.
+
+## Operation-identity candidate verification (2026-09-10)
+
+Candidate `857d5f6` adds typed operation identities and preserves stale-control
+precedence. On the integration tree, focused release nextest passed 26/26
+(two tests classified leaky), and the full release nextest passed 1698 tests
+with four skips (`nextest run ID 4c217c5d-84af-40db-9db1-ec5fc5ba456c`). The
+required CLI release build with `--features render` also passed. The companion
+obscura-benchmark checkout is not present in this workspace, so the required
+33/33 obstacle-course replay could not be executed; earlier retained evidence
+for this repository reports the unchanged observer-intersection result as
+32/33. This is an open gate, not a waiver.
