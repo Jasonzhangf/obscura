@@ -3367,10 +3367,6 @@ impl Page {
 
         self.dom = Some(dom);
         self.init_js();
-        // Main document commit occurs before load-delaying subresources and
-        // load handlers. Host navigation may acknowledge this boundary while
-        // the autonomous page pump continues the remaining load phase.
-        self.navigation_committed = true;
         let author_stylesheets = self.fetch_stylesheets().await;
 
         // Inject CSS as a global so getComputedStyle and any CSS-aware shim
@@ -3438,7 +3434,9 @@ impl Page {
         // listeners never registered, frameworks never bootstrapped,
         // page.click() handlers were no-ops. Now scripts run regardless
         // of waitUntil and DCL means "DOM parsed AND scripts executed".
-        self.execute_scripts().await;
+        let drive_load_phase = wait_until != crate::lifecycle::WaitUntil::DomContentLoaded;
+        self.execute_scripts_with_module_budget_and_load_wait(None, drive_load_phase)
+            .await;
 
         #[cfg(feature = "render")]
         {
@@ -3463,6 +3461,13 @@ impl Page {
         // on the next line, so building frames further down left every real CDP
         // client seeing a page with no frames at all.
         self.build_document_frames().await;
+
+        // Host may acknowledge a committed DCL navigation while the
+        // autonomous page pump finishes load-delaying work. Set this only
+        // after every await required to expose the committed document, and
+        // keep the DCL return immediately adjacent so cancellation cannot
+        // turn this marker into a synthetic success.
+        self.navigation_committed = true;
 
         if wait_until == crate::lifecycle::WaitUntil::DomContentLoaded {
             return Ok(());
