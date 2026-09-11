@@ -76,26 +76,34 @@ pub fn start(id: String, network: bool, mut incoming: mpsc::Receiver<Work>,
                 // Navigation caused by dispatched input/page scripts is page work,
                 // after the input receipt. Never cancel it to inject another input.
                 if failure.is_none() {
-                    if let Some(page) = page.as_mut() {
-                        match timeout(BUDGET, page_work(page.process_pending_navigation())).await {
-                            Ok(Ok(false)) => {},
-                            outcome => {
-                                document_revision += 1;
-                                frames.send_replace(media::state(FramePacket::Waiting { session_id: id.clone() }));
-                                match outcome {
-                                    Ok(Ok(true)) => {},
-                                    Ok(Err(cause)) => failure = Some(format!("Page navigation failed: {cause}")),
-                                    Err(_) => failure = Some("Page navigation outcome unknown after deadline".into()),
-                                    _ => unreachable!(),
+                    let has_navigation_continuation = page
+                        .as_ref()
+                        .is_some_and(Page::has_navigation_continuation);
+                    if !has_navigation_continuation {
+                        if let Some(page) = page.as_mut() {
+                            match timeout(BUDGET, page_work(page.process_pending_navigation())).await {
+                                Ok(Ok(false)) => {},
+                                outcome => {
+                                    document_revision += 1;
+                                    frames.send_replace(media::state(FramePacket::Waiting { session_id: id.clone() }));
+                                    match outcome {
+                                        Ok(Ok(true)) => {},
+                                        Ok(Err(cause)) => failure = Some(format!("Page navigation failed: {cause}")),
+                                        Err(_) => failure = Some("Page navigation outcome unknown after deadline".into()),
+                                        _ => unreachable!(),
+                                    }
+                                    if updates.send(PageUpdate { document_revision, fault: failure.clone() }).await.is_err() { break; }
                                 }
-                                if updates.send(PageUpdate { document_revision, fault: failure.clone() }).await.is_err() { break; }
                             }
                         }
                     }
                 }
+                let navigation_exclusive = page
+                    .as_ref()
+                    .is_some_and(Page::navigation_continuation_exclusive);
                 tokio::select! {
                     changed = interested.changed() => { if changed.is_err() { break; } }
-                    _ = frame_clock.tick(), if *interested.borrow() > 0 => {
+                    _ = frame_clock.tick(), if *interested.borrow() > 0 && !navigation_exclusive => {
                         if frame_fence.as_ref().is_some_and(|cancel| cancel.load(Ordering::Acquire)) { continue; }
                         let frame = if let Some(cause) = &failure {
                             media::state(FramePacket::Unavailable { session_id: id.clone(), message: cause.clone() })
@@ -116,7 +124,7 @@ pub fn start(id: String, network: bool, mut incoming: mpsc::Receiver<Work>,
                         if frame_fence.as_ref().is_some_and(|cancel| cancel.load(Ordering::Acquire)) { continue; }
                         frames.send_replace(frame);
                     }
-                    work = incoming.recv() => {
+                    work = incoming.recv(), if !navigation_exclusive => {
                         let Some(work) = work else { break; };
                         let expected_document = match &work.kind {
                             WorkKind::Browser { operation, .. } => Some(operation.document_revision),
@@ -185,12 +193,23 @@ pub fn start(id: String, network: bool, mut incoming: mpsc::Receiver<Work>,
                         }
                         idle = false;
                     }
-                    result = async {
-                        if failure.is_some() || page.is_none() { return std::future::pending().await; }
-                        if idle { clock.tick().await; }
-                        page_work(page.as_mut().unwrap().run_autonomous_event_loop_turn()).await
-                    } => match result {
-                        Ok(next_idle) => idle = next_idle,
+                    page_turn = async {
+                        if failure.is_some() || page.is_none() {
+                            return std::future::pending().await;
+                        }
+                        if page.as_ref().is_some_and(Page::has_navigation_continuation) {
+                            page_work(page.as_mut().unwrap().run_navigation_continuation_turn())
+                                .await
+                                .map(|done| (true, done))
+                        } else {
+                            if idle { clock.tick().await; }
+                            page_work(page.as_mut().unwrap().run_autonomous_event_loop_turn())
+                                .await
+                                .map(|next_idle| (false, next_idle))
+                        }
+                    } => match page_turn {
+                        Ok((true, _)) => { idle = false; }
+                        Ok((false, next_idle)) => { idle = next_idle; }
                         Err(cause) => {
                             failure = Some(cause.clone());
                             if updates.send(PageUpdate { document_revision, fault: Some(cause) }).await.is_err() { break; }
@@ -227,22 +246,18 @@ async fn execute(page: &mut Option<Page>, command: Command, operation: &Operatio
         match command {
             Command::Navigate { url } => match timeout(
                 BUDGET,
-                page_work(page.navigate_with_wait(
-                    &url,
-                    obscura_browser::lifecycle::WaitUntil::DomContentLoaded,
-                )),
+                page_work(page.navigate_for_host(&url)),
             )
             .await
             {
                 Ok(Ok(())) => Ok(Some(ResultValue::Input { input: input_receipt(operation) })),
                 Ok(Err(cause)) => Err(("NAVIGATION_FAILED", cause.to_string())),
-                Err(_) if page.navigation_committed() => {
-                    Ok(Some(ResultValue::Input { input: input_receipt(operation) }))
+                Err(_) => {
+                    let cause =
+                        "Navigation deadline: partial outcome; recreate session explicitly".to_string();
+                    fault = Some(cause.clone());
+                    Err(("OUTCOME_UNKNOWN", cause))
                 }
-                Err(_) => Err((
-                    "NAVIGATION_FAILED",
-                    "Navigation deadline before main document commit".into(),
-                )),
             },
             Command::Evaluate { expression } => {
                 if let Some(js) = page.js.as_mut() {

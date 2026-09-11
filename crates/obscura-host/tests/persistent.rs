@@ -594,6 +594,77 @@ fn navigation_commit_is_receipted_before_a_pending_load() {
 }
 
 #[test]
+fn slow_stylesheet_navigation_keeps_css_in_the_page_continuation() {
+    let daemon = Daemon::start_with_network(true);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (css_seen_tx, css_seen_rx) = std::sync::mpsc::channel();
+    let (release_css_tx, release_css_rx) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0u8; 4096];
+        let length = stream.read(&mut request).unwrap();
+        assert!(String::from_utf8_lossy(&request[..length]).contains("GET / HTTP/1.1"));
+        let body = format!(
+            "<title>slow-css</title><link rel='stylesheet' href='http://{address}/slow.css'><div class='target'>target</div>"
+        );
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+
+        let (mut stream, _) = listener.accept().unwrap();
+        let length = stream.read(&mut request).unwrap();
+        assert!(String::from_utf8_lossy(&request[..length]).contains("GET /slow.css HTTP/1.1"));
+        css_seen_tx.send(()).unwrap();
+        release_css_rx
+            .recv_timeout(Duration::from_secs(8))
+            .expect("test did not release the stylesheet");
+        let css = ".target { color: rgb(1, 2, 3) }";
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/css\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{css}",
+            css.len()
+        )
+        .unwrap();
+    });
+
+    let mut agent = daemon.connect();
+    agent.ok(json!({"type":"attach","mode":"agent"}));
+    let before = agent.ok(json!({"type":"status"}));
+    let reply = agent.raw(json!({
+        "id": 302,
+        "operation": identity(&before),
+        "command": {"type":"navigate","url":format!("http://{address}/")}
+    }));
+    css_seen_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("navigation did not retain the stylesheet request");
+    release_css_tx.send(()).unwrap();
+    server.join().unwrap();
+
+    assert_eq!(reply["type"], "result", "{reply}");
+    assert_eq!(reply["value"]["input"]["state"], "succeeded");
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if agent.eval("globalThis.__obscura_css.includes('rgb(1, 2, 3')") == true {
+            break;
+        }
+        assert!(Instant::now() < deadline, "stylesheet continuation did not complete");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        agent
+            .eval("document.querySelectorAll('style[data-obscura-external-stylesheets]').length")
+            .as_f64(),
+        Some(1.0)
+    );
+}
+
+#[test]
 fn click_receipt_precedes_navigation_and_old_document_input_is_rejected() {
     let daemon = Daemon::start_with_network(true);
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

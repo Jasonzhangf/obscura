@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{future::Future, pin::Pin, sync::Arc};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use obscura_dom::{parse_html, DomTree};
@@ -295,9 +295,12 @@ pub struct Page {
     /// Optional per-page cap. Pages without a value keep the default.
     navigation_chain_limit: Option<usize>,
     /// True once the requested navigation has a committed main document.
-    /// Explicit Host navigation uses this to distinguish a pre-commit timeout
-    /// from a committed navigation whose load event is still pending.
+    /// Whether the current document response has committed. This is diagnostic
+    /// state only; Host success is never inferred from this marker.
     navigation_committed: bool,
+    /// Remaining Host navigation work. This lives on Page so a cancelled
+    /// caller poll cannot drop stylesheet futures or their eventual CSS.
+    navigation_continuation: Option<NavigationContinuation>,
     /// Navigation history for Page.getNavigationHistory / navigateToHistoryEntry.
     /// Entries are URLs in visit order; `history_index` is the current position.
     /// Pushed on every successful navigation; truncated on goBack -> new nav.
@@ -402,6 +405,294 @@ struct StylesheetImport {
 enum AuthorStylesheetTarget {
     Linked(usize),
     InlineImport(usize),
+}
+
+type StylesheetBatch = Vec<(
+    String,
+    Url,
+    u8,
+    Result<Response, ObscuraNetError>,
+)>;
+type StylesheetBatchFuture = Pin<Box<dyn Future<Output = StylesheetBatch>>>;
+
+/// Page-owned continuation for stylesheet graph loading. Every network future
+/// is created from cloned page resources and retained here, so cancelling the
+/// caller's poll cannot drop an in-flight stylesheet or lose its bytes.
+struct StylesheetContinuation {
+    document_url: Url,
+    roots: Vec<(AuthorStylesheetTarget, String, Option<String>)>,
+    scheduled: std::collections::HashSet<String>,
+    pending: Vec<(String, Url, u8)>,
+    active: Option<StylesheetBatchFuture>,
+    sheets: std::collections::HashMap<String, LoadedStylesheet>,
+    aliases: std::collections::HashMap<String, String>,
+    http_client: Arc<ObscuraHttpClient>,
+    callbacks: Arc<CallbackRegistry>,
+    blocked_url_patterns: Vec<String>,
+    #[cfg(feature = "stealth")]
+    stealth_client: Option<Arc<StealthHttpClient>>,
+}
+
+impl StylesheetContinuation {
+    fn new(page: &Page) -> Self {
+        let (all_links, inline_imports) = page
+            .js
+            .as_ref()
+            .and_then(|js| {
+                js.with_dom(|dom| {
+                    (
+                        linked_stylesheet_requests(dom),
+                        inline_stylesheet_import_requests(dom),
+                    )
+                })
+            })
+            .unwrap_or_default();
+        let document_url = page
+            .url
+            .clone()
+            .unwrap_or_else(|| Url::parse("about:blank").expect("about:blank URL"));
+        let document_base = page
+            .resolve_base_url()
+            .unwrap_or_else(|| document_url.clone());
+        let mut roots = Vec::new();
+        let mut scheduled = std::collections::HashSet::new();
+        let mut pending = Vec::new();
+        for (link_index, href) in all_links {
+            let Ok(resolved) = document_base.join(&href) else {
+                continue;
+            };
+            let (key, resolved) = canonical_stylesheet_url(resolved);
+            if !subresource_allowed(Some(&document_url), resolved.as_str()) {
+                tracing::warn!(
+                    "blocking cross-scheme <link rel=stylesheet href>: page={} href={}",
+                    page.url_string(),
+                    resolved,
+                );
+                continue;
+            }
+            if page.should_block_url(resolved.as_str()) {
+                tracing::info!("Blocked stylesheet by interception: {}", resolved);
+                continue;
+            }
+            roots.push((AuthorStylesheetTarget::Linked(link_index), key.clone(), None));
+            if scheduled.insert(key.clone()) && scheduled.len() <= MAX_STYLESHEET_RESOURCES {
+                pending.push((key, resolved, 0u8));
+            }
+        }
+        for (style_index, import) in inline_imports {
+            let Ok(resolved) = document_base.join(&import.url) else {
+                continue;
+            };
+            let (key, resolved) = canonical_stylesheet_url(resolved);
+            if !subresource_allowed(Some(&document_url), resolved.as_str())
+                || page.should_block_url(resolved.as_str())
+            {
+                tracing::info!("Blocked inline stylesheet import: {}", resolved);
+                continue;
+            }
+            roots.push((
+                AuthorStylesheetTarget::InlineImport(style_index),
+                key.clone(),
+                import.media,
+            ));
+            if scheduled.insert(key.clone()) && scheduled.len() <= MAX_STYLESHEET_RESOURCES {
+                pending.push((key, resolved, 1u8));
+            }
+        }
+        let mut blocked_url_patterns = page.blocked_url_patterns.clone();
+        if page.intercept_enabled {
+            blocked_url_patterns.extend(page.intercept_block_patterns.iter().cloned());
+        }
+        Self {
+            document_url,
+            roots,
+            scheduled,
+            pending,
+            active: None,
+            sheets: std::collections::HashMap::new(),
+            aliases: std::collections::HashMap::new(),
+            http_client: page.http_client.clone(),
+            callbacks: page.callbacks.clone(),
+            blocked_url_patterns,
+            #[cfg(feature = "stealth")]
+            stealth_client: page.stealth_client.clone(),
+        }
+    }
+
+    fn is_blocked(&self, url: &str) -> bool {
+        self.blocked_url_patterns
+            .iter()
+            .any(|pattern| url_matches_cdp_pattern(pattern, url))
+    }
+
+    fn start_batch(&mut self) {
+        if self.active.is_some() || self.pending.is_empty() {
+            return;
+        }
+        let batch = std::mem::take(&mut self.pending);
+        let client = self.http_client.clone();
+        let callbacks = self.callbacks.clone();
+        let initiator = self.document_url.clone();
+        #[cfg(feature = "stealth")]
+        let stealth_client = self.stealth_client.clone();
+        let future: StylesheetBatchFuture = Box::pin(async move {
+            use futures::StreamExt as _;
+            futures::stream::iter(batch.into_iter().map(
+                move |(key, requested_url, depth)| {
+                    let client = client.clone();
+                    let callbacks = callbacks.clone();
+                    let initiator = initiator.clone();
+                    #[cfg(feature = "stealth")]
+                    let stealth_client = stealth_client.clone();
+                    async move {
+                        let request =
+                            ResourceRequest::subresource(ResourceType::Stylesheet, &initiator);
+                        #[cfg(feature = "stealth")]
+                        let result = if let Some(stealth_client) = stealth_client {
+                            stealth_client
+                                .fetch_resource_with_callbacks(
+                                    &requested_url,
+                                    request,
+                                    Some(&callbacks),
+                                )
+                                .await
+                        } else {
+                            client
+                                .fetch_resource_with_callbacks(
+                                    &requested_url,
+                                    request,
+                                    Some(&callbacks),
+                                )
+                                .await
+                        };
+                        #[cfg(not(feature = "stealth"))]
+                        let result = client
+                            .fetch_resource_with_callbacks(
+                                &requested_url,
+                                request,
+                                Some(&callbacks),
+                            )
+                            .await;
+                        (key, requested_url, depth, result)
+                    }
+                },
+            ))
+            .buffered(16)
+            .collect::<Vec<_>>()
+            .await
+        });
+        self.active = Some(future);
+    }
+
+    async fn advance(&mut self) -> StylesheetBatch {
+        self.start_batch();
+        let Some(active) = self.active.as_mut() else {
+            return Vec::new();
+        };
+        let results = active.await;
+        self.active = None;
+        results
+    }
+
+    fn process_results(&mut self, results: StylesheetBatch) -> Vec<Response> {
+        let mut responses = Vec::new();
+        for (key, requested_url, depth, result) in results {
+            let response = match result {
+                Ok(response) => response,
+                Err(error) => {
+                    tracing::debug!(
+                        "Failed to fetch stylesheet {}: {}",
+                        requested_url,
+                        error
+                    );
+                    continue;
+                }
+            };
+            let response_url = response.url.clone();
+            let (response_key, response_url) = canonical_stylesheet_url(response_url);
+            if let Some(existing) = self.aliases.get(&response_key).cloned() {
+                self.aliases.insert(key, existing);
+                continue;
+            }
+            let css = obscura_net::decode_non_html(&response.body, response.content_type());
+            let (imports, rules) = split_css_imports(&css);
+            let imports = if depth < MAX_STYLESHEET_IMPORT_DEPTH {
+                imports
+            } else {
+                Vec::new()
+            };
+            self.aliases.insert(key.clone(), key.clone());
+            self.aliases.insert(response_key, key.clone());
+            self.sheets.insert(
+                key,
+                LoadedStylesheet {
+                    response_url: response_url.clone(),
+                    imports: imports.clone(),
+                    rules,
+                },
+            );
+            if depth < MAX_STYLESHEET_IMPORT_DEPTH {
+                for import in imports {
+                    let Ok(import_url) = response_url.join(&import.url) else {
+                        continue;
+                    };
+                    let (import_key, import_url) = canonical_stylesheet_url(import_url);
+                    if self.aliases.contains_key(&import_key)
+                        || self.scheduled.contains(&import_key)
+                    {
+                        continue;
+                    }
+                    if self.scheduled.len() >= MAX_STYLESHEET_RESOURCES {
+                        tracing::warn!(
+                            "stylesheet resource cap reached at {} resources",
+                            MAX_STYLESHEET_RESOURCES
+                        );
+                        continue;
+                    }
+                    if !subresource_allowed(Some(&self.document_url), import_url.as_str())
+                        || self.is_blocked(import_url.as_str())
+                    {
+                        tracing::info!("Blocked stylesheet import: {}", import_url);
+                        continue;
+                    }
+                    self.scheduled.insert(import_key.clone());
+                    self.pending.push((import_key, import_url, depth + 1));
+                }
+            }
+            responses.push(response);
+        }
+        responses
+    }
+
+    fn is_complete(&self) -> bool {
+        self.pending.is_empty() && self.active.is_none()
+    }
+
+    fn materialize(&self) -> Vec<(AuthorStylesheetTarget, String)> {
+        self.roots
+            .iter()
+            .filter_map(|(target, key, media)| {
+                materialize_stylesheet_graph(
+                    key,
+                    &self.sheets,
+                    &self.aliases,
+                    &mut std::collections::HashSet::new(),
+                )
+                .map(|css| {
+                    let css = match media {
+                        Some(media) => format!("@media {media} {{\n{css}\n}}\n"),
+                        None => css,
+                    };
+                    (*target, css)
+                })
+            })
+            .collect()
+    }
+}
+
+enum NavigationContinuation {
+    Stylesheets(StylesheetContinuation),
+    Scripts,
 }
 
 fn canonical_stylesheet_url(mut url: Url) -> (String, Url) {
@@ -1160,6 +1451,7 @@ impl Page {
             navigation_timeout: None,
             navigation_chain_limit: None,
             navigation_committed: false,
+            navigation_continuation: None,
             history: Vec::new(),
             history_index: 0,
             network_events: Vec::new(),
@@ -1211,6 +1503,27 @@ impl Page {
     /// parser work, dynamic scripts, or `load` listeners are still pending.
     pub fn navigation_committed(&self) -> bool {
         self.navigation_committed
+    }
+
+    /// Whether a Host navigation has post-commit work owned by this Page.
+    #[doc(hidden)]
+    pub fn has_navigation_continuation(&self) -> bool {
+        self.navigation_continuation.is_some()
+    }
+
+    /// Script execution is an exclusive continuation phase. The Host keeps
+    /// other commands queued until it reaches an idle boundary, while the
+    /// stylesheet phase remains cancellable by a newer navigation.
+    #[doc(hidden)]
+    pub fn navigation_continuation_exclusive(&self) -> bool {
+        matches!(
+            self.navigation_continuation.as_ref(),
+            Some(NavigationContinuation::Scripts)
+        )
+    }
+
+    fn cancel_navigation_continuation(&mut self) {
+        self.navigation_continuation = None;
     }
 
     fn should_block_url(&self, url: &str) -> bool {
@@ -1913,145 +2226,16 @@ impl Page {
     }
 
     async fn fetch_stylesheets(&mut self) -> Vec<(AuthorStylesheetTarget, String)> {
-        let (all_links, inline_imports) = match &self.js {
-            Some(js) => js
-                .with_dom(|dom| {
-                    (
-                        linked_stylesheet_requests(dom),
-                        inline_stylesheet_import_requests(dom),
-                    )
-                })
-                .unwrap_or_default(),
-            None => {
-                tracing::info!("fetch_stylesheets: no js runtime");
-                return Vec::new();
-            }
-        };
-
+        let mut continuation = StylesheetContinuation::new(self);
         tracing::info!(
-            "fetch_stylesheets: found {} stylesheet links and {} inline imports",
-            all_links.len(),
-            inline_imports.len()
+            "fetch_stylesheets: found {} stylesheet roots",
+            continuation.roots.len()
         );
-
-        let Some(document_url) = self.url.clone() else {
-            return Vec::new();
-        };
-        let document_base = self
-            .resolve_base_url()
-            .unwrap_or_else(|| document_url.clone());
-        let mut roots = Vec::new();
-        let mut scheduled = std::collections::HashSet::new();
-        let mut pending = Vec::new();
-        for (link_index, href) in all_links {
-            let Ok(resolved) = document_base.join(&href) else {
-                continue;
-            };
-            let (key, resolved) = canonical_stylesheet_url(resolved);
-            if !subresource_allowed(Some(&document_url), resolved.as_str()) {
-                tracing::warn!(
-                    "blocking cross-scheme <link rel=stylesheet href>: page={} href={}",
-                    self.url_string(),
-                    resolved,
-                );
-                continue;
-            }
-            if self.should_block_url(resolved.as_str()) {
-                tracing::info!("Blocked stylesheet by interception: {}", resolved);
-                continue;
-            }
-            roots.push((AuthorStylesheetTarget::Linked(link_index), key.clone(), None));
-            if scheduled.insert(key.clone()) {
-                if scheduled.len() <= MAX_STYLESHEET_RESOURCES {
-                    pending.push((key, resolved, 0u8));
-                }
-            }
-        }
-        for (style_index, import) in inline_imports {
-            let Ok(resolved) = document_base.join(&import.url) else {
-                continue;
-            };
-            let (key, resolved) = canonical_stylesheet_url(resolved);
-            if !subresource_allowed(Some(&document_url), resolved.as_str())
-                || self.should_block_url(resolved.as_str())
-            {
-                tracing::info!("Blocked inline stylesheet import: {}", resolved);
-                continue;
-            }
-            roots.push((
-                AuthorStylesheetTarget::InlineImport(style_index),
-                key.clone(),
-                import.media,
-            ));
-            if scheduled.insert(key.clone()) && scheduled.len() <= MAX_STYLESHEET_RESOURCES {
-                pending.push((key, resolved, 1u8));
-            }
-        }
-
-        let mut sheets = std::collections::HashMap::new();
-        let mut aliases = std::collections::HashMap::new();
-        while !pending.is_empty() {
-            let batch = std::mem::take(&mut pending);
-            let client = self.http_client.clone();
-            #[cfg(feature = "stealth")]
-            let stealth_client = self.stealth_client.clone();
-            let callbacks = self.callbacks.clone();
-            let initiator = document_url.clone();
-            use futures::StreamExt as _;
-            let results: Vec<_> =
-                futures::stream::iter(batch.into_iter().map(|(key, requested_url, depth)| {
-                    let client = client.clone();
-                    #[cfg(feature = "stealth")]
-                    let stealth_client = stealth_client.clone();
-                    let callbacks = callbacks.clone();
-                    let initiator = initiator.clone();
-                    async move {
-                        let request =
-                            ResourceRequest::subresource(ResourceType::Stylesheet, &initiator);
-                        #[cfg(feature = "stealth")]
-                        let result = if let Some(stealth_client) = stealth_client {
-                            stealth_client
-                                .fetch_resource_with_callbacks(
-                                    &requested_url,
-                                    request,
-                                    Some(&callbacks),
-                                )
-                                .await
-                        } else {
-                            client
-                                .fetch_resource_with_callbacks(
-                                    &requested_url,
-                                    request,
-                                    Some(&callbacks),
-                                )
-                                .await
-                        };
-                        #[cfg(not(feature = "stealth"))]
-                        let result = client
-                            .fetch_resource_with_callbacks(
-                                &requested_url,
-                                request,
-                                Some(&callbacks),
-                            )
-                            .await;
-                        (key, requested_url, depth, result)
-                    }
-                }))
-                .buffered(16)
-                .collect()
-                .await;
-
-            for (key, requested_url, depth, result) in results {
-                let response = match result {
-                    Ok(response) => response,
-                    Err(error) => {
-                        tracing::debug!("Failed to fetch stylesheet {}: {}", requested_url, error);
-                        continue;
-                    }
-                };
-                let response_url = response.url.clone();
+        while !continuation.is_complete() {
+            let results = continuation.advance().await;
+            for response in continuation.process_results(results) {
                 self.record_network_event_with_body(
-                    response_url.as_str(),
+                    response.url.as_str(),
                     "GET",
                     "Stylesheet",
                     response.status,
@@ -2059,78 +2243,41 @@ impl Page {
                     &response.body,
                     false,
                 );
-
-                let (response_key, response_url) = canonical_stylesheet_url(response_url);
-                if let Some(existing) = aliases.get(&response_key).cloned() {
-                    aliases.insert(key, existing);
-                    continue;
-                }
-                let css = obscura_net::decode_non_html(&response.body, response.content_type());
-                let (imports, rules) = split_css_imports(&css);
-                let imports = if depth < MAX_STYLESHEET_IMPORT_DEPTH {
-                    imports
-                } else {
-                    Vec::new()
-                };
-                aliases.insert(key.clone(), key.clone());
-                aliases.insert(response_key, key.clone());
-                sheets.insert(
-                    key,
-                    LoadedStylesheet {
-                        response_url: response_url.clone(),
-                        imports: imports.clone(),
-                        rules,
-                    },
-                );
-
-                if depth >= MAX_STYLESHEET_IMPORT_DEPTH {
-                    continue;
-                }
-                for import in imports {
-                    let Ok(import_url) = response_url.join(&import.url) else {
-                        continue;
-                    };
-                    let (import_key, import_url) = canonical_stylesheet_url(import_url);
-                    if aliases.contains_key(&import_key) || scheduled.contains(&import_key) {
-                        continue;
-                    }
-                    if scheduled.len() >= MAX_STYLESHEET_RESOURCES {
-                        tracing::warn!(
-                            "stylesheet resource cap reached at {} resources",
-                            MAX_STYLESHEET_RESOURCES
-                        );
-                        continue;
-                    }
-                    if !subresource_allowed(Some(&document_url), import_url.as_str())
-                        || self.should_block_url(import_url.as_str())
-                    {
-                        tracing::info!("Blocked stylesheet import: {}", import_url);
-                        continue;
-                    }
-                    scheduled.insert(import_key.clone());
-                    pending.push((import_key, import_url, depth + 1));
-                }
             }
         }
+        continuation.materialize()
+    }
 
-        roots
-            .into_iter()
-            .filter_map(|(target, key, media)| {
-                materialize_stylesheet_graph(
-                    &key,
-                    &sheets,
-                    &aliases,
-                    &mut std::collections::HashSet::new(),
-                )
-                .map(|css| {
-                    let css = match media {
-                        Some(media) => format!("@media {media} {{\n{css}\n}}\n"),
-                        None => css,
-                    };
-                    (target, css)
-                })
-            })
-            .collect()
+    fn install_author_stylesheets(
+        &mut self,
+        author_stylesheets: &[(AuthorStylesheetTarget, String)],
+    ) {
+        if author_stylesheets.is_empty() {
+            return;
+        }
+        if let Some(js) = &mut self.js {
+            let combined_css = author_stylesheets
+                .iter()
+                .map(|(_, css)| css.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            // Use the thorough template-literal escape that covers U+2028 /
+            // U+2029 and other control chars.
+            let escaped = escape_for_js_template_literal(&combined_css);
+            let code = format!("globalThis.__obscura_css = `{}`;", escaped);
+            let _ = js.execute_script("<css>", &code);
+            for (target, css) in author_stylesheets {
+                let code = match target {
+                    AuthorStylesheetTarget::Linked(link_index) => {
+                        materialize_linked_stylesheet_script(*link_index, css)
+                    }
+                    AuthorStylesheetTarget::InlineImport(style_index) => {
+                        materialize_inline_import_script(*style_index, css)
+                    }
+                };
+                let _ = js.execute_script("<fetch_stylesheets>", &code);
+            }
+        }
     }
 
     async fn execute_scripts(&mut self) {
@@ -2990,6 +3137,7 @@ impl Page {
         method: &str,
         body: &str,
     ) -> Result<(), PageError> {
+        self.cancel_navigation_continuation();
         // Hard ceiling on a single end-to-end navigation. Without this a slow
         // primary fetch or a runaway settle loop can hold the V8 lock for
         // arbitrarily long (we've measured 60+ seconds on JS-heavy news
@@ -3004,7 +3152,7 @@ impl Page {
 
         let result = match tokio::time::timeout(
             nav_timeout,
-            self.navigate_with_wait_post_inner(url_str, wait_until, method, body, ""),
+            self.navigate_with_wait_post_inner(url_str, wait_until, method, body, "", false),
         )
         .await
         {
@@ -3018,6 +3166,30 @@ impl Page {
         };
         if result.is_ok() {
             self.push_history(self.url_string());
+        }
+        result
+    }
+
+    /// Start a Host-owned navigation and return after the main document has
+    /// committed. Load work, including slow stylesheet graphs, remains in the
+    /// Page-owned continuation and is advanced by the Host worker.
+    #[doc(hidden)]
+    pub async fn navigate_for_host(&mut self, url_str: &str) -> Result<(), PageError> {
+        self.cancel_navigation_continuation();
+        let result = self
+            .navigate_with_wait_post_inner(
+                url_str,
+                crate::lifecycle::WaitUntil::DomContentLoaded,
+                "GET",
+                "",
+                "",
+                true,
+            )
+            .await;
+        if result.is_ok() {
+            self.push_history(self.url_string());
+        } else {
+            self.cancel_navigation_continuation();
         }
         result
     }
@@ -3099,6 +3271,117 @@ impl Page {
         self.advance_frames().await;
     }
 
+    async fn finish_host_navigation_continuation(&mut self) -> Result<(), PageError> {
+        self.document_timeline_origin = std::time::Instant::now();
+        #[cfg(feature = "render")]
+        if let Some(js) = &self.js {
+            js.reset_animation_timeline();
+        }
+        if let Some(js) = &mut self.js {
+            let _ = js.execute_script(
+                "<iframe-load>",
+                "(function() { var iframes = document.querySelectorAll('iframe[src]'); for (var i = 0; i < iframes.length; i++) { var src = iframes[i].getAttribute('src'); if (src && src !== 'about:blank') iframes[i]._loadIframeSrc(src); } })()",
+            );
+        }
+
+        #[cfg(feature = "render")]
+        {
+            let warmup_ms = std::env::var("OBSCURA_RENDER_RESOURCE_WARMUP_MS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(1_000);
+            let _ = self.prepare_screenshot_resources(warmup_ms).await;
+        }
+
+        // Host navigation acknowledges the committed document before this
+        // continuation. Scripts still run exactly once before DCL is exposed;
+        // load-delaying dynamic scripts remain for the autonomous pump.
+        self.execute_scripts_with_module_budget_and_load_wait(None, false)
+            .await;
+
+        #[cfg(feature = "render")]
+        {
+            let warmup_ms = std::env::var("OBSCURA_RENDER_RESOURCE_POST_SCRIPT_WARMUP_MS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(1_000);
+            let _ = self.prepare_screenshot_resources(warmup_ms).await;
+        }
+
+        self.lifecycle = LifecycleState::DomContentLoaded;
+        self.build_document_frames().await;
+        if let Some(js) = &mut self.js {
+            if let Ok(new_title) = js.evaluate("document.title") {
+                if let Some(title) = new_title.as_str() {
+                    self.title = title.to_string();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Advance the Page-owned Host navigation continuation. The returned
+    /// boolean is true only after the continuation reaches its idle boundary.
+    /// A caller may cancel this method while it waits on a network future: the
+    /// future remains in `self.navigation_continuation` and is resumed by the
+    /// next call. A new navigation explicitly replaces that state.
+    #[doc(hidden)]
+    pub async fn run_navigation_continuation_turn(&mut self) -> Result<bool, String> {
+        if self.navigation_continuation.is_none() {
+            return Ok(true);
+        }
+        // Suspending the JS realm is a real pause boundary. Keep the network
+        // future and CSS graph untouched until resume_js restores the realm.
+        if self.js.is_none() {
+            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+            return Ok(false);
+        }
+
+        let stylesheet_phase = matches!(
+            self.navigation_continuation.as_ref(),
+            Some(NavigationContinuation::Stylesheets(_))
+        );
+        if stylesheet_phase {
+            let (responses, author_stylesheets) = {
+                let continuation = self
+                    .navigation_continuation
+                    .as_mut()
+                    .expect("stylesheet continuation exists");
+                let NavigationContinuation::Stylesheets(stylesheets) = continuation else {
+                    unreachable!("continuation phase changed while borrowed");
+                };
+                let results = stylesheets.advance().await;
+                let responses = stylesheets.process_results(results);
+                let author_stylesheets = stylesheets
+                    .is_complete()
+                    .then(|| stylesheets.materialize());
+                (responses, author_stylesheets)
+            };
+            for response in responses {
+                self.record_network_event_with_body(
+                    response.url.as_str(),
+                    "GET",
+                    "Stylesheet",
+                    response.status,
+                    &response.headers,
+                    &response.body,
+                    false,
+                );
+            }
+            if let Some(author_stylesheets) = author_stylesheets {
+                self.install_author_stylesheets(&author_stylesheets);
+                self.navigation_continuation = Some(NavigationContinuation::Scripts);
+            }
+            return Ok(false);
+        }
+
+        self.finish_host_navigation_continuation()
+            .await
+            .map_err(|error| error.to_string())?;
+        self.navigation_continuation = None;
+        Ok(true)
+    }
+
     /// Advance one wake-driven browser task for a continuously owned page.
     /// `true` means deno_core reached full idle; `false` means one wake/task was
     /// delivered and the owner should offer another turn after servicing any
@@ -3168,6 +3451,7 @@ impl Page {
         method: &str,
         body: &str,
         initial_referrer: &str,
+        defer_host_continuation: bool,
     ) -> Result<(), PageError> {
         let mut current_url = url_str.to_string();
         let mut current_method = method.to_string();
@@ -3181,6 +3465,7 @@ impl Page {
                 &current_method,
                 &current_body,
                 &document_referrer,
+                defer_host_continuation,
             )
             .await?;
             if let Some((next_url, next_method, next_body)) = self.take_pending_navigation() {
@@ -3237,7 +3522,9 @@ impl Page {
         method: &str,
         body: &str,
         referrer: &str,
+        defer_host_continuation: bool,
     ) -> Result<(), PageError> {
+        self.cancel_navigation_continuation();
         let url = Url::parse(url_str).map_err(|e| PageError::InvalidUrl(e.to_string()))?;
 
         self.navigation_committed = false;
@@ -3367,40 +3654,19 @@ impl Page {
 
         self.dom = Some(dom);
         self.init_js();
+        self.navigation_committed = true;
+        if defer_host_continuation {
+            self.navigation_continuation = Some(NavigationContinuation::Stylesheets(
+                StylesheetContinuation::new(self),
+            ));
+            return Ok(());
+        }
         let author_stylesheets = self.fetch_stylesheets().await;
 
         // Inject CSS as a global so getComputedStyle and any CSS-aware shim
         // can read it. Has to happen before scripts run, regardless of
         // waitUntil, so handlers that read window.__obscura_css see it.
-        if !author_stylesheets.is_empty() {
-            if let Some(js) = &mut self.js {
-                let combined_css = author_stylesheets
-                    .iter()
-                    .map(|(_, css)| css.as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                // Use the thorough template-literal escape that
-                // covers U+2028 / U+2029 and other control chars.
-                // The previous escaper only handled `, \, and ${,
-                // letting attacker-controlled CSS containing a raw
-                // U+2028 break out of the template literal and run
-                // arbitrary JS in the page's V8 realm.
-                let escaped = escape_for_js_template_literal(&combined_css);
-                let code = format!("globalThis.__obscura_css = `{}`;", escaped);
-                let _ = js.execute_script("<css>", &code);
-                for (target, css) in &author_stylesheets {
-                    let code = match target {
-                        AuthorStylesheetTarget::Linked(link_index) => {
-                            materialize_linked_stylesheet_script(*link_index, css)
-                        }
-                        AuthorStylesheetTarget::InlineImport(style_index) => {
-                            materialize_inline_import_script(*style_index, css)
-                        }
-                    };
-                    let _ = js.execute_script("<fetch_stylesheets>", &code);
-                }
-            }
-        }
+        self.install_author_stylesheets(&author_stylesheets);
         self.document_timeline_origin = std::time::Instant::now();
         #[cfg(feature = "render")]
         if let Some(js) = &self.js {
@@ -3461,13 +3727,6 @@ impl Page {
         // on the next line, so building frames further down left every real CDP
         // client seeing a page with no frames at all.
         self.build_document_frames().await;
-
-        // Host may acknowledge a committed DCL navigation while the
-        // autonomous page pump finishes load-delaying work. Set this only
-        // after every await required to expose the committed document, and
-        // keep the DCL return immediately adjacent so cancellation cannot
-        // turn this marker into a synthetic success.
-        self.navigation_committed = true;
 
         if wait_until == crate::lifecycle::WaitUntil::DomContentLoaded {
             return Ok(());
@@ -3590,6 +3849,7 @@ impl Page {
     }
 
     pub fn navigate_blank(&mut self) {
+        self.cancel_navigation_continuation();
         self.pending_frame_work.clear();
         self.frames.clear();
         self.js = None;
@@ -4584,6 +4844,7 @@ impl Page {
                     &method,
                     &body,
                     &source_url,
+                    false,
                 ),
             )
             .await
@@ -5251,6 +5512,237 @@ mod tests {
             "cycle is cut without reordering rules"
         );
         assert!(sheets[2].contains(&format!("url(\"{origin}/theme/img/second.png\")")));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn host_stylesheet_continuation_survives_cancellation_and_suspend() {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let origin = format!("http://{address}");
+        let response_origin = origin.clone();
+        let (css_seen_tx, css_seen_rx) = std::sync::mpsc::channel();
+        let (release_css_tx, release_css_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let length = stream.read(&mut request).unwrap();
+            assert!(String::from_utf8_lossy(&request[..length]).contains("GET / HTTP/1.1"));
+            let body = format!(
+                "<title>continuation</title><link rel='stylesheet' href='{response_origin}/slow.css'>"
+            );
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let length = stream.read(&mut request).unwrap();
+            assert!(
+                String::from_utf8_lossy(&request[..length]).contains("GET /slow.css HTTP/1.1")
+            );
+            css_seen_tx.send(()).unwrap();
+            release_css_rx
+                .recv_timeout(std::time::Duration::from_secs(8))
+                .expect("test did not release the stylesheet");
+            let css = ".target { color: rgb(4, 5, 6) }";
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/css\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{css}",
+                css.len()
+            );
+        });
+
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "host-stylesheet-continuation".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("host-stylesheet-continuation".to_string(), context);
+        page.navigate_for_host(&origin).await.unwrap();
+
+        let cancelled = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            page.run_navigation_continuation_turn(),
+        )
+        .await;
+        assert!(cancelled.is_err(), "the slow stylesheet should still be pending");
+        css_seen_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("stylesheet continuation did not retain its request");
+        assert!(page.has_navigation_continuation());
+
+        page.suspend_js();
+        assert!(!page.has_js());
+        assert_eq!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                page.run_navigation_continuation_turn(),
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+            false,
+            "a suspended realm must pause the continuation"
+        );
+        release_css_tx.send(()).unwrap();
+        page.resume_js();
+
+        assert!(!page.run_navigation_continuation_turn().await.unwrap());
+        assert!(page.run_navigation_continuation_turn().await.unwrap());
+        assert!(!page.has_navigation_continuation());
+        server.join().unwrap();
+
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("globalThis.__obscura_css.includes('rgb(4, 5, 6')")
+                .unwrap(),
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate(
+                    "document.querySelectorAll('style[data-obscura-external-stylesheets]').length"
+                )
+                .unwrap()
+                .as_f64(),
+            Some(1.0)
+        );
+        let stylesheet_events = page
+            .network_events
+            .iter()
+            .filter(|event| event.resource_type == "Stylesheet")
+            .count();
+        assert_eq!(stylesheet_events, 1);
+        assert!(page.run_navigation_continuation_turn().await.unwrap());
+        assert_eq!(
+            page.network_events
+                .iter()
+                .filter(|event| event.resource_type == "Stylesheet")
+                .count(),
+            stylesheet_events
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn new_host_navigation_replaces_pending_stylesheet_continuation() {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let origin = format!("http://{address}");
+        let response_origin = origin.clone();
+        let (css_seen_tx, css_seen_rx) = std::sync::mpsc::channel();
+        let (release_css_tx, release_css_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let length = stream.read(&mut request).unwrap();
+            assert!(String::from_utf8_lossy(&request[..length]).contains("GET /old HTTP/1.1"));
+            let body = format!(
+                "<title>old</title><link rel='stylesheet' href='{response_origin}/old.css'>"
+            );
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let length = stream.read(&mut request).unwrap();
+            assert!(
+                String::from_utf8_lossy(&request[..length]).contains("GET /old.css HTTP/1.1")
+            );
+            css_seen_tx.send(()).unwrap();
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let length = stream.read(&mut request).unwrap();
+            assert!(String::from_utf8_lossy(&request[..length]).contains("GET /new HTTP/1.1"));
+            let body = "<title>new</title><div class='new'>new</div>";
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+
+            release_css_rx
+                .recv_timeout(std::time::Duration::from_secs(8))
+                .expect("test did not release the replaced stylesheet");
+            let css = ".old { color: rgb(7, 8, 9) }";
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/css\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{css}",
+                css.len()
+            );
+        });
+
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "replace-host-continuation".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("replace-host-continuation".to_string(), context);
+        page.navigate_for_host(&format!("{origin}/old")).await.unwrap();
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                page.run_navigation_continuation_turn(),
+            )
+            .await
+            .is_err()
+        );
+        css_seen_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("old stylesheet did not start");
+
+        page.navigate_for_host(&format!("{origin}/new")).await.unwrap();
+        assert!(!page.run_navigation_continuation_turn().await.unwrap());
+        assert!(page.run_navigation_continuation_turn().await.unwrap());
+        release_css_tx.send(()).unwrap();
+        server.join().unwrap();
+
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("document.title")
+                .unwrap(),
+            serde_json::json!("new")
+        );
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("typeof globalThis.__obscura_css")
+                .unwrap(),
+            serde_json::json!("undefined")
+        );
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate(
+                    "document.querySelectorAll('style[data-obscura-external-stylesheets]').length"
+                )
+                .unwrap()
+                .as_f64(),
+            Some(0.0)
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
