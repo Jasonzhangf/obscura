@@ -301,6 +301,10 @@ pub struct Page {
     /// Remaining Host navigation work. This lives on Page so a cancelled
     /// caller poll cannot drop stylesheet futures or their eventual CSS.
     navigation_continuation: Option<NavigationContinuation>,
+    /// Parser-discovered async classic script fetches remain page-owned after
+    /// DOMContentLoaded. They may execute while Host accepts commands, and are
+    /// cancelled only when this document is replaced.
+    parser_async_continuation: Option<ParserAsyncScriptContinuation>,
     /// Navigation history for Page.getNavigationHistory / navigateToHistoryEntry.
     /// Entries are URLs in visit order; `history_index` is the current position.
     /// Pushed on every successful navigation; truncated on goBack -> new nav.
@@ -414,6 +418,49 @@ type StylesheetBatch = Vec<(
     Result<Response, ObscuraNetError>,
 )>;
 type StylesheetBatchFuture = Pin<Box<dyn Future<Output = StylesheetBatch>>>;
+
+struct ParserAsyncScriptResult {
+    nid: u32,
+    requested_url: String,
+    response: Result<Response, ObscuraNetError>,
+}
+
+/// Page-owned fetches for parser-discovered `async` classic scripts. These
+/// requests start with the parser's other external resources, but their
+/// completion is consumed by the Page owner so cancelling a Host turn cannot
+/// drop the in-flight fetch or its eventual script execution.
+struct ParserAsyncScriptContinuation {
+    tasks: futures::stream::FuturesUnordered<tokio::task::JoinHandle<ParserAsyncScriptResult>>,
+}
+
+impl ParserAsyncScriptContinuation {
+    fn new() -> Self {
+        Self {
+            tasks: futures::stream::FuturesUnordered::new(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.tasks.is_empty()
+    }
+
+    fn spawn(
+        &mut self,
+        nid: u32,
+        requested_url: String,
+        future: impl Future<Output = ParserAsyncScriptResult> + Send + 'static,
+    ) {
+        self.tasks.push(tokio::spawn(future));
+        tracing::debug!(nid, %requested_url, "started parser async classic script fetch");
+    }
+
+    async fn advance(
+        &mut self,
+    ) -> Option<Result<ParserAsyncScriptResult, tokio::task::JoinError>> {
+        use futures::StreamExt as _;
+        self.tasks.next().await
+    }
+}
 
 /// Page-owned continuation for stylesheet graph loading. Every network future
 /// is created from cloned page resources and retained here, so cancelling the
@@ -1452,6 +1499,7 @@ impl Page {
             navigation_chain_limit: None,
             navigation_committed: false,
             navigation_continuation: None,
+            parser_async_continuation: None,
             history: Vec::new(),
             history_index: 0,
             network_events: Vec::new(),
@@ -1509,6 +1557,10 @@ impl Page {
     #[doc(hidden)]
     pub fn has_navigation_continuation(&self) -> bool {
         self.navigation_continuation.is_some()
+            || self
+                .parser_async_continuation
+                .as_ref()
+                .is_some_and(|continuation| !continuation.is_empty())
     }
 
     /// Script execution is an exclusive continuation phase. The Host keeps
@@ -1524,6 +1576,7 @@ impl Page {
 
     fn cancel_navigation_continuation(&mut self) {
         self.navigation_continuation = None;
+        self.parser_async_continuation = None;
     }
 
     fn should_block_url(&self, url: &str) -> bool {
@@ -2353,6 +2406,180 @@ impl Page {
         );
     }
 
+    fn dispatch_parser_async_script_event(&mut self, nid: u32, event: &'static str) {
+        if let Some(js) = &mut self.js {
+            // The script wrapper is retained by the bootstrap cache, while the
+            // native nid remains the document-owned identity. Dispatching from
+            // that identity keeps onload/onerror listeners live even when the
+            // element moved after the parser encountered it.
+            let _ = js.execute_script(
+                "<parser-async-script-event>",
+                &format!(
+                    "try {{ var script = globalThis._wrap({nid}); if (script) script.dispatchEvent(new Event('{event}')); }} catch(e) {{}}"
+                ),
+            );
+        }
+    }
+
+    fn execute_parser_async_script(&mut self, result: ParserAsyncScriptResult) {
+        let ParserAsyncScriptResult {
+            nid,
+            requested_url,
+            response,
+        } = result;
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::warn!("Failed to fetch parser async script {}: {}", requested_url, error);
+                self.dispatch_parser_async_script_event(nid, "error");
+                return;
+            }
+        };
+
+        self.record_network_event_with_body(
+            &requested_url,
+            "GET",
+            "Script",
+            response.status,
+            &response.headers,
+            &response.body,
+            false,
+        );
+        if !script_response_is_executable(response.status) {
+            tracing::warn!(
+                "Refusing to execute parser async script {} after HTTP {}",
+                requested_url,
+                response.status
+            );
+            self.dispatch_parser_async_script_event(nid, "error");
+            return;
+        }
+
+        let execution_url = response.url.to_string();
+        let code = obscura_net::decode_non_html(&response.body, response.content_type());
+        if let Some(js) = &mut self.js {
+            let _ = js.execute_script(
+                "<current-script>",
+                &format!("globalThis.__currentScriptNid={nid};"),
+            );
+            if let Err(error) = js.execute_script_guarded(&execution_url, &code) {
+                tracing::warn!("Parser async script error ({}): {}", execution_url, error);
+            }
+            let _ = js.execute_script(
+                "<current-script>",
+                "globalThis.__currentScriptNid=0;",
+            );
+        }
+        self.dispatch_parser_async_script_event(nid, "load");
+    }
+
+    async fn run_parser_async_script_turn(&mut self) -> Result<bool, String> {
+        if self.parser_async_continuation.is_none() {
+            return Ok(true);
+        }
+        // A suspended realm cannot execute the completion or dispatch its
+        // element event. Keep the fetch future in Page ownership until resume.
+        if self.js.is_none() {
+            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+            return Ok(false);
+        }
+
+        let result = {
+            let continuation = self
+                .parser_async_continuation
+                .as_mut()
+                .expect("parser async continuation exists");
+            continuation.advance().await
+        };
+        let Some(result) = result else {
+            self.parser_async_continuation = None;
+            return Ok(true);
+        };
+        match result {
+            Ok(result) => self.execute_parser_async_script(result),
+            Err(error) => {
+                tracing::warn!("parser async script task failed: {}", error);
+            }
+        }
+
+        let done = self
+            .parser_async_continuation
+            .as_ref()
+            .map(|continuation| continuation.is_empty())
+            .unwrap_or(true);
+        if done {
+            self.parser_async_continuation = None;
+        }
+        Ok(done)
+    }
+
+    async fn drive_load_delaying_scripts_with_parser(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> bool {
+        let mut prefer_parser = true;
+        loop {
+            let parser_pending = self
+                .parser_async_continuation
+                .as_ref()
+                .is_some_and(|continuation| !continuation.is_empty());
+            let dynamic_pending = self
+                .js
+                .as_mut()
+                .is_some_and(|js| js.has_pending_load_delaying_scripts());
+            if !parser_pending && !dynamic_pending {
+                return true;
+            }
+            let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now())
+            else {
+                return false;
+            };
+            if remaining.is_zero() {
+                return false;
+            }
+            let poll_budget = remaining.min(tokio::time::Duration::from_millis(25));
+
+            if parser_pending && (prefer_parser || !dynamic_pending) {
+                prefer_parser = false;
+                match tokio::time::timeout(poll_budget, self.run_parser_async_script_turn())
+                    .await
+                {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => {
+                        tracing::warn!(
+                            "parser async script continuation failed while waiting for load: {}",
+                            error
+                        );
+                    }
+                    Err(_) => {}
+                }
+                continue;
+            }
+
+            prefer_parser = true;
+            let Some(js) = &mut self.js else {
+                return false;
+            };
+            match tokio::time::timeout(poll_budget, js.run_load_delaying_event_loop_tick()).await
+            {
+                Ok(Ok(_idle)) => {
+                    if js.has_pending_load_delaying_scripts() {
+                        tokio::task::yield_now().await;
+                    }
+                }
+                Ok(Err(error)) => {
+                    if obscura_js::runtime::is_fatal_event_loop_error(&error) {
+                        tracing::warn!("load-delaying script event loop failed: {error}");
+                        return false;
+                    }
+                    tracing::warn!("load-delaying script task error, continuing: {error}");
+                    tokio::task::yield_now().await;
+                }
+                Err(_) => {}
+            }
+        }
+    }
+
     async fn execute_scripts_with_module_budget(&mut self, module_budget_override: Option<u64>) {
         self.execute_scripts_with_module_budget_and_load_wait(module_budget_override, true)
             .await;
@@ -2523,6 +2750,7 @@ impl Page {
 
         tracing::info!("Found {} parser-discovered scripts", all_scripts.len());
         let mut fetch_tasks: Vec<(usize, String)> = Vec::new();
+        let mut parser_async_tasks: Vec<(u32, String)> = Vec::new();
 
         for (i, script) in all_scripts.iter().enumerate() {
             if !matches!(script.kind, ScriptKind::Classic) {
@@ -2557,7 +2785,11 @@ impl Page {
                     tracing::info!("Blocked script by interception: {}", full_url);
                     continue;
                 }
-                fetch_tasks.push((i, full_url));
+                if script.is_async {
+                    parser_async_tasks.push((script.nid, full_url));
+                } else {
+                    fetch_tasks.push((i, full_url));
+                }
             }
         }
 
@@ -2567,6 +2799,63 @@ impl Page {
             .url
             .clone()
             .unwrap_or_else(|| Url::parse("about:blank").unwrap());
+
+        // Parser async classic scripts start fetching at their parser
+        // encounter point. Keep each task in Page ownership while the
+        // parser-blocking/defer/module work below proceeds; awaiting these
+        // fetches here would make an async script gate DOMContentLoaded.
+        if !parser_async_tasks.is_empty() {
+            let mut continuation = ParserAsyncScriptContinuation::new();
+            for (nid, requested_url) in parser_async_tasks {
+                let client = client.clone();
+                let cbs = page_callbacks.clone();
+                let initiator = script_initiator.clone();
+                let requested_url_for_fetch = requested_url.clone();
+                continuation.spawn(
+                    nid,
+                    requested_url,
+                    async move {
+                        let parsed = Url::parse(&requested_url_for_fetch)
+                            .unwrap_or_else(|_| Url::parse("about:blank").unwrap());
+                        let response = if parsed.scheme() == "data" {
+                            // data: URIs are inline; decode locally, no network
+                            // fetch is needed.
+                            let body = decode_data_uri(&requested_url_for_fetch).unwrap_or_default();
+                            let content_type = requested_url_for_fetch
+                                .strip_prefix("data:")
+                                .and_then(|s| s.split(',').next())
+                                .unwrap_or("application/javascript")
+                                .split(';')
+                                .next()
+                                .unwrap_or("application/javascript")
+                                .to_string();
+                            let mut headers = std::collections::HashMap::new();
+                            headers.insert("content-type".to_string(), content_type);
+                            Ok(Response {
+                                url: parsed,
+                                status: 200,
+                                headers,
+                                body,
+                                redirected_from: Vec::new(),
+                            })
+                        } else {
+                            let request =
+                                ResourceRequest::subresource(ResourceType::Script, &initiator);
+                            client
+                                .fetch_resource_with_callbacks(&parsed, request, Some(&cbs))
+                                .await
+                        };
+                        ParserAsyncScriptResult {
+                            nid,
+                            requested_url: requested_url_for_fetch,
+                            response,
+                        }
+                    },
+                );
+            }
+            self.parser_async_continuation = Some(continuation);
+        }
+
         let fetch_futures: Vec<_> = fetch_tasks
             .iter()
             .map(|(idx, url)| {
@@ -2823,6 +3112,7 @@ impl Page {
             };
 
         let mut post_parse = Vec::new();
+        let mut parser_async_grace_used = false;
 
         // Process parser-discovered scripts in encounter order. Import maps
         // register at their exact position; module graphs start there too, but
@@ -2849,6 +3139,29 @@ impl Page {
                     }
                 }
                 ScriptKind::Classic => {
+                    if script.is_async && script.src.is_some() {
+                        // The fetch is owned by `parser_async_continuation`.
+                        // Its completion is executed by the Page pump and does
+                        // not participate in parser/DCL ordering.
+                        // Give an already-ready response one short task window
+                        // before the parser advances to the next script. A
+                        // ready async script may intentionally run before a
+                        // later import map, while the bounded window prevents
+                        // a slow response from holding parsing.
+                        if drive_load_phase && !parser_async_grace_used {
+                            // A direct `WaitUntil::Load` navigation has no Host
+                            // continuation turn to observe a response which
+                            // is already ready. Its 25ms handoff is bounded
+                            // separately from the page script deadline.
+                            parser_async_grace_used = true;
+                            let _ = tokio::time::timeout(
+                                tokio::time::Duration::from_millis(25),
+                                self.run_parser_async_script_turn(),
+                            )
+                            .await;
+                        }
+                        continue;
+                    }
                     if script.is_defer && !script.is_async && script.src.is_some() {
                         post_parse.push(ScheduledScript::Classic(index));
                     } else {
@@ -3092,14 +3405,17 @@ impl Page {
                  try { window.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false})); } catch(e) {}",
             );
 
-            if drive_load_phase {
-                let load_blockers_finished =
-                    Self::drive_load_delaying_scripts(js, script_deadline).await;
-                if !load_blockers_finished {
-                    tracing::warn!(
-                        "script deadline reached with load-delaying dynamic scripts still pending"
-                    );
-                }
+        }
+        if drive_load_phase {
+            let load_blockers_finished = self
+                .drive_load_delaying_scripts_with_parser(script_deadline)
+                .await;
+            if !load_blockers_finished {
+                tracing::warn!(
+                    "script deadline reached with load-delaying scripts still pending"
+                );
+            }
+            if let Some(js) = &mut self.js {
                 Self::fire_load_event(js);
             }
         }
@@ -3328,7 +3644,7 @@ impl Page {
     #[doc(hidden)]
     pub async fn run_navigation_continuation_turn(&mut self) -> Result<bool, String> {
         if self.navigation_continuation.is_none() {
-            return Ok(true);
+            return self.run_parser_async_script_turn().await;
         }
         // Suspending the JS realm is a real pause boundary. Keep the network
         // future and CSS graph untouched until resume_js restores the realm.
@@ -3378,7 +3694,15 @@ impl Page {
         self.finish_host_navigation_continuation()
             .await
             .map_err(|error| error.to_string())?;
-        self.navigation_continuation = None;
+        // `finish_host_navigation_continuation` may have started parser-owned
+        // async classic fetches. Keep that independent continuation alive so
+        // Host can accept commands while those requests remain pending.
+        if matches!(
+            self.navigation_continuation.as_ref(),
+            Some(NavigationContinuation::Scripts)
+        ) {
+            self.navigation_continuation = None;
+        }
         Ok(true)
     }
 

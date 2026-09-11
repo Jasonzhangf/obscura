@@ -594,6 +594,90 @@ fn navigation_commit_is_receipted_before_a_pending_load() {
 }
 
 #[test]
+fn parser_async_script_does_not_block_dcl_or_host_commands() {
+    let daemon = Daemon::start_with_network(true);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (script_seen_tx, script_seen_rx) = std::sync::mpsc::channel();
+    let (release_script_tx, release_script_rx) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0u8; 4096];
+        let length = stream.read(&mut request).unwrap();
+        assert!(String::from_utf8_lossy(&request[..length]).contains("GET / HTTP/1.1"));
+        let body = format!(
+            "<title>async-parser</title><input id='field' style='position:absolute;left:10px;top:10px;width:240px;height:40px'><script async src='http://{address}/never.js'></script>"
+        );
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+
+        let (mut stream, _) = listener.accept().unwrap();
+        let length = stream.read(&mut request).unwrap();
+        assert!(String::from_utf8_lossy(&request[..length]).contains("GET /never.js HTTP/1.1"));
+        script_seen_tx.send(()).unwrap();
+        release_script_rx
+            .recv_timeout(Duration::from_secs(8))
+            .expect("test did not release the parser async script");
+        let body = "globalThis.__never_parser_script_ran = true;";
+        let _ = write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+    });
+
+    let mut agent = daemon.connect();
+    agent.ok(json!({"type":"attach","mode":"agent"}));
+    let before = agent.ok(json!({"type":"status"}));
+    let reply = agent.raw(json!({
+        "id": 303,
+        "operation": identity(&before),
+        "command": {"type":"navigate","url":format!("http://{address}/")}
+    }));
+    assert_eq!(reply["type"], "result", "{reply}");
+    assert_eq!(reply["value"]["input"]["state"], "succeeded");
+    assert_eq!(
+        reply["value"]["input"]["document_revision"].as_u64(),
+        Some(before["document_revision"].as_u64().unwrap() + 1)
+    );
+    script_seen_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("parser async script request did not start");
+
+    // The unresolved parser async fetch leaves the Page-owned task pending,
+    // but the committed document and DCL work remain usable by the Host.
+    assert_eq!(agent.eval("document.readyState === 'interactive'"), true);
+    agent.ok(json!({"type":"click","x":30,"y":30}));
+    agent.ok(json!({"type":"input_text","text":"usable while async fetch waits"}));
+    assert_eq!(
+        agent.eval("document.getElementById('field').value"),
+        "usable while async fetch waits"
+    );
+    let resized = agent.ok(json!({"type":"resize","width":390,"height":640}));
+    assert_eq!(resized["viewport"], json!([390.0, 640.0]));
+
+    release_script_tx.send(()).unwrap();
+    server.join().unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if agent.eval("globalThis.__never_parser_script_ran === true") == true {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "parser async script did not execute after its response"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    agent.ok(json!({"type":"close_session"}));
+}
+
+#[test]
 fn slow_stylesheet_navigation_keeps_css_in_the_page_continuation() {
     let daemon = Daemon::start_with_network(true);
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -662,6 +746,113 @@ fn slow_stylesheet_navigation_keeps_css_in_the_page_continuation() {
             .as_f64(),
         Some(1.0)
     );
+}
+
+#[test]
+fn pending_navigation_cancels_old_stylesheet_before_materialization() {
+    let daemon = Daemon::start_with_network(true);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (css_seen_tx, css_seen_rx) = std::sync::mpsc::channel();
+    let (new_seen_tx, new_seen_rx) = std::sync::mpsc::channel();
+    let (release_css_tx, release_css_rx) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0u8; 4096];
+        let length = stream.read(&mut request).unwrap();
+        assert!(String::from_utf8_lossy(&request[..length]).contains("GET /old HTTP/1.1"));
+        let body = format!(
+            "<title>old</title><link rel='stylesheet' href='http://{address}/old.css'><button style='position:absolute;left:10px;top:10px;width:240px;height:60px' onclick=\"location.href='/new'\">go</button>"
+        );
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+
+        let (mut css_stream, _) = listener.accept().unwrap();
+        let length = css_stream.read(&mut request).unwrap();
+        assert!(String::from_utf8_lossy(&request[..length]).contains("GET /old.css HTTP/1.1"));
+        css_seen_tx.send(()).unwrap();
+
+        let (mut new_stream, _) = listener.accept().unwrap();
+        let length = new_stream.read(&mut request).unwrap();
+        assert!(String::from_utf8_lossy(&request[..length]).contains("GET /new HTTP/1.1"));
+        new_seen_tx.send(()).unwrap();
+        let body = "<title>new</title><div class='new'>new</div>";
+        write!(
+            new_stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+
+        release_css_rx
+            .recv_timeout(Duration::from_secs(8))
+            .expect("test did not release the replaced stylesheet");
+        let css = ".old { color: rgb(7, 8, 9) }";
+        let _ = write!(
+            css_stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/css\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{css}",
+            css.len()
+        );
+    });
+
+    let mut agent = daemon.connect();
+    agent.ok(json!({"type":"attach","mode":"agent"}));
+    let before = agent.ok(json!({"type":"status"}));
+    let navigate = agent.raw(json!({
+        "id": 304,
+        "operation": identity(&before),
+        "command": {"type":"navigate","url":format!("http://{address}/old")}
+    }));
+    assert_eq!(navigate["type"], "result", "{navigate}");
+    assert_eq!(navigate["value"]["input"]["state"], "succeeded");
+    css_seen_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("old stylesheet request did not start");
+
+    let old_operation = identity(&agent.ok(json!({"type":"status"})));
+    let next_sequence = old_operation["sequence"].as_u64().unwrap() + 1;
+    let mut stale_operation = old_operation.clone();
+    stale_operation["operation_id"] = json!(format!("op-{next_sequence}"));
+    stale_operation["sequence"] = json!(next_sequence);
+    let click = json!({
+        "id": 305,
+        "operation": old_operation,
+        "command": {"type":"click","x":30,"y":30}
+    });
+    let stale = json!({
+        "id": 306,
+        "operation": stale_operation,
+        "command": {"type":"evaluate","expression":"document.title"}
+    });
+    writeln!(agent.0.get_mut(), "{click}").unwrap();
+    writeln!(agent.0.get_mut(), "{stale}").unwrap();
+
+    let click_reply = agent.read();
+    assert_eq!(click_reply["type"], "result", "{click_reply}");
+    assert_eq!(click_reply["value"]["input"]["state"], "succeeded");
+    new_seen_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("click did not request the new document");
+    let stale_reply = agent.read();
+    release_css_tx.send(()).unwrap();
+    server.join().unwrap();
+    assert_eq!(stale_reply["type"], "error", "{stale_reply}");
+    assert_eq!(stale_reply["code"], "STALE_DOCUMENT");
+
+    assert_eq!(agent.eval("document.title"), "new");
+    assert_eq!(agent.eval("typeof globalThis.__obscura_css"), "undefined");
+    assert_eq!(
+        agent
+            .eval("document.querySelectorAll('style[data-obscura-external-stylesheets]').length")
+            .as_f64(),
+        Some(0.0)
+    );
+
+    agent.ok(json!({"type":"close_session"}));
 }
 
 #[test]

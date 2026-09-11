@@ -76,24 +76,25 @@ pub fn start(id: String, network: bool, mut incoming: mpsc::Receiver<Work>,
                 // Navigation caused by dispatched input/page scripts is page work,
                 // after the input receipt. Never cancel it to inject another input.
                 if failure.is_none() {
-                    let has_navigation_continuation = page
-                        .as_ref()
-                        .is_some_and(Page::has_navigation_continuation);
-                    if !has_navigation_continuation {
-                        if let Some(page) = page.as_mut() {
-                            match timeout(BUDGET, page_work(page.process_pending_navigation())).await {
-                                Ok(Ok(false)) => {},
-                                outcome => {
-                                    document_revision += 1;
-                                    frames.send_replace(media::state(FramePacket::Waiting { session_id: id.clone() }));
-                                    match outcome {
-                                        Ok(Ok(true)) => {},
-                                        Ok(Err(cause)) => failure = Some(format!("Page navigation failed: {cause}")),
-                                        Err(_) => failure = Some("Page navigation outcome unknown after deadline".into()),
-                                        _ => unreachable!(),
-                                    }
-                                    if updates.send(PageUpdate { document_revision, fault: failure.clone() }).await.is_err() { break; }
+                    if let Some(page) = page.as_mut() {
+                        // A script or input can request navigation while an
+                        // older stylesheet/script continuation is still alive.
+                        // Consume that request at the top of the next worker
+                        // turn so navigate_single cancels the old Page-owned
+                        // continuation before it can materialize into the new
+                        // document.
+                        match timeout(BUDGET, page_work(page.process_pending_navigation())).await {
+                            Ok(Ok(false)) => {},
+                            outcome => {
+                                document_revision += 1;
+                                frames.send_replace(media::state(FramePacket::Waiting { session_id: id.clone() }));
+                                match outcome {
+                                    Ok(Ok(true)) => {},
+                                    Ok(Err(cause)) => failure = Some(format!("Page navigation failed: {cause}")),
+                                    Err(_) => failure = Some("Page navigation outcome unknown after deadline".into()),
+                                    _ => unreachable!(),
                                 }
+                                if updates.send(PageUpdate { document_revision, fault: failure.clone() }).await.is_err() { break; }
                             }
                         }
                     }
