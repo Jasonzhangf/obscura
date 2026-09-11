@@ -2,7 +2,7 @@
 use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
 use anyhow::{Context, Result};
 use obscura_browser::{BrowserContext, Page};
-use obscura_host_protocol::{Command, EvaluationResult, FrameInfo, FramePacket, InputReceipt, InputState, PixelFormat, ResultValue};
+use obscura_host_protocol::{Command, EvaluationResult, FrameInfo, FramePacket, InputReceipt, InputState, Operation, PixelFormat, ResultValue};
 use crate::media::{self, SharedFrame};
 use obscura_browser::input::{Input, InputError};
 use tokio::sync::{mpsc, oneshot};
@@ -18,7 +18,7 @@ pub struct Completion {
 pub struct PageUpdate { pub document_revision: u64, pub fault: Option<String> }
 pub struct Work { pub kind: WorkKind, pub reply: oneshot::Sender<Completion> }
 pub enum WorkKind {
-    Browser { command: Command, document_revision: u64 },
+    Browser { command: Command, operation: Operation },
     /// Host-assigned shared viewport; declarations apply to the current Page,
     /// while explicit Agent resize retains its admitted document fence.
     Viewport { width: u32, height: u32, revision: u64, document_revision: Option<u64>, cancel: Arc<AtomicBool> },
@@ -119,7 +119,7 @@ pub fn start(id: String, network: bool, mut incoming: mpsc::Receiver<Work>,
                     work = incoming.recv() => {
                         let Some(work) = work else { break; };
                         let expected_document = match &work.kind {
-                            WorkKind::Browser { document_revision, .. } => Some(*document_revision),
+                            WorkKind::Browser { operation, .. } => Some(operation.document_revision),
                             WorkKind::Viewport { document_revision, .. } => *document_revision,
                         };
                         let mut completion = if failure.is_some() && !matches!(work.kind, WorkKind::Browser { command: Command::CloseSession {}, .. }) {
@@ -159,13 +159,14 @@ pub fn start(id: String, network: bool, mut incoming: mpsc::Receiver<Work>,
                                     }
                                     Completion { result, viewport: page.as_ref().map(|page| page.viewport), fault, document_revision, viewport_revision }
                                 }
-                                WorkKind::Browser { command, .. } => {
+                                WorkKind::Browser { command, operation } => {
                                     let navigation = matches!(command, Command::Navigate { .. });
-                                    let completion = execute(&mut page, command).await;
+                                    let mut completion = execute(&mut page, command, &operation).await;
                                     if navigation {
                                         document_revision += 1;
                                         frames.send_replace(media::state(FramePacket::Waiting { session_id: id.clone() }));
                                     }
+                                    stamp_input_receipt(&mut completion.result, &operation, document_revision, viewport_revision);
                                     completion
                                 }
                             }
@@ -217,7 +218,7 @@ async fn capture(page: &mut Page) -> Result<(u32, u32, Vec<u8>), String> {
     { let _ = page; Err("Frames require a render-enabled Host".into()) }
 }
 
-async fn execute(page: &mut Option<Page>, command: Command) -> Completion {
+async fn execute(page: &mut Option<Page>, command: Command, operation: &Operation) -> Completion {
     let mut fault = None;
     let result = if matches!(command, Command::CloseSession {}) {
         *page = None;
@@ -263,7 +264,12 @@ async fn execute(page: &mut Option<Page>, command: Command) -> Completion {
                     let result = timeout(BUDGET, page_work(obscura_browser::input::perform(page, input))).await;
                     let fired = page.js.as_mut().expect("input retains runtime").disarm_watchdog(watchdog);
                     match result {
-                        Ok(Ok(())) if !fired => Ok(Some(ResultValue::Input { input: InputReceipt { state: InputState::Succeeded } })),
+                        Ok(Ok(())) if !fired => Ok(Some(ResultValue::Input { input: InputReceipt {
+                            operation_id: operation.operation_id.clone(), session_id: operation.session_id.clone(),
+                            attachment_id: operation.attachment_id, sequence: operation.sequence,
+                            control_epoch: operation.control_epoch, viewport_revision: operation.viewport_revision,
+                            document_revision: operation.document_revision, state: InputState::Succeeded,
+                        } })),
                         Ok(Err(InputError::Rejected(cause))) if !fired => Err(("INPUT_REJECTED", cause)),
                         outcome => {
                             let cause = match outcome {
@@ -280,4 +286,50 @@ async fn execute(page: &mut Option<Page>, command: Command) -> Completion {
         }
     } else { Err(("SESSION_CLOSED", "Session was explicitly closed".into())) };
     Completion { result, viewport: page.as_ref().map(|page| page.viewport), fault, document_revision: 0, viewport_revision: 0 }
+}
+
+fn stamp_input_receipt(
+    result: &mut Result<Option<ResultValue>, (&'static str, String)>,
+    operation: &Operation,
+    document_revision: u64,
+    viewport_revision: u64,
+) {
+    if let Ok(Some(ResultValue::Input { input })) = result {
+        input.document_revision = document_revision;
+        input.viewport_revision = viewport_revision;
+        input.operation_id = operation.operation_id.clone();
+        input.session_id = operation.session_id.clone();
+        input.attachment_id = operation.attachment_id;
+        input.sequence = operation.sequence;
+        input.control_epoch = operation.control_epoch;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stamp_input_receipt;
+    use obscura_host_protocol::{InputReceipt, InputState, Operation, OperationId, ResultValue};
+
+    fn operation() -> Operation {
+        Operation { operation_id: OperationId("op-1".into()), session_id: "session".into(), attachment_id: 7,
+            sequence: 3, control_epoch: 4, viewport_revision: 5, document_revision: 6 }
+    }
+
+    #[test]
+    fn receipt_uses_completion_revisions_and_operation_identity() {
+        let operation = operation();
+        let mut result = Ok(Some(ResultValue::Input { input: InputReceipt {
+            operation_id: OperationId("wrong".into()), session_id: "wrong".into(), attachment_id: 0,
+            sequence: 0, control_epoch: 0, viewport_revision: 0, document_revision: 0, state: InputState::Succeeded,
+        } }));
+        stamp_input_receipt(&mut result, &operation, 9, 10);
+        let Some(ResultValue::Input { input }) = result.unwrap() else { panic!("missing input receipt") };
+        assert_eq!(input.operation_id, operation.operation_id);
+        assert_eq!(input.session_id, operation.session_id);
+        assert_eq!(input.attachment_id, 7);
+        assert_eq!(input.sequence, 3);
+        assert_eq!(input.control_epoch, 4);
+        assert_eq!(input.viewport_revision, 10);
+        assert_eq!(input.document_revision, 9);
+    }
 }

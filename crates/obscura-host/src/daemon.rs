@@ -491,7 +491,7 @@ pub async fn serve(socket_dir: PathBuf, allow_private_network: bool) -> Result<(
                                         continue;
                                     }
                                 }
-                            } else { WorkKind::Browser { command, document_revision: record.operation.document_revision } };
+                            } else { WorkKind::Browser { command, operation: record.operation.clone() } };
                             let (finished, result) = oneshot::channel();
                             if work.try_send(Work { kind, reply: finished }).is_err() {
                                 session.viewport_update = None;
@@ -587,4 +587,67 @@ pub async fn serve(socket_dir: PathBuf, allow_private_network: bool) -> Result<(
     tokio::task::spawn_blocking(move || worker.join().map_err(|_| anyhow::anyhow!("browser worker panicked"))?).await??;
     drop(session); drop(listener); drop(media_listener); drop(directory);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use obscura_host_protocol::OperationId;
+
+    fn operation(operation_id: &str) -> Operation {
+        Operation {
+            operation_id: OperationId(operation_id.into()),
+            session_id: "session".into(),
+            attachment_id: 1,
+            sequence: 1,
+            control_epoch: 1,
+            viewport_revision: 1,
+            document_revision: 2,
+        }
+    }
+
+    fn session() -> Session {
+        let mut attachments = HashMap::new();
+        attachments.insert(1, Attachment { mode: Mode::Agent, viewport: None, webrtc: None });
+        Session {
+            id: "session".into(),
+            viewport: Some((800.0, 600.0)),
+            attachments,
+            agent: Some(1),
+            viewport_revision: 1,
+            document_revision: 2,
+            fault: None,
+            control: Control { epoch: 1, phase: ControlPhase::Agent },
+            records: HashMap::new(),
+            retired: HashSet::new(),
+            viewport_owner: None,
+            viewport_update: None,
+            viewport_repair: None,
+        }
+    }
+
+    #[test]
+    fn duplicate_operation_returns_cached_result_and_operation_id_conflict_errors() {
+        let mut session = session();
+        let first_operation = operation("op-1");
+        let command = Command::Evaluate { expression: "window.count = (window.count || 0) + 1".into() };
+        let cached = Response::Result { id: 9, value: ResultValue::Closed { closed: true } };
+        session.records.insert(1, Record { operation: first_operation.clone(), command: command.clone(), response: Some(cached) });
+
+        let duplicate = Request { id: 11, command: command.clone(), operation: Some(first_operation.clone()) };
+        match session.request(1, duplicate, false) {
+            Ok(Response::Result { id, value }) => {
+                assert_eq!(id, 11);
+                assert!(matches!(value, ResultValue::Closed { closed: true }));
+            }
+            other => panic!("expected cached result, got {other:?}"),
+        }
+
+        let conflicting_operation_id = operation("op-2");
+        let conflict = Request { id: 12, command: command.clone(), operation: Some(conflicting_operation_id) };
+        match session.request(1, conflict, false) {
+            Ok(Response::Error { code, .. }) => assert_eq!(code, "OPERATION_CONFLICT"),
+            other => panic!("expected operation conflict, got {other:?}"),
+        }
+    }
 }

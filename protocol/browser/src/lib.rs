@@ -130,7 +130,16 @@ pub enum ResultValue {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct InputReceipt { pub state: InputState }
+pub struct InputReceipt {
+    pub operation_id: OperationId,
+    pub session_id: String,
+    pub attachment_id: u64,
+    pub sequence: u64,
+    pub control_epoch: u64,
+    pub viewport_revision: u64,
+    pub document_revision: u64,
+    pub state: InputState,
+}
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InputState { Succeeded }
