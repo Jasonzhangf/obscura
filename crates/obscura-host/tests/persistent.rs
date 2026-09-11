@@ -530,6 +530,69 @@ fn human_navigation_respects_control_identity_and_document_revision() {
 }
 
 #[test]
+fn navigation_commit_is_receipted_before_a_pending_load() {
+    let daemon = Daemon::start_with_network(true);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (release, gate) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        loop {
+            let mut line = String::new();
+            assert!(reader.read_line(&mut line).unwrap() > 0);
+            if line == "\r\n" {
+                break;
+            }
+        }
+        let body = format!(
+            "<title>committed</title><body data-state='parsed'><script>var s=document.createElement('script');s.src='http://{address}/never.js';document.body.appendChild(s);</script>"
+        );
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        gate.recv_timeout(Duration::from_secs(8)).unwrap();
+    });
+
+    let mut agent = daemon.connect();
+    agent.ok(json!({"type":"attach","mode":"agent"}));
+    let before = agent.ok(json!({"type":"status"}));
+    let reply = agent.raw(json!({
+        "id": 301,
+        "operation": identity(&before),
+        "command": {"type":"navigate","url":format!("http://{address}/")}
+    }));
+    assert_eq!(reply["type"], "result", "{reply}");
+    let value = reply["value"].clone();
+    assert_eq!(value["input"]["state"], "succeeded");
+    assert_eq!(
+        value["input"]["document_revision"].as_u64(),
+        Some(before["document_revision"].as_u64().unwrap() + 1)
+    );
+    assert_eq!(value["input"]["operation_id"], format!("op-{}", before["next_sequence"]));
+    assert_eq!(agent.ok(json!({"type":"status"}))["fault"], Value::Null);
+    assert_eq!(agent.eval("document.title"), "committed");
+    assert_eq!(
+        agent.eval("globalThis.__obscura_hasPendingLoadDelayingScripts?.() === true"),
+        true
+    );
+
+    let mut observer = daemon.connect();
+    let attached = observer.ok(json!({"type":"attach","mode":"observe"}));
+    let granted = observer.ok(json!({
+        "type":"request_takeover",
+        "epoch":attached["control"]["epoch"]
+    }));
+    assert_eq!(granted["control"]["phase"]["type"], "human");
+    observer.ok(json!({"type":"release_control","epoch":granted["control"]["epoch"]}));
+    release.send(()).unwrap();
+    server.join().unwrap();
+}
+
+#[test]
 fn click_receipt_precedes_navigation_and_old_document_input_is_rejected() {
     let daemon = Daemon::start_with_network(true);
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

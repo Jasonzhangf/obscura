@@ -225,14 +225,24 @@ async fn execute(page: &mut Option<Page>, command: Command, operation: &Operatio
         Ok(Some(ResultValue::Closed { closed: true }))
     } else if let Some(page) = page.as_mut() {
         match command {
-            Command::Navigate { url } => match timeout(BUDGET, page_work(page.navigate(&url))).await {
+            Command::Navigate { url } => match timeout(
+                BUDGET,
+                page_work(page.navigate_with_wait(
+                    &url,
+                    obscura_browser::lifecycle::WaitUntil::DomContentLoaded,
+                )),
+            )
+            .await
+            {
                 Ok(Ok(())) => Ok(Some(ResultValue::Input { input: input_receipt(operation) })),
                 Ok(Err(cause)) => Err(("NAVIGATION_FAILED", cause.to_string())),
-                Err(_) => {
-                    let cause = "Navigation deadline: partial outcome; recreate session explicitly".to_string();
-                    fault = Some(cause.clone());
-                    Err(("OUTCOME_UNKNOWN", cause))
+                Err(_) if page.navigation_committed() => {
+                    Ok(Some(ResultValue::Input { input: input_receipt(operation) }))
                 }
+                Err(_) => Err((
+                    "NAVIGATION_FAILED",
+                    "Navigation deadline before main document commit".into(),
+                )),
             },
             Command::Evaluate { expression } => {
                 if let Some(js) = page.js.as_mut() {

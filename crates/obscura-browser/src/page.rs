@@ -294,6 +294,10 @@ pub struct Page {
     navigation_timeout: Option<std::time::Duration>,
     /// Optional per-page cap. Pages without a value keep the default.
     navigation_chain_limit: Option<usize>,
+    /// True once the requested navigation has a committed main document.
+    /// Explicit Host navigation uses this to distinguish a pre-commit timeout
+    /// from a committed navigation whose load event is still pending.
+    navigation_committed: bool,
     /// Navigation history for Page.getNavigationHistory / navigateToHistoryEntry.
     /// Entries are URLs in visit order; `history_index` is the current position.
     /// Pushed on every successful navigation; truncated on goBack -> new nav.
@@ -1155,6 +1159,7 @@ impl Page {
             document_timeline_origin: std::time::Instant::now(),
             navigation_timeout: None,
             navigation_chain_limit: None,
+            navigation_committed: false,
             history: Vec::new(),
             history_index: 0,
             network_events: Vec::new(),
@@ -1199,6 +1204,13 @@ impl Page {
     pub fn navigation_chain_limit(&self) -> usize {
         self.navigation_chain_limit
             .unwrap_or_else(default_navigation_chain_limit)
+    }
+
+    /// Whether the current document has been committed. This is deliberately
+    /// separate from lifecycle `Loaded`: a main document may be committed while
+    /// parser work, dynamic scripts, or `load` listeners are still pending.
+    pub fn navigation_committed(&self) -> bool {
+        self.navigation_committed
     }
 
     fn should_block_url(&self, url: &str) -> bool {
@@ -2122,7 +2134,8 @@ impl Page {
     }
 
     async fn execute_scripts(&mut self) {
-        self.execute_scripts_with_module_budget(None).await;
+        self.execute_scripts_with_module_budget_and_load_wait(None, true)
+            .await;
     }
 
     /// Drive only dynamic script elements which participate in the current
@@ -2176,7 +2189,33 @@ impl Page {
         true
     }
 
+    fn fire_load_event(js: &mut ObscuraJsRuntime) {
+        // readyState becomes complete before the load event. A script inserted
+        // by an onload handler is post-load work and remains pending for the
+        // autonomous page pump or an explicit caller settle.
+        let _ = js.execute_script(
+            "<load-event>",
+            "globalThis.__documentReadyState__ = 'complete';\n\
+             try {\n\
+               const loadEvent = new Event('load', {bubbles:false,cancelable:false});\n\
+               if (typeof window.onload === 'function') {\n\
+                 try { window.onload.call(window, loadEvent); } catch(e) {}\n\
+               }\n\
+               try { window.dispatchEvent(loadEvent); } catch(e) {}\n\
+             } catch(e) {}",
+        );
+    }
+
     async fn execute_scripts_with_module_budget(&mut self, module_budget_override: Option<u64>) {
+        self.execute_scripts_with_module_budget_and_load_wait(module_budget_override, true)
+            .await;
+    }
+
+    async fn execute_scripts_with_module_budget_and_load_wait(
+        &mut self,
+        module_budget_override: Option<u64>,
+        drive_load_phase: bool,
+    ) {
         let scripts_started = std::time::Instant::now();
         tracing::info!(
             "execute_scripts called, js runtime exists: {}",
@@ -2906,28 +2945,16 @@ impl Page {
                  try { window.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false})); } catch(e) {}",
             );
 
-            let load_blockers_finished =
-                Self::drive_load_delaying_scripts(js, script_deadline).await;
-            if !load_blockers_finished {
-                tracing::warn!(
-                    "script deadline reached with load-delaying dynamic scripts still pending"
-                );
+            if drive_load_phase {
+                let load_blockers_finished =
+                    Self::drive_load_delaying_scripts(js, script_deadline).await;
+                if !load_blockers_finished {
+                    tracing::warn!(
+                        "script deadline reached with load-delaying dynamic scripts still pending"
+                    );
+                }
+                Self::fire_load_event(js);
             }
-
-            // readyState becomes complete before the load event. A script
-            // inserted by an onload handler is therefore post-load work and
-            // remains pending until an explicit caller settle/wait.
-            let _ = js.execute_script(
-                "<load-event>",
-                "globalThis.__documentReadyState__ = 'complete';\n\
-                 try {\n\
-                   const loadEvent = new Event('load', {bubbles:false,cancelable:false});\n\
-                   if (typeof window.onload === 'function') {\n\
-                     try { window.onload.call(window, loadEvent); } catch(e) {}\n\
-                   }\n\
-                   try { window.dispatchEvent(loadEvent); } catch(e) {}\n\
-                 } catch(e) {}",
-            );
         }
         if let Some(token) = exec_wd {
             if let Some(js) = self.js.as_mut() {
@@ -3082,6 +3109,14 @@ impl Page {
             Some(js) => js.run_autonomous_event_loop_turn().await,
             None => Ok(true),
         }?;
+        if self.lifecycle == LifecycleState::DomContentLoaded {
+            if let Some(js) = self.js.as_mut() {
+                if !js.has_pending_load_delaying_scripts() {
+                    Self::fire_load_event(js);
+                    self.lifecycle = LifecycleState::Loaded;
+                }
+            }
+        }
         // Dynamic iframe fetches finish on the page event loop, but their
         // realms must be built by Page between turns. Keep the autonomous CDP
         // pump on the same generic frame path as settle(), so a client that
@@ -3205,6 +3240,7 @@ impl Page {
     ) -> Result<(), PageError> {
         let url = Url::parse(url_str).map_err(|e| PageError::InvalidUrl(e.to_string()))?;
 
+        self.navigation_committed = false;
         self.lifecycle = LifecycleState::Loading;
         self.referrer = referrer.to_string();
         self.url = Some(url.clone());
@@ -3248,6 +3284,7 @@ impl Page {
         if url.scheme() == "about" {
             self.navigate_blank();
             self.init_js();
+            self.navigation_committed = true;
             // Preloads (Page.addScriptToEvaluateOnNewDocument, the
             // Runtime.addBinding shim) must run on about:blank too —
             // puppeteer's `browser.newPage()` lands on about:blank and
@@ -3330,6 +3367,10 @@ impl Page {
 
         self.dom = Some(dom);
         self.init_js();
+        // Main document commit occurs before load-delaying subresources and
+        // load handlers. Host navigation may acknowledge this boundary while
+        // the autonomous page pump continues the remaining load phase.
+        self.navigation_committed = true;
         let author_stylesheets = self.fetch_stylesheets().await;
 
         // Inject CSS as a global so getComputedStyle and any CSS-aware shim
@@ -3552,6 +3593,7 @@ impl Page {
             "<!DOCTYPE html><html><head></head><body></body></html>",
         ));
         self.title = String::new();
+        self.navigation_committed = true;
         self.lifecycle = LifecycleState::Loaded;
         self.document_timeline_origin = std::time::Instant::now();
     }
