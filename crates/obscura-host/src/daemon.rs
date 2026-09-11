@@ -619,6 +619,7 @@ mod tests {
             fault: None,
             control: Control { epoch: 1, phase: ControlPhase::Agent },
             records: HashMap::new(),
+            operation_ids: HashMap::new(),
             retired: HashSet::new(),
             viewport_owner: None,
             viewport_update: None,
@@ -632,7 +633,7 @@ mod tests {
         let first_operation = operation("op-1");
         let command = Command::Evaluate { expression: "window.count = (window.count || 0) + 1".into() };
         let cached = Response::Result { id: 9, value: ResultValue::Closed { closed: true } };
-        session.records.insert(1, Record { operation: first_operation.clone(), command: command.clone(), response: Some(cached) });
+        session.records.entry(1).or_default().push_back(Record { operation: first_operation.clone(), command: command.clone(), response: Some(cached) });
 
         let duplicate = Request { id: 11, command: command.clone(), operation: Some(first_operation.clone()) };
         match session.request(1, duplicate, false) {
