@@ -444,6 +444,12 @@ impl ParserAsyncScriptContinuation {
         self.tasks.is_empty()
     }
 
+    fn abort(&mut self) {
+        for task in self.tasks.iter_mut() {
+            task.abort();
+        }
+    }
+
     fn spawn(
         &mut self,
         nid: u32,
@@ -1576,7 +1582,9 @@ impl Page {
 
     fn cancel_navigation_continuation(&mut self) {
         self.navigation_continuation = None;
-        self.parser_async_continuation = None;
+        if let Some(mut continuation) = self.parser_async_continuation.take() {
+            continuation.abort();
+        }
     }
 
     fn should_block_url(&self, url: &str) -> bool {
@@ -6066,6 +6074,138 @@ mod tests {
                 .unwrap()
                 .as_f64(),
             Some(0.0)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn new_host_navigation_aborts_pending_parser_async_script_fetch() {
+        use std::io::{Read as _, Write as _};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let origin = format!("http://{address}");
+        let response_origin = origin.clone();
+        let (script_seen_tx, script_seen_rx) = std::sync::mpsc::channel();
+        let (release_script_tx, release_script_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let mut request = [0u8; 4096];
+            let (mut stream, _) = listener.accept().unwrap();
+            let length = stream.read(&mut request).unwrap();
+            assert!(String::from_utf8_lossy(&request[..length]).contains("GET /old HTTP/1.1"));
+            let body = format!(
+                "<title>old</title><script async src='{response_origin}/old.js'></script>"
+            );
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+
+            let (mut old_script_stream, _) = listener.accept().unwrap();
+            let length = old_script_stream.read(&mut request).unwrap();
+            assert!(
+                String::from_utf8_lossy(&request[..length]).contains("GET /old.js HTTP/1.1")
+            );
+            script_seen_tx.send(()).unwrap();
+
+            // Accept the replacement document before waiting for the test to
+            // release the old script. This proves the cancelled request does
+            // not keep the Page's HTTP client occupied.
+            let (mut stream, _) = listener.accept().unwrap();
+            let length = stream.read(&mut request).unwrap();
+            assert!(String::from_utf8_lossy(&request[..length]).contains("GET /new HTTP/1.1"));
+            let body = "<title>new</title><div class='new'>new</div>";
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+
+            release_script_rx
+                .recv_timeout(std::time::Duration::from_secs(8))
+                .expect("test did not release the cancelled parser script");
+            let body = "globalThis.__old_script_ran = true;";
+            let _ = write!(
+                old_script_stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        });
+
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "abort-parser-async-script".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("abort-parser-async-script".to_string(), context);
+        let old_script_responses = std::sync::Arc::new(AtomicUsize::new(0));
+        let observed_old_script_responses = old_script_responses.clone();
+        page.on_response(std::sync::Arc::new(move |request, _| {
+            if request.url.path() == "/old.js" {
+                observed_old_script_responses.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+
+        page.navigate_for_host(&format!("{origin}/old"))
+            .await
+            .unwrap();
+        assert!(!page.run_navigation_continuation_turn().await.unwrap());
+        assert!(page.run_navigation_continuation_turn().await.unwrap());
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                page.run_navigation_continuation_turn(),
+            )
+            .await
+            .is_err(),
+            "the parser async script should remain pending"
+        );
+        script_seen_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("parser async script request did not start");
+        assert_eq!(page.http_client.active_requests(), 1);
+
+        page.navigate_for_host(&format!("{origin}/new"))
+            .await
+            .unwrap();
+        assert!(!page.run_navigation_continuation_turn().await.unwrap());
+        assert!(page.run_navigation_continuation_turn().await.unwrap());
+        let client = page.http_client.clone();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async move {
+            while client.active_requests() != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("cancelled parser async script remained in flight");
+        assert_eq!(page.http_client.active_requests(), 0);
+
+        release_script_tx.send(()).unwrap();
+        server.join().unwrap();
+
+        assert_eq!(old_script_responses.load(Ordering::SeqCst), 0);
+        assert!(!page.has_navigation_continuation());
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("document.title")
+                .unwrap(),
+            serde_json::json!("new")
+        );
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("typeof globalThis.__old_script_ran")
+                .unwrap(),
+            serde_json::json!("undefined")
         );
     }
 
