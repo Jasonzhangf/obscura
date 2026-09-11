@@ -226,7 +226,7 @@ async fn execute(page: &mut Option<Page>, command: Command, operation: &Operatio
     } else if let Some(page) = page.as_mut() {
         match command {
             Command::Navigate { url } => match timeout(BUDGET, page_work(page.navigate(&url))).await {
-                Ok(Ok(())) => Ok(None),
+                Ok(Ok(())) => Ok(Some(ResultValue::Input { input: input_receipt(operation) })),
                 Ok(Err(cause)) => Err(("NAVIGATION_FAILED", cause.to_string())),
                 Err(_) => {
                     let cause = "Navigation deadline: partial outcome; recreate session explicitly".to_string();
@@ -264,12 +264,7 @@ async fn execute(page: &mut Option<Page>, command: Command, operation: &Operatio
                     let result = timeout(BUDGET, page_work(obscura_browser::input::perform(page, input))).await;
                     let fired = page.js.as_mut().expect("input retains runtime").disarm_watchdog(watchdog);
                     match result {
-                        Ok(Ok(())) if !fired => Ok(Some(ResultValue::Input { input: InputReceipt {
-                            operation_id: operation.operation_id.clone(), session_id: operation.session_id.clone(),
-                            attachment_id: operation.attachment_id, sequence: operation.sequence,
-                            control_epoch: operation.control_epoch, viewport_revision: operation.viewport_revision,
-                            document_revision: operation.document_revision, state: InputState::Succeeded,
-                        } })),
+                        Ok(Ok(())) if !fired => Ok(Some(ResultValue::Input { input: input_receipt(operation) })),
                         Ok(Err(InputError::Rejected(cause))) if !fired => Err(("INPUT_REJECTED", cause)),
                         outcome => {
                             let cause = match outcome {
@@ -286,6 +281,19 @@ async fn execute(page: &mut Option<Page>, command: Command, operation: &Operatio
         }
     } else { Err(("SESSION_CLOSED", "Session was explicitly closed".into())) };
     Completion { result, viewport: page.as_ref().map(|page| page.viewport), fault, document_revision: 0, viewport_revision: 0 }
+}
+
+fn input_receipt(operation: &Operation) -> InputReceipt {
+    InputReceipt {
+        operation_id: operation.operation_id.clone(),
+        session_id: operation.session_id.clone(),
+        attachment_id: operation.attachment_id,
+        sequence: operation.sequence,
+        control_epoch: operation.control_epoch,
+        viewport_revision: operation.viewport_revision,
+        document_revision: operation.document_revision,
+        state: InputState::Succeeded,
+    }
 }
 
 fn stamp_input_receipt(

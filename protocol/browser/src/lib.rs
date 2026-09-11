@@ -129,7 +129,7 @@ pub enum ResultValue {
     WebRtcConsumed { session_id: String, attachment_id: u64 },
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct InputReceipt {
     pub operation_id: OperationId,
     pub session_id: String,
@@ -140,7 +140,7 @@ pub struct InputReceipt {
     pub document_revision: u64,
     pub state: InputState,
 }
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InputState { Succeeded }
 
@@ -351,7 +351,7 @@ pub struct WebRtcProbeReport {
 
 #[cfg(test)]
 mod tests {
-    use super::{Operation, OperationId};
+    use super::{InputReceipt, InputState, Operation, OperationId};
 
     #[test]
     fn operation_id_is_required_and_round_trips_as_a_typed_field() {
@@ -377,5 +377,38 @@ mod tests {
             "document_revision": 19
         });
         assert!(serde_json::from_value::<Operation>(missing).is_err());
+    }
+
+    #[test]
+    fn input_receipt_round_trips_the_complete_operation_abi() {
+        let receipt = InputReceipt {
+            operation_id: OperationId("navigate-1".into()),
+            session_id: "session".into(),
+            attachment_id: 7,
+            sequence: 11,
+            control_epoch: 13,
+            viewport_revision: 17,
+            document_revision: 19,
+            state: InputState::Succeeded,
+        };
+        let encoded = serde_json::to_value(&receipt).unwrap();
+        for field in [
+            "operation_id", "session_id", "attachment_id", "sequence",
+            "control_epoch", "viewport_revision", "document_revision", "state",
+        ] {
+            assert!(encoded.get(field).is_some(), "missing receipt field {field}");
+        }
+        assert_eq!(serde_json::from_value::<InputReceipt>(encoded).unwrap(), receipt);
+
+        let missing_state = serde_json::json!({
+            "operation_id": "navigate-1",
+            "session_id": "session",
+            "attachment_id": 7,
+            "sequence": 11,
+            "control_epoch": 13,
+            "viewport_revision": 17,
+            "document_revision": 19
+        });
+        assert!(serde_json::from_value::<InputReceipt>(missing_state).is_err());
     }
 }

@@ -185,50 +185,52 @@ async fn main() -> Result<()> {
             let navigate_operation = operation_for(&status)?;
             let navigated = request_dc(&data_channel, &mut control_rx, &track, &mut media, &session_id,
                 Request { id: 103, command: Command::Navigate { url: INPUT_FIXTURE.into() }, operation: Some(navigate_operation.clone()) }).await?;
-            status = status_from_response(navigated)?;
+            expect_input(navigated)?;
+            status = status_from_response(request_dc(&data_channel, &mut control_rx, &track, &mut media, &session_id,
+                Request { id: 104, command: Command::Status {}, operation: None }).await?)?;
 
             let mut stale_document = operation_for(&status)?;
             stale_document.document_revision = navigate_operation.document_revision;
             let stale_document_response = request_dc(&data_channel, &mut control_rx, &track, &mut media, &session_id,
-                Request { id: 104, command: Command::Click { x: args.click_x, y: args.click_y }, operation: Some(stale_document) }).await?;
+                Request { id: 105, command: Command::Click { x: args.click_x, y: args.click_y }, operation: Some(stale_document) }).await?;
             expect_error(stale_document_response, "STALE_DOCUMENT")?;
 
             let mut stale_operation = operation_for(&status)?;
             stale_operation.control_epoch = initial_epoch;
             let stale_control_response = request_dc(&data_channel, &mut control_rx, &track, &mut media, &session_id,
-                Request { id: 105, command: Command::Click { x: args.click_x, y: args.click_y }, operation: Some(stale_operation) }).await?;
+                Request { id: 106, command: Command::Click { x: args.click_x, y: args.click_y }, operation: Some(stale_operation) }).await?;
             expect_error(stale_control_response, "STALE_CONTROL")?;
 
             let click_operation = operation_for(&status)?;
             let clicked = request_dc(&data_channel, &mut control_rx, &track, &mut media, &session_id,
-                Request { id: 106, command: Command::Click { x: args.click_x, y: args.click_y }, operation: Some(click_operation.clone()) }).await?;
+                Request { id: 107, command: Command::Click { x: args.click_x, y: args.click_y }, operation: Some(click_operation.clone()) }).await?;
             expect_input(clicked)?;
             let duplicate = request_dc(&data_channel, &mut control_rx, &track, &mut media, &session_id,
-                Request { id: 107, command: Command::Click { x: args.click_x, y: args.click_y }, operation: Some(click_operation) }).await?;
+                Request { id: 108, command: Command::Click { x: args.click_x, y: args.click_y }, operation: Some(click_operation) }).await?;
             expect_input(duplicate)?;
             status = status_from_response(request_dc(&data_channel, &mut control_rx, &track, &mut media, &session_id,
-                Request { id: 108, command: Command::Status {}, operation: None }).await?)?;
+                Request { id: 109, command: Command::Status {}, operation: None }).await?)?;
 
             let focus_click = request_dc(&data_channel, &mut control_rx, &track, &mut media, &session_id,
-                Request { id: 109, command: Command::Click { x: 30.0, y: 95.0 }, operation: Some(operation_for(&status)?) }).await?;
+                Request { id: 110, command: Command::Click { x: 30.0, y: 95.0 }, operation: Some(operation_for(&status)?) }).await?;
             expect_input(focus_click)?;
             status = status_from_response(request_dc(&data_channel, &mut control_rx, &track, &mut media, &session_id,
-                Request { id: 110, command: Command::Status {}, operation: None }).await?)?;
+                Request { id: 111, command: Command::Status {}, operation: None }).await?)?;
 
             let input = request_dc(&data_channel, &mut control_rx, &track, &mut media, &session_id,
-                Request { id: 111, command: Command::InputText { text: "移动端中文输入".into() }, operation: Some(operation_for(&status)?) }).await?;
+                Request { id: 112, command: Command::InputText { text: "移动端中文输入".into() }, operation: Some(operation_for(&status)?) }).await?;
             expect_input(input)?;
             status = status_from_response(request_dc(&data_channel, &mut control_rx, &track, &mut media, &session_id,
-                Request { id: 112, command: Command::Status {}, operation: None }).await?)?;
+                Request { id: 113, command: Command::Status {}, operation: None }).await?)?;
 
             let scroll = request_dc(&data_channel, &mut control_rx, &track, &mut media, &session_id,
-                Request { id: 113, command: Command::Scroll { x: 30.0, y: 100.0, delta_x: 0.0, delta_y: 400.0 }, operation: Some(operation_for(&status)?) }).await?;
+                Request { id: 114, command: Command::Scroll { x: 30.0, y: 100.0, delta_x: 0.0, delta_y: 400.0 }, operation: Some(operation_for(&status)?) }).await?;
             expect_input(scroll)?;
             status = status_from_response(request_dc(&data_channel, &mut control_rx, &track, &mut media, &session_id,
-                Request { id: 114, command: Command::Status {}, operation: None }).await?)?;
+                Request { id: 115, command: Command::Status {}, operation: None }).await?)?;
 
             let released = request_dc(&data_channel, &mut control_rx, &track, &mut media, &session_id,
-                Request { id: 115, command: Command::ReleaseControl { epoch: status.control.epoch }, operation: None }).await?;
+                Request { id: 116, command: Command::ReleaseControl { epoch: status.control.epoch }, operation: None }).await?;
             status = status_from_response(released)?;
             ensure!(matches!(status.control.phase, ControlPhase::Agent), "Host did not release WebRTC human control");
             browser_path_done = true;

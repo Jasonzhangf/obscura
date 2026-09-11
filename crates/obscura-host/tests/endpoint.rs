@@ -39,6 +39,7 @@ async fn exercise() {
     let mut line = String::new(); local.read_line(&mut line).await.unwrap();
     let mut state = local_request(&mut local, serde_json::json!({"id":1,"command":{"type":"attach","mode":"agent"}})).await;
     state = local_request(&mut local, serde_json::json!({"id":2,"operation":identity(&state),"command":{"type":"navigate","url":"data:text/html,<button id='target' style='width:200px;height:100px' onclick='window.clicked=1'>remote click</button>"}})).await;
+    assert_eq!(state["state"], "succeeded");
     assert_eq!(state["document_revision"], 1);
     // Reserve a loopback port only for this test's explicit listener.
     let reservation = std::net::TcpListener::bind((bind_ip, 0)).unwrap();

@@ -508,9 +508,23 @@ fn human_navigation_respects_control_identity_and_document_revision() {
     assert_eq!(observer.send(json!({"type":"navigate","url":"file:///blocked"}))["code"], "INVALID_URL");
 
     let before = observer.ok(json!({"type":"status"}));
-    let after = observer.ok(json!({"type":"navigate","url":"data:text/html,<title>after</title>"}));
+    let navigate_request = json!({"id":203,"operation":identity(&before),"command":{"type":"navigate","url":"data:text/html,<title>after</title>"}});
+    let first = observer.raw(navigate_request.clone());
+    assert_eq!(first["type"], "result", "{first}");
+    let after = first["value"].clone();
+    assert_eq!(after["state"], "succeeded");
+    assert_eq!(after["operation_id"], format!("op-{}", before["next_sequence"]));
+    assert_eq!(after["session_id"], before["session_id"]);
+    assert_eq!(after["attachment_id"], attached["attachment_id"]);
+    assert_eq!(after["sequence"], before["next_sequence"]);
+    assert_eq!(after["control_epoch"], before["control"]["epoch"]);
+    assert_eq!(after["viewport_revision"], before["viewport_revision"]);
     assert_eq!(after["document_revision"].as_u64(), Some(before["document_revision"].as_u64().unwrap() + 1));
-    observer.ok(json!({"type":"release_control","epoch":after["control"]["epoch"]}));
+    let replay = observer.raw(navigate_request);
+    assert_eq!(replay["type"], "result", "{replay}");
+    assert_eq!(replay["value"], after);
+    assert_eq!(observer.ok(json!({"type":"status"}))["document_revision"], after["document_revision"]);
+    observer.ok(json!({"type":"release_control","epoch":after["control_epoch"]}));
     assert_eq!(agent.eval("document.title"), "after");
 }
 
@@ -803,7 +817,8 @@ fn unknown_outcome_never_grants_pending_takeover() {
     let daemon = Daemon::start();
     let mut agent = daemon.connect();
     agent.ok(json!({"type":"attach","mode":"agent"}));
-    let status = agent.ok(json!({"type":"navigate","url":"data:text/html,<button style='position:absolute;left:10px;top:10px;width:200px;height:60px' onmousedown='while(true){}'>stuck press</button>"}));
+    agent.ok(json!({"type":"navigate","url":"data:text/html,<button style='position:absolute;left:10px;top:10px;width:200px;height:60px' onmousedown='while(true){}'>stuck press</button>"}));
+    let status = agent.ok(json!({"type":"status"}));
     let mut human = daemon.connect(); human.ok(json!({"type":"attach","mode":"observe"}));
     writeln!(agent.0.get_mut(), "{}", json!({"id":7,"operation":identity(&status),"command":{"type":"click","x":30,"y":30}})).unwrap();
     let deadline = Instant::now() + Duration::from_secs(1);
