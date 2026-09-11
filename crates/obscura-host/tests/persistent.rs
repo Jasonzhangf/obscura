@@ -407,7 +407,8 @@ fn viewers_share_raw_frames_and_follow_input_and_viewport_changes() {
     let daemon = Daemon::start();
     let mut agent = daemon.connect(); agent.ok(json!({"type":"attach","mode":"agent"}));
     agent.ok(json!({"type":"resize","width":160,"height":120}));
-    let state = agent.ok(json!({"type":"navigate","url":"data:text/html,<style>html,body{margin:0;background:rgb(12,34,56)}button{position:absolute;left:0;top:0;width:40px;height:40px;border:0;background:rgb(255,0,0)}</style><button id='tile' onclick=\"this.style.background='rgb(0,255,0)'\"></button><input id='retained' value='same document' style='position:absolute;left:50px;top:50px;width:100px;height:30px'>"}));
+    agent.ok(json!({"type":"navigate","url":"data:text/html,<style>html,body{margin:0;background:rgb(12,34,56)}button{position:absolute;left:0;top:0;width:40px;height:40px;border:0;background:rgb(255,0,0)}</style><button id='tile' onclick=\"this.style.background='rgb(0,255,0)'\"></button><input id='retained' value='same document' style='position:absolute;left:50px;top:50px;width:100px;height:30px'>"}));
+    let state = agent.ok(json!({"type":"status"}));
     assert_eq!(std::fs::metadata(daemon.dir.join("frames.sock")).unwrap().permissions().mode() & 0o777, 0o600);
     let mut first = Media::connect(&daemon); let mut second = Media::connect(&daemon);
     let (mut a, mut pixels_a) = first.frame(); let (mut b, mut pixels_b) = second.frame();
