@@ -511,7 +511,8 @@ fn human_navigation_respects_control_identity_and_document_revision() {
     let navigate_request = json!({"id":203,"operation":identity(&before),"command":{"type":"navigate","url":"data:text/html,<title>after</title>"}});
     let first = observer.raw(navigate_request.clone());
     assert_eq!(first["type"], "result", "{first}");
-    let after = first["value"].clone();
+    let value = first["value"].clone();
+    let after = value["input"].clone();
     assert_eq!(after["state"], "succeeded");
     assert_eq!(after["operation_id"], format!("op-{}", before["next_sequence"]));
     assert_eq!(after["session_id"], before["session_id"]);
@@ -522,7 +523,7 @@ fn human_navigation_respects_control_identity_and_document_revision() {
     assert_eq!(after["document_revision"].as_u64(), Some(before["document_revision"].as_u64().unwrap() + 1));
     let replay = observer.raw(navigate_request);
     assert_eq!(replay["type"], "result", "{replay}");
-    assert_eq!(replay["value"], after);
+    assert_eq!(replay["value"], value);
     assert_eq!(observer.ok(json!({"type":"status"}))["document_revision"], after["document_revision"]);
     observer.ok(json!({"type":"release_control","epoch":after["control_epoch"]}));
     assert_eq!(agent.eval("document.title"), "after");
