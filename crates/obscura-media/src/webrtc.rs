@@ -15,7 +15,8 @@ use anyhow::{Context, Result, bail, ensure};
 use obscura_host_protocol::{
     WEBRTC_CONTROL_LABEL, WEBRTC_H264_FMTP, WEBRTC_PROTOCOL_VERSION, WebRtcCandidateEvidence,
     WebRtcCapability, WebRtcControlMessage, WebRtcDataChannelEvidence, WebRtcFrameEvidence,
-    WebRtcNetworkPath, WebRtcProbeReport, WebRtcSessionBinding, WebRtcTransport, WebRtcVideoCodec,
+    SourceDimensions, WebRtcNetworkPath, WebRtcProbeReport, WebRtcSessionBinding, WebRtcTransport,
+    WebRtcVideoCodec,
 };
 use rtc::{
     media::{Sample, io::sample_builder::SampleBuilder},
@@ -87,8 +88,7 @@ pub async fn run_local_webrtc_probe(input: WebRtcProbeInput) -> Result<WebRtcPro
         "encoded access unit exceeds negotiated WebRTC media budget"
     );
 
-    let coded_width = even_dimension(input.width);
-    let coded_height = even_dimension(input.height);
+    let source_dimensions = SourceDimensions::from_raw(input.width, input.height);
 
     let offerer_gather = Arc::new(Notify::new());
     let offerer_connected = Arc::new(Notify::new());
@@ -257,8 +257,7 @@ pub async fn run_local_webrtc_probe(input: WebRtcProbeInput) -> Result<WebRtcPro
     let receiver_task = tokio::spawn(receive_and_decode_h264(
         answerer_track_rx,
         input.ffmpeg.clone(),
-        coded_width,
-        coded_height,
+        source_dimensions,
         track_ready_tx,
     ));
     // The first RTP packet opens the remote track. Wait for that typed
@@ -417,10 +416,6 @@ pub(crate) fn h264_media_track() -> MediaStreamTrack {
     )
 }
 
-fn even_dimension(value: u32) -> u32 {
-    value.saturating_add(1) & !1
-}
-
 pub(crate) async fn wait_for_notify(notify: &Notify, description: &str) -> Result<()> {
     timeout(PROBE_TIMEOUT, notify.notified())
         .await
@@ -543,8 +538,7 @@ async fn service_answerer_control(
 async fn receive_and_decode_h264(
     mut track_rx: mpsc::Receiver<Arc<dyn TrackRemote>>,
     ffmpeg: PathBuf,
-    coded_width: u32,
-    coded_height: u32,
+    source_dimensions: SourceDimensions,
     track_ready_tx: oneshot::Sender<()>,
 ) -> Result<WebRtcFrameEvidence> {
     let track = timeout(PROBE_TIMEOUT, track_rx.recv())
@@ -575,11 +569,15 @@ async fn receive_and_decode_h264(
                         "reassembled H.264 access unit exceeds media budget"
                     );
                     let (decoded_rgba_bytes, decoded_rgba_checksum, decoded_nonzero) =
-                        decode_access_unit(&ffmpeg, coded_width, coded_height, &sample.data)
-                            .await?;
+                        decode_access_unit(
+                            &ffmpeg,
+                            source_dimensions.width,
+                            source_dimensions.height,
+                            &sample.data,
+                        )
+                        .await?;
                     return Ok(WebRtcFrameEvidence {
-                        coded_width,
-                        coded_height,
+                        source_dimensions,
                         rtp_packets_received: packet_count,
                         access_unit_bytes: sample.data.len() as u64,
                         decoded_rgba_bytes: decoded_rgba_bytes as u64,

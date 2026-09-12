@@ -7,7 +7,7 @@ use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use obscura_host_protocol::{Command, ControlPhase, InputState, Mode, Operation, PixelFormat,
     Request, Response, ResultValue, SessionStatus, WebRtcCapability, WebRtcControlMessage,
-    WebRtcSignal, WebRtcVideoCodec, WebRtcVideoFrame, WebRtcTransport,
+    SourceDimensions, WebRtcSignal, WebRtcVideoCodec, WebRtcVideoFrame, WebRtcTransport,
     WEBRTC_CONTROL_LABEL, WEBRTC_PROTOCOL_VERSION};
 use rtc::{media::io::sample_builder::SampleBuilder, rtp::codec::h264::H264Packet,
     rtp_transceiver::{RTCRtpTransceiverDirection, RTCRtpTransceiverInit},
@@ -161,7 +161,12 @@ async fn main() -> Result<()> {
         while let Some((rtp_timestamp, descriptor, sample)) = media.take_matching() {
             validate_video_frame(&descriptor, &sample, rtp_timestamp, &session_id, &mut last_sequence, &mut last_pts,
                 &mut last_encoder_id, &mut last_dimensions)?;
-            let decoded = decode_sample(&sample.data, descriptor.coded_width, descriptor.coded_height).await?;
+            let decoded = decode_sample(
+                &sample.data,
+                descriptor.source.source_dimensions.width,
+                descriptor.source.source_dimensions.height,
+            )
+            .await?;
             let changed = last_checksum.is_some_and(|checksum| checksum != decoded.checksum);
             last_checksum = Some(decoded.checksum);
             evidence.push(FrameEvidence { descriptor, checksum: decoded.checksum, rtp_packets: sample.packet_count, changed });
@@ -278,8 +283,7 @@ async fn main() -> Result<()> {
             "codec": frame.descriptor.codec,
             "keyframe": frame.descriptor.keyframe,
             "access_unit_bytes": frame.descriptor.access_unit_bytes,
-            "coded_width": frame.descriptor.coded_width,
-            "coded_height": frame.descriptor.coded_height,
+            "source_dimensions": frame.descriptor.source.source_dimensions,
             "pts_us": frame.descriptor.pts_us,
             "checksum": frame.checksum,
             "rtp_packets": frame.rtp_packets,
@@ -361,8 +365,6 @@ impl MediaAssociations {
     }
 }
 
-fn even_dimension(value: u32) -> u32 { value.saturating_add(1) & !1 }
-
 fn validate_descriptor(descriptor: &WebRtcVideoFrame, session_id: &str) -> Result<()> {
     ensure!(descriptor.source.session_id == session_id, "WebRTC frame session identity differs from Host session");
     ensure!(matches!(descriptor.source.pixel_format, PixelFormat::PremultipliedRgba8),
@@ -377,9 +379,10 @@ fn validate_descriptor(descriptor: &WebRtcVideoFrame, session_id: &str) -> Resul
     ensure!(descriptor.keyframe, "WebRTC frame is not independently decodable");
     ensure!(descriptor.access_unit_bytes > 0 && descriptor.access_unit_bytes <= obscura_media::MAX_ACCESS_UNIT as u64,
         "WebRTC frame access-unit length is invalid");
-    ensure!(descriptor.coded_width == even_dimension(descriptor.source.width)
-        && descriptor.coded_height == even_dimension(descriptor.source.height),
-        "WebRTC frame coded dimensions do not match source dimensions");
+    ensure!(descriptor.source.source_dimensions == SourceDimensions::from_raw(
+        descriptor.source.width,
+        descriptor.source.height,
+    ), "WebRTC frame encoded source dimensions do not match raw source dimensions");
     Ok(())
 }
 
@@ -679,9 +682,10 @@ mod association_tests {
             source: obscura_host_protocol::FrameInfo {
                 session_id: "session".into(), sequence, document_revision: 0, viewport_revision: 0,
                 width: 160, height: 120, stride: 640, byte_length: 160 * 120 * 4,
-                pixel_format: PixelFormat::PremultipliedRgba8,
+                pixel_format: PixelFormat::PremultipliedRgba8, rotation: None,
+                source_dimensions: SourceDimensions::from_raw(160, 120),
             },
-            encoder_id: "encoder".into(), rtp_timestamp, coded_width: 160, coded_height: 120,
+            encoder_id: "encoder".into(), rtp_timestamp,
             codec: WebRtcVideoCodec::H264AnnexB, pts_us: sequence, keyframe: true,
             access_unit_bytes: 1,
         }

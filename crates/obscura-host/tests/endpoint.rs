@@ -4,6 +4,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio_rustls::rustls::{self, pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName}};
 use tokio_tungstenite::{client_async, tungstenite::{client::IntoClientRequest, Message}};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use obscura_host_protocol::HOST_PROTOCOL_VERSION;
 
 #[tokio::test]
 async fn mutual_tls_endpoint_preserves_host_and_fences_remote_agent_access() {
@@ -65,7 +66,7 @@ async fn exercise() {
     let (mut control, response) = client_async(format!("wss://localhost:{}/control", address.port()), tls).await.unwrap();
     let token = response.headers()["x-obscura-media-token"].to_str().unwrap().to_string();
     let ready: serde_json::Value = serde_json::from_str(control.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
-    assert_eq!(ready["version"], 5);
+    assert_eq!(ready["version"], HOST_PROTOCOL_VERSION);
     if let Ok(serial) = std::env::var("OBSCURA_ENDPOINT_ADB_SERIAL") {
         assert!(!bind_ip.is_loopback(), "Device probe requires an explicit reachable bind IP");
         // Ephemeral test-only pairing, never installed into device/system trust.

@@ -67,7 +67,7 @@ execute diagnostic JavaScript. The granted human holder can click, insert text
 and scroll through the same admission/receipt owner as Agent input.
 Evaluate remains an Agent diagnostic surface, not the final atomic input API:
 page-created timers/network continue after its completion, as before.
-Request IDs correlate replies only; version 5 requires the separate operation
+Request IDs correlate replies only; version 6 requires the separate operation
 envelope including a typed operation_id and document_revision.
 Typed SessionStatus returns the requesting attachment's connection-scoped ID
 and mode as well as the shared Session ID and viewport. Reconnect creates a new
@@ -87,7 +87,7 @@ execution both locally and at admission, including work already queued when
 an autonomous page callback fails. Graceful shutdown waits for accepted work
 before joining the owning thread.
 
-### Local operation and takeover contract (version 5)
+### Local operation and takeover contract (version 6)
 
 Every browser mutation, including diagnostic evaluation and explicit close,
 requires `operation`: operation_id, session_id, attachment_id, sequence,
@@ -165,7 +165,14 @@ that assignment into frames. Equal dimensions perform no layout or revision
 change. Input rejects old viewport revisions instead of reinterpreting coordinates.
 Control-state push subscriptions are not implemented; clients query status.
 
-### Shared mobile viewport declaration (version 5)
+### Shared mobile viewport declaration (version 6)
+
+Each committed frame carries the typed `source_dimensions` used by the H.264
+encoder. It is derived once from the raw RGBA dimensions (even coded width and
+height); media and WebRTC descriptors reuse that field instead of maintaining
+separate coded-dimension values. A committed explicit orientation carries a
+separate `rotation` identity whose revision advances when orientation changes,
+including equal-size portrait/landscape changes.
 
 The sole ABI is `protocol/browser/src/lib.rs`. Observe attachments may include
 `viewport` in `attach`, then update it with `declare_viewport`. Both are control
@@ -283,7 +290,7 @@ one ABI revision. The raw Host `FramePacket` stream retains its own
 
 This local marker boundary is separate from the WebRTC protocol version. Typed
 WebRTC signaling and DataChannel messages also deny unknown fields, and
-`WEBRTC_PROTOCOL_VERSION` is exactly `4`; the Hello exchange rejects older
+`WEBRTC_PROTOCOL_VERSION` is exactly `5`; the Hello exchange rejects older
 versions. A v4 peer therefore gets the typed `ENCODER_UNAVAILABLE` error
 only after the endpoint has validated the v4 capability and binding. No version
 negotiation, unknown-field tolerance or compatibility fallback is implied by

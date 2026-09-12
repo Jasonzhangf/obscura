@@ -1,6 +1,6 @@
 #![cfg(unix)]
 use std::{os::unix::fs::DirBuilderExt, path::PathBuf, process::Stdio, time::Duration};
-use obscura_host_protocol::{FrameInfo, FramePacket, PixelFormat, VideoPacket};
+use obscura_host_protocol::{FrameInfo, FramePacket, PixelFormat, SourceDimensions, VideoPacket};
 use tokio::{io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader}, net::{UnixListener, UnixStream}};
 
 struct Directory(PathBuf);
@@ -47,18 +47,19 @@ async fn exercise(missing_encoder: bool) {
         let pixels = [0, 128, 0, 255].repeat(width * height);
         let info = FrameInfo { session_id: "live-session".into(), sequence, document_revision: 7,
             viewport_revision: sequence, width: width as u32, height: height as u32, stride: width as u32 * 4,
-            byte_length: pixels.len() as u64, pixel_format: PixelFormat::PremultipliedRgba8 };
+            byte_length: pixels.len() as u64, pixel_format: PixelFormat::PremultipliedRgba8,
+            rotation: None, source_dimensions: SourceDimensions::from_raw(width as u32, height as u32) };
         write(&mut source, &FramePacket::Frame { info }, &pixels).await;
         let (packet, bytes) = read(&mut receiver).await;
         if missing_encoder {
             assert!(matches!(packet, VideoPacket::EncoderUnavailable { .. }));
             assert!(!child.wait().await.unwrap().success()); return;
         }
-        let VideoPacket::AccessUnit { source, encoder_id, pts_us, coded_width, coded_height, keyframe, .. } = packet else { panic!("expected access unit"); };
+        let VideoPacket::AccessUnit { source, encoder_id, pts_us, keyframe, .. } = packet else { panic!("expected access unit"); };
         assert_eq!(source.sequence, sequence); assert_eq!(source.document_revision, 7);
         assert_eq!(source.viewport_revision, sequence);
         assert_eq!((source.width, source.height), (width as u32, height as u32));
-        assert_eq!((coded_width, coded_height), (((width + 1) & !1) as u32, ((height + 1) & !1) as u32));
+        assert_eq!(source.source_dimensions, SourceDimensions::from_raw(width as u32, height as u32));
         assert!(keyframe && !bytes.is_empty());
         if let Some(previous) = encoder { assert_eq!(previous, encoder_id); }
         if let Some(previous) = timestamp { assert!(pts_us > previous); }
@@ -138,7 +139,8 @@ async fn public_adapter_recovers_after_host_unavailable() {
     let pixels = [0, 128, 0, 255].repeat(64 * 48);
     let info = FrameInfo { session_id: "recoverable-session".into(), sequence: 1, document_revision: 1,
         viewport_revision: 1, width: 64, height: 48, stride: 64 * 4,
-        byte_length: pixels.len() as u64, pixel_format: PixelFormat::PremultipliedRgba8 };
+        byte_length: pixels.len() as u64, pixel_format: PixelFormat::PremultipliedRgba8,
+        rotation: None, source_dimensions: SourceDimensions::from_raw(64, 48) };
     write(&mut source, &FramePacket::Frame { info }, &pixels).await;
     assert!(matches!(read(&mut receiver).await.0, VideoPacket::AccessUnit { .. }));
     write(&mut source, &FramePacket::Closed { session_id: "recoverable-session".into() }, &[]).await;

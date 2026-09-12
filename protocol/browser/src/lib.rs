@@ -72,6 +72,40 @@ pub enum Device { Phone, Desktop }
 #[serde(rename_all = "snake_case")]
 pub enum Orientation { Portrait, Landscape }
 
+/// Encoded source surface dimensions derived from the raw RGBA viewport.
+///
+/// `FrameInfo.width` and `FrameInfo.height` remain the visible raw dimensions;
+/// this typed value is the even-dimension source surface consumed by the
+/// encoder. The display must crop the encoded padding back to the raw frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceDimensions {
+    pub width: u32,
+    pub height: u32,
+}
+
+impl SourceDimensions {
+    pub const fn from_raw(width: u32, height: u32) -> Self {
+        Self {
+            width: width.saturating_add(1) & !1,
+            height: height.saturating_add(1) & !1,
+        }
+    }
+}
+
+/// Identity of the explicitly declared page orientation.
+///
+/// The revision advances only when the committed orientation changes. A
+/// viewport-size change is identified by `SessionStatus.viewport_revision`;
+/// keeping these identities separate preserves equal-size layout behavior and
+/// still distinguishes a portrait/landscape transition with the same bounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RotationIdentity {
+    pub orientation: Orientation,
+    pub revision: u64,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Control {
     pub epoch: u64,
@@ -105,6 +139,10 @@ pub struct SessionStatus {
     pub viewport_revision: u64,
     pub document_revision: u64,
     pub viewport: Option<(f32, f32)>,
+    /// Even encoded source dimensions derived from the committed raw viewport.
+    pub source_dimensions: Option<SourceDimensions>,
+    /// Explicit orientation identity for the committed viewport, when one was declared.
+    pub rotation: Option<RotationIdentity>,
     /// Attachment whose declaration supplied the committed viewport; null when unmanaged.
     pub viewport_owner: Option<u64>,
     /// Declaration accepted or layout executing, but not yet committed. Fence new input.
@@ -169,6 +207,10 @@ pub struct FrameInfo {
     pub sequence: u64,
     pub document_revision: u64,
     pub viewport_revision: u64,
+    /// Explicit orientation identity for the frame's committed viewport.
+    pub rotation: Option<RotationIdentity>,
+    /// Even encoded source surface dimensions derived from this raw frame.
+    pub source_dimensions: SourceDimensions,
     pub width: u32,
     pub height: u32,
     pub stride: u32,
@@ -189,8 +231,6 @@ pub enum VideoPacket {
         source: FrameInfo,
         encoder_id: String,
         pts_us: u64,
-        coded_width: u32,
-        coded_height: u32,
         codec: VideoCodec,
         keyframe: bool,
         byte_length: u64,
@@ -206,11 +246,12 @@ pub enum VideoPacket {
 #[serde(rename_all = "snake_case")]
 pub enum VideoCodec { H264AnnexB }
 
-/// Version 5 requires an explicit typed operation ID for every browser mutation.
-pub const HOST_PROTOCOL_VERSION: u32 = 5;
-/// Version 4 carries the version 5 browser operation envelope over DataChannel.
-/// Older peers are rejected during the Hello exchange.
-pub const WEBRTC_PROTOCOL_VERSION: u32 = 4;
+/// Version 6 adds typed encoded source dimensions and rotation identity to Host
+/// status/frame descriptors while retaining the raw frame dimensions.
+pub const HOST_PROTOCOL_VERSION: u32 = 6;
+/// Version 5 carries the version 6 browser operation and media identity fields
+/// over DataChannel. Older peers are rejected during the Hello exchange.
+pub const WEBRTC_PROTOCOL_VERSION: u32 = 5;
 pub const WEBRTC_CONTROL_LABEL: &str = "obscura.control.v1";
 pub const WEBRTC_H264_FMTP: &str = "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f";
 
@@ -287,8 +328,6 @@ pub struct WebRtcVideoFrame {
     /// Exact encoder incarnation from the Host media owner.
     pub encoder_id: String,
     pub rtp_timestamp: u32,
-    pub coded_width: u32,
-    pub coded_height: u32,
     pub codec: WebRtcVideoCodec,
     pub pts_us: u64,
     pub keyframe: bool,
@@ -312,8 +351,7 @@ pub struct WebRtcCandidateEvidence {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WebRtcFrameEvidence {
-    pub coded_width: u32,
-    pub coded_height: u32,
+    pub source_dimensions: SourceDimensions,
     pub rtp_packets_received: u64,
     pub access_unit_bytes: u64,
     pub decoded_rgba_bytes: u64,
@@ -351,7 +389,26 @@ pub struct WebRtcProbeReport {
 
 #[cfg(test)]
 mod tests {
-    use super::{InputReceipt, InputState, Operation, OperationId};
+    use super::{InputReceipt, InputState, Operation, OperationId, Orientation, RotationIdentity, SourceDimensions};
+
+    #[test]
+    fn encoded_source_dimensions_keep_raw_and_padded_sizes_typed() {
+        assert_eq!(SourceDimensions::from_raw(347, 580), SourceDimensions { width: 348, height: 580 });
+        assert_eq!(SourceDimensions::from_raw(348, 580), SourceDimensions { width: 348, height: 580 });
+        let encoded = serde_json::to_value(SourceDimensions::from_raw(347, 580)).unwrap();
+        assert_eq!(encoded, serde_json::json!({"width":348,"height":580}));
+    }
+
+    #[test]
+    fn rotation_identity_is_explicit_and_strictly_typed() {
+        let identity = RotationIdentity { orientation: Orientation::Portrait, revision: 2 };
+        let encoded = serde_json::to_value(identity).unwrap();
+        assert_eq!(encoded, serde_json::json!({"orientation":"portrait","revision":2}));
+        assert_eq!(serde_json::from_value::<RotationIdentity>(encoded).unwrap(), identity);
+        assert!(serde_json::from_value::<RotationIdentity>(serde_json::json!({
+            "orientation":"portrait", "revision":2, "angle":90
+        })).is_err());
+    }
 
     #[test]
     fn operation_id_is_required_and_round_trips_as_a_typed_field() {

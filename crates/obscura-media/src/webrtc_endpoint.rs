@@ -8,7 +8,7 @@ use std::{net::SocketAddr, sync::Arc, time::{Duration, Instant}};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use obscura_host_protocol::{Request, Response, VideoCodec, VideoPacket, WebRtcCapability, WebRtcControlMessage,
-    WebRtcSessionBinding, WebRtcTransport, WebRtcVideoCodec, WebRtcVideoFrame,
+    SourceDimensions, WebRtcSessionBinding, WebRtcTransport, WebRtcVideoCodec, WebRtcVideoFrame,
     WEBRTC_CONTROL_LABEL, WEBRTC_PROTOCOL_VERSION};
 use rtc::rtp::{codec::h264::{H264Packet, H264Payloader}, packetizer::{new_packetizer, Depacketizer, Packetizer}, sequence::new_random_sequencer};
 use tokio::{sync::{mpsc, Notify, watch}, time::{sleep, timeout}};
@@ -261,15 +261,15 @@ async fn emit_frame(
 ) -> Result<()> {
     let Some(frame) = frame else { return Ok(()); };
     if !frame_available(&frame.packet)? { return Ok(()); }
-    let VideoPacket::AccessUnit { source, encoder_id, pts_us, coded_width, coded_height, codec, keyframe, byte_length } = &frame.packet else {
+    let VideoPacket::AccessUnit { source, encoder_id, pts_us, codec, keyframe, byte_length } = &frame.packet else {
         unreachable!("non-access-unit media packet passed the availability guard");
     };
     ensure!(source.session_id == binding.session_id, "Host media session changed during WebRTC stream");
     ensure!(matches!(codec, VideoCodec::H264AnnexB), "Host produced a non-H.264 WebRTC access unit");
     ensure!(*byte_length as usize == frame.bytes.len(), "Host media descriptor does not match access-unit length");
     ensure!(*byte_length <= MAX_ACCESS_UNIT as u64, "Host media access unit exceeds WebRTC budget");
-    ensure!(*coded_width == even_dimension(source.width) && *coded_height == even_dimension(source.height),
-        "Host coded dimensions do not match source viewport");
+    ensure!(source.source_dimensions == SourceDimensions::from_raw(source.width, source.height),
+        "Host encoded source dimensions do not match raw source viewport");
     if let Some(sequence) = last_sequence {
         ensure!(source.sequence > *sequence, "Host media frame sequence regressed or repeated");
         ensure!(source.document_revision >= *last_document_revision && source.viewport_revision >= *last_viewport_revision,
@@ -290,8 +290,6 @@ async fn emit_frame(
         source: source.clone(),
         encoder_id: encoder_id.clone(),
         rtp_timestamp,
-        coded_width: *coded_width,
-        coded_height: *coded_height,
         codec: WebRtcVideoCodec::H264AnnexB,
         pts_us: *pts_us,
         keyframe: *keyframe,
@@ -358,8 +356,6 @@ fn validate_capability(capability: &WebRtcCapability) -> Result<()> {
     Ok(())
 }
 
-fn even_dimension(value: u32) -> u32 { value.saturating_add(1) & !1 }
-
 struct EndpointHandler {
     gathered: Arc<Notify>,
     data_tx: mpsc::Sender<Arc<dyn DataChannel>>,
@@ -399,10 +395,11 @@ mod tests {
         let access_unit = VideoPacket::AccessUnit {
             source: obscura_host_protocol::FrameInfo {
                 session_id: "boundary-session".into(), sequence: 1, document_revision: 1,
-                viewport_revision: 1, width: 2, height: 2, stride: 8, byte_length: 16,
+                viewport_revision: 1, rotation: None, source_dimensions: SourceDimensions::from_raw(2, 2),
+                width: 2, height: 2, stride: 8, byte_length: 16,
                 pixel_format: obscura_host_protocol::PixelFormat::PremultipliedRgba8,
             },
-            encoder_id: "encoder".into(), pts_us: 1, coded_width: 2, coded_height: 2,
+            encoder_id: "encoder".into(), pts_us: 1,
             codec: VideoCodec::H264AnnexB, keyframe: true, byte_length: 1,
         };
         assert!(terminal_encoder_error(&unavailable).is_none());

@@ -2,7 +2,7 @@
 use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
 use anyhow::{Context, Result};
 use obscura_browser::{BrowserContext, Page};
-use obscura_host_protocol::{Command, EvaluationResult, FrameInfo, FramePacket, InputReceipt, InputState, Operation, PixelFormat, ResultValue};
+use obscura_host_protocol::{Command, EvaluationResult, FrameInfo, FramePacket, InputReceipt, InputState, Operation, PixelFormat, ResultValue, RotationIdentity, SourceDimensions};
 use crate::media::{self, SharedFrame};
 use obscura_browser::input::{Input, InputError};
 use tokio::sync::{mpsc, oneshot};
@@ -14,6 +14,7 @@ pub struct Completion {
     pub fault: Option<String>,
     pub document_revision: u64,
     pub viewport_revision: u64,
+    pub rotation: Option<RotationIdentity>,
 }
 pub struct PageUpdate { pub document_revision: u64, pub fault: Option<String> }
 pub struct Work { pub kind: WorkKind, pub reply: oneshot::Sender<Completion> }
@@ -21,7 +22,7 @@ pub enum WorkKind {
     Browser { command: Command, operation: Operation },
     /// Host-assigned shared viewport; declarations apply to the current Page,
     /// while explicit Agent resize retains its admitted document fence.
-    Viewport { width: u32, height: u32, revision: u64, document_revision: Option<u64>, cancel: Arc<AtomicBool> },
+    Viewport { width: u32, height: u32, revision: u64, rotation: Option<RotationIdentity>, document_revision: Option<u64>, cancel: Arc<AtomicBool> },
 }
 const BUDGET: Duration = Duration::from_secs(5);
 
@@ -65,6 +66,7 @@ pub fn start(id: String, network: bool, mut incoming: mpsc::Receiver<Work>,
             let mut failure: Option<String> = None;
             let mut document_revision = 0;
             let mut viewport_revision = 0;
+            let mut rotation: Option<RotationIdentity> = None;
             let mut frame_sequence = 0u64;
             let mut frame_clock = tokio::time::interval(Duration::from_millis(333));
             frame_clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -115,6 +117,7 @@ pub fn start(id: String, network: bool, mut incoming: mpsc::Receiver<Work>,
                                     Arc::new(media::Frame {
                                         packet: FramePacket::Frame { info: FrameInfo { session_id: id.clone(), sequence: frame_sequence,
                                             document_revision, viewport_revision, width, height, stride: width * 4,
+                                            rotation, source_dimensions: SourceDimensions::from_raw(width, height),
                                             byte_length: pixels.len() as u64, pixel_format: PixelFormat::PremultipliedRgba8 } },
                                         pixels,
                                     })
@@ -138,12 +141,13 @@ pub fn start(id: String, network: bool, mut incoming: mpsc::Receiver<Work>,
                                 fault: failure.clone(),
                                 document_revision,
                                 viewport_revision,
+                                rotation,
                             }
                         } else if expected_document.is_some_and(|expected| expected != document_revision) {
-                            Completion { result: Err(("STALE_DOCUMENT", "Document changed before execution".into())), viewport: page.as_ref().map(|page| page.viewport), fault: None, document_revision, viewport_revision }
+                            Completion { result: Err(("STALE_DOCUMENT", "Document changed before execution".into())), viewport: page.as_ref().map(|page| page.viewport), fault: None, document_revision, viewport_revision, rotation }
                         } else {
                             match work.kind {
-                                WorkKind::Viewport { width, height, revision, cancel, .. } => {
+                                WorkKind::Viewport { width, height, revision, rotation: target_rotation, cancel, .. } => {
                                     frame_fence = Some(Arc::clone(&cancel));
                                     let mut fault = None;
                                     let result = if cancel.load(Ordering::Acquire) {
@@ -161,12 +165,12 @@ pub fn start(id: String, network: bool, mut incoming: mpsc::Receiver<Work>,
                                             }
                                         }
                                         if let Some(cause) = &fault { Err(("OUTCOME_UNKNOWN", cause.clone())) }
-                                        else { viewport_revision = revision; Ok(None) }
+                                        else { viewport_revision = revision; rotation = target_rotation; Ok(None) }
                                     } else { Err(("SESSION_CLOSED", "Session was explicitly closed".into())) };
                                     if cancel.load(Ordering::Acquire) {
                                         frames.send_replace(media::state(FramePacket::Waiting { session_id: id.clone() }));
                                     }
-                                    Completion { result, viewport: page.as_ref().map(|page| page.viewport), fault, document_revision, viewport_revision }
+                                    Completion { result, viewport: page.as_ref().map(|page| page.viewport), fault, document_revision, viewport_revision, rotation }
                                 }
                                 WorkKind::Browser { command, operation } => {
                                     let navigation = matches!(command, Command::Navigate { .. });
@@ -182,6 +186,7 @@ pub fn start(id: String, network: bool, mut incoming: mpsc::Receiver<Work>,
                         };
                         completion.document_revision = document_revision;
                         completion.viewport_revision = viewport_revision;
+                        completion.rotation = rotation;
                         if completion.fault.is_some() { failure = completion.fault.clone(); }
                         if page.is_none() { frames.send_replace(media::state(FramePacket::Closed { session_id: id.clone() })); }
                         else if let Some(message) = &failure { frames.send_replace(media::state(FramePacket::Unavailable { session_id: id.clone(), message: message.clone() })); }
@@ -306,7 +311,7 @@ async fn execute(page: &mut Option<Page>, command: Command, operation: &Operatio
             _ => unreachable!("control commands stay on daemon thread"),
         }
     } else { Err(("SESSION_CLOSED", "Session was explicitly closed".into())) };
-    Completion { result, viewport: page.as_ref().map(|page| page.viewport), fault, document_revision: 0, viewport_revision: 0 }
+    Completion { result, viewport: page.as_ref().map(|page| page.viewport), fault, document_revision: 0, viewport_revision: 0, rotation: None }
 }
 
 fn input_receipt(operation: &Operation) -> InputReceipt {

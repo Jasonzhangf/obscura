@@ -2,7 +2,7 @@
 use std::{path::PathBuf, time::{Duration, Instant}};
 use anyhow::{ensure, Context, Result};
 use clap::Parser;
-use obscura_host_protocol::{FramePacket, VideoCodec, VideoPacket};
+use obscura_host_protocol::{FramePacket, SourceDimensions, VideoCodec, VideoPacket};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 #[derive(Parser)]
@@ -49,6 +49,8 @@ async fn main() -> Result<()> {
             FramePacket::Frame { info } => {
                 obscura_media::validate_pixels(info.width, info.height, info.byte_length)?;
                 ensure!(info.stride == info.width * 4, "Unsupported raw frame stride");
+                ensure!(info.source_dimensions == SourceDimensions::from_raw(info.width, info.height),
+                    "Host source dimensions do not match raw frame dimensions");
                 if let Some((sequence, document, viewport)) = previous {
                     ensure!(info.sequence > sequence && info.document_revision >= document && info.viewport_revision >= viewport,
                         "Regressive Host frame identity");
@@ -60,8 +62,7 @@ async fn main() -> Result<()> {
                 match obscura_media::encode(&args.ffmpeg, info.width, info.height, rgba).await {
                     Ok(encoded) => {
                         bytes = encoded;
-                        VideoPacket::AccessUnit { coded_width: (info.width + 1) & !1, coded_height: (info.height + 1) & !1,
-                            source: info, encoder_id: encoder_id.clone(), pts_us, codec: VideoCodec::H264AnnexB,
+                        VideoPacket::AccessUnit { source: info, encoder_id: encoder_id.clone(), pts_us, codec: VideoCodec::H264AnnexB,
                             keyframe: true, byte_length: bytes.len() as u64 }
                     }
                     Err(error) => {

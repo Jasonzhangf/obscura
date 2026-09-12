@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use anyhow::{Context, Result};
-use obscura_host_protocol::{Command, Control, ControlPhase, Device, FramePacket, Mode, Operation, OperationId, Request, Response, ResultValue, SessionStatus, ViewportDeclaration, WebRtcCapability, WebRtcSessionBinding, WebRtcTransport, WebRtcVideoCodec, HOST_PROTOCOL_VERSION, WEBRTC_CONTROL_LABEL, WEBRTC_PROTOCOL_VERSION};
+use obscura_host_protocol::{Command, Control, ControlPhase, Device, FramePacket, Mode, Operation, OperationId, Request, Response, ResultValue, RotationIdentity, SessionStatus, SourceDimensions, ViewportDeclaration, WebRtcCapability, WebRtcSessionBinding, WebRtcTransport, WebRtcVideoCodec, HOST_PROTOCOL_VERSION, WEBRTC_CONTROL_LABEL, WEBRTC_PROTOCOL_VERSION};
 use crate::media;
 use crate::worker::{self, Completion, Work, WorkKind};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -89,11 +89,12 @@ struct Session {
     retired: HashSet<u64>,
     viewport_owner: Option<u64>,
     viewport_update: Option<ViewportUpdate>,
-    viewport_repair: Option<(u32, u32)>,
+    viewport_repair: Option<(u32, u32, Option<obscura_host_protocol::Orientation>)>,
+    rotation: Option<RotationIdentity>,
 }
 struct Attachment { mode: Mode, viewport: Option<ViewportDeclaration>, webrtc: Option<WebRtcGrant> }
 struct WebRtcGrant { capability: WebRtcCapability, binding: WebRtcSessionBinding, consumed: bool }
-struct ViewportUpdate { owner: Option<u64>, width: u32, height: u32, revision: u64, cancelled: bool, cancel: Arc<AtomicBool> }
+struct ViewportUpdate { owner: Option<u64>, width: u32, height: u32, revision: u64, rotation: Option<RotationIdentity>, cancelled: bool, cancel: Arc<AtomicBool> }
 struct Record { operation: Operation, command: Command, response: Option<Response> }
 fn valid_viewport(width: u32, height: u32) -> bool {
     width > 0 && height > 0 && width <= 4096 && height <= 4096 && u64::from(width) * u64::from(height) <= 4_194_304
@@ -124,14 +125,29 @@ impl Session {
     }
     fn viewport_pending(&self) -> bool {
         self.viewport_update.is_some() || self.viewport_repair.is_some() || self.selected_viewport().is_some_and(|(_, viewport)|
-            self.viewport != Some((viewport.css_width as f32, viewport.css_height as f32)))
+            !self.committed_viewport_matches(viewport.css_width, viewport.css_height, Some(viewport.orientation)))
     }
-    fn viewport_work(&mut self, owner: Option<u64>, width: u32, height: u32, document_revision: Option<u64>) -> Result<WorkKind, String> {
+    fn committed_viewport_matches(&self, width: u32, height: u32, orientation: Option<obscura_host_protocol::Orientation>) -> bool {
+        self.viewport == Some((width as f32, height as f32)) && self.rotation.map(|rotation| rotation.orientation) == orientation
+    }
+    fn viewport_work(&mut self, owner: Option<u64>, width: u32, height: u32, orientation: Option<obscura_host_protocol::Orientation>, document_revision: Option<u64>) -> Result<WorkKind, String> {
+        let orientation = orientation.or_else(|| self.rotation.map(|rotation| rotation.orientation));
         let revision = if self.viewport == Some((width as f32, height as f32)) { self.viewport_revision }
             else { self.viewport_revision.checked_add(1).ok_or("Viewport revision exhausted; recreate session")? };
+        let rotation = match orientation {
+            Some(orientation) if self.rotation.is_some_and(|current| current.orientation == orientation) => self.rotation,
+            Some(orientation) => {
+                let revision = match self.rotation {
+                    Some(current) => current.revision.checked_add(1).ok_or("Rotation revision exhausted; recreate session")?,
+                    None => 1,
+                };
+                Some(RotationIdentity { orientation, revision })
+            }
+            None => None,
+        };
         let cancel = Arc::new(AtomicBool::new(false));
-        self.viewport_update = Some(ViewportUpdate { owner, width, height, revision, cancelled: false, cancel: Arc::clone(&cancel) });
-        Ok(WorkKind::Viewport { width, height, revision, document_revision, cancel })
+        self.viewport_update = Some(ViewportUpdate { owner, width, height, revision, rotation, cancelled: false, cancel: Arc::clone(&cancel) });
+        Ok(WorkKind::Viewport { width, height, revision, rotation, document_revision, cancel })
     }
     fn detach(&mut self, connection: u64) {
         self.retired.insert(connection);
@@ -175,6 +191,15 @@ impl Session {
             next_sequence: self.records.get(&connection).and_then(|records| records.back())
                 .map_or(1, |record| record.operation.sequence.saturating_add(1)),
             viewport: self.viewport,
+            source_dimensions: self.viewport.and_then(|(width, height)| {
+                if width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0
+                    && width.fract() == 0.0 && height.fract() == 0.0
+                    && width <= u32::MAX as f32 && height <= u32::MAX as f32
+                {
+                    Some(SourceDimensions::from_raw(width as u32, height as u32))
+                } else { None }
+            }),
+            rotation: self.rotation,
             viewport_owner: self.viewport_owner,
             viewport_pending: self.viewport_pending(),
         })
@@ -399,7 +424,7 @@ pub async fn serve(socket_dir: PathBuf, allow_private_network: bool) -> Result<(
     let (interest, interested) = tokio::sync::watch::channel(0usize);
     let worker = worker::start(id.clone(), allow_private_network, incoming_work, ready, faults, frames, interested)?;
     let viewport = initialized.await.context("browser worker stopped during startup")?.map_err(anyhow::Error::msg)?;
-    let mut session = Session { id: id.clone(), viewport: Some(viewport), attachments: HashMap::new(), agent: None, viewport_revision: 0, document_revision: 0, fault: None, control: Control { epoch: 1, phase: ControlPhase::Agent }, records: HashMap::new(), operation_ids: HashMap::new(), retired: HashSet::new(), viewport_owner: None, viewport_update: None, viewport_repair: None };
+    let mut session = Session { id: id.clone(), viewport: Some(viewport), attachments: HashMap::new(), agent: None, viewport_revision: 0, document_revision: 0, fault: None, control: Control { epoch: 1, phase: ControlPhase::Agent }, records: HashMap::new(), operation_ids: HashMap::new(), retired: HashSet::new(), viewport_owner: None, viewport_update: None, viewport_repair: None, rotation: None };
     let listener = UnixListener::bind(directory.0.join("host.sock"))?;
     std::fs::set_permissions(directory.0.join("host.sock"), std::fs::Permissions::from_mode(0o600))?;
     let media_listener = UnixListener::bind(directory.0.join("frames.sock"))?;
@@ -416,11 +441,11 @@ pub async fn serve(socket_dir: PathBuf, allow_private_network: bool) -> Result<(
         // Declarations remain responsive while atomic work completes. Schedule only
         // the latest elected pair, before admitting any subsequent browser mutation.
         if pending.is_none() && session.fault.is_none() && session.viewport.is_some() {
-            let target = session.viewport_repair.take().map(|(width, height)| (None, width, height, true))
-                .or_else(|| session.selected_viewport().map(|(owner, viewport)| (Some(owner), viewport.css_width, viewport.css_height, false)));
+            let target = session.viewport_repair.take().map(|(width, height, orientation)| (None, width, height, orientation, true))
+                .or_else(|| session.selected_viewport().map(|(owner, viewport)| (Some(owner), viewport.css_width, viewport.css_height, Some(viewport.orientation), false)));
             match target {
-                Some((owner, width, height, force)) if force || session.viewport != Some((width as f32, height as f32)) => {
-                    match session.viewport_work(owner, width, height, None) {
+                Some((owner, width, height, orientation, force)) if force || !session.committed_viewport_matches(width, height, orientation) => {
+                    match session.viewport_work(owner, width, height, orientation, None) {
                         Ok(kind) => {
                             let (reply, result) = oneshot::channel();
                             if work.try_send(Work { kind, reply }).is_err() {
@@ -431,7 +456,7 @@ pub async fn serve(socket_dir: PathBuf, allow_private_network: bool) -> Result<(
                         Err(cause) => session.fault = Some(cause),
                     }
                 }
-                Some((owner, _, _, _)) => session.viewport_owner = owner,
+                Some((owner, _, _, _, _)) => session.viewport_owner = owner,
                 None => session.viewport_owner = None,
             }
         }
@@ -483,7 +508,7 @@ pub async fn serve(socket_dir: PathBuf, allow_private_network: bool) -> Result<(
                         Err(command) => {
                             let record = Record { operation: operation.expect("mutation admission checked identity"), command: command.clone(), response: None };
                             let kind = if let Command::Resize { width, height } = command {
-                                match session.viewport_work(None, width, height, Some(record.operation.document_revision)) {
+                                match session.viewport_work(None, width, height, None, Some(record.operation.document_revision)) {
                                     Ok(kind) => kind,
                                     Err(cause) => {
                                         session.fault = Some(cause.clone());
@@ -515,20 +540,29 @@ pub async fn serve(socket_dir: PathBuf, allow_private_network: bool) -> Result<(
                     Ok(completion) => {
                         // A failed resize may have changed Page partially. Keep the
                         // last committed geometry/revision and fence the faulted Page.
-                        if viewport_update.is_none() { session.viewport = completion.viewport; }
+                        if viewport_update.is_none() {
+                            session.viewport = completion.viewport;
+                            session.rotation = completion.rotation;
+                        }
                         session.document_revision = session.document_revision.max(completion.document_revision);
                         if completion.fault.is_some() { session.fault = completion.fault; }
                         if let Some(update) = viewport_update {
                             if update.cancelled {
                                 if completion.result.is_ok() {
-                                    session.viewport_repair = session.viewport.map(|(width, height)| (width as u32, height as u32));
+                                    session.viewport_repair = session.viewport.map(|(width, height)| {
+                                        (width as u32, height as u32, session.rotation.map(|rotation| rotation.orientation))
+                                    });
                                 }
                             } else if completion.result.is_ok() {
-                                if completion.viewport_revision != update.revision || completion.viewport != Some((update.width as f32, update.height as f32)) {
+                                if completion.viewport_revision != update.revision
+                                    || completion.viewport != Some((update.width as f32, update.height as f32))
+                                    || completion.rotation != update.rotation
+                                {
                                     session.fault = Some("Viewport completion mismatched Host assignment; recreate session".into());
                                 } else {
                                     session.viewport = completion.viewport;
                                     session.viewport_revision = completion.viewport_revision;
+                                    session.rotation = completion.rotation;
                                     session.viewport_owner = update.owner;
                                 }
                             }
