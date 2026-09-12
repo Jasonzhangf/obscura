@@ -132,8 +132,8 @@ async fn exercise() {
     assert_eq!(header["source"]["session_id"], ready["session_id"]);
     assert_eq!(header["source"]["width"], 391);
     assert_eq!(header["source"]["height"], 701);
-    assert_eq!(header["coded_width"], 392);
-    assert_eq!(header["coded_height"], 702);
+    assert_eq!(header["source"]["source_dimensions"]["width"], 392);
+    assert_eq!(header["source"]["source_dimensions"]["height"], 702);
     assert_eq!(header["byte_length"].as_u64().unwrap() as usize, packet.len() - 4 - length);
     control.send(Message::text(r#"{"id":10,"command":{"type":"declare_viewport","viewport":{"device":"phone","css_width":701,"css_height":391,"orientation":"landscape"}}}"#)).await.unwrap();
     let declaration: serde_json::Value = serde_json::from_str(control.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
@@ -147,6 +147,8 @@ async fn exercise() {
     }
     assert_eq!(state["viewport"], serde_json::json!([701.0,391.0]));
     assert_eq!(state["viewport_revision"], 2);
+    assert_eq!(state["rotation"]["orientation"], "landscape");
+    assert_eq!(state["rotation"]["revision"], 2);
     control.send(Message::text(serde_json::json!({"id":3,"command":{"type":"request_takeover","epoch":attached["value"]["control"]["epoch"]}}).to_string())).await.unwrap();
     let takeover: serde_json::Value = serde_json::from_str(control.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
     assert_eq!(takeover["value"]["control"]["phase"]["type"], "human");
