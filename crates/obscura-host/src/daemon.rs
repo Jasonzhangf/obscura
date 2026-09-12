@@ -38,6 +38,10 @@ fn error(id: u64, code: &str, message: impl Into<String>) -> Response {
     Response::Error { id, code: code.into(), message: message.into() }
 }
 
+fn host_control(epoch: u64, phase: ControlPhase) -> Control {
+    Control { epoch, token: uuid::Uuid::new_v4().to_string(), phase }
+}
+
 fn bounded_response(response: Response) -> Result<Response> {
     if serde_json::to_vec(&response)?.len() > 1024 * 1024 {
         let id = match response { Response::Result { id, .. } | Response::Error { id, .. } => id, Response::Ready { .. } => 0 };
@@ -168,7 +172,7 @@ impl Session {
     }
     fn transition(&mut self, phase: ControlPhase) {
         if let Some(epoch) = self.control.epoch.checked_add(1) {
-            self.control = Control { epoch, phase };
+            self.control = host_control(epoch, phase);
         } else { self.fault = Some("Control epoch exhausted; recreate session".into()); }
     }
     fn finish_handover(&mut self) {
@@ -424,7 +428,7 @@ pub async fn serve(socket_dir: PathBuf, allow_private_network: bool) -> Result<(
     let (interest, interested) = tokio::sync::watch::channel(0usize);
     let worker = worker::start(id.clone(), allow_private_network, incoming_work, ready, faults, frames, interested)?;
     let viewport = initialized.await.context("browser worker stopped during startup")?.map_err(anyhow::Error::msg)?;
-    let mut session = Session { id: id.clone(), viewport: Some(viewport), attachments: HashMap::new(), agent: None, viewport_revision: 0, document_revision: 0, fault: None, control: Control { epoch: 1, phase: ControlPhase::Agent }, records: HashMap::new(), operation_ids: HashMap::new(), retired: HashSet::new(), viewport_owner: None, viewport_update: None, viewport_repair: None, rotation: None };
+    let mut session = Session { id: id.clone(), viewport: Some(viewport), attachments: HashMap::new(), agent: None, viewport_revision: 0, document_revision: 0, fault: None, control: host_control(1, ControlPhase::Agent), records: HashMap::new(), operation_ids: HashMap::new(), retired: HashSet::new(), viewport_owner: None, viewport_update: None, viewport_repair: None, rotation: None };
     let listener = UnixListener::bind(directory.0.join("host.sock"))?;
     std::fs::set_permissions(directory.0.join("host.sock"), std::fs::Permissions::from_mode(0o600))?;
     let media_listener = UnixListener::bind(directory.0.join("frames.sock"))?;
@@ -651,14 +655,26 @@ mod tests {
             viewport_revision: 1,
             document_revision: 2,
             fault: None,
-            control: Control { epoch: 1, phase: ControlPhase::Agent },
+            control: host_control(1, ControlPhase::Agent),
             records: HashMap::new(),
             operation_ids: HashMap::new(),
             retired: HashSet::new(),
             viewport_owner: None,
             viewport_update: None,
             viewport_repair: None,
+            rotation: None,
         }
+    }
+
+    fn status(response: Response) -> SessionStatus {
+        match response {
+            Response::Result { value: ResultValue::Status(status), .. } => status,
+            other => panic!("expected status response, got {other:?}"),
+        }
+    }
+
+    fn status_of(session: &mut Session, connection: u64) -> SessionStatus {
+        status(session.request(connection, Request { id: 99, command: Command::Status {}, operation: None }, false).unwrap())
     }
 
     #[test]
@@ -684,5 +700,74 @@ mod tests {
             Ok(Response::Error { code, .. }) => assert_eq!(code, "OPERATION_CONFLICT"),
             other => panic!("expected operation conflict, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn control_tokens_are_host_issued_and_stable_per_phase() {
+        let mut session = session();
+        let initial = status_of(&mut session, 1);
+        assert!(!initial.control.token.is_empty());
+        assert_eq!(status_of(&mut session, 1).control, initial.control);
+
+        status(session.request(2, Request {
+            id: 1,
+            command: Command::Attach { mode: Mode::Observe, viewport: None },
+            operation: None,
+        }, false).unwrap());
+
+        let waiting = status(session.request(2, Request {
+            id: 2,
+            command: Command::RequestTakeover { epoch: initial.control.epoch },
+            operation: None,
+        }, true).unwrap());
+        assert!(matches!(waiting.control.phase, ControlPhase::Waiting { attachment_id: 2 }));
+        assert_ne!(waiting.control.token, initial.control.token);
+        assert_eq!(status_of(&mut session, 2).control, waiting.control);
+
+        session.finish_handover();
+        let human = status_of(&mut session, 2);
+        assert!(matches!(human.control.phase, ControlPhase::Human { attachment_id: 2 }));
+        assert_ne!(human.control.token, waiting.control.token);
+        assert_eq!(status_of(&mut session, 2).control, human.control);
+
+        let takeover_again = status(session.request(2, Request {
+            id: 3,
+            command: Command::RequestTakeover { epoch: human.control.epoch },
+            operation: None,
+        }, false).unwrap());
+        assert_eq!(takeover_again.control, human.control);
+
+        let released = status(session.request(2, Request {
+            id: 4,
+            command: Command::ReleaseControl { epoch: human.control.epoch },
+            operation: None,
+        }, false).unwrap());
+        assert!(matches!(released.control.phase, ControlPhase::Agent));
+        assert_ne!(released.control.token, human.control.token);
+        assert_eq!(status_of(&mut session, 2).control, released.control);
+
+        let human = status(session.request(2, Request {
+            id: 5,
+            command: Command::RequestTakeover { epoch: released.control.epoch },
+            operation: None,
+        }, false).unwrap());
+        assert!(matches!(human.control.phase, ControlPhase::Human { attachment_id: 2 }));
+
+        let paused = status(session.request(2, Request { id: 6, command: Command::Detach {}, operation: None }, false).unwrap());
+        assert!(matches!(paused.control.phase, ControlPhase::Paused));
+        assert_ne!(paused.control.token, human.control.token);
+
+        let resumed = status(session.request(1, Request {
+            id: 7,
+            command: Command::ResumeAgent { epoch: paused.control.epoch },
+            operation: None,
+        }, false).unwrap());
+        assert!(matches!(resumed.control.phase, ControlPhase::Agent));
+        assert_ne!(resumed.control.token, paused.control.token);
+        assert_eq!(status_of(&mut session, 1).control, resumed.control);
+
+        let tokens = [initial.control.token, waiting.control.token, human.control.token,
+            released.control.token, paused.control.token, resumed.control.token];
+        assert_eq!(tokens.iter().collect::<HashSet<_>>().len(), tokens.len());
     }
 }
