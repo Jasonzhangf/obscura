@@ -1,6 +1,7 @@
 #![cfg(unix)]
 use std::{os::unix::fs::DirBuilderExt, path::PathBuf, process::Stdio, time::Duration};
-use obscura_host_protocol::{FrameInfo, FramePacket, PixelFormat, SourceDimensions, VideoPacket};
+use obscura_host_protocol::{FrameInfo, FramePacket, PixelFormat, SourceDimensions, VideoPacket, VideoQualityProfile, VideoQualitySettings};
+use obscura_media::QualityControl;
 use tokio::{io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader}, net::{UnixListener, UnixStream}};
 
 struct Directory(PathBuf);
@@ -19,6 +20,11 @@ impl Drop for Directory {
 async fn write(socket: &mut UnixStream, packet: &FramePacket, pixels: &[u8]) {
     let mut header = serde_json::to_vec(packet).unwrap(); header.push(b'\n');
     socket.write_all(&header).await.unwrap(); socket.write_all(pixels).await.unwrap();
+}
+async fn write_quality(socket: &mut UnixStream, command: &QualityControl) {
+    let mut bytes = serde_json::to_vec(command).unwrap();
+    bytes.push(b'\n');
+    socket.write_all(&bytes).await.unwrap();
 }
 async fn read(socket: &mut BufReader<UnixStream>) -> (VideoPacket, Vec<u8>) {
     let mut header = Vec::new(); socket.read_until(b'\n', &mut header).await.unwrap();
@@ -146,4 +152,64 @@ async fn public_adapter_recovers_after_host_unavailable() {
     write(&mut source, &FramePacket::Closed { session_id: "recoverable-session".into() }, &[]).await;
     assert!(matches!(read(&mut receiver).await.0, VideoPacket::Closed { .. }));
     assert!(child.wait().await.unwrap().success());
+}
+
+#[tokio::test]
+async fn quality_control_updates_live_encoder_and_rejects_session_or_generation_drift() {
+    let dir = Directory::new();
+    let raw = UnixListener::bind(dir.0.join("raw")).unwrap();
+    let video = UnixListener::bind(dir.0.join("video")).unwrap();
+    let quality = UnixListener::bind(dir.0.join("quality")).unwrap();
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_obscura-media"));
+    command.arg("--frames-socket").arg(dir.0.join("raw"))
+        .arg("--video-socket").arg(dir.0.join("video"))
+        .arg("--quality-socket").arg(dir.0.join("quality"));
+    let child = command.stdout(Stdio::null()).stderr(Stdio::piped()).kill_on_drop(true).spawn().unwrap();
+    let (mut source, _) = raw.accept().await.unwrap();
+    let mut receiver = BufReader::new(video.accept().await.unwrap().0);
+    let (mut quality_socket, _) = quality.accept().await.unwrap();
+    write(&mut source, &FramePacket::Waiting { session_id: "quality-session".into() }, &[]).await;
+    assert!(matches!(read(&mut receiver).await.0, VideoPacket::Waiting { .. }));
+    write_quality(&mut quality_socket, &QualityControl::Update {
+        session_id: "quality-session".into(),
+        generation: 1,
+        requested: VideoQualitySettings { profile: VideoQualityProfile::Low, low_latency: false },
+        effective: VideoQualitySettings { profile: VideoQualityProfile::Low, low_latency: false },
+    }).await;
+    let pixels = [0, 128, 0, 255].repeat(64 * 48);
+    let info = FrameInfo { session_id: "quality-session".into(), sequence: 1, document_revision: 1,
+        viewport_revision: 1, width: 64, height: 48, stride: 64 * 4,
+        byte_length: pixels.len() as u64, pixel_format: PixelFormat::PremultipliedRgba8,
+        rotation: None, source_dimensions: SourceDimensions::from_raw(64, 48) };
+    write(&mut source, &FramePacket::Frame { info }, &pixels).await;
+    assert!(matches!(read(&mut receiver).await.0, VideoPacket::AccessUnit { .. }));
+    write_quality(&mut quality_socket, &QualityControl::Update {
+        session_id: "quality-session".into(),
+        generation: 1,
+        requested: VideoQualitySettings { profile: VideoQualityProfile::High, low_latency: true },
+        effective: VideoQualitySettings { profile: VideoQualityProfile::High, low_latency: true },
+    }).await;
+    let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output()).await.unwrap().unwrap();
+    assert!(!output.status.success(), "generation regression must fail the adapter");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Quality control generation regressed"));
+}
+
+#[tokio::test]
+async fn quality_control_disconnect_is_explicit_failure() {
+    let dir = Directory::new();
+    let raw = UnixListener::bind(dir.0.join("raw")).unwrap();
+    let video = UnixListener::bind(dir.0.join("video")).unwrap();
+    let quality = UnixListener::bind(dir.0.join("quality")).unwrap();
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_obscura-media"));
+    command.arg("--frames-socket").arg(dir.0.join("raw"))
+        .arg("--video-socket").arg(dir.0.join("video"))
+        .arg("--quality-socket").arg(dir.0.join("quality"));
+    let child = command.stdout(Stdio::null()).stderr(Stdio::piped()).kill_on_drop(true).spawn().unwrap();
+    let (_source, _) = raw.accept().await.unwrap();
+    let (_receiver, _) = video.accept().await.unwrap();
+    let (quality_socket, _) = quality.accept().await.unwrap();
+    drop(quality_socket);
+    let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output()).await.unwrap().unwrap();
+    assert!(!output.status.success(), "quality control disconnect must fail the adapter");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Quality control socket closed unexpectedly"));
 }

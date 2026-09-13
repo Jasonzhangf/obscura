@@ -25,6 +25,7 @@ struct Directory(PathBuf);
 impl Drop for Directory {
     fn drop(&mut self) {
         if let Err(error) = std::fs::remove_file(self.0.join("encoded.sock")) { eprintln!("encoded socket cleanup: {error}"); }
+        if let Err(error) = std::fs::remove_file(self.0.join("quality.sock")) { eprintln!("quality socket cleanup: {error}"); }
         if let Err(error) = std::fs::remove_dir(&self.0) { eprintln!("endpoint directory cleanup: {error}"); }
     }
 }
@@ -48,14 +49,21 @@ pub async fn serve(args: Args) -> Result<()> {
     let encoded = directory.0.join("encoded.sock");
     let listener = UnixListener::bind(&encoded)?;
     std::fs::set_permissions(&encoded, std::fs::Permissions::from_mode(0o600))?;
+    let quality_path = directory.0.join("quality.sock");
+    let quality_listener = UnixListener::bind(&quality_path)?;
+    std::fs::set_permissions(&quality_path, std::fs::Permissions::from_mode(0o600))?;
     let mut encoder = tokio::process::Command::new(&args.media_bin)
         .arg("--frames-socket").arg(args.host_dir.join("frames.sock")).arg("--video-socket").arg(&encoded)
+        .arg("--quality-socket").arg(&quality_path)
         .arg("--ffmpeg").arg(args.ffmpeg).stdout(Stdio::null()).stderr(Stdio::inherit()).kill_on_drop(true).spawn().context("Start single media adapter")?;
     let (latest, frames) = watch::channel(None);
     let (encoded_latest, encoded_frames) = watch::channel(None);
+    let (encoded_socket, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept()).await.context("Media adapter startup deadline")??;
+    let (quality_socket, _) = tokio::time::timeout(Duration::from_secs(10), quality_listener.accept()).await.context("Media quality control startup deadline")??;
+    let (_, quality_write) = quality_socket.into_split();
+    let quality = Arc::new(channels::QualityPublisher::new(quality_write));
     let media = async {
-        let (socket, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept()).await.context("Media adapter startup deadline")??;
-        channels::ingest(socket, latest, encoded_latest).await
+        channels::ingest(encoded_socket, latest, encoded_latest).await
     };
     tokio::pin!(media);
     let (media_lifecycle, mut media_lifecycle_rx) = watch::channel(MediaLifecycle { ingest_done: false, active: 0 });
@@ -91,6 +99,7 @@ pub async fn serve(args: Args) -> Result<()> {
                 let media_lifecycle = media_lifecycle.clone(); let media_failure = media_failure.clone();
                 let webrtc_bind = args.webrtc_bind_ip.map(|ip| SocketAddr::new(ip, 0));
                 let host = args.host_dir.join("host.sock");
+                let quality = quality.clone();
                 clients.spawn(async move {
                     let _permit = permit;
                     tokio::time::timeout(Duration::from_secs(3600), async {
@@ -137,7 +146,7 @@ pub async fn serve(args: Args) -> Result<()> {
                             let (active, _) = watch::channel(false);
                             grants.lock().expect("grant owner").insert(token.clone(), Grant { peer, active: active.clone(), media_used: false });
                             let _lease = Lease { token, grants };
-                            channels::control(remote, &host, active, encoded_frames, enable_webrtc, webrtc_bind).await
+                            channels::control(remote, &host, active, encoded_frames, enable_webrtc, webrtc_bind, quality).await
                         } else {
                             let _media_lease = media_lease.context("Missing media lease")?;
                             let result = channels::media(remote, frames, media_active.context("Missing media grant")?).await;

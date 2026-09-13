@@ -1,12 +1,22 @@
-use std::{net::SocketAddr, path::Path, sync::Arc, time::Duration};
+use std::{net::SocketAddr, path::Path, sync::{atomic::{AtomicU64, Ordering}, Arc}, time::Duration};
 use anyhow::{bail, ensure, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use obscura_host_protocol::{Command, Mode, Request, Response, ResultValue, VideoPacket, WebRtcSignal};
 use obscura_media::EncodedFrame;
-use tokio::{io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader}, net::UnixStream, sync::{mpsc, watch}};
+use tokio::{io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader}, net::UnixStream, sync::{mpsc, watch, Mutex as TokioMutex}};
 use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
 
 pub type Socket = WebSocketStream<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>;
+pub struct QualityPublisher {
+    socket: TokioMutex<tokio::net::unix::OwnedWriteHalf>,
+    generation: AtomicU64,
+}
+impl QualityPublisher {
+    pub fn new(socket: tokio::net::unix::OwnedWriteHalf) -> Self {
+        Self { socket: TokioMutex::new(socket), generation: AtomicU64::new(0) }
+    }
+}
+pub type QualitySocket = Arc<QualityPublisher>;
 pub struct Video { pub bytes: Vec<u8>, pub closed: bool }
 pub type Frame = Arc<Video>;
 
@@ -28,6 +38,29 @@ async fn reply(reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>) -> Resul
     Ok(serde_json::from_slice(&bytes)?)
 }
 
+async fn publish_quality(
+    quality: &QualitySocket,
+    session_id: &str,
+    response: &Response,
+) -> Result<()> {
+    let Response::Result { value: ResultValue::VideoQuality { quality: state }, .. } = response else {
+        return Ok(());
+    };
+    let generation = quality.generation.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |generation| generation.checked_add(1))
+        .map_err(|_| anyhow::anyhow!("Quality control generation exhausted"))? + 1;
+    let command = obscura_media::QualityControl::Update {
+        session_id: session_id.to_owned(),
+        generation,
+        requested: state.requested,
+        effective: state.effective,
+    };
+    let mut bytes = serde_json::to_vec(&command)?;
+    bytes.push(b'\n');
+    let mut writer = quality.socket.lock().await;
+    tokio::time::timeout(Duration::from_secs(2), (&mut *writer).write_all(&bytes)).await.context("Endpoint quality control write stalled")??;
+    Ok(())
+}
+
 pub async fn control(
     mut remote: Socket,
     path: &Path,
@@ -35,10 +68,15 @@ pub async fn control(
     latest: watch::Receiver<Option<Arc<EncodedFrame>>>,
     enable_webrtc: bool,
     webrtc_bind: Option<SocketAddr>,
+    quality: QualitySocket,
 ) -> Result<()> {
     let local = UnixStream::connect(path).await.context("Connect local Host control")?;
     let (read, mut write) = local.into_split(); let mut reader = BufReader::new(read);
     let ready = reply(&mut reader).await?;
+    let session_id = match &ready {
+        Response::Ready { session_id, .. } => session_id.clone(),
+        other => bail!("Host control bootstrap returned unexpected response: {other:?}"),
+    };
     send(&mut remote, Message::text(serde_json::to_string(&ready)?)).await?;
     let mut webrtc_task: Option<tokio::task::JoinHandle<Result<()>>> = None;
     let mut browser_requests: Option<mpsc::Receiver<Request>> = None;
@@ -117,6 +155,7 @@ pub async fn control(
                 } else {
                     remote_command_error(request.id)
                 };
+                publish_quality(&quality, &session_id, &result).await?;
                 let detached = update_active(&active, &result);
                 send(&mut remote, Message::text(serde_json::to_string(&result)?)).await?;
                 if detached {
@@ -142,6 +181,7 @@ pub async fn control(
                 } else {
                     remote_command_error(request.id)
                 };
+                publish_quality(&quality, &session_id, &result).await?;
                 let detached = update_active(&active, &result);
                 let response_tx = browser_responses.as_ref().context("WebRTC browser response pump unavailable")?;
                 response_tx.send(result).await.context("WebRTC browser response receiver ended")?;
@@ -299,6 +339,7 @@ pub async fn ingest(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use obscura_host_protocol::{LinkQuality, VideoQualityProfile, VideoQualitySettings, VideoQualityState};
     use tokio::io::AsyncWriteExt;
 
     #[test]
@@ -307,6 +348,61 @@ mod tests {
             profile: obscura_host_protocol::VideoQualityProfile::Balanced,
             low_latency: true,
         }));
+    }
+
+    #[tokio::test]
+    async fn quality_response_is_published_only_for_successful_host_state() {
+        let (quality_socket, mut receiver) = UnixStream::pair().expect("create quality stream pair");
+        let (_, writer) = quality_socket.into_split();
+        let quality = Arc::new(QualityPublisher::new(writer));
+        let state = VideoQualityState {
+            requested: VideoQualitySettings { profile: VideoQualityProfile::Low, low_latency: true },
+            effective: VideoQualitySettings { profile: VideoQualityProfile::Balanced, low_latency: false },
+            link: LinkQuality { rtt_ms: None, jitter_ms: None, loss_ratio: None, queue_ms: None },
+        };
+        publish_quality(&quality, "session", &Response::Result {
+            id: 1,
+            value: ResultValue::VideoQuality { quality: state },
+        }).await.unwrap();
+        let mut bytes = Vec::new();
+        BufReader::new(&mut receiver).read_until(b'\n', &mut bytes).await.unwrap();
+        let published: obscura_media::QualityControl = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(published, obscura_media::QualityControl::Update {
+            session_id: "session".into(),
+            generation: 1,
+            requested: state.requested,
+            effective: state.effective,
+        });
+        assert_eq!(quality.generation.load(Ordering::SeqCst), 1);
+
+        publish_quality(&quality, "session", &Response::Error {
+            id: 2,
+            code: "QUALITY_UNSUPPORTED".into(),
+            message: "unsupported".into(),
+        }).await.unwrap();
+        let mut trailing = Vec::new();
+        assert!(tokio::time::timeout(Duration::from_millis(50), BufReader::new(&mut receiver).read_until(b'\n', &mut trailing)).await.is_err(),
+            "failed quality responses must not publish effective state");
+        assert_eq!(quality.generation.load(Ordering::SeqCst), 1);
+
+        let second = VideoQualityState {
+            requested: VideoQualitySettings { profile: VideoQualityProfile::High, low_latency: true },
+            effective: VideoQualitySettings { profile: VideoQualityProfile::High, low_latency: true },
+            link: LinkQuality { rtt_ms: None, jitter_ms: None, loss_ratio: None, queue_ms: None },
+        };
+        publish_quality(&quality, "session", &Response::Result {
+            id: 3,
+            value: ResultValue::VideoQuality { quality: second },
+        }).await.unwrap();
+        let mut next = Vec::new();
+        BufReader::new(&mut receiver).read_until(b'\n', &mut next).await.unwrap();
+        let published: obscura_media::QualityControl = serde_json::from_slice(&next).unwrap();
+        assert_eq!(published, obscura_media::QualityControl::Update {
+            session_id: "session".into(),
+            generation: 2,
+            requested: second.requested,
+            effective: second.effective,
+        });
     }
 
     #[tokio::test]
