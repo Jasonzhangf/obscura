@@ -455,7 +455,7 @@ pub struct WebRtcProbeReport {
 
 #[cfg(test)]
 mod tests {
-    use super::{Control, ControlPhase, InputReceipt, InputState, Operation, OperationId, Orientation, RemoteFocusCapability, RotationIdentity, SessionStatus, SourceDimensions, VideoQualityProfile, VideoQualitySettings, VideoQualityState, LinkQuality};
+    use super::{Command, Control, ControlPhase, InputReceipt, InputState, Operation, OperationId, Orientation, RemoteFocusCapability, Request, RotationIdentity, SessionStatus, SourceDimensions, VideoQualityProfile, VideoQualitySettings, VideoQualityState, LinkQuality};
 
     fn control(token: &str) -> Control {
         Control { epoch: 7, token: token.into(), phase: ControlPhase::Human { attachment_id: 11 } }
