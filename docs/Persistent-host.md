@@ -72,7 +72,15 @@ envelope including a typed operation_id and document_revision.
 Typed SessionStatus returns the requesting attachment's connection-scoped ID
 and mode as well as the shared Session ID and viewport. Reconnect creates a new
 attachment identity; daemon restart creates a new Session identity. Observation
-does not imply human control capability.
+does not imply human control capability. `SessionStatus.remote_focus` is either
+null or a Host-issued `RemoteFocusCapability` with `session_id`,
+`document_revision`, `viewport_revision`, `control_epoch`, `focused` and
+`editable`. The capability is a Page-thread observation of
+`document.activeElement`; the daemon only binds it to the current Session
+identity, document/viewport revisions and control epoch. It is cleared on
+disconnect, control transition, viewport admission, document/viewport revision
+change, worker fault or a failed focus sample. A null capability means the Host
+cannot prove that the observation still describes the live Page.
 
 The control loop and Page run on separate OS threads. `daemon.rs` owns
 attachments and admission; `worker.rs` creates, executes and drops Page/V8 on
@@ -290,8 +298,9 @@ one ABI revision. The raw Host `FramePacket` stream retains its own
 
 This local marker boundary is separate from the WebRTC protocol version. Typed
 WebRTC signaling and DataChannel messages also deny unknown fields, and
-`WEBRTC_PROTOCOL_VERSION` is exactly `5`; the Hello exchange rejects older
-versions. A v4 peer therefore gets the typed `ENCODER_UNAVAILABLE` error
+`WEBRTC_PROTOCOL_VERSION` is exactly `7`; the Hello exchange rejects older
+versions. The local Host `Ready` response reports `HOST_PROTOCOL_VERSION` `8`.
+A v4 peer therefore gets the typed `ENCODER_UNAVAILABLE` error
 only after the endpoint has validated the v4 capability and binding. No version
 negotiation, unknown-field tolerance or compatibility fallback is implied by
 the local H.264 socket.

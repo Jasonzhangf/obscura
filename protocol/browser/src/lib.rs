@@ -125,6 +125,22 @@ pub enum ControlPhase {
     Paused,
 }
 
+/// A page focus observation bound to the exact Host state that produced it.
+///
+/// The capability is absent from `SessionStatus` when the Host cannot prove
+/// that the observation still describes the live Page. Consumers must not
+/// retain a previous capability across a disconnect or revision change.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteFocusCapability {
+    pub session_id: String,
+    pub document_revision: u64,
+    pub viewport_revision: u64,
+    pub control_epoch: u64,
+    pub focused: bool,
+    pub editable: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionStatus {
@@ -151,6 +167,8 @@ pub struct SessionStatus {
     pub viewport_owner: Option<u64>,
     /// Declaration accepted or layout executing, but not yet committed. Fence new input.
     pub viewport_pending: bool,
+    /// Last Page-owned activeElement observation, bound to current revisions and control.
+    pub remote_focus: Option<RemoteFocusCapability>,
 }
 
 fn require_non_empty_control_token<'de, D>(deserializer: D) -> Result<String, D::Error>
@@ -261,11 +279,11 @@ pub enum VideoPacket {
 #[serde(rename_all = "snake_case")]
 pub enum VideoCodec { H264AnnexB }
 
-/// Version 7 adds a Host-issued non-empty control token to SessionStatus.
-pub const HOST_PROTOCOL_VERSION: u32 = 7;
-/// Version 6 carries the version 7 control token in browser responses over
-/// DataChannel. Older peers are rejected during the Hello exchange.
-pub const WEBRTC_PROTOCOL_VERSION: u32 = 6;
+/// Version 8 adds the revision-bound remote focus capability to SessionStatus.
+pub const HOST_PROTOCOL_VERSION: u32 = 8;
+/// Version 7 carries the version 8 remote focus capability in browser responses
+/// over DataChannel. Older peers are rejected during the Hello exchange.
+pub const WEBRTC_PROTOCOL_VERSION: u32 = 7;
 pub const WEBRTC_CONTROL_LABEL: &str = "obscura.control.v1";
 pub const WEBRTC_H264_FMTP: &str = "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f";
 
@@ -403,7 +421,7 @@ pub struct WebRtcProbeReport {
 
 #[cfg(test)]
 mod tests {
-    use super::{Control, ControlPhase, InputReceipt, InputState, Operation, OperationId, Orientation, RotationIdentity, SessionStatus, SourceDimensions};
+    use super::{Control, ControlPhase, InputReceipt, InputState, Operation, OperationId, Orientation, RemoteFocusCapability, RotationIdentity, SessionStatus, SourceDimensions};
 
     fn control(token: &str) -> Control {
         Control { epoch: 7, token: token.into(), phase: ControlPhase::Human { attachment_id: 11 } }
@@ -427,6 +445,14 @@ mod tests {
             rotation: Some(RotationIdentity { orientation: Orientation::Portrait, revision: 2 }),
             viewport_owner: Some(11),
             viewport_pending: false,
+            remote_focus: Some(RemoteFocusCapability {
+                session_id: "session".into(),
+                document_revision: 8,
+                viewport_revision: 5,
+                control_epoch: 7,
+                focused: true,
+                editable: true,
+            }),
         }
     }
 
@@ -456,6 +482,8 @@ mod tests {
         let status = status("host-token");
         let encoded = serde_json::to_value(&status).unwrap();
         assert_eq!(encoded["control"]["token"], "host-token");
+        assert_eq!(encoded["remote_focus"]["focused"], true);
+        assert_eq!(encoded["remote_focus"]["editable"], true);
         assert_eq!(serde_json::from_value::<SessionStatus>(encoded.clone()).unwrap(), status);
 
         let mut missing = encoded.clone();
@@ -465,6 +493,27 @@ mod tests {
         let mut empty = encoded;
         empty["control"]["token"] = serde_json::json!("");
         assert!(serde_json::from_value::<SessionStatus>(empty).is_err());
+    }
+
+    #[test]
+    fn remote_focus_capability_round_trips_and_rejects_unknown_fields() {
+        let capability = RemoteFocusCapability {
+            session_id: "session".into(),
+            document_revision: 8,
+            viewport_revision: 5,
+            control_epoch: 7,
+            focused: true,
+            editable: false,
+        };
+        let encoded = serde_json::to_value(&capability).unwrap();
+        assert_eq!(serde_json::from_value::<RemoteFocusCapability>(encoded.clone()).unwrap(), capability);
+        let mut unknown = encoded;
+        unknown["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<RemoteFocusCapability>(unknown).is_err());
+
+        let mut status = serde_json::to_value(status("host-token")).unwrap();
+        status["remote_focus"] = serde_json::Value::Null;
+        assert_eq!(serde_json::from_value::<SessionStatus>(status).unwrap().remote_focus, None);
     }
 
     #[test]

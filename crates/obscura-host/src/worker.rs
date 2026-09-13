@@ -11,12 +11,22 @@ use tokio::time::{timeout, Duration};
 pub struct Completion {
     pub result: Result<Option<ResultValue>, (&'static str, String)>,
     pub viewport: Option<(f32, f32)>,
+    pub focus: Option<FocusSnapshot>,
     pub fault: Option<String>,
     pub document_revision: u64,
     pub viewport_revision: u64,
     pub rotation: Option<RotationIdentity>,
 }
-pub struct PageUpdate { pub document_revision: u64, pub fault: Option<String> }
+pub struct PageUpdate {
+    pub document_revision: u64,
+    pub focus: Option<FocusSnapshot>,
+    pub fault: Option<String>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FocusSnapshot {
+    pub focused: bool,
+    pub editable: bool,
+}
 pub struct Work { pub kind: WorkKind, pub reply: oneshot::Sender<Completion> }
 pub enum WorkKind {
     Browser { command: Command, operation: Operation },
@@ -90,13 +100,22 @@ pub fn start(id: String, network: bool, mut incoming: mpsc::Receiver<Work>,
                             outcome => {
                                 document_revision += 1;
                                 frames.send_replace(media::state(FramePacket::Waiting { session_id: id.clone() }));
-                                match outcome {
-                                    Ok(Ok(true)) => {},
-                                    Ok(Err(cause)) => failure = Some(format!("Page navigation failed: {cause}")),
-                                    Err(_) => failure = Some("Page navigation outcome unknown after deadline".into()),
+                                let navigated = match outcome {
+                                    Ok(Ok(true)) => true,
+                                    Ok(Err(cause)) => {
+                                        failure = Some(format!("Page navigation failed: {cause}"));
+                                        false
+                                    }
+                                    Err(_) => {
+                                        failure = Some("Page navigation outcome unknown after deadline".into());
+                                        false
+                                    }
                                     _ => unreachable!(),
-                                }
-                                if updates.send(PageUpdate { document_revision, fault: failure.clone() }).await.is_err() { break; }
+                                };
+                                let focus = if navigated && failure.is_none() {
+                                    page_work(async { focus_snapshot(page) }).await
+                                } else { None };
+                                if updates.send(PageUpdate { document_revision, focus, fault: failure.clone() }).await.is_err() { break; }
                             }
                         }
                     }
@@ -138,13 +157,14 @@ pub fn start(id: String, network: bool, mut incoming: mpsc::Receiver<Work>,
                             Completion {
                                 result: Err(("SESSION_FAULTED", failure.clone().unwrap())),
                                 viewport: page.as_ref().map(|page| page.viewport),
+                                focus: None,
                                 fault: failure.clone(),
                                 document_revision,
                                 viewport_revision,
                                 rotation,
                             }
                         } else if expected_document.is_some_and(|expected| expected != document_revision) {
-                            Completion { result: Err(("STALE_DOCUMENT", "Document changed before execution".into())), viewport: page.as_ref().map(|page| page.viewport), fault: None, document_revision, viewport_revision, rotation }
+                            Completion { result: Err(("STALE_DOCUMENT", "Document changed before execution".into())), viewport: page.as_ref().map(|page| page.viewport), focus: None, fault: None, document_revision, viewport_revision, rotation }
                         } else {
                             match work.kind {
                                 WorkKind::Viewport { width, height, revision, rotation: target_rotation, cancel, .. } => {
@@ -170,14 +190,20 @@ pub fn start(id: String, network: bool, mut incoming: mpsc::Receiver<Work>,
                                     if cancel.load(Ordering::Acquire) {
                                         frames.send_replace(media::state(FramePacket::Waiting { session_id: id.clone() }));
                                     }
-                                    Completion { result, viewport: page.as_ref().map(|page| page.viewport), fault, document_revision, viewport_revision, rotation }
+                                    Completion { result, viewport: page.as_ref().map(|page| page.viewport), focus: None, fault, document_revision, viewport_revision, rotation }
                                 }
                                 WorkKind::Browser { command, operation } => {
-                                    let navigation = matches!(command, Command::Navigate { .. });
+                                    let navigation = matches!(&command, Command::Navigate { .. });
+                                    let focus_after = matches!(&command, Command::Click { .. } | Command::InputText { .. } | Command::Navigate { .. });
                                     let mut completion = execute(&mut page, command, &operation).await;
                                     if navigation {
                                         document_revision += 1;
                                         frames.send_replace(media::state(FramePacket::Waiting { session_id: id.clone() }));
+                                    }
+                                    if focus_after && completion.result.is_ok() && completion.fault.is_none() {
+                                        if let Some(page) = page.as_mut() {
+                                            completion.focus = page_work(async { focus_snapshot(page) }).await;
+                                        }
                                     }
                                     stamp_input_receipt(&mut completion.result, &operation, document_revision, viewport_revision);
                                     completion
@@ -218,7 +244,7 @@ pub fn start(id: String, network: bool, mut incoming: mpsc::Receiver<Work>,
                         Ok((false, next_idle)) => { idle = next_idle; }
                         Err(cause) => {
                             failure = Some(cause.clone());
-                            if updates.send(PageUpdate { document_revision, fault: Some(cause) }).await.is_err() { break; }
+                            if updates.send(PageUpdate { document_revision, focus: None, fault: Some(cause) }).await.is_err() { break; }
                         }
                     },
                 }
@@ -311,7 +337,48 @@ async fn execute(page: &mut Option<Page>, command: Command, operation: &Operatio
             _ => unreachable!("control commands stay on daemon thread"),
         }
     } else { Err(("SESSION_CLOSED", "Session was explicitly closed".into())) };
-    Completion { result, viewport: page.as_ref().map(|page| page.viewport), fault, document_revision: 0, viewport_revision: 0, rotation: None }
+    Completion { result, viewport: page.as_ref().map(|page| page.viewport), focus: None, fault, document_revision: 0, viewport_revision: 0, rotation: None }
+}
+
+const REMOTE_FOCUS_QUERY: &str = r#"(function () {
+    var active = document.activeElement;
+    var body = document.body;
+    var root = document.documentElement;
+    var focused = !!active && active !== body && active !== root;
+    var editable = false;
+    if (focused) {
+        var tag = String(active.localName || '').toLowerCase();
+        var disabled = typeof globalThis.__obscura_isDisabled === 'function' && globalThis.__obscura_isDisabled(active);
+        var type = String(active.type || 'text').toLowerCase();
+        var textInput = tag === 'textarea' || (tag === 'input' && ['text','search','email','url','tel','password','number'].includes(type));
+        editable = !disabled && !active.readOnly && !active.hasAttribute('readonly') && textInput;
+        if (!editable && typeof active.getAttribute === 'function') {
+            var element = active;
+            while (element && element !== document) {
+                var contenteditable = element.getAttribute('contenteditable');
+                if (contenteditable !== null) {
+                    editable = contenteditable.toLowerCase() !== 'false';
+                    break;
+                }
+                element = element.parentElement;
+            }
+        }
+    }
+    return { focused: focused, editable: editable };
+})()"#;
+
+fn focus_snapshot(page: &mut Page) -> Option<FocusSnapshot> {
+    let js = page.js.as_mut()?;
+    let watchdog = js.arm_watchdog(BUDGET);
+    let value = js.evaluate(REMOTE_FOCUS_QUERY);
+    let fired = page.js.as_mut().expect("focus sampling retains runtime").disarm_watchdog(watchdog);
+    if fired { return None; }
+    let value = value.ok()?;
+    let object = value.as_object()?;
+    Some(FocusSnapshot {
+        focused: object.get("focused")?.as_bool()?,
+        editable: object.get("editable")?.as_bool()?,
+    })
 }
 
 fn input_receipt(operation: &Operation) -> InputReceipt {

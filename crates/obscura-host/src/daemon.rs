@@ -3,9 +3,9 @@ use std::path::PathBuf;
 use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use anyhow::{Context, Result};
-use obscura_host_protocol::{Command, Control, ControlPhase, Device, FramePacket, Mode, Operation, OperationId, Request, Response, ResultValue, RotationIdentity, SessionStatus, SourceDimensions, ViewportDeclaration, WebRtcCapability, WebRtcSessionBinding, WebRtcTransport, WebRtcVideoCodec, HOST_PROTOCOL_VERSION, WEBRTC_CONTROL_LABEL, WEBRTC_PROTOCOL_VERSION};
+use obscura_host_protocol::{Command, Control, ControlPhase, Device, FramePacket, Mode, Operation, OperationId, RemoteFocusCapability, Request, Response, ResultValue, RotationIdentity, SessionStatus, SourceDimensions, ViewportDeclaration, WebRtcCapability, WebRtcSessionBinding, WebRtcTransport, WebRtcVideoCodec, HOST_PROTOCOL_VERSION, WEBRTC_CONTROL_LABEL, WEBRTC_PROTOCOL_VERSION};
 use crate::media;
-use crate::worker::{self, Completion, Work, WorkKind};
+use crate::worker::{self, Completion, FocusSnapshot, Work, WorkKind};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot, Semaphore};
@@ -95,6 +95,7 @@ struct Session {
     viewport_update: Option<ViewportUpdate>,
     viewport_repair: Option<(u32, u32, Option<obscura_host_protocol::Orientation>)>,
     rotation: Option<RotationIdentity>,
+    remote_focus: Option<RemoteFocusCapability>,
 }
 struct Attachment { mode: Mode, viewport: Option<ViewportDeclaration>, webrtc: Option<WebRtcGrant> }
 struct WebRtcGrant { capability: WebRtcCapability, binding: WebRtcSessionBinding, consumed: bool }
@@ -135,6 +136,7 @@ impl Session {
         self.viewport == Some((width as f32, height as f32)) && self.rotation.map(|rotation| rotation.orientation) == orientation
     }
     fn viewport_work(&mut self, owner: Option<u64>, width: u32, height: u32, orientation: Option<obscura_host_protocol::Orientation>, document_revision: Option<u64>) -> Result<WorkKind, String> {
+        self.remote_focus = None;
         let orientation = orientation.or_else(|| self.rotation.map(|rotation| rotation.orientation));
         let revision = if self.viewport == Some((width as f32, height as f32)) { self.viewport_revision }
             else { self.viewport_revision.checked_add(1).ok_or("Viewport revision exhausted; recreate session")? };
@@ -154,6 +156,7 @@ impl Session {
         Ok(WorkKind::Viewport { width, height, revision, rotation, document_revision, cancel })
     }
     fn detach(&mut self, connection: u64) {
+        self.remote_focus = None;
         self.retired.insert(connection);
         self.attachments.remove(&connection);
         if self.viewport_owner == Some(connection) { self.viewport_owner = None; }
@@ -171,6 +174,7 @@ impl Session {
         }
     }
     fn transition(&mut self, phase: ControlPhase) {
+        self.remote_focus = None;
         if let Some(epoch) = self.control.epoch.checked_add(1) {
             self.control = host_control(epoch, phase);
         } else { self.fault = Some("Control epoch exhausted; recreate session".into()); }
@@ -181,6 +185,18 @@ impl Session {
                 self.transition(ControlPhase::Human { attachment_id });
             }
         }
+    }
+    fn record_remote_focus(&mut self, focus: Option<FocusSnapshot>, document_revision: u64, viewport_revision: u64) {
+        self.remote_focus = focus
+            .filter(|_| document_revision == self.document_revision && viewport_revision == self.viewport_revision)
+            .map(|focus| RemoteFocusCapability {
+                session_id: self.id.clone(),
+                document_revision,
+                viewport_revision,
+                control_epoch: self.control.epoch,
+                focused: focus.focused,
+                editable: focus.editable,
+            });
     }
     fn status(&self, connection: u64, busy: bool) -> ResultValue {
         ResultValue::Status(SessionStatus {
@@ -206,6 +222,7 @@ impl Session {
             rotation: self.rotation,
             viewport_owner: self.viewport_owner,
             viewport_pending: self.viewport_pending(),
+            remote_focus: self.remote_focus.clone(),
         })
     }
     fn request(&mut self, connection: u64, request: Request, busy: bool) -> Result<Response, Command> {
@@ -414,6 +431,7 @@ struct Pending {
 struct PendingOperation {
     id: u64,
     connection: u64,
+    control_epoch: u64,
     reply: oneshot::Sender<Response>,
 }
 
@@ -428,7 +446,7 @@ pub async fn serve(socket_dir: PathBuf, allow_private_network: bool) -> Result<(
     let (interest, interested) = tokio::sync::watch::channel(0usize);
     let worker = worker::start(id.clone(), allow_private_network, incoming_work, ready, faults, frames, interested)?;
     let viewport = initialized.await.context("browser worker stopped during startup")?.map_err(anyhow::Error::msg)?;
-    let mut session = Session { id: id.clone(), viewport: Some(viewport), attachments: HashMap::new(), agent: None, viewport_revision: 0, document_revision: 0, fault: None, control: host_control(1, ControlPhase::Agent), records: HashMap::new(), operation_ids: HashMap::new(), retired: HashSet::new(), viewport_owner: None, viewport_update: None, viewport_repair: None, rotation: None };
+    let mut session = Session { id: id.clone(), viewport: Some(viewport), attachments: HashMap::new(), agent: None, viewport_revision: 0, document_revision: 0, fault: None, control: host_control(1, ControlPhase::Agent), records: HashMap::new(), operation_ids: HashMap::new(), retired: HashSet::new(), viewport_owner: None, viewport_update: None, viewport_repair: None, rotation: None, remote_focus: None };
     let listener = UnixListener::bind(directory.0.join("host.sock"))?;
     std::fs::set_permissions(directory.0.join("host.sock"), std::fs::Permissions::from_mode(0o600))?;
     let media_listener = UnixListener::bind(directory.0.join("frames.sock"))?;
@@ -528,10 +546,11 @@ pub async fn serve(socket_dir: PathBuf, allow_private_network: bool) -> Result<(
                                 let _ = reply.send(error(id, "SESSION_FAULTED", session.fault.clone().unwrap()));
                             } else {
                                 session.operation_ids.entry(connection).or_default().insert(record.operation.operation_id.clone());
+                                let control_epoch = record.operation.control_epoch;
                                 let records = session.records.entry(connection).or_default();
                                 if records.len() == MAX_RECEIPTS { records.pop_front(); }
                                 records.push_back(record);
-                                pending = Some(Pending { operation: Some(PendingOperation { id, connection, reply }), result });
+                                pending = Some(Pending { operation: Some(PendingOperation { id, connection, control_epoch, reply }), result });
                             }
                         }
                     }
@@ -540,8 +559,12 @@ pub async fn serve(socket_dir: PathBuf, allow_private_network: bool) -> Result<(
             completion = async { (&mut pending.as_mut().unwrap().result).await }, if pending.is_some() => {
                 let finished = pending.take().unwrap();
                 let viewport_update = session.viewport_update.take();
+                let operation_control_epoch = finished.operation.as_ref().map(|operation| operation.control_epoch);
                 let outcome = match completion {
                     Ok(completion) => {
+                        let document_changed = completion.document_revision != session.document_revision;
+                        let viewport_changed = completion.viewport_revision != session.viewport_revision;
+                        if document_changed || viewport_changed { session.remote_focus = None; }
                         // A failed resize may have changed Page partially. Keep the
                         // last committed geometry/revision and fence the faulted Page.
                         if viewport_update.is_none() {
@@ -574,6 +597,15 @@ pub async fn serve(socket_dir: PathBuf, allow_private_network: bool) -> Result<(
                         if finished.operation.is_none() {
                             if let Err((code, cause)) = &completion.result { session.fault = Some(format!("Viewport application failed: {code}: {cause}")); }
                         }
+                        if finished.operation.is_some()
+                            && operation_control_epoch == Some(session.control.epoch)
+                            && session.fault.is_none()
+                            && completion.result.is_ok()
+                            && completion.document_revision == session.document_revision
+                            && completion.viewport_revision == session.viewport_revision
+                        {
+                            session.record_remote_focus(completion.focus, completion.document_revision, completion.viewport_revision);
+                        }
                         session.finish_handover();
                         match completion.result {
                             Ok(_) if session.fault.is_some() && session.viewport.is_some() => Err(("SESSION_FAULTED", session.fault.clone().unwrap())),
@@ -602,8 +634,18 @@ pub async fn serve(socket_dir: PathBuf, allow_private_network: bool) -> Result<(
             update = fault_events.recv(), if session.fault.is_none() => {
                 match update {
                     Some(update) => {
+                        let previous_document = session.document_revision;
                         session.document_revision = session.document_revision.max(update.document_revision);
                         session.fault = update.fault;
+                        if session.fault.is_some() {
+                            session.remote_focus = None;
+                        } else if update.document_revision >= previous_document {
+                            // A navigation update invalidates the old observation first,
+                            // then may replace it with the Page-thread sample for the
+                            // newly committed document.
+                            if session.document_revision != previous_document { session.remote_focus = None; }
+                            session.record_remote_focus(update.focus, update.document_revision, session.viewport_revision);
+                        }
                     }
                     None => session.fault = Some("Browser worker stopped".into()),
                 }
@@ -663,6 +705,7 @@ mod tests {
             viewport_update: None,
             viewport_repair: None,
             rotation: None,
+            remote_focus: None,
         }
     }
 

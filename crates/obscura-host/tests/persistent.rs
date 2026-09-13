@@ -491,6 +491,62 @@ fn human_click_text_and_scroll_use_the_live_page() {
 }
 
 #[test]
+fn remote_focus_is_revision_bound_and_cleared_by_control_viewport_and_disconnect() {
+    let daemon = Daemon::start();
+    let mut agent = daemon.connect();
+    let attached = agent.ok(json!({"type":"attach","mode":"agent"}));
+    agent.ok(json!({"type":"navigate","url":"data:text/html,<style>body{margin:0}input,button{position:absolute;left:10px;width:220px;height:40px}input{top:10px}button{top:70px}</style><input id='field'><button id='button'>button</button>"}));
+
+    let focused_input = agent.ok(json!({"type":"status"}));
+    let capability = &focused_input["remote_focus"];
+    assert_eq!(capability["session_id"], attached["session_id"]);
+    assert_eq!(capability["document_revision"], focused_input["document_revision"]);
+    assert_eq!(capability["viewport_revision"], focused_input["viewport_revision"]);
+    assert_eq!(capability["control_epoch"], focused_input["control"]["epoch"]);
+    assert_eq!(capability["focused"], false, "navigation leaves the body focused");
+    assert_eq!(capability["editable"], false);
+
+    agent.ok(json!({"type":"click","x":30,"y":30}));
+    let after_input_click = agent.ok(json!({"type":"status"}));
+    assert_eq!(after_input_click["remote_focus"]["focused"], true);
+    assert_eq!(after_input_click["remote_focus"]["editable"], true);
+    assert_eq!(after_input_click["remote_focus"]["document_revision"], after_input_click["document_revision"]);
+
+    agent.ok(json!({"type":"click","x":30,"y":90}));
+    let after_button_click = agent.ok(json!({"type":"status"}));
+    assert_eq!(after_button_click["remote_focus"]["focused"], true);
+    assert_eq!(after_button_click["remote_focus"]["editable"], false);
+    assert_eq!(after_button_click["remote_focus"]["control_epoch"], after_button_click["control"]["epoch"]);
+
+    let resized = agent.ok(json!({"type":"resize","width":390,"height":640}));
+    assert!(resized["remote_focus"].is_null(), "viewport admission invalidates the prior Page observation");
+    let settled_resize = settled(&mut agent);
+    assert!(settled_resize["remote_focus"].is_null(), "viewport completion has no new focus sample");
+
+    let mut observer = daemon.connect();
+    let observer_status = observer.ok(json!({"type":"attach","mode":"observe"}));
+    let waiting = observer.ok(json!({"type":"request_takeover","epoch":observer_status["control"]["epoch"]}));
+    assert!(waiting["remote_focus"].is_null(), "control transition invalidates the prior Page observation");
+    let human = observer.ok(json!({"type":"status"}));
+    assert!(human["remote_focus"].is_null(), "takeover grants a new control epoch");
+
+    observer.ok(json!({"type":"click","x":30,"y":30}));
+    let human_focus = observer.ok(json!({"type":"status"}));
+    assert_eq!(human_focus["remote_focus"]["focused"], true);
+    assert_eq!(human_focus["remote_focus"]["editable"], true);
+    assert_eq!(human_focus["remote_focus"]["control_epoch"], human_focus["control"]["epoch"]);
+
+    drop(observer);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let status = agent.ok(json!({"type":"status"}));
+        if status["remote_focus"].is_null() { break; }
+        assert!(Instant::now() < deadline, "EOF left a stale remote focus capability: {status}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
 fn human_navigation_respects_control_identity_and_document_revision() {
     let daemon = Daemon::start();
     let mut agent = daemon.connect();
