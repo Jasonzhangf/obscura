@@ -99,7 +99,8 @@ async fn exercise(encoder_failure: bool) -> anyhow::Result<()> {
     for frame in frames {
         anyhow::ensure!(frame["session_id"] == first_report["session_id"]
             && frame["width"] == 160 && frame["height"] == 120 && frame["stride"] == 640
-            && frame["coded_width"] == 160 && frame["coded_height"] == 120
+            && frame["source_dimensions"]["width"] == 160
+            && frame["source_dimensions"]["height"] == 120
             && frame["codec"] == "h264_annex_b" && frame["keyframe"] == true,
             "incomplete WebRTC frame descriptor: {frame}");
         anyhow::ensure!(frame["encoder_id"].as_str().is_some_and(|value| !value.is_empty())
