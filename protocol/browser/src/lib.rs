@@ -34,6 +34,7 @@ pub enum Command {
     DeclareViewport { viewport: ViewportDeclaration },
     Detach {},
     Status {},
+    SetVideoQuality { profile: VideoQualityProfile, low_latency: bool },
     RequestTakeover { epoch: u64 },
     ReleaseControl { epoch: u64 },
     ResumeAgent { epoch: u64 },
@@ -169,6 +170,38 @@ pub struct SessionStatus {
     pub viewport_pending: bool,
     /// Last Page-owned activeElement observation, bound to current revisions and control.
     pub remote_focus: Option<RemoteFocusCapability>,
+    /// Host-owned media control state. This is not part of `Operation`.
+    pub video_quality: VideoQualityState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoQualityProfile { Low, Balanced, High }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct VideoQualitySettings {
+    pub profile: VideoQualityProfile,
+    pub low_latency: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LinkQuality {
+    /// Null means the Host has no typed measurement; values are never inferred
+    /// from logs, payloads, or transport activity.
+    pub rtt_ms: Option<f64>,
+    pub jitter_ms: Option<f64>,
+    pub loss_ratio: Option<f64>,
+    pub queue_ms: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct VideoQualityState {
+    pub requested: VideoQualitySettings,
+    pub effective: VideoQualitySettings,
+    pub link: LinkQuality,
 }
 
 fn require_non_empty_control_token<'de, D>(deserializer: D) -> Result<String, D::Error>
@@ -193,6 +226,7 @@ pub struct EvaluationResult {
 #[serde(untagged)]
 pub enum ResultValue {
     Status(SessionStatus),
+    VideoQuality { quality: VideoQualityState },
     Evaluation { result: EvaluationResult },
     Closed { closed: bool },
     Input { input: InputReceipt },
@@ -279,11 +313,11 @@ pub enum VideoPacket {
 #[serde(rename_all = "snake_case")]
 pub enum VideoCodec { H264AnnexB }
 
-/// Version 8 adds the revision-bound remote focus capability to SessionStatus.
-pub const HOST_PROTOCOL_VERSION: u32 = 8;
-/// Version 7 carries the version 8 remote focus capability in browser responses
+/// Version 9 adds typed video quality control to SessionStatus and ResultValue.
+pub const HOST_PROTOCOL_VERSION: u32 = 9;
+/// Version 8 carries the version 9 remote focus and video quality ABI in browser responses
 /// over DataChannel. Older peers are rejected during the Hello exchange.
-pub const WEBRTC_PROTOCOL_VERSION: u32 = 7;
+pub const WEBRTC_PROTOCOL_VERSION: u32 = 8;
 pub const WEBRTC_CONTROL_LABEL: &str = "obscura.control.v1";
 pub const WEBRTC_H264_FMTP: &str = "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f";
 
@@ -421,7 +455,7 @@ pub struct WebRtcProbeReport {
 
 #[cfg(test)]
 mod tests {
-    use super::{Control, ControlPhase, InputReceipt, InputState, Operation, OperationId, Orientation, RemoteFocusCapability, RotationIdentity, SessionStatus, SourceDimensions};
+    use super::{Control, ControlPhase, InputReceipt, InputState, Operation, OperationId, Orientation, RemoteFocusCapability, RotationIdentity, SessionStatus, SourceDimensions, VideoQualityProfile, VideoQualitySettings, VideoQualityState, LinkQuality};
 
     fn control(token: &str) -> Control {
         Control { epoch: 7, token: token.into(), phase: ControlPhase::Human { attachment_id: 11 } }
@@ -453,6 +487,11 @@ mod tests {
                 focused: true,
                 editable: true,
             }),
+            video_quality: VideoQualityState {
+                requested: VideoQualitySettings { profile: VideoQualityProfile::Balanced, low_latency: false },
+                effective: VideoQualitySettings { profile: VideoQualityProfile::Balanced, low_latency: false },
+                link: LinkQuality { rtt_ms: None, jitter_ms: None, loss_ratio: None, queue_ms: None },
+            },
         }
     }
 
@@ -536,6 +575,36 @@ mod tests {
     }
 
     #[test]
+    fn video_quality_control_is_bounded_and_round_trips() {
+        let command = super::Command::SetVideoQuality { profile: VideoQualityProfile::High, low_latency: true };
+        let encoded = serde_json::to_value(&command).unwrap();
+        assert_eq!(encoded, serde_json::json!({"type":"set_video_quality","profile":"high","low_latency":true}));
+        assert_eq!(serde_json::from_value::<super::Command>(encoded).unwrap(), command);
+
+        let unknown_profile = serde_json::json!({"type":"set_video_quality","profile":"ultra","low_latency":false});
+        assert!(serde_json::from_value::<super::Command>(unknown_profile).is_err());
+        let unknown_field = serde_json::json!({"type":"set_video_quality","profile":"low","low_latency":false,"bitrate_kbps":900});
+        assert!(serde_json::from_value::<super::Command>(unknown_field).is_err());
+    }
+
+    #[test]
+    fn video_quality_state_round_trips_requested_effective_and_typed_link_metrics() {
+        let state = VideoQualityState {
+            requested: VideoQualitySettings { profile: VideoQualityProfile::Low, low_latency: true },
+            effective: VideoQualitySettings { profile: VideoQualityProfile::Balanced, low_latency: false },
+            link: LinkQuality { rtt_ms: Some(24.5), jitter_ms: Some(3.25), loss_ratio: Some(0.01), queue_ms: None },
+        };
+        let encoded = serde_json::to_value(state).unwrap();
+        assert_eq!(serde_json::from_value::<VideoQualityState>(encoded.clone()).unwrap(), state);
+        assert_eq!(encoded["requested"]["profile"], "low");
+        assert_eq!(encoded["effective"]["profile"], "balanced");
+        assert_eq!(encoded["link"]["loss_ratio"], 0.01);
+        let mut unknown = encoded;
+        unknown["link"]["bandwidth_kbps"] = serde_json::json!(1000);
+        assert!(serde_json::from_value::<VideoQualityState>(unknown).is_err());
+    }
+
+    #[test]
     fn operation_id_is_required_and_round_trips_as_a_typed_field() {
         let operation = Operation {
             operation_id: OperationId("019d0d66-c5dc-7492-a097-39ac8f06f434".into()),
@@ -592,5 +661,34 @@ mod tests {
             "document_revision": 19
         });
         assert!(serde_json::from_value::<InputReceipt>(missing_state).is_err());
+    }
+
+    #[test]
+    fn video_quality_abi_round_trips_and_rejects_unknown_profile_or_fields() {
+        let quality = VideoQualityState {
+            requested: VideoQualitySettings { profile: VideoQualityProfile::High, low_latency: true },
+            effective: VideoQualitySettings { profile: VideoQualityProfile::High, low_latency: true },
+            link: LinkQuality { rtt_ms: Some(12.5), jitter_ms: Some(2.0), loss_ratio: None, queue_ms: Some(4.0) },
+        };
+        let encoded = serde_json::to_value(quality).unwrap();
+        assert_eq!(serde_json::from_value::<VideoQualityState>(encoded.clone()).unwrap(), quality);
+
+        let mut unknown = encoded;
+        unknown["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<VideoQualityState>(unknown).is_err());
+
+        let request = serde_json::json!({
+            "id": 1,
+            "command": { "type": "set_video_quality", "profile": "balanced", "low_latency": false }
+        });
+        let parsed: Request = serde_json::from_value(request).unwrap();
+        assert_eq!(parsed.operation, None);
+        assert!(matches!(parsed.command, Command::SetVideoQuality { profile: VideoQualityProfile::Balanced, low_latency: false }));
+
+        let unknown_profile = serde_json::json!({
+            "id": 1,
+            "command": { "type": "set_video_quality", "profile": "ultra", "low_latency": false }
+        });
+        assert!(serde_json::from_value::<Request>(unknown_profile).is_err());
     }
 }

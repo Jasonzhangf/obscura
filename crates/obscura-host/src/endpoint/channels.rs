@@ -162,6 +162,7 @@ fn permitted_remote_command(command: &Command) -> bool {
         Command::Attach { mode: Mode::Observe, .. }
             | Command::DeclareViewport { .. }
             | Command::Status {}
+            | Command::SetVideoQuality { .. }
             | Command::Detach {}
             | Command::RequestTakeover { .. }
             | Command::ReleaseControl { .. }
@@ -299,6 +300,14 @@ pub async fn ingest(
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
+
+    #[test]
+    fn remote_observer_may_change_video_quality_without_operation_identity() {
+        assert!(permitted_remote_command(&Command::SetVideoQuality {
+            profile: obscura_host_protocol::VideoQualityProfile::Balanced,
+            low_latency: true,
+        }));
+    }
 
     #[tokio::test]
     async fn terminal_encoder_unavailable_closes_fanout_watches() {

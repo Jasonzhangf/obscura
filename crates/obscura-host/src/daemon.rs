@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use anyhow::{Context, Result};
-use obscura_host_protocol::{Command, Control, ControlPhase, Device, FramePacket, Mode, Operation, OperationId, RemoteFocusCapability, Request, Response, ResultValue, RotationIdentity, SessionStatus, SourceDimensions, ViewportDeclaration, WebRtcCapability, WebRtcSessionBinding, WebRtcTransport, WebRtcVideoCodec, HOST_PROTOCOL_VERSION, WEBRTC_CONTROL_LABEL, WEBRTC_PROTOCOL_VERSION};
+use obscura_host_protocol::{Command, Control, ControlPhase, Device, FramePacket, LinkQuality, Mode, Operation, OperationId, RemoteFocusCapability, Request, Response, ResultValue, RotationIdentity, SessionStatus, SourceDimensions, VideoQualityProfile, VideoQualitySettings, VideoQualityState, ViewportDeclaration, WebRtcCapability, WebRtcSessionBinding, WebRtcTransport, WebRtcVideoCodec, HOST_PROTOCOL_VERSION, WEBRTC_CONTROL_LABEL, WEBRTC_PROTOCOL_VERSION};
 use crate::media;
 use crate::worker::{self, Completion, FocusSnapshot, Work, WorkKind};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -96,9 +96,19 @@ struct Session {
     viewport_repair: Option<(u32, u32, Option<obscura_host_protocol::Orientation>)>,
     rotation: Option<RotationIdentity>,
     remote_focus: Option<RemoteFocusCapability>,
+    video_quality: VideoQualityState,
+    video_quality_capability: VideoQualityCapability,
 }
 struct Attachment { mode: Mode, viewport: Option<ViewportDeclaration>, webrtc: Option<WebRtcGrant> }
 struct WebRtcGrant { capability: WebRtcCapability, binding: WebRtcSessionBinding, consumed: bool }
+#[derive(Debug, Clone, Copy)]
+struct VideoQualityCapability { low: bool, balanced: bool, high: bool }
+impl VideoQualityCapability {
+    const CURRENT: Self = Self { low: true, balanced: true, high: true };
+    fn supports(self, profile: VideoQualityProfile) -> bool {
+        match profile { VideoQualityProfile::Low => self.low, VideoQualityProfile::Balanced => self.balanced, VideoQualityProfile::High => self.high }
+    }
+}
 struct ViewportUpdate { owner: Option<u64>, width: u32, height: u32, revision: u64, rotation: Option<RotationIdentity>, cancelled: bool, cancel: Arc<AtomicBool> }
 struct Record { operation: Operation, command: Command, response: Option<Response> }
 fn valid_viewport(width: u32, height: u32) -> bool {
@@ -223,6 +233,7 @@ impl Session {
             viewport_owner: self.viewport_owner,
             viewport_pending: self.viewport_pending(),
             remote_focus: self.remote_focus.clone(),
+            video_quality: self.video_quality,
         })
     }
     fn request(&mut self, connection: u64, request: Request, busy: bool) -> Result<Response, Command> {
@@ -341,6 +352,11 @@ impl Session {
                         grant.consumed = true;
                         return Ok(Response::Result { id, value: ResultValue::WebRtcConsumed { session_id: self.id.clone(), attachment_id: connection } });
                     }
+                    Command::SetVideoQuality { profile, low_latency } => {
+                        let quality = VideoQualitySettings { profile, low_latency };
+                        self.video_quality = VideoQualityState { requested: quality, effective: quality, link: LinkQuality { rtt_ms: None, jitter_ms: None, loss_ratio: None, queue_ms: None } };
+                        return Ok(Response::Result { id, value: ResultValue::VideoQuality { quality: self.video_quality } });
+                    }
                     Command::DeclareViewport { viewport } => {
                         let attachment = self.attachments.get_mut(&connection).unwrap();
                         if attachment.mode != Mode::Observe { return Ok(error(id, "OBSERVER_REQUIRED", "Only observer attachments declare a viewport")); }
@@ -446,7 +462,7 @@ pub async fn serve(socket_dir: PathBuf, allow_private_network: bool) -> Result<(
     let (interest, interested) = tokio::sync::watch::channel(0usize);
     let worker = worker::start(id.clone(), allow_private_network, incoming_work, ready, faults, frames, interested)?;
     let viewport = initialized.await.context("browser worker stopped during startup")?.map_err(anyhow::Error::msg)?;
-    let mut session = Session { id: id.clone(), viewport: Some(viewport), attachments: HashMap::new(), agent: None, viewport_revision: 0, document_revision: 0, fault: None, control: host_control(1, ControlPhase::Agent), records: HashMap::new(), operation_ids: HashMap::new(), retired: HashSet::new(), viewport_owner: None, viewport_update: None, viewport_repair: None, rotation: None, remote_focus: None };
+    let mut session = Session { id: id.clone(), viewport: Some(viewport), attachments: HashMap::new(), agent: None, viewport_revision: 0, document_revision: 0, fault: None, control: host_control(1, ControlPhase::Agent), records: HashMap::new(), operation_ids: HashMap::new(), retired: HashSet::new(), viewport_owner: None, viewport_update: None, viewport_repair: None, rotation: None, remote_focus: None, video_quality: VideoQualityState { requested: VideoQualitySettings { profile: VideoQualityProfile::Balanced, low_latency: false }, effective: VideoQualitySettings { profile: VideoQualityProfile::Balanced, low_latency: false }, link: LinkQuality { rtt_ms: None, jitter_ms: None, loss_ratio: None, queue_ms: None } } };
     let listener = UnixListener::bind(directory.0.join("host.sock"))?;
     std::fs::set_permissions(directory.0.join("host.sock"), std::fs::Permissions::from_mode(0o600))?;
     let media_listener = UnixListener::bind(directory.0.join("frames.sock"))?;
@@ -706,6 +722,7 @@ mod tests {
             viewport_repair: None,
             rotation: None,
             remote_focus: None,
+            video_quality: VideoQualityState { requested: VideoQualitySettings { profile: VideoQualityProfile::Balanced, low_latency: false }, effective: VideoQualitySettings { profile: VideoQualityProfile::Balanced, low_latency: false }, link: LinkQuality { rtt_ms: None, jitter_ms: None, loss_ratio: None, queue_ms: None } },
         }
     }
 
@@ -812,5 +829,28 @@ mod tests {
         let tokens = [initial.control.token, waiting.control.token, human.control.token,
             released.control.token, paused.control.token, resumed.control.token];
         assert_eq!(tokens.iter().collect::<HashSet<_>>().len(), tokens.len());
+    }
+
+    #[test]
+    fn video_quality_is_a_typed_control_request_and_not_a_browser_operation() {
+        let mut session = session();
+        let response = session.request(1, Request {
+            id: 17,
+            command: Command::SetVideoQuality { profile: VideoQualityProfile::High, low_latency: true },
+            operation: None,
+        }, false).unwrap();
+        let Response::Result { value: ResultValue::VideoQuality { quality }, .. } = response else {
+            panic!("expected typed video quality result");
+        };
+        assert_eq!(quality.requested.profile, VideoQualityProfile::High);
+        assert!(quality.requested.low_latency);
+        assert_eq!(quality.effective, quality.requested);
+
+        let with_operation = session.request(1, Request {
+            id: 18,
+            command: Command::SetVideoQuality { profile: VideoQualityProfile::Low, low_latency: false },
+            operation: Some(operation("quality-operation")),
+        }, false).unwrap();
+        assert!(matches!(with_operation, Response::Error { code, .. } if code == "INVALID_OPERATION"));
     }
 }
