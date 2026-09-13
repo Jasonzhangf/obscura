@@ -13,7 +13,10 @@ impl Directory {
 }
 impl Drop for Directory {
     fn drop(&mut self) {
-        for name in ["raw", "video"] { std::fs::remove_file(self.0.join(name)).unwrap(); }
+        for name in ["raw", "video", "quality"] {
+            let path = self.0.join(name);
+            if path.exists() { std::fs::remove_file(path).unwrap(); }
+        }
         std::fs::remove_dir(&self.0).unwrap();
     }
 }
