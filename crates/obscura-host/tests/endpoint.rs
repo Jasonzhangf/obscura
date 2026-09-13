@@ -113,6 +113,22 @@ async fn exercise() {
     let mut request = format!("wss://localhost:{}/media", address.port()).into_client_request().unwrap();
     request.headers_mut().insert("authorization", format!("Bearer {token}").parse().unwrap());
     let (mut video, _) = client_async(request, tls).await.unwrap();
+    // A media connection is read-only at the server. A client that writes to it
+    // must fail only that connection, not the endpoint after a later valid
+    // Closed delivery.
+    let bad_tls = connector.connect(ServerName::try_from("localhost").unwrap(), tokio::net::TcpStream::connect(address).await.unwrap()).await.unwrap();
+    let (mut bad_control, bad_response) = client_async(format!("wss://localhost:{}/control", address.port()), bad_tls).await.unwrap();
+    let bad_token = bad_response.headers()["x-obscura-media-token"].to_str().unwrap().to_string();
+    let bad_ready: serde_json::Value = serde_json::from_str(bad_control.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+    assert_eq!(bad_ready["version"], HOST_PROTOCOL_VERSION);
+    bad_control.send(Message::text(r#"{"id":101,"command":{"type":"attach","mode":"observe"}}"#)).await.unwrap();
+    let bad_attached: serde_json::Value = serde_json::from_str(bad_control.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+    assert_eq!(bad_attached["value"]["mode"], "observe");
+    let bad_tls = connector.connect(ServerName::try_from("localhost").unwrap(), tokio::net::TcpStream::connect(address).await.unwrap()).await.unwrap();
+    let mut bad_request = format!("wss://localhost:{}/media", address.port()).into_client_request().unwrap();
+    bad_request.headers_mut().insert("authorization", format!("Bearer {bad_token}").parse().unwrap());
+    let (mut bad_video, _) = client_async(bad_request, bad_tls).await.unwrap();
+    bad_video.send(Message::Text("not media".into())).await.unwrap();
     let packet = loop {
         let message = video.next().await.unwrap().unwrap();
         if let Message::Binary(bytes) = message {

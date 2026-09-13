@@ -10,6 +10,17 @@ pub type Socket = WebSocketStream<tokio_rustls::server::TlsStream<tokio::net::Tc
 pub struct Video { pub bytes: Vec<u8>, pub closed: bool }
 pub type Frame = Arc<Video>;
 
+#[derive(Debug)]
+pub struct MediaChannelReadOnly;
+
+impl std::fmt::Display for MediaChannelReadOnly {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Media channel is read-only")
+    }
+}
+
+impl std::error::Error for MediaChannelReadOnly {}
+
 async fn reply(reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>) -> Result<Response> {
     let mut bytes = Vec::new();
     (&mut *reader).take(1024 * 1024 + 1).read_until(b'\n', &mut bytes).await?;
@@ -237,7 +248,7 @@ pub async fn media(mut remote: Socket, mut latest: watch::Receiver<Option<Frame>
                 Some(Ok(Message::Ping(bytes))) => send(&mut remote, Message::Pong(bytes)).await?,
                 Some(Ok(Message::Pong(_))) => {}
                 Some(Ok(Message::Close(_))) | None => return Ok(()),
-                _ => anyhow::bail!("Media channel is read-only"),
+                _ => return Err(MediaChannelReadOnly.into()),
             }
         }
     }

@@ -142,8 +142,12 @@ pub async fn serve(args: Args) -> Result<()> {
                             let _media_lease = media_lease.context("Missing media lease")?;
                             let result = channels::media(remote, frames, media_active.context("Missing media grant")?).await;
                             if let Err(error) = &result {
-                                let mut failure = media_failure.lock().expect("media failure owner");
-                                if failure.is_none() { *failure = Some(error.to_string()); }
+                                // A client write on the read-only media channel is a
+                                // per-connection protocol failure, not a Closed delivery failure.
+                                if error.downcast_ref::<channels::MediaChannelReadOnly>().is_none() {
+                                    let mut failure = media_failure.lock().expect("media failure owner");
+                                    if failure.is_none() { *failure = Some(error.to_string()); }
+                                }
                             }
                             result
                         }
