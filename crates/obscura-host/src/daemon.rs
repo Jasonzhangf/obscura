@@ -353,8 +353,11 @@ impl Session {
                         return Ok(Response::Result { id, value: ResultValue::WebRtcConsumed { session_id: self.id.clone(), attachment_id: connection } });
                     }
                     Command::SetVideoQuality { profile, low_latency } => {
+                        if !self.video_quality_capability.supports(profile) {
+                            return Ok(error(id, "QUALITY_UNSUPPORTED", "Encoder does not support the requested video quality profile"));
+                        }
                         let quality = VideoQualitySettings { profile, low_latency };
-                        self.video_quality = VideoQualityState { requested: quality, effective: quality, link: LinkQuality { rtt_ms: None, jitter_ms: None, loss_ratio: None, queue_ms: None } };
+                        self.video_quality = VideoQualityState { requested: quality, effective: quality, link: self.video_quality.link };
                         return Ok(Response::Result { id, value: ResultValue::VideoQuality { quality: self.video_quality } });
                     }
                     Command::DeclareViewport { viewport } => {
@@ -462,7 +465,7 @@ pub async fn serve(socket_dir: PathBuf, allow_private_network: bool) -> Result<(
     let (interest, interested) = tokio::sync::watch::channel(0usize);
     let worker = worker::start(id.clone(), allow_private_network, incoming_work, ready, faults, frames, interested)?;
     let viewport = initialized.await.context("browser worker stopped during startup")?.map_err(anyhow::Error::msg)?;
-    let mut session = Session { id: id.clone(), viewport: Some(viewport), attachments: HashMap::new(), agent: None, viewport_revision: 0, document_revision: 0, fault: None, control: host_control(1, ControlPhase::Agent), records: HashMap::new(), operation_ids: HashMap::new(), retired: HashSet::new(), viewport_owner: None, viewport_update: None, viewport_repair: None, rotation: None, remote_focus: None, video_quality: VideoQualityState { requested: VideoQualitySettings { profile: VideoQualityProfile::Balanced, low_latency: false }, effective: VideoQualitySettings { profile: VideoQualityProfile::Balanced, low_latency: false }, link: LinkQuality { rtt_ms: None, jitter_ms: None, loss_ratio: None, queue_ms: None } } };
+    let mut session = Session { id: id.clone(), viewport: Some(viewport), attachments: HashMap::new(), agent: None, viewport_revision: 0, document_revision: 0, fault: None, control: host_control(1, ControlPhase::Agent), records: HashMap::new(), operation_ids: HashMap::new(), retired: HashSet::new(), viewport_owner: None, viewport_update: None, viewport_repair: None, rotation: None, remote_focus: None, video_quality: VideoQualityState { requested: VideoQualitySettings { profile: VideoQualityProfile::Balanced, low_latency: true }, effective: VideoQualitySettings { profile: VideoQualityProfile::Balanced, low_latency: true }, link: LinkQuality { rtt_ms: None, jitter_ms: None, loss_ratio: None, queue_ms: None } }, video_quality_capability: VideoQualityCapability::CURRENT };
     let listener = UnixListener::bind(directory.0.join("host.sock"))?;
     std::fs::set_permissions(directory.0.join("host.sock"), std::fs::Permissions::from_mode(0o600))?;
     let media_listener = UnixListener::bind(directory.0.join("frames.sock"))?;
@@ -723,6 +726,7 @@ mod tests {
             rotation: None,
             remote_focus: None,
             video_quality: VideoQualityState { requested: VideoQualitySettings { profile: VideoQualityProfile::Balanced, low_latency: false }, effective: VideoQualitySettings { profile: VideoQualityProfile::Balanced, low_latency: false }, link: LinkQuality { rtt_ms: None, jitter_ms: None, loss_ratio: None, queue_ms: None } },
+            video_quality_capability: VideoQualityCapability::CURRENT,
         }
     }
 
