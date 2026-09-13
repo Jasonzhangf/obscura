@@ -18,10 +18,29 @@ def receive(reader):
     return json.loads(header)
 
 
+def host_protocol_version_from_source():
+    source = pathlib.Path(__file__).resolve().parents[3] / "protocol" / "browser" / "src" / "lib.rs"
+    prefix = "pub const HOST_PROTOCOL_VERSION: u32 = "
+    values = []
+    for line in source.read_text().splitlines():
+        if line.startswith(prefix):
+            value = line[len(prefix):].strip()
+            if value.endswith(";"):
+                value = value[:-1].strip()
+            values.append(value)
+    if len(values) != 1:
+        raise RuntimeError(f"expected one HOST_PROTOCOL_VERSION in {source}, found {len(values)}")
+    try:
+        return int(values[0])
+    except ValueError as error:
+        raise RuntimeError(f"invalid HOST_PROTOCOL_VERSION in {source}: {values[0]!r}") from error
+
+
 def main():
     host_bin, media_bin, evidence = sys.argv[1:]
     evidence = pathlib.Path(evidence)
     evidence.mkdir()
+    host_protocol_version = host_protocol_version_from_source()
     with tempfile.TemporaryDirectory(prefix="om-", dir="/tmp") as directory:
         root = pathlib.Path(directory)
         video = socket.socket(socket.AF_UNIX)
@@ -43,7 +62,11 @@ def main():
                     assert time.monotonic() < deadline and host.poll() is None
                     time.sleep(0.02)
             replies = control.makefile("rb")
-            assert receive(replies)["version"] == 6
+            ready = receive(replies)
+            assert ready["version"] == host_protocol_version, {
+                "ready": ready,
+                "expected": host_protocol_version,
+            }
 
             def request(command, operation=None):
                 control.sendall(json.dumps({"id": 1, "command": command, "operation": operation}).encode() + b"\n")
@@ -60,7 +83,8 @@ def main():
 
             request({"type": "attach", "mode": "agent"})
             mutate({"type": "resize", "width": 160, "height": 120})
-            state = mutate({"type": "navigate", "url": "data:text/html,<style>body{margin:0;background:white}button{width:40px;height:40px;border:0;background:red}</style><button onclick=\"this.style.background='lime'\"></button><input id='field' value='retained'>"})
+            mutate({"type": "navigate", "url": "data:text/html,<style>body{margin:0;background:white}button{width:40px;height:40px;border:0;background:red}</style><button onclick=\"this.style.background='lime'\"></button><input id='field' value='retained'>"})
+            state = request({"type": "status"})
             media = subprocess.Popen([media_bin, "--frames-socket", str(root / "host" / "frames.sock"),
                                       "--video-socket", str(root / "video")], stdout=subprocess.DEVNULL,
                                      stderr=(evidence / "media.log").open("wb"))
@@ -82,8 +106,10 @@ def main():
                 result = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "h264", "-i", "pipe:0",
                                          "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"],
                                         input=data, capture_output=True, timeout=5, check=True)
-                assert len(result.stdout) == packet["coded_width"] * packet["coded_height"] * 3
-                offset = (20 * packet["coded_width"] + 20) * 3
+                coded_width = packet["source"]["source_dimensions"]["width"]
+                coded_height = packet["source"]["source_dimensions"]["height"]
+                assert len(result.stdout) == coded_width * coded_height * 3
+                offset = (20 * coded_width + 20) * 3
                 return result.stdout[offset:offset + 3]
 
             packet, data = frame()
@@ -106,7 +132,7 @@ def main():
                 if packet["source"]["viewport_revision"] == resized["viewport_revision"]:
                     break
                 assert time.monotonic() < deadline
-            assert (packet["coded_width"], packet["coded_height"]) == (392, 846)
+            assert (packet["source"]["source_dimensions"]["width"], packet["source"]["source_dimensions"]["height"]) == (392, 846)
             assert packet["source"]["document_revision"] == state["document_revision"]
             assert mutate({"type": "evaluate", "expression": "document.getElementById('field').value"})["result"]["value"] == "retained"
             decoded(packet, data)
