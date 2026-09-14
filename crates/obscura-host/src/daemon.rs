@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use anyhow::{Context, Result};
-use obscura_host_protocol::{Command, Control, ControlPhase, Device, FramePacket, LinkQuality, Mode, Operation, OperationId, RemoteFocusCapability, Request, Response, ResultValue, RotationIdentity, SessionStatus, SourceDimensions, VideoQualityProfile, VideoQualitySettings, VideoQualityState, ViewportDeclaration, WebRtcCapability, WebRtcSessionBinding, WebRtcTransport, WebRtcVideoCodec, HOST_PROTOCOL_VERSION, WEBRTC_CONTROL_LABEL, WEBRTC_PROTOCOL_VERSION};
+use obscura_host_protocol::{Command, Control, ControlPhase, Device, FramePacket, InputEvent, LinkQuality, Mode, Operation, OperationId, RemoteFocusCapability, Request, Response, ResultValue, RotationIdentity, SessionStatus, SourceDimensions, VideoQualityProfile, VideoQualitySettings, VideoQualityState, ViewportDeclaration, WebRtcCapability, WebRtcSessionBinding, WebRtcTransport, WebRtcVideoCodec, HOST_PROTOCOL_VERSION, WEBRTC_CONTROL_LABEL, WEBRTC_PROTOCOL_VERSION};
 use crate::media;
 use crate::worker::{self, Completion, FocusSnapshot, Work, WorkKind};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -238,7 +238,7 @@ impl Session {
     }
     fn request(&mut self, connection: u64, request: Request, busy: bool) -> Result<Response, Command> {
         let id = request.id;
-        let controlled = matches!(request.command, Command::Click { .. } | Command::InputText { .. } | Command::Scroll { .. } | Command::Navigate { .. });
+        let controlled = matches!(request.command, Command::Click { .. } | Command::InputText { .. } | Command::Scroll { .. } | Command::InputEvent { .. } | Command::Navigate { .. });
         let mutation = controlled || matches!(request.command, Command::Evaluate { .. } | Command::Resize { .. } | Command::CloseSession {});
         if mutation {
             let Some(operation) = &request.operation else { return Ok(error(id, "OPERATION_REQUIRED", "Browser mutations require an operation identity")); };
@@ -434,6 +434,20 @@ impl Session {
                     }
                     Command::InputText { text } => {
                         if text.chars().count() > 4096 { return Ok(error(id, "TEXT_TOO_LARGE", "At most 4096 characters per text operation")); }
+                    }
+                    Command::InputEvent { event: InputEvent::Key { key, code, modifiers, text } } => {
+                        if key.is_empty() || key.chars().count() > 128 {
+                            return Ok(error(id, "INVALID_KEY", "Key must be 1..128 characters"));
+                        }
+                        if code.is_empty() || code.chars().count() > 128 {
+                            return Ok(error(id, "INVALID_KEY_CODE", "Key code must be 1..128 characters"));
+                        }
+                        if modifiers & !0x0f != 0 {
+                            return Ok(error(id, "INVALID_MODIFIERS", "Only Alt, Ctrl, Meta and Shift modifiers are supported"));
+                        }
+                        if text.chars().count() > 4096 {
+                            return Ok(error(id, "TEXT_TOO_LARGE", "At most 4096 characters per key operation"));
+                        }
                     }
                     _ => unreachable!("control commands handled above"),
                 }
@@ -705,6 +719,17 @@ mod tests {
         }
     }
 
+    fn typed_key() -> Command {
+        Command::InputEvent {
+            event: InputEvent::Key {
+                key: "a".into(),
+                code: "KeyA".into(),
+                modifiers: 0,
+                text: "a".into(),
+            },
+        }
+    }
+
     fn session() -> Session {
         let mut attachments = HashMap::new();
         attachments.insert(1, Attachment { mode: Mode::Agent, viewport: None, webrtc: None });
@@ -764,6 +789,66 @@ mod tests {
             Ok(Response::Error { code, .. }) => assert_eq!(code, "OPERATION_CONFLICT"),
             other => panic!("expected operation conflict, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn typed_key_input_is_a_controlled_operation_with_the_existing_stale_fences() {
+        let mut session = session();
+        let missing_identity = session.request(1, Request {
+            id: 1,
+            command: typed_key(),
+            operation: None,
+        }, false).unwrap();
+        assert!(matches!(missing_identity, Response::Error { code, .. } if code == "OPERATION_REQUIRED"));
+
+        let mut stale_control = operation("typed-stale-control");
+        stale_control.control_epoch = 2;
+        let response = session.request(1, Request {
+            id: 2,
+            command: typed_key(),
+            operation: Some(stale_control),
+        }, false).unwrap();
+        assert!(matches!(response, Response::Error { code, .. } if code == "STALE_CONTROL"));
+
+        let mut stale_viewport = operation("typed-stale-viewport");
+        stale_viewport.viewport_revision = 2;
+        let response = session.request(1, Request {
+            id: 3,
+            command: typed_key(),
+            operation: Some(stale_viewport),
+        }, false).unwrap();
+        assert!(matches!(response, Response::Error { code, .. } if code == "STALE_VIEWPORT"));
+
+        let mut stale_document = operation("typed-stale-document");
+        stale_document.document_revision = 3;
+        let response = session.request(1, Request {
+            id: 4,
+            command: typed_key(),
+            operation: Some(stale_document),
+        }, false).unwrap();
+        assert!(matches!(response, Response::Error { code, .. } if code == "STALE_DOCUMENT"));
+
+        let response = session.request(1, Request {
+            id: 5,
+            command: typed_key(),
+            operation: Some(operation("typed-valid")),
+        }, false);
+        assert!(matches!(response, Err(Command::InputEvent { .. })));
+
+        let invalid_modifiers = Command::InputEvent {
+            event: InputEvent::Key {
+                key: "a".into(),
+                code: "KeyA".into(),
+                modifiers: 16,
+                text: "a".into(),
+            },
+        };
+        let response = session.request(1, Request {
+            id: 6,
+            command: invalid_modifiers,
+            operation: Some(operation("typed-invalid-modifiers")),
+        }, false).unwrap();
+        assert!(matches!(response, Response::Error { code, .. } if code == "INVALID_MODIFIERS"));
     }
 
     #[test]

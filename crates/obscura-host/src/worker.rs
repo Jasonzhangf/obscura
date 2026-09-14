@@ -2,7 +2,7 @@
 use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
 use anyhow::{Context, Result};
 use obscura_browser::{BrowserContext, Page};
-use obscura_host_protocol::{Command, EvaluationResult, FrameInfo, FramePacket, InputReceipt, InputState, Operation, PixelFormat, ResultValue, RotationIdentity, SourceDimensions};
+use obscura_host_protocol::{Command, EvaluationResult, FrameInfo, FramePacket, InputEvent, InputReceipt, InputState, Operation, PixelFormat, ResultValue, RotationIdentity, SourceDimensions};
 use crate::media::{self, SharedFrame};
 use obscura_browser::input::{Input, InputError};
 use tokio::sync::{mpsc, oneshot};
@@ -194,7 +194,7 @@ pub fn start(id: String, network: bool, mut incoming: mpsc::Receiver<Work>,
                                 }
                                 WorkKind::Browser { command, operation } => {
                                     let navigation = matches!(&command, Command::Navigate { .. });
-                                    let focus_after = matches!(&command, Command::Click { .. } | Command::InputText { .. } | Command::Navigate { .. });
+                                    let focus_after = matches!(&command, Command::Click { .. } | Command::InputText { .. } | Command::InputEvent { .. } | Command::Navigate { .. });
                                     let mut completion = execute(&mut page, command, &operation).await;
                                     if navigation {
                                         document_revision += 1;
@@ -309,11 +309,14 @@ async fn execute(page: &mut Option<Page>, command: Command, operation: &Operatio
                     }
                 } else { Err(("RUNTIME_UNAVAILABLE", "Navigate before evaluation".into())) }
             }
-            command @ (Command::Click { .. } | Command::InputText { .. } | Command::Scroll { .. }) => {
+            command @ (Command::Click { .. } | Command::InputText { .. } | Command::Scroll { .. } | Command::InputEvent { .. }) => {
                 let input = match &command {
                     Command::Click { x, y } => Input::Click { x: *x, y: *y },
                     Command::InputText { text } => Input::Text(text),
                     Command::Scroll { x, y, delta_x, delta_y } => Input::Scroll { x: *x, y: *y, delta_x: *delta_x, delta_y: *delta_y },
+                    Command::InputEvent { event: InputEvent::Key { key, code, modifiers, text } } => Input::Key {
+                        key, code, modifiers: *modifiers, text,
+                    },
                     _ => unreachable!(),
                 };
                 if let Some(js) = page.js.as_mut() {

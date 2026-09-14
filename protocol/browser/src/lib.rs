@@ -45,6 +45,9 @@ pub enum Command {
     Click { x: f64, y: f64 },
     InputText { text: String },
     Scroll { x: f64, y: f64, delta_x: f64, delta_y: f64 },
+    /// A complete typed input operation. The Host treats the event and its
+    /// terminal receipt as one operation; it is not UI state or media data.
+    InputEvent { event: InputEvent },
     CloseSession {},
     /// Host-local WebRTC grant lifecycle. Endpoint calls these on the same
     /// attachment that was created through the mTLS control bootstrap.
@@ -248,6 +251,17 @@ pub struct InputReceipt {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InputState { Succeeded }
+
+/// Typed input stream events. One `Request` carrying this value is one atomic
+/// operation. Transport adapters may stream these requests independently from
+/// UI messages, while the Host still admits them through the operation owner.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum InputEvent {
+    /// Dispatch one complete key press and release. `text` is the committed
+    /// text associated with the key-down, and may be empty for non-printing keys.
+    Key { key: String, code: String, modifiers: u64, text: String },
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -455,7 +469,7 @@ pub struct WebRtcProbeReport {
 
 #[cfg(test)]
 mod tests {
-    use super::{Command, Control, ControlPhase, InputReceipt, InputState, Operation, OperationId, Orientation, RemoteFocusCapability, Request, RotationIdentity, SessionStatus, SourceDimensions, VideoQualityProfile, VideoQualitySettings, VideoQualityState, LinkQuality};
+    use super::{Command, Control, ControlPhase, InputEvent, InputReceipt, InputState, Operation, OperationId, Orientation, RemoteFocusCapability, Request, RotationIdentity, SessionStatus, SourceDimensions, VideoQualityProfile, VideoQualitySettings, VideoQualityState, LinkQuality};
 
     fn control(token: &str) -> Control {
         Control { epoch: 7, token: token.into(), phase: ControlPhase::Human { attachment_id: 11 } }
@@ -661,6 +675,46 @@ mod tests {
             "document_revision": 19
         });
         assert!(serde_json::from_value::<InputReceipt>(missing_state).is_err());
+    }
+
+    #[test]
+    fn typed_key_input_event_round_trips_with_a_strict_command_shape() {
+        let command = Command::InputEvent {
+            event: InputEvent::Key {
+                key: "A".into(),
+                code: "KeyA".into(),
+                modifiers: 8,
+                text: "A".into(),
+            },
+        };
+        let encoded = serde_json::to_value(&command).unwrap();
+        assert_eq!(encoded, serde_json::json!({
+            "type": "input_event",
+            "event": {
+                "type": "key",
+                "key": "A",
+                "code": "KeyA",
+                "modifiers": 8,
+                "text": "A"
+            }
+        }));
+        assert_eq!(serde_json::from_value::<Command>(encoded.clone()).unwrap(), command);
+
+        let mut unknown = encoded;
+        unknown["event"]["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<Command>(unknown).is_err());
+
+        let mut unknown_event = serde_json::json!({
+            "type": "key",
+            "key": "A",
+            "code": "KeyA",
+            "modifiers": 8,
+            "text": "A",
+            "unexpected": true
+        });
+        assert!(serde_json::from_value::<InputEvent>(unknown_event.clone()).is_err());
+        unknown_event["type"] = serde_json::json!("unknown");
+        assert!(serde_json::from_value::<InputEvent>(unknown_event).is_err());
     }
 
     #[test]

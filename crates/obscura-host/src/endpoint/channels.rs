@@ -209,7 +209,8 @@ fn permitted_remote_command(command: &Command) -> bool {
             | Command::Navigate { .. }
             | Command::Click { .. }
             | Command::InputText { .. }
-            | Command::Scroll { .. })
+            | Command::Scroll { .. }
+            | Command::InputEvent { .. })
 }
 
 fn remote_command_error(id: u64) -> Response {
@@ -339,7 +340,7 @@ pub async fn ingest(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use obscura_host_protocol::{LinkQuality, VideoQualityProfile, VideoQualitySettings, VideoQualityState};
+    use obscura_host_protocol::{InputEvent, LinkQuality, VideoQualityProfile, VideoQualitySettings, VideoQualityState};
     use tokio::io::AsyncWriteExt;
 
     #[test]
@@ -347,6 +348,18 @@ mod tests {
         assert!(permitted_remote_command(&Command::SetVideoQuality {
             profile: obscura_host_protocol::VideoQualityProfile::Balanced,
             low_latency: true,
+        }));
+    }
+
+    #[test]
+    fn remote_observer_may_forward_typed_key_input_through_the_authenticated_path() {
+        assert!(permitted_remote_command(&Command::InputEvent {
+            event: InputEvent::Key {
+                key: "a".into(),
+                code: "KeyA".into(),
+                modifiers: 0,
+                text: "a".into(),
+            },
         }));
     }
 

@@ -12,6 +12,7 @@ pub enum Input<'a> {
     Click { x: f64, y: f64 },
     Text(&'a str),
     Scroll { x: f64, y: f64, delta_x: f64, delta_y: f64 },
+    Key { key: &'a str, code: &'a str, modifiers: u64, text: &'a str },
 }
 pub enum InputError { Rejected(String), Unknown(String) }
 
@@ -32,6 +33,12 @@ pub async fn perform(page: &mut Page, input: Input<'_>) -> Result<(), InputError
         }
         Input::Scroll { x, y, delta_x, delta_y } => {
             dispatch("dispatchMouseEvent", &json!({"type":"mouseWheel","x":x,"y":y,"deltaX":delta_x,"deltaY":delta_y}), page).await.map_err(InputError::Unknown)?;
+        }
+        Input::Key { key, code, modifiers, text } => {
+            dispatch("dispatchKeyEvent", &json!({"type":"keyDown","key":key,"code":code,"modifiers":modifiers,"text":text}), page)
+                .await.map_err(InputError::Unknown)?;
+            dispatch("dispatchKeyEvent", &json!({"type":"keyUp","key":key,"code":code,"modifiers":modifiers}), page)
+                .await.map_err(InputError::Unknown)?;
         }
     }
     Ok(())
@@ -335,6 +342,8 @@ pub async fn dispatch(
             let key = params.get("key").and_then(|v| v.as_str()).unwrap_or("");
             let code = params.get("code").and_then(|v| v.as_str()).unwrap_or("");
             let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            let modifiers = params.get("modifiers").and_then(|v| v.as_u64()).unwrap_or(0);
+            let (alt_key, ctrl_key, meta_key, shift_key) = modifier_flags(modifiers);
 
             {
                 match event_type {
@@ -342,7 +351,7 @@ pub async fn dispatch(
                         let js = format!(
                             "(function() {{\
                                 var target = document.activeElement || document.body;\
-                                var evt = globalThis.__obscura_markTrusted(new KeyboardEvent('keydown', {{bubbles:true,cancelable:true,key:{key},code:{code}}}));\
+                                var evt = globalThis.__obscura_markTrusted(new KeyboardEvent('keydown', {{bubbles:true,cancelable:true,key:{key},code:{code},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
                                 target.dispatchEvent(evt);\
                             }})()",
                             // Escape backslash BEFORE single-quote (as the text
@@ -351,6 +360,10 @@ pub async fn dispatch(
                             // and produce a syntax error that drops the event.
                             key = js_str(key),
                             code = js_str(code),
+                            alt_key = alt_key,
+                            ctrl_key = ctrl_key,
+                            meta_key = meta_key,
+                            shift_key = shift_key,
                         );
                         evaluate(page, &js)?;
 
@@ -363,19 +376,19 @@ pub async fn dispatch(
                             // it submits the containing form. Real Chrome distinguishes
                             // these two and we should too: previously every Enter tried
                             // to submit the nearest form even from a textarea.
-                            let js = "(function() {\
+                            let js = format!("(function() {{\
                                 var target = document.activeElement;\
                                 if (!target) return;\
-                                target.dispatchEvent(globalThis.__obscura_markTrusted(new KeyboardEvent('keypress', {bubbles:true,key:'Enter',code:'Enter'})));\
-                                if (target.localName === 'textarea') {\
+                                target.dispatchEvent(globalThis.__obscura_markTrusted(new KeyboardEvent('keypress', {{bubbles:true,key:'Enter',code:'Enter',altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}})));\
+                                if (target.localName === 'textarea') {{\
                                     globalThis.__obscura_setFieldValue(target, 'value', (target.value || '') + '\\n');\
-                                    target.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {bubbles:true})));\
-                                } else {\
+                                    target.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {{bubbles:true}})));\
+                                }} else {{\
                                     var form = target.form || (target.closest && target.closest('form'));\
                                     if (form) {{ try {{ if (typeof form.requestSubmit === 'function') {{ form.requestSubmit(); }} else {{ form.submit(); }} }} catch(e) {{}} }}\
-                                }\
-                            })()";
-                            evaluate(page, js)?;
+                                }}\
+                            }})()", alt_key = alt_key, ctrl_key = ctrl_key, meta_key = meta_key, shift_key = shift_key);
+                            evaluate(page, &js)?;
                         }
 
                         if key == "Backspace" {
@@ -386,11 +399,15 @@ pub async fn dispatch(
                         let js = format!(
                             "(function() {{\
                                 var target = document.activeElement || document.body;\
-                                var evt = globalThis.__obscura_markTrusted(new KeyboardEvent('keyup', {{bubbles:true,key:{key},code:{code}}}));\
+                                var evt = globalThis.__obscura_markTrusted(new KeyboardEvent('keyup', {{bubbles:true,key:{key},code:{code},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
                                 target.dispatchEvent(evt);\
                             }})()",
                             key = js_str(key),
                             code = js_str(code),
+                            alt_key = alt_key,
+                            ctrl_key = ctrl_key,
+                            meta_key = meta_key,
+                            shift_key = shift_key,
                         );
                         evaluate(page, &js)?;
                     }

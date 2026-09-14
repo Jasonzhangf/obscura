@@ -55,7 +55,7 @@ impl Client {
         serde_json::from_str(&line).unwrap()
     }
     fn send(&mut self, command: Value) -> Value {
-        let operation = if matches!(command["type"].as_str(), Some("evaluate" | "navigate" | "resize" | "close_session" | "click" | "input_text" | "scroll")) {
+        let operation = if matches!(command["type"].as_str(), Some("evaluate" | "navigate" | "resize" | "close_session" | "click" | "input_text" | "scroll" | "input_event")) {
             let status = self.ok(json!({"type":"status"}));
             Some(identity(&status))
         } else { None };
@@ -488,6 +488,38 @@ fn human_click_text_and_scroll_use_the_live_page() {
     assert_eq!(agent.eval("window.events.every(e=>e[1]===true)"), true);
     assert_eq!(agent.eval("window.events.filter(e=>e[0]==='input').length").as_f64(), Some(1.0));
     assert_eq!(agent.eval("globalThis.__obscura_mouse_down===null"), true);
+}
+
+#[test]
+fn typed_key_input_is_atomic_and_preserves_key_event_order_and_modifiers() {
+    let daemon = Daemon::start();
+    let mut agent = daemon.connect();
+    agent.ok(json!({"type":"attach","mode":"agent"}));
+    agent.ok(json!({"type":"navigate","url":"data:text/html,<input id='field' style='position:absolute;left:10px;top:10px;width:200px;height:40px'>"}));
+    agent.eval("window.keyEvents=[];document.addEventListener('keydown',e=>window.keyEvents.push(['keydown',e.key,e.code,e.shiftKey,e.ctrlKey,e.isTrusted]));document.addEventListener('keyup',e=>window.keyEvents.push(['keyup',e.key,e.code,e.shiftKey,e.ctrlKey,e.isTrusted]))");
+    agent.ok(json!({"type":"click","x":30,"y":30}));
+
+    let before = agent.ok(json!({"type":"status"}));
+    let reply = agent.raw(json!({
+        "id": 7,
+        "operation": identity(&before),
+        "command": {
+            "type": "input_event",
+            "event": {"type":"key","key":"A","code":"KeyA","modifiers":8,"text":"A"}
+        }
+    }));
+    assert_eq!(reply["type"], "result", "{reply}");
+    assert_eq!(reply["value"]["input"]["state"], "succeeded");
+    assert_eq!(reply["value"]["input"]["sequence"], before["next_sequence"]);
+    assert_eq!(agent.eval("document.getElementById('field').value"), "A");
+    assert_eq!(agent.eval("window.keyEvents.length").as_f64(), Some(2.0));
+    assert_eq!(agent.eval("window.keyEvents[0][0]"), "keydown");
+    assert_eq!(agent.eval("window.keyEvents[1][0]"), "keyup");
+    assert_eq!(agent.eval("window.keyEvents[0][1]"), "A");
+    assert_eq!(agent.eval("window.keyEvents[0][2]"), "KeyA");
+    assert_eq!(agent.eval("window.keyEvents[0][3]"), true);
+    assert_eq!(agent.eval("window.keyEvents[0][4]"), false);
+    assert_eq!(agent.eval("window.keyEvents.every(e=>e[5]===true)"), true);
 }
 
 #[test]
