@@ -503,7 +503,7 @@ struct PendingOperation {
     reply: oneshot::Sender<Response>,
 }
 
-pub async fn serve(socket_dir: PathBuf, allow_private_network: bool) -> Result<()> {
+pub async fn serve(socket_dir: PathBuf, storage_dir: Option<PathBuf>, allow_private_network: bool) -> Result<()> {
     let id = uuid::Uuid::new_v4().to_string();
     std::fs::DirBuilder::new().mode(0o700).create(&socket_dir).context("socket directory must be new")?;
     let directory = SocketDir(socket_dir);
@@ -512,7 +512,7 @@ pub async fn serve(socket_dir: PathBuf, allow_private_network: bool) -> Result<(
     let (faults, mut fault_events) = mpsc::channel(1);
     let (frames, latest) = tokio::sync::watch::channel(media::state(FramePacket::Waiting { session_id: id.clone() }));
     let (interest, interested) = tokio::sync::watch::channel(0usize);
-    let worker = worker::start(id.clone(), allow_private_network, incoming_work, ready, faults, frames, interested)?;
+    let worker = worker::start(id.clone(), storage_dir, allow_private_network, incoming_work, ready, faults, frames, interested)?;
     let viewport = initialized.await.context("browser worker stopped during startup")?.map_err(anyhow::Error::msg)?;
     let mut session = Session { id: id.clone(), viewport: Some(viewport), attachments: HashMap::new(), agent: None, viewport_revision: 0, document_revision: 0, fault: None, control: host_control(1, ControlPhase::Agent), records: HashMap::new(), operation_ids: HashMap::new(), retired: HashSet::new(), viewport_owner: None, viewport_update: None, viewport_repair: None, rotation: None, remote_focus: None, video_quality: VideoQualityState { requested: VideoQualitySettings { profile: VideoQualityProfile::Balanced, low_latency: true }, effective: VideoQualitySettings { profile: VideoQualityProfile::Balanced, low_latency: true }, link: LinkQuality { rtt_ms: None, jitter_ms: None, loss_ratio: None, queue_ms: None } }, video_quality_capability: VideoQualityCapability::CURRENT };
     let listener = UnixListener::bind(directory.0.join("host.sock"))?;

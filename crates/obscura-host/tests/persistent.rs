@@ -11,9 +11,18 @@ impl Daemon {
         Self::start_with_network(false)
     }
     fn start_with_network(network: bool) -> Self {
+        Self::start_with_options(network, None)
+    }
+    fn start_with_storage(storage_dir: std::path::PathBuf) -> Self {
+        Self::start_with_options(true, Some(storage_dir))
+    }
+    fn start_with_options(network: bool, storage_dir: Option<std::path::PathBuf>) -> Self {
         let dir = std::path::PathBuf::from("/tmp").join(format!("oh-{}", uuid::Uuid::new_v4()));
         let mut command = Command::new(env!("CARGO_BIN_EXE_obscura-host"));
         command.arg("--socket-dir").arg(&dir).stdout(Stdio::null());
+        if let Some(storage_dir) = storage_dir {
+            command.arg("--storage-dir").arg(storage_dir);
+        }
         if network { command.arg("--allow-private-network"); }
         let child = command.spawn().unwrap();
         let mut daemon = Self { child, dir };
@@ -39,6 +48,14 @@ impl Daemon {
         stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
         let mut client = Client(BufReader::new(stream));
         assert_eq!(client.read()["type"], "ready"); client
+    }
+    fn shutdown(&mut self) {
+        if self.child.try_wait().unwrap().is_none() {
+            let pid = self.child.id().to_string();
+            let status = Command::new("kill").args(["-TERM", pid.as_str()]).status().unwrap();
+            assert!(status.success(), "failed to send SIGTERM to Host pid {pid}: {status}");
+        }
+        self.child.wait().unwrap();
     }
 }
 impl Drop for Daemon {
@@ -89,6 +106,67 @@ fn settled(client: &mut Client) -> Value {
         assert!(Instant::now() < deadline, "viewport did not settle: {status}");
         std::thread::sleep(Duration::from_millis(5));
     }
+}
+
+#[test]
+fn storage_dir_restores_cookie_across_host_restart_without_dom_storage_persistence() {
+    let storage_dir = std::path::PathBuf::from("/tmp").join(format!("oh-profile-{}", uuid::Uuid::new_v4()));
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        for request_index in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request = String::new();
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                if line == "\r\n" { break; }
+                request.push_str(&line);
+            }
+            if request_index == 0 {
+                assert!(!request.to_ascii_lowercase().contains("cookie: sid="), "first request unexpectedly had a persisted cookie: {request}");
+            } else {
+                assert!(request.to_ascii_lowercase().contains("cookie: sid=from-server"), "restart did not send the saved cookie: {request}");
+            }
+            let body = if request_index == 0 {
+                "<title>profile-first</title><script>localStorage.setItem('m1','ephemeral');</script>"
+            } else {
+                "<title>profile-second</title>"
+            };
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nSet-Cookie: sid=from-server; Path=/\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ).unwrap();
+        }
+    });
+
+    let first = Daemon::start_with_storage(storage_dir.clone());
+    let mut first_agent = first.connect();
+    first_agent.ok(json!({"type":"attach","mode":"agent"}));
+    first_agent.ok(json!({"type":"navigate","url":format!("http://{address}/")}));
+    assert_eq!(first_agent.eval("document.cookie"), "sid=from-server");
+    assert_eq!(first_agent.eval("localStorage.getItem('m1')"), "ephemeral");
+    drop(first_agent);
+    let mut first = first;
+    first.shutdown();
+
+    let cookie_file = storage_dir.join("cookies.json");
+    assert!(cookie_file.is_file(), "Host did not write {cookie_file:?}");
+    let cookies = std::fs::read_to_string(&cookie_file).unwrap();
+    assert!(cookies.contains("from-server"), "saved cookie file did not contain the response cookie: {cookies}");
+
+    let second = Daemon::start_with_storage(storage_dir.clone());
+    let mut second_agent = second.connect();
+    second_agent.ok(json!({"type":"attach","mode":"agent"}));
+    second_agent.ok(json!({"type":"navigate","url":format!("http://{address}/")}));
+    assert_eq!(second_agent.eval("document.cookie"), "sid=from-server");
+    assert_eq!(second_agent.eval("localStorage.getItem('m1')"), Value::Null, "Host must not claim DOM storage persistence");
+    second_agent.ok(json!({"type":"close_session"}));
+    drop(second);
+    server.join().unwrap();
+    std::fs::remove_dir_all(storage_dir).unwrap();
 }
 
 #[test]

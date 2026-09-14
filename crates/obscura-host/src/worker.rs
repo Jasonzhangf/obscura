@@ -54,7 +54,7 @@ async fn page_work<T>(future: impl std::future::Future<Output = T>) -> T {
     }).await
 }
 
-pub fn start(id: String, network: bool, mut incoming: mpsc::Receiver<Work>,
+pub fn start(id: String, storage_dir: Option<std::path::PathBuf>, network: bool, mut incoming: mpsc::Receiver<Work>,
     ready: oneshot::Sender<Result<(f32, f32), String>>,
     updates: mpsc::Sender<PageUpdate>,
     frames: tokio::sync::watch::Sender<SharedFrame>,
@@ -65,7 +65,7 @@ pub fn start(id: String, network: bool, mut incoming: mpsc::Receiver<Work>,
     Ok(std::thread::Builder::new().name("obscura-page".into()).spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
         runtime.block_on(async move {
-            let context = Arc::new(BrowserContext::with_storage_and_network(id.clone(), None, false, None, None, network));
+            let context = Arc::new(BrowserContext::with_storage_and_network(id.clone(), None, false, None, storage_dir, network));
             let mut page = Page::new(id.clone(), context);
             if let Err(cause) = page_work(page.navigate("about:blank")).await {
                 let _ = ready.send(Err(cause.to_string()));
@@ -249,6 +249,13 @@ pub fn start(id: String, network: bool, mut incoming: mpsc::Receiver<Work>,
                     },
                 }
             }
+            // The Page owns the only BrowserContext instance. Persist its
+            // cookie jar while still on the Page thread, before V8 and the
+            // context are dropped. No storage backend exists for DOM storage
+            // in this Host slice, so only the CookieJar is written here.
+            if let Some(page) = page.as_ref() {
+                page.context.save_cookies();
+            }
             Ok(())
         })
     })?)
@@ -272,6 +279,9 @@ async fn capture(page: &mut Page) -> Result<(u32, u32, Vec<u8>), String> {
 async fn execute(page: &mut Option<Page>, command: Command, operation: &Operation) -> Completion {
     let mut fault = None;
     let result = if matches!(command, Command::CloseSession {}) {
+        if let Some(page) = page.as_ref() {
+            page.context.save_cookies();
+        }
         *page = None;
         Ok(Some(ResultValue::Closed { closed: true }))
     } else if let Some(page) = page.as_mut() {

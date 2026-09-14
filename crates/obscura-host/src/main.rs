@@ -12,6 +12,9 @@ struct Args {
     /// New private directory for host.sock. Existing directories are rejected.
     #[arg(long)]
     socket_dir: std::path::PathBuf,
+    /// Directory containing the persistent browser profile (cookies.json).
+    #[arg(long)]
+    storage_dir: Option<std::path::PathBuf>,
     #[arg(long)]
     allow_private_network: bool,
 }
@@ -20,7 +23,7 @@ struct Args {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    daemon::serve(args.socket_dir, args.allow_private_network).await
+    daemon::serve(args.socket_dir, args.storage_dir, args.allow_private_network).await
 }
 
 #[cfg(not(unix))]
