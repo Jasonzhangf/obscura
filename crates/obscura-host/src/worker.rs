@@ -2,7 +2,7 @@
 use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
 use anyhow::{Context, Result};
 use obscura_browser::{BrowserContext, Page};
-use obscura_host_protocol::{Command, EvaluationResult, FrameInfo, FramePacket, InputEvent, InputReceipt, InputState, Operation, PixelFormat, ResultValue, RotationIdentity, SourceDimensions};
+use obscura_host_protocol::{Command, EvaluationResult, FrameInfo, FramePacket, InputEvent, InputReceipt, InputState, Operation, PixelFormat, PointerButton, ResultValue, RotationIdentity, SourceDimensions};
 use crate::media::{self, SharedFrame};
 use obscura_browser::input::{Input, InputError};
 use tokio::sync::{mpsc, oneshot};
@@ -314,8 +314,26 @@ async fn execute(page: &mut Option<Page>, command: Command, operation: &Operatio
                     Command::Click { x, y } => Input::Click { x: *x, y: *y },
                     Command::InputText { text } => Input::Text(text),
                     Command::Scroll { x, y, delta_x, delta_y } => Input::Scroll { x: *x, y: *y, delta_x: *delta_x, delta_y: *delta_y },
-                    Command::InputEvent { event: InputEvent::Key { key, code, modifiers, text } } => Input::Key {
-                        key, code, modifiers: *modifiers, text,
+                    Command::InputEvent { event } => match event {
+                        InputEvent::Key { key, code, modifiers, text } => Input::Key {
+                            key, code, modifiers: *modifiers, text,
+                        },
+                        InputEvent::Click { x, y } => Input::Click { x: *x, y: *y },
+                        InputEvent::Scroll { x, y, delta_x, delta_y } => Input::Scroll {
+                            x: *x, y: *y, delta_x: *delta_x, delta_y: *delta_y,
+                        },
+                        InputEvent::PointerDown { pointer_id, x, y, button, buttons, modifiers } => Input::PointerDown {
+                            pointer_id: *pointer_id, x: *x, y: *y, button: pointer_button_name(*button), buttons: *buttons, modifiers: *modifiers,
+                        },
+                        InputEvent::PointerMove { pointer_id, x, y, button, buttons, modifiers } => Input::PointerMove {
+                            pointer_id: *pointer_id, x: *x, y: *y, button: pointer_button_name(*button), buttons: *buttons, modifiers: *modifiers,
+                        },
+                        InputEvent::PointerUp { pointer_id, x, y, button, buttons, modifiers } => Input::PointerUp {
+                            pointer_id: *pointer_id, x: *x, y: *y, button: pointer_button_name(*button), buttons: *buttons, modifiers: *modifiers,
+                        },
+                        InputEvent::PointerCancel { pointer_id, x, y, button, buttons, modifiers } => Input::PointerCancel {
+                            pointer_id: *pointer_id, x: *x, y: *y, button: pointer_button_name(*button), buttons: *buttons, modifiers: *modifiers,
+                        },
                     },
                     _ => unreachable!(),
                 };
@@ -341,6 +359,17 @@ async fn execute(page: &mut Option<Page>, command: Command, operation: &Operatio
         }
     } else { Err(("SESSION_CLOSED", "Session was explicitly closed".into())) };
     Completion { result, viewport: page.as_ref().map(|page| page.viewport), focus: None, fault, document_revision: 0, viewport_revision: 0, rotation: None }
+}
+
+fn pointer_button_name(button: PointerButton) -> &'static str {
+    match button {
+        PointerButton::None => "none",
+        PointerButton::Left => "left",
+        PointerButton::Middle => "middle",
+        PointerButton::Right => "right",
+        PointerButton::Back => "back",
+        PointerButton::Forward => "forward",
+    }
 }
 
 const REMOTE_FOCUS_QUERY: &str = r#"(function () {

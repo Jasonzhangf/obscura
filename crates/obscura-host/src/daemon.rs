@@ -114,6 +114,9 @@ struct Record { operation: Operation, command: Command, response: Option<Respons
 fn valid_viewport(width: u32, height: u32) -> bool {
     width > 0 && height > 0 && width <= 4096 && height <= 4096 && u64::from(width) * u64::from(height) <= 4_194_304
 }
+fn valid_point(viewport: (f32, f32), x: f64, y: f64) -> bool {
+    x.is_finite() && y.is_finite() && x >= 0.0 && y >= 0.0 && x < viewport.0 as f64 && y < viewport.1 as f64
+}
 fn validate_webrtc_capability(capability: &WebRtcCapability) -> Result<(), String> {
     if capability.protocol_version != WEBRTC_PROTOCOL_VERSION {
         return Err(format!("Unsupported WebRTC protocol version {}", capability.protocol_version));
@@ -422,8 +425,8 @@ impl Session {
                     Command::Evaluate { .. } => {},
                     Command::Click { x, y } | Command::Scroll { x, y, .. } => {
                         if !cfg!(feature = "render") { return Ok(error(id, "INPUT_UNAVAILABLE", "Coordinate input requires a render-enabled Host")); }
-                        let (width, height) = self.viewport.unwrap();
-                        if !x.is_finite() || !y.is_finite() || *x < 0.0 || *y < 0.0 || *x >= width as f64 || *y >= height as f64 {
+                        let viewport = self.viewport.unwrap();
+                        if !valid_point(viewport, *x, *y) {
                             return Ok(error(id, "INVALID_POINT", "Coordinates must be inside the current CSS viewport"));
                         }
                         if let Command::Scroll { delta_x, delta_y, .. } = &command {
@@ -435,18 +438,50 @@ impl Session {
                     Command::InputText { text } => {
                         if text.chars().count() > 4096 { return Ok(error(id, "TEXT_TOO_LARGE", "At most 4096 characters per text operation")); }
                     }
-                    Command::InputEvent { event: InputEvent::Key { key, code, modifiers, text } } => {
-                        if key.is_empty() || key.chars().count() > 128 {
-                            return Ok(error(id, "INVALID_KEY", "Key must be 1..128 characters"));
+                    Command::InputEvent { event } => match event {
+                        InputEvent::Key { key, code, modifiers, text } => {
+                            if key.is_empty() || key.chars().count() > 128 {
+                                return Ok(error(id, "INVALID_KEY", "Key must be 1..128 characters"));
+                            }
+                            if code.is_empty() || code.chars().count() > 128 {
+                                return Ok(error(id, "INVALID_KEY_CODE", "Key code must be 1..128 characters"));
+                            }
+                            if modifiers & !0x0f != 0 {
+                                return Ok(error(id, "INVALID_MODIFIERS", "Only Alt, Ctrl, Meta and Shift modifiers are supported"));
+                            }
+                            if text.chars().count() > 4096 {
+                                return Ok(error(id, "TEXT_TOO_LARGE", "At most 4096 characters per key operation"));
+                            }
                         }
-                        if code.is_empty() || code.chars().count() > 128 {
-                            return Ok(error(id, "INVALID_KEY_CODE", "Key code must be 1..128 characters"));
-                        }
-                        if modifiers & !0x0f != 0 {
-                            return Ok(error(id, "INVALID_MODIFIERS", "Only Alt, Ctrl, Meta and Shift modifiers are supported"));
-                        }
-                        if text.chars().count() > 4096 {
-                            return Ok(error(id, "TEXT_TOO_LARGE", "At most 4096 characters per key operation"));
+                        InputEvent::Click { x, y } | InputEvent::Scroll { x, y, .. }
+                        | InputEvent::PointerDown { x, y, .. }
+                        | InputEvent::PointerMove { x, y, .. }
+                        | InputEvent::PointerUp { x, y, .. }
+                        | InputEvent::PointerCancel { x, y, .. } => {
+                            if !cfg!(feature = "render") { return Ok(error(id, "INPUT_UNAVAILABLE", "Coordinate input requires a render-enabled Host")); }
+                            if !valid_point(self.viewport.unwrap(), *x, *y) {
+                                return Ok(error(id, "INVALID_POINT", "Coordinates must be inside the current CSS viewport"));
+                            }
+                            let (delta_x, delta_y) = match event {
+                                InputEvent::Scroll { delta_x, delta_y, .. } => (*delta_x, *delta_y),
+                                _ => (0.0, 0.0),
+                            };
+                            if !delta_x.is_finite() || !delta_y.is_finite() || delta_x.abs() > 4096.0 || delta_y.abs() > 4096.0 {
+                                return Ok(error(id, "INVALID_SCROLL", "Scroll deltas must be finite and within 4096 CSS pixels"));
+                            }
+                            let (buttons, modifiers) = match event {
+                                InputEvent::PointerDown { buttons, modifiers, .. }
+                                | InputEvent::PointerMove { buttons, modifiers, .. }
+                                | InputEvent::PointerUp { buttons, modifiers, .. }
+                                | InputEvent::PointerCancel { buttons, modifiers, .. } => (*buttons, *modifiers),
+                                _ => (0, 0),
+                            };
+                            if buttons & !0x1f != 0 {
+                                return Ok(error(id, "INVALID_BUTTONS", "Only None, Left, Right, Middle, Back and Forward button bits are supported"));
+                            }
+                            if modifiers & !0x0f != 0 {
+                                return Ok(error(id, "INVALID_MODIFIERS", "Only Alt, Ctrl, Meta and Shift modifiers are supported"));
+                            }
                         }
                     }
                     _ => unreachable!("control commands handled above"),
@@ -705,7 +740,7 @@ pub async fn serve(socket_dir: PathBuf, allow_private_network: bool) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use obscura_host_protocol::OperationId;
+    use obscura_host_protocol::{OperationId, PointerButton};
 
     fn operation(operation_id: &str) -> Operation {
         Operation {
@@ -726,6 +761,19 @@ mod tests {
                 code: "KeyA".into(),
                 modifiers: 0,
                 text: "a".into(),
+            },
+        }
+    }
+
+    fn typed_pointer_down() -> Command {
+        Command::InputEvent {
+            event: InputEvent::PointerDown {
+                pointer_id: 7,
+                x: 30.0,
+                y: 40.0,
+                button: PointerButton::Left,
+                buttons: 1,
+                modifiers: 0,
             },
         }
     }
@@ -849,6 +897,55 @@ mod tests {
             operation: Some(operation("typed-invalid-modifiers")),
         }, false).unwrap();
         assert!(matches!(response, Response::Error { code, .. } if code == "INVALID_MODIFIERS"));
+    }
+
+    #[test]
+    fn typed_pointer_input_validates_coordinates_masks_and_operation_fences() {
+        let mut session = session();
+        let missing_identity = session.request(1, Request {
+            id: 1,
+            command: typed_pointer_down(),
+            operation: None,
+        }, false).unwrap();
+        assert!(matches!(missing_identity, Response::Error { code, .. } if code == "OPERATION_REQUIRED"));
+
+        let mut stale = operation("pointer-stale");
+        stale.viewport_revision = 2;
+        let response = session.request(1, Request {
+            id: 2,
+            command: typed_pointer_down(),
+            operation: Some(stale),
+        }, false).unwrap();
+        assert!(matches!(response, Response::Error { code, .. } if code == "STALE_VIEWPORT"));
+
+        let mut outside = typed_pointer_down();
+        if let Command::InputEvent { event: InputEvent::PointerDown { x, .. } } = &mut outside {
+            *x = 800.0;
+        }
+        let response = session.request(1, Request {
+            id: 3,
+            command: outside,
+            operation: Some(operation("pointer-outside")),
+        }, false).unwrap();
+        assert!(matches!(response, Response::Error { code, .. } if code == "INVALID_POINT"));
+
+        let mut invalid_buttons = typed_pointer_down();
+        if let Command::InputEvent { event: InputEvent::PointerDown { buttons, .. } } = &mut invalid_buttons {
+            *buttons = 0x20;
+        }
+        let response = session.request(1, Request {
+            id: 4,
+            command: invalid_buttons,
+            operation: Some(operation("pointer-buttons")),
+        }, false).unwrap();
+        assert!(matches!(response, Response::Error { code, .. } if code == "INVALID_BUTTONS"));
+
+        let response = session.request(1, Request {
+            id: 5,
+            command: typed_pointer_down(),
+            operation: Some(operation("pointer-valid")),
+        }, false);
+        assert!(matches!(response, Err(Command::InputEvent { event: InputEvent::PointerDown { .. } })));
     }
 
     #[test]

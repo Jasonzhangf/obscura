@@ -13,6 +13,10 @@ pub enum Input<'a> {
     Text(&'a str),
     Scroll { x: f64, y: f64, delta_x: f64, delta_y: f64 },
     Key { key: &'a str, code: &'a str, modifiers: u64, text: &'a str },
+    PointerDown { pointer_id: u64, x: f64, y: f64, button: &'a str, buttons: u64, modifiers: u64 },
+    PointerMove { pointer_id: u64, x: f64, y: f64, button: &'a str, buttons: u64, modifiers: u64 },
+    PointerUp { pointer_id: u64, x: f64, y: f64, button: &'a str, buttons: u64, modifiers: u64 },
+    PointerCancel { pointer_id: u64, x: f64, y: f64, button: &'a str, buttons: u64, modifiers: u64 },
 }
 pub enum InputError { Rejected(String), Unknown(String) }
 
@@ -39,6 +43,42 @@ pub async fn perform(page: &mut Page, input: Input<'_>) -> Result<(), InputError
                 .await.map_err(InputError::Unknown)?;
             dispatch("dispatchKeyEvent", &json!({"type":"keyUp","key":key,"code":code,"modifiers":modifiers}), page)
                 .await.map_err(InputError::Unknown)?;
+        }
+        Input::PointerDown { pointer_id, x, y, button, buttons, modifiers } => {
+            dispatch("dispatchPointerEvent", &json!({
+                "type":"pointerdown", "pointerId":pointer_id, "x":x, "y":y,
+                "button":button, "buttons":buttons, "modifiers":modifiers,
+            }), page).await.map_err(InputError::Unknown)?;
+            dispatch("dispatchMouseEvent", &json!({
+                "type":"mousePressed", "x":x, "y":y, "button":button,
+                "buttons":buttons, "modifiers":modifiers,
+            }), page).await.map_err(InputError::Unknown)?;
+        }
+        Input::PointerMove { pointer_id, x, y, button, buttons, modifiers } => {
+            dispatch("dispatchPointerEvent", &json!({
+                "type":"pointermove", "pointerId":pointer_id, "x":x, "y":y,
+                "button":button, "buttons":buttons, "modifiers":modifiers,
+            }), page).await.map_err(InputError::Unknown)?;
+            dispatch("dispatchMouseEvent", &json!({
+                "type":"mouseMoved", "x":x, "y":y, "button":button,
+                "buttons":buttons, "modifiers":modifiers,
+            }), page).await.map_err(InputError::Unknown)?;
+        }
+        Input::PointerUp { pointer_id, x, y, button, buttons, modifiers } => {
+            dispatch("dispatchPointerEvent", &json!({
+                "type":"pointerup", "pointerId":pointer_id, "x":x, "y":y,
+                "button":button, "buttons":buttons, "modifiers":modifiers,
+            }), page).await.map_err(InputError::Unknown)?;
+            dispatch("dispatchMouseEvent", &json!({
+                "type":"mouseReleased", "x":x, "y":y, "button":button,
+                "buttons":buttons, "modifiers":modifiers,
+            }), page).await.map_err(InputError::Unknown)?;
+        }
+        Input::PointerCancel { pointer_id, x, y, button, buttons, modifiers } => {
+            dispatch("dispatchPointerEvent", &json!({
+                "type":"pointercancel", "pointerId":pointer_id, "x":x, "y":y,
+                "button":button, "buttons":buttons, "modifiers":modifiers,
+            }), page).await.map_err(InputError::Unknown)?;
         }
     }
     Ok(())
@@ -151,6 +191,88 @@ pub async fn dispatch(
     page: &mut Page,
 ) -> Result<(), String> {
     match method {
+        "dispatchPointerEvent" => {
+            let event_type = params.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            let event_name = match event_type {
+                "pointerdown" | "pointermove" | "pointerup" | "pointercancel" => event_type,
+                _ => return Err(format!("Unknown pointer event type: {event_type}")),
+            };
+            let pointer_id = params.get("pointerId").and_then(|v| v.as_u64()).unwrap_or(0);
+            let x = params.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let y = params.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let button = params.get("button").and_then(|v| v.as_str()).unwrap_or("none");
+            let button_code = mouse_button_code(button);
+            let buttons = params.get("buttons").and_then(|v| v.as_u64()).unwrap_or(0);
+            let modifiers = params.get("modifiers").and_then(|v| v.as_u64()).unwrap_or(0);
+            let (alt_key, ctrl_key, meta_key, shift_key) = modifier_flags(modifiers);
+            let target = match event_name {
+                "pointerdown" => format!(
+                    "(document.elementFromPoint && document.elementFromPoint({x},{y})) || document.body || document.documentElement",
+                    x = x,
+                    y = y,
+                ),
+                "pointercancel" => format!(
+                    "(state && state.pointerId === {pointer_id} && state.target) || (document.elementFromPoint && document.elementFromPoint({x},{y})) || document.body || document.documentElement",
+                    pointer_id = pointer_id,
+                    x = x,
+                    y = y,
+                ),
+                _ => format!(
+                    "(document.elementFromPoint && document.elementFromPoint({x},{y})) || (state && state.pointerId === {pointer_id} && state.target) || document.body || document.documentElement",
+                    pointer_id = pointer_id,
+                    x = x,
+                    y = y,
+                ),
+            };
+            let terminal = event_name == "pointerup" || event_name == "pointercancel";
+            let cancelled = event_name == "pointercancel";
+            let code = format!(
+                "(function() {{\
+                    var state = globalThis.__obscura_pointer_down;\
+                    var target = {target};\
+                    if (!target) return;\
+                    if ('{event_name}' === 'pointerdown') {{\
+                        globalThis.__obscura_pointer_down = {{pointerId:{pointer_id},target:target}};\
+                        globalThis.__obscura_click_target = target;\
+                    }}\
+                    var evt = globalThis.__obscura_markTrusted(new PointerEvent('{event_name}', {{bubbles:true,cancelable:true,view:globalThis,clientX:{x},clientY:{y}}}));\
+                    evt.pointerId = {pointer_id};\
+                    evt.pointerType = 'mouse';\
+                    evt.isPrimary = true;\
+                    evt.clientX = {x};\
+                    evt.clientY = {y};\
+                    evt.button = {button_code};\
+                    evt.buttons = {buttons};\
+                    evt.altKey = {alt_key};\
+                    evt.ctrlKey = {ctrl_key};\
+                    evt.metaKey = {meta_key};\
+                    evt.shiftKey = {shift_key};\
+                    target.dispatchEvent(evt);\
+                    if ({terminal} && state && state.pointerId === {pointer_id}) {{\
+                        globalThis.__obscura_pointer_down = null;\
+                        if ({cancelled}) {{\
+                            globalThis.__obscura_mouse_down = null;\
+                            globalThis.__obscura_click_target = null;\
+                        }}\
+                    }}\
+                }})()",
+                target = target,
+                event_name = event_name,
+                pointer_id = pointer_id,
+                x = x,
+                y = y,
+                button_code = button_code,
+                buttons = buttons,
+                alt_key = alt_key,
+                ctrl_key = ctrl_key,
+                meta_key = meta_key,
+                shift_key = shift_key,
+                terminal = terminal,
+                cancelled = cancelled,
+            );
+            evaluate(page, &code)?;
+            Ok(())
+        }
         "dispatchMouseEvent" => {
             let event_type = params.get("type").and_then(|v| v.as_str()).unwrap_or("");
             let x = params.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
@@ -270,6 +392,26 @@ pub async fn dispatch(
                         y = y,
                         button_code = button_code,
                         click_count = click_count,
+                        alt_key = alt_key,
+                        ctrl_key = ctrl_key,
+                        meta_key = meta_key,
+                        shift_key = shift_key,
+                    );
+                    evaluate(page, &code)?;
+                }
+            } else if event_type == "mouseMoved" {
+                {
+                    let code = format!(
+                        "(function() {{\
+                            var target = (document.elementFromPoint && document.elementFromPoint({x},{y})) || globalThis.__obscura_click_target || document.activeElement || document.body;\
+                            if (!target) return;\
+                            var evt = globalThis.__obscura_markTrusted(new MouseEvent('mousemove', {{bubbles:true,cancelable:true,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:{buttons},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
+                            target.dispatchEvent(evt);\
+                        }})()",
+                        x = x,
+                        y = y,
+                        button_code = button_code,
+                        buttons = buttons,
                         alt_key = alt_key,
                         ctrl_key = ctrl_key,
                         meta_key = meta_key,

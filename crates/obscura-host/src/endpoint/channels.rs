@@ -340,7 +340,7 @@ pub async fn ingest(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use obscura_host_protocol::{InputEvent, LinkQuality, VideoQualityProfile, VideoQualitySettings, VideoQualityState};
+    use obscura_host_protocol::{InputEvent, LinkQuality, PointerButton, VideoQualityProfile, VideoQualitySettings, VideoQualityState};
     use tokio::io::AsyncWriteExt;
 
     #[test]
@@ -359,6 +359,20 @@ mod tests {
                 code: "KeyA".into(),
                 modifiers: 0,
                 text: "a".into(),
+            },
+        }));
+    }
+
+    #[test]
+    fn remote_observer_may_forward_typed_pointer_input_through_the_authenticated_path() {
+        assert!(permitted_remote_command(&Command::InputEvent {
+            event: InputEvent::PointerCancel {
+                pointer_id: 3,
+                x: 10.0,
+                y: 20.0,
+                button: PointerButton::None,
+                buttons: 0,
+                modifiers: 0,
             },
         }));
     }

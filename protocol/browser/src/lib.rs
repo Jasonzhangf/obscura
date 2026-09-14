@@ -261,7 +261,27 @@ pub enum InputEvent {
     /// Dispatch one complete key press and release. `text` is the committed
     /// text associated with the key-down, and may be empty for non-printing keys.
     Key { key: String, code: String, modifiers: u64, text: String },
+    /// A compatibility click with the same primary-button semantics as
+    /// `Command::Click`, carried through the typed input envelope.
+    Click { x: f64, y: f64 },
+    /// A compatibility wheel gesture with the same bounded deltas as
+    /// `Command::Scroll`, carried through the typed input envelope.
+    Scroll { x: f64, y: f64, delta_x: f64, delta_y: f64 },
+    /// Begin a pointer gesture. `buttons` is the currently-held button mask;
+    /// `button` identifies the button changed by this event.
+    PointerDown { pointer_id: u64, x: f64, y: f64, button: PointerButton, buttons: u64, modifiers: u64 },
+    /// Move one pointer while preserving its explicit held-button mask.
+    PointerMove { pointer_id: u64, x: f64, y: f64, button: PointerButton, buttons: u64, modifiers: u64 },
+    /// Release the button identified by `button` and finish this pointer event.
+    PointerUp { pointer_id: u64, x: f64, y: f64, button: PointerButton, buttons: u64, modifiers: u64 },
+    /// Explicitly terminate a pointer gesture. The browser owner clears its
+    /// held-pointer state and never synthesizes a click from cancellation.
+    PointerCancel { pointer_id: u64, x: f64, y: f64, button: PointerButton, buttons: u64, modifiers: u64 },
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PointerButton { None, Left, Middle, Right, Back, Forward }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -469,7 +489,7 @@ pub struct WebRtcProbeReport {
 
 #[cfg(test)]
 mod tests {
-    use super::{Command, Control, ControlPhase, InputEvent, InputReceipt, InputState, Operation, OperationId, Orientation, RemoteFocusCapability, Request, RotationIdentity, SessionStatus, SourceDimensions, VideoQualityProfile, VideoQualitySettings, VideoQualityState, LinkQuality};
+    use super::{Command, Control, ControlPhase, InputEvent, InputReceipt, InputState, Operation, OperationId, Orientation, PointerButton, RemoteFocusCapability, Request, RotationIdentity, SessionStatus, SourceDimensions, VideoQualityProfile, VideoQualitySettings, VideoQualityState, LinkQuality};
 
     fn control(token: &str) -> Control {
         Control { epoch: 7, token: token.into(), phase: ControlPhase::Human { attachment_id: 11 } }
@@ -715,6 +735,55 @@ mod tests {
         assert!(serde_json::from_value::<InputEvent>(unknown_event.clone()).is_err());
         unknown_event["type"] = serde_json::json!("unknown");
         assert!(serde_json::from_value::<InputEvent>(unknown_event).is_err());
+    }
+
+    #[test]
+    fn typed_pointer_events_round_trip_with_click_and_scroll_compatibility() {
+        let events = [
+            InputEvent::Click { x: 31.0, y: 42.0 },
+            InputEvent::Scroll { x: 31.0, y: 42.0, delta_x: 0.0, delta_y: 75.0 },
+            InputEvent::PointerDown {
+                pointer_id: 9, x: 31.0, y: 42.0, button: PointerButton::Left, buttons: 1, modifiers: 8,
+            },
+            InputEvent::PointerMove {
+                pointer_id: 9, x: 33.0, y: 44.0, button: PointerButton::Left, buttons: 1, modifiers: 8,
+            },
+            InputEvent::PointerUp {
+                pointer_id: 9, x: 33.0, y: 44.0, button: PointerButton::Left, buttons: 0, modifiers: 8,
+            },
+            InputEvent::PointerCancel {
+                pointer_id: 10, x: 50.0, y: 60.0, button: PointerButton::None, buttons: 0, modifiers: 0,
+            },
+        ];
+        for event in events {
+            let command = Command::InputEvent { event: event.clone() };
+            let encoded = serde_json::to_value(&command).unwrap();
+            assert_eq!(serde_json::from_value::<Command>(encoded.clone()).unwrap(), command);
+            let mut unknown = encoded;
+            unknown["event"]["unexpected"] = serde_json::json!(true);
+            assert!(serde_json::from_value::<Command>(unknown).is_err());
+        }
+
+        let encoded = serde_json::to_value(Command::InputEvent {
+            event: InputEvent::PointerDown {
+                pointer_id: 9, x: 31.0, y: 42.0, button: PointerButton::Left, buttons: 1, modifiers: 8,
+            },
+        }).unwrap();
+        assert_eq!(encoded, serde_json::json!({
+            "type": "input_event",
+            "event": {
+                "type": "pointer_down",
+                "pointer_id": 9,
+                "x": 31.0,
+                "y": 42.0,
+                "button": "left",
+                "buttons": 1,
+                "modifiers": 8
+            }
+        }));
+        let mut unknown_button = encoded;
+        unknown_button["event"]["button"] = serde_json::json!("eraser");
+        assert!(serde_json::from_value::<Command>(unknown_button).is_err());
     }
 
     #[test]
