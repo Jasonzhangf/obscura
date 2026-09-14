@@ -37,15 +37,17 @@ fn response(stream: &mut TcpStream) -> io::Result<()> {
     } else {
         let mut body = String::from(
             "<!doctype html><meta name='viewport' content='width=device-width'>\
-             <title>Obscura profile fixture</title><style>body{font:18px sans-serif;max-width:680px;margin:0 auto;padding:24px}section{margin:24px 0;padding:16px;border:1px solid #bbb}input{font-size:18px;padding:8px;width:90%}</style>\
-             <h1>Obscura profile fixture</h1><section><label>Persistent form<input id='field' value=''></label></section>\
-             <section><p>Cookie: <code id='cookie'>(pending)</code></p><p>Local storage: <code id='storage'>(pending)</code></p></section>",
+             <title>Obscura profile fixture</title><style>body{font:18px sans-serif;margin:0;background:white}#target{position:absolute;left:0;top:0;width:180px;height:50px;background:red;color:white;font-size:18px}#field{position:absolute;left:0;top:55px;width:220px;height:100px;font-size:18px;box-sizing:border-box}#meta{position:absolute;left:0;top:165px}#long{margin-top:220px;min-height:3000px;background:blue;color:white;padding:8px}</style>\
+             <button id='target' onclick=\"window.clicked=(window.clicked||0)+1;this.style.background='lime'\">touch</button>\
+             <input id='field' value='' placeholder='Persistent form'>\
+             <section id='meta'><h1>Obscura profile fixture</h1><p>Cookie: <code id='cookie'>(pending)</code></p><p>Local storage: <code id='storage'>(pending)</code></p></section>\
+             <div id='long'>",
         );
         for index in 0..40 {
             body.push_str(&format!("<p>Long page row {index}: stable content for mobile viewport and scroll replay.</p>"));
         }
         body.push_str(
-            "<script>document.getElementById('cookie').textContent=document.cookie||'(empty)';\
+            "</div><script>document.getElementById('cookie').textContent=document.cookie||'(empty)';\
              document.getElementById('storage').textContent=localStorage.getItem('m1')||'(empty)';\
              localStorage.setItem('m1','page-only');</script>",
         );
