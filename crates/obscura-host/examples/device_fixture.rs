@@ -37,7 +37,7 @@ fn response(stream: &mut TcpStream) -> io::Result<()> {
     } else {
         let mut body = String::from(
             "<!doctype html><meta name='viewport' content='width=device-width'>\
-             <title>Obscura profile fixture</title><style>body{font:18px sans-serif;margin:0;background:white}#target{position:absolute;left:0;top:0;width:180px;height:50px;background:red;color:white;font-size:18px}#field{position:absolute;left:0;top:55px;width:220px;height:100px;font-size:18px;box-sizing:border-box}#meta{position:absolute;left:0;top:165px}#long{margin-top:220px;min-height:3000px;background:blue;color:white;padding:8px}</style>\
+             <title>Obscura profile fixture</title><style>body{font:18px sans-serif;margin:0;background:white}#target{position:absolute;left:0;top:80px;width:180px;height:50px;background:red;color:white;font-size:18px}#field{position:absolute;left:0;top:135px;width:220px;height:100px;font-size:18px;box-sizing:border-box}#meta{position:absolute;left:0;top:245px}#long{margin-top:300px;min-height:3000px;background:blue;color:white;padding:8px}</style>\
              <button id='target' onclick=\"window.clicked=(window.clicked||0)+1;this.style.background='lime'\">touch</button>\
              <input id='field' value='' placeholder='Persistent form'>\
              <section id='meta'><h1>Obscura profile fixture</h1><p>Cookie: <code id='cookie'>(pending)</code></p><p>Local storage: <code id='storage'>(pending)</code></p></section>\
