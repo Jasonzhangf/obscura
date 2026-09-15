@@ -54,7 +54,7 @@
     'Node', 'Element', 'Document', 'DocumentFragment', 'DocumentType',
     'Animation', 'KeyframeEffect', 'DocumentTimeline',
     'Text', 'Comment', 'CDATASection', 'ProcessingInstruction', 'CharacterData',
-    'CSSStyleDeclaration', 'DOMStringMap', 'DOMTokenList', 'NamedNodeMap', 'Screen', 'NetworkInformation',
+    'BarProp', 'CSSStyleDeclaration', 'DOMStringMap', 'DOMTokenList', 'NamedNodeMap', 'Screen', 'NetworkInformation',
     'MessageChannel', 'MessagePort', 'BroadcastChannel', 'CustomElementRegistry',
     'Scheduler',
     'XMLHttpRequestEventTarget', 'HTMLMediaElement', 'HTMLVideoElement',
@@ -7005,6 +7005,28 @@ globalThis.Notification = class Notification {
 
 globalThis.WebGLRenderingContext = class WebGLRenderingContext {};
 globalThis.WebGL2RenderingContext = class WebGL2RenderingContext {};
+
+class BarProp {
+  get visible() { return true; }
+}
+Object.defineProperty(BarProp.prototype, Symbol.toStringTag, {
+  value: 'BarProp',
+  configurable: true,
+});
+globalThis.BarProp = BarProp;
+['locationbar', 'menubar', 'personalbar', 'scrollbars', 'statusbar', 'toolbar'].forEach(function(name) {
+  const bar = new BarProp();
+  const getter = function() { return bar; };
+  const setter = function() {};
+  _markNative(getter);
+  _markNative(setter);
+  Object.defineProperty(globalThis, name, {
+    get: getter,
+    set: setter,
+    enumerable: true,
+    configurable: true,
+  });
+});
 
 class Screen {
   constructor(w, h, availW, availH) {

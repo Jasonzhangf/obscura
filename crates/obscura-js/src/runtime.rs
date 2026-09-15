@@ -3735,6 +3735,82 @@ mod tests {
         rt
     }
 
+    #[test]
+    fn barprop_window_surface_is_standard() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const names = [
+                        'locationbar', 'menubar', 'personalbar',
+                        'scrollbars', 'statusbar', 'toolbar'
+                    ];
+                    const descriptors = Object.fromEntries(names.map((name) => {
+                        const descriptor = Object.getOwnPropertyDescriptor(window, name);
+                        return [name, descriptor ? {
+                            enumerable: descriptor.enumerable,
+                            configurable: descriptor.configurable,
+                            hasGetter: typeof descriptor.get === 'function',
+                            hasSetter: typeof descriptor.set === 'function',
+                        } : null];
+                    }));
+                    const barPropType = typeof BarProp;
+                    const values = names.map((name) => window[name]);
+                    let bareToolbar;
+                    let bareToolbarReadError = null;
+                    try {
+                        bareToolbar = toolbar;
+                    } catch (error) {
+                        bareToolbar = undefined;
+                        bareToolbarReadError = error && error.name;
+                    }
+                    return JSON.stringify({
+                        barPropType,
+                        globalToolbarType: typeof toolbar,
+                        windowToolbarType: typeof window.toolbar,
+                        bareToolbarReadError,
+                        toolbarIdentity: bareToolbar === window.toolbar,
+                        toolbarInstance: barPropType === 'function'
+                            && bareToolbar instanceof BarProp,
+                        toolbarTag: Object.prototype.toString.call(bareToolbar),
+                        toolbarVisible: bareToolbar && bareToolbar.visible,
+                        distinctBars: new Set(values).size === names.length,
+                        descriptors,
+                    });
+                })()"#,
+            )
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(result.as_str().unwrap()).unwrap();
+        let expected_descriptor = serde_json::json!({
+            "enumerable": true,
+            "configurable": true,
+            "hasGetter": true,
+            "hasSetter": true,
+        });
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "barPropType": "function",
+                "globalToolbarType": "object",
+                "windowToolbarType": "object",
+                "bareToolbarReadError": null,
+                "toolbarIdentity": true,
+                "toolbarInstance": true,
+                "toolbarTag": "[object BarProp]",
+                "toolbarVisible": true,
+                "distinctBars": true,
+                "descriptors": {
+                    "locationbar": expected_descriptor,
+                    "menubar": expected_descriptor,
+                    "personalbar": expected_descriptor,
+                    "scrollbars": expected_descriptor,
+                    "statusbar": expected_descriptor,
+                    "toolbar": expected_descriptor,
+                },
+            })
+        );
+    }
+
     // SEC-503 / #820 — createObjectURL must reject non-Blob input (an object
     // that merely has a .text() method, e.g. Response) with a TypeError, as
     // Chrome does; a real Blob is still accepted.
