@@ -122,7 +122,10 @@ init → commit → domcontentloaded → load → networkidle2 → networkidle0
 
 ## Storage
 
-`--storage-dir` persists cookies (`cookies.json`) and localStorage (`localStorage/<origin>.json`). Reads on process start, writes on every navigation and on graceful shutdown.
+`--storage-dir` persists cookies (`cookies.json`) and localStorage
+(`local-storage/<origin-bytes-hex>.json`). Reads on process start; writes before
+navigation replaces a document, before `suspend_js`, and on graceful shutdown.
+Malformed profile entries fail explicitly instead of loading as empty.
 
 ## Stealth
 

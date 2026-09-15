@@ -109,7 +109,71 @@ fn settled(client: &mut Client) -> Value {
 }
 
 #[test]
-fn storage_dir_restores_cookie_across_host_restart_without_dom_storage_persistence() {
+fn navigation_away_restores_local_storage_on_return_and_never_writes_it_to_the_new_origin() {
+    let storage_dir = std::path::PathBuf::from("/tmp").join(format!("oh-profile-{}", uuid::Uuid::new_v4()));
+    let first_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let first_address = first_listener.local_addr().unwrap();
+    let second_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let second_address = second_listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        // Host keeps the page continuously owned, so warmup/fan-out may open
+        // more connections than the three explicit navigations. Serve whatever
+        // arrives on the first origin instead of pinning an exact count.
+        loop {
+            let (mut stream, _) = first_listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap() == 0 { break; }
+                if line == "\r\n" { break; }
+            }
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n<title>origin-a</title>",
+                "<title>origin-a</title>".len()
+            ).unwrap();
+        }
+    });
+    let second_server = std::thread::spawn(move || loop {
+        let (mut stream, _) = second_listener.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap() == 0 { break; }
+            if line == "\r\n" { break; }
+        }
+        let body = "<title>origin-b</title>";
+        let _ = write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+    });
+
+    let daemon = Daemon::start_with_storage(storage_dir.clone());
+    let mut agent = daemon.connect();
+    agent.ok(json!({"type":"attach","mode":"agent"}));
+    agent.ok(json!({"type":"navigate","url":format!("http://{first_address}/")}));
+    assert_eq!(agent.eval("localStorage.setItem('m1','from-a')"), Value::Null);
+    agent.ok(json!({"type":"navigate","url":format!("http://{second_address}/")}));
+    assert_eq!(
+        agent.eval("localStorage.getItem('m1')"),
+        Value::Null,
+        "localStorage leaked into another origin"
+    );
+    agent.ok(json!({"type":"navigate","url":format!("http://{first_address}/")}));
+    assert_eq!(
+        agent.eval("localStorage.getItem('m1')"),
+        "from-a",
+        "navigating away must persist the outgoing document's localStorage"
+    );
+    drop(agent);
+    drop(daemon);
+    std::fs::remove_dir_all(storage_dir).unwrap();
+}
+
+#[test]
+fn storage_dir_restores_cookie_and_local_storage_across_host_restart() {
     let storage_dir = std::path::PathBuf::from("/tmp").join(format!("oh-profile-{}", uuid::Uuid::new_v4()));
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
@@ -162,7 +226,11 @@ fn storage_dir_restores_cookie_across_host_restart_without_dom_storage_persisten
     second_agent.ok(json!({"type":"attach","mode":"agent"}));
     second_agent.ok(json!({"type":"navigate","url":format!("http://{address}/")}));
     assert_eq!(second_agent.eval("document.cookie"), "sid=from-server");
-    assert_eq!(second_agent.eval("localStorage.getItem('m1')"), Value::Null, "Host must not claim DOM storage persistence");
+    assert_eq!(
+        second_agent.eval("localStorage.getItem('m1')"),
+        "ephemeral",
+        "Host must restore localStorage from the persistent profile"
+    );
     second_agent.ok(json!({"type":"close_session"}));
     drop(second);
     server.join().unwrap();

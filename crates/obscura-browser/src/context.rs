@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use obscura_net::{CookieJar, ObscuraHttpClient, RobotsCache};
@@ -30,6 +30,20 @@ pub struct BrowserContext {
     /// models: file:// is a local file-system read, while private-network is
     /// the broader SSRF gate from issue #4.
     pub allow_private_network: bool,
+}
+
+fn storage_origin_key(url: &url::Url) -> Option<String> {
+    url.origin().is_tuple().then(|| url.origin().ascii_serialization())
+}
+
+fn local_storage_path(storage_dir: &Path, url: &url::Url) -> Option<PathBuf> {
+    let origin = storage_origin_key(url)?;
+    let mut key = String::with_capacity(origin.len() * 2);
+    for byte in origin.bytes() {
+        use std::fmt::Write as _;
+        write!(&mut key, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    Some(storage_dir.join("local-storage").join(format!("{key}.json")))
 }
 
 impl BrowserContext {
@@ -205,6 +219,93 @@ impl BrowserContext {
                 tracing::info!("Saved cookies to {}", cookie_path.display());
             }
         }
+    }
+
+    pub fn load_local_storage(
+        &self,
+        url: &url::Url,
+    ) -> Result<std::collections::BTreeMap<String, String>, String> {
+        let Some(path) = self
+            .storage_dir
+            .as_deref()
+            .and_then(|dir| local_storage_path(dir, url))
+        else {
+            return Ok(std::collections::BTreeMap::new());
+        };
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(std::collections::BTreeMap::new());
+            }
+            Err(error) => {
+                return Err(format!(
+                    "read localStorage {}: {error}",
+                    path.display()
+                ));
+            }
+        };
+        serde_json::from_slice(&bytes)
+            .map_err(|error| format!("parse localStorage {}: {error}", path.display()))
+    }
+
+    pub fn save_local_storage(
+        &self,
+        url: &url::Url,
+        values: &std::collections::BTreeMap<String, String>,
+    ) -> Result<(), String> {
+        let Some(path) = self
+            .storage_dir
+            .as_deref()
+            .and_then(|dir| local_storage_path(dir, url))
+        else {
+            return Ok(());
+        };
+        let parent = path.parent().ok_or_else(|| format!("invalid localStorage path: {}", path.display()))?;
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("create {}: {error}", parent.display()))?;
+        let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+        let bytes = serde_json::to_vec(values)
+            .map_err(|error| format!("encode {}: {error}", path.display()))?;
+        std::fs::write(&temporary, bytes)
+            .map_err(|error| format!("write {}: {error}", temporary.display()))?;
+        std::fs::rename(&temporary, &path)
+            .map_err(|error| format!("rename {} -> {}: {error}", temporary.display(), path.display()))
+    }
+}
+
+#[cfg(test)]
+mod local_storage_tests {
+    use super::*;
+
+    #[test]
+    fn origin_keys_do_not_collide_after_encoding() {
+        let first = url::Url::parse("https://a-b.example/").unwrap();
+        let second = url::Url::parse("https://a_b.example/").unwrap();
+        let first = local_storage_path(Path::new("/profile"), &first).unwrap();
+        let second = local_storage_path(Path::new("/profile"), &second).unwrap();
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn a_corrupt_local_storage_file_fails_instead_of_loading_empty() {
+        let dir = std::path::PathBuf::from("/tmp").join(format!(
+            "obscura-ls-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let url = url::Url::parse("https://example.test/").unwrap();
+        let path = local_storage_path(&dir, &url).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{not json").unwrap();
+        let context = BrowserContext::with_storage("corrupt".to_string(), Some(dir.clone()));
+        let error = context
+            .load_local_storage(&url)
+            .expect_err("corrupt profile must not load as empty");
+        assert!(error.contains("parse localStorage"), "{error}");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
 

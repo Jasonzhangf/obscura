@@ -8,6 +8,7 @@
 
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, TcpListener, TcpStream};
+use std::sync::OnceLock;
 
 use clap::Parser;
 
@@ -20,6 +21,11 @@ struct Args {
     /// TCP port, or 0 to select an available port.
     #[arg(long, default_value_t = 0)]
     port: u16,
+}
+
+fn storage_marker() -> &'static str {
+    static MARKER: OnceLock<String> = OnceLock::new();
+    MARKER.get_or_init(|| format!("persist-{}", uuid::Uuid::new_v4()))
 }
 
 fn response(stream: &mut TcpStream) -> io::Result<()> {
@@ -35,6 +41,7 @@ fn response(stream: &mut TcpStream) -> io::Result<()> {
     let body = if path == "/health" {
         "ok\n".to_string()
     } else {
+        let marker = storage_marker();
         let mut body = String::from(
             "<!doctype html><meta name='viewport' content='width=device-width'>\
              <title>Obscura profile fixture</title><style>body{font:18px sans-serif;margin:0;background:white}#target{position:absolute;left:0;top:0;width:180px;height:180px;background:red;color:white;font-size:18px}#field{position:absolute;left:0;top:190px;width:220px;height:100px;font-size:18px;box-sizing:border-box}#meta{position:absolute;left:0;top:300px}#long{margin-top:400px;min-height:3000px;background:blue;color:white;padding:8px}</style>\
@@ -49,8 +56,10 @@ fn response(stream: &mut TcpStream) -> io::Result<()> {
         body.push_str(
             "</div><script>document.getElementById('cookie').textContent=document.cookie||'(empty)';\
              document.getElementById('storage').textContent=localStorage.getItem('m1')||'(empty)';\
-             localStorage.setItem('m1','page-only');</script>",
+             if(!localStorage.getItem('m1'))localStorage.setItem('m1',",
         );
+        body.push_str(&serde_json::to_string(marker).expect("marker is JSON-safe"));
+        body.push_str(");</script>");
         body
     };
 

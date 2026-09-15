@@ -250,11 +250,11 @@ pub fn start(id: String, storage_dir: Option<std::path::PathBuf>, network: bool,
                 }
             }
             // The Page owns the only BrowserContext instance. Persist its
-            // cookie jar while still on the Page thread, before V8 and the
-            // context are dropped. No storage backend exists for DOM storage
-            // in this Host slice, so only the CookieJar is written here.
-            if let Some(page) = page.as_ref() {
+            // cookie jar and the current document's localStorage while still
+            // on the Page thread, before V8 and the context are dropped.
+            if let Some(page) = page.as_mut() {
                 page.context.save_cookies();
+                page.persist_local_storage().map_err(anyhow::Error::msg)?;
             }
             Ok(())
         })
@@ -279,8 +279,22 @@ async fn capture(page: &mut Page) -> Result<(u32, u32, Vec<u8>), String> {
 async fn execute(page: &mut Option<Page>, command: Command, operation: &Operation) -> Completion {
     let mut fault = None;
     let result = if matches!(command, Command::CloseSession {}) {
-        if let Some(page) = page.as_ref() {
+        if let Some(page) = page.as_mut() {
             page.context.save_cookies();
+            match page.persist_local_storage() {
+                Ok(()) => {}
+                Err(error) => {
+                    return Completion {
+                        result: Err(("PROFILE_STORAGE_FAILED", error)),
+                        viewport: Some(page.viewport),
+                        focus: None,
+                        fault: None,
+                        document_revision: 0,
+                        viewport_revision: 0,
+                        rotation: None,
+                    };
+                }
+            }
         }
         *page = None;
         Ok(Some(ResultValue::Closed { closed: true }))

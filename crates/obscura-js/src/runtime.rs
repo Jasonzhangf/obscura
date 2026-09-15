@@ -1866,6 +1866,13 @@ impl ObscuraJsRuntime {
         self.v8_to_json(result)
     }
 
+    pub fn local_storage_snapshot(&mut self) -> Result<std::collections::BTreeMap<String, String>, String> {
+        let value = self.evaluate(
+            "Object.fromEntries(Object.keys(globalThis.localStorage).map((key) => [key, globalThis.localStorage.getItem(key)]))",
+        )?;
+        serde_json::from_value(value).map_err(|error| format!("localStorage snapshot: {error}"))
+    }
+
     pub async fn evaluate_for_cdp(
         &mut self,
         expression: &str,

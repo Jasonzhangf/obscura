@@ -294,6 +294,9 @@ pub struct Page {
     navigation_timeout: Option<std::time::Duration>,
     /// Optional per-page cap. Pages without a value keep the default.
     navigation_chain_limit: Option<usize>,
+    /// First profile read error for the current document. Surface it at the
+    /// next persistence boundary instead of replacing corrupt state silently.
+    profile_error: Option<String>,
     /// True once the requested navigation has a committed main document.
     /// Whether the current document response has committed. This is diagnostic
     /// state only; Host success is never inferred from this marker.
@@ -1503,6 +1506,7 @@ impl Page {
             document_timeline_origin: std::time::Instant::now(),
             navigation_timeout: None,
             navigation_chain_limit: None,
+            profile_error: None,
             navigation_committed: false,
             navigation_continuation: None,
             parser_async_continuation: None,
@@ -2258,6 +2262,18 @@ impl Page {
         }
 
         rt.run_page_init();
+        if let Some(url) = self.url.clone() {
+            match self.context.load_local_storage(&url) {
+                Ok(values) => {
+                    let entries = serde_json::to_string(&values).unwrap_or_else(|_| "{}".to_string());
+                    let _ = rt.execute_script(
+                        "<local-storage>",
+                        &format!("globalThis.__obscura_install_local_storage({entries});"),
+                    );
+                }
+                Err(error) => self.profile_error = Some(error),
+            }
+        }
         let _ = rt.execute_script(
             "<device-metrics>",
             &format!("globalThis.devicePixelRatio={};", self.device_scale_factor),
@@ -3857,6 +3873,8 @@ impl Page {
         defer_host_continuation: bool,
     ) -> Result<(), PageError> {
         self.cancel_navigation_continuation();
+        self.persist_local_storage()
+            .map_err(PageError::ProfileStorage)?;
         let url = Url::parse(url_str).map_err(|e| PageError::InvalidUrl(e.to_string()))?;
 
         self.navigation_committed = false;
@@ -4695,6 +4713,20 @@ impl Page {
         }
     }
 
+    pub fn persist_local_storage(&mut self) -> Result<(), String> {
+        if let Some(error) = self.profile_error.take() {
+            return Err(error);
+        }
+        let Some(url) = self.url.clone() else {
+            return Ok(());
+        };
+        let Some(js) = self.js.as_mut() else {
+            return Ok(());
+        };
+        let values = js.local_storage_snapshot()?;
+        self.context.save_local_storage(&url, &values)
+    }
+
     pub async fn evaluate_for_cdp(
         &mut self,
         expression: &str,
@@ -5022,6 +5054,7 @@ impl Page {
     }
 
     pub fn suspend_js(&mut self) {
+        let _ = self.persist_local_storage();
         let Some(js) = &mut self.js else {
             return;
         };
@@ -8991,6 +9024,9 @@ pub enum PageError {
 
     #[error("Parse error: {0}")]
     ParseError(String),
+
+    #[error("Profile storage error: {0}")]
+    ProfileStorage(String),
 
     /// A page kept triggering its own navigations until the chain's limit
     /// was exhausted. HTTP 3xx redirects are followed one layer down, in

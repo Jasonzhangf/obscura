@@ -10827,6 +10827,15 @@ const _mkStore = () => {
 globalThis.localStorage = _mkStore();
 globalThis.sessionStorage = _mkStore();
 
+// The Host owns the persistent profile. It injects the current origin's saved
+// values before page scripts run; ordinary runtimes without a storage profile
+// keep the in-memory Storage implementation.
+globalThis.__obscura_install_local_storage = function(entries) {
+  if (!entries || typeof entries !== 'object') throw new TypeError('localStorage entries must be an object');
+  const store = globalThis.localStorage;
+  for (const key of Object.keys(entries)) store._data[key] = String(entries[key]);
+};
+
 globalThis.btoa = globalThis.btoa || ((s) => { const b = new TextEncoder().encode(s); const c="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"; let r=""; for(let i=0;i<b.length;i+=3){const a=b[i],bb=b[i+1]??0,cc=b[i+2]??0; r+=c[a>>2]+c[((a&3)<<4)|(bb>>4)]+(i+1<b.length?c[((bb&15)<<2)|(cc>>6)]:"=")+(i+2<b.length?c[cc&63]:"=");} return r; });
 globalThis.atob = globalThis.atob || ((s) => {
   const c="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
