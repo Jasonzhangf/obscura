@@ -18,6 +18,7 @@ serde_json = { workspace = true }
 uuid = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
+tracing-subscriber = { workspace = true }
 tokio-tungstenite = { workspace = true }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 futures-util = "0.3"
