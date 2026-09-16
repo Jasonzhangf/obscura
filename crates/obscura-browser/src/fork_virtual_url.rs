@@ -36,8 +36,60 @@ impl Page {
         if self.url.as_ref() == Some(&parsed) {
             return false;
         }
+        js.set_url(virtual_url);
         self.url = Some(parsed);
         self.push_history(self.url_string());
         true
+    }
+}
+
+#[cfg(all(test, feature = "render"))]
+mod tests {
+    use std::io::{Read, Write};
+
+    use super::Page;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn virtual_url_change_keeps_prepared_frame_available() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request);
+            let body = r#"<!doctype html><html><body>
+                <div style="width:100px;height:100px;background:red"></div>
+            </body></html>"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "virtual-url-frame".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = Page::new("virtual-url-frame".to_string(), context);
+        page.set_viewport((100.0, 80.0));
+        page.navigate(&format!("http://{address}/start"))
+            .await
+            .unwrap();
+
+        page.render_frame().expect("initial frame");
+        page.evaluate("history.pushState({}, '', '/route?tabtype=weibo')");
+        assert!(
+            page.sync_virtual_url(),
+            "history.pushState must be adopted by the Page URL"
+        );
+        page.render_frame()
+            .expect("frame must stay available after a same-document URL change");
     }
 }
