@@ -13791,7 +13791,16 @@ globalThis.print = function() {}; _markNative(globalThis.print);
 globalThis.alert = function() {}; _markNative(globalThis.alert);
 globalThis.confirm = function() { return true; }; _markNative(globalThis.confirm);
 globalThis.prompt = function() { return null; }; _markNative(globalThis.prompt);
-globalThis.open = function() { return null; }; _markNative(globalThis.open);
+// This runtime owns one top-level browsing context. Treat window.open(url) as
+// a same-page navigation so links that use a popup target remain usable instead
+// of silently doing nothing. Return the current window for callers that keep a
+// handle and assign its location later.
+globalThis.open = function(url) {
+  if (url !== undefined && url !== null && String(url) !== '') {
+    location.assign(String(url));
+  }
+  return globalThis;
+}; _markNative(globalThis.open);
 globalThis.close = function() {}; _markNative(globalThis.close);
 globalThis.stop = function() {}; _markNative(globalThis.stop);
 // `window.postMessage` targets this same window. It was a no-op, so a page

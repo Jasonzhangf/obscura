@@ -14659,6 +14659,55 @@ mod tests {
     }
 
     #[test]
+    fn test_blank_link_click_uses_current_page_navigation() {
+        let mut rt = setup_runtime(
+            r#"<a id="next" target="_blank" href="/next">next</a>"#,
+        );
+        let href = rt
+            .evaluate(
+                r#"(function() {
+                    document.getElementById('next').click();
+                    return location.href;
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(href, serde_json::json!("http://example.com/next"));
+        assert_eq!(
+            rt.take_pending_navigation(),
+            Some((
+                "http://example.com/next".to_string(),
+                "GET".to_string(),
+                "".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_window_open_uses_current_page_navigation() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let opened = rt
+            .evaluate(
+                r#"(function() {
+                    const child = window.open('/next', '_blank');
+                    return [child === window, location.href];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            opened,
+            serde_json::json!([true, "http://example.com/next"])
+        );
+        assert_eq!(
+            rt.take_pending_navigation(),
+            Some((
+                "http://example.com/next".to_string(),
+                "GET".to_string(),
+                "".to_string()
+            ))
+        );
+    }
+
+    #[test]
     fn test_location_navigation_coerces_url_objects() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let hrefs = rt

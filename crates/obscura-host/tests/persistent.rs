@@ -1135,6 +1135,62 @@ fn click_receipt_precedes_navigation_and_old_document_input_is_rejected() {
 }
 
 #[test]
+fn popup_link_click_navigates_the_single_host_page() {
+    let daemon = Daemon::start_with_network(true);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        loop {
+            let mut line = String::new();
+            assert!(reader.read_line(&mut line).unwrap() > 0);
+            if line == "\r\n" { break; }
+        }
+        let body = "<title>popup destination</title><div id='destination'>opened</div>";
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ).unwrap();
+    });
+
+    let mut agent = daemon.connect();
+    agent.ok(json!({"type":"attach","mode":"agent"}));
+    agent.ok(json!({"type":"navigate","url":format!(
+        "data:text/html,<button style='position:absolute;left:10px;top:10px;width:200px;height:60px' onclick=\"window.open('http://{address}/','_blank')\">open</button>"
+    )}));
+    let before = agent.ok(json!({"type":"status"}));
+    let activation = agent.raw(json!({
+        "id": 77,
+        "operation": identity(&before),
+        "command": {
+            "type": "evaluate",
+            "expression": "document.querySelector('button').click()"
+        }
+    }));
+    assert!(
+        activation["type"] == "result" || activation["code"] == "STALE_DOCUMENT",
+        "popup activation did not reach the Host navigation boundary: {activation}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = agent.ok(json!({"type":"status"}));
+        if status["document_revision"].as_u64().unwrap_or(0) >= 2
+            && status["viewport_pending"] == false
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "popup navigation did not commit: {status}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(agent.eval("document.title"), "popup destination");
+    assert_eq!(agent.eval("document.getElementById('destination').textContent"), "opened");
+    server.join().unwrap();
+}
+
+#[test]
 fn takeover_during_real_click_waits_for_release_and_click_dispatch() {
     let daemon = Daemon::start();
     let mut agent = daemon.connect(); agent.ok(json!({"type":"attach","mode":"agent"}));
