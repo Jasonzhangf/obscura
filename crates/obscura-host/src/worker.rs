@@ -36,6 +36,22 @@ pub enum WorkKind {
 }
 const BUDGET: Duration = Duration::from_secs(5);
 
+/// Minimum interval between captured frames.
+///
+/// The 3 fps ceiling this replaces was a latency floor, not a protection: the
+/// capture path is a synchronous paint that measured in single-digit
+/// milliseconds, so the tick rate was the dominant delay for every viewer.
+/// `OBSCURA_FRAME_PERIOD_MS` tunes it for benchmarking; it is clamped to a
+/// range that keeps a misconfigured value from either spinning the paint loop
+/// or reintroducing the old ceiling.
+fn frame_period() -> Duration {
+    let configured = std::env::var("OBSCURA_FRAME_PERIOD_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(33);
+    Duration::from_millis(configured.clamp(8, 1000))
+}
+
 // Bound actual synchronous polls, never parked timers/network futures.
 async fn page_work<T>(future: impl std::future::Future<Output = T>) -> T {
     let mut future = std::pin::pin!(future);
@@ -78,7 +94,12 @@ pub fn start(id: String, storage_dir: Option<std::path::PathBuf>, network: bool,
             let mut viewport_revision = 0;
             let mut rotation: Option<RotationIdentity> = None;
             let mut frame_sequence = 0u64;
-            let mut frame_clock = tokio::time::interval(Duration::from_millis(333));
+            // Capture cadence. This was a hardcoded 333 ms (3 fps) ceiling,
+            // which set the floor on glass-to-glass latency no matter how fast
+            // the page or encoder was; measured capture itself costs single
+            // digit milliseconds. Default to a 30 fps budget and allow an
+            // operator override for tuning without a rebuild.
+            let mut frame_clock = tokio::time::interval(frame_period());
             frame_clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut idle = false;
             let mut frame_fence: Option<Arc<AtomicBool>> = None;
