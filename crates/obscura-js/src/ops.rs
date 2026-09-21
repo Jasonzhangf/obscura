@@ -2323,6 +2323,35 @@ fn cors_response_allows(
     }
 }
 
+/// Referer value for a scripted request, following the same policy the
+/// navigation path applies in `obscura_net::request_referrer`: same-origin
+/// sends the full document URL without username, password, or fragment;
+/// cross-origin is reduced to the serialized origin; and an https->http
+/// downgrade sends nothing. An unparseable or non-http(s) document URL yields
+/// no header rather than a guessed value.
+fn fetch_referrer_header(referrer: &str, target_url: &str) -> Option<String> {
+    if referrer.is_empty() {
+        return None;
+    }
+    let source = url::Url::parse(referrer).ok()?;
+    let target = url::Url::parse(target_url).ok()?;
+    if !matches!(source.scheme(), "http" | "https") || !matches!(target.scheme(), "http" | "https") {
+        return None;
+    }
+    if source.scheme() == "https" && target.scheme() == "http" {
+        return None;
+    }
+    if source.origin() == target.origin() {
+        let mut value = source;
+        let _ = value.set_username("");
+        let _ = value.set_password(None);
+        value.set_fragment(None);
+        Some(value.to_string())
+    } else {
+        Some(format!("{}/", source.origin().ascii_serialization()))
+    }
+}
+
 #[op2(async)]
 #[string]
 async fn op_fetch_url(
@@ -2334,6 +2363,7 @@ async fn op_fetch_url(
     #[string] origin: String,
     #[string] mode: String,
     #[string] credentials: String,
+    #[string] referrer: String,
 ) -> Result<String, deno_error::JsErrorBox> {
     let body = body.to_vec();
     tracing::debug!(
@@ -2682,6 +2712,23 @@ async fn op_fetch_url(
                 "User-Agent",
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
             );
+        }
+
+        // Browsers attach Referer to scripted requests according to the
+        // document's referrer policy; the page cannot set or suppress it from
+        // JS. Origins that gate on an in-site referer (Sina's QR endpoint
+        // answers 403 without one) therefore saw every fetch()/XHR as
+        // unreferenced. Same-origin uses the full document URL with the
+        // fragment stripped, cross-origin is downgraded to the origin, and a
+        // downgrade https->http is suppressed, matching request_referrer on
+        // the navigation path.
+        if !custom_headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("referer"))
+        {
+            if let Some(value) = fetch_referrer_header(&referrer, &current_url) {
+                req = req.header(reqwest::header::REFERER, value);
+            }
         }
 
         for (k, v) in &custom_headers {
@@ -3127,6 +3174,40 @@ mod tests {
     use super::{
         cors_response_allows, glob_match, validate_fetch_url, FetchCredentials, ObscuraState,
     };
+    use super::fetch_referrer_header;
+
+    // Sina's QR endpoint answers 403 to a scripted request that carries no
+    // Referer, so fetch()/XHR must send the document URL the way the
+    // navigation path already does.
+    #[test]
+    fn fetch_referrer_follows_the_same_origin_policy_as_navigation() {
+        let doc = "https://passport.weibo.com/sso/signin?entry=miniblog&source=miniblog";
+
+        // Same origin: the full document URL, fragment stripped.
+        assert_eq!(
+            fetch_referrer_header(doc, "https://passport.weibo.com/sso/v2/qrcode/image?entry=miniblog"),
+            Some("https://passport.weibo.com/sso/signin?entry=miniblog&source=miniblog".to_string())
+        );
+        assert_eq!(
+            fetch_referrer_header("https://a.example/x#frag", "https://a.example/y"),
+            Some("https://a.example/x".to_string())
+        );
+
+        // Cross origin: reduced to the origin, with a trailing slash.
+        assert_eq!(
+            fetch_referrer_header(doc, "https://v2.qr.weibo.cn/inf/gen"),
+            Some("https://passport.weibo.com/".to_string())
+        );
+
+        // https -> http is suppressed, non-http(s) sources are suppressed, and
+        // an unusable document URL yields no header rather than a guess.
+        assert_eq!(
+            fetch_referrer_header("https://a.example/x", "http://a.example/y"),
+            None
+        );
+        assert_eq!(fetch_referrer_header("about:blank", "https://a.example/y"), None);
+        assert_eq!(fetch_referrer_header("", "https://a.example/y"), None);
+    }
     use crate::runtime::ObscuraJsRuntime;
     use obscura_dom::parse_html;
     use std::cell::RefCell;

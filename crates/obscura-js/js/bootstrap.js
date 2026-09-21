@@ -326,7 +326,8 @@ async function __fetchDynClassicScript(task) {
     body = _decodeDataScriptUrl(task.url);
   } else {
     const raw = await Deno.core.ops.op_fetch_url(
-      task.url, "GET", "{}", new Uint8Array(0), task.pageOrigin, "no-cors", "same-origin"
+      task.url, "GET", "{}", new Uint8Array(0), task.pageOrigin, "no-cors", "same-origin",
+      __documentReferrer()
     );
     const parsed = JSON.parse(raw);
     // The HTML script-fetch algorithm treats an unsuccessful HTTP response
@@ -410,6 +411,20 @@ async function __processDynScriptQueue() {
     }
   } finally {
     __dynScriptBusy = false;
+  }
+}
+// The document URL HTTP requests are charged against: what a browser sends as
+// Referer for same-origin scripted requests. Read from native state rather
+// than location.href so a pending history entry or a synchronous location
+// setter cannot make the referer disagree with the document actually in the
+// DOM. Returns "" when the URL is unusable, which suppresses the header.
+function __documentReferrer() {
+  try {
+    const raw = _domParse("document_url");
+    if (!raw) return "";
+    return new URL(raw).href;
+  } catch (e) {
+    return "";
   }
 }
 // Resolve a resource URL (script src / link href) against <base href> or the
@@ -552,7 +567,8 @@ async function _fetchLinkedCss(url, pageOrigin, depth = 0, seen = new Set()) {
   if (depth > 4 || seen.has(url)) return "";
   seen.add(url);
   const raw = await Deno.core.ops.op_fetch_url(
-    url, "GET", "{}", new Uint8Array(0), pageOrigin, "no-cors", "same-origin"
+    url, "GET", "{}", new Uint8Array(0), pageOrigin, "no-cors", "same-origin",
+    __documentReferrer()
   );
   const parsed = JSON.parse(raw);
   if (parsed.blocked || parsed.status >= 400 || parsed.status === 0) {
@@ -7247,7 +7263,7 @@ globalThis.fetch = async (input, init = {}) => {
     throw new TypeError("Failed to execute 'fetch': '" + fetchCredentials + "' is not a valid RequestCredentials value");
   }
   const pageOrigin = (function() { try { const u = new URL(_domParse("document_url") || "about:blank"); return u.origin; } catch(e) { return ""; } })();
-  const raw = await Deno.core.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode, fetchCredentials);
+  const raw = await Deno.core.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode, fetchCredentials, __documentReferrer());
   const parsed = JSON.parse(raw);
   if (parsed.blocked) {
     const err = new TypeError('net::ERR_FAILED');
