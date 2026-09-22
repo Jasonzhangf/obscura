@@ -6810,6 +6810,21 @@ function _chromeMajor() {
   var m = (globalThis.__obscura_ua || '').match(/Chrome\/(\d+)/);
   return m ? (m[1] | 0) : 145;
 }
+// Touch and mobile hints are part of the same identity statement as the UA.
+// Chromium reports them from the platform the UA describes, so a profile that
+// says Android must not answer `maxTouchPoints: 0` / `mobile: false`: that
+// combination is not a device any real browser produces, and mobile sites
+// branch on it directly (`navigator.maxTouchPoints > 0`).
+function _uaIsMobile() {
+  var ua = globalThis.__obscura_ua || '';
+  return /Mobile|Android|iPhone|iPad|iPod/.test(ua);
+}
+function _uaMobileModel() {
+  // Chromium's UA-CH `model` is the device model, which lives in the UA's
+  // platform comment for Android: "Android 14; Pixel 7".
+  var m = (globalThis.__obscura_ua || '').match(/Android [^;)]*;\s*([^;)]+?)\)/);
+  return m ? m[1].trim() : '';
+}
 // Chromium derives the sec-ch-ua GREASE brand, version, and brand order
 // deterministically from the Chrome major version
 // (components/embedder_support/user_agent_utils.cc). Replicating it keeps
@@ -6837,24 +6852,25 @@ function _uaBrands() {
 // hop below, not as own props here: own accessors are a bot tell.
 globalThis.navigator = {
   onLine: true, cookieEnabled: true,
-  maxTouchPoints: 0,
+  get maxTouchPoints() { return _uaIsMobile() ? 5 : 0; },
   vendor: "Google Inc.", product: "Gecko", productSub: "20030107",
   doNotTrack: null,
   connection: new NetworkInformation(),
   pdfViewerEnabled: true,
   userAgentData: {
-    mobile: false,
+    get mobile() { return _uaIsMobile(); },
     get brands() { return _uaBrands(); },
     get platform() { return globalThis.__obscura_ua_platform || "Windows"; },
     getHighEntropyValues(hints) {
       var brands = _uaBrands();
+      var mobile = _uaIsMobile();
       return Promise.resolve({
-        architecture: "x86",
-        bitness: "64",
+        architecture: mobile ? "arm" : "x86",
+        bitness: mobile ? "" : "64",
         brands: brands,
         fullVersionList: brands.map(function(b) { return {brand: b.brand, version: b.version + ".0.0.0"}; }),
-        mobile: false,
-        model: "",
+        mobile: mobile,
+        model: mobile ? _uaMobileModel() : "",
         platform: globalThis.__obscura_ua_platform || "Windows",
         platformVersion: globalThis.__obscura_ua_platform_version || "15.0.0",
         uaFullVersion: _chromeMajor() + ".0.0.0",

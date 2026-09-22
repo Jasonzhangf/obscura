@@ -3,6 +3,43 @@ use std::sync::Arc;
 
 use obscura_net::{CookieJar, ObscuraHttpClient, RobotsCache};
 
+/// One browser identity: the UA string plus the platform surfaces that must
+/// agree with it. `navigator.platform` and the UA-CH platform fields are part
+/// of the same statement as the UA, so they travel together.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BrowserIdentity {
+    pub user_agent: String,
+    pub platform: String,
+    pub ua_platform: String,
+    pub ua_platform_version: String,
+}
+
+impl BrowserIdentity {
+    fn from_profile(profile: &crate::profiles::BrowserProfile) -> Self {
+        Self {
+            user_agent: profile.user_agent.to_string(),
+            platform: profile.platform.to_string(),
+            ua_platform: profile.ua_platform.to_string(),
+            ua_platform_version: profile.ua_platform_version.to_string(),
+        }
+    }
+
+    /// Desktop identity for a client that attaches as `Device::Desktop`.
+    pub fn desktop() -> Self {
+        Self::from_profile(
+            crate::profiles::PROFILES
+                .iter()
+                .find(|profile| profile.platform == "MacIntel")
+                .expect("macOS profile is part of the browser identity catalog"),
+        )
+    }
+
+    /// Identity for a client that attaches as `Device::Phone`.
+    pub fn phone() -> Self {
+        Self::from_profile(crate::profiles::phone_profile())
+    }
+}
+
 pub struct BrowserContext {
     pub id: String,
     pub cookie_jar: Arc<CookieJar>,
@@ -86,6 +123,28 @@ impl BrowserContext {
         Self::_new_inner(id, proxy_url, stealth, user_agent, storage_dir, allow_private_network)
     }
 
+    /// Create a context under an explicit identity. The Host uses this to open
+    /// a Session behind the identity of whichever device holds it.
+    pub fn with_identity(
+        id: String,
+        storage_dir: Option<PathBuf>,
+        allow_private_network: bool,
+        identity: BrowserIdentity,
+    ) -> Self {
+        Self::_new_inner_with_identity(id, None, false, storage_dir, allow_private_network, identity)
+    }
+
+    /// Rebind UA and platform surfaces to another identity. Only the Page owner
+    /// may call this: it decides when the live document's JS surfaces are
+    /// updated and when the new identity first applies to a navigation.
+    pub(crate) async fn replace_identity(&mut self, identity: BrowserIdentity) {
+        self.user_agent = identity.user_agent;
+        self.platform = identity.platform;
+        self.ua_platform = identity.ua_platform;
+        self.ua_platform_version = identity.ua_platform_version;
+        self.http_client.set_user_agent(&self.user_agent).await;
+    }
+
     fn _new_inner(
         id: String,
         proxy_url: Option<String>,
@@ -93,6 +152,24 @@ impl BrowserContext {
         user_agent: Option<String>,
         storage_dir: Option<PathBuf>,
         allow_private_network: bool,
+    ) -> Self {
+        let profile = crate::profiles::select_profile();
+        let identity = match user_agent {
+            // A caller-supplied UA is authoritative for that whole identity:
+            // an Android UA must not keep a desktop `navigator.platform`.
+            Some(user_agent) => crate::profiles::identity_for_user_agent(&user_agent),
+            None => BrowserIdentity::from_profile(profile),
+        };
+        Self::_new_inner_with_identity(id, proxy_url, stealth, storage_dir, allow_private_network, identity)
+    }
+
+    fn _new_inner_with_identity(
+        id: String,
+        proxy_url: Option<String>,
+        stealth: bool,
+        storage_dir: Option<PathBuf>,
+        allow_private_network: bool,
+        identity: BrowserIdentity,
     ) -> Self {
         let cookie_jar = Arc::new(CookieJar::new());
 
@@ -120,26 +197,21 @@ impl BrowserContext {
         if stealth {
             client.block_trackers = true;
         }
-        let profile = crate::profiles::select_profile();
-        let resolved_ua = user_agent.unwrap_or_else(|| profile.user_agent.to_string());
-        let platform = profile.platform.to_string();
-        let ua_platform = profile.ua_platform.to_string();
-        let ua_platform_version = profile.ua_platform_version.to_string();
         // Sync the http client's UA at construction so navigation requests pick it
         // up before any async setup runs. The lock has no other holders here, so
         // try_write always succeeds; we fall back silently if it ever fails.
         if let Ok(mut guard) = client.user_agent.try_write() {
-            *guard = resolved_ua.clone();
+            *guard = identity.user_agent.clone();
         }
         let http_client = Arc::new(client);
         BrowserContext {
             id,
             cookie_jar,
             http_client,
-            user_agent: resolved_ua,
-            platform,
-            ua_platform,
-            ua_platform_version,
+            user_agent: identity.user_agent,
+            platform: identity.platform,
+            ua_platform: identity.ua_platform,
+            ua_platform_version: identity.ua_platform_version,
             proxy_url,
             robots_cache: Arc::new(RobotsCache::new()),
             obey_robots: false,
@@ -324,6 +396,40 @@ mod tests {
         assert_eq!(ctx.user_agent, "Custom-UA/1.0");
         let client_ua = ctx.http_client.user_agent.read().await.clone();
         assert_eq!(client_ua, "Custom-UA/1.0");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn phone_identity_matches_its_user_agent_on_every_surface() {
+        let identity = BrowserIdentity::phone();
+        let ctx = BrowserContext::with_identity("phone".to_string(), None, false, identity.clone());
+        // A site sees one statement, not a UA that contradicts navigator.platform.
+        assert!(ctx.user_agent.contains("Android"));
+        assert_eq!(ctx.platform, "Linux armv8l");
+        assert_eq!(ctx.ua_platform, "Android");
+        assert_eq!(ctx.http_client.user_agent.read().await.as_str(), identity.user_agent);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn replace_identity_rebinds_user_agent_and_platform_together() {
+        let mut ctx = BrowserContext::with_identity("switch".to_string(), None, false, BrowserIdentity::desktop());
+        assert!(ctx.user_agent.contains("Macintosh"));
+        ctx.replace_identity(BrowserIdentity::phone()).await;
+        assert!(ctx.user_agent.contains("Android"), "{}", ctx.user_agent);
+        assert_eq!(ctx.platform, "Linux armv8l");
+        assert_eq!(ctx.ua_platform, "Android");
+        assert!(ctx.http_client.user_agent.read().await.contains("Android"));
+    }
+
+    #[test]
+    fn caller_supplied_user_agent_does_not_keep_a_desktop_platform() {
+        let ctx = BrowserContext::with_full_options(
+            "derived".to_string(),
+            None,
+            false,
+            Some("Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Mobile Safari/537.36".to_string()),
+        );
+        assert_eq!(ctx.platform, "Linux armv8l");
+        assert_eq!(ctx.ua_platform, "Android");
     }
 
     #[tokio::test(flavor = "current_thread")]

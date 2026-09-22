@@ -2,7 +2,7 @@
 use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
 use anyhow::{Context, Result};
 use obscura_browser::{BrowserContext, Page};
-use obscura_host_protocol::{Command, EvaluationResult, FrameInfo, FramePacket, InputEvent, InputReceipt, InputState, Operation, PixelFormat, PointerButton, ResultValue, RotationIdentity, SourceDimensions};
+use obscura_host_protocol::{Command, Device, EvaluationResult, FrameInfo, FramePacket, InputEvent, InputReceipt, InputState, Operation, PixelFormat, PointerButton, ResultValue, RotationIdentity, SourceDimensions};
 use crate::media::{self, SharedFrame};
 use obscura_browser::input::{Input, InputError};
 use tokio::sync::{mpsc, oneshot};
@@ -32,7 +32,7 @@ pub enum WorkKind {
     Browser { command: Command, operation: Operation },
     /// Host-assigned shared viewport; declarations apply to the current Page,
     /// while explicit Agent resize retains its admitted document fence.
-    Viewport { width: u32, height: u32, revision: u64, rotation: Option<RotationIdentity>, document_revision: Option<u64>, cancel: Arc<AtomicBool> },
+    Viewport { width: u32, height: u32, revision: u64, device: Device, rotation: Option<RotationIdentity>, document_revision: Option<u64>, cancel: Arc<AtomicBool> },
 }
 const BUDGET: Duration = Duration::from_secs(5);
 
@@ -92,6 +92,10 @@ pub fn start(id: String, storage_dir: Option<std::path::PathBuf>, network: bool,
             let mut failure: Option<String> = None;
             let mut document_revision = 0;
             let mut viewport_revision = 0;
+            // Identity is owned by the elected attachment's device. The Host
+            // starts on its build-time default and adopts the first declared
+            // device, so a phone that takes the session browses as a phone.
+            let mut identity_device: Option<Device> = None;
             let mut rotation: Option<RotationIdentity> = None;
             let mut frame_sequence = 0u64;
             // Capture cadence. This was a hardcoded 333 ms (3 fps) ceiling,
@@ -188,14 +192,28 @@ pub fn start(id: String, storage_dir: Option<std::path::PathBuf>, network: bool,
                             Completion { result: Err(("STALE_DOCUMENT", "Document changed before execution".into())), viewport: page.as_ref().map(|page| page.viewport), focus: None, fault: None, document_revision, viewport_revision, rotation }
                         } else {
                             match work.kind {
-                                WorkKind::Viewport { width, height, revision, rotation: target_rotation, cancel, .. } => {
+                                WorkKind::Viewport { width, height, revision, device, rotation: target_rotation, cancel, .. } => {
                                     frame_fence = Some(Arc::clone(&cancel));
                                     let mut fault = None;
                                     let result = if cancel.load(Ordering::Acquire) {
                                         frames.send_replace(media::state(FramePacket::Waiting { session_id: id.clone() }));
                                         Ok(None)
                                     } else if let Some(page) = page.as_mut() {
-                                        if page.viewport != (width as f32, height as f32) {
+                                        if identity_device != Some(device) {
+                                            // Identity follows whoever holds the session. The live
+                                            // document is never reloaded for this: attaching a device
+                                            // must not destroy page state, and the next navigation is
+                                            // the first document that must see the new identity.
+                                            let identity = match device {
+                                                Device::Phone => obscura_browser::BrowserIdentity::phone(),
+                                                Device::Desktop => obscura_browser::BrowserIdentity::desktop(),
+                                            };
+                                            match page_work(page.adopt_identity(&identity)).await {
+                                                Ok(()) => identity_device = Some(device),
+                                                Err(cause) => fault = Some(format!("Identity adoption failed: {cause}")),
+                                            }
+                                        }
+                                        if fault.is_none() && page.viewport != (width as f32, height as f32) {
                                             // Invalidate before changing layout. The same Page retains DOM,
                                             // JS, form state and pending tasks; no attachment-specific render.
                                             frames.send_replace(media::state(FramePacket::Waiting { session_id: id.clone() }));

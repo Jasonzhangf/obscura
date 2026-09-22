@@ -7,7 +7,7 @@ pub mod page;
 pub mod pdf;
 pub mod profiles;
 
-pub use context::BrowserContext;
+pub use context::{BrowserContext, BrowserIdentity};
 pub use lifecycle::{LifecycleState, WaitUntil};
 pub use obscura_js::HTML_TO_MARKDOWN_JS;
 #[cfg(feature = "render")]

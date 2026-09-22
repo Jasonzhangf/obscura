@@ -94,6 +94,10 @@ struct Session {
     viewport_owner: Option<u64>,
     viewport_update: Option<ViewportUpdate>,
     viewport_repair: Option<(u32, u32, Option<obscura_host_protocol::Orientation>)>,
+    /// Identity of the attachment that last held the geometry. Repairs and
+    /// Agent resizes re-apply it so a geometry-only change never silently
+    /// rewrites the browser identity.
+    viewport_device: Option<Device>,
     rotation: Option<RotationIdentity>,
     remote_focus: Option<RemoteFocusCapability>,
     video_quality: VideoQualityState,
@@ -109,7 +113,7 @@ impl VideoQualityCapability {
         match profile { VideoQualityProfile::Low => self.low, VideoQualityProfile::Balanced => self.balanced, VideoQualityProfile::High => self.high }
     }
 }
-struct ViewportUpdate { owner: Option<u64>, width: u32, height: u32, revision: u64, rotation: Option<RotationIdentity>, cancelled: bool, cancel: Arc<AtomicBool> }
+struct ViewportUpdate { owner: Option<u64>, width: u32, height: u32, revision: u64, device: Device, rotation: Option<RotationIdentity>, cancelled: bool, cancel: Arc<AtomicBool> }
 struct Record { operation: Operation, command: Command, response: Option<Response> }
 fn valid_viewport(width: u32, height: u32) -> bool {
     width > 0 && height > 0 && width <= 4096 && height <= 4096 && u64::from(width) * u64::from(height) <= 4_194_304
@@ -142,13 +146,20 @@ impl Session {
                 u64::from(viewport.css_width) * u64::from(viewport.css_height), viewport.css_width, *id))
     }
     fn viewport_pending(&self) -> bool {
+        // Identity is part of the committed assignment, not only its geometry:
+        // without the device check, a phone attaching at the already-committed
+        // geometry would keep the previous device's user agent.
         self.viewport_update.is_some() || self.viewport_repair.is_some() || self.selected_viewport().is_some_and(|(_, viewport)|
-            !self.committed_viewport_matches(viewport.css_width, viewport.css_height, Some(viewport.orientation)))
+            !self.committed_viewport_matches(viewport.css_width, viewport.css_height, Some(viewport.orientation))
+                || self.viewport_device != Some(viewport.device))
     }
     fn committed_viewport_matches(&self, width: u32, height: u32, orientation: Option<obscura_host_protocol::Orientation>) -> bool {
         self.viewport == Some((width as f32, height as f32)) && self.rotation.map(|rotation| rotation.orientation) == orientation
     }
-    fn viewport_work(&mut self, owner: Option<u64>, width: u32, height: u32, orientation: Option<obscura_host_protocol::Orientation>, document_revision: Option<u64>) -> Result<WorkKind, String> {
+    /// `device` is the identity of the attachment that holds this geometry; it
+    /// is the same election that produced the width and height, so the Page
+    /// never renders under one device's geometry and another device's UA.
+    fn viewport_work(&mut self, owner: Option<u64>, width: u32, height: u32, device: Device, orientation: Option<obscura_host_protocol::Orientation>, document_revision: Option<u64>) -> Result<WorkKind, String> {
         self.remote_focus = None;
         let orientation = orientation.or_else(|| self.rotation.map(|rotation| rotation.orientation));
         let revision = if self.viewport == Some((width as f32, height as f32)) { self.viewport_revision }
@@ -165,8 +176,8 @@ impl Session {
             None => None,
         };
         let cancel = Arc::new(AtomicBool::new(false));
-        self.viewport_update = Some(ViewportUpdate { owner, width, height, revision, rotation, cancelled: false, cancel: Arc::clone(&cancel) });
-        Ok(WorkKind::Viewport { width, height, revision, rotation, document_revision, cancel })
+        self.viewport_update = Some(ViewportUpdate { owner, width, height, revision, device, rotation, cancelled: false, cancel: Arc::clone(&cancel) });
+        Ok(WorkKind::Viewport { width, height, revision, device, rotation, document_revision, cancel })
     }
     fn detach(&mut self, connection: u64) {
         self.remote_focus = None;
@@ -514,7 +525,7 @@ pub async fn serve(socket_dir: PathBuf, storage_dir: Option<PathBuf>, allow_priv
     let (interest, interested) = tokio::sync::watch::channel(0usize);
     let worker = worker::start(id.clone(), storage_dir, allow_private_network, incoming_work, ready, faults, frames, interested)?;
     let viewport = initialized.await.context("browser worker stopped during startup")?.map_err(anyhow::Error::msg)?;
-    let mut session = Session { id: id.clone(), viewport: Some(viewport), attachments: HashMap::new(), agent: None, viewport_revision: 0, document_revision: 0, fault: None, control: host_control(1, ControlPhase::Agent), records: HashMap::new(), operation_ids: HashMap::new(), retired: HashSet::new(), viewport_owner: None, viewport_update: None, viewport_repair: None, rotation: None, remote_focus: None, video_quality: VideoQualityState { requested: VideoQualitySettings { profile: VideoQualityProfile::Balanced, low_latency: true }, effective: VideoQualitySettings { profile: VideoQualityProfile::Balanced, low_latency: true }, link: LinkQuality { rtt_ms: None, jitter_ms: None, loss_ratio: None, queue_ms: None } }, video_quality_capability: VideoQualityCapability::CURRENT };
+    let mut session = Session { id: id.clone(), viewport: Some(viewport), attachments: HashMap::new(), agent: None, viewport_revision: 0, document_revision: 0, fault: None, control: host_control(1, ControlPhase::Agent), records: HashMap::new(), operation_ids: HashMap::new(), retired: HashSet::new(), viewport_owner: None, viewport_update: None, viewport_repair: None, viewport_device: None, rotation: None, remote_focus: None, video_quality: VideoQualityState { requested: VideoQualitySettings { profile: VideoQualityProfile::Balanced, low_latency: true }, effective: VideoQualitySettings { profile: VideoQualityProfile::Balanced, low_latency: true }, link: LinkQuality { rtt_ms: None, jitter_ms: None, loss_ratio: None, queue_ms: None } }, video_quality_capability: VideoQualityCapability::CURRENT };
     let listener = UnixListener::bind(directory.0.join("host.sock"))?;
     std::fs::set_permissions(directory.0.join("host.sock"), std::fs::Permissions::from_mode(0o600))?;
     let media_listener = UnixListener::bind(directory.0.join("frames.sock"))?;
@@ -531,11 +542,16 @@ pub async fn serve(socket_dir: PathBuf, storage_dir: Option<PathBuf>, allow_priv
         // Declarations remain responsive while atomic work completes. Schedule only
         // the latest elected pair, before admitting any subsequent browser mutation.
         if pending.is_none() && session.fault.is_none() && session.viewport.is_some() {
-            let target = session.viewport_repair.take().map(|(width, height, orientation)| (None, width, height, orientation, true))
-                .or_else(|| session.selected_viewport().map(|(owner, viewport)| (Some(owner), viewport.css_width, viewport.css_height, Some(viewport.orientation), false)));
+            // A repair restores the geometry the Host already committed, so it
+            // keeps that assignment's identity; a fresh election takes the
+            // device of the attachment whose declaration won it.
+            let selected = session.selected_viewport();
+            let target = session.viewport_repair.take()
+                .map(|(width, height, orientation)| (None, width, height, orientation, session.viewport_device, true))
+                .or_else(|| selected.map(|(owner, viewport)| (Some(owner), viewport.css_width, viewport.css_height, Some(viewport.orientation), Some(viewport.device), false)));
             match target {
-                Some((owner, width, height, orientation, force)) if force || !session.committed_viewport_matches(width, height, orientation) => {
-                    match session.viewport_work(owner, width, height, orientation, None) {
+                Some((owner, width, height, orientation, device, force)) if force || !session.committed_viewport_matches(width, height, orientation) => {
+                    match device.ok_or("Viewport assignment has no declaring device".to_string()).and_then(|device| session.viewport_work(owner, width, height, device, orientation, None)) {
                         Ok(kind) => {
                             let (reply, result) = oneshot::channel();
                             if work.try_send(Work { kind, reply }).is_err() {
@@ -546,7 +562,7 @@ pub async fn serve(socket_dir: PathBuf, storage_dir: Option<PathBuf>, allow_priv
                         Err(cause) => session.fault = Some(cause),
                     }
                 }
-                Some((owner, _, _, _, _)) => session.viewport_owner = owner,
+                Some((owner, _, _, _, _, _)) => session.viewport_owner = owner,
                 None => session.viewport_owner = None,
             }
         }
@@ -598,7 +614,8 @@ pub async fn serve(socket_dir: PathBuf, storage_dir: Option<PathBuf>, allow_priv
                         Err(command) => {
                             let record = Record { operation: operation.expect("mutation admission checked identity"), command: command.clone(), response: None };
                             let kind = if let Command::Resize { width, height } = command {
-                                match session.viewport_work(None, width, height, None, Some(record.operation.document_revision)) {
+                                let device = session.viewport_device.unwrap_or(Device::Desktop);
+                                match session.viewport_work(None, width, height, device, None, Some(record.operation.document_revision)) {
                                     Ok(kind) => kind,
                                     Err(cause) => {
                                         session.fault = Some(cause.clone());
@@ -658,6 +675,7 @@ pub async fn serve(socket_dir: PathBuf, storage_dir: Option<PathBuf>, allow_priv
                                     session.viewport = completion.viewport;
                                     session.viewport_revision = completion.viewport_revision;
                                     session.rotation = completion.rotation;
+                                    session.viewport_device = Some(update.device);
                                     session.viewport_owner = update.owner;
                                 }
                             }
@@ -796,6 +814,7 @@ mod tests {
             viewport_owner: None,
             viewport_update: None,
             viewport_repair: None,
+            viewport_device: None,
             rotation: None,
             remote_focus: None,
             video_quality: VideoQualityState { requested: VideoQualitySettings { profile: VideoQualityProfile::Balanced, low_latency: false }, effective: VideoQualitySettings { profile: VideoQualityProfile::Balanced, low_latency: false }, link: LinkQuality { rtt_ms: None, jitter_ms: None, loss_ratio: None, queue_ms: None } },
@@ -812,6 +831,62 @@ mod tests {
 
     fn status_of(session: &mut Session, connection: u64) -> SessionStatus {
         status(session.request(connection, Request { id: 99, command: Command::Status {}, operation: None }, false).unwrap())
+    }
+
+    #[test]
+    fn elected_viewport_carries_the_identity_of_its_declaring_device() {
+        let mut session = session();
+        session.attachments.insert(2, Attachment {
+            mode: Mode::Observe,
+            viewport: Some(ViewportDeclaration {
+                device: Device::Desktop,
+                css_width: 1280,
+                css_height: 800,
+                orientation: obscura_host_protocol::Orientation::Landscape,
+            }),
+            webrtc: None,
+        });
+        session.attachments.insert(3, Attachment {
+            mode: Mode::Observe,
+            viewport: Some(ViewportDeclaration {
+                device: Device::Phone,
+                css_width: 391,
+                css_height: 701,
+                orientation: obscura_host_protocol::Orientation::Portrait,
+            }),
+            webrtc: None,
+        });
+        let (owner, viewport) = session.selected_viewport().expect("an observer declared a viewport");
+        // Whoever declares the phone geometry is who the page must be: a phone
+        // session is not rendered inside a desktop identity.
+        assert_eq!(viewport.device, Device::Phone);
+        assert_eq!((viewport.css_width, viewport.css_height), (391, 701));
+        assert_eq!(owner, 3);
+    }
+
+    #[test]
+    fn an_identity_only_change_still_counts_as_a_pending_viewport() {
+        let mut session = session();
+        // The Host has already committed this exact geometry as desktop.
+        session.viewport = Some((391.0, 701.0));
+        session.rotation = Some(RotationIdentity {
+            orientation: obscura_host_protocol::Orientation::Portrait,
+            revision: 1,
+        });
+        session.viewport_device = Some(Device::Desktop);
+        session.attachments.insert(4, Attachment {
+            mode: Mode::Observe,
+            viewport: Some(ViewportDeclaration {
+                device: Device::Phone,
+                css_width: 391,
+                css_height: 701,
+                orientation: obscura_host_protocol::Orientation::Portrait,
+            }),
+            webrtc: None,
+        });
+        // Same geometry, different device: the page still owes a phone identity,
+        // so the daemon must schedule work instead of accepting the old commit.
+        assert!(session.viewport_pending());
     }
 
     #[test]

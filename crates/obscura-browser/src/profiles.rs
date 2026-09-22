@@ -56,6 +56,70 @@ pub static PROFILES: &[BrowserProfile] = &[
     },
 ];
 
+/// Phone browser identity.
+///
+/// The pool above is desktop-only, so a phone client attached to the Host was
+/// still served a Windows desktop identity. Responsive sites then rendered a
+/// desktop layout inside a phone-sized viewport, which is exactly the
+/// misalignment users reported on weibo. The identity has to follow the
+/// attaching device, not the Host's build-time default.
+pub static PHONE_PROFILE: BrowserProfile = BrowserProfile {
+    user_agent: "Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Mobile Safari/537.36",
+    platform: "Linux armv8l",
+    ua_platform: "Android",
+    ua_platform_version: "14.0.0",
+};
+
+pub fn phone_profile() -> &'static BrowserProfile {
+    &PHONE_PROFILE
+}
+
+/// Derive the platform surfaces for a caller-supplied UA string.
+///
+/// The profile pool only covers desktop identities, so a caller that pins a UA
+/// (the Host, for one) would otherwise send an Android UA while
+/// `navigator.platform` and the UA-CH platform fields still said Windows.
+/// Keeping them consistent is the point of an identity, not a nicety: sites
+/// branch on the whole bundle.
+pub fn identity_for_user_agent(user_agent: &str) -> crate::context::BrowserIdentity {
+    if user_agent.contains("Android") {
+        let version = user_agent
+            .split("Android ")
+            .nth(1)
+            .and_then(|rest| rest.split(|ch: char| !ch.is_ascii_digit() && ch != '.').next())
+            .map(|version| format!("{}.0.0", version.split('.').next().unwrap_or("14")))
+            .unwrap_or_else(|| "14.0.0".to_string());
+        return crate::context::BrowserIdentity {
+            user_agent: user_agent.to_string(),
+            platform: "Linux armv8l".into(),
+            ua_platform: "Android".into(),
+            ua_platform_version: version,
+        };
+    }
+    if user_agent.contains("Windows NT") {
+        return crate::context::BrowserIdentity {
+            user_agent: user_agent.to_string(),
+            platform: "Win32".into(),
+            ua_platform: "Windows".into(),
+            ua_platform_version: "10.0.0".into(),
+        };
+    }
+    if user_agent.contains("Macintosh") {
+        return crate::context::BrowserIdentity {
+            user_agent: user_agent.to_string(),
+            platform: "MacIntel".into(),
+            ua_platform: "macOS".into(),
+            ua_platform_version: "14.6.0".into(),
+        };
+    }
+    crate::context::BrowserIdentity {
+        user_agent: user_agent.to_string(),
+        platform: "Linux x86_64".into(),
+        ua_platform: "Linux".into(),
+        ua_platform_version: "6.5.0".into(),
+    }
+}
+
 pub fn random_profile() -> &'static BrowserProfile {
     let idx = (std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

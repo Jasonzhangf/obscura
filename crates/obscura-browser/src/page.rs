@@ -2063,6 +2063,31 @@ impl Page {
         }
     }
 
+    /// Adopt a browser identity for subsequent navigations.
+    ///
+    /// This deliberately does not reload the live document. Reloading would
+    /// discard DOM, JS and form state on a session whose whole contract is that
+    /// attaching a device does not destroy the page, and re-fetching would
+    /// re-run the origin's scripts as a side effect of a layout declaration.
+    /// The UA, platform and touch surfaces above are updated in place, so the
+    /// next real navigation -- which is when a site actually chooses its layout
+    /// -- is the first document that sees the new identity.
+    pub async fn adopt_identity(&mut self, identity: &crate::BrowserIdentity) -> Result<(), String> {
+        let context = Arc::get_mut(&mut self.context)
+            .ok_or("Browser context is shared; document identity cannot be adopted")?;
+        context.replace_identity(identity.clone()).await;
+        self.http_client = self.context.http_client.clone();
+        if let Some(js) = self.js.as_mut() {
+            js.set_user_agent(&self.context.user_agent);
+            js.set_platform(
+                &self.context.platform,
+                &self.context.ua_platform,
+                &self.context.ua_platform_version,
+            );
+        }
+        Ok(())
+    }
+
     /// Set or clear the CDP physical-screen override independently of layout.
     pub fn set_screen_size_override(&mut self, size: Option<(f32, f32)>, emulated: bool) {
         self.screen_size_override = size.filter(|(width, height)| {
