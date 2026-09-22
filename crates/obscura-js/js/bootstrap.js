@@ -12704,11 +12704,48 @@ class _RemoteWindow {
   get opener() { return null; }
   get closed() { return false; }
   get length() { return 0; }
+  // Only the top browsing context is navigable from here; see _RemoteTopLocation.
+  get location() { return this._frameId === 0 ? _remoteTopLocation(0) : undefined; }
   focus() {}
   blur() {}
   close() {}
 }
 _markNative(_RemoteWindow.prototype.postMessage);
+
+// The top browsing context's location, as a frame sees it.
+//
+// Only `top` gets this: navigating it is the one cross-context write a login
+// widget is permitted to make (the SSO iframe pattern), and a write that lands
+// nowhere leaves the user on the login screen holding valid cookies. The URL
+// is resolved against the *top* document, which is what a relative
+// `top.location.href = '/home'` means, and the write goes through the op that
+// owns top-level navigation. A non-top remote window has no location here; that
+// is a separate capability this engine does not provide.
+class _RemoteTopLocation {
+  get href() { return Deno.core.ops.op_top_url(); }
+  set href(url) { Deno.core.ops.op_navigate_top(_resolveUrlForTop(String(url)), 'GET', ''); }
+  assign(url) { Deno.core.ops.op_navigate_top(_resolveUrlForTop(String(url)), 'GET', ''); }
+  replace(url) { Deno.core.ops.op_navigate_top(_resolveUrlForTop(String(url)), 'GET', ''); }
+  reload() { Deno.core.ops.op_navigate_top(_resolveUrlForTop(''), 'GET', ''); }
+  toString() { return this.href; }
+}
+
+// Resolve against the top document, not the caller's realm: a frame that asks
+// for '/home' means the top document's '/home'.
+function _resolveUrlForTop(url) {
+  const base = Deno.core.ops.op_top_url();
+  try { return new URL(url || base, base).href; } catch (e) { return url; }
+}
+
+const _remoteTopLocations = new Map();
+function _remoteTopLocation(frameId) {
+  let location = _remoteTopLocations.get(frameId);
+  if (!location) {
+    location = new _RemoteTopLocation();
+    _remoteTopLocations.set(frameId, location);
+  }
+  return location;
+}
 
 const _remoteWindows = new Map();
 function _remoteWindow(frameId) {

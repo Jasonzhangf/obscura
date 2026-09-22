@@ -4043,6 +4043,34 @@ fn op_navigate(
     gs.pending_navigation = Some((url.to_string(), method.to_string(), body.to_string()));
 }
 
+// `top.location = ...` from a frame is the one cross-context write a login
+// widget is allowed to make, and it always moves the *top* document. The page
+// realm is the only owner of top-level navigation, so this records against the
+// page state no matter which realm called it. `op_navigate` cannot serve here:
+// it writes to the caller's realm, and only the page's pending navigation is
+// ever drained.
+#[op2(fast)]
+fn op_navigate_top(
+    state: &OpState,
+    #[string] url: &str,
+    #[string] method: &str,
+    #[string] body: &str,
+) {
+    let gs = state.borrow::<SharedState>().clone();
+    let mut gs = gs.borrow_mut();
+    gs.url = url.to_string();
+    gs.pending_navigation = Some((url.to_string(), method.to_string(), body.to_string()));
+}
+
+// The URL of the top browsing context, read by a frame's `top.location` while
+// it is still the login document. Served from the page realm because that is
+// the realm whose URL the write above targets.
+#[op2]
+#[string]
+fn op_top_url(state: &OpState) -> String {
+    state.borrow::<SharedState>().borrow().url.clone()
+}
+
 fn frame_message_queue_entry_limit() -> usize {
     std::env::var("OBSCURA_FRAME_MESSAGE_QUEUE_ENTRIES")
         .ok()
@@ -4991,6 +5019,8 @@ pub fn build_extension() -> Extension {
         op_get_cookies(),
         op_set_cookie(),
         op_navigate(),
+        op_navigate_top(),
+        op_top_url(),
         op_frame_document_ready(),
         op_post_frame_message(),
         op_sleep(),

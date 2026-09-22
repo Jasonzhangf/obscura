@@ -1191,6 +1191,80 @@ fn popup_link_click_navigates_the_single_host_page() {
 }
 
 #[test]
+fn frame_login_navigates_the_top_document_through_top_location() {
+    // A login widget commonly lives in an iframe and finishes by moving the top
+    // browsing context: `top.location.href = '/home'`. That write is the only
+    // thing the frame can do to reveal the signed-in page, so dropping it
+    // leaves the user on the login screen with valid cookies.
+    let daemon = Daemon::start_with_network(true);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        // Serve until the test stops asking; the Host may also fetch the
+        // frame's own document and a favicon on top of the two navigations.
+        let deadline = std::time::Instant::now() + Duration::from_secs(12);
+        while std::time::Instant::now() < deadline {
+            listener.set_nonblocking(true).unwrap();
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(accepted) => break accepted,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() >= deadline { return; }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept: {error}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                if line == "\r\n" { break; }
+            }
+            let path = request_line.split_ascii_whitespace().nth(1).unwrap_or("/").to_string();
+            let body = match path.as_str() {
+                "/frame-login" => {
+                    "<title>frame login</title><script>top.location.href='/home';</script>".to_string()
+                }
+                "/home" => "<title>home</title><div id='who'>HOME</div>".to_string(),
+                _ => {
+                    "<title>login parent</title><div id='who'>LOGIN</div>\
+                     <iframe src='/frame-login'></iframe>"
+                        .to_string()
+                }
+            };
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ).unwrap();
+        }
+    });
+
+    let mut agent = daemon.connect();
+    agent.ok(json!({"type":"attach","mode":"agent"}));
+    agent.ok(json!({"type":"navigate","url":format!("http://{address}/login")}));
+    std::thread::sleep(Duration::from_millis(500));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = agent.ok(json!({"type":"status"}));
+        if status["document_revision"].as_u64().unwrap_or(0) >= 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "a frame's top.location write never reached the top document: {status}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(agent.eval("document.title"), "home");
+    server.join().unwrap();
+}
+
+#[test]
 fn takeover_during_real_click_waits_for_release_and_click_dispatch() {
     let daemon = Daemon::start();
     let mut agent = daemon.connect(); agent.ok(json!({"type":"attach","mode":"agent"}));
