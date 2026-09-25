@@ -2188,6 +2188,50 @@ impl Page {
             .fetch_with_callbacks(url, Some(&self.callbacks))
             .await
     }
+
+    /// Top-level document fetch that carries the initiating document with the
+    /// request. A page-driven navigation (location change, meta refresh, form
+    /// POST, 302 chain) must look initiated to the network layer: Sina's SSO
+    /// crossdomain endpoint answers 403 when the Referer header is absent,
+    /// which left the weibo login redirect chain on a blank page. Host-initiated
+    /// navigations keep an empty referrer and stay uninitiated.
+    async fn fetch_document(
+        &self,
+        url: &Url,
+        method: &str,
+        body: &str,
+    ) -> Result<Response, ObscuraNetError> {
+        let source = (!self.referrer.is_empty())
+            .then(|| Url::parse(&self.referrer).ok())
+            .flatten()
+            .filter(|parsed| matches!(parsed.scheme(), "http" | "https"));
+        let mut request = ResourceRequest::navigation();
+        if let Some(source) = source {
+            request.initiator = Some(source.clone());
+            request.referrer = Some(source);
+        }
+        if method == "POST" {
+            self.http_client
+                .fetch_request_with_callbacks(
+                    "POST",
+                    url,
+                    Some(body.as_bytes().to_vec()),
+                    request,
+                    Some(&self.callbacks),
+                )
+                .await
+        } else {
+            #[cfg(feature = "stealth")]
+            if let Some(ref stealth) = self.stealth_client {
+                return stealth
+                    .fetch_resource_with_callbacks(url, request, Some(&self.callbacks))
+                    .await;
+            }
+            self.http_client
+                .fetch_resource_with_callbacks(url, request, Some(&self.callbacks))
+                .await
+        }
+    }
     fn init_js(&mut self) {
         // init_js is also the new-document path.  Only resume_js explicitly
         // takes these IDs out before entering here and restores them after the
@@ -3981,10 +4025,8 @@ impl Page {
                 body: body_bytes,
                 redirected_from: Vec::new(),
             })
-        } else if method == "POST" {
-            self.http_client
-                .post_form_with_callbacks(&url, body, Some(&self.callbacks))
-                .await
+        } else if method == "POST" || method == "GET" {
+            self.fetch_document(&url, method, body).await
         } else {
             self.do_fetch(&url).await
         }

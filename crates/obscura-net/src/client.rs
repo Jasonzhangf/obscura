@@ -1234,6 +1234,30 @@ impl ObscuraHttpClient {
             .await
     }
 
+    /// Fetch a browser-owned request with a caller-supplied method and body,
+    /// used by Page navigation so the initiator/referrer travel with the
+    /// request (Sina's SSO crossdomain endpoint 403s an unreferenced
+    /// navigation).
+    pub async fn fetch_request_with_callbacks(
+        &self,
+        method: &str,
+        url: &Url,
+        initial_body: Option<Vec<u8>>,
+        request: ResourceRequest,
+        callbacks: Option<&CallbackRegistry>,
+    ) -> Result<Response, ObscuraNetError> {
+        let initial_method = match method {
+            "POST" => Method::POST,
+            "PUT" => Method::PUT,
+            "PATCH" => Method::PATCH,
+            "DELETE" => Method::DELETE,
+            "HEAD" => Method::HEAD,
+            _ => Method::GET,
+        };
+        self.fetch_with_profile(initial_method, url, initial_body, callbacks, request)
+            .await
+    }
+
     async fn resource_cache_key(
         &self,
         method: &Method,
