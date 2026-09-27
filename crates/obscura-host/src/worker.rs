@@ -1,7 +1,8 @@
 //! Sole Page owner. No attachment or transport state enters the browser thread.
 use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
+use std::task::Poll;
 use anyhow::{Context, Result};
-use obscura_browser::{BrowserContext, Page};
+use obscura_browser::{BrowserContext, Page, PageError};
 use obscura_host_protocol::{Command, Device, EvaluationResult, FrameInfo, FramePacket, InputEvent, InputReceipt, InputState, Operation, PixelFormat, PointerButton, ResultValue, RotationIdentity, SourceDimensions};
 use crate::media::{self, SharedFrame};
 use obscura_browser::input::{Input, InputError};
@@ -34,7 +35,7 @@ pub enum WorkKind {
     /// while explicit Agent resize retains its admitted document fence.
     Viewport { width: u32, height: u32, revision: u64, device: Device, rotation: Option<RotationIdentity>, document_revision: Option<u64>, cancel: Arc<AtomicBool> },
 }
-const BUDGET: Duration = Duration::from_secs(5);
+const BUDGET: Duration = Duration::from_secs(30);
 
 /// Minimum interval between captured frames.
 ///
@@ -53,20 +54,26 @@ fn frame_period() -> Duration {
 }
 
 // Bound actual synchronous polls, never parked timers/network futures.
-async fn page_work<T>(future: impl std::future::Future<Output = T>) -> T {
+async fn page_work<T>(future: impl std::future::Future<Output = T>) -> Result<T, String> {
     let mut future = std::pin::pin!(future);
     std::future::poll_fn(|cx| {
         let (cancel, stopped) = std::sync::mpsc::channel::<()>();
+        let exceeded = Arc::new(AtomicBool::new(false));
+        let mark = Arc::clone(&exceeded);
         let watchdog = std::thread::spawn(move || {
-            if stopped.recv_timeout(Duration::from_secs(10)).is_err_and(|e| matches!(e, std::sync::mpsc::RecvTimeoutError::Timeout)) {
-                eprintln!("Host synchronous browser work exceeded hard deadline; session outcome unknown");
-                std::process::exit(70);
+            if stopped.recv_timeout(Duration::from_secs(30)).is_err_and(|e| matches!(e, std::sync::mpsc::RecvTimeoutError::Timeout)) {
+                eprintln!("Host synchronous browser work exceeded hard deadline");
+                mark.store(true, Ordering::Release);
             }
         });
         let result = future.as_mut().poll(cx);
         drop(cancel);
         watchdog.join().expect("process watchdog failed");
-        result
+        match result {
+            Poll::Ready(_value) if exceeded.load(Ordering::Acquire) => Poll::Ready(Err("HARD_DEADLINE_EXCEEDED".to_string())),
+            Poll::Ready(value) => Poll::Ready(Ok(value)),
+            Poll::Pending => Poll::Pending,
+        }
     }).await
 }
 
@@ -83,7 +90,7 @@ pub fn start(id: String, storage_dir: Option<std::path::PathBuf>, network: bool,
         runtime.block_on(async move {
             let context = Arc::new(BrowserContext::with_storage_and_network(id.clone(), None, false, None, storage_dir, network));
             let mut page = Page::new(id.clone(), context);
-            if let Err(cause) = page_work(page.navigate("about:blank")).await {
+            if let Err(cause) = page_work(page.navigate("about:blank")).await.map_err(anyhow::Error::msg) {
                 let _ = ready.send(Err(cause.to_string()));
                 return Err(cause).context("initialize session");
             }
@@ -120,29 +127,36 @@ pub fn start(id: String, storage_dir: Option<std::path::PathBuf>, network: bool,
                         // turn so navigate_single cancels the old Page-owned
                         // continuation before it can materialize into the new
                         // document.
-                        match timeout(BUDGET, page_work(page.process_pending_navigation())).await {
-                            Ok(Ok(false)) => {},
-                            outcome => {
-                                document_revision += 1;
-                                frames.send_replace(media::state(FramePacket::Waiting { session_id: id.clone() }));
-                                let navigated = match outcome {
-                                    Ok(Ok(true)) => true,
-                                    Ok(Err(cause)) => {
-                                        failure = Some(format!("Page navigation failed: {cause}"));
-                                        false
-                                    }
-                                    Err(_) => {
-                                        failure = Some("Page navigation outcome unknown after deadline".into());
-                                        false
-                                    }
-                                    _ => unreachable!(),
-                                };
-                                let focus = if navigated && failure.is_none() {
-                                    page_work(async { focus_snapshot(page) }).await
-                                } else { None };
-                                if updates.send(PageUpdate { document_revision, focus, fault: failure.clone() }).await.is_err() { break; }
-                            }
-                        }
+            match timeout(BUDGET, page_work(page.process_pending_navigation())).await {
+                Ok(Ok(Ok(true))) => {
+                    document_revision += 1;
+                    frames.send_replace(media::state(FramePacket::Waiting { session_id: id.clone() }));
+                    let focus = page_work(async { focus_snapshot(page) }).await.ok().flatten();
+                    if updates.send(PageUpdate { document_revision, focus, fault: failure.clone() }).await.is_err() { break; }
+                }
+                Ok(Ok(Ok(false))) => {}
+                Ok(Ok(Err(cause))) => {
+                    document_revision += 1;
+                    frames.send_replace(media::state(FramePacket::Waiting { session_id: id.clone() }));
+                    failure = Some(format!("Page navigation failed: {cause}"));
+                    let focus = None;
+                    if updates.send(PageUpdate { document_revision, focus, fault: failure.clone() }).await.is_err() { break; }
+                }
+                Ok(Err(cause)) => {
+                    document_revision += 1;
+                    frames.send_replace(media::state(FramePacket::Waiting { session_id: id.clone() }));
+                    failure = Some(format!("Page navigation failed: {cause}"));
+                    let focus = None;
+                    if updates.send(PageUpdate { document_revision, focus, fault: failure.clone() }).await.is_err() { break; }
+                }
+                Err(_) => {
+                    document_revision += 1;
+                    frames.send_replace(media::state(FramePacket::Waiting { session_id: id.clone() }));
+                    failure = Some("Page navigation outcome unknown after deadline".into());
+                    let focus = None;
+                    if updates.send(PageUpdate { document_revision, focus, fault: failure.clone() }).await.is_err() { break; }
+                }
+            }
                     }
                 }
                 let navigation_exclusive = page
@@ -176,7 +190,7 @@ pub fn start(id: String, storage_dir: Option<std::path::PathBuf>, network: bool,
                         let Some(work) = work else { break; };
                         let expected_document = match &work.kind {
                             WorkKind::Browser { operation, .. } => Some(operation.document_revision),
-                            WorkKind::Viewport { document_revision, .. } => *document_revision,
+                            WorkKind::Viewport { document_revision, .. } => document_revision.clone(),
                         };
                         let mut completion = if failure.is_some() && !matches!(work.kind, WorkKind::Browser { command: Command::CloseSession {}, .. }) {
                             Completion {
@@ -209,8 +223,10 @@ pub fn start(id: String, storage_dir: Option<std::path::PathBuf>, network: bool,
                                                 Device::Desktop => obscura_browser::BrowserIdentity::desktop(),
                                             };
                                             match page_work(page.adopt_identity(&identity)).await {
-                                                Ok(()) => identity_device = Some(device),
-                                                Err(cause) => fault = Some(format!("Identity adoption failed: {cause}")),
+                                                Ok(Ok(())) => identity_device = Some(device),
+                                                Ok(Err(cause)) if cause == "HARD_DEADLINE_EXCEEDED" => fault = Some("Identity hard deadline exceeded".into()),
+                                                Ok(Err(cause)) => fault = Some(cause),
+                                                Err(_) => fault = Some("Identity update outcome unknown after deadline".into()),
                                             }
                                         }
                                         if fault.is_none() && page.viewport != (width as f32, height as f32) {
@@ -218,7 +234,9 @@ pub fn start(id: String, storage_dir: Option<std::path::PathBuf>, network: bool,
                                             // JS, form state and pending tasks; no attachment-specific render.
                                             frames.send_replace(media::state(FramePacket::Waiting { session_id: id.clone() }));
                                             let watchdog = page.js.as_mut().map(|js| js.arm_watchdog(BUDGET));
-                                            page_work(async { page.set_viewport((width as f32, height as f32)); }).await;
+                                            if let Err(cause) = page_work(async { page.set_viewport((width as f32, height as f32)); }).await {
+                                                fault = Some(cause);
+                                            }
                                             if watchdog.is_some_and(|watchdog| page.js.as_mut().expect("viewport retains runtime").disarm_watchdog(watchdog)) {
                                                 fault = Some("Viewport callback deadline: partial layout outcome; recreate session explicitly".to_string());
                                             }
@@ -232,8 +250,8 @@ pub fn start(id: String, storage_dir: Option<std::path::PathBuf>, network: bool,
                                     Completion { result, viewport: page.as_ref().map(|page| page.viewport), focus: None, fault, document_revision, viewport_revision, rotation }
                                 }
                                 WorkKind::Browser { command, operation } => {
-                                    let navigation = matches!(&command, Command::Navigate { .. });
-                                    let focus_after = matches!(&command, Command::Click { .. } | Command::InputText { .. } | Command::InputEvent { .. } | Command::Navigate { .. });
+                                    let navigation = matches!(&command, Command::Navigate { .. } | Command::Back {} | Command::Forward {} | Command::Reload {});
+                                    let focus_after = matches!(&command, Command::Click { .. } | Command::InputText { .. } | Command::InputEvent { .. } | Command::Navigate { .. } | Command::Back {} | Command::Forward {} | Command::Reload {});
                                     let mut completion = execute(&mut page, command, &operation).await;
                                     if navigation {
                                         document_revision += 1;
@@ -241,7 +259,7 @@ pub fn start(id: String, storage_dir: Option<std::path::PathBuf>, network: bool,
                                     }
                                     if focus_after && completion.result.is_ok() && completion.fault.is_none() {
                                         if let Some(page) = page.as_mut() {
-                                            completion.focus = page_work(async { focus_snapshot(page) }).await;
+                                    completion.focus = page_work(async { focus_snapshot(page) }).await.ok().flatten();
                                         }
                                     }
                                     stamp_input_receipt(&mut completion.result, &operation, document_revision, viewport_revision);
@@ -279,11 +297,21 @@ pub fn start(id: String, storage_dir: Option<std::path::PathBuf>, network: bool,
                                 .map(|next_idle| (false, next_idle))
                         }
                     } => match page_turn {
-                        Ok((true, _)) => { idle = false; }
-                        Ok((false, next_idle)) => { idle = next_idle; }
-                        Err(cause) => {
+                        Ok((true, Ok(true))) => { idle = false; }
+                        Ok((true, Ok(false))) => { idle = false; }
+                        Ok((true, Err(cause))) => {
                             failure = Some(cause.clone());
                             if updates.send(PageUpdate { document_revision, focus: None, fault: Some(cause) }).await.is_err() { break; }
+                        }
+                        Ok((false, Ok(true))) => { idle = true; }
+                        Ok((false, Ok(false))) => { idle = false; }
+                        Ok((false, Err(cause))) => {
+                            failure = Some(cause.clone());
+                            if updates.send(PageUpdate { document_revision, focus: None, fault: Some(cause) }).await.is_err() { break; }
+                        }
+                        Err(cause) => {
+                            failure = Some(format!("Page continuation deadline: {cause}"));
+                            if updates.send(PageUpdate { document_revision, focus: None, fault: Some(cause.clone()) }).await.is_err() { break; }
                         }
                     },
                 }
@@ -306,10 +334,11 @@ async fn capture(page: &mut Page) -> Result<(u32, u32, Vec<u8>), String> {
         // Local raw diagnostic stream, bounded independently of the control
         // reply budget. Video encoding will consume these pixels directly.
         if page.viewport.0 * page.viewport.1 > 4_194_304.0 { return Err("Raw frame exceeds 4 megapixel budget".into()); }
-        page_work(async {
+        let rendered = page_work(async {
             page.prepare_screenshot_resources(50).await;
             page.render_frame()
-        }).await
+        }).await??;
+        Ok(rendered)
     }
     #[cfg(not(feature = "render"))]
     { let _ = page; Err("Frames require a render-enabled Host".into()) }
@@ -345,29 +374,84 @@ async fn execute(page: &mut Option<Page>, command: Command, operation: &Operatio
             )
             .await
             {
-                Ok(Ok(())) => Ok(Some(ResultValue::Input { input: input_receipt(operation) })),
-                Ok(Err(cause)) => Err(("NAVIGATION_FAILED", cause.to_string())),
-                Err(_) => {
+                        Ok(Ok(Ok(()))) => Ok(Some(ResultValue::Input { input: input_receipt(operation) })),
+                        Ok(Ok(Err(PageError::NoHistory(cause)))) => Err(("NAVIGATION_FAILED", format!("No history entry: {cause}"))),
+                        Ok(Ok(Err(cause))) => Err(("NAVIGATION_FAILED", cause.to_string())),
+                        Ok(Err(cause)) if cause == "HARD_DEADLINE_EXCEEDED" => {
+                            let cause = "Navigation hard deadline exceeded; recreate session explicitly".to_string();
+                            fault = Some(cause.clone());
+                            Err(("OUTCOME_UNKNOWN", cause))
+                        }
+                        Ok(Err(cause)) => {
+                            let cause = format!("Navigation work failed before timeout: {cause}");
+                            fault = Some(cause.clone());
+                            Err(("OUTCOME_UNKNOWN", cause))
+                        }
+                        Err(_) => {
                     let cause =
                         "Navigation deadline: partial outcome; recreate session explicitly".to_string();
                     fault = Some(cause.clone());
                     Err(("OUTCOME_UNKNOWN", cause))
                 }
             },
+            Command::Back {} | Command::Forward {} | Command::Reload {} => {
+                let result = match command {
+                    Command::Back {} => page_work(page.go_back()).await,
+                    Command::Forward {} => page_work(page.go_forward()).await,
+                    Command::Reload {} => page_work(page.reload()).await,
+                    _ => unreachable!("history navigation command"),
+                };
+                match timeout(BUDGET, std::future::ready(result)).await {
+                    Ok(Ok(Ok(()))) => Ok(Some(ResultValue::Input { input: input_receipt(operation) })),
+                    Ok(Ok(Err(PageError::NoHistory(cause)))) => Err(("NAVIGATION_FAILED", format!("No history entry: {cause}"))),
+                    Ok(Ok(Err(cause))) => Err(("NAVIGATION_FAILED", cause.to_string())),
+                    Ok(Err(cause)) if cause == "HARD_DEADLINE_EXCEEDED" => {
+                        let cause = "Navigation hard deadline exceeded; recreate session explicitly".to_string();
+                        fault = Some(cause.clone());
+                        Err(("OUTCOME_UNKNOWN", cause))
+                    }
+                    Ok(Err(cause)) => {
+                        let cause = format!("Navigation work failed before timeout: {cause}");
+                        fault = Some(cause.clone());
+                        Err(("OUTCOME_UNKNOWN", cause))
+                    }
+                    Err(_) => {
+                        let cause = "Navigation deadline: partial outcome; recreate session explicitly".to_string();
+                        fault = Some(cause.clone());
+                        Err(("OUTCOME_UNKNOWN", cause))
+                    }
+                }
+            }
             Command::Evaluate { expression } => {
                 if let Some(js) = page.js.as_mut() {
                     let watchdog = js.arm_watchdog(BUDGET);
                     let result = timeout(BUDGET, page_work(page.evaluate_for_cdp_with_timeout(&expression, true, true, 4000))).await;
                     let fired = page.js.as_mut().expect("evaluation retains runtime").disarm_watchdog(watchdog);
-                    if fired || result.is_err() {
-                        let cause = "Evaluation deadline: partial outcome; recreate session explicitly".to_string();
-                        fault = Some(cause.clone());
-                        Err(("OUTCOME_UNKNOWN", cause))
-                    } else {
-                        match result.unwrap() {
-                            Ok(value) if !value.thrown => Ok(Some(ResultValue::Evaluation { result: EvaluationResult { value: value.value, js_type: value.js_type } })),
-                            Ok(value) => Err(("JAVASCRIPT_EXCEPTION", value.description)),
-                            Err(cause) => { fault = Some(cause.clone()); Err(("OUTCOME_UNKNOWN", cause)) }
+                    match result {
+                        Ok(Ok(Ok(value))) if !fired && !value.thrown => Ok(Some(ResultValue::Evaluation { result: EvaluationResult { value: value.value, js_type: value.js_type } })),
+                        Ok(Ok(Ok(value))) => Err(("JAVASCRIPT_EXCEPTION", value.description)),
+                        Ok(Ok(Err(cause))) if fired => {
+                            fault = Some(cause.clone());
+                            Err(("OUTCOME_UNKNOWN", cause))
+                        }
+                        Ok(Ok(Err(cause))) => {
+                            fault = Some(cause.clone());
+                            Err(("OUTCOME_UNKNOWN", cause))
+                        }
+                        Ok(Err(cause)) if fired => {
+                            let cause = format!("Evaluation hard deadline exceeded: {cause}");
+                            fault = Some(cause.clone());
+                            Err(("OUTCOME_UNKNOWN", cause))
+                        }
+                        Ok(Err(cause)) => {
+                            let cause = format!("Evaluation work failed: {cause}");
+                            fault = Some(cause.clone());
+                            Err(("OUTCOME_UNKNOWN", cause))
+                        }
+                        Err(_) => {
+                            let cause = "Evaluation deadline: partial outcome; recreate session explicitly".to_string();
+                            fault = Some(cause.clone());
+                            Err(("OUTCOME_UNKNOWN", cause))
                         }
                     }
                 } else { Err(("RUNTIME_UNAVAILABLE", "Navigate before evaluation".into())) }
@@ -405,13 +489,27 @@ async fn execute(page: &mut Option<Page>, command: Command, operation: &Operatio
                     let result = timeout(BUDGET, page_work(obscura_browser::input::perform(page, input))).await;
                     let fired = page.js.as_mut().expect("input retains runtime").disarm_watchdog(watchdog);
                     match result {
-                        Ok(Ok(())) if !fired => Ok(Some(ResultValue::Input { input: input_receipt(operation) })),
-                        Ok(Err(InputError::Rejected(cause))) if !fired => Err(("INPUT_REJECTED", cause)),
-                        outcome => {
-                            let cause = match outcome {
-                                Ok(Err(InputError::Unknown(cause))) => cause,
-                                _ => "Input deadline: injection outcome unknown; recreate session".into(),
-                            };
+                        Ok(Ok(Ok(()))) if !fired => Ok(Some(ResultValue::Input { input: input_receipt(operation) })),
+                        Ok(Ok(Ok(()))) => {
+                            fault = Some("Input deadline: partial outcome; recreate session".into());
+                            Err(("OUTCOME_UNKNOWN", "Input deadline: partial outcome; recreate session".into()))
+                        }
+                        Ok(Ok(Err(InputError::Rejected(cause)))) if !fired => Err(("INPUT_REJECTED", cause)),
+                        Ok(Ok(Err(InputError::Rejected(cause)))) => {
+                            fault = Some(cause.clone());
+                            Err(("OUTCOME_UNKNOWN", cause))
+                        }
+                        Ok(Ok(Err(InputError::Unknown(cause)))) => {
+                            fault = Some(cause.clone());
+                            Err(("OUTCOME_UNKNOWN", cause))
+                        }
+                        Ok(Err(cause)) => {
+                            let cause = format!("Input hard deadline exceeded: {cause}");
+                            fault = Some(cause.clone());
+                            Err(("OUTCOME_UNKNOWN", cause))
+                        }
+                        Err(_) => {
+                            let cause: String = "Input deadline: injection outcome unknown; recreate session".into();
                             fault = Some(cause.clone());
                             Err(("OUTCOME_UNKNOWN", cause))
                         }
