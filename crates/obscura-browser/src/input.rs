@@ -232,7 +232,7 @@ pub async fn dispatch(
                     var target = {target};\
                     if (!target) return;\
                     if ('{event_name}' === 'pointerdown') {{\
-                        globalThis.__obscura_pointer_down = {{pointerId:{pointer_id},target:target}};\
+                        globalThis.__obscura_pointer_down = {{pointerId:{pointer_id},target:target,x:{x},y:{y}}};\
                         globalThis.__obscura_click_target = target;\
                     }}\
                     var evt = globalThis.__obscura_markTrusted(new PointerEvent('{event_name}', {{bubbles:true,cancelable:true,view:globalThis,clientX:{x},clientY:{y}}}));\
@@ -248,11 +248,45 @@ pub async fn dispatch(
                     evt.metaKey = {meta_key};\
                     evt.shiftKey = {shift_key};\
                     target.dispatchEvent(evt);\
+                    try {{                        var touchType = '{event_name}' === 'pointerdown' ? 'touchstart' : '{event_name}' === 'pointermove' ? 'touchmove' : '{event_name}' === 'pointerup' ? 'touchend' : null;                        if (touchType && typeof TouchEvent === 'function') {{                            var t = new Touch({{identifier:{pointer_id},target:target,clientX:{x},clientY:{y},pageX:{x},pageY:{y},radiusX:1,radiusY:1,rotationAngle:0,force:0}});                            var touchEvt = globalThis.__obscura_markTrusted(new TouchEvent(touchType, {{bubbles:true,cancelable:true,view:globalThis,clientX:{x},clientY:{y},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));                            Object.defineProperty(touchEvt, 'touches', {{value: touchType === 'touchend' ? [] : [t]}});                            Object.defineProperty(touchEvt, 'targetTouches', {{value: touchType === 'touchend' ? [] : [t]}});                            Object.defineProperty(touchEvt, 'changedTouches', {{value: [t]}});                            target.dispatchEvent(touchEvt);                        }}                    }} catch(_e) {{}}\
                     if ({terminal} && state && state.pointerId === {pointer_id}) {{\
                         globalThis.__obscura_pointer_down = null;\
                         if ({cancelled}) {{\
                             globalThis.__obscura_mouse_down = null;\
                             globalThis.__obscura_click_target = null;\
+                        }}\
+                    }}\
+                    if ('{event_name}' === 'pointermove' && {buttons} > 0) {{\
+                        var down = globalThis.__obscura_pointer_down;\
+                        if (down && down.pointerId === {pointer_id} && down.x != null) {{\
+                            var dragX = {x} - down.x;\
+                            var dragY = {y} - down.y;\
+                            var target = (document.elementFromPoint && document.elementFromPoint({x},{y})) || down.target || document.body || document.documentElement;\
+                            var scrollEl = null;\
+                            var el = target;\
+                            while (el && el.nodeType === 1) {{\
+                                var overflowX = '', overflowY = '', scrollWidth = 0, clientWidth = 0, scrollHeight = 0, clientHeight = 0;\
+                                try {{\
+                                    var style = getComputedStyle(el);\
+                                    overflowX = style.overflowX || style.overflow || '';\
+                                    overflowY = style.overflowY || style.overflow || '';\
+                                    scrollWidth = el.scrollWidth || 0;\
+                                    clientWidth = el.clientWidth || 0;\
+                                    scrollHeight = el.scrollHeight || 0;\
+                                    clientHeight = el.clientHeight || 0;\
+                                }} catch (_e) {{ break; }}\
+                                var canX = (overflowX === 'auto' || overflowX === 'scroll' || overflowX === 'overlay') && scrollWidth > clientWidth;\
+                                var canY = (overflowY === 'auto' || overflowY === 'scroll' || overflowY === 'overlay') && scrollHeight > clientHeight;\
+                                if (canX || canY) {{ scrollEl = el; break; }}\
+                                el = el.parentElement;\
+                            }}\
+                            if (!scrollEl) {{\
+                                var root = document.scrollingElement || document.documentElement || document.body;\
+                                if (root && ((root.scrollWidth || 0) > (root.clientWidth || 0) || (root.scrollHeight || 0) > (root.clientHeight || 0))) scrollEl = root;\
+                            }}\
+                            if (scrollEl && typeof scrollEl.scrollBy === 'function') scrollEl.scrollBy(-dragX, -dragY);\
+                            down.x = {x};\
+                            down.y = {y};\
                         }}\
                     }}\
                 }})()",
