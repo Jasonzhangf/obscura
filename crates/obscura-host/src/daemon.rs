@@ -252,7 +252,7 @@ impl Session {
     }
     fn request(&mut self, connection: u64, request: Request, busy: bool) -> Result<Response, Command> {
         let id = request.id;
-        let controlled = matches!(request.command, Command::Click { .. } | Command::InputText { .. } | Command::Scroll { .. } | Command::InputEvent { .. } | Command::Navigate { .. });
+        let controlled = matches!(request.command, Command::Click { .. } | Command::InputText { .. } | Command::Scroll { .. } | Command::InputEvent { .. } | Command::Navigate { .. } | Command::Back {} | Command::Forward {} | Command::Reload {});
         let mutation = controlled || matches!(request.command, Command::Evaluate { .. } | Command::Resize { .. } | Command::CloseSession {});
         if mutation {
             let Some(operation) = &request.operation else { return Ok(error(id, "OPERATION_REQUIRED", "Browser mutations require an operation identity")); };
@@ -433,6 +433,7 @@ impl Session {
                             return Ok(error(id, "INVALID_URL", "Unsupported navigation scheme"));
                         }
                     }
+                    Command::Back {} | Command::Forward {} | Command::Reload {} => {},
                     Command::Evaluate { .. } => {},
                     Command::Click { x, y } | Command::Scroll { x, y, .. } => {
                         if !cfg!(feature = "render") { return Ok(error(id, "INPUT_UNAVAILABLE", "Coordinate input requires a render-enabled Host")); }

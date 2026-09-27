@@ -39,6 +39,9 @@ pub enum Command {
     ReleaseControl { epoch: u64 },
     ResumeAgent { epoch: u64 },
     Navigate { url: String },
+    Back {},
+    Forward {},
+    Reload {},
     /// Agent diagnostics only; not a human input operation or read-only API.
     Evaluate { expression: String },
     Resize { width: u32, height: u32 },

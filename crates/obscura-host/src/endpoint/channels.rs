@@ -207,6 +207,9 @@ fn permitted_remote_command(command: &Command) -> bool {
             | Command::RequestTakeover { .. }
             | Command::ReleaseControl { .. }
             | Command::Navigate { .. }
+            | Command::Back {}
+            | Command::Forward {}
+            | Command::Reload {}
             | Command::Click { .. }
             | Command::InputText { .. }
             | Command::Scroll { .. }

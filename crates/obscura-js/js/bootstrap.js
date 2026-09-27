@@ -6879,7 +6879,7 @@ globalThis.navigator = {
     },
     toJSON() { return {brands:this.brands,mobile:this.mobile,platform:this.platform}; },
   },
-  serviceWorker: { ready: Promise.resolve(), register(){return Promise.resolve();}, getRegistrations(){return Promise.resolve([]);}, controller: null, oncontrollerchange: null, onmessage: null, addEventListener(){}, removeEventListener(){}, dispatchEvent(){return true;} },
+  serviceWorker: { ready: Promise.resolve(), register(){return Promise.resolve(__obscura_service_worker_registration());}, getRegistrations(){return Promise.resolve([]);}, controller: null, oncontrollerchange: null, onmessage: null, addEventListener(){}, removeEventListener(){}, dispatchEvent(){return true;} },
   mediaDevices: {
     enumerateDevices() {
       return Promise.resolve([
@@ -15150,8 +15150,27 @@ if (typeof SharedWorker === 'undefined') {
     constructor() { this.port = { postMessage(){}, onmessage:null, start(){}, close(){}, addEventListener(){}, removeEventListener(){} }; this.onerror = null; }
   };
 }
+function __obscura_service_worker_registration() {
+  var reg = {
+    active: null,
+    installing: null,
+    waiting: null,
+    scope: 'https://' + location.hostname + '/',
+    registration_id: 0,
+    updateViaCache: 'all',
+    onupdatefound: null,
+    oncontrollerchange: null,
+    addEventListener(){},
+    removeEventListener(){},
+    dispatchEvent(){return true;},
+    update(){return Promise.resolve();},
+    unregister(){return Promise.resolve(true);}
+  };
+  reg.ready = Promise.resolve(reg);
+  return reg;
+}
 if (typeof ServiceWorkerContainer === 'undefined') {
-  globalThis.ServiceWorkerContainer = class { register(){return Promise.resolve();} getRegistrations(){return Promise.resolve([]);} };
+  globalThis.ServiceWorkerContainer = class { register(){return Promise.resolve(__obscura_service_worker_registration());} getRegistrations(){return Promise.resolve([]);} };
 }
 
 if (typeof URLPattern === 'undefined') {

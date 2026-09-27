@@ -3603,6 +3603,64 @@ impl Page {
         result
     }
 
+    /// Host browser back operation. Unlike CDP's entry-id API, this advances
+    /// the Page history cursor first so the returned cursor is the new entry.
+    pub async fn go_back(&mut self) -> Result<(), PageError> {
+        if self.history_index == 0 {
+            return Err(PageError::NoHistory("no previous history entry".into()));
+        }
+        let index = self.history_index - 1;
+        let url = self.history.get(index).cloned().ok_or_else(|| {
+            PageError::NoHistory("previous history entry is missing".into())
+        })?;
+        self.set_history_index(index);
+        self.navigate_with_wait_post_inner(
+            &url,
+            crate::lifecycle::WaitUntil::DomContentLoaded,
+            "GET",
+            "",
+            "",
+            true,
+        )
+        .await
+    }
+
+    /// Host browser forward operation. The cursor points at the destination
+    /// before fetching, so a failed reload leaves the Page history explicit.
+    pub async fn go_forward(&mut self) -> Result<(), PageError> {
+        let index = self.history_index.saturating_add(1);
+        if index >= self.history.len() {
+            return Err(PageError::NoHistory("no next history entry".into()));
+        }
+        let url = self.history.get(index).cloned().ok_or_else(|| {
+            PageError::NoHistory("next history entry is missing".into())
+        })?;
+        self.set_history_index(index);
+        self.navigate_with_wait_post_inner(
+            &url,
+            crate::lifecycle::WaitUntil::DomContentLoaded,
+            "GET",
+            "",
+            "",
+            true,
+        )
+        .await
+    }
+
+    pub async fn reload(&mut self) -> Result<(), PageError> {
+        let url = self.url_string();
+        let url = if url == "about:blank" { "about:blank" } else { &url };
+        self.navigate_with_wait_post_inner(
+            url,
+            crate::lifecycle::WaitUntil::DomContentLoaded,
+            "GET",
+            "",
+            "",
+            true,
+        )
+        .await
+    }
+
     /// Drive the JS event loop after navigation so deferred work can run:
     /// pending timers (setTimeout / setInterval), queued microtasks, in-flight
     /// fetches, and completion callbacks such as testharness's
@@ -9100,6 +9158,8 @@ pub enum PageError {
     /// obscura-net, and report `ObscuraNetError::TooManyRedirects`.
     #[error("Too many client-initiated navigations, the chain reached its limit of {0} documents")]
     TooManyClientNavigations(usize),
+    #[error("History navigation failed: {0}")]
+    NoHistory(String),
 }
 
 impl From<ObscuraNetError> for PageError {

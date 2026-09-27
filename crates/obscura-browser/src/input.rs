@@ -275,8 +275,8 @@ pub async fn dispatch(
                                     scrollHeight = el.scrollHeight || 0;\
                                     clientHeight = el.clientHeight || 0;\
                                 }} catch (_e) {{ break; }}\
-                                var canX = (overflowX === 'auto' || overflowX === 'scroll' || overflowX === 'overlay') && scrollWidth > clientWidth;\
-                                var canY = (overflowY === 'auto' || overflowY === 'scroll' || overflowY === 'overlay') && scrollHeight > clientHeight;\
+                                var canX = overflowX !== 'visible' && overflowX !== 'clip' && scrollWidth > clientWidth;\
+                                var canY = overflowY !== 'visible' && overflowY !== 'clip' && scrollHeight > clientHeight;\
                                 if (canX || canY) {{ scrollEl = el; break; }}\
                                 el = el.parentElement;\
                             }}\
@@ -285,6 +285,7 @@ pub async fn dispatch(
                                 if (root && ((root.scrollWidth || 0) > (root.clientWidth || 0) || (root.scrollHeight || 0) > (root.clientHeight || 0))) scrollEl = root;\
                             }}\
                             if (scrollEl && typeof scrollEl.scrollBy === 'function') scrollEl.scrollBy(-dragX, -dragY);\
+                            else {{ var root = document.scrollingElement || document.documentElement || document.body; if (root && typeof root.scrollBy === 'function') root.scrollBy(-dragX, -dragY); else if (typeof window.scrollBy === 'function') window.scrollBy(-dragX, -dragY); else window.scrollTo((window.pageXOffset||0)+dragX, (window.pageYOffset||0)+dragY); }}\
                             down.x = {x};\
                             down.y = {y};\
                         }}\
