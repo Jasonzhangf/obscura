@@ -64,7 +64,7 @@ async fn exercise() {
     let (mut control, response) = client_async(format!("wss://localhost:{}/control", address.port()), tls).await.unwrap();
     let token = response.headers()["x-obscura-media-token"].to_str().unwrap().to_string();
     let ready: serde_json::Value = serde_json::from_str(control.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
-    assert_eq!(ready["version"], 4);
+    assert_eq!(ready["version"], 10);
     if let Ok(serial) = std::env::var("OBSCURA_ENDPOINT_ADB_SERIAL") {
         assert!(!bind_ip.is_loopback(), "Device probe requires an explicit reachable bind IP");
         // Ephemeral test-only pairing, never installed into device/system trust.

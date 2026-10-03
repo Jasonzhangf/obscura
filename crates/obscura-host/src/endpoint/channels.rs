@@ -157,6 +157,7 @@ fn permitted_remote_command(command: &Command) -> bool {
             | Command::Navigate { .. }
             | Command::Click { .. }
             | Command::InputText { .. }
+            | Command::Input { .. }
             | Command::Scroll { .. })
 }
 

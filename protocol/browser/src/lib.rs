@@ -13,6 +13,12 @@ pub struct Request {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Operation {
+    /// Host10 operation identity. Distinct from `sequence`: one user-semantic
+    /// operation (a click, a whole drag/pinch, one composition) keeps a single
+    /// id while its typed events carry their own `event_sequence`. Legacy
+    /// callers that predate Host10 omit it; the Host normalizes to `legacy-N`.
+    #[serde(default)]
+    pub operation_id: String,
     pub session_id: String,
     pub attachment_id: u64,
     pub sequence: u64,
@@ -39,6 +45,9 @@ pub enum Command {
     Click { x: f64, y: f64 },
     InputText { text: String },
     Scroll { x: f64, y: f64, delta_x: f64, delta_y: f64 },
+    /// Host10 typed remote input. One lease (gesture or composition) is one
+    /// operation; the envelope's `event_sequence` orders the events inside it.
+    Input { envelope: InputEnvelope },
     CloseSession {},
     /// Host-local WebRTC grant lifecycle. Endpoint calls these on the same
     /// attachment that was created through the mTLS control bootstrap.
@@ -104,6 +113,11 @@ pub struct SessionStatus {
     pub viewport_owner: Option<u64>,
     /// Declaration accepted or layout executing, but not yet committed. Fence new input.
     pub viewport_pending: bool,
+    /// Engine-confirmed editing target. `null` when focus is not editable.
+    pub editor_context: Option<EditorContext>,
+    /// Held gesture/composition lease. New Agent operations are fenced while
+    /// this is present; takeover waits for its terminal event.
+    pub input_lease: Option<InputLease>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -120,6 +134,7 @@ pub enum ResultValue {
     Evaluation { result: EvaluationResult },
     Closed { closed: bool },
     Input { input: InputReceipt },
+    Editing { editing: EditingReceipt },
     WebRtcAuthorization { binding: WebRtcSessionBinding, capability: WebRtcCapability },
     WebRtcConsumed { session_id: String, attachment_id: u64 },
 }
@@ -128,7 +143,159 @@ pub enum ResultValue {
 pub struct InputReceipt { pub state: InputState }
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum InputState { Succeeded }
+pub enum InputState { Pending, Succeeded, Cancelled }
+
+/// Identity of the frame the client had presented when it produced an event.
+///
+/// The Host validates session/document/viewport fencing only. A new frame
+/// sequence alone never invalidates input; display rectangle/transform stays a
+/// client-local concern and is deliberately absent from the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PresentedFrameIdentity {
+    pub session_id: String,
+    pub frame_sequence: u64,
+    pub document_revision: u64,
+    pub viewport_revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum InputBinding {
+    Gesture { gesture_session_id: String },
+    Editor {
+        edit_session_id: String,
+        target_id: String,
+        focus_revision: u64,
+        editor_revision: u64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum InputEvent {
+    PointerDown { pointer_id: u64, x: f64, y: f64, button: String, buttons: u64, modifiers: u64 },
+    PointerMove { pointer_id: u64, x: f64, y: f64, buttons: u64, modifiers: u64 },
+    PointerUp { pointer_id: u64, x: f64, y: f64, button: String, buttons: u64, modifiers: u64 },
+    PointerCancel { pointer_id: u64 },
+    CompositionBegin { data: String },
+    CompositionUpdate { data: String },
+    CompositionCommit { data: String },
+    CompositionCancel {},
+    ReplaceText { text: String, input_type: String },
+    DeleteRange { start: u64, end: u64 },
+    DeleteSurrounding { before: u64, after: u64 },
+    SetSelection { start: u64, end: u64, direction: SelectionDirection },
+    EditorAction { action: String },
+    KeyDown { key: String, code: String, text: Option<String>, modifiers: u64 },
+    KeyUp { key: String, code: String, modifiers: u64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct InputEnvelope {
+    pub event_sequence: u64,
+    pub frame: PresentedFrameIdentity,
+    pub binding: InputBinding,
+    pub event: InputEvent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EditorKind { Input, Textarea, ContentEditable }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectionDirection { Forward, Backward, None }
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SelectionRange {
+    /// UTF-16 code-unit offsets into the target's text value.
+    pub start: u64,
+    pub end: u64,
+    pub direction: SelectionDirection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompositionState {
+    pub data: String,
+    /// UTF-16 range currently occupied by the uncommitted composition text.
+    pub start: u64,
+    pub end: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaretRect { pub x: f64, pub y: f64, pub width: f64, pub height: f64 }
+
+/// Bounded text around the caret, in UTF-16 code units. Password targets never
+/// carry plaintext; only the selection/length metadata remains.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SurroundingText {
+    pub text: String,
+    /// Offset of `text` inside the full value, in UTF-16 code units.
+    pub offset: u64,
+    pub before_length: u64,
+    pub after_length: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditorContext {
+    /// Engine-assigned, document-lifetime-stable node identity.
+    pub target_id: String,
+    pub kind: EditorKind,
+    pub editable: bool,
+    pub read_only: bool,
+    pub input_type: Option<String>,
+    pub input_mode: Option<String>,
+    pub enter_key_hint: Option<String>,
+    pub multiline: bool,
+    pub password: bool,
+    pub focus_revision: u64,
+    pub editor_revision: u64,
+    pub selection: Option<SelectionRange>,
+    pub composition: Option<CompositionState>,
+    pub caret: Option<CaretRect>,
+    pub surrounding: Option<SurroundingText>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputLeaseKind { Gesture, Composition }
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct InputLease {
+    pub kind: InputLeaseKind,
+    pub operation_id: String,
+    pub attachment_id: u64,
+    pub gesture_session_id: Option<String>,
+    pub edit_session_id: Option<String>,
+    pub target_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EditingState { Pending, Applied, Cancelled, Rejected, Failed, Unknown }
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditingReceipt {
+    pub operation_id: String,
+    pub edit_session_id: String,
+    pub target_id: String,
+    pub focus_revision: u64,
+    pub editor_revision: u64,
+    pub event_sequence: u64,
+    pub state: EditingState,
+    pub selection: Option<SelectionRange>,
+    pub composition: Option<CompositionState>,
+    pub message: Option<String>,
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -192,10 +359,13 @@ pub enum VideoPacket {
 #[serde(rename_all = "snake_case")]
 pub enum VideoCodec { H264AnnexB }
 
-/// Version 3 adds the typed browser request/response envelopes and replaces
-/// the flat video identity projection with the complete source descriptor.
-/// Older v2 peers are rejected during the Hello exchange.
-pub const WEBRTC_PROTOCOL_VERSION: u32 = 3;
+/// Version 9 pairs with Host10: the typed browser request/response envelopes
+/// plus the target-bound EditorContext/EditingEvent/EditingReceipt ABI and the
+/// complete gesture/composition lease. Older peers are rejected during Hello.
+pub const WEBRTC_PROTOCOL_VERSION: u32 = 9;
+/// Host bootstrap wire version. Host10 adds operation identity plus typed
+/// remote editing to the existing attachment/control/revision fences.
+pub const HOST_PROTOCOL_VERSION: u32 = 10;
 pub const WEBRTC_CONTROL_LABEL: &str = "obscura.control.v1";
 pub const WEBRTC_H264_FMTP: &str = "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f";
 

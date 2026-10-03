@@ -2,9 +2,9 @@
 use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
 use anyhow::{Context, Result};
 use obscura_browser::{BrowserContext, Page};
-use obscura_host_protocol::{Command, EvaluationResult, FrameInfo, FramePacket, InputReceipt, InputState, PixelFormat, ResultValue};
+use obscura_host_protocol::{Command, EditingReceipt, EditingState, EditorContext, EvaluationResult, FrameInfo, FramePacket, InputBinding, InputReceipt, InputState, PixelFormat, ResultValue};
 use crate::media::{self, SharedFrame};
-use obscura_browser::input::{Input, InputError};
+use obscura_browser::input::{EditError, Input, InputError};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{timeout, Duration};
 
@@ -14,11 +14,12 @@ pub struct Completion {
     pub fault: Option<String>,
     pub document_revision: u64,
     pub viewport_revision: u64,
+    pub editor_context: Option<EditorContext>,
 }
 pub struct PageUpdate { pub document_revision: u64, pub fault: Option<String> }
 pub struct Work { pub kind: WorkKind, pub reply: oneshot::Sender<Completion> }
 pub enum WorkKind {
-    Browser { command: Command, document_revision: u64 },
+    Browser { command: Command, document_revision: u64, operation_id: String },
     /// Host-assigned shared viewport; declarations apply to the current Page,
     /// while explicit Agent resize retains its admitted document fence.
     Viewport { width: u32, height: u32, revision: u64, document_revision: Option<u64>, cancel: Arc<AtomicBool> },
@@ -63,6 +64,7 @@ pub fn start(id: String, network: bool, mut incoming: mpsc::Receiver<Work>,
             if ready.send(Ok(page.viewport)).is_err() { return Ok(()); }
             let mut page = Some(page);
             let mut failure: Option<String> = None;
+            let mut current_editor_context: Option<EditorContext> = None;
             let mut document_revision = 0;
             let mut viewport_revision = 0;
             let mut frame_sequence = 0u64;
@@ -129,9 +131,10 @@ pub fn start(id: String, network: bool, mut incoming: mpsc::Receiver<Work>,
                                 fault: failure.clone(),
                                 document_revision,
                                 viewport_revision,
+                                editor_context: current_editor_context.clone(),
                             }
                         } else if expected_document.is_some_and(|expected| expected != document_revision) {
-                            Completion { result: Err(("STALE_DOCUMENT", "Document changed before execution".into())), viewport: page.as_ref().map(|page| page.viewport), fault: None, document_revision, viewport_revision }
+                            Completion { result: Err(("STALE_DOCUMENT", "Document changed before execution".into())), viewport: page.as_ref().map(|page| page.viewport), fault: None, document_revision, viewport_revision, editor_context: current_editor_context.clone() }
                         } else {
                             match work.kind {
                                 WorkKind::Viewport { width, height, revision, cancel, .. } => {
@@ -157,11 +160,11 @@ pub fn start(id: String, network: bool, mut incoming: mpsc::Receiver<Work>,
                                     if cancel.load(Ordering::Acquire) {
                                         frames.send_replace(media::state(FramePacket::Waiting { session_id: id.clone() }));
                                     }
-                                    Completion { result, viewport: page.as_ref().map(|page| page.viewport), fault, document_revision, viewport_revision }
+                                    Completion { result, viewport: page.as_ref().map(|page| page.viewport), fault, document_revision, viewport_revision, editor_context: current_editor_context.clone() }
                                 }
-                                WorkKind::Browser { command, .. } => {
+                                WorkKind::Browser { command, operation_id, .. } => {
                                     let navigation = matches!(command, Command::Navigate { .. });
-                                    let completion = execute(&mut page, command).await;
+                                    let completion = execute(&mut page, command, &operation_id, current_editor_context.clone()).await;
                                     if navigation {
                                         document_revision += 1;
                                         frames.send_replace(media::state(FramePacket::Waiting { session_id: id.clone() }));
@@ -172,6 +175,7 @@ pub fn start(id: String, network: bool, mut incoming: mpsc::Receiver<Work>,
                         };
                         completion.document_revision = document_revision;
                         completion.viewport_revision = viewport_revision;
+                        current_editor_context = completion.editor_context.clone();
                         if completion.fault.is_some() { failure = completion.fault.clone(); }
                         if page.is_none() { frames.send_replace(media::state(FramePacket::Closed { session_id: id.clone() })); }
                         else if let Some(message) = &failure { frames.send_replace(media::state(FramePacket::Unavailable { session_id: id.clone(), message: message.clone() })); }
@@ -217,15 +221,44 @@ async fn capture(page: &mut Page) -> Result<(u32, u32, Vec<u8>), String> {
     { let _ = page; Err("Frames require a render-enabled Host".into()) }
 }
 
-async fn execute(page: &mut Option<Page>, command: Command) -> Completion {
+fn gesture_state(receipt: obscura_browser::input::GestureReceipt) -> InputState {
+    match receipt {
+        obscura_browser::input::GestureReceipt::Pending => InputState::Pending,
+        obscura_browser::input::GestureReceipt::Succeeded => InputState::Succeeded,
+        obscura_browser::input::GestureReceipt::Cancelled => InputState::Cancelled,
+    }
+}
+
+fn editing_state(state: &str) -> EditingState {
+    match state {
+        "pending" => EditingState::Pending,
+        "applied" => EditingState::Applied,
+        "cancelled" => EditingState::Cancelled,
+        "failed" => EditingState::Failed,
+        "unknown" => EditingState::Unknown,
+        _ => EditingState::Rejected,
+    }
+}
+
+async fn execute(
+    page: &mut Option<Page>,
+    command: Command,
+    operation_id: &str,
+    current_editor_context: Option<EditorContext>,
+) -> Completion {
     let mut fault = None;
+    let mut editor_context = current_editor_context;
     let result = if matches!(command, Command::CloseSession {}) {
         *page = None;
+        editor_context = None;
         Ok(Some(ResultValue::Closed { closed: true }))
     } else if let Some(page) = page.as_mut() {
         match command {
             Command::Navigate { url } => match timeout(BUDGET, page_work(page.navigate(&url))).await {
-                Ok(Ok(())) => Ok(None),
+                Ok(Ok(())) => {
+                    editor_context = None;
+                    Ok(None)
+                }
                 Ok(Err(cause)) => Err(("NAVIGATION_FAILED", cause.to_string())),
                 Err(_) => {
                     let cause = "Navigation deadline: partial outcome; recreate session explicitly".to_string();
@@ -263,7 +296,10 @@ async fn execute(page: &mut Option<Page>, command: Command) -> Completion {
                     let result = timeout(BUDGET, page_work(obscura_browser::input::perform(page, input))).await;
                     let fired = page.js.as_mut().expect("input retains runtime").disarm_watchdog(watchdog);
                     match result {
-                        Ok(Ok(())) if !fired => Ok(Some(ResultValue::Input { input: InputReceipt { state: InputState::Succeeded } })),
+                        Ok(Ok(context)) if !fired => {
+                            editor_context = context.and_then(|value| serde_json::from_value(value).ok());
+                            Ok(Some(ResultValue::Input { input: InputReceipt { state: InputState::Succeeded } }))
+                        }
                         Ok(Err(InputError::Rejected(cause))) if !fired => Err(("INPUT_REJECTED", cause)),
                         outcome => {
                             let cause = match outcome {
@@ -276,8 +312,90 @@ async fn execute(page: &mut Option<Page>, command: Command) -> Completion {
                     }
                 } else { Err(("INPUT_REJECTED", "Input runtime unavailable".into())) }
             }
+            Command::Input { envelope } => {
+                let event = match serde_json::to_value(&envelope.event) {
+                    Ok(event) => event,
+                    Err(cause) => {
+                        fault = None;
+                        return Completion { result: Err(("INVALID_EDITOR_EVENT", cause.to_string())), viewport: Some(page.viewport), fault, document_revision: 0, viewport_revision: 0, editor_context };
+                    }
+                };
+                match &envelope.binding {
+                    InputBinding::Gesture { .. } => {
+                        if page.js.is_some() {
+                            let js = page.js.as_mut().expect("checked runtime");
+                            let watchdog = js.arm_watchdog(BUDGET);
+                            let result = timeout(BUDGET, page_work(obscura_browser::input::perform_gesture(page, &event))).await;
+                            let fired = page.js.as_mut().expect("input retains runtime").disarm_watchdog(watchdog);
+                            match result {
+                                Ok(Ok((receipt, context))) if !fired => {
+                                    editor_context = context.and_then(|value| serde_json::from_value(value).ok());
+                                    Ok(Some(ResultValue::Input { input: InputReceipt { state: gesture_state(receipt) } }))
+                                }
+                                Ok(Err(InputError::Rejected(cause))) if !fired => Err(("INPUT_REJECTED", cause)),
+                                outcome => {
+                                    let cause = match outcome {
+                                        Ok(Err(InputError::Unknown(cause))) => cause,
+                                        _ => "Gesture deadline: injection outcome unknown; recreate session".into(),
+                                    };
+                                    fault = Some(cause.clone());
+                                    Err(("OUTCOME_UNKNOWN", cause))
+                                }
+                            }
+                        } else { Err(("INPUT_REJECTED", "Input runtime unavailable".into())) }
+                    }
+                    InputBinding::Editor { edit_session_id, target_id, focus_revision, editor_revision } => {
+                        let binding = match serde_json::to_value(&envelope.binding) {
+                            Ok(binding) => binding,
+                            Err(cause) => {
+                                fault = None;
+                                return Completion { result: Err(("INVALID_EDITOR_EVENT", cause.to_string())), viewport: Some(page.viewport), fault, document_revision: 0, viewport_revision: 0, editor_context };
+                            }
+                        };
+                        if page.js.is_some() {
+                            let js = page.js.as_mut().expect("checked runtime");
+                            let watchdog = js.arm_watchdog(BUDGET);
+                            let result = page_work(async { obscura_browser::input::apply_editor_event(page, &binding, &event) }).await;
+                            let fired = page.js.as_mut().expect("input retains runtime").disarm_watchdog(watchdog);
+                            match result {
+                                Ok(value) if !fired => {
+                                    editor_context = value.get("context").cloned()
+                                        .and_then(|value| serde_json::from_value(value).ok());
+                                    let selection = value.get("selection").cloned()
+                                        .and_then(|value| serde_json::from_value(value).ok());
+                                    let composition = value.get("composition").cloned()
+                                        .and_then(|value| serde_json::from_value(value).ok());
+                                    let state = editing_state(value.get("state").and_then(|value| value.as_str()).unwrap_or("rejected"));
+                                    let confirmed_revision = value.get("editor_revision").and_then(|value| value.as_u64()).unwrap_or(*editor_revision);
+                                    Ok(Some(ResultValue::Editing { editing: EditingReceipt {
+                                        operation_id: operation_id.to_string(),
+                                        edit_session_id: edit_session_id.clone(),
+                                        target_id: target_id.clone(),
+                                        focus_revision: *focus_revision,
+                                        editor_revision: confirmed_revision,
+                                        event_sequence: envelope.event_sequence,
+                                        state,
+                                        selection,
+                                        composition,
+                                        message: None,
+                                    } }))
+                                }
+                                Err(EditError::Rejected(code, cause)) if !fired => Err((code, cause)),
+                                outcome => {
+                                    let cause = match outcome {
+                                        Err(EditError::Unknown(cause)) => cause,
+                                        _ => "Editing deadline: injection outcome unknown; recreate session".into(),
+                                    };
+                                    fault = Some(cause.clone());
+                                    Err(("OUTCOME_UNKNOWN", cause))
+                                }
+                            }
+                        } else { Err(("INPUT_REJECTED", "Input runtime unavailable".into())) }
+                    }
+                }
+            }
             _ => unreachable!("control commands stay on daemon thread"),
         }
     } else { Err(("SESSION_CLOSED", "Session was explicitly closed".into())) };
-    Completion { result, viewport: page.as_ref().map(|page| page.viewport), fault, document_revision: 0, viewport_revision: 0 }
+    Completion { result, viewport: page.as_ref().map(|page| page.viewport), fault, document_revision: 0, viewport_revision: 0, editor_context }
 }

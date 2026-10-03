@@ -8,6 +8,17 @@ fn evaluate(page: &mut Page, expression: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn evaluate_value(page: &mut Page, expression: &str) -> Result<Value, String> {
+    page.js
+        .as_mut()
+        .ok_or("Input runtime unavailable")?
+        .evaluate(expression)
+}
+
+fn editor_context_from_dispatch(value: Value) -> Option<Value> {
+    value.is_object().then_some(value)
+}
+
 pub enum Input<'a> {
     Click { x: f64, y: f64 },
     Text(&'a str),
@@ -15,26 +26,166 @@ pub enum Input<'a> {
 }
 pub enum InputError { Rejected(String), Unknown(String) }
 
+/// Engine-side result of one gesture event. The Host owns the wire ABI and
+/// maps this to `InputState`; the browser crate deliberately does not depend
+/// on the Host protocol crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GestureReceipt { Pending, Succeeded, Cancelled }
+
+/// Engine-side editing failure. `Rejected` is a deterministic pre- or
+/// mid-execution refusal that did not change page content; `Unknown` means the
+/// injection outcome cannot be proven.
+#[derive(Debug)]
+pub enum EditError { Rejected(&'static str, String), Unknown(String) }
+
+/// Engine-confirmed EditorContext as the Host wire JSON shape. The Host is the
+/// single owner of `protocol/browser`; this crate returns the same field names
+/// so there is no second ABI to drift.
+pub fn editor_context_json(page: &mut Page) -> Result<Value, String> {
+    let js = page.js.as_mut().ok_or("Input runtime unavailable")?;
+    js.evaluate("globalThis.__obscura_editor_context()")
+}
+
+fn static_edit_code(code: &str) -> &'static str {
+    match code {
+        "NO_EDITOR_CONTEXT" => "NO_EDITOR_CONTEXT",
+        "NOT_EDITABLE" => "NOT_EDITABLE",
+        "INVALID_UTF16_RANGE" => "INVALID_UTF16_RANGE",
+        "NO_ACTIVE_COMPOSITION" => "NO_ACTIVE_COMPOSITION",
+        "COMPOSITION_ALREADY_ACTIVE" => "COMPOSITION_ALREADY_ACTIVE",
+        "INVALID_EDITOR_ACTION" => "INVALID_EDITOR_ACTION",
+        _ => "INVALID_EDITOR_EVENT",
+    }
+}
+
+fn validate_editor_binding(context: &Value, binding: &Value) -> Result<(), EditError> {
+    if context.is_null() {
+        return Err(EditError::Rejected("NO_EDITOR_CONTEXT", "No editable target is focused".into()));
+    }
+    let target_id = binding.get("target_id").and_then(Value::as_str).unwrap_or("");
+    let focus_revision = binding.get("focus_revision").and_then(Value::as_u64);
+    let editor_revision = binding.get("editor_revision").and_then(Value::as_u64);
+    if context.get("target_id").and_then(Value::as_str) != Some(target_id) {
+        return Err(EditError::Rejected("STALE_EDITOR_TARGET", "Editor target changed".into()));
+    }
+    if focus_revision.is_none() || context.get("focus_revision").and_then(Value::as_u64) != focus_revision {
+        return Err(EditError::Rejected("STALE_FOCUS_REVISION", "Focus revision changed".into()));
+    }
+    if editor_revision.is_none() || context.get("editor_revision").and_then(Value::as_u64) != editor_revision {
+        return Err(EditError::Rejected("STALE_EDITOR_REVISION", "Editor revision changed".into()));
+    }
+    if context.get("editable").and_then(Value::as_bool) != Some(true) {
+        return Err(EditError::Rejected("NOT_EDITABLE", "Editor target is not writable".into()));
+    }
+    Ok(())
+}
+
+/// Apply one typed editing event against the currently focused target. The
+/// `binding` is the Host `InputBinding` JSON; `event` is the Host `InputEvent`
+/// JSON. Returns the JS confirmation object on success.
+pub fn apply_editor_event(page: &mut Page, binding: &Value, event: &Value) -> Result<Value, EditError> {
+    let context = editor_context_json(page).map_err(EditError::Unknown)?;
+    validate_editor_binding(&context, binding)?;
+    let literal = serde_json::to_string(event).map_err(|error| EditError::Unknown(error.to_string()))?;
+    let expression = format!("globalThis.__obscura_editor_apply({literal})");
+    let js = page.js.as_mut().ok_or_else(|| EditError::Rejected("INPUT_UNAVAILABLE", "Input runtime unavailable".into()))?;
+    let result = js.evaluate(&expression).map_err(EditError::Unknown)?;
+    if result.get("ok").and_then(Value::as_bool) != Some(true) {
+        let code = result.get("code").and_then(Value::as_str).unwrap_or("INVALID_EDITOR_EVENT");
+        let message = result.get("message").and_then(Value::as_str).unwrap_or("Editing event rejected");
+        return Err(EditError::Rejected(static_edit_code(code), message.to_string()));
+    }
+    Ok(result)
+}
+
+/// Dispatch one gesture event. Down/move keep the lease open; up/cancel are
+/// the terminal events the Host waits on before any takeover.
+pub async fn perform_gesture(
+    page: &mut Page,
+    event: &Value,
+) -> Result<(GestureReceipt, Option<Value>), InputError> {
+    let event_type = event.get("type").and_then(Value::as_str).unwrap_or("");
+    match event_type {
+        "pointer_down" => {
+            let params = json!({
+                "type": "mousePressed",
+                "x": event.get("x").and_then(Value::as_f64).unwrap_or(0.0),
+                "y": event.get("y").and_then(Value::as_f64).unwrap_or(0.0),
+                "button": event.get("button").and_then(Value::as_str).unwrap_or("left"),
+                "buttons": event.get("buttons").and_then(Value::as_u64).unwrap_or(1),
+                "modifiers": event.get("modifiers").and_then(Value::as_u64).unwrap_or(0),
+            });
+            let context = dispatch("dispatchMouseEvent", &params, page)
+                .await
+                .map_err(InputError::Unknown)
+                .and_then(|value| Ok(editor_context_from_dispatch(value)))?;
+            Ok((GestureReceipt::Pending, context))
+        }
+        "pointer_move" => {
+            let params = json!({
+                "type": "mouseMoved",
+                "x": event.get("x").and_then(Value::as_f64).unwrap_or(0.0),
+                "y": event.get("y").and_then(Value::as_f64).unwrap_or(0.0),
+                "buttons": event.get("buttons").and_then(Value::as_u64).unwrap_or(1),
+                "modifiers": event.get("modifiers").and_then(Value::as_u64).unwrap_or(0),
+            });
+            let context = dispatch("dispatchMouseEvent", &params, page)
+                .await
+                .map_err(InputError::Unknown)
+                .and_then(|value| Ok(editor_context_from_dispatch(value)))?;
+            Ok((GestureReceipt::Pending, context))
+        }
+        "pointer_up" => {
+            let params = json!({
+                "type": "mouseReleased",
+                "x": event.get("x").and_then(Value::as_f64).unwrap_or(0.0),
+                "y": event.get("y").and_then(Value::as_f64).unwrap_or(0.0),
+                "button": event.get("button").and_then(Value::as_str).unwrap_or("left"),
+                "buttons": 0,
+                "modifiers": event.get("modifiers").and_then(Value::as_u64).unwrap_or(0),
+            });
+            let context = dispatch("dispatchMouseEvent", &params, page)
+                .await
+                .map_err(InputError::Unknown)
+                .and_then(|value| Ok(editor_context_from_dispatch(value)))?;
+            Ok((GestureReceipt::Succeeded, context))
+        }
+        "pointer_cancel" => {
+            evaluate(page, "globalThis.__obscura_mouse_down=null;true").map_err(InputError::Unknown)?;
+            Ok((GestureReceipt::Cancelled, None))
+        }
+        other => Err(InputError::Rejected(format!("Unsupported gesture event: {other}"))),
+    }
+}
+
 /// Complete input injection only. Navigation and page tasks are owned by the
 /// caller's event loop; they are not part of a held pointer/text operation.
-pub async fn perform(page: &mut Page, input: Input<'_>) -> Result<(), InputError> {
+pub async fn perform(page: &mut Page, input: Input<'_>) -> Result<Option<Value>, InputError> {
     match input {
         Input::Click { x, y } => {
             dispatch("dispatchMouseEvent", &json!({"type":"mousePressed","x":x,"y":y,"button":"left"}), page).await.map_err(InputError::Unknown)?;
-            dispatch("dispatchMouseEvent", &json!({"type":"mouseReleased","x":x,"y":y,"button":"left"}), page).await.map_err(InputError::Unknown)?;
+            let context = dispatch("dispatchMouseEvent", &json!({"type":"mouseReleased","x":x,"y":y,"button":"left"}), page)
+                .await
+                .map_err(InputError::Unknown)
+                .map(editor_context_from_dispatch)?;
+            Ok(context)
         }
         Input::Text(text) => {
             let js = page.js.as_mut().ok_or_else(|| InputError::Rejected("Input runtime unavailable".into()))?;
             let editable = js.evaluate("(function(){var t=document.activeElement;return !!(t && (t.localName==='input'||t.localName==='textarea') && !t.readOnly && !t.hasAttribute('readonly') && !globalThis.__obscura_isDisabled(t) && (t.localName==='textarea'||['text','search','email','url','tel','password','number'].includes((t.type||'text').toLowerCase())))})()")
                 .map_err(InputError::Unknown)?;
             if editable != Value::Bool(true) { return Err(InputError::Rejected("Focus an enabled, writable text input or textarea".into())); }
-            dispatch("insertText", &json!({"text":text}), page).await.map_err(InputError::Unknown)?;
+            let context = dispatch("insertText", &json!({"text":text}), page)
+                .await
+                .map_err(InputError::Unknown)
+                .map(editor_context_from_dispatch)?;
+            Ok(context)
         }
         Input::Scroll { x, y, delta_x, delta_y } => {
             dispatch("dispatchMouseEvent", &json!({"type":"mouseWheel","x":x,"y":y,"deltaX":delta_x,"deltaY":delta_y}), page).await.map_err(InputError::Unknown)?;
+            Ok(None)
         }
     }
-    Ok(())
 }
 
 /// Embed a string as a JS string literal (double-quoted, with backslash,
@@ -76,6 +227,7 @@ fn insert_text_js(text: &str) -> String {
                 t.setSelectionRange(caret, caret);\
             }}\
             t.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {{bubbles:true}})));\
+            return globalThis.__obscura_editor_context();\
         }})()",
         text = literal,
     )
@@ -142,7 +294,7 @@ pub async fn dispatch(
     method: &str,
     params: &Value,
     page: &mut Page,
-) -> Result<(), String> {
+) -> Result<Value, String> {
     match method {
         "dispatchMouseEvent" => {
             let event_type = params.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -168,8 +320,9 @@ pub async fn dispatch(
                             globalThis.__obscura_mouse_down = {{target:target,button:{button_code},clickCount:{click_count}}};\
                             var evt = globalThis.__obscura_markTrusted(new MouseEvent('mousedown', {{bubbles:true,cancelable:true,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:{buttons},detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
                             var allowed = target.dispatchEvent(evt);\
-                            var focusTarget = target.closest ? target.closest('input,textarea,button,select,a[href],[tabindex]') : null;\
+                            var focusTarget = target.closest ? target.closest('input,textarea,button,select,a[href],[tabindex],[contenteditable]') : null;\
                             if (allowed && focusTarget && !globalThis.__obscura_isDisabled(focusTarget)) focusTarget.focus();\
+                            return globalThis.__obscura_editor_context();\
                         }})()",
                         x = x,
                         y = y,
@@ -181,7 +334,7 @@ pub async fn dispatch(
                         meta_key = meta_key,
                         shift_key = shift_key,
                     );
-                    evaluate(page, &code)?;
+                    return evaluate_value(page, &code);
                 }
             } else if event_type == "mouseReleased" {
                 {
@@ -258,6 +411,7 @@ pub async fn dispatch(
                                 if (clickTarget.setSelectionRange) clickTarget.setSelectionRange(0, len);\
                                 else {{ clickTarget.selectionStart = 0; clickTarget.selectionEnd = len; }}\
                             }}\
+                            return globalThis.__obscura_editor_context();\
                         }})()",
                         x = x,
                         y = y,
@@ -268,7 +422,27 @@ pub async fn dispatch(
                         meta_key = meta_key,
                         shift_key = shift_key,
                     );
-                    evaluate(page, &code)?;
+                    return evaluate_value(page, &code);
+                }
+            } else if event_type == "mouseMoved" {
+                {
+                    let code = format!(
+                        "(function() {{\
+                            var target = (document.elementFromPoint && document.elementFromPoint({x},{y})) || globalThis.__obscura_click_target || document.activeElement || document.body;\
+                            if (!target) return;\
+                            var evt = globalThis.__obscura_markTrusted(new MouseEvent('mousemove', {{bubbles:true,cancelable:true,view:globalThis,clientX:{x},clientY:{y},button:0,buttons:{buttons},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
+                            target.dispatchEvent(evt);\
+                            return globalThis.__obscura_editor_context();\
+                        }})()",
+                        x = x,
+                        y = y,
+                        buttons = buttons,
+                        alt_key = alt_key,
+                        ctrl_key = ctrl_key,
+                        meta_key = meta_key,
+                        shift_key = shift_key,
+                    );
+                    return evaluate_value(page, &code);
                 }
             } else if event_type == "mouseWheel" {
                 let delta_x = params.get("deltaX").and_then(|v| v.as_f64()).unwrap_or(0.0);
@@ -307,6 +481,7 @@ pub async fn dispatch(
                                     try {{ globalThis.dispatchEvent(new Event('scroll', {{bubbles:false}})); }} catch (_e) {{}}\
                                 }}, 0);\
                             }} else if (scrollTarget && typeof scrollTarget.scrollBy === 'function') scrollTarget.scrollBy(dx, dy);\
+                            return globalThis.__obscura_editor_context();\
                         }})()",
                         x = x,
                         y = y,
@@ -317,18 +492,17 @@ pub async fn dispatch(
                         meta_key = meta_key,
                         shift_key = shift_key,
                     );
-                    evaluate(page, &code)?;
+                    return evaluate_value(page, &code);
                 }
             }
 
-            Ok(())
+            Ok(Value::Null)
         }
         // Chrome's Input.insertText: Playwright's fill() focuses the field in
         // page and then types the whole value through this one call (#577).
         "insertText" => {
             let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("");
-            evaluate(page, &insert_text_js(text))?;
-            Ok(())
+            return evaluate_value(page, &insert_text_js(text));
         }
         "dispatchKeyEvent" => {
             let event_type = params.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -405,7 +579,7 @@ pub async fn dispatch(
                 }
             }
 
-            Ok(())
+            Ok(Value::Null)
         }
         _ => Err(format!("Unknown Input method: {}", method)),
     }

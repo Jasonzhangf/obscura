@@ -5,8 +5,8 @@ use std::{collections::BTreeMap, net::{IpAddr, SocketAddr}, path::PathBuf, sync:
 use anyhow::{Context, Result, bail, ensure};
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
-use obscura_host_protocol::{Command, ControlPhase, InputState, Mode, Operation, PixelFormat,
-    Request, Response, ResultValue, SessionStatus, WebRtcCapability, WebRtcControlMessage,
+use obscura_host_protocol::{Command, ControlPhase, EditingState, InputBinding, InputEnvelope, InputEvent, InputState, Mode, Operation, PixelFormat,
+    PresentedFrameIdentity, Request, Response, ResultValue, SelectionDirection, SessionStatus, WebRtcCapability, WebRtcControlMessage,
     WebRtcSignal, WebRtcVideoCodec, WebRtcVideoFrame, WebRtcTransport,
     WEBRTC_CONTROL_LABEL, WEBRTC_PROTOCOL_VERSION};
 use rtc::{media::io::sample_builder::SampleBuilder, rtp::codec::h264::H264Packet,
@@ -172,6 +172,31 @@ async fn main() -> Result<()> {
             let forbidden = request_dc(&data_channel, &mut control_rx, &track, &mut media, &session_id,
                 Request { id: 100, command: Command::Evaluate { expression: "window.location.href".into() }, operation: None }).await?;
             expect_error(forbidden, "REMOTE_COMMAND_FORBIDDEN")?;
+            let forbidden_input = request_dc(&data_channel, &mut control_rx, &track, &mut media, &session_id,
+                Request { id: 118, command: Command::Input {
+                    envelope: InputEnvelope {
+                        event_sequence: 0,
+                        frame: PresentedFrameIdentity {
+                            session_id: session_id.clone(),
+                            frame_sequence: 0,
+                            document_revision: status.document_revision,
+                            viewport_revision: status.viewport_revision,
+                        },
+                        binding: InputBinding::Gesture { gesture_session_id: "unauthorized".into() },
+                        event: InputEvent::PointerDown {
+                            pointer_id: 1, x: 10.0, y: 10.0, button: "left".into(), buttons: 1, modifiers: 0,
+                        },
+                    },
+                }, operation: Some(Operation {
+                    operation_id: "unauthorized-input".into(),
+                    session_id: session_id.clone(),
+                    attachment_id,
+                    sequence: status.next_sequence,
+                    control_epoch: status.control.epoch,
+                    viewport_revision: status.viewport_revision,
+                    document_revision: status.document_revision,
+                }) }).await?;
+            expect_error(forbidden_input, "CONTROL_REQUIRED")?;
 
             let takeover = request_dc(&data_channel, &mut control_rx, &track, &mut media, &session_id,
                 Request { id: 101, command: Command::RequestTakeover { epoch: initial_epoch }, operation: None }).await?;
@@ -221,6 +246,62 @@ async fn main() -> Result<()> {
             status = status_from_response(request_dc(&data_channel, &mut control_rx, &track, &mut media, &session_id,
                 Request { id: 112, command: Command::Status {}, operation: None }).await?)?;
 
+            let context = status.editor_context.as_ref().context("Host did not publish EditorContext after focus")?;
+            let mut input_operation = operation_for(&status)?;
+            input_operation.operation_id = "receiver-editor-1".into();
+            let edit = request_dc(&data_channel, &mut control_rx, &track, &mut media, &session_id,
+                Request { id: 116, operation: Some(input_operation.clone()), command: Command::Input {
+                    envelope: InputEnvelope {
+                        event_sequence: 0,
+                        frame: PresentedFrameIdentity {
+                            session_id: status.session_id.clone(),
+                            frame_sequence: 0,
+                            document_revision: status.document_revision,
+                            viewport_revision: status.viewport_revision,
+                        },
+                        binding: InputBinding::Editor {
+                            edit_session_id: "receiver-edit".into(),
+                            target_id: context.target_id.clone(),
+                            focus_revision: context.focus_revision,
+                            editor_revision: context.editor_revision,
+                        },
+                        event: InputEvent::SetSelection { start: 0, end: 7, direction: SelectionDirection::Forward },
+                    },
+                } }).await?;
+            match edit {
+                Response::Result { value: ResultValue::Editing { editing }, .. } => {
+                    ensure!(matches!(editing.state, EditingState::Applied), "Host editing receipt was not applied: {editing:?}");
+                }
+                other => bail!("expected applied WebRTC editing receipt, got {other:?}"),
+            }
+            let replay = request_dc(&data_channel, &mut control_rx, &track, &mut media, &session_id,
+                Request { id: 117, operation: Some(input_operation), command: Command::Input {
+                    envelope: InputEnvelope {
+                        event_sequence: 0,
+                        frame: PresentedFrameIdentity {
+                            session_id: status.session_id.clone(),
+                            frame_sequence: 0,
+                            document_revision: status.document_revision,
+                            viewport_revision: status.viewport_revision,
+                        },
+                        binding: InputBinding::Editor {
+                            edit_session_id: "receiver-edit".into(),
+                            target_id: context.target_id.clone(),
+                            focus_revision: context.focus_revision,
+                            editor_revision: context.editor_revision,
+                        },
+                        event: InputEvent::SetSelection { start: 0, end: 7, direction: SelectionDirection::Forward },
+                    },
+                } }).await?;
+            match replay {
+                Response::Result { value: ResultValue::Editing { editing }, .. } => {
+                    ensure!(matches!(editing.state, EditingState::Applied), "replayed editing receipt changed: {editing:?}");
+                }
+                other => bail!("expected replayed WebRTC editing receipt, got {other:?}"),
+            }
+
+            status = status_from_response(request_dc(&data_channel, &mut control_rx, &track, &mut media, &session_id,
+                Request { id: 119, command: Command::Status {}, operation: None }).await?)?;
             let scroll = request_dc(&data_channel, &mut control_rx, &track, &mut media, &session_id,
                 Request { id: 113, command: Command::Scroll { x: 30.0, y: 100.0, delta_x: 0.0, delta_y: 400.0 }, operation: Some(operation_for(&status)?) }).await?;
             expect_input(scroll)?;
@@ -516,10 +597,12 @@ async fn request_dc(
 }
 
 fn operation_for(status: &SessionStatus) -> Result<Operation> {
+    let sequence = status.next_sequence;
     Ok(Operation {
+        operation_id: format!("receiver-operation-{sequence}"),
         session_id: status.session_id.clone(),
         attachment_id: status.attachment_id.context("Host status has no WebRTC attachment")?,
-        sequence: status.next_sequence,
+        sequence,
         control_epoch: status.control.epoch,
         viewport_revision: status.viewport_revision,
         document_revision: status.document_revision,

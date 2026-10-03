@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use anyhow::{Context, Result};
-use obscura_host_protocol::{Command, Control, ControlPhase, Device, FramePacket, Mode, Operation, Request, Response, ResultValue, SessionStatus, ViewportDeclaration, WebRtcCapability, WebRtcSessionBinding, WebRtcTransport, WebRtcVideoCodec, WEBRTC_CONTROL_LABEL, WEBRTC_PROTOCOL_VERSION};
+use obscura_host_protocol::{Command, Control, ControlPhase, Device, EditorContext, FramePacket, InputBinding, InputEnvelope, InputEvent, InputLease, InputLeaseKind, Mode, Operation, Request, Response, ResultValue, SessionStatus, ViewportDeclaration, WebRtcCapability, WebRtcSessionBinding, WebRtcTransport, WebRtcVideoCodec, HOST_PROTOCOL_VERSION, WEBRTC_CONTROL_LABEL, WEBRTC_PROTOCOL_VERSION};
 use crate::media;
 use crate::worker::{self, Completion, Work, WorkKind};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -53,7 +53,7 @@ async fn write(stream: &mut tokio::net::unix::OwnedWriteHalf, response: Response
 async fn connection(stream: UnixStream, id: u64, session: String, events: mpsc::Sender<Event>) -> Result<()> {
     let (read, mut out) = stream.into_split();
     let mut reader = BufReader::new(read);
-    write(&mut out, Response::Ready { version: 4, session_id: session }).await?;
+    write(&mut out, Response::Ready { version: HOST_PROTOCOL_VERSION, session_id: session }).await?;
     loop {
         let mut frame = Vec::new();
         let size = (&mut reader).take((MAX_FRAME + 1) as u64).read_until(b'\n', &mut frame).await?;
@@ -87,11 +87,79 @@ struct Session {
     viewport_owner: Option<u64>,
     viewport_update: Option<ViewportUpdate>,
     viewport_repair: Option<(u32, u32)>,
+    editor_context: Option<EditorContext>,
+    input_lease: Option<InputLease>,
+    sequences: HashMap<u64, u64>,
 }
 struct Attachment { mode: Mode, viewport: Option<ViewportDeclaration>, webrtc: Option<WebRtcGrant> }
 struct WebRtcGrant { capability: WebRtcCapability, binding: WebRtcSessionBinding, consumed: bool }
 struct ViewportUpdate { owner: Option<u64>, width: u32, height: u32, revision: u64, cancelled: bool, cancel: Arc<AtomicBool> }
-struct Record { operation: Operation, command: Command, response: Option<Response> }
+struct Record { operation: Operation, command: Command, response: Option<Response>, events: HashMap<u64, (InputEnvelope, Response)>, open: bool }
+enum Admission {
+    Replied(Response),
+    Run(Dispatch),
+}
+struct Dispatch {
+    connection: u64,
+    command: Command,
+    operation: Operation,
+    input: Option<InputEnvelope>,
+    fresh: bool,
+}
+
+fn replay_response(id: u64, response: &Response) -> Response {
+    match response {
+        Response::Result { value, .. } => Response::Result { id, value: value.clone() },
+        Response::Error { code, message, .. } => error(id, code, message.clone()),
+        Response::Ready { .. } => unreachable!("bootstrap responses are never cached"),
+    }
+}
+
+fn input_event_terminal(event: &InputEvent) -> bool {
+    matches!(event,
+        InputEvent::PointerUp { .. }
+            | InputEvent::PointerCancel { .. }
+            | InputEvent::CompositionCommit { .. }
+            | InputEvent::CompositionCancel { .. }
+            | InputEvent::ReplaceText { .. }
+            | InputEvent::DeleteRange { .. }
+            | InputEvent::DeleteSurrounding { .. }
+            | InputEvent::SetSelection { .. }
+            | InputEvent::EditorAction { .. }
+            | InputEvent::KeyDown { .. }
+            | InputEvent::KeyUp { .. })
+}
+
+fn lease_projection(operation: &Operation, command: &Command) -> Option<InputLease> {
+    let Command::Input { envelope } = command else { return None; };
+    let base = |kind: InputLeaseKind, gesture: Option<String>, edit: Option<String>, target: Option<String>| InputLease {
+        kind,
+        operation_id: operation.operation_id.clone(),
+        attachment_id: operation.attachment_id,
+        gesture_session_id: gesture,
+        edit_session_id: edit,
+        target_id: target,
+    };
+    match &envelope.binding {
+        InputBinding::Gesture { gesture_session_id } => Some(base(InputLeaseKind::Gesture, Some(gesture_session_id.clone()), None, None)),
+        InputBinding::Editor { edit_session_id, target_id, .. } => Some(base(InputLeaseKind::Composition, None, Some(edit_session_id.clone()), Some(target_id.clone()))),
+    }
+}
+
+/// Deterministic pre-execution editing refusals that did not consume the
+/// operation sequence. Everything else (including OUTCOME_UNKNOWN) stays
+/// recorded so a replay returns the known result instead of re-executing.
+fn unconsumed_input_error(code: &str) -> bool {
+    matches!(code,
+        "STALE_EDITOR_TARGET" | "STALE_FOCUS_REVISION" | "STALE_EDITOR_REVISION"
+            | "NO_EDITOR_CONTEXT" | "NOT_EDITABLE" | "INVALID_UTF16_RANGE"
+            | "INVALID_EDITOR_EVENT" | "INVALID_EDITOR_ACTION" | "NO_ACTIVE_COMPOSITION"
+            | "COMPOSITION_ALREADY_ACTIVE" | "INPUT_REJECTED" | "INPUT_UNAVAILABLE")
+}
+
+fn input_envelope(command: &Command) -> Option<&InputEnvelope> {
+    match command { Command::Input { envelope } => Some(envelope), _ => None }
+}
 fn valid_viewport(width: u32, height: u32) -> bool {
     width > 0 && height > 0 && width <= 4096 && height <= 4096 && u64::from(width) * u64::from(height) <= 4_194_304
 }
@@ -131,8 +199,15 @@ impl Session {
         Ok(WorkKind::Viewport { width, height, revision, document_revision, cancel })
     }
     fn detach(&mut self, connection: u64) {
+        // A disconnected attachment can no longer deliver the composition's
+        // terminal event. End the local lease here so a later field never
+        // inherits it and so takeover does not wait forever.
+        if self.input_lease.as_ref().is_some_and(|lease| lease.attachment_id == connection) {
+            self.input_lease = None;
+        }
         self.retired.insert(connection);
         self.attachments.remove(&connection);
+        self.sequences.remove(&connection);
         if self.viewport_owner == Some(connection) { self.viewport_owner = None; }
         if let Some(update) = self.viewport_update.as_mut() {
             if update.owner == Some(connection) {
@@ -152,11 +227,52 @@ impl Session {
         } else { self.fault = Some("Control epoch exhausted; recreate session".into()); }
     }
     fn finish_handover(&mut self) {
-        if self.fault.is_none() && self.viewport.is_some() {
+        if self.fault.is_none() && self.viewport.is_some() && self.input_lease.is_none() {
             if let ControlPhase::Waiting { attachment_id } = self.control.phase {
                 self.transition(ControlPhase::Human { attachment_id });
             }
         }
+    }
+    fn response_editor_context(&self) -> Option<EditorContext> {
+        self.editor_context.clone()
+    }
+    fn next_sequence(&self, connection: u64) -> u64 {
+        self.sequences.get(&connection).copied().unwrap_or(0).saturating_add(1)
+    }
+    fn binding_fence(&self, id: u64, binding: &InputBinding) -> Option<Response> {
+        let InputBinding::Editor { target_id, focus_revision, editor_revision, .. } = binding else { return None; };
+        let Some(context) = &self.editor_context else {
+            return Some(error(id, "NO_EDITOR_CONTEXT", "No editable target is focused"));
+        };
+        if context.target_id != *target_id { return Some(error(id, "STALE_EDITOR_TARGET", "Editor target changed")); }
+        if context.focus_revision != *focus_revision { return Some(error(id, "STALE_FOCUS_REVISION", "Focus revision changed")); }
+        if context.editor_revision != *editor_revision { return Some(error(id, "STALE_EDITOR_REVISION", "Editor revision changed")); }
+        if !context.editable { return Some(error(id, "NOT_EDITABLE", "Editor target is not writable")); }
+        None
+    }
+    fn continues_open_lease(&self, connection: u64, operation: &Operation) -> bool {
+        self.input_lease.as_ref().is_some_and(|lease|
+            lease.attachment_id == connection && lease.operation_id == operation.operation_id)
+    }
+    fn begin_dispatch(&mut self, dispatch: &Dispatch) -> Option<u64> {
+        let previous_sequence = self
+            .sequences
+            .insert(dispatch.connection, dispatch.operation.sequence);
+        let open = dispatch.input.as_ref().is_some_and(|envelope| !input_event_terminal(&envelope.event));
+        if dispatch.fresh {
+            if open { self.input_lease = lease_projection(&dispatch.operation, &dispatch.command); }
+            self.records.insert(dispatch.connection, Record {
+                operation: dispatch.operation.clone(),
+                command: dispatch.command.clone(),
+                response: None,
+                events: HashMap::new(),
+                open,
+            });
+        } else if let Some(record) = self.records.get_mut(&dispatch.connection) {
+            record.command = dispatch.command.clone();
+            record.open = open;
+        }
+        previous_sequence
     }
     fn status(&self, connection: u64, busy: bool) -> ResultValue {
         ResultValue::Status(SessionStatus {
@@ -165,84 +281,135 @@ impl Session {
             mode: self.attachments.get(&connection).map(|attachment| attachment.mode),
             agent_attached: self.agent.is_some(), viewport_revision: self.viewport_revision,
             document_revision: self.document_revision,
-            operation_running: busy,
+            operation_running: busy || self.input_lease.is_some(),
             control: self.control.clone(),
             fault: self.fault.clone(),
-            next_sequence: self.records.get(&connection).map_or(1, |r| r.operation.sequence.saturating_add(1)),
+            next_sequence: self.next_sequence(connection),
             viewport: self.viewport,
             viewport_owner: self.viewport_owner,
             viewport_pending: self.viewport_pending(),
+            editor_context: self.response_editor_context(),
+            input_lease: self.input_lease.clone(),
         })
     }
-    fn request(&mut self, connection: u64, request: Request, busy: bool) -> Result<Response, Command> {
+    fn request(&mut self, connection: u64, request: Request, busy: bool) -> Admission {
         let id = request.id;
-        let controlled = matches!(request.command, Command::Click { .. } | Command::InputText { .. } | Command::Scroll { .. } | Command::Navigate { .. });
+        let controlled = matches!(request.command, Command::Click { .. } | Command::InputText { .. } | Command::Scroll { .. } | Command::Navigate { .. } | Command::Input { .. });
         let mutation = controlled || matches!(request.command, Command::Evaluate { .. } | Command::Resize { .. } | Command::CloseSession {});
+        let mut operation: Option<Operation> = None;
+        let mut fresh = true;
         if mutation {
-            let Some(operation) = &request.operation else { return Ok(error(id, "OPERATION_REQUIRED", "Browser mutations require an operation identity")); };
-            if operation.session_id != self.id || operation.attachment_id != connection {
-                return Ok(error(id, "STALE_ATTACHMENT", "Operation identity belongs to another session or connection"));
+            let Some(raw) = request.operation.as_ref() else {
+                return Admission::Replied(error(id, "OPERATION_REQUIRED", "Browser mutations require an operation identity"));
+            };
+            let mut normalized = raw.clone();
+            if normalized.operation_id.is_empty() { normalized.operation_id = format!("legacy-{}", normalized.sequence); }
+            if normalized.session_id != self.id || normalized.attachment_id != connection {
+                return Admission::Replied(error(id, "STALE_ATTACHMENT", "Operation identity belongs to another session or connection"));
             }
             if let Some(previous) = self.records.get(&connection) {
-                if operation.sequence == previous.operation.sequence {
-                    if *operation != previous.operation || request.command != previous.command {
-                        return Ok(error(id, "OPERATION_CONFLICT", "Sequence already belongs to different operation content"));
+                if previous.operation.operation_id == normalized.operation_id {
+                    if previous.operation != normalized {
+                        return Admission::Replied(error(id, "OPERATION_CONFLICT", "Operation identity was reused with different fencing"));
                     }
-                    return Ok(match &previous.response {
-                        Some(Response::Result { value, .. }) => Response::Result { id, value: value.clone() },
-                        Some(Response::Error { code, message, .. }) => error(id, code, message.clone()),
-                        None => error(id, "OPERATION_RUNNING", "Operation already accepted; do not execute again"),
-                        _ => unreachable!(),
-                    });
-                }
-                if operation.sequence <= previous.operation.sequence {
-                    return Ok(error(id, "OPERATION_EXPIRED", "Receipt expired; operation must not be replayed"));
+                    match &request.command {
+                        Command::Input { envelope } => {
+                            if let Some((prior, response)) = previous.events.get(&envelope.event_sequence) {
+                                if prior == envelope { return Admission::Replied(replay_response(id, response)); }
+                                if let Some(response) = self.binding_fence(id, &envelope.binding) { return Admission::Replied(response); }
+                                return Admission::Replied(error(id, "OPERATION_CONFLICT", "Event sequence already belongs to different event content"));
+                            }
+                            if previous.open {
+                                fresh = false;
+                            } else {
+                                return Admission::Replied(error(id, "OPERATION_EXPIRED", "Operation lease already terminated; use the next operation identity"));
+                            }
+                        }
+                        _ => {
+                            if let Some(response) = &previous.response {
+                                if previous.command == request.command {
+                                    return Admission::Replied(replay_response(id, response));
+                                }
+                                return Admission::Replied(error(id, "OPERATION_CONFLICT", "Sequence already belongs to different operation content"));
+                            }
+                            if previous.command != request.command {
+                                return Admission::Replied(error(id, "OPERATION_CONFLICT", "Sequence already belongs to different operation content"));
+                            }
+                            return Admission::Replied(error(id, "OPERATION_RUNNING", "Operation already accepted; do not execute again"));
+                        }
+                    }
+                } else if previous.open {
+                    return Admission::Replied(error(id, "OPERATION_BUSY", "Wait for the active gesture/composition lease to terminate"));
                 }
             }
-            let expected = self.records.get(&connection).map_or(Some(1), |r| r.operation.sequence.checked_add(1));
-            if Some(operation.sequence) != expected { return Ok(error(id, "INVALID_SEQUENCE", "Use the next sequence from Host status")); }
-            if operation.control_epoch != self.control.epoch { return Ok(error(id, "STALE_CONTROL", "Control epoch changed")); }
-            if operation.viewport_revision != self.viewport_revision { return Ok(error(id, "STALE_VIEWPORT", "Viewport revision changed")); }
-            if operation.document_revision != self.document_revision { return Ok(error(id, "STALE_DOCUMENT", "Document revision changed")); }
+            if fresh && normalized.sequence <= self.sequences.get(&connection).copied().unwrap_or(0) {
+                return Admission::Replied(error(id, "OPERATION_EXPIRED", "Receipt expired; operation must not be replayed"));
+            }
+            // An accepted gesture/composition lease outlives the control-epoch
+            // fence that admitted it: takeover waits for its terminal event, so
+            // the original attachment must still be able to deliver that event
+            // under the epoch that granted the lease.
+            if !self.continues_open_lease(connection, &normalized) && normalized.control_epoch != self.control.epoch {
+                return Admission::Replied(error(id, "STALE_CONTROL", "Control epoch changed"));
+            }
+            if normalized.viewport_revision != self.viewport_revision { return Admission::Replied(error(id, "STALE_VIEWPORT", "Viewport revision changed")); }
+            if normalized.document_revision != self.document_revision { return Admission::Replied(error(id, "STALE_DOCUMENT", "Document revision changed")); }
+            if fresh {
+                if normalized.sequence != self.next_sequence(connection) {
+                    return Admission::Replied(error(id, "INVALID_SEQUENCE", "Use the next sequence from Host status"));
+                }
+            } else if self.sequences.get(&connection).copied() != Some(normalized.sequence) {
+                return Admission::Replied(error(id, "INVALID_SEQUENCE", "Lease events keep the operation sequence"));
+            }
+            if let Command::Input { envelope } = &request.command {
+                if envelope.frame.session_id != self.id
+                    || envelope.frame.document_revision != self.document_revision
+                    || envelope.frame.viewport_revision != self.viewport_revision {
+                    return Admission::Replied(error(id, "STALE_FRAME", "Presented frame identity does not match the current Host revisions"));
+                }
+            }
+            operation = Some(normalized);
         } else if request.operation.is_some() {
-            return Ok(error(id, "INVALID_OPERATION", "Control requests cannot carry browser operation identity"));
+            return Admission::Replied(error(id, "INVALID_OPERATION", "Control requests cannot carry browser operation identity"));
         }
-        if self.viewport.is_none() { return Ok(error(id, "SESSION_CLOSED", "Session was explicitly closed")); }
+        if self.viewport.is_none() { return Admission::Replied(error(id, "SESSION_CLOSED", "Session was explicitly closed")); }
         if self.attachments.contains_key(&connection) && matches!(request.command, Command::Status {} | Command::Detach {}) {
             if matches!(request.command, Command::Detach {}) { self.detach(connection); }
-            return Ok(Response::Result { id, value: self.status(connection, busy) });
+            return Admission::Replied(Response::Result { id, value: self.status(connection, busy) });
         }
         if matches!(&request.command, Command::CloseSession {}) && self.agent == Some(connection) {
-            if self.fault.is_none() && !matches!(self.control.phase, ControlPhase::Agent) { return Ok(error(id, "CONTROL_REQUIRED", "Agent control is suspended")); }
-            return if busy { Ok(error(id, "OPERATION_BUSY", "Wait for the accepted operation to finish")) } else { Err(request.command) };
+            if self.fault.is_none() && !matches!(self.control.phase, ControlPhase::Agent) { return Admission::Replied(error(id, "CONTROL_REQUIRED", "Agent control is suspended")); }
+            return if busy { Admission::Replied(error(id, "OPERATION_BUSY", "Wait for the accepted operation to finish")) } else {
+                Admission::Run(Dispatch { connection, command: request.command, operation: operation.expect("mutation admission checked identity"), input: None, fresh: true })
+            };
         }
-        if let Some(fault) = &self.fault { return Ok(error(id, "SESSION_FAULTED", fault.clone())); }
+        if let Some(fault) = &self.fault { return Admission::Replied(error(id, "SESSION_FAULTED", fault.clone())); }
         match request.command {
             Command::Attach { mode, viewport } => {
-                if self.retired.contains(&connection) { return Ok(error(id, "RECONNECT_REQUIRED", "Detached identities cannot be reused; open a new connection")); }
-                if self.attachments.contains_key(&connection) { return Ok(error(id, "ALREADY_ATTACHED", "Use a new connection to change attachment mode")); }
-                if mode == Mode::Agent && self.agent.is_some() { return Ok(error(id, "AGENT_BUSY", "Agent attachment already exists")); }
+                if self.retired.contains(&connection) { return Admission::Replied(error(id, "RECONNECT_REQUIRED", "Detached identities cannot be reused; open a new connection")); }
+                if self.attachments.contains_key(&connection) { return Admission::Replied(error(id, "ALREADY_ATTACHED", "Use a new connection to change attachment mode")); }
+                if mode == Mode::Agent && self.agent.is_some() { return Admission::Replied(error(id, "AGENT_BUSY", "Agent attachment already exists")); }
                 if let Some(viewport) = viewport {
-                    if mode != Mode::Observe { return Ok(error(id, "OBSERVER_REQUIRED", "Only observer attachments declare a viewport")); }
-                    if !valid_viewport(viewport.css_width, viewport.css_height) { return Ok(error(id, "INVALID_VIEWPORT", "Dimensions must be 1..4096 and at most 4194304 CSS pixels")); }
+                    if mode != Mode::Observe { return Admission::Replied(error(id, "OBSERVER_REQUIRED", "Only observer attachments declare a viewport")); }
+                    if !valid_viewport(viewport.css_width, viewport.css_height) { return Admission::Replied(error(id, "INVALID_VIEWPORT", "Dimensions must be 1..4096 and at most 4194304 CSS pixels")); }
                 }
                 self.attachments.insert(connection, Attachment { mode, viewport, webrtc: None });
                 if mode == Mode::Agent { self.agent = Some(connection); }
-                Ok(Response::Result { id, value: self.status(connection, busy) })
+                Admission::Replied(Response::Result { id, value: self.status(connection, busy) })
             }
             command => {
-                if !self.attachments.contains_key(&connection) { return Ok(error(id, "ATTACH_REQUIRED", "Attach first")); }
-                match command {
+                if !self.attachments.contains_key(&connection) { return Admission::Replied(error(id, "ATTACH_REQUIRED", "Attach first")); }
+                match &command {
                     Command::AuthorizeWebRtc { capability } => {
                         let attachment = self.attachments.get_mut(&connection).unwrap();
                         if attachment.mode != Mode::Observe {
-                            return Ok(error(id, "OBSERVER_REQUIRED", "WebRTC media requires an observer attachment"));
+                            return Admission::Replied(error(id, "OBSERVER_REQUIRED", "WebRTC media requires an observer attachment"));
                         }
-                        if let Err(message) = validate_webrtc_capability(&capability) {
-                            return Ok(error(id, "WEBRTC_CAPABILITY_REJECTED", message));
+                        if let Err(message) = validate_webrtc_capability(capability) {
+                            return Admission::Replied(error(id, "WEBRTC_CAPABILITY_REJECTED", message));
                         }
                         if attachment.webrtc.is_some() {
-                            return Ok(error(id, "WEBRTC_GRANT_EXISTS", "WebRTC authorization already exists; detach and reconnect"));
+                            return Admission::Replied(error(id, "WEBRTC_GRANT_EXISTS", "WebRTC authorization already exists; detach and reconnect"));
                         }
                         let binding = WebRtcSessionBinding {
                             session_id: self.id.clone(),
@@ -250,39 +417,39 @@ impl Session {
                             auth_binding: uuid::Uuid::new_v4().as_bytes().to_vec(),
                         };
                         attachment.webrtc = Some(WebRtcGrant { capability: capability.clone(), binding: binding.clone(), consumed: false });
-                        return Ok(Response::Result { id, value: ResultValue::WebRtcAuthorization { binding, capability } });
+                        return Admission::Replied(Response::Result { id, value: ResultValue::WebRtcAuthorization { binding, capability: capability.clone() } });
                     }
                     Command::ConsumeWebRtc { binding, capability } => {
                         let Some(attachment) = self.attachments.get_mut(&connection) else {
-                            return Ok(error(id, "ATTACH_REQUIRED", "Attach before consuming a WebRTC authorization"));
+                            return Admission::Replied(error(id, "ATTACH_REQUIRED", "Attach before consuming a WebRTC authorization"));
                         };
                         let Some(grant) = attachment.webrtc.as_mut() else {
-                            return Ok(error(id, "WEBRTC_GRANT_MISSING", "No Host-issued WebRTC authorization exists"));
+                            return Admission::Replied(error(id, "WEBRTC_GRANT_MISSING", "No Host-issued WebRTC authorization exists"));
                         };
                         if grant.consumed {
-                            return Ok(error(id, "WEBRTC_GRANT_USED", "WebRTC authorization is single-use"));
+                            return Admission::Replied(error(id, "WEBRTC_GRANT_USED", "WebRTC authorization is single-use"));
                         }
-                        if grant.binding != binding {
-                            return Ok(error(id, "STALE_WEBRTC_BINDING", "WebRTC authorization does not match this Session attachment"));
+                        if &grant.binding != binding {
+                            return Admission::Replied(error(id, "STALE_WEBRTC_BINDING", "WebRTC authorization does not match this Session attachment"));
                         }
-                        if grant.capability != capability {
-                            return Ok(error(id, "WEBRTC_CAPABILITY_MISMATCH", "WebRTC capability differs from Host authorization"));
+                        if &grant.capability != capability {
+                            return Admission::Replied(error(id, "WEBRTC_CAPABILITY_MISMATCH", "WebRTC capability differs from Host authorization"));
                         }
                         grant.consumed = true;
-                        return Ok(Response::Result { id, value: ResultValue::WebRtcConsumed { session_id: self.id.clone(), attachment_id: connection } });
+                        return Admission::Replied(Response::Result { id, value: ResultValue::WebRtcConsumed { session_id: self.id.clone(), attachment_id: connection } });
                     }
                     Command::DeclareViewport { viewport } => {
                         let attachment = self.attachments.get_mut(&connection).unwrap();
-                        if attachment.mode != Mode::Observe { return Ok(error(id, "OBSERVER_REQUIRED", "Only observer attachments declare a viewport")); }
-                        if !valid_viewport(viewport.css_width, viewport.css_height) { return Ok(error(id, "INVALID_VIEWPORT", "Dimensions must be 1..4096 and at most 4194304 CSS pixels")); }
-                        attachment.viewport = Some(viewport);
-                        return Ok(Response::Result { id, value: self.status(connection, busy) });
+                        if attachment.mode != Mode::Observe { return Admission::Replied(error(id, "OBSERVER_REQUIRED", "Only observer attachments declare a viewport")); }
+                        if !valid_viewport(viewport.css_width, viewport.css_height) { return Admission::Replied(error(id, "INVALID_VIEWPORT", "Dimensions must be 1..4096 and at most 4194304 CSS pixels")); }
+                        attachment.viewport = Some(*viewport);
+                        return Admission::Replied(Response::Result { id, value: self.status(connection, busy) });
                     }
                     Command::RequestTakeover { epoch } | Command::ReleaseControl { epoch } | Command::ResumeAgent { epoch } => {
-                        if epoch != self.control.epoch { return Ok(error(id, "STALE_CONTROL", "Control epoch changed")); }
-                        match command {
+                        if *epoch != self.control.epoch { return Admission::Replied(error(id, "STALE_CONTROL", "Control epoch changed")); }
+                        match &command {
                             Command::RequestTakeover { .. } => {
-                                if self.agent == Some(connection) { return Ok(error(id, "OBSERVER_REQUIRED", "Use an observer attachment for human takeover")); }
+                                if self.agent == Some(connection) { return Admission::Replied(error(id, "OBSERVER_REQUIRED", "Use an observer attachment for human takeover")); }
                                 match self.control.phase {
                                     ControlPhase::Agent | ControlPhase::Paused => {
                                         // Acceptance fences Agent immediately, before the worker finishes.
@@ -290,65 +457,106 @@ impl Session {
                                         if !busy { self.finish_handover(); }
                                     }
                                     ControlPhase::Waiting { attachment_id } | ControlPhase::Human { attachment_id } if attachment_id == connection => {},
-                                    _ => return Ok(error(id, "CONTROL_BUSY", "Another attachment requested human control")),
+                                    _ => return Admission::Replied(error(id, "CONTROL_BUSY", "Another attachment requested human control")),
                                 }
                             }
                             Command::ReleaseControl { .. } => {
-                                if !matches!(self.control.phase, ControlPhase::Human { attachment_id } if attachment_id == connection) { return Ok(error(id, "CONTROL_REQUIRED", "Only the human holder may release control")); }
-                                if busy { return Ok(error(id, "OPERATION_BUSY", "Finish the current operation before release")); }
+                                if !matches!(self.control.phase, ControlPhase::Human { attachment_id } if attachment_id == connection) { return Admission::Replied(error(id, "CONTROL_REQUIRED", "Only the human holder may release control")); }
+                                if busy { return Admission::Replied(error(id, "OPERATION_BUSY", "Finish the current operation before release")); }
                                 self.transition(ControlPhase::Agent);
                             }
                             Command::ResumeAgent { .. } => {
-                                if self.agent != Some(connection) || !matches!(self.control.phase, ControlPhase::Paused) { return Ok(error(id, "CONTROL_REQUIRED", "Explicit Agent resume requires paused control")); }
-                                if busy { return Ok(error(id, "OPERATION_BUSY", "Finish the accepted operation before resume")); }
+                                if self.agent != Some(connection) || !matches!(self.control.phase, ControlPhase::Paused) { return Admission::Replied(error(id, "CONTROL_REQUIRED", "Explicit Agent resume requires paused control")); }
+                                if busy { return Admission::Replied(error(id, "OPERATION_BUSY", "Finish the accepted operation before resume")); }
                                 self.transition(ControlPhase::Agent);
                             }
                             _ => unreachable!(),
                         }
-                        return Ok(Response::Result { id, value: self.status(connection, busy) });
+                        return Admission::Replied(Response::Result { id, value: self.status(connection, busy) });
                     }
                     _ => {},
                 }
                 if controlled {
                     let allowed = matches!(self.control.phase, ControlPhase::Agent) && self.agent == Some(connection)
                         || matches!(self.control.phase, ControlPhase::Human { attachment_id } if attachment_id == connection);
-                    if !allowed { return Ok(error(id, "CONTROL_REQUIRED", "Input requires current control ownership")); }
+                    let lease_owner = operation.as_ref().is_some_and(|operation| self.continues_open_lease(connection, operation));
+                    if !allowed && !lease_owner { return Admission::Replied(error(id, "CONTROL_REQUIRED", "Input requires current control ownership")); }
                 } else {
-                    if self.agent != Some(connection) { return Ok(error(id, "AGENT_REQUIRED", "Observer cannot mutate or evaluate JavaScript")); }
-                    if !matches!(self.control.phase, ControlPhase::Agent) { return Ok(error(id, "CONTROL_REQUIRED", "Agent control is suspended")); }
+                    if self.agent != Some(connection) { return Admission::Replied(error(id, "AGENT_REQUIRED", "Observer cannot mutate or evaluate JavaScript")); }
+                    if !matches!(self.control.phase, ControlPhase::Agent) { return Admission::Replied(error(id, "CONTROL_REQUIRED", "Agent control is suspended")); }
                 }
-                if self.viewport_pending() { return Ok(error(id, "VIEWPORT_PENDING", "Wait for the shared viewport to commit")); }
-                if busy { return Ok(error(id, "OPERATION_BUSY", "Wait for the accepted operation to finish")); }
+                if self.viewport_pending() { return Admission::Replied(error(id, "VIEWPORT_PENDING", "Wait for the shared viewport to commit")); }
+                if busy { return Admission::Replied(error(id, "OPERATION_BUSY", "Wait for the accepted operation to finish")); }
                 match &command {
                     Command::Resize { width, height } => {
-                        if self.selected_viewport().is_some() { return Ok(error(id, "VIEWPORT_MANAGED", "Attached viewers select the shared viewport")); }
-                        if !valid_viewport(*width, *height) { return Ok(error(id, "INVALID_VIEWPORT", "Dimensions must be 1..4096 and at most 4194304 CSS pixels")); }
+                        if self.selected_viewport().is_some() { return Admission::Replied(error(id, "VIEWPORT_MANAGED", "Attached viewers select the shared viewport")); }
+                        if !valid_viewport(*width, *height) { return Admission::Replied(error(id, "INVALID_VIEWPORT", "Dimensions must be 1..4096 and at most 4194304 CSS pixels")); }
                     }
                     Command::Navigate { url } => {
                         // This local bootstrap surface never enables file navigation.
                         if !(url.starts_with("https://") || url.starts_with("http://") || url.starts_with("data:text/html,") || url == "about:blank") {
-                            return Ok(error(id, "INVALID_URL", "Unsupported navigation scheme"));
+                            return Admission::Replied(error(id, "INVALID_URL", "Unsupported navigation scheme"));
                         }
                     }
                     Command::Evaluate { .. } => {},
                     Command::Click { x, y } | Command::Scroll { x, y, .. } => {
-                        if !cfg!(feature = "render") { return Ok(error(id, "INPUT_UNAVAILABLE", "Coordinate input requires a render-enabled Host")); }
+                        if !cfg!(feature = "render") { return Admission::Replied(error(id, "INPUT_UNAVAILABLE", "Coordinate input requires a render-enabled Host")); }
                         let (width, height) = self.viewport.unwrap();
                         if !x.is_finite() || !y.is_finite() || *x < 0.0 || *y < 0.0 || *x >= width as f64 || *y >= height as f64 {
-                            return Ok(error(id, "INVALID_POINT", "Coordinates must be inside the current CSS viewport"));
+                            return Admission::Replied(error(id, "INVALID_POINT", "Coordinates must be inside the current CSS viewport"));
                         }
                         if let Command::Scroll { delta_x, delta_y, .. } = &command {
                             if !delta_x.is_finite() || !delta_y.is_finite() || delta_x.abs() > 4096.0 || delta_y.abs() > 4096.0 {
-                                return Ok(error(id, "INVALID_SCROLL", "Scroll deltas must be finite and within 4096 CSS pixels"));
+                                return Admission::Replied(error(id, "INVALID_SCROLL", "Scroll deltas must be finite and within 4096 CSS pixels"));
                             }
                         }
                     }
                     Command::InputText { text } => {
-                        if text.chars().count() > 4096 { return Ok(error(id, "TEXT_TOO_LARGE", "At most 4096 characters per text operation")); }
+                        if text.chars().count() > 4096 { return Admission::Replied(error(id, "TEXT_TOO_LARGE", "At most 4096 characters per text operation")); }
+                    }
+                    Command::Input { envelope } => {
+                        let Some(dispatched) = &operation else { unreachable!("typed input is a mutation") };
+                        if let Some(response) = self.binding_fence(id, &envelope.binding) {
+                            return Admission::Replied(response);
+                        }
+                        if let Some(existing) = &self.input_lease {
+                            let matches_lease = match (&existing.kind, &envelope.binding) {
+                                (InputLeaseKind::Gesture, InputBinding::Gesture { gesture_session_id }) => existing.gesture_session_id.as_deref() == Some(gesture_session_id.as_str()),
+                                (InputLeaseKind::Composition, InputBinding::Editor { edit_session_id, target_id, .. }) => {
+                                    existing.edit_session_id.as_deref() == Some(edit_session_id.as_str())
+                                        && existing.target_id.as_deref() == Some(target_id.as_str())
+                                        && existing.attachment_id == dispatched.attachment_id
+                                        && existing.operation_id == dispatched.operation_id
+                                }
+                                _ => false,
+                            };
+                            if !matches_lease {
+                                return Admission::Replied(error(id, "INPUT_LEASE_BUSY", "Another gesture/composition lease is active"));
+                            }
+                        }
+                        if matches!(envelope.binding, InputBinding::Gesture { .. }) && !cfg!(feature = "render") {
+                            return Admission::Replied(error(id, "INPUT_UNAVAILABLE", "Gesture input requires a render-enabled Host"));
+                        }
+                        if let InputEvent::ReplaceText { text, .. } = &envelope.event {
+                            if text.chars().count() > 4096 { return Admission::Replied(error(id, "TEXT_TOO_LARGE", "At most 4096 characters per editing event")); }
+                        }
+                        return Admission::Run(Dispatch {
+                            connection,
+                            command: command.clone(),
+                            operation: dispatched.clone(),
+                            input: Some(envelope.clone()),
+                            fresh,
+                        });
                     }
                     _ => unreachable!("control commands handled above"),
                 }
-                Err(command)
+                Admission::Run(Dispatch {
+                    connection,
+                    command,
+                    operation: operation.expect("mutation admission checked identity"),
+                    input: None,
+                    fresh: true,
+                })
             }
         }
     }
@@ -361,6 +569,9 @@ struct Pending {
 struct PendingOperation {
     id: u64,
     connection: u64,
+    operation: Operation,
+    fresh: bool,
+    previous_sequence: Option<u64>,
     reply: oneshot::Sender<Response>,
 }
 
@@ -375,7 +586,24 @@ pub async fn serve(socket_dir: PathBuf, allow_private_network: bool) -> Result<(
     let (interest, interested) = tokio::sync::watch::channel(0usize);
     let worker = worker::start(id.clone(), allow_private_network, incoming_work, ready, faults, frames, interested)?;
     let viewport = initialized.await.context("browser worker stopped during startup")?.map_err(anyhow::Error::msg)?;
-    let mut session = Session { id: id.clone(), viewport: Some(viewport), attachments: HashMap::new(), agent: None, viewport_revision: 0, document_revision: 0, fault: None, control: Control { epoch: 1, phase: ControlPhase::Agent }, records: HashMap::new(), retired: HashSet::new(), viewport_owner: None, viewport_update: None, viewport_repair: None };
+    let mut session = Session {
+        id: id.clone(),
+        viewport: Some(viewport),
+        attachments: HashMap::new(),
+        agent: None,
+        viewport_revision: 0,
+        document_revision: 0,
+        fault: None,
+        control: Control { epoch: 1, phase: ControlPhase::Agent },
+        records: HashMap::new(),
+        retired: HashSet::new(),
+        viewport_owner: None,
+        viewport_update: None,
+        viewport_repair: None,
+        editor_context: None,
+        input_lease: None,
+        sequences: HashMap::new(),
+    };
     let listener = UnixListener::bind(directory.0.join("host.sock"))?;
     std::fs::set_permissions(directory.0.join("host.sock"), std::fs::Permissions::from_mode(0o600))?;
     let media_listener = UnixListener::bind(directory.0.join("frames.sock"))?;
@@ -448,34 +676,56 @@ pub async fn serve(socket_dir: PathBuf, allow_private_network: bool) -> Result<(
                     interest.send_replace(viewers);
                 }
                 Event::Gone(connection) => {
+                    if session.input_lease.as_ref().is_some_and(|lease| lease.attachment_id == connection) {
+                        session.input_lease = None;
+                    }
+                    if session.records.contains_key(&connection) {
+                        session.records.remove(&connection);
+                    }
                     session.detach(connection);
                     session.retired.remove(&connection);
                 }
                 Event::Request { connection, request, reply } => {
                     let id = request.id;
-                    let operation = request.operation.clone();
                     match session.request(connection, request, pending.is_some()) {
-                        Ok(response) => { let _ = reply.send(response); }
-                        Err(command) => {
-                            let record = Record { operation: operation.expect("mutation admission checked identity"), command: command.clone(), response: None };
-                            let kind = if let Command::Resize { width, height } = command {
-                                match session.viewport_work(None, width, height, Some(record.operation.document_revision)) {
+                        Admission::Replied(response) => { let _ = reply.send(response); }
+                        Admission::Run(dispatch) => {
+                            let previous_sequence = session.begin_dispatch(&dispatch);
+                            let record_operation = dispatch.operation.clone();
+                            let kind = if let Command::Resize { width, height } = &dispatch.command {
+                                match session.viewport_work(None, *width, *height, Some(record_operation.document_revision)) {
                                     Ok(kind) => kind,
                                     Err(cause) => {
                                         session.fault = Some(cause.clone());
                                         let _ = reply.send(error(id, "SESSION_FAULTED", cause));
+                                        session.records.remove(&dispatch.connection);
+                                        session.input_lease = None;
                                         continue;
                                     }
                                 }
-                            } else { WorkKind::Browser { command, document_revision: record.operation.document_revision } };
+                            } else {
+                                WorkKind::Browser {
+                                    command: dispatch.command.clone(),
+                                    document_revision: record_operation.document_revision,
+                                    operation_id: record_operation.operation_id.clone(),
+                                }
+                            };
                             let (finished, result) = oneshot::channel();
                             if work.try_send(Work { kind, reply: finished }).is_err() {
                                 session.viewport_update = None;
                                 session.fault = Some("Browser worker unavailable; recreate session explicitly".into());
                                 let _ = reply.send(error(id, "SESSION_FAULTED", session.fault.clone().unwrap()));
+                                session.records.remove(&dispatch.connection);
+                                session.input_lease = None;
                             } else {
-                                session.records.insert(connection, record);
-                                pending = Some(Pending { operation: Some(PendingOperation { id, connection, reply }), result });
+                                pending = Some(Pending { operation: Some(PendingOperation {
+                                    id,
+                                    connection,
+                                    operation: record_operation,
+                                    fresh: dispatch.fresh,
+                                    previous_sequence,
+                                    reply,
+                                }), result });
                             }
                         }
                     }
@@ -509,6 +759,7 @@ pub async fn serve(socket_dir: PathBuf, allow_private_network: bool) -> Result<(
                         if finished.operation.is_none() {
                             if let Err((code, cause)) = &completion.result { session.fault = Some(format!("Viewport application failed: {code}: {cause}")); }
                         }
+                        session.editor_context = completion.editor_context.clone();
                         session.finish_handover();
                         match completion.result {
                             Ok(_) if session.fault.is_some() && session.viewport.is_some() => Err(("SESSION_FAULTED", session.fault.clone().unwrap())),
@@ -523,12 +774,39 @@ pub async fn serve(socket_dir: PathBuf, allow_private_network: bool) -> Result<(
                 // Cache only the latest bounded receipt per live attachment. Earlier
                 // sequences are rejected, never silently evicted into re-execution.
                 if let Some(operation) = finished.operation {
+                    let error_code = match &outcome { Err((code, _)) => Some(*code), Ok(_) => None };
+                    let unconsumed = operation.fresh && error_code.is_some_and(unconsumed_input_error);
                     let response = match outcome {
                         Ok(value) => Response::Result { id: operation.id, value: value.unwrap_or_else(|| session.status(operation.connection, false)) },
                         Err((code, cause)) => error(operation.id, code, cause),
                     };
                     let response = bounded_response(response)?;
-                    if let Some(record) = session.records.get_mut(&operation.connection) { record.response = Some(response.clone()); }
+                    let envelope = session.records.get(&operation.connection)
+                        .filter(|record| record.operation.operation_id == operation.operation.operation_id)
+                        .and_then(|record| input_envelope(&record.command).cloned());
+                    if let Some(envelope) = envelope {
+                        if unconsumed {
+                            session.records.remove(&operation.connection);
+                            session.input_lease = None;
+                            if let Some(previous_sequence) = operation.previous_sequence {
+                                session.sequences.insert(operation.connection, previous_sequence);
+                            } else {
+                                session.sequences.remove(&operation.connection);
+                            }
+                        } else if let Some(record) = session.records.get_mut(&operation.connection) {
+                            let terminal = input_event_terminal(&envelope.event);
+                            record.events.insert(envelope.event_sequence, (envelope, response.clone()));
+                            if terminal {
+                                record.open = false;
+                                if session.input_lease.as_ref().is_some_and(|lease| lease.operation_id == operation.operation.operation_id) {
+                                    session.input_lease = None;
+                                }
+                            }
+                        }
+                    } else if let Some(record) = session.records.get_mut(&operation.connection) {
+                        record.response = Some(response.clone());
+                    }
+                    session.finish_handover();
                     let _ = operation.reply.send(response);
                 }
             },
